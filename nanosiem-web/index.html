@@ -33,11 +33,17 @@
   <!-- Theme initialization script - prevents flash of wrong theme -->
   <script>
     (function() {
+      // Keep in sync with THEMES in src/lib/theme.ts. This runs before the
+      // bundle loads, so it cannot import it — but an unknown stored value must
+      // not be pasted onto <html> as a class, so validate against the list.
+      const themes = ['light', 'dark', 'matte'];
       const storageKey = 'nanosiem-theme';
-      const theme = localStorage.getItem(storageKey) || 'dark';
+      const stored = localStorage.getItem(storageKey) || 'dark';
       const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-      const resolvedTheme = theme === 'system' ? systemTheme : theme;
-      document.documentElement.classList.add(resolvedTheme);
+      const resolvedTheme = stored === 'system' ? systemTheme : stored;
+      document.documentElement.classList.add(
+        themes.indexOf(resolvedTheme) === -1 ? 'dark' : resolvedTheme
+      );
     })();
   </script>
 </head>

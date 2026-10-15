@@ -7,6 +7,9 @@
 //!
 //! Requirements: 8.1, 8.2, 8.3, 8.4, 8.5
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
 use sqlx::PgPool;
 use tracing::{debug, info};
 
@@ -28,6 +31,38 @@ pub enum PrevalenceSettingsError {
     InvalidCacheTtl(u64),
 }
 
+/// NAN-3451: the Settings → Prevalence rarity threshold as one live value
+/// shared by every clone of the [`super::PrevalenceService`] that owns it and
+/// every lake prevalence client bound to it.
+///
+/// Empty until a value is actually read from (or written to)
+/// `system_settings`, so a deployment default such as
+/// `NANO_LAKE_PREVALENCE_RARITY_THRESHOLD` stays in force when Settings are
+/// unreadable (hosted-shared control logins hold no grant on that table).
+/// Once Settings hold a value, it wins: the env value is only the fallback.
+#[derive(Debug, Clone, Default)]
+pub struct RarityThresholdSetting(Arc<AtomicU64>);
+
+impl RarityThresholdSetting {
+    /// A setting that already holds `threshold`.
+    pub fn fixed(threshold: u64) -> Self {
+        let setting = Self::default();
+        setting.set(threshold);
+        setting
+    }
+
+    /// Record the Settings value. `0` is not a valid threshold and clears it.
+    pub fn set(&self, threshold: u64) {
+        self.0.store(threshold, Ordering::Relaxed);
+    }
+
+    /// The Settings value, or `None` when none has been read.
+    pub fn get(&self) -> Option<u64> {
+        let threshold = self.0.load(Ordering::Relaxed);
+        (threshold > 0).then_some(threshold)
+    }
+}
+
 /// Prevalence settings manager
 ///
 /// Handles loading and saving prevalence configuration from/to PostgreSQL.
@@ -46,6 +81,16 @@ impl PrevalenceSettings {
     ///
     /// Returns the current configuration or defaults if not set.
     pub async fn get_config(&self) -> Result<PrevalenceConfig, PrevalenceSettingsError> {
+        Ok(self.stored_config().await?.unwrap_or_else(|| {
+            debug!("No system_settings row found, using defaults");
+            PrevalenceConfig::default()
+        }))
+    }
+
+    /// The stored configuration, or `None` when the deployment has no
+    /// `system_settings` row. NAN-3451: only a stored value may override a
+    /// deployment default such as the lake's env rarity threshold.
+    pub async fn stored_config(&self) -> Result<Option<PrevalenceConfig>, PrevalenceSettingsError> {
         let row = sqlx::query_as::<_, PrevalenceConfigRow>(
             r#"
             SELECT
@@ -62,20 +107,14 @@ impl PrevalenceSettings {
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(row) => Ok(PrevalenceConfig {
-                rarity_threshold: row.rarity_threshold as u64,
-                enable_hash_tracking: row.enable_hash_tracking,
-                enable_domain_tracking: row.enable_domain_tracking,
-                enable_ip_tracking: row.enable_ip_tracking,
-                retention_days: row.retention_days as u32,
-                cache_ttl_seconds: row.cache_ttl_seconds as u64,
-            }),
-            None => {
-                debug!("No system_settings row found, using defaults");
-                Ok(PrevalenceConfig::default())
-            }
-        }
+        Ok(row.map(|row| PrevalenceConfig {
+            rarity_threshold: row.rarity_threshold as u64,
+            enable_hash_tracking: row.enable_hash_tracking,
+            enable_domain_tracking: row.enable_domain_tracking,
+            enable_ip_tracking: row.enable_ip_tracking,
+            retention_days: row.retention_days as u32,
+            cache_ttl_seconds: row.cache_ttl_seconds as u64,
+        }))
     }
 
     /// Update prevalence configuration in the database
@@ -188,6 +227,20 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// NAN-3451: an unread setting defers to the deployment default; a read
+    /// one wins and is visible through every clone.
+    #[test]
+    fn rarity_setting_is_shared_and_empty_until_read() {
+        let setting = RarityThresholdSetting::default();
+        assert_eq!(setting.get(), None);
+        let bound = setting.clone();
+        setting.set(7);
+        assert_eq!(bound.get(), Some(7));
+        assert_eq!(RarityThresholdSetting::fixed(12).get(), Some(12));
+        setting.set(0);
+        assert_eq!(bound.get(), None);
     }
 
     #[test]

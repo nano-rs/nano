@@ -85,7 +85,7 @@ function RailItem({ section, activeId, parentId, isOpen, onToggle, filteredChild
         <div className="pl-6 pt-0.5 pb-1 flex flex-col gap-0.5">
           {filteredChildren.map(c => {
             const cActive = activeId === c.id;
-            const CIcon = c.icon;
+            const CIcon = c.icon || section.icon;
             return (
               <Link
                 key={c.id}
@@ -97,11 +97,7 @@ function RailItem({ section, activeId, parentId, isOpen, onToggle, filteredChild
                     : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
                 )}
               >
-                {CIcon ? (
-                  <CIcon className={cn('w-[11px] h-[11px]', cActive ? 'text-primary' : 'text-muted-foreground/70')} />
-                ) : (
-                  <span className="w-1 h-1 rounded-full bg-muted-foreground/60" />
-                )}
+                <CIcon strokeWidth={1.5} className={cn('w-[11px] h-[11px] shrink-0', cActive ? 'text-primary' : 'text-muted-foreground/70')} />
                 <span className="flex-1 truncate">{c.label}</span>
               </Link>
             );
@@ -119,6 +115,7 @@ interface SettingsRailProps {
 export function SettingsRail({ onBackToApp }: SettingsRailProps) {
   const location = useLocation();
   const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
+  const sharedTenant = user?.deployment_mode === 'enterprise_shared';
   const { capabilities } = useCapabilities();
   const { data: systemConfig } = useSystemConfig();
   const isAirGap = systemConfig?.air_gap === true;
@@ -147,19 +144,21 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
       .map((s): SettingsSection | null => {
         if (s.capability && !capabilities[s.capability]) return null;
         if (s.demoHidden && isDemoUser) return null;
+        if (s.sharedOnly && !sharedTenant) return null;
         if (s.airgapOnly && !isAirGap) return null;
         const sectionVisible = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
         if (!sectionVisible) return null;
         const children = (s.children || []).filter(c => {
           if (c.capability && !capabilities[c.capability]) return false;
+          if (c.sharedHidden && sharedTenant) return false;
           return hasAny(c.permissions, checkPerm);
         });
         return { ...s, children };
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap, sharedTenant]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();

@@ -17,6 +17,7 @@
 
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { REDChart, type RedSeries } from '@/components/observability/charts';
+import { CHART_SERIES } from '@/lib/chart-colors';
 import type {
   MetricWidgetConfig,
   MetricSeries,
@@ -25,16 +26,7 @@ import type {
 
 // Same palette the dashboard VisualizationRenderer uses, so multi-series metric
 // widgets read consistently against nPL/SQL panels on the same board.
-const SERIES_COLORS = [
-  '#3b82f6',
-  '#22c55e',
-  '#eab308',
-  '#ef4444',
-  '#a855f7',
-  '#06b6d4',
-  '#f97316',
-  '#ec4899',
-];
+const SERIES_COLORS = CHART_SERIES;
 
 /** Coerce the loosely-typed panel-data rows back into MetricSeries[]. */
 export function rowsToMetricSeries(rows: Record<string, unknown>[]): MetricSeries[] {

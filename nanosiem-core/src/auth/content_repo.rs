@@ -65,13 +65,13 @@ pub enum TargetEffect {
     PlaybookCreate,
     /// Materializes a repository file that declares `kind: hunt` into a hunt —
     /// a `playbooks` row of `kind = 'hunt'` plus its `hunt_specs` extension
-    /// (NAN-2238).
+    ///
     ///
     /// Deliberately NOT [`TargetEffect::PlaybookCreate`]. A response playbook is
     /// a document a human follows; a hunt is an autonomous process that reads
     /// production telemetry, and authoring one is gated on `hunts:manage`.
     /// Folding the two into one effect would let `playbooks:manage` author
-    /// hunts, which is exactly the kind-boundary erosion the rest of NAN-2238
+    /// hunts, which is exactly the kind-boundary erosion the rest of
     /// spends a schema on preventing.
     ///
     /// It is not `hunts:run`: an imported hunt lands DISABLED, so creating one
@@ -179,17 +179,29 @@ mod tests {
 
     #[test]
     fn each_effect_maps_to_the_canonical_route_capability() {
-        assert_eq!(TargetEffect::DetectionCreate.permission(), "detections:create");
+        assert_eq!(
+            TargetEffect::DetectionCreate.permission(),
+            "detections:create"
+        );
         assert_eq!(TargetEffect::DetectionEdit.permission(), "detections:edit");
-        assert_eq!(TargetEffect::DetectionDelete.permission(), "detections:delete");
+        assert_eq!(
+            TargetEffect::DetectionDelete.permission(),
+            "detections:delete"
+        );
         assert_eq!(
             TargetEffect::DetectionPromote.permission(),
             "detections:promote"
         );
         assert_eq!(TargetEffect::DetectionView.permission(), "detections:view");
-        assert_eq!(TargetEffect::LogSourceCreate.permission(), "log_sources:create");
+        assert_eq!(
+            TargetEffect::LogSourceCreate.permission(),
+            "log_sources:create"
+        );
         assert_eq!(TargetEffect::LogSourceEdit.permission(), "log_sources:edit");
-        assert_eq!(TargetEffect::LogSourceDelete.permission(), "log_sources:delete");
+        assert_eq!(
+            TargetEffect::LogSourceDelete.permission(),
+            "log_sources:delete"
+        );
         assert_eq!(TargetEffect::LogSourceView.permission(), "log_sources:view");
         assert_eq!(
             TargetEffect::SourceConfigEdit.permission(),
@@ -237,7 +249,10 @@ mod tests {
     fn system_grants_everything() {
         let grants = TargetGrants::system();
         for effect in TargetEffect::ALL {
-            assert!(grants.allows(effect), "{effect:?} must be granted to SYSTEM");
+            assert!(
+                grants.allows(effect),
+                "{effect:?} must be granted to SYSTEM"
+            );
             assert_eq!(grants.ensure(effect), Ok(()));
         }
     }

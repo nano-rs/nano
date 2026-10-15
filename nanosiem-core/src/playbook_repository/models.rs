@@ -27,10 +27,14 @@ pub struct PlaybookRepository {
     pub last_synced_at: Option<DateTime<Utc>>,
     pub last_sync_commit: Option<String>,
     pub last_sync_status: Option<String>,
+    #[sqlx(default)]
+    pub sync_started_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub sync_lease_expires_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
     pub playbook_count: Option<i32>,
     pub enabled: Option<bool>,
-    /// Which `playbooks.kind` values this repository may produce (NAN-2238).
+    /// Which `playbooks.kind` values this repository may produce.
     ///
     /// A runbook is a document a human follows; a hunt is a process that
     /// executes on a cadence against production telemetry. Before this, both
@@ -262,4 +266,60 @@ pub struct PlaybookBundleImportResult {
     pub content_version: String,
     /// Number of playbooks synced (upserted) into the repository catalog.
     pub synced: usize,
+}
+
+/// A linked import whose upstream catalog file changed since it
+/// was imported or last applied (`playbook_imports.upstream_changed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PlaybookUpstreamUpdate {
+    /// The tenant's imported playbook.
+    #[serde(with = "typeid::playbook")]
+    #[schema(value_type = String)]
+    pub playbook_id: Uuid,
+    #[serde(with = "typeid::repo_playbook")]
+    #[schema(value_type = String)]
+    pub repository_playbook_id: Uuid,
+    pub file_path: String,
+    /// Upstream title (catalog frontmatter).
+    pub title: Option<String>,
+    /// `response` | `hunt`.
+    pub kind: String,
+    pub import_type: String,
+    /// Catalog commit the import was taken at (or last applied from).
+    pub imported_commit: Option<String>,
+    /// Upstream file blob SHA now in the catalog.
+    pub upstream_sha: Option<String>,
+}
+
+/// `GET /api/playbook-repositories/{id}/upstream-updates`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaybookUpstreamUpdatesResponse {
+    pub updates: Vec<PlaybookUpstreamUpdate>,
+    /// Linked imports with a pending upstream change across every repository.
+    pub total_count: i64,
+}
+
+/// The result of applying one upstream change to an imported playbook.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApplyPlaybookUpstreamResult {
+    #[serde(with = "typeid::playbook")]
+    #[schema(value_type = String)]
+    pub playbook_id: Uuid,
+    /// False when nothing was pending (already current) or the apply failed
+    /// (bulk only; `message` says why).
+    pub updated: bool,
+    /// The playbook's version after the apply.
+    pub version: Option<i32>,
+    /// The playbook's status after the apply: a content change on a `live`
+    /// playbook returns it to `draft` for review, as any edit does.
+    pub status: Option<String>,
+    pub message: String,
+}
+
+/// `POST /api/playbook-repositories/{id}/apply-all-upstream-updates`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BulkApplyPlaybookUpstreamResult {
+    pub updated: i32,
+    pub failed: i32,
+    pub results: Vec<ApplyPlaybookUpstreamResult>,
 }

@@ -141,7 +141,11 @@ impl IdentitySyncScheduler {
             self.sync_interval_hours(provider),
             self.config.staleness_multiplier,
         );
-        if let Err(e) = self.service.reconcile_stale_users(&provider.id, cutoff).await {
+        if let Err(e) = self
+            .service
+            .reconcile_stale_users(&provider.id, cutoff)
+            .await
+        {
             warn!(provider_id = %provider.id, error = %e, "Staleness reconciliation failed");
         }
     }

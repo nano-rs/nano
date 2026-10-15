@@ -7,18 +7,21 @@ This directory contains the Vector configuration for NanoSIEM's log ingestion pi
 ```
 config/vector/
 ├── 00-base.toml              # Core pipeline: sources, auth, rate limiting
-├── 20-dynamic-router.toml    # Auto-generated router (DO NOT EDIT)
-├── 50-generic-parser.toml    # Generic parser for unknown source types
-├── 90-sinks.toml             # Output sinks (NanoSIEM API, Prometheus)
-├── sinks/
-│   ├── clickhouse.toml.disabled  # Direct ClickHouse sink (optional)
-│   └── *.bak                     # Backup sink configurations
+├── 01-vector-source.toml     # Vector-to-Vector source
+├── 02-hec-source.toml        # Splunk HEC source
+├── 03-otlp-source.toml       # OTLP source
+├── 04-otlp-lake-sink.toml    # OTLP lake sink
+├── 92-metrics.toml           # Internal metrics and collector errors
+├── sinks/                    # Optional extra sinks (empty by default)
 ├── sources/
-│   └── parsers/              # Deployed parser configs (auto-generated)
+│   ├── configs/              # Source configs (written by the API)
+│   └── parsers/              # Parser pipeline (written by the API)
+│       ├── _router.toml      # Routes events to parsers
 │       ├── _combiner.toml    # Combines all parser outputs
-│       └── *.toml            # Individual parser configs
-├── certs/                    # TLS certificates (optional)
-└── *.bak                     # Backup files (not loaded)
+│       ├── _ocsf_sink.toml   # OCSF lake (Parquet bronze) sink
+│       └── *.toml            # Pipeline, enrichment and per-parser configs
+├── backup/                   # Last-good copy of sources/parsers
+└── certs/                    # TLS certificates (optional)
 ```
 
 ## File Loading Order
@@ -76,9 +79,47 @@ curl -X POST http://localhost:8080/ \
   -d '{"message": "User logged in", "user": "john"}'
 ```
 
+## Ingest tokens
+
+A token decides the source, 100% token based. Every token is bound to exactly
+one log source, and every event sent with it lands in that source whatever
+`sourcetype` (HEC) or `X-Source-Type` / body `source_type` (HTTP) it declares.
+A different declared type is kept only as the raw `claimed_source_type` field.
+There is no multiplex and no fallback mode.
+
+- **Named ingest tokens**, issued for a source and revoked by an admin in
+  Ingestion -> Credentials (`/api/ingest-tokens`). The value is shown once;
+  nano-api stores only its SHA-256 and writes the accepted tokens to
+  `/etc/vector/dynamic/ingest-tokens/tokens.json` (0600, shared
+  `nano-vector-dynamic` volume): each entry's `name` is the bound source's
+  route key, which the fork stamps as `%nano_credential_name` and
+  `source_type_extract` (HTTP) / `hec_normalize` (HEC) route on. The
+  nano-rs/vector `valid_tokens_file` option re-reads the file at most every
+  2 s, so issue, bind and revoke take effect within seconds with no reload.
+  Lake rows store `metadata.nano_credential_id`, so you can search by sender.
+- **Unbound tokens** (older tokens that migration 363 could not bind
+  unambiguously, or tokens whose source was deleted) are left out of the file
+  and refused with 401 until an admin binds them.
+- **The install token** `VECTOR_AUTH_TOKEN` ("Install token (legacy)") is
+  accepted only once it is bound to a source (and enabled); it is then listed
+  in the file like a named token. With an install token set, nano-api writes
+  `fallback_enabled = false`, so the sources' static fallback never accepts a
+  token. Only with no install token at all does the
+  `VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true` opt-in route by declared type.
+- **The platform pull credential** (`npp_` + HMAC of `VECTOR_AUTH_TOKEN`) is
+  how nano-api's own collector integrations post several log types on one
+  connection; it is the one credential whose declared type is kept. The
+  push-enrichment lane (`:8090`) keeps the install token and is unaffected.
+
+A Vector aggregator forwarding several log types uses one `splunk_hec_logs`
+(or `http`) sink per type, each with the token bound to that type's source.
+Ingestion -> Credentials shows the snippet.
+
+Needs `ghcr.io/nano-rs/vector` 0.59.0-nano.7 or later (`valid_tokens_file`).
+
 ## Environment Variables
 
-- `VECTOR_AUTH_TOKEN` - Bearer token for authentication (default: `nanosiem-default-token`)
+- `VECTOR_AUTH_TOKEN` - Install token: accepted only once bound to a source; keys the platform pull credential (default: `nanosiem-default-token`)
 - `NANOSIEM_INGESTION_URL` - API endpoint for log delivery (default: `http://host.docker.internal:3000/api/ingest`)
 - `VECTOR_DATA_DIR` - Directory for disk buffer persistence
 
@@ -108,6 +149,50 @@ alternative sink and source configurations (`sinks/*.disabled`,
 ## Sink Options
 
 NanoSIEM supports two ingestion paths:
+
+### Native OTLP object-lake routing
+
+`03-otlp-source.toml` owns the listener and routes spans/metrics to exactly one
+backend from `NANO_LOG_QUERY_BACKEND`. Legacy installs use the existing
+ClickHouse sinks. Lake installs use `04-otlp-lake-sink.toml` and set:
+
+```bash
+NANO_OTEL_LAKE_INGEST_URL=http://lake-otel:3014
+NANO_OTEL_LAKE_INGEST_TOKEN=<ingest-only-token>
+```
+
+Vector sends one native flattened OTLP span or metric point per NDJSON row to
+`/v1/otlp/spans` or `/v1/otlp/metrics`. The Rust endpoint derives tenant
+identity from its own configuration, not from the request body. Both lake sinks
+use blocking disk buffers and end-to-end acknowledgements. Normal operation is
+single-write: a lake install does not retain a second ClickHouse telemetry copy.
+
+Validate the optional graph and its envelope contract before deployment:
+
+```bash
+CLICKHOUSE_URL=http://clickhouse:8123 \
+CLICKHOUSE_DATABASE=nanosiem \
+CLICKHOUSE_USER=nanosiem \
+CLICKHOUSE_PASSWORD='<configured secret>' \
+CLICKHOUSE_OTEL_SPANS_TABLE=otel_spans_raw \
+CLICKHOUSE_OTEL_METRICS_TABLE=otel_metrics_raw \
+NANO_LOG_QUERY_BACKEND=lake \
+NANO_OTEL_LAKE_INGEST_URL=http://lake-otel:3014 \
+NANO_OTEL_LAKE_INGEST_TOKEN='<ingest-only-token>' \
+vector validate --dangerously-allow-env-var-interpolation --skip-healthchecks \
+  config/vector/03-otlp-source.toml config/vector/04-otlp-lake-sink.toml
+CLICKHOUSE_URL=http://clickhouse:8123 \
+CLICKHOUSE_DATABASE=nanosiem \
+CLICKHOUSE_USER=nanosiem \
+CLICKHOUSE_PASSWORD='<configured secret>' \
+CLICKHOUSE_OTEL_SPANS_TABLE=otel_spans_raw \
+CLICKHOUSE_OTEL_METRICS_TABLE=otel_metrics_raw \
+NANO_LOG_QUERY_BACKEND=lake \
+NANO_OTEL_LAKE_INGEST_URL=http://lake-otel:3014 \
+NANO_OTEL_LAKE_INGEST_TOKEN='<ingest-only-token>' \
+vector test --dangerously-allow-env-var-interpolation \
+  config/vector/03-otlp-source.toml config/vector/04-otlp-lake-sink.toml
+```
 
 ### 1. NanoSIEM API Sink (Default)
 

@@ -1,0 +1,125 @@
+{
+  "time": 1790236978704,
+  "count": 1,
+  "status": "New",
+  "message": "drive_by_js_execution_chain - device.hostname=e2e-6defdeb8-db.corp.local",
+  "metadata": {
+    "uid": "alert:1fabcd30-f9b4-4ecb-b994-4bc7e7ab1818:faabbbee1a045eed8f0f1c737238cf8d2094e8ff6345f2bf9e6084c7816991ca",
+    "product": {
+      "name": "nano",
+      "vendor_name": "nano"
+    },
+    "version": "1.9.0",
+    "log_name": "signals",
+    "log_source": "signals",
+    "tenant_uid": "tenant-a"
+  },
+  "severity": "Critical",
+  "type_uid": 200401,
+  "unmapped": {
+    "realtime": false,
+    "rule_mode": "alerting",
+    "risk_factors": [
+      "severity_default:Critical"
+    ],
+    "raw_risk_score": 90,
+    "matched_events_sample": [
+      "{\"_nano_source_types\":[\"windows_sysmon\"],\"device.hostname\":\"e2e-6defdeb8-db.corp.local\",\"risk_factors\":[\"Drive-by JavaScript execution chain\"],\"risk_score\":95,\"sequence_duration_seconds\":33,\"step1_actor_user_name\":\"svc_dc\",\"step1_file_hashes_value\":[\"3e120cc23a568678151b2bc258291511e3fa0b5983f7cf301aac95e4c0d2a44c\"],\"step1_file_path\":\"C:\\\\Users\\\\svc_dc\\\\Downloads\\\\search_term\\\\EhDSjenZsx.js\",\"step2_process_cmd_line\":\"wscript.exe \\\"C:\\\\Users\\\\svc_dc\\\\Downloads\\\\search_term\\\\EhDSjenZsx.js\\\"\",\"step2_process_name\":\"wscript.exe\",\"step3_dst_endpoint_ip\":\"203.0.113.77\",\"step3_dst_endpoint_port\":443,\"step4_actor_process_name\":\"wscript.exe\",\"step4_process_cmd_line\":\"powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File \\\"C:\\\\Users\\\\svc_dc\\\\AppData\\\\Local\\\\Temp\\\\stage.ps1\\\"\",\"step4_process_name\":\"powershell.exe\",\"time\":\"2026-09-24 08:02:58.704000\"}"
+    ],
+    "matched_events_redacted": false
+  },
+  "class_uid": 2004,
+  "resources": [
+    {
+      "name": "e2e-6defdeb8-db.corp.local",
+      "role": "Affected",
+      "device": {
+        "name": "e2e-6defdeb8-db.corp.local",
+        "type_id": 0,
+        "hostname": "e2e-6defdeb8-db.corp.local",
+        "risk_level": "Critical",
+        "risk_score": 90,
+        "risk_level_id": 4
+      },
+      "role_id": 3,
+      "hostname": "e2e-6defdeb8-db.corp.local"
+    }
+  ],
+  "status_id": 1,
+  "class_name": "Detection Finding",
+  "risk_level": "Critical",
+  "risk_score": 90,
+  "activity_id": 1,
+  "observables": [
+    {
+      "name": "resources[0].hostname",
+      "type": "Hostname",
+      "value": "e2e-6defdeb8-db.corp.local",
+      "type_id": 1
+    }
+  ],
+  "severity_id": 5,
+  "category_uid": 2,
+  "finding_info": {
+    "uid": "alert:1fabcd30-f9b4-4ecb-b994-4bc7e7ab1818:faabbbee1a045eed8f0f1c737238cf8d2094e8ff6345f2bf9e6084c7816991ca",
+    "title": "drive_by_js_execution_chain",
+    "types": [
+      "alert"
+    ],
+    "attacks": [
+      {
+        "tactic": {
+          "uid": "TA0001"
+        }
+      },
+      {
+        "tactic": {
+          "uid": "TA0002"
+        }
+      },
+      {
+        "tactic": {
+          "uid": "TA0011"
+        }
+      },
+      {
+        "technique": {
+          "uid": "T1059.001"
+        }
+      },
+      {
+        "technique": {
+          "uid": "T1059.007"
+        }
+      },
+      {
+        "technique": {
+          "uid": "T1071.001"
+        }
+      },
+      {
+        "technique": {
+          "uid": "T1189"
+        }
+      },
+      {
+        "technique": {
+          "uid": "T1204.002"
+        }
+      }
+    ],
+    "analytic": {
+      "uid": "4e099fbb-4abc-4c92-bbd9-6183420696aa",
+      "name": "drive_by_js_execution_chain",
+      "type": "Rule",
+      "type_id": 1
+    },
+    "data_sources": [
+      "windows_sysmon"
+    ]
+  },
+  "risk_details": "severity_default:Critical",
+  "activity_name": "Create",
+  "category_name": "Findings",
+  "risk_level_id": 4
+}

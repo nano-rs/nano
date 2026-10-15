@@ -48,8 +48,7 @@ impl OktaSync {
         // NAN-1196: `url` derives from the admin-supplied `domain` (and Okta's
         // own pagination Link header); validate the destination before sending
         // the SSWS token to it.
-        let (client, url) =
-            super::guarded_client(url, std::time::Duration::from_secs(30)).await?;
+        let (client, url) = super::guarded_client(url, std::time::Duration::from_secs(30)).await?;
         let resp = client
             .get(url)
             .header("Authorization", format!("SSWS {}", creds.api_token))
@@ -59,20 +58,13 @@ impl OktaSync {
             .map_err(|e| SyncError::NetworkError(e.to_string()))?;
 
         if resp.status().as_u16() == 429 {
-            let retry_after = resp
-                .headers()
-                .get("x-rate-limit-reset")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|epoch| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    epoch.saturating_sub(now)
-                });
+            // NAN-3483: Retry-After first, else X-Rate-Limit-Reset (epoch).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             return Err(SyncError::RateLimited {
-                retry_after_secs: retry_after,
+                retry_after_secs: super::rate_limit_wait_secs(resp.headers(), now),
             });
         }
 
@@ -126,7 +118,10 @@ impl SyncProvider for OktaSync {
         let mut all_users = Vec::new();
 
         loop {
-            let (page, next) = self.fetch_page(&creds, &url).await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&creds, &url)
+            })
+            .await?;
             all_users.extend(page);
             match next {
                 Some(next_url) => url = next_url,
@@ -152,7 +147,10 @@ impl SyncProvider for OktaSync {
         let mut total = 0u64;
 
         loop {
-            let (page, next) = self.fetch_page(&creds, &url).await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&creds, &url)
+            })
+            .await?;
             let page_size = page.len();
             total += on_page(page).await?;
 
@@ -193,7 +191,10 @@ impl SyncProvider for OktaSync {
         // Delta syncs are bounded (only changed users), safe to collect
         let mut users = Vec::new();
         loop {
-            let (page, next) = self.fetch_page(&creds, &url).await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&creds, &url)
+            })
+            .await?;
             users.extend(page);
             match next {
                 Some(next_url) => url = next_url,

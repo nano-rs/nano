@@ -43,7 +43,11 @@ use crate::{error::ApiError, state::AppState};
 
 /// Create a RuleRepositoryService from app state
 pub(crate) fn get_rule_repo_service(state: &AppState) -> Result<RuleRepositoryService, ApiError> {
-    let service = RuleRepositoryService::with_dual_pool(&state.dual_pool);
+    let service = RuleRepositoryService::with_dual_pool(&state.dual_pool)
+        // NAN-2361: the coverage analyzer reads its source/class inventory
+        // through search under the lake backend — there is no ClickHouse logs
+        // table to scan there. Without this every rule reports no coverage.
+        .with_search_service(std::sync::Arc::new(state.search_service.clone()));
     let detection_service = std::sync::Arc::new(state.detection_service.clone());
     Ok(service.with_detection_service(detection_service))
 }
@@ -94,6 +98,7 @@ pub(crate) fn get_rule_repo_service(state: &AppState) -> Result<RuleRepositorySe
         ConvertSigmaResponse,
         FieldMappingResponse,
         SyncStartResponse,
+        nanosiem_core::rule_repository::SyncAccepted,
         SyncStatusResponse,
         UpstreamUpdatesResponse,
     ))

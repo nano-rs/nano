@@ -18,8 +18,7 @@ fn is_gate(expr: &SearchExpr, excluded: &str) -> bool {
         SearchExpr::FieldFilter {
             field,
             op: Comparator::Ne,
-            value: Value::String(s),
-        } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case(excluded)
+            value: Value::String(s), .. } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case(excluded)
     )
 }
 
@@ -491,7 +490,9 @@ fn test_enforce_source_type_exclusion_wraps_or_queries() {
 
     match rewritten {
         Query::Search(SearchExpr::And(_, right)) => match right.as_ref() {
-            SearchExpr::FieldFilter { field, op, value } => {
+            SearchExpr::FieldFilter {
+                field, op, value, ..
+            } => {
                 assert_eq!(field, "source_type");
                 assert_eq!(*op, Comparator::Ne);
                 assert_eq!(value, &Value::String("audit".to_string()));
@@ -599,6 +600,42 @@ fn test_scope_gate_multi_member_renders_sorted_not_in() {
         out.contains(r#"source_type NOT IN ("audit", "insider")"#),
         "multi-member gate must render sorted NOT IN: {out}"
     );
+}
+
+#[test]
+fn test_scope_gate_can_target_canonical_ocsf_log_source() {
+    let deny_set = deny(&["audit", "restricted-edr"]);
+    let out = enforce_source_scope_with_field(
+        "error | append [search user.name=alice]",
+        &deny_set,
+        "metadata.log_source",
+    )
+    .unwrap();
+    assert!(out.contains("metadata.log_source NOT IN"), "{out}");
+    assert!(!out.contains("source_type"), "{out}");
+    let reparsed = parse_query(&out).unwrap();
+    assert!(all_scans_gated(&reparsed, &SourceGate::plain(&deny_set, "metadata.log_source")));
+}
+
+#[test]
+fn test_scope_gate_normalizes_policy_values_for_canonical_ocsf_sources() {
+    let deny_set = deny(&[" Audit ", "RESTRICTED-EDR"]);
+    let out = enforce_source_scope_with_field(
+        "error | append [search user.name=alice]",
+        &deny_set,
+        "metadata.log_source",
+    )
+    .unwrap();
+    assert!(
+        out.contains(r#"metadata.log_source NOT IN ("audit", "restricted-edr")"#),
+        "{out}"
+    );
+    let normalized = deny(&["audit", "restricted-edr"]);
+    let reparsed = parse_query(&out).unwrap();
+    assert!(all_scans_gated(
+        &reparsed,
+        &SourceGate::plain(&normalized, "metadata.log_source")
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +781,25 @@ fn test_scope_gate_empty_deny_set_returns_input_verbatim() {
     }
 }
 
+#[test]
+fn exact_source_scope_is_positive_and_rejects_nested_or_invalid_authority() {
+    let enforced =
+        enforce_exact_source_scope("status=failure | stats count by user", "Windows_Security")
+            .expect("exact source gate");
+    let reparsed = parse_query(&enforced).expect("exact source output reparses");
+    assert!(top_scan_has_exact_source(
+        &reparsed,
+        "windows_security",
+        "source_type"
+    ));
+    assert!(enforce_exact_source_scope(
+        "status=failure | append [search source_type=foreign]",
+        "windows_security",
+    )
+    .is_err());
+    assert!(enforce_exact_source_scope("*", "unsafe/source").is_err());
+}
+
 /// Double application is safe: the second pass re-gates the already-gated
 /// query, the result still parses, and every scan still carries the gate at
 /// top level. (Semantically `X AND g AND g` ≡ `X AND g`.)
@@ -764,8 +820,8 @@ fn test_scope_gate_idempotent_double_application() {
 #[test]
 fn test_scope_gate_preserves_time_modifiers() {
     let deny_set = deny(&["audit", "insider"]);
-    let out = enforce_source_scope("error earliest=-12h latest=now | stats count", &deny_set)
-        .unwrap();
+    let out =
+        enforce_source_scope("error earliest=-12h latest=now | stats count", &deny_set).unwrap();
     assert!(out.contains("source_type NOT IN"), "{out}");
     assert!(out.contains("earliest=-12h"), "earliest= dropped: {out}");
     assert!(out.contains("latest=now"), "latest= dropped: {out}");
@@ -809,8 +865,14 @@ fn test_scope_gate_preserves_query_semantics() {
         &deny_set,
     )
     .unwrap();
-    assert!(out.contains("windows_sysmon"), "main predicate dropped: {out}");
-    assert!(out.contains("windows_event"), "subsearch predicate dropped: {out}");
+    assert!(
+        out.contains("windows_sysmon"),
+        "main predicate dropped: {out}"
+    );
+    assert!(
+        out.contains("windows_event"),
+        "subsearch predicate dropped: {out}"
+    );
     assert!(out.contains("by src_ip"), "pipeline dropped: {out}");
 }
 
@@ -903,7 +965,10 @@ fn test_quote_bearing_values_survive_the_scope_gate() {
 fn test_nan1157_windows_paths_unchanged_by_the_scope_gate() {
     let deny_set = deny(&["audit"]);
     for (npl, needle) in [
-        (r#"file_path="C:\Windows\System32\""#, r"C:\Windows\System32\"),
+        (
+            r#"file_path="C:\Windows\System32\""#,
+            r"C:\Windows\System32\",
+        ),
         (r#"file_path="C:\Windows\System32""#, r"C:\Windows\System32"),
         // `\\` collapses to `\` on the way in (NAN-1157), so a UNC path is
         // written with four leading backslashes and must come back with two.
@@ -944,4 +1009,387 @@ fn first_string_value(query: &Query) -> Option<String> {
         Query::Search(expr) => walk(expr),
         Query::Piped { source, .. } => first_string_value(source),
     }
+}
+
+#[test]
+fn lake_split_preserves_stateful_suffix_order() {
+    let parsed = parse_query(
+        "src_endpoint.ip=* | head 100 | lookup threat_intel src_endpoint.ip OUTPUT confidence | where confidence>50 | stats count by confidence",
+    )
+    .unwrap();
+    let (prefix, suffix) = split_lake_post_processing(&parsed);
+    assert_eq!(prefix.pretty_print(), "src_endpoint.ip=\"*\" | head 100");
+    assert!(matches!(suffix.first(), Some(Command::Lookup { .. })));
+    assert!(matches!(suffix.get(1), Some(Command::Where { .. })));
+    assert!(matches!(suffix.get(2), Some(Command::Stats { .. })));
+}
+
+#[test]
+fn lake_split_keeps_identity_resolution_out_of_storage_sql() {
+    let parsed = parse_query(
+        "src_endpoint.ip=* | head 100 | resolve_identity src_endpoint.ip | where identity_name!=\"\"",
+    )
+    .unwrap();
+    let (prefix, suffix) = split_lake_post_processing(&parsed);
+    assert_eq!(prefix.pretty_print(), "src_endpoint.ip=\"*\" | head 100");
+    assert!(matches!(
+        suffix.first(),
+        Some(Command::ResolveIdentity { .. })
+    ));
+    assert!(matches!(suffix.get(1), Some(Command::Where { .. })));
+}
+
+#[test]
+fn lake_split_keeps_ai_enrichment_out_of_storage_sql() {
+    let parsed = parse_query(
+        r#"metadata.log_source="windows_sysmon" | ai "classify these events" | where ai_verdict="TP""#,
+    )
+    .unwrap();
+    let (prefix, suffix) = split_lake_post_processing(&parsed);
+
+    assert_eq!(
+        prefix.pretty_print(),
+        r#"metadata.log_source="windows_sysmon""#
+    );
+    assert!(matches!(suffix.first(), Some(Command::Ai { .. })));
+    assert!(matches!(suffix.get(1), Some(Command::Where { .. })));
+}
+
+#[test]
+fn lake_data_source_inputlookup_replaces_the_storage_stream() {
+    let parsed = parse_query(
+        "src_endpoint.ip=* | head 100 | inputlookup threat_intel | stats count() by threat_type",
+    )
+    .unwrap();
+    let (prefix, suffix) = split_lake_post_processing(&parsed);
+
+    assert_eq!(prefix.pretty_print(), "src_endpoint.ip=\"*\" | head 100");
+    assert!(lake_post_processing_replaces_source(&suffix));
+}
+
+#[test]
+fn lake_enrichment_inputlookup_still_requires_storage_rows() {
+    let parsed = parse_query(
+        "src_endpoint.ip=* | inputlookup url=\"https://example.com/{src_endpoint.ip}\" key=src_endpoint.ip",
+    )
+    .unwrap();
+    let (_, suffix) = split_lake_post_processing(&parsed);
+
+    assert!(!lake_post_processing_replaces_source(&suffix));
+}
+
+#[test]
+fn lake_stateful_visitor_reaches_every_subsearch_shape() {
+    for query in [
+        r#"* | append [* | lookup iocs src_endpoint.ip OUTPUT confidence]"#,
+        r#"* | join src_endpoint.ip [* | prevalence enrich=true]"#,
+        r#"* | where src_endpoint.ip IN [* | resolve_identity field=src_endpoint.ip | return src_endpoint.ip]"#,
+        r#"src_endpoint.ip IN [* | inputlookup url="https://example.test/feed.csv"]"#,
+        r#"* | append [* | join src_endpoint.ip [* | ai "classify these events"]]"#,
+    ] {
+        let parsed = parse_query(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+        assert!(
+            contains_lake_post_processing_anywhere(&parsed),
+            "recursive visitor missed {query}"
+        );
+        assert!(
+            contains_nested_lake_post_processing(&parsed),
+            "nested visitor missed {query}"
+        );
+    }
+}
+
+#[test]
+fn lake_stateful_visitor_distinguishes_outer_suffix_from_nested_state() {
+    for query in [
+        r#"* | lookup iocs src_endpoint.ip OUTPUT confidence"#,
+        r#"* | prevalence enrich=true"#,
+        r#"* | resolve_identity field=src_endpoint.ip"#,
+        r#"* | inputlookup url="https://example.test/{src_endpoint.ip}" key=src_endpoint.ip"#,
+        r#"* | ai "classify these events""#,
+    ] {
+        let parsed = parse_query(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+        assert!(contains_lake_post_processing_anywhere(&parsed));
+        assert!(
+            !contains_nested_lake_post_processing(&parsed),
+            "outer suffix was misclassified as nested: {query}"
+        );
+    }
+
+    for query in [
+        r#"* | append [* | stats count by process.name] | stats count"#,
+        r#"* | join src_endpoint.ip [* | where src_endpoint.ip=*]"#,
+        r#"* | where src_endpoint.ip IN [* | return src_endpoint.ip]"#,
+    ] {
+        let parsed = parse_query(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+        assert!(!contains_lake_post_processing_anywhere(&parsed));
+        assert!(!contains_nested_lake_post_processing(&parsed));
+    }
+}
+
+#[test]
+fn exact_source_scope_uses_canonical_lake_field_and_preserves_disjunction() {
+    let result = enforce_exact_source_scope_with_field(
+        "http_request.url.path=\"/a\" OR http_request.url.path=\"/b\" | head 10",
+        "Apache_Access", "metadata.log_source",
+    ).unwrap();
+    let parsed = crate::query::parse_query(&result).unwrap();
+    assert!(top_scan_has_exact_source(&parsed, "apache_access", "metadata.log_source"));
+    assert!(!result.contains("source_type"));
+    assert!(result.contains("/a") && result.contains("/b"));
+    assert!(enforce_exact_source_scope_with_field("*", "apache_access", "unmapped.source_type").is_err());
+    assert!(enforce_exact_source_scope_with_field("*", "unsafe/source", "metadata.log_source").is_err());
+}
+
+// ---------------------------------------------------------------------------
+// NAN-3257: lean `| tree` candidate projection
+// ---------------------------------------------------------------------------
+
+fn lean_tree_candidate(query: &str) -> Query {
+    let profile = crate::schema::OcsfProfile::lake_1_9();
+    let mut parsed = parse_query(query).unwrap();
+    apply_profile_product_semantics(&mut parsed, &profile);
+    lake_tree_candidate_query(&parsed, &profile).expect("terminal lean tree projects")
+}
+
+fn table_names(query: &Query) -> Vec<String> {
+    let query = match query {
+        Query::Piped { source, command: Command::Sort { .. } } => source.as_ref(),
+        other => other,
+    };
+    let Query::Piped { command: Command::Table { fields }, .. } = query else {
+        panic!("expected a terminal table: {}", query.pretty_print());
+    };
+    fields.iter().map(|field| field.name.clone()).collect()
+}
+
+#[test]
+fn lean_process_tree_reads_a_narrow_edge_projection_for_any_process_source() {
+    // Field-based, not source-based: an EDR/osquery-style filter, no
+    // metadata.log_source anywhere.
+    let candidate = lean_tree_candidate(r#"device.hostname="ws1" | tree process"#);
+    let names = table_names(&candidate);
+    for field in [
+        "time",
+        "process.uid",
+        "actor.process.uid",
+        "process.parent_process.uid",
+        "process.name",
+        "process.cmd_line",
+        "actor.process.name",
+        "process.parent_process.name",
+    ] {
+        assert!(names.iter().any(|name| name == field), "{field} not in {names:?}");
+    }
+    let text = candidate.pretty_print();
+    assert!(!text.contains("tree"), "{text}");
+    // The edge predicate is in the base search: child set, a parent set, and
+    // child != parent, for either parent path.
+    let Query::Piped { source, .. } = &candidate else { unreachable!() };
+    let Query::Search(expr) = source.as_ref() else {
+        panic!("edge predicate must join the base search: {text}");
+    };
+    let rendered = format!("{expr:?}");
+    for needle in ["process.parent_process.uid", "actor.process.uid", "Bareword"] {
+        assert!(rendered.contains(needle), "{needle} missing in {rendered}");
+    }
+    // Round-trips through nPL text for the worker.
+    let reparsed = parse_query(&text).unwrap();
+    assert_eq!(table_names(&reparsed), names);
+}
+
+#[test]
+fn lean_web_tree_reads_any_http_shaped_source() {
+    let candidate = lean_tree_candidate("http_request.http_method=GET | tree web");
+    let names = table_names(&candidate);
+    for field in [
+        "http_request.url.url_string",
+        "url.url_string",
+        "http_request.referrer",
+        "http_request.url.hostname",
+        "dst_endpoint.hostname",
+        "url.hostname",
+    ] {
+        assert!(names.iter().any(|name| name == field), "{field} not in {names:?}");
+    }
+}
+
+#[test]
+fn lean_tree_preview_samples_edges_before_its_head() {
+    let candidate = lean_tree_candidate(r#"device.hostname="ws1" | head 200 | tree process"#);
+    let text = candidate.pretty_print();
+    let head = text.find("head 200").expect("head kept");
+    let edge = text.find("process.parent_process.uid").expect("edge predicate");
+    assert!(edge < head, "edge predicate must filter before the head: {text}");
+}
+
+/// NAN-3451: an open-core lake snapshot that carries the `enrichments[]`
+/// prevalence stamp arrays (the five `prevalence_*` scalars are derived).
+fn open_core_stamped_profile() -> crate::schema::OcsfProfile {
+    use crate::schema::FieldType;
+    let inventory = crate::schema::LAKE_PREVALENCE_STAMP_ARRAYS
+        .into_iter()
+        .chain(["file.hashes.value", "process.file.hashes.value"])
+        .map(|name| (name.to_string(), FieldType::Array))
+        .chain(
+            ["dst_endpoint.ip", "dst_endpoint.hostname", "query.hostname"]
+                .into_iter()
+                .map(|name| (name.to_string(), FieldType::String)),
+        )
+        .collect();
+    crate::schema::OcsfProfile::try_lake_1_9_with_snapshot_field_types(inventory).unwrap()
+}
+
+fn tree_candidate_names(query: &str, profile: &dyn crate::schema::SchemaProfile) -> Vec<String> {
+    let mut parsed = parse_query(query).unwrap();
+    apply_profile_product_semantics(&mut parsed, profile);
+    table_names(&lake_tree_candidate_query(&parsed, profile).expect("terminal lake tree projects"))
+}
+
+const USER_HOST_TREE: &str =
+    "nanosmoke | tree parent=actor.user.name child=device.hostname label=device.hostname";
+
+/// NAN-3451: the narrow tree candidate used to drop every prevalence column,
+/// so no node of an open-core lake tree ever showed prevalence. It now
+/// carries the derived scalars the builder reads, and, with `prevalence=`,
+/// that field plus the stamp arrays `RowPrevalence::for_field` matches on.
+#[test]
+fn open_core_tree_candidate_projects_the_prevalence_the_builder_reads() {
+    let profile = open_core_stamped_profile();
+    let scalars = [
+        "prevalence_min",
+        "prevalence_process_hash",
+        "prevalence_file_hash",
+        "prevalence_dest_domain",
+        "prevalence_dest_ip",
+    ];
+
+    let names = tree_candidate_names(USER_HOST_TREE, &profile);
+    for field in scalars {
+        assert!(names.iter().any(|name| name == field), "{field} not in {names:?}");
+    }
+    // Without `prevalence=` the scalars answer; the stamp arrays stay out.
+    for array in crate::schema::LAKE_PREVALENCE_STAMP_ARRAYS {
+        assert!(!names.iter().any(|name| name == array), "{array} in {names:?}");
+    }
+    // Only fields the profile resolves: no UDM-only prevalence names.
+    for unknown in ["prevalence_sha256", "prevalence_sha1", "prevalence_md5", "prevalence_url"] {
+        assert!(!names.iter().any(|name| name == unknown), "{unknown} in {names:?}");
+    }
+    let unique = names.iter().collect::<BTreeSet<_>>();
+    assert_eq!(unique.len(), names.len(), "duplicate column: {names:?}");
+
+    let with_field = tree_candidate_names(
+        &format!("{USER_HOST_TREE} prevalence=file.hashes.value"),
+        &profile,
+    );
+    for field in scalars
+        .into_iter()
+        .chain(["file.hashes.value"])
+        .chain(crate::schema::LAKE_PREVALENCE_STAMP_ARRAYS)
+    {
+        assert!(with_field.iter().any(|name| name == field), "{field} not in {with_field:?}");
+    }
+    let unique = with_field.iter().collect::<BTreeSet<_>>();
+    assert_eq!(unique.len(), with_field.len(), "duplicate column: {with_field:?}");
+    // Still a narrow projection.
+    assert!(with_field.len() < 20, "{with_field:?}");
+}
+
+/// NAN-3451: an unstamped snapshot keeps the scalars unknown (#4644), so the
+/// candidate never names them; lean's physical stamp columns are projected
+/// as themselves, never shadowed by the enrichment derivation.
+#[test]
+fn tree_candidate_prevalence_follows_the_profile() {
+    use crate::schema::SchemaProfile as _;
+    let unstamped = tree_candidate_names(USER_HOST_TREE, &crate::schema::OcsfProfile::lake_1_9());
+    assert!(
+        !unstamped.iter().any(|name| name.starts_with("prevalence_")),
+        "{unstamped:?}"
+    );
+
+    let mut inventory = std::collections::BTreeMap::new();
+    for field in ["prevalence_min", "prevalence_process_hash", "prevalence_file_hash",
+                  "prevalence_dest_domain", "prevalence_dest_ip"] {
+        inventory.insert(field.to_string(), crate::schema::FieldType::Integer);
+    }
+    let lean = crate::schema::OcsfProfile::try_lake_1_9_with_snapshot_field_types(inventory).unwrap();
+    let names = tree_candidate_names(USER_HOST_TREE, &lean);
+    for field in ["prevalence_min", "prevalence_process_hash", "prevalence_file_hash",
+                  "prevalence_dest_domain", "prevalence_dest_ip"] {
+        assert!(names.iter().any(|name| name == field), "{field} not in {names:?}");
+        assert!(lean.source_computed_column(field).is_none(), "{field} shadowed on lean");
+    }
+}
+
+#[test]
+fn non_terminal_or_unresolved_trees_keep_the_pass_through() {
+    let profile = crate::schema::OcsfProfile::lake_1_9();
+    let after = parse_query("* | tree parent=actor.process.uid child=process.uid label=process.name | head 5").unwrap();
+    assert!(lake_tree_candidate_query(&after, &profile).is_none());
+    let unknown = parse_query("* | tree parent=nonsense_parent child=process.uid label=process.name").unwrap();
+    assert!(lake_tree_candidate_query(&unknown, &profile).is_none());
+}
+
+/// NAN-3261: the web candidate projects the path/host alternates and admits a
+/// path-only page with a referrer as an edge, without a column comparison
+/// between a path and a full-URL referrer (which would never be equal).
+#[test]
+fn lean_web_tree_candidate_admits_path_only_pages() {
+    let candidate = lean_tree_candidate("* | tree web");
+    let names = table_names(&candidate);
+    for field in ["http_request.url.path", "http_request.url.hostname", "http_request.referrer"] {
+        assert!(names.iter().any(|name| name == field), "{field} not in {names:?}");
+    }
+    assert!(!names.iter().any(|name| name.contains('+')), "composite keys are not columns: {names:?}");
+    let text = candidate.pretty_print();
+    assert!(!text.contains('+'), "{text}");
+    let Query::Piped { source, .. } = &candidate else { unreachable!() };
+    let Query::Search(expr) = source.as_ref() else {
+        panic!("edge predicate must join the base search: {text}");
+    };
+    let rendered = format!("{expr:?}");
+    assert!(rendered.contains("\"http_request.url.path\""), "{rendered}");
+    assert!(
+        !text.contains("http_request.url.path!=http_request.referrer")
+            && !text.contains("http_request.url.path != http_request.referrer"),
+        "path vs referrer must not be column-compared: {text}"
+    );
+    let reparsed = parse_query(&text).unwrap();
+    assert_eq!(table_names(&reparsed), names);
+}
+
+#[test]
+fn tree_key_shapes_are_field_based() {
+    assert_eq!(tree_key_shape("http_request.url.path"), TreeKeyShape::Path);
+    assert_eq!(tree_key_shape("url.path"), TreeKeyShape::Path);
+    assert_eq!(
+        tree_key_shape("http_request.url.hostname+http_request.url.path"),
+        TreeKeyShape::HostPath
+    );
+    assert_eq!(tree_key_shape("http_request.url.url_string"), TreeKeyShape::Raw);
+    assert_eq!(tree_key_shape("process.uid"), TreeKeyShape::Raw);
+}
+
+/// NAN-3294: conduit_proxy logs no referrer. A web-tree candidate that
+/// required `http_request.referrer` therefore matched nothing on such a
+/// source; it must admit every request with a URL and carry the client.
+#[test]
+fn lean_web_tree_candidate_does_not_require_a_referrer() {
+    let candidate = lean_tree_candidate(r#"metadata.log_source="conduit_proxy" | tree web"#);
+    let names = table_names(&candidate);
+    for field in ["src_endpoint.ip", "src_endpoint.hostname", "device.hostname", "time"] {
+        assert!(names.iter().any(|name| name == field), "{field} not in {names:?}");
+    }
+    let Query::Piped { source, .. } = &candidate else { unreachable!() };
+    let Query::Search(expr) = source.as_ref() else { panic!("edge joins the base search") };
+    let rendered = format!("{expr:?}");
+    assert!(rendered.contains("\"http_request.url.url_string\""), "{rendered}");
+    assert!(
+        !rendered.contains("field: \"http_request.referrer\""),
+        "the referrer is projected, never required: {rendered}"
+    );
+    // A process tree still requires its parent edge.
+    let process = format!("{:?}", lean_tree_candidate("* | tree process"));
+    assert!(process.contains("field: \"actor.process.uid\""), "{process}");
 }

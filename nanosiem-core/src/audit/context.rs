@@ -15,6 +15,9 @@ pub struct ClientContext {
     pub ip_address: Option<String>,
     /// Client user agent string
     pub user_agent: Option<String>,
+    /// Per-request id (`X-Request-ID`, set by the API's request-id
+    /// middleware) — the OCSF `api.request.uid` of audit events (NAN-3227).
+    pub request_id: Option<String>,
 }
 
 impl ClientContext {
@@ -23,6 +26,13 @@ impl ClientContext {
         Self {
             ip_address,
             user_agent,
+            request_id: None,
         }
+    }
+
+    /// Attach the per-request id (`X-Request-ID`).
+    pub fn with_request_id(mut self, request_id: Option<String>) -> Self {
+        self.request_id = request_id;
+        self
     }
 }

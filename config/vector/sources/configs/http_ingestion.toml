@@ -1,21 +1,25 @@
 # Auto-generated routing rules for system-level source: HTTP Ingestion
 # DO NOT EDIT - changes will be overwritten
-# Generated at: 2026-06-24T13:08:57.536389+00:00
+# Generated at: 2026-08-13T21:20:04.927038+00:00
 
 [transforms.http_ingestion_route]
 inputs = ["source_type_extract"]
 source = """
 # Apply routing rules to set source_type
-if .source_type == "apache_access" {
-    .source_type = "apache_access"
-} else if .source_type == "windows_sysmon" {
+if .source_type == "windows_sysmon" {
     .source_type = "windows_sysmon"
+} else if .source_type == "apache_access" {
+    .source_type = "apache_access"
 } else if .source_type == "aws_cloudtrail" {
     .source_type = "aws_cloudtrail"
-} else if .source_type == "conduit" {
-    .source_type = "conduit"
+} else if .source_type == "conduit_proxy" {
+    .source_type = "conduit_proxy"
 } else if .source_type == "windows_event" {
     .source_type = "windows_event"
+} else if .source_type == "nan2029_auth0_1784977568677" {
+    .source_type = "nan2029_auth0_1784977568677"
+} else if .source_type == "gws_login" {
+    .source_type = "gws_login"
 }
 # else: passthrough — keep existing .source_type
 """

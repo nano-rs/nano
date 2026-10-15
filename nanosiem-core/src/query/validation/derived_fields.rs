@@ -10,7 +10,13 @@
 use crate::query::ast::{
     AggFunc, Aggregation, Command, EvalExpression, Query, RexMode, SearchExpr,
 };
+use crate::query::command_outputs::command_created_columns;
 use std::collections::HashSet;
+
+/// Marker used by the validator after a command whose output schema is loaded
+/// at runtime. Field-name syntax is still validated, but a static event-schema
+/// typo gate cannot judge columns supplied by an input/lookup table.
+pub(crate) const DYNAMIC_PIPELINE_SCHEMA: &str = "__nano_dynamic_pipeline_schema__";
 
 /// Collect all field names created by pipeline commands in a query.
 ///
@@ -55,6 +61,10 @@ fn collect_fields_from_eval_expr(expr: &EvalExpression, fields: &mut Vec<String>
         EvalExpression::Field(field) => fields.push(field.clone()),
         EvalExpression::Literal(_) => {}
         EvalExpression::FunctionCall { args, .. } => {
+            if let Some(search) = crate::query::searchmatch_search_expr(expr) {
+                fields.extend(collect_fields_from_expr(&search));
+                return;
+            }
             for arg in args {
                 collect_fields_from_eval_expr(arg, fields);
             }
@@ -109,11 +119,20 @@ fn insert_agg_reference_alias(agg: &Aggregation, fields: &mut HashSet<String>) {
     if agg.alias.is_none() {
         if let Some(field) = &agg.field {
             fields.insert(format!("{}_{}", agg.func.as_str(), field).to_lowercase());
+            if let Some(leaf) = field.rsplit('.').next().filter(|leaf| *leaf != field) {
+                fields.insert(format!("{}_{}", agg.func.as_str(), leaf).to_lowercase());
+            }
         }
     }
 }
 
 pub(super) fn collect_command_output_fields(command: &Command, fields: &mut HashSet<String>) {
+    // NAN-3328 / NAN-3314: the shared created-column registry (also used by
+    // the SQL generator) — bin `_end`, anomaly helpers, funnel, lateral, risk,
+    // table aliases. The arms below add validator-specific names on top.
+    for column in command_created_columns(command) {
+        fields.insert(column.to_lowercase());
+    }
     match command {
         Command::Stats {
             aggregations,
@@ -221,9 +240,10 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 insert_agg_reference_alias(agg, fields);
             }
         }
+        // `| ai` (NAN-3190) outputs come from the shared registry above.
         Command::Risk { .. } => {
-            fields.insert("risk_score".to_string());
-            fields.insert("risk_factors".to_string());
+            // risk_score/risk_factors/risk_entity come from the shared
+            // registry; `risk_level` stays accepted as before.
             fields.insert("risk_level".to_string());
         }
         Command::Prevalence { enrich, .. } => {
@@ -245,12 +265,25 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 fields.insert("last_seen".to_string());
             }
         }
-        Command::Lookup { output_fields, .. } => {
+        Command::Lookup {
+            output_fields,
+            output_renames,
+            ..
+        } => {
             if let Some(of) = output_fields {
                 for f in of {
-                    fields.insert(f.to_lowercase());
+                    let target = output_renames
+                        .iter()
+                        .find(|r| &r.from == f)
+                        .map_or(f, |r| &r.to);
+                    fields.insert(target.to_lowercase());
                 }
+            } else {
+                fields.insert(DYNAMIC_PIPELINE_SCHEMA.to_string());
             }
+        }
+        Command::InputLookup { .. } => {
+            fields.insert(DYNAMIC_PIPELINE_SCHEMA.to_string());
         }
         Command::Transaction {
             fields: tx_fields, ..
@@ -280,12 +313,20 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 fields.insert(format!("step{}_time", n));
                 fields.insert(format!("step{}_event_id", n));
                 for field in capture_fields {
-                    fields.insert(format!("step{}_{}", n, field.to_lowercase()));
+                    fields.insert(format!(
+                        "step{}_{}",
+                        n,
+                        field.to_lowercase().replace('.', "_")
+                    ));
                 }
                 // Auto-captured fields from condition expressions
                 let cond_fields = collect_fields_from_expr(cond);
                 for field in &cond_fields {
-                    fields.insert(format!("step{}_{}", n, field.to_lowercase()));
+                    fields.insert(format!(
+                        "step{}_{}",
+                        n,
+                        field.to_lowercase().replace('.', "_")
+                    ));
                 }
             }
             fields.insert("sequence_duration_seconds".to_string());
@@ -297,10 +338,8 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 fields.insert(o.to_lowercase());
             }
         }
-        Command::Anomaly { .. } => {
-            fields.insert("anomaly_score".to_string());
-            fields.insert("is_anomaly".to_string());
-        }
+        // Anomaly outputs (helper columns, `expected`, the `{func}_{field}`
+        // aggregate) come from the shared registry above.
         Command::ResolveIdentity { .. } => {
             // Mirror the codegen registration (NAN-1380, regression of #2057):
             // `collect_computed_field_names` in `clickhouse_sql_gen::field_analysis`
@@ -312,6 +351,10 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             // resolve_identity makes them unambiguous — an ambiguous reference
             // is codegen's diagnostic to give, not a "did you mean" typo).
             for f in [
+                "identity_name",
+                "identity_hostname",
+                "identity_user",
+                "identity_mac",
                 "identity_confidence",
                 "identity_observed_at",
                 "identity_source",
@@ -347,6 +390,18 @@ mod tests {
         let fields = collect_derived_fields(&query);
         assert!(fields.contains("unique_users"));
         assert!(fields.contains("src_ip"));
+    }
+
+    #[test]
+    fn anomaly_aggregation_registers_stable_output_fields() {
+        let query = parse_query(
+            "* | anomaly sum(traffic.bytes) by src_endpoint.ip | table sum_traffic_bytes, expected, anomaly_score",
+        )
+        .unwrap();
+        let fields = collect_derived_fields(&query);
+        assert!(fields.contains("sum_traffic_bytes"));
+        assert!(fields.contains("expected"));
+        assert!(fields.contains("anomaly_score"));
     }
 
     #[test]
@@ -631,12 +686,14 @@ mod tests {
         ] {
             assert!(fields.contains(f), "missing always-bare output: {f}");
         }
-        for (col_suffix, _, _) in
-            crate::query::clickhouse_sql_gen::identity::IDENTITY_COLUMN_FIELDS
-                .iter()
-                .chain(crate::query::clickhouse_sql_gen::identity::IDENTITY_DICT_ONLY_FIELDS.iter())
+        for (col_suffix, _, _) in crate::query::clickhouse_sql_gen::identity::IDENTITY_COLUMN_FIELDS
+            .iter()
+            .chain(crate::query::clickhouse_sql_gen::identity::IDENTITY_DICT_ONLY_FIELDS.iter())
         {
-            assert!(fields.contains(*col_suffix), "missing bare alias: {col_suffix}");
+            assert!(
+                fields.contains(*col_suffix),
+                "missing bare alias: {col_suffix}"
+            );
         }
     }
 
@@ -670,5 +727,17 @@ mod tests {
         assert!(fields.contains("step3_user_agent"));
         assert!(fields.contains("sequence_duration_seconds"));
         assert!(fields.contains("sequence_count"));
+    }
+
+    #[test]
+    fn sequence_dotted_capture_uses_its_query_facing_alias() {
+        let query = parse_query(
+            r#"metadata.log_source="windows_sysmon" | sequence by user.name maxspan=5m fields(file.hashes.value) [class_uid=1001] [class_uid=1007]"#,
+        )
+        .unwrap();
+        let fields = collect_derived_fields(&query);
+        assert!(fields.contains("step1_file_hashes_value"));
+        assert!(fields.contains("step2_file_hashes_value"));
+        assert!(!fields.contains("step2_file.hashes.value"));
     }
 }

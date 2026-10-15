@@ -69,33 +69,47 @@ export class AuthApi {
   }
 
   // MFA endpoints
-  // The optional `challengeToken` arg covers forced enrolment — the user
+  // The optional `challengeToken` arg covers forced enrollment — the user
   // is mid-login with no session yet, just a 5-minute mfa_challenge from
-  // the prior login response. Voluntary enrolment from User Settings
+  // the prior login response. Voluntary enrollment from User Settings
   // omits it and authenticates via Bearer.
-  async setupMfa(challengeToken?: string): Promise<MfaSetupResponse> {
+  async setupMfa(challengeToken?: string, tenantSlug?: string): Promise<MfaSetupResponse> {
     return this.request('/api/auth/mfa/setup', {
       method: 'POST',
-      body: JSON.stringify(challengeToken ? { challenge_token: challengeToken } : {}),
+      body: JSON.stringify({
+        ...(challengeToken ? { challenge_token: challengeToken } : {}),
+        ...(tenantSlug ? { tenant_slug: tenantSlug } : {}),
+      }),
     });
   }
 
   async verifyMfaSetup(
     code: string,
     challengeToken?: string,
+    tenantSlug?: string,
   ): Promise<MfaSetupCompleteResponse> {
     return this.request('/api/auth/mfa/verify-setup', {
       method: 'POST',
-      body: JSON.stringify(
-        challengeToken ? { code, challenge_token: challengeToken } : { code },
-      ),
+      body: JSON.stringify({
+        code,
+        ...(challengeToken ? { challenge_token: challengeToken } : {}),
+        ...(tenantSlug ? { tenant_slug: tenantSlug } : {}),
+      }),
     });
   }
 
-  async verifyMfaChallenge(challengeToken: string, code: string): Promise<AuthResponse> {
+  async verifyMfaChallenge(
+    challengeToken: string,
+    code: string,
+    tenantSlug?: string,
+  ): Promise<AuthResponse> {
     return this.request('/api/auth/mfa/challenge', {
       method: 'POST',
-      body: JSON.stringify({ challenge_token: challengeToken, code }),
+      body: JSON.stringify({
+        challenge_token: challengeToken,
+        code,
+        ...(tenantSlug ? { tenant_slug: tenantSlug } : {}),
+      }),
     });
   }
 

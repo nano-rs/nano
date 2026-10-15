@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * Generate a v4 UUID that works in non-secure contexts.
  *

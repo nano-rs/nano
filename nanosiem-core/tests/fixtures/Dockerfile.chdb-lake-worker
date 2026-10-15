@@ -1,0 +1,11 @@
+ARG QUERY_IMAGE=us-central1-docker.pkg.dev/nano-rs/nanosiem-scale-tests/nan2361/scale04/query@sha256:c38776f4238987568c9c83a63c27a8930998299615ea6544267aa3eaea810e3e
+ARG BUILDER_IMAGE=nan2361-scale03-lake-retained-builder-amd64:ced9291a8
+
+FROM ${QUERY_IMAGE} AS query
+FROM ${BUILDER_IMAGE}
+
+COPY --from=query /usr/local/lib/nano-chdb/libchdb.so /opt/nano/libchdb.so
+COPY chdb_lake_worker.py /opt/nano/chdb_lake_worker.py
+
+ENV NANOSIEM_FIXTURE_CHDB_LIBRARY=/opt/nano/libchdb.so
+ENTRYPOINT ["python3", "/opt/nano/chdb_lake_worker.py"]

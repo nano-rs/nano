@@ -1,13 +1,16 @@
 # Auto-generated Vector configuration for parser: Apache HTTP Server (OCSF)
 # DO NOT EDIT - changes will be overwritten
-# Generated at: 2026-06-14T20:28:39.890914+00:00
+# Generated at: 2026-08-21T17:16:00.988800+00:00
 
 
 [transforms.apache_http_server__ocsf__parse]
 type = "remap"
 inputs = ["source_router.apache_http_server__ocsf_"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
 source = '''
-# Apache Combined Log Format -> OCSF 1.8.0 HTTP Activity (class_uid 4002)
+# Apache Combined Log Format -> OCSF 1.9.0 HTTP Activity (class_uid 4002)
 # Format: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"
 #
 # Emits the COMPLETE standard OCSF record on the root. This object is what
@@ -18,7 +21,7 @@ raw_log = string!(.message)
 parsed, err = parse_apache_log(raw_log, "combined")
 
 if err == null {
-    # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+    # ---- method -> activity_id (OCSF HTTP Activity enum, 1.9.0) ----
     # parse_apache_log returns method as a known String; no coalescing needed.
     method = upcase(string!(parsed.method))
     activity_id = 99
@@ -88,8 +91,9 @@ if err == null {
         "status": status_str,
         "time": time_ms,
         "message": raw_log,
+        "raw_data": raw_log,
         "metadata": {
-            "version": "1.8.0",
+            "version": "1.9.0",
             "uid": uuid_v4(),
             "product": {
                 "name": "Apache HTTP Server",
@@ -124,8 +128,9 @@ if err == null {
         "status_id": 0,
         "time": 0,
         "message": raw_log,
+        "raw_data": raw_log,
         "metadata": {
-            "version": "1.8.0",
+            "version": "1.9.0",
             "uid": uuid_v4(),
             "product": {
                 "name": "Apache HTTP Server",
@@ -135,14 +140,15 @@ if err == null {
         }
     }
 }
-
 '''
 
 [transforms.apache_http_server__ocsf__ocsf_split]
 type = "route"
 inputs = ["apache_http_server__ocsf__parse"]
 [transforms.apache_http_server__ocsf__ocsf_split.route]
-ocsf = 'exists(.class_uid)'
+# Explicit parser failures must stay on the UDM recovery path so
+# metadata.parse_error remains searchable and countable.
+ocsf = 'exists(.class_uid) && !exists(.parse_error) && !exists(.metadata.parse_error)'
 
 [transforms.apache_http_server__ocsf__ocsf_prepare]
 type = "remap"
@@ -155,11 +161,15 @@ if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
 src_type = downcase(to_string(%source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 . = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+# Protected identity for the pre-sampling parser-health branch.
+# The OCSF ClickHouse sink ignores this internal field.
+._nano_parser_id = "c371c91d-5079-402d-b180-21681619376c"
+._nano_parser_failure = false
 '''
 
 [transforms.apache_http_server__ocsf__output]
 type = "remap"
-inputs = ["apache_http_server__ocsf__ocsf_split._unmatched"]
+inputs = ["apache_http_server__ocsf__ocsf_split._unmatched", "apache_http_server__ocsf__parse.dropped"]
 source = '''
 # Flatten for ClickHouse - standard NanoSIEM format
 # Spread all .udm fields to top level, preserve .ext
@@ -173,9 +183,27 @@ ts_val = now()
 
 # Handle metadata - ensure it's an object
 meta_val = .metadata
-if meta_val == null {
+if !is_object(meta_val) {
 meta_val = {}
 }
+# Vector annotates rerouted runtime failures under
+# `.metadata.dropped`. Preserve the full diagnostic and promote
+# stable fields that ClickHouse health queries can aggregate.
+if exists(.metadata.dropped.message) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.metadata.dropped.message) ?? "Parser runtime error"
+meta_val.parse_stage = to_string(.metadata.dropped.component_id) ?? "parser"
+} else if exists(.parse_error) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.parse_error) ?? "Unknown parse error"
+} else if exists(.metadata.parse_error) {
+meta_val.parse_failure = true
+}
+# Protected deployment identity: parser-authored VRL cannot spoof
+# attribution because this is assigned after the parser runs.
+meta_val.parser_id = "c371c91d-5079-402d-b180-21681619376c"
+meta_val.parser_name = "Apache HTTP Server (OCSF)"
+parse_failure_val = to_bool(meta_val.parse_failure) ?? false
 
 # Handle ext - preserve source-specific queryable fields
 # Parser sets fields like .ext.principal_id, .ext.bucket_name
@@ -202,15 +230,16 @@ udm_val = {}
 "timestamp": ts_val,
 "message": msg_val,
 "metadata": encode_json(meta_val),
+"_nano_parser_failure": parse_failure_val,
 "ext": ext_val,
 "source_type": st_val
 }
 
 # Inject vendor, product, and category from log_sources metadata
 # These are configured in the UI and don't require parser VRL to set them
-.vendor = "Apache Software Foundation"
+.vendor = "Apache"
 .product = "Apache HTTP Server"
-.vendor_product = "Apache Software Foundation Apache HTTP Server"
+.vendor_product = "Apache Apache HTTP Server"
 .category = "application"
 .namespace = "default"
 

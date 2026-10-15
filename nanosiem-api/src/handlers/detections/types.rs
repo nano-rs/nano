@@ -16,6 +16,9 @@ pub struct ListDetectionsQuery {
     pub mode: Option<String>,
     /// Filter by detection mode (real-time, scheduled)
     pub detection_mode: Option<String>,
+    /// Include archived (deleted) rules. Default false, same as hosted.
+    #[serde(default)]
+    pub include_archived: bool,
 }
 
 /// Request for testing a detection rule
@@ -28,7 +31,7 @@ pub struct TestRuleRequest {
     #[serde(default = "default_test_days")]
     pub days: i64,
     /// Explicit `[start, end]` window. Preferred over `days`. Must be at
-    /// most 14 days wide; longer ranges return a 400 (NAN-741).
+    /// most 14 days wide; longer ranges return a 400.
     pub time_range: Option<TimeRangeRequest>,
     /// Cron expression to step at when testing an ad-hoc query (no saved
     /// rule). Ignored by `/api/rules/{id}/test`, which always uses the saved
@@ -41,7 +44,7 @@ pub struct TestRuleRequest {
     #[serde(default)]
     pub lookback_minutes: Option<i64>,
     /// Dataset to test against: "logs" (default), "spans", or "metrics"
-    /// (NAN-1561). Used by the ad-hoc `/api/rules/test` path so the rule
+    /// Used by the ad-hoc `/api/rules/test` path so the rule
     /// editor can preview spans/metrics rules before save. Ignored by
     /// `/api/rules/{id}/test`, which uses the saved rule's dataset.
     #[serde(default)]
@@ -58,11 +61,30 @@ fn default_test_days() -> i64 {
     7
 }
 
-/// Request for importing detection rules
+/// Request for importing detection rules: either `{"rules": [...]}` or the
+/// web client's file upload `{"data": "<file contents>", "format": "json"|"yaml"}`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ImportRulesRequest {
-    pub rules: Vec<nanosiem_core::NewDetectionRule>,
+    /// Structured rules to import.
+    #[serde(default)]
+    pub rules: Option<Vec<nanosiem_core::NewDetectionRule>>,
+    /// Raw rule file contents (an export file, a `rules:` document, or one rule).
+    #[serde(default)]
+    pub data: Option<String>,
+    /// Format of `data`; defaults to JSON.
+    #[serde(default)]
+    pub format: Option<RuleTransferFormat>,
 }
+
+/// Query for `GET /api/rules/export`.
+#[derive(Debug, Deserialize, Default, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ExportRulesQuery {
+    /// `json` (default) or `yaml`.
+    pub format: Option<RuleTransferFormat>,
+}
+
+pub use nanosiem_core::detection::rule_transfer::RuleTransferFormat;
 
 /// Response for import operation
 #[derive(Debug, Serialize, ToSchema)]
@@ -129,17 +151,17 @@ pub struct DetectionMatch {
     /// Number of events that matched
     pub event_count: i32,
     /// The actual events that triggered this detection. Each event also
-    /// carries a canonical envelope injected by the API (NAN-830):
+    /// carries a canonical envelope injected by the API:
     /// `_match_event_time` (RFC 3339 string, optional), `_match_event_label`
     /// (one-line summary, always present), and `_match_kind` (`"raw"`,
     /// `"aggregate"`, or `"sequence"`, always present). UI clients should prefer these
     /// fields over inferring from the user's free-form rule output.
     pub events: Vec<serde_json::Value>,
-    /// Whether the match has been reviewed by an analyst (NAN-494).
+    /// Whether the match has been reviewed by an analyst.
     /// Null on legacy responses; absent in JSON when false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed: Option<bool>,
-    /// When the match was reviewed, if at all (NAN-494).
+    /// When the match was reviewed, if at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -176,7 +198,7 @@ pub struct ValidateDetectionResponse {
     pub creates_materialized_view: bool,
     /// Human-readable explanation of mode selection
     pub mode_reason: String,
-    /// NAN-1688: whether the query *shape* qualifies for real-time
+    /// whether the query *shape* qualifies for real-time
     /// (materialized-view) mode, independent of the requested mode. Lets the
     /// editor nudge a scheduled rule that could run real-time. Dataset
     /// (logs-only) and risk-entity gating is applied by the UI, which knows the
@@ -186,7 +208,7 @@ pub struct ValidateDetectionResponse {
     /// when eligible, or why the query is ineligible otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_eligible_reason: Option<String>,
-    /// NAN-1691: whether a `| prevalence` FILTER in the query will push into
+    /// whether a `| prevalence` FILTER in the query will push into
     /// ClickHouse (memory-safe) vs fall back to an in-memory scan that returns
     /// approximate results and wastes memory on the search/jobs pods. `true`
     /// when there is no prevalence filter or it pushes down.

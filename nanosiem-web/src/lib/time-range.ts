@@ -153,3 +153,115 @@ export function toApiTimeRange(range: string | TimeRangeValue): TimeRange {
     end: now.toISOString(),
   };
 }
+
+// ── NAN-3884: relative label, resolved window, URL form ───────────────────
+
+/** The compact label for a preset (`7d` for "Last 7 days"), or the preset itself. */
+export function presetShortLabel(preset: string): string {
+  for (const category of TIME_RANGE_PRESETS) {
+    const hit = category.presets.find((p) => p.value === preset);
+    if (hit) return hit.short;
+  }
+  return preset;
+}
+
+/** The viewer's IANA timezone (falls back to UTC where Intl cannot say). */
+export function localTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+function formatInZone(date: Date, timeZone: string, withYear: boolean): string {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    month: 'short',
+    day: 'numeric',
+    year: withYear ? 'numeric' : undefined,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? '';
+  const day = `${get('month')} ${get('day')}${withYear ? `, ${get('year')}` : ''}`;
+  return `${day} ${get('hour')}:${get('minute')}`;
+}
+
+function zoneAbbreviation(date: Date, timeZone: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone, timeZoneName: 'short' }).formatToParts(date);
+    return parts.find((p) => p.type === 'timeZoneName')?.value ?? timeZone;
+  } catch {
+    return timeZone;
+  }
+}
+
+/**
+ * A resolved window in the viewer's timezone: `Oct 8 10:02 → Oct 15 10:02 EDT`.
+ * Years appear only when the window crosses one, or is not this year.
+ */
+export function formatTimeWindow(range: TimeRange, timeZone: string = localTimeZone(), now: Date = new Date()): string {
+  const start = new Date(range.start);
+  const end = new Date(range.end);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return '';
+  const yearOf = (d: Date) => new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric' }).format(d);
+  const withYear = yearOf(start) !== yearOf(end) || yearOf(end) !== yearOf(now);
+  return `${formatInZone(start, timeZone, withYear)} → ${formatInZone(end, timeZone, withYear)} ${zoneAbbreviation(end, timeZone)}`;
+}
+
+/**
+ * The picker value next to the window it resolved to: `7d · Oct 8 10:02 →
+ * Oct 15 10:02 EDT` for a preset, the bare window for a fixed range.
+ */
+export function formatTimeWindowLabel(value: TimeRangeValue, range: TimeRange, timeZone?: string, now?: Date): string {
+  const resolved = formatTimeWindow(range, timeZone, now);
+  if (value.type === 'preset' && value.preset) {
+    const label = presetShortLabel(value.preset);
+    return resolved ? `${label} · ${resolved}` : label;
+  }
+  return resolved;
+}
+
+/**
+ * Write a range into URL params. A preset stays relative (`time=Last 7 days`)
+ * so a reload, back-nav or shared link re-resolves it against "now"; a fixed
+ * range carries its exact bounds (`start`/`end`).
+ */
+export function writeTimeRangeParams(params: URLSearchParams, value: TimeRangeValue): void {
+  if (value.type === 'preset' && value.preset) {
+    params.set('time', value.preset);
+    params.delete('start');
+    params.delete('end');
+    return;
+  }
+  const resolved = toApiTimeRange(value);
+  params.delete('time');
+  params.set('start', resolved.start);
+  params.set('end', resolved.end);
+}
+
+/** Read a range from URL params; fixed bounds win over a preset. `null` when absent. */
+export function readTimeRangeParams(params: URLSearchParams): TimeRangeValue | null {
+  const start = params.get('start');
+  const end = params.get('end');
+  if (start && end) return { type: 'custom', start: new Date(start), end: new Date(end) };
+  const preset = params.get('time');
+  if (preset) return { type: 'preset', preset };
+  return null;
+}
+
+/**
+ * Hover text for a page's own "last N" window selector (Alerts, Prevalence,
+ * Risk, Case search): the window `durationMs` back from now, in the viewer's
+ * timezone. `null` (all time) has no window to show.
+ */
+export function trailingWindowTitle(durationMs: number | null, now: Date = new Date(), timeZone?: string): string | undefined {
+  if (durationMs == null || !Number.isFinite(durationMs)) return undefined;
+  return formatTimeWindow(
+    { start: new Date(now.getTime() - durationMs).toISOString(), end: now.toISOString() },
+    timeZone,
+    now,
+  );
+}

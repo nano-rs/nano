@@ -29,6 +29,7 @@ import type {
   BulkUpdateRulesResponse,
   DetectionHealthSummary,
   FleetHealthSummary,
+  ScheduleLagSummary,
   NoisyRulesResponse,
   RuleVersionResponse,
   CreateRetroHuntRequest,
@@ -48,11 +49,14 @@ export class DetectionsApi {
     severity?: string;
     mode?: string;
     search?: string;
+    /** Include archived (deleted) rules, which the API hides by default. */
+    includeArchived?: boolean;
   }): Promise<DetectionRule[]> {
     const searchParams = new URLSearchParams();
     if (params?.severity) searchParams.set('severity', params.severity);
     if (params?.mode) searchParams.set('mode', params.mode);
     if (params?.search) searchParams.set('search', params.search);
+    if (params?.includeArchived) searchParams.set('include_archived', 'true');
 
     const query = searchParams.toString();
     return this.request(`/api/rules${query ? `?${query}` : ''}`);
@@ -215,6 +219,11 @@ export class DetectionsApi {
     return this.request('/api/rules/fleet-health');
   }
 
+  /** Per-tenant detection scheduling lag for the /rules overview strip (NAN-3064). */
+  async getSchedulingLag(): Promise<ScheduleLagSummary> {
+    return this.request('/api/rules/scheduling-lag');
+  }
+
   /** Top-N noisiest detection rules by 7-day match count (NAN-370). */
   async getNoisyRules(limit?: number): Promise<NoisyRulesResponse> {
     const params = limit ? `?limit=${limit}` : '';
@@ -292,15 +301,15 @@ export class DetectionsApi {
     return this.request(`/api/rules/${ruleId}/predicates`);
   }
 
-  async importDetections(data: string, format: 'yaml' | 'json'): Promise<{ imported: number }> {
+  /** Import a rule file (an export file, a `rules:` document, or one rule). */
+  async importDetections(
+    data: string,
+    format: 'yaml' | 'json',
+  ): Promise<{ imported: number; failed: number; errors: string[] }> {
     return this.request('/api/rules/import', {
       method: 'POST',
       body: JSON.stringify({ data, format }),
     });
-  }
-
-  async exportDetections(format: 'yaml' | 'json'): Promise<string> {
-    return this.request(`/api/rules/export?format=${format}`);
   }
 
   // Alerts

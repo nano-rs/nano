@@ -57,6 +57,27 @@ impl PrettyPrint for Aggregation {
             AggFunc::HistogramQuantile(pct) => {
                 format!("histogram_quantile({}, {})", field_str, pct)
             }
+            // NAN-2361: a CONDITIONAL aggregation must round-trip its predicate.
+            //
+            // This printed `func(field)` and dropped `condition` entirely, so
+            // `count(eval(<predicate>))` serialized back to a bare `count()`.
+            // That is not cosmetic: the lake path pretty-prints the AST to nPL
+            // and sends THAT to the worker, so the predicate never reached
+            // storage and every conditional aggregate silently returned the
+            // unconditional result. Measured live on 2,345 proxy events,
+            // `count(eval(query.hostname=<value>))` returned 2,345 for a column
+            // NULL on all of them — the worker was correct, it was simply asked
+            // the wrong question. Every layer downstream (parser, ClickHouse
+            // codegen, lake compiler) already handled the condition properly;
+            // the loss happened here, on the way out.
+            _ if self.condition.is_some() => {
+                // Safe to unwrap: guarded by the match arm.
+                let condition = self
+                    .condition
+                    .as_ref()
+                    .expect("condition present in this arm");
+                format!("{}(eval({}))", self.func.as_str(), condition.pretty_print())
+            }
             _ => format!("{}({})", self.func.as_str(), field_str),
         };
 
@@ -64,5 +85,23 @@ impl PrettyPrint for Aggregation {
             Some(alias) => format!("{} as {}", base, alias),
             None => base,
         }
+    }
+}
+
+#[cfg(test)]
+mod nan2361_tests {
+    use super::*;
+    use crate::query::parse_query;
+
+    #[test]
+    fn nan2361_conditional_aggregation_round_trips_its_predicate() {
+        let printed = parse_query(r#"* | stats count(eval(status="error")) as errors"#)
+            .expect("parses")
+            .pretty_print();
+        assert!(printed.contains("eval("), "predicate dropped: {printed}");
+        let plain = parse_query("* | stats count() as c")
+            .expect("parses")
+            .pretty_print();
+        assert!(!plain.contains("eval("));
     }
 }

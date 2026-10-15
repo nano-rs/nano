@@ -63,6 +63,17 @@ impl HealthScheduler {
         }
     }
 
+    /// NAN-3464: on a lake deployment, judge feed staleness from the lake's
+    /// own last event per source. Without it the monitor reads the legacy
+    /// ClickHouse/PostgreSQL `logs` table, which a lake does not have.
+    pub fn with_lake_feed_freshness(
+        mut self,
+        lake: Arc<dyn super::feed_monitor::LakeFeedFreshness>,
+    ) -> Self {
+        self.feed_monitor = self.feed_monitor.with_lake_freshness(lake);
+        self
+    }
+
     /// Start the scheduler as a background task
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {

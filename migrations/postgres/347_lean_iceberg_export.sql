@@ -1,0 +1,25 @@
+-- NAN-3580: default-off tenant export, write-only sealed credentials and durable cursor.
+CREATE TABLE IF NOT EXISTS public.iceberg_export_settings (
+    tenant_id UUID PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    customer_config JSONB NOT NULL CHECK (jsonb_typeof(customer_config)='object' AND octet_length(customer_config::text)<=16384),
+    credentials_encrypted BYTEA NOT NULL CHECK (octet_length(credentials_encrypted)<=32768),
+    credentials_nonce TEXT NOT NULL CHECK (length(credentials_nonce)<=64),
+    revision BIGINT NOT NULL DEFAULT 1 CHECK (revision>0),
+    export_state JSONB NOT NULL DEFAULT '{"exported":{},"last_plan_ms":0}',
+    pending_manifest JSONB,
+    lease_owner UUID,
+    lease_until TIMESTAMPTZ,
+    lease_generation BIGINT NOT NULL DEFAULT 0,
+    next_run_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    failures INTEGER NOT NULL DEFAULT 0,
+    last_success TIMESTAMPTZ,
+    lag_hours BIGINT NOT NULL DEFAULT 0 CHECK (lag_hours>=0),
+    bytes_copied BIGINT NOT NULL DEFAULT 0 CHECK (bytes_copied>=0),
+    files BIGINT NOT NULL DEFAULT 0 CHECK (files>=0),
+    errors JSONB NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK ((lease_owner IS NULL)=(lease_until IS NULL)),
+    CHECK (octet_length(export_state::text)<=16777216),
+    CHECK (octet_length(pending_manifest::text)<=16777216)
+);

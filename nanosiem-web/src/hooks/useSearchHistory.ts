@@ -3,6 +3,8 @@
 import { useState, useCallback, useEffect } from 'react';
 import type { TimeRangeValue } from '@/hooks/use-api';
 import { getAccessToken } from '@/lib/auth-token';
+import { requestCredentials } from '@/lib/request-credentials';
+import { invalidateFieldUsageCache } from '@/lib/query-autocomplete';
 
 export interface SearchHistoryEntry {
   id: string;
@@ -65,16 +67,23 @@ function apiEntryToLocal(entry: ApiHistoryEntry): SearchHistoryEntry {
   };
 }
 
-export function useSearchHistory() {
+export function useSearchHistory({ enabled = true }: { enabled?: boolean } = {}) {
   const [searchHistory, setSearchHistory] = useState<SearchHistoryEntry[]>([]);
-  const [historyEnabled, setHistoryEnabled] = useState(true);
-  const [isLoading, setIsLoading] = useState(true);
+  const [historyEnabled, setHistoryEnabled] = useState(enabled);
+  const [isLoading, setIsLoading] = useState(enabled);
 
   // Fetch history from API
   const fetchHistory = useCallback(async () => {
+    if (!enabled) {
+      setSearchHistory([]);
+      setHistoryEnabled(false);
+      setIsLoading(false);
+      return;
+    }
     try {
       const response = await fetch(`${API_BASE}/api/search/history`, {
         headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
       });
       
       if (response.ok) {
@@ -87,61 +96,69 @@ export function useSearchHistory() {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [enabled]);
 
   // Load history on mount
   useEffect(() => {
     fetchHistory();
   }, [fetchHistory]);
 
-  const toggleHistoryEnabled = useCallback(async (enabled: boolean) => {
+  const toggleHistoryEnabled = useCallback(async (nextEnabled: boolean) => {
+    if (!enabled) return;
     try {
       const response = await fetch(`${API_BASE}/api/search/history/settings`, {
         method: 'PUT',
         headers: getAuthHeaders(),
-        body: JSON.stringify({ enabled }),
+        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
+        body: JSON.stringify({ enabled: nextEnabled }),
       });
       
       if (response.ok) {
-        setHistoryEnabled(enabled);
+        setHistoryEnabled(nextEnabled);
       }
     } catch (err) {
       console.error('Failed to toggle history:', err);
     }
-  }, []);
+  }, [enabled]);
 
   const clearSearchHistory = useCallback(async () => {
+    if (!enabled) return;
     try {
       const response = await fetch(`${API_BASE}/api/search/history`, {
         method: 'DELETE',
         headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
       });
       
       if (response.ok) {
         setSearchHistory([]);
+        invalidateFieldUsageCache();
       }
     } catch (err) {
       console.error('Failed to clear history:', err);
     }
-  }, []);
+  }, [enabled]);
 
   const deleteHistoryEntry = useCallback(async (id: string) => {
+    if (!enabled) return;
     try {
       const response = await fetch(`${API_BASE}/api/search/history/${id}`, {
         method: 'DELETE',
         headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
       });
       
       if (response.ok) {
         setSearchHistory(prev => prev.filter(h => h.id !== id));
+        invalidateFieldUsageCache();
       }
     } catch (err) {
       console.error('Failed to delete history entry:', err);
     }
-  }, []);
+  }, [enabled]);
 
   const addToSearchHistory = useCallback(async (entry: Omit<SearchHistoryEntry, 'id' | 'timestamp'>) => {
-    if (!historyEnabled) return;
+    if (!enabled || !historyEnabled) return;
     
     // Build request body
     const body: Record<string, unknown> = {
@@ -161,12 +178,16 @@ export function useSearchHistory() {
       const response = await fetch(`${API_BASE}/api/search/history`, {
         method: 'POST',
         headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
         body: JSON.stringify(body),
       });
       
       if (response.ok) {
         const newEntry: ApiHistoryEntry = await response.json();
         const localEntry = apiEntryToLocal(newEntry);
+        // The server dropped its cached ranking for us; drop ours so the
+        // fields just searched show under "Recent (you)" right away.
+        invalidateFieldUsageCache();
         
         // Add to front, dedupe by checking if already exists
         setSearchHistory(prev => {
@@ -177,7 +198,7 @@ export function useSearchHistory() {
     } catch (err) {
       console.error('Failed to add to history:', err);
     }
-  }, [historyEnabled]);
+  }, [enabled, historyEnabled]);
 
   const refreshHistory = useCallback(() => {
     fetchHistory();

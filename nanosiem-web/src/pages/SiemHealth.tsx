@@ -49,6 +49,8 @@ import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { useToast } from '@/hooks/use-toast';
 import { Markdown } from '@/components/ui/markdown';
 import { SystemHealthEventsPanel } from '@/components/system-health/SystemHealthEventsPanel';
+import { LogSourceHealthList } from '@/components/log-sources/LogSourceHealthChart';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import {
   Popover,
   PopoverContent,
@@ -57,7 +59,7 @@ import {
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
-import { api } from '@/lib/api';
+import { api, ApiClientError } from '@/lib/api';
 import type {
   CollectedMetrics,
   FindingSuppression,
@@ -93,14 +95,19 @@ const TONE_BG: Record<Tone, string> = {
   'fg-3': 'bg-foreground/5 border-border',
 };
 
+// The four status tones stay as fixed oklch: they are severity signals, and a
+// DOWN dot must read the same red on every theme. The three NEUTRAL tones were
+// the problem — hardcoded to the dark theme's own greys (#A8ACB4 is literally
+// `--muted-foreground` in dark), so they carried that cast onto every other
+// theme and were near-invisible in light mode.
 const TONE_DOT: Record<Tone, string> = {
   critical: 'oklch(62% 0.22 18)',
   high: 'oklch(72% 0.18 28)',
   medium: 'oklch(80% 0.15 78)',
   good: 'oklch(70% 0.16 160)',
-  fg: '#A8ACB4',
-  'fg-2': '#A8ACB4',
-  'fg-3': '#6A6F78',
+  fg: 'var(--muted-foreground)',
+  'fg-2': 'var(--muted-foreground)',
+  'fg-3': 'var(--fg-4)',
 };
 
 const STATUS_META: Record<
@@ -883,8 +890,11 @@ function StageDetail({
       </div>
 
       {/* Stage-specific content */}
-      {stage.id === 'ingestion' && (
+      {stage.id === 'ingestion' && (report.metrics?.ingestion || !report.metrics?.tenant_ingestion) && (
         <IngestionDetail metrics={report.metrics?.ingestion} />
+      )}
+      {stage.id === 'ingestion' && !report.metrics?.ingestion && report.metrics?.tenant_ingestion && (
+        <TenantIngestionDetail metrics={report.metrics.tenant_ingestion} />
       )}
       {stage.id === 'parsing' && (
         <ParsingDetail metrics={report.metrics?.parsing} />
@@ -1530,6 +1540,63 @@ function AlertingDetail({
   );
 }
 
+function formatLakeBytes(bytes: number): string {
+  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+/** Hosted-shared tenant (NAN-2361): what the lake recorded, not event counts. */
+function TenantIngestionDetail({
+  metrics,
+}: {
+  metrics: NonNullable<CollectedMetrics['tenant_ingestion']>;
+}) {
+  const delta =
+    metrics.bytes_prior_24h > 0
+      ? Math.round(((metrics.bytes_24h - metrics.bytes_prior_24h) / metrics.bytes_prior_24h) * 100)
+      : null;
+  return (
+    <>
+      <MetricsGrid
+        items={[
+          {
+            label: 'Objects / 24h',
+            value: metrics.objects_24h.toLocaleString(),
+            tone: metrics.objects_24h > 0 ? 'good' : metrics.lifetime_objects > 0 ? 'critical' : 'fg-2',
+          },
+          {
+            label: 'Bytes / 24h',
+            value: formatLakeBytes(metrics.bytes_24h),
+            delta,
+            tone: deltaTone(delta),
+          },
+          {
+            label: 'Prior 24h',
+            value: `${metrics.objects_prior_24h.toLocaleString()} · ${formatLakeBytes(metrics.bytes_prior_24h)}`,
+            tone: 'fg-2',
+          },
+          {
+            label: 'Written to date',
+            value: `${metrics.lifetime_objects.toLocaleString()} · ${formatLakeBytes(metrics.lifetime_bytes)}`,
+            tone: 'fg',
+          },
+        ]}
+      />
+      <div className="px-5 py-3 text-[11.5px] text-muted-foreground">
+        Objects and bytes are the lake's writer completion receipts for this tenant
+        {metrics.writer_classes_24h.length > 0
+          ? ` (${metrics.writer_classes_24h.join(', ')})`
+          : ''}
+        ; per-event counts are not recorded per object.
+        {metrics.last_written_at ? ` Last write ${metrics.last_written_at.replace('T', ' ').slice(0, 19)} UTC.` : ''}
+      </div>
+    </>
+  );
+}
+
 function EmptyDetail({ label }: { label: string }) {
   return (
     <div className="px-5 py-8 text-center text-[12.5px] text-muted-foreground">
@@ -1662,17 +1729,38 @@ export function SiemHealth() {
   const { toast } = useToast();
   const isAdmin = hasPermission('settings:system');
   const aiAuthored = useAiAuthored();
+  // NAN-3207: per-source volume vs expected band (hosted-shared tenants only).
+  const shared = useSharedTenant();
+  const sourceHealth = shared && hasPermission('log_sources:view') ? (
+    <div className="mt-4">
+      <LogSourceHealthList />
+    </div>
+  ) : null;
 
-  const { data: report, isLoading } = useQuery({
+  const { data: report, isLoading, error: latestError, refetch: refetchLatest } = useQuery({
     queryKey: ['siem-health', 'latest'],
     queryFn: () => api.getSiemHealthLatest(),
     retry: false,
   });
+  // `GET /api/siem-health/reports/latest` answers 404 while no report exists
+  // (the tenant-scoped handler on the shared lake too). That is the empty
+  // state, not a failure; only another status is an error.
+  const noReportYet = latestError instanceof ApiClientError
+    ? latestError.status === 404
+    : (latestError as { status?: number } | null)?.status === 404;
+  const latestFailed = latestError !== null && !noReportYet;
 
   const triggerMutation = useMutation({
     mutationFn: () => api.triggerSiemHealthCheck(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['siem-health'] });
+    },
+    onError: (err: unknown) => {
+      toast({
+        title: 'Health check did not run',
+        description: err instanceof Error ? err.message : 'Try again in a moment.',
+        variant: 'destructive',
+      });
     },
   });
 
@@ -1763,7 +1851,37 @@ export function SiemHealth() {
     );
   }
 
-  /* ---- No report yet ---- */
+  /* ---- Could not load ---- */
+  if (!report && latestFailed) {
+    return (
+      <div className="flex flex-col px-6 pt-5 pb-6">
+        <div className="flex items-end gap-3">
+          <div className="min-w-0">
+            <Eyebrow icon={HeartPulse}>SIEM health</Eyebrow>
+            <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
+              Health report unavailable
+            </h1>
+            <p className="mt-0.5 text-[12px] text-muted-foreground">
+              {latestError instanceof Error ? latestError.message : 'The latest report could not be loaded.'}
+            </p>
+          </div>
+        </div>
+        <SystemHealthEventsPanel />
+        <div className="mt-8 rounded-md border border-border bg-card px-6 py-10 text-center">
+          <button
+            type="button"
+            onClick={() => refetchLatest()}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-[11.5px] font-medium text-foreground hover:bg-foreground/[0.04]"
+          >
+            <RefreshCw className="h-[12px] w-[12px]" />
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- No report yet (404 from /reports/latest) ---- */
   if (!report) {
     return (
       <div className="flex flex-col px-6 pt-5 pb-6">
@@ -1771,16 +1889,17 @@ export function SiemHealth() {
           <div className="min-w-0">
             <Eyebrow icon={HeartPulse}>SIEM health</Eyebrow>
             <h1 className="mt-1 text-[20px] font-semibold tracking-[-0.015em] text-foreground">
-              No health reports yet
+              No health report yet
             </h1>
             <p className="mt-0.5 text-[12px] text-muted-foreground">
               Health checks run automatically every 12 hours.
-              {isAdmin ? ' You can also trigger one manually below.' : ''}
+              {isAdmin ? ' Generate the first one now.' : ''}
             </p>
           </div>
         </div>
         <SystemHealthEventsPanel />
-        <div className="mt-8 rounded-xl border border-border bg-card px-6 py-12 text-center">
+        {sourceHealth}
+        <div className="mt-8 rounded-md border border-border bg-card px-6 py-12 text-center">
           <HeartPulse className="mx-auto mb-3 h-8 w-8 text-muted-foreground/40" />
           <p className="text-[13px] text-foreground">
             Once a health check completes, this page will surface ingestion,
@@ -1799,9 +1918,7 @@ export function SiemHealth() {
                   triggerMutation.isPending && 'animate-spin',
                 )}
               />
-              {triggerMutation.isPending
-                ? 'Running…'
-                : 'Run first health check'}
+              {triggerMutation.isPending ? 'Generating…' : 'Generate now'}
             </button>
           )}
         </div>
@@ -1887,6 +2004,8 @@ export function SiemHealth() {
       </div>
 
       <SystemHealthEventsPanel />
+
+      {sourceHealth}
 
       {/* Pipeline spine */}
       <div className="mt-4">

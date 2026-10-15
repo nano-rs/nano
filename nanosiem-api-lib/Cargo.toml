@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 nanosiem-core = { path = "../nanosiem-core" }
 axum.workspace = true
+tower.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -26,3 +27,4 @@ utoipa.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 tracing-subscriber.workspace = true
+regex = "1.12"

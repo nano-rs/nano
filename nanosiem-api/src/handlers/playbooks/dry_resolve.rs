@@ -105,7 +105,7 @@ pub struct DryResolveRequest {
     pub alert_id: Option<String>,
     /// OR resolve against an inline alert payload — useful when the author
     /// wants to test against a synthetic event before any real alert exists.
-    /// NAN-474: typed struct (was `serde_json::Value`) so wrong-typed fields
+    /// typed struct (was `serde_json::Value`) so wrong-typed fields
     /// return a clean 400 instead of silently degrading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_alert: Option<DryResolveSampleAlert>,
@@ -264,7 +264,14 @@ fn severity_str(sev: &nanosiem_core::Severity) -> Option<String> {
 fn snapshot_from_inline_payload(payload: &DryResolveSampleAlert) -> JsonValue {
     let matched_events = JsonValue::Array(payload.matched_events.clone());
     let entities = EntityExtractor::new().extract_from_events(&matched_events);
+    snapshot_from_inline_events(payload, &matched_events, &entities)
+}
 
+fn snapshot_from_inline_events(
+    payload: &DryResolveSampleAlert,
+    matched_events: &JsonValue,
+    entities: &[nanosiem_core::entity_extraction::ExtractedEntity],
+) -> JsonValue {
     build_snapshot_from_alert(
         "",
         None,
@@ -274,8 +281,8 @@ fn snapshot_from_inline_payload(payload: &DryResolveSampleAlert) -> JsonValue {
         payload.rule_id.as_deref(),
         payload.rule_name.as_deref(),
         payload.severity.as_deref(),
-        &matched_events,
-        &entities,
+        matched_events,
+        entities,
     )
 }
 
@@ -365,7 +372,14 @@ mod tests {
     #[test]
     fn context_summary_includes_entity_counts_and_source_type() {
         let payload = synthetic_alert_payload();
-        let snapshot = snapshot_from_inline_payload(&payload);
+        // The synthetic event uses flat field names; classify it under an
+        // explicit profile rather than the process-env schema (NAN-3491).
+        let matched_events = JsonValue::Array(payload.matched_events.clone());
+        let entities = EntityExtractor::new().extract_from_events_with_profile(
+            &matched_events,
+            &nanosiem_core::schema::UdmProfile::new(),
+        );
+        let snapshot = snapshot_from_inline_events(&payload, &matched_events, &entities);
         let ctx: RunContext = serde_json::from_value(snapshot.clone()).unwrap();
         let summary = build_context_summary(&ctx, &snapshot);
 

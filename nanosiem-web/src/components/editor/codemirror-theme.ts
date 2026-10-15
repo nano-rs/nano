@@ -92,8 +92,24 @@ export const editorTheme = EditorView.theme({
       maxHeight: '300px',
     },
     '& > ul > li': {
-      padding: '6px 12px',
+      // Dense rows: 26px (18px line + 4px padding), mono field names.
+      padding: '4px 10px',
+      lineHeight: '18px',
       color: 'var(--foreground)',
+    },
+    // Field-group labels (Recent / Popular / Common / All fields), NAN-3812.
+    '& > ul > completion-section': {
+      display: 'block',
+      padding: '6px 10px 2px',
+      fontFamily: '"Geist", system-ui, sans-serif',
+      fontSize: '10px',
+      lineHeight: '14px',
+      fontWeight: '500',
+      letterSpacing: '0.04em',
+      textTransform: 'uppercase',
+      color: 'var(--muted-foreground)',
+      borderBottom: 'none',
+      opacity: '1',
     },
     '& > ul > li[aria-selected]': {
       backgroundColor: 'var(--primary)',

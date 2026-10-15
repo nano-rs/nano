@@ -26,7 +26,10 @@ fn deep_implicit_and_chain_is_rejected_not_overflowed() {
 #[test]
 fn deep_or_chain_is_rejected_not_overflowed() {
     let q = vec!["a"; 5000].join(" OR ");
-    assert!(parse_query(&q).is_err(), "an over-long OR chain must be rejected");
+    assert!(
+        parse_query(&q).is_err(),
+        "an over-long OR chain must be rejected"
+    );
 }
 
 #[test]

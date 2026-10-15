@@ -217,7 +217,7 @@ fn streamstats_command(input: &str) -> ParseResult<'_, Command> {
 fn where_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("where").parse(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, condition) = search_expr(input)?;
+    let (input, condition) = super::search_expr::where_expr(input)?;
 
     Ok((input, Command::Where { condition }))
 }
@@ -230,7 +230,69 @@ fn search_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = multispace1(input)?;
     let (input, condition) = search_expr(input)?;
 
-    Ok((input, Command::Where { condition }))
+    Ok((
+        input,
+        Command::Where {
+            condition: search_wildcards_to_like(condition),
+        },
+    ))
+}
+
+/// NAN-3315: piped `| search` shares `Command::Where` with `| where`, whose
+/// `field=value` is a literal comparison (`where user="adm*"` matches the
+/// text `adm*`). Search semantics differ: a `*`/`?` in an `=`/`!=` value is a
+/// wildcard, exactly as in the base search. Make that explicit in the AST as
+/// a `LIKE`/`NOT LIKE` (the where generator emits case-insensitive `iLike`),
+/// so the piped stage matches what the same term matches before the pipe.
+/// `field=*` stays an existence test, which both scopes already agree on.
+fn search_wildcards_to_like(expr: SearchExpr) -> SearchExpr {
+    match expr {
+        SearchExpr::FieldFilter {
+            field,
+            op: op @ (Comparator::Eq | Comparator::Ne),
+            value: Value::String(s),
+            rhs,
+        } if s != "*" && (s.contains('*') || s.contains('?')) => SearchExpr::FieldFilter {
+            field,
+            op: if op == Comparator::Eq {
+                Comparator::Like
+            } else {
+                Comparator::NotLike
+            },
+            value: Value::String(glob_to_like_pattern(&s)),
+            rhs,
+        },
+        SearchExpr::And(l, r) => SearchExpr::And(
+            Box::new(search_wildcards_to_like(*l)),
+            Box::new(search_wildcards_to_like(*r)),
+        ),
+        SearchExpr::Or(l, r) => SearchExpr::Or(
+            Box::new(search_wildcards_to_like(*l)),
+            Box::new(search_wildcards_to_like(*r)),
+        ),
+        SearchExpr::Not(e) => SearchExpr::Not(Box::new(search_wildcards_to_like(*e))),
+        SearchExpr::Group(e) => SearchExpr::Group(Box::new(search_wildcards_to_like(*e))),
+        other => other,
+    }
+}
+
+/// Glob (`*`, `?`) to a raw SQL LIKE pattern, escaping LIKE's own `%`, `_` and
+/// `\` so they match literally. SQL string-literal escaping is the
+/// generator's job (`escape_string`), not this function's.
+fn glob_to_like_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        match c {
+            '*' => out.push('%'),
+            '?' => out.push('_'),
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Parse sort command: sort [N] [-|+]field, [-|+]field2, ... or sort field [asc|desc]
@@ -388,7 +450,7 @@ fn tail_command(input: &str) -> ParseResult<'_, Command> {
     ))
 }
 
-/// Parse timechart command: timechart [span=duration] [limit=N] agg1, agg2 [by field] [limit=N]
+/// Parse timechart command: timechart [span=duration|bins=N] [limit=N] agg1, agg2 [by field] [limit=N]
 /// limit can appear before aggregations or after split-by
 fn timechart_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("timechart").parse(input)?;
@@ -396,14 +458,41 @@ fn timechart_command(input: &str) -> ParseResult<'_, Command> {
 
     // Parse optional span=, limit=, cont= before aggregations (any order)
     let mut span: Option<Duration> = None;
+    let mut bins: Option<u32> = None;
     let mut limit: Option<usize> = None;
     let mut cont = false;
+    let mut useother = true;
     let mut remaining = input;
 
     loop {
+        if let Ok((rest, v)) = timechart_useother(remaining) {
+            if let Ok((rest, _)) = multispace1::<_, nom::error::Error<&str>>(rest) {
+                useother = v;
+                remaining = rest;
+                continue;
+            }
+        }
         if span.is_none() {
             if let Ok((rest, s)) = terminated(span_spec, multispace1).parse(remaining) {
                 span = Some(s);
+                remaining = rest;
+                continue;
+            }
+        }
+        // NAN-3385: `bins=N` — at most N buckets over the search window,
+        // resolved to a round span once the time range is known.
+        if bins.is_none() {
+            if let Ok((rest, _)) =
+                tag_no_case::<_, _, nom::error::Error<&str>>("bins=").parse(remaining)
+            {
+                let (rest, n) = terminated(
+                    nom::combinator::verify(map_res(digit1, |s: &str| s.parse::<u32>()), |n: &u32| {
+                        *n > 0
+                    }),
+                    multispace1,
+                )
+                .parse(rest)?;
+                bins = Some(n);
                 remaining = rest;
                 continue;
             }
@@ -455,6 +544,13 @@ fn timechart_command(input: &str) -> ParseResult<'_, Command> {
     // Parse optional trailing params after split-by (limit=, cont=)
     let mut remaining = input;
     loop {
+        if let Ok((rest, _)) = multispace1::<_, nom::error::Error<&str>>(remaining) {
+            if let Ok((rest, v)) = timechart_useother(rest) {
+                useother = v;
+                remaining = rest;
+                continue;
+            }
+        }
         if limit.is_none() {
             let limit_result: Result<(&str, usize), nom::Err<nom::error::Error<&str>>> = preceded(
                 delimited(multispace1, tag_no_case("limit="), multispace0),
@@ -491,11 +587,14 @@ fn timechart_command(input: &str) -> ParseResult<'_, Command> {
     Ok((
         remaining,
         Command::Timechart {
+            // An explicit span= wins over bins=.
+            bins: if span.is_some() { None } else { bins },
             span: span.unwrap_or(Duration::from_secs(3600)), // Default 1 hour
             aggregations,
             split_by,
             limit,
             cont,
+            useother,
         },
     ))
 }
@@ -610,7 +709,7 @@ fn field_rename(input: &str) -> ParseResult<'_, FieldRename> {
     Ok((input, FieldRename { from, to }))
 }
 
-/// Parse lookup command: lookup <table_name> <key_field> [OUTPUT <field1>, <field2>, ...] [CASE_INSENSITIVE]
+/// Parse lookup <table> <column> [AS <event>] [OUTPUT|OUTPUTNEW <column> [AS <result>], ...].
 /// Examples:
 ///   lookup assets src_ip
 ///   lookup users user OUTPUT name, email
@@ -626,24 +725,58 @@ fn lookup_command(input: &str) -> ParseResult<'_, Command> {
     // Parse key field
     let (input, key_field_local) = field_name(input)?;
 
-    // Parse optional "as alias" clause: maps local field to a different name in the lookup table
-    // e.g., "lookup assets src_ip as ip" means match events' src_ip against lookup's ip column
+    // Parse optional AS event-field clause (legacy order is handled below).
     let (input, key_field_alias) = opt(preceded(
         delimited(multispace1, tag_no_case("as"), multispace1),
         field_name,
     ))
     .parse(input)?;
 
-    // When "as alias" is present, use the alias as key_field (the lookup table's column name)
-    // — e.g. `src_ip as ip` -> use "ip" as the key_field for the lookup join.
-    let key_field = key_field_alias.unwrap_or(key_field_local);
+    // Splunk order is table-column AS event-field. Retain legacy event-first
+    // queries when the first side is dotted and the second is flat, or only
+    // the first side is a physical UDM event column. Generated inventory
+    // fields like `ip` must not count here. Other pairs use Splunk order.
+    let is_event_field = |field: &str| {
+        use crate::schema::SchemaProfile;
+        field.contains('.')
+            || matches!(crate::schema::UdmProfile::new().resolve(field),
+                crate::schema::FieldResolution::ExplicitColumn(column) if column == field)
+    };
+    let (key_field, event_field) = match key_field_alias {
+        Some(alias) if (key_field_local.contains('.') && !alias.contains('.'))
+            || (is_event_field(&key_field_local) && !is_event_field(&alias)) =>
+            (alias, key_field_local),
+        Some(alias) => (key_field_local, alias),
+        None => (key_field_local.clone(), key_field_local),
+    };
 
-    // Parse optional OUTPUT clause
-    let (input, output_fields) = opt(preceded(
-        delimited(multispace1, tag_no_case("OUTPUT"), multispace1),
-        field_list_fn,
-    ))
-    .parse(input)?;
+    let (input, output) = opt(preceded(
+        multispace1,
+        pair(
+            alt((value(true, tag_no_case("OUTPUTNEW")), value(false, tag_no_case("OUTPUT")))),
+            preceded(multispace1, separated_list1(
+                alt((delimited(multispace0, char(','), multispace0), value(',', multispace1))),
+                |input| {
+                    let (input, from) = alt((quoted_string, field_name)).parse(input)?;
+                    if from.eq_ignore_ascii_case("CASE_INSENSITIVE") {
+                        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+                    }
+                    let (input, to) = opt(preceded(
+                        delimited(multispace1, tag_no_case("AS"), multispace1), alt((quoted_string, field_name)),
+                    )).parse(input)?;
+                    Ok((input, FieldRename { to: to.unwrap_or_else(|| from.clone()), from }))
+                },
+            )),
+        ),
+    )).parse(input)?;
+    let (output_new, output_fields, output_renames) = match output {
+        Some((new, fields)) => (
+            new,
+            Some(fields.iter().map(|f| f.from.clone()).collect()),
+            fields.into_iter().filter(|f| f.from != f.to).collect(),
+        ),
+        None => (false, None, Vec::new()),
+    };
 
     // Parse optional CASE_INSENSITIVE flag
     let (input, case_insensitive) = map(
@@ -656,8 +789,11 @@ fn lookup_command(input: &str) -> ParseResult<'_, Command> {
         input,
         Command::Lookup {
             table_name,
+            event_field,
             key_field,
             output_fields,
+            output_renames,
+            output_new,
             case_insensitive,
         },
     ))
@@ -967,4 +1103,8 @@ fn output_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = multispace1(input)?;
     let (input, destination) = field_name(input)?;
     Ok((input, Command::Output { destination }))
+}
+
+fn timechart_useother(input: &str) -> ParseResult<'_, bool> {
+    preceded(tag_no_case("useother="), alt((value(true, tag_no_case("true")), value(false, tag_no_case("false"))))).parse(input)
 }

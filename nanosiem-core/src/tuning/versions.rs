@@ -954,7 +954,7 @@ impl RuleVersionManager {
 
         if detection_mode == "real-time" && changed {
             sqlx::query(
-                r#"
+                concat!(r#"
                 INSERT INTO detection_rule_runtime_sync_jobs (
                     rule_id, desired_version_id, status, attempts,
                     claimed_by, claimed_at, last_error
@@ -964,7 +964,7 @@ impl RuleVersionManager {
                     CASE WHEN $3::TEXT IS NULL THEN NULL ELSE NOW() END,
                     NULL
                 )
-                ON CONFLICT (rule_id) DO UPDATE SET
+                ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
                     desired_version_id = EXCLUDED.desired_version_id,
                     status = 'pending',
                     attempts = 0,
@@ -972,7 +972,7 @@ impl RuleVersionManager {
                     claimed_at = EXCLUDED.claimed_at,
                     last_error = NULL,
                     updated_at = NOW()
-                "#,
+                "#),
             )
             .bind(rule_id)
             .bind(revert_version_id)
@@ -1080,7 +1080,7 @@ impl RuleVersionManager {
         desired_version_id: i32,
     ) -> Result<(), VersionManagerError> {
         let affected = sqlx::query(
-            r#"
+            concat!(r#"
             INSERT INTO detection_rule_runtime_sync_jobs (
                 rule_id, desired_version_id, status, attempts,
                 claimed_by, claimed_at, last_error
@@ -1088,7 +1088,7 @@ impl RuleVersionManager {
             SELECT $1, $2, 'pending', 0, NULL, NULL, NULL
             FROM detection_rules
             WHERE id = $1
-            ON CONFLICT (rule_id) DO UPDATE SET
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
                 desired_version_id = EXCLUDED.desired_version_id,
                 status = 'pending',
                 attempts = 0,
@@ -1096,7 +1096,7 @@ impl RuleVersionManager {
                 claimed_at = NULL,
                 last_error = NULL,
                 updated_at = NOW()
-            "#,
+            "#),
         )
         .bind(rule_id)
         .bind(desired_version_id)
@@ -1316,7 +1316,7 @@ mod tests {
 
     // `revert_migration_persists_results_and_runtime_reconciliation` used to live
     // here. It `include_str!`s an ENTERPRISE migration (9000031), and the open-core
-    // mirror strips `migrations/postgres-enterprise/` — so in the mirror this file
+    // mirror strips the enterprise migrations — so in the mirror this file
     // still compiled under `cargo check` but its test target did not, which took
     // down every unit test in `nanosiem-core` for anyone cloning the public repo.
     // Moved to `tests/tuning_revert_integration.rs`, which the strip drops whole.

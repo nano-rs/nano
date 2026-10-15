@@ -38,10 +38,10 @@ import {
   Hash,
   Plus,
   LayoutDashboard,
-  Loader2,
   CircleCheck,
   CircleAlert,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { 
   useDashboards, 
   useCreateDashboard, 
@@ -365,7 +365,7 @@ export function AddToDashboardDialog({
               </Label>
               {loadingDashboards ? (
                 <div className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
-                  <Loader2 className="w-[12px] h-[12px] animate-spin" />
+                  <LoadingIcon className="w-[12px] h-[12px]" />
                   Loading dashboards…
                 </div>
               ) : dashboards && dashboards.length > 0 ? (
@@ -452,7 +452,7 @@ export function AddToDashboardDialog({
           >
             {isLoading ? (
               <>
-                <Loader2 className="w-[12px] h-[12px] animate-spin" />
+                <LoadingIcon className="w-[12px] h-[12px]" />
                 {mode === 'new' ? 'Creating…' : 'Adding…'}
               </>
             ) : (

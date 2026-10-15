@@ -7,7 +7,8 @@
 // re-using the real parser instead of the mock's `parsePipeline` hack.
 
 import { lazy, Suspense } from 'react';
-import { Share2, Loader2 } from 'lucide-react';
+import { Share2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cronHuman } from './helpers';
 
 const RuleFlowEditor = lazy(() => import('@/components/detection/editor/RuleFlowEditor'));
@@ -49,7 +50,7 @@ export function FlowLens({ query, schedule, lookback }: FlowLensProps) {
         <Suspense
           fallback={
             <div className="h-full flex items-center justify-center text-muted-foreground">
-              <Loader2 className="w-5 h-5 animate-spin" />
+              <LoadingIcon className="w-5 h-5" />
             </div>
           }
         >

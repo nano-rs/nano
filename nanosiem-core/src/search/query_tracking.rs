@@ -39,14 +39,54 @@ pub struct QueryInfo {
 #[derive(Debug, Clone, Default)]
 pub struct QueryTracker {
     active: Arc<DashMap<String, QueryInfo>>,
+    /// NAN-3883: `DELETE /api/search/{id}` for an id this instance is not
+    /// running yet, keyed by request id: the principal that asked and when.
+    /// The UI cancels a superseded run's request id the moment it starts the
+    /// next one, often before that run's `POST` has been admitted (the browser
+    /// abort itself never reaches search through the edge). Without this the
+    /// cancel found nothing (`{"cancelled":false}`) and the superseded search
+    /// ran to completion or escalation beside the current one.
+    cancel_requests: Arc<DashMap<String, (Uuid, Instant)>>,
+    /// NAN-3883: one signal per interactive request a handler is serving, so
+    /// a cancel that lands before the query reached the engine (admission,
+    /// planning, cache lookup) still stops it. The token tells one
+    /// registration from a later one under the same id.
+    cancel_signals: Arc<DashMap<String, (Uuid, tokio::sync::watch::Sender<bool>)>>,
+}
+
+/// NAN-3883: how long a cancel for a not-yet-arrived request id is kept.
+/// The cancel and the request it targets leave the browser together.
+pub const CANCEL_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// NAN-3883: an interactive request's cancel signal; unregisters on drop.
+#[derive(Debug)]
+pub struct CancelSignal {
+    registry: Arc<DashMap<String, (Uuid, tokio::sync::watch::Sender<bool>)>>,
+    request_id: String,
+    token: Uuid,
+    receiver: tokio::sync::watch::Receiver<bool>,
+}
+
+impl CancelSignal {
+    /// Resolves once the request is cancelled; pending forever otherwise.
+    pub async fn cancelled(&mut self) {
+        if self.receiver.wait_for(|cancelled| *cancelled).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl Drop for CancelSignal {
+    fn drop(&mut self) {
+        let token = self.token;
+        self.registry.remove_if(&self.request_id, |_, (registered, _)| *registered == token);
+    }
 }
 
 impl QueryTracker {
     /// Create a new query tracker
     pub fn new() -> Self {
-        Self {
-            active: Arc::new(DashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a new query
@@ -103,6 +143,51 @@ impl QueryTracker {
         }
     }
 
+    /// NAN-3883: register `request_id`'s cancel signal for the handler that
+    /// serves it. `None` when a cancel for it already arrived from
+    /// `principal` (the caller answers QUERY_CANCELLED without running it).
+    pub fn cancel_signal(&self, request_id: &str, principal: Uuid) -> Option<CancelSignal> {
+        if self.take_cancel_request(request_id, principal) {
+            return None;
+        }
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let token = Uuid::new_v4();
+        self.cancel_signals.insert(request_id.to_string(), (token, sender));
+        Some(CancelSignal {
+            registry: Arc::clone(&self.cancel_signals),
+            request_id: request_id.to_string(),
+            token,
+            receiver,
+        })
+    }
+
+    /// NAN-3883: cancel `request_id` on behalf of `principal` (already
+    /// authorized as its owner, or the id is unknown everywhere). Signals a
+    /// handler serving it and returns `true`; otherwise remembers the cancel
+    /// for [`CANCEL_REQUEST_TTL`] so the request is refused if it arrives
+    /// later, and returns `false`.
+    pub fn request_cancel(&self, request_id: &str, principal: Uuid) -> bool {
+        if let Some(entry) = self.cancel_signals.get(request_id) {
+            let _ = entry.value().1.send(true);
+            return true;
+        }
+        self.cancel_requests
+            .retain(|_, (_, at)| at.elapsed() <= CANCEL_REQUEST_TTL);
+        self.cancel_requests
+            .insert(request_id.to_string(), (principal, Instant::now()));
+        false
+    }
+
+    /// NAN-3883: consume a remembered cancel of `request_id` by `principal`.
+    /// Another principal's cancel never stops this principal's request.
+    fn take_cancel_request(&self, request_id: &str, principal: Uuid) -> bool {
+        self.cancel_requests
+            .remove_if(request_id, |_, (owner, at)| {
+                *owner == principal && at.elapsed() <= CANCEL_REQUEST_TTL
+            })
+            .is_some()
+    }
+
     /// Unregister a query (call when query completes)
     ///
     /// Returns the QueryInfo if it was registered
@@ -133,23 +218,44 @@ impl QueryTracker {
     /// Queries that fail to call `unregister()` (e.g., due to error paths or panics)
     /// leave orphaned entries in the tracker. This method cleans them up.
     pub fn cleanup_stale(&self, max_age: std::time::Duration) -> usize {
-        let stale_ids: Vec<String> = self
-            .active
-            .iter()
-            .filter(|r| r.value().started_at.elapsed() > max_age)
-            .map(|r| r.key().clone())
-            .collect();
-        let count = stale_ids.len();
-        for id in stale_ids {
-            self.active.remove(&id);
-        }
-        count
+        let mut removed = 0;
+        // Check and remove under the same shard write lock. A collected list
+        // of IDs could otherwise delete a newly registered replacement after
+        // the original stale entry was observed.
+        self.active.retain(|_, info| {
+            if info.started_at.elapsed() > max_age {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_removes_only_current_stale_entries_and_reports_actual_removals() {
+        let tracker = QueryTracker::new();
+        let owner = Uuid::now_v7();
+        assert!(tracker.reserve_request("stale".into(), owner));
+        tracker.active.get_mut("stale").unwrap().started_at =
+            Instant::now() - std::time::Duration::from_secs(7200);
+        assert!(tracker.reserve_request("replaced".into(), owner));
+        tracker.active.get_mut("replaced").unwrap().started_at =
+            Instant::now() - std::time::Duration::from_secs(7200);
+        tracker.register("replaced".into(), "current-query".into());
+        assert_eq!(tracker.cleanup_stale(std::time::Duration::from_secs(3600)), 1);
+        assert!(tracker.get("stale").is_none());
+        let fresh = tracker.get("replaced").unwrap();
+        assert_eq!(fresh.query_id, "current-query");
+        assert_eq!(fresh.owner_principal_id, Some(owner));
+        assert_eq!(tracker.cleanup_stale(std::time::Duration::from_secs(3600)), 0);
+    }
 
     #[test]
     fn test_query_tracker_register_unregister() {
@@ -232,5 +338,46 @@ mod tests {
         // claimable either — fail closed rather than let a late caller adopt it.
         tracker.register("req-2".to_string(), "ch-2".to_string());
         assert!(!tracker.reserve_request("req-2".to_string(), key_b));
+    }
+
+    /// NAN-3883: the UI cancels a superseded run as it starts the next one;
+    /// the cancel may land before that run's request is admitted.
+    #[test]
+    fn a_cancel_before_the_request_arrives_refuses_it_for_that_principal_only() {
+        let tracker = QueryTracker::new();
+        let owner = Uuid::now_v7();
+        let other = Uuid::now_v7();
+        assert!(!tracker.request_cancel("t:req-early", owner), "nothing was running yet");
+        // Another principal reusing the id is unaffected.
+        assert!(tracker.cancel_signal("t:req-early", other).is_some());
+        // The owner's late request is refused, once.
+        assert!(tracker.cancel_signal("t:req-early", owner).is_none());
+        assert!(tracker.cancel_signal("t:req-early", owner).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_the_handler_serves_the_request_signals_it() {
+        let tracker = QueryTracker::new();
+        let owner = Uuid::now_v7();
+        let mut signal = tracker.cancel_signal("t:req-live", owner).unwrap();
+        assert!(tracker.request_cancel("t:req-live", owner));
+        tokio::time::timeout(std::time::Duration::from_secs(1), signal.cancelled())
+            .await
+            .expect("the serving handler sees the cancel");
+        drop(signal);
+        // Unregistered on drop: a later cancel is remembered instead.
+        assert!(!tracker.request_cancel("t:req-live", owner));
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_signal_stays_pending_and_a_stale_drop_keeps_the_new_registration() {
+        let tracker = QueryTracker::new();
+        let owner = Uuid::now_v7();
+        let mut first = tracker.cancel_signal("t:req", owner).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), first.cancelled()).await.is_err());
+        let mut second = tracker.cancel_signal("t:req", owner).unwrap();
+        drop(first);
+        assert!(tracker.request_cancel("t:req", owner), "the live registration survived the stale drop");
+        tokio::time::timeout(std::time::Duration::from_secs(1), second.cancelled()).await.unwrap();
     }
 }

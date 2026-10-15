@@ -10,6 +10,9 @@
 // =============================================================================
 
 export interface ParserRepository {
+  sync_started_at?: string | null;
+  sync_lease_expires_at?: string | null;
+  next_sync_at?: string | null;
   id: string;
   name: string;
   slug: string;
@@ -94,9 +97,20 @@ export interface RepositoryParserFilter {
 }
 
 export interface ParserSyncStartResponse {
+  sync_started_at?: string | null;
+  sync_lease_expires_at?: string | null;
+  next_sync_at?: string | null;
   repository_id: string;
+  /** `'syncing'` when the sync runs in the background (dedicated); a terminal
+   *  status (`'success'`) when it ran synchronously (hosted-shared). */
   status: string;
   message: string;
+  /** Terminal counts, present only when `status` is terminal. */
+  parsers_added?: number;
+  parsers_updated?: number;
+  parsers_removed?: number;
+  parsers_skipped?: number;
+  parser_count?: number;
 }
 
 export interface ParserSyncStatus {
@@ -250,9 +264,10 @@ export class ParserRepositoriesApi {
 
   /** Start syncing a repository (async - returns immediately, sync runs in background) */
   async syncRepository(id: string): Promise<ParserSyncStartResponse> {
-    return this.request(`/api/parser-repositories/${id}/sync`, {
+    const result = await this.request<ParserSyncStartResponse>(`/api/parser-repositories/${id}/sync`, {
       method: 'POST',
     });
+    return { ...result, repository_id: id, message: result.message ?? 'Repository sync accepted.' };
   }
 
   async getSyncStatus(id: string): Promise<ParserSyncStatus> {

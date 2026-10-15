@@ -1,0 +1,77 @@
+[
+  {
+    "manifest": {
+      "contract_version": 1,
+      "scope": "nano/platform-enrichment",
+      "feed_id": "ipinfo_lite",
+      "revision": 1,
+      "fencing_epoch": 3,
+      "bucket": "nano-platform-feeds",
+      "object_key": "platform-enrichment/v1/ipinfo_lite/3/1/15db582905557a6276c2da8a69df242ecbb7b37001b06fd83eac793beef27990.mmdb",
+      "digest": "15db582905557a6276c2da8a69df242ecbb7b37001b06fd83eac793beef27990",
+      "byte_count": 24523341,
+      "uncompressed_bytes": 24523341,
+      "mapped_bytes": 24523341,
+      "row_count": 3611825,
+      "schema_version": 1,
+      "mapping_revision": 1,
+      "adapter_version": "ipinfo-mmdb/1",
+      "license_revision": "ipinfo-lite-cc-by-sa-4.0-reviewed-2026-09-21",
+      "upstream_at": "2026-09-20T08:03:19Z",
+      "fetched_at": "2026-09-21T01:54:21.179570980Z",
+      "valid_until": "2026-10-04T08:03:19Z",
+      "signer_key_id": "platform-ad038f5046fb19e51bf310e0"
+    },
+    "signature": "c5fce903a0e95aee72155c5a9bebcaf41788072ae857ed5ded8746f6c9902fa2da255b2cd7c50d98289e0ac4a4f4f646ebb5f1af7fa7c0481ab0e2073427b00f"
+  },
+  {
+    "manifest": {
+      "contract_version": 1,
+      "scope": "nano/platform-enrichment",
+      "feed_id": "threatfox",
+      "revision": 2,
+      "fencing_epoch": 5,
+      "bucket": "nano-platform-feeds",
+      "object_key": "platform-enrichment/v1/threatfox/5/2/714d765ca8c1922d96357e4fcc3723ccc0791c1c41af27a260a1c236bb7f1557.pack",
+      "digest": "714d765ca8c1922d96357e4fcc3723ccc0791c1c41af27a260a1c236bb7f1557",
+      "byte_count": 29898612,
+      "uncompressed_bytes": 29898612,
+      "mapped_bytes": 29898612,
+      "row_count": 96965,
+      "schema_version": 1,
+      "mapping_revision": 1,
+      "adapter_version": "packed-ioc/1",
+      "license_revision": "threatfox-abusech-cc0-reviewed-2026-09-21",
+      "upstream_at": "2026-09-21T05:48:41Z",
+      "fetched_at": "2026-09-21T06:00:20.034404215Z",
+      "valid_until": "2026-09-22T05:48:41Z",
+      "signer_key_id": "platform-ad038f5046fb19e51bf310e0"
+    },
+    "signature": "9b043c4cb6e05a465d87373f101d4009ad1366f53519c23ca25d04a2af152b862faca9283192b6043681576c0466a8477822911373ec66fa12727695607fd209"
+  },
+  {
+    "manifest": {
+      "contract_version": 1,
+      "scope": "nano/platform-enrichment",
+      "feed_id": "tor_exit_nodes",
+      "revision": 2,
+      "fencing_epoch": 5,
+      "bucket": "nano-platform-feeds",
+      "object_key": "platform-enrichment/v1/tor_exit_nodes/5/2/50dc2ab1917c5b490a693a1913537815b5fee80bbc9c6ca9732b6aa417897f7a.pack",
+      "digest": "50dc2ab1917c5b490a693a1913537815b5fee80bbc9c6ca9732b6aa417897f7a",
+      "byte_count": 71592,
+      "uncompressed_bytes": 71592,
+      "mapped_bytes": 71592,
+      "row_count": 1376,
+      "schema_version": 1,
+      "mapping_revision": 1,
+      "adapter_version": "packed-exact/1",
+      "license_revision": "tor-bulk-exit-list-public-reviewed-2026-09-21",
+      "upstream_at": "2026-09-21T05:57:52Z",
+      "fetched_at": "2026-09-21T06:00:28.662269724Z",
+      "valid_until": "2026-09-22T05:57:52Z",
+      "signer_key_id": "platform-ad038f5046fb19e51bf310e0"
+    },
+    "signature": "064c92e9d069991f718f8e0bc80eebb87cb295f479e218cde46d5f790958cebbbc99c8e7f0d7c0781d00724ff676244f33c82ecc9ffc33ace79078da8614ea07"
+  }
+]

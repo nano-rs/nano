@@ -26,9 +26,9 @@ use nanosiem_core::audit::{
     CREDENTIAL_ROLLED_BACK, CREDENTIAL_ROTATED, CREDENTIAL_UPDATED,
 };
 use nanosiem_core::parsers::{
-    CloudCredential, CloudCredentialVersion, CreateCloudCredential, CredentialRepository,
-    CredentialRepositoryError, RollbackCloudCredential, RotateCloudCredential,
-    UpdateCloudCredential,
+    azure_event_hubs_credentials_complete, is_supported_credential_provider, CloudCredential,
+    CloudCredentialVersion, CreateCloudCredential, CredentialRepository, CredentialRepositoryError,
+    RollbackCloudCredential, RotateCloudCredential, UpdateCloudCredential,
 };
 
 use crate::handlers::AuditExt;
@@ -72,6 +72,16 @@ impl CredentialApiError {
 
         (status, Self::new(error_type, &err.to_string()))
     }
+}
+
+fn invalid_provider() -> (StatusCode, Json<CredentialApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(CredentialApiError::new(
+            "invalid_provider",
+            "Provider must be 'aws_s3', 'gcp_pubsub', 'kafka', or 'azure_event_hubs'",
+        )),
+    )
 }
 
 fn forbidden() -> (StatusCode, Json<CredentialApiError>) {
@@ -189,17 +199,8 @@ pub async fn create_credential(
 ) -> Result<(StatusCode, Json<CloudCredential>), (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:create").map_err(|_| forbidden())?;
 
-    if request.provider != "aws_s3"
-        && request.provider != "gcp_pubsub"
-        && request.provider != "kafka"
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(CredentialApiError::new(
-                "invalid_provider",
-                "Provider must be 'aws_s3', 'gcp_pubsub', or 'kafka'",
-            )),
-        ));
+    if !is_supported_credential_provider(&request.provider) {
+        return Err(invalid_provider());
     }
 
     if request.provider == "aws_s3" {
@@ -230,6 +231,17 @@ pub async fn create_credential(
             Json(CredentialApiError::new(
                 "invalid_credentials",
                 "GCP Pub/Sub credentials must include 'credentials_json'",
+            )),
+        ));
+    } else if request.provider == "azure_event_hubs"
+        && !azure_event_hubs_credentials_complete(&request.credentials)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(CredentialApiError::new(
+                "invalid_credentials",
+                "Azure Event Hubs credentials must include either 'connection_string', or \
+                 'azure_tenant_id', 'azure_client_id' and 'azure_client_secret'",
             )),
         ));
     }
@@ -424,7 +436,7 @@ pub async fn delete_credential(
     path = "/api/credentials/provider/{provider}",
     tag = "credentials",
     params(
-        ("provider" = String, Path, description = "Provider name (aws_s3, gcp_pubsub, kafka)")
+        ("provider" = String, Path, description = "Provider name (aws_s3, gcp_pubsub, kafka, azure_event_hubs)")
     ),
     responses(
         (status = 200, description = "List of credentials for provider", body = CredentialListResponse),
@@ -440,14 +452,8 @@ pub async fn list_credentials_by_provider(
 ) -> Result<Json<CredentialListResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    if provider != "aws_s3" && provider != "gcp_pubsub" && provider != "kafka" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(CredentialApiError::new(
-                "invalid_provider",
-                "Provider must be 'aws_s3', 'gcp_pubsub', or 'kafka'",
-            )),
-        ));
+    if !is_supported_credential_provider(&provider) {
+        return Err(invalid_provider());
     }
 
     let repo = CredentialRepository::new(state.pool.clone());

@@ -250,18 +250,41 @@ pub const FILE_PREDICATE: &str = p_file!();
 /// service.
 pub const EVENT_KIND_SQL: &str = concat!(
     "CASE",
-    " WHEN ", p_alert!(), " THEN 'ALERT'",
-    " WHEN ", p_dhcp!(), " THEN 'DHCP'",
-    " WHEN ", p_dns!(), " THEN 'DNS'",
-    " WHEN ", p_auth!(),
-        " THEN CASE WHEN ", p_auth_fail!(), " THEN 'AUTH_FAILURE' ELSE 'AUTH_SUCCESS' END",
-    " WHEN ", p_image_load!(), " THEN 'IMAGE_LOAD'",
-    " WHEN ", p_registry!(), " THEN 'REGISTRY'",
-    " WHEN ", p_pipe!(), " THEN 'PIPE'",
-    " WHEN ", p_network!(), " THEN 'NETWORK'",
-    " WHEN ", p_process!(), " THEN 'PROCESS'",
-    " WHEN ", p_file!(), " THEN 'FILE'",
-    " WHEN ", p_network_fallback!(), " THEN 'NETWORK'",
+    " WHEN ",
+    p_alert!(),
+    " THEN 'ALERT'",
+    " WHEN ",
+    p_dhcp!(),
+    " THEN 'DHCP'",
+    " WHEN ",
+    p_dns!(),
+    " THEN 'DNS'",
+    " WHEN ",
+    p_auth!(),
+    " THEN CASE WHEN ",
+    p_auth_fail!(),
+    " THEN 'AUTH_FAILURE' ELSE 'AUTH_SUCCESS' END",
+    " WHEN ",
+    p_image_load!(),
+    " THEN 'IMAGE_LOAD'",
+    " WHEN ",
+    p_registry!(),
+    " THEN 'REGISTRY'",
+    " WHEN ",
+    p_pipe!(),
+    " THEN 'PIPE'",
+    " WHEN ",
+    p_network!(),
+    " THEN 'NETWORK'",
+    " WHEN ",
+    p_process!(),
+    " THEN 'PROCESS'",
+    " WHEN ",
+    p_file!(),
+    " THEN 'FILE'",
+    " WHEN ",
+    p_network_fallback!(),
+    " THEN 'NETWORK'",
     " ELSE 'EVENT'",
     " END",
 );
@@ -274,11 +297,33 @@ pub const EVENT_KIND_SQL: &str = concat!(
 /// this module.
 pub const LANE_SQL: &str = concat!(
     "CASE",
-    " WHEN ", p_alert!(), " THEN 4",
-    " WHEN ", p_auth!(), " THEN 0",
-    " WHEN (", p_process!(), " OR ", p_image_load!(), ") THEN 1",
-    " WHEN (", p_dns!(), " OR ", p_dhcp!(), " OR ", p_network!(), " OR ", p_network_fallback!(), ") THEN 2",
-    " WHEN (", p_file!(), " OR ", p_registry!(), " OR ", p_pipe!(), ") THEN 3",
+    " WHEN ",
+    p_alert!(),
+    " THEN 4",
+    " WHEN ",
+    p_auth!(),
+    " THEN 0",
+    " WHEN (",
+    p_process!(),
+    " OR ",
+    p_image_load!(),
+    ") THEN 1",
+    " WHEN (",
+    p_dns!(),
+    " OR ",
+    p_dhcp!(),
+    " OR ",
+    p_network!(),
+    " OR ",
+    p_network_fallback!(),
+    ") THEN 2",
+    " WHEN (",
+    p_file!(),
+    " OR ",
+    p_registry!(),
+    " OR ",
+    p_pipe!(),
+    ") THEN 3",
     " ELSE -1",
     " END",
 );
@@ -309,9 +354,21 @@ mod tests {
         assert_eq!(DHCP_PREDICATE, p_dhcp!(), "DHCP_PREDICATE drift");
         assert_eq!(DNS_PREDICATE, p_dns!(), "DNS_PREDICATE drift");
         assert_eq!(AUTH_PREDICATE, p_auth!(), "AUTH_PREDICATE drift");
-        assert_eq!(AUTH_FAIL_PREDICATE, p_auth_fail!(), "AUTH_FAIL_PREDICATE drift");
-        assert_eq!(IMAGE_LOAD_PREDICATE, p_image_load!(), "IMAGE_LOAD_PREDICATE drift");
-        assert_eq!(REGISTRY_PREDICATE, p_registry!(), "REGISTRY_PREDICATE drift");
+        assert_eq!(
+            AUTH_FAIL_PREDICATE,
+            p_auth_fail!(),
+            "AUTH_FAIL_PREDICATE drift"
+        );
+        assert_eq!(
+            IMAGE_LOAD_PREDICATE,
+            p_image_load!(),
+            "IMAGE_LOAD_PREDICATE drift"
+        );
+        assert_eq!(
+            REGISTRY_PREDICATE,
+            p_registry!(),
+            "REGISTRY_PREDICATE drift"
+        );
         assert_eq!(PIPE_PREDICATE, p_pipe!(), "PIPE_PREDICATE drift");
         assert_eq!(NETWORK_PREDICATE, p_network!(), "NETWORK_PREDICATE drift");
         assert_eq!(PROCESS_PREDICATE, p_process!(), "PROCESS_PREDICATE drift");
@@ -371,11 +428,17 @@ mod tests {
     fn lane_sql_is_well_formed() {
         assert!(LANE_SQL.starts_with("CASE"));
         assert!(LANE_SQL.ends_with("END"));
-        assert_eq!(LANE_SQL.matches("CASE").count(), LANE_SQL.matches("END").count());
+        assert_eq!(
+            LANE_SQL.matches("CASE").count(),
+            LANE_SQL.matches("END").count()
+        );
         // Sanity: the 5 lane indices must all appear
         for idx in 0..5 {
-            assert!(LANE_SQL.contains(&format!(" THEN {idx} ")) || LANE_SQL.contains(&format!(" THEN {idx}\n")),
-                "lane {idx} missing from LANE_SQL: {LANE_SQL}");
+            assert!(
+                LANE_SQL.contains(&format!(" THEN {idx} "))
+                    || LANE_SQL.contains(&format!(" THEN {idx}\n")),
+                "lane {idx} missing from LANE_SQL: {LANE_SQL}"
+            );
         }
     }
 }

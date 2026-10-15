@@ -16,6 +16,8 @@ import {
   COMPUTED_FIELDS_SET,
   FIELD_ALIASES_SET,
   TREE_STEP_PATTERN,
+  DOTTED_FIELD_PATH_PATTERN,
+  isDottedFieldReference,
 } from '@/lib/query-tokens';
 
 // Combined UDM field names (includes enriched, IOC, computed, and aliases)
@@ -33,22 +35,31 @@ export function registerDynamicFields(fields: string[]) {
   }
 }
 
-interface QueryState {
+export interface QueryState {
   afterRegexOp: boolean;
   inBlockComment: boolean;
+  /** Previous significant token was a comparison operator (NAN-3383). */
+  afterComparison: boolean;
+  /** Next significant token starts a pipe segment (query start or after `|`). */
+  segmentStart: boolean;
+  /** Pipe command of the current segment (lowercase), null in the search segment. */
+  command: string | null;
 }
 
 function createInitialState(): QueryState {
   return {
     afterRegexOp: false,
     inBlockComment: false,
+    afterComparison: false,
+    segmentStart: true,
+    command: null,
   };
 }
 
 /**
  * Stream-based tokenizer for query language
  */
-const queryLanguageDefinition = {
+export const queryLanguageDefinition = {
   name: 'query',
 
   startState: createInitialState,
@@ -87,6 +98,13 @@ const queryLanguageDefinition = {
       return 'lineComment';
     }
 
+    // Context for dotted-path classification (NAN-3383): consume the
+    // previous-token flags; the operator / pipe branches below re-arm them.
+    const afterComparison = state.afterComparison;
+    const atSegmentStart = state.segmentStart;
+    state.afterComparison = false;
+    state.segmentStart = false;
+
     // Regex patterns after =~ or ~ operators
     if (state.afterRegexOp && stream.peek() === '/') {
       if (stream.match(/^\/(?:[^/\\\n]|\\.)+\/[igmsuy]*/)) {
@@ -98,30 +116,36 @@ const queryLanguageDefinition = {
     // Check for regex operators (=~ and ~)
     if (stream.match(/^=~|^~/)) {
       state.afterRegexOp = true;
+      state.afterComparison = true;
       return 'operator';
     }
 
     // Comparison operators
     if (stream.match(/^!=|^>=|^<=/)) {
       state.afterRegexOp = false;
+      state.afterComparison = true;
       return 'operator';
     }
 
     // Plain = can be followed by regex
     if (stream.match(/^=/)) {
       state.afterRegexOp = true;
+      state.afterComparison = true;
       return 'operator';
     }
 
     // Other comparison operators
     if (stream.match(/^>|^</)) {
       state.afterRegexOp = false;
+      state.afterComparison = true;
       return 'operator';
     }
 
     // Pipe operator (special highlighting)
     if (stream.match(/^\|/)) {
       state.afterRegexOp = false;
+      state.segmentStart = true;
+      state.command = null;
       return 'separator';
     }
 
@@ -133,6 +157,22 @@ const queryLanguageDefinition = {
     // Strings
     if (stream.match(/^"[^"]*"/)) {
       return 'string';
+    }
+
+    // Dotted field paths (`metadata.log_source`, `actor.user.name`) are ONE
+    // token (NAN-3383). Checked before keywords / identifiers so the head
+    // segment isn't split off at the `.`. Dotted values (`dest_host=evil.com`,
+    // a bare `evil.com` term) are not fields; IPs start with a digit so never match.
+    const pathStart = stream.pos;
+    if (stream.match(DOTTED_FIELD_PATH_PATTERN)) {
+      const path = stream.string.slice(pathStart, stream.pos);
+      const isField = isDottedFieldReference(path, {
+        command: state.command,
+        afterComparison,
+        rest: stream.string.slice(stream.pos),
+        knownFields: UDM_FIELD_NAMES,
+      });
+      return isField ? 'special(propertyName)' : 'variableName';
     }
 
     // Keywords (AND, OR, NOT, IN, CONTAINS, LIKE, STARTSWITH, ENDSWITH)
@@ -168,6 +208,7 @@ const queryLanguageDefinition = {
 
       // Pipe commands
       if (PIPE_COMMANDS_SET.has(wordLower)) {
+        if (atSegmentStart) state.command = wordLower;
         return 'function(variableName)';
       }
 

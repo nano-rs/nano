@@ -11,7 +11,8 @@ import { useState, useEffect, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Loader2, Bell, AlertTriangle } from 'lucide-react';
+import { Bell, AlertTriangle } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api, Alert } from '@/lib/api';
 
 const SEVERITY_ORDER: Record<string, number> = {
@@ -98,7 +99,7 @@ export function UnassignedAlerts() {
       <CardContent className="px-2 pb-2">
         {isLoading ? (
           <div className="flex items-center justify-center py-6">
-            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+            <LoadingIcon className="w-4 h-4 text-muted-foreground" />
           </div>
         ) : alerts.length === 0 ? (
           <div className="text-center py-6">

@@ -96,6 +96,7 @@ pub enum MitreSyncError {
 pub struct MitreSync {
     repository: MitreRepository,
     source: SyncSource,
+    reconcile_rules: bool,
 }
 
 impl MitreSync {
@@ -103,6 +104,19 @@ impl MitreSync {
         Self {
             repository,
             source: SyncSource::pinned(),
+            reconcile_rules: true,
+        }
+    }
+
+    /// Platform-catalog-only sync for the hosted-shared control login: the
+    /// six `mitre_*` tables are written, the detection-rule mapping reconcile
+    /// (which touches the RLS-registered `detection_rules`) is skipped. Tenant
+    /// rule mappings are validated on write by the 9000262 definer trigger.
+    pub fn platform_catalog_only(repository: MitreRepository) -> Self {
+        Self {
+            repository,
+            source: SyncSource::pinned(),
+            reconcile_rules: false,
         }
     }
 
@@ -210,6 +224,7 @@ impl MitreSync {
             &self.source.release,
             &self.source.url,
             &self.source.sha256,
+            self.reconcile_rules,
         )
         .await?;
 
@@ -320,8 +335,14 @@ impl MitreSync {
     fn parse_catalog(
         &self,
         bundle: &StixBundle,
-    ) -> Result<(Vec<MitreTactic>, Vec<MitreTechnique>, Vec<MitreTechniqueAlias>), MitreSyncError>
-    {
+    ) -> Result<
+        (
+            Vec<MitreTactic>,
+            Vec<MitreTechnique>,
+            Vec<MitreTechniqueAlias>,
+        ),
+        MitreSyncError,
+    > {
         let mut tactic_map = HashMap::new();
         let mut tactic_ids = HashSet::new();
         let mut tactics = Vec::new();
@@ -787,6 +808,7 @@ mod tests {
             .expect("lazy pool");
         MitreSync {
             repository: MitreRepository::new(pool),
+            reconcile_rules: true,
             source: SyncSource {
                 release: "test".to_string(),
                 url,
@@ -867,7 +889,9 @@ mod tests {
     #[test]
     fn harvests_revoked_by_edges_as_technique_aliases() {
         let bundle: StixBundle = serde_json::from_str(ALIAS_BUNDLE).expect("bundle parses");
-        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string()].into_iter().collect();
+        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string()]
+            .into_iter()
+            .collect();
 
         let aliases = resolve_technique_aliases(&bundle, &live);
 
@@ -892,9 +916,13 @@ mod tests {
         let bundle: StixBundle = serde_json::from_str(ALIAS_BUNDLE).expect("bundle parses");
         // Pretend T1562.001 is still live: it must not be recorded as an alias,
         // or resolve_mitre_technique_alias would forward a current technique.
-        let live: HashSet<String> = ["T1059".to_string(), "T1685".to_string(), "T1562.001".to_string()]
-            .into_iter()
-            .collect();
+        let live: HashSet<String> = [
+            "T1059".to_string(),
+            "T1685".to_string(),
+            "T1562.001".to_string(),
+        ]
+        .into_iter()
+        .collect();
 
         let aliases = resolve_technique_aliases(&bundle, &live);
 
@@ -956,8 +984,7 @@ mod tests {
         .expect("bundle parses");
 
         let sync = test_sync("http://x".to_string(), b"x", "bundle--ds", 1_048_576);
-        let (_tactics, techniques, _aliases) =
-            sync.parse_catalog(&bundle).expect("catalog parses");
+        let (_tactics, techniques, _aliases) = sync.parse_catalog(&bundle).expect("catalog parses");
         let technique = techniques
             .iter()
             .find(|t| t.id == "T1059")
@@ -966,7 +993,10 @@ mod tests {
         // these are exactly the labels nanosiem_sources_for keys on.
         assert_eq!(
             technique.data_sources,
-            vec!["Command Execution".to_string(), "Process Creation".to_string()]
+            vec![
+                "Command Execution".to_string(),
+                "Process Creation".to_string()
+            ]
         );
     }
 

@@ -68,6 +68,13 @@ impl UserApiError {
                 "validation_error",
                 "Unable to create user with provided details",
             ),
+            // The policy message names only the unmet requirements, never the
+            // submitted password, so it is safe to return to the admin.
+            UserRepositoryError::PasswordRequirementsNotMet(msg) => (
+                StatusCode::BAD_REQUEST,
+                "password_requirements",
+                msg.as_str(),
+            ),
             UserRepositoryError::PasswordHashError(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -267,7 +274,18 @@ pub async fn create_user(
             .count_users()
             .await
             .map(|c| c as u32)
-            .unwrap_or(0);
+            // Fail closed (NAN-2761): an unreadable count must not read as 0
+            // and wave the create past the team-member cap.
+            .map_err(|e| {
+                tracing::error!(error = %e, "user count unavailable for tier limit");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(UserApiError::new(
+                        "tier_limit_unavailable",
+                        "Team member limit could not be verified; retry shortly",
+                    )),
+                )
+            })?;
         nanosiem_core::check_limit(
             "team members",
             user_count,
@@ -842,3 +860,34 @@ pub async fn update_my_preferences(
     )
 )]
 pub struct UsersApiDoc;
+
+#[cfg(test)]
+mod password_policy_tests {
+    use super::*;
+
+    /// The admin create/update endpoints must surface a policy rejection as a
+    /// 400 the UI can act on — not the 500 that `PasswordHashError` returns.
+    #[test]
+    fn policy_rejection_maps_to_bad_request() {
+        let (status, body) = UserApiError::from_repo_error(
+            &UserRepositoryError::PasswordRequirementsNotMet(
+                "Password must contain at least one digit".to_string(),
+            ),
+        );
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.error, "password_requirements");
+        assert!(body.message.contains("digit"));
+    }
+
+    /// A hashing failure is an internal fault and must stay opaque.
+    #[test]
+    fn hash_failure_stays_a_generic_500() {
+        let (status, body) =
+            UserApiError::from_repo_error(&UserRepositoryError::PasswordHashError("bcrypt".into()));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "internal_error");
+        assert!(!body.message.contains("bcrypt"));
+    }
+}

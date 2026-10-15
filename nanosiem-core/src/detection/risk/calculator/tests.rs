@@ -19,7 +19,5 @@ fn has_query_risk_score_treats_null_as_absent() {
     assert!(!ScoreCalculator::has_query_risk_score(
         &json!({"raw_risk_score": null})
     ));
-    assert!(!ScoreCalculator::has_query_risk_score(
-        &json!({"other": 1})
-    ));
+    assert!(!ScoreCalculator::has_query_risk_score(&json!({"other": 1})));
 }

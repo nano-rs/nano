@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Tests for canonical Vector component naming (NAN-2196).
 
 use super::{

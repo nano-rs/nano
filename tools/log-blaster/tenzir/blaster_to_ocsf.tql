@@ -103,10 +103,22 @@ if src == "windows_sysmon" {
     }
 
     // The PARENT process (initiator), present on Process Create (EID 1).
+    //
+    // NAN-2361: `uid` was missing here while the sibling `subject_process`
+    // three lines up correctly maps `ProcessGuid` -> `uid`. The Rust generator
+    // (event-core/src/generators/sysmon.rs) DOES emit a real, coherent
+    // `ParentProcessGuid` that matches a previously-spawned child's GUID in
+    // its in-memory process tree -- this mapping just threw it away on the
+    // way into OCSF, so `actor.process.uid` (what `| tree process` reads as
+    // the parent id) was empty on every Process Create event. Confirmed live:
+    // 50,000 class_uid=1007/activity_id=1 rows, 20,564 distinct child uids,
+    // ZERO distinct parent uids. Genuine lineage existed in the raw event and
+    // was silently discarded one hop later.
     parent_process = {
       name: parent_proc_name,
       cmd_line: string(ed.ParentCommandLine?).otherwise(""),
       pid: int(ed.ParentProcessId?).otherwise(0),
+      uid: string(ed.ParentProcessGuid?).otherwise(""),
     }
     has_parent = pimg != "" or string(ed.ParentCommandLine?).otherwise("") != ""
     actor_process = subject_process
@@ -588,10 +600,12 @@ if src == "windows_sysmon" {
         length: int(p.response_bytes?).otherwise(0),
         status: status_str,
       },
-      // OCSF: bytes_in = client->destination, bytes_out = destination->client.
+      // OCSF 1.9 network_traffic (NAN-2995): bytes_in = destination -> source,
+      // bytes_out = source -> destination. src = client, so the response is
+      // bytes_in and the request is bytes_out.
       traffic: {
-        bytes_in: int(p.request_bytes?).otherwise(0),
-        bytes_out: int(p.response_bytes?).otherwise(0),
+        bytes_in: int(p.response_bytes?).otherwise(0),
+        bytes_out: int(p.request_bytes?).otherwise(0),
       },
       // Proxy-specific signals with no native OCSF home -> standard `unmapped`.
       unmapped: {
@@ -608,6 +622,13 @@ if src == "windows_sysmon" {
         duration_ms: p.duration_ms?,
       },
     }
+
+    // NAN-3294: Conduit logs `referer` (omitted when the request had none)
+    // and `user_agent`. referrer -> url is the `| tree web` parent -> child edge.
+    conduit_ref = string(p.referer?).otherwise("")
+    if conduit_ref != "" { ev.http_request.referrer = conduit_ref }
+    conduit_ua = string(p.user_agent?).otherwise("")
+    if conduit_ua != "" { ev.http_request.user_agent = conduit_ua }
 
     // authenticated proxy user -> actor.user.name (+ top-level user.name)
     auth_user = string(p.username?).otherwise("")
@@ -715,8 +736,9 @@ if src == "windows_sysmon" {
         url: {path: string(g["url.original"]?).otherwise("")},
       },
       http_response: {code: code, length: size, status: status_str},
-      // traffic.bytes_out exercises the promoted `traffic.bytes_out` column.
-      traffic: {bytes_out: size},
+      // OCSF 1.9 (NAN-2995): the response size flows server -> client, i.e.
+      // destination -> source, which is traffic.bytes_in.
+      traffic: {bytes_in: size},
     }
 
     // referrer: grok maps "-" to null; only emit when real

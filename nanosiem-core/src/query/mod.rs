@@ -11,9 +11,14 @@
 //!   `TimeRange`/`SqlGenError` types)
 
 mod ast;
+pub mod stats_page;
 pub(crate) mod clickhouse_sql_gen;
+pub(crate) mod command_outputs;
+pub mod migration;
 mod parser;
 mod pretty_print;
+pub mod source_alias;
+mod time_bins;
 mod sql_gen;
 pub mod validation;
 
@@ -42,6 +47,13 @@ pub(crate) use clickhouse_sql_gen::{
 };
 // `pub` (not `pub(crate)`): consumed by the DDL↔Rust column drift gate
 // (`tests/logs_ddl_column_consistency.rs`, NAN-1623) — see MATERIALIZED_COLUMNS above.
+/// Coarse indicator classifier (ip/hash/url/cve/user/domain/other). Exported so
+/// enrichment publishers stamp a snapshot's `key_type` with the SAME
+/// classification the IOC hunt uses to scope observables — if the two disagree,
+/// a stored indicator is typed one way and searched another.
+pub use clickhouse_sql_gen::search_expr::classify_indicator;
+pub use clickhouse_sql_gen::search_expr::hostname_equality_expands;
+pub use clickhouse_sql_gen::search_expr::rhs_compiles_as_value;
 pub use clickhouse_sql_gen::EXPLICIT_COLUMNS;
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
 // OTLP observability (NAN-1528): dataset selector + trace/metrics fetch SQL the
@@ -61,7 +73,8 @@ pub use clickhouse_sql_gen::otel::{
 // page-views / top-pages / recent-errors, and synthetic-check results summaries.
 pub use clickhouse_sql_gen::otel::{
     infra_hosts_sql, rum_pageviews_series_sql, rum_recent_errors_sql, rum_top_pages_sql,
-    rum_web_vitals_sql, synthetic_history_sql, synthetic_summary_sql, InfraHostsFilters, RumFilters,
+    rum_web_vitals_sql, synthetic_history_sql, synthetic_summary_sql, InfraHostsFilters,
+    RumFilters,
 };
 // Observability ↔ security convergence (NAN-1542): a service's entities + the
 // detection signals firing against them.
@@ -74,10 +87,12 @@ pub use clickhouse_sql_gen::otel::{
     metric_scalar_sql, metric_tag_keys_sql, metric_tag_values_sql, metric_timeseries_v2_sql,
     valid_tag_key, MetricAgg, MetricQuery, MetricTagFilter,
 };
+pub(crate) use parser::{extract_time_modifier_tokens, strip_comments, subsearch_depths};
 pub use parser::{parse_query, ParseError};
-pub(crate) use parser::extract_time_modifier_tokens;
+pub(crate) use pretty_print::npl_quoted_literal;
 pub use pretty_print::PrettyPrint;
 pub use sql_gen::{SqlGenError, TimeRange};
+pub use time_bins::{resolve_timechart_bins, round_span_for_bins};
 pub use validation::{
     // Query cost analysis (query cost analysis)
     analyze_query_cost,
@@ -85,7 +100,9 @@ pub use validation::{
     contains_aggregation,
     contains_join,
     contains_risk_command,
+    extract_comparator_field_candidates,
     is_aggregation_command,
+    mask_query_literals,
     pre_aggregation_subquery,
     suggest_similar_fields,
     validate_field_name,
@@ -97,6 +114,29 @@ pub use validation::{
     QueryWarning,
     WarningSeverity,
 };
+
+/// The search expression inside `searchmatch("<terms>")`, if `expr` is that
+/// call with one string literal that parses as a plain search (no pipes).
+///
+/// Single source of truth for the SQL generator and every field collector
+/// (projection pruning, field validation, derived-field analysis): the terms
+/// live in a string literal, so any AST walk that does not unpack them here
+/// misses the fields they reference.
+pub(crate) fn searchmatch_search_expr(expr: &EvalExpression) -> Option<SearchExpr> {
+    let EvalExpression::FunctionCall { name, args } = expr else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("searchmatch") {
+        return None;
+    }
+    let [EvalExpression::Literal(Value::String(text))] = args.as_slice() else {
+        return None;
+    };
+    match parse_query(text).ok()? {
+        Query::Search(search) => Some(search),
+        Query::Piped { .. } => None,
+    }
+}
 
 /// Sanitize an untrusted value for safe interpolation inside an nPL
 /// **double-quoted** string literal, e.g. `field="<value>"`.

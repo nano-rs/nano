@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 // response — serde/utoipa derives are not required.
 // ============================================================================
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct CloudDossierFacetFilters {
     pub services: Vec<String>,
     pub regions: Vec<String>,
@@ -117,6 +117,9 @@ fn build_facet_clause(
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudDossier {
+    /// Only the newest bounded event page; aggregate fields are not window totals.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bounded_preview: bool,
     pub identity: CloudDossierIdentity,
     pub risk: CloudDossierRisk,
     pub facets: CloudDossierFacets,
@@ -129,6 +132,10 @@ pub struct CloudDossier {
     pub error_rate: CloudDossierErrorRate,
     pub stream: Vec<CloudDossierStreamEvent>,
     pub window_label: String,
+    /// Present when the exact dossier exceeded the interactive resource
+    /// envelope and was admitted to the isolated durable query lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<crate::search::AsyncSearchResponse>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -530,6 +537,25 @@ impl SearchService {
         time_range: &TimeRange,
         scope: &ScopeSet,
     ) -> Result<CloudDossier, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(CloudDossier::default());
+        };
+        let time_range = &retention_time_range;
+
+        if self.backend() == crate::search::config::SearchBackend::Lake {
+            return self
+                .query_lake_cloud_dossier(
+                    principal,
+                    account_filter,
+                    provider_filter,
+                    facet_filters,
+                    time_range,
+                    scope,
+                )
+                .await;
+        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(CloudDossier::default()),
@@ -621,10 +647,8 @@ impl SearchService {
         // (byte-identical projection), OCSF emits a transform() back to the UDM
         // label. The value-literal predicates that COMPARE change_type are built
         // separately below.
-        let change_type_select = format!(
-            "{} AS change_type",
-            Self::change_type_label_expr(profile)
-        );
+        let change_type_select =
+            format!("{} AS change_type", Self::change_type_label_expr(profile));
 
         // Value-literal predicate `change_type = 'permission_change'` is built
         // inline in the key-actions and posture predicates below, gated to the
@@ -711,8 +735,7 @@ impl SearchService {
         // Every query binds: start, end, principal, [provider], [account]
         // in that order. Identity clause matches either exact `user` or the
         // trailing component of a `role/session` compound user string.
-        let identity_match =
-            format!("({user_col} = ? OR splitByChar('/', {user_col})[1] = ?)");
+        let identity_match = format!("({user_col} = ? OR splitByChar('/', {user_col})[1] = ?)");
         let identity_match = identity_match.as_str();
 
         // --- 1. Identity query ---------------------------------------------
@@ -892,10 +915,7 @@ impl SearchService {
             })
             .collect();
         let facet_dim_count = facet_dim_blocks.len();
-        let facets_sql = format!(
-            "SELECT * FROM {}",
-            facet_dim_blocks.join(" UNION ALL ")
-        );
+        let facets_sql = format!("SELECT * FROM {}", facet_dim_blocks.join(" UNION ALL "));
 
         // --- 5. AssumeRole chain --------------------------------------------
         // Rows where the principal is the one CALLING AssumeRole. We return
@@ -1278,7 +1298,8 @@ impl SearchService {
             for _ in 0..facet_dim_count {
                 q = q.bind(start_str.clone()).bind(end_str.clone());
                 q = q.bind(principal_bind.clone()).bind(principal_bind.clone());
-                if let (true, Some(p)) = (bind_provider, provider_filter.filter(|p| !p.is_empty())) {
+                if let (true, Some(p)) = (bind_provider, provider_filter.filter(|p| !p.is_empty()))
+                {
                     q = q.bind(p.to_string());
                 }
                 for v in &facet_binds {
@@ -1301,19 +1322,31 @@ impl SearchService {
             )
         };
 
-        let identity_fut = fetch_rows(bind_principal_query(&identity_sql), "cloud_dossier.identity");
+        let identity_fut = fetch_rows(
+            bind_principal_query(&identity_sql),
+            "cloud_dossier.identity",
+        );
         let ua_fut = fetch_rows(bind_principal_query(&ua_sql), "cloud_dossier.user_agents");
         let ip_fut = fetch_rows(bind_principal_query(&ip_sql), "cloud_dossier.ips");
         let facets_fut = fetch_rows(bind_facets_query(), "cloud_dossier.facets");
         let chain_fut = fetch_rows(bind_principal_query(&chain_sql), "cloud_dossier.chain");
-        let key_actions_fut =
-            fetch_rows(bind_principal_query(&key_actions_sql), "cloud_dossier.key_actions");
-        let timeline_fut = fetch_rows(bind_principal_query(&timeline_sql), "cloud_dossier.timeline");
+        let key_actions_fut = fetch_rows(
+            bind_principal_query(&key_actions_sql),
+            "cloud_dossier.key_actions",
+        );
+        let timeline_fut = fetch_rows(
+            bind_principal_query(&timeline_sql),
+            "cloud_dossier.timeline",
+        );
         let actions_fut = fetch_rows(bind_principal_query(&actions_sql), "cloud_dossier.actions");
-        let resources_fut =
-            fetch_rows(bind_principal_query(&resources_sql), "cloud_dossier.resources");
-        let error_rate_fut =
-            fetch_rows(bind_principal_query(&error_rate_sql), "cloud_dossier.error_rate");
+        let resources_fut = fetch_rows(
+            bind_principal_query(&resources_sql),
+            "cloud_dossier.resources",
+        );
+        let error_rate_fut = fetch_rows(
+            bind_principal_query(&error_rate_sql),
+            "cloud_dossier.error_rate",
+        );
         let error_codes_fut = fetch_rows(
             bind_principal_query(&error_codes_sql),
             "cloud_dossier.error_codes",
@@ -1413,6 +1446,7 @@ impl SearchService {
         let stream = build_stream(&stream_rows);
 
         Ok(CloudDossier {
+            bounded_preview: false,
             identity,
             risk,
             facets,
@@ -1425,6 +1459,7 @@ impl SearchService {
             error_rate,
             stream,
             window_label: window_label(time_range),
+            durable_job: None,
         })
     }
 }
@@ -1580,8 +1615,8 @@ fn build_identity(
         })
         .collect();
 
-    let is_role = principal.to_ascii_lowercase().contains("role")
-        || principal.starts_with("arn:aws:sts::");
+    let is_role =
+        principal.to_ascii_lowercase().contains("role") || principal.starts_with("arn:aws:sts::");
 
     // MFA tri-state: None for roles (N/A), Some(true) if we've ever seen an
     // MFA-yes call, Some(false) otherwise.
@@ -1609,7 +1644,11 @@ fn build_identity(
 
     CloudDossierIdentity {
         id: principal.to_string(),
-        principal_type: if is_role { "role".into() } else { "iam_user".into() },
+        principal_type: if is_role {
+            "role".into()
+        } else {
+            "iam_user".into()
+        },
         arn: None, // ARN backfill is a follow-up — would require parsing message / user_identity JSON
         account: account.clone(),
         account_name: None,
@@ -1749,10 +1788,7 @@ fn build_assume_chain(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let at_raw = row
-                .get("at")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let at_raw = row.get("at").and_then(|v| v.as_str()).unwrap_or("");
             let severity = classify_action_severity(&action);
             Some(CloudDossierKeyAction {
                 at: format_hhmm(at_raw),
@@ -1897,17 +1933,18 @@ fn build_timeline(
         .take(4)
         .filter_map(|row| {
             let at = row.get("at").and_then(|v| v.as_str()).unwrap_or("");
-            let ts = chrono::DateTime::parse_from_str(
-                &format!("{at} +0000"),
-                "%Y-%m-%d %H:%M:%S%.f %z",
-            )
-            .ok()
-            .map(|dt| dt.timestamp() as u64)
-            .or_else(|| {
-                chrono::DateTime::parse_from_str(&format!("{at} +0000"), "%Y-%m-%d %H:%M:%S %z")
+            let ts =
+                chrono::DateTime::parse_from_str(&format!("{at} +0000"), "%Y-%m-%d %H:%M:%S%.f %z")
                     .ok()
                     .map(|dt| dt.timestamp() as u64)
-            })?;
+                    .or_else(|| {
+                        chrono::DateTime::parse_from_str(
+                            &format!("{at} +0000"),
+                            "%Y-%m-%d %H:%M:%S %z",
+                        )
+                        .ok()
+                        .map(|dt| dt.timestamp() as u64)
+                    })?;
             let bucket = if ts > unix_start {
                 ((ts - unix_start) / bucket_secs) as u32
             } else {
@@ -2062,8 +2099,7 @@ fn build_auth_posture(rows: &[serde_json::Value], principal: &str) -> CloudDossi
                 .get("is_role")
                 .and_then(|v| v.as_bool())
                 .unwrap_or_else(|| {
-                    name.to_ascii_lowercase().contains("role")
-                        || name.starts_with("arn:aws:sts::")
+                    name.to_ascii_lowercase().contains("role") || name.starts_with("arn:aws:sts::")
                 });
             let mfa = if is_role {
                 None
@@ -2079,10 +2115,7 @@ fn build_auth_posture(rows: &[serde_json::Value], principal: &str) -> CloudDossi
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty() && !s.starts_with("1970"))
                 .map(|s| format_hhmm(s));
-            let priv_calls = row
-                .get("priv_calls")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let priv_calls = row.get("priv_calls").and_then(|v| v.as_u64()).unwrap_or(0);
             let anomaly = name == principal;
             Some(CloudDossierPosturePrincipal {
                 name,
@@ -2098,14 +2131,8 @@ fn build_auth_posture(rows: &[serde_json::Value], principal: &str) -> CloudDossi
         .collect();
 
     let total = principals.len() as u64;
-    let with_mfa = principals
-        .iter()
-        .filter(|p| p.mfa == Some(true))
-        .count() as u64;
-    let without_mfa = principals
-        .iter()
-        .filter(|p| p.mfa == Some(false))
-        .count() as u64;
+    let with_mfa = principals.iter().filter(|p| p.mfa == Some(true)).count() as u64;
+    let without_mfa = principals.iter().filter(|p| p.mfa == Some(false)).count() as u64;
     let privileged_without_mfa = principals
         .iter()
         .filter(|p| p.privileged && p.mfa == Some(false))

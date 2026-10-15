@@ -22,7 +22,7 @@ pub struct EnrichmentSourceInfo {
     pub last_sync_at: Option<String>,
     pub last_sync_status: Option<String>,
     pub record_count: i64,
-    /// NAN-1124: rows deprovisioned by the reconcile job (push sources).
+    /// rows deprovisioned by the reconcile job (push sources).
     pub deprovisioned_count: i64,
     /// Sanitized config (API keys masked)
     pub config: serde_json::Value,
@@ -132,4 +132,8 @@ pub struct AgentLookupResponse {
     pub artifact: String,
     pub artifact_type: String,
     pub results: Vec<AgentLookupProviderResult>,
+    /// Why no external provider was called ( `internal_domain` when
+    /// the artifact is under an internal DNS suffix; privacy and cost).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }

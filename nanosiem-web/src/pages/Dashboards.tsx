@@ -12,7 +12,6 @@ import {
   LayoutDashboard,
   Layers,
   List,
-  Loader2,
   Lock,
   MoreHorizontal,
   Plus,
@@ -24,6 +23,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -425,7 +425,7 @@ export function Dashboards() {
   const [dashboardToDelete, setDashboardToDelete] = useState<DashboardSummary | null>(null);
   const [builderInitialMode, setBuilderInitialMode] = useState<'blank' | 'generate'>('blank');
 
-  // PIVT bridge — `@dashboard <prompt>` opens the builder pre-seeded to generate
+  // pivt bridge — `@dashboard <prompt>` opens the builder pre-seeded to generate
   // mode. Only wired when generation is actually available: in open builds the
   // wizard is a null stub, so opening it would flip state and render nothing
   // (NAN-2356).
@@ -689,7 +689,7 @@ export function Dashboards() {
               onClick={handleImportClick}
               disabled={importing}
             >
-              {importing ? <Loader2 className="w-[12px] h-[12px] animate-spin" /> : <Upload className="w-[12px] h-[12px]" />}
+              {importing ? <LoadingIcon className="w-[12px] h-[12px]" /> : <Upload className="w-[12px] h-[12px]" />}
               Import
             </Button>
           )}
@@ -788,7 +788,7 @@ export function Dashboards() {
       {/* Body */}
       {loading ? (
         <div className="flex items-center justify-center py-16">
-          <Loader2 className="w-6 h-6 animate-spin text-primary" />
+          <LoadingIcon className="w-6 h-6 text-primary" />
         </div>
       ) : filteredDashboards.length === 0 ? (
         <EmptyState

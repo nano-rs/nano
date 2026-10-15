@@ -7,6 +7,7 @@ import { useQuery } from '@tanstack/react-query';
 import type { CoverageFilters, MitreCoverageResponse } from '@/components/mitre/types';
 import { useAuth } from '@/contexts/AuthContext';
 import { getAccessToken } from '@/lib/auth-token';
+import { requestCredentials } from '@/lib/request-credentials';
 import { mitreAuthScope, mitreQueryKeys, normalizeMitreFilter } from './mitre-query-keys';
 
 interface MitreTactic {
@@ -71,10 +72,16 @@ function authHeaders(): HeadersInit {
 async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(authHeaders());
   new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  // NAN-2361: never present the tab bearer AND the origin's access-token
+  // cookie together. The shared-tenant API refuses a request carrying two
+  // credentials ("Provide exactly one authentication credential", 401)
+  // before any route fence runs — which is exactly how /api/mitre* returned
+  // 401 (not the 503 tenant_route_not_scoped every other unported route
+  // gave) for a tenant session. Same rule the main ApiClient applies.
   const response = await fetch(`${API_BASE_URL}${path}`, {
     ...init,
     headers,
-    credentials: 'include',
+    credentials: requestCredentials(path, headers),
   });
   if (!response.ok) {
     throw new Error(`MITRE request failed (${response.status})`);

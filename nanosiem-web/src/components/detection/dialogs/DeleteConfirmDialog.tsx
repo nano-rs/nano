@@ -25,10 +25,9 @@ export function DeleteConfirmDialog({
       title="Delete Detection Rule?"
       description={
         <>
-          This will permanently delete the detection rule "
-          <span className="text-foreground font-medium">{ruleName}</span>". This action cannot be
-          undone. All associated alerts and matches will remain but will no longer be linked to this
-          rule.
+          The detection rule "
+          <span className="text-foreground font-medium">{ruleName}</span>" stops running and moves to
+          Archived. Its matches and alerts are kept and stay linked to it.
         </>
       }
       confirmLabel="Delete Rule"

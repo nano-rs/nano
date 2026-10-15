@@ -147,12 +147,18 @@ fn spath_input_ext_targets_ocsf_event_tail() {
         r#"* | spath input=ext path="request.method" output=method | stats count() by method"#,
         "nanosiem",
     );
+    // NAN-1426 moved tail access from JSONExtractString to native subcolumn
+    // access (it re-serialized the whole event per row). The sibling test
+    // `ext_prefix_remaps_to_unmapped_under_ocsf` was updated then; this one was
+    // missed and has been asserting the pre-1426 spelling since. The intent of
+    // the test is unchanged and is what matters: spath must target the profile's
+    // JSON tail column, never the nonexistent OCSF `ext`.
     assert!(
-        sql.contains("JSONExtractString(unmapped, 'request.method')"),
-        "spath must extract from the OCSF tail column `unmapped` (NAN-1343/1443); SQL:\n{sql}"
+        sql.contains(r#"multiIf(isNotNull(unmapped."request"."method")"#),
+        "spath must extract from the OCSF tail column `unmapped` via subcolumn access (NAN-1343/1443, NAN-1426); SQL:\n{sql}"
     );
     assert!(
-        !sql.contains("JSONExtractString(ext,"),
+        !sql.contains("JSONExtractString(ext,") && !sql.contains(r#"ext."request""#),
         "spath must not reference the nonexistent OCSF `ext` column (NAN-1343); SQL:\n{sql}"
     );
 }

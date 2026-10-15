@@ -1,0 +1,524 @@
+# google_workspace_ocsf parser_vrl, nano-rs/parsers ocsf-1.9 @ 18c2b03
+# (parsers-ocsf/google_workspace/parser.yaml), byte-identical to the VRL
+# published on a hosted tenant's gws_token source. NAN-3490 regression fixture.
+# Google Workspace Reports API activity JSON -> OCSF 1.9.0.
+raw_log = string!(.message)
+__raw_body = raw_log
+__source_kv = {}
+parsed, err = parse_json(raw_log)
+__source_kv = object(parsed) ?? {}
+
+if err != null || !is_object(parsed) {
+    # Unparseable input is emitted as an OCSF Base Event (class_uid 0)
+    # rather than being guessed into a security class: it stays valid, and
+    # therefore visible, without fabricating a user or an outcome.
+    . = {
+        "class_uid": 0,
+        "class_name": "Base Event",
+        "category_uid": 0,
+        "category_name": "Uncategorized",
+        "activity_id": 0,
+        "activity_name": "Unknown",
+        "type_uid": 0,
+        "severity_id": 1,
+        "severity": "Informational",
+        "status_id": 0,
+        "status": "Unknown",
+        "time": 0,
+        "raw_data": raw_log,
+        "metadata": {
+            "version": "1.9.0",
+            "uid": uuid_v4(),
+            "log_level": "error",
+            "log_name": "Google Workspace Reports",
+            "log_provider": "Google Workspace",
+            "product": { "name": "Google Workspace", "vendor_name": "Google" }
+        },
+        "unmapped": { "parse_error": "not a JSON object" }
+    }
+} else {
+    p = object!(parsed)
+    id = object(p.id) ?? {}
+    actor_in = object(p.actor) ?? {}
+    actor_app = object(actor_in.applicationInfo) ?? {}
+    net = object(p.networkInfo) ?? {}
+
+    app = downcase(string(id.applicationName) ?? "")
+
+    # ---- time: id.time is RFC3339 in practice, epoch seconds historically ----
+    time_ms = 0
+    time_raw = to_string(id.time) ?? ""
+    if time_raw != "" {
+        t, terr = parse_timestamp(time_raw, "%+")
+        if terr == null {
+            time_ms = to_unix_timestamp(t, unit: "milliseconds")
+        } else {
+            epoch = to_int(time_raw) ?? 0
+            if epoch > 0 { time_ms = epoch * 1000 }
+        }
+    }
+
+    # ---- first event + flattened parameters ----
+    events_arr = array(p.events) ?? []
+    first = {}
+    if length(events_arr) > 0 { first = object(events_arr[0]) ?? {} }
+    event_name = string(first.name) ?? ""
+    event_kind = string(first.type) ?? ""
+
+    params = {}
+    for_each(array(first.parameters) ?? []) -> |_i, prm| {
+        po = object(prm) ?? {}
+        pname = to_string(po.name) ?? ""
+        if pname != "" {
+            # Dots in an unmapped key wedge lake publication.
+            key = replace(pname, ".", "_")
+            if exists(po.value) {
+                params = set!(params, [key], to_string(po.value) ?? "")
+            } else if exists(po.intValue) {
+                params = set!(params, [key], to_string(po.intValue) ?? "")
+            } else if exists(po.boolValue) {
+                params = set!(params, [key], to_string(po.boolValue) ?? "")
+            } else if exists(po.multiValue) {
+                params = set!(params, [key], encode_json(array(po.multiValue) ?? []))
+            }
+        }
+    }
+
+    # ---- acting principal ----
+    actor_email = string(actor_in.email) ?? ""
+    actor_user = { "name": downcase(actor_email) }
+    if actor_email == "" { actor_user = { "name": "unknown" } }
+    profile_id = to_string(actor_in.profileId) ?? ""
+    if profile_id != "" { actor_user = set!(actor_user, ["uid"], profile_id) }
+    if match(actor_email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+        actor_user = set!(actor_user, ["email_addr"], downcase(actor_email))
+        ap = split(actor_email, "@")
+        if length(ap) == 2 { actor_user = set!(actor_user, ["domain"], downcase(string(ap[1]) ?? "")) }
+    }
+
+    # ---- subject user named by the admin event parameters ----
+    subj_email = string(params.USER_EMAIL) ?? string(params.affected_email_address) ?? string(params.NEW_VALUE) ?? ""
+    have_subject = match(subj_email, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$')
+    subject = { "name": downcase(subj_email), "email_addr": downcase(subj_email) }
+
+    group_email = string(params.GROUP_EMAIL) ?? ""
+
+    # ---- class routing ----
+    is_usermgmt = event_name == "CREATE_USER" || event_name == "DELETE_USER" || event_name == "SUSPEND_USER" ||
+                  event_name == "UNSUSPEND_USER" || event_name == "CHANGE_PASSWORD" || event_name == "CHANGE_PASSWORD_ON_NEXT_LOGIN" ||
+                  event_name == "GRANT_ADMIN_PRIVILEGE" || event_name == "REVOKE_ADMIN_PRIVILEGE" ||
+                  event_name == "GRANT_DELEGATED_ADMIN_PRIVILEGES" || event_name == "REVOKE_DELEGATED_ADMIN_PRIVILEGES" ||
+                  event_name == "UNENROLL_USER_FROM_STRONG_AUTH" || event_name == "ENROLL_USER_IN_STRONG_AUTH" ||
+                  event_name == "TURN_OFF_2_STEP_VERIFICATION" || event_name == "RENAME_USER" ||
+                  event_name == "MOVE_USER_TO_ORG_UNIT" || event_name == "ARCHIVE_USER" || event_name == "UNARCHIVE_USER"
+    is_groupmgmt = event_name == "CREATE_GROUP" || event_name == "DELETE_GROUP" || event_name == "ADD_GROUP_MEMBER" ||
+                   event_name == "REMOVE_GROUP_MEMBER" || event_name == "UPDATE_GROUP_MEMBER" ||
+                   event_name == "UPDATE_GROUP_SETTING" || event_name == "CHANGE_GROUP_NAME" || group_email != ""
+
+    class_uid = 6003
+    if app == "login" {
+        class_uid = 3002
+    } else if app == "drive" {
+        class_uid = 6006
+    } else if is_usermgmt {
+        class_uid = 3007
+    } else if is_groupmgmt {
+        class_uid = 3006
+    }
+
+    status_id = 1
+    status_str = "Success"
+    severity_id = 1
+    severity = "Informational"
+
+    ocsf = {}
+
+    if class_uid == 3002 {
+        activity_id = 1
+        activity_name = "Logon"
+        if event_name == "logout" { activity_id = 2; activity_name = "Logoff" }
+        if event_name == "login_failure" {
+            status_id = 2; status_str = "Failure"; severity_id = 2; severity = "Low"
+        } else if event_name == "login_success" {
+            status_id = 1; status_str = "Success"
+        } else if event_name != "logout" {
+            status_id = 0; status_str = "Unknown"
+        }
+        if event_name == "suspicious_login" || event_name == "suspicious_login_less_secure_app" {
+            severity_id = 4; severity = "High"
+        }
+
+        ocsf.class_uid = 3002
+        ocsf.class_name = "Authentication"
+        ocsf.category_uid = 3
+        ocsf.category_name = "Identity & Access Management"
+        ocsf.activity_id = activity_id
+        ocsf.activity_name = activity_name
+        # Authentication 3002 carries the authenticating principal in `user`.
+        ocsf.user = actor_user
+        ocsf.service = { "name": "Google Workspace" }
+        ocsf.is_remote = true
+
+        # login_type distinguishes password / saml / google_password /
+        # exchange — the field that shows whether SSO was bypassed.
+        login_type = string(params.login_type) ?? ""
+        if login_type != "" {
+            lt = downcase(login_type)
+            ap_id = 99
+            if lt == "saml" { ap_id = 5 }
+            if lt == "oauth" || lt == "exchange" { ap_id = 6 }
+            ocsf.auth_protocol_id = ap_id
+            ocsf.auth_protocol = login_type
+        }
+        challenge = string(params.login_challenge_method) ?? ""
+        ocsf.is_mfa = challenge != "" || downcase(login_type) == "2sv"
+        if challenge != "" { ocsf.status_detail = challenge }
+    } else if class_uid == 3007 {
+        activity_id = 2
+        activity_name = "Update"
+        if event_name == "CREATE_USER" { activity_id = 1; activity_name = "Create" }
+        if event_name == "DELETE_USER" { activity_id = 3; activity_name = "Delete" }
+        if event_name == "UNSUSPEND_USER" || event_name == "UNARCHIVE_USER" { activity_id = 4; activity_name = "Enable" }
+        if event_name == "SUSPEND_USER" || event_name == "ARCHIVE_USER" { activity_id = 5; activity_name = "Disable" }
+        if event_name == "CHANGE_PASSWORD" { activity_id = 8; activity_name = "Password Change" }
+        if event_name == "CHANGE_PASSWORD_ON_NEXT_LOGIN" { activity_id = 9; activity_name = "Password Reset" }
+        if event_name == "ENROLL_USER_IN_STRONG_AUTH" { activity_id = 12; activity_name = "Enable MFA Factors" }
+        if event_name == "UNENROLL_USER_FROM_STRONG_AUTH" || event_name == "TURN_OFF_2_STEP_VERIFICATION" { activity_id = 13; activity_name = "Disable MFA Factors" }
+        if event_name == "GRANT_ADMIN_PRIVILEGE" || event_name == "GRANT_DELEGATED_ADMIN_PRIVILEGES" { activity_id = 14; activity_name = "Assign Privileges" }
+        if event_name == "REVOKE_ADMIN_PRIVILEGE" || event_name == "REVOKE_DELEGATED_ADMIN_PRIVILEGES" { activity_id = 15; activity_name = "Remove Privileges" }
+
+        ocsf.class_uid = 3007
+        ocsf.class_name = "User Management"
+        ocsf.category_uid = 3
+        ocsf.category_name = "Identity & Access Management"
+        ocsf.activity_id = activity_id
+        ocsf.activity_name = activity_name
+        if have_subject { ocsf.user = subject } else { ocsf.user = actor_user }
+        ocsf.actor = { "user": actor_user }
+        priv = string(params.PRIVILEGE_NAME) ?? ""
+        if priv != "" { ocsf.privileges = [priv] }
+    } else if class_uid == 3006 {
+        activity_id = 99
+        activity_name = "Other"
+        if event_name == "CREATE_GROUP" { activity_id = 6; activity_name = "Create" }
+        if event_name == "DELETE_GROUP" { activity_id = 5; activity_name = "Delete" }
+        if event_name == "ADD_GROUP_MEMBER" { activity_id = 3; activity_name = "Add User" }
+        if event_name == "REMOVE_GROUP_MEMBER" { activity_id = 4; activity_name = "Remove User" }
+        if event_name == "UPDATE_GROUP_SETTING" || event_name == "CHANGE_GROUP_NAME" || event_name == "UPDATE_GROUP_MEMBER" { activity_id = 9; activity_name = "Update" }
+
+        ocsf.class_uid = 3006
+        ocsf.class_name = "Group Management"
+        ocsf.category_uid = 3
+        ocsf.category_name = "Identity & Access Management"
+        ocsf.activity_id = activity_id
+        ocsf.activity_name = activity_name
+        gname = group_email
+        if gname == "" { gname = "unknown" }
+        ocsf.group = { "name": gname }
+        if have_subject { ocsf.user = subject }
+        ocsf.actor = { "user": actor_user }
+    } else if class_uid == 6006 {
+        activity_id = 99
+        activity_name = "Other"
+        en = downcase(event_name)
+        if en == "upload" || en == "create" { activity_id = 1; activity_name = "Upload" }
+        if en == "download" { activity_id = 2; activity_name = "Download" }
+        if en == "edit" { activity_id = 3; activity_name = "Update" }
+        if en == "trash" || en == "delete" { activity_id = 4; activity_name = "Delete" }
+        if en == "rename" { activity_id = 5; activity_name = "Rename" }
+        if en == "copy" { activity_id = 6; activity_name = "Copy" }
+        if en == "move" || en == "add_to_folder" || en == "remove_from_folder" { activity_id = 7; activity_name = "Move" }
+        if en == "untrash" { activity_id = 8; activity_name = "Restore" }
+        if en == "preview" { activity_id = 9; activity_name = "Preview" }
+        if en == "view" { activity_id = 14; activity_name = "Open" }
+        if starts_with(en, "change_user_access") || starts_with(en, "change_document_access") || starts_with(en, "change_acl_editors") || en == "add_to_shared_drive" { activity_id = 12; activity_name = "Share" }
+        if starts_with(en, "sheets_import_range") { activity_id = 15; activity_name = "Sync" }
+
+        ocsf.class_uid = 6006
+        ocsf.class_name = "File Hosting Activity"
+        ocsf.category_uid = 6
+        ocsf.category_name = "Application Activity"
+        ocsf.activity_id = activity_id
+        ocsf.activity_name = activity_name
+        ocsf.actor = { "user": actor_user }
+        doc_title = string(params.doc_title) ?? ""
+        if doc_title == "" { doc_title = string(params.doc_id) ?? "" }
+        if doc_title == "" { doc_title = "unknown" }
+        file_obj = { "name": doc_title, "type_id": 1 }
+        doc_id = string(params.doc_id) ?? ""
+        if doc_id != "" { file_obj = set!(file_obj, ["uid"], doc_id) }
+        doc_type = string(params.doc_type) ?? ""
+        if doc_type != "" { file_obj = set!(file_obj, ["mime_type"], doc_type) }
+        owner = string(params.owner) ?? ""
+        if match(owner, r'^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$') {
+            file_obj = set!(file_obj, ["owner"], { "name": downcase(owner), "email_addr": downcase(owner) })
+        }
+        ocsf.file = file_obj
+    } else {
+        activity_id = 99
+        activity_name = "Other"
+        en = downcase(event_name)
+        if contains(en, "create") || contains(en, "add") || contains(en, "authorize") { activity_id = 1; activity_name = "Create" }
+        if contains(en, "view") || contains(en, "list") || contains(en, "download") { activity_id = 2; activity_name = "Read" }
+        if contains(en, "change") || contains(en, "update") || contains(en, "edit") { activity_id = 3; activity_name = "Update" }
+        if contains(en, "delete") || contains(en, "remove") || contains(en, "revoke") { activity_id = 4; activity_name = "Delete" }
+
+        ocsf.class_uid = 6003
+        ocsf.class_name = "API Activity"
+        ocsf.category_uid = 6
+        ocsf.category_name = "Application Activity"
+        ocsf.activity_id = activity_id
+        ocsf.activity_name = activity_name
+        op = event_name
+        if op == "" { op = "unknown" }
+        svc_name = "Google Workspace"
+        if app != "" { svc_name = "Google Workspace " + app }
+        ocsf.api = { "operation": op, "service": { "name": svc_name } }
+        ocsf.actor = { "user": actor_user }
+        # The OAuth application acting on the user's behalf — the single most
+        # useful signal in the token stream.
+        oauth_app = string(actor_app.applicationName) ?? string(params.app_name) ?? ""
+        oauth_client = string(actor_app.oauthClientId) ?? string(params.client_id) ?? ""
+        if oauth_app != "" || oauth_client != "" {
+            res = { "type": "OAuthApplication" }
+            if oauth_app != "" { res = set!(res, ["name"], oauth_app) }
+            if oauth_client != "" { res = set!(res, ["uid"], oauth_client) }
+            ocsf.resources = [res]
+        }
+    }
+
+    # ---- source endpoint ----
+    src_ip = string(p.ipAddress) ?? ""
+    src_ep = {}
+    if src_ip != "" { src_ep = set!(src_ep, ["ip"], downcase(src_ip)) }
+    region_code = string(net.regionCode) ?? ""
+    if region_code != "" { src_ep = set!(src_ep, ["location"], { "country": region_code }) }
+    if length(src_ep) == 0 { src_ep = { "hostname": "unknown" } }
+    ocsf.src_endpoint = src_ep
+
+    # ---- common envelope ----
+    ocsf.status_id = status_id
+    ocsf.status = status_str
+    ocsf.severity_id = severity_id
+    ocsf.severity = severity
+    ocsf.type_uid = to_int(ocsf.class_uid) * 100 + to_int(ocsf.activity_id)
+    ocsf.time = time_ms
+    msg = event_name
+    if msg == "" { msg = app }
+    if msg == "" { msg = "google_workspace_event" }
+    ocsf.message = msg
+    ocsf.raw_data = raw_log
+
+    # Google documents (time, uniqueQualifier, applicationName, customerId) as
+    # the composite key; the collector is at-least-once around the watermark.
+    uniq = to_string(id.uniqueQualifier) ?? ""
+    customer = to_string(id.customerId) ?? ""
+    record_uid = ""
+    if uniq != "" && time_raw != "" {
+        record_uid = join!(["gws", app, customer, uniq, time_raw], "|")
+    }
+    if record_uid == "" { record_uid = uuid_v4() }
+    ocsf.metadata = {
+        "version": "1.9.0",
+        "uid": record_uid,
+        "original_event_uid": record_uid,
+        "event_code": event_name,
+        "log_name": "Google Workspace Reports",
+        "log_provider": "Google Workspace",
+        "tenant_uid": customer,
+        "product": { "name": "Google Workspace", "vendor_name": "Google" }
+    }
+
+    cand = {
+        "application": app,
+        "event_category": event_kind,
+        "actor_caller_type": string(actor_in.callerType) ?? "",
+        "oauth_application": string(actor_app.applicationName) ?? "",
+        "oauth_client_id": string(actor_app.oauthClientId) ?? "",
+        "oauth_impersonation": to_string(actor_app.impersonation) ?? "",
+        "owner_domain": string(p.ownerDomain) ?? "",
+        "region_code": region_code,
+        "subdivision_code": string(net.subdivisionCode) ?? "",
+        "unique_qualifier": uniq
+    }
+    unmapped = {}
+    for_each(cand) -> |k, v| {
+        if v != "" { unmapped = set!(unmapped, [k], v) }
+    }
+    unmapped = set!(unmapped, ["event_count"], length(events_arr))
+    if length(params) > 0 { unmapped = set!(unmapped, ["params"], params) }
+    if length(events_arr) > 1 { unmapped = set!(unmapped, ["events_json"], encode_json(events_arr)) }
+    ocsf.unmapped = unmapped
+
+    . = ocsf
+}
+
+# NAN-2421 residual spill. Generated by scripts/residual_spill.py; edit the template.
+# __source_kv is a local variable, never an OCSF attribute. The checker instruments
+# this marker to observe the parsed source without changing production output.
+# Exact value representation is evaluated AFTER branch selection. Numeric strings
+# count as represented by their typed scalar; other transformations are explicit.
+__mapped = object!(parse_json!(encode_json(.)))
+__existing = object(__mapped.unmapped) ?? {}
+__discard = del(__mapped.raw_data)
+__discard = del(__mapped.unmapped)
+if __mapped.message == __raw_body { __discard = del(__mapped.message) }
+__represented = []
+__walk = map_values(__mapped, recursive: true) -> |value| {
+    __represented = push(__represented, encode_json(value))
+    if !is_object(value) && !is_array(value) && !is_null(value) {
+        __represented = push(__represented, to_string(value) ?? "")
+    }
+    value
+}
+__consumed = []
+# BEGIN parser-specific transformations
+# id.applicationName: Parser lowercases this source value; consume only when the normalized value is emitted.
+# id.time: Successful ISO timestamp conversion to the selected event clock in milliseconds.
+# Only source keys read by this parser are eligible for exact-value consumption; the selected branch must emit the value. Unknown keys always spill, even when their value equals an OCSF default.
+__candidates = ["actor", "actor.applicationInfo", "actor.applicationInfo.applicationName", "actor.applicationInfo.impersonation", "actor.applicationInfo.oauthClientId", "actor.callerType", "actor.email", "actor.profileId", "events", "id", "id.applicationName", "id.customerId", "id.time", "id.uniqueQualifier", "ipAddress", "networkInfo", "networkInfo.regionCode", "networkInfo.subdivisionCode", "ownerDomain"]
+__preserve = []
+__rules = array!(parse_json!("[{\"source\":\"id.applicationName\",\"kind\":\"lowercase\",\"reason\":\"Parser lowercases this source value; consume only when the normalized value is emitted.\"},{\"source\":\"id.time\",\"kind\":\"epoch_ms\",\"target\":\"time\",\"reason\":\"Successful ISO timestamp conversion to the selected event clock in milliseconds.\"}]"))
+__source_flat = flatten(__source_kv)
+for_each(__rules) -> |_index, rule| {
+    __source_key = string!(rule.source)
+    __value = get!(__source_flat, [__source_key])
+    __expected = null
+    __valid = false
+    if rule.kind == "lowercase" && is_string(__value) {
+        __expected = downcase(string!(__value))
+        __valid = true
+    } else if rule.kind == "epoch_ms" {
+        __clock, __clock_err = parse_timestamp(string(__value) ?? "", string(rule.format) ?? "%+")
+        if __clock_err == null {
+            __expected = to_unix_timestamp(__clock, unit: "milliseconds")
+            __valid = true
+        }
+    } else if rule.kind == "scale" {
+        __number, __number_err = to_float(__value)
+        if __number_err == null && __value != null && !is_boolean(__value) {
+            __expected = to_int(__number * to_float!(rule.factor))
+            __valid = true
+        }
+    } else if rule.kind == "hex" {
+        __hex = replace(downcase(string(__value) ?? ""), r'^0x', "")
+        __integer, __integer_err = parse_int(__hex, base: 16)
+        __expected = __integer
+        __valid = is_string(__value) && starts_with(downcase(string(__value) ?? ""), "0x") && __integer_err == null
+    } else if rule.kind == "enum" {
+        __expected = get!(object!(rule.values), [downcase(to_string(__value) ?? "")])
+        __valid = __expected != null
+    }
+    __matches = includes(__represented, encode_json(__expected))
+    if is_string(rule.target) { __matches = get!(., split(string!(rule.target), ".")) == __expected }
+    if __valid && __matches { __consumed = push(__consumed, __source_key) }
+}
+# END parser-specific transformations
+# Redact at every depth, including objects inside arrays, before serialization.
+__safe = map_values(object!(parse_json!(encode_json({"source": __source_kv, "existing": __existing}))), recursive: true) -> |value| {
+    if is_object(value) {
+        # Header/parameter arrays commonly encode sensitive keys as name/value
+        # or Key/Value objects instead of using the secret name as an object key.
+        __sensitive_pair = false
+        for_each(object!(value)) -> |key, child| {
+            if includes(["name", "key"], downcase(key)) && match(downcase(string(child) ?? ""), r'password|secret|authorization|token') {
+                __sensitive_pair = true
+            }
+        }
+        for_each(object!(value)) -> |key, _child| {
+            if match(downcase(key), r'password|secret|authorization|token') || (__sensitive_pair && includes(["value", "values"], downcase(key))) {
+                value = set!(value, [key], "<redacted>")
+            }
+        }
+    }
+    value
+}
+# Escape literal dots before flattening so dotted source keys cannot overwrite
+# nested paths. Decode for naming, and disambiguate collisions with suffixes.
+__escaped = map_keys(object!(__safe.source), recursive: true) -> |key| {
+    replace(replace(key, "~", "~0"), ".", "~1")
+}
+__flat = flatten(__escaped)
+__residual = {}
+for_each(__flat) -> |key, value| {
+    key = replace(replace(key, "~1", "."), "~0", "~")
+    # flatten stops at arrays, so objects inside an array still carry the
+    # escaped keys: decode them too, or `a.b` spills as `a~1b` (NAN-3604).
+    if is_array(value) || is_object(value) {
+        value = get!(map_keys({"v": value}, recursive: true) -> |inner| {
+            replace(replace(inner, "~1", "."), "~0", "~")
+        }, ["v"])
+    }
+    __same = includes(__represented, encode_json(value))
+    if !is_object(value) && !is_array(value) && !is_null(value) {
+        __same = __same || includes(__represented, to_string(value) ?? "")
+    }
+    # A scalar array is consumed only if every element is represented. Preserve
+    # partially represented arrays intact, including their ordering and repeats.
+    if is_array(value) && !is_empty(array!(value)) {
+        __all_items = true
+        for_each(array!(value)) -> |_index, item| {
+            __item_same = includes(__represented, encode_json(item))
+            if !is_object(item) && !is_array(item) && !is_null(item) {
+                __item_same = __item_same || includes(__represented, to_string(item) ?? "")
+            }
+            if is_object(item) || is_array(item) || !__item_same { __all_items = false }
+        }
+        __same = __same || __all_items
+    }
+    if __same && includes(__candidates, key) { __consumed = push(__consumed, key) }
+    # Redacted leaves always remain visible. Do not spill a copy of the raw body.
+    if (!includes(__consumed, key) || value == "<redacted>") && value != __raw_body {
+        __parts = map_values(split(key, ".")) -> |part| { snakecase(string!(part)) }
+        __base = join!(__parts, ".")
+        __key = __base
+        __suffix = 2
+        if includes(keys(__residual), __key) {
+            for_each(__flat) -> |_other_key, _other_value| {
+                if includes(keys(__residual), __key) {
+                    __key = __base + "_" + to_string(__suffix)
+                    __suffix = __suffix + 1
+                }
+            }
+        }
+        __complex = is_object(value)
+        if is_array(value) {
+            for_each(array!(value)) -> |_index, item| {
+                if is_object(item) || is_array(item) { __complex = true }
+            }
+        }
+        __spill = if __complex { encode_json(value) } else { value }
+        __residual = set!(__residual, [__key], __spill)
+    }
+}
+# Keep existing derived evidence, but remove null placeholders and mapped copies.
+# Source-derived aliases are replaced by canonical dotted source paths above.
+__original_values = []
+for_each(flatten(__source_kv)) -> |_key, value| {
+    __original_values = push(__original_values, encode_json(value))
+    if !is_object(value) && !is_array(value) { __original_values = push(__original_values, to_string(value) ?? "") }
+}
+for_each(flatten(__existing)) -> |key, value| {
+    __source_alias = includes(__original_values, encode_json(value)) || includes(__original_values, to_string(value) ?? "")
+    __mapped_alias = includes(__represented, encode_json(value)) || includes(__represented, to_string(value) ?? "")
+    __decoded, __decode_err = parse_json(string(value) ?? "")
+    __encoded_container = __decode_err == null && (is_object(__decoded) || is_array(__decoded))
+    if !is_null(value) && value != "" && !__source_alias && !__mapped_alias && !__encoded_container && value != __raw_body {
+        # Existing aggregates may contain sensitive descendants; the canonical
+        # source spill above is the authoritative representation of containers.
+        if !is_array(value) && !is_object(value) && !match(downcase(key), r'password|secret|authorization|token') {
+            __key = snakecase(key)
+            if !includes(keys(__residual), __key) { __residual = set!(__residual, [__key], value) }
+        }
+    }
+}
+# Parser-declared derived evidence is merged after source spill, with recursive
+# redaction. These entries preserve meaning beyond source scalar value equality.
+for_each(__preserve) -> |_index, key| {
+    __derived = get!(object!(__safe.existing), [string!(key)])
+    if __derived != null { __residual = set!(__residual, [string!(key)], __derived) }
+}
+__discard = del(.unmapped)
+if !is_empty(__residual) { .unmapped = __residual }
+.
+# END NAN-2421 residual spill

@@ -57,10 +57,14 @@ pub fn extract_base_query(query: &str) -> &str {
 pub struct LookupCommandInfo {
     /// Name of the lookup table
     pub table_name: String,
-    /// Field in the log results to match against the lookup table's key
+    /// Field in event/pipeline results whose values are enriched.
+    pub event_field: String,
+    /// Column in the lookup table matched against `event_field`.
     pub key_field: String,
     /// Optional list of fields to output from the lookup table
     pub output_fields: Option<Vec<String>>,
+    pub output_renames: Vec<crate::query::FieldRename>,
+    pub output_new: bool,
     /// Whether to perform case-insensitive matching
     pub case_insensitive: bool,
 }
@@ -83,15 +87,21 @@ fn extract_lookup_commands_recursive(query: &Query, lookups: &mut Vec<LookupComm
             // Then check if this command is a lookup
             if let Command::Lookup {
                 table_name,
+                event_field,
                 key_field,
                 output_fields,
+                output_renames,
+                output_new,
                 case_insensitive,
             } = command
             {
                 lookups.push(LookupCommandInfo {
                     table_name: table_name.clone(),
+                    event_field: event_field.clone(),
                     key_field: key_field.clone(),
                     output_fields: output_fields.clone(),
+                    output_renames: output_renames.clone(),
+                    output_new: *output_new,
                     case_insensitive: *case_insensitive,
                 });
             }
@@ -102,6 +112,8 @@ fn extract_lookup_commands_recursive(query: &Query, lookups: &mut Vec<LookupComm
 /// Information about a prevalence command extracted from a query
 #[derive(Debug, Clone)]
 pub struct PrevalenceCommandInfo {
+    /// Explicit result fields to classify and look up. Empty uses automatic discovery.
+    pub artifact_fields: Vec<String>,
     /// Filter conditions (can have multiple, all must be satisfied)
     pub conditions: Vec<PrevalenceCondition>,
     /// Time window for prevalence calculation
@@ -134,12 +146,14 @@ fn extract_prevalence_commands_recursive(query: &Query, cmds: &mut Vec<Prevalenc
 
             // Then check if this command is a prevalence command
             if let Command::Prevalence {
+                artifact_fields,
                 conditions,
                 time_window,
                 enrich,
             } = command
             {
                 cmds.push(PrevalenceCommandInfo {
+                    artifact_fields: artifact_fields.clone(),
                     conditions: conditions.clone(),
                     time_window: *time_window,
                     enrich: *enrich,
@@ -811,6 +825,10 @@ pub struct TreeCommandInfo {
     pub prevalence_field: Option<String>,
     /// Optional root filter - show only subtree(s) rooted at nodes matching this pattern
     pub root_filter: Option<String>,
+    /// NAN-3294: the named preset (`tree web` / `tree process`), when used.
+    /// A web tree over a source that logs no referrer falls back to a
+    /// client → domain → URL layout instead of an empty tree.
+    pub preset: Option<crate::query::TreePreset>,
 }
 
 /// Extract tree command from a parsed query (only one tree command is supported per query)
@@ -831,9 +849,11 @@ pub fn extract_tree_command(query: &Query) -> Option<TreeCommandInfo> {
                 detail_field,
                 prevalence_field,
                 root_filter,
+                preset,
             } = command
             {
                 return Some(TreeCommandInfo {
+                    preset: *preset,
                     parent_field: parent_field.clone(),
                     child_field: child_field.clone(),
                     label_field: label_field.clone(),
@@ -868,6 +888,31 @@ pub const FUNNEL_DROPPER_FIELDS: &[&str] = &[
     "user",
     "action",
 ];
+
+/// Canonical OCSF 1.9 attributes used for funnel dropper attribution.
+///
+/// The lake contract intentionally does not translate these back through the
+/// legacy UDM namespace.  Keep the legacy list above for ClickHouse tenants and
+/// choose this list for the strict OCSF lane.
+pub const OCSF_FUNNEL_DROPPER_FIELDS: &[&str] = &[
+    "process.name",
+    "src_endpoint.hostname",
+    "dst_endpoint.hostname",
+    "dst_endpoint.ip",
+    "dst_endpoint.port",
+    "user.name",
+    "activity_name",
+];
+
+pub fn funnel_dropper_fields(
+    profile: &dyn crate::schema::SchemaProfile,
+) -> &'static [&'static str] {
+    if profile.uses_strict_canonical_fields() {
+        OCSF_FUNNEL_DROPPER_FIELDS
+    } else {
+        FUNNEL_DROPPER_FIELDS
+    }
+}
 
 /// Information about a funnel command extracted from a query.
 ///
@@ -1089,6 +1134,86 @@ pub fn extract_lateral_command(query: &Query) -> Option<LateralCommandInfo> {
     }
 }
 
+/// Extract an exact canonical OCSF entity equality from the base search to use
+/// as the root of a lake lateral graph.
+///
+/// The base query is authoritative. Deriving the seed from the first returned
+/// event can silently choose a different entity carried by that event (for
+/// example `src_endpoint.hostname`) even when the analyst explicitly searched
+/// for `device.hostname="lt-legal-001"`. Only exact, non-wildcard canonical
+/// OCSF user/host/IP predicates qualify; legacy UDM names are deliberately not
+/// accepted by this lake-only extraction seam.
+pub fn extract_lake_lateral_identifier_from_query(
+    query: &Query,
+    info: &LateralCommandInfo,
+) -> Option<(String, String)> {
+    const USERS: &[&str] = &["user.name", "actor.user.name"];
+    const HOSTS: &[&str] = &[
+        "src_endpoint.hostname",
+        "device.hostname",
+        "dst_endpoint.hostname",
+        "src_endpoint.ip",
+        "dst_endpoint.ip",
+    ];
+
+    let allowed: Vec<&str> = if let Some(field) = info.entity_field.as_deref() {
+        if USERS.contains(&field) || HOSTS.contains(&field) {
+            vec![field]
+        } else {
+            return None;
+        }
+    } else {
+        match info.seed_type {
+            crate::query::LateralSeedType::User => USERS.to_vec(),
+            crate::query::LateralSeedType::Host => HOSTS.to_vec(),
+            crate::query::LateralSeedType::Auto => USERS.iter().chain(HOSTS).copied().collect(),
+        }
+    };
+
+    // NAN-3059: the documented seeds are UDM-spelled (`user="jsmith" |
+    // lateral`, `src_host="WKS-0142" | lateral seed=host`). Read them as the
+    // canonical OCSF entity they name; otherwise a user filter fell through to
+    // row-based seeding, which prefers hosts, and the trace was seeded on
+    // whichever workstation the first row happened to carry.
+    fn canonical_entity_field(field: &str) -> &str {
+        match field {
+            "user" | "src_user" | "username" | "user_name" => "actor.user.name",
+            "dest_user" => "user.name",
+            "src_host" | "host" | "hostname" => "device.hostname",
+            "dest_host" => "dst_endpoint.hostname",
+            "src_ip" => "src_endpoint.ip",
+            "dest_ip" => "dst_endpoint.ip",
+            other => other,
+        }
+    }
+
+    fn exact_entity(expr: &SearchExpr, allowed: &[&str]) -> Option<(String, String)> {
+        match expr {
+            SearchExpr::FieldFilter {
+                field,
+                op: Comparator::Eq,
+                value,
+                ..
+            } if allowed.contains(&canonical_entity_field(field)) => {
+                let value = match value {
+                    Value::String(value) => value.clone(),
+                    Value::Ip(value) => value.to_string(),
+                    _ => return None,
+                };
+                (!value.is_empty() && !value.chars().any(|ch| matches!(ch, '*' | '?')))
+                    .then(|| (canonical_entity_field(field).to_string(), value))
+            }
+            SearchExpr::And(left, right) => {
+                exact_entity(left, allowed).or_else(|| exact_entity(right, allowed))
+            }
+            SearchExpr::Group(inner) => exact_entity(inner, allowed),
+            _ => None,
+        }
+    }
+
+    exact_entity(get_root_search_expr(query)?, &allowed)
+}
+
 /// Extract commands that come after the `| lateral` command in the pipeline.
 /// These will be applied as post-processing after lateral movement tracing.
 pub fn extract_post_lateral_commands(query: &Query) -> Vec<Command> {
@@ -1122,8 +1247,25 @@ fn query_has_lateral(query: &Query) -> bool {
 }
 
 /// Known asset identifier fields in priority order
-const ASSET_IDENTIFIER_FIELDS: &[&str] =
-    &["src_host", "dest_host", "src_ip", "dest_ip", "user", "mac"];
+const ASSET_IDENTIFIER_FIELDS: &[&str] = &[
+    // Temporary ClickHouse/UDM lane.
+    "src_host",
+    "dest_host",
+    "src_ip",
+    "dest_ip",
+    "user",
+    "mac",
+    // Canonical OCSF lane. These are independent fields, not aliases.
+    "src_endpoint.hostname",
+    "dst_endpoint.hostname",
+    "device.hostname",
+    "src_endpoint.ip",
+    "dst_endpoint.ip",
+    "user.name",
+    "actor.user.name",
+    "src_endpoint.mac",
+    "dst_endpoint.mac",
+];
 
 /// Extract an asset identifier directly from the query AST, avoiding the need to execute
 /// the initial search query. Returns `Some((field, value))` if the search expression contains
@@ -1163,6 +1305,7 @@ fn extract_eq_field_value(
             field,
             op: Comparator::Eq,
             value,
+            ..
         } => {
             let is_target = match target_field {
                 Some(t) => field == t,
@@ -1233,9 +1376,10 @@ pub fn extract_baseline_command(query: &Query) -> Option<BaselineCommandInfo> {
 }
 
 /// Resolve `(entity_type, value)` for a baseline command: explicit args win,
-/// otherwise infer from a leading equality filter — `src_host`/`dest_host` → host,
-/// `src_ip`/`dest_ip` → ip, `user`/`src_user`/`dest_user` → user (`| asset`'s
-/// literal-entity detection). Returns `None` when nothing baselineable is present.
+/// otherwise infer from a leading equality filter. The two storage lanes have
+/// independent field vocabularies: legacy UDM names remain valid only when its
+/// profile validates them, while canonical OCSF paths are recognized directly.
+/// Returns `None` when nothing baselineable is present.
 pub fn resolve_baseline_entity(
     query: &Query,
     info: &BaselineCommandInfo,
@@ -1246,9 +1390,13 @@ pub fn resolve_baseline_entity(
     let expr = get_root_search_expr(query)?;
     let (field, value) = extract_eq_field_value(expr, None)?;
     let entity_type = match field.as_str() {
-        "src_host" | "dest_host" => "host",
-        "src_ip" | "dest_ip" => "ip",
-        "user" | "src_user" | "dest_user" => "user",
+        "src_host"
+        | "dest_host"
+        | "src_endpoint.hostname"
+        | "dst_endpoint.hostname"
+        | "device.hostname" => "host",
+        "src_ip" | "dest_ip" | "src_endpoint.ip" | "dst_endpoint.ip" => "ip",
+        "user" | "src_user" | "dest_user" | "user.name" | "actor.user.name" => "user",
         _ => return None,
     };
     Some((entity_type.to_string(), value))
@@ -1357,6 +1505,17 @@ pub enum PanelBlockedCommand {
     Funnel,
     Baseline,
 }
+
+/// Hosted shared-Search dependency guard (tenant-pinned lake state only).
+#[cfg(feature = "enterprise")]
+#[path = "enterprise_shared_dependencies.rs"]
+mod enterprise_shared_dependencies;
+#[cfg(feature = "enterprise")]
+pub use enterprise_shared_dependencies::{
+    validate_enterprise_shared_query_dependencies,
+    validate_enterprise_shared_query_dependencies_with, EnterpriseSharedBlockedDependency,
+    EnterpriseSharedQueryCapabilities,
+};
 
 impl PanelBlockedCommand {
     /// Short keyword that appears in nPL pipelines (without the leading `|`).
@@ -1485,6 +1644,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lake_lateral_identifier_honors_exact_canonical_base_filter() {
+        let query = parse_query(
+            "class_uid=1007 AND device.hostname=\"lt-legal-001.corp.local\" | lateral seed=host",
+        )
+        .unwrap();
+        let info = extract_lateral_command(&query).unwrap();
+        assert_eq!(
+            extract_lake_lateral_identifier_from_query(&query, &info),
+            Some((
+                "device.hostname".to_string(),
+                "lt-legal-001.corp.local".to_string(),
+            ))
+        );
+    }
+
+    /// NAN-3059: the documented UDM seeds name their canonical entity. A
+    /// `user=` seed used to fall through to row-based detection, which prefers
+    /// hosts, so `user="slopez" | lateral` traced a random workstation.
+    #[test]
+    fn lake_lateral_identifier_reads_documented_udm_seeds_canonically() {
+        for (query_text, expected) in [
+            ("user=\"slopez\" | lateral", ("actor.user.name", "slopez")),
+            ("user=\"slopez\" | lateral seed=user", ("actor.user.name", "slopez")),
+            (
+                "src_host=\"lt-legal-001\" | lateral seed=host",
+                ("device.hostname", "lt-legal-001"),
+            ),
+            ("src_ip=\"10.1.3.76\" | lateral", ("src_endpoint.ip", "10.1.3.76")),
+        ] {
+            let query = parse_query(query_text).unwrap();
+            let info = extract_lateral_command(&query).unwrap();
+            assert_eq!(
+                extract_lake_lateral_identifier_from_query(&query, &info),
+                Some((expected.0.to_string(), expected.1.to_string())),
+                "{query_text}"
+            );
+        }
+        // A host seed type never takes a user filter as its seed.
+        let query = parse_query("user=\"slopez\" | lateral seed=host").unwrap();
+        let info = extract_lateral_command(&query).unwrap();
+        assert_eq!(extract_lake_lateral_identifier_from_query(&query, &info), None);
+    }
+
+    #[test]
+    fn lake_lateral_identifier_rejects_wildcard_filters() {
+        for query_text in [
+            "src_host=\"lt-*\" | lateral seed=host",
+            "device.hostname=\"lt-*\" | lateral seed=host",
+        ] {
+            let query = parse_query(query_text).unwrap();
+            let info = extract_lateral_command(&query).unwrap();
+            assert_eq!(
+                extract_lake_lateral_identifier_from_query(&query, &info),
+                None,
+                "{query_text}"
+            );
+        }
+    }
+
     /// NAN-1179: a leading-pipe query has no base filter, so `extract_base_query`
     /// returns the empty string. The histogram path must treat this as match-all
     /// rather than parsing "" (which fails with "Empty query" and drops the
@@ -1495,7 +1714,11 @@ mod tests {
         use crate::query::{ClickHouseSqlGenerator, Query, SearchExpr, TimeRange};
 
         for q in ["| stats count by src_ip", "| timechart span=1h count"] {
-            assert_eq!(extract_base_query(q), "", "leading-pipe base must be empty: {q}");
+            assert_eq!(
+                extract_base_query(q),
+                "",
+                "leading-pipe base must be empty: {q}"
+            );
         }
 
         // The match-all substitute the histogram path uses for an empty base.
@@ -1602,7 +1825,9 @@ mod tests {
     #[test]
     fn test_prevalence_pushdown_eligible_ok_cases() {
         // No prevalence at all → eligible.
-        assert!(check_prevalence_pushdown_eligible(&parse_query("error | head 10").unwrap()).is_ok());
+        assert!(
+            check_prevalence_pushdown_eligible(&parse_query("error | head 10").unwrap()).is_ok()
+        );
         // Enrich-only (no conditions) → decorates an already-bounded set → eligible.
         assert!(check_prevalence_pushdown_eligible(
             &parse_query("error | prevalence enrich=true").unwrap()
@@ -1713,18 +1938,48 @@ mod tests {
         };
         // Pushes down: enrich, or a count-field filter, with only simple post-commands.
         assert!(applies("error | prevalence enrich=true", true, true));
-        assert!(applies("error | prevalence hash_prevalence <= 5 window=7d | head 50", true, true));
-        assert!(applies("error | prevalence domain_prevalence < 3 | where x>1 | sort -count", true, true));
+        assert!(applies(
+            "error | prevalence hash_prevalence <= 5 window=7d | head 50",
+            true,
+            true
+        ));
+        assert!(applies(
+            "error | prevalence domain_prevalence < 3 | where x>1 | sort -count",
+            true,
+            true
+        ));
         // A trailing aggregation is pushed into the JOIN as a SQL GROUP BY (NAN-366).
-        assert!(applies("error | prevalence hash_prevalence <= 5 | stats count by src_ip", true, true));
+        assert!(applies(
+            "error | prevalence hash_prevalence <= 5 | stats count by src_ip",
+            true,
+            true
+        ));
         // Does NOT push down.
         assert!(!applies("error | head 10", true, true)); // no prevalence command
-        assert!(!applies("error | stats count by user | prevalence hash_prevalence <= 5", true, true)); // aggregation BEFORE can't reshape into a JOIN
-        assert!(!applies("error | prevalence hash_prevalence <= 5 | streamstats count", true, true)); // field-creating window command after
-        assert!(!applies("error | prevalence hash_first_seen > now() - 24h", true, true)); // first_seen isn't a count field
-        // Deploy-invariant terms gate it off regardless of shape.
-        assert!(!applies("error | prevalence hash_prevalence <= 5", false, true), "non-clickhouse must not push down");
-        assert!(!applies("error | prevalence hash_prevalence <= 5", true, false), "no prevalence service must not push down");
+        assert!(!applies(
+            "error | stats count by user | prevalence hash_prevalence <= 5",
+            true,
+            true
+        )); // aggregation BEFORE can't reshape into a JOIN
+        assert!(!applies(
+            "error | prevalence hash_prevalence <= 5 | streamstats count",
+            true,
+            true
+        )); // field-creating window command after
+        assert!(!applies(
+            "error | prevalence hash_first_seen > now() - 24h",
+            true,
+            true
+        )); // first_seen isn't a count field
+            // Deploy-invariant terms gate it off regardless of shape.
+        assert!(
+            !applies("error | prevalence hash_prevalence <= 5", false, true),
+            "non-clickhouse must not push down"
+        );
+        assert!(
+            !applies("error | prevalence hash_prevalence <= 5", true, false),
+            "no prevalence service must not push down"
+        );
     }
 
     #[test]
@@ -1833,17 +2088,15 @@ mod tests {
         let query =
             parse_query("source_type=firewall | append [search * | anomaly bytes_out]").unwrap();
         assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedAnomaly));
-        let query =
-            parse_query("source_type=firewall | append [search * | dedup src_ip]").unwrap();
+        let query = parse_query("source_type=firewall | append [search * | dedup src_ip]").unwrap();
         assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
     }
 
     #[test]
     fn test_oom_append_subsearch_with_own_filter_allowed() {
-        let query = parse_query(
-            "source_type=firewall | append [search source_type=proxy | dedup src_ip]",
-        )
-        .unwrap();
+        let query =
+            parse_query("source_type=firewall | append [search source_type=proxy | dedup src_ip]")
+                .unwrap();
         assert_eq!(detect_oom_risk(&query), None);
     }
 
@@ -2119,10 +2372,7 @@ mod tests {
 
     #[test]
     fn classify_lookup_is_analytics() {
-        let q = parse_query(
-            "source_type=foo | lookup threats src_ip OUTPUT threat_score",
-        )
-        .unwrap();
+        let q = parse_query("source_type=foo | lookup threats src_ip OUTPUT threat_score").unwrap();
         assert_eq!(
             classify_query_cost(&q, &one_day_range()),
             crate::search::admission::QueryPriority::Analytics
@@ -2264,10 +2514,8 @@ mod tests {
     /// OR arm must require BOTH branches narrow, not either.
     #[test]
     fn unscoped_prevalence_rejects_or_with_wildcard_branch() {
-        let q = parse_query(
-            "source_host=server01 OR user=* | prevalence enrich=true window=7d",
-        )
-        .unwrap();
+        let q = parse_query("source_host=server01 OR user=* | prevalence enrich=true window=7d")
+            .unwrap();
         let result = validate_panel_query_unscoped_prevalence(&q);
         assert!(
             matches!(&result, Err(fields) if fields.contains(&"user".to_string())),
@@ -2278,10 +2526,9 @@ mod tests {
 
     #[test]
     fn unscoped_prevalence_allows_or_with_both_narrowing() {
-        let q = parse_query(
-            "severity=high OR severity=critical | prevalence enrich=true window=7d",
-        )
-        .unwrap();
+        let q =
+            parse_query("severity=high OR severity=critical | prevalence enrich=true window=7d")
+                .unwrap();
         assert!(validate_panel_query_unscoped_prevalence(&q).is_ok());
     }
 
@@ -2295,7 +2542,12 @@ mod tests {
         use super::super::enforce_source_type_exclusion;
 
         // Filter-free baseline: unbounded count stays.
-        for q in ["*", "* | head 100", "* | sort -timestamp", "* | table src_ip, user"] {
+        for q in [
+            "*",
+            "* | head 100",
+            "* | sort -timestamp",
+            "* | table src_ip, user",
+        ] {
             assert!(
                 !query_has_per_row_filters(&parse_query(q).unwrap()),
                 "`{q}` must classify as filter-free"

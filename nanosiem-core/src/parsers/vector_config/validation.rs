@@ -43,6 +43,13 @@ pub(super) fn validate_argv(container_name: &str, container_staging_path: &str) 
         "vector".to_string(),
         "validate".to_string(),
         "--no-environment".to_string(),
+        // Vector 0.57 makes config interpolation opt-in. The candidate tree
+        // contains the same `${NAME:-default}` settings as the running tree,
+        // whose process is launched with this flag. Without it validation
+        // rejects valid TOML before it can validate the topology. This does
+        // not re-enable component or health checks; `--no-environment` still
+        // prevents the validator from binding the live listeners.
+        "--dangerously-allow-env-var-interpolation".to_string(),
     ];
     for dir in staged_config_dir_args(container_staging_path) {
         argv.push("--config-dir".to_string());

@@ -32,6 +32,9 @@ pub(crate) fn get_target_repo(state: &AppState) -> DetectionCodeTargetRepository
 
 /// Map repository errors to API errors.
 pub(crate) fn map_target_err(e: DetectionCodeTargetError) -> ApiError {
+    if nanosiem_core::db::contention::is_lock_contention(&e) {
+        return ApiError::ResourceLockContention;
+    }
     match e {
         DetectionCodeTargetError::NotFound(id) => {
             ApiError::NotFound(format!("Push target not found: {id}"))
@@ -73,3 +76,13 @@ pub(crate) fn map_target_err(e: DetectionCodeTargetError) -> ApiError {
     ))
 )]
 pub struct DetectionCodeTargetsApiDoc;
+
+#[cfg(test)]
+mod lock_contention_contract_tests {
+    use super::*;
+    use crate::handlers::lock_contention_contract_tests::{database_error, assert_contention};
+    #[tokio::test]
+    async fn lock_contention_is_retryable() {
+        assert_contention(axum::response::IntoResponse::into_response(map_target_err(DetectionCodeTargetError::Database(database_error("55P03"))))).await;
+    }
+}

@@ -68,15 +68,12 @@ pub fn dashboard_panel_executes_search_sql(panel: &serde_json::Value) -> bool {
 
 /// Whether any panel in a dashboard can execute through the raw-SQL path.
 pub fn dashboard_executes_search_sql(dashboard: &Dashboard) -> bool {
-    dashboard
-        .panels
-        .as_array()
-        .is_some_and(|panels| {
-            panels
-                .iter()
-                .take(MAX_DASHBOARD_PANELS)
-                .any(dashboard_panel_executes_search_sql)
-        })
+    dashboard.panels.as_array().is_some_and(|panels| {
+        panels
+            .iter()
+            .take(MAX_DASHBOARD_PANELS)
+            .any(dashboard_panel_executes_search_sql)
+    })
 }
 
 /// Current dashboard object authorization facts used by request handlers and

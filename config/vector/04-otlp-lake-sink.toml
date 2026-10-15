@@ -1,0 +1,262 @@
+# Native OTLP spans and metrics -> Nano object lake (NAN-2361)
+# =============================================================================
+# The existing 03-otlp-source.toml owns the OTLP listener and routes each native
+# record to exactly one selected backend. Legacy installs keep their ClickHouse
+# sink; lake installs use this durable HTTP-to-Iceberg path.
+#
+# The overlay consumes the one-record-per-event span shape from
+# `otlp_traces_prep` and the pre-ClickHouse native metric shape from
+# `otlp_metrics_to_log`. It does not normalize traces or metrics into OCSF:
+# OCSF is the event/log dataset, while spans and metrics retain their native
+# OTLP semantics in separate Iceberg datasets.
+#
+# Required environment variables:
+#   NANO_OTEL_LAKE_INGEST_URL
+#   NANO_OTEL_LAKE_INGEST_TOKEN
+#
+# Wire contract: newline-delimited JSON, one envelope per span or metric point.
+# The endpoint authenticates the bearer token and stamps its configured tenant
+# server-side. Tenant identity is intentionally absent from this untrusted
+# request body.
+# =============================================================================
+
+[transforms.otlp_lake_spans_envelope]
+type = "remap"
+inputs = ["otlp_traces_backend.lake"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = false
+source = '''
+event, err = parse_json(.event)
+if err != null || !is_object(event) { abort }
+
+event_time_unix_nano = to_string(event.startTimeUnixNano) ?? ""
+if event_time_unix_nano == "" || event_time_unix_nano == "0" { abort }
+ingest_time_unix_nano = to_string(to_unix_timestamp(now(), unit: "nanoseconds"))
+if ingest_time_unix_nano == "0" { abort }
+
+. = {
+    "schema_version": "nano-otlp-lake-v1",
+    "dataset": "spans",
+    "source_type": "otlp_trace",
+    "ingest_time_unix_nano": ingest_time_unix_nano,
+    "event": event
+}
+'''
+
+[transforms.otlp_lake_metrics_envelope]
+type = "remap"
+inputs = ["otlp_metrics_backend.lake"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = false
+source = '''
+ts = .timestamp
+if !is_timestamp(ts) { ts = now() }
+nanos = to_string(to_unix_timestamp(ts, unit: "nanoseconds") ?? 0)
+if nanos == "0" { abort }
+
+# metric_to_log exposes the data-point and resource attributes in `.tags`.
+# Preserve their native separation in OTLP KeyValue arrays; the Rust endpoint
+# stores both flattened maps plus the complete raw OTLP object.
+attrs = []
+res_attrs = []
+tags = object(.tags) ?? {}
+for_each(tags) -> |k, v| {
+    sv = if is_object(v) || is_array(v) { encode_json(v) } else { to_string(v) ?? "" }
+    if starts_with(k, "resource.") {
+        rk = replace(k, "resource.", "")
+        res_attrs = push(res_attrs, { "key": rk, "value": { "stringValue": sv } })
+    } else {
+        attrs = push(attrs, { "key": k, "value": { "stringValue": sv } })
+    }
+}
+
+event = {
+    "name": to_string(.name) ?? "",
+    "unit": to_string(.unit) ?? "",
+    "timeUnixNano": nanos,
+    "attributes": attrs,
+    "resource": { "attributes": res_attrs }
+}
+
+metric_kind = to_string(.kind) ?? ""
+temporality = if metric_kind == "absolute" { 2 } else if metric_kind == "incremental" { 1 } else { 0 }
+ingest_time_unix_nano = to_string(to_unix_timestamp(now(), unit: "nanoseconds"))
+if ingest_time_unix_nano == "0" { abort }
+
+if exists(.gauge) {
+    event = set!(event, ["type"], "gauge")
+    event = set!(event, ["asDouble"], to_float(.gauge.value) ?? 0.0)
+} else if exists(.counter) {
+    event = set!(event, ["type"], "sum")
+    event = set!(event, ["asDouble"], to_float(.counter.value) ?? 0.0)
+    event = set!(event, ["aggregationTemporality"], temporality)
+} else if exists(.aggregated_histogram) {
+    event = set!(event, ["type"], "histogram")
+    event = set!(event, ["aggregationTemporality"], temporality)
+    event = set!(event, ["count"], to_int(.aggregated_histogram.count) ?? 0)
+    event = set!(event, ["sum"], to_float(.aggregated_histogram.sum) ?? 0.0)
+    buckets = array(.aggregated_histogram.buckets) ?? []
+    last_bucket = length(buckets) - 1
+    bucket_counts = []
+    explicit_bounds = []
+    for_each(buckets) -> |i, bucket| {
+        bucket_counts = push(bucket_counts, to_int(bucket.count) ?? 0)
+        if i < last_bucket {
+            explicit_bounds = push(explicit_bounds, to_float(bucket.upper_limit) ?? 0.0)
+        }
+    }
+    event = set!(event, ["bucketCounts"], bucket_counts)
+    event = set!(event, ["explicitBounds"], explicit_bounds)
+} else {
+    # The native Iceberg v1 schema intentionally supports gauge, sum, and
+    # histogram points. Reject unknown Vector metric variants instead of
+    # silently recording them as zero-valued gauges.
+    abort
+}
+
+. = {
+    "schema_version": "nano-otlp-lake-v1",
+    "dataset": "metrics",
+    "source_type": "otlp_metric",
+    "ingest_time_unix_nano": ingest_time_unix_nano,
+    "event": event
+}
+'''
+
+# The HTTP sink encodes each buffered batch as NDJSON. A batch is acknowledged
+# upstream only after the Rust lake ingest endpoint returns success. Disk
+# buffers block when full: accepted telemetry is never deliberately shed.
+# Vector 0.57 parses typed numeric TOML before environment interpolation, so the
+# numeric limits below are concrete deployment defaults. A deployment renderer
+# may materialize different numeric values for larger tenants.
+[sinks.otlp_lake_spans]
+type = "http"
+inputs = ["otlp_lake_spans_envelope"]
+uri = "${NANO_OTEL_LAKE_INGEST_URL:-http://127.0.0.1:9}/v1/otlp/spans"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+acknowledgements.enabled = true
+
+[sinks.otlp_lake_spans.buffer]
+type = "disk"
+max_size = 5368709120
+when_full = "block"
+
+[sinks.otlp_lake_spans.batch]
+max_bytes = 5242880
+max_events = 5000
+timeout_secs = 1
+
+[sinks.otlp_lake_spans.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+
+[sinks.otlp_lake_spans.request.headers]
+Authorization = "Bearer ${NANO_OTEL_LAKE_INGEST_TOKEN:-legacy-disabled-legacy-disabled}"
+Content-Type = "application/x-ndjson"
+
+[sinks.otlp_lake_spans.healthcheck]
+enabled = false
+
+[sinks.otlp_lake_metrics]
+type = "http"
+inputs = ["otlp_lake_metrics_envelope"]
+uri = "${NANO_OTEL_LAKE_INGEST_URL:-http://127.0.0.1:9}/v1/otlp/metrics"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+acknowledgements.enabled = true
+
+[sinks.otlp_lake_metrics.buffer]
+type = "disk"
+max_size = 5368709120
+when_full = "block"
+
+[sinks.otlp_lake_metrics.batch]
+max_bytes = 5242880
+max_events = 5000
+timeout_secs = 1
+
+[sinks.otlp_lake_metrics.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+
+[sinks.otlp_lake_metrics.request.headers]
+Authorization = "Bearer ${NANO_OTEL_LAKE_INGEST_TOKEN:-legacy-disabled-legacy-disabled}"
+Content-Type = "application/x-ndjson"
+
+[sinks.otlp_lake_metrics.healthcheck]
+enabled = false
+
+# Contract tests run with `vector test` after enabling this overlay. They pin
+# the object-valued native event and ensure tenant identity never enters the
+# producer-controlled row.
+[[tests]]
+name = "otlp lake span envelope is native and tenantless"
+
+[tests.input]
+insert_at = "otlp_lake_spans_envelope"
+type = "log"
+
+[tests.input.log_fields]
+event = '''{"traceId":"0123456789abcdef0123456789abcdef","spanId":"0123456789abcdef","startTimeUnixNano":"1786572000000000000","name":"GET /health"}'''
+
+[[tests.outputs]]
+extract_from = "otlp_lake_spans_envelope"
+
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.schema_version, "nano-otlp-lake-v1")
+assert_eq!(.dataset, "spans")
+assert_eq!(.source_type, "otlp_trace")
+assert!(is_string(.ingest_time_unix_nano))
+assert_eq!(.event.traceId, "0123456789abcdef0123456789abcdef")
+assert_eq!(.event.name, "GET /health")
+assert!(!exists(.tenant_id))
+'''
+
+[[tests]]
+name = "otlp lake histogram envelope preserves native metric semantics"
+
+[tests.input]
+insert_at = "otlp_lake_metrics_envelope"
+type = "log"
+
+[tests.input.log_fields]
+name = "http.server.request.duration"
+unit = "ms"
+kind = "incremental"
+timestamp = "2026-08-12T22:00:00Z"
+aggregated_histogram = { count = 7, sum = 130.0, buckets = [{ count = 2, upper_limit = 10.0 }, { count = 3, upper_limit = 50.0 }, { count = 2, upper_limit = 100.0 }] }
+tags = { route = "/checkout", "resource.service.name" = "api" }
+
+[[tests.outputs]]
+extract_from = "otlp_lake_metrics_envelope"
+
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.schema_version, "nano-otlp-lake-v1")
+assert_eq!(.dataset, "metrics")
+assert_eq!(.source_type, "otlp_metric")
+assert!(is_string(.ingest_time_unix_nano))
+assert_eq!(.event.name, "http.server.request.duration")
+assert_eq!(.event.unit, "ms")
+assert_eq!(.event.type, "histogram")
+assert_eq!(.event.aggregationTemporality, 1)
+assert_eq!(.event.count, 7)
+assert_eq!(.event.sum, 130.0)
+assert_eq!(.event.bucketCounts, [2, 3, 2])
+assert_eq!(.event.explicitBounds, [10.0, 50.0])
+assert_eq!(.event.attributes[0].key, "route")
+assert_eq!(.event.resource.attributes[0].key, "service.name")
+assert!(!exists(.tenant_id))
+'''

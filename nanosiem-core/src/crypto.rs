@@ -107,6 +107,23 @@ impl EncryptionService {
         }
     }
 
+    /// Keyed integrity tag (HMAC-SHA512, 64 bytes) under this service's key,
+    /// domain-separated by `domain` so a tag from one ledger can never verify
+    /// in another. Used by the hosted-shared custom-enrichment artifact
+    /// ledger (`manifest_signature`, NAN-2361 wave 5).
+    pub fn keyed_mac_sha512(&self, domain: &[u8], message: &[u8]) -> [u8; 64] {
+        use hmac::{Hmac, KeyInit, Mac};
+        let mut mac = <Hmac<sha2::Sha512> as KeyInit>::new_from_slice(&self.key)
+            .expect("HMAC accepts any key length");
+        mac.update(domain);
+        mac.update(&[0u8]);
+        mac.update(message);
+        let tag = mac.finalize().into_bytes();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(&tag);
+        out
+    }
+
     /// Encrypt plaintext bytes and return the ciphertext with nonce
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedData, CryptoError> {
         let cipher = Aes256Gcm::new_from_slice(&self.key)
@@ -220,7 +237,10 @@ mod tests {
         let saved = [
             ("NANOSIEM_ENCRYPTION_KEY", save("NANOSIEM_ENCRYPTION_KEY")),
             ("OIDC_SECRET_KEY", save("OIDC_SECRET_KEY")),
-            ("NANOSIEM_ALLOW_DEFAULT_KEYS", save("NANOSIEM_ALLOW_DEFAULT_KEYS")),
+            (
+                "NANOSIEM_ALLOW_DEFAULT_KEYS",
+                save("NANOSIEM_ALLOW_DEFAULT_KEYS"),
+            ),
             ("NANOSIEM_DEV_MODE", save("NANOSIEM_DEV_MODE")),
         ];
 

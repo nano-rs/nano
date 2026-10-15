@@ -95,6 +95,194 @@ pub enum SyncError {
 }
 
 // =============================================================================
+// NAN-3483: bounded 429 retry inside a sync
+// =============================================================================
+
+/// How a sync rides out provider rate limits. One 429 used to fail the whole
+/// sync and park the provider for the scheduler's 30-minute failure cooldown;
+/// now the page request is retried after the wait the provider asks for, a
+/// bounded number of times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateLimitPolicy {
+    /// Retries per request after the first 429 (attempts = retries + 1).
+    pub max_retries: u32,
+    /// Longest wait honoured. A provider asking for more fails the sync now
+    /// (with the wait in the error) rather than holding it open.
+    pub max_wait: std::time::Duration,
+    /// Wait when the 429 carries no usable Retry-After / reset header.
+    pub default_wait: std::time::Duration,
+}
+
+impl Default for RateLimitPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 5,
+            max_wait: std::time::Duration::from_secs(120),
+            default_wait: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+/// Run `op`, retrying it while it returns [`SyncError::RateLimited`] under
+/// `policy`. Any other result (success or another error) returns at once.
+pub(crate) async fn retry_rate_limited<T, F, Fut>(
+    policy: RateLimitPolicy,
+    mut op: F,
+) -> Result<T, SyncError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, SyncError>>,
+{
+    let mut retries = 0u32;
+    loop {
+        match op().await {
+            Err(SyncError::RateLimited { retry_after_secs }) if retries < policy.max_retries => {
+                let wait = retry_after_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(policy.default_wait);
+                if wait > policy.max_wait {
+                    return Err(SyncError::RateLimited { retry_after_secs });
+                }
+                // A reset already in the past (or "0") still waits a second so
+                // the retry lands after the window rolls over.
+                let wait = wait.max(std::time::Duration::from_secs(1));
+                retries += 1;
+                tracing::warn!(
+                    wait_secs = wait.as_secs(),
+                    retry = retries,
+                    max_retries = policy.max_retries,
+                    "Identity provider rate limited; retrying after its requested wait"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Seconds to wait from a 429's headers: `Retry-After` (delta-seconds) when
+/// present, else Okta's `X-Rate-Limit-Reset` (epoch seconds) relative to
+/// `now_epoch_secs`.
+pub(crate) fn rate_limit_wait_secs(
+    headers: &reqwest::header::HeaderMap,
+    now_epoch_secs: u64,
+) -> Option<u64> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    header("retry-after").or_else(|| {
+        header("x-rate-limit-reset").map(|epoch| epoch.saturating_sub(now_epoch_secs))
+    })
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    fn limited(secs: Option<u64>) -> SyncError {
+        SyncError::RateLimited { retry_after_secs: secs }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_after_the_requested_wait_then_succeeds() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let out = retry_rate_limited(RateLimitPolicy::default(), || async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(limited(Some(3))),
+                1 => Err(limited(Some(7))),
+                _ => Ok("page"),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out, "page");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Slept exactly what the provider asked for, in order.
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_max_retries() {
+        let calls = AtomicU32::new(0);
+        let policy = RateLimitPolicy { max_retries: 2, ..Default::default() };
+        let err = retry_rate_limited(policy, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(limited(Some(1)))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncError::RateLimited { retry_after_secs: Some(1) }));
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "first attempt + 2 retries");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_over_the_cap_fails_now() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        let err = retry_rate_limited(RateLimitPolicy::default(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(limited(Some(3600)))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncError::RateLimited { retry_after_secs: Some(3600) }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_header_uses_the_default_wait_and_zero_waits_a_second() {
+        let calls = AtomicU32::new(0);
+        let started = tokio::time::Instant::now();
+        retry_rate_limited(RateLimitPolicy::default(), || async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(limited(None)),
+                1 => Err(limited(Some(0))),
+                _ => Ok(()),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(30 + 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn other_errors_are_not_retried() {
+        let calls = AtomicU32::new(0);
+        let err = retry_rate_limited(RateLimitPolicy::default(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(SyncError::AuthError("E0000011".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, SyncError::AuthError(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn wait_prefers_retry_after_then_okta_reset() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("x-rate-limit-reset", HeaderValue::from_static("1000060"));
+        assert_eq!(rate_limit_wait_secs(&h, 1_000_000), Some(60));
+        // Reset already passed: zero, not an underflow.
+        assert_eq!(rate_limit_wait_secs(&h, 2_000_000), Some(0));
+        h.insert("retry-after", HeaderValue::from_static("5"));
+        assert_eq!(rate_limit_wait_secs(&h, 1_000_000), Some(5));
+        assert_eq!(rate_limit_wait_secs(&HeaderMap::new(), 1_000_000), None);
+        let mut bad = HeaderMap::new();
+        bad.insert("retry-after", HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"));
+        assert_eq!(rate_limit_wait_secs(&bad, 1_000_000), None);
+    }
+}
+
+// =============================================================================
 // NAN-1196: SSRF guard for outbound identity-provider requests
 // =============================================================================
 //
@@ -179,7 +367,8 @@ mod ssrf_tests {
             "::ffff:10.0.0.1", // IPv4-mapped private
         ] {
             assert!(
-                v.validate_ip_address(ip.parse::<IpAddr>().unwrap()).is_err(),
+                v.validate_ip_address(ip.parse::<IpAddr>().unwrap())
+                    .is_err(),
                 "{ip} should be blocked"
             );
         }
@@ -200,9 +389,11 @@ mod ssrf_tests {
     async fn guard_rejects_scheme_and_literal_metadata() {
         let t = std::time::Duration::from_secs(30);
         assert!(guarded_client("http://example.com/", t).await.is_err());
-        assert!(guarded_client("https://169.254.169.254/latest/meta-data/", t)
-            .await
-            .is_err());
+        assert!(
+            guarded_client("https://169.254.169.254/latest/meta-data/", t)
+                .await
+                .is_err()
+        );
         assert!(guarded_client("https://10.0.0.5/api/v1/users", t)
             .await
             .is_err());

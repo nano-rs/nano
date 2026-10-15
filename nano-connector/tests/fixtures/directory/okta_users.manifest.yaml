@@ -1,0 +1,135 @@
+name: Okta Users
+slug: okta_users
+category: collector
+description: "Sync Okta users and group memberships into nano's identity registry"
+icon: users
+author: nano
+version: 2
+changelog: >-
+  v2: identity connector (NAN-3503). Users and group memberships now go
+  straight to nano's identity snapshot (kind: identity) instead of the
+  nano_enrich lane: a full snapshot daily, so removed users drop out, and an
+  hourly delta (search on lastUpdated) in between, so a deprovisioning shows up
+  within the hour as account_status=deprovisioned. New groups stream: each
+  user's Okta groups, with PRIVILEGED_GROUPS marking admin groups. New roles
+  stream: every user holding an Okta admin role is marked privileged. Full
+  runs now include STAGED and DEPROVISIONED users (the plain list omits
+  them). Hosted feeds are keyless: an Okta API Services app trusts nano's pull
+  broker through private_key_jwt (scopes okta.users.read, okta.groups.read,
+  okta.roles.read), so no API token is created or stored. Self-hosted keeps
+  the SSWS API token, which needs read access to users, groups and roles (a
+  Read-only Administrator token has it).
+  v1: initial release, on the nano-connector runtime (no Deno script). Walks
+  /api/v1/users every six hours and pushes each user to the identity lane,
+  where the okta_identity normalizer maps it into the user registry.
+
+requires_credential: required
+credential_fields:
+  - name: API_TOKEN
+    label: API token (self-hosted only)
+    field_type: secret
+    required: true
+    help: >-
+      Self-hosted only; hosted nano never asks for it. Okta Admin Console →
+      Security → API → Tokens → Create token, as a Read-only Administrator.
+      Okta expires a token that goes unused for 30 days; the hourly sync keeps
+      it alive.
+
+config_fields:
+  - name: OKTA_DOMAIN
+    label: Okta org domain
+    field_type: hostname
+    required: true
+    placeholder: "acme.okta.com"
+    help: >-
+      Your Okta org hostname, without https:// or a path. Use the org domain
+      (acme.okta.com), not a custom sign-in domain.
+  - name: CLIENT_ID
+    label: API Services app client ID (hosted)
+    field_type: string
+    required: false
+    placeholder: "0oa1b2c3d4e5f6g7h8i9"
+    help: >-
+      Hosted nano: required. The Client ID of the Okta API Services app you
+      created for nano (Applications → your app → General). Self-hosted
+      installs use the API token instead and can leave this empty.
+  - name: PRIVILEGED_GROUPS
+    label: Privileged groups
+    field_type: string
+    required: false
+    placeholder: "Okta Admins, Break Glass"
+    help: >-
+      Optional. Comma-separated Okta group names whose members nano treats as
+      administrators.
+
+allowed_domain_suffixes:
+  - ".okta.com"
+  - ".oktapreview.com"
+  - ".okta-emea.com"
+  - ".okta-gov.com"
+  - ".okta.mil"
+
+# Identity streams: their rows go to nano's identity snapshot, not to ingest,
+# so `nano_identity` marks them (no parser, no log source).
+streams:
+  - id: users
+    label: Directory users
+    source_type: nano_identity
+    default: true
+    description: "Every Okta user with profile and status: full daily, changes hourly"
+  - id: groups
+    label: Group memberships
+    source_type: nano_identity
+    default: true
+    description: "Which Okta groups each user belongs to"
+  - id: roles
+    label: Admin roles
+    source_type: nano_identity
+    default: true
+    description: "Users holding an Okta admin role, marked as admins"
+
+config:
+  # Hosted UI uses source-bound connector feeds (keyless connector.hosted.yaml).
+  hosted_connector: true
+  poll_schedule: "0 * * * *"
+  max_run_secs: 3600
+  max_events_per_emit: 1000
+
+tags:
+  - identity
+  - okta
+
+categories:
+  - identity
+
+components:
+  - id: directory
+    label: Directory
+    kind: identity
+    description: "Users, status changes, group memberships and admin roles from the Okta Users, Groups and Roles APIs"
+    connector_spec: connector.yaml
+    hosted_connector_spec: connector.hosted.yaml
+    config_fields: [OKTA_DOMAIN, CLIENT_ID, PRIVILEGED_GROUPS]
+    default: true
+    setup:
+      scopes:
+        - "okta.users.read"
+        - "okta.groups.read"
+        - "okta.roles.read"
+      permissions:
+        - "Read-Only Administrator role assigned to the API Services app"
+      steps:
+        - "In the Okta Admin Console open **Applications → Applications → Create App Integration**, choose **API Services**, and name it `nano directory sync`. Copy its **Client ID** into the field above."
+        - "Under **Client Credentials** click **Edit** and set **Client authentication** to **Public key / Private key**."
+        - "Under **Public Keys** choose **Use a URL to fetch keys dynamically** and enter `https://pull-broker.nano.rs/v1/okta/jwks/<your nano tenant id>` (nano shows the exact URL on this page), or add the public JWK served at that URL by hand. Save."
+        - "Under **General Settings** turn off **Require Demonstrating Proof of Possession (DPoP) header in token requests**."
+        - "Open the **Okta API Scopes** tab and grant `okta.users.read`, `okta.groups.read` and `okta.roles.read`."
+        - "Open the **Admin roles** tab, click **Edit assignments**, and assign the **Read-Only Administrator** role to the app. Okta answers 403 to every call until the app holds a role."
+        - "Enter your Okta org domain (for example `acme.okta.com`), not a custom sign-in domain."
+        - "Self-hosted nano only: instead of the app, create an API token as a Read-only Administrator (**Security → API → Tokens**) and paste it into API token."
+
+# NAN-3490 / NAN-3503: this integration exists only as a nano-connector spec.
+runtime: connector
+connector_spec: connector.yaml
+# Hosted runner only: keyless private_key_jwt via nano's pull broker.
+hosted_connector_spec: connector.hosted.yaml

@@ -281,13 +281,13 @@ impl DetectionMatchRepository {
             sql.push_str(&MatchScope::sql_predicate("dm.source_types", 5));
         }
         sql.push_str(
-            r#"
-        ON CONFLICT (match_id) DO UPDATE
+            concat!(r#"
+        ON CONFLICT ("#, crate::tenant_key!(), r#"match_id) DO UPDATE
         SET reviewed_at = EXCLUDED.reviewed_at,
             reviewed_by = EXCLUDED.reviewed_by,
             note        = EXCLUDED.note
         RETURNING reviewed_at, reviewed_by, note
-        "#,
+        "#),
         );
 
         let mut q = sqlx::query_as::<_, (DateTime<Utc>, Option<Uuid>, Option<String>)>(&sql)

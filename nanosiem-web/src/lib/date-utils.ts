@@ -11,6 +11,21 @@ import { formatDistanceToNow } from 'date-fns';
 import { formatInTimeZone } from 'date-fns-tz';
 
 /**
+ * Parse a timestamp string as UTC (handles database format without Z suffix).
+ *
+ * ClickHouse `toString(DateTime)` and the lake's chDB JSONEachRow both emit
+ * naive `"YYYY-MM-DD HH:MM:SS[.ffffff]"` strings. A bare `new Date(...)` would
+ * interpret those in the browser's LOCAL zone — actively wrong when the UI
+ * prints the result with a "UTC" label.
+ *
+ * Re-exported from `lib/parse-timestamp-utc.ts` rather than reimplemented: two
+ * same-named copies existed with DIFFERENT empty-input contracts (Invalid Date
+ * here, "now" there), split across twelve files with nothing to indicate which
+ * one a new call site would get.
+ */
+export { parseTimestampAsUTC } from './parse-timestamp-utc';
+
+/**
  * Format a date as UTC string for display
  * Example: "Dec 21, 2025, 14:30:45 UTC"
  */

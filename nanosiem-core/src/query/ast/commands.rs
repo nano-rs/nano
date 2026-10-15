@@ -15,6 +15,15 @@ use super::lateral::{LateralMethod, LateralSeedType};
 use super::prevalence::{PrevalenceCondition, PrevalenceTimeWindow};
 use super::types::{BinSpan, Query, SearchExpr, WindowType};
 
+/// Named tree layouts are semantic product presets. Keeping the preset in the
+/// AST lets each storage profile choose its canonical fields without treating
+/// the historical expansion as query-language aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreePreset {
+    Process,
+    Web,
+}
+
 /// Piped commands that transform query results
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -57,10 +66,19 @@ pub enum Command {
     /// timechart command: time-based aggregation
     Timechart {
         span: Duration,
+        /// `bins=N` (NAN-3385): at most N buckets over the search window. While
+        /// set, `span` is only the 1 h placeholder; `resolve_timechart_bins`
+        /// replaces it with a round span derived from the query time range and
+        /// clears this. `span=` wins when both are written.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bins: Option<u32>,
         aggregations: Vec<Aggregation>,
         split_by: Vec<String>,
         /// Limit number of split-by series (top N by first aggregation).
         limit: Option<usize>,
+        /// Include the aggregate of excluded series (default: true).
+        #[serde(default = "default_timechart_useother")]
+        useother: bool,
         /// Continuous time axis — fill gaps with zeros (default: false).
         cont: bool,
     },
@@ -69,14 +87,23 @@ pub enum Command {
     /// rename command: rename fields in results
     Rename { mappings: Vec<FieldRename> },
     /// lookup command: enrich results with data from lookup tables
-    /// Syntax: lookup <table_name> <key_field> [OUTPUT <field1>, <field2>, ...] [CASE_INSENSITIVE]
+    /// Syntax: lookup <table> <column> [AS <event_field>] [OUTPUT|OUTPUTNEW <column> [AS <result>], ...] [CASE_INSENSITIVE]
     Lookup {
         /// Name of the lookup table
         table_name: String,
-        /// Field in the log results to match against the lookup table's key
+        /// Field in the event/pipeline results whose values are enriched.
+        event_field: String,
+        /// Column in the lookup table matched against `event_field`. When no
+        /// `AS` clause is present this is identical to `event_field`.
         key_field: String,
         /// Optional list of fields to output from the lookup table (None = all fields)
         output_fields: Option<Vec<String>>,
+        /// Renames from lookup columns to derived result fields.
+        #[serde(default)]
+        output_renames: Vec<FieldRename>,
+        /// Preserve existing non-null result values.
+        #[serde(default)]
+        output_new: bool,
         /// Whether to perform case-insensitive matching
         case_insensitive: bool,
     },
@@ -278,6 +305,10 @@ pub enum Command {
     /// Syntax: prevalence hash_prevalence < 5 domain_first_seen > now()-24h window=24h
     /// Syntax: prevalence enrich=true [window=24h]
     Prevalence {
+        /// Explicit result fields whose artifact values should be enriched.
+        /// Empty preserves automatic hash/domain/IP discovery.
+        #[serde(default)]
+        artifact_fields: Vec<String>,
         /// Filter conditions (can have multiple, all must be satisfied)
         conditions: Vec<PrevalenceCondition>,
         /// Time window for prevalence calculation
@@ -365,6 +396,9 @@ pub enum Command {
     /// Syntax: tree parent=<field> child=<field> label=<field> [detail=<field>] [prevalence=<field>] [root=<pattern>]
     /// Builds a tree structure from flat results based on parent-child relationships
     Tree {
+        /// Named semantic preset, if the analyst used `tree process` or
+        /// `tree web`. Explicit field syntax leaves this unset.
+        preset: Option<TreePreset>,
         /// Field containing parent identifier (e.g., parent_process_id, referrer)
         parent_field: String,
         /// Field containing child identifier (e.g., process_id, url)
@@ -391,6 +425,9 @@ pub enum Command {
     ResolveIdentity {
         /// Field to resolve -- IP, user, or hostname (default: src_ip)
         field: String,
+        /// True when the field came from the command's semantic default rather
+        /// than an explicit analyst-supplied field name.
+        field_is_default: bool,
         /// Maximum age of identity observation to use (default: 24h)
         max_age: Duration,
     },
@@ -689,6 +726,8 @@ pub enum InputLookupFormat {
     Json,
     /// CSV response with headers
     Csv,
+    /// Newline-delimited JSON objects
+    Ndjson,
 }
 
 impl InputLookupFormat {
@@ -697,6 +736,7 @@ impl InputLookupFormat {
         match self {
             InputLookupFormat::Json => "json",
             InputLookupFormat::Csv => "csv",
+            InputLookupFormat::Ndjson => "ndjson",
         }
     }
 
@@ -705,6 +745,7 @@ impl InputLookupFormat {
         match s.to_lowercase().as_str() {
             "json" => Some(InputLookupFormat::Json),
             "csv" => Some(InputLookupFormat::Csv),
+            "ndjson" => Some(InputLookupFormat::Ndjson),
             _ => None,
         }
     }
@@ -714,12 +755,20 @@ impl InputLookupFormat {
 ///
 /// Templates can contain `{field}` placeholders that get substituted
 /// with values from the search results during enrichment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct UrlTemplate {
     /// The raw template string with optional {field} placeholders
     pub template: String,
     /// Extracted field names from placeholders (e.g., ["src_ip", "user"])
     pub fields: Vec<String>,
+}
+
+impl std::fmt::Debug for UrlTemplate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UrlTemplate")
+            .field("template", &crate::inputlookup::storage_policy::redact_single_url(&self.template))
+            .field("has_placeholders", &self.has_placeholders()).finish()
+    }
 }
 
 impl UrlTemplate {
@@ -832,4 +881,8 @@ pub struct FieldRename {
     pub from: String,
     /// New field name (alias)
     pub to: String,
+}
+
+fn default_timechart_useother() -> bool {
+    true
 }

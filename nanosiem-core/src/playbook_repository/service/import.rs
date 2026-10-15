@@ -78,7 +78,10 @@ impl PlaybookRepositoryService {
         // so `hunts/x.md` is a fact about configuration, not about the file.
         let (fm, body) = split_frontmatter(&repo_playbook.raw_content)
             .map_err(|e| PlaybookRepositoryError::Parse(e.to_string()))?;
-        let kind = fm.as_ref().map(|f| f.kind).unwrap_or(PlaybookKind::Response);
+        let kind = fm
+            .as_ref()
+            .map(|f| f.kind)
+            .unwrap_or(PlaybookKind::Response);
 
         if !repo_accepts_kind(&repo, kind.as_str()) {
             return Err(PlaybookRepositoryError::KindNotAllowed {
@@ -297,7 +300,9 @@ impl PlaybookRepositoryService {
         use super::super::models::PlaybookBundleImportResult;
         use super::sync::{catalog_kind, is_syncable_playbook_file, resolve_category};
 
-        let repo = self.find_or_create_airgap_playbook_repository(user_id).await?;
+        let repo = self
+            .find_or_create_airgap_playbook_repository(user_id)
+            .await?;
 
         let mut synced = 0usize;
 
@@ -415,7 +420,7 @@ impl PlaybookRepositoryService {
             name: AIRGAP_PLAYBOOK_REPOSITORY_NAME.to_string(),
             slug: Some(AIRGAP_PLAYBOOK_REPOSITORY_SLUG.to_string()),
             description: Some(
-                "Playbooks imported from offline air-gapped bundles (NAN-1220).".to_string(),
+                "Playbooks imported from offline air-gapped bundles.".to_string(),
             ),
             // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
             url: "airgap://playbooks".to_string(),

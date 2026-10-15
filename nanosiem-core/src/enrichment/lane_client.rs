@@ -10,8 +10,8 @@
 //! its target enrichment table, so the field mapping lives in the parsers repo
 //! rather than hard-coded in this binary.
 //!
-//! Wire contract (see `config/vector/00-base.toml`): POST NDJSON to the Vector
-//! HTTP ingest source (`:8080`) with `X-Source-Type: nano_enrich` and
+//! Wire contract (see `config/vector/00-base.toml`): POST NDJSON to Vector's
+//! dedicated enrichment source (`:8090`) with `X-Source-Type: nano_enrich` and
 //! `Authorization: Bearer <VECTOR_AUTH_TOKEN>`. The `auth_check` transform
 //! validates the bearer token and the `enrichment_router` claims
 //! `source_type == "nano_enrich"`, routing by `.source` to the per-source
@@ -62,16 +62,23 @@ impl EnrichmentLaneClient {
         }
     }
 
-    /// Build from the environment: `VECTOR_INGEST_URL` (default
-    /// `http://vector:8080/`) and `VECTOR_AUTH_TOKEN`. NAN-1151 provisions both
+    /// Build from the environment: `VECTOR_ENRICHMENT_INGEST_URL` (default
+    /// `http://vector:8090/`, with `VECTOR_INGEST_URL` as an upgrade fallback)
+    /// and `VECTOR_AUTH_TOKEN`. NAN-1151 provisions both
     /// to `nanosiem-api` (where the identity-sync scheduler runs); without the
     /// token, pushes to a token-protected Vector will 401 — callers should gate
     /// on [`is_configured`](Self::is_configured) and surface that rather than
     /// drop enrichment data silently.
     pub fn from_env() -> Self {
-        Self {
-            inner: VectorIngestClient::from_env(),
-        }
+        let ingest_url = std::env::var("VECTOR_ENRICHMENT_INGEST_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| std::env::var("VECTOR_INGEST_URL").ok())
+            .unwrap_or_else(|| "http://vector:8090/".to_string());
+        let auth_token = std::env::var("VECTOR_AUTH_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Self::new(ingest_url, auth_token)
     }
 
     /// Whether a bearer token is present. A token-protected Vector rejects
@@ -95,7 +102,6 @@ impl EnrichmentLaneClient {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -128,7 +134,9 @@ mod tests {
 
     #[test]
     fn empty_token_is_treated_as_unconfigured() {
-        assert!(!EnrichmentLaneClient::new("http://vector:8080/", Some(String::new())).is_configured());
+        assert!(
+            !EnrichmentLaneClient::new("http://vector:8080/", Some(String::new())).is_configured()
+        );
         assert!(!EnrichmentLaneClient::new("http://vector:8080/", None).is_configured());
         assert!(
             EnrichmentLaneClient::new("http://vector:8080/", Some("tok".into())).is_configured()

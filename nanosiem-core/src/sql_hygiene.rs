@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Shared SQL-literal hygiene helpers (NAN-1616).
 //!
 //! Consolidates the escaping/formatting logic that was previously copy-pasted
@@ -92,10 +94,7 @@ pub fn is_safe_sql_identifier(s: &str) -> bool {
 /// columns in ClickHouse, so do not swap one form for the other in existing SQL
 /// without checking which the schema actually has.
 pub fn escape_sql_identifier(s: impl AsRef<str>) -> String {
-    format!(
-        "`{}`",
-        s.as_ref().replace('\\', "\\\\").replace('`', "\\`")
-    )
+    format!("`{}`", s.as_ref().replace('\\', "\\\\").replace('`', "\\`"))
 }
 
 /// Escape a raw string for use in a ClickHouse `LIKE`/`ILIKE` pattern.

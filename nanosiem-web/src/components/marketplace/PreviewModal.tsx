@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * NAN-574 — Marketplace preview output modal.
+ * NAN-574 — Marketplace preview output sheet (DetailSheet since NAN-3209).
  *
  * Triggered from the "preview output" button in the drawer header. Calls
  * POST /api/marketplace/catalog/{slug}/preview with a sample artifact and
@@ -17,11 +17,10 @@
 
 import { useEffect, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle, Eye, Loader2, RefreshCw,
+  AlertTriangle, CheckCircle, Eye, RefreshCw,
 } from 'lucide-react';
-import {
-  Dialog, DialogContent, DialogHeader, DialogTitle,
-} from '@/components/ui/dialog';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import { DetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -98,22 +97,19 @@ export function PreviewModal({ slug, name, open, onOpenChange }: PreviewModalPro
   const sample = ARTIFACT_TYPES.find(t => t.value === artifactType)?.sample;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[640px] p-0 overflow-hidden">
-        <DialogHeader className="px-5 py-4 border-b border-border/60 bg-muted/20 space-y-0">
-          <DialogTitle className="flex items-center gap-2 text-[14px] font-semibold">
-            <Eye className="w-[14px] h-[14px] text-primary" />
-            Preview output
-            {name && <span className="text-muted-foreground font-normal">· {name}</span>}
-          </DialogTitle>
-          <p className="text-[11.5px] text-muted-foreground mt-1">
-            Runs the enrichment once against a sample artifact in the Deno sandbox.
-            Credentials and allowed-domains use the saved configuration.
-          </p>
-        </DialogHeader>
-
+    <DetailSheet
+      open={open}
+      onOpenChange={onOpenChange}
+      size="md"
+      breadcrumb={['Marketplace', name ?? slug ?? undefined]}
+      icon={<Eye className="w-[14px] h-[14px] text-primary" />}
+      title="Preview output"
+      description="Runs the enrichment once against a sample artifact in the Deno sandbox. Credentials and allowed-domains use the saved configuration."
+      meta={slug ? <span>{slug}</span> : undefined}
+      bodyClassName="p-0"
+    >
         {/* Inputs row */}
-        <div className="px-5 py-3 border-b border-border/60 flex items-end gap-2">
+        <div className="sticky top-0 z-10 bg-card px-4 py-3 border-b border-border/60 flex items-end gap-2">
           <div className="w-[110px]">
             <Label className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground">
               Type
@@ -154,24 +150,23 @@ export function PreviewModal({ slug, name, open, onOpenChange }: PreviewModalPro
             onClick={() => run()}
             disabled={running || !slug}
           >
-            {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+            {running ? <LoadingIcon className="w-3.5 h-3.5" /> : <RefreshCw className="w-3.5 h-3.5" />}
             Run
           </Button>
         </div>
 
         {/* Result body */}
-        <div className="max-h-[460px] overflow-y-auto">
+        <div>
           {!response && running && (
-            <div className="px-5 py-12 flex items-center justify-center text-[12px] text-muted-foreground">
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" /> running sandbox…
+            <div className="px-4 py-12 flex items-center justify-center text-[12px] text-muted-foreground">
+              <LoadingIcon className="w-4 h-4 mr-2" /> running sandbox…
             </div>
           )}
           {response && (
             <PreviewResultBody response={response} />
           )}
         </div>
-      </DialogContent>
-    </Dialog>
+    </DetailSheet>
   );
 }
 
@@ -179,7 +174,7 @@ function PreviewResultBody({ response }: { response: PreviewResponse }) {
   // 1. Backend-declined preview (native / identity / missing code) — show note.
   if (response.note) {
     return (
-      <div className="px-5 py-5 text-[12.5px] text-muted-foreground" style={{ textWrap: 'pretty' }}>
+      <div className="px-4 py-4 text-[12.5px] text-muted-foreground" style={{ textWrap: 'pretty' }}>
         <div className="flex items-start gap-2">
           <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
           <span>{response.note}</span>
@@ -189,7 +184,7 @@ function PreviewResultBody({ response }: { response: PreviewResponse }) {
   }
 
   return (
-    <div className="px-5 py-4 space-y-3">
+    <div className="px-4 py-3 space-y-3">
       {/* Status row */}
       <div className="flex items-center gap-2 text-[11px] font-mono">
         {response.success ? (

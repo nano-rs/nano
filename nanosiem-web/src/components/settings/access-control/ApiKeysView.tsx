@@ -13,6 +13,12 @@
  *
  * Mockup features parked until backend support lands:
  *   • IP allowlist — `ApiKeySummary` has no `ip_ranges` field.
+ *
+ * Hosted-shared tenants (NAN-2361): the client maps the tenant automation-key
+ * registry onto the same types (`lib/shared-automation-keys.ts`). What differs
+ * on the page is lifecycle: revoke is terminal (no Enable, no separate Delete —
+ * a revoked key stays listed), keys can be `expired`, and rotate is the only
+ * way to a new secret. `useSharedTenant()` gates exactly those controls.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -24,13 +30,14 @@ import {
   RefreshCw,
   AlertCircle,
   Check,
-  Loader2,
   ShieldOff,
   Pencil,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import {
   api,
   type ApiKeySummary,
@@ -50,24 +57,27 @@ import {
 } from '@/components/ui/alert-dialog';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC, formatRelativeCompact } from '@/lib/date-utils';
+import { isSharedKeyScope } from '@/lib/shared-automation-keys';
 import { CreateApiKeyDialog } from './CreateApiKeyDialog';
 import { EditApiKeyDialog } from './EditApiKeyDialog';
 import { CallVolumeChart } from './CallVolumeChart';
 
-type DerivedStatus = 'active' | 'expiring' | 'unused' | 'revoked';
+type DerivedStatus = 'active' | 'expiring' | 'expired' | 'unused' | 'revoked';
 
 const STATUS_PILL: Record<DerivedStatus, { label: string; cls: string }> = {
   active: { label: 'Active', cls: 'bg-emerald-500/15 text-emerald-500 border-emerald-500/30' },
   expiring: { label: 'Expiring', cls: 'bg-yellow-500/12 text-yellow-500 border-yellow-500/30' },
+  expired: { label: 'Expired', cls: 'bg-foreground/10 text-muted-foreground border-border' },
   unused: { label: 'Unused', cls: 'bg-foreground/10 text-muted-foreground border-border' },
   revoked: { label: 'Revoked', cls: 'bg-red-500/12 text-red-500 border-red-500/30' },
 };
 
-function deriveStatus(k: ApiKeySummary): DerivedStatus {
-  if (!k.enabled) return 'revoked';
+function deriveStatus(k: ApiKeySummary, now = Date.now()): DerivedStatus {
+  if (!k.enabled || k.status === 'revoked') return 'revoked';
   if (k.expires_at) {
     const expiresMs = new Date(k.expires_at).getTime();
-    const days = (expiresMs - Date.now()) / 86_400_000;
+    const days = (expiresMs - now) / 86_400_000;
+    if (k.status === 'expired' || days <= 0) return 'expired';
     if (days < 14) return 'expiring';
   }
   if (!k.last_used_at) return 'unused';
@@ -139,6 +149,8 @@ function ApiKeyListItem({ apiKey, selected, onSelect }: ApiKeyListItemProps) {
 interface ApiKeyDetailProps {
   apiKey: ApiKeySummary;
   permissions: PermissionInfo[];
+  /** Hosted-shared tenant: revoke is terminal, no enable / delete. */
+  sharedTenant: boolean;
   onEdit: () => void;
   onRotate: () => void;
   onRevoke: () => void;
@@ -146,11 +158,16 @@ interface ApiKeyDetailProps {
   onDelete: () => void;
 }
 
-function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnable, onDelete }: ApiKeyDetailProps) {
+function ApiKeyDetail({ apiKey, permissions, sharedTenant, onEdit, onRotate, onRevoke, onEnable, onDelete }: ApiKeyDetailProps) {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('apikeys:edit');
   const canDelete = hasPermission('apikeys:delete');
   const status = deriveStatus(apiKey);
+  // A shared registry only rotates a live (non-expired) key; an expired one
+  // can still be edited (extend expiry) or revoked.
+  const canRotate = apiKey.enabled && !(sharedTenant && status === 'expired');
+  // On a shared tenant revoke IS the delete: same DELETE verb, `apikeys:delete`.
+  const canRevoke = sharedTenant ? canDelete : canEdit;
 
   const permissionMap = useMemo(() => new Map(permissions.map(p => [p.id, p])), [permissions]);
 
@@ -180,39 +197,49 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
               {apiKey.expires_at && (
                 <>
                   <span>·</span>
-                  <span>expires {formatUTC(apiKey.expires_at)}</span>
+                  <span>{status === 'expired' ? 'expired' : 'expires'} {formatUTC(apiKey.expires_at)}</span>
+                </>
+              )}
+              {apiKey.revoked_at && (
+                <>
+                  <span>·</span>
+                  <span>revoked {formatUTC(apiKey.revoked_at)}</span>
                 </>
               )}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            {canEdit && (
+            {canEdit && (!sharedTenant || apiKey.enabled) && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onEdit}>
                 <Pencil className="w-[11px] h-[11px]" />
                 Edit
               </Button>
             )}
-            {canEdit && apiKey.enabled && (
+            {canEdit && canRotate && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onRotate}>
                 <RefreshCw className="w-[11px] h-[11px]" />
                 Rotate
               </Button>
             )}
-            {canEdit && (apiKey.enabled ? (
+            {canRevoke && apiKey.enabled && (
               <Button
                 size="sm"
                 variant="outline"
-                className="h-7 text-[11.5px] px-2.5 text-yellow-500 hover:text-yellow-500/90"
+                className={cn(
+                  'h-7 text-[11.5px] px-2.5',
+                  sharedTenant ? 'text-red-500 hover:text-red-500/90' : 'text-yellow-500 hover:text-yellow-500/90',
+                )}
                 onClick={onRevoke}
               >
                 <ShieldOff className="w-[11px] h-[11px]" />
                 Revoke
               </Button>
-            ) : (
+            )}
+            {canEdit && !apiKey.enabled && !sharedTenant && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onEnable}>
                 Enable
               </Button>
-            ))}
+            )}
           </div>
         </div>
         {apiKey.description && (
@@ -232,7 +259,7 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           <Labeled label="Expires" mono>{apiKey.expires_at ? formatUTC(apiKey.expires_at) : 'Never'}</Labeled>
         </div>
 
-        <CallVolumeChart apiKeyId={apiKey.id} />
+        <CallVolumeChart apiKeyId={apiKey.id} sharedTenant={sharedTenant} />
 
         {/* Scopes */}
         <div>
@@ -270,15 +297,18 @@ function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnabl
           </div>
         )}
 
-        {/* Danger zone */}
-        {canDelete && (
+        {/* Danger zone. Shared tenants: revoke is the terminal action and the
+            row stays as audit history, so there is no separate delete. */}
+        {canDelete && (sharedTenant ? apiKey.enabled : true) && (
           <div className="rounded-md border border-red-500/25 bg-red-500/5 p-3 flex items-center gap-3">
             <AlertCircle className="w-[13px] h-[13px] text-red-500 shrink-0" />
             <div className="flex-1 text-[11.5px] text-foreground/80">
-              Deleting a key removes it permanently. Active sessions using it will fail their next request.
+              {sharedTenant
+                ? 'Revoking a key is permanent on this tenant. Requests using it fail immediately; the key stays listed as revoked.'
+                : 'Deleting a key removes it permanently. Active sessions using it will fail their next request.'}
             </div>
-            <button onClick={onDelete} className="text-[11px] text-red-500 hover:underline shrink-0">
-              Delete key
+            <button onClick={sharedTenant ? onRevoke : onDelete} className="text-[11px] text-red-500 hover:underline shrink-0">
+              {sharedTenant ? 'Revoke key' : 'Delete key'}
             </button>
           </div>
         )}
@@ -331,6 +361,7 @@ function RevealOnceCard({ secret, onDismiss }: RevealOnceCardProps) {
 export function ApiKeysView() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
+  const sharedTenant = useSharedTenant();
   const canCreate = hasPermission('apikeys:create');
 
   const [keys, setKeys] = useState<ApiKeySummary[]>([]);
@@ -353,10 +384,13 @@ export function ApiKeysView() {
         api.listApiKeys(),
         api.listPermissions().catch(() => []),
       ]);
-      setKeys(keysRes.api_keys);
-      setPermissions(permsRes);
-      if (!selectedId && keysRes.api_keys.length > 0) {
-        setSelectedId(keysRes.api_keys[0].id);
+      const nextKeys = Array.isArray(keysRes.api_keys) ? keysRes.api_keys : [];
+      setKeys(nextKeys);
+      // A shared registry issues only scopes the owner holds (and never a
+      // platform-ambient one), so offer exactly those instead of a 403 later.
+      setPermissions(sharedTenant ? permsRes.filter(p => isSharedKeyScope(p.id) && hasPermission(p.id)) : permsRes);
+      if (!selectedId && nextKeys.length > 0) {
+        setSelectedId(nextKeys[0].id);
       }
     } catch (err) {
       toast({
@@ -390,7 +424,9 @@ export function ApiKeysView() {
     if (!pendingRevoke) return;
     setActionLoading(true);
     try {
-      await api.disableApiKey(pendingRevoke.id);
+      // Shared registry: revoke is the DELETE verb and is terminal.
+      if (sharedTenant) await api.deleteApiKey(pendingRevoke.id);
+      else await api.disableApiKey(pendingRevoke.id);
       toast({ title: 'Key revoked', description: `${pendingRevoke.name} can no longer call the API.` });
       setPendingRevoke(null);
       await fetchAll();
@@ -494,7 +530,7 @@ export function ApiKeysView() {
           <div className="flex-1 overflow-y-auto scrollbar-thin">
             {loading ? (
               <div className="flex items-center justify-center py-12">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                <LoadingIcon className="w-4 h-4 text-muted-foreground" />
               </div>
             ) : filtered.length === 0 ? (
               <div className="px-4 py-8 text-center text-[11.5px] text-muted-foreground">
@@ -512,7 +548,7 @@ export function ApiKeysView() {
             )}
           </div>
           <div className="shrink-0 h-8 px-3 border-t border-border flex items-center font-mono text-[10.5px] text-muted-foreground">
-            {keys.length} keys · {keys.filter(k => !k.enabled).length} revoked
+            {keys.length} keys · {keys.filter(k => deriveStatus(k) === 'revoked').length} revoked
           </div>
         </div>
 
@@ -520,6 +556,7 @@ export function ApiKeysView() {
           <ApiKeyDetail
             apiKey={selected}
             permissions={permissions}
+            sharedTenant={sharedTenant}
             onEdit={() => setShowEdit(true)}
             onRotate={() => setPendingRotate(selected)}
             onRevoke={() => setPendingRevoke(selected)}
@@ -563,10 +600,17 @@ export function ApiKeysView() {
         variant="danger"
         title="Revoke API key"
         description={
-          <>
-            Revoke <span className="text-foreground font-medium">{pendingRevoke?.name}</span>? This
-            is reversible — you can re-enable the key from its detail panel.
-          </>
+          sharedTenant ? (
+            <>
+              Revoke <span className="text-foreground font-medium">{pendingRevoke?.name}</span>? This
+              cannot be undone — the key stops working immediately and stays listed as revoked.
+            </>
+          ) : (
+            <>
+              Revoke <span className="text-foreground font-medium">{pendingRevoke?.name}</span>? This
+              is reversible — you can re-enable the key from its detail panel.
+            </>
+          )
         }
         confirmLabel="Revoke"
         loadingLabel="Revoking…"
@@ -613,7 +657,7 @@ export function ApiKeysView() {
           <AlertDialogFooter className="border-t border-border px-5 py-3 flex flex-row items-center gap-2 sm:justify-end space-x-0">
             <AlertDialogCancel className="h-7 text-[11.5px] mt-0">Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={handleRotate} disabled={actionLoading} className="h-7 text-[11.5px]">
-              {actionLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+              {actionLoading && <LoadingIcon className="w-3 h-3" />}
               Rotate
             </AlertDialogAction>
           </AlertDialogFooter>

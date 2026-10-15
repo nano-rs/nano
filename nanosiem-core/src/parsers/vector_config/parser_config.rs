@@ -47,6 +47,83 @@ src_type = downcase(to_string(%source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 . = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }"#;
 
+/// NAN-3079: the lake bronze form of `unmapped`, inserted into
+/// [`OCSF_PREPARE_VRL`] before the row is shaped (tenant parser bundles only).
+///
+/// The bronze sink encodes each Vector batch as ONE Parquet file whose schema
+/// is inferred from that batch (`schema_mode = "auto_infer"`). `unmapped` is
+/// the schema-free part of an OCSF row: the residual spill writes an empty or
+/// scalar array as a list but an array of objects as a JSON string, and a
+/// source field can be a number in one event and a string in the next. One
+/// such value in a batch fails the Arrow encode and Vector drops the WHOLE
+/// batch (every source's rows in it), which is how the lean visibility gate
+/// lost `conduit_proxy` probes (`threat_signals: []`) plus blaster rows.
+///
+/// Carried as one JSON string, `unmapped` is always a string column in
+/// bronze. ingest[T] decodes it back into the object before admission
+/// (`nanosiem_lake_worker::bronze::decode_bronze_unmapped`), so parts and
+/// search are unchanged.
+const LAKE_BRONZE_UNMAPPED_VRL: &str = r#"# NAN-3079: one JSON string, so a type-drifted unmapped value can never fail
+# (and drop) the whole bronze Parquet batch. ingest[T] decodes it back.
+if is_object(ocsf_event.unmapped) { ocsf_event.unmapped = encode_json(ocsf_event.unmapped) }
+"#;
+
+/// [`OCSF_PREPARE_VRL`] with [`LAKE_BRONZE_UNMAPPED_VRL`] spliced in before
+/// the row is shaped (after `ocsf_event` is bound).
+fn ocsf_prepare_vrl(lake_bronze: bool) -> String {
+    if !lake_bronze {
+        return OCSF_PREPARE_VRL.to_string();
+    }
+    let (head, tail) = OCSF_PREPARE_VRL
+        .split_once("\n. = {")
+        .expect("OCSF_PREPARE_VRL shapes the row last");
+    format!("{head}\n{LAKE_BRONZE_UNMAPPED_VRL}. = {{{tail}")
+}
+
+/// Knobs for [`VectorConfigManager::generate_parser_config_with`].
+///
+/// The default reproduces [`VectorConfigManager::generate_parser_config`]
+/// byte for byte. The tenant parser-bundle build (NAN-2604) needs every knob:
+/// its output is content-addressed, so it cannot depend on the wall clock or
+/// on the builder's environment, and a tenant-authored parser must not be able
+/// to choose the source label its rows are stored under.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParserConfigOptions<'a> {
+    /// Fixed `# Generated at:` header value. `None` stamps `Utc::now()`.
+    pub generated_at: Option<&'a str>,
+    /// Force the NAN-1246 OCSF lane on or off. `None` reads
+    /// `NANO_SCHEMA_PROFILE` like the deploy path.
+    pub ocsf: Option<bool>,
+    /// Pin `_output`'s `source_type` to this value, ignoring any
+    /// `.source_type` the parser VRL set on the event. `None` keeps the
+    /// trusted-parser behaviour (event value, falling back to the parser's).
+    pub pinned_source_type: Option<&'a str>,
+    /// NAN-3079: the lane feeds the lake bronze Parquet sink (tenant parser
+    /// bundles): carry `unmapped` as one JSON string so per-batch schema
+    /// inference cannot fail on a type-drifted value. `false` (the legacy
+    /// deploy paths) keeps the prepare VRL byte for byte.
+    pub lake_bronze: bool,
+    /// NAN-3197: also sample the OCSF lane. The `{name}_sample` step reads
+    /// `{name}_output` (the UDM lane) only, so an OCSF parser's events, which
+    /// leave through `{name}_ocsf_prepare`, were never sampled. With this set
+    /// and a ratio below 1, the generator also emits `{name}_ocsf_sample`
+    /// after `{name}_ocsf_prepare` (which stays the pre-sampling parser-health
+    /// identity) with the same semantics: parse failures are never dropped and
+    /// the exclude condition is honoured, evaluated on the parsed OCSF event.
+    /// `false` (the legacy deploy paths) keeps the output byte for byte.
+    pub sample_ocsf_lane: bool,
+}
+
+/// Encode `value` as a TOML basic string. JSON string escaping is a subset of
+/// TOML's except for U+007F (DEL), which JSON leaves raw and TOML forbids
+/// unescaped; one DEL in a processing-plan literal would otherwise make the
+/// whole generated parser file invalid TOML.
+pub(crate) fn toml_basic_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .expect("string serialization")
+        .replace('\u{7f}', "\\u007f")
+}
+
 impl VectorConfigManager {
     /// Generate Vector TOML config for a single parser (returns string)
     pub fn generate_parser_config_string(&self, parser: &Parser) -> String {
@@ -55,16 +132,29 @@ impl VectorConfigManager {
 
     /// Generate Vector TOML config for a single parser
     pub(super) fn generate_parser_config(&self, parser: &Parser) -> String {
+        self.generate_parser_config_with(parser, &ParserConfigOptions::default())
+    }
+
+    /// [`Self::generate_parser_config`] with explicit, environment-free knobs.
+    pub fn generate_parser_config_with(
+        &self,
+        parser: &Parser,
+        options: &ParserConfigOptions<'_>,
+    ) -> String {
         // NAN-942: the parser name lands in a single-line TOML comment.
         // Without escape, an admin-set name containing a literal newline
         // could close the comment and inject TOML structure on the next
         // line (e.g. a fresh [sinks.X] section).
+        let generated_at = options
+            .generated_at
+            .map(safe_for_toml_comment)
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         let mut config = format!(
             "# Auto-generated Vector configuration for parser: {}\n\
              # DO NOT EDIT - changes will be overwritten\n\
              # Generated at: {}\n\n",
             safe_for_toml_comment(&parser.name),
-            chrono::Utc::now().to_rfc3339()
+            generated_at
         );
 
         let safe_name = Self::safe_name(&parser.name);
@@ -72,6 +162,15 @@ impl VectorConfigManager {
         let extension_name = format!("{}_extension", safe_name);
 
         let (source_config, source_name) = self.generate_source_config(parser);
+
+        let pipe_plan = crate::parsers::pipe::stored_plan(&parser.parser_vrl)
+            .ok()
+            .flatten()
+            .filter(|plan| plan.has_native());
+        let pipe_chain = pipe_plan.as_ref().map(|plan| {
+            crate::parsers::pipe::native::render(plan, &safe_name, &parse_name)
+                .expect("validated native plan")
+        });
 
         let has_extension = parser.extension_enabled
             && parser
@@ -84,7 +183,18 @@ impl VectorConfigManager {
         let parser_is_stub = parser.parser_vrl.trim().is_empty();
         let skip_parse_transform = has_extension && parser_is_stub;
 
-        let transform_config = if skip_parse_transform {
+        let transform_config = if let Some(chain) = &pipe_chain {
+            let mut alias = parser.clone();
+            alias.parser_vrl = ".".into();
+            let mut text = self.generate_transform_config(&alias, &source_name);
+            let mut document = toml::Table::new();
+            document.insert("transforms".into(), chain.transforms.clone().into());
+            if !chain.tables.is_empty() {
+                document.insert("enrichment_tables".into(), chain.tables.clone().into());
+            }
+            text.push_str(&toml::to_string(&document).expect("native config"));
+            text
+        } else if skip_parse_transform {
             String::new()
         } else {
             self.generate_transform_config(parser, &source_name)
@@ -102,12 +212,17 @@ impl VectorConfigManager {
             extension_name.clone()
         } else if skip_parse_transform {
             source_name.clone()
+        } else if let Some(chain) = &pipe_chain {
+            chain.output.clone()
         } else {
             parse_name.clone()
         };
         let mut failure_inputs = Vec::new();
         if !skip_parse_transform {
             failure_inputs.push(format!("{parse_name}.dropped"));
+            if let Some(chain) = &pipe_chain {
+                failure_inputs.extend(chain.failures.clone());
+            }
         }
         if has_extension {
             failure_inputs.push(format!("{extension_name}.dropped"));
@@ -116,6 +231,8 @@ impl VectorConfigManager {
         let extension_config = if has_extension {
             let extension_input = if skip_parse_transform {
                 source_name.clone()
+            } else if let Some(chain) = &pipe_chain {
+                chain.output.clone()
             } else {
                 parse_name.clone()
             };
@@ -131,17 +248,24 @@ impl VectorConfigManager {
         // NANO_SCHEMA_PROFILE=ocsf so UDM deployments stay byte-identical (no lane).
         // The shared `clickhouse_ocsf_logs` sink is emitted once by the deploy
         // orchestration (inputs = every parser's `_ocsf_prepare`).
-        let (ocsf_lane_config, successful_output_input) = if Self::ocsf_mode() {
-            let split_name = format!("{}_ocsf_split", safe_name);
-            let lane = self.generate_ocsf_lane(&safe_name, &successful_output_input, parser.id);
-            (lane, format!("{}._unmatched", split_name))
-        } else {
-            (String::new(), successful_output_input)
-        };
+        let (ocsf_lane_config, successful_output_input) =
+            if options.ocsf.unwrap_or_else(Self::ocsf_mode) {
+                let split_name = format!("{}_ocsf_split", safe_name);
+                let mut lane = self.generate_ocsf_lane(&safe_name, &successful_output_input, parser.id, options.lake_bronze);
+                if options.sample_ocsf_lane {
+                    if let Some(sampled) = Self::sample_ocsf_lane(&lane, &safe_name, parser) {
+                        lane = sampled;
+                    }
+                }
+                (lane, format!("{}._unmatched", split_name))
+            } else {
+                (String::new(), successful_output_input)
+            };
 
         let mut output_inputs = vec![successful_output_input];
         output_inputs.extend(failure_inputs);
-        let output_config = self.generate_output_transform(parser, &output_inputs);
+        let output_config =
+            self.generate_output_transform(parser, &output_inputs, options.pinned_source_type);
 
         config.push_str(&source_config);
         config.push_str("\n");
@@ -167,13 +291,17 @@ impl VectorConfigManager {
         config
     }
 
-    /// NAN-1246: true only under `NANO_SCHEMA_PROFILE=ocsf` — the deployment-wide
-    /// gate for generating the native-OCSF ingestion lane. UDM (default) → false,
-    /// so no OCSF transforms/sink are emitted and the config is byte-identical.
+    /// NAN-1246: the deployment-wide gate for generating the native-OCSF
+    /// ingestion lane. NAN-3491: true when `NANO_SCHEMA_PROFILE` is unset or
+    /// `ocsf`; a refused legacy value (`udm`) renders without the lane. Only the
+    /// schema id matters here, so this does not build the manifest profile.
     pub(crate) fn ocsf_mode() -> bool {
-        crate::schema::active_profile_from_env()
-            .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
-            .unwrap_or(false)
+        crate::schema::runtime_profile::runtime_schema_id()
+            .is_ok_and(|id| id == crate::schema::SchemaId::Ocsf)
+    }
+
+    pub(crate) fn lake_mode() -> bool {
+        crate::schema::log_query_backend_is_lake()
     }
 
     /// NAN-1246: per-parser OCSF fork. Routes events whose VRL emitted a root
@@ -187,6 +315,7 @@ impl VectorConfigManager {
         safe_name: &str,
         input_name: &str,
         parser_id: uuid::Uuid,
+        lake_bronze: bool,
     ) -> String {
         let split = format!("{}_ocsf_split", safe_name);
         let prepare = format!("{}_ocsf_prepare", safe_name);
@@ -209,8 +338,58 @@ impl VectorConfigManager {
              ._nano_parser_id = \"{parser_id}\"\n\
              ._nano_parser_failure = false\n\
              '''\n",
-            vrl = OCSF_PREPARE_VRL
+            vrl = ocsf_prepare_vrl(lake_bronze)
         )
+    }
+
+    /// NAN-3197: [`Self::generate_ocsf_lane`] plus `{name}_ocsf_sample`, or
+    /// `None` when the parser has no ratio strictly between 0 and 1.
+    ///
+    /// The exclude condition is a VRL expression over the parsed event, but
+    /// the sample step reads the shaped `{event, timestamp, source_type}` row
+    /// and a Vector condition cannot rebind `.` (it is read-only). So
+    /// `{name}_ocsf_prepare` evaluates the expression while `.` is still the
+    /// OCSF event and carries the verdict as `._nano_sampling_exclude`, beside
+    /// `._nano_parser_failure` on the row envelope (the lake storage prepare
+    /// keeps only `.event`). The same expression is also `{name}_sample`'s
+    /// read-only condition, so one that mutates the event never validates.
+    fn sample_ocsf_lane(lane: &str, safe_name: &str, parser: &Parser) -> Option<String> {
+        let ratio = parser.sampling_ratio.filter(|ratio| *ratio > 0.0 && *ratio < 1.0)?;
+        let prepare = format!("{safe_name}_ocsf_prepare");
+        let sample = format!("{safe_name}_ocsf_sample");
+        let mut lane = lane.to_string();
+        let mut exclude = String::from("to_bool(._nano_parser_failure) ?? false");
+        let user_exclude = parser
+            .sampling_exclude_condition
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        if let Some(condition) = user_exclude {
+            // SECURITY: spliced into a `'''` literal: keep it one line and
+            // unable to close the literal (same rule as the parser VRL).
+            let condition = condition.replace("'''", "' ' '").replace(['\r', '\n'], " ");
+            let bind = "ocsf_event = .\n";
+            let at = lane.find(bind).expect("OCSF prepare binds the event first") + bind.len();
+            lane.insert_str(
+                at,
+                &format!(
+                    "# NAN-3197: the source's sampling exclude condition, on the parsed OCSF event.\n\
+                     nano_sampling_exclude = ({condition}) == true\n"
+                ),
+            );
+            let marker = "._nano_parser_failure = false\n";
+            let at = lane.rfind(marker).expect("OCSF prepare marks the parser failure") + marker.len();
+            lane.insert_str(at, "._nano_sampling_exclude = nano_sampling_exclude\n");
+            exclude = format!("({exclude}) || (to_bool(._nano_sampling_exclude) ?? false)");
+        }
+        lane.push_str(&format!(
+            "\n[transforms.{sample}]\n\
+             type = \"sample\"\n\
+             inputs = [\"{prepare}\"]\n\
+             ratio = {ratio}\n\
+             exclude = \"{exclude}\"\n"
+        ));
+        Some(lane)
     }
 
     /// Generate the optional `{safe_name}_extension` remap transform (NAN-874).
@@ -221,6 +400,13 @@ impl VectorConfigManager {
     pub(super) fn generate_extension_transform(&self, parser: &Parser, input_name: &str) -> String {
         let safe_name = Self::safe_name(&parser.name);
         let extension_name = format!("{}_extension", safe_name);
+
+        if let Some(source) = parser.extension_vrl.as_deref().filter(|s| s.starts_with(crate::parsers::pipe::HEADER)) {
+            let program = crate::parsers::pipe::runtime_program(source)
+                .unwrap_or_else(|_| "abort # invalid processing extension".into());
+            let source = toml_basic_string(&program);
+            return format!("[transforms.{extension_name}]\ntype = \"remap\"\ninputs = [\"{input_name}\"]\ndrop_on_abort = true\ndrop_on_error = true\nreroute_dropped = true\nsource = {source}\n");
+        }
 
         // SECURITY: same TOML-injection sanitization as parser_vrl.
         let sanitized_vrl = parser
@@ -282,8 +468,15 @@ impl VectorConfigManager {
 
         // SECURITY: Sanitize VRL code to prevent TOML injection
         // The validator should have already blocked ''', but double-check here
-        let sanitized_vrl = parser
-            .parser_vrl
+        let runtime_vrl = crate::parsers::pipe::runtime_program(&parser.parser_vrl)
+            .unwrap_or_else(|_| "abort # invalid processing plan".into());
+        if parser.parser_vrl.starts_with(crate::parsers::pipe::HEADER) {
+            // A TOML basic string preserves every literal, including triple
+            // quotes, rather than modifying tenant data to fit a delimiter.
+            let source = toml_basic_string(&runtime_vrl);
+            return format!("[transforms.{transform_name}]\ntype = \"remap\"\ninputs = [\"{source_name}\"]\ndrop_on_abort = true\ndrop_on_error = true\nreroute_dropped = true\nsource = {source}\n");
+        }
+        let sanitized_vrl = runtime_vrl
             .replace("'''", "' ' '") // Break up triple quotes
             .replace("\r\n", "\n") // Normalize line endings
             .replace("\r", "\n");
@@ -321,6 +514,7 @@ impl VectorConfigManager {
         &self,
         parser: &Parser,
         input_names: &[String],
+        pinned_source_type: Option<&str>,
     ) -> String {
         let safe_name = Self::safe_name(&parser.name);
         let output_name = format!("{}_output", safe_name);
@@ -336,6 +530,25 @@ impl VectorConfigManager {
             safe_name.clone()
         } else {
             parser.source_type.clone()
+        };
+
+        let source_type_block = match pinned_source_type {
+            // A tenant parser runs untrusted VRL: whatever it wrote to
+            // `.source_type` is discarded, so it cannot relabel its rows as
+            // another source (the label source-visibility RBAC keys on).
+            Some(pinned) => format!(
+                "# Pinned source_type: parser VRL cannot choose its storage label\n\
+                 st_val = \"{}\"\n",
+                escape_vrl_string(pinned)
+            ),
+            None => format!(
+                "# Handle source_type - use .source_type if set, otherwise default\n\
+                 st_val = .source_type\n\
+                 if st_val == null {{\n\
+                 st_val = \"{}\"\n\
+                 }}\n",
+                output_source_type
+            ),
         };
 
         // Generate timezone VRL if non-UTC
@@ -402,11 +615,7 @@ impl VectorConfigManager {
                  ext_val = {{}}\n\
              }}\n\
              \n\
-             # Handle source_type - use .source_type if set, otherwise default\n\
-             st_val = .source_type\n\
-             if st_val == null {{\n\
-                 st_val = \"{}\"\n\
-             }}\n\
+             {}\
              \n\
              # Preserve message and udm object\n\
              msg_val = .message\n\
@@ -456,7 +665,7 @@ impl VectorConfigManager {
                 .unwrap_or_default(),
             parser.id,
             escape_vrl_string(&parser.name),
-            output_source_type,
+            source_type_block,
             // NAN-942: metadata fields are admin-controlled string scalars
             // that flow into VRL double-quoted literals (`.vendor = "{}"`).
             // Without escape, a value containing `"`, `\`, or `\n` would
@@ -475,6 +684,7 @@ impl VectorConfigManager {
 #[cfg(test)]
 mod tests {
     use super::super::VectorConfigManager;
+    use super::ParserConfigOptions;
     use crate::parsers::types::Parser;
     use chrono::Utc;
     use uuid::Uuid;
@@ -521,12 +731,25 @@ mod tests {
         VectorConfigManager::new(std::path::PathBuf::from("/tmp/nanosiem-test"))
     }
 
+    /// Render with the OCSF lane forced off: these tests pin the parse →
+    /// extension → output chain itself, independent of the deployment's schema
+    /// profile (which defaults to OCSF since NAN-3491).
+    fn udm_lane_config(m: &VectorConfigManager, p: &Parser) -> String {
+        m.generate_parser_config_with(
+            p,
+            &ParserConfigOptions {
+                ocsf: Some(false),
+                ..ParserConfigOptions::default()
+            },
+        )
+    }
+
     /// Without an enabled extension, output reads directly from _parse — same as before NAN-874.
     #[test]
     fn extension_disabled_keeps_parse_to_output_chain() {
         let m = manager();
         let p = make_parser(".message = string!(.message)", None, false);
-        let config = m.generate_parser_config_string(&p);
+        let config = udm_lane_config(&m, &p);
 
         assert!(config.contains("[transforms.test_apache_parse]"));
         assert!(config.contains("[transforms.test_apache_output]"));
@@ -564,6 +787,49 @@ mod tests {
         );
     }
 
+    /// NAN-2604: the default options reproduce the pre-options output: the
+    /// trusted-parser source_type fallback and a wall-clock header.
+    #[test]
+    fn default_options_keep_the_trusted_source_type_block() {
+        let m = manager();
+        let p = make_parser(".message = string!(.message)", None, false);
+        let config = m.generate_parser_config_string(&p);
+        assert!(
+            config.contains(
+                "# Handle source_type - use .source_type if set, otherwise default\n\
+                 st_val = .source_type\n\
+                 if st_val == null {\n\
+                 st_val = \"test_apache\"\n\
+                 }\n\
+                 \n\
+                 # Preserve message and udm object\n"
+            ),
+            "{config}"
+        );
+        assert!(config.contains("# Generated at: 20"), "{config}");
+    }
+
+    /// NAN-2604: explicit options make the output clock- and env-free and
+    /// pin the storage label.
+    #[test]
+    fn explicit_options_pin_label_clock_and_lane() {
+        let m = manager();
+        let p = make_parser(".message = string!(.message)", None, false);
+        let options = super::ParserConfigOptions {
+            generated_at: Some("fixed"),
+            ocsf: Some(true),
+            pinned_source_type: Some("acme"),
+            lake_bronze: false,
+            sample_ocsf_lane: false,
+        };
+        let a = m.generate_parser_config_with(&p, &options);
+        assert_eq!(a, m.generate_parser_config_with(&p, &options));
+        assert!(a.contains("# Generated at: fixed\n"));
+        assert!(a.contains("[transforms.test_apache_ocsf_prepare]"));
+        assert!(a.contains("st_val = \"acme\"\n"));
+        assert!(!a.contains("st_val = .source_type"));
+    }
+
     /// An empty/blank extension_vrl should be treated as no extension even when extension_enabled=true.
     #[test]
     fn extension_enabled_but_blank_is_ignored() {
@@ -586,7 +852,7 @@ mod tests {
             Some(".team = \"soc\""),
             true,
         );
-        let config = m.generate_parser_config_string(&p);
+        let config = udm_lane_config(&m, &p);
 
         assert!(config.contains("[transforms.test_apache_parse]"));
         assert!(config.contains("[transforms.test_apache_extension]"));
@@ -635,7 +901,7 @@ mod tests {
     fn stub_case_skips_parse_and_extension_reads_from_source() {
         let m = manager();
         let p = make_parser("", Some(".message = string!(.raw)"), true);
-        let config = m.generate_parser_config_string(&p);
+        let config = udm_lane_config(&m, &p);
 
         assert!(
             !config.contains("[transforms.test_apache_parse]"),
@@ -856,6 +1122,78 @@ mod tests {
         );
     }
 
+    /// NAN-3079 regression: the lake-bronze prepare VRL compiles, carries
+    /// `unmapped` as ONE JSON string (the exact conduit probe shape that
+    /// dropped whole bronze batches: `threat_signals: []` next to rows whose
+    /// `threat_signals` is a string), and leaves the rest of the row alone.
+    /// The legacy (ClickHouse) lane stays byte for byte.
+    #[test]
+    fn lake_bronze_prepare_carries_unmapped_as_one_json_string() {
+        use vrl::compiler::runtime::Runtime;
+        use vrl::compiler::state::RuntimeState;
+        use vrl::compiler::{compile, TargetValue, TimeZone};
+        use vrl::value::{Secrets, Value};
+
+        assert_eq!(super::ocsf_prepare_vrl(false), super::OCSF_PREPARE_VRL);
+        let source = super::ocsf_prepare_vrl(true);
+        let program = compile(&source, &vrl::stdlib::all())
+            .unwrap_or_else(|e| panic!("lake prepare VRL failed to compile: {e:?}\n{source}"))
+            .program;
+        let run = |event: serde_json::Value| -> serde_json::Value {
+            let mut metadata = vrl::value::ObjectMap::new();
+            metadata.insert("source_type".into(), Value::from("conduit_proxy"));
+            let mut target = TargetValue {
+                value: Value::from(event),
+                metadata: Value::Object(metadata),
+                secrets: Secrets::new(),
+            };
+            Runtime::new(RuntimeState::default())
+                .resolve(&mut target, &program, &TimeZone::Local)
+                .expect("lake prepare VRL runs");
+            target.value.try_into().expect("JSON row")
+        };
+
+        let probe = serde_json::json!({
+            "class_uid": 4002, "time": 1_790_745_903_346_i64,
+            "metadata": {"uid": "u-probe"},
+            "unmapped": {"threat_signals": [], "rule_id": null, "tls_intercepted": true},
+        });
+        let row = run(probe);
+        let encoded = row["event"]["unmapped"].as_str().expect("unmapped is one JSON string");
+        let decoded: serde_json::Value = serde_json::from_str(encoded).unwrap();
+        assert_eq!(decoded, serde_json::json!({"threat_signals": [], "rule_id": null, "tls_intercepted": true}));
+        assert_eq!(row["event"]["metadata"]["uid"], "u-probe");
+        assert_eq!(row["event"]["class_uid"], 4002);
+        assert_eq!(row["source_type"], "conduit_proxy");
+
+        // The blaster shape (a JSON-string spill) gets the same column type.
+        let blaster = run(serde_json::json!({
+            "class_uid": 4002, "time": 1_790_745_903_346_i64,
+            "unmapped": {"threat_signals": "[{\"name\":\"dga_entropy\"}]"},
+        }));
+        assert!(blaster["event"]["unmapped"].is_string());
+
+        // No unmapped: nothing is added.
+        let bare = run(serde_json::json!({"class_uid": 4002, "time": 1_i64}));
+        assert!(bare["event"].get("unmapped").is_none());
+
+        // Only the tenant-bundle (lake) lane carries it.
+        let m = manager();
+        let p = make_parser(".message = string!(.message)", None, false);
+        let mut options = super::ParserConfigOptions {
+            generated_at: Some("fixed"),
+            ocsf: Some(true),
+            pinned_source_type: Some("acme"),
+            lake_bronze: false,
+            sample_ocsf_lane: false,
+        };
+        assert!(!m.generate_parser_config_with(&p, &options).contains("NAN-3079"));
+        options.lake_bronze = true;
+        assert!(m
+            .generate_parser_config_with(&p, &options)
+            .contains("ocsf_event.unmapped = encode_json(ocsf_event.unmapped)"));
+    }
+
     // NAN-1246: the per-parser OCSF lane forks `class_uid` events to `_ocsf_prepare`
     // and its embedded VRL compiles. (Tests `generate_ocsf_lane` directly to avoid
     // the env-racy `ocsf_mode` gate.)
@@ -864,7 +1202,7 @@ mod tests {
         use vrl::compiler::compile;
         let m = manager();
         let parser_id = uuid::Uuid::new_v4();
-        let lane = m.generate_ocsf_lane("apache", "apache_parse", parser_id);
+        let lane = m.generate_ocsf_lane("apache", "apache_parse", parser_id, false);
         assert!(lane.contains("[transforms.apache_ocsf_split]"), "{lane}");
         assert!(lane.contains("inputs = [\"apache_parse\"]"), "{lane}");
         assert!(
@@ -890,5 +1228,188 @@ mod tests {
             compile(vrl, &vrl::stdlib::all()).is_ok(),
             "generated lane VRL failed to compile:\n{vrl}"
         );
+    }
+
+    fn lake_options() -> super::ParserConfigOptions<'static> {
+        super::ParserConfigOptions {
+            generated_at: Some("fixed"),
+            ocsf: Some(true),
+            pinned_source_type: Some("acme"),
+            lake_bronze: true,
+            sample_ocsf_lane: true,
+        }
+    }
+
+    fn block<'c>(config: &'c str, name: &str) -> Option<&'c str> {
+        let header = format!("[transforms.{name}]\n");
+        let start = config.find(&header)?;
+        let rest = &config[start + header.len()..];
+        Some(&rest[..rest.find("\n[transforms.").map_or(rest.len(), |end| end + 1)])
+    }
+
+    /// NAN-3197: with the option off (every legacy deploy path) nothing
+    /// changes; with it on, no ratio / ratio 1 emits no step at all.
+    #[test]
+    fn ocsf_lane_sampling_is_opt_in_and_needs_a_ratio_below_one() {
+        let m = manager();
+        let mut p = make_parser(".message = string!(.message)", None, false);
+        p.sampling_ratio = Some(0.25);
+        let mut off = lake_options();
+        off.sample_ocsf_lane = false;
+        assert!(!m.generate_parser_config_with(&p, &off).contains("_ocsf_sample"));
+        for ratio in [None, Some(1.0)] {
+            p.sampling_ratio = ratio;
+            let config = m.generate_parser_config_with(&p, &lake_options());
+            assert!(!config.contains("type = \"sample\""), "{ratio:?}: {config}");
+            assert!(!config.contains("nano_sampling_exclude"), "{ratio:?}: {config}");
+            assert_eq!(config, m.generate_parser_config_with(&p, &off), "{ratio:?}");
+        }
+    }
+
+    /// NAN-3197: a ratio below 1 samples BOTH lanes. `_ocsf_sample` reads
+    /// `_ocsf_prepare` (which stays the pre-sampling health identity), never
+    /// drops a parse failure and honours the exclude condition, which
+    /// `_ocsf_prepare` evaluates on the parsed OCSF event.
+    #[test]
+    fn ocsf_lane_sampling_keeps_failures_and_honours_the_exclude_condition() {
+        use vrl::compiler::runtime::Runtime;
+        use vrl::compiler::state::RuntimeState;
+        use vrl::compiler::{compile, TargetValue, TimeZone};
+        use vrl::value::{Secrets, Value};
+
+        let m = manager();
+        let mut p = make_parser(".message = string!(.message)", None, false);
+        p.sampling_ratio = Some(0.1);
+        p.sampling_exclude_condition = Some("(to_int(.severity_id) ?? 0) >= 4".to_string());
+        let config = m.generate_parser_config_with(&p, &lake_options());
+
+        let udm = block(&config, "test_apache_sample").expect("UDM lane sample");
+        assert!(udm.contains("inputs = [\"test_apache_output\"]"), "{udm}");
+        assert!(udm.contains("to_bool(._nano_parser_failure) ?? false"), "{udm}");
+        let ocsf = block(&config, "test_apache_ocsf_sample").expect("OCSF lane sample");
+        assert!(ocsf.contains("type = \"sample\""), "{ocsf}");
+        assert!(ocsf.contains("inputs = [\"test_apache_ocsf_prepare\"]"), "{ocsf}");
+        assert!(ocsf.contains("ratio = 0.1"), "{ocsf}");
+        let table: toml::Table = config.parse().expect("valid TOML");
+        let exclude = "(to_bool(._nano_parser_failure) ?? false) || (to_bool(._nano_sampling_exclude) ?? false)";
+        assert_eq!(table["transforms"]["test_apache_ocsf_sample"]["exclude"].as_str(), Some(exclude));
+        let functions = vrl::stdlib::all();
+        assert!(compile(exclude, &functions).is_ok(), "exclude must compile");
+        // Parse failures never take the OCSF lane: the split keeps them on
+        // `_output`, whose `_sample` excludes them.
+        let split = table["transforms"]["test_apache_ocsf_split"]["route"]["ocsf"].as_str().unwrap();
+        assert!(split.contains("!exists(.parse_error)"), "{split}");
+
+        // The prepare VRL compiles and carries the verdict per event.
+        let prepare = table["transforms"]["test_apache_ocsf_prepare"]["source"].as_str().unwrap();
+        let program = compile(prepare, &functions)
+            .unwrap_or_else(|e| panic!("sampled prepare VRL failed to compile: {e:?}\n{prepare}"))
+            .program;
+        let run = |event: serde_json::Value| -> serde_json::Value {
+            let mut target = TargetValue {
+                value: Value::from(event),
+                metadata: Value::Object(vrl::value::ObjectMap::new()),
+                secrets: Secrets::new(),
+            };
+            Runtime::new(RuntimeState::default())
+                .resolve(&mut target, &program, &TimeZone::Local)
+                .expect("sampled prepare VRL runs");
+            target.value.try_into().expect("JSON row")
+        };
+        let critical = run(serde_json::json!({"class_uid": 2004, "time": 1_i64, "severity_id": 5}));
+        assert_eq!(critical["_nano_sampling_exclude"], true, "{critical}");
+        assert_eq!(critical["_nano_parser_failure"], false);
+        assert_eq!(critical["event"]["severity_id"], 5, "the event is unchanged");
+        assert!(critical["event"].get("_nano_sampling_exclude").is_none());
+        let routine = run(serde_json::json!({"class_uid": 2004, "time": 1_i64, "severity_id": 1}));
+        assert_eq!(routine["_nano_sampling_exclude"], false, "{routine}");
+        let absent = run(serde_json::json!({"class_uid": 2004, "time": 1_i64}));
+        assert_eq!(absent["_nano_sampling_exclude"], false, "{absent}");
+    }
+
+    /// NAN-3197: without an exclude condition the OCSF sample only guards
+    /// parse failures, and the prepare VRL is the unsampled one.
+    #[test]
+    fn ocsf_lane_sampling_without_exclude_leaves_prepare_alone() {
+        let m = manager();
+        let mut p = make_parser(".message = string!(.message)", None, false);
+        p.sampling_ratio = Some(0.5);
+        let sampled = m.generate_parser_config_with(&p, &lake_options());
+        let ocsf = block(&sampled, "test_apache_ocsf_sample").expect("OCSF lane sample");
+        assert!(ocsf.contains("exclude = \"to_bool(._nano_parser_failure) ?? false\""), "{ocsf}");
+        assert!(!sampled.contains("nano_sampling_exclude"));
+        p.sampling_ratio = None;
+        let plain = m.generate_parser_config_with(&p, &lake_options());
+        assert_eq!(block(&sampled, "test_apache_ocsf_prepare"), block(&plain, "test_apache_ocsf_prepare"));
+    }
+
+    /// NAN-3197: an extension (and an extension-only stub) feeds the OCSF
+    /// split, so sampling applies after the extension on both lanes.
+    #[test]
+    fn ocsf_lane_sampling_applies_after_the_extension() {
+        let m = manager();
+        for parser_vrl in [".message = string!(.message)", ""] {
+            let mut p = make_parser(parser_vrl, Some(".ext.team = \"red\""), true);
+            p.sampling_ratio = Some(0.2);
+            p.sampling_exclude_condition = Some(".ext.team == \"blue\"".into());
+            let config = m.generate_parser_config_with(&p, &lake_options());
+            let split = block(&config, "test_apache_ocsf_split").expect("split");
+            assert!(split.contains("inputs = [\"test_apache_extension\"]"), "{split}");
+            assert!(block(&config, "test_apache_ocsf_sample").is_some(), "{config}");
+            assert!(block(&config, "test_apache_sample").is_some(), "{config}");
+            assert!(config.contains("nano_sampling_exclude = (.ext.team == \"blue\") == true"), "{config}");
+        }
+    }
+
+    /// NAN-3197: the exclude condition cannot close the `'''` literal it is
+    /// spliced into.
+    #[test]
+    fn ocsf_lane_sampling_exclude_cannot_break_out_of_the_literal() {
+        let m = manager();
+        let mut p = make_parser(".message = string!(.message)", None, false);
+        p.sampling_ratio = Some(0.5);
+        // One line (multi-line conditions are refused upstream, NAN-2604 model).
+        p.sampling_exclude_condition = Some("true)''' [transforms.evil] type = \"remap\" '''(".into());
+        let config = m.generate_parser_config_with(&p, &lake_options());
+        let table: toml::Table = config.parse().expect("still valid TOML");
+        assert!(table["transforms"].get("evil").is_none(), "{config}");
+    }
+
+    /// A processing-plan literal carrying DEL (U+007F) or other control
+    /// characters must still render valid TOML whose `source` round-trips.
+    #[test]
+    fn processing_plan_literals_with_control_characters_render_valid_toml() {
+        let value = "a\u{7f}b\u{1}c\"'''${X}";
+        let plan = crate::parsers::pipe::Plan {
+            version: 2,
+            revision: 1,
+            steps: vec![serde_json::from_value(serde_json::json!({
+                "id": "set", "name": "Set", "kind": "set", "enabled": true,
+                "config": {"field": "note", "value": value}
+            }))
+            .unwrap()],
+        };
+        let stored = format!(
+            "{}{}\n{}",
+            crate::parsers::pipe::HEADER,
+            serde_json::to_string(&plan).unwrap(),
+            crate::parsers::pipe::BODY
+        );
+        let expected = plan.program().unwrap();
+        let m = manager();
+        for p in [
+            make_parser(&stored, None, false),
+            make_parser(". = .", Some(&stored), true),
+        ] {
+            let config = m.generate_parser_config_string(&p);
+            let table: toml::Table = config.parse().expect("valid TOML");
+            let sources: Vec<&str> = table["transforms"]
+                .as_table()
+                .unwrap()
+                .values()
+                .filter_map(|t| t.get("source").and_then(toml::Value::as_str))
+                .collect();
+            assert!(sources.contains(&expected.as_str()), "{config}");
+        }
     }
 }

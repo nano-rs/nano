@@ -1,10 +1,14 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "0.1.703",
+  "version": "1.0.2",
   "type": "module",
   "scripts": {
+    "test:user-visible-text": "vitest run src/user-visible-text.test.ts",
     "dev": "vite",
+    "test:marketplace-ui": "tsx --tsconfig tsconfig.app.json --test src/components/marketplace/*.test.tsx src/enterprise/components/marketplace/*.test.tsx src/pages/Marketplace.test.tsx",
+    "test:build-update": "tsx --test src/lib/build-update.test.mjs",
+    "test:cache-headers": "sh scripts/check-cache-headers.sh",
     "generate:udm": "node scripts/generate-udm-fields.mjs",
     "build": "node scripts/generate-udm-fields.mjs && tsc -b && vite build",
     "lint": "eslint .",
@@ -15,9 +19,17 @@
     "test:log-source-transports": "node --test src/lib/log-source-transports.test.ts",
     "test:log-source-pivt-context": "node --test src/lib/log-source-pivt-context.test.ts",
     "test:npl-quote": "node --test src/lib/npl-quote.test.ts",
+    "test:cold-scan-progress": "node --test src/lib/cold-scan-progress.test.ts",
+    "test:search-tail": "tsx --test src/pages/search-tail.test.ts",
+    "test:search-ui": "vitest run src/components/ui/date-time-range-picker.test.tsx src/pages/Search.interactive.test.tsx src/pages/search-timeline.test.ts src/pages/interactive-search.test.ts src/pages/async-search-paging.test.ts src/pages/async-search-artifact.test.ts",
+    "test:in-window-observation": "node --test src/lib/prevalence/inWindowObservation.test.ts",
+    "validate:in-window-prevalence": "node scripts/validate-in-window-prevalence.mjs",
     "test:npl-pipeline": "node --test src/lib/npl-pipeline.test.ts",
+    "test:shared-dashboard-panels": "node --test src/lib/shared-dashboard-panels.test.ts",
+    "test:shared-automation-keys": "node --test src/lib/shared-automation-keys.test.ts",
     "test:theme-tokens": "node --test src/lib/theme-tokens.test.ts",
     "test:notification-permissions": "node --test src/components/notification-query-policy.test.ts",
+    "test:repository-sync": "tsx --test src/hooks/repository-sync-state.test.ts src/hooks/use-sync-complete.test.mjs",
     "test:repository-permissions": "node --test src/components/repositories/repository-action-policy.test.ts",
     "test:scope-presets": "node --test src/components/settings/access-control/scope-presets.test.ts",
     "test:oidc-provider-slug": "node --test src/enterprise/pages/Settings/oidc-provider-slug.test.ts",
@@ -26,7 +38,13 @@
     "test:enterprise-stub-gating": "node tests/e2e/check-enterprise-stub-gating.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "test:deadlinks": "node tests/e2e/check-dead-links.mjs",
-    "test:e2e:404": "node tests/e2e/crawl-404.mjs"
+    "test:e2e:404": "node tests/e2e/crawl-404.mjs",
+    "test:row-path": "node --test src/lib/row-path.test.ts",
+    "test:theme-parity": "node --test src/lib/theme-parity.test.ts",
+    "test:toast-tokens": "node --test src/lib/toast-tokens.test.ts",
+    "test:refresh-session": "node --test src/lib/refresh-coordinator.test.ts src/lib/refresh-takeover.test.ts src/lib/session-credentials.test.ts src/lib/authenticated-fetch.test.ts src/lib/request-credentials.test.ts && node --import tsx --test src/lib/api/search-refresh.test.ts",
+    "test:raw-fetch-credentials": "node --test src/lib/raw-fetch-credentials.test.ts",
+    "test:csv-safe": "node --test src/lib/csv-safe.test.ts src/lib/search-csv.test.ts src/lib/audit-csv.test.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.0",
@@ -117,6 +135,8 @@
   "devDependencies": {
     "@eslint/js": "^9.11.1",
     "@tailwindcss/vite": "^4.2.0",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
     "@types/dagre": "^0.7.54",
     "@types/diff": "^7.0.2",
     "@types/node": "^25.0.0",
@@ -127,11 +147,15 @@
     "eslint-plugin-react-hooks": "^5.1.0-rc.0",
     "eslint-plugin-react-refresh": "^0.5.0",
     "globals": "^17.3.0",
+    "jsdom": "^30.1.0",
     "postcss": "^8.4.47",
     "puppeteer-core": "^25.3.0",
+    "react-test-renderer": "^19.2.5",
     "tailwindcss": "^4.2.0",
+    "tsx": "^4.23.13",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.1",
-    "vite": "^8.0.10"
+    "vite": "^8.0.10",
+    "vitest": "^5.0.1"
   }
 }

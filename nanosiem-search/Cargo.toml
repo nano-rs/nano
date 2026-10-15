@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 nanosiem-core = { path = "../nanosiem-core" }
+nanosiem-api-lib = { path = "../nanosiem-api-lib" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +28,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+sqlx.workspace = true
 
 # SSE streaming
 async-stream = "0.3"
@@ -45,6 +47,12 @@ redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
 sha2 = "0.11"
 hex = "0.4"
 flate2 = "1"
+reqwest = { version = "0.13", features = ["json"] }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+async-trait = "0.1"
+tempfile = "3.25"
 
 [features]
 default = []

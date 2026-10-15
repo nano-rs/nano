@@ -5,18 +5,19 @@
 //! This module provides functionality to fetch, store, and query MITRE ATT&CK
 //! tactics and techniques from the official MITRE CTI repository.
 
+pub mod attack_names;
 pub mod data_sources;
 pub(crate) mod mapping;
 mod repository;
 mod sync;
 mod types;
 
-pub use repository::MitreRepository;
+pub use repository::{build_mitre_coverage, MitreRepository, RuleTechniqueRow};
 pub use sync::{MitreSync, MitreSyncError, MitreSyncOutcome, MitreSyncResult};
 pub use types::{
     CoverageLevel, CoverageSummary, CoverageUnit, CoveringRule, DataSource, DataSourceReadiness,
     MitreCoverageResponse, MitreQuarantinedMapping, MitreReconcileOutcome, MitreSyncMetadata,
-    MitreSyncState, MitreTactic, MitreTechnique, MitreTechniqueAlias,
-    TacticCoverage, TechniqueCoverage, TelemetryReadinessSnapshot,
-    TELEMETRY_READINESS_LOOKBACK_HOURS, TELEMETRY_STALE_AFTER_MINUTES,
+    MitreSyncState, MitreTactic, MitreTechnique, MitreTechniqueAlias, TacticCoverage,
+    TechniqueCoverage, TelemetryReadinessSnapshot, TELEMETRY_READINESS_LOOKBACK_HOURS,
+    TELEMETRY_STALE_AFTER_MINUTES,
 };

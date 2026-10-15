@@ -254,7 +254,7 @@ pub struct PlaybookRun {
     pub outcome: Option<String>,
     pub ttr_minutes: Option<i32>,
     pub step_completion: Option<serde_json::Value>,
-    /// NAN-462: frozen snapshot of `{case, alert, rule, source_type,
+    /// frozen snapshot of `{case, alert, rule, source_type,
     /// top_matched_event, entities}` captured at attach time. Consumed by
     /// the templating engine at render time (see `playbooks::runtime`).
     /// Null for manual-attach runs without alert context.
@@ -272,7 +272,7 @@ pub struct PlaybookPermission {
     /// Display label. AUTHORITATIVE only for the reserved synthetic principals
     /// (`api_key`, `demo_analyst`), which carry `role_id = None`.
     pub role: String,
-    /// NAN-2097: the STABLE ACL key for a real role. `None` only for the
+    /// the STABLE ACL key for a real role. `None` only for the
     /// synthetic principals above. Matching on the id rather than the name is
     /// what makes an entry survive a role rename, prevents a later role reusing
     /// the name from capturing the grant, and lets `ON DELETE RESTRICT` require
@@ -437,7 +437,7 @@ pub struct PlaybookStep {
     pub id: String,
     /// Slash command kind: `query` | `pivot` | `enrichment` | `baseline` |
     /// `lead` | `decision` | `action` | `review` | `note`. The last three are
-    /// response-only; `baseline` and `lead` are the hunt additions (NAN-2238).
+    /// response-only; `baseline` and `lead` are the hunt additions.
     pub kind: String,
     pub label: String,
     #[serde(default)]
@@ -670,7 +670,7 @@ pub struct FinishRunRequest {
     /// `{ step_id: { completed_at?, skipped?, operator_note? }, ... }`.
     #[serde(default)]
     pub step_completion: Option<serde_json::Value>,
-    /// NAN-475: optional closing note from the analyst. Stored under the
+    /// optional closing note from the analyst. Stored under the
     /// synthetic step id `__run__` in `step_completion` so it co-locates
     /// with the documented per-step schema (`operator_note` field) without
     /// needing a dedicated column.
@@ -751,7 +751,7 @@ pub struct SetPermissionRequest {
     pub member_count: Option<i32>,
 }
 
-/// NAN-463 — body for `PATCH /api/playbook-runs/{run_id}/steps/{step_id}`.
+/// body for `PATCH /api/playbook-runs/{run_id}/steps/{step_id}`.
 ///
 /// Only fields present in the request overwrite the corresponding fields
 /// on the step's `step_completion` entry. Omitting a field preserves what
@@ -766,7 +766,7 @@ pub struct UpdateStepCompletionRequest {
     pub note: Option<String>,
 }
 
-/// NAN-462 — response body for `GET /api/playbook-runs/{id}/resolved`.
+/// response body for `GET /api/playbook-runs/{id}/resolved`.
 ///
 /// Returns the parsed playbook doc with `{{...}}` tokens substituted
 /// against the run's frozen [`crate::playbooks::runtime::RunContext`]

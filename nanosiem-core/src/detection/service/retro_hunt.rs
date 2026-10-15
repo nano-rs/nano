@@ -83,7 +83,10 @@ impl DetectionService {
             return Err(DetectionError::RulePaused(rule.id));
         }
         if rule.mode == RuleMode::Staging {
-            debug!("Skipping execution of staging retro-hunt rule: {}", rule.name);
+            debug!(
+                "Skipping execution of staging retro-hunt rule: {}",
+                rule.name
+            );
             return Ok(None);
         }
 
@@ -111,12 +114,13 @@ impl DetectionService {
         // with a timestamp but no value (impossible via this engine, but cheap to
         // guard) restarts from the beginning rather than skipping the tie group.
         let watermark_before = state.as_ref().and_then(|s| s.watermark);
-        let cursor_before: Option<(i64, String)> = state.as_ref().and_then(|s| {
-            match (s.watermark, s.watermark_value.as_ref()) {
-                (Some(ts), Some(v)) => Some((ts.timestamp_millis(), v.clone())),
-                _ => None,
-            }
-        });
+        let cursor_before: Option<(i64, String)> =
+            state
+                .as_ref()
+                .and_then(|s| match (s.watermark, s.watermark_value.as_ref()) {
+                    (Some(ts), Some(v)) => Some((ts.timestamp_millis(), v.clone())),
+                    _ => None,
+                });
 
         let run_id = repo
             .start_run(rule.id, watermark_before)
@@ -151,7 +155,15 @@ impl DetectionService {
             Err(e) => {
                 if let Err(fe) = repo
                     .finish_run(
-                        run_id, "error", 0, 0, 0, false, 0, watermark_before, Some(&e.to_string()),
+                        run_id,
+                        "error",
+                        0,
+                        0,
+                        0,
+                        false,
+                        0,
+                        watermark_before,
+                        Some(&e.to_string()),
                     )
                     .await
                 {
@@ -340,6 +352,31 @@ impl DetectionService {
             return Ok(None);
         }
 
+        let per_event_remaining = if rule.mode == RuleMode::Alerting
+            && rule.alert_mode == AlertMode::PerEvent
+        {
+            let plan = super::alerts::plan_per_event_batch(
+                results.len(),
+                self.config.max_events_per_alert,
+            )?;
+            results.truncate(plan.batch_len);
+            if self.primary_lake_detection_backend() {
+                plan.remaining
+            } else {
+                if plan.remaining > 0 {
+                    warn!(
+                        rule_id = %rule.id,
+                        retained = plan.batch_len,
+                        dropped = plan.remaining,
+                        "Legacy ClickHouse retro per-event window exceeded its configured storm cap"
+                    );
+                }
+                0
+            }
+        } else {
+            0
+        };
+
         inject_detected_at(&mut results, Utc::now());
         let match_count = results.len() as i64;
         let today = Utc::now().date_naive();
@@ -389,12 +426,21 @@ impl DetectionService {
                             match_count,
                             today,
                             global_weight,
+                            matched_kind,
                         )
                         .await?
                     }
                 };
-                self.record_matched_events(rule.id, matched_kind, &results)
-                    .await?;
+                if rule.alert_mode != AlertMode::PerEvent {
+                    self.record_matched_events(rule.id, matched_kind, &results)
+                        .await?;
+                }
+                if per_event_remaining > 0 {
+                    return Err(DetectionError::WindowDrainPending {
+                        processed: results.len(),
+                        remaining_at_least: per_event_remaining,
+                    });
+                }
                 Ok(alert)
             }
             // Staging/Paused are handled by the caller.
@@ -424,7 +470,9 @@ impl DetectionService {
             .unwrap_or_else(|| DEFAULT_RETRO_HUNT_CRON.to_string());
         self.validate_cron(&cron)?;
 
-        let lookback_days = req.lookback_days.unwrap_or(DEFAULT_RETRO_HUNT_LOOKBACK_DAYS);
+        let lookback_days = req
+            .lookback_days
+            .unwrap_or(DEFAULT_RETRO_HUNT_LOOKBACK_DAYS);
         let max_indicators = req
             .max_indicators_per_run
             .unwrap_or(DEFAULT_RETRO_HUNT_MAX_INDICATORS);
@@ -437,9 +485,8 @@ impl DetectionService {
         } else {
             req.feeds.join(", ")
         };
-        let display_query = format!(
-            "retro-hunt: new IOCs from {feeds_label} over last {lookback_days}d"
-        );
+        let display_query =
+            format!("retro-hunt: new IOCs from {feeds_label} over last {lookback_days}d");
 
         let new_rule = NewDetectionRule {
             name: req.name.clone(),
@@ -496,7 +543,10 @@ impl DetectionService {
         // live+cron rule to the scheduler, which would try to parse that
         // placeholder as nPL and fail on every cycle. Roll the rule back instead
         // and surface the error.
-        if let Err(e) = self.finish_retro_hunt_create(&rule, req, lookback_days, max_indicators, &cron).await {
+        if let Err(e) = self
+            .finish_retro_hunt_create(&rule, req, lookback_days, max_indicators, &cron)
+            .await
+        {
             if let Err(cleanup) = self.rule_repo.delete(rule.id).await {
                 error!(
                     rule_id = %rule.id,
@@ -552,8 +602,12 @@ impl DetectionService {
 
         // Schedule the first run promptly (like a promoted standard rule). Done
         // LAST so the scheduler can only ever pick up a fully-built rule.
-        let next_run =
-            crate::detection::scheduler::calculate_next_run_with_jitter(cron, Utc::now(), rule.id, 30);
+        let next_run = crate::detection::scheduler::calculate_next_run_phased(
+            cron,
+            Utc::now(),
+            rule.id,
+            crate::detection::scheduler::configured_phase_cap_secs(),
+        );
         self.rule_repo
             .update_next_run_at(rule.id, Some(next_run))
             .await?;
@@ -670,7 +724,7 @@ struct RetroHuntOutcome {
 ///   the newest.
 ///
 /// Pure + deterministic so the drain/skip invariants are unit-tested.
-fn plan_cursor(
+pub fn plan_cursor(
     candidates: &[(i64, String)],
     cap: usize,
     cursor_before: Option<(i64, String)>,
@@ -702,7 +756,7 @@ fn hit_event_id(rule_id: uuid::Uuid, value: &str, last_seen: &str) -> String {
 
 /// Synthesize one detection-match event per retro HIT, carrying the indicator as
 /// the risk entity plus retro context for the alert/matches UI.
-fn build_hit_events(
+pub fn build_hit_events(
     rule_id: uuid::Uuid,
     hits: &[RetroHuntHit],
     candidates: &[&RetroFeedCandidate],

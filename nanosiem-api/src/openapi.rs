@@ -157,6 +157,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::prevalence::PrevalenceApiDoc::openapi(),
         handlers::mitre::MitreApiDoc::openapi(),
         handlers::log_sources::LogSourcesApiDoc::openapi(),
+        handlers::source_onboarding::SourceOnboardingApiDoc::openapi(),
         handlers::source_configs::SourceConfigsApiDoc::openapi(),
         // Per-source RBAC scope admin (NAN-1799) — core (open + enterprise).
         handlers::source_scopes::SourceScopesApiDoc::openapi(),
@@ -168,6 +169,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::demo::DemoApiDoc::openapi(),
         handlers::tuning::TuningApiDoc::openapi(),
         handlers::settings::SettingsApiDoc::openapi(),
+        handlers::iceberg_export::IcebergExportApiDoc::openapi(),
         handlers::notifications::NotificationsApiDoc::openapi(),
         handlers::feedback::FeedbackApiDoc::openapi(),
         handlers::folder_settings::FolderSettingsApiDoc::openapi(),
@@ -184,6 +186,9 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::hunts::HuntsApiDoc::openapi(),
         handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi(),
         handlers::marketplace::MarketplaceApiDoc::openapi(),
+        handlers::connector_feeds::ConnectorFeedsApiDoc::openapi(),
+        handlers::ingest_tokens::IngestTokensApiDoc::openapi(),
+        handlers::landing_sources::LandingSourcesApiDoc::openapi(),
         #[cfg(feature = "enterprise")]
         handlers::integrations::IntegrationsApiDoc::openapi(),
         handlers::upload::UploadApiDoc::openapi(),
@@ -201,7 +206,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
     ];
 
     // Enterprise-only sub-docs. Their handler modules (`melod`, `notebooks`,
-    // `risk`) and the `nanosiem-enterprise::*` types they reference are gated
+    // `risk`) and the `enterprise::*` types they reference are gated
     // behind the `enterprise` feature, so the registrations have to live
     // here too — open builds simply omit these endpoints from the spec.
     #[cfg(feature = "enterprise")]
@@ -209,12 +214,14 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         // License / phone-home (NAN-1193): stripped from the open edition, so
         // the open spec omits the /api/license path entirely.
         sub_docs.push(handlers::license::LicenseApiDoc::openapi());
+        sub_docs.extend(shared_sub_docs());
         // Phase 3.2 (NAN-744): cases + incidents lifted to enterprise.
         sub_docs.push(handlers::cases::CasesApiDoc::openapi());
         sub_docs.push(handlers::incidents::IncidentsApiDoc::openapi());
         sub_docs.push(handlers::notebooks::NotebooksApiDoc::openapi());
         sub_docs.push(handlers::melod::MelodApiDoc::openapi());
         sub_docs.push(handlers::risk::RiskApiDoc::openapi());
+        sub_docs.push(handlers::risk_watchlists::RiskWatchlistsApiDoc::openapi());
         sub_docs.push(handlers::entity_context::EntityContextApiDoc::openapi());
         sub_docs.push(handlers::agent_enrichment::AgentEnrichmentApiDoc::openapi());
         sub_docs.push(handlers::custom_enrichment::CustomEnrichmentApiDoc::openapi());
@@ -233,19 +240,83 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         // Air-gapped rule + playbook bundle import (NAN-1220) — enterprise only.
         sub_docs.push(handlers::airgap::rules::AirgapRulesApiDoc::openapi());
         sub_docs.push(handlers::airgap::playbooks::AirgapPlaybooksApiDoc::openapi());
-        // Observability ↔ Security convergence cross-link (NAN-1542) — gated to
-        // enterprise in NAN-1544. The open spec omits this path entirely.
-        sub_docs
-            .push(handlers::observability_service_signals::ObservabilityServiceSignalsApiDoc::openapi());
     }
 
     sub_docs
 }
 
+/// Shared handlers replace dedicated operations at the same URL. Keep this
+/// inventory shared by both the combined and tenant-specific spec builders.
+#[cfg(feature = "enterprise")]
+fn shared_sub_docs() -> Vec<utoipa::openapi::OpenApi> {
+    vec![
+        nanosiem_enterprise::handlers::enterprise_shared_detections::EnterpriseSharedDetectionsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_alerts::EnterpriseSharedAlertsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_alert_triage::EnterpriseSharedAlertTriageApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_app_shell::EnterpriseSharedAppShellApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_dashboards::EnterpriseSharedDashboardsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_dashboard_panels::EnterpriseSharedDashboardPanelsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_reports::EnterpriseSharedReportsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_cases_notebooks::EnterpriseSharedCasesNotebooksApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_observability::EnterpriseSharedObservabilityApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_detection_dashboard::EnterpriseSharedDetectionDashboardApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_detection_editor::EnterpriseSharedDetectionEditorApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_mitre::EnterpriseSharedMitreApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_rule_repositories::EnterpriseSharedRuleRepositoriesApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_iam::EnterpriseSharedIamApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_settings::EnterpriseSharedSettingsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_sources::EnterpriseSharedSourcesApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_enrichment::EnterpriseSharedEnrichmentApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_melod::EnterpriseSharedMelodApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_cases_extras::EnterpriseSharedCasesExtrasApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_hunting::EnterpriseSharedHuntingApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_playbooks::EnterpriseSharedPlaybooksApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_tuning::EnterpriseSharedTuningApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_marketplace::EnterpriseSharedMarketplaceApiDoc::openapi(),
+        nanosiem_enterprise::handlers::hosted_collectors::HostedCollectorsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_pull_sources::EnterpriseSharedPullSourcesApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_rules_alerts_remainder::EnterpriseSharedRulesAlertsRemainderApiDoc::openapi(),
+        nanosiem_enterprise::handlers::shared_automation_keys::SharedAutomationKeysApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_oidc_settings::EnterpriseSharedOidcSettingsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_queues::EnterpriseSharedQueuesApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_exports::EnterpriseSharedExportsApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_search_extras::EnterpriseSharedSearchExtrasApiDoc::openapi(),
+        nanosiem_enterprise::handlers::enterprise_shared_iam_extras::EnterpriseSharedIamExtrasApiDoc::openapi(),
+        nanosiem_enterprise::handlers::shared_r2_owner_observation::R2OwnerObservationApiDoc::openapi(),
+    ]
+}
+
+fn build_shared_openapi() -> utoipa::openapi::OpenApi {
+    let mut spec = ApiDoc::openapi();
+    #[cfg(feature = "enterprise")]
+    merge_sub_docs(&mut spec, shared_sub_docs());
+    // First-operation-wins now preserves the tenant handler's wire contract.
+    // Unported legacy paths are removed by the live shared route fences below.
+    merge_sub_docs(&mut spec, sub_docs());
+    finish_openapi(spec)
+}
+
 fn merge_sub_docs(spec: &mut utoipa::openapi::OpenApi, sub_docs: Vec<utoipa::openapi::OpenApi>) {
     for sub in sub_docs {
-        // Merge paths
-        spec.paths.paths.extend(sub.paths.paths);
+        // Merge paths per OPERATION, first wins. A whole-item `extend` let a
+        // later doc that documents only `GET /x/{id}` erase the earlier doc's
+        // `PUT /x/{id}` (NAN-2361: the hosted-shared docs share many
+        // paths with the dedicated handlers they replace in shared mode).
+        for (path, item) in sub.paths.paths {
+            match spec.paths.paths.get_mut(&path) {
+                None => {
+                    spec.paths.paths.insert(path, item);
+                }
+                Some(existing) => {
+                    macro_rules! keep_first {
+                        ($($m:ident),*) => {$(
+                            if existing.$m.is_none() { existing.$m = item.$m; }
+                        )*};
+                    }
+                    keep_first!(get, put, post, delete, options, head, patch, trace);
+                }
+            }
+        }
 
         // Merge components (schemas, etc.)
         if let Some(sub_components) = sub.components {
@@ -266,6 +337,9 @@ fn finish_openapi(mut spec: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenAp
     if let Some(search_components) = search_spec.components {
         if let Some(ref mut components) = spec.components {
             components.schemas.extend(search_components.schemas);
+            for (name, scheme) in search_components.security_schemes {
+                components.security_schemes.entry(name).or_insert(scheme);
+            }
         } else {
             spec.components = Some(search_components);
         }
@@ -277,6 +351,175 @@ fn finish_openapi(mut spec: utoipa::openapi::OpenApi) -> utoipa::openapi::OpenAp
 /// Build the Swagger UI service that serves the interactive docs.
 pub fn swagger_ui() -> utoipa_swagger_ui::SwaggerUi {
     utoipa_swagger_ui::SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", build_openapi())
+}
+
+/// Shared root docs disclose only the static location of tenant documentation.
+/// Like tenant docs assets, this response is independent of credentials.
+/// Install outside the API auth layers, only on a shared deployment.
+pub async fn shared_root_docs_fence(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = request.uri().path();
+    if path == "/api-docs/openapi.json" || path == "/swagger-ui" || path.starts_with("/swagger-ui/")
+    {
+        tracing::warn!(path, "enterprise-shared root documentation unavailable");
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "route_not_available",
+                "message": "Use /t/<tenant>/swagger-ui/ for hosted tenant API documentation",
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Public, static tenant API contract. No tenant records or credentials are
+/// read to render documentation. Runtime auth still decides permissions.
+fn shared_openapi_template() -> &'static serde_json::Value {
+    static SPEC: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    SPEC.get_or_init(|| {
+        use axum::http::Method;
+        let mut spec = serde_json::to_value(build_shared_openapi()).expect("serialize OpenAPI");
+        let paths = spec["paths"].as_object_mut().expect("OpenAPI paths");
+        paths.retain(|path, item| {
+            if !path.starts_with("/api/") { return false; }
+            let probe = path.split('/').map(|part| {
+                if part.starts_with('{') && part.ends_with('}') {
+                    match part {
+                        "{page}" => "0",
+                        "{slug}" => "example",
+                        _ => "00000000-0000-4000-8000-000000000001",
+                    }
+                } else { part }
+            }).collect::<Vec<_>>().join("/");
+            let ops = item.as_object_mut().expect("OpenAPI path item");
+            ops.remove("servers");
+            for (name, method) in [("get", Method::GET), ("post", Method::POST),
+                ("put", Method::PUT), ("patch", Method::PATCH), ("delete", Method::DELETE),
+                ("head", Method::HEAD), ("options", Method::OPTIONS), ("trace", Method::TRACE)] {
+                let allowed = if path.starts_with("/api/search") && ![
+                    "/api/search/history", "/api/search/share", "/api/search/shared",
+                    "/api/search/explanation", "/api/search/saved",
+                ].iter().any(|base| path == base || path.starts_with(&format!("{base}/"))) {
+                    nanosiem_search::openapi::shared_documented_operation(&method, &probe)
+                } else {
+                    crate::middleware::auth::shared_documented_operation(&method, &probe)
+                };
+                if !allowed { ops.remove(name); }
+                else if let Some(operation) = ops.get_mut(name) {
+                    operation.as_object_mut().expect("OpenAPI operation").remove("servers");
+                    operation["security"] = serde_json::json!([{ "api_key": [] }]);
+                }
+            }
+            ["get", "post", "put", "patch", "delete", "head", "options", "trace"]
+                .iter().any(|name| ops.contains_key(*name))
+        });
+        // Keep only schemas reachable from the tenant contract. Platform-only
+        // endpoints and their model inventory must not leak into this document.
+        fn references(value: &serde_json::Value, names: &mut std::collections::BTreeSet<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(reference) = map.get("$ref").and_then(|v| v.as_str()) {
+                        if let Some(name) = reference.strip_prefix("#/components/schemas/") {
+                            names.insert(name.to_owned());
+                        }
+                    }
+                    for value in map.values() { references(value, names); }
+                }
+                serde_json::Value::Array(values) => for value in values { references(value, names); },
+                _ => {}
+            }
+        }
+        let mut needed = std::collections::BTreeSet::new();
+        references(&spec["paths"], &mut needed);
+        let schemas = spec["components"]["schemas"].as_object_mut().expect("OpenAPI schemas");
+        loop {
+            let count = needed.len();
+            for name in needed.clone() {
+                if let Some(schema) = schemas.get(&name) { references(schema, &mut needed); }
+            }
+            if count == needed.len() { break; }
+        }
+        schemas.retain(|name, _| needed.contains(name));
+        spec["components"]["securitySchemes"].as_object_mut().expect("security schemes")
+            .retain(|name, _| name == "api_key");
+        spec["security"] = serde_json::json!([{ "api_key": [] }]);
+        spec["info"]["description"] = serde_json::json!(
+            "Tenant API. Use Authorize to paste an X-API-Key for this tenant. Browser sessions are not used by Try it out. Existing API permissions and tenant isolation apply. Authenticated requests to endpoints unavailable for hosted tenants return HTTP 404 with route_not_available and the message: This endpoint is not available for hosted tenants."
+        );
+        spec.as_object_mut().unwrap().remove("tags");
+        spec
+    })
+}
+
+fn tenant_openapi(slug: &str) -> serde_json::Value {
+    let mut spec = shared_openapi_template().clone();
+    spec["servers"] = serde_json::json!([{ "url": format!("/t/{slug}") }]);
+    spec
+}
+
+/// Tenant docs are auth-independent static assets; only explicit API
+/// credentials can execute requests, through the tenant path/auth fence.
+pub fn tenant_swagger_router() -> axum::Router {
+    use axum::{
+        extract::Path,
+        http::{header, StatusCode},
+        response::{IntoResponse, Redirect, Response},
+        routing::get,
+    };
+    use nanosiem_api_lib::tenant_path::canonical_slug;
+    async fn spec(Path(slug): Path<String>) -> Response {
+        if !canonical_slug(&slug) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        axum::Json(tenant_openapi(&slug)).into_response()
+    }
+    async fn redirect(Path(slug): Path<String>) -> Response {
+        if !canonical_slug(&slug) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Redirect::temporary(&format!("/t/{slug}/swagger-ui/")).into_response()
+    }
+    async fn asset(slug: String, asset: String) -> Response {
+        if !canonical_slug(&slug) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        if asset == "swagger-initializer.js" {
+            return (
+                [(header::CONTENT_TYPE, "application/javascript")],
+                include_str!("tenant_swagger.js"),
+            )
+                .into_response();
+        }
+        match utoipa_swagger_ui::serve(
+            &asset,
+            std::sync::Arc::new(utoipa_swagger_ui::Config::default()),
+        ) {
+            Ok(Some(file)) => (
+                [(header::CONTENT_TYPE, file.content_type)],
+                file.bytes.into_owned(),
+            )
+                .into_response(),
+            Ok(None) => StatusCode::NOT_FOUND.into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+    axum::Router::new()
+        .route("/t/{slug}/api-docs/openapi.json", get(spec))
+        .route("/t/{slug}/swagger-ui", get(redirect))
+        .route("/t/{slug}/swagger-ui/", get(|Path(slug): Path<String>| asset(slug, String::new())))
+        .route("/t/{slug}/swagger-ui/{*asset}", get(|Path((slug, file)): Path<(String, String)>| asset(slug, file)))
+        .layer(axum::middleware::map_response(|mut response: Response| async move {
+            response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response.headers_mut().insert(header::CONTENT_SECURITY_POLICY,
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'".parse().unwrap());
+            response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+            response
+        }))
 }
 
 /// True for the API paths whose response shapes cross the desktop's typed
@@ -408,8 +651,692 @@ pub fn desktop_wire_spec() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_visible_openapi_contains_no_internal_ticket_ids() {
+        fn walk(value: &serde_json::Value, path: &str, pattern: &regex::Regex, violations: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => {
+                    if pattern.is_match(text) { violations.push(path.to_owned()); }
+                }
+                serde_json::Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        walk(value, &format!("{path}/{index}"), pattern, violations);
+                    }
+                }
+                serde_json::Value::Object(values) => {
+                    for (key, value) in values {
+                        walk(value, &format!("{path}/{key}"), pattern, violations);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let pattern = regex::Regex::new(r"\b(?:NAN|FOR)-?\d+\b").unwrap();
+        let mut violations = Vec::new();
+        walk(&serde_json::to_value(super::build_openapi()).unwrap(), "", &pattern, &mut violations);
+        assert!(violations.is_empty(), "internal ticket references in OpenAPI at:\n{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn iceberg_export_contract_is_admin_bearer_and_write_only() {
+        let check=|spec:serde_json::Value| {
+        let path=&spec["paths"]["/api/settings/iceberg-export"];
+        for method in ["get","put"] {
+            assert!(path[method]["security"].as_array().unwrap().iter().any(|s|s.get("bearer_auth").is_some()));
+            assert!(path[method]["responses"]["403"].is_object());
+        }
+        let schemas=&spec["components"]["schemas"];
+        assert_eq!(schemas["UpdateExportSettings"]["properties"]["credentials"]["writeOnly"],true);
+        let response=schemas["ExportSettings"]["properties"].as_object().unwrap();
+        for secret in ["credentials","catalog_credential","access_key_id","secret_access_key","session_token","credentials_encrypted","credentials_nonce"] { assert!(!response.contains_key(secret)); }
+        assert!(schemas["CustomerExportConfig"].is_object());
+        assert!(schemas["CatalogAuthentication"].is_object());
+        };
+        check(serde_json::to_value(super::build_openapi()).unwrap());
+        #[cfg(feature="enterprise")]
+        check(serde_json::to_value(super::build_shared_openapi()).unwrap());
+    }
+
+    /// NAN-3652: API descriptions say "HEC", never the vendor name; only the
+    /// HEC wire literals (`Authorization: Splunk`, `splunk_hec*`) may carry it.
+    #[test]
+    fn openapi_descriptions_do_not_name_a_vendor() {
+        let check = |spec: serde_json::Value| {
+            let text = serde_json::to_string(&spec).unwrap();
+            let mentions = nanosiem_core::branding::vendor_name_mentions(&text);
+            assert!(mentions.is_empty(), "OpenAPI text names a vendor: {mentions:#?}");
+        };
+        check(serde_json::to_value(super::build_openapi()).unwrap());
+        #[cfg(feature = "enterprise")]
+        check(serde_json::to_value(super::build_shared_openapi()).unwrap());
+    }
+
     use super::*;
     use utoipa::openapi::path::HttpMethod;
+
+    #[tokio::test]
+    async fn shared_root_docs_return_neutral_404_and_tenant_docs_stay_open() {
+        use axum::{
+            body::{to_bytes, Body},
+            http::{Request, StatusCode},
+            Router,
+        };
+        use tower::ServiceExt;
+        let app = nanosiem_api_lib::tenant_path::scoped_api_router(tenant_swagger_router())
+            .layer(axum::middleware::from_fn(shared_root_docs_fence));
+        for path in [
+            "/api-docs/openapi.json",
+            "/swagger-ui",
+            "/swagger-ui/",
+            "/swagger-ui/swagger-ui-bundle.js",
+        ] {
+            for credential in [
+                None,
+                Some(("x-api-key", "local-fixture")),
+                Some(("authorization", "Bearer local-fixture")),
+            ] {
+                let mut request = Request::builder().uri(path);
+                if let Some((name, value)) = credential {
+                    request = request.header(name, value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+                assert!(!response.headers().contains_key("retry-after"));
+                let body: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                        .unwrap();
+                assert_eq!(body["error"], "route_not_available");
+                assert_eq!(
+                    body["message"],
+                    "Use /t/<tenant>/swagger-ui/ for hosted tenant API documentation"
+                );
+                for word in ["isolation", "scoped", "not yet"] {
+                    assert!(!body.to_string().contains(word));
+                }
+            }
+        }
+        for path in ["/t/acme/swagger-ui/", "/t/acme/api-docs/openapi.json"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        // The dedicated/open-core root docs router remains available.
+        let dedicated: Router = Router::new().merge(swagger_ui());
+        for path in ["/api-docs/openapi.json", "/swagger-ui/"] {
+            let response = dedicated
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+    }
+
+    // Tenant API docs are mounted only for the hosted shared profile.
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn tenant_swagger_is_real_ui_and_spec_targets_its_tenant() {
+        use axum::{
+            body::{to_bytes, Body},
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let app = nanosiem_api_lib::tenant_path::scoped_api_router(tenant_swagger_router());
+        for slug in ["acme-soc", "other-soc"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/t/{slug}/swagger-ui/"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("script-src 'self'"));
+            let html = String::from_utf8(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(html.contains("Swagger UI"));
+            assert!(html.contains("swagger-ui-bundle.js"));
+            assert!(!html.contains("/src/main.tsx"));
+            for asset in [
+                "swagger-ui-bundle.js",
+                "swagger-ui.css",
+                "swagger-initializer.js",
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/t/{slug}/swagger-ui/{asset}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{asset}");
+                assert!(
+                    to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                        .len()
+                        > 100
+                );
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/t/{slug}/api-docs/openapi.json"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let spec: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                spec["servers"],
+                serde_json::json!([{ "url": format!("/t/{slug}") }])
+            );
+            assert!(spec["paths"]["/api/search"]["post"].is_object());
+            #[cfg(feature = "enterprise")]
+            assert_eq!(
+                spec["paths"]["/api/rules"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/CreateTenantDetectionRequest"
+            );
+            for path in [
+                "/api/internal/vector-config/{id}",
+                "/api/platform/tenants",
+                "/api/airgap/license/import",
+                "/api/search/sql",
+                "/api/search/admin/stats",
+            ] {
+                assert!(spec["paths"].get(path).is_none(), "{path}");
+            }
+            assert!(spec["paths"]["/api/settings/tier"].get("put").is_none());
+            assert_eq!(
+                spec["components"]["securitySchemes"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                spec["components"]["securitySchemes"]["api_key"]["name"],
+                "X-API-Key"
+            );
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/t/%61cme/api-docs/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn tenant_collector_contract_includes_every_lifecycle_operation() {
+        let spec = tenant_openapi("buddytenant");
+        for (path, method) in [
+            ("/api/marketplace/collectors", "get"),
+            ("/api/marketplace/collectors/{slug}", "get"),
+            ("/api/marketplace/collectors/{slug}", "put"),
+            ("/api/marketplace/collectors/{slug}", "delete"),
+            ("/api/marketplace/collectors/{slug}/install", "post"),
+            ("/api/marketplace/collectors/{slug}/feeds/{feed_id}/reset-checkpoint", "post"),
+            ("/api/marketplace/collectors/{slug}/credentials", "put"),
+            ("/api/marketplace/collectors/{slug}/components", "get"),
+            ("/api/marketplace/collectors/{slug}/components/{component}", "put"),
+            ("/api/marketplace/collectors/{slug}/components/{component}", "delete"),
+        ] {
+            let operation = &spec["paths"][path][method];
+            assert!(operation.is_object(), "missing tenant collector {method} {path}");
+            assert_eq!(operation["security"], serde_json::json!([{ "api_key": [] }]));
+        }
+        assert_eq!(
+            spec["paths"]["/api/marketplace/collectors/{slug}/install"]["post"]
+                ["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/InstallInput"
+        );
+        assert_eq!(
+            spec["paths"]["/api/marketplace/collectors/{slug}/feeds/{feed_id}/reset-checkpoint"]["post"]
+                ["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ResetCheckpointInput"
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn tenant_pull_source_contract_includes_every_operation() {
+        let spec = tenant_openapi("buddytenant");
+        for (path, method) in [
+            ("/api/pull-sources", "get"),
+            ("/api/pull-sources", "post"),
+            ("/api/pull-sources/setup/aws", "get"),
+            ("/api/pull-sources/setup/gcp", "get"),
+            ("/api/pull-sources/{id}", "get"),
+            ("/api/pull-sources/{id}", "delete"),
+            ("/api/pull-sources/{id}", "patch"),
+            ("/api/pull-sources/{id}/pause", "post"),
+            ("/api/pull-sources/{id}/resume", "post"),
+            ("/api/pull-sources/{id}/retry", "post"),
+        ] {
+            let operation = &spec["paths"][path][method];
+            assert!(operation.is_object(), "missing tenant pull-source {method} {path}");
+            assert_eq!(operation["security"], serde_json::json!([{ "api_key": [] }]));
+        }
+        assert_eq!(
+            spec["paths"]["/api/pull-sources"]["post"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/CreatePullSourceRequest"
+        );
+        assert_eq!(
+            spec["paths"]["/api/pull-sources/{id}"]["patch"]["requestBody"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/UpdatePullSourceRequest"
+        );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn shared_repository_sync_accepted_contract() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        for kind in ["rule", "parser", "playbook"] {
+            let path = format!("/api/{kind}-repositories/{{id}}/sync");
+            assert!(spec["paths"][&path]["post"]["responses"].get("202").is_some(), "{path}");
+        }
+        let schema = &spec["components"]["schemas"]["SyncAccepted"];
+        for field in ["sync_started_at", "sync_lease_expires_at", "status"] {
+            assert!(schema["required"].as_array().unwrap().iter().any(|value| value == field));
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn platform_repository_sync_accepted_contract() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let responses = &spec["paths"]["/api/marketplace/repos/{id}/sync"]["post"]["responses"];
+        assert!(responses.get("200").is_some());
+        assert!(responses.get("202").is_some());
+        assert!(responses["429"]["headers"].get("Retry-After").is_some());
+        let schema = &spec["components"]["schemas"]["SyncNowAccepted"];
+        for field in ["request_id", "repository_id", "managed_by_platform", "status"] {
+            assert!(schema["required"].as_array().unwrap().iter().any(|value| value == field));
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn marketplace_inventory_contract() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        for (path, method) in [
+            ("/api/marketplace/items", "get"),
+            ("/api/marketplace/items/{id}", "get"),
+            ("/api/marketplace/items/{id}/toggle", "post"),
+        ] {
+            let op = &spec["paths"][path][method];
+            assert!(op["security"].is_array(), "{path}");
+            assert!(op["responses"].get("200").is_some());
+            assert!(op["responses"].get("403").is_some());
+        }
+        for (path, method) in [
+            ("/api/marketplace/items/{feed_id}/checkout", "get"),
+            ("/api/marketplace/items/{feed_id}/checkout", "post"),
+            ("/api/platform/feeds", "get"),
+            ("/api/platform/feeds/{feed_id}/tenants", "get"),
+            ("/api/platform/feeds/{feed_id}/commands", "post"),
+        ] {
+            let op = &spec["paths"][path][method];
+            assert!(op["security"].is_array(), "{path}");
+            assert!(op["responses"].get("200").is_some());
+            assert!(op["responses"].get("403").is_some());
+        }
+        assert_eq!(spec["components"]["schemas"]["CheckoutRequest"]["additionalProperties"], false);
+        assert_eq!(spec["components"]["schemas"]["FeedCommand"]["additionalProperties"], false);
+        let toggle = &spec["paths"]["/api/marketplace/items/{id}/toggle"]["post"];
+        for status in ["400", "404", "409", "503"] {
+            assert!(toggle["responses"].get(status).is_some());
+        }
+        let schema = &spec["components"]["schemas"];
+        assert!(schema["InventoryProvenance"]["oneOf"].as_array().unwrap().len() == 3);
+        assert!(schema["InventoryToggle"]["required"].as_array().unwrap().iter().any(|field| field == "expected_revision"));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn synthient_lifecycle_private_callback_and_tenant_preferences() {
+        use nanosiem_enterprise::handlers::shared_private_provisioning::EnterpriseSharedPrivateProvisioningApiDoc;
+        let private=serde_json::to_value(EnterpriseSharedPrivateProvisioningApiDoc::openapi()).unwrap();
+        let callback="/internal/v1/enterprise-shared/platform-enrichment:billing";
+        let op=&private["paths"][callback]["post"];
+        assert!(op["security"][0]["nano_main_service_identity"].is_array());
+        assert_eq!(private["components"]["schemas"]["BillingEvent"]["additionalProperties"],false);
+        let public=serde_json::to_value(build_openapi()).unwrap();
+        assert!(public["paths"].get(callback).is_none());
+        let path="/api/enrichment/entitlements/{feed_id}";
+        for method in ["get","post"] {
+            assert!(public["paths"][path][method]["security"].is_array());
+            assert!(public["paths"][path][method]["responses"]["403"].is_object());
+        }
+        assert_eq!(public["components"]["schemas"]["EntitlementPreference"]["additionalProperties"],false);
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn ingest_cell_generation_roll_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_private_provisioning::EnterpriseSharedPrivateProvisioningApiDoc;
+        let path = "/internal/v1/enterprise-shared/ingest-cells:roll-generation";
+        let private = serde_json::to_value(EnterpriseSharedPrivateProvisioningApiDoc::openapi()).unwrap();
+        // Phase 7 adds the sandbox billing callback on the private listener;
+        // NAN-2590 adds ingest-credential-requests:pending and :fulfil;
+        // NAN-2594 adds ingest-credential-requests:fulfil-collector;
+        // NAN-2590 (9001880) adds ingest-credential-requests:reject;
+        // NAN-2879 adds lake-part-deletes:attest and lake-part-log:index;
+        // NAN-2942 adds provisioning-outbox:expedite;
+        // NAN-2980 adds hec-sources:credentials.
+        assert_eq!(private["paths"].as_object().unwrap().len(), 28);
+        assert!(private["paths"]["/internal/v1/enterprise-shared/hec-sources:credentials"]["post"].is_object());
+        assert!(!build_openapi().paths.paths.contains_key("/internal/v1/enterprise-shared/hec-sources:credentials"),
+            "hec-sources:credentials must stay off the public spec");
+        assert!(!build_openapi().paths.paths.contains_key("/internal/v1/enterprise-shared/bronze-deletes:attest"));
+        for private_only in ["/internal/v1/enterprise-shared/lake-part-deletes:attest", "/internal/v1/enterprise-shared/lake-part-log:index"] {
+            assert!(private["paths"][private_only]["post"].is_object(), "{private_only}");
+            assert!(!build_openapi().paths.paths.contains_key(private_only), "{private_only} must stay off the public spec");
+        }
+        let operation = &private["paths"][path]["post"];
+        assert!(operation["security"][0]["nano_main_service_identity"].is_array());
+        assert_eq!(operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/IngestCellRollGenerationRequest");
+        for status in ["200", "400", "401", "403", "409", "413", "415", "429", "503", "504"] {
+            assert!(operation["responses"][status].is_object(), "{status}");
+        }
+        let schema = &private["components"]["schemas"]["IngestCellRollGenerationRequest"];
+        for field in ["request_id", "tenant_id", "expected_generation", "actor", "reason", "release"] {
+            assert!(schema["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn ingest_credential_fulfilment_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_private_provisioning::EnterpriseSharedPrivateProvisioningApiDoc;
+        let private = serde_json::to_value(EnterpriseSharedPrivateProvisioningApiDoc::openapi()).unwrap();
+        for (path, schema) in [
+            ("/internal/v1/enterprise-shared/ingest-credential-requests:pending", "IngestCredentialRequestsPendingRequest"),
+            ("/internal/v1/enterprise-shared/ingest-credential-requests:fulfil", "IngestCredentialRequestFulfilRequest"),
+            ("/internal/v1/enterprise-shared/ingest-credential-requests:fulfil-collector", "IngestCredentialCollectorFulfilRequest"),
+            ("/internal/v1/enterprise-shared/ingest-credential-requests:reject", "IngestCredentialRequestRejectRequest"),
+        ] {
+            let operation = &private["paths"][path]["post"];
+            assert!(operation["security"][0]["nano_main_service_identity"].is_array(), "{path}");
+            assert_eq!(operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{schema}"));
+            for status in ["200", "400", "401", "403", "413", "415", "429", "503", "504"] {
+                assert!(operation["responses"][status].is_object(), "{path} {status}");
+            }
+            assert_eq!(private["components"]["schemas"][schema]["additionalProperties"], false, "{schema}");
+            assert!(!build_openapi().paths.paths.contains_key(path));
+        }
+        let fulfil = &private["components"]["schemas"]["IngestCredentialRequestFulfilRequest"];
+        for field in ["request_id", "tenant_id", "template_route_id", "expected_template", "digest_key_id",
+            "secret_digest_hex", "sealed_token_hex", "actor"] {
+            assert!(fulfil["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+        // NAN-2594: the collector twin carries the template ARRAY instead.
+        let collector = &private["components"]["schemas"]["IngestCredentialCollectorFulfilRequest"];
+        for field in ["request_id", "tenant_id", "expected_templates", "digest_key_id",
+            "secret_digest_hex", "sealed_token_hex", "actor"] {
+            assert!(collector["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+        assert!(collector["properties"].get("template_route_id").is_none());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn source_enrollment_protocols_keep_private_path_contract() {
+        use nanosiem_enterprise::handlers::shared_private_provisioning::EnterpriseSharedPrivateProvisioningApiDoc;
+        let private = serde_json::to_value(EnterpriseSharedPrivateProvisioningApiDoc::openapi()).unwrap();
+        // NAN-2423 extends the body, adding no public or private paths
+        // (the NAN-2590 / NAN-2594 fulfilment operations, and 9001880's
+        // reject, are counted here too; so are NAN-2879's two lake-part
+        // paths, which this count had missed, and NAN-2942's
+        // provisioning-outbox:expedite, and NAN-2980's hec-sources:credentials).
+        assert_eq!(private["paths"].as_object().unwrap().len(), 28);
+        let path = "/internal/v1/enterprise-shared/hec-sources:enroll";
+        assert_eq!(private["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/HecSourceEnrollRequest");
+        let schemas = &private["components"]["schemas"];
+        assert!(schemas["HecSourceEnrollRequest"]["properties"]["sources"].is_object());
+        assert!(schemas["SourceProtocolEnrollment"]["properties"]["protocols"].is_object());
+        assert!(!schemas["HecSourceEnrollRequest"]["required"].as_array().unwrap().iter().any(|v| v == "sources"));
+        assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn operator_automation_key_op_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_operator_automation_keys::EnterpriseSharedOperatorAutomationKeyApiDoc;
+        // NAN-3843: automation-keys:issue for nano-main super-admins; never in
+        // the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedOperatorAutomationKeyApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        let path = "/internal/v1/enterprise-shared/automation-keys:issue";
+        assert!(paths.contains_key(path));
+        assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn operator_member_ops_are_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_operator_members::EnterpriseSharedOperatorMembersApiDoc;
+        // NAN-3825: tenant-members:list / tenant-members:manage for MSSP
+        // partners through nano-main; never in the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedOperatorMembersApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 2);
+        for path in ["/internal/v1/enterprise-shared/tenant-members:list", "/internal/v1/enterprise-shared/tenant-members:manage"] {
+            assert!(paths.contains_key(path), "{path}");
+            assert!(!build_openapi().paths.paths.contains_key(path), "{path}");
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn tenant_ai_allowance_op_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_tenant_ai_allowance::EnterpriseSharedTenantAiAllowanceApiDoc;
+        // NAN-3512: tenant-ai-allowance:set for nano-main's lean billing; never
+        // in the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedTenantAiAllowanceApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        let path = "/internal/v1/enterprise-shared/tenant-ai-allowance:set";
+        assert!(paths.contains_key(path));
+        assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn region_rls_key_op_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_region_rls_key::EnterpriseSharedRegionRlsKeyApiDoc;
+        // NAN-3361: rls-context-keys:region-rotate for nano-main's region key
+        // rotator; never in the customer spec, and no receipt schema carries
+        // key bytes.
+        let private = serde_json::to_value(EnterpriseSharedRegionRlsKeyApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        let path = "/internal/v1/enterprise-shared/rls-context-keys:region-rotate";
+        assert!(paths.contains_key(path));
+        assert!(!build_openapi().paths.paths.contains_key(path));
+        for receipt in ["EnterpriseSharedRegionRlsKeyReceipt", "EnterpriseSharedRegionRlsKeyMetadata"] {
+            let schema = serde_json::to_string(&private["components"]["schemas"][receipt]).unwrap();
+            assert!(schema.len() > 2 && !schema.contains("hmac"), "{receipt}");
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn parser_bundle_roll_ops_are_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_parser_bundle_roll::EnterpriseSharedParserBundleRollApiDoc;
+        // NAN-2603: eight private provisioner ops, plus NAN-2607's
+        // parser-rollouts:sources, plus 9001860's parser-rollouts:tenant-sources;
+        // none may leak into the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedParserBundleRollApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 10);
+        let public = build_openapi();
+        for path in paths.keys() {
+            assert!(path.starts_with("/internal/v1/enterprise-shared/parser-"), "{path}");
+            assert!(!public.paths.paths.contains_key(path), "{path}");
+        }
+        let schema = &private["components"]["schemas"]["EnterpriseSharedParserBundleRollRequest"];
+        for field in ["request_id", "tenant_id", "expected_activation_revision", "actor", "reason", "origin", "composition", "release"] {
+            assert!(schema["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn tenant_ip_context_routes_survive_root_merge_with_auth_and_schemas() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        for (path, method) in [
+            ("/api/enrichment/ip-context/batch", "post"),
+            ("/api/enrichment/ip-context/sources/{id}", "delete"),
+            ("/api/enrichment/ip-context/stats", "get"),
+        ] {
+            let item = &spec["paths"][path];
+            assert_eq!(item.as_object().unwrap().len(), 1);
+            let op = &item[method];
+            assert_eq!(op["security"], serde_json::json!([{"bearer_auth": []}, {"api_key": []}]));
+            assert!(op["responses"]["503"].is_object());
+        }
+        assert_eq!(spec["paths"]["/api/enrichment/ip-context/batch"]["post"]["requestBody"]
+            ["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/TenantIpContextBatchRequest");
+        for schema in ["TenantIpContextBatchRequest", "TenantIpContextBatchResponse", "TenantIpContextDeleteResponse",
+            "TenantIpContextStatsResponse", "LakeIpContextInput"] {
+            assert!(spec["components"]["schemas"][schema].is_object(), "{schema}");
+        }
+        assert!(spec["paths"]["/v1/ip-context/batch"].is_null());
+        assert!(spec["paths"]["/v1/ip-context/stats"].is_null());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn lake_pipeline_alerts_op_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_lake_pipeline_alerts::EnterpriseSharedLakePipelineAlertsApiDoc;
+        // NAN-2632: nano-main's platform alert pipeline polls
+        // lake-pipeline-alerts:read; it must never leak into the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedLakePipelineAlertsApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        let public = build_openapi();
+        for path in paths.keys() {
+            assert_eq!(path, "/internal/v1/enterprise-shared/lake-pipeline-alerts:read");
+            assert!(!public.paths.paths.contains_key(path), "{path}");
+        }
+        let alert = &private["components"]["schemas"]["EnterpriseSharedLakePipelineAlert"];
+        for field in ["alert_key", "stage", "signal", "severity", "state", "first_fired_at", "last_changed_at", "threshold", "unit", "revision"] {
+            assert!(alert["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn parser_rollout_observation_ops_are_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_parser_rollout_observation::EnterpriseSharedParserRolloutObservationApiDoc;
+        // NAN-2645: lake-generations:state, parser-rollouts:landing and
+        // parser-rollouts:probe for nano-main's rollout orchestrator; none may
+        // leak into the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedParserRolloutObservationApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 3);
+        let public = build_openapi();
+        for path in paths.keys() {
+            assert!(["/internal/v1/enterprise-shared/lake-generations:state",
+                     "/internal/v1/enterprise-shared/parser-rollouts:landing",
+                     "/internal/v1/enterprise-shared/parser-rollouts:probe"].contains(&path.as_str()), "{path}");
+            assert!(!public.paths.paths.contains_key(path), "{path}");
+        }
+        let state = &private["components"]["schemas"]["EnterpriseSharedLakeGenerationState"];
+        for field in ["tenant_id", "evaluated_at", "publish_in_flight", "in_flight", "latest", "last_published_at",
+                      "consecutive_failed_cycles", "upload_p95_seconds"] {
+            assert!(state["properties"][field].is_object(), "{field}");
+        }
+        let source = &private["components"]["schemas"]["EnterpriseSharedParserRolloutLandingSource"];
+        for field in ["source_slug", "rows_since", "parsed_ok", "parse_errors", "rows_under_pending_bundle", "searchable"] {
+            assert!(source["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn lean_audit_delivery_ops_are_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_lean_audit_delivery::EnterpriseSharedLeanAuditDeliveryApiDoc;
+        // NAN-2999: audit-events:delivery and audit-events:ack for nano-main's
+        // lean audit delivery loop; neither may leak into the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedLeanAuditDeliveryApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 2);
+        let public = build_openapi();
+        for path in paths.keys() {
+            assert!(["/internal/v1/enterprise-shared/audit-events:delivery",
+                     "/internal/v1/enterprise-shared/audit-events:ack"].contains(&path.as_str()), "{path}");
+            assert!(!public.paths.paths.contains_key(path), "{path}");
+        }
+        let envelope = &private["components"]["schemas"]["EnterpriseSharedLeanAuditDeliveryEnvelope"];
+        for field in ["via", "protocol", "source_slug", "method", "path", "headers", "body_base64", "body_bytes", "body_sha256"] {
+            assert!(envelope["required"].as_array().unwrap().iter().any(|v| v == field), "{field}");
+        }
+    }
+
+    #[test]
+    fn cold_ceiling_search_contract_documents_actionable_422_and_bytes() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        for path in ["/api/search", "/api/search/stream"] {
+            let description = spec["paths"][path]["post"]["responses"]["422"]["description"].as_str().unwrap();
+            // NAN-3644: the 2 GiB COLD_BUDGET_EXCEEDED refusal is gone; only
+            // the reader's ceiling is a 422.
+            assert!(description.contains("COLD_SCAN_TOO_LARGE"), "{description}");
+            assert!(!description.contains("COLD_BUDGET_EXCEEDED"), "{description}");
+        }
+        let detail = &spec["components"]["schemas"]["ErrorDetail"];
+        let alternatives = detail["anyOf"].as_array().or_else(|| detail["oneOf"].as_array()).unwrap();
+        assert!(alternatives.iter().any(|variant| {
+            let properties = &variant["properties"];
+            properties.get("needed_bytes").is_some()
+                && properties.get("ceiling_bytes").is_some()
+                && properties.get("background_ceiling_bytes").is_some()
+                && properties.get("retryable").is_some()
+                && properties.get("reason").is_some()
+        }), "{detail}");
+    }
 
     #[test]
     fn verify_openapi_spec_generates() {
@@ -472,6 +1399,42 @@ mod tests {
                 source_config_properties.contains_key("credential_id"),
                 "{label} source-configuration contract lost active credential_id"
             );
+        }
+    }
+
+    #[test]
+    fn verify_tree_page_contract() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let operation = &spec["paths"]["/api/search/tree-page"]["post"];
+        assert_eq!(operation["requestBody"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/TreePageRequest");
+        assert_eq!(operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/TreePageResponse");
+        assert!(operation["security"].as_array().unwrap().iter().any(|security| security.get("api_key").is_some()));
+        let response = &spec["components"]["schemas"]["TreePageResponse"]["properties"];
+        assert_eq!(response["nodes"]["type"], "array");
+        assert_eq!(response["total_count_exact"]["type"], "boolean");
+        assert!(response.get("next_offset").is_some());
+        assert!(response.get("source_truncated").is_some());
+    }
+
+    #[test]
+    fn verify_source_onboarding_contract() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        for (path, method) in [
+            ("/api/source-onboarding", "get"),
+            ("/api/source-onboarding/actions", "post"),
+            ("/api/source-onboarding/import-preview", "post"),
+            ("/api/source-onboarding/export", "get"),
+        ] {
+            let operation = &spec["paths"][path][method];
+            assert!(operation["responses"]["200"].is_object(), "{path}");
+            assert!(operation["responses"]["403"].is_object(), "{path}");
+            assert!(operation["security"].as_array().unwrap().iter().any(|s| s.get("api_key").is_some()), "{path}");
+        }
+        assert_eq!(spec["paths"]["/api/source-onboarding/actions"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/Action");
+        assert_eq!(spec["paths"]["/api/source-onboarding/import-preview"]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/CsvRequest");
+        assert!(spec["paths"]["/api/source-onboarding/export"]["get"]["responses"]["200"]["content"]["text/csv"].is_object());
+        for schema in ["Action", "CsvRequest", "JoinedPlan", "JoinedSource", "PlannedSource", "Wave", "Progress", "Suggestion", "Settings", "PreviewRow"] {
+            assert!(spec["components"]["schemas"][schema].is_object(), "{schema}");
         }
     }
 
@@ -616,15 +1579,157 @@ mod tests {
         //   GET /api/internal/vector-config/generations/{generation}/files/{path}
         // Counted in both editions — the delivery endpoint is not gated.
         // Enterprise floor 562 + 2 = 564; open floor 444 + 2 = 446.
+        // NAN-2361 moved the Observability ↔ Security convergence cross-link
+        // (NAN-1542/NAN-1544, previously the ENTERPRISE-only api-service path
+        // GET /api/observability/services/{service}/security-signals) into the
+        // search service as the shared path
+        // GET /api/search/services/{service}/security-signals (merged below,
+        // both editions). Enterprise floor 564 - 1 + 1 = 564; open floor
+        // 446 + 1 = 447.
         #[cfg(feature = "enterprise")]
-        let min_paths = 564;
+        // NAN-2469 phase 10 adds four checkout/operator paths: 569 + 4 = 573.
+        // NAN-2592 adds four ENTERPRISE shared-onboarding templates:
+        //   /api/log-sources/ingest-credentials/requests/{id} (GET state),
+        //   /api/log-sources/ingest-credentials/requests/{id}/reveal (POST),
+        //   /api/log-sources/ingest-credentials/{credential_id}/revoke (POST),
+        //   /api/log-sources/sender-templates (GET). Open is unchanged.
+        // Enterprise floor 573 + 4 = 577.
+        // NAN-2597 adds two ENTERPRISE "credentials that can write S" reads:
+        //   /api/log-sources/{id}/credentials (GET),
+        //   /api/log-sources/ingest-credentials/writers/{source_slug} (GET).
+        // Enterprise floor 577 + 2 = 579.
+        // NAN-2607 adds seven ENTERPRISE shared parser-rollout templates:
+        //   /api/log-sources/{id}/rollout (POST), /api/log-sources/{id}/rollouts,
+        //   /api/log-sources/rollouts, /api/log-sources/rollouts/{rollout_id},
+        //   /api/log-sources/parser-base-offers,
+        //   /api/log-sources/parser-base-offers/{offer_id}/merge (POST),
+        //   /api/log-sources/{id}/samples (GET/PUT). Open is unchanged.
+        // Enterprise floor 579 (NAN-2597) + 7 = 586.
+        // NAN-2617 adds one ENTERPRISE decision (b) pre-check:
+        //   /api/log-sources/ingest-credentials/precheck (POST). Open is unchanged.
+        // Enterprise floor 586 + 1 = 587.
+        // NAN-2598 adds two ENTERPRISE activity reads:
+        //   /api/log-sources/ingest-credentials/{credential_id}/activity (GET),
+        //   /api/log-sources/ingest-sources/{source_slug}/activity (GET).
+        // Enterprise floor 587 + 2 = 589.
+        // NAN-2977 adds one ENTERPRISE zero-base carry-forward:
+        //   /api/log-sources/parser-base-offers/{offer_id}/carry-forward (POST).
+        // Enterprise floor 589 + 1 = 590.
+        // NAN-3038 adds three ENTERPRISE code-free IOC list routes:
+        //   /api/ioc-lists (GET/POST), /api/ioc-lists/{id} (GET/PUT/DELETE),
+        //   /api/ioc-lists/{id}/publish (POST).
+        // Enterprise floor 590 + 3 = 593.
+        // NAN-3064 adds /api/rules/scheduling-lag (GET) to both builds.
+        // Enterprise floor 593 + 1 = 594; open 447 + 1 = 448.
+        // NAN-3077 adds the shared POST /api/search/tree-page template.
+        // NAN-3109 phase 2 adds the allowlist item and internal search ACL paths.
+        // NAN-3009 adds three authenticated custom IP context paths.
+        // NAN-3191 adds one ENTERPRISE shared-tenant AI tier path:
+        //   /api/melod/settings/ai-tier (GET/PUT). Open is unchanged.
+        // NAN-3203 adds three ENTERPRISE shared playbook upstream paths:
+        //   /api/playbook-repositories/{id}/upstream-updates (GET),
+        //   /api/playbook-repositories/{id}/apply-all-upstream-updates (POST),
+        //   /api/playbooks/{id}/apply-upstream-update (POST). Open is unchanged.
+        // NAN-3205 adds one ENTERPRISE pivt playbook drafting path:
+        //   /api/melod/playbook/draft (POST). Open is unchanged.
+        // NAN-3207 adds two ENTERPRISE per-source health series reads:
+        //   /api/log-sources/health-series (GET),
+        //   /api/log-sources/{id}/health-series (GET). Open is unchanged.
+        // NAN-3219 adds one ENTERPRISE AI tuning mode path:
+        //   /api/melod/settings/ai-tuning (GET/PUT, dedicated + shared twin).
+        //   Open is unchanged.
+        // NAN-3225 adds one ENTERPRISE entity risk series read:
+        //   /api/entities/{entity_type}/{entity_value}/risk-timeline (GET).
+        // NAN-3226 adds one ENTERPRISE internal-domains settings path:
+        //   /api/settings/internal-domains (GET/PUT, dedicated + shared twin).
+        //   Open is unchanged.
+        // NAN-3228 adds six ENTERPRISE risk watchlist paths (dedicated + shared twin):
+        //   /api/risk/watchlists (GET/POST), /api/risk/watchlists/{watchlist_id}
+        //   (GET/PATCH/DELETE), .../{watchlist_id}/members (POST),
+        //   .../{watchlist_id}/members/remove (POST), /api/risk/watchlists/lookup
+        //   (GET), /api/risk/watchlists/memberships (GET). Open is unchanged.
+        // NAN-3249 adds one ENTERPRISE risk watchlist path (dedicated + shared twin):
+        //   /api/risk/watchlists/suggest (POST). Open is unchanged.
+        // NAN-3421 adds four enterprise Pipe inspection path templates.
+        // NAN-3418 adds the capture snapshot read:
+        //   /api/log-sources/{id}/capture-sessions/{session_id}/snapshot (GET).
+        // NAN-3447 adds the recent-events read for Pipe preview:
+        //   /api/log-sources/{id}/pipe-recent-events (POST).
+        // NAN-3572 adds three hosted collector lifecycle path templates.
+        // NAN-3592 adds five tenant pull-source path templates:
+        //   /api/pull-sources (GET/POST), /api/pull-sources/setup/aws (GET),
+        //   /api/pull-sources/{id} (GET/DELETE), .../{id}/pause, .../{id}/resume (POST).
+        // NAN-3598 adds /api/pull-sources/setup/gcp (GET).
+        // NAN-3604 adds /api/pull-sources/setup/azure (GET).
+        // NAN-3618 adds /api/pull-sources/{id}/retry (POST).
+        // NAN-3729 adds PATCH on /api/pull-sources/{id} (no new path template).
+        // NAN-3621 adds the Pipe lane inputs reads:
+        //   /api/log-sources/{id}/pipe-inputs (GET), /api/log-sources/pipe-inputs (GET).
+        // NAN-3490 adds the hosted feed checkpoint reset:
+        //   /api/marketplace/collectors/{slug}/feeds/{feed_id}/reset-checkpoint (POST).
+        // NAN-3503 adds the hosted collector vendor components:
+        //   /api/marketplace/collectors/{slug}/components (GET),
+        //   /api/marketplace/collectors/{slug}/components/{component} (PUT/DELETE).
+        // NAN-3684: four source-onboarding paths.
+        // NAN-3729 adds the hosted credential rotation path.
+        // NAN-3770 adds three dedicated ingest-token path templates to both
+        // builds: /api/ingest-tokens (GET/POST),
+        // /api/ingest-tokens/{credential_id}/revoke (POST),
+        // /api/ingest-tokens/install-token (PUT).
+        // NAN-3806 adds /api/ingest-tokens/{credential_id}/bind (POST) to both builds.
+        // NAN-3763 adds hosted threat-intel lookups: /api/threat-intel/providers (GET),
+        //   /api/threat-intel/providers/{provider} (PUT/DELETE), /api/threat-intel/lookup (POST).
+        // NAN-3807 adds two dedicated bucket-drop path templates to both builds:
+        //   /api/landing-sources (GET), /api/landing-sources/{source_id}/files (GET).
+        // NAN-3812 adds /api/me/field-usage (GET) to both builds.
+        // NAN-3881 adds hosted /api/threat-intel/indicator-lookup (POST).
+        // NAN-3882 adds the ENTERPRISE IOC list viewer:
+        //   /api/ioc-lists/{list_id}/indicators (GET). Open is unchanged.
+        let min_paths = 660;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 446;
+        // NAN-3577: floor matches the regenerated default-feature published spec.
+        // NAN-3806: +1 (/api/ingest-tokens/{credential_id}/bind); NAN-3807: +2 (landing sources);
+        // NAN-3812: +1 (/api/me/field-usage).
+        let min_paths = 480;
 
         assert!(
             path_count >= min_paths,
             "Expected at least {min_paths} paths, got {path_count}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn threat_intel_lookup_contract_is_published() {
+        let spec = build_openapi();
+        let item = |p: &str| spec.paths.paths.get(p).unwrap_or_else(|| panic!("missing {p}"));
+        assert!(item("/api/threat-intel/providers").get.is_some());
+        let provider = item("/api/threat-intel/providers/{provider}");
+        assert!(provider.put.is_some() && provider.delete.is_some());
+        let lookup = item("/api/threat-intel/lookup");
+        assert!(lookup.post.is_some());
+        assert!(item("/api/threat-intel/indicator-lookup").post.is_some());
+        let body = serde_json::to_string(&spec.components).unwrap();
+        for schema in ["ThreatIntelLookupRequest", "ThreatIntelLookupResponse", "ThreatIntelProviderResult", "ThreatIntelProviderStatus", "ThreatIntelProvidersResponse",
+            "ThreatIntelIndicatorLookupRequest", "ThreatIntelIndicatorLookupResponse", "ThreatIntelIndicatorSourceMatches", "ThreatIntelIndicatorMatch"] {
+            assert!(body.contains(&format!("\"{schema}\"")), "missing schema {schema}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn pipe_inspection_contract_keeps_runtime_ops_private() {
+        use nanosiem_enterprise::handlers::shared_pipe_capture::{SharedPipeCaptureApiDoc, PENDING_PATH, CLAIM_PATH, COMPLETE_PATH};
+        let public = build_openapi();
+        for path in ["/api/log-sources/{id}/pipe-capabilities", "/api/log-sources/{id}/pipe-preview",
+            "/api/log-sources/{id}/pipe-recent-events", "/api/log-sources/{id}/pipe-inputs", "/api/log-sources/pipe-inputs", "/api/log-sources/{id}/capture-sessions", "/api/log-sources/{id}/capture-sessions/{session_id}"] {
+            assert!(public.paths.paths.contains_key(path), "missing {path}");
+        }
+        let private = SharedPipeCaptureApiDoc::openapi();
+        for path in [PENDING_PATH, CLAIM_PATH, COMPLETE_PATH] {
+            assert!(!public.paths.paths.contains_key(path), "private runtime operation exposed");
+            assert!(private.paths.paths.contains_key(path));
+        }
     }
 
     /// NAN-1918: the quarantine listing is the only operator-visible surface
@@ -637,6 +1742,13 @@ mod tests {
             spec.paths.paths.contains_key("/api/mitre/quarantine"),
             "GET /api/mitre/quarantine must be registered in MitreApiDoc"
         );
+    }
+
+    #[test]
+    fn inputlookup_internal_auth_is_a_separate_service_scheme() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        assert!(spec["components"]["securitySchemes"].get("egress_service_bearer").is_some());
+        assert_eq!(spec["paths"]["/internal/inputlookup/egress-check"]["post"]["security"][0], serde_json::json!({"egress_service_bearer": []}));
     }
 
     /// A duplicated `#[test]` attribute on the test above had been absorbing
@@ -820,11 +1932,11 @@ mod tests {
     /// Active Hunter, observability, reports, source scopes, trace search —
     /// were simply absent from the docs.
     ///
-    /// STRUCTURAL, not byte-exact, and deliberately so. Byte-exactness would
-    /// force a 1.7 MB regeneration for a one-word description edit, and that
-    /// churn is what gets a gate switched off. Comparing the path and schema
-    /// SETS catches the failure that actually happened (endpoints missing
-    /// entirely) without punishing field-level annotation work.
+    /// NAN-3577 — compare the entire parsed document, so changes to existing
+    /// operations, schema fields, security, servers, and descriptions also
+    /// require regeneration. JSON equality ignores formatting and object key
+    /// order while preserving every published value. This runs in the existing
+    /// CI and pre-commit `openapi::tests` validation path without another build.
     ///
     /// Open build only: the script exports with default features, so under
     /// `--features enterprise` the fresh spec legitimately carries ~143 extra
@@ -888,24 +2000,44 @@ mod tests {
             fresh_schemas.iter().filter(|s| !committed_schemas.contains(s)).collect();
         let stale_schemas: Vec<&String> =
             committed_schemas.iter().filter(|s| !fresh_schemas.contains(s)).collect();
+        let changed_paths: Vec<&String> = fresh_paths
+            .iter()
+            .filter(|p| committed_paths.contains(p) && committed["paths"][*p] != fresh["paths"][*p])
+            .collect();
+        let changed_schemas: Vec<&String> = fresh_schemas
+            .iter()
+            .filter(|s| {
+                committed_schemas.contains(s)
+                    && committed["components"]["schemas"][*s] != fresh["components"]["schemas"][*s]
+            })
+            .collect();
+        let changed_sections: Vec<String> = keys_at(&committed, "")
+            .into_iter()
+            .chain(keys_at(&fresh, ""))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|key| committed.get(key) != fresh.get(key))
+            .collect();
 
         assert!(
-            missing_paths.is_empty()
-                && stale_paths.is_empty()
-                && missing_schemas.is_empty()
-                && stale_schemas.is_empty(),
+            committed == fresh,
             "docs/api/openapi.json is STALE — the published API reference no longer matches the \
              code.\n\n\
              undocumented endpoints ({}): {missing_paths:?}\n\
              documented but gone ({}): {stale_paths:?}\n\
              undocumented schemas ({}): {missing_schemas:?}\n\
              documented but gone ({}): {stale_schemas:?}\n\n\
+             changed existing endpoints ({}): {changed_paths:?}\n\
+             changed existing schemas ({}): {changed_schemas:?}\n\
+             changed document sections: {changed_sections:?}\n\n\
              Regenerate:\n  bash tools/export-openapi.sh\n\n\
              Then skim the diff — a newly appearing path is a surface you are about to publish.",
             missing_paths.len(),
             stale_paths.len(),
             missing_schemas.len(),
             stale_schemas.len(),
+            changed_paths.len(),
+            changed_schemas.len(),
         );
     }
 

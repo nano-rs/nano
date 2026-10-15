@@ -29,11 +29,42 @@ pub trait SchemaProfile: Send + Sync {
     /// Identity of this profile (`Udm` | `Ocsf`).
     fn id(&self) -> SchemaId;
 
+    /// Whether query tokens must remain exact canonical schema paths.
+    ///
+    /// The object-lake OCSF contract uses this to reject every historical UDM
+    /// alias and Nano convenience name. Legacy table profiles return `false`
+    /// so their established query vocabulary remains isolated and unchanged.
+    fn uses_strict_canonical_fields(&self) -> bool {
+        false
+    }
+
+    /// Whether the dotless-hostname FQDN expansion (`= v OR startsWith(.., 'v.')`)
+    /// compares an ingest-lowercased column RAW (NAN-3154).
+    ///
+    /// ClickHouse tables keep `lower(col)` in both legs: their migration-119
+    /// `lower(col)` text index serves equality AND startsWith, while a raw
+    /// startsWith is not bloom-servable. The object lake has no such index:
+    /// `lower(col)` there disables Parquet bloom, min/max and page pushdown on
+    /// the equality leg, so it compares raw like every other lowercased Eq.
+    fn lowercased_host_prefix_compares_raw(&self) -> bool {
+        false
+    }
+
     // --- Field universe & resolution ---
 
     /// All queryable canonical field names with their metadata
     /// (replaces `UDM_COLUMNS` / `EXPLICIT_COLUMNS`).
     fn fields(&self) -> &[FieldDef];
+
+    /// Snapshot-discovered fields that are not part of the build-time profile.
+    ///
+    /// Immutable lake manifests publish the exact typed physical leaves in a
+    /// snapshot. Returning owned names here lets schema discovery and minor
+    /// OCSF upgrades follow that signed inventory without leaking strings into
+    /// the process-wide static registry. Table-backed profiles return none.
+    fn snapshot_fields(&self) -> Vec<(String, FieldType)> {
+        Vec::new()
+    }
 
     /// Resolve an nPL field token to its physical ClickHouse location.
     ///
@@ -41,6 +72,13 @@ pub trait SchemaProfile: Send + Sync {
     /// `is_explicit_column()` exactly: [`FieldResolution::ExplicitColumn`] for
     /// known names, [`FieldResolution::Unknown`] otherwise.
     fn resolve(&self, npl_field: &str) -> FieldResolution;
+
+    /// Computed scalar exposed by the source projection, plus its physical inputs.
+    /// Only profile-owned expressions are permitted here; names are never SQL.
+    fn source_computed_column(&self, _field: &str) -> Option<(String, Vec<&'static str>)> {
+        None
+    }
+
 
     /// Map a user-typed alias to its canonical field name
     /// (`sourcetype` → `source_type`, `hostname` → `host`).
@@ -65,6 +103,12 @@ pub trait SchemaProfile: Send + Sync {
 
     /// Whether the field is a ClickHouse `UUID` (compared via `toString()`).
     fn is_uuid_field(&self, field: &str) -> bool;
+
+    /// Whether a canonical field addresses an array of string values and must
+    /// use element-membership semantics for search predicates.
+    fn is_string_array_field(&self, _field: &str) -> bool {
+        false
+    }
 
     /// Fields eligible for PREWHERE extraction (indexed / bloom-filtered).
     fn prewhere_fields(&self) -> &[&str];
@@ -278,6 +322,14 @@ pub trait SchemaProfile: Send + Sync {
     /// raw-SQL builders; this exposes it to the `field_to_sql_expr` value/group
     /// seam so `stats count by src_host` sees the host wherever the class put it.
     fn class_split_value_sql(&self, _udm_field: &str) -> Option<String> {
+        None
+    }
+
+    /// Physical input columns consumed by
+    /// [`class_split_value_sql`](Self::class_split_value_sql). A storage profile
+    /// without a materialized unified column exposes these so slim stage-0
+    /// projections retain both sides of the value-pick expression.
+    fn class_split_source_fields(&self, _udm_field: &str) -> Option<(&'static str, &'static str)> {
         None
     }
 

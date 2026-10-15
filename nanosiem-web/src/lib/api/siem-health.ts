@@ -133,13 +133,36 @@ export interface AlertingMetrics {
   active_routing_rules: number;
 }
 
+/**
+ * Hosted-shared tenant reports (NAN-2361) carry what the lake recorded for
+ * the tenant instead of event counts: objects/bytes from writer completion
+ * receipts over the last 24 h and the prior 24 h.
+ */
+export interface TenantIngestionMetrics {
+  objects_24h: number;
+  bytes_24h: number;
+  objects_prior_24h: number;
+  bytes_prior_24h: number;
+  lifetime_objects: number;
+  lifetime_bytes: number;
+  last_written_at: string | null;
+  writer_classes_24h: string[];
+}
+
 export interface CollectedMetrics {
-  ingestion: IngestionMetrics;
-  parsing: ParsingMetrics;
-  enrichment: EnrichmentMetrics;
+  /** Absent on hosted-shared tenant reports (event counts are not observable). */
+  ingestion?: IngestionMetrics;
+  /** Absent on hosted-shared tenant reports (measured by the platform parser cell). */
+  parsing?: ParsingMetrics;
+  /** Absent on hosted-shared tenant reports. */
+  enrichment?: EnrichmentMetrics;
   detection: DetectionMetrics;
   alerting: AlertingMetrics;
   collected_at: string;
+  /** Hosted-shared tenant reports only. */
+  tenant_ingestion?: TenantIngestionMetrics;
+  /** `"shared_lake"` on hosted-shared tenant reports. */
+  collector_backend?: string;
 }
 
 export interface SiemHealthReport {
@@ -167,7 +190,7 @@ export interface SiemHealthReportSummary {
   overall_score: number;
   overall_status: string;
   ingestion_score: number;
-  parsing_score: number;
+  parsing_score: number | null;
   detection_score: number;
   enrichment_score: number | null;
   alerting_score: number | null;

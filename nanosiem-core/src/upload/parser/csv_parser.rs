@@ -59,7 +59,13 @@ impl FileParser {
                 Ok(record) => {
                     // Generate headers if not set
                     if headers.is_empty() {
-                        headers = (0..record.len()).map(|i| format!("col_{}", i)).collect();
+                        headers = if record.len() == 1 {
+                            vec![Self::indicator_column(record.get(0).unwrap_or(""))
+                                .unwrap_or("value")
+                                .to_string()]
+                        } else {
+                            (0..record.len()).map(|i| format!("col_{}", i)).collect()
+                        };
                         result.headers = Some(headers.clone());
                     }
 
@@ -70,11 +76,8 @@ impl FileParser {
                     // column-shifted records that poison lookup/enrichment
                     // data downstream (NAN-1363).
                     if record.len() != headers.len() {
-                        let msg = format!(
-                            "expected {} fields, found {}",
-                            headers.len(),
-                            record.len()
-                        );
+                        let msg =
+                            format!("expected {} fields, found {}", headers.len(), record.len());
                         if config.skip_invalid {
                             result.add_error(RecordError::new(line_number, msg));
                         } else {

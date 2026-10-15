@@ -29,7 +29,9 @@ pub enum SourceType {
     AwsS3,
     /// GCP Pub/Sub subscription - source_type defined per feed
     GcpPubSub,
-    /// Splunk HTTP Event Collector - uses HEC sourcetype field
+    /// Azure Event Hubs consumer group - source_type defined per feed (NAN-3764)
+    AzureEventHubs,
+    /// HTTP Event Collector (HEC) - uses the HEC sourcetype field
     SplunkHec,
     /// Vector-to-Vector forwarding - source_type field in event
     Vector,
@@ -42,6 +44,7 @@ impl SourceType {
             Self::Kafka => "kafka",
             Self::AwsS3 => "aws_s3",
             Self::GcpPubSub => "gcp_pubsub",
+            Self::AzureEventHubs => "azure_event_hubs",
             Self::SplunkHec => "splunk_hec",
             Self::Vector => "vector",
         }
@@ -53,6 +56,7 @@ impl SourceType {
             "kafka" => Some(Self::Kafka),
             "aws_s3" | "aws_sqs" | "s3" => Some(Self::AwsS3),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
+            "azure_event_hubs" => Some(Self::AzureEventHubs),
             "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),
             "vector" => Some(Self::Vector),
             _ => None,
@@ -66,7 +70,8 @@ impl SourceType {
             Self::Kafka => "Kafka",
             Self::AwsS3 => "AWS S3",
             Self::GcpPubSub => "GCP Pub/Sub",
-            Self::SplunkHec => "Splunk HEC",
+            Self::AzureEventHubs => "Azure Event Hubs",
+            Self::SplunkHec => "HEC",
             Self::Vector => "Vector",
         }
     }
@@ -78,7 +83,8 @@ impl SourceType {
             Self::Kafka => "Consume logs from Kafka topics (source_type per feed)",
             Self::AwsS3 => "Ingest logs from AWS S3 via SQS (source_type per feed)",
             Self::GcpPubSub => "Subscribe to GCP Pub/Sub topics (source_type per feed)",
-            Self::SplunkHec => "Receive logs via Splunk HEC (uses HEC sourcetype)",
+            Self::AzureEventHubs => "Consume Azure Event Hubs (source_type per feed)",
+            Self::SplunkHec => "Receive logs via HTTP Event Collector (HEC); routes on the HEC sourcetype",
             Self::Vector => "Receive from on-prem Vector aggregator (source_type in event)",
         }
     }
@@ -90,6 +96,7 @@ impl SourceType {
             Self::Kafka,
             Self::AwsS3,
             Self::GcpPubSub,
+            Self::AzureEventHubs,
             Self::SplunkHec,
             Self::Vector,
         ]
@@ -310,7 +317,7 @@ pub struct NewLogSource {
     pub source_type: String,
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
-    /// NAN-928: dispatch source-configuration this parser should consume from.
+    /// dispatch source-configuration this parser should consume from.
     /// When set on a fetch-source parser (kafka/aws_s3/gcp_pubsub), the
     /// generator emits a filter on the source-config's routing transform
     /// instead of a parser-owned Vector source.
@@ -329,8 +336,8 @@ pub struct NewLogSource {
     pub sampling_ratio: Option<f64>,
     /// VRL condition for events that are NEVER sampled.
     pub sampling_exclude_condition: Option<String>,
-    /// NAN-1920 lifecycle: "draft" | "active". Omitted → defaults to "active"
-    /// in the repository INSERT, so pre-NAN-1920 callers are unaffected. The
+    ///  lifecycle: "draft" | "active". Omitted → defaults to "active"
+    /// in the repository INSERT, so older callers are unaffected. The
     /// AddFeed wizard sends "draft" for its auto-persisted in-progress feed.
     #[serde(default)]
     pub lifecycle_status: Option<String>,
@@ -363,13 +370,13 @@ pub struct UpdateLogSource {
     pub timezone: Option<String>,
     pub source_type: Option<String>,
     pub parser_vrl: Option<String>,
-    /// NAN-1151: enrichment-parser mapping VRL. Lets the upstream-update/apply
+    /// enrichment-parser mapping VRL. Lets the upstream-update/apply
     /// path refresh a linked enrichment parser (which carries `normalize_vrl`,
     /// not `parser_vrl`).
     #[serde(default)]
     pub normalize_vrl: Option<String>,
     pub output_fields: Option<serde_json::Value>,
-    /// NAN-928: rebind dispatch source. `None` here means "no change"; use
+    /// rebind dispatch source. `None` here means "no change"; use
     /// the dedicated null-clear path on the API if you need to unbind.
     #[serde(default, with = "typeid::source_config::opt")]
     #[schema(value_type = Option<String>)]
@@ -394,7 +401,7 @@ pub struct UpdateLogSource {
     pub sampling_ratio: Option<f64>,
     /// VRL condition for events that are NEVER sampled. None = no change.
     pub sampling_exclude_condition: Option<String>,
-    /// Optional VRL overlay (NAN-874). Tri-state semantics enforced by
+    /// Optional VRL overlay. Tri-state semantics enforced by
     /// `repository::update`'s SQL CASE expression:
     ///   - `None`           → column unchanged
     ///   - `Some("")`       → column set to NULL (extension removed)
@@ -493,6 +500,38 @@ pub struct LogSourceHealth {
     /// generic message like `dispatch failure` would be worse than silence.
     #[serde(default)]
     pub collector_error_hint: Option<String>,
+
+    // Admission refusals (NAN-3680)
+    //
+    // A third state, distinct from both of the above: data arrived and
+    // parsed, but the lake's strict OCSF admission refused the row, so it
+    // never became searchable.
+    /// Rows the lake refused at strict OCSF admission in the last 24 hours.
+    /// `None` when this deployment does not record refusals per source
+    /// (unknown, never zero).
+    #[serde(default)]
+    pub refused_events_24h: Option<i64>,
+    /// The newest refusal, value-free (reason code and OCSF attribute path).
+    #[serde(default)]
+    pub last_refusal: Option<LogSourceRefusalSample>,
+
+    // NAN-3765.
+    /// Why this enabled source is not part of the deployed collector
+    /// configuration, e.g. "waiting for source configuration 'Hub' to be
+    /// deployed". `None` when it is deployed (or disabled). It deploys on its
+    /// own once the reason clears.
+    #[serde(default)]
+    pub pending_reason: Option<String>,
+}
+
+/// why the lake refused rows of a source, free of row content: a
+/// stable reason code (`ocsf_constraint_failed`) and, when known, the OCSF
+/// attribute path it concerns (`device`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LogSourceRefusalSample {
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 
 /// One collector failure, as reported by the collector itself.
@@ -620,10 +659,10 @@ pub struct LogSourceVersion {
     pub created_by: Option<Uuid>,
     pub change_reason: String,
     pub reverted_from_version: Option<i32>,
-    /// Snapshot of extension_vrl at publish time (NAN-874).
+    /// Snapshot of extension_vrl at publish time.
     #[serde(default)]
     pub extension_vrl: Option<String>,
-    /// Snapshot of extension_enabled at publish time (NAN-874).
+    /// Snapshot of extension_enabled at publish time.
     #[serde(default)]
     pub extension_enabled: bool,
 }
@@ -772,6 +811,10 @@ pub struct ParserTestResult {
     /// Number of top-level fields in `output` (0 when output is None or not an object).
     #[serde(default)]
     pub extracted_field_count: u32,
+    /// Present when the caller requested OCSF validation of the successfully
+    /// transformed output. VRL compilation/execution failures leave this empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_validation: Option<crate::parsers::OcsfValidationResult>,
 }
 
 /// Result of testing VRL against a real event, comparing current vs new parse

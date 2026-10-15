@@ -3,6 +3,12 @@
 /**
  * Source Visibility — per-source RBAC scoping (NAN-1802, backend NAN-1789).
  *
+ * DEDICATED deployments only. A hosted-shared tenant (NAN-2361 wave 8)
+ * renders `SourceVisibility` instead: on the lake the restriction key is the
+ * source slug (`metadata.log_source`), visibility is group-based with
+ * per-member exceptions, and the legacy `/api/source-scopes*` mutations are
+ * retired (410). Nothing below runs for a shared tenant.
+ *
  * Master/detail admin surface for the restricted-source registry:
  *   • LEFT   — the restricted-source registry. Each listed `source_type` is
  *              invisible-by-default; add via a picker of ingested source types
@@ -24,7 +30,6 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   EyeOff,
   Plus,
-  Loader2,
   Search as SearchIcon,
   ShieldCheck,
   Users as UsersIcon,
@@ -33,10 +38,12 @@ import {
   Trash2,
   Info,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import {
   api,
   EVERYONE_GROUP_ID,
@@ -69,6 +76,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip';
 import { formatUTC } from '@/lib/date-utils';
+import { SourceVisibility } from './SourceVisibility';
 
 function isEveryone(groupId: string): boolean {
   return groupId === EVERYONE_GROUP_ID;
@@ -156,6 +164,7 @@ function GrantsDetail({
   grants,
   loading,
   canManage,
+  shared,
   onAddGrant,
   onRevoke,
   onRemoveRestricted,
@@ -164,11 +173,14 @@ function GrantsDetail({
   grants: SourceScopeGrant[];
   loading: boolean;
   canManage: boolean;
+  /** Hosted-shared tenant (NAN-2361): grantees are roles, not groups. */
+  shared: boolean;
   onAddGrant: () => void;
   onRevoke: (grant: SourceScopeGrant) => void;
   onRemoveRestricted: () => void;
 }) {
-  const everyoneGrant = grants.find((g) => isEveryone(g.group_id));
+  const everyoneGrant = shared ? undefined : grants.find((g) => isEveryone(g.group_id));
+  const noun = shared ? 'role' : 'group';
 
   return (
     <div className="flex-1 overflow-y-auto scrollbar-thin">
@@ -227,7 +239,7 @@ function GrantsDetail({
             <EyeOff className="w-[14px] h-[14px] text-amber-500 shrink-0 mt-0.5" />
             <div className="text-[11.5px] text-foreground/80 leading-relaxed">
               Invisible by default. Only members of the{' '}
-              <span className="text-foreground font-medium">{grants.length}</span> granted group
+              <span className="text-foreground font-medium">{grants.length}</span> granted {noun}
               {grants.length === 1 ? '' : 's'} below can see events from this source.
             </div>
           </div>
@@ -237,7 +249,7 @@ function GrantsDetail({
         <div className="grid grid-cols-3 gap-6">
           <div>
             <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1.5">
-              Granted groups
+              Granted {noun}s
             </div>
             <div className="font-mono text-[12px] text-foreground tabular-nums">{grants.length}</div>
           </div>
@@ -261,7 +273,7 @@ function GrantsDetail({
         <div>
           <div className="flex items-center gap-2 mb-2">
             <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">
-              Group grants
+              {shared ? 'Role grants' : 'Group grants'}
             </div>
             <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">
               {grants.length}
@@ -271,18 +283,18 @@ function GrantsDetail({
           <div className="rounded-md border border-border overflow-hidden">
             <div className="grid grid-cols-[20px_minmax(160px,2fr)_minmax(120px,1fr)_120px_28px] gap-3 px-3 py-1.5 bg-card/50 border-b border-border text-[10px] uppercase tracking-[0.08em] text-muted-foreground font-medium">
               <span />
-              <span>Group</span>
+              <span>{shared ? 'Role' : 'Group'}</span>
               <span>Granted by</span>
               <span>Granted</span>
               <span />
             </div>
             {loading ? (
               <div className="px-4 py-6 text-center">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground inline" />
+                <LoadingIcon className="w-4 h-4 text-muted-foreground inline" />
               </div>
             ) : grants.length === 0 ? (
               <div className="px-4 py-6 text-center text-[11.5px] text-muted-foreground">
-                No groups granted yet — nobody can see this source.
+                No {noun}s granted yet — nobody can see this source.
               </div>
             ) : (
               grants.map((g) => {
@@ -466,7 +478,7 @@ function AddRestrictedDialog({
             onClick={() => onCreate(trimmed, description.trim())}
           >
             {saving ? (
-              <Loader2 className="w-[12px] h-[12px] animate-spin" />
+              <LoadingIcon className="w-[12px] h-[12px]" />
             ) : (
               <EyeOff className="w-[12px] h-[12px]" />
             )}
@@ -490,6 +502,7 @@ function AddGrantDialog({
   grantedGroupIds,
   onGrant,
   saving,
+  shared,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -498,8 +511,10 @@ function AddGrantDialog({
   grantedGroupIds: Set<string>;
   onGrant: (groupId: string) => void;
   saving: boolean;
+  shared: boolean;
 }) {
   const [groupId, setGroupId] = useState('');
+  const noun = shared ? 'role' : 'group';
 
   useEffect(() => {
     if (open) setGroupId('');
@@ -522,10 +537,10 @@ function AddGrantDialog({
         <SheetHeader className="space-y-1.5 border-b border-border px-5 py-4 text-left">
           <SheetTitle className="flex items-center gap-2 text-[14px] font-semibold">
             <UsersIcon className="w-[14px] h-[14px] text-muted-foreground" />
-            Grant group access
+            Grant {noun} access
           </SheetTitle>
           <SheetDescription className="text-[11.5px] leading-relaxed text-muted-foreground">
-            Give a group visibility of{' '}
+            Give a {noun} visibility of{' '}
             <span className="font-mono text-foreground/80">{sourceType}</span>.
           </SheetDescription>
         </SheetHeader>
@@ -533,16 +548,16 @@ function AddGrantDialog({
         <div className="px-5 py-4 flex flex-col gap-3 flex-1 overflow-y-auto">
           <div>
             <label className="text-[11px] uppercase tracking-[0.1em] text-muted-foreground font-medium mb-1.5 block">
-              Group
+              {shared ? 'Role' : 'Group'}
             </label>
             <Select value={groupId} onValueChange={setGroupId}>
               <SelectTrigger className="h-8 text-[12px]">
-                <SelectValue placeholder="Select a group…" />
+                <SelectValue placeholder={`Select a ${noun}…`} />
               </SelectTrigger>
               <SelectContent>
                 {available.length === 0 ? (
                   <div className="px-2 py-2 text-[11.5px] text-muted-foreground">
-                    All groups already granted.
+                    All {noun}s already granted.
                   </div>
                 ) : (
                   available.map((g) => (
@@ -595,7 +610,7 @@ function AddGrantDialog({
             onClick={() => onGrant(groupId)}
           >
             {saving ? (
-              <Loader2 className="w-[12px] h-[12px] animate-spin" />
+              <LoadingIcon className="w-[12px] h-[12px]" />
             ) : (
               <Plus className="w-[12px] h-[12px]" />
             )}
@@ -612,10 +627,24 @@ function AddGrantDialog({
 // ---------------------------------------------------------------------------
 
 export function SourceScopes() {
+  // Hosted-shared tenant (NAN-2361 wave 8): group-based visibility on the
+  // lake's `metadata.log_source`. Decided before any hook below runs so the
+  // dedicated page's requests never fire on the shared cluster.
+  const sharedTenant = useSharedTenant();
+  if (sharedTenant) {
+    return <SourceVisibility />;
+  }
+  return <DedicatedSourceScopes />;
+}
+
+function DedicatedSourceScopes() {
   useDocumentTitle('Source Visibility');
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const canManage = hasPermission('source_scopes:manage');
+  // Always a dedicated deployment here (the shared tenant returned above);
+  // the `shared` role-grantee branches are kept for the wave-3 wire shape.
+  const shared = false;
 
   const [restricted, setRestricted] = useState<RestrictedSource[]>([]);
   const [groups, setGroups] = useState<GroupDetail[]>([]);
@@ -641,13 +670,26 @@ export function SourceScopes() {
   const fetchRestricted = async (keepSelection = true) => {
     setLoading(true);
     try {
-      const [res, groupsRes, types] = await Promise.all([
+      const [res, grantees, types] = await Promise.all([
         api.sourceScopes.listRestricted(),
-        api.listGroups(),
+        shared
+          ? api.listRoles().then((r) =>
+              r.roles.map<GroupDetail>((role) => ({
+                id: role.id,
+                name: role.name,
+                description: role.description,
+                is_system: role.is_system,
+                roles: [],
+                member_count: 0,
+                created_at: role.created_at,
+                updated_at: role.updated_at,
+              })),
+            )
+          : api.listGroups().then((g) => g.groups),
         api.getSourceTypes().catch(() => [] as [string, number][]),
       ]);
       setRestricted(res.restricted);
-      setGroups(groupsRes.groups);
+      setGroups(grantees);
       setIngestedTypes(types.map(([st]) => st));
       if (!keepSelection || selected == null) {
         setSelected(res.restricted[0]?.source_type ?? null);
@@ -821,7 +863,15 @@ export function SourceScopes() {
     }
   };
 
-  const modelHelp = (
+  const modelHelp = shared ? (
+    <>
+      An <span className="font-medium">empty</span> registry means every source is visible to
+      everyone (allow-all). Listing a source_type hides it by default; it is then visible only to
+      members holding the roles you grant (and to holders of{' '}
+      <span className="font-mono">source_scopes:view_all</span>). Remove the restriction to
+      re-open it for everyone.
+    </>
+  ) : (
     <>
       An <span className="font-medium">empty</span> registry means every source is visible to
       everyone (allow-all). Listing a source_type hides it by default; it is then visible only to
@@ -842,7 +892,7 @@ export function SourceScopes() {
             <HelpDot text={modelHelp} />
           </div>
           <p className="text-[11.5px] text-muted-foreground mt-0.5">
-            Restrict which analyst groups can see events from a{' '}
+            Restrict which analyst {shared ? 'roles' : 'groups'} can see events from a{' '}
             <span className="font-mono">source_type</span>. Empty registry = visible to everyone.
           </p>
         </div>
@@ -876,7 +926,7 @@ export function SourceScopes() {
             <div className="flex-1 overflow-y-auto scrollbar-thin">
               {loading ? (
                 <div className="flex items-center justify-center py-12">
-                  <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                  <LoadingIcon className="w-4 h-4 text-muted-foreground" />
                 </div>
               ) : filtered.length === 0 ? (
                 <div className="px-4 py-10 text-center">
@@ -914,6 +964,7 @@ export function SourceScopes() {
               grants={grants}
               loading={grantsLoading}
               canManage={canManage}
+              shared={shared}
               onAddGrant={() => setShowAddGrant(true)}
               onRevoke={setPendingRevoke}
               onRemoveRestricted={() => setPendingRemove(selectedSource)}
@@ -965,6 +1016,7 @@ export function SourceScopes() {
           grantedGroupIds={grantedGroupIds}
           onGrant={handleAddGrant}
           saving={saving}
+          shared={shared}
         />
       )}
 
@@ -977,7 +1029,7 @@ export function SourceScopes() {
           <>
             Make <span className="font-mono text-foreground font-medium">{pendingRemove?.source_type}</span>{' '}
             visible to everyone again? All {' '}
-            <span className="text-foreground font-medium">group grants for this source are deleted</span>.
+            <span className="text-foreground font-medium">{shared ? 'role' : 'group'} grants for this source are deleted</span>.
             This cannot be undone.
           </>
         }

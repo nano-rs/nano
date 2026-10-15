@@ -39,7 +39,11 @@
 //! - `rate_limit_per_minute`: Rate limit per user (default: 60)
 //! - `allow_http`: Whether to allow plain HTTP (default: false)
 
+pub mod egress_auth;
 mod fetcher;
+pub mod shared;
+mod shared_parser;
+pub mod storage_policy;
 mod response_parser;
 mod service;
 mod ssrf;
@@ -48,6 +52,8 @@ mod types;
 pub use fetcher::{CacheStats, FetchError, FetchResult, UrlFetcher};
 pub use response_parser::ParseError;
 pub use service::{params_from_command, InputLookupError, InputLookupOutcome, InputLookupService};
+#[cfg(test)]
+pub(crate) use service::tests::FakeStore;
 pub use ssrf::{
     ai_base_url_validator, pin_resolved_addrs, private_ai_endpoints_allowed,
     restricted_redirect_policy, IpCidr, SsrfConfig, SsrfError, SsrfValidator,

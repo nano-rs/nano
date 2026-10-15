@@ -8,7 +8,8 @@
 
 import { useMemo, useState, useCallback } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { AlertTriangle, Loader2 } from 'lucide-react';
+import { AlertTriangle } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import {
@@ -61,7 +62,7 @@ export function Matches() {
 
   // NAN-1296: schema-aware entity classification for match entities, so any
   // promoted entity field (UDM or OCSF) resolves without a hardcoded list.
-  const { resolveEntityType } = useSchemaEntityMap();
+  const { resolveEntityType, schema } = useSchemaEntityMap();
   const views: MatchView[] = useMemo(() => {
     return (matchesData?.matches || []).map((m) => buildMatchView(m, resolveEntityType));
   }, [matchesData, resolveEntityType]);
@@ -130,12 +131,16 @@ export function Matches() {
         await demoteDetection(apiRule.id);
         toast({ title: 'Alerting disabled', description: 'Rule demoted to live mode.' });
       } else {
-        await promoteDetection(apiRule.id);
-        toast({ title: 'Alerting enabled' });
+        // Promote is one lifecycle step: a staging rule goes live first
+        // (bound to its source), a live rule starts alerting.
+        const updated = await promoteDetection(apiRule.id);
+        toast(updated?.mode === 'alerting'
+          ? { title: 'Alerting enabled' }
+          : { title: `Promoted to ${updated?.mode ?? 'live'}`, description: 'Promote again to enable alerting.' });
       }
       refetchRule();
-    } catch {
-      toast({ title: 'Error', description: 'Failed to update rule mode.', variant: 'destructive' });
+    } catch (e: unknown) {
+      toast({ title: 'Error', description: e instanceof Error ? e.message : 'Failed to update rule mode.', variant: 'destructive' });
     }
   }, [apiRule, promoteDetection, demoteDetection, refetchRule, toast]);
 
@@ -151,32 +156,41 @@ export function Matches() {
     // entirely when pivoting to raw events — the analyst wants the underlying
     // activity for the entity, not a re-run of the rule's stats.
     const baseFilter = apiRule.query.split('|')[0].trim();
+    const ocsf = schema === 'ocsf';
     let entityFilter: string;
     switch (view.entity.type) {
       case 'user':
       case 'role':
       case 'service':
-        entityFilter = raw.startsWith('arn:')
-          ? `user_identity.arn="${escaped}"`
-          : `user="${escaped}"`;
+        entityFilter = ocsf
+          ? raw.startsWith('arn:')
+            ? `(actor.user.uid="${escaped}" OR actor.user.name="${escaped}")`
+            : `(actor.user.name="${escaped}" OR actor.user.uid="${escaped}" OR user.name="${escaped}" OR user.uid="${escaped}")`
+          : raw.startsWith('arn:')
+            ? `user_identity.arn="${escaped}"`
+            : `user="${escaped}"`;
         break;
       case 'host':
-        entityFilter = `(src_host="${escaped}" OR dest_host="${escaped}" OR hostname="${escaped}")`;
+        entityFilter = ocsf
+          ? `(device.hostname="${escaped}" OR src_endpoint.hostname="${escaped}" OR dst_endpoint.hostname="${escaped}")`
+          : `(src_host="${escaped}" OR dest_host="${escaped}" OR hostname="${escaped}")`;
         break;
       case 'ip':
-        entityFilter = `(src_ip="${escaped}" OR dest_ip="${escaped}")`;
+        entityFilter = ocsf
+          ? `(src_endpoint.ip="${escaped}" OR dst_endpoint.ip="${escaped}")`
+          : `(src_ip="${escaped}" OR dest_ip="${escaped}")`;
         break;
       default:
         entityFilter = `"${escaped}"`;
     }
     const q = baseFilter ? `${baseFilter} ${entityFilter}` : entityFilter;
     navigate(`/search?q=${encodeURIComponent(q)}`);
-  }, [apiRule, navigate]);
+  }, [apiRule, navigate, schema]);
 
   if (ruleLoading) {
     return (
       <div className="p-12 flex items-center justify-center">
-        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-6 h-6 text-muted-foreground" />
       </div>
     );
   }

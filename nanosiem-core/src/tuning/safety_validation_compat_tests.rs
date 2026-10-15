@@ -40,7 +40,10 @@ fn empty_object_reads_as_conservative_defaults() {
 fn partial_object_honours_present_fields_and_defaults_the_rest() {
     let v: SafetyValidation =
         serde_json::from_value(serde_json::json!({ "is_safe": true })).expect("legacy partial row");
-    assert!(v.is_safe, "an explicit is_safe:true must survive the defaults");
+    assert!(
+        v.is_safe,
+        "an explicit is_safe:true must survive the defaults"
+    );
     assert!(
         !v.critical_indicators_preserved,
         "absent critical_indicators_preserved must fail closed, not inherit is_safe"

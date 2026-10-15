@@ -124,12 +124,16 @@ impl Default for DualPoolConfig {
     }
 }
 
+/// Placeholder ClickHouse URL used when `CLICKHOUSE_URL` is unset: nothing
+/// listens there, so an accidental ClickHouse call fails fast (NAN-3491).
+const INERT_CLICKHOUSE_URL: &str = "http://127.0.0.1:1";
+
 impl DualPoolConfig {
     /// Create a new configuration from environment variables
     ///
     /// Environment variables:
     /// - `DATABASE_URL`: PostgreSQL connection URL
-    /// - `CLICKHOUSE_URL`: ClickHouse HTTP interface URL
+    /// - `CLICKHOUSE_URL`: ClickHouse HTTP interface URL (optional; inert when unset)
     /// - `CLICKHOUSE_DATABASE`: ClickHouse database name
     /// - `CLICKHOUSE_USER`: ClickHouse username for runtime queries (default: "nanosiem")
     /// - `CLICKHOUSE_PASSWORD`: ClickHouse password for runtime user (default: empty)
@@ -144,11 +148,15 @@ impl DualPoolConfig {
             DualPoolError::ConfigError("DATABASE_URL environment variable is required".to_string())
         })?;
 
-        let clickhouse_url = std::env::var("CLICKHOUSE_URL").map_err(|_| {
-            DualPoolError::ConfigError(
-                "CLICKHOUSE_URL environment variable is required".to_string(),
-            )
-        })?;
+        // NAN-3491: logs are served by the lake and no service process connects
+        // to ClickHouse, so CLICKHOUSE_URL is never required. The inert URL
+        // remains only because a few compatibility service types still carry a
+        // clickhouse::Client while their lake/PG branch is selected; any
+        // accidental use fails immediately.
+        let clickhouse_url = std::env::var("CLICKHOUSE_URL")
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| INERT_CLICKHOUSE_URL.to_string());
 
         let clickhouse_database =
             std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "nanosiem".to_string());
@@ -164,8 +172,8 @@ impl DualPoolConfig {
 
         // NAN-2001: raw-SQL feature identities. Username overridable; password
         // REQUIRED (validated at DualPool::new — boot fails closed if absent).
-        let clickhouse_rawsql_user =
-            std::env::var("CLICKHOUSE_RAWSQL_USER").unwrap_or_else(|_| "nanosiem_rawsql".to_string());
+        let clickhouse_rawsql_user = std::env::var("CLICKHOUSE_RAWSQL_USER")
+            .unwrap_or_else(|_| "nanosiem_rawsql".to_string());
         let clickhouse_rawsql_password = std::env::var("CLICKHOUSE_RAWSQL_PASSWORD").ok();
         let clickhouse_rawsql_noaudit_user = std::env::var("CLICKHOUSE_RAWSQL_NOAUDIT_USER")
             .unwrap_or_else(|_| "nanosiem_rawsql_noaudit".to_string());
@@ -471,13 +479,14 @@ pub fn on_cluster_clause() -> String {
 /// whose projection contains only the process fields nano needs. Single-node
 /// installs retain the direct system-table path required by `KILL QUERY`.
 pub fn system_processes_source() -> &'static str {
-    system_processes_source_for_cluster(
-        std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref(),
-    )
+    system_processes_source_for_cluster(std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref())
 }
 
 pub(crate) fn system_processes_source_for_cluster(cluster: Option<&str>) -> &'static str {
-    if cluster.map(str::trim).is_some_and(|value| !value.is_empty()) {
+    if cluster
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
         "cluster_processes"
     } else {
         "system.processes"
@@ -490,7 +499,10 @@ pub(crate) fn system_processes_source_for_cluster(cluster: Option<&str>) -> &'st
 /// env is unset/blank AND a non-empty cluster name was probed. Returns `None`
 /// when the env already has a usable value (keep it) or nothing was probed
 /// (nothing to converge to). Trims both sides.
-pub(crate) fn cluster_env_to_set(current_env: Option<&str>, probed: Option<&str>) -> Option<String> {
+pub(crate) fn cluster_env_to_set(
+    current_env: Option<&str>,
+    probed: Option<&str>,
+) -> Option<String> {
     if current_env.map(str::trim).is_some_and(|v| !v.is_empty()) {
         return None;
     }
@@ -609,6 +621,10 @@ const RAWSQL_HIDE_POLICY_NAMES: &[&str] = &[
 pub struct DualPool {
     postgres: PgPool,
     clickhouse: ClickHouseClient,
+    /// Whether ClickHouse is an active runtime dependency. Canonical lake mode
+    /// keeps inert compatibility clients but must never probe or gate health on
+    /// a database that is intentionally absent.
+    clickhouse_required: bool,
     /// Admin client for DDL operations (CREATE/DROP views, etc.)
     /// Falls back to regular client if admin credentials not configured
     clickhouse_admin: ClickHouseClient,
@@ -627,6 +643,104 @@ pub struct DualPool {
 }
 
 impl DualPool {
+    /// Create the canonical lake control-plane pool without contacting
+    /// ClickHouse.
+    ///
+    /// PostgreSQL is still mandatory. The ClickHouse client values are inert
+    /// compatibility handles for services whose type migration is not yet
+    /// complete; canonical lake/PG routing must prevent their use. Keeping
+    /// this constructor separate preserves the legacy fail-fast connection,
+    /// grant, policy, and schema checks in [`Self::new`].
+    pub async fn new_lake_control_plane(config: &DualPoolConfig) -> Result<Self, DualPoolError> {
+        Self::new_lake_control_plane_with_min_connections(config, 0).await
+    }
+
+    /// Search keeps two control-plane connections ready; other lake processes
+    /// retain the existing lazy pool and connection-budget behavior.
+    pub async fn new_lake_control_plane_with_min_connections(config: &DualPoolConfig, minimum: u32) -> Result<Self, DualPoolError> {
+        let minimum = minimum.min(config.pg_max_connections.clamp(1, 4));
+        let mut pg_options = super::connection_budget::pool_options(config.pg_max_connections.clamp(1, 4))
+            .acquire_timeout(Duration::from_secs(config.pg_connect_timeout_secs))
+            .idle_timeout(Duration::from_secs(config.pg_idle_timeout_secs.clamp(1, 60)))
+            // NAN-3231: sqlx's built-in pre-acquire ping is an uncounted extra
+            // round trip on every checkout. The search admission pool relies on
+            // the short idle timeout + max lifetime instead (a dead socket fails
+            // the authority statement, which is fail-closed). An operator who
+            // opts back in gets the same ping through `before_acquire`, where it
+            // is counted in the request's `db_roundtrips`.
+            .test_before_acquire(false);
+        if config.pg_test_before_acquire {
+            pg_options = pg_options.before_acquire(|connection, _meta| {
+                Box::pin(async move {
+                    use crate::request_timing::RequestDb;
+                    use sqlx::Connection;
+                    connection.ping().request_db().await.map(|()| true)
+                })
+            });
+        }
+        if config.pg_max_lifetime_secs > 0 {
+            pg_options = pg_options.max_lifetime(Duration::from_secs(config.pg_max_lifetime_secs));
+        }
+        let options = super::pooler::options(&config.postgres_url)
+            .map_err(|error| DualPoolError::PostgresConnectionError(error.to_string()))?;
+        let postgres = if minimum == 0 {
+            Ok(pg_options.min_connections(0).connect_lazy_with(options))
+        } else {
+            pg_options.min_connections(minimum).connect_with(options).await
+        }.map_err(|error| {
+                DualPoolError::PostgresConnectionError(format!(
+                    "Failed to connect to PostgreSQL at '{}': {}",
+                    Self::sanitize_url(&config.postgres_url),
+                    error
+                ))
+            })?;
+
+        let client = |user: &str, password: Option<&str>| {
+            let mut value = ClickHouseClient::default()
+                .with_url(&config.clickhouse_url)
+                .with_database(&config.clickhouse_database)
+                .with_user(user);
+            if let Some(password) = password.filter(|value| !value.is_empty()) {
+                value = value.with_password(password);
+            }
+            value
+        };
+        let clickhouse = client(&config.clickhouse_user, Some(&config.clickhouse_password));
+        let clickhouse_admin = client(
+            config
+                .clickhouse_admin_user
+                .as_deref()
+                .unwrap_or(&config.clickhouse_user),
+            config
+                .clickhouse_admin_password
+                .as_deref()
+                .or(Some(config.clickhouse_password.as_str())),
+        );
+        let clickhouse_rawsql = client(
+            &config.clickhouse_rawsql_user,
+            config.clickhouse_rawsql_password.as_deref(),
+        );
+        let clickhouse_rawsql_noaudit = client(
+            &config.clickhouse_rawsql_noaudit_user,
+            config.clickhouse_rawsql_noaudit_password.as_deref(),
+        );
+
+        tracing::info!(
+            postgres = %Self::sanitize_url(&config.postgres_url),
+            "Canonical lake control plane initialized without ClickHouse"
+        );
+        Ok(Self {
+            postgres,
+            clickhouse,
+            clickhouse_required: false,
+            clickhouse_admin,
+            clickhouse_rawsql,
+            clickhouse_rawsql_noaudit,
+            is_clustered: false,
+            logs_table: "logs",
+        })
+    }
+
     /// Create a new dual pool with connections to both databases
     ///
     /// This will establish connections to both PostgreSQL and ClickHouse.
@@ -646,7 +760,7 @@ impl DualPool {
         }
 
         let postgres = pg_options
-            .connect(&config.postgres_url)
+            .connect_with(super::pooler::options(&config.postgres_url).map_err(|error| DualPoolError::PostgresConnectionError(error.to_string()))?)
             .await
             .map_err(|e| {
                 DualPoolError::PostgresConnectionError(format!(
@@ -775,8 +889,11 @@ impl DualPool {
         // and the search service has no admin, but api/jobs boot from the same
         // DualPool and will fail the deploy visibly rather than silently leak audit.
         if using_admin {
-            Self::assert_rawsql_row_policies_present(&clickhouse_admin, &config.clickhouse_database)
-                .await?;
+            Self::assert_rawsql_row_policies_present(
+                &clickhouse_admin,
+                &config.clickhouse_database,
+            )
+            .await?;
         }
 
         // Detect whether distributed tables exist (cluster mode)
@@ -829,6 +946,7 @@ impl DualPool {
         Ok(Self {
             postgres,
             clickhouse,
+            clickhouse_required: true,
             clickhouse_admin,
             clickhouse_rawsql,
             clickhouse_rawsql_noaudit,
@@ -849,7 +967,7 @@ impl DualPool {
     ) -> Result<ClickHouseClient, DualPoolError> {
         let password = password.as_ref().ok_or_else(|| {
             DualPoolError::ConfigError(format!(
-                "{env_var} is required for the raw-SQL feature identity '{user}' (NAN-2001). \
+                "{env_var} is required for the raw-SQL feature identity '{user}'. \
                  Boot fails closed rather than falling back to the broad ClickHouse account. \
                  Set {env_var} to the password of the '{user}' ClickHouse user."
             ))
@@ -900,8 +1018,7 @@ impl DualPool {
             .await
             .map_err(|e| {
                 DualPoolError::ClickHouseConnectionError(format!(
-                    "Could not read grants for raw-SQL identity '{user}' to verify the allowlist \
-                     (NAN-2001): {e}"
+                    "Could not read grants for raw-SQL identity '{user}' to verify the allowlist: {e}"
                 ))
             })?;
 
@@ -926,7 +1043,7 @@ impl DualPool {
             if !db.eq_ignore_ascii_case("nanosiem") {
                 return Err(DualPoolError::ConfigError(format!(
                     "raw-SQL identity '{user}' holds a SELECT grant outside the nanosiem database \
-                     ('{db}.{table}', NAN-2001) — it must be granted SELECT only on the explicit \
+                     ('{db}.{table}') — it must be granted SELECT only on the explicit \
                      nanosiem allowlist tables. Fix the grant declaration for this identity."
                 )));
             }
@@ -934,7 +1051,7 @@ impl DualPool {
             if table == "*" {
                 return Err(DualPoolError::ConfigError(format!(
                     "raw-SQL identity '{user}' holds a whole-database SELECT grant on nanosiem.* \
-                     (NAN-2001) — it must be granted SELECT only on the explicit allowlist tables. \
+                     — it must be granted SELECT only on the explicit allowlist tables. \
                      Fix the grant declaration for this identity."
                 )));
             }
@@ -949,14 +1066,14 @@ impl DualPool {
             if !allowed.contains(&t.as_str()) {
                 return Err(DualPoolError::ConfigError(format!(
                     "raw-SQL identity '{user}' is granted SELECT on 'nanosiem.{t}', which is NOT in \
-                     its expected raw-SQL allowlist (NAN-2001). This is a security drift — refusing \
-                     to boot. Reconcile the grant declaration (users.d XML / k8s tpl / nano-main)."
+                     its expected raw-SQL allowlist. This is a security drift — refusing \
+                     to boot. Reconcile the grant declaration (users.d XML / k8s template)."
                 )));
             }
         }
         if !normalized.contains("logs") {
             return Err(DualPoolError::ConfigError(format!(
-                "raw-SQL identity '{user}' is not granted SELECT on nanosiem.logs (NAN-2001) — its \
+                "raw-SQL identity '{user}' is not granted SELECT on nanosiem.logs — its \
                  grants did not load. Check the user's <grants> in the ClickHouse user config."
             )));
         }
@@ -983,14 +1100,14 @@ impl DualPool {
             .await
             .map_err(|e| {
                 DualPoolError::ClickHouseConnectionError(format!(
-                    "Could not verify raw-SQL audit row policies via the admin client (NAN-2001): {e}"
+                    "Could not verify raw-SQL audit row policies via the admin client: {e}"
                 ))
             })?;
 
         let expected = RAWSQL_HIDE_POLICY_NAMES.len() as u64;
         if found < expected {
             return Err(DualPoolError::ConfigError(format!(
-                "Only {found}/{expected} raw-SQL audit row policies exist in ClickHouse (NAN-2001). \
+                "Only {found}/{expected} raw-SQL audit row policies exist in ClickHouse. \
                  `nanosiem_rawsql_noaudit` is granted SELECT but the RESTRICTIVE \
                  `source_type != 'audit'` policies are missing — a noaudit raw-SQL caller could read \
                  audit rows. This means the ClickHouse migrator's `ensure_rawsql_row_policies` step \
@@ -1012,7 +1129,11 @@ impl DualPool {
     async fn converge_cluster_env(client: &ClickHouseClient) {
         let current = std::env::var("CLICKHOUSE_CLUSTER").ok();
         // Fast path: env already provides a usable name.
-        if current.as_deref().map(str::trim).is_some_and(|v| !v.is_empty()) {
+        if current
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty())
+        {
             tracing::info!(
                 "Cluster mode: using CLICKHOUSE_CLUSTER='{}' (from env)",
                 current.as_deref().unwrap_or("").trim()
@@ -1084,6 +1205,15 @@ impl DualPool {
         &self.clickhouse_rawsql_noaudit
     }
 
+    /// Whether ClickHouse is an active runtime dependency for this process.
+    ///
+    /// Canonical lake mode intentionally retains inert client handles while
+    /// storage-specific services are migrated, but product schedulers must use
+    /// this capability check before starting a ClickHouse-only lane.
+    pub fn clickhouse_required(&self) -> bool {
+        self.clickhouse_required
+    }
+
     /// Whether this ClickHouse deployment has distributed tables (cluster mode).
     /// When true, queries should target `logs_distributed` instead of `logs`.
     pub fn is_clustered(&self) -> bool {
@@ -1146,15 +1276,18 @@ impl DualPool {
             Err(e) => (false, Some(e.to_string())),
         };
 
-        // Check ClickHouse health
-        let ch_start = Instant::now();
-        let ch_result = self.clickhouse.query("SELECT 1").fetch_one::<u8>().await;
-        let clickhouse_latency_ms = ch_start.elapsed().as_millis() as u64;
-
-        let (clickhouse_healthy, clickhouse_error) = match ch_result {
-            Ok(_) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
-        };
+        let (clickhouse_healthy, clickhouse_error, clickhouse_latency_ms) =
+            if self.clickhouse_required {
+                let ch_start = Instant::now();
+                let ch_result = self.clickhouse.query("SELECT 1").fetch_one::<u8>().await;
+                let latency_ms = ch_start.elapsed().as_millis() as u64;
+                match ch_result {
+                    Ok(_) => (true, None, latency_ms),
+                    Err(error) => (false, Some(error.to_string()), latency_ms),
+                }
+            } else {
+                (true, None, 0)
+            };
 
         HealthStatus {
             postgres_healthy,
@@ -1283,7 +1416,10 @@ mod tests {
 
     #[test]
     fn system_processes_reads_use_the_definer_view_only_on_clusters() {
-        assert_eq!(system_processes_source_for_cluster(None), "system.processes");
+        assert_eq!(
+            system_processes_source_for_cluster(None),
+            "system.processes"
+        );
         assert_eq!(
             system_processes_source_for_cluster(Some("   ")),
             "system.processes"
@@ -1346,26 +1482,24 @@ mod tests {
             "users.d must not grant REMOTE to the runtime user"
         );
 
-        let (Some(generic), Some(aws), Some(rackspace)) = (
-            enterprise_deploy_surface("deploy/k8s/clickhouse/clickhouse.yaml"),
-            enterprise_deploy_surface("deploy/k8s/aws-db/clickhouse.yaml.tpl"),
-            enterprise_deploy_surface("deploy/k8s/rackspace-db/clickhouse.yaml.tpl"),
-        ) else {
+        let Some(generic) = enterprise_deploy_surface("deploy/k8s/clickhouse/clickhouse.yaml") else {
             // Open-core / mirror tree: `deploy/` is absent by design. The
             // users.d assertions above already ran.
             return;
         };
-        let (generic, aws, rackspace) = (generic.as_str(), aws.as_str(), rackspace.as_str());
+        let providers = provider_db_surfaces();
+        assert!(
+            providers.iter().any(|(name, _)| name == "aws"),
+            "deploy/k8s must keep the aws-db ClickHouse overlay"
+        );
 
         // users.d is asserted above, unconditionally — only the deploy-only
         // surfaces belong here.
-        let surfaces = [
-            ("generic k8s", generic),
-            ("aws", aws),
-            ("rackspace", rackspace),
-        ];
+        let surfaces: Vec<(&str, &str)> = std::iter::once(("generic k8s", generic.as_str()))
+            .chain(providers.iter().map(|(name, config)| (name.as_str(), config.as_str())))
+            .collect();
 
-        for (name, config) in surfaces {
+        for &(name, config) in &surfaces {
             assert!(
                 config.contains("GRANT SELECT ON system.processes"),
                 "{name} must preserve local KILL/progress visibility"
@@ -1376,17 +1510,12 @@ mod tests {
             );
         }
 
-        let aws_runtime = aws
-            .split_once("        nanosiem:\n")
-            .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
-            .map(|(section, _)| section)
-            .expect("AWS runtime section");
-        let rackspace_runtime = rackspace
-            .split_once("        nanosiem:\n")
-            .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
-            .map(|(section, _)| section)
-            .expect("Rackspace runtime section");
-        for (name, runtime_section) in [("aws", aws_runtime), ("rackspace", rackspace_runtime)] {
+        for (name, config) in &providers {
+            let runtime_section = config
+                .split_once("        nanosiem:\n")
+                .and_then(|(_, rest)| rest.split_once("        nanosiem_admin:\n"))
+                .map(|(section, _)| section)
+                .unwrap_or_else(|| panic!("{name} runtime section"));
             assert!(
                 !runtime_section.contains("GRANT REMOTE"),
                 "{name} must not grant REMOTE to the runtime user"
@@ -1399,11 +1528,7 @@ mod tests {
 
         // The migration identity owns the DEFINER view and must be able to fan
         // out its source plus reconcile SELECT for already-created users.
-        for (name, config) in [
-            ("generic k8s", generic),
-            ("aws", aws),
-            ("rackspace", rackspace),
-        ] {
+        for &(name, config) in &surfaces {
             assert!(
                 config.contains("GRANT REMOTE, CLUSTER ON *.*"),
                 "{name} admin must be able to execute clustered DEFINER DDL"
@@ -1416,10 +1541,35 @@ mod tests {
         }
     }
 
+    /// Every per-provider ClickHouse overlay, `deploy/k8s/<provider>-db/
+    /// clickhouse.yaml.tpl`, as `(provider, contents)` sorted by provider.
+    /// Empty when `deploy/k8s` is absent (the mirror tree).
+    fn provider_db_surfaces() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/k8s");
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => panic!("failed to read {}: {e}", root.display()),
+        };
+        let mut surfaces: Vec<(String, String)> = entries
+            .map(|entry| entry.expect("deploy/k8s entry").file_name().to_string_lossy().into_owned())
+            .filter_map(|dir| {
+                let provider = dir.strip_suffix("-db")?.to_string();
+                enterprise_deploy_surface(&format!("deploy/k8s/{dir}/clickhouse.yaml.tpl"))
+                    .map(|config| (provider, config))
+            })
+            .collect();
+        surfaces.sort();
+        surfaces
+    }
+
     #[test]
     fn cluster_env_to_set_converges_only_when_needed() {
         // Env already set → keep it (return None), regardless of probe.
-        assert_eq!(cluster_env_to_set(Some("nanosiem_cluster"), Some("default")), None);
+        assert_eq!(
+            cluster_env_to_set(Some("nanosiem_cluster"), Some("default")),
+            None
+        );
         assert_eq!(cluster_env_to_set(Some("  ncl  "), None), None);
         // Env unset/blank + a probed cluster → set the probed name (trimmed).
         assert_eq!(
@@ -1478,7 +1628,10 @@ mod tests {
         // No duplicates.
         let mut seen = std::collections::HashSet::new();
         for t in DISTRIBUTED_TABLES {
-            assert!(seen.insert(*t), "duplicate table in DISTRIBUTED_TABLES: {t}");
+            assert!(
+                seen.insert(*t),
+                "duplicate table in DISTRIBUTED_TABLES: {t}"
+            );
         }
     }
 
@@ -1511,7 +1664,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_from_env_missing_postgres() {
+    fn test_config_from_env_requires_postgres_not_clickhouse() {
         // Clear env vars
         std::env::remove_var("DATABASE_URL");
         std::env::remove_var("CLICKHOUSE_URL");
@@ -1520,5 +1673,13 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, DualPoolError::ConfigError(_)));
+
+        // NAN-3491: Postgres + the lake is a complete deployment, so a missing
+        // CLICKHOUSE_URL is never an error. One test so the two
+        // DATABASE_URL mutations cannot race across test threads.
+        std::env::set_var("DATABASE_URL", "postgres://fixture@127.0.0.1:1/never_connect");
+        let config = DualPoolConfig::from_env();
+        std::env::remove_var("DATABASE_URL");
+        assert_eq!(config.unwrap().clickhouse_url, INERT_CLICKHOUSE_URL);
     }
 }

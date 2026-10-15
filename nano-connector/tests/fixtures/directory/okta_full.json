@@ -1,0 +1,2385 @@
+[
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/users",
+  "status": 200,
+  "body": [
+   {
+    "id": "00udir00000000000000",
+    "status": "DEPROVISIONED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta0@example.com",
+     "email": "okta0@example.com",
+     "firstName": "Okta",
+     "lastName": "User0",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": null,
+     "managerId": null,
+     "employeeNumber": "E30000",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000000"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000001",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta1@example.com",
+     "email": "okta1@example.com",
+     "firstName": "Okta",
+     "lastName": "User1",
+     "displayName": "Okta User1",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30001",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000001"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000002",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta2@example.com",
+     "email": "okta2@example.com",
+     "firstName": "Okta",
+     "lastName": "User2",
+     "displayName": "Okta User2",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30002",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000002"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000003",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta3@example.com",
+     "email": "okta3@example.com",
+     "firstName": "Okta",
+     "lastName": "User3",
+     "displayName": "Okta User3",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30003",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000003"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000004",
+    "status": "SUSPENDED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta4@example.com",
+     "email": "okta4@example.com",
+     "firstName": "Okta",
+     "lastName": "User4",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30004",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000004"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000005",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta5@example.com",
+     "email": "okta5@example.com",
+     "firstName": "Okta",
+     "lastName": "User5",
+     "displayName": "Okta User5",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30005",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000005"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000006",
+    "status": "LOCKED_OUT",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta6@example.com",
+     "email": "okta6@example.com",
+     "firstName": "Okta",
+     "lastName": "User6",
+     "displayName": "Okta User6",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30006",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000006"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000007",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta7@example.com",
+     "email": "okta7@example.com",
+     "firstName": "Okta",
+     "lastName": "User7",
+     "displayName": "Okta User7",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30007",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000007"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000008",
+    "status": "STAGED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta8@example.com",
+     "email": "okta8@example.com",
+     "firstName": "Okta",
+     "lastName": "User8",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30008",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000008"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000009",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta9@example.com",
+     "email": "okta9@example.com",
+     "firstName": "Okta",
+     "lastName": "User9",
+     "displayName": "Okta User9",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30009",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000009"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000a",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta10@example.com",
+     "email": "okta10@example.com",
+     "firstName": "Okta",
+     "lastName": "User10",
+     "displayName": "Okta User10",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30010",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000a"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000b",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta11@example.com",
+     "email": "okta11@example.com",
+     "firstName": "Okta",
+     "lastName": "User11",
+     "displayName": "Okta User11",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30011",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000b"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000c",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta12@example.com",
+     "email": "okta12@example.com",
+     "firstName": "Okta",
+     "lastName": "User12",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30012",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000c"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000d",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta13@example.com",
+     "email": "okta13@example.com",
+     "firstName": "Okta",
+     "lastName": "User13",
+     "displayName": "Okta User13",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30013",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000d"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000e",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta14@example.com",
+     "email": "okta14@example.com",
+     "firstName": "Okta",
+     "lastName": "User14",
+     "displayName": "Okta User14",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30014",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000e"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000f",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta15@example.com",
+     "email": "okta15@example.com",
+     "firstName": "Okta",
+     "lastName": "User15",
+     "displayName": "Okta User15",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30015",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000f"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000010",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta16@example.com",
+     "email": "okta16@example.com",
+     "firstName": "Okta",
+     "lastName": "User16",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30016",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000010"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000011",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta17@example.com",
+     "email": "okta17@example.com",
+     "firstName": "Okta",
+     "lastName": "User17",
+     "displayName": "Okta User17",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30017",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000011"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000012",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta18@example.com",
+     "email": "okta18@example.com",
+     "firstName": "Okta",
+     "lastName": "User18",
+     "displayName": "Okta User18",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30018",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000012"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000013",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta19@example.com",
+     "email": "okta19@example.com",
+     "firstName": "Okta",
+     "lastName": "User19",
+     "displayName": "Okta User19",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30019",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000013"
+     }
+    }
+   }
+  ],
+  "query": {
+   "search": "status eq \"STAGED\" or status eq \"PROVISIONED\" or status eq \"ACTIVE\" or status eq \"RECOVERY\" or status eq \"PASSWORD_EXPIRED\" or status eq \"LOCKED_OUT\" or status eq \"SUSPENDED\" or status eq \"DEPROVISIONED\""
+  },
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/users?limit=200&search=status+eq+%22STAGED%22+or+status+eq+%22PROVISIONED%22+or+status+eq+%22ACTIVE%22+or+status+eq+%22RECOVERY%22+or+status+eq+%22PASSWORD_EXPIRED%22+or+status+eq+%22LOCKED_OUT%22+or+status+eq+%22SUSPENDED%22+or+status+eq+%22DEPROVISIONED%22>; rel=\"self\", <https://acme.okta.com/api/v1/users?limit=200&search=status+eq+%22STAGED%22+or+status+eq+%22PROVISIONED%22+or+status+eq+%22ACTIVE%22+or+status+eq+%22RECOVERY%22+or+status+eq+%22PASSWORD_EXPIRED%22+or+status+eq+%22LOCKED_OUT%22+or+status+eq+%22SUSPENDED%22+or+status+eq+%22DEPROVISIONED%22&after=20>; rel=\"next\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/users",
+  "status": 200,
+  "body": [
+   {
+    "id": "00udir00000000000014",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta20@example.com",
+     "email": "okta20@example.com",
+     "firstName": "Okta",
+     "lastName": "User20",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30020",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000014"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000015",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta21@example.com",
+     "email": "okta21@example.com",
+     "firstName": "Okta",
+     "lastName": "User21",
+     "displayName": "Okta User21",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30021",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000015"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000016",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta22@example.com",
+     "email": "okta22@example.com",
+     "firstName": "Okta",
+     "lastName": "User22",
+     "displayName": "Okta User22",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30022",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000016"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000017",
+    "status": "DEPROVISIONED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta23@example.com",
+     "email": "okta23@example.com",
+     "firstName": "Okta",
+     "lastName": "User23",
+     "displayName": "Okta User23",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30023",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000017"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000018",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta24@example.com",
+     "email": "okta24@example.com",
+     "firstName": "Okta",
+     "lastName": "User24",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30024",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000018"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000019",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta25@example.com",
+     "email": "okta25@example.com",
+     "firstName": "Okta",
+     "lastName": "User25",
+     "displayName": "Okta User25",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30025",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000019"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000001a",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta26@example.com",
+     "email": "okta26@example.com",
+     "firstName": "Okta",
+     "lastName": "User26",
+     "displayName": "Okta User26",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30026",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000001a"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000001b",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta27@example.com",
+     "email": "okta27@example.com",
+     "firstName": "Okta",
+     "lastName": "User27",
+     "displayName": "Okta User27",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30027",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000001b"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000001c",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta28@example.com",
+     "email": "okta28@example.com",
+     "firstName": "Okta",
+     "lastName": "User28",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30028",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000001c"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000001d",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta29@example.com",
+     "email": "okta29@example.com",
+     "firstName": "Okta",
+     "lastName": "User29",
+     "displayName": "Okta User29",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30029",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000001d"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000001e",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta30@example.com",
+     "email": "okta30@example.com",
+     "firstName": "Okta",
+     "lastName": "User30",
+     "displayName": "Okta User30",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30030",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000001e"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000001f",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta31@example.com",
+     "email": "okta31@example.com",
+     "firstName": "Okta",
+     "lastName": "User31",
+     "displayName": "Okta User31",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30031",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000001f"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000020",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta32@example.com",
+     "email": "okta32@example.com",
+     "firstName": "Okta",
+     "lastName": "User32",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30032",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000020"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000021",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta33@example.com",
+     "email": "okta33@example.com",
+     "firstName": "Okta",
+     "lastName": "User33",
+     "displayName": "Okta User33",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30033",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000021"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000022",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta34@example.com",
+     "email": "okta34@example.com",
+     "firstName": "Okta",
+     "lastName": "User34",
+     "displayName": "Okta User34",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30034",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000022"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000023",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta35@example.com",
+     "email": "okta35@example.com",
+     "firstName": "Okta",
+     "lastName": "User35",
+     "displayName": "Okta User35",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30035",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000023"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000024",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta36@example.com",
+     "email": "okta36@example.com",
+     "firstName": "Okta",
+     "lastName": "User36",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30036",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000024"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000025",
+    "status": "LOCKED_OUT",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta37@example.com",
+     "email": "okta37@example.com",
+     "firstName": "Okta",
+     "lastName": "User37",
+     "displayName": "Okta User37",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30037",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000025"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000026",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta38@example.com",
+     "email": "okta38@example.com",
+     "firstName": "Okta",
+     "lastName": "User38",
+     "displayName": "Okta User38",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30038",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000026"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000027",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta39@example.com",
+     "email": "okta39@example.com",
+     "firstName": "Okta",
+     "lastName": "User39",
+     "displayName": "Okta User39",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30039",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000027"
+     }
+    }
+   }
+  ],
+  "query": {
+   "search": "status eq \"STAGED\" or status eq \"PROVISIONED\" or status eq \"ACTIVE\" or status eq \"RECOVERY\" or status eq \"PASSWORD_EXPIRED\" or status eq \"LOCKED_OUT\" or status eq \"SUSPENDED\" or status eq \"DEPROVISIONED\"",
+   "after": "20"
+  },
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/users?limit=200&search=status+eq+%22STAGED%22+or+status+eq+%22PROVISIONED%22+or+status+eq+%22ACTIVE%22+or+status+eq+%22RECOVERY%22+or+status+eq+%22PASSWORD_EXPIRED%22+or+status+eq+%22LOCKED_OUT%22+or+status+eq+%22SUSPENDED%22+or+status+eq+%22DEPROVISIONED%22&after=20>; rel=\"self\", <https://acme.okta.com/api/v1/users?limit=200&search=status+eq+%22STAGED%22+or+status+eq+%22PROVISIONED%22+or+status+eq+%22ACTIVE%22+or+status+eq+%22RECOVERY%22+or+status+eq+%22PASSWORD_EXPIRED%22+or+status+eq+%22LOCKED_OUT%22+or+status+eq+%22SUSPENDED%22+or+status+eq+%22DEPROVISIONED%22&after=40>; rel=\"next\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/users",
+  "status": 200,
+  "body": [
+   {
+    "id": "00udir00000000000028",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta40@example.com",
+     "email": "okta40@example.com",
+     "firstName": "Okta",
+     "lastName": "User40",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30040",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000028"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000029",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta41@example.com",
+     "email": "okta41@example.com",
+     "firstName": "Okta",
+     "lastName": "User41",
+     "displayName": "Okta User41",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30041",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000029"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000002a",
+    "status": "SUSPENDED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta42@example.com",
+     "email": "okta42@example.com",
+     "firstName": "Okta",
+     "lastName": "User42",
+     "displayName": "Okta User42",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30042",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000002a"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000002b",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta43@example.com",
+     "email": "okta43@example.com",
+     "firstName": "Okta",
+     "lastName": "User43",
+     "displayName": "Okta User43",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30043",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000002b"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000002c",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta44@example.com",
+     "email": "okta44@example.com",
+     "firstName": "Okta",
+     "lastName": "User44",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30044",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000002c"
+     }
+    }
+   }
+  ],
+  "query": {
+   "search": "status eq \"STAGED\" or status eq \"PROVISIONED\" or status eq \"ACTIVE\" or status eq \"RECOVERY\" or status eq \"PASSWORD_EXPIRED\" or status eq \"LOCKED_OUT\" or status eq \"SUSPENDED\" or status eq \"DEPROVISIONED\"",
+   "after": "40"
+  },
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/users?limit=200&search=status+eq+%22STAGED%22+or+status+eq+%22PROVISIONED%22+or+status+eq+%22ACTIVE%22+or+status+eq+%22RECOVERY%22+or+status+eq+%22PASSWORD_EXPIRED%22+or+status+eq+%22LOCKED_OUT%22+or+status+eq+%22SUSPENDED%22+or+status+eq+%22DEPROVISIONED%22&after=40>; rel=\"self\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/groups",
+  "status": 200,
+  "body": [
+   {
+    "id": "00gdir00000000000000",
+    "type": "OKTA_GROUP",
+    "profile": {
+     "name": "Okta Admins",
+     "description": null
+    },
+    "lastUpdated": "2026-10-01T00:00:00.000Z"
+   },
+   {
+    "id": "00gdir00000000000001",
+    "type": "OKTA_GROUP",
+    "profile": {
+     "name": "Group 1",
+     "description": null
+    },
+    "lastUpdated": "2026-10-01T00:00:00.000Z"
+   },
+   {
+    "id": "00gdir00000000000002",
+    "type": "OKTA_GROUP",
+    "profile": {
+     "name": "Group 2",
+     "description": null
+    },
+    "lastUpdated": "2026-10-01T00:00:00.000Z"
+   }
+  ],
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/groups?limit=200>; rel=\"self\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/groups/00gdir00000000000000/users",
+  "status": 200,
+  "body": [
+   {
+    "id": "00udir00000000000000",
+    "status": "DEPROVISIONED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta0@example.com",
+     "email": "okta0@example.com",
+     "firstName": "Okta",
+     "lastName": "User0",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": null,
+     "managerId": null,
+     "employeeNumber": "E30000",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000000"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000001",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta1@example.com",
+     "email": "okta1@example.com",
+     "firstName": "Okta",
+     "lastName": "User1",
+     "displayName": "Okta User1",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30001",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000001"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000002",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta2@example.com",
+     "email": "okta2@example.com",
+     "firstName": "Okta",
+     "lastName": "User2",
+     "displayName": "Okta User2",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30002",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000002"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000003",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta3@example.com",
+     "email": "okta3@example.com",
+     "firstName": "Okta",
+     "lastName": "User3",
+     "displayName": "Okta User3",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30003",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000003"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000004",
+    "status": "SUSPENDED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta4@example.com",
+     "email": "okta4@example.com",
+     "firstName": "Okta",
+     "lastName": "User4",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30004",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000004"
+     }
+    }
+   }
+  ],
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/groups/00gdir00000000000000/users?limit=200>; rel=\"self\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/groups/00gdir00000000000001/users",
+  "status": 200,
+  "body": [
+   {
+    "id": "00udir00000000000005",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta5@example.com",
+     "email": "okta5@example.com",
+     "firstName": "Okta",
+     "lastName": "User5",
+     "displayName": "Okta User5",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30005",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000005"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000006",
+    "status": "LOCKED_OUT",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta6@example.com",
+     "email": "okta6@example.com",
+     "firstName": "Okta",
+     "lastName": "User6",
+     "displayName": "Okta User6",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30006",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000006"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000007",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta7@example.com",
+     "email": "okta7@example.com",
+     "firstName": "Okta",
+     "lastName": "User7",
+     "displayName": "Okta User7",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30007",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000007"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000008",
+    "status": "STAGED",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta8@example.com",
+     "email": "okta8@example.com",
+     "firstName": "Okta",
+     "lastName": "User8",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30008",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000008"
+     }
+    }
+   },
+   {
+    "id": "00udir00000000000009",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta9@example.com",
+     "email": "okta9@example.com",
+     "firstName": "Okta",
+     "lastName": "User9",
+     "displayName": "Okta User9",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30009",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir00000000000009"
+     }
+    }
+   }
+  ],
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/groups/00gdir00000000000001/users?limit=200>; rel=\"self\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/groups/00gdir00000000000002/users",
+  "status": 200,
+  "body": [
+   {
+    "id": "00udir0000000000000a",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta10@example.com",
+     "email": "okta10@example.com",
+     "firstName": "Okta",
+     "lastName": "User10",
+     "displayName": "Okta User10",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30010",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000a"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000b",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta11@example.com",
+     "email": "okta11@example.com",
+     "firstName": "Okta",
+     "lastName": "User11",
+     "displayName": "Okta User11",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30011",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000b"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000c",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta12@example.com",
+     "email": "okta12@example.com",
+     "firstName": "Okta",
+     "lastName": "User12",
+     "displayName": null,
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30012",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": null,
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000c"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000d",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": "2026-10-09T12:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta13@example.com",
+     "email": "okta13@example.com",
+     "firstName": "Okta",
+     "lastName": "User13",
+     "displayName": "Okta User13",
+     "department": "Engineering",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30013",
+     "userType": "Employee",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000d"
+     }
+    }
+   },
+   {
+    "id": "00udir0000000000000e",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "activated": "2025-01-01T00:00:00.000Z",
+    "statusChanged": "2026-10-01T00:00:00.000Z",
+    "lastLogin": null,
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "passwordChanged": "2025-06-01T00:00:00.000Z",
+    "type": {
+     "id": "otymock"
+    },
+    "profile": {
+     "login": "okta14@example.com",
+     "email": "okta14@example.com",
+     "firstName": "Okta",
+     "lastName": "User14",
+     "displayName": "Okta User14",
+     "department": "Finance",
+     "title": "Synthetic",
+     "manager": "Okta User0",
+     "managerId": "okta0@example.com",
+     "employeeNumber": "E30014",
+     "userType": "Contractor",
+     "organization": "Example Corp",
+     "city": "Ottawa",
+     "countryCode": "CA",
+     "mobilePhone": "+1 555 0300",
+     "primaryPhone": "+1 555 0100"
+    },
+    "_links": {
+     "self": {
+      "href": "https://acme.okta.com/api/v1/users/00udir0000000000000e"
+     }
+    }
+   }
+  ],
+  "headers": {
+   "link": "<https://acme.okta.com/api/v1/groups/00gdir00000000000002/users?limit=200>; rel=\"self\"",
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/iam/assignees/users",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "id": "00udir00000000000001",
+     "orn": "orn:okta:directory:mock:users:00udir00000000000001",
+     "_links": {
+      "self": {
+       "href": "https://acme.okta.com/api/v1/users/00udir00000000000001"
+      }
+     }
+    },
+    {
+     "id": "00udir00000000000002",
+     "orn": "orn:okta:directory:mock:users:00udir00000000000002",
+     "_links": {
+      "self": {
+       "href": "https://acme.okta.com/api/v1/users/00udir00000000000002"
+      }
+     }
+    }
+   ],
+   "_links": {}
+  },
+  "headers": {
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/users/00udir00000000000001/roles",
+  "status": 200,
+  "body": [
+   {
+    "id": "ra1dir0000000100",
+    "label": "User Admin",
+    "type": "USER_ADMIN",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "assignmentType": "USER"
+   }
+  ],
+  "headers": {
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "acme.okta.com",
+  "path": "/api/v1/users/00udir00000000000002/roles",
+  "status": 200,
+  "body": [
+   {
+    "id": "ra1dir0000000200",
+    "label": "Read Only Admin",
+    "type": "READ_ONLY_ADMIN",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "assignmentType": "USER"
+   },
+   {
+    "id": "ra1dir0000000201",
+    "label": "Help Desk Admin",
+    "type": "HELP_DESK_ADMIN",
+    "status": "ACTIVE",
+    "created": "2025-01-01T00:00:00.000Z",
+    "lastUpdated": "2026-10-01T00:00:00.000Z",
+    "assignmentType": "USER"
+   }
+  ],
+  "headers": {
+   "x-rate-limit-limit": "600",
+   "x-rate-limit-remaining": "500",
+   "x-rate-limit-reset": "1791763201"
+  }
+ }
+]

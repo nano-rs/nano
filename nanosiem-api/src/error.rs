@@ -8,8 +8,8 @@
 //! (which would create a circular dependency). NAN-752 lifted them.
 //!
 //! `From` impls that reference enterprise-tier error types
-//! (`nanosiem_enterprise::CaseServiceError` etc.) live in the
-//! `nanosiem-enterprise` crate to satisfy the orphan rule. They're applied
-//! automatically when `nanosiem-enterprise` is linked.
+//! (`enterprise::CaseServiceError` etc.) live in the
+//! the enterprise crate crate to satisfy the orphan rule. They're applied
+//! automatically when the enterprise crate is linked.
 
 pub use nanosiem_api_lib::{ApiError, ErrorDetail, ErrorResponse};

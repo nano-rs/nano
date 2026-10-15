@@ -94,7 +94,14 @@ pub async fn create_retro_hunt(
             .list_rules()
             .await
             .map(|r| r.len() as u32)
-            .unwrap_or(0);
+            // Fail closed (NAN-2761): an unreadable count must not read as 0
+            // and wave the create past the cap.
+            .map_err(|e| {
+                tracing::error!(error = %e, "detection rule count unavailable for tier limit");
+                ApiError::ServiceUnavailable(
+                    "Detection rule limit could not be verified; retry shortly".to_string(),
+                )
+            })?;
         nanosiem_core::check_limit(
             "detection rules",
             rule_count,

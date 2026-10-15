@@ -35,7 +35,8 @@ impl RuleRepositoryRepository {
         created_by: Option<Uuid>,
     ) -> Result<RuleRepository, RuleRepositoryRepositoryError> {
         // Generate slug from URL: github.com/owner/repo -> owner/repo
-        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
+        let slug =
+            crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, RuleRepository>(
             r#"
@@ -51,10 +52,11 @@ impl RuleRepositoryRepository {
         .bind(&slug)
         .bind(&repo.description)
         .bind(&repo.url)
-        .bind(repo.branch.as_deref().unwrap_or("main"))
+        .bind(crate::schema::default_content_branch(&repo.url, repo.branch.as_deref()))
         .bind(repo.rules_path.as_deref().unwrap_or("rules/"))
         .bind(repo.rule_format.as_deref().unwrap_or("sigma"))
-        .bind(repo.auto_sync_enabled.unwrap_or(false))
+        // NAN-3758: the first-party catalogs follow upstream unless the caller opts out.
+        .bind(repo.auto_sync_enabled.unwrap_or_else(|| crate::schema::is_first_party_content_url(&repo.url)))
         .bind(repo.sync_interval_hours.unwrap_or(24))
         .bind(created_by)
         .fetch_one(&self.pool)
@@ -115,8 +117,8 @@ impl RuleRepositoryRepository {
         };
 
         // If selected_paths changed, clear last_sync_commit to force a full re-sync
-        let paths_changed = update.selected_paths.is_some()
-            && update.selected_paths != repo.selected_paths;
+        let paths_changed =
+            update.selected_paths.is_some() && update.selected_paths != repo.selected_paths;
 
         let result = sqlx::query_as::<_, RuleRepository>(
             r#"

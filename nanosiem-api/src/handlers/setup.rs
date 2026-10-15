@@ -183,13 +183,14 @@ pub async fn initialize_system(
         ));
     }
 
-    if request.password.len() < 12 {
+    // Full authoritative policy, not just the length floor this used to check.
+    // `UserRepository::create_user` re-validates (it is the layer that cannot be
+    // bypassed); checking here too gives the first-run form the specific list of
+    // unmet requirements without a database round trip.
+    if let Err(e) = nanosiem_core::auth::validate_password(&request.password) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(SetupError::new(
-                "validation_error",
-                "Password must be at least 12 characters",
-            )),
+            Json(SetupError::new("password_requirements", &e.to_string())),
         ));
     }
 
@@ -209,6 +210,9 @@ pub async fn initialize_system(
             let (status, error_type, message) = match &e {
                 nanosiem_core::auth::UserRepositoryError::EmailExists(_) => {
                     (StatusCode::CONFLICT, "email_exists", "Email already exists")
+                }
+                nanosiem_core::auth::UserRepositoryError::PasswordRequirementsNotMet(msg) => {
+                    (StatusCode::BAD_REQUEST, "password_requirements", msg.as_str())
                 }
                 nanosiem_core::auth::UserRepositoryError::PasswordHashError(msg) => {
                     (StatusCode::BAD_REQUEST, "password_error", msg.as_str())

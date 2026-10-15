@@ -15,7 +15,7 @@
 //! (`versions.rs`), tuning data types, and the base-rate scheduler /
 //! threshold detector / metrics-collection runtime live in core. Phase 3.5
 //! lifted the AI-driven runtime — `agent`, `orchestrator`, `hint_agent`,
-//! `safety`, `ai_error` — to `nanosiem-enterprise::tuning`; the open-core
+//! `safety`, `ai_error` — to `enterprise::tuning`; the open-core
 //! scheduler now consumes a `dyn TuningProposalGenerator` (defined in
 //! `nanosiem-core::extensions::tuning_proposal_generator`) so it stays
 //! decoupled from the enterprise concrete types.
@@ -23,6 +23,7 @@
 pub mod baseline;
 pub mod cache;
 pub mod metrics;
+pub mod mode;
 pub mod notifications;
 pub mod rate_limiter;
 pub mod repository;
@@ -38,6 +39,7 @@ pub mod versions;
 pub use baseline::*;
 pub use cache::*;
 pub use metrics::*;
+pub use mode::*;
 pub use notifications::*;
 pub use rate_limiter::*;
 pub use repository::*;

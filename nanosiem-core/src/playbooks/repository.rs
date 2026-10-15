@@ -13,6 +13,18 @@ use super::acl::{
     acl_sql, is_synthetic_role, push_acl, PlaybookAction, PlaybookPrincipal, SYNTHETIC_ROLES,
 };
 use super::error::PlaybookError;
+
+// NAN-2361: the tenant-leading unique index exists only under the enterprise
+// overlay migrations (9000361); the open edition keeps its original key.
+// Selected at compile time by the feature.
+#[cfg(feature = "enterprise")]
+const PERMISSION_ROLE_ID_CONFLICT: &str = "ON CONFLICT (tenant_id, playbook_id, role_id) WHERE role_id IS NOT NULL DO UPDATE SET";
+#[cfg(not(feature = "enterprise"))]
+const PERMISSION_ROLE_ID_CONFLICT: &str = "ON CONFLICT (playbook_id, role_id) WHERE role_id IS NOT NULL DO UPDATE SET";
+#[cfg(feature = "enterprise")]
+const PERMISSION_ROLE_CONFLICT: &str = "ON CONFLICT (tenant_id, playbook_id, role) WHERE role_id IS NULL DO UPDATE SET";
+#[cfg(not(feature = "enterprise"))]
+const PERMISSION_ROLE_CONFLICT: &str = "ON CONFLICT (playbook_id, role) WHERE role_id IS NULL DO UPDATE SET";
 use super::models::{
     CreatePlaybookRequest, ForkPlaybookRequest, ListPlaybooksQuery, Playbook, PlaybookApproval,
     PlaybookPermission, PlaybookRun, PlaybookScope, PlaybookStatus, PlaybookVersion,
@@ -180,18 +192,23 @@ impl PlaybookRepository {
         push_acl(&mut qb, "playbooks.id", PlaybookAction::View, principal);
 
         if let Some(cat) = query.category {
-            qb.push(" AND category = ").push_bind(cat.as_str().to_string());
+            qb.push(" AND category = ")
+                .push_bind(cat.as_str().to_string());
         }
         if let Some(status) = query.status {
-            qb.push(" AND status = ").push_bind(status.as_str().to_string());
+            qb.push(" AND status = ")
+                .push_bind(status.as_str().to_string());
         }
         if let Some(ref signal) = query.signal {
-            qb.push(" AND ").push_bind(signal.clone()).push(" = ANY(match_signals)");
+            qb.push(" AND ")
+                .push_bind(signal.clone())
+                .push(" = ANY(match_signals)");
         }
         if let Some(ref search) = query.search {
             let pattern = format!("%{}%", search);
             qb.push(" AND (title ILIKE ").push_bind(pattern.clone());
-            qb.push(" OR COALESCE(subtitle, '') ILIKE ").push_bind(pattern);
+            qb.push(" OR COALESCE(subtitle, '') ILIKE ")
+                .push_bind(pattern);
             qb.push(")");
         }
         if let Some(adaptive) = query.adaptive {
@@ -249,18 +266,23 @@ impl PlaybookRepository {
         qb.push(RESPONSE_KIND).push(" AND ");
         push_acl(&mut qb, "playbooks.id", PlaybookAction::View, principal);
         if let Some(cat) = query.category {
-            qb.push(" AND category = ").push_bind(cat.as_str().to_string());
+            qb.push(" AND category = ")
+                .push_bind(cat.as_str().to_string());
         }
         if let Some(status) = query.status {
-            qb.push(" AND status = ").push_bind(status.as_str().to_string());
+            qb.push(" AND status = ")
+                .push_bind(status.as_str().to_string());
         }
         if let Some(ref signal) = query.signal {
-            qb.push(" AND ").push_bind(signal.clone()).push(" = ANY(match_signals)");
+            qb.push(" AND ")
+                .push_bind(signal.clone())
+                .push(" = ANY(match_signals)");
         }
         if let Some(ref search) = query.search {
             let pattern = format!("%{}%", search);
             qb.push(" AND (title ILIKE ").push_bind(pattern.clone());
-            qb.push(" OR COALESCE(subtitle, '') ILIKE ").push_bind(pattern);
+            qb.push(" OR COALESCE(subtitle, '') ILIKE ")
+                .push_bind(pattern);
             qb.push(")");
         }
         if let Some(adaptive) = query.adaptive {
@@ -472,7 +494,11 @@ impl PlaybookRepository {
         // values rather than mere field presence so a retry carrying the
         // already-current value does not demote a live playbook or mint a
         // spurious version.
-        let doc_changed = req.doc.as_deref().map(|d| d != current.doc).unwrap_or(false);
+        let doc_changed = req
+            .doc
+            .as_deref()
+            .map(|d| d != current.doc)
+            .unwrap_or(false);
         let danger_policy_changed = req
             .danger_policy
             .as_ref()
@@ -482,7 +508,10 @@ impl PlaybookRepository {
             })
             .unwrap_or(false);
         let content_or_metadata_changed = doc_changed
-            || req.title.as_ref().is_some_and(|value| value != &current.title)
+            || req
+                .title
+                .as_ref()
+                .is_some_and(|value| value != &current.title)
             || req
                 .subtitle
                 .as_ref()
@@ -502,7 +531,10 @@ impl PlaybookRepository {
             || req
                 .scope
                 .is_some_and(|value| value.as_str() != current.scope)
-            || req.tags.as_ref().is_some_and(|value| value != &current.tags)
+            || req
+                .tags
+                .as_ref()
+                .is_some_and(|value| value != &current.tags)
             || req
                 .owner_team
                 .as_ref()
@@ -518,10 +550,7 @@ impl PlaybookRepository {
         };
 
         let title = req.title.clone().unwrap_or_else(|| current.title.clone());
-        let subtitle = req
-            .subtitle
-            .clone()
-            .or_else(|| current.subtitle.clone());
+        let subtitle = req.subtitle.clone().or_else(|| current.subtitle.clone());
         let category = req
             .category
             .map(|c| c.as_str().to_string())
@@ -630,7 +659,7 @@ impl PlaybookRepository {
                 INSERT INTO playbook_versions (
                     playbook_id, version, doc, metadata, note, author_id, author_name
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (playbook_id, version) DO NOTHING
+                ON CONFLICT ON CONSTRAINT playbook_versions_playbook_id_version_key DO NOTHING
                 "#,
             )
             .bind(pb.id)
@@ -666,9 +695,9 @@ impl PlaybookRepository {
             "UPDATE playbooks SET status = 'archived', updated_at = NOW() \
               WHERE id = $1 AND kind = 'response'",
         )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -699,10 +728,7 @@ impl PlaybookRepository {
             .title
             .clone()
             .unwrap_or_else(|| format!("{} (fork)", source.title));
-        let new_owner = req
-            .owner_team
-            .clone()
-            .or_else(|| source.owner_team.clone());
+        let new_owner = req.owner_team.clone().or_else(|| source.owner_team.clone());
 
         // New playbook: same content, draft, source_linked=FALSE, no adaptive_source
         let pb = sqlx::query_as::<_, Playbook>(
@@ -1222,9 +1248,12 @@ impl PlaybookRepository {
             severity,
             entities: entity_rows
                 .into_iter()
-                .map(|(entity_type, value)| {
-                    crate::entity_extraction::ExtractedEntity { entity_type, value }
-                })
+                .map(
+                    |(entity_type, value)| crate::entity_extraction::ExtractedEntity {
+                        entity_type,
+                        value,
+                    },
+                )
                 .collect(),
         })
     }
@@ -1281,13 +1310,7 @@ impl PlaybookRepository {
         // mutations remain concurrent; the shared parent lock only conflicts
         // with an ACL writer's exclusive lock.
         let mut tx = self.pool.begin().await?;
-        Self::lock_run_playbook_for_action(
-            &mut tx,
-            run_id,
-            PlaybookAction::Run,
-            principal,
-        )
-        .await?;
+        Self::lock_run_playbook_for_action(&mut tx, run_id, PlaybookAction::Run, principal).await?;
 
         // jsonb_set with `create_missing=true`: target path is
         // `step_completion -> $step_id`; value is the prior entry (or `{}`)
@@ -1322,7 +1345,13 @@ impl PlaybookRepository {
                  ))
                  AND {acl}
                RETURNING *"#,
-            acl = acl_sql("playbook_runs.playbook_id", PlaybookAction::Run, "$5", "$6", "$7"),
+            acl = acl_sql(
+                "playbook_runs.playbook_id",
+                PlaybookAction::Run,
+                "$5",
+                "$6",
+                "$7"
+            ),
         );
         let run: Option<PlaybookRun> = sqlx::query_as(&sql)
             .bind(run_id)
@@ -1354,13 +1383,7 @@ impl PlaybookRepository {
         // Otherwise an UPDATE can snapshot a grant, block behind a revoker, and
         // resume after commit without re-evaluating the ACL.
         let mut tx = self.pool.begin().await?;
-        Self::lock_run_playbook_for_action(
-            &mut tx,
-            run_id,
-            PlaybookAction::Run,
-            principal,
-        )
-        .await?;
+        Self::lock_run_playbook_for_action(&mut tx, run_id, PlaybookAction::Run, principal).await?;
 
         // NAN-2044: case visibility is enforced ATOMICALLY, as a conjunction of
         // the UPDATE itself (not a separate check-then-act probe), so a
@@ -1396,7 +1419,13 @@ impl PlaybookRepository {
                  ))
                  AND {acl}
                RETURNING *"#,
-            acl = acl_sql("playbook_runs.playbook_id", PlaybookAction::Run, "$5", "$6", "$7"),
+            acl = acl_sql(
+                "playbook_runs.playbook_id",
+                PlaybookAction::Run,
+                "$5",
+                "$6",
+                "$7"
+            ),
         );
         let run: Option<PlaybookRun> = sqlx::query_as(&sql)
             .bind(run_id)
@@ -1635,7 +1664,13 @@ impl PlaybookRepository {
                  (SELECT EXTRACT(EPOCH FROM (NOW() - MAX(started_at))) / 3600.0
                     FROM r)
                    AS hours_since_last_run"#,
-            acl = acl_sql("playbook_runs.playbook_id", PlaybookAction::View, "$2", "$3", "$4"),
+            acl = acl_sql(
+                "playbook_runs.playbook_id",
+                PlaybookAction::View,
+                "$2",
+                "$3",
+                "$4"
+            ),
         );
         let totals = sqlx::query(&totals_sql)
             .bind(playbook_id)
@@ -1721,13 +1756,9 @@ impl PlaybookRepository {
         // NAN-2097: submitting for review mutates the playbook's status, so it is
         // an EDIT. Lock first, then evaluate the ACL in a fresh statement
         // snapshot; see `lock_playbook_for_action`.
-        let current = Self::lock_playbook_for_action(
-            &mut tx,
-            playbook_id,
-            PlaybookAction::Edit,
-            principal,
-        )
-        .await?;
+        let current =
+            Self::lock_playbook_for_action(&mut tx, playbook_id, PlaybookAction::Edit, principal)
+                .await?;
 
         if let Some(approver_id) = approver_id {
             let eligible_sql = format!("SELECT {}", approval_assignee_eligible_sql("$1", "$2"));
@@ -2106,36 +2137,38 @@ impl PlaybookRepository {
         // conflict on `(playbook_id, role_id)` (partial unique index) and re-sync
         // the display label; synthetic principals, whose `role` IS the key,
         // conflict on `(playbook_id, role)`.
+        let role_id_sql = format!(
+            r#"INSERT INTO playbook_permissions
+                 (playbook_id, role, role_id, can_view, can_run, can_edit, can_publish, member_count)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               {PERMISSION_ROLE_ID_CONFLICT}
+                 role         = EXCLUDED.role,
+                 can_view     = EXCLUDED.can_view,
+                 can_run      = EXCLUDED.can_run,
+                 can_edit     = EXCLUDED.can_edit,
+                 can_publish  = EXCLUDED.can_publish,
+                 member_count = EXCLUDED.member_count,
+                 updated_at   = NOW()
+               RETURNING *"#
+        );
+        let role_sql = format!(
+            r#"INSERT INTO playbook_permissions
+                 (playbook_id, role, role_id, can_view, can_run, can_edit, can_publish, member_count)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               {PERMISSION_ROLE_CONFLICT}
+                 role_id      = EXCLUDED.role_id,
+                 can_view     = EXCLUDED.can_view,
+                 can_run      = EXCLUDED.can_run,
+                 can_edit     = EXCLUDED.can_edit,
+                 can_publish  = EXCLUDED.can_publish,
+                 member_count = EXCLUDED.member_count,
+                 updated_at   = NOW()
+               RETURNING *"#
+        );
         let row: PlaybookPermission = if role_id.is_some() {
-            sqlx::query_as(
-                r#"INSERT INTO playbook_permissions
-                     (playbook_id, role, role_id, can_view, can_run, can_edit, can_publish, member_count)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                   ON CONFLICT (playbook_id, role_id) WHERE role_id IS NOT NULL DO UPDATE SET
-                     role         = EXCLUDED.role,
-                     can_view     = EXCLUDED.can_view,
-                     can_run      = EXCLUDED.can_run,
-                     can_edit     = EXCLUDED.can_edit,
-                     can_publish  = EXCLUDED.can_publish,
-                     member_count = EXCLUDED.member_count,
-                     updated_at   = NOW()
-                   RETURNING *"#,
-            )
+            sqlx::query_as(&role_id_sql)
         } else {
-            sqlx::query_as(
-                r#"INSERT INTO playbook_permissions
-                     (playbook_id, role, role_id, can_view, can_run, can_edit, can_publish, member_count)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                   ON CONFLICT (playbook_id, role) WHERE role_id IS NULL DO UPDATE SET
-                     role_id      = EXCLUDED.role_id,
-                     can_view     = EXCLUDED.can_view,
-                     can_run      = EXCLUDED.can_run,
-                     can_edit     = EXCLUDED.can_edit,
-                     can_publish  = EXCLUDED.can_publish,
-                     member_count = EXCLUDED.member_count,
-                     updated_at   = NOW()
-                   RETURNING *"#,
-            )
+            sqlx::query_as(&role_sql)
         }
         .bind(playbook_id)
         .bind(role)
@@ -2149,8 +2182,7 @@ impl PlaybookRepository {
         .await?;
 
         Self::assert_acl_still_administrable(&mut tx, playbook_id).await?;
-        Self::assert_acl_still_allows_principal(&mut tx, playbook_id, principal)
-            .await?;
+        Self::assert_acl_still_allows_principal(&mut tx, playbook_id, principal).await?;
         tx.commit().await?;
         Ok(row)
     }
@@ -2205,8 +2237,7 @@ impl PlaybookRepository {
         }
 
         Self::assert_acl_still_administrable(&mut tx, playbook_id).await?;
-        Self::assert_acl_still_allows_principal(&mut tx, playbook_id, principal)
-            .await?;
+        Self::assert_acl_still_allows_principal(&mut tx, playbook_id, principal).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2455,7 +2486,11 @@ impl PlaybookRepository {
             .as_ref()
             .and_then(|v| v.get("case_id"))
             .and_then(|v| v.as_str())
-            .and_then(|s| crate::typeid::decode("case", s).ok().or_else(|| Uuid::parse_str(s).ok()));
+            .and_then(|s| {
+                crate::typeid::decode("case", s)
+                    .ok()
+                    .or_else(|| Uuid::parse_str(s).ok())
+            });
 
         // Flip the flags + bump version.
         let new_version = current.current_version + 1;
@@ -2650,7 +2685,7 @@ mod kind_scope_tests {
     ///
     /// Read at RUNTIME, not via `include_str!`.
     ///
-    /// `tools/sync-to-nano-mirror.sh` strips `migrations/postgres-enterprise/`
+    /// `tools/sync-to-nano-mirror.sh` strips the enterprise migrations
     /// but keeps this file, so a compile-time include of that path makes the
     /// public mirror fail to build — the NAN-2169 shape. The script's existing
     /// answer is to delete whole test FILES that read stripped paths, which is

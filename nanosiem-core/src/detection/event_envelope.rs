@@ -21,6 +21,7 @@
 //! NAN-826 / NAN-829. Moving them server-side means future regressions get
 //! fixed once, in one Rust function, instead of three TS files.
 
+use chrono::{DateTime, SecondsFormat};
 use serde_json::{Map, Value};
 
 pub const MATCH_EVENT_TIME: &str = "_match_event_time";
@@ -98,6 +99,7 @@ fn pick_kind(obj: &Map<String, Value>) -> Kind {
 /// never masquerades as the event time.
 fn pick_time(obj: &Map<String, Value>) -> Option<String> {
     for key in [
+        "time",
         "timestamp",
         "eventTime",
         "ingest_time",
@@ -107,8 +109,10 @@ fn pick_time(obj: &Map<String, Value>) -> Option<String> {
         "last_seen",
         "first_seen",
     ] {
-        if let Some(v) = str_field(obj, key) {
-            return Some(v.to_string());
+        if let Some(value) = value_field(obj, key) {
+            if let Some(timestamp) = event_time_string(value) {
+                return Some(timestamp);
+            }
         }
     }
     // Loose scan — pick the latest-parsing timestamp-shaped string in any
@@ -132,6 +136,35 @@ fn pick_time(obj: &Map<String, Value>) -> Option<String> {
     best.map(|(_, s)| s.to_string())
 }
 
+/// Canonical OCSF 1.9 stores `time` as Unix epoch milliseconds. Projected
+/// rules and older sources can still return seconds, microseconds, nanoseconds,
+/// or formatted strings, so normalize every common unit to one RFC 3339 value
+/// for the UI envelope.
+fn event_time_string(value: &Value) -> Option<String> {
+    if let Some(timestamp) = value.as_str() {
+        let timestamp = timestamp.trim();
+        return (!timestamp.is_empty()).then(|| timestamp.to_string());
+    }
+
+    let epoch = value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))?;
+    let magnitude = epoch.unsigned_abs();
+    let timestamp = if magnitude >= 100_000_000_000_000_000 {
+        DateTime::from_timestamp(
+            epoch.div_euclid(1_000_000_000),
+            epoch.rem_euclid(1_000_000_000) as u32,
+        )
+    } else if magnitude >= 100_000_000_000_000 {
+        DateTime::from_timestamp_micros(epoch)
+    } else if magnitude >= 100_000_000_000 {
+        DateTime::from_timestamp_millis(epoch)
+    } else {
+        DateTime::from_timestamp(epoch, 0)
+    }?;
+    Some(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
 /// Label picker. Raw events prefer the canonical action fields; aggregates
 /// fall through to user-aliased summary strings, then count-based derivation,
 /// then a generic `"stats aggregate"` so the cell is never empty.
@@ -141,6 +174,7 @@ fn pick_label(obj: &Map<String, Value>, kind: Kind) -> Option<String> {
     }
 
     for key in [
+        "activity_name",
         "eventName",
         "event_type",
         "action",
@@ -211,25 +245,29 @@ fn pick_entity(obj: &Map<String, Value>) -> Option<(String, String)> {
     }
 
     for (keys, ty) in [
-        (&["user", "actor.user.name", "user.name"][..], "user"),
         (
             &[
-                "src_host",
-                "hostname",
-                "dest_host",
+                "actor.user.name",
+                "user.name",
+                "actor.user.uid",
+                "user.uid",
+                "user",
+            ][..],
+            "user",
+        ),
+        (
+            &[
                 "device.hostname",
                 "src_endpoint.hostname",
                 "dst_endpoint.hostname",
+                "src_host",
+                "hostname",
+                "dest_host",
             ][..],
             "hostname",
         ),
         (
-            &[
-                "src_ip",
-                "dest_ip",
-                "src_endpoint.ip",
-                "dst_endpoint.ip",
-            ][..],
+            &["src_endpoint.ip", "dst_endpoint.ip", "src_ip", "dest_ip"][..],
             "ip",
         ),
     ] {
@@ -271,13 +309,14 @@ fn risk_row_label(obj: &Map<String, Value>) -> Option<String> {
     if str_field(obj, "entity").is_none() {
         return None;
     }
-    let (score, window) = [("score_24h", "24h"), ("score_7d", "7d")]
-        .iter()
-        .find_map(|(key, window)| {
-            numeric_field(obj, key)
-                .filter(|n| n.is_finite())
-                .map(|n| (n, *window))
-        })?;
+    let (score, window) =
+        [("score_24h", "24h"), ("score_7d", "7d")]
+            .iter()
+            .find_map(|(key, window)| {
+                numeric_field(obj, key)
+                    .filter(|n| n.is_finite())
+                    .map(|n| (n, *window))
+            })?;
     let label = format!("risk {} ({window})", format_count(score));
     match str_field(obj, "last_rule_name") {
         Some(rule) => Some(format!("{label} · {}", truncate(rule, 72))),
@@ -375,12 +414,12 @@ fn aggregate_measure_label(obj: &Map<String, Value>) -> Option<String> {
 }
 
 fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
-    if let Some(process) = first_str(obj, &["process_name", "process.name", "actor.process.name"]) {
+    if let Some(process) = first_str(obj, &["actor.process.name", "process.name", "process_name"]) {
         return Some(process.to_string());
     }
 
     let file_action = first_str(obj, &["file_action"]);
-    let file = first_str(obj, &["file_name", "file.name", "file_path", "file.path"]);
+    let file = first_str(obj, &["file.name", "file.path", "file_name", "file_path"]);
     if file_action.is_some() || file.is_some() {
         return Some(match (file_action, file) {
             (Some(action), Some(path)) => format!("{action} · {}", basename(path)),
@@ -405,14 +444,14 @@ fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
         });
     }
 
-    let method = first_str(obj, &["http_method", "http_request.http_method"]);
+    let method = first_str(obj, &["http_request.http_method", "http_method"]);
     let destination = first_str(
         obj,
         &[
-            "dest_host",
             "http_request.url.hostname",
-            "url",
             "http_request.url.url_string",
+            "dest_host",
+            "url",
             "dest_ip",
         ],
     );
@@ -440,7 +479,7 @@ fn semantic_raw_label(obj: &Map<String, Value>) -> Option<String> {
     if let Some(risk) = risk_row_label(obj) {
         return Some(risk);
     }
-    first_str(obj, &["source_type"])
+    first_str(obj, &["metadata.log_source", "source_type"])
         .map(|source| format!("{} event", source.replace(['_', '-'], " ")))
 }
 
@@ -504,7 +543,20 @@ fn truncate(value: &str, max_chars: usize) -> String {
 }
 
 fn str_field<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    let value = obj.get(key).or_else(|| {
+    value_field(obj, key)
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        })
+}
+
+fn value_field<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
+    obj.get(key).or_else(|| {
         let mut parts = key.split('.');
         let first = parts.next()?;
         let mut value = obj.get(first)?;
@@ -512,14 +564,6 @@ fn str_field<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
             value = value.as_object()?.get(part)?;
         }
         Some(value)
-    });
-    value.and_then(|v| v.as_str()).and_then(|s| {
-        let t = s.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
     })
 }
 

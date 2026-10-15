@@ -414,7 +414,7 @@ pub struct QuarantineResponse {
 
 /// List detection-rule MITRE mappings dropped by a catalog sync.
 ///
-/// NAN-1918: before this endpoint existed the quarantine table had no reader at
+/// before this endpoint existed the quarantine table had no reader at
 /// all, so a sync that renumbered techniques destroyed rule mappings with no
 /// operator-visible trace beyond a log line carrying a bare count.
 #[utoipa::path(

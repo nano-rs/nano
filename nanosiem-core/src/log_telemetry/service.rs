@@ -76,7 +76,10 @@ impl LogTelemetryService {
         bucket: BucketSize,
         deny_set: &std::collections::BTreeSet<String>,
     ) -> Result<Vec<HourlyPoint>, LogTelemetryError> {
-        Ok(self.repo.buckets_all(window_hours, bucket, deny_set).await?)
+        Ok(self
+            .repo
+            .buckets_all(window_hours, bucket, deny_set)
+            .await?)
     }
 
     /// Total event count for the window across every source the caller may see.

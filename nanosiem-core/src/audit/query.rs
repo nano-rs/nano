@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -280,12 +281,17 @@ fn row_to_entry(row: AuditRow) -> ClickHouseAuditEntry {
 #[derive(Clone)]
 pub struct AuditQueryService {
     dual_pool: DualPool,
+    lake_mode: bool,
 }
 
 impl AuditQueryService {
     /// Create a new audit query service
     pub fn new(dual_pool: DualPool) -> Self {
-        Self { dual_pool }
+        let lake_mode = crate::schema::log_query_backend_is_lake();
+        Self {
+            dual_pool,
+            lake_mode,
+        }
     }
 
     /// Query audit logs from ClickHouse
@@ -293,6 +299,9 @@ impl AuditQueryService {
         &self,
         query: &ClickHouseAuditQuery,
     ) -> Result<Vec<ClickHouseAuditEntry>, AuditQueryError> {
+        if self.lake_mode {
+            return self.query_postgres(query).await;
+        }
         let client = self.dual_pool.clickhouse();
         let limit = query.limit.unwrap_or(50).min(1000);
         let offset = query.offset.unwrap_or(0);
@@ -327,6 +336,9 @@ impl AuditQueryService {
 
     /// Count audit logs matching query
     pub async fn count(&self, query: &ClickHouseAuditQuery) -> Result<u64, AuditQueryError> {
+        if self.lake_mode {
+            return self.count_postgres(query).await;
+        }
         let client = self.dual_pool.clickhouse();
         let filters = resolve_filters(query);
 
@@ -355,6 +367,9 @@ impl AuditQueryService {
 
     /// Get distinct action values from audit events
     pub async fn get_distinct_actions(&self) -> Result<Vec<String>, AuditQueryError> {
+        if self.lake_mode {
+            return self.distinct_postgres("action").await;
+        }
         let client = self.dual_pool.clickhouse();
         let since = Utc::now() - chrono::Duration::days(90);
 
@@ -376,6 +391,9 @@ impl AuditQueryService {
 
     /// Get distinct source values from audit events
     pub async fn get_distinct_sources(&self) -> Result<Vec<String>, AuditQueryError> {
+        if self.lake_mode {
+            return self.distinct_postgres("source").await;
+        }
         let client = self.dual_pool.clickhouse();
         let since = Utc::now() - chrono::Duration::days(90);
 
@@ -420,6 +438,30 @@ impl AuditQueryService {
         api_key_id: Uuid,
         start: DateTime<Utc>,
     ) -> Result<Vec<(chrono::NaiveDate, i64)>, AuditQueryError> {
+        if self.lake_mode {
+            let rows = sqlx::query(
+                "SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day, COUNT(*)::bigint AS count \
+                 FROM platform_audit_events \
+                 WHERE occurred_at >= $1 AND api_key_id = $2 \
+                 GROUP BY day ORDER BY day",
+            )
+            .bind(start)
+            .bind(api_key_id)
+            .fetch_all(self.dual_pool.postgres())
+            .await
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.try_get("day")
+                            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+                        row.try_get("count")
+                            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+                    ))
+                })
+                .collect();
+        }
         let client = self.dual_pool.clickhouse();
 
         // Bucket on the UTC calendar day explicitly so day boundaries match the
@@ -452,6 +494,207 @@ impl AuditQueryService {
             })
             .collect()
     }
+
+    async fn query_postgres(
+        &self,
+        query: &ClickHouseAuditQuery,
+    ) -> Result<Vec<ClickHouseAuditEntry>, AuditQueryError> {
+        let (where_sql, bind_values) = postgres_filter_sql(query);
+        let limit = query.limit.unwrap_or(50).clamp(1, 1000);
+        let offset = query.offset.unwrap_or(0).max(0);
+        let sql = format!(
+            "SELECT event_id, occurred_at, actor_name, action, source, ip_address, user_agent, \
+                    status, message, metadata, resource_type, resource_id, resource_name, \
+                    api_key_id, api_key_name \
+             FROM platform_audit_events {where_sql} \
+             ORDER BY occurred_at DESC LIMIT {limit} OFFSET {offset}"
+        );
+        let rows = bind_postgres_filters(sqlx::query(&sql), query, &bind_values)
+            .fetch_all(self.dual_pool.postgres())
+            .await
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+
+        rows.into_iter().map(postgres_row_to_entry).collect()
+    }
+
+    async fn count_postgres(&self, query: &ClickHouseAuditQuery) -> Result<u64, AuditQueryError> {
+        let (where_sql, bind_values) = postgres_filter_sql(query);
+        let sql =
+            format!("SELECT COUNT(*)::bigint AS count FROM platform_audit_events {where_sql}");
+        let row = bind_postgres_filters(sqlx::query(&sql), query, &bind_values)
+            .fetch_one(self.dual_pool.postgres())
+            .await
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+        let count: i64 = row
+            .try_get("count")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    async fn distinct_postgres(&self, column: &str) -> Result<Vec<String>, AuditQueryError> {
+        // Callers pass one of the two fixed identifiers above; keep the match so
+        // a future refactor cannot turn this into an identifier-injection seam.
+        let column = match column {
+            "action" => "action",
+            "source" => "source",
+            _ => {
+                return Err(AuditQueryError::QueryError(
+                    "invalid audit facet".to_string(),
+                ))
+            }
+        };
+        let sql = format!(
+            "SELECT DISTINCT {column} AS value FROM platform_audit_events \
+             WHERE occurred_at >= NOW() - INTERVAL '90 days' AND {column} != '' \
+             ORDER BY value"
+        );
+        sqlx::query(&sql)
+            .fetch_all(self.dual_pool.postgres())
+            .await
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?
+            .into_iter()
+            .map(|row| {
+                row.try_get("value")
+                    .map_err(|error| AuditQueryError::QueryError(error.to_string()))
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PostgresAuditBind {
+    Start,
+    End,
+    Action,
+    Source,
+    Actor,
+    ResourceType,
+    Status,
+}
+
+fn postgres_filter_sql(query: &ClickHouseAuditQuery) -> (String, Vec<PostgresAuditBind>) {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    let mut next = 1;
+    let mut add = |clause: String, bind: PostgresAuditBind| {
+        clauses.push(clause.replace('?', &format!("${next}")));
+        binds.push(bind);
+        next += 1;
+    };
+
+    add("occurred_at >= ?".to_string(), PostgresAuditBind::Start);
+    add("occurred_at <= ?".to_string(), PostgresAuditBind::End);
+    if query.action.is_some() {
+        add("action = ?".to_string(), PostgresAuditBind::Action);
+    }
+    if query.source.is_some() {
+        add("source = ?".to_string(), PostgresAuditBind::Source);
+    }
+    if query.actor_id.is_some() {
+        add("actor_id = ?".to_string(), PostgresAuditBind::Actor);
+    }
+    if query.resource_type.is_some() {
+        add(
+            "resource_type = ?".to_string(),
+            PostgresAuditBind::ResourceType,
+        );
+    }
+    if query.success.is_some() {
+        add("status = ?".to_string(), PostgresAuditBind::Status);
+    }
+    (format!("WHERE {}", clauses.join(" AND ")), binds)
+}
+
+fn bind_postgres_filters<'q>(
+    mut statement: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    query: &'q ClickHouseAuditQuery,
+    binds: &[PostgresAuditBind],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    let start = query
+        .start_time
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::days(30));
+    let end = query.end_time.unwrap_or_else(Utc::now);
+    for bind in binds {
+        statement = match bind {
+            PostgresAuditBind::Start => statement.bind(start),
+            PostgresAuditBind::End => statement.bind(end),
+            PostgresAuditBind::Action => statement.bind(query.action.as_deref().unwrap_or("")),
+            PostgresAuditBind::Source => statement.bind(query.source.as_deref().unwrap_or("")),
+            PostgresAuditBind::Actor => statement.bind(query.actor_id.unwrap_or_default()),
+            PostgresAuditBind::ResourceType => {
+                statement.bind(query.resource_type.as_deref().unwrap_or(""))
+            }
+            PostgresAuditBind::Status => statement.bind(if query.success.unwrap_or(false) {
+                "success"
+            } else {
+                "failure"
+            }),
+        };
+    }
+    statement
+}
+
+fn postgres_row_to_entry(
+    row: sqlx::postgres::PgRow,
+) -> Result<ClickHouseAuditEntry, AuditQueryError> {
+    let metadata: serde_json::Value = row
+        .try_get("metadata")
+        .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+    let event_id: Uuid = row
+        .try_get("event_id")
+        .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+    let resource_id: Option<Uuid> = row
+        .try_get("resource_id")
+        .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+    let api_key_id: Option<Uuid> = row
+        .try_get("api_key_id")
+        .map_err(|error| AuditQueryError::QueryError(error.to_string()))?;
+    Ok(ClickHouseAuditEntry {
+        event_id: event_id.to_string(),
+        timestamp: row
+            .try_get("occurred_at")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        user: row
+            .try_get("actor_name")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        action: Some(
+            row.try_get("action")
+                .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        ),
+        source: Some(
+            row.try_get("source")
+                .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        ),
+        src_ip: row
+            .try_get("ip_address")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        user_agent: row
+            .try_get("user_agent")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        status: Some(
+            row.try_get("status")
+                .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        ),
+        message: row
+            .try_get("message")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        actor_id: metadata
+            .get("actor_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        resource_type: row
+            .try_get("resource_type")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        resource_id: resource_id.map(|id| id.to_string()),
+        resource_name: row
+            .try_get("resource_name")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        api_key_id: api_key_id.map(|id| id.to_string()),
+        api_key_name: row
+            .try_get("api_key_name")
+            .map_err(|error| AuditQueryError::QueryError(error.to_string()))?,
+        metadata,
+    })
 }
 
 #[cfg(test)]
@@ -468,7 +711,7 @@ mod tests {
             src_ip: "10.0.0.1".to_string(),
             user_agent: String::new(),
             status: "success".to_string(),
-            message: "[detection] rule_created by Dan Lussier".to_string(),
+            message: "[detection] rule_created by Jane Analyst".to_string(),
             metadata: metadata.to_string(),
         }
     }
@@ -478,21 +721,44 @@ mod tests {
     /// keep rendering the display-case name, which lives in metadata.
     #[test]
     fn entry_user_prefers_display_case_actor_name_from_metadata() {
-        let entry = row_to_entry(row("dan lussier", r#"{"actor_name":"Dan Lussier"}"#));
-        assert_eq!(entry.user.as_deref(), Some("Dan Lussier"));
+        let entry = row_to_entry(row("jane analyst", r#"{"actor_name":"Jane Analyst"}"#));
+        assert_eq!(entry.user.as_deref(), Some("Jane Analyst"));
     }
 
     /// Rows without a metadata actor_name (system/API-key events, or legacy
     /// metadata shapes) fall back to the `user` column verbatim.
     #[test]
     fn entry_user_falls_back_to_column_without_actor_name() {
-        let entry = row_to_entry(row("dan lussier", "{}"));
-        assert_eq!(entry.user.as_deref(), Some("dan lussier"));
+        let entry = row_to_entry(row("jane analyst", "{}"));
+        assert_eq!(entry.user.as_deref(), Some("jane analyst"));
 
-        let entry = row_to_entry(row("dan lussier", r#"{"actor_name":null}"#));
-        assert_eq!(entry.user.as_deref(), Some("dan lussier"));
+        let entry = row_to_entry(row("jane analyst", r#"{"actor_name":null}"#));
+        assert_eq!(entry.user.as_deref(), Some("jane analyst"));
 
         let entry = row_to_entry(row("", "{}"));
         assert_eq!(entry.user, None);
+    }
+
+    #[test]
+    fn postgres_audit_filters_are_parameterized_in_stable_order() {
+        let actor = Uuid::now_v7();
+        let query = ClickHouseAuditQuery {
+            actor_id: Some(actor),
+            action: Some("rule_created".to_string()),
+            source: Some("detection".to_string()),
+            resource_type: Some("detection_rule".to_string()),
+            success: Some(true),
+            ..Default::default()
+        };
+
+        let (sql, binds) = postgres_filter_sql(&query);
+
+        assert_eq!(
+            sql,
+            "WHERE occurred_at >= $1 AND occurred_at <= $2 AND action = $3 AND source = $4 AND actor_id = $5 AND resource_type = $6 AND status = $7"
+        );
+        assert_eq!(binds.len(), 7);
+        assert!(matches!(binds[0], PostgresAuditBind::Start));
+        assert!(matches!(binds[6], PostgresAuditBind::Status));
     }
 }

@@ -45,8 +45,7 @@ impl EntraIdSync {
             creds.tenant_id
         );
 
-        let (client, url) =
-            super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
+        let (client, url) = super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
         let resp = client
             .post(url)
             .form(&[
@@ -91,8 +90,7 @@ impl EntraIdSync {
         token: &str,
         url: &str,
     ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
-        let (client, url) =
-            super::guarded_client(url, std::time::Duration::from_secs(30)).await?;
+        let (client, url) = super::guarded_client(url, std::time::Duration::from_secs(30)).await?;
         let resp = client
             .get(url)
             .bearer_auth(token)
@@ -172,7 +170,10 @@ impl SyncProvider for EntraIdSync {
         let mut all_users = Vec::new();
 
         loop {
-            let (page, next) = self.fetch_page(&token, &url).await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&token, &url)
+            })
+            .await?;
             all_users.extend(page);
             match next {
                 Some(next_url) => url = next_url,
@@ -199,7 +200,10 @@ impl SyncProvider for EntraIdSync {
         let mut total = 0u64;
 
         loop {
-            let (page, next) = self.fetch_page(&token, &url).await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&token, &url)
+            })
+            .await?;
             let page_size = page.len();
             total += on_page(page).await?;
 

@@ -1,43 +1,222 @@
 # Authoring a Tenzir → OCSF → nano pipeline
 
-Agent-facing guide for writing or fixing the Tenzir pipeline that ships OCSF
-events into nano (this directory's `pipeline.tql`). Human-readable too. If you
-are an AI assistant helping a user customize their bundled `nano-tenzir` node,
-this is your reference — read it before editing `pipeline.tql`.
+This guide is for agents writing or fixing a Tenzir pipeline that ships OCSF
+events into nano. People can read it too.
 
-Ground truth for field mappings is the parser set in the **parsers repo**
-(`parsers-ocsf/<source>/parser.yaml`). End-user docs:
-<https://nano.rs/docs/ocsf/integrations/direct-ocsf>.
+nano runs on the **lean lake** now: Parquet parts in an object store, written
+by the lake-cell ingestor. ClickHouse is gone. The old `to_clickhouse` path
+(`pipeline.tql` and [Legacy](#legacy-clickhouse-era-direct-ingestion-retired)
+below) does not work on a lean install.
 
----
-
-## TL;DR — the rules that bite
-
-1. **Sink is fixed. Do not change it.** Write with the native `to_clickhouse`
-   operator into `nanosiem.ocsf_logs_raw`, `tls=false`, `mode="append"`,
-   native port `9000`. Editing the table name or sink will break ingestion.
-2. **Requires Tenzir ≥ 6.6.0.** The first release whose `to_clickhouse` accepts
-   `ocsf_logs_raw`'s column types AND omits server-derived columns it doesn't
-   send. On Tenzir 6.4.0–6.5.x, target the legacy `nanosiem.ocsf_logs_native_raw`
-   entrypoint instead — see
-   [Target table & the legacy entrypoint](#target-table--the-legacy-entrypoint).
-3. **Send only `{event, source_type}`.** `timestamp` and `id` are server-derived
-   — leave them out and their ClickHouse DEFAULTs fire. A **null** in a required
-   column still drops the event even with a DEFAULT (only ABSENT columns default),
-   so guard mapped values like `source_type` with `.otherwise("unknown")`.
-4. **Wire shape is `{event, source_type}`.** `event` is the full OCSF 1.8.0
-   object; it MUST carry `class_uid` and `time` (epoch **milliseconds**).
-5. **Lowercase** `source_type` and any value you write that nano lowercases at
-   ingest (IPs, hostnames, hashes).
-6. You own everything between source and sink: parse + map your logs to OCSF.
-7. **Batch before the sink.** Put `unordered { batch }` right before
-   `to_clickhouse` — real OCSF is schema-heterogeneous, and without it every event
-   becomes a 1-row native INSERT that OOM-kills the node under load. See
-   [Batch before the sink](#batch-before-the-sink).
+Field mappings follow the parser set in the **parsers repo**
+(`parsers-ocsf/<source>/parser.yaml`, `ocsf-1.9` branch).
 
 ---
 
-## The sink (copy verbatim)
+## Where Tenzir sends: the bucket drop (open core)
+
+Tenzir already emits OCSF 1.9, so it skips Vector. It writes files straight
+into the install's object store (RustFS), and the lake converts each file into
+ordinary bronze:
+
+```
+Tenzir ─ to_s3 { write_parquet } ─▶ landing-ocsf-v1/tenant_id=<T>/source=<source_id>/<uuid>.parquet
+   ─▶ lake_landing_ingest (lean-landing): claim once per (key, etag), run Vector's own
+      ocsf_lake_storage_prepare VRL, pre-check strict OCSF 1.9, write one bronze object
+   ─▶ bronze-v2/[shard=N/]tenant_id=<T>/<secs>-<uuid>.parquet
+   ─▶ lake-cell part ingest: the SAME admission as Vector's files (IPinfo geo/ASN,
+      tenant IOC enrichments[], identity, prevalence, platform stamps, uid window)
+```
+
+| | Status | How |
+|---|---|---|
+| **Bucket drop (THE path)** | Open core, lean profile | `to_s3` + `write_parquet` (or `write_ndjson`, optionally `.gz`) into the source's folder |
+| HTTP through Vector (fallback) | Works on open core | `POST http://<nano-host>/ingest` with a per-sender ingest token; see [below](#fallback-http-through-vector) |
+| HEC through Vector | Open core: does not work with `to_splunk` | see [below](#why-not-to_splunk-on-open-core) |
+| Hosted | Out of scope for the bucket drop | hosted tenants have no install object store to drop into |
+
+### Install modes
+
+The pinned, tested Tenzir is **`tenzir/tenzir:v6.19.1`**
+(`@sha256:6e96f962bc0a957d94d5149f840f7603c47a7b11d995e0f1fc167c141db7c06f`,
+the same pin as the compose `tenzir` service and `images.lock`).
+
+- `install.sh` (default): Vector ingest **and** the bucket drop, side by side.
+  Tenzir can drop files into any lean install.
+- `install.sh --tenzir`: Tenzir-direct. The lean stack **without Vector** and
+  without the connector runner. What that removes:
+  - HTTP `/ingest`, HEC (`:8088`), OTLP (`/otlp`, `:4317/4318`), Vector native
+    (`:6000`) and fluent are not offered; nginx answers 502 on `/ingest` and
+    `/otlp`.
+  - Pull connectors and directory (identity) sync, which deliver through
+    Vector, are not available; the connector runner is not started.
+  - Parser deploys have no Vector to render into; map in Tenzir instead.
+  - Synthetic checks report their metrics over Vector's OTLP and do not run.
+
+  What stays: the lake cell, lean-landing, the enrichment coordinator
+  (IPinfo, tenant IOCs, prevalence), lean-otel, and the platform audit lane,
+  which has its own private Vector (`lean-audit-vector`) and is unaffected.
+- `install.sh --add-vector` turns a Tenzir-direct install into the default
+  (Vector plus the bucket drop). A re-run without either flag keeps the mode
+  the install has (`NANO_VECTOR_PROFILE` in `.env`: `none` = no Vector).
+- The bundled node: `docker compose --profile tenzir up -d tenzir` runs the
+  pinned Tenzir with `.nano-tenzir/pipeline.tql` (seeded from
+  `lean/sysmon-bucket.tql`; edit its source and paste your sink). It is never
+  started by `up` on its own.
+
+### Add a source
+
+```sh
+docker compose run --rm lean-landing-admin add --name tenzir-sysmon [--route <key>] [--endpoint <host:port>]
+```
+
+It creates a disabled log source (never rendered into Vector), a landing
+source, and a RustFS user whose only policy is `s3:PutObject` on
+`arn:aws:s3:::nano-lake/landing-ocsf-v1/tenant_id=<T>/source=<source_id>/*`.
+It prints the key and a ready-to-paste `to_s3` sink **once**; the key is not
+stored or logged anywhere. `list` shows sources; `revoke <source_id>` deletes
+the RustFS user and its policy, which is the revocation.
+
+The key can only put objects into its own folder: it cannot read, list or
+delete, and cannot write into another source's folder or into bronze (probed
+on RustFS 1.0.1). Tenzir's multipart uploads succeed with `s3:PutObject`
+alone (a 71 MiB file on CT 106 with Tenzir v6.18.0 and v6.19.1), so the policy carries no
+`s3:AbortMultipartUpload`.
+
+### The pipeline: `lean/sysmon-bucket.tql`
+
+```
+to_s3 "s3://nano-lake/landing-ocsf-v1/tenant_id=<T>/source=<id>/{uuid}.parquet?endpoint_override=lake-object-store:9000&scheme=http",
+  aws_iam={access_key_id: "<key>", secret_access_key: "<secret>"} {
+  write_parquet
+}
+```
+
+- **The folder decides the source.** Every row gets
+  `metadata.log_source = <route key>`, `metadata.tenant_uid = <T>`,
+  `metadata.nano_credential_id = <the source's credential id>` and
+  `metadata.ingress_transport = "landing_bucket"`, whatever the file says.
+- **Keep `metadata.uid` stable** (Sysmon `ProcessGuid`, `RecordID` plus host).
+  It is kept as sent unless it is a bare random UUIDv4 that does not appear in
+  `raw_data`. A row without a uid gets one derived from the file's SHA-256 and
+  the row's ordinal. Resending the same events adds no duplicates: the lake's
+  uid dedupe window drops them (a resend days later can fall outside it).
+- **Formats:** `.parquet` (Tenzir's typed nested `write_parquet`), `.ndjson`,
+  `.jsonl`, `.json`, each NDJSON form optionally `.gz`. A typed `time` column
+  (RFC 3339 string after decoding) is read as the event time.
+- **Caps:** 256 MiB per file on the store, 1 GiB decoded NDJSON, 250 000 rows.
+- **Refusals never wedge.** A bad row is counted and left out. A file with
+  nothing admissible (unreadable, wrong tenant or source, revoked source, over a
+  cap, failing 5 times) is refused whole and moved to
+  `landing-ocsf-v1-refused/...`. Status, with a value-free reason, is on
+  **Ingestion → Credentials → Bucket drop sources** and
+  `GET /api/landing-sources[/{id}/files]`.
+- **Vector features do not apply, by design.** nano Pipe filters and sampling
+  and VRL parsers run in Vector; bucket-drop rows never pass through it. Map
+  and filter in Tenzir.
+
+### Reaching RustFS
+
+RustFS stays internal by default: run Tenzir on the nano host on the compose
+network (`--network nano_default`, endpoint `lake-object-store:9000`, `scheme=http`).
+For a Tenzir node on another host, put a TLS listener in front of RustFS
+(for example an nginx `stream`/`server` block on a dedicated port with your
+certificate, proxying to `lake-object-store:9000`), firewall it to the
+sender, and pass `--endpoint <host>:<port> --scheme https` to `add` so the
+printed sink uses it. Never publish RustFS's plain port 9000 beyond the host.
+
+### Fallback: HTTP through Vector
+
+`lean/sysmon-http.tql` POSTs NDJSON to open-core `/ingest` with a per-sender
+ingest token. Proven 100/100 on CT 106 (Tenzir `v6.18.0`), but:
+
+- **Class 0, not your class.** With no parser deployed for the source,
+  Vector's generic lane wraps every event as OCSF class 0 Base Event; your
+  mapping survives only inside `raw_data` and `message`. A passthrough parser
+  fixes this, but keeps Vector in the loop.
+- **Your `metadata` is replaced.** `metadata.uid` is re-minted, so a sender
+  retry can duplicate events. `metadata.log_source` comes from the token's
+  bound source or `X-Source-Type`.
+- **Close a request every few seconds:** wrap `to_http` in `every 2s { … }`;
+  `buffer_all=true` sends `Content-Length` and lets it retry on 5xx.
+
+Ingest tokens: **Ingestion → Credentials**, or `POST /api/ingest-tokens` with
+`{"name": "tenzir-sysmon"}` (`settings:system`). The value is shown once; keep
+it in the Tenzir node's environment, never in a `.tql` file.
+
+### Why not `to_splunk` on open core
+
+Open-core HEC is Vector's `splunk_hec` source with indexer acknowledgements
+on. It refuses any request that has no `X-Splunk-Request-Channel` header
+(`{"text":"Data channel is missing","code":10}`), and `to_splunk` has no
+header option. The hosted Worker synthesizes a channel itself, so this refusal
+is specific to open core.
+
+---
+
+## OCSF mapping conventions (lean)
+
+- Map to the released OCSF **1.9.0** schema and set `metadata.version` to
+  `"1.9.0"`. Lake admission runs a strict OCSF 1.9 validator
+  (`nanosiem_core::parsers::validate_ocsf_event`). It refuses unknown
+  attributes, a wrong `type_uid`, and missing required objects (for example
+  `device` on System Activity classes).
+- `type_uid = class_uid * 100 + activity_id`.
+- `time` is integer epoch **milliseconds**.
+- Keep the original bytes as a **string** in `raw_data`. Lake admission
+  refuses a source row without a non-empty `raw_data` and a matching
+  `raw_data_size`; the storage stage fills `raw_data_size` (and `raw_data`
+  from `message`) when they are missing.
+  - Read input with `read_lines` and parse with `line.parse_json()` to keep
+    the original line byte-exact.
+  - `print_json()` re-renders the record, so it is not byte-exact.
+- Put a meaningful summary in `message`; bare-keyword search targets it.
+- Set `metadata.uid` from a natural record id (Sysmon `ProcessGuid`, or
+  `RecordID` plus host). The bucket drop keeps a sender uid, and the lake
+  dedupes on it.
+- Lowercase anything nano lowercases at ingest: hostnames, IPs, hashes.
+- Put anything that has no OCSF attribute in `unmapped`. Do not invent
+  top-level fields; strict admission refuses them.
+
+Representative classes (mirror `parsers-ocsf/<source>/parser.yaml` so
+Tenzir rows look like Vector-parsed rows):
+
+| Source / event | OCSF class | `class_uid` |
+|---|---|---|
+| Sysmon EID 1/5 (process create/terminate), 10 | Process Activity | `1007` |
+| Sysmon EID 7 (image load) | Module Activity | `1005` |
+| Sysmon EID 12 (registry key) | Registry Key Activity | `201001` |
+| Sysmon EID 13 (registry value) | Registry Value Activity | `201002` |
+| Sysmon EID 3 (network) | Network Activity | `4001` |
+| Sysmon EID 11/23 (file) | File System Activity | `1001` |
+| Sysmon EID 22 (DNS) | DNS Activity | `4003` |
+| Proxy / Apache access (HTTP) | HTTP Activity | `4002` |
+| CloudTrail API call | API Activity | `6003` |
+| Unknown / unroutable | Process Activity (Other) | `1007`, `activity_id=99` |
+
+## Validate end to end
+
+1. Send a run with a unique marker in `message`, for example
+   `cmd.exe /c echo <run>-0001`.
+2. Search (`POST /api/search`, with a search-only API key in `X-API-Key`) for:
+   - `<run>` (expect N rows);
+   - `<run> | stats count` (expect N);
+   - `<run> | stats count by metadata.uid | where count > 1` (expect no rows).
+3. Check that `metadata.nano_credential_id` is your token's credential id.
+
+Bronze objects are ingested within seconds on open core. A search 20 s after
+the send already returned the full 100/100.
+
+---
+
+## Legacy: ClickHouse-era direct ingestion (retired)
+
+Everything below applies only to gen1 ClickHouse installs (the `legacy`
+compose profile, which the `tenzir` profile and `pipeline.tql` depend on).
+`install.sh` refuses the bundled Tenzir profile in lake mode. It is kept for
+installs that have not moved yet.
+
+### The sink (copy verbatim)
 
 ```tql
 to_clickhouse table="nanosiem.ocsf_logs_raw",
@@ -59,7 +238,7 @@ Why each argument:
 
 ---
 
-## Batch before the sink
+### Batch before the sink
 
 Put this **immediately before** `to_clickhouse`:
 
@@ -81,11 +260,11 @@ inserts. Measured on the OCSF rig: **avg ~23 rows/insert (max 183), bounded
 memory (no OOM), 16× more landed.** Order is irrelevant once rows are in
 ClickHouse. Raise `timeout` for bigger batches at a little more ingest latency.
 `unordered` alone (without `batch`) or `batch` alone (ordered) do **not** help —
-you need both. (Rationale: NAN-1839.)
+you need both.
 
 ---
 
-## Target table & the legacy entrypoint
+### Target table & the legacy entrypoint
 
 Write directly to **`nanosiem.ocsf_logs_raw`** (Tenzir ≥ 6.6.0). It's an
 `ENGINE = Null` landing table exposing `event JSON` + `source_type` +
@@ -121,12 +300,17 @@ to_clickhouse → ocsf_logs_native_raw → (forwarding MV) → ocsf_logs_raw →
 Same wire shape, same result, one extra hop. It stays supported but is
 **deprecated** in favour of the direct write. No projection is duplicated either
 way; `ocsf_logs_raw_mv` is the single source of truth for derivation/enrichment.
-(Schema: `clickhouse/ocsf/init.sql`. Rationale: NAN-1603 added the native shim;
-NAN-1788 made the direct `ocsf_logs_raw` write the default on Tenzir 6.6.0.)
+(Schema: `clickhouse/ocsf/init.sql`. The native shim came first; the direct
+`ocsf_logs_raw` write became the default on Tenzir 6.6.0.)
 
 ---
 
-## OCSF mapping conventions
+### OCSF mapping conventions
+
+Pin mappings and fixtures to the released OCSF 1.9.0 schema. Tenzir 6.10.0's
+`ocsf::cast` accepts 1.9.0 and the `ai_operation` plus `record_integrity`
+profiles. Do not claim a 1.8 mapping is 1.9 by changing only
+`metadata.version`; update and validate its actual event-class/profile fields.
 
 Mirror `parsers-ocsf/<source>/parser.yaml` exactly — same `class_uid`,
 `activity_id`, and promoted fields as the Vector lane, so direct-ingested rows
@@ -156,7 +340,7 @@ Rules:
 - Don't drop unroutable input — land a minimal debuggable record (class `1007`,
   `activity_id=99`, `message=<raw>`) like the Vector parsers do.
 
-### `raw_data` — keep the original (NAN-1827)
+#### `raw_data` — keep the original
 
 If you parse a raw log, put the **untouched original** (syslog header included) on
 `event.raw_data`, and use `event.message` for the human-readable summary. nano
@@ -177,13 +361,13 @@ archive.
   meaningful. Explicit `raw_data` hunts do get a text index (`idx_raw_data_words`).
 - Costs nothing if you skip it (empty column), but the original is then gone — the
   Vector lanes take that route deliberately, putting the raw log in `message`
-  instead. Don't do **both**: the raw log stored twice is exactly what NAN-1443
-  deleted (it was ~46% of the table).
+  instead. Don't do **both**: the raw log stored twice is exactly what an
+  earlier cleanup deleted (it was ~46% of the table).
 - `raw_data_hash` / `raw_data_size` are **not** promoted — nothing emits them yet.
   Send them and they are dropped (they are standard OCSF attributes, so they will
   not land in `unmapped` either). Ask before relying on them.
 
-### `time` fallback
+#### `time` fallback
 
 `event.time` should be epoch ms. nano's `timestamp` derivation never silently
 drops a row — it accepts ms, detects+converts seconds/microseconds, parses
@@ -194,7 +378,7 @@ the spec shape).
 
 ---
 
-## Source shape
+### Source shape
 
 The bundled `pipeline.tql` listens with `accept_http` and expects already-OCSF
 NDJSON. Swap the source for whatever you ingest (`load_tcp`, `load_kafka`,
@@ -204,7 +388,7 @@ receive `{message, timestamp, source_type}` and route on `source_type`.
 
 ---
 
-## Validate end-to-end (always do this)
+### Validate end-to-end (always do this)
 
 Run the pipeline against a reachable ClickHouse, push a marked event, and read it
 back out of `ocsf_logs` (not `ocsf_logs_raw` — that's `ENGINE = Null`):
@@ -226,7 +410,7 @@ scale too — local 2M-row timing can mislead.
 
 ---
 
-## Common failures → fix
+### Common failures → fix
 
 | Symptom | Cause / fix |
 |---|---|
@@ -234,14 +418,14 @@ scale too — local 2M-row timing can mislead.
 | `unsupported ClickHouse type 'JSON'` | Tenzir < 6.4.0, or a clickhouse-cpp sink. Upgrade to ≥ 6.6.0. |
 | `unsupported ClickHouse type 'DateTime64(...)'` / `LowCardinality` | Tenzir < 6.6.0 writing to `ocsf_logs_raw`. Upgrade to ≥ 6.6.0, or target the legacy `ocsf_logs_native_raw` entrypoint. |
 | `required column missing in input` / events silently dropped | Tenzir < 6.6.0 can't omit the server-derived `timestamp`/`id`, or a **null** in a required column (nulls drop the event even with a DEFAULT). Upgrade to ≥ 6.6.0 and guard mapped values with `.otherwise(...)`. |
-| `ACCESS_DENIED` on insert | `nanosiem_ingest` lacks INSERT/SELECT on the target (`ocsf_logs_raw`, or `ocsf_logs_native_raw` on the legacy path) or `SELECT` on the `*_prevalence_agg` tables the MV cascade reads (NAN-1787). Grants ship in `clickhouse/users.d/nanosiem-users.xml`; reload with `SYSTEM RELOAD USERS` (or redeploy). |
+| `ACCESS_DENIED` on insert | `nanosiem_ingest` lacks INSERT/SELECT on the target (`ocsf_logs_raw`, or `ocsf_logs_native_raw` on the legacy path) or `SELECT` on the `*_prevalence_agg` tables the MV cascade reads. Grants ship in `clickhouse/users.d/nanosiem-users.xml`; reload with `SYSTEM RELOAD USERS` (or redeploy). |
 | Rows land as `source_type='unknown'` | Set a lowercase `source_type` on each record. |
 | Rows present but `timestamp` is "now" | `event.time` missing/garbage → fell back to insert time. Emit epoch ms. |
 | `event` is a JSON **string**, not an object | Emit a JSON object; a stringified blob fails parsing and async inserts can drop the batch. |
 
 ---
 
-## Connection environment
+### Connection environment
 
 | Var | Default | Meaning |
 |---|---|---|

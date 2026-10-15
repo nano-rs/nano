@@ -58,7 +58,8 @@ export function Chk({ checked, indeterminate, onChange, onClick, ariaLabel }: Ch
     if (ref.current) ref.current.indeterminate = !!indeterminate;
   }, [indeterminate]);
   return (
-    <label className="inline-flex items-center justify-center cursor-pointer" onClick={onClick}>
+    <label className="relative inline-flex items-center justify-center cursor-pointer" onClick={onClick}>
+      {/* eslint-disable-next-line no-restricted-syntax -- visually hidden (sr-only) native input keeps native keyboard/form semantics; the styled sibling <span> draws the checkbox, incl. indeterminate */}
       <input
         ref={ref}
         type="checkbox"

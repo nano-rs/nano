@@ -26,7 +26,7 @@ use crate::parsers::types::Parser;
 /// - `hec_normalize_covered`: a splunk_hec routing config is deployed
 /// - `hec_normalize_present`: the deployment's base Vector config actually
 ///   defines `[transforms.hec_normalize]`. OOTB open-core (config/vector/
-///   02-hec-source.toml) does; nano-main customer deploys do not — their
+///   02-hec-source.toml) does; the platform customer deploys do not — their
 ///   Splunk HEC events flow through `splunk_in` → `auth_check` →
 ///   `source_type_extract` instead. Emitting `hec_normalize` when absent
 ///   makes Vector 0.55 reject the config on startup (`Input "hec_normalize"
@@ -99,7 +99,7 @@ pub fn otlp_source_present() -> bool {
 /// `02-hec-source.toml` and the router must keep wiring HEC events into
 /// `source_router` directly.
 ///
-/// nano-main customer deploys (Hetzner via compose-generator, K8s via
+/// the platform customer deploys (Hetzner via compose-generator, K8s via
 /// k8s-manifests/vector.ts) set this to `"false"`; their base config uses
 /// `splunk_in` + `auth_check` and never defines `hec_normalize`.
 pub fn hec_normalize_present() -> bool {
@@ -244,7 +244,7 @@ pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
 ///
 /// One function, so a new alias cannot be half-taught to the codebase again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Transport {
+pub(crate) enum Transport {
     /// HTTP ingest and Vector-native, plus anything unrecognized — all of which
     /// `generate_source_config` funnels through `source_router`.
     Routed,
@@ -255,11 +255,13 @@ pub(super) enum Transport {
     Fetch,
 }
 
-pub(super) fn transport_of(source_type: &str) -> Transport {
+pub(crate) fn transport_of(source_type: &str) -> Transport {
     match source_type {
         "splunk_hec" | "splunk" | "hec" => Transport::SplunkHec,
         "opentelemetry" | "otlp" => Transport::Otlp,
-        "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" => Transport::Fetch,
+        "kafka" | "aws_s3" | "aws_sqs" | "s3" | "gcp_pubsub" | "pubsub" | "azure_event_hubs" => {
+            Transport::Fetch
+        }
         // "routed", "vector", and unknown labels alike: `generate_source_config`
         // defaults unrecognized source types to the router, so they share it.
         _ => Transport::Routed,
@@ -419,6 +421,62 @@ fn escape_vrl_string_for_router(s: &str) -> String {
     out
 }
 
+/// The HEC lane's routing transform. HEC parser filters always consume it
+/// (`parser_claimed_route`, `sources.rs`).
+pub const HEC_ROUTE: &str = "splunk_hec_route";
+
+/// The always-on HEC channel from the static base config (02-hec-source.toml).
+const HEC_NORMALIZE: &str = "hec_normalize";
+
+/// NAN-3765: guarantee `splunk_hec_route` exists whenever a HEC parser claims it.
+///
+/// The route is normally declared by the HEC source config's
+/// `configs/splunk_hec.toml`, but that file is only rendered when the source
+/// config is deployed AND carries non-default routing rules. With the HEC
+/// source disabled, absent, or still on its default rules, every HEC parser
+/// filter (`inputs = ["splunk_hec_route"]`) and the `splunk_hec_route_unclaimed`
+/// filter referenced a missing component: Vector rejected each reload, and a
+/// restart in that state would not have booted at all.
+///
+/// `inputs` is the pre-substitution `source_router` input list. When HEC is
+/// claimed, the route is not among the inputs, and `hec_normalize` is (the
+/// channel is present and not intermediated by a route), this swaps
+/// `hec_normalize` for `splunk_hec_route` and returns a passthrough block that
+/// declares the route on top of `hec_normalize`. The topology is then the same
+/// as with a deployed default-rules HEC source config, so the NAN-930
+/// `_unclaimed` substitution keeps claimed events out of `source_router`.
+///
+/// Returns the (possibly rewritten) inputs and the block (empty when unused).
+/// The block lives in `_router.toml`; `SourceConfigService::update_dynamic_router`
+/// strips and re-derives it alongside the `_unclaimed` blocks.
+pub fn apply_hec_route_fallback(inputs: Vec<String>, hec_claimed: bool) -> (Vec<String>, String) {
+    let route_declared = inputs.iter().any(|input| input == HEC_ROUTE);
+    let channel_present = inputs.iter().any(|input| input == HEC_NORMALIZE);
+    if !hec_claimed || route_declared || !channel_present {
+        return (inputs, String::new());
+    }
+    let inputs = inputs
+        .into_iter()
+        .map(|input| {
+            if input == HEC_NORMALIZE {
+                HEC_ROUTE.to_string()
+            } else {
+                input
+            }
+        })
+        .collect();
+    let block = format!(
+        "[transforms.{HEC_ROUTE}]\n\
+         # NAN-3765: passthrough HEC route. No HEC source configuration declares\n\
+         # this route, but HEC log sources consume it. Replaced by the source\n\
+         # configuration's own route once one with routing rules is deployed.\n\
+         type = \"filter\"\n\
+         inputs = [\"{HEC_NORMALIZE}\"]\n\
+         condition = 'true'\n\n"
+    );
+    (inputs, block)
+}
+
 /// NAN-930: shared between `router.rs::write_router_config` (active path)
 /// and `staging.rs::stage_parsers` (validation path). Both writers emit
 /// `_router.toml` and both need the same dedupe-substitution to prevent
@@ -451,14 +509,29 @@ pub(super) fn build_router_inputs_with_claim_dedupe(
         }
     }
 
+    // NAN-3765: HEC parsers filter on `splunk_hec_route`, which a source
+    // config only declares when one is deployed with non-default routing
+    // rules. Without it, stand in a passthrough route so the parser filters
+    // and the `_unclaimed` filter below never reference a missing component.
+    let raw_inputs: Vec<String> = base_inputs
+        .into_iter()
+        .chain(source_config_routes.iter().cloned())
+        .collect();
+    let (raw_inputs, hec_fallback_block) =
+        apply_hec_route_fallback(raw_inputs, claims.contains_key(HEC_ROUTE));
+
+    // NAN-3765: a claimed route that does not feed `source_router` (its
+    // source config is disabled, undeployed, or not rendered) gets no
+    // `_unclaimed` filter — that filter's only input would be dangling.
+    claims.retain(|route, _| raw_inputs.iter().any(|input| input == route));
+
     let substitutions: HashMap<String, String> = claims
         .keys()
         .map(|route| (route.to_string(), format!("{}_unclaimed", route)))
         .collect();
 
-    let final_inputs: Vec<String> = base_inputs
+    let final_inputs: Vec<String> = raw_inputs
         .iter()
-        .chain(source_config_routes.iter())
         .map(|name| {
             substitutions
                 .get(name)
@@ -471,7 +544,7 @@ pub(super) fn build_router_inputs_with_claim_dedupe(
         claims.iter().map(|(k, v)| (*k, v)).collect();
     claimed_sorted.sort_by_key(|(k, _)| *k);
 
-    let mut filter_blocks = String::new();
+    let mut filter_blocks = hec_fallback_block;
     if !claimed_sorted.is_empty() {
         filter_blocks.push_str(
             "# =============================================================================\n\
@@ -503,6 +576,10 @@ pub(super) fn build_router_inputs_with_claim_dedupe(
 /// `enrichment_router_block` here and `generate_enrichment_lane` in deploy.rs
 /// route through this one function. Real sources (`ad`, `entra`, `okta`,
 /// `google`, `workday`) pass through unchanged.
+/// NAN-3767: `kind: identity_directory` records (the connector runner's
+/// stage / delta envelopes), routed beside every per-source identity route.
+pub(super) const IDENTITY_DIRECTORY_ROUTE: &str = "identity_directory";
+
 pub(super) fn enrichment_route_name(source: &str) -> String {
     source
         .chars()
@@ -510,17 +587,98 @@ pub(super) fn enrichment_route_name(source: &str) -> String {
         .collect()
 }
 
+/// NAN-3483: route (and transform suffix) that receives every `kind=identity`
+/// record whose `.source` has no normalizer. Its transform logs the source and
+/// aborts, so the record dead-letters loudly instead of being dropped by the
+/// router's `_unmatched` output or mis-mapped by another source's VRL.
+pub(super) const UNROUTED_IDENTITY_ROUTE: &str = "unrouted_identity";
+
+/// A `Parser` carrying one built-in identity normalizer (NAN-3483).
+pub(super) fn builtin_identity_parser(
+    builtin: &crate::identity::normalizers::BuiltinIdentityNormalizer,
+) -> Parser {
+    let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    Parser {
+        id: uuid::Uuid::nil(),
+        name: builtin.parser_name.to_string(),
+        description: Some("built-in identity normalizer".to_string()),
+        source_type: "nano_enrich".to_string(),
+        parser_vrl: String::new(),
+        output_fields: None,
+        feed_id: None,
+        dispatch_source_config_id: None,
+        dispatch_route_name: None,
+        enabled: true,
+        validated: true,
+        validation_error: None,
+        category: Some("identity".to_string()),
+        vendor: None,
+        product: None,
+        kind: "enrichment".to_string(),
+        enrich_kind: Some("identity".to_string()),
+        enrich_source: Some(builtin.source.to_string()),
+        target_table: Some("user_registry".to_string()),
+        normalize_vrl: Some(builtin.normalize_vrl.to_string()),
+        namespace: "default".to_string(),
+        timezone: "UTC".to_string(),
+        match_values: None,
+        sampling_ratio: None,
+        sampling_exclude_condition: None,
+        extension_vrl: None,
+        extension_enabled: false,
+        created_at: epoch,
+        updated_at: epoch,
+    }
+}
+
+/// The enrichment parsers the GENERATED lane deploys (NAN-3483): the enabled
+/// ones as given (their order decides which wins a shared source, as before),
+/// then a built-in identity normalizer for every identity source none of them
+/// covers. A provider's normalizer therefore never depends on someone
+/// importing its parser by hand; an imported, enabled one still overrides.
+pub(super) fn effective_enrichment_parsers(enabled: &[&Parser]) -> Vec<Parser> {
+    let covered: std::collections::HashSet<String> = enabled
+        .iter()
+        .filter_map(|p| p.enrich_source.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(enrichment_route_name)
+        .collect();
+    let mut out: Vec<Parser> = enabled.iter().map(|p| (*p).clone()).collect();
+    for builtin in crate::identity::normalizers::BUILTIN_IDENTITY_NORMALIZERS {
+        if !covered.contains(&enrichment_route_name(builtin.source)) {
+            out.push(builtin_identity_parser(builtin));
+        }
+    }
+    out
+}
+
+/// VRL list literal of the given sources, for an `includes(...)` condition.
+fn vrl_string_list<'a>(sources: impl IntoIterator<Item = &'a str>) -> String {
+    sources
+        .into_iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Emit the `[transforms.enrichment_router]` block (NAN-1124 / NAN-1151).
 ///
 /// Routes `nano_enrich` records to per-`source` outputs
-/// (`enrichment_router.<source>`) — one route per deployed enrichment parser's
-/// `enrich_source` — which the generated lane's
-/// `enrichment_normalize_<source>` transforms consume. When NO enrichment
-/// parsers are deployed, `write_enrichment_config` falls back to the committed
-/// static `_enrichment.toml` (which consumes the legacy per-`kind` outputs), so
-/// we emit those per-kind routes in that case to keep its inputs from dangling
-/// (NAN-867). Shared by the active writer (`router.rs`) and the staging writer
-/// (`staging.rs`) so the two can never byte-drift.
+/// (`enrichment_router.<source>`), which the lane's
+/// `enrichment_normalize_<source>` transforms consume. Shared by the active
+/// writer (`router.rs`) and the staging writer (`staging.rs`) so the two can
+/// never byte-drift.
+///
+/// - Enrichment parsers enabled: one route per source of
+///   [`effective_enrichment_parsers`] (imported + built-in identity defaults).
+/// - None enabled: the committed static lane is deployed, which consumes the
+///   legacy per-`kind` outputs (NAN-867), so those are emitted. NAN-3483: the
+///   legacy `identity` route (the AD normalizer) now only takes `source=ad` or
+///   an untagged record; each other built-in identity source gets its own
+///   route to its own normalizer.
+///
+/// Either way an `unrouted_identity` route catches `kind=identity` records
+/// whose source has no normalizer, so they dead-letter visibly.
 pub(super) fn enrichment_router_block(
     enrichment_parsers: &[&Parser],
     inputs_formatted: &str,
@@ -534,33 +692,71 @@ pub(super) fn enrichment_router_block(
          inputs = [{inputs_formatted}]\n\n\
          [transforms.enrichment_router.route]\n"
     );
+    const IS_ENRICH: &str = "downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\"";
+    const IS_IDENTITY: &str = "downcase(to_string(.kind) ?? \"\") == \"identity\"";
+    const SOURCE: &str = "downcase(to_string(.source) ?? \"\")";
 
-    // Deployed enrichment parsers' sources, deduped + stable-ordered.
-    let mut sources: Vec<&str> = enrichment_parsers
-        .iter()
-        .filter_map(|p| p.enrich_source.as_deref())
-        .filter(|s| !s.is_empty())
-        .collect();
-    sources.sort_unstable();
-    sources.dedup();
+    // Callers pass the ENABLED enrichment parsers; the lane takes the same
+    // branch on the same test (`enrichment_lane_config_for_backend`), so a
+    // generated lane never meets the fallback routes or vice versa.
+    let has_enabled = !enrichment_parsers.is_empty();
 
-    if sources.is_empty() {
+    // Identity sources that have a normalizer on this lane.
+    let mut identity_sources: Vec<String>;
+    if !has_enabled {
         // Static-fallback lane consumes the legacy per-kind outputs.
-        for kind in ["identity", "ip_context", "ioc", "asset"] {
+        out.push_str(&format!(
+            "identity = '{IS_ENRICH} && {IS_IDENTITY} && includes([\"ad\", \"\"], {SOURCE})'\n"
+        ));
+        for kind in ["ip_context", "ioc", "asset"] {
             out.push_str(&format!(
-                "{kind} = 'downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\" && downcase(to_string(.kind) ?? \"\") == \"{kind}\"'\n"
+                "{kind} = '{IS_ENRICH} && downcase(to_string(.kind) ?? \"\") == \"{kind}\"'\n"
             ));
         }
+        identity_sources = vec!["ad".to_string(), String::new()];
+        for builtin in crate::identity::normalizers::BUILTIN_IDENTITY_NORMALIZERS {
+            if builtin.source == "ad" {
+                continue;
+            }
+            let route = enrichment_route_name(builtin.source);
+            out.push_str(&format!(
+                "{route} = '{IS_ENRICH} && {IS_IDENTITY} && {SOURCE} == \"{}\"'\n",
+                builtin.source
+            ));
+            identity_sources.push(builtin.source.to_string());
+        }
     } else {
-        for source in sources {
+        let effective = effective_enrichment_parsers(enrichment_parsers);
+        let mut sources: Vec<&str> = effective
+            .iter()
+            .filter_map(|p| p.enrich_source.as_deref())
+            .filter(|s| !s.is_empty())
+            .collect();
+        sources.sort_unstable();
+        sources.dedup();
+        for source in &sources {
             let route = enrichment_route_name(source);
+            // NAN-3767: the runner's envelope route owns this key.
+            if route == IDENTITY_DIRECTORY_ROUTE {
+                continue;
+            }
             // Match the raw `.source` value; the route KEY is the sanitized name
             // so the lane's `enrichment_router.<route>` input resolves.
             out.push_str(&format!(
-                "{route} = 'downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\" && downcase(to_string(.source) ?? \"\") == \"{source}\"'\n"
+                "{route} = '{IS_ENRICH} && {SOURCE} == \"{source}\"'\n"
             ));
         }
+        identity_sources = sources.iter().map(|s| s.to_string()).collect();
     }
+    identity_sources.sort_unstable();
+    identity_sources.dedup();
+    out.push_str(&format!(
+        "{IDENTITY_DIRECTORY_ROUTE} = '{IS_ENRICH} && downcase(to_string(.kind) ?? \"\") == \"{IDENTITY_DIRECTORY_ROUTE}\"'\n"
+    ));
+    out.push_str(&format!(
+        "{UNROUTED_IDENTITY_ROUTE} = '{IS_ENRICH} && {IS_IDENTITY} && !includes([{}], {SOURCE})'\n",
+        vrl_string_list(identity_sources.iter().map(String::as_str))
+    ));
     out.push('\n');
     out
 }
@@ -885,7 +1081,7 @@ impl VectorConfigManager {
             enrichment_parsers.iter().filter(|p| p.enabled).collect();
         config.push_str(&enrichment_router_block(
             &enabled_enrichment,
-            &inputs_formatted,
+            "\"enrichment_prepare\"",
         ));
 
         // Add placeholder transforms
@@ -1114,7 +1310,7 @@ source = ".source_type = \"foo\""
         }
     }
 
-    /// NAN-867: when the base config doesn't define `hec_normalize` (nano-main
+    /// NAN-867: when the base config doesn't define `hec_normalize` (the platform
     /// customer deploys), the router must never reference it. Vector 0.55
     /// rejects dangling input references and aborts startup.
     #[test]
@@ -1241,7 +1437,13 @@ source = ".source_type = \"foo\""
     /// Fetch-source parser bound via DISPATCH FROM claims that route.
     #[test]
     fn parser_claimed_route_returns_dispatch_route_for_bound_fetch_parser() {
-        for source_type in ["kafka", "aws_s3", "aws_sqs", "gcp_pubsub"] {
+        for source_type in [
+            "kafka",
+            "aws_s3",
+            "aws_sqs",
+            "gcp_pubsub",
+            "azure_event_hubs",
+        ] {
             let p = parser_for_claim_tests(source_type, Some("nan884_smoke_route"));
             assert_eq!(parser_claimed_route(&p), Some("nan884_smoke_route"));
         }
@@ -1371,7 +1573,10 @@ source = ".source_type = \"foo\""
             match_values: Some(vec!["shared".into()]),
             ..parser_for_claim_tests("kafka", None)
         };
-        let b = Parser { name: "Kafka B".into(), ..a.clone() };
+        let b = Parser {
+            name: "Kafka B".into(),
+            ..a.clone()
+        };
         assert!(find_source_type_collisions(&[a, b]).is_empty());
     }
 
@@ -1384,7 +1589,10 @@ source = ".source_type = \"foo\""
             match_values: Some(vec!["shared".into()]),
             ..parser_for_claim_tests("kafka", Some("orders_route"))
         };
-        let b = Parser { name: "Kafka B".into(), ..a.clone() };
+        let b = Parser {
+            name: "Kafka B".into(),
+            ..a.clone()
+        };
 
         let found = find_source_type_collisions(&[a, b]);
         assert_eq!(found.len(), 1, "got: {found:?}");
@@ -1415,11 +1623,21 @@ source = ".source_type = \"foo\""
     /// two parsers whose names collapse to the same safe_name contend for it.
     #[test]
     fn collision_detected_via_the_safe_name_fallback() {
-        let a = Parser { match_values: None, ..parser_named("My Source", "routed", &[]) };
-        let b = Parser { match_values: None, ..parser_named("my-source", "routed", &[]) };
+        let a = Parser {
+            match_values: None,
+            ..parser_named("My Source", "routed", &[])
+        };
+        let b = Parser {
+            match_values: None,
+            ..parser_named("my-source", "routed", &[])
+        };
 
         let found = find_source_type_collisions(&[a, b]);
-        assert_eq!(found.len(), 1, "safe_name collapses both to my_source: {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "safe_name collapses both to my_source: {found:?}"
+        );
     }
 
     /// The message must name the value AND every claimant — resolving this is
@@ -1440,12 +1658,14 @@ source = ".source_type = \"foo\""
     /// Output is stable across runs so the error does not churn.
     #[test]
     fn collisions_are_deterministically_ordered() {
-        let mk = || vec![
-            parser_named("Z parser", "routed", &["b_type"]),
-            parser_named("A parser", "routed", &["b_type"]),
-            parser_named("M parser", "routed", &["a_type"]),
-            parser_named("N parser", "routed", &["a_type"]),
-        ];
+        let mk = || {
+            vec![
+                parser_named("Z parser", "routed", &["b_type"]),
+                parser_named("A parser", "routed", &["b_type"]),
+                parser_named("M parser", "routed", &["a_type"]),
+                parser_named("N parser", "routed", &["a_type"]),
+            ]
+        };
         let first = find_source_type_collisions(&mk());
         for _ in 0..8 {
             assert_eq!(find_source_type_collisions(&mk()), first);
@@ -1524,6 +1744,7 @@ source = ".source_type = \"foo\""
             ("s3", Fetch),
             ("gcp_pubsub", Fetch),
             ("pubsub", Fetch),
+            ("azure_event_hubs", Fetch),
         ] {
             assert_eq!(transport_of(st), want, "transport_of({st})");
         }

@@ -10,6 +10,10 @@
 // =============================================================================
 
 export interface RuleRepository {
+  sync_started_at?: string | null;
+  sync_lease_expires_at?: string | null;
+  next_sync_at?: string | null;
+  managed_by_platform?: boolean;
   id: string;
   name: string;
   slug: string;
@@ -80,6 +84,10 @@ export interface RepositoryRule {
   tags: string[] | null;
   requires_fields: string[] | null;
   requires_source_types: string[] | null;
+  // NAN-2361: derived by the API from the rule's class_uid against live
+  // telemetry. Present only when the rule declares no requires_source_types
+  // (every OCSF rule) and the caller may observe the live inventory.
+  suggested_source_types?: string[];
   conversion_status: 'pending' | 'success' | 'failed' | 'manual' | 'untranslated';
   converted_npl: string | null;
   conversion_confidence: number | null;
@@ -118,6 +126,9 @@ export interface SyncResult {
 
 /** Response when starting a sync (async operation) */
 export interface SyncStartResponse {
+  sync_started_at?: string | null;
+  sync_lease_expires_at?: string | null;
+  next_sync_at?: string | null;
   repository_id: string;
   status: string;
   message: string;
@@ -350,9 +361,10 @@ export class RuleRepositoriesApi {
 
   /** Start syncing a repository (async - returns immediately, sync runs in background) */
   async syncRepository(id: string): Promise<SyncStartResponse> {
-    return this.request(`/api/rule-repositories/${id}/sync`, {
+    const result = await this.request<SyncStartResponse>(`/api/rule-repositories/${id}/sync`, {
       method: 'POST',
     });
+    return { ...result, repository_id: id, message: result.message ?? 'Repository sync accepted.' };
   }
 
   async getSyncStatus(id: string): Promise<SyncStatus> {

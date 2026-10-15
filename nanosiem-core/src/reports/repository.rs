@@ -14,6 +14,29 @@ use uuid::Uuid;
 
 use super::types::*;
 
+/// NAN-2361: the fixed compatibility tenant every deployment-global writer
+/// lands in (migrations 9000073/9000084/9000230). The dedicated repository
+/// only ever sees this tenant; hosted-shared tenants are reached exclusively
+/// through `crate::shared_reports` inside a signed transaction.
+pub const COMPATIBILITY_TENANT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0100);
+
+// The tenant column exists only under the enterprise overlay migrations
+// (9000230). The open edition keeps the pre-NAN-2361 SQL; every tenant-aware
+// fragment below is selected at compile time by the feature, and the bound
+// tenant parameter stays in place so the placeholder numbering is identical.
+#[cfg(feature = "enterprise")]
+const DEFINITION_TENANT_PREDICATE: &str = "AND rd.tenant_id = $2";
+#[cfg(not(feature = "enterprise"))]
+const DEFINITION_TENANT_PREDICATE: &str = "AND $2::uuid IS NOT NULL";
+#[cfg(feature = "enterprise")]
+const CLAIMABLE_TENANT_PREDICATE: &str = "AND tenant_id = $4";
+#[cfg(not(feature = "enterprise"))]
+const CLAIMABLE_TENANT_PREDICATE: &str = "AND $4::uuid IS NOT NULL";
+#[cfg(feature = "enterprise")]
+const RUN_CONFLICT_TARGET: &str = "ON CONFLICT (tenant_id, id)";
+#[cfg(not(feature = "enterprise"))]
+const RUN_CONFLICT_TARGET: &str = "ON CONFLICT (id)";
+
 #[derive(Debug, Error)]
 pub enum ReportRepositoryError {
     #[error("Database error: {0}")]
@@ -80,15 +103,19 @@ impl ReportRepository {
         &self,
         id: Uuid,
     ) -> Result<ReportDefinition, ReportRepositoryError> {
-        let row = sqlx::query_as::<_, ReportDefinitionRow>(
+        let row = sqlx::query_as::<_, ReportDefinitionRow>(&format!(
             r#"
             SELECT rd.*, u.name AS owner_name
             FROM report_definitions rd
             LEFT JOIN users u ON u.id = rd.owner_id
             WHERE rd.id = $1
+              -- NAN-2361: hosted-shared tenants' definitions are reachable
+              -- only through the enterprise-shared tenant surface.
+              {DEFINITION_TENANT_PREDICATE}
             "#,
-        )
+        ))
         .bind(id)
+        .bind(COMPATIBILITY_TENANT_ID)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(ReportRepositoryError::DefinitionNotFound(id))?;
@@ -195,11 +222,16 @@ impl ReportRepository {
         node_id: &str,
         stale_timeout_secs: i64,
     ) -> Result<Vec<ClaimedReportDefinition>, ReportRepositoryError> {
-        let rows = sqlx::query_as::<_, ReportDefinitionRow>(
+        let rows = sqlx::query_as::<_, ReportDefinitionRow>(&format!(
             r#"
             WITH claimable AS (
                 SELECT id FROM report_definitions
                 WHERE enabled = true
+                  -- NAN-2361: a hosted-shared tenant's definition is executed
+                  -- only by the per-tenant runner inside that tenant's signed
+                  -- transaction; the deployment-global scheduler claims only
+                  -- compatibility-tenant rows.
+                  {CLAIMABLE_TENANT_PREDICATE}
                   AND next_run_at IS NOT NULL AND next_run_at <= NOW()
                   AND (claimed_by IS NULL OR claimed_at < NOW() - make_interval(secs => $3))
                   -- F-32: never schedule a run for a definition whose OWNER is
@@ -224,10 +256,11 @@ impl ReportRepository {
             WHERE id IN (SELECT id FROM claimable)
             RETURNING *, NULL::text AS owner_name
             "#,
-        )
+        ))
         .bind(batch_size)
         .bind(node_id)
         .bind(stale_timeout_secs as f64)
+        .bind(COMPATIBILITY_TENANT_ID)
         .fetch_all(&self.pool)
         .await?;
 
@@ -315,17 +348,17 @@ impl ReportRepository {
         definition_id: Uuid,
         triggered_by: &str,
     ) -> Result<(), ReportRepositoryError> {
-        sqlx::query(
+        sqlx::query(&format!(
             r#"
             INSERT INTO report_runs (id, definition_id, status, triggered_by, started_at)
             VALUES ($1, $2, 'running', $3, NOW())
-            ON CONFLICT (id) DO UPDATE
+            {RUN_CONFLICT_TARGET} DO UPDATE
                 SET status = 'running', started_at = NOW(),
                     finished_at = NULL, error = NULL,
                     requires_search_sql = FALSE,
                     search_sql_requirement_complete = FALSE
             "#,
-        )
+        ))
         .bind(run_id)
         .bind(definition_id)
         .bind(triggered_by)
@@ -406,6 +439,7 @@ impl ReportRepository {
             .await?;
 
         for artifact in artifacts {
+            let artifact_id = Uuid::now_v7();
             sqlx::query(
                 r#"
                 INSERT INTO report_run_artifacts
@@ -413,7 +447,7 @@ impl ReportRepository {
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 "#,
             )
-            .bind(Uuid::now_v7())
+            .bind(artifact_id)
             .bind(run_id)
             .bind(&artifact.kind)
             .bind(&artifact.filename)
@@ -422,6 +456,11 @@ impl ReportRepository {
             .bind(&artifact.content)
             .execute(&mut *tx)
             .await?;
+            #[cfg(feature="enterprise")]
+            sqlx::query("UPDATE report_run_artifacts SET platform_read_fence=$2 WHERE id=$1")
+                .bind(artifact_id)
+                .bind(artifact.platform_read_fence.as_ref().map(|f|serde_json::to_value(f).expect("bounded result fence")))
+                .execute(&mut *tx).await?;
         }
 
         sqlx::query(
@@ -627,12 +666,37 @@ impl ReportRepository {
         })
     }
 
+    #[cfg(feature="enterprise")]
+    async fn validate_enrichment_fence(&self, fence: &crate::platform_enrichment::read::ReadFence) -> Result<(),ReportRepositoryError> {
+        // Dedicated report rows use a compatibility tenant, while the event
+        // worker can have a different server-assigned tenant. Never infer its
+        // authority from the report row or from the downloadable fence itself.
+        let tenant = std::env::var("NANO_LAKE_TENANT_ID")
+            .map(|value| value.parse().unwrap_or(Uuid::nil()))
+            .unwrap_or(COMPATIBILITY_TENANT_ID);
+        let current = crate::platform_enrichment::read::resolve_from_environment(tenant).await;
+        if fence.tenant_id != tenant || fence.authority_sha256 != current.cache_identity()
+            || fence.valid_until.is_some_and(|until| until <= chrono::Utc::now()) {
+            return Err(ReportRepositoryError::InvalidData("report enrichment authorization expired or changed".into()));
+        }
+        Ok(())
+    }
+
     /// Fetch artifact bytes only after callers have authorized against
     /// [`Self::get_artifact_scope`].
     pub async fn get_artifact_bytes(
         &self,
         artifact_id: Uuid,
     ) -> Result<ReportArtifactContent, ReportRepositoryError> {
+        #[cfg(feature="enterprise")]
+        let fence = {
+            let value: Option<serde_json::Value> = sqlx::query_scalar("SELECT NULLIF(to_jsonb(a)->'platform_read_fence','null'::jsonb) FROM report_run_artifacts a WHERE id=$1")
+                .bind(artifact_id).fetch_optional(&self.pool).await?.flatten();
+            value.map(serde_json::from_value::<crate::platform_enrichment::read::ReadFence>).transpose()
+                .map_err(|_|ReportRepositoryError::InvalidData("invalid enrichment result fence".into()))?
+        };
+        #[cfg(feature="enterprise")]
+        if let Some(fence) = &fence { self.validate_enrichment_fence(fence).await?; }
         let row = sqlx::query_as::<_, ArtifactBytesRow>(
             r#"
             SELECT filename, content_type, content
@@ -644,6 +708,8 @@ impl ReportRepository {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(ReportRepositoryError::ArtifactNotFound(artifact_id))?;
+        #[cfg(feature="enterprise")]
+        if let Some(fence) = &fence { self.validate_enrichment_fence(fence).await?; }
         Ok(ReportArtifactContent {
             filename: row.filename,
             content_type: row.content_type,

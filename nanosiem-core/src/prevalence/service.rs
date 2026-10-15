@@ -129,6 +129,10 @@ pub struct PrevalenceService {
     repository: PrevalenceRepository,
     config: Arc<RwLock<PrevalenceConfig>>,
     cache: Arc<RwLock<PrevalenceCache>>,
+    /// NAN-3451: the rarity threshold as last read from or written to
+    /// Settings; empty for a service built from defaults. Lake prevalence
+    /// clients bind to it so Settings drive the lake path too.
+    settings_rarity: super::settings::RarityThresholdSetting,
 }
 
 impl PrevalenceService {
@@ -142,6 +146,7 @@ impl PrevalenceService {
                 config.cache_ttl_seconds,
             ))),
             config: Arc::new(RwLock::new(config)),
+            settings_rarity: Default::default(),
         }
     }
 
@@ -158,6 +163,7 @@ impl PrevalenceService {
                 config.cache_ttl_seconds,
             ))),
             config: Arc::new(RwLock::new(config)),
+            settings_rarity: Default::default(),
         }
     }
 
@@ -175,15 +181,26 @@ impl PrevalenceService {
         use super::settings::PrevalenceSettings;
 
         let settings = PrevalenceSettings::new(pg_pool.clone());
-        let config = settings.get_config().await.unwrap_or_else(|e| {
+        let stored = settings.stored_config().await.unwrap_or_else(|e| {
             tracing::warn!(
                 "Failed to load prevalence config from database: {}, using defaults",
                 e
             );
-            PrevalenceConfig::default()
+            None
         });
 
-        Self::with_config(clickhouse_client, table_names, config)
+        // NAN-3226: the tenant's internal suffixes never list as domains.
+        let internal = crate::internal_domains::dedicated_cached(pg_pool).await;
+        let mut service = Self::with_config(
+            clickhouse_client,
+            table_names,
+            stored.clone().unwrap_or_default(),
+        );
+        service.repository = service.repository.with_internal_domains(&internal);
+        if let Some(config) = stored {
+            service.settings_rarity.set(config.rarity_threshold);
+        }
+        service
     }
 
     /// Get the current configuration
@@ -199,10 +216,18 @@ impl PrevalenceService {
         let mut cache = self.cache.write().await;
         cache.update_ttl(new_config.cache_ttl_seconds);
 
+        // Every caller passes a config read from or written to Settings.
+        self.settings_rarity.set(new_config.rarity_threshold);
         let mut config = self.config.write().await;
         *config = new_config;
 
         debug!("Prevalence config updated, cache invalidated");
+    }
+
+    /// NAN-3451: the live Settings rarity threshold, for binding a lake
+    /// prevalence client (`LakePrevalenceClient::with_rarity_setting`).
+    pub fn rarity_setting(&self) -> super::settings::RarityThresholdSetting {
+        self.settings_rarity.clone()
     }
 
     /// Get the current rarity threshold value
@@ -468,8 +493,10 @@ impl PrevalenceService {
             // `Accounts.Google.com` both MATCH a found row and get a correctly
             // keyed empty fallback (audit P9). The final result lookup lowercases
             // the input, so an empty keyed on the verbatim case would be lost.
-            let found_domains: std::collections::HashSet<String> =
-                domain_rows.iter().map(|r| r.domain.to_lowercase()).collect();
+            let found_domains: std::collections::HashSet<String> = domain_rows
+                .iter()
+                .map(|r| r.domain.to_lowercase())
+                .collect();
 
             // Add found domains to results
             for row in domain_rows {
@@ -637,6 +664,7 @@ impl PrevalenceService {
         let to_data = |row: super::repository::DictPrevalenceRow| PrevalenceData {
             artifact_type: ArtifactType::detect(&row.artifact),
             host_count: row.host_count,
+            host_count_saturated: false,
             total_occurrences: row.total_occurrences,
             first_seen: PrevalenceRepository::micros_to_datetime(row.first_seen),
             last_seen: PrevalenceRepository::micros_to_datetime(row.last_seen),
@@ -1201,6 +1229,7 @@ impl PrevalenceService {
             limit,
             offset,
             has_more,
+            next_cursor: None,
             rarity_threshold,
             rare_count,
             new_count,
@@ -1276,12 +1305,19 @@ impl PrevalenceService {
         }
 
         // Active schema profile for column resolution (NAN-1241). This is a
-        // best-effort enrichment path with no Result channel; a malformed
-        // profile env already fails fast at boot, so fall back to the UDM
-        // profile (byte-identical default) on the unreachable error case.
-        let profile = crate::schema::active_profile_from_env().unwrap_or_else(|_| {
-            crate::schema::profile_for_id(crate::schema::SchemaId::Udm)
-        });
+        // best-effort enrichment path with no Result channel.
+        //
+        // NAN-2361: it used to substitute the UDM profile here. On the canonical
+        // OCSF lake that aims the inline-context SQL at UDM column names, so the
+        // subtitles are either empty or resolved from the wrong schema. Leave the
+        // context unset and say why — a missing subtitle is obvious, a wrong one
+        // is not.
+        let Ok(profile) = crate::schema::active_profile_from_env() else {
+            tracing::error!(
+                "prevalence explorer context skipped: cannot resolve the active schema profile"
+            );
+            return;
+        };
 
         let ctx_map = self
             .repository
@@ -1408,6 +1444,9 @@ pub enum PrevalenceError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    #[error("Prevalence backend error: {0}")]
+    Backend(String),
 }
 
 #[cfg(test)]

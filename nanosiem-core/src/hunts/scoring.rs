@@ -329,7 +329,10 @@ mod tests {
                 .iter()
                 .find(|c| c.factor == "rarity")
                 .expect("rarity factor is always emitted");
-            assert_eq!(rarity.value, 0.0, "corrupt prevalence {corrupt} scored as rare");
+            assert_eq!(
+                rarity.value, 0.0,
+                "corrupt prevalence {corrupt} scored as rare"
+            );
             assert_eq!(rarity.detail, "prevalence not measured");
             assert!(result.value.is_finite());
             assert!((0.0..=1.0).contains(&result.value));

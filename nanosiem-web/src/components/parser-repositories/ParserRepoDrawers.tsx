@@ -15,11 +15,11 @@ import {
   CircleCheck,
   Clock,
   GitCommit,
-  Loader2,
   RefreshCw,
   X,
   XCircle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import type { CreateParserRepositoryRequest } from '@/lib/api/parser-repositories';
 import type { ParserRepoView } from './helpers';
@@ -111,7 +111,11 @@ export function SyncHistoryDrawer({
       footer={
         <div className="flex items-center gap-2">
           <div className="flex-1 text-[10.5px] text-muted-foreground font-mono">
-            {repo.autoSync !== 'off' ? (
+            {repo.autoSync !== 'off' && repo.nextSync.overdue ? (
+              <span className={repo.lastSync.result === 'failed' ? 'text-destructive' : 'text-warning'}>
+                auto-sync overdue · {repo.nextSync.cadence}
+              </span>
+            ) : repo.autoSync !== 'off' ? (
               <>
                 next auto-sync in <span className="text-foreground/70">{repo.nextSync.in}</span> ·{' '}
                 {repo.nextSync.cadence}
@@ -162,7 +166,7 @@ export function SyncHistoryDrawer({
                 {repo.lastSync.result === 'failed' ? (
                   <XCircle className="w-[12px] h-[12px] text-destructive" strokeWidth={1.5} />
                 ) : repo.lastSync.result === 'pending' ? (
-                  <Loader2 className="w-[12px] h-[12px] text-warning animate-spin" strokeWidth={1.5} />
+                  <LoadingIcon className="w-[12px] h-[12px] text-warning" strokeWidth={1.5} />
                 ) : (
                   <CircleCheck className="w-[12px] h-[12px] text-success" strokeWidth={1.5} />
                 )}
@@ -225,7 +229,7 @@ interface AddRepoProps {
 export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoProps) {
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
-  const [branch, setBranch] = useState('main');
+  const [branch, setBranch] = useState('');
   const [parsersPath, setParsersPath] = useState('');
   const [cadence, setCadence] = useState<'off' | 'hourly' | '4h' | 'daily'>('hourly');
 
@@ -233,7 +237,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
     if (open) {
       setName('');
       setUrl('');
-      setBranch('main');
+      setBranch('');
       setParsersPath('');
       setCadence('hourly');
     }
@@ -248,7 +252,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
     onSubmit({
       name: name.trim(),
       url: url.trim(),
-      branch: branch.trim() || 'main',
+      branch: branch.trim() || undefined,
       parsers_path: parsersPath.trim() || undefined,
       auto_sync_enabled: cadence !== 'off',
       sync_interval_hours: cadenceHours || 1,
@@ -303,6 +307,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
           <Field label="Branch">
             <input
               value={branch}
+              placeholder="Automatic"
               onChange={(e) => setBranch(e.target.value)}
               className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
             />

@@ -17,9 +17,9 @@ import {
   Code,
   ExternalLink,
   FileText,
-  Loader2,
   Zap,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import {
   fromApiAlert,
@@ -38,8 +38,16 @@ import { parseMonitorAlert } from '@/components/alerts/monitorAlert';
 import { AlertTriageBar } from '@/components/alerts/AlertTriageBar';
 import { AssociateCaseButton } from '@/components/alerts/AssociateCaseButton';
 import { EventViewer } from '@/components/matches/EventViewer';
+import { RiskNotableBreakdown } from '@/enterprise/components/risk/RiskNotableBreakdown';
+import { riskNotableEntity } from '@/lib/risk-notable';
 
 type TabId = 'events' | 'rule' | 'timeline';
+
+// NAN-2361: the router basename carries the tenant prefix, so every mode links
+// to the same in-app paths.
+function useTenantRuleLink() {
+  return (id: string) => `/rules/${id}`;
+}
 
 function fmtUTC(d: Date): string {
   return d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
@@ -76,6 +84,11 @@ export function AlertDetail() {
       : 'Risk alert';
   }, [apiAlert]);
 
+  // NAN-3225: risk notables — the retired `risk_notable` kind and the
+  // `dataset=risk` rule alerts that replaced it — embed the entity's risk
+  // breakdown as of the notable (enterprise; the open-edition stub is empty).
+  const riskNotable = useMemo(() => riskNotableEntity(apiAlert), [apiAlert]);
+
   const displayName = monitor ? monitor.title : riskNotableTitle ?? alert?.ruleName ?? null;
 
   // Monitor alerts have no rule; `alert.ruleId` is undefined so `useDetection`
@@ -108,7 +121,7 @@ export function AlertDetail() {
   if (loading) {
     return (
       <div className="p-12 flex items-center justify-center">
-        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-6 h-6 text-muted-foreground" />
       </div>
     );
   }
@@ -222,6 +235,15 @@ export function AlertDetail() {
               (enterprise; self-gates). Works for detection + monitor alerts. */}
           <AssociateCaseButton alertId={alert.id} onAssociated={refetchAlert} />
         </div>
+        {riskNotable && (
+          <div className="mt-3">
+            <RiskNotableBreakdown
+              entity={riskNotable.entity}
+              entityType={riskNotable.entity_type}
+              at={alert.timestamp.toISOString()}
+            />
+          </div>
+        )}
       </div>
 
       {/* Tab bar — sticky inside the page scroll container. */}
@@ -385,11 +407,12 @@ function RuleTab({
 }: {
   apiRule: ReturnType<typeof useDetection>['data'];
 }) {
+  const tenantRuleLink = useTenantRuleLink();
   const ruleNarrative = apiRule?.narrative;
   if (!apiRule) {
     return (
       <div className="p-6 text-center">
-        <Loader2 className="w-5 h-5 animate-spin mx-auto text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 mx-auto text-muted-foreground" />
         <p className="text-[11.5px] text-muted-foreground mt-2">Loading rule details…</p>
       </div>
     );
@@ -487,7 +510,7 @@ function RuleTab({
         </div>
 
         <Link
-          to={`/rules/${apiRule.id}`}
+          to={tenantRuleLink(apiRule.id)}
           className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 inline-flex items-center justify-center gap-1.5"
         >
           Open rule

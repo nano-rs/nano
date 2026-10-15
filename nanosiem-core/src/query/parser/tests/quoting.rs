@@ -204,7 +204,7 @@ fn the_bare_terms_a_siem_analyst_actually_types() {
         ("cidr", "10.0.0.0/8"),
         ("windows path", r"C:\Windows\System32\cmd.exe"),
         ("unc path", r"\\fileserver\share"),
-        ("domain\\user", r"CORP\dlussier"),
+        ("domain\\user", r"CORP\janalyst"),
         ("registry", r"HKLM\Software\Microsoft"),
         ("plus address", "dan+alerts@nano.rs"),
         ("email", "dan@nano.rs"),
@@ -261,13 +261,16 @@ fn the_added_characters_did_not_swallow_an_operator() {
 #[test]
 fn the_new_characters_work_as_field_values_too() {
     for (query, expected) in [
-        ("src_ip=2605:d580:140c:23ec:f867:a0ba:cd2f:a493", "2605:d580:140c:23ec:f867:a0ba:cd2f:a493"),
+        (
+            "src_ip=2605:d580:140c:23ec:f867:a0ba:cd2f:a493",
+            "2605:d580:140c:23ec:f867:a0ba:cd2f:a493",
+        ),
         ("dest=10.0.0.1:443", "10.0.0.1:443"),
         ("net=10.0.0.0/8", "10.0.0.0/8"),
         ("user=dan+alerts@nano.rs", "dan+alerts@nano.rs"),
         ("sender=dan@nano.rs", "dan@nano.rs"),
         ("path=C:\\Windows\\System32", "C:\\Windows\\System32"),
-        ("user=CORP\\dlussier", "CORP\\dlussier"),
+        ("user=CORP\\janalyst", "CORP\\janalyst"),
         // Leading digits are the trap: the number parser grabs them.
         ("user=123+alerts@nano.rs", "123+alerts@nano.rs"),
     ] {

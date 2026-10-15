@@ -68,7 +68,7 @@ async fn account_locked_signaled_once_on_threshold_crossing() {
     // NOT signal a lock.
     for attempt in 1..threshold {
         let err = svc
-            .login(&email, "wrong-password", None, None)
+            .login(&email, "wrong-password", None, None, None)
             .await
             .expect_err("wrong password must fail");
         assert!(
@@ -80,7 +80,7 @@ async fn account_locked_signaled_once_on_threshold_crossing() {
     // The attempt whose increment first reaches the threshold is the single
     // fresh-lock signal the handler audits as `user_locked`.
     let crossing = svc
-        .login(&email, "wrong-password", None, None)
+        .login(&email, "wrong-password", None, None, None)
         .await
         .expect_err("crossing attempt must fail");
     assert!(
@@ -92,7 +92,7 @@ async fn account_locked_signaled_once_on_threshold_crossing() {
     // re-signal a fresh lock (audit-inflation guard) — it falls back to the
     // generic error while still being throttled.
     let after = svc
-        .login(&email, "wrong-password", None, None)
+        .login(&email, "wrong-password", None, None, None)
         .await
         .expect_err("post-lock attempt must fail");
     assert!(

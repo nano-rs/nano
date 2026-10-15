@@ -1,6 +1,6 @@
 # Auto-generated dynamic router for deployed parsers
 # DO NOT EDIT - changes will be overwritten by parser deployment
-# Generated at: 2026-06-14T20:28:39.893706+00:00
+# Generated at: 2026-08-21T17:16:00.996704+00:00
 
 # =============================================================================
 # Dynamic Source Type Router
@@ -8,22 +8,23 @@
 # Accepts input from HTTP pipeline, Vector native protocol, and source configurations.
 [transforms.source_router]
 type = "route"
-inputs = ["vector_merge", "http_ingestion_route", "nan884_smoke_sasl_plaintext_route", "splunk_hec_route"]
+inputs = ["vector_merge", "hec_normalize", "otlp_logs_prep", "http_ingestion_route"]
 
 [transforms.source_router.route]
-apache_http_server__ocsf_ = 'includes(["apache", "apache_access"], .source_type)'
-aws_cloudtrail__ocsf_ = 'includes(["aws_cloudtrail", "cloudtrail"], .source_type)'
-conduit_mitm_proxy__ocsf_ = 'includes(["conduit", "conduit_proxy", "conduit-proxy"], .source_type)'
-microsoft_sysmon__json__ocsf_ = 'includes(["sysmon", "windows_sysmon", "sysmon_json"], .source_type)'
-windows_event_log__ocsf_ = 'includes(["windows_event", "winlogbeat", "windows", "win_event", "winevent"], .source_type)'
-generic = '!includes(["apache", "apache_access", "aws_cloudtrail", "cloudtrail", "conduit", "conduit_proxy", "conduit-proxy", "sysmon", "windows_sysmon", "sysmon_json", "windows_event", "winlogbeat", "windows", "win_event", "winevent"], .source_type) && !starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
+apache_http_server__ocsf_ = '.source_type == "apache_access"'
+aws_cloudtrail__ocsf_ = '.source_type == "aws_cloudtrail"'
+conduit_mitm_proxy__ocsf_ = '.source_type == "conduit_proxy"'
+microsoft_sysmon__ocsf_ = '.source_type == "windows_sysmon"'
+opentelemetry_logs__ocsf_ = '.source_type == "otlp_log"'
+windows_event_log__ocsf_ = '.source_type == "windows_event"'
+generic = '!includes(["apache_access", "aws_cloudtrail", "conduit_proxy", "windows_sysmon", "otlp_log", "windows_event"], .source_type) && !starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
 
 # =============================================================================
 # NAN-1124/NAN-1151: Enrichment lane router (nano_enrich -> per-source outputs)
 # =============================================================================
 [transforms.enrichment_router]
 type = "route"
-inputs = ["vector_merge", "http_ingestion_route", "nan884_smoke_sasl_plaintext_route", "splunk_hec_route"]
+inputs = ["enrichment_prepare"]
 
 [transforms.enrichment_router.route]
 identity = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "identity"'

@@ -115,7 +115,10 @@ async fn grants_and_denied_difference() {
     let grant = repo.add_grant(&src, group_id, None).await.expect("grant");
     assert_eq!(grant.group_id, group_id);
     assert_eq!(grant.group_name.as_deref(), Some("scope-test-group"));
-    let _again = repo.add_grant(&src, group_id, None).await.expect("re-grant");
+    let _again = repo
+        .add_grant(&src, group_id, None)
+        .await
+        .expect("re-grant");
 
     assert_eq!(repo.list_grants(&src).await.expect("list").len(), 1);
     assert!(repo

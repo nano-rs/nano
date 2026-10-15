@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import {
   Sheet,
@@ -324,7 +324,7 @@ export function MetricMonitorDialog({
             onClick={handleSubmit}
             disabled={!valid || submitting}
           >
-            {submitting && <Loader2 className="h-[11px] w-[11px] animate-spin" />}
+            {submitting && <LoadingIcon className="h-[11px] w-[11px]" />}
             {editing ? 'Save changes' : 'Create monitor'}
           </Button>
         </div>

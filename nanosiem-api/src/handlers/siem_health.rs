@@ -151,7 +151,7 @@ pub struct TriggerResponse {
 /// and `total` as an unrestricted one, with the narrative column withheld on
 /// every row whose provenance is not provably disjoint from their deny set.
 ///
-/// Requires the `settings:system` permission (NAN-1801 — health reports carry
+/// Requires the `settings:system` permission (health reports carry
 /// fleet-wide per-source telemetry).
 ///
 /// GET /api/siem-health/reports
@@ -287,9 +287,10 @@ pub async fn get_report(
 
 /// Manually trigger a SIEM health check (admin only)
 ///
-/// Runs the full health check pipeline: collect metrics from ClickHouse and PostgreSQL,
-/// analyze with AI (or fallback scoring), and store the report. This is the same pipeline
-/// that runs automatically every 12 hours.
+/// Runs the full health check pipeline through the active event-query backend
+/// plus PostgreSQL control-plane state, analyzes with AI (or fallback scoring),
+/// and stores the report. This is the same pipeline that runs automatically
+/// every 12 hours.
 ///
 /// Requires the `settings:system` permission.
 ///
@@ -345,16 +346,28 @@ pub async fn trigger_health_check(
     let ai_analyzer: Arc<dyn SiemHealthAiAnalyzer> = Arc::new(NoopSiemHealthAiAnalyzer);
 
     let collection_scope = auth.effective_viewer_scope();
-    let report_id = nanosiem_core::siem_health::scheduler::run_health_check_with_trigger(
-        &state.pool,
-        &ch_client,
-        is_clustered,
-        ai_analyzer.as_ref(),
-        &repo,
-        &collection_scope,
-        Some(auth.user_id()),
-    )
-    .await;
+    let report_id = if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        nanosiem_core::siem_health::scheduler::run_health_check_with_search_trigger(
+            &state.pool,
+            &state.search_service,
+            ai_analyzer.as_ref(),
+            &repo,
+            &collection_scope,
+            Some(auth.user_id()),
+        )
+        .await
+    } else {
+        nanosiem_core::siem_health::scheduler::run_health_check_with_trigger(
+            &state.pool,
+            &ch_client,
+            is_clustered,
+            ai_analyzer.as_ref(),
+            &repo,
+            &collection_scope,
+            Some(auth.user_id()),
+        )
+        .await
+    };
 
     match report_id {
         Some(id) => Ok(Json(TriggerResponse {

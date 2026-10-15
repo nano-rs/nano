@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Data exfiltration scenario — staging, compression, upload.
 //!
 //! Sysmon scripted steps go through `process_create_step` (NAN-1058). The two

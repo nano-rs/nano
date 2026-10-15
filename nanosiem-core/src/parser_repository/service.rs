@@ -127,6 +127,12 @@ impl ParserRepositoryService {
         }
     }
 
+    /// Use a specific GitHub client (local fixtures in tests).
+    pub fn with_github_client(mut self, github_client: GitHubClient) -> Self {
+        self.github_client = github_client;
+        self
+    }
+
     /// Compatibility check between a `source_configurations.config_type`
     /// and a parser's `ingestion_method`. NAN-943.
     ///
@@ -163,6 +169,7 @@ impl ParserRepositoryService {
             ("kafka", "kafka")
                 | ("aws_s3", "aws_s3")
                 | ("gcp_pubsub", "gcp_pubsub")
+                | ("azure_event_hubs", "azure_event_hubs")
                 | ("splunk_hec", "splunk_hec")
                 | ("http", "routed")
                 | ("vector", "vector")
@@ -527,7 +534,24 @@ impl ParserRepositoryService {
         let parsers_path =
             crate::schema::active_repo_path(repo.parsers_path.as_deref().unwrap_or("parsers/"));
         let parsers_path = parsers_path.as_str();
-        let branch = &repo.branch;
+        // NAN-2361: a lake tenant needs the `ocsf-1.9` content branch; every
+        // default (PG column, create fallback, the one-click add button) says
+        // `main`, which is the OCSF 1.8 set. Only the first-party content repo
+        // is remapped — third-party sources have no such branch.
+        let resolved_branch = if owner == "nano-rs" {
+            crate::schema::active_content_branch(&repo.branch)
+        } else {
+            repo.branch.clone()
+        };
+        if resolved_branch != repo.branch {
+            info!(
+                repo_id = %id,
+                stored = %repo.branch,
+                resolved = %resolved_branch,
+                "Lake profile: syncing the OCSF 1.9 content branch"
+            );
+        }
+        let branch = resolved_branch.as_str();
 
         info!(repo_id = %id, owner = %owner, repo = %repo_name, "Starting parser repository sync");
 
@@ -2019,7 +2043,7 @@ impl ParserRepositoryService {
             name: AIRGAP_REPOSITORY_NAME.to_string(),
             slug: Some(AIRGAP_REPOSITORY_SLUG.to_string()),
             description: Some(
-                "Parsers imported from offline air-gapped bundles (NAN-1201).".to_string(),
+                "Parsers imported from offline air-gapped bundles.".to_string(),
             ),
             // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
             url: "airgap://parsers".to_string(),

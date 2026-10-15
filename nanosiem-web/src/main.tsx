@@ -14,6 +14,19 @@ import '@fontsource/geist-mono/700.css';
 import { createRoot } from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
+import { toast } from 'sonner';
+import { watchForNewBuild } from './lib/build-update';
+
+if (import.meta.env.PROD) {
+  watchForNewBuild(() => {
+    toast('A new version of nano is available.', {
+      id: 'build-update',
+      duration: Infinity,
+      description: 'Save your work, then reload to update.',
+      action: { label: 'Reload', onClick: () => window.location.reload() },
+    });
+  });
+}
 
 createRoot(document.getElementById('root')!).render(
   <App />

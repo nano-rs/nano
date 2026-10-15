@@ -43,6 +43,7 @@ interface HeaderProps {
 }
 
 export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlot, pushTargetsSlot }: HeaderProps) {
+  syncing = syncing || repo?.raw.last_sync_status === 'syncing';
   return (
     <div className="shrink-0 border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-border bg-card flex items-center justify-center shrink-0">
@@ -85,7 +86,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
               className="h-[26px] px-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-[10.5px] font-mono flex items-center gap-1"
             >
               <Clock className="w-[11px] h-[11px]" strokeWidth={1.5} />
-              {repo.lastSync.relative}
+              {repo.raw.managed_by_platform ? `Managed by nano · last synced ${repo.lastSync.relative}` : repo.lastSync.relative}
             </button>
             <button
               type="button"
@@ -99,7 +100,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
               )}
             >
               <RefreshCw className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')} strokeWidth={1.5} />
-              {syncing ? 'Syncing…' : 'Sync now'}
+              {syncing ? (repo.raw.sync_started_at ? `Syncing since ${new Date(repo.raw.sync_started_at).toLocaleTimeString()}` : 'Syncing…') : 'Sync now'}
             </button>
           </div>
         )

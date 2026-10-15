@@ -12,10 +12,10 @@ import {
   GripHorizontal,
   RefreshCw,
   ArrowUpToLine,
-  Loader2,
   Search,
   AlertTriangle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Slider } from '@/components/ui/slider';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { QueryEditor } from '@/components/editor';
@@ -325,7 +325,7 @@ export function DetectionTesterPanel({
                 disabled={isSearching || !panelQuery.trim()}
               >
                 {isSearching
-                  ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ? <LoadingIcon className="w-3.5 h-3.5" />
                   : <Play className="w-3.5 h-3.5" />
                 }
                 Run

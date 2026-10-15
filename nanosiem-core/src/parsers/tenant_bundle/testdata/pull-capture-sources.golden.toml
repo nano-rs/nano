@@ -1,0 +1,314 @@
+# NAN-3369: platform pull sources, rendered by the parser-bundle build from the
+# server's pull-source rows. Platform-owned: DO NOT EDIT. Coordinates come from
+# the container env the Worker sets (NANO_PULL_<ID>_*); credentials never do.
+# End-to-end acknowledgements: a source deletes/acks only after the Bronze
+# sink's edge-log commit.
+
+# Pull source 00000000-0000-0000-0000-0000000000a1 (aws_s3) -> lane aws_cloudtrail.
+[sources.nano_pull_000000000000000000000000000000a1]
+type = "aws_s3"
+region = "${NANO_PULL_000000000000000000000000000000A1_REGION}"
+endpoint = "http://aws.internal"
+compression = "auto"
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a1.auth]
+access_key_id = "nano-pull-inert"
+secret_access_key = "nano-pull-inert"
+
+[sources.nano_pull_000000000000000000000000000000a1.sqs]
+queue_url = "${NANO_PULL_000000000000000000000000000000A1_QUEUE_URL}"
+delete_message = true
+delete_failed_message = false
+visibility_timeout_secs = 900
+client_concurrency = 4
+max_number_of_messages = 1
+
+[transforms.nano_pull_000000000000000000000000000000a1_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a1"]
+source = '''
+.source_type = "aws_cloudtrail"
+%source_type = "aws_cloudtrail"
+%tenant_id = "bbbbbbbb-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a1"
+.auth_status = "authenticated"
+.content_format = "nano_pull_aws_s3"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+# NAN-3371: CloudTrail file -> one event per record; digest files are not events.
+nano_pull_object = string(.object) ?? ""
+if starts_with(nano_pull_object, "CloudTrail-Digest/") || contains(nano_pull_object, "/CloudTrail-Digest/") {
+  . = []
+} else {
+  nano_pull_parsed, nano_pull_error = parse_json(string(.message) ?? "")
+  nano_pull_is_envelope = false
+  nano_pull_records = []
+  if nano_pull_error == null && is_object(nano_pull_parsed) {
+    nano_pull_envelope = object(nano_pull_parsed) ?? {}
+    if is_array(nano_pull_envelope.Records) {
+      nano_pull_is_envelope = true
+      nano_pull_records = array(nano_pull_envelope.Records) ?? []
+    }
+  }
+  if nano_pull_is_envelope {
+    del(.message)
+    nano_pull_event = .
+    . = map_values(nano_pull_records) -> |nano_pull_record| {
+      nano_pull_one = nano_pull_event
+      nano_pull_one.message = encode_json(nano_pull_record)
+      nano_pull_one
+    }
+  }
+}
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a2 (aws_sqs) -> lane apache_access.
+[sources.nano_pull_000000000000000000000000000000a2]
+type = "aws_sqs"
+region = "${NANO_PULL_000000000000000000000000000000A2_REGION}"
+endpoint = "http://aws.internal"
+queue_url = "${NANO_PULL_000000000000000000000000000000A2_QUEUE_URL}"
+delete_message = true
+visibility_timeout_secs = 900
+acknowledgements.enabled = true
+
+[sources.nano_pull_000000000000000000000000000000a2.auth]
+access_key_id = "nano-pull-inert"
+secret_access_key = "nano-pull-inert"
+
+[transforms.nano_pull_000000000000000000000000000000a2_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a2"]
+source = '''
+.source_type = "apache_access"
+%source_type = "apache_access"
+%tenant_id = "bbbbbbbb-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a2"
+.auth_status = "authenticated"
+.content_format = "nano_pull_aws_sqs"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a3 (gcp_pubsub) -> lane windows_sysmon.
+[sources.nano_pull_000000000000000000000000000000a3]
+type = "gcp_pubsub"
+# Token: metadata.google.internal handler, 3600 s tokens (D-L).
+project = "${NANO_PULL_000000000000000000000000000000A3_GCP_PROJECT}"
+subscription = "${NANO_PULL_000000000000000000000000000000A3_GCP_SUBSCRIPTION}"
+ack_deadline_secs = 600
+acknowledgements.enabled = true
+
+[transforms.nano_pull_000000000000000000000000000000a3_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a3"]
+source = '''
+.source_type = "windows_sysmon"
+%source_type = "windows_sysmon"
+%tenant_id = "bbbbbbbb-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a3"
+.auth_status = "authenticated"
+.content_format = "nano_pull_gcp_pubsub"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+'''
+
+# Pull source 00000000-0000-0000-0000-0000000000a4 (azure_event_hubs) -> lane windows_sysmon.
+[sources.nano_pull_000000000000000000000000000000a4]
+type = "azure_event_hubs"
+# Token: entra.internal managed-identity handler (http://entra.internal/msi/token).
+namespace = "${NANO_PULL_000000000000000000000000000000A4_EH_NAMESPACE}"
+event_hub_name = "${NANO_PULL_000000000000000000000000000000A4_EH_NAME}"
+consumer_group = "${NANO_PULL_000000000000000000000000000000A4_EH_CONSUMER_GROUP}"
+start_position = "latest"
+checkpoint_interval_secs = 5
+acknowledgements.enabled = true
+decoding.codec = "bytes"
+framing.method = "bytes"
+
+[sources.nano_pull_000000000000000000000000000000a4.auth]
+azure_credential_kind = "managed_identity"
+user_assigned_managed_identity_id = "${NANO_PULL_000000000000000000000000000000A4_AZURE_CLIENT_ID}"
+user_assigned_managed_identity_id_type = "client_id"
+
+[sources.nano_pull_000000000000000000000000000000a4.checkpoint_store]
+type = "azure_blob"
+account_name = "${NANO_PULL_000000000000000000000000000000A4_CHECKPOINT_ACCOUNT}"
+container_name = "${NANO_PULL_000000000000000000000000000000A4_CHECKPOINT_CONTAINER}"
+
+[sources.nano_pull_000000000000000000000000000000a4.checkpoint_store.auth]
+azure_credential_kind = "managed_identity"
+user_assigned_managed_identity_id = "${NANO_PULL_000000000000000000000000000000A4_AZURE_CLIENT_ID}"
+user_assigned_managed_identity_id_type = "client_id"
+
+[transforms.nano_pull_000000000000000000000000000000a4_stamp]
+type = "remap"
+inputs = ["nano_pull_000000000000000000000000000000a4"]
+source = '''
+.source_type = "windows_sysmon"
+%source_type = "windows_sysmon"
+%tenant_id = "bbbbbbbb-0000-4000-8000-000000000042"
+%nano_credential_id = "pull:00000000-0000-0000-0000-0000000000a4"
+.auth_status = "authenticated"
+.content_format = "nano_pull_azure_event_hubs"
+.routing_timestamp = now()
+if !exists(.message) { .message = "" }
+if !is_object(.metadata) { .metadata = {} }
+.metadata.forwarded_via = "pull"
+# NAN-3604: Event Hubs message -> one event per record ({"records": [...]} or a bare array).
+nano_pull_parsed, nano_pull_error = parse_json(string(.message) ?? "")
+nano_pull_is_batch = false
+nano_pull_records = []
+if nano_pull_error == null {
+  if is_array(nano_pull_parsed) {
+    nano_pull_is_batch = true
+    nano_pull_records = array(nano_pull_parsed) ?? []
+  } else if is_object(nano_pull_parsed) {
+    nano_pull_envelope = object(nano_pull_parsed) ?? {}
+    if is_array(nano_pull_envelope.records) {
+      nano_pull_is_batch = true
+      nano_pull_records = array(nano_pull_envelope.records) ?? []
+    }
+  }
+}
+if nano_pull_is_batch {
+  del(.message)
+  del(.properties)
+  nano_pull_total = length(nano_pull_records)
+  nano_pull_truncated = nano_pull_total > 10000
+  if nano_pull_truncated {
+    nano_pull_records = slice(nano_pull_records, 0, 10000) ?? []
+  }
+  nano_pull_event = .
+  nano_pull_out = map_values(nano_pull_records) -> |nano_pull_record| {
+    nano_pull_one = nano_pull_event
+    nano_pull_one.message = string(nano_pull_record) ?? encode_json(nano_pull_record)
+    nano_pull_one
+  }
+  if nano_pull_truncated {
+    nano_pull_marker = nano_pull_event
+    nano_pull_marker.nano_pull_error = "azure_records_truncated"
+    nano_pull_marker.nano_pull_records_total = nano_pull_total
+    nano_pull_marker.nano_pull_records_cap = 10000
+    nano_pull_marker.message = encode_json({"nano_pull_error": "azure_records_truncated", "records_total": nano_pull_total, "records_kept": 10000})
+    nano_pull_out = push(nano_pull_out, nano_pull_marker)
+  }
+  . = nano_pull_out
+}
+'''
+
+# NAN-3623 Nano Pipe live capture (opt-in, worker.pipe_capture): sampled pulled
+# events reach the tenant's capture sessions through the tenant-bound
+# capture.internal handler. Decoupled from acknowledgements by the memory-table
+# buffer: capture can never delay, fail or drop a pulled event (pull.rs render_capture_tap).
+[sources.nano_pipe_capture_status]
+type = "http_client"
+endpoint = "http://capture.internal/v1/status"
+scrape_interval_secs = 2
+scrape_timeout_secs = 1.5
+decoding.codec = "json"
+
+[transforms.nano_pipe_capture_active]
+type = "remap"
+inputs = ["nano_pipe_capture_status"]
+source = '''
+. = filter(object(.active) ?? {}) -> |nano_capture_slug, nano_capture_on| {
+  nano_capture_on == 1 && match(nano_capture_slug, r'^[a-z0-9][a-z0-9_-]{0,99}$')
+}
+'''
+
+[enrichment_tables.nano_pipe_capture_sessions]
+type = "memory"
+inputs = ["nano_pipe_capture_active"]
+ttl = 6
+scan_interval = 1
+
+[transforms.nano_pipe_capture_select]
+type = "filter"
+inputs = ["nano_pull_000000000000000000000000000000a1_stamp", "nano_pull_000000000000000000000000000000a2_stamp", "nano_pull_000000000000000000000000000000a3_stamp", "nano_pull_000000000000000000000000000000a4_stamp"]
+condition = '''
+is_object(get_enrichment_table_record("nano_pipe_capture_sessions", {"key": string(.source_type) ?? ""}) ?? null)
+'''
+
+[transforms.nano_pipe_capture_throttle]
+type = "throttle"
+inputs = ["nano_pipe_capture_select"]
+threshold = 20
+window_secs = 1
+key_field = "{{ source_type }}"
+
+[transforms.nano_pipe_capture_shape]
+type = "remap"
+inputs = ["nano_pipe_capture_throttle"]
+source = '''
+nano_capture_message = string(.message) ?? encode_json(.message)
+nano_capture_event = {"message": nano_capture_message, "source_type": string(.source_type) ?? ""}
+if strlen(nano_capture_message) > 32768 {
+  nano_capture_event = {"message": "", "source_type": nano_capture_event.source_type, "truncated": true}
+}
+. = set!({}, [uuid_v4()], nano_capture_event)
+'''
+
+[enrichment_tables.nano_pipe_capture_buffer]
+type = "memory"
+inputs = ["nano_pipe_capture_shape"]
+ttl = 30
+scan_interval = 5
+max_byte_size = 1048576
+source_config.source_key = "nano_pipe_capture_export"
+source_config.export_interval = 1
+source_config.export_batch_size = 200
+source_config.remove_after_export = true
+
+[sinks.nano_pipe_capture_observe]
+type = "http"
+inputs = ["nano_pipe_capture_export"]
+uri = "http://capture.internal/v1/observe"
+method = "post"
+encoding.codec = "json"
+healthcheck.enabled = false
+batch.max_events = 200
+batch.max_bytes = 262144
+batch.timeout_secs = 1
+request.concurrency = 1
+request.retry_attempts = 0
+request.timeout_secs = 5
+buffer.type = "memory"
+buffer.max_events = 400
+buffer.when_full = "drop_newest"
+
+# NAN-3371/NAN-3372 loss accounting (nano-pull-loss-fence-v1): a discard the source
+# keeps for the customer's DLQ is not loss. The pull Worker scrapes only this
+# exporter (scrapes are metered egress); the rule is pull.rs LOSS_FENCE_CONTRACT.
+[sources.nano_pull_loss_metrics]
+type = "internal_metrics"
+scrape_interval_secs = 10
+namespace = "nanosiem_pull"
+
+[transforms.nano_pull_loss_select]
+type = "filter"
+inputs = ["nano_pull_loss_metrics"]
+condition = '''
+component = to_string(.tags.component_id) ?? ""
+pull = starts_with(component, "nano_pull_") && !starts_with(component, "nano_pull_loss_")
+tap = starts_with(component, "nano_pipe_capture_")
+(!tap && .name == "component_discarded_events_total") ||
+  (component == "nano_pull_loss_metrics" && .name == "component_sent_events_total") ||
+  (pull && includes(["component_received_events_total", "component_errors_total",
+    "sqs_message_received_messages_total", "sqs_message_delete_succeeded_total",
+    "sqs_message_delete_failed_total", "sqs_message_processing_succeeded_total"], .name)) ||
+  (component == "ocsf_parquet_bronze" && includes(["component_sent_events_total", "component_errors_total"], .name))
+'''
+
+[sinks.nano_pull_loss_exporter]
+type = "prometheus_exporter"
+inputs = ["nano_pull_loss_select"]
+address = "0.0.0.0:9597"
+default_namespace = "nanosiem_pull"

@@ -195,21 +195,59 @@ impl ParserService {
     pub fn validate_parser_fields(&self, vrl_code: &str) -> VrlValidationResult {
         let mut warnings = Vec::new();
 
-        // Extract field assignments from VRL code
-        // Look for patterns like: .field_name = ...
-        let field_pattern = regex::Regex::new(r"\.([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*=|\s*\[)").unwrap();
+        // Extract the fields this parser WRITES.
+        //
+        // NAN-2361: the previous pattern (`\.(name)(?:\s*=|\s*\[)`) scanned
+        // anywhere in the line and captured a single segment, which produced
+        // two classes of false positive — both reported as "not in UDM schema…
+        // will be preserved in metadata", about fields that are neither:
+        //
+        //   `.src_ip[0] = .source_ips[0]`   warned about `source_ips`, the
+        //       SOURCE field being READ. A parser reads arbitrary input fields
+        //       by definition; only its assignment targets are UDM's business.
+        //       (Bare `.a = .b` escaped it only because the RHS lacked a `[`.)
+        //   `.metadata.event_id = 4624`     warned about `event_id`, because
+        //       the capture took the segment after `metadata.` and the
+        //       metadata/udm guard only ever saw a single segment.
+        //
+        // So: anchor to the start of a statement, capture the WHOLE dotted
+        // path, and judge it by its ROOT segment.
+        let field_pattern = regex::Regex::new(
+            r"(?m)^\s*\.([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)(?:\[[^\]]*\])*\s*=(?:[^=]|$)",
+        )
+        .unwrap();
 
         let mut found_fields = std::collections::HashSet::new();
         let mut unknown_fields = Vec::new();
 
         for cap in field_pattern.captures_iter(vrl_code) {
             if let Some(field_match) = cap.get(1) {
-                let field_name = field_match.as_str();
+                let path = field_match.as_str();
+                let mut segments = path.split('.');
+                let root = segments.next().unwrap_or(path);
 
-                // Skip special fields that are not UDM fields
-                if field_name == "metadata" || field_name == "udm" {
+                // `.metadata.*` is the documented SPILL: arbitrary producer keys
+                // live there by design, so nothing under it is "unknown".
+                if root == "metadata" {
                     continue;
                 }
+
+                // `.udm.*` is the UDM namespace itself, so validate the LEAF.
+                //
+                // Skipping the whole subtree (as the root-only rule did) turns
+                // validation off for any parser that writes this way — measured
+                // on the shipped Windows Event Log parser, that is 452 of its
+                // assignments, i.e. all of them. The leaf is exactly the field
+                // name UDM knows.
+                let field_name = if root == "udm" {
+                    match segments.next() {
+                        // A bare `.udm = {}` container init writes no field.
+                        None => continue,
+                        Some(leaf) => leaf,
+                    }
+                } else {
+                    root
+                };
 
                 // Skip fields we've already checked
                 if found_fields.contains(field_name) {

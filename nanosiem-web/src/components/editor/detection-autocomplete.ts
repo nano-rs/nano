@@ -22,6 +22,7 @@ import {
   getQueryAutocompleteSuggestions,
   type AutocompleteOption as QueryOption,
 } from '@/lib/query-autocomplete';
+import { COMPLETION_TOKEN_BEFORE, COMPLETION_VALID_FOR } from './search-autocomplete';
 
 // YAML field value options (static fields)
 export const YAML_FIELD_OPTIONS: Record<string, YamlOption[]> = {
@@ -153,6 +154,13 @@ function queryOptionsToCompletions(
         // Add parentheses for function completion
         completion.apply = `${opt.value}()`;
         break;
+      case 'parameter':
+        completion.type = 'property';
+        break;
+      case 'argument_value':
+        // Plain value (span=1h, type=inner): never append `()` (NAN-3193).
+        completion.type = 'constant';
+        break;
       case 'source_type':
         completion.type = 'enum';
         // Only wrap in quotes if not already inside quotes
@@ -171,7 +179,7 @@ function queryOptionsToCompletions(
   const result: CompletionResult = {
     from,
     options: completions,
-    validFor: /^[\w*]*$/,
+    validFor: COMPLETION_VALID_FOR,
   };
 
   // If we have a specific end position (e.g., to replace closing quote too)
@@ -223,7 +231,7 @@ async function yamlAutocomplete(context: CompletionContext): Promise<CompletionR
 /**
  * Query section autocomplete source
  */
-async function queryAutocomplete(context: CompletionContext): Promise<CompletionResult | null> {
+export async function queryAutocomplete(context: CompletionContext): Promise<CompletionResult | null> {
   const doc = context.state.doc.toString();
   const pos = context.pos;
 
@@ -245,7 +253,7 @@ async function queryAutocomplete(context: CompletionContext): Promise<Completion
 
   // Find where the current word starts
   let from = pos;
-  const wordMatch = textBefore.match(/[\w*]+$/);
+  const wordMatch = textBefore.match(COMPLETION_TOKEN_BEFORE);
   if (wordMatch) {
     from = pos - wordMatch[0].length;
   }

@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::auth::password::hash_password;
+use crate::auth::password::{hash_password, validate_password, PasswordError};
 use crate::auth::types::{
     builtin_groups, CreateUserRequest, GroupSummary, LandingPage, QueryMode, SearchHubStyle,
     TimeRangePreset, UpdateUserRequest, User, UserPreferences,
@@ -27,6 +27,8 @@ pub enum UserRepositoryError {
     EmailExists(String),
     #[error("Password hashing error: {0}")]
     PasswordHashError(String),
+    #[error("Password does not meet requirements: {0}")]
+    PasswordRequirementsNotMet(String),
     #[error("Invalid password reset token")]
     InvalidResetToken,
     #[error("Password reset token expired")]
@@ -35,10 +37,79 @@ pub enum UserRepositoryError {
     GrantAuthorityChanged,
 }
 
+impl From<PasswordError> for UserRepositoryError {
+    fn from(err: PasswordError) -> Self {
+        match err {
+            PasswordError::ComplexityNotMet(msg) => {
+                UserRepositoryError::PasswordRequirementsNotMet(msg)
+            }
+            PasswordError::TooLong(_) => {
+                UserRepositoryError::PasswordRequirementsNotMet(err.to_string())
+            }
+            PasswordError::HashingFailed(_) | PasswordError::VerificationFailed(_) => {
+                UserRepositoryError::PasswordHashError(err.to_string())
+            }
+        }
+    }
+}
+
+/// Reject a plaintext that does not satisfy the single authoritative policy
+/// (`PasswordRequirements::default()` plus `MAX_PASSWORD_BYTES`).
+///
+/// SECURITY (password-policy bypass): the admin user-management endpoints used
+/// to hand `CreateUserRequest.password` / `UpdateUserRequest.password` straight
+/// to `hash_password`, so `POST /api/users` and `PUT /api/users/{id}` could
+/// install a one-character credential that `login`, `reset_password` and
+/// `change_password` would all have refused. The check lives in the repository
+/// rather than in the HTTP handler deliberately: `create_user` has three
+/// independent callers (the admin endpoint, first-run `POST
+/// /api/setup/initialize`, and demo provisioning), and handler-level validation
+/// would leave every current and future non-HTTP caller able to skip it. This
+/// is the last layer before `users.password_hash` is written, so it is the only
+/// place the policy cannot be routed around.
+fn reject_noncompliant_password(password: &str) -> Result<(), UserRepositoryError> {
+    validate_password(password).map_err(UserRepositoryError::from)
+}
+
+/// Validate a new plaintext against the authoritative policy, then hash it off
+/// the async runtime (bcrypt is CPU-intensive).
+///
+/// Every repository path that writes `users.password_hash` calls this — it is
+/// the only place `hash_password` is invoked in this module, which is asserted
+/// by `hashing_only_happens_behind_validation` below. Validation runs first so
+/// a rejected password is never hashed.
+async fn validate_and_hash_password(password: &str) -> Result<String, UserRepositoryError> {
+    reject_noncompliant_password(password)?;
+    let pwd = password.to_string();
+    tokio::task::spawn_blocking(move || hash_password(&pwd))
+        .await
+        .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
+        .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))
+}
+
 /// Repository for user operations
 #[derive(Clone)]
 pub struct UserRepository {
     pool: PgPool,
+}
+
+/// Compare-and-swap material for consuming one encrypted backup-code list.
+pub struct BackupCodeRotation<'a> {
+    pub expected_encrypted: &'a [u8],
+    pub expected_nonce: &'a str,
+    pub replacement_encrypted: &'a [u8],
+    pub replacement_nonce: &'a str,
+}
+
+/// Exact enterprise-shared credential allowed to mutate a pending MFA setup.
+/// The values come from a validated, tenant-bound signed token.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedMfaSetupAuthority {
+    pub tenant_id: Uuid,
+    pub jti: Uuid,
+    pub authenticated_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub is_challenge: bool,
 }
 
 impl UserRepository {
@@ -51,6 +122,51 @@ impl UserRepository {
         &self.pool
     }
 
+    /// Database-clock fence for non-password authentication continuations.
+    pub async fn authentication_fence_time(&self) -> Result<DateTime<Utc>, UserRepositoryError> {
+        Ok(sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// Revalidate the exact password hash after its expensive bcrypt check and
+    /// return a database-clock authentication fence while holding a shared row
+    /// lock. An already-running reset/change wins first and exposes its new
+    /// hash; a later reset/change waits and advances `tokens_valid_from` beyond
+    /// the returned fence, invalidating every shared continuation minted from
+    /// this authentication.
+    pub async fn lock_current_password_authentication(
+        &self,
+        user_id: Uuid,
+        expected_password_hash: &str,
+    ) -> Result<Option<DateTime<Utc>>, UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query_as::<_, (Option<String>, String)>(
+            r#"
+            SELECT password_hash, status
+            FROM users
+            WHERE id = $1
+            FOR SHARE
+            "#,
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((password_hash, status)) = current else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        if status != "active" || password_hash.as_deref() != Some(expected_password_hash) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let authenticated_at = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(authenticated_at))
+    }
+
     /// Create a new local user
     /// Requirements: 1.1
     ///
@@ -59,12 +175,9 @@ impl UserRepository {
         &self,
         request: &CreateUserRequest,
     ) -> Result<User, UserRepositoryError> {
-        // Hash the password first (use spawn_blocking as bcrypt is CPU-intensive)
-        let pwd = request.password.clone();
-        let password_hash = tokio::task::spawn_blocking(move || hash_password(&pwd))
-            .await
-            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
-            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?;
+        // Validate against the authoritative policy, then hash (spawn_blocking:
+        // bcrypt is CPU-intensive). Rejected before any row is written.
+        let password_hash = validate_and_hash_password(&request.password).await?;
 
         // Create the user - rely on unique constraint for email uniqueness (race-condition safe)
         let user = sqlx::query_as::<_, User>(
@@ -113,11 +226,7 @@ impl UserRepository {
         request: &CreateUserRequest,
         stamp: crate::auth::GrantAuthorityStamp,
     ) -> Result<User, UserRepositoryError> {
-        let pwd = request.password.clone();
-        let password_hash = tokio::task::spawn_blocking(move || hash_password(&pwd))
-            .await
-            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
-            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?;
+        let password_hash = validate_and_hash_password(&request.password).await?;
 
         let mut tx = self.pool.begin().await?;
         if !crate::auth::lock_and_verify_grant_authority(&mut tx, stamp).await? {
@@ -175,6 +284,43 @@ impl UserRepository {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| UserRepositoryError::NotFoundByEmail(email.to_string()))
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// Hosted `enterprise_shared` sign-in identity for `email` (FRO-754).
+    ///
+    /// Identities are tenant-scoped: the same e-mail in two tenants is two
+    /// `users` rows with separate credentials (`users.home_tenant_id`,
+    /// migration 9003465). With a tenant selector, that tenant's scoped
+    /// identity wins; the legacy global row (`home_tenant_id IS NULL`, exact
+    /// e-mail as before) is the fallback only when the tenant has none.
+    /// Without a selector only a legacy row can match. A scoped identity of
+    /// another tenant is never returned. The slug is only a selector:
+    /// membership is still resolved after the password check.
+    ///
+    /// Never call this outside the shared profile: the column exists only
+    /// with the enterprise overlay.
+    pub async fn get_enterprise_shared_user_for_login(
+        &self,
+        tenant_slug: Option<&str>,
+        email: &str,
+    ) -> Result<User, UserRepositoryError> {
+        sqlx::query_as::<_, User>(
+            r#"
+            SELECT u.* FROM users u
+             WHERE ($1::text IS NOT NULL
+                    AND u.home_tenant_id = (SELECT t.id FROM tenants t WHERE t.slug = $1::text)
+                    AND lower(u.email) = lower($2))
+                OR (u.home_tenant_id IS NULL AND u.email = $2)
+             ORDER BY (u.home_tenant_id IS NULL) ASC
+             LIMIT 1
+            "#,
+        )
+        .bind(tenant_slug)
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| UserRepositoryError::NotFoundByEmail(email.to_string()))
     }
 
     /// List all users
@@ -247,13 +393,7 @@ impl UserRepository {
         // opening the transaction (bcrypt is CPU-intensive → spawn_blocking).
         let existing = self.get_user_by_id(id).await?;
         let password_hash = if let Some(ref new_password) = request.password {
-            let pwd = new_password.clone();
-            Some(
-                tokio::task::spawn_blocking(move || hash_password(&pwd))
-                    .await
-                    .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
-                    .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?,
-            )
+            Some(validate_and_hash_password(new_password).await?)
         } else {
             existing.password_hash.clone()
         };
@@ -279,13 +419,7 @@ impl UserRepository {
     ) -> Result<User, UserRepositoryError> {
         let existing = self.get_user_by_id(id).await?;
         let password_hash = if let Some(ref new_password) = request.password {
-            let pwd = new_password.clone();
-            Some(
-                tokio::task::spawn_blocking(move || hash_password(&pwd))
-                    .await
-                    .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
-                    .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?,
-            )
+            Some(validate_and_hash_password(new_password).await?)
         } else {
             existing.password_hash.clone()
         };
@@ -557,12 +691,7 @@ impl UserRepository {
         id: Uuid,
         new_password: &str,
     ) -> Result<(), UserRepositoryError> {
-        // Use spawn_blocking as bcrypt is CPU-intensive
-        let pwd = new_password.to_string();
-        let password_hash = tokio::task::spawn_blocking(move || hash_password(&pwd))
-            .await
-            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?
-            .map_err(|e| UserRepositoryError::PasswordHashError(e.to_string()))?;
+        let password_hash = validate_and_hash_password(new_password).await?;
 
         let result = sqlx::query(
             r#"
@@ -584,6 +713,130 @@ impl UserRepository {
         }
 
         Ok(())
+    }
+
+    /// Consume a reset token, replace the password, advance the credential
+    /// watermark and remove every refresh session in one transaction.
+    /// NAN-3790: the tenants a hosted-shared account's security events are
+    /// audited in. A tenant-scoped identity (`home_tenant_id`, FRO-754 /
+    /// NAN-3788) belongs to exactly its home tenant; a legacy global identity
+    /// to every tenant where it holds an active membership. Only active
+    /// tenants. Empty when the account belongs to none.
+    #[cfg(feature = "enterprise")]
+    pub async fn audit_tenants_for_user(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Vec<crate::auth::TrustedTenantContext>, UserRepositoryError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            r#"
+            SELECT t.id, t.slug
+              FROM public.users u
+              JOIN public.tenants t ON t.status = 'active' AND (
+                   t.id = u.home_tenant_id
+                   OR (u.home_tenant_id IS NULL AND EXISTS (
+                       SELECT 1 FROM public.tenant_members m
+                        WHERE m.tenant_id = t.id AND m.user_id = u.id AND m.status = 'active')))
+             WHERE u.id = $1
+             ORDER BY t.id
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(tenant_id, tenant_slug)| crate::auth::TrustedTenantContext { tenant_id, tenant_slug })
+            .collect())
+    }
+
+    pub async fn reset_password_and_revoke_sessions(
+        &self,
+        reset_token: &str,
+        new_password: &str,
+    ) -> Result<Uuid, UserRepositoryError> {
+        let password_hash = validate_and_hash_password(new_password).await?;
+        let mut tx = self.pool.begin().await?;
+        let user_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE users SET
+                password_hash = $2,
+                password_reset_token = NULL,
+                password_reset_expires = NULL,
+                totp_secret_encrypted = CASE WHEN mfa_enabled THEN totp_secret_encrypted ELSE NULL END,
+                totp_secret_nonce = CASE WHEN mfa_enabled THEN totp_secret_nonce ELSE NULL END,
+                mfa_setup_pending = CASE WHEN mfa_enabled THEN mfa_setup_pending ELSE FALSE END,
+                mfa_setup_authority_tenant_id = NULL,
+                mfa_setup_authority_jti = NULL,
+                mfa_setup_authority_authenticated_at = NULL,
+                mfa_setup_authority_expires_at = NULL,
+                mfa_setup_authority_is_challenge = NULL,
+                tokens_valid_from = clock_timestamp(),
+                updated_at = clock_timestamp()
+            WHERE password_reset_token = $1
+              AND password_reset_expires > clock_timestamp()
+            RETURNING id
+            "#,
+        )
+        .bind(reset_token)
+        .bind(password_hash)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(UserRepositoryError::InvalidResetToken)?;
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(user_id)
+    }
+
+    /// Replace a password only if the hash verified by the caller is still
+    /// the exact current hash, while advancing the revocation watermark and
+    /// deleting refresh sessions in the same users-row transaction.
+    pub async fn change_password_and_revoke_sessions_if_current(
+        &self,
+        user_id: Uuid,
+        expected_password_hash: &str,
+        new_password: &str,
+    ) -> Result<bool, UserRepositoryError> {
+        let password_hash = validate_and_hash_password(new_password).await?;
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE users SET
+                password_hash = $3,
+                password_reset_token = NULL,
+                password_reset_expires = NULL,
+                totp_secret_encrypted = CASE WHEN mfa_enabled THEN totp_secret_encrypted ELSE NULL END,
+                totp_secret_nonce = CASE WHEN mfa_enabled THEN totp_secret_nonce ELSE NULL END,
+                mfa_setup_pending = CASE WHEN mfa_enabled THEN mfa_setup_pending ELSE FALSE END,
+                mfa_setup_authority_tenant_id = NULL,
+                mfa_setup_authority_jti = NULL,
+                mfa_setup_authority_authenticated_at = NULL,
+                mfa_setup_authority_expires_at = NULL,
+                mfa_setup_authority_is_challenge = NULL,
+                tokens_valid_from = clock_timestamp(),
+                updated_at = clock_timestamp()
+            WHERE id = $1
+              AND password_hash = $2
+              AND status = 'active'
+            "#,
+        )
+        .bind(user_id)
+        .bind(expected_password_hash)
+        .bind(password_hash)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Set user groups (replaces existing group memberships)
@@ -685,7 +938,13 @@ impl UserRepository {
     /// working until natural expiry (default 900s).
     pub async fn disable_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
         let result = sqlx::query(
-            "UPDATE users SET status = 'disabled', tokens_valid_from = NOW(), updated_at = NOW() \
+            "UPDATE users SET status = 'disabled', tokens_valid_from = NOW(), \
+             totp_secret_encrypted = CASE WHEN mfa_enabled THEN totp_secret_encrypted ELSE NULL END, \
+             totp_secret_nonce = CASE WHEN mfa_enabled THEN totp_secret_nonce ELSE NULL END, \
+             mfa_setup_pending = CASE WHEN mfa_enabled THEN mfa_setup_pending ELSE FALSE END, \
+             mfa_setup_authority_tenant_id = NULL, mfa_setup_authority_jti = NULL, \
+             mfa_setup_authority_authenticated_at = NULL, mfa_setup_authority_expires_at = NULL, \
+             mfa_setup_authority_is_challenge = NULL, updated_at = NOW() \
              WHERE id = $1",
         )
         .bind(id)
@@ -706,7 +965,13 @@ impl UserRepository {
     /// tokens; this closes the access-token hole).
     pub async fn stamp_tokens_valid_from(&self, id: Uuid) -> Result<(), UserRepositoryError> {
         let result = sqlx::query(
-            "UPDATE users SET tokens_valid_from = NOW(), updated_at = NOW() WHERE id = $1",
+            "UPDATE users SET tokens_valid_from = NOW(), \
+             totp_secret_encrypted = CASE WHEN mfa_enabled THEN totp_secret_encrypted ELSE NULL END, \
+             totp_secret_nonce = CASE WHEN mfa_enabled THEN totp_secret_nonce ELSE NULL END, \
+             mfa_setup_pending = CASE WHEN mfa_enabled THEN mfa_setup_pending ELSE FALSE END, \
+             mfa_setup_authority_tenant_id = NULL, mfa_setup_authority_jti = NULL, \
+             mfa_setup_authority_authenticated_at = NULL, mfa_setup_authority_expires_at = NULL, \
+             mfa_setup_authority_is_challenge = NULL, updated_at = NOW() WHERE id = $1",
         )
         .bind(id)
         .execute(&self.pool)
@@ -907,6 +1172,185 @@ impl UserRepository {
         Ok(())
     }
 
+    /// Store a shared pending TOTP secret only while the exact signed
+    /// credential remains current. The JTI advisory lock orders this mutation
+    /// with durable exact-token revocation; the users-row update orders it
+    /// with logout/password-reset watermarks.
+    pub async fn store_pending_totp_secret_for_shared_authority(
+        &self,
+        user_id: Uuid,
+        authority: SharedMfaSetupAuthority,
+        totp_encrypted: &[u8],
+        totp_nonce: &str,
+    ) -> Result<bool, UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 2361))")
+            .bind(authority.jti)
+            .execute(&mut *tx)
+            .await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE users SET
+                totp_secret_encrypted = $2,
+                totp_secret_nonce = $3,
+                mfa_setup_pending = TRUE,
+                mfa_setup_authority_tenant_id = $4,
+                mfa_setup_authority_jti = $5,
+                mfa_setup_authority_authenticated_at = $6,
+                mfa_setup_authority_expires_at = $7,
+                mfa_setup_authority_is_challenge = $8,
+                updated_at = clock_timestamp()
+            WHERE id = $1
+              AND status = 'active'
+              AND mfa_enabled = FALSE
+              AND (tokens_valid_from IS NULL OR tokens_valid_from < $6)
+              AND NOT EXISTS (SELECT 1 FROM revoked_tokens WHERE jti = $5)
+              AND (
+                    mfa_setup_pending = FALSE
+                    OR totp_secret_encrypted IS NULL
+                    OR mfa_setup_authority_jti = $5
+                  )
+            "#,
+        )
+        .bind(user_id)
+        .bind(totp_encrypted)
+        .bind(totp_nonce)
+        .bind(authority.tenant_id)
+        .bind(authority.jti)
+        .bind(authority.authenticated_at)
+        .bind(authority.expires_at)
+        .bind(authority.is_challenge)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let tenant_authority_current = sqlx::query_scalar::<_, Uuid>(
+            "SELECT member.user_id
+             FROM tenants AS tenant
+             JOIN tenant_members AS member ON member.tenant_id = tenant.id
+             WHERE tenant.id = $1 AND member.user_id = $2
+               AND tenant.status = 'active' AND member.status = 'active'
+               AND (tenant.tokens_valid_from IS NULL OR tenant.tokens_valid_from < $3)
+               AND (member.tokens_valid_from IS NULL OR member.tokens_valid_from < $3)
+             FOR SHARE OF tenant, member",
+        )
+        .bind(authority.tenant_id)
+        .bind(user_id)
+        .bind(authority.authenticated_at)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !tenant_authority_current {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Activate MFA only for the exact shared credential and exact pending
+    /// secret that were verified. Challenge credentials are durably consumed
+    /// in the same transaction as the MFA state transition.
+    pub async fn enable_mfa_for_shared_authority(
+        &self,
+        user_id: Uuid,
+        authority: SharedMfaSetupAuthority,
+        expected_totp_encrypted: &[u8],
+        expected_totp_nonce: &str,
+        backup_encrypted: &[u8],
+        backup_nonce: &str,
+    ) -> Result<bool, UserRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 2361))")
+            .bind(authority.jti)
+            .execute(&mut *tx)
+            .await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE users SET
+                mfa_enabled = TRUE,
+                backup_codes_encrypted = $2,
+                backup_codes_nonce = $3,
+                mfa_setup_pending = FALSE,
+                mfa_setup_authority_tenant_id = NULL,
+                mfa_setup_authority_jti = NULL,
+                mfa_setup_authority_authenticated_at = NULL,
+                mfa_setup_authority_expires_at = NULL,
+                mfa_setup_authority_is_challenge = NULL,
+                updated_at = clock_timestamp()
+            WHERE id = $1
+              AND status = 'active'
+              AND mfa_enabled = FALSE
+              AND mfa_setup_pending = TRUE
+              AND totp_secret_encrypted = $4
+              AND totp_secret_nonce = $5
+              AND mfa_setup_authority_tenant_id = $6
+              AND mfa_setup_authority_jti = $7
+              AND mfa_setup_authority_authenticated_at = $8
+              AND mfa_setup_authority_expires_at = $9
+              AND mfa_setup_authority_is_challenge = $10
+              AND mfa_setup_authority_expires_at > clock_timestamp()
+              AND (tokens_valid_from IS NULL OR tokens_valid_from < $8)
+              AND NOT EXISTS (SELECT 1 FROM revoked_tokens WHERE jti = $7)
+            "#,
+        )
+        .bind(user_id)
+        .bind(backup_encrypted)
+        .bind(backup_nonce)
+        .bind(expected_totp_encrypted)
+        .bind(expected_totp_nonce)
+        .bind(authority.tenant_id)
+        .bind(authority.jti)
+        .bind(authority.authenticated_at)
+        .bind(authority.expires_at)
+        .bind(authority.is_challenge)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let tenant_authority_current = sqlx::query_scalar::<_, Uuid>(
+            "SELECT member.user_id
+             FROM tenants AS tenant
+             JOIN tenant_members AS member ON member.tenant_id = tenant.id
+             WHERE tenant.id = $1 AND member.user_id = $2
+               AND tenant.status = 'active' AND member.status = 'active'
+               AND (tenant.tokens_valid_from IS NULL OR tenant.tokens_valid_from < $3)
+               AND (member.tokens_valid_from IS NULL OR member.tokens_valid_from < $3)
+             FOR SHARE OF tenant, member",
+        )
+        .bind(authority.tenant_id)
+        .bind(user_id)
+        .bind(authority.authenticated_at)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !tenant_authority_current {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if authority.is_challenge {
+            let claimed = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) \
+                 ON CONFLICT (jti) DO NOTHING RETURNING jti",
+            )
+            .bind(authority.jti)
+            .bind(authority.expires_at.timestamp())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            if !claimed {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Disable MFA for a user (clears all MFA fields)
     pub async fn disable_mfa(&self, user_id: Uuid) -> Result<(), UserRepositoryError> {
         let result = sqlx::query(
@@ -980,6 +1424,155 @@ impl UserRepository {
         Ok(())
     }
 
+    /// Atomically claim a single-use MFA challenge and, when a backup code was
+    /// used, rotate the exact encrypted list that was verified. The unique JTI
+    /// insert and backup-code compare-and-swap share one transaction, so only
+    /// one concurrent completion can reach session issuance.
+    pub async fn consume_mfa_challenge(
+        &self,
+        user_id: Uuid,
+        challenge_jti: Uuid,
+        challenge_exp: i64,
+        backup_rotation: Option<BackupCodeRotation<'_>>,
+    ) -> Result<bool, UserRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) \
+             ON CONFLICT (jti) DO NOTHING RETURNING jti",
+        )
+        .bind(challenge_jti)
+        .bind(challenge_exp)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !claimed {
+            return Ok(false);
+        }
+
+        if let Some(rotation) = backup_rotation {
+            let updated = sqlx::query(
+                r#"
+                UPDATE users SET
+                    backup_codes_encrypted = $2,
+                    backup_codes_nonce = $3,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND backup_codes_encrypted = $4
+                  AND backup_codes_nonce = $5
+                "#,
+            )
+            .bind(user_id)
+            .bind(rotation.replacement_encrypted)
+            .bind(rotation.replacement_nonce)
+            .bind(rotation.expected_encrypted)
+            .bind(rotation.expected_nonce)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Ok(false);
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// Shared challenge consumption adds the immutable password-authentication
+    /// fence to the same row/JTI transaction. Logout/reset either commits its
+    /// watermark first and this fails, or commits later and invalidates every
+    /// token/session carrying this older authentication time.
+    pub async fn consume_enterprise_shared_mfa_challenge(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+        challenge_jti: Uuid,
+        challenge_exp: i64,
+        authenticated_at: DateTime<Utc>,
+        backup_rotation: Option<BackupCodeRotation<'_>>,
+    ) -> Result<bool, UserRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 2361))")
+            .bind(challenge_jti)
+            .execute(&mut *transaction)
+            .await?;
+        let current = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM users
+             WHERE id = $1
+               AND status = 'active'
+               AND (tokens_valid_from IS NULL OR tokens_valid_from < $2)
+             FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(authenticated_at)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !current {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let tenant_authority_current = sqlx::query_scalar::<_, Uuid>(
+            "SELECT member.user_id
+             FROM tenants AS tenant
+             JOIN tenant_members AS member ON member.tenant_id = tenant.id
+             WHERE tenant.id = $1 AND member.user_id = $2
+               AND tenant.status = 'active' AND member.status = 'active'
+               AND (tenant.tokens_valid_from IS NULL OR tenant.tokens_valid_from < $3)
+               AND (member.tokens_valid_from IS NULL OR member.tokens_valid_from < $3)
+             FOR SHARE OF tenant, member",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(authenticated_at)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !tenant_authority_current {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) \
+             ON CONFLICT (jti) DO NOTHING RETURNING jti",
+        )
+        .bind(challenge_jti)
+        .bind(challenge_exp)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .is_some();
+        if !claimed {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(rotation) = backup_rotation {
+            let updated = sqlx::query(
+                r#"
+                UPDATE users SET
+                    backup_codes_encrypted = $2,
+                    backup_codes_nonce = $3,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND backup_codes_encrypted = $4
+                  AND backup_codes_nonce = $5
+                "#,
+            )
+            .bind(user_id)
+            .bind(rotation.replacement_encrypted)
+            .bind(rotation.replacement_nonce)
+            .bind(rotation.expected_encrypted)
+            .bind(rotation.expected_nonce)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                transaction.rollback().await?;
+                return Ok(false);
+            }
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     /// Check if MFA is required globally
     pub async fn is_mfa_required_globally(&self) -> Result<bool, UserRepositoryError> {
         let result: Option<(bool,)> =
@@ -1000,5 +1593,55 @@ impl UserRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod password_policy_tests {
+    use super::*;
+    use crate::auth::password::MAX_PASSWORD_BYTES;
+
+    #[test]
+    fn admin_set_password_must_meet_complexity() {
+        // The exact bypass that existed before: a one-character admin-set
+        // password reached bcrypt unvalidated.
+        for weak in ["x", "short", "alllowercase1!", "NoSpecials12345", "NoDigits-Here!"] {
+            assert!(
+                matches!(
+                    reject_noncompliant_password(weak),
+                    Err(UserRepositoryError::PasswordRequirementsNotMet(_))
+                ),
+                "{weak:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_set_password_respects_the_max_byte_cap() {
+        let oversized = format!("Aa1!{}", "x".repeat(MAX_PASSWORD_BYTES));
+        assert!(matches!(
+            reject_noncompliant_password(&oversized),
+            Err(UserRepositoryError::PasswordRequirementsNotMet(_))
+        ));
+    }
+
+    #[test]
+    fn compliant_password_is_accepted() {
+        assert!(reject_noncompliant_password("Strong-Passphrase-2361!").is_ok());
+    }
+
+    /// Guard against a future call site re-introducing the bypass by hashing
+    /// directly. `hash_password` must be invoked exactly once in this module —
+    /// inside `validate_and_hash_password`, after validation.
+    #[test]
+    fn hashing_only_happens_behind_validation() {
+        let source = include_str!("users.rs");
+        // Assembled at runtime so this assertion does not match itself.
+        let needle = format!("{}_password(&pwd)", "hash");
+        let invocations = source.matches(needle.as_str()).count();
+        assert_eq!(
+            invocations, 1,
+            "every password write must go through validate_and_hash_password"
+        );
     }
 }

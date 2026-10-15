@@ -21,13 +21,13 @@ import {
 } from '@/components/ui/select';
 import {
   Search,
-  Loader2,
   ChevronRight,
   ChevronLeft,
   FileCode,
   ArrowDownToLine,
   BookOpen,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { RepositoryRule } from '@/lib/api/rule-repositories';
 import { toast } from 'sonner';
@@ -189,7 +189,7 @@ export function RulePickerPanel({ onLoadRule }: RulePickerPanelProps) {
   if (loadingRepos) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }
@@ -255,7 +255,7 @@ export function RulePickerPanel({ onLoadRule }: RulePickerPanelProps) {
       <div className="space-y-1.5">
         {loadingRules ? (
           <div className="flex items-center justify-center py-8">
-            <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            <LoadingIcon className="w-5 h-5 text-muted-foreground" />
           </div>
         ) : paginatedRules.length === 0 ? (
           <div className="text-center py-8">

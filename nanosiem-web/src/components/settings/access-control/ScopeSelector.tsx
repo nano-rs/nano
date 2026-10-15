@@ -10,6 +10,14 @@
  *
  * The preset definitions themselves live in `./scope-presets` so they can be
  * tested against the real permission catalogue without a DOM (NAN-2226).
+ *
+ * NAN-3611: the custom list renders the WHOLE catalogue. It used to render
+ * `slice(0, 100)` of it with no indication; the catalogue has grown past 100,
+ * so everything alphabetically after `risk:view` (all of `search:*`,
+ * `settings:*`, `users:*`, …) only appeared when filtering, and a key built by
+ * "clicking everything" silently lacked `search:execute`. The list scrolls
+ * (it is a few hundred 32px rows at most), the header shows selected/total,
+ * and "Select all" acts on exactly the rows the current filter shows.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -60,6 +68,19 @@ export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'c
     );
   }, [scopeQuery, permissions]);
 
+  const filteredIds = filteredScopes.map(p => p.id);
+  const allFilteredOn = filteredIds.length > 0 && filteredIds.every(id => customScopes.has(id));
+
+  /** Select (or clear) every scope the current filter shows. */
+  const toggleAllFiltered = () => {
+    const next = new Set(customScopes);
+    for (const id of filteredIds) {
+      if (allFilteredOn) next.delete(id);
+      else next.add(id);
+    }
+    setCustomScopes(next);
+  };
+
   const toggleScope = (id: string) => {
     const next = new Set(customScopes);
     if (next.has(id)) next.delete(id);
@@ -105,10 +126,25 @@ export function ScopeSelector({ permissions, initialScopes, defaultPresetId = 'c
               placeholder="Filter scopes…"
               className="flex-1 bg-transparent outline-none text-[11px] text-foreground placeholder:text-muted-foreground/70"
             />
-            <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">{customScopes.size}</span>
+            <button
+              type="button"
+              onClick={toggleAllFiltered}
+              disabled={filteredIds.length === 0}
+              data-testid="scope-select-all"
+              className="text-[10.5px] text-muted-foreground hover:text-foreground disabled:opacity-50"
+            >
+              {allFilteredOn ? 'Clear' : 'Select all'}{scopeQuery.trim() ? ' shown' : ''}
+            </button>
+            <span
+              data-testid="scope-selected-count"
+              title={`${customScopes.size} of ${permissions.length} scopes selected`}
+              className="font-mono text-[10px] text-muted-foreground/70 tabular-nums"
+            >
+              {customScopes.size}/{permissions.length}
+            </span>
           </div>
           <div className="max-h-[200px] overflow-y-auto scrollbar-thin">
-            {filteredScopes.slice(0, 100).map(p => {
+            {filteredScopes.map(p => {
               const on = customScopes.has(p.id);
               return (
                 <button

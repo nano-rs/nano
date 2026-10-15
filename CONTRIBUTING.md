@@ -27,36 +27,40 @@ Prerequisites:
 - Rust stable (we test on the latest stable; nightly not required)
 - Node 20+ and npm
 - PostgreSQL 18+
-- ClickHouse 24+
+- Docker (the local lake runs in compose)
 - Optional: `cargo-watch`, `sqlx-cli`
 
-> **Note on the local-dev story.** A polished `docker-compose.yml` +
-> `.env.example` for one-command setup is in flight. Until that lands, run
-> Postgres + ClickHouse via whatever local tooling you prefer (Homebrew,
-> the official ClickHouse / Postgres container images directly, etc.) and
-> follow the bare-host path below.
+> **Note on the local-dev story.** Events live in the lake (OCSF 1.9 Parquet,
+> queried by chDB); there is no ClickHouse server. Run the lake services with
+> `COMPOSE_PROFILES=lake docker compose -f docker-compose.opensource.yml up -d`
+> and the Rust services from source with `./scripts/start-microservices-dev.sh --lake`
+> (see `docs/getting-started/open-core-operations.md` §7), or follow the
+> bare-host path below against a local Postgres. The legacy ClickHouse edition
+> lives on branch `legacy/clickhouse`, unsupported.
 
 Bare-host setup:
 
 ```bash
 git clone https://github.com/nano-rs/nano.git
-cd nanosiem
+cd nano
 
-# Run migrations against your local Postgres + ClickHouse
-cargo run --bin clickhouse_migrator
-sqlx migrate run --source migrations/postgres
+# Run migrations against your local Postgres
+cargo run --bin postgres_migrator
 
 # Start services
 cargo run --bin nanosiem-api &       # :3000
 cargo run --bin nanosiem-search &    # :3002
 
+# Privileged cell fixtures (requires delegated mount/cgroup sandbox)
+cargo test -p nanosiem-lake-cell --features sandbox-integration --test isolation --test zero_downtime_roll
+
 # Frontend
-cd nanosiem-web && npm install && npm run dev   # :5173
+cd nanosiem-web && npm ci && VITE_EDITION=open npm run dev   # :5173
 ```
 
 The exact env-var contract is in
-`nanosiem-api/src/config.rs` — at minimum you'll set the Postgres and
-ClickHouse connection strings.
+`nanosiem-api/src/config.rs` — at minimum you'll set the Postgres connection
+string plus `NANO_LOG_QUERY_BACKEND=lake` and `NANO_SCHEMA_PROFILE=ocsf`.
 
 OpenAPI / Swagger is at <http://localhost:3000/swagger-ui>.
 
@@ -73,17 +77,20 @@ OpenAPI / Swagger is at <http://localhost:3000/swagger-ui>.
 
 ```bash
 # Backend
-cargo test --workspace                       # full suite (open build)
+cargo test                                   # default OSS suite
 cargo test --workspace --features enterprise # enterprise build (if you have access)
 cargo test -p nanosiem-api openapi::tests    # OpenAPI spec + contract self-check
+
+# Privileged cell fixtures (requires delegated mount/cgroup sandbox)
+cargo test -p nanosiem-lake-cell --features sandbox-integration --test isolation --test zero_downtime_roll
 
 # Frontend
 cd nanosiem-web
 npm test
-npm run build                                # vite + tsc strict — catches what dev hides
+VITE_EDITION=open npm run build               # vite + tsc strict
 ```
 
-For changes touching ClickHouse schema or VRL parsers, run the relevant
+For changes touching the nPL compiler or VRL parsers, run the relevant
 integration suite (see `tests/`). Generated VRL templates need a
 `vrl::compiler::compile` round-trip in tests — Rust can't see inside string
 literals.
@@ -95,12 +102,12 @@ We expect:
 - **No SOLID violations introduced.** New files should not balloon
   responsibility — pull a service or repository if a handler grows past
   ~200 lines.
-- **No unbounded queries.** ClickHouse code paths must filter on
-  `timestamp` and respect the 100k default row limit.
-- **Parameterized SQL only.** sqlx with compile-time verification on the
-  Rust side; no string-format SQL anywhere.
-- **OpenAPI annotations on every new handler.** See `CLAUDE.md` for the
-  pattern. The `openapi::tests` suite enforces path counts and API contracts.
+- **No unbounded queries.** Log queries must carry a time range and
+  respect the default row limit.
+- **Parameterized SQL only.** Bind every value with sqlx on the Rust
+  side; no string-format SQL anywhere.
+- **OpenAPI annotations on every new handler.** Follow the handler-local
+  `utoipa::path` and `ApiDoc` registration pattern. The `openapi::tests` suite enforces path counts and API contracts.
 
 Before pushing, run `cargo fmt`, `cargo clippy --all-targets --workspace`,
 and `cargo test`. The CI will, but doing it locally is faster than a round

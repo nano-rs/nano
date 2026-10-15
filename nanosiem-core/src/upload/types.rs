@@ -224,7 +224,7 @@ pub struct PreviewResult {
     pub total_rows_estimate: usize,
     /// Number of source lines that failed to parse and were skipped. When
     /// non-zero the preview is partial — surfacing this prevents the
-    /// "looks clean" trap during parser/upload review (NAN-1364).
+    /// "looks clean" trap during parser/upload review.
     #[serde(default)]
     pub rejected_count: usize,
     /// Per-line parse errors for rejected lines, capped at

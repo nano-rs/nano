@@ -188,8 +188,10 @@ impl DemoService {
         let name = display_name
             .clone()
             .unwrap_or_else(|| "Demo User".to_string());
-        // Generate a random password — demo users never log in with credentials
-        let password = generate_demo_token();
+        // Generate a random password — demo users never log in with credentials.
+        // It must still satisfy the authoritative policy, which
+        // `UserRepository::create_user` now enforces for every caller.
+        let password = generate_demo_password();
 
         let user = self
             .user_repo
@@ -236,9 +238,16 @@ impl DemoService {
         // rotate it.  Without this, demo users get logged out when the
         // access token expires (~15 min) because the refresh silently fails.
         let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let session_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
+        let session_expires_at =
+            Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
         self.session_repo
-            .create_session(user.id, &refresh_token_hash, ip_address, user_agent, session_expires_at)
+            .create_session(
+                user.id,
+                &refresh_token_hash,
+                ip_address,
+                user_agent,
+                session_expires_at,
+            )
             .await
             .map_err(|e| DemoError::UserError(format!("session creation failed: {e}")))?;
 
@@ -307,11 +316,15 @@ impl DemoService {
 
         // Clean up any previous auth sessions for this user (re-claims
         // would otherwise stack orphan rows until the 7-day TTL expires)
-        let _ = self.session_repo.delete_user_sessions(session.user_id).await;
+        let _ = self
+            .session_repo
+            .delete_user_sessions(session.user_id)
+            .await;
 
         // Create a session row so the standard refresh_token flow works
         let refresh_token_hash = hash_token(&token_pair.refresh_token);
-        let session_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
+        let session_expires_at =
+            Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
         self.session_repo
             .create_session(
                 session.user_id,
@@ -763,6 +776,18 @@ pub async fn track_demo_resource_standalone(
         .execute(pool)
         .await;
     }
+}
+
+/// Random throwaway password for an ephemeral demo identity.
+///
+/// Demo users never authenticate with a password, but `create_user` validates
+/// every plaintext against `PasswordRequirements::default()`, and a random
+/// alphanumeric token satisfies the uppercase/lowercase/digit classes only by
+/// chance and the special-character class never. The fixed suffix guarantees one
+/// character from each required class; the 32 random characters carry the
+/// entropy.
+fn generate_demo_password() -> String {
+    format!("{}Aa1!", generate_demo_token())
 }
 
 /// Generate a URL-safe random token for demo session links.

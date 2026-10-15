@@ -6,7 +6,7 @@
  * entities the indicator landed on (click to pivot to events).
  */
 
-import { Sparkles, Info, Box, ArrowUpRight } from 'lucide-react';
+import { ShieldAlert, Info, Box, ArrowUpRight } from 'lucide-react';
 import type { RetroIndicator } from '@/lib/api/types';
 import {
   RE_VERDICT,
@@ -48,7 +48,6 @@ export function RetroSummary({
   const pct = total > 0 ? (d.distinct_hosts / total) * 100 : 0;
   const v = d.verdict;
   const vc = RE_VERDICT[v];
-  const maxF = Math.max(1, ...d.matched_fields.map((f) => f[1]));
   const maxE = Math.max(1, ...d.top_entities.map((e) => e.hits));
 
   return (
@@ -73,7 +72,11 @@ export function RetroSummary({
             <div className="flex items-center gap-2 text-[11px] text-fg-3 font-mono flex-wrap">
               {d.source && (
                 <>
-                  <Sparkles className="w-[12px] h-[12px] text-brand" />
+                  {/* ShieldAlert, not Sparkles: this line is threat-intel
+                      attribution ("a feed flagged this indicator"), not an
+                      AI/generated affordance, which is what a sparkle reads as
+                      everywhere else in the product. */}
+                  <ShieldAlert className="w-[12px] h-[12px] text-brand shrink-0" />
                   <span>
                     matched <span className="text-fg-2">{d.source}</span>
                   </span>
@@ -89,23 +92,6 @@ export function RetroSummary({
                 </>
               )}
             </div>
-            {/* matched fields */}
-            {d.matched_fields.length > 0 && (
-              <div className="mt-4 pt-3 border-t border-border">
-                <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-fg-3 font-semibold mb-2">matched fields</div>
-                <div className="flex flex-col gap-1.5">
-                  {d.matched_fields.map(([f, n]) => (
-                    <div key={f} className="grid items-center gap-2" style={{ gridTemplateColumns: '88px 1fr 56px' }}>
-                      <span className="font-mono text-[11px] text-fg-2 truncate">{f}</span>
-                      <div className="h-[7px] rounded-full overflow-hidden bg-fg/6">
-                        <div className="h-full rounded-full" style={{ width: `${(n / maxF) * 100}%`, background: 'var(--color-brand)' }} />
-                      </div>
-                      <span className="font-mono text-[10.5px] text-fg tabular-nums text-right">{reNum(n)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
           </div>
 
           {/* verdict */}
@@ -156,8 +142,26 @@ export function RetroSummary({
         {d.top_entities.length > 0 && (
           <div className="mt-3 rounded-lg border border-border overflow-hidden">
             <div className="px-3 py-2 border-b border-border flex items-center gap-2" style={{ background: 'var(--color-panel)' }}>
-              <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-fg-3 font-semibold">top entities</span>
-              <span className="font-mono text-[10px] text-fg-4 normal-case">where it landed — pivot to investigate</span>
+              {/* NAN-2361: name the cap. The server truncates to 10 by hits, but
+                  the panel rendered a bare "top entities" — so an indicator on
+                  2,000 assets looked like it touched 10, and drilling into the
+                  asset view (which shows all of them) contradicted the panel.
+                  `distinct_hosts` is the true population, so state both. */}
+              <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-fg-3 font-semibold">
+                {/* Count the rows actually RENDERED. `distinct_hosts` counts
+                    hosts, while top_entities can include users and IPs, so
+                    min()-ing the two printed "top 2" above 10 visible rows. */}
+                top {d.top_entities.length}
+                {d.distinct_hosts > d.top_entities.length && (
+                  <span className="text-fg-4"> of {reNum(d.distinct_hosts)}</span>
+                )}{' '}
+                entities
+              </span>
+              <span className="font-mono text-[10px] text-fg-4 normal-case">
+                {d.distinct_hosts > d.top_entities.length
+                  ? 'most hits first — pivot to investigate, or open the asset for the full set'
+                  : 'where it landed — pivot to investigate'}
+              </span>
             </div>
             <div className="divide-y divide-border/60">
               {d.top_entities.map((e, i) => (

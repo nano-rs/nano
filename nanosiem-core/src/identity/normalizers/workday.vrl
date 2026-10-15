@@ -1,0 +1,178 @@
+# Map a pushed nano_enrich/kind=identity Workday RaaS row to user_registry.
+# Workday column names are admin-defined and case-varying, so each target
+# tries a list of candidate top-level keys in order; first non-empty wins.
+# `get(value: ., path: [k])` reads the dynamic top-level key k.
+now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+# external_id (REQUIRED — abort + log if no candidate is present).
+pick_external = ""
+for_each(["Worker_ID","worker_id","Employee_ID","employee_id","WID","wid"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_external == "" && v != "" { pick_external = v }
+}
+external_id = pick_external
+if external_id == "" {
+    log("nano_enrich workday identity record missing external_id; dead-lettering", level: "warn")
+    abort
+}
+
+pick_username = ""
+for_each(["User_Name","user_name","Username","username","UserID","userId"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_username == "" && v != "" { pick_username = v }
+}
+
+# Workday has no UPN; upn = email.
+pick_email = ""
+for_each(["Email","email","Email_Address","email_address","primaryWorkEmail","Work_Email","work_email"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_email == "" && v != "" { pick_email = v }
+}
+
+pick_first = ""
+for_each(["First_Name","first_name","Legal_First_Name","Preferred_First_Name"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_first == "" && v != "" { pick_first = v }
+}
+
+pick_last = ""
+for_each(["Last_Name","last_name","Legal_Last_Name","Preferred_Last_Name"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_last == "" && v != "" { pick_last = v }
+}
+
+# display_name with first+last fallback when no full-name candidate is present.
+pick_display = ""
+for_each(["Legal_Name_Full","Preferred_Name_Full","Display_Name","display_name","Full_Name","full_name","Worker"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_display == "" && v != "" { pick_display = v }
+}
+if pick_display == "" {
+    pick_display = strip_whitespace(pick_first + " " + pick_last)
+}
+
+pick_department = ""
+for_each(["Department","department","Cost_Center","Supervisory_Organization","supervisoryOrganization"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_department == "" && v != "" { pick_department = v }
+}
+
+pick_title = ""
+for_each(["Job_Title","job_title","Business_Title","business_title","Title","title"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_title == "" && v != "" { pick_title = v }
+}
+
+pick_manager_upn = ""
+for_each(["Manager_Email","manager_email","Manager_ID","manager_id"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_manager_upn == "" && v != "" { pick_manager_upn = v }
+}
+
+pick_manager_dn = ""
+for_each(["Manager","manager","Manager_Name","manager_name"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_manager_dn == "" && v != "" { pick_manager_dn = v }
+}
+
+pick_company = ""
+for_each(["Company","company","Organization","organization"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_company == "" && v != "" { pick_company = v }
+}
+
+pick_office = ""
+for_each(["Location","location","Office","office","Work_Location","Building"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_office == "" && v != "" { pick_office = v }
+}
+
+pick_city = ""
+for_each(["City","city","Work_City","work_city","Location_City"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_city == "" && v != "" { pick_city = v }
+}
+
+pick_country = ""
+for_each(["Country","country","Work_Country","work_country","Country_Code"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_country == "" && v != "" { pick_country = v }
+}
+
+pick_phone = ""
+for_each(["Phone","phone","Work_Phone","work_phone","primaryWorkPhone","Mobile"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_phone == "" && v != "" { pick_phone = v }
+}
+
+pick_emp_type = ""
+for_each(["Employee_Type","employee_type","Worker_Type","worker_type","Worker_Sub_Type","Position_Type"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_emp_type == "" && v != "" { pick_emp_type = v }
+}
+if pick_emp_type == "" { pick_emp_type = "employee" }
+
+# employee_id falls back to external_id (employee_id column is never empty).
+pick_emp_id = ""
+for_each(["Employee_ID","employee_id","Badge_ID","badge_id"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if pick_emp_id == "" && v != "" { pick_emp_id = v }
+}
+if pick_emp_id == "" { pick_emp_id = external_id }
+
+# account_enabled: read the first non-empty active-status candidate, lowercase,
+# then enabled(1) when in {1,true,yes,active}. When NO status field is present
+# at all, default to enabled (1) — a row in the report implies an active worker.
+pick_active_raw = ""
+active_field_present = false
+for_each(["Active_Status","active_status","Is_Active","is_active","Status","status","Active","active"]) -> |_i, k| {
+    v = to_string(get(value: ., path: [k]) ?? "") ?? ""
+    if !active_field_present && v != "" {
+        active_field_present = true
+        pick_active_raw = v
+    }
+}
+account_enabled = 1
+if active_field_present {
+    av = downcase(pick_active_raw)
+    account_enabled = if includes(["1", "true", "yes", "active"], av) { 1 } else { 0 }
+}
+account_status = if account_enabled == 0 { "disabled" } else { "active" }
+
+# version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+# otherwise stamp now. last_synced_at is the formatted-string form of version.
+version = to_int(.version) ?? 0
+if version <= 0 { version = now_ms }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+# sync_hash over the raw pushed row (computed before the reshape below).
+sync_hash = sha2(encode_json(.), variant: "SHA-256")
+
+. = {
+    "provider_id": to_string(.provider_id) ?? "",
+    "external_id": external_id,
+    "username": pick_username,
+    "upn": pick_email,
+    "email": pick_email,
+    "display_name": pick_display,
+    "first_name": pick_first,
+    "last_name": pick_last,
+    "department": pick_department,
+    "title": pick_title,
+    "manager_upn": pick_manager_upn,
+    "manager_display_name": pick_manager_dn,
+    "company": pick_company,
+    "office_location": pick_office,
+    "city": pick_city,
+    "country": pick_country,
+    "groups": [],
+    "account_enabled": account_enabled,
+    "account_status": account_status,
+    "mfa_enabled": 0,
+    "phone": pick_phone,
+    "employee_id": pick_emp_id,
+    "employee_type": pick_emp_type,
+    "sync_hash": sync_hash,
+    "last_synced_at": last_synced_at,
+    "version": version
+}

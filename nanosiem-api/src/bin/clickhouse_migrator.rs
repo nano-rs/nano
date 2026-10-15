@@ -243,10 +243,10 @@ async fn run() -> Result<()> {
             config.clickhouse_rawsql_noaudit_password.as_deref(),
         )
         .await
-        .context("ensuring raw-SQL feature users (NAN-2003)")?;
+        .context("ensuring raw-SQL feature users")?;
     if rawsql_users_created > 0 {
         tracing::info!(
-            "NAN-2003: bootstrapped {} raw-SQL feature user(s)",
+            "bootstrapped {} raw-SQL feature user(s)",
             rawsql_users_created
         );
     }
@@ -259,9 +259,9 @@ async fn run() -> Result<()> {
     let policy_count = migrator
         .ensure_rawsql_row_policies()
         .await
-        .context("ensuring raw-SQL audit row policies (NAN-2001)")?;
+        .context("ensuring raw-SQL audit row policies")?;
     tracing::info!(
-        "NAN-2001: ensured raw-SQL audit row policies on {} table(s)",
+        "ensured raw-SQL audit row policies on {} table(s)",
         policy_count
     );
 

@@ -39,7 +39,10 @@ fn stream_safety_lag_secs_defaults_when_env_unset() {
     // Env is process-global; only assert the default when the var is absent so
     // this stays robust under parallel test execution.
     if std::env::var("NANOSIEM_ALERT_STREAM_SAFETY_LAG_SECS").is_err() {
-        assert_eq!(stream_safety_lag_secs(), DEFAULT_ALERT_STREAM_SAFETY_LAG_SECS);
+        assert_eq!(
+            stream_safety_lag_secs(),
+            DEFAULT_ALERT_STREAM_SAFETY_LAG_SECS
+        );
     }
 }
 

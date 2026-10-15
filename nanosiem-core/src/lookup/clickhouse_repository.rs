@@ -126,11 +126,7 @@ impl ClickHouseLookupRepository {
     /// registry primary key, so encoding the key from `columns.first()` would make
     /// rows on a non-first-PK table unretrievable until a merge/backfill rewrote
     /// them — mirror what `insert_backfill_rows` already does.
-    async fn resolve_key_field(
-        &self,
-        table_name: &str,
-        columns: &[LookupColumn],
-    ) -> String {
+    async fn resolve_key_field(&self, table_name: &str, columns: &[LookupColumn]) -> String {
         let fallback = || columns.first().map(|c| c.name.clone()).unwrap_or_default();
         // The online row methods receive the PHYSICAL `table_name`; the registry's
         // `get_table` resolves by logical name, so match on `table_name` via
@@ -213,7 +209,11 @@ impl ClickHouseLookupRepository {
         // Build the optional key filter as an IN list of literals. The values
         // are user-supplied lookup keys; CH string-literal-escape them.
         let key_filter = key_values.map(|vals| {
-            let col = if case_insensitive { "key_lc" } else { "key_raw" };
+            let col = if case_insensitive {
+                "key_lc"
+            } else {
+                "key_raw"
+            };
             let list = vals
                 .iter()
                 .map(|v| {
@@ -290,10 +290,7 @@ impl ClickHouseLookupRepository {
         let mut out = HashMap::new();
         // Reconstruct the key column.
         let key_val = match type_of(key_field) {
-            Some(ty) => Self::coerce_to_type(
-                serde_json::Value::String(live.key_raw.clone()),
-                &ty,
-            ),
+            Some(ty) => Self::coerce_to_type(serde_json::Value::String(live.key_raw.clone()), &ty),
             None => serde_json::Value::String(live.key_raw.clone()),
         };
 
@@ -532,7 +529,7 @@ impl LookupStore for ClickHouseLookupRepository {
         // node, leaving orphaned rows on the others).
         // `on_cluster_clause()` is empty on single-node → byte-identical DDL.
         let sql = format!(
-            "ALTER TABLE nanosiem.lookup_rows{on_cluster} DELETE WHERE lookup_table_name = ?",
+            "ALTER TABLE nanosiem.lookup_rows{on_cluster} DELETE WHERE lookup_table_name = ? SETTINGS mutations_sync = 2",
             on_cluster = on_cluster_clause()
         );
         self.ch
@@ -544,31 +541,27 @@ impl LookupStore for ClickHouseLookupRepository {
     }
 
     #[instrument(skip(self))]
-    async fn truncate_dynamic_table(
-        &self,
-        table_name: &str,
-    ) -> Result<(), LookupRepositoryError> {
+    async fn truncate_dynamic_table(&self, table_name: &str) -> Result<(), LookupRepositoryError> {
         // Same as drop at the data level — remove all rows for this logical table.
         self.drop_dynamic_table(table_name).await
     }
 
-    #[instrument(skip(self, _columns))]
+    #[instrument(skip(self, columns))]
     async fn swap_staged_table(
         &self,
         old_physical: &str,
         staging_physical: &str,
-        _registry_name: &str,
-        _columns: &[LookupColumn],
-        _primary_key: Option<&str>,
-        _row_count: i64,
+        registry_name: &str,
+        columns: &[LookupColumn],
+        primary_key: Option<&str>,
+        row_count: i64,
     ) -> Result<(), LookupRepositoryError> {
         // Version-generation swap. The service has already inserted the new
         // generation under `staging_physical`. Re-key those staged rows to the
         // live name `old_physical` at a fresh swap-version generation, then drop
         // the prior generation (version < swap_version). If the re-key INSERT
         // fails, we skip the DELETE so the old generation stays intact.
-        if !Self::is_valid_identifier(old_physical)
-            || !Self::is_valid_identifier(staging_physical)
+        if !Self::is_valid_identifier(old_physical) || !Self::is_valid_identifier(staging_physical)
         {
             return Err(LookupRepositoryError::InvalidTableName(
                 old_physical.to_string(),
@@ -597,7 +590,7 @@ impl LookupStore for ClickHouseLookupRepository {
         // table, NAN-1728); empty clause on single-node → identical DDL.
         let drop_sql = format!(
             "ALTER TABLE nanosiem.lookup_rows{on_cluster} DELETE \
-             WHERE lookup_table_name = ? AND version < ?",
+             WHERE lookup_table_name = ? AND version < ? SETTINGS mutations_sync = 2",
             on_cluster = on_cluster_clause()
         );
         self.ch
@@ -607,6 +600,10 @@ impl LookupStore for ClickHouseLookupRepository {
             .execute()
             .await
             .map_err(Self::ch_err)?;
+
+        self.registry
+            .publish_replaced_table(registry_name, columns, primary_key, row_count)
+            .await?;
 
         // Clean up the staging generation (best-effort; data is already live).
         let _ = self.drop_dynamic_table(staging_physical).await;
@@ -662,10 +659,7 @@ impl LookupStore for ClickHouseLookupRepository {
             .iter()
             .filter(|row| expected.contains(&row.row_id))
             .count();
-        Ok((
-            existing.len() as i64,
-            record_count.saturating_sub(present),
-        ))
+        Ok((existing.len() as i64, record_count.saturating_sub(present)))
     }
 
     async fn insert_records_idempotent(
@@ -807,7 +801,11 @@ impl LookupStore for ClickHouseLookupRepository {
             .iter()
             .map(|v| {
                 let s = Self::key_to_string(v);
-                if case_insensitive { s.to_lowercase() } else { s }
+                if case_insensitive {
+                    s.to_lowercase()
+                } else {
+                    s
+                }
             })
             .collect();
 
@@ -819,7 +817,11 @@ impl LookupStore for ClickHouseLookupRepository {
                 .get(key_field)
                 .map(|v| {
                     let s = ClickHouseLookupRepository::key_to_string(v);
-                    if case_insensitive { s.to_lowercase() } else { s }
+                    if case_insensitive {
+                        s.to_lowercase()
+                    } else {
+                        s
+                    }
                 })
                 .unwrap_or_default();
             if !pushdown && !wanted.iter().any(|w| *w == cmp_val) {
@@ -993,7 +995,10 @@ mod tests {
             "row_id, key_raw, cols_json",
             Some("key_lc IN ('a', 'b')"),
         );
-        assert!(sql.contains("WHERE d = 0 AND key_lc IN ('a', 'b')"), "{sql}");
+        assert!(
+            sql.contains("WHERE d = 0 AND key_lc IN ('a', 'b')"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1002,7 +1007,10 @@ mod tests {
             "row_id, key_raw, cols_json",
             Some("key_raw IN ('A', 'B')"),
         );
-        assert!(sql.contains("WHERE d = 0 AND key_raw IN ('A', 'B')"), "{sql}");
+        assert!(
+            sql.contains("WHERE d = 0 AND key_raw IN ('A', 'B')"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -1016,8 +1024,7 @@ mod tests {
         rec.insert("host".to_string(), serde_json::json!("WS01"));
         rec.insert("owner".to_string(), serde_json::json!("alice"));
         rec.insert("risk".to_string(), serde_json::json!(7));
-        let (key_raw, cols_json) =
-            ClickHouseLookupRepository::encode_record("host", &cols, &rec);
+        let (key_raw, cols_json) = ClickHouseLookupRepository::encode_record("host", &cols, &rec);
         assert_eq!(key_raw, "WS01");
         // Key field is NOT duplicated into cols_json.
         assert!(!cols_json.contains_key("host"));
@@ -1041,8 +1048,7 @@ mod tests {
         rec.insert("owner".to_string(), serde_json::json!("alice"));
         rec.insert("risk".to_string(), serde_json::json!(7));
         // PK is the SECOND column (`owner`), not the first (`host`).
-        let (key_raw, cols_json) =
-            ClickHouseLookupRepository::encode_record("owner", &cols, &rec);
+        let (key_raw, cols_json) = ClickHouseLookupRepository::encode_record("owner", &cols, &rec);
         // key_raw carries the PK value, and key_lc (derived at insert) lowercases
         // it — this is the value `lookup_batch`'s `key_lc IN (...)` filter probes.
         assert_eq!(key_raw, "alice");

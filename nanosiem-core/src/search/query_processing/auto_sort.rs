@@ -76,7 +76,10 @@ pub fn apply_auto_sort(query: Query) -> (Query, AutoSortDecision) {
             }
         )
     }) else {
-        return (rebuild_pipeline(base, commands), AutoSortDecision::NotApplicable);
+        return (
+            rebuild_pipeline(base, commands),
+            AutoSortDecision::NotApplicable,
+        );
     };
 
     // If anything after the trailing stats re-orders output, leave the user's
@@ -105,7 +108,11 @@ pub fn apply_auto_sort(query: Query) -> (Query, AutoSortDecision) {
     let pick = aggregations
         .iter()
         .find(|a| a.func == AggFunc::Count && a.field.is_none())
-        .or_else(|| aggregations.iter().find(|a| a.func.is_meaningful_for_top_n()));
+        .or_else(|| {
+            aggregations
+                .iter()
+                .find(|a| a.func.is_meaningful_for_top_n())
+        });
 
     let Some(agg) = pick else {
         return (
@@ -138,13 +145,8 @@ pub fn auto_sort_warning(decision: &AutoSortDecision) -> Option<QueryWarningOutp
         AutoSortDecision::Applied { field } => Some(QueryWarningOutput {
             severity: "info".to_string(),
             code: "AUTO_SORT_APPLIED".to_string(),
-            message: format!(
-                "Results sorted by '{}' descending (implicit).",
-                field
-            ),
-            suggestion: Some(
-                "Add an explicit `| sort` clause to control ordering.".to_string(),
-            ),
+            message: format!("Results sorted by '{}' descending (implicit).", field),
+            suggestion: Some("Add an explicit `| sort` clause to control ordering.".to_string()),
             impact: None,
         }),
         AutoSortDecision::SkippedNonNumeric => Some(QueryWarningOutput {

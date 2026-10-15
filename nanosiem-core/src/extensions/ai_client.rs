@@ -239,8 +239,7 @@ pub trait AiClient: Send + Sync {
                     Err(e) => last_err = e,
                 },
                 None => {
-                    last_err =
-                        format!("response was not parseable JSON (got {} chars)", raw.len())
+                    last_err = format!("response was not parseable JSON (got {} chars)", raw.len())
                 }
             }
             // Feed the bad turn + a corrective instruction into the retry.
@@ -446,26 +445,251 @@ impl AiClient for NoopAiClient {
     ) -> Result<Vec<Value>, ExtensionError> {
         // Tag every row as SKIPPED so the frontend can show a "AI unavailable"
         // hint without breaking the table shape.
-        Ok(rows
-            .into_iter()
-            .map(|mut row| {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("ai_verdict".into(), Value::String("SKIPPED".into()));
-                    obj.insert("ai_confidence".into(), Value::Number(0.into()));
-                    obj.insert(
-                        "ai_reasoning".into(),
-                        Value::String("AI unavailable in this build".into()),
-                    );
+        Ok(skipped_rows(rows, "AI unavailable in this build"))
+    }
+}
+
+/// Tag every row `ai_verdict = "SKIPPED"` with `reason` as `ai_reasoning`,
+/// preserving the table shape for the `| ai` pipe.
+pub fn skipped_rows(rows: Vec<Value>, reason: &str) -> Vec<Value> {
+    rows.into_iter()
+        .map(|mut row| {
+            if let Some(obj) = row.as_object_mut() {
+                obj.insert("ai_verdict".into(), Value::String("SKIPPED".into()));
+                obj.insert("ai_confidence".into(), Value::Number(0.into()));
+                obj.insert("ai_reasoning".into(), Value::String(reason.to_string()));
+            }
+            row
+        })
+        .collect()
+}
+
+/// Builds the real AI client; `Err` carries a human-readable reason.
+pub type AiClientFactory = std::sync::Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<std::sync::Arc<dyn AiClient>, String>>
+        + Send
+        + Sync,
+>;
+
+/// AI client for a process whose AI setup failed at boot (NAN-3185).
+///
+/// Before this, a failed boot setup (e.g. `CLOUDFLARE_AI_GATEWAY_URL` missing
+/// from the search deployment) left the open-core [`NoopAiClient`] in place for
+/// the life of the process: every `| ai` row said "AI unavailable in this
+/// build" (reads like an open-core build, hides the real cause) and fixing the
+/// config needed a restart. This client
+///
+/// - tags rows with WHY AI is unavailable (`what: reason`), and
+/// - re-runs the factory on use, at most once per `retry_interval`, so a later
+///   fix (credentials added in Settings, a DB that came back) takes effect
+///   without a restart. Env-var fixes still need a new pod, by nature.
+///
+/// Concurrent callers share one in-flight attempt (the slow path is a mutex).
+pub struct DeferredAiClient {
+    what: &'static str,
+    factory: AiClientFactory,
+    retry_interval: std::time::Duration,
+    ready: tokio::sync::OnceCell<std::sync::Arc<dyn AiClient>>,
+    /// (last failure reason, earliest next attempt)
+    failure: tokio::sync::Mutex<(String, tokio::time::Instant)>,
+}
+
+impl DeferredAiClient {
+    /// `initial_error` is the boot failure; the first retry happens once
+    /// `retry_interval` has elapsed. `what` prefixes the reason shown to users,
+    /// e.g. "AI not configured for search service".
+    pub fn new(
+        what: &'static str,
+        initial_error: String,
+        retry_interval: std::time::Duration,
+        factory: AiClientFactory,
+    ) -> Self {
+        Self {
+            what,
+            factory,
+            retry_interval,
+            ready: tokio::sync::OnceCell::new(),
+            failure: tokio::sync::Mutex::new((
+                initial_error,
+                tokio::time::Instant::now() + retry_interval,
+            )),
+        }
+    }
+
+    /// The real client, or the user-facing reason it is unavailable.
+    async fn client(&self) -> Result<std::sync::Arc<dyn AiClient>, String> {
+        if let Some(client) = self.ready.get() {
+            return Ok(client.clone());
+        }
+        let mut failure = self.failure.lock().await;
+        if let Some(client) = self.ready.get() {
+            return Ok(client.clone());
+        }
+        if tokio::time::Instant::now() >= failure.1 {
+            match (self.factory)().await {
+                Ok(client) => {
+                    tracing::info!(what = self.what, "AI client configured on retry");
+                    let _ = self.ready.set(client.clone());
+                    return Ok(client);
                 }
-                row
-            })
-            .collect())
+                Err(e) => {
+                    tracing::warn!(what = self.what, error = %e, "AI client retry failed");
+                    *failure = (e, tokio::time::Instant::now() + self.retry_interval);
+                }
+            }
+        }
+        Err(format!("{}: {}", self.what, failure.0))
+    }
+}
+
+#[async_trait]
+impl AiClient for DeferredAiClient {
+    fn is_available(&self) -> bool {
+        self.ready.get().is_some_and(|c| c.is_available())
+    }
+
+    async fn complete(
+        &self,
+        messages: Vec<AiMessage>,
+        system_prompt: &str,
+    ) -> Result<String, ExtensionError> {
+        match self.client().await {
+            Ok(client) => client.complete(messages, system_prompt).await,
+            Err(_) => Err(ExtensionError::Unavailable("AI client not configured")),
+        }
+    }
+
+    async fn enrich_rows(
+        &self,
+        rows: Vec<Value>,
+        prompt: &str,
+        max_rows: usize,
+    ) -> Result<Vec<Value>, ExtensionError> {
+        match self.client().await {
+            Ok(client) => client.enrich_rows(rows, prompt, max_rows).await,
+            Err(reason) => Ok(skipped_rows(rows, &reason)),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod deferred {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        /// Marks rows `ai_verdict = "OK"` so tests can tell the real client ran.
+        struct OkClient;
+        #[async_trait]
+        impl AiClient for OkClient {
+            fn is_available(&self) -> bool {
+                true
+            }
+            async fn complete(&self, _: Vec<AiMessage>, _: &str) -> Result<String, ExtensionError> {
+                Ok("done".into())
+            }
+            async fn enrich_rows(
+                &self,
+                rows: Vec<Value>,
+                _: &str,
+                _: usize,
+            ) -> Result<Vec<Value>, ExtensionError> {
+                Ok(rows
+                    .into_iter()
+                    .map(|mut r| {
+                        r["ai_verdict"] = Value::String("OK".into());
+                        r
+                    })
+                    .collect())
+            }
+        }
+
+        /// Factory failing the first `fail_times` calls, then succeeding.
+        fn factory(calls: Arc<AtomicUsize>, fail_times: usize) -> AiClientFactory {
+            Arc::new(move || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n < fail_times {
+                        Err(format!("still broken ({n})"))
+                    } else {
+                        Ok(Arc::new(OkClient) as Arc<dyn AiClient>)
+                    }
+                })
+            })
+        }
+
+        fn rows() -> Vec<Value> {
+            vec![serde_json::json!({"src_ip": "10.0.0.1"})]
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn says_why_and_does_not_retry_inside_the_interval() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let client = DeferredAiClient::new(
+                "AI not configured for search service",
+                "CLOUDFLARE_AI_GATEWAY_URL not set".into(),
+                Duration::from_secs(60),
+                factory(calls.clone(), usize::MAX),
+            );
+            let out = client.enrich_rows(rows(), "p", 10).await.unwrap();
+            assert_eq!(out[0]["ai_verdict"], "SKIPPED");
+            assert_eq!(
+                out[0]["ai_reasoning"],
+                "AI not configured for search service: CLOUDFLARE_AI_GATEWAY_URL not set"
+            );
+            assert_eq!(out[0]["src_ip"], "10.0.0.1");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "no retry before the interval"
+            );
+            assert!(!client.is_available());
+            assert!(matches!(
+                client.complete(vec![], "s").await,
+                Err(ExtensionError::Unavailable(_))
+            ));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn retries_after_the_interval_reports_the_new_reason_then_recovers() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let client = DeferredAiClient::new(
+                "AI not configured for search service",
+                "boot failure".into(),
+                Duration::from_secs(60),
+                factory(calls.clone(), 1),
+            );
+            tokio::time::advance(Duration::from_secs(61)).await;
+            let out = client.enrich_rows(rows(), "p", 10).await.unwrap();
+            assert_eq!(
+                out[0]["ai_reasoning"],
+                "AI not configured for search service: still broken (0)"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            // Inside the next interval: no new attempt.
+            client.enrich_rows(rows(), "p", 10).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            tokio::time::advance(Duration::from_secs(61)).await;
+            let out = client.enrich_rows(rows(), "p", 10).await.unwrap();
+            assert_eq!(out[0]["ai_verdict"], "OK");
+            assert!(client.is_available());
+            assert_eq!(client.complete(vec![], "s").await.unwrap(), "done");
+            // Built once; never rebuilt.
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn noop_client_keeps_its_open_core_message() {
+            let out = NoopAiClient.enrich_rows(rows(), "p", 10).await.unwrap();
+            assert_eq!(out[0]["ai_reasoning"], "AI unavailable in this build");
+        }
+    }
 
     #[tokio::test]
     async fn ai_stream_from_complete_yields_one_chunk() {
@@ -503,7 +727,8 @@ mod tests {
 
     #[test]
     fn extract_json_object_handles_bare_object() {
-        let v = extract_json_object(r#"{"disposition":"false_positive","confidence":0.9}"#).unwrap();
+        let v =
+            extract_json_object(r#"{"disposition":"false_positive","confidence":0.9}"#).unwrap();
         assert_eq!(v["disposition"], "false_positive");
     }
 
@@ -575,7 +800,10 @@ mod tests {
         let schema = serde_json::json!({ "type": "object", "required": ["queries"] });
         let value = serde_json::json!({ "other": 1 });
         let err = validate_structured(&value, &schema).unwrap_err();
-        assert!(err.contains("missing required field 'queries'"), "got: {err}");
+        assert!(
+            err.contains("missing required field 'queries'"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -608,7 +836,10 @@ mod tests {
         // Second element is missing `query`.
         let bad = serde_json::json!({ "queries": [{ "query": "a" }, { "reason": "no query" }] });
         let err = validate_structured(&bad, &schema).unwrap_err();
-        assert!(err.contains("[1]"), "expected the offending index in: {err}");
+        assert!(
+            err.contains("[1]"),
+            "expected the offending index in: {err}"
+        );
         assert!(err.contains("missing required field 'query'"), "got: {err}");
     }
 
@@ -625,9 +856,7 @@ mod tests {
     impl ScriptedClient {
         fn new(responses: Vec<&str>) -> Self {
             Self {
-                responses: std::sync::Mutex::new(
-                    responses.into_iter().map(String::from).collect(),
-                ),
+                responses: std::sync::Mutex::new(responses.into_iter().map(String::from).collect()),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 last_message_count: std::sync::atomic::AtomicUsize::new(0),
             }

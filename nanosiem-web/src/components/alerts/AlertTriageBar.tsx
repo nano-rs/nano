@@ -15,7 +15,8 @@
 // separately as a follow-up.
 
 import { useCallback, useEffect, useState } from 'react';
-import { Check, CircleCheck, UserPlus, Loader2 } from 'lucide-react';
+import { Check, CircleCheck, UserPlus } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
 import type { UserDetail } from '@/lib/api/types';
@@ -195,7 +196,7 @@ export function AlertTriageBar({
             className="h-7 px-2.5 rounded-md border border-border bg-card text-[11.5px] text-foreground hover:bg-foreground/5 inline-flex items-center gap-1.5 disabled:opacity-50"
             title="Acknowledge alert"
           >
-            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+            {busy ? <LoadingIcon className="h-3 w-3" /> : <Check className="h-3 w-3" />}
             Acknowledge
           </button>
         )}

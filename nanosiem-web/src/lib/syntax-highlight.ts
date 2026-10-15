@@ -17,6 +17,9 @@ import {
   IOC_FIELDS_SET,
   COMPUTED_FIELDS_SET,
   FIELD_ALIASES_SET,
+  COMPARISON_OPERATORS_SET,
+  DOTTED_FIELD_PATH_PATTERN,
+  isDottedFieldReference,
 } from './query-tokens';
 
 /** Token types produced by the query tokenizer */
@@ -120,6 +123,16 @@ export function escapeHtml(text: string): string {
     .replace(/>/g, '&gt;');
 }
 
+const isWhitespaceToken = (t: Token) => t.type === 'text' && /^\s*$/.test(t.value);
+
+/** Pipe command of the segment being tokenized (lowercase), or null in the search segment. */
+function currentSegmentCommand(tokens: Token[]): string | null {
+  let i = tokens.length - 1;
+  while (i >= 0 && !(tokens[i].type === 'operator' && tokens[i].value === '|')) i--;
+  const first = tokens.slice(i + 1).find((t) => !isWhitespaceToken(t));
+  return first && first.type === 'function' ? first.value.toLowerCase() : null;
+}
+
 /**
  * Tokenize a query string into an array of tokens.
  * This is the core tokenization logic used by both the HTML and React renderers.
@@ -199,6 +212,25 @@ export function tokenizeQuery(code: string): Token[] {
     if (stringMatch) {
       tokens.push({ type: 'string', value: stringMatch[0] });
       remaining = remaining.slice(stringMatch[0].length);
+      continue;
+    }
+
+    // Dotted field paths (`metadata.log_source`) are ONE token (NAN-3383) —
+    // checked before keywords / UDM names so the head segment isn't split off at
+    // the `.`. Dotted values (`dest_host=evil.com`, a bare `evil.com` term) stay
+    // plain text; IPs start with a digit so never match.
+    const dottedMatch = remaining.match(DOTTED_FIELD_PATH_PATTERN);
+    if (dottedMatch) {
+      const path = dottedMatch[0];
+      const rest = remaining.slice(path.length);
+      const isField = isDottedFieldReference(path, {
+        command: currentSegmentCommand(tokens),
+        afterComparison: !!lastNonWsToken && lastNonWsToken.type === 'operator' && COMPARISON_OPERATORS_SET.has(lastNonWsToken.value),
+        rest,
+        knownFields: udmFieldNames,
+      });
+      tokens.push({ type: isField ? 'udm-field' : 'text', value: path });
+      remaining = rest;
       continue;
     }
 

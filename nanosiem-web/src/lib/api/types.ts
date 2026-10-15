@@ -45,12 +45,59 @@ export type SearchDataset = 'logs' | 'spans' | 'metrics' | 'risk';
 export interface AsyncSearchResponse {
   /** Job ID for polling status */
   job_id: string;
-  /** Initial status (always "running") */
-  status: 'running';
+  /** Initial status. Durable lake jobs enter the shared queue first;
+   * `completed` re-serves an identical settled search's finished job (NAN-3809). */
+  status: 'queued' | 'running' | 'completed';
+  /**
+   * NAN-2361 hosted-shared tenants: the queued export is a tenant export job
+   * (`/api/exports/{kind}/{id}`), not a search job. When present, poll
+   * `status_url` and download from `download_url` instead of the search-job
+   * routes.
+   */
+  task_kind?: string;
+  status_url?: string;
+  download_url?: string;
+}
+
+/** One queued tenant export job (NAN-2361 hosted-shared, `/api/exports/*`). */
+export interface TenantExportJob {
+  job_id: string;
+  kind: 'prevalence' | 'audit';
+  task_kind: string;
+  format: 'csv' | 'json';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'expired';
+  owner_user_id: string;
+  params: Record<string, unknown>;
+  row_limit: number;
+  attempts: number;
+  row_count?: number | null;
+  truncated: boolean;
+  content_type?: string | null;
+  filename?: string | null;
+  artifact_bytes?: number | null;
+  artifact_sha256?: string | null;
+  error?: string | null;
+  created_at: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  expires_at: string;
+  download_url: string;
+  status_url: string;
+}
+
+export interface EnqueueExportRequest {
+  format?: 'csv' | 'json';
+  row_limit?: number;
+  params: Record<string, unknown>;
 }
 
 /** Progress information for a running search job */
 export interface SearchJobProgress {
+  /** Runner phase (e.g. `scanning` once a lean cell attempt is dispatched;
+   * NAN-3883: `retrying_<n>` while it re-sends after a cold-fetch timeout) */
+  phase?: string;
+  /** Attempt number of the running claim */
+  attempt?: number;
   /** Number of rows scanned so far */
   rows_scanned: number;
   /** Estimated total rows to scan */
@@ -59,6 +106,12 @@ export interface SearchJobProgress {
   percent: number;
   /** Time elapsed since job started (milliseconds) */
   elapsed_ms: number;
+  /** NAN-3644: with `phase: 'cold_scan'`, uncached bytes a lean-cell read has fetched */
+  cold_bytes_read?: number;
+  /** NAN-3644: uncached bytes the read's admitted leases will fetch (may grow) */
+  cold_bytes_total?: number;
+  /** NAN-3644: the read waits for the reader's heavy cold-read slot */
+  queued?: boolean;
 }
 
 /** Status of an async search job */
@@ -77,12 +130,30 @@ export interface SearchJobStatus {
   progress?: SearchJobProgress;
   /** Search results (when completed) */
   result?: SearchResponse;
+  /** Paged durable result metadata. Object-store coordinates stay server-side. */
+  durable_result?: { rows: number; pages: number; page_rows: number; has_more?: boolean };
   /** Error message (when failed) */
   error?: string;
   /** Queue position (1-based, when queued) */
   queue_position?: number;
   /** Estimated wait time in seconds (when queued) */
   estimated_wait_seconds?: number;
+  /** Stable product operation for typed durable jobs. */
+  task_kind?: string;
+  /** Original nPL, used to reopen the owning product view from Jobs. */
+  query?: string;
+  /** Immutable query window captured when the job was admitted. */
+  time_range?: TimeRange;
+  /** Dataset captured when the job was admitted. */
+  dataset?: SearchDataset;
+}
+
+export interface SearchJobResultPage {
+  page: number;
+  pages: number;
+  total_rows: number;
+  row_offset: number;
+  rows: Record<string, unknown>[];
 }
 
 /** Summary of a search job for the active searches panel */
@@ -94,6 +165,7 @@ export interface SearchJobSummary {
   elapsed_ms: number;
   queue_position?: number;
   priority: QueryPriority;
+  task_kind?: string;
 }
 
 /** Summary of a search job for the admin view (includes user_id) */
@@ -106,6 +178,7 @@ export interface AdminSearchJobSummary {
   elapsed_ms: number;
   queue_position?: number;
   priority: QueryPriority;
+  task_kind?: string;
 }
 
 /** Admission control statistics */
@@ -133,6 +206,17 @@ export interface SearchAdmissionConfig {
   analytics_max_memory_gb: number;
   realtime_max_execution_time: number;
   realtime_max_memory_gb: number;
+  /** Hosted-shared only: the platform verdict (the page is read-only). */
+  managed_by_platform?: PlatformManagedSetting;
+  /** Hosted-shared only: per-field verdict on whether the shared lake enforces it. */
+  shared_lake_applicability?: Record<string, SharedLakeSettingApplicability>;
+}
+
+/** Whether one search setting is enforced on the shared lake (NAN-3300). */
+export interface SharedLakeSettingApplicability {
+  applies_on_shared_lake: boolean;
+  /** What enforces it, or why the shared lake doesn't use it. */
+  detail: string;
 }
 
 /** Admin-configurable search query safety limits */
@@ -142,28 +226,55 @@ export interface SearchQueryLimitsConfig {
   max_post_processing_groups: number;
   max_streaming_cache_rows: number;
   block_on_cost_errors: boolean;
+  /** Hosted-shared only: the platform verdict (the page is read-only). */
+  managed_by_platform?: PlatformManagedSetting;
+  /** Hosted-shared only: per-field verdict on whether the shared lake enforces it. */
+  shared_lake_applicability?: Record<string, SharedLakeSettingApplicability>;
 }
 
 // ============================================================================
 // Streaming Search SSE Types
 // ============================================================================
 
+/**
+ * Terminal search error. NAN-3644: `COLD_SCAN_TOO_LARGE` (the reader's
+ * cold-read ceiling) carries its byte metadata; a cold read under it is never
+ * refused. `budget_bytes` is the pre-NAN-3644 `COLD_BUDGET_EXCEEDED` field a
+ * search service still mid-roll may send.
+ */
+export interface SearchStreamError {
+  code: string;
+  message: string;
+  reason?: string;
+  needed_bytes?: number;
+  ceiling_bytes?: number;
+  background_ceiling_bytes?: number;
+  budget_bytes?: number;
+  retryable?: boolean;
+}
+
 /** Callbacks for SSE streaming search events */
 export interface SearchStreamCallbacks {
+  onViewUpdate?: (data: { view: string; rows: Record<string, unknown>[]; completed_hops: number; complete: boolean }) => void;
   onQueued?: (data: { queue_position: number; estimated_wait_seconds: number }) => void;
   onStarted?: (data: { job_id: string; query_id: string; is_streaming: boolean }) => void;
   onProgress?: (data: SearchJobProgress) => void;
   onRows?: (data: { rows: Record<string, unknown>[]; batch_index: number; cumulative_count: number }) => void;
+  /** NAN-3264: follow-stream liveness, sent by the server's follow loop when it has sent nothing else for a while. */
+  onHeartbeat?: (data: { delivered: number }) => void;
   onMetadata?: (data: SearchStreamMetadata) => void;
   onCompleted?: (data: { total_rows_delivered: number }) => void;
-  onError?: (data: { code: string; message: string }) => void;
+  onError?: (data: SearchStreamError) => void;
   // NAN-1595: server cache status parsed from the stream response headers.
   onCacheMeta?: (meta: import('./index').CacheMeta) => void;
 }
 
 /** Metadata delivered after all rows (or with single batch for non-streaming queries) */
 export interface SearchStreamMetadata {
+  completeness?: EventCompleteness;
   total_count: number;
+  /** NAN-2550: see `SearchResponse.total_count_exact`. Read as `?? false`. */
+  total_count_exact?: boolean;
   execution_time_ms: number;
   fields: FieldInfo[];
   histogram?: HistogramBucket[];
@@ -184,6 +295,19 @@ export interface RawSqlRequest {
 export interface HistogramBucket {
   time: string;
   count: number;
+}
+
+/** NAN-3093: `POST /api/search/histogram` — a search's timeline on its own. */
+export interface SearchHistogramRequest {
+  query: string;
+  time_range: TimeRange;
+  dataset?: string;
+}
+
+export interface SearchHistogramResponse {
+  histogram: HistogramBucket[];
+  /** The search's exact total, when the timeline proves it. */
+  total_count?: number;
 }
 
 // Query warning from cost analysis (query cost analysis)
@@ -318,6 +442,10 @@ export interface RetroResponse {
   limit?: number;
   has_more?: boolean;
 }
+
+/** Retro summaries may be ready inline; campaign and pivot forms run as a
+ * durable lake job and return the same job handle used by async Search. */
+export type RetroResultResponse = RetroResponse | AsyncSearchResponse;
 
 // ============================================================================
 // OpenTelemetry observability (NAN-1528)
@@ -536,6 +664,8 @@ export interface MetricMonitorRequest {
 
 export interface MetricMonitorListResponse {
   monitors: MetricMonitor[];
+  /** Present on shared-lake tenants (NAN-2361): whether metrics back evaluation. */
+  telemetry?: import('./observability').TelemetryAvailability;
 }
 
 /** Filters for the recent-traces list (GET /api/search/traces, NAN-1534). */
@@ -596,10 +726,49 @@ export interface MetricNamesResponse {
   count?: number;
 }
 
+/** Completeness metadata from a served lake publication. */
+export interface EventCompleteness {
+  status: string;
+  generation?: string;
+  reason?: string | null;
+  events_complete_through_ms?: number | null;
+  /** Display-only worker decision; older workers omit it. */
+  freshness_notice_required?: boolean;
+  unpublished_revisions?: number;
+  oldest_unpublished_age_ms?: number | null;
+  byte_pressure_percent?: number;
+  object_pressure_percent?: number;
+}
+
 export interface SearchResponse {
+  /** Paging is independent of delayed count metadata. */
+  has_more?: boolean;
+  next_offset?: number | null;
+  completeness?: EventCompleteness;
   results: Record<string, unknown>[];
   total_count: number;
+  /**
+   * NAN-2550: whether `total_count` is the exact number of matching rows.
+   *
+   * When false, `total_count` is a PROVEN LOWER BOUND — at least that many rows
+   * match and more may exist. Render it as `N+`, never as a total. A lake page
+   * cannot cheaply produce a search-wide count, so this is the normal shape
+   * there; it used to arrive as a `LAKE_PAGE_BOUND_COUNT` entry in `warnings`,
+   * which the UI rendered as a banner over a perfectly correct page.
+   *
+   * Optional on the wire: a server that predates the field omits it, and callers
+   * must read it as `?? false` ("assume not exact") rather than trusting the
+   * number as a total.
+   */
+  total_count_exact?: boolean;
   execution_time_ms: number;
+  /**
+   * NAN-3008: total server wall time of the request (admission, lake readiness
+   * waits and retries, cold starts, companions, rows query). Shown as the
+   * search time; `execution_time_ms` covers the rows query only. Absent from
+   * older servers.
+   */
+  server_wall_ms?: number;
   fields: FieldInfo[];
   generated_sql?: string;
   histogram?: HistogramBucket[];
@@ -617,6 +786,9 @@ export interface FieldInfo {
   count: number;
   top_values: [string, number][];
   cardinality?: number;  // Total unique values across ALL matching events (from server-side topK)
+  // NAN-3566: counted over a sample of this many newest events (lake), not
+  // the whole window. Absent = exact.
+  sampled_rows?: number;
 }
 
 // Active schema profile's field universe (GET /api/schema/fields). Profile-aware
@@ -633,6 +805,10 @@ export interface SchemaFieldInfo {
 
 export interface SchemaFieldsResponse {
   schema: string;            // active discriminator: "udm" | "ocsf"
+  /** Exact external schema release; omitted for legacy compatibility profiles. */
+  schema_version?: string;
+  /** Exact canonical paths are required; false for the retiring table profiles. */
+  strict_canonical_fields: boolean;
   fields: SchemaFieldInfo[];
 }
 
@@ -682,11 +858,24 @@ export interface FieldValuesResponse {
   may_have_more_values: boolean;
   /** Legacy alias of `covered_event_count`; not a matching-event population. */
   total_count: number;
+  /**
+   * NAN-3093: counted over the newest slice `[sampled_start, sampled_end]` of
+   * a wide window the count rollups cannot answer, not the whole window.
+   */
+  approximate?: boolean;
+  sampled_start?: string;
+  sampled_end?: string;
 }
 
 // ============================================================================
 // Asset Events Pagination Types
 // ============================================================================
+
+/** Stable newest-first continuation key for immutable lake-backed views. */
+export interface ProductViewCursor {
+  time: string;
+  event_uid: string;
+}
 
 /** Facet counts for asset view filtering */
 export interface AssetFacets {
@@ -709,6 +898,8 @@ export interface AssetPagination {
   limit: number;
   /** Whether more events are available */
   has_more: boolean;
+  /** Stable continuation key for the next lake page. */
+  next_cursor?: ProductViewCursor;
   /** Facet counts for filtering UI */
   facets: AssetFacets;
 }
@@ -737,10 +928,14 @@ export interface AssetEventsRequest {
   time_range: TimeRange;
   /** Offset for pagination */
   offset?: number;
+  /** Stable continuation key returned by the previous lake page. */
+  cursor?: ProductViewCursor;
   /** Limit for pagination (default 500) */
   limit?: number;
   /** Optional filters */
   filters?: AssetEventFilters;
+  /** Product-view fetch phase. Lake clients paint the page before exact summary work. */
+  fetch?: 'full' | 'page' | 'summary';
 }
 
 /** Request for fetching true first/last seen timestamps for an asset */
@@ -788,7 +983,36 @@ export interface ArtifactPrevalence {
   is_rare: boolean;
   prevalence_score: number;
   total_occurrences: number;
+  /**
+   * First seen WITHIN the searched window for THIS asset (min event timestamp
+   * over the asset's rows) — NOT an environment-wide first-seen. Novelty
+   * ("new to env") must key off `env_first_seen` instead.
+   */
   first_seen: string;
+  /**
+   * REAL environment-wide first-seen from the prevalence baseline (all-time
+   * min), present only when the baseline knows the artifact. Never substitute
+   * `first_seen` for it — that mislabels long-known artifacts as "new to env".
+   */
+  env_first_seen?: string;
+  /**
+   * NAN-2361: where `host_count` came from. Absent on the ClickHouse/UDM path,
+   * which emits no provenance — treat a real count there as a baseline.
+   */
+  /**
+   * NAN-2361: `global` is emitted by asset mode's unscoped discovery query — a
+   * MEASURED environment-wide count. Omitting it from this union made the
+   * scatter plot fall through to its "unmeasured" branch and render a real
+   * measurement hollow, with a tooltip claiming it was never observed.
+   */
+  prevalence_source?: 'baseline' | 'global' | 'in-window' | 'none';
+  /**
+   * Distinct hosts observed in the queried window. A strict lower bound on
+   * environment prevalence — it cannot see an asset that touched the artifact
+   * before the window opened — so it is shown alongside the baseline, never
+   * as a replacement for it.
+   */
+  in_window_hosts?: number;
 }
 
 /** Response with per-event artifact occurrences and prevalence metadata */
@@ -801,6 +1025,33 @@ export interface AssetArtifactsResponse {
   domain_prevalence: ArtifactPrevalence[];
   /** Rarity threshold from prevalence settings */
   rarity_threshold: number;
+  /**
+   * True number of unique artifacts (hashes + domains) matched before the
+   * per-class 50-artifact summary LIMIT. Absent on older services.
+   */
+  total_artifacts?: number;
+  /**
+   * The summary was capped: at least one class had more than 50 artifacts.
+   * Render counts as "at least N", never as exact.
+   */
+  artifacts_truncated?: boolean;
+  /** NAN-3094: present while a lean summary is still being built. */
+  progress?: ProductViewProgress;
+}
+
+/**
+ * NAN-3094: how far a progressively built lean product view has got. While
+ * `complete` is false the response covers `covered_start..covered_end` so
+ * far; render it and ask again (without the cache bypass) after
+ * `retry_after_ms`.
+ */
+export interface ProductViewProgress {
+  complete: boolean;
+  covered_start?: string;
+  covered_end?: string;
+  retry_after_ms?: number;
+  /** Why the finished view covers less than the requested window. */
+  note?: string;
 }
 
 /** Response for paginated asset events */
@@ -809,6 +1060,8 @@ export interface AssetEventsResponse {
   events: Record<string, unknown>[];
   /** Total count of matching events */
   total_count: number;
+  /** Whether total_count is exact rather than a proven page lower bound. */
+  total_count_exact: boolean;
   /** Facet counts for filtering UI */
   facets: AssetFacets;
   /** Current offset */
@@ -817,6 +1070,12 @@ export interface AssetEventsResponse {
   limit: number;
   /** Whether more events are available */
   has_more: boolean;
+  /** Stable continuation key for the next lake page. */
+  next_cursor?: ProductViewCursor;
+  /** Exact summary work promoted to the shared durable Jobs lane. */
+  durable_job?: AsyncSearchResponse;
+  /** NAN-3094: present while a lean summary is still being built. */
+  progress?: ProductViewProgress;
 }
 
 // ============================================================================
@@ -865,10 +1124,14 @@ export interface CloudEventsRequest {
   time_range: TimeRange;
   /** Offset for pagination */
   offset?: number;
+  /** Stable continuation key returned by the previous lake page. */
+  cursor?: ProductViewCursor;
   /** Limit for pagination (default 200) */
   limit?: number;
   /** Optional filters */
   filters?: CloudEventFilters;
+  /** Product-view fetch phase. Lake clients paint the page before exact summary work. */
+  fetch?: 'full' | 'page' | 'summary';
 }
 
 /** Response for paginated cloud events */
@@ -877,6 +1140,8 @@ export interface CloudEventsResponse {
   events: Record<string, unknown>[];
   /** Total count of matching events */
   total_count: number;
+  /** Whether total_count is exact rather than a proven page lower bound. */
+  total_count_exact: boolean;
   /** Facet counts for filtering UI */
   facets: CloudFacets;
   /** Current offset */
@@ -885,10 +1150,14 @@ export interface CloudEventsResponse {
   limit: number;
   /** Whether more events are available */
   has_more: boolean;
+  /** Stable continuation key for the next lake page. */
+  next_cursor?: ProductViewCursor;
   /** Filtered resources (only present when offset=0 and filters active) */
   resources?: Record<string, unknown>[];
   /** Filtered user activity (only present when offset=0 and filters active) */
   user_activity?: CloudUserActivity[];
+  /** Exact summary work promoted to the shared durable Search Jobs lane. */
+  durable_job?: AsyncSearchResponse;
 }
 
 // ============================================================================
@@ -933,6 +1202,8 @@ export interface CloudUserTimelineResponse {
   events: Record<string, unknown>[];
   /** Session summary with risk indicators */
   summary: CloudUserSessionSummary;
+  /** Durable queue handoff when the exact timeline exceeds the interactive lane. */
+  durable_job?: AsyncSearchResponse;
 }
 
 // ============================================================================
@@ -969,6 +1240,8 @@ export interface CloudEntityPivotResponse {
   cross_references: EntityCrossReference[];
   /** Entity summary */
   entity_summary: Record<string, unknown>;
+  /** Durable queue handoff when the exact pivot exceeds the interactive lane. */
+  durable_job?: AsyncSearchResponse;
 }
 
 /** Pre-aggregated cloud user activity */
@@ -1149,6 +1422,13 @@ export interface CreateDetectionRequest {
   // Server enforces: mode='specific' requires playbook_id; other modes must leave it null.
   playbook_selector_mode?: 'none' | 'specific' | 'adaptive';
   playbook_id?: string | null;
+  // Hosted-shared lake only: the ingest source the rule is bound to. A rule
+  // runs against exactly one source; send `source_slug` (resolved server-side
+  // to that source's newest active route) or an exact route id + revision.
+  // Omitted: a live/alerting rule is bound to the query's unambiguous source.
+  source_slug?: string;
+  source_route_id?: string;
+  source_route_revision?: number;
 }
 
 export type UpdateDetectionRequest = Partial<CreateDetectionRequest>;
@@ -1633,10 +1913,12 @@ export interface DiscoveredSourcetype {
 // Cloud Credential types
 export type CredentialEnvironment = 'prod' | 'staging' | 'dev';
 
+export type CloudCredentialProvider = 'aws_s3' | 'gcp_pubsub' | 'kafka' | 'azure_event_hubs';
+
 export interface CloudCredential {
   id: string;
   name: string;
-  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka';
+  provider: CloudCredentialProvider;
   description?: string;
   region?: string;
   /**
@@ -1657,8 +1939,8 @@ export interface CloudCredential {
 
 export interface CreateCloudCredentialRequest {
   name: string;
-  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka';
-  credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
+  provider: CloudCredentialProvider;
+  credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials | AzureEventHubsCredentials;
   description?: string;
   region?: string;
   environment?: CredentialEnvironment;
@@ -1675,7 +1957,7 @@ export interface UpdateCloudCredentialRequest {
 }
 
 export interface RotateCredentialRequest {
-  credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
+  credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials | AzureEventHubsCredentials;
   note?: string;
 }
 
@@ -1732,6 +2014,20 @@ export interface AwsS3Credentials {
 
 export interface GcpPubSubCredentials {
   credentials_json: string;
+}
+
+/**
+ * NAN-3764: an Event Hubs connection string, or an Entra service principal
+ * (all three fields). `checkpoint_connection_string` is the Blob Storage
+ * connection string for checkpoints (optional with a principal that holds a
+ * Storage Blob role).
+ */
+export interface AzureEventHubsCredentials {
+  connection_string?: string;
+  checkpoint_connection_string?: string;
+  azure_tenant_id?: string;
+  azure_client_id?: string;
+  azure_client_secret?: string;
 }
 
 export interface KafkaCredentials {
@@ -1846,9 +2142,61 @@ export interface EnhancedDeploymentResponse {
 export interface AiAvailability {
   connected: boolean;
   model_available: boolean;
+  /** Hosted-shared only: the tenant's own AI switch (NAN-2361). */
+  tenant_enabled?: boolean;
+  /** Hosted-shared only: whether the tenant plan includes pivt. */
+  plan_includes_ai?: boolean;
+  /**
+   * Hosted-shared only (NAN-2361 wave 8): the platform has an enabled AI
+   * provider with a stored credential, independent of this tenant's plan or
+   * switch. `false` means "the platform has not configured AI yet", which is
+   * a different message from "your plan / switch".
+   */
+  platform_ai_configured?: boolean;
+  model_catalog_last_synced_at?: string | null;
+  model_catalog_last_sync_error?: string | null;
+}
+
+/**
+ * Hosted-shared tenant AI settings (NAN-2361). Provider / model configuration
+ * is platform-managed; a tenant owns only these switches and its guidance.
+ */
+export interface TenantAiSettings {
+  ai_enabled: boolean;
+  allow_log_samples_in_prompts: boolean;
+  allow_external_url_fetch: boolean;
+  organizational_context: OrganizationalContext;
+  updated_by: string | null;
+  updated_at: string | null;
+  provider_managed_by_platform: boolean;
+  /**
+   * NAN-2361 wave 6: the tenant system AI principal — background narration
+   * (shadow investigation), recon narration and summaries. Kill switch and
+   * caps; `ai_enabled = false` stops it too.
+   */
+  background_ai_enabled: boolean;
+  /** Credit-equivalents per UTC day; 0 turns background AI off. */
+  background_ai_daily_credit_cap: number;
+  background_ai_max_calls_per_run: number;
+  /** NAN-3191: AI cost/quality tier (`/api/melod/settings/ai-tier` changes it). */
+  ai_tier?: 'standard' | 'economy';
+  /** NAN-3219: tenant-wide AI tuning mode (`/api/melod/settings/ai-tuning` changes it). */
+  ai_tuning_mode?: 'on' | 'manual' | 'off';
+}
+
+export interface UpdateTenantAiSettingsRequest {
+  ai_enabled?: boolean;
+  allow_log_samples_in_prompts?: boolean;
+  allow_external_url_fetch?: boolean;
+  organizational_context?: OrganizationalContext;
+  background_ai_enabled?: boolean;
+  background_ai_daily_credit_cap?: number;
+  background_ai_max_calls_per_run?: number;
 }
 
 export interface ProviderCredentials {
+  model_catalog_last_synced_at?: string | null;
+  model_catalog_last_sync_error?: string | null;
   provider: string;
   display_name: string;
   enabled: boolean;
@@ -2000,6 +2348,19 @@ export interface ClickHouseStorageStats {
   ttl_days: number | null;
 }
 
+export interface LakeStorageStats {
+  total_size_bytes: number;
+  total_size_pretty: string;
+  row_count: number;
+  object_count: number;
+  index_size_bytes: number;
+  index_size_pretty: string;
+  index_overhead_percent: number;
+  file_format: string;
+  table_format: string;
+  manifest_modified_at: string | null;
+}
+
 export interface DiskPressureStatus {
   usage_fraction: number;
   total_bytes: number;
@@ -2016,10 +2377,50 @@ export interface DiskPressureStatus {
 }
 
 export interface StorageOverview {
+  log_backend: 'clickhouse' | 'iceberg' | 'lake';
   clickhouse_enabled: boolean;
   postgres: StorageStats | null;
   clickhouse: ClickHouseStorageStats | null;
+  lake: LakeStorageStats | null;
   disk_pressure: DiskPressureStatus | null;
+  /**
+   * Hosted-shared tenants (NAN-2361): what the lake has recorded for the
+   * tenant (R2 writer completion receipts, written to date) and the plan
+   * retention; absent on dedicated deployments.
+   */
+  tenant_lake?: TenantLakeStorageFacts | null;
+  retention?: TenantRetention;
+  managed_by_platform?: PlatformManagedSetting;
+}
+
+export interface TenantLakeWriterClassFacts {
+  writer_class: string;
+  objects: number;
+  bytes: number;
+  first_written_at: string | null;
+  last_written_at: string | null;
+}
+
+export interface TenantLakeStorageFacts {
+  objects: number;
+  bytes: number;
+  first_written_at: string | null;
+  last_written_at: string | null;
+  /** Hot-tail and primary Iceberg data objects only (the ingest path). */
+  ingest_objects: number;
+  ingest_bytes: number;
+  writer_classes: TenantLakeWriterClassFacts[];
+}
+
+/** Plan-derived retention for a hosted-shared tenant (`GET /api/settings/retention`). */
+export interface TenantRetention {
+  enabled: boolean;
+  retention_days: number;
+  job_id: number | null;
+  /** Oldest event time the plan retains (irreversible floor). */
+  retained_from: string;
+  plan_code: string;
+  managed_by_platform: PlatformManagedSetting;
 }
 
 export interface UpdateClickHouseRetentionRequest {
@@ -2106,6 +2507,11 @@ export interface EntityRiskSummary {
   last_rule_name?: string;
   last_severity?: string;
   risk_level: RiskLevel;
+  /** NAN-3228: unweighted score when a watchlist weight applies; `risk_score`
+   * is then the effective score `base × (1 + watch_weight)`. */
+  base_risk_score?: number;
+  /** NAN-3228: applied watchlist weight (max of the entity's enabled lists). */
+  watch_weight?: number;
 }
 
 export interface RiskAnalyticsOverview {
@@ -2129,9 +2535,24 @@ export interface RiskOverviewResponse {
   entity_types: EntityTypeCount[];
 }
 
+/** NAN-2361: typed "is this computed / provisioned for this tenant?" verdict
+ * carried by hosted-shared answers (risk, prevalence, identity directory,
+ * enrichment execution). Absent on dedicated deployments. */
+export interface TenantCapabilityAvailability {
+  capability: string;
+  available: boolean;
+  reason?: string | null;
+  detail?: string | null;
+}
+
 export interface RiskEntitiesResponse {
   entities: EntityRiskSummary[];
+  /** Rows in this page, not a universe count when has_more is true. */
   total: number;
+  has_more: boolean;
+  total_exact: boolean;
+  /** Hosted-shared only: `available: false` means risk is not computed for this tenant yet. */
+  availability?: TenantCapabilityAvailability;
 }
 
 export interface ClearEntityRiskRequest {
@@ -2149,6 +2570,7 @@ export interface RiskEntitiesQuery {
   window?: '24h' | '7d' | 'all';
   entity_type?: string;
   min_score?: number;
+  max_score?: number;
   limit?: number;
   offset?: number;
 }
@@ -2223,6 +2645,55 @@ export interface EntityRuleContribution {
   decayed_contribution_7d: number;
   last_fire_at: string;
   last_fire_score: number;
+  /** MITRE ATT&CK tactics of the contributing rule (NAN-3225). IDs
+   * (`TA0006`), slugs (`credential-access`) or labels, as the rule stores
+   * them. Absent from servers that predate the field. */
+  mitre_tactics?: string[];
+  /** MITRE ATT&CK technique IDs of the contributing rule (NAN-3225). */
+  mitre_techniques?: string[];
+}
+
+/** One point of an entity's decay-weighted 7d risk score (NAN-3225). */
+export interface EntityRiskTimelinePoint {
+  /** Evaluation instant (ISO). */
+  t: string;
+  /** The entity's decayed 7d score at `t` — same decay curve as the headline. */
+  score: number;
+}
+
+/** Fires of one rule inside one hour bucket of the timeline (NAN-3225). */
+export interface EntityRiskTimelineMarker {
+  /** Bucket start (ISO); the bucket spans `step_seconds`. */
+  t: string;
+  /** Latest fire inside the bucket (ISO). */
+  last_fire_at: string;
+  rule_id: string;
+  rule_name: string;
+  severity: string;
+  fires: number;
+  /** Undecayed per-fire score sum inside the bucket. */
+  score: number;
+  /** Tactics stamped on the findings when they fired. */
+  mitre_tactics: string[];
+}
+
+/** `GET /api/entities/{type}/{value}/risk-timeline` (NAN-3225). Only
+ * findings the caller's source scope admits contribute. */
+export interface EntityRiskTimelineResponse {
+  entity: string;
+  entity_type: string;
+  /** Series end (ISO): now, or the requested `at` (e.g. a notable's time). */
+  anchor: string;
+  step_seconds: number;
+  window_hours: number;
+  points: EntityRiskTimelinePoint[];
+  markers: EntityRiskTimelineMarker[];
+  /** Per-rule contributions AT `anchor` — equals `rule_contributions` when
+   * anchored at now; the breakdown "at notable time" otherwise. */
+  contributions: EntityRuleContribution[];
+  /** True when the bucket read hit its row cap; the oldest buckets dropped. */
+  truncated: boolean;
+  availability?: TenantCapabilityAvailability;
 }
 
 export interface EntityContextResponse {
@@ -2330,6 +2801,8 @@ export interface HistoricalAnalysisResult {
   total_matches: number;
   days_analyzed: number;
   daily_average: number;
+  /** NAN-3240: set when the replay was narrowed or skipped (search budget). */
+  note?: string;
 }
 
 // Tuning suggestion
@@ -2415,6 +2888,14 @@ export interface CorrectQueryResponse {
    * "unverified" (NAN-1496).
    */
   validated: boolean;
+  /** Tenant-bound job identity (enterprise-shared only). */
+  job_id?: string;
+  /** Server-authenticated tenant attested by the assigned Search worker. */
+  tenant_id?: string;
+  /** Immutable Search worker identity attested for this response. */
+  worker_identity?: string;
+  /** Active Search assignment revision attested for this response. */
+  worker_assignment_revision?: number;
 }
 
 /** Request to review a successful query for best practices */
@@ -2547,7 +3028,7 @@ export interface SystemOverview {
 }
 
 export interface SystemConfig {
-  deployment_mode: "managed" | "self-hosted";
+  deployment_mode: "managed" | "enterprise_shared" | "self-hosted";
   settings_editable: boolean;
   api_keys_editable: boolean;
   ai_providers_editable: boolean;
@@ -2631,6 +3112,7 @@ export interface UploadConfig {
   mode?: 'replace' | 'append';
   csv_delimiter?: string;
   csv_has_headers?: boolean;
+  has_header?: boolean;
 }
 
 export interface UploadResponse {
@@ -2761,6 +3243,7 @@ export interface CreateLookupTableConfig {
   format?: FileFormat;
   csv_delimiter?: string;
   csv_has_headers?: boolean;
+  has_header?: boolean;
   mode?: 'replace' | 'append';
   column_types?: { column: string; data_type: string }[];
   flatten_json?: boolean;
@@ -3109,6 +3592,7 @@ export interface ParserConfig {
   format: FileFormat;
   csv_delimiter?: string;
   csv_has_headers?: boolean;
+  has_header?: boolean | null;
   custom_headers?: string[];
   encoding?: string;
   max_records?: number;
@@ -3261,6 +3745,11 @@ export interface CurrentUser {
   roles: string[];
   permissions: string[];
   is_api_key?: boolean;
+  deployment_mode: 'managed' | 'enterprise_shared' | 'self-hosted' | 'demo';
+  active_tenant?: {
+    id: string;
+    slug: string;
+  };
 }
 
 export interface OidcProviderInfo {
@@ -3394,6 +3883,186 @@ export interface UpdateUserRequest {
   group_ids?: string[];
 }
 
+// ---------------------------------------------------------------------------
+// Hosted-shared tenant IAM (NAN-2361). A tenant "user" is a membership: roles
+// are assigned to it directly (no groups) and a new member is invited, not
+// created with a password.
+// ---------------------------------------------------------------------------
+
+export interface SharedTenantMemberRole {
+  id: string;
+  name: string;
+}
+
+/** `UserDetail` plus the membership fields the shared API adds. */
+export interface SharedTenantMember extends UserDetail {
+  membership_id: string;
+  membership_status: 'active' | 'suspended';
+  roles: SharedTenantMemberRole[];
+  mfa_enabled: boolean;
+  invitation_state?: 'pending' | 'consumed' | 'revoked' | 'expired' | null;
+  invitation_expires_at?: string | null;
+}
+
+export interface SharedTenantInviteRequest {
+  email: string;
+  name: string;
+  /** `role_…` typeid of one platform system role; defaults to ReadOnly. */
+  role_id?: string;
+}
+
+export interface SharedTenantInvitation {
+  invitation_id: string;
+  expires_at: string;
+  /** Path relative to the tenant origin: `/t/<slug>/auth/shared/activate#<token>` (bare `/auth/shared/activate#…` on older servers). */
+  activation_path: string;
+  activation_token: string;
+}
+
+/**
+ * NAN-2361 wave 5: inviting an EXISTING identity records a membership
+ * invitation the identity accepts from a signed-in session (console) or via
+ * the emailed link. The platform has no e-mail transport: the subject / body
+ * are ready-to-send copy the admin forwards.
+ */
+export interface SharedTenantMembershipInvitation {
+  invitation_id: string;
+  expires_at: string;
+  /** Path relative to the tenant origin: `/auth/shared/memberships/accept#<token>`. */
+  acceptance_path: string;
+  acceptance_token: string;
+  email_subject: string;
+  email_body: string;
+}
+
+export interface SharedTenantInviteResponse extends SharedTenantMember {
+  /** For an existing identity, `activation_path` is the ACCEPTANCE link. */
+  invitation: SharedTenantInvitation;
+  invitation_kind: 'activation' | 'acceptance';
+  membership_invitation?: SharedTenantMembershipInvitation;
+}
+
+export interface SharedTenantUpdateMemberRequest {
+  role_ids?: string[];
+  group_ids?: string[];
+  status?: 'active' | 'disabled';
+}
+
+/** An existing-identity invitation as the tenant admin lists it. */
+export interface SharedTenantMembershipInvitationSummary {
+  id: string;
+  user_id: string;
+  email: string;
+  name: string;
+  role_id: string;
+  role_name: string;
+  state: 'pending' | 'accepted' | 'revoked' | 'expired';
+  invited_by: string;
+  invited_by_name?: string | null;
+  issued_at: string;
+  expires_at: string;
+  accepted_at?: string | null;
+}
+
+export interface SharedTenantMembershipInvitationListResponse {
+  invitations: SharedTenantMembershipInvitationSummary[];
+  total: number;
+}
+
+/** A pending invitation addressed to the signed-in identity by another tenant. */
+export interface MySharedTenantInvitation {
+  id: string;
+  tenant_id: string;
+  tenant_slug: string;
+  tenant_display_name: string;
+  role_name: string;
+  invited_by_name?: string | null;
+  issued_at: string;
+  expires_at: string;
+}
+
+export interface MySharedTenantInvitationListResponse {
+  invitations: MySharedTenantInvitation[];
+}
+
+export interface AcceptMySharedTenantInvitationResponse {
+  target_tenant_id: string;
+  target_tenant_slug: string;
+  target_membership_id: string;
+  idempotent_replay: boolean;
+  target_login_path: string;
+}
+
+/** Legacy typed verdict kept for older shared list responses (no longer emitted in wave 5). */
+export interface SharedTenantIamVerdict {
+  managed_by: 'platform';
+  reason: 'roles_managed_by_platform' | 'groups_not_a_tenant_concept';
+  detail: string;
+}
+
+/**
+ * NAN-2361 wave 5: hosted-shared OIDC provider administration (step-up
+ * admin API: fresh MFA within five minutes, exact Origin, idempotency key,
+ * revision ledger). camelCase on the wire, unlike the dedicated settings API.
+ */
+export interface SharedOidcAdminProvider {
+  id: string;
+  name: string;
+  slug: string;
+  issuer: string;
+  clientId: string;
+  scopes: string[];
+  groupClaim?: string | null;
+  enabled: boolean;
+  revision: number;
+  secretRevision: number;
+  discoveryValidated: boolean;
+}
+
+export interface SharedOidcAdminProviderList {
+  providers: SharedOidcAdminProvider[];
+}
+
+export interface SharedOidcAdminMutationResponse {
+  provider: SharedOidcAdminProvider;
+  idempotentReplay: boolean;
+}
+
+export interface SharedOidcAdminCreateRequest {
+  idempotency_key: string;
+  name: string;
+  slug: string;
+  issuer: string;
+  client_id: string;
+  client_secret: string;
+  scopes: string[];
+  group_claim?: string | null;
+}
+
+export interface SharedOidcAdminUpdateRequest {
+  idempotency_key: string;
+  name: string;
+  issuer: string;
+  client_id: string;
+  scopes: string[];
+  group_claim?: string | null;
+}
+
+/** Error body of the step-up admin API (`oidc_provider_admin_denied` = stale MFA / not fresh). */
+export interface SharedOidcAdminApiError {
+  error: string;
+  message: string;
+}
+
+/** Typed "managed by the platform" verdict carried by shared settings responses. */
+export interface PlatformManagedSetting {
+  managed_by: 'platform';
+  reason: 'managed_by_platform';
+  setting: string;
+  detail: string;
+  plan_code?: string;
+}
+
 // Group Management Types
 export interface GroupSummary {
   id: string;
@@ -3441,6 +4110,10 @@ export interface RoleDetail {
   name: string;
   description?: string;
   is_system: boolean;
+  /** Hosted-shared tenants: `true` for a role this tenant created (NAN-2361 wave 5). */
+  tenant_owned?: boolean;
+  /** Hosted-shared tenants: members holding the role. */
+  member_count?: number;
   permissions: string[];
   created_at: string;
   updated_at: string;
@@ -3482,6 +4155,17 @@ export interface ApiKeySummary {
   rate_limit?: number;
   last_used_at?: string;
   created_at: string;
+  /**
+   * Hosted-shared tenants only (NAN-2361, mapped by
+   * `lib/shared-automation-keys.ts`): lifecycle status. Revoke is terminal
+   * there — `enabled` is derived as `status !== 'revoked'` and there is no
+   * enable / disable. Absent on a dedicated deployment.
+   */
+  status?: 'active' | 'revoked' | 'expired';
+  /** Hosted-shared only: when the key was revoked. */
+  revoked_at?: string;
+  /** Hosted-shared only: bumps on every rotate. */
+  key_revision?: number;
 }
 
 export interface ApiKeyListResponse {
@@ -3588,12 +4272,14 @@ export interface AuditLogQuery {
 // Prevalence Tracking Types
 // ============================================================================
 
-export type PrevalenceArtifactType = 'hash_md5' | 'hash_sha256' | 'hash_unknown' | 'domain' | 'subdomain' | 'ip_address' | 'ip_address_private';
+export type PrevalenceArtifactType = 'hash_md5' | 'hash_sha256' | 'hash_unknown' | 'domain' | 'subdomain' | 'ip_address' | 'ip_address_private' | 'identity';
 
 export interface PrevalenceData {
   artifact: string;
   artifact_type: PrevalenceArtifactType;
   host_count: number;
+  /** True when host_count is a lower bound from a bounded snapshot set. */
+  host_count_saturated?: boolean;
   total_occurrences: number;
   first_seen: string;
   last_seen: string;
@@ -3620,6 +4306,10 @@ export interface RareArtifactsQuery {
   type?: string;
   limit?: number;
   offset?: number;
+  /** Lean tenants (NAN-3088): page this rare-list job's result. */
+  job_id?: string;
+  /** Lean tenants: queue a fresh computation instead of reusing one. */
+  refresh?: boolean;
 }
 
 export interface NewArtifactsQuery {
@@ -3635,6 +4325,21 @@ export interface ArtifactListResponse {
   limit: number;
   offset: number;
   has_more: boolean;
+  availability?: {
+    capability: string;
+    available: boolean;
+    reason?: string | null;
+    detail?: string | null;
+  };
+  /** Lean tenants (NAN-3088): the durable job the list is read from. A
+   * `job_status` other than `completed` means the page is empty and still
+   * computing; poll `/api/search/jobs/{job_id}`, then ask again with `job_id`. */
+  job_id?: string;
+  job_status?: SearchJobStatusValue;
+  /** The rare set hit the export row cap; `total` is a floor. */
+  truncated?: boolean;
+  computed_at?: string;
+  rarity_threshold?: number;
 }
 
 export interface ScatterPlotRequest {
@@ -3650,6 +4355,8 @@ export interface PrevalenceScatterPoint {
   artifact: string;
   artifact_type: PrevalenceArtifactType;
   host_count: number;
+  /** True when host_count is a lower bound from a bounded snapshot set. */
+  host_count_saturated?: boolean;
   first_seen: string;
   last_seen: string;
   total_occurrences: number;
@@ -3680,6 +4387,8 @@ export interface ArtifactExplorerItem {
   artifact: string;
   artifact_type: PrevalenceArtifactType;
   host_count: number;
+  /** True when host_count is a lower bound from a bounded snapshot set. */
+  host_count_saturated?: boolean;
   total_occurrences: number;
   first_seen: string;
   last_seen: string;
@@ -3723,6 +4432,8 @@ export interface ArtifactExplorerResponse {
   limit: number;
   offset: number;
   has_more: boolean;
+  /** Stable continuation for the next page of this immutable snapshot. */
+  next_cursor?: PrevalenceExplorerCursor;
   rarity_threshold: number;
   rare_count: number;
   new_count: number;
@@ -3730,6 +4441,14 @@ export interface ArtifactExplorerResponse {
   /** When true, the headline counts are floors over a capped fetch buffer
    * (real values are higher) and should render as `N+`, not exact totals. */
   counts_approximate?: boolean;
+  /** Hosted-shared only: `available: false` means no prevalence snapshot is computed for this tenant yet. */
+  availability?: TenantCapabilityAvailability;
+}
+
+export interface PrevalenceExplorerCursor {
+  last_seen: string;
+  kind: string;
+  artifact: string;
 }
 
 export interface ArtifactHostEntry {
@@ -3796,6 +4515,27 @@ export interface ArtifactDetailResponse {
   geo?: ArtifactGeoEntry[];
   /** NAN-849: threat-intel verdicts from configured enrichment sources. */
   threat_intel?: ArtifactThreatIntelEntry[];
+  /** NAN-3210: enterprise-shared (lean) tenants report warming / read failures here. */
+  availability?: TenantCapabilityAvailability;
+  /**
+   * NAN-3766: the time range the facet counts cover. Absent = the whole
+   * window, exactly. A common artifact at volume is counted newest-first
+   * within a fixed budget and may cover only the newest part of the window.
+   */
+  coverage?: ArtifactDetailCoverage;
+}
+
+export interface ArtifactDetailCoverage {
+  /** Every event in the window was counted. */
+  complete: boolean;
+  /** Some facet counts can be lower bounds (too many distinct values). */
+  approximate: boolean;
+  /** A wider answer is still being built; poll again. */
+  refining: boolean;
+  scanned_start: string;
+  scanned_end: string;
+  window_start: string;
+  window_end: string;
 }
 
 export interface ArtifactExplorerQuery {
@@ -3805,6 +4545,9 @@ export interface ArtifactExplorerQuery {
   search?: string;
   limit?: number;
   offset?: number;
+  cursor_last_seen?: string;
+  cursor_kind?: string;
+  cursor_artifact?: string;
 }
 
 // Health Monitoring Settings
@@ -3815,6 +4558,16 @@ export interface HealthMonitoringSettings {
   feed_monitoring_enabled: boolean;
   /** Legacy field for backwards compatibility */
   enabled: boolean;
+  /** Hosted-shared only (NAN-2361): tenant SIEM-health report thresholds. */
+  feed_silence_hours?: number;
+  ingest_drop_percent?: number;
+  execution_lag_hours?: number;
+  stale_rule_days?: number;
+  untriaged_alert_hours?: number;
+  /** Hosted-shared only (NAN-2361 wave 8): scheduled SIEM-health report cadence. */
+  scheduled_reports_enabled?: boolean;
+  report_interval_hours?: number;
+  report_retention_days?: number;
 }
 
 export interface UpdateHealthMonitoringSettingsRequest {
@@ -3824,6 +4577,16 @@ export interface UpdateHealthMonitoringSettingsRequest {
   ai_monitoring_enabled?: boolean;
   /** Feed staleness monitoring (free) */
   feed_monitoring_enabled?: boolean;
+  /** Hosted-shared only (NAN-2361): tenant SIEM-health report thresholds. */
+  feed_silence_hours?: number;
+  ingest_drop_percent?: number;
+  execution_lag_hours?: number;
+  stale_rule_days?: number;
+  untriaged_alert_hours?: number;
+  /** Hosted-shared only (NAN-2361 wave 8): scheduled SIEM-health report cadence. */
+  scheduled_reports_enabled?: boolean;
+  report_interval_hours?: number;
+  report_retention_days?: number;
 }
 
 export interface UpdatePrevalenceSettingsRequest {
@@ -5018,6 +5781,24 @@ export interface ReorderTabsRequest {
 // Log Sources
 // ============================================================================
 
+/** NAN-3653: one configured delivery feeding a log source's lane. */
+export interface LogSourceDelivery {
+  /** `pull` (cloud pull source) or `connector` (hosted connector feed). */
+  kind: 'pull' | 'connector' | string;
+  /** Pull provider (`aws_s3_sqs`, `gcp_pubsub`, ...) or connector slug (`google_workspace`, ...). */
+  provider: string;
+  label: string;
+  id: string;
+  name: string;
+}
+
+/** NAN-3653: how the customer connected a platform-delivered log source. */
+export interface LogSourceOrigin {
+  /** Distinct delivery labels joined with " + ", e.g. "AWS S3 (SQS)", "Google Workspace". */
+  label: string;
+  deliveries: LogSourceDelivery[];
+}
+
 export interface LogSource {
   id: string;
   name: string;
@@ -5039,6 +5820,13 @@ export interface LogSource {
    * endpoints that join source_configurations.
    */
   dispatch_source_config_type?: string | null;
+  /**
+   * NAN-3653 (hosted-shared): how the customer connected a source the platform
+   * delivers (cloud pull source or hosted connector feed). Those deliveries
+   * reach the tenant over an internal transport, so the UI shows this label
+   * instead of `source_type`. Absent for push-only sources.
+   */
+  origin?: LogSourceOrigin | null;
   parser_vrl: string;
   output_fields?: Record<string, unknown>;
   category?: string;
@@ -5076,6 +5864,14 @@ export interface LogSource {
   source_parser_linked: boolean;
   created_at: string;
   updated_at: string;
+  /**
+   * NAN-2361 hosted-shared tenants only: the tenant's declared volume/tags
+   * and the 24h lake-admitted ingestion summary for this entry. Absent on
+   * dedicated deployments.
+   */
+  expected_eps?: number | null;
+  tags?: string[];
+  ingest?: LogSourceIngestSummary | null;
 }
 
 export interface NewLogSource {
@@ -5179,6 +5975,26 @@ export interface LogSourceHealth {
   collector_errors_24h: number;
   /** A likely cause, when the error signature points at one. Often null. */
   collector_error_hint: string | null;
+  /**
+   * NAN-3680: rows the lake refused at strict OCSF admission (24 h). Absent or
+   * null when the deployment does not record refusals per source (unknown, not zero).
+   */
+  refused_events_24h?: number | null;
+  /** NAN-3680: the newest refusal, value-free. */
+  last_refusal?: LogSourceRefusalSample | null;
+  /**
+   * NAN-3765: why this enabled source is not in the deployed Vector config
+   * (e.g. waiting for its source configuration to be deployed). Null when it is.
+   */
+  pending_reason?: string | null;
+}
+
+/** NAN-3680: why the lake refused rows of a source: a reason code and the OCSF attribute path, never a row value. */
+export interface LogSourceRefusalSample {
+  /** e.g. `ocsf_constraint_failed`, `time_invalid`. */
+  reason: string;
+  /** e.g. `device`; absent when the refusal names no attribute. */
+  field?: string | null;
 }
 
 /** One collector failure, as reported by the collector itself (NAN-2196). */
@@ -5196,10 +6012,603 @@ export interface CollectorError {
   component_type: string;
 }
 
+/**
+ * NAN-2361 hosted-shared tenants: the typed "managed by the platform" /
+ * "no ingestion observed" / "issuance pending" verdict the onboarding
+ * routes attach instead of a 503.
+ */
+export interface PlatformManagedVerdict {
+  managed_by_platform: boolean;
+  reason: 'platform_managed' | 'no_ingestion_observed' | 'issuance_pending' | string;
+  detail: string;
+}
+
+/** One hosted ingest source (credential + route) provisioned for the tenant. */
+export interface TenantIngestSource {
+  credential_id: string;
+  route_id: string;
+  protocol: 'hec' | 'otlp_http' | 'nano_https' | string;
+  label: string;
+  source_slug: string;
+  credential_state: 'active' | 'revoked' | string;
+  route_state: 'active' | 'suspended' | 'revoked' | string;
+  route_revision: number;
+  cell_name: string;
+  cell_state: string;
+  created_at: string;
+  revoked_at?: string | null;
+}
+
+/** The tenant's OTLP handoff drain (lake_otel_ingest) heartbeat and counters. */
+export interface TenantOtelDrain {
+  drain_identity: string;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_drained_at?: string | null;
+  batches_drained: number;
+  rows_drained: number;
+  live: boolean;
+}
+
+/** GET /api/log-sources/ingest-endpoint — "how do I send data" for a shared tenant. */
+export interface TenantIngestEndpoint {
+  hostname: string;
+  base_url: string;
+  hec_url: string;
+  otlp_logs_url: string;
+  /** OTLP/HTTP traces and metrics endpoints (per-source `otlp_trace` / `otlp_metric` credentials). */
+  otlp_traces_url: string;
+  otlp_metrics_url: string;
+  /** true only while the tenant's lake_otel_ingest drain has reported within 15 minutes (NAN-2361 wave 6). */
+  otlp_telemetry_ingested: boolean;
+  /** The drain's facts when one has ever reported; null otherwise. */
+  otlp_drain?: TenantOtelDrain | null;
+  nano_https_url: string;
+  hec_health_url: string;
+  endpoint_state: 'ready' | 'rolling' | 'suspended' | 'unavailable' | 'provisioning' | string;
+  cell_name?: string | null;
+  cell_state?: string | null;
+  worker_release_phase?: string | null;
+  worker_release_updated_at?: string | null;
+  active_parser_bundle_revision?: number | null;
+  sources: TenantIngestSource[];
+  credential_issuance: PlatformManagedVerdict;
+  /** What the tenant's rendered ingest Worker accepts; gate the collector option on it. */
+  ingress_contract: TenantIngressContract;
+}
+
+/** NAN-2592 / NAN-2597: the tenant ingest Worker's credential contract (v2 = source + collector). */
+export interface TenantIngressContract {
+  version: number;
+  credential_kinds: Array<'source' | 'collector' | string>;
+  collector_credentials: boolean;
+  /** Where a collector event declares its source, `<protocol>:<location>` (e.g. `hec:event.sourcetype`). */
+  source_declarations: string[];
+}
+
+/** A tenant ingest-credential issuance request (fulfilled by the platform, NAN-2590/2592). */
+export interface TenantIngestCredentialRequest {
+  id: string;
+  protocol: string;
+  label: string;
+  log_source_id?: string | null;
+  state: 'pending' | 'issued' | 'rejected' | 'revoked' | string;
+  requested_by: string;
+  requested_at: string;
+  reason?: string | null;
+  credential_id?: string | null;
+  fulfilled_at?: string | null;
+  /** `<reason_code>: <text>` when rejected. */
+  disposition?: string | null;
+  updated_at: string;
+  kind: 'source' | 'collector' | string;
+  source_slugs?: string[] | null;
+  /** Collector only: `{declared_name: slug}`. */
+  source_aliases?: Record<string, string> | null;
+  restricted_sources_acknowledged: boolean;
+  reveal_key_alg?: 'x25519' | 'p256' | null;
+  sealed_expires_at?: string | null;
+  revealed_at?: string | null;
+  /** True while the sealed token can still be revealed. */
+  sealed_token_ready: boolean;
+}
+
+/** POST /api/log-sources/ingest-credentials (NAN-2592). */
+export interface IngestCredentialRequestInput {
+  protocol: 'hec' | 'otlp_http' | 'nano_https';
+  label: string;
+  /** Default `source`; `collector` = one token for a pipeline's allowlist (NAN-2597). */
+  kind?: 'source' | 'collector';
+  /** Exactly one slug for a source credential; one or more, distinct, for a collector (`unknown` is implicit). */
+  source_slugs: string[];
+  /** Collector only: extra names an event may declare, `{declared_name: slug}` (≤ 16 KiB). */
+  source_aliases?: Record<string, string>;
+  /** Raw browser public key (32-byte X25519 or 65-byte uncompressed P-256), unpadded base64url. */
+  reveal_public_key: string;
+  reveal_key_alg?: 'x25519' | 'p256';
+  /** Needed (with source_scopes:manage) for a source the requester is restricted from. */
+  restricted_sources_acknowledged?: boolean;
+  log_source_id?: string;
+  reason?: string;
+}
+
+/** `POST /api/log-sources/ingest-credentials/precheck` (NAN-2617). */
+export interface IngestCredentialPrecheckInput {
+  kind: 'source' | 'collector';
+  source_slugs: string[];
+}
+
+/**
+ * The issuance guard's answer for the signed user without an acknowledgement:
+ * `verdict` null = allowed; `restricted_sources_unacknowledged` = allowed once
+ * acknowledged (needs_acknowledgement); any other code = blocked
+ * (`source_restricted`, `mixed_restrictions_require_manage`, `permission_missing`, ...).
+ */
+export interface IngestCredentialPrecheck {
+  verdict: string | null;
+  allowed: boolean;
+  needs_acknowledgement: boolean;
+  blocked: boolean;
+}
+
+/** How the browser opens `sealed_token` (envelope v1, NAN-2591). */
+export interface IngestCredentialSealing {
+  scheme: 'ECDH-HKDF-SHA256-A256GCM' | string;
+  key_alg: 'x25519' | 'p256' | string;
+  /** Exact AES-GCM AAD as a UTF-8 string: request_id + tenant_id, lowercase UUIDs, no separator. */
+  aad: string;
+  encoding: 'base64url' | string;
+}
+
+/** GET .../ingest-credentials/requests/{id} (state) and POST .../requests/{id}/reveal (state + sealed token, once). */
+export interface IngestCredentialReveal {
+  request_id: string;
+  tenant_id: string;
+  state: 'pending' | 'issued' | 'rejected' | string;
+  kind: string;
+  protocol: string;
+  label: string;
+  source_slugs: string[];
+  credential_id?: string | null;
+  disposition?: string | null;
+  sealed_expires_at?: string | null;
+  revealed_at?: string | null;
+  /** True while POST .../reveal would return the token. */
+  sealed_token_ready: boolean;
+  /** Unpadded base64url of the sealed envelope; present only on the one successful reveal. */
+  sealed_token?: string | null;
+  sealing?: IngestCredentialSealing | null;
+}
+
+export interface TenantIngestCredentialRoute {
+  route_id: string;
+  source_slug: string;
+  state: string;
+  revision: number;
+}
+
+/** An issued credential (control-plane rows joined with its SIEM request, if any). */
+export interface TenantIngestCredential {
+  credential_id: string;
+  kind: string;
+  protocol: string;
+  label: string;
+  state: 'active' | 'revoked' | string;
+  source_slugs: string[];
+  /** Collector aliases, `{declared_name: slug}`; empty for a source credential. */
+  source_aliases?: Record<string, string>;
+  routes: TenantIngestCredentialRoute[];
+  cell_name: string;
+  created_at: string;
+  revoked_at?: string | null;
+  revocable: boolean;
+  request_id?: string | null;
+  requested_by?: string | null;
+  requested_at?: string | null;
+  revealed_at?: string | null;
+  /** NAN-2599: activity columns; present on `GET /api/log-sources/ingest-credentials` only. */
+  activity?: IngestCredentialActivitySummary | null;
+}
+
+/** NAN-2599: the Credentials table's activity columns (24 h), under the caller's source visibility. */
+export interface IngestCredentialActivitySummary {
+  /** Last request the edge accepted, else the last event the lake admitted. */
+  last_seen_at: string | null;
+  /** Events the edge accepted in its rolling 24 h; null when withheld or not recorded yet. */
+  edge_events_24h: number | null;
+  lake_events_24h: number;
+  parse_failures_24h: number;
+  last_rejected_at: string | null;
+  last_rejection_class: string | null;
+  last_rejection_status: number | null;
+  /** Part of the activity is withheld: the caller is denied one of the credential's sources. */
+  redacted: boolean;
+}
+
+/** One credential that can write a source (NAN-2597, design §2.5). */
+export interface TenantSourceWriter extends TenantIngestCredential {
+  /** The asked-for labels it writes (`unknown`/`default` when `implicit`). */
+  writes: string[];
+  /** Names an event may declare to land there (collector slug + aliases); empty for a source credential. */
+  declared_names: string[];
+  /** Writes only via the implicit `unknown` (a collector event with no declared source). */
+  implicit: boolean;
+}
+
+/** NAN-2598: what the tenant's ingest Worker saw for one credential (rolling 24 h). */
+export interface EdgeCredentialActivity {
+  first_accepted_at: string | null;
+  last_accepted_at: string | null;
+  last_rejected_at: string | null;
+  last_rejection_class: string | null;
+  last_rejection_status: number | null;
+  requests_24h: number;
+  events_24h: number;
+  /** Wire bytes as received (possibly compressed). */
+  bytes_24h: number;
+  unknown_event_requests_24h: number;
+  sampled_at: string | null;
+  recorded_at: string | null;
+}
+
+export interface CredentialSourceActivity {
+  source_slug: string;
+  protocol: string;
+  events: number;
+  bytes: number;
+  parse_failures: number;
+  first_event_at: string;
+  last_event_at: string;
+}
+
+export interface CredentialActivityHour {
+  hour: string;
+  events: number;
+  bytes: number;
+  parse_failures: number;
+}
+
+/** NAN-2598: what the lake admitted (and made searchable) for one credential. */
+export interface LakeCredentialActivity {
+  events: number;
+  bytes: number;
+  parse_failures: number;
+  first_event_at: string | null;
+  last_event_at: string | null;
+  first_searchable_at: string | null;
+  last_searchable_at: string | null;
+  sources: CredentialSourceActivity[];
+  hours: CredentialActivityHour[];
+}
+
+export type CredentialFirstEventState = 'waiting' | 'received' | 'searchable';
+
+export interface CredentialFirstEvent {
+  received_at_edge: string | null;
+  searchable_at: string | null;
+  state: CredentialFirstEventState;
+}
+
+/** `GET /api/log-sources/ingest-credentials/{credential_id}/activity` (NAN-2598). */
+export interface IngestCredentialActivity {
+  credential_id: string;
+  window_hours: number;
+  edge: EdgeCredentialActivity | null;
+  lake: LakeCredentialActivity;
+  first_event: CredentialFirstEvent;
+  /** NAN-2599: part of the activity was withheld (a source the caller is denied); `edge` is then null. */
+  redacted?: boolean;
+}
+
+export interface SourceCredentialActivity {
+  /** null = rows the edge did not attribute to a credential. */
+  credential_id: string | null;
+  label: string | null;
+  kind: string | null;
+  protocol: string;
+  state: string | null;
+  events: number;
+  bytes: number;
+  parse_failures: number;
+  first_event_at: string;
+  last_event_at: string;
+  first_searchable_at: string | null;
+  edge: EdgeCredentialActivity | null;
+}
+
+/** `GET /api/log-sources/ingest-sources/{source_slug}/activity` (NAN-2598). */
+export interface IngestSourceActivity {
+  /** Counter label; `unknown` is counted as `default`. */
+  source_slug: string;
+  window_hours: number;
+  events: number;
+  bytes: number;
+  parse_failures: number;
+  first_event_at: string | null;
+  last_event_at: string | null;
+  credentials: SourceCredentialActivity[];
+}
+
+/** GET /api/log-sources/{id}/credentials and GET .../ingest-credentials/writers/{source_slug}. */
+export interface TenantSourceWriters {
+  source_slugs: string[];
+  writers: TenantSourceWriter[];
+}
+
+/** GET /api/log-sources/ingest-credentials. */
+export interface TenantIngestCredentialList {
+  credentials: TenantIngestCredential[];
+  requests: TenantIngestCredentialRequest[];
+}
+
+/** POST /api/log-sources/ingest-credentials/{credential_id}/revoke response. */
+export interface IngestCredentialRevocation {
+  credential_id: string;
+  revoked: boolean;
+  replayed: boolean;
+  revoked_at?: string | null;
+}
+
+export interface SenderTemplatePlaceholder {
+  marker: string;
+  source: string;
+  description: string;
+  secret: boolean;
+}
+
+export interface SenderTemplate {
+  id: string;
+  sender: 'curl' | 'vector' | 'fluent_bit' | 'otel_collector' | 'cribl' | string;
+  sender_name: string;
+  protocol: 'hec' | 'nano_https' | 'otlp_http' | string;
+  credential_kinds: string[];
+  format: 'shell' | 'toml' | 'yaml' | 'ini' | 'text' | string;
+  title: string;
+  description: string;
+  body: string;
+}
+
+/** GET /api/log-sources/sender-templates. */
+export interface SenderTemplateCatalog {
+  version: number;
+  placeholders: SenderTemplatePlaceholder[];
+  templates: SenderTemplate[];
+}
+
+export interface IngestObservationPoint {
+  hour: string;
+  writer_class: string;
+  objects: number;
+  bytes: number;
+}
+
+/** GET /api/log-sources/ingestion-observed — what the lake recorded for the tenant. */
+export interface TenantIngestObservation {
+  window_hours: number;
+  observed: boolean;
+  total_objects: number;
+  total_bytes: number;
+  first_observed_at?: string | null;
+  last_observed_at?: string | null;
+  points: IngestObservationPoint[];
+  verdict?: PlatformManagedVerdict | null;
+}
+
+/**
+ * NAN-2361 hosted-shared tenants: 24h lake-admitted ingestion for one registry
+ * entry, attached to each row of GET /api/log-sources (absent on dedicated).
+ */
+export interface LogSourceIngestSummary {
+  /** The lake source slugs (`metadata.log_source`) this entry answers for. */
+  source_slugs: string[];
+  events_last_24h: number;
+  events_last_hour: number;
+  bytes_last_24h: number;
+  parse_failures_24h: number;
+  last_event_at?: string | null;
+  health_status: 'healthy' | 'stale' | 'no_data' | 'disabled' | 'error';
+  /** NAN-3680: rows refused at strict OCSF admission (24 h); absent = not recorded on this lake. */
+  refused_events_24h?: number | null;
+  last_refusal?: LogSourceRefusalSample | null;
+}
+
+export interface LogSourceStatsPoint {
+  hour: string;
+  events: number;
+  bytes: number;
+  parse_failures: number;
+  /** NAN-3680: rows refused at strict OCSF admission in this hour. */
+  refused_events?: number;
+}
+
+/** GET /api/log-sources/{id}/stats — per-source hourly series (hosted-shared). */
+export interface TenantLogSourceStats {
+  log_source_id: string;
+  log_source_name: string;
+  window_hours: number;
+  source_slugs: string[];
+  observed: boolean;
+  total_events: number;
+  total_bytes: number;
+  total_parse_failures: number;
+  first_event_at?: string | null;
+  last_event_at?: string | null;
+  points: LogSourceStatsPoint[];
+  verdict?: PlatformManagedVerdict | null;
+  /** NAN-3680: rows refused at strict OCSF admission in the window; absent = not recorded on this lake. */
+  total_refused_events?: number | null;
+  last_refusal?: LogSourceRefusalSample | null;
+}
+
+// ---------------------------------------------------------------------------
+// Parser-bundle rollouts (hosted-shared, NAN-2607 / NAN-2603 ledger)
+// ---------------------------------------------------------------------------
+
+export type ParserRolloutKind = 'publish' | 'revert' | 'merge_base';
+export type ParserRolloutState = 'pending' | 'building' | 'validated' | 'rolling' | 'live' | 'failed' | 'rolled_back';
+
+/** A tenant parser rollout request (`shared_parser_rollout_requests`). */
+export interface TenantParserRollout {
+  id: string;
+  kind: ParserRolloutKind;
+  state: ParserRolloutState;
+  /** lsrc_ typeid, same format as LogSource.id. */
+  log_source_id: string | null;
+  log_source_version_ids: string[];
+  /** NAN-3298: version_number of each publication in `log_source_version_ids`, ascending. */
+  version_numbers?: number[];
+  base_offer_id: string | null;
+  requested_by: string;
+  requested_at: string;
+  request_reason: string | null;
+  state_revision: number;
+  roll_id: string | null;
+  bundle_revision: number | null;
+  content_sha256: string | null;
+  report_sha256: string | null;
+  /** Vector's message (or the orchestrator's) on failure. */
+  failure_reason: string | null;
+  /** The failing component (without the stage prefix). */
+  failure_component: string | null;
+  /** inputs | sandbox | overlay | structural_guard | vector_validate | vector_test | package | sign | roll | render | verify | promote */
+  failure_stage: string | null;
+  /** Milliseconds per stage (queue_ms, build_ms, sign_ms, roll_ms, render_ms, verify_ms, ...). */
+  stage_timings: Record<string, number> | null;
+  updated_at: string;
+  completed_at: string | null;
+  terminal: boolean;
+  /**
+   * Publish coalescing (design §7.6, NAN-2617): set only while `state` is
+   * `pending` for a publish/revert. The tenant's pending publish/revert
+   * requests roll together in one parser-bundle roll after `rolls_after`
+   * (the oldest pending request + `window_seconds`).
+   */
+  batch?: ParserRolloutBatch | null;
+}
+
+export interface ParserRolloutBatch {
+  window_seconds: number;
+  /** ISO time the batch becomes eligible to roll. */
+  rolls_after: string;
+  /** Every pending request in the batch, this one included. */
+  request_ids: string[];
+}
+
+export interface ParserBaseOfferDiff {
+  unified?: string;
+  truncated?: boolean;
+  platform_files_changed?: string[];
+  overlay_files_changed?: string[];
+  fork_upstream?: unknown[];
+  diff_sha256?: string;
+  [key: string]: unknown;
+}
+
+/** "Platform update available" (decision a): a platform base the tenant was not rolled onto. */
+export interface TenantParserBaseOffer {
+  id: string;
+  state: 'available' | 'merge_pending' | 'merged' | 'superseded';
+  base_content_sha256: string;
+  base_source_revision: string;
+  runtime_image_digest: string;
+  validation_state: 'failed' | 'passed' | 'untested';
+  failure_reason: string | null;
+  failure_component: string | null;
+  failure_stage: string | null;
+  changed_platform_sources: string[];
+  diff: ParserBaseOfferDiff;
+  offered_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+  merge_request_id: string | null;
+  merged_roll_id: string | null;
+}
+
+/** Parser samples stored with the active published version (fed to the build Job's `vector test`). */
+export interface TenantParserSamples {
+  log_source_id: string;
+  publication_id: string | null;
+  version_id: number | null;
+  version_number: number | null;
+  samples: string[];
+  updated_at: string | null;
+  max_samples: number;
+  max_sample_bytes: number;
+}
+
+/** Deploy / publish on hosted-shared: the deployment result plus the rollout it filed (null = platform-parsed). */
+export type SharedDeploymentResponse = EnhancedDeploymentResponse & { rollout?: TenantParserRollout | null };
+/** Revert on hosted-shared: the new version plus the rollout it filed. */
+export type SharedRevertResponse = LogSourceVersion & { rollout?: TenantParserRollout | null };
+
 export interface IngestionHistoryPoint {
   source_type: string;
   timestamp: string;
   count: number;
+}
+
+// NAN-3207: per-log-source health series — hourly volume against a seasonal
+// expected band, plus per-segment (class / product / region / account /
+// service) series so a drop in one slice of a source is visible.
+// NAN-3246: `learning` = no baseline yet because fewer than
+// `baseline_days_required` same-hour days exist since the source (or
+// segment) was first seen; `unknown` = not judgeable for another reason.
+export type SourceHealthState =
+  | 'healthy'
+  | 'degraded'
+  | 'stale'
+  | 'segment_drop'
+  | 'disabled'
+  | 'learning'
+  | 'unknown';
+export type BucketAssessment = 'no_baseline' | 'source_silent' | 'dropped' | 'low' | 'normal';
+export type SegmentDimension = 'class' | 'product' | 'region' | 'account' | 'service';
+
+export interface HealthSeriesPoint {
+  /** RFC3339, hourly, oldest first; the last point is the current (partial) hour. */
+  hour: string;
+  events: number;
+  /** Seasonal median (same hour, previous 7 days). */
+  expected: number | null;
+  low: number | null;
+  high: number | null;
+  /** null for unsettled hours (the current hour). */
+  assessment: BucketAssessment | null;
+}
+
+export interface SegmentHealthSeries {
+  dimension: SegmentDimension;
+  /** "(other)" for the out-of-top-K bucket. */
+  value: string;
+  search_field: string;
+  /** The out-of-top-K bucket; never judged. */
+  other: boolean;
+  state: SourceHealthState;
+  dropped_since: string | null;
+  /** Same-hour look-back days of history behind the newest judged hour (0..7). */
+  baseline_days: number;
+  /** Days needed before a baseline exists. */
+  baseline_days_required: number;
+  window_events: number;
+  points: HealthSeriesPoint[];
+}
+
+export interface LogSourceHealthSeries {
+  log_source_id: string;
+  log_source_name: string;
+  source_slugs: string[];
+  state: SourceHealthState;
+  window_hours: number;
+  last_event_at: string | null;
+  /** Same-hour look-back days of history behind the newest judged hour (0..7). */
+  baseline_days: number;
+  /** Days needed before a baseline exists. */
+  baseline_days_required: number;
+  points: HealthSeriesPoint[];
+  /** Drops first, then by volume. */
+  segments: SegmentHealthSeries[];
+  /** false: segment counts unavailable (totals still render). */
+  segments_available: boolean;
 }
 
 export interface LogSourceDeployment {
@@ -5239,6 +6648,13 @@ export interface LogSourceTestResult {
   error?: string;
   /** Optional count of fields the parser extracted from this sample. */
   extracted_field_count?: number;
+  /** OCSF output validation, present only when explicitly requested. */
+  schema_validation?: {
+    valid: boolean;
+    schema_version: string;
+    errors: Array<{ code: string; attribute_path: string; message: string }>;
+    warnings: Array<{ code: string; attribute_path: string; message: string }>;
+  };
 }
 
 /** NAN-522: namespace validation response. */
@@ -5306,7 +6722,7 @@ export interface LogSourceWithDraftStatus extends LogSource {
 // Source Configurations (Infrastructure + Routing)
 // ============================================================================
 
-export type SourceConfigType = 'http' | 'kafka' | 'aws_s3' | 'aws_sqs' | 'gcp_pubsub' | 'splunk_hec' | 'vector' | 'otlp';
+export type SourceConfigType = 'http' | 'kafka' | 'aws_s3' | 'aws_sqs' | 'gcp_pubsub' | 'azure_event_hubs' | 'splunk_hec' | 'vector' | 'otlp';
 export type MatchType = 'exact' | 'prefix' | 'suffix' | 'regex' | 'contains' | 'default';
 
 export interface RoutingRule {
@@ -5506,7 +6922,10 @@ export interface TimeWindowedRiskScore {
 
 export interface TimeWindowedRiskResponse {
   entities: TimeWindowedRiskScore[];
+  /** Number returned in this page, not a universe count when has_more is true. */
   total: number;
+  has_more: boolean;
+  total_exact: boolean;
 }
 
 export interface TimeWindowedRiskQuery {
@@ -5714,6 +7133,7 @@ export type NotificationType =
   | 'alert_assigned'
   | 'ai_provider_down'
   | 'data_feed_stale'
+  | 'data_feed_segment_drop'
   | 'search_access_removed'
   | 'case_access_removed'
   | 'system'
@@ -5726,7 +7146,9 @@ export type NotificationType =
   | 'search_failed'
   | 'notebook_mention'
   | 'report_ready'
-  | 'model_deprecated';
+  | 'model_deprecated'
+  // NAN-3230: the tenant's internal DNS suffix list changed (admins only).
+  | 'internal_domains_changed';
 
 export interface Notification {
   id: string;
@@ -5807,6 +7229,24 @@ export interface ReportRun {
   artifact_truncated: boolean;
   error?: string;
   artifacts: ReportArtifactMeta[];
+  /**
+   * NAN-2361 wave 7: tenant system AI executive narrative of a hosted-shared
+   * run. Absent on dedicated deployments and on runs that predate the lane.
+   */
+  ai_summary?: ReportRunAiSummary;
+}
+
+/** Hosted-shared report narrative (`report_runs.ai_summary`). */
+export interface ReportRunAiSummary {
+  state: 'completed' | 'skipped' | 'failed';
+  narrative?: string;
+  key_findings: string[];
+  reason?: string;
+  model_id?: string;
+  run_id?: string;
+  calls: number;
+  credits: number;
+  generated_at: string;
 }
 
 export interface CreateReportRequest {
@@ -5871,25 +7311,10 @@ export interface Feedback {
   updated_at: string;
 }
 
-export interface FeedbackWithUser extends Feedback {
-  user_name?: string;
-  user_email?: string;
-}
-
 export interface CreateFeedbackRequest {
   category: FeedbackCategory;
   title: string;
   description: string;
-}
-
-export interface UpdateFeedbackRequest {
-  status?: FeedbackStatus;
-  admin_notes?: string;
-}
-
-export interface FeedbackListResponse {
-  feedback: FeedbackWithUser[];
-  total: number;
 }
 
 export interface FeedbackResponse {
@@ -5998,45 +7423,6 @@ export interface IpLookupResult {
   timezone?: string;
 }
 
-// AI Failure Tracking
-export type AiAgentType = 'query' | 'dashboard' | 'detection' | 'parser' | 'summarize';
-
-export interface AiFailure {
-  id: string;
-  agent_type: AiAgentType;
-  user_request: string;
-  generated_query?: string;
-  error_message: string;
-  error_type: string;
-  retry_count: number;
-  was_resolved: boolean;
-  input_context?: Record<string, unknown>;
-  stack_trace?: string;
-  model_version?: string;
-  created_at: string;
-}
-
-export interface AiFailureStats {
-  agent_type: AiAgentType;
-  total_failures: number;
-  resolved_count: number;
-  avg_retries: number;
-  last_failure?: string;
-}
-
-export interface AiFailuresResponse {
-  failures: AiFailure[];
-  stats: AiFailureStats[];
-  total_count: number;
-}
-
-export interface GetAiFailuresRequest {
-  agent_type?: AiAgentType;
-  limit?: number;
-  offset?: number;
-}
-
-
 // User Preferences
 export type QueryMode = 'standard' | 'advanced';
 
@@ -6064,27 +7450,6 @@ export interface UpdateUserPreferencesRequest {
   default_time_range?: TimeRangePreset;
   search_hub_style?: SearchHubStyle;
   landing_page?: LandingPage;
-}
-
-// Developer Settings (Scheduler Control)
-export interface DeveloperSettings {
-  detection_scheduler_enabled: boolean;
-  tuning_scheduler_enabled: boolean;
-  enrichment_sync_scheduler_enabled: boolean;
-  custom_enrichment_scheduler_enabled: boolean;
-  ai_monitoring_enabled: boolean;
-  feed_monitoring_enabled: boolean;
-  model_catalog_sync_scheduler_enabled: boolean;
-}
-
-export interface UpdateDeveloperSettingsRequest {
-  detection_scheduler_enabled?: boolean;
-  tuning_scheduler_enabled?: boolean;
-  enrichment_sync_scheduler_enabled?: boolean;
-  custom_enrichment_scheduler_enabled?: boolean;
-  ai_monitoring_enabled?: boolean;
-  feed_monitoring_enabled?: boolean;
-  model_catalog_sync_scheduler_enabled?: boolean;
 }
 
 // ============================================================================
@@ -6225,11 +7590,16 @@ export interface IdentityProviderSummary {
   enabled: boolean;
   has_credentials: boolean;
   config?: Record<string, unknown>;
+  /** idle | in_progress | completed | partial | failed (NAN-3483: partial = some records dead-lettered). */
   sync_status?: string;
   last_sync_at?: string;
   last_sync_error?: string;
   last_sync_duration_ms?: number;
   user_count?: number;
+  /** NAN-3483: records the last sync fetched / mapped / dead-lettered. */
+  last_sync_records_total?: number | null;
+  last_sync_records_synced?: number | null;
+  last_sync_records_dead_lettered?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -6347,12 +7717,28 @@ export interface IdentityResolveResponse {
 
 export type GdprIdentifierType = 'username' | 'email' | 'ip';
 
-export type GdprAnonymizationStatus = 'pending' | 'running' | 'completed' | 'failed';
+/**
+ * `queued_for_platform` exists only for hosted-shared tenants (NAN-2361):
+ * the tenant recorded and executed the request; the platform's erasure
+ * runner performs the lake rewrite and moves it through `running`.
+ */
+export type GdprAnonymizationStatus =
+  | 'pending'
+  | 'queued_for_platform'
+  | 'running'
+  | 'completed'
+  | 'failed';
 
 export interface GdprSubmitRequest {
   identifier_type: GdprIdentifierType;
   identifier_value: string;
   justification?: string;
+  /**
+   * Also rewrite free-text mentions (`message` / unmapped fields) of the
+   * subject with the request's identifier hash. Default true (NAN-2361
+   * wave 6); snake_case on the wire like every other field here.
+   */
+  redact_free_text?: boolean;
 }
 
 export interface GdprAnonymizationPreview {
@@ -6382,6 +7768,11 @@ export interface GdprAnonymizationRequest {
   created_at: string;
   started_at?: string;
   completed_at?: string;
+  /** Hosted-shared only: when the tenant handed the request to the platform. */
+  queued_at?: string | null;
+  queued_by?: string | null;
+  /** Whether free-text mentions were (or will be) rewritten too. */
+  redact_free_text?: boolean;
 }
 
 export interface GdprAnonymizationListResponse {
@@ -6458,6 +7849,27 @@ export interface AiUsageDetail {
   by_agent: AgentUsage[];
   daily: DailyAiUsage[];
   recent: AiUsageEvent[];
+  /** Hosted-shared only (NAN-2361 wave 6): background (system principal) share. */
+  background?: BackgroundAiUsage;
+}
+
+export interface BackgroundAiRunCount {
+  purpose: string;
+  status: string;
+  runs: number;
+  credits: number;
+}
+
+export interface BackgroundAiUsage {
+  calls: number;
+  credits: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  credits_today: number;
+  calls_today: number;
+  daily_credit_cap: number;
+  enabled: boolean;
+  runs_by_purpose: BackgroundAiRunCount[];
 }
 
 export interface DailyUsage {
@@ -6547,6 +7959,36 @@ export interface FleetHealthSummary {
   slow: number;
   /** next_run_at is past due — scheduler stuck or rule is repeatedly timing out */
   errors: number;
+}
+
+/** NAN-3064 — one rule behind its schedule. */
+export interface LaggingRule {
+  rule_id: string;
+  rule_name: string;
+  /** Seconds past the rule's scheduled run time */
+  lag_secs: number;
+  /** Schedule interval in seconds (null when the cron is invalid) */
+  interval_secs: number | null;
+  /** lag > 2 × interval: the rule has missed at least one run */
+  over_2x_interval: boolean;
+}
+
+/**
+ * NAN-3064 — per-tenant detection scheduling lag
+ * (`GET /api/rules/scheduling-lag`). Lag = now − next_run_at once a rule is
+ * due; rules not yet due count as 0 in the p95.
+ */
+export interface ScheduleLagSummary {
+  total: number;
+  behind_schedule: number;
+  over_2x_interval: number;
+  max_lag_secs: number;
+  p95_lag_secs: number;
+  behind_grace_secs: number;
+  /** Any rule lagging more than twice its interval */
+  degraded: boolean;
+  worst: LaggingRule[];
+  measured_at: string;
 }
 
 // ============================================================================
@@ -6696,6 +8138,10 @@ export interface AssetDossierResponse {
   auth: AssetDossierAuth;
   files: AssetDossierFiles;
   dns: AssetDossierDns;
+  /** Exact dossier was admitted to the isolated durable Search Jobs lane. */
+  durable_job?: AsyncSearchResponse | null;
+  /** NAN-3094: present while a lean dossier is still being built. */
+  progress?: ProductViewProgress | null;
 }
 
 // ============================================================================
@@ -6705,6 +8151,7 @@ export interface AssetDossierResponse {
 // ============================================================================
 
 export interface CloudOverviewRequest {
+  fetch?: 'page' | 'identities' | 'services' | 'changes' | 'denied' | 'full';
   /** Optional provider filter ("aws", "gcp", "azure") — omit for all */
   provider?: string | null;
   /** Optional account scope (AWS account id or gcp project id) — omit for all */
@@ -6849,6 +8296,9 @@ export interface CloudOverviewChange {
 }
 
 export interface CloudOverviewResponse {
+  section?: 'page' | 'identities' | 'services' | 'changes' | 'denied';
+  preview_events?: CloudDossierStreamEvent[];
+  requires_durable?: boolean;
   header: CloudOverviewHeader;
   accounts: CloudOverviewAccount[];
   risky_principals: CloudOverviewPrincipal[];
@@ -6856,6 +8306,8 @@ export interface CloudOverviewResponse {
   anomalies: CloudOverviewAnomaly[];
   service_health: CloudOverviewServiceHealth[];
   changes: CloudOverviewChange[];
+  /** Exact overview was admitted to the isolated durable Search Jobs lane. */
+  durable_job?: AsyncSearchResponse | null;
 }
 
 // ============================================================================
@@ -6865,6 +8317,7 @@ export interface CloudOverviewResponse {
 // ============================================================================
 
 export interface CloudDossierRequest {
+  fetch?: 'page' | 'full';
   /** Required — scope to a single IAM principal id (user / role / service account) */
   principal: string;
   /** Optional account scope (AWS account id / GCP project id) */
@@ -7114,6 +8567,8 @@ export interface CloudDossierStreamEvent {
 }
 
 export interface CloudDossierResponse {
+  /** Aggregate fields describe a newest-page sample, not the full window. */
+  bounded_preview?: boolean;
   identity: CloudDossierIdentity;
   risk: CloudDossierRisk;
   facets: CloudDossierFacets;
@@ -7127,6 +8582,8 @@ export interface CloudDossierResponse {
   stream: CloudDossierStreamEvent[];
   /** Echo of the window label the backend chose ("last 7d", etc.) */
   window_label: string;
+  /** Exact dossier was admitted to the isolated durable Search Jobs lane. */
+  durable_job?: AsyncSearchResponse | null;
 }
 
 // NAN-426 / NAN-427 — Queues + queue routing rules.
@@ -7353,6 +8810,36 @@ export interface ParsedStepTree {
   intro: string[];
   phases: PlaybookPhase[];
   steps?: PlaybookStep[];
+}
+
+/** NAN-3205: severities accepted by the pivt playbook-drafting brief. */
+export type PlaybookDraftSeverity = 'low' | 'medium' | 'high' | 'critical';
+
+/** NAN-3205: `POST /api/melod/playbook/draft` request body. */
+export interface DraftPlaybookRequest {
+  brief: string;
+  entity?: string;
+  urgency?: string;
+  category?: PlaybookCategory;
+  severity?: PlaybookDraftSeverity;
+  data_sources?: string[];
+}
+
+/** NAN-3205: completed playbook-draft job result — a document validated
+ *  server-side against the playbook schema (nPL steps parsed). */
+export interface PlaybookDraft {
+  doc: string;
+  title: string;
+  subtitle?: string | null;
+  category: PlaybookCategory;
+  match_signals: string[];
+  tags: string[];
+  danger_policy: DangerPolicy;
+  review_cadence?: string | null;
+  parsed: ParsedStepTree;
+  step_count: number;
+  /** True when the first answer failed validation and one repair pass fixed it. */
+  repaired: boolean;
 }
 
 /** A playbook row (typeid `pb_*`). */
@@ -7685,4 +9172,275 @@ export interface SourceScopeGrantsResponse {
 export interface CreateSourceScopeGrantRequest {
   source_type: string;
   group_id: string;
+}
+
+// ---------------------------------------------------------------------------
+// Source visibility — hosted-shared lake (NAN-2361 wave 8)
+//
+// On the lake every event carries `metadata.log_source` (the ingest route
+// slug). Visibility is GROUP-based: a restriction is (group, source slug);
+// per-member `restrict` / `allow` exceptions handle one-offs. Everything is
+// visible by default. `GET /api/source-visibility` is the page's whole state.
+// ---------------------------------------------------------------------------
+
+/** One of the tenant's real sources (mono slug), including `default`. */
+export interface VisibleSource {
+  /** The slug (`metadata.log_source`); the restriction key. */
+  slug: string;
+  /** `hec` | `otlp_http` | `nano_https` for a provisioned route; `default` for the conventional lane; `observed` | `registry` | `restricted` when derived. */
+  protocol: string;
+  last_seen_at?: string | null;
+  events_last_24h: number;
+}
+
+export interface VisibilityGroup {
+  id: string;
+  name: string;
+  member_count: number;
+}
+
+export interface VisibilityMember {
+  id: string;
+  name: string;
+  email: string;
+  /** `active` | `suspended`. */
+  status: string;
+  group_ids: string[];
+  /** Holds `source_scopes:view_all`: sees everything regardless of groups. */
+  view_all: boolean;
+}
+
+export type SourceExceptionMode = 'restrict' | 'allow';
+
+export interface GroupSourceRestriction {
+  group_id: string;
+  source_slug: string;
+}
+
+export interface MemberSourceException {
+  user_id: string;
+  source_slug: string;
+  mode: SourceExceptionMode;
+}
+
+export interface SourceVisibilityModel {
+  sources: VisibleSource[];
+  groups: VisibilityGroup[];
+  members: VisibilityMember[];
+  restrictions: GroupSourceRestriction[];
+  exceptions: MemberSourceException[];
+}
+
+export interface SetGroupRestrictionsRequest {
+  restricted_sources: string[];
+}
+
+export interface GroupRestrictionsResponse {
+  group_id: string;
+  restricted_sources: string[];
+}
+
+export interface MemberSourceExceptionInput {
+  source_slug: string;
+  mode: SourceExceptionMode;
+}
+
+export interface SetMemberExceptionsRequest {
+  exceptions: MemberSourceExceptionInput[];
+}
+
+export interface MemberExceptionsResponse {
+  user_id: string;
+  exceptions: MemberSourceExceptionInput[];
+}
+
+export interface EffectiveSourceVisibility {
+  user_id: string;
+  restricted_sources: string[];
+}
+
+export interface TreePageRequest {
+  job_id?: string;
+  query?: string;
+  time_range?: TimeRange;
+  parent_path?: number[];
+  offset?: number;
+  limit?: number;
+}
+export interface TreePageResponse {
+  status: string;
+  error: string | null;
+  preview: boolean;
+  nodes: Record<string, unknown>[];
+  config: Record<string, unknown> | null;
+  next_offset: number | null;
+  total_roots: number;
+  total_nodes: number;
+  source_truncated: boolean;
+  total_count: number;
+  total_count_exact: boolean;
+  /** NAN-3261: why the tree is empty/edgeless/partial, e.g. the missing field. */
+  note?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// NAN-3228: risk watchlists (`/api/risk/watchlists/*`)
+// ---------------------------------------------------------------------------
+
+export type WatchEntityType = 'user' | 'host' | 'ip' | 'hash';
+
+export interface RiskWatchlistTypeCounts {
+  user: number;
+  host: number;
+  ip: number;
+  hash: number;
+}
+
+export interface RiskWatchlist {
+  id: string;
+  name: string;
+  description: string;
+  /** 0..1, two decimals. */
+  weight: number;
+  /** Paused lists keep members but apply no weight. */
+  enabled: boolean;
+  owner_id: string | null;
+  owner_label: string;
+  created_at: string;
+  updated_at: string;
+  review_at: string | null;
+  member_count: number;
+  type_counts: RiskWatchlistTypeCounts;
+}
+
+export interface RiskWatchlistRef {
+  id: string;
+  name: string;
+  weight: number;
+  enabled: boolean;
+}
+
+export interface RiskWatchlistMember {
+  entity_type: WatchEntityType;
+  entity_value: string;
+  note: string;
+  added_by: string;
+  added_at: string;
+  also_on: string[];
+  /** Unweighted 7d decayed risk (absent: no findings in 7d). */
+  base_score?: number | null;
+  /** Effective 7d risk under the entity's max enabled-list weight. */
+  effective_score?: number | null;
+  risk_level?: 'low' | 'medium' | 'high' | 'critical' | null;
+}
+
+export interface RiskWatchlistMemberInput {
+  value: string;
+  /** Omit to let the server detect it. */
+  entity_type?: WatchEntityType;
+}
+
+export interface RiskWatchlistLimits {
+  max_watchlists: number;
+  max_members_per_watchlist: number;
+  max_members_per_tenant: number;
+}
+
+export interface RiskWatchlistsResponse {
+  watchlists: RiskWatchlist[];
+  limits: RiskWatchlistLimits;
+}
+
+export interface RiskWatchlistDetailResponse {
+  watchlist: RiskWatchlist;
+  members: RiskWatchlistMember[];
+  availability?: TenantCapabilityAvailability;
+}
+
+export interface CreateRiskWatchlistRequest {
+  name: string;
+  description?: string;
+  weight?: number;
+  enabled?: boolean;
+  review_at?: string | null;
+  members?: RiskWatchlistMemberInput[];
+  note?: string;
+}
+
+export interface UpdateRiskWatchlistRequest {
+  name?: string;
+  description?: string;
+  weight?: number;
+  enabled?: boolean;
+  review_at?: string;
+  clear_review_at?: boolean;
+}
+
+export interface AddRiskWatchlistMembersResponse {
+  watchlist: RiskWatchlist;
+  added: string[];
+  duplicates: string[];
+}
+
+export interface RemoveRiskWatchlistMembersResponse {
+  watchlist: RiskWatchlist;
+  removed: number;
+}
+
+export interface DeleteRiskWatchlistResponse {
+  deleted: boolean;
+  members_removed: number;
+}
+
+export interface RiskWatchlistLookupResponse {
+  entity: string;
+  watchlists: RiskWatchlistRef[];
+  effective_weight: number;
+}
+
+export interface RiskWatchlistMembership {
+  entity_value: string;
+  watchlists: RiskWatchlistRef[];
+  effective_weight: number;
+}
+
+export interface RiskWatchlistMembershipsResponse {
+  memberships: RiskWatchlistMembership[];
+}
+
+// NAN-3249: entity suggestions + "not seen" for watchlist values
+// (`POST /api/risk/watchlists/suggest`, ≤50 values per request).
+
+export type RiskWatchlistSuggestMatch = 'domain_user' | 'user_principal' | 'fqdn' | 'short_name';
+
+export interface RiskWatchlistSuggestion {
+  /** Normalized (lowercase) observed entity value — what one click adds. */
+  value: string;
+  /** Observed risk entity type: 'user' | 'email' | 'hostname' | 'ip' | 'cloud_account'. */
+  entity_type: string;
+  last_seen: string;
+  match_kind: RiskWatchlistSuggestMatch;
+}
+
+export interface RiskWatchlistSuggestResult {
+  /** Normalized input value (trim + lowercase). */
+  value: string;
+  entity_type: WatchEntityType;
+  /** An exact (case-insensitive) match exists in the window. */
+  seen: boolean;
+  last_seen: string | null;
+  /** ≤10 variants (never the exact value), newest first. */
+  suggestions: RiskWatchlistSuggestion[];
+}
+
+export interface RiskWatchlistSuggestRequest {
+  values: RiskWatchlistMemberInput[];
+}
+
+export interface RiskWatchlistSuggestResponse {
+  /** Look-back horizon of the risk ledger (currently 28). */
+  window_days: number;
+  /** Empty when risk could not be read — a missing value means "unknown", not "not seen". */
+  results: RiskWatchlistSuggestResult[];
+  availability?: TenantCapabilityAvailability | null;
 }

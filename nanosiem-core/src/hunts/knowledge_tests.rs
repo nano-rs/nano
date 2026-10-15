@@ -437,7 +437,10 @@ fn a_non_numeric_confidence_is_rejected_before_it_reaches_the_check() {
 #[test]
 fn the_category_rollup_is_bounded_and_drops_the_long_tail_not_the_alphabet() {
     let (sql, _) = build_category_counts_sql(
-        &ListKnowledgeQuery { limit: 50, ..Default::default() },
+        &ListKnowledgeQuery {
+            limit: 50,
+            ..Default::default()
+        },
         &ArtifactScope::system(),
     );
     assert!(
@@ -490,7 +493,7 @@ fn the_record_outcome_is_snake_case_on_the_wire() {
 
 /// Read at RUNTIME, not via `include_str!`.
 ///
-/// `tools/sync-to-nano-mirror.sh` strips `migrations/postgres-enterprise/` but
+/// `tools/sync-to-nano-mirror.sh` strips the enterprise migrations but
 /// keeps this file, so a compile-time include of that path makes the public
 /// mirror fail to build — the NAN-2169 shape. A runtime read compiles
 /// everywhere and skips where the migration is absent, which keeps the coverage
@@ -513,7 +516,8 @@ fn migration_source() -> Option<String> {
 /// took the number, which is exactly the event this exists to survive.
 #[test]
 fn the_migration_guards_are_reading_a_real_file() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations/postgres-enterprise");
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations/postgres-enterprise");
     if !dir.is_dir() {
         // Stripped mirror: nothing to assert.
         return;
@@ -554,10 +558,11 @@ fn the_identity_index_is_unconditional_so_a_revocation_cannot_be_undone() {
     let start = migration
         .find("uq_hunt_knowledge_identity")
         .expect("the identity index must exist");
-    let statement = &migration[start..start
-        + migration[start..]
-            .find(';')
-            .expect("index statement is terminated")];
+    let statement = &migration[start
+        ..start
+            + migration[start..]
+                .find(';')
+                .expect("index statement is terminated")];
     assert!(
         statement.contains("(category, subject, fact_digest)"),
         "fact identity is not (category, subject, fact_digest): {statement}"
@@ -578,7 +583,8 @@ fn the_identity_index_is_unconditional_so_a_revocation_cannot_be_undone() {
 #[test]
 fn the_recording_upsert_refuses_to_resurrect_a_revoked_fact() {
     assert!(
-        KNOWLEDGE_SOURCE.contains("ON CONFLICT (category, subject, fact_digest) DO UPDATE"),
+        KNOWLEDGE_SOURCE
+            .contains("ON CONFLICT (tenant_id, category, subject, fact_digest) DO UPDATE"),
         "the recording statement no longer upserts on the fact identity"
     );
     assert!(

@@ -11,7 +11,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { CalendarClock, Loader2 } from 'lucide-react';
+import { CalendarClock } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
   Sheet,
   SheetContent,
@@ -324,7 +325,7 @@ export function ScheduleReportDialog({
             onClick={handleSubmit}
             disabled={!canSubmit || saving}
           >
-            {saving && <Loader2 className="w-[11px] h-[11px] animate-spin" />}
+            {saving && <LoadingIcon className="w-[11px] h-[11px]" />}
             {editing ? 'Save changes' : 'Schedule report'}
           </Button>
         </div>

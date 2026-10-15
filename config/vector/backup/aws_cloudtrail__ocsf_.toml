@@ -1,13 +1,16 @@
 # Auto-generated Vector configuration for parser: AWS CloudTrail (OCSF)
 # DO NOT EDIT - changes will be overwritten
-# Generated at: 2026-06-14T20:28:39.891602+00:00
+# Generated at: 2026-08-21T17:16:00.991856+00:00
 
 
 [transforms.aws_cloudtrail__ocsf__parse]
 type = "remap"
 inputs = ["source_router.aws_cloudtrail__ocsf_"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
 source = '''
-# AWS CloudTrail JSON -> OCSF 1.8.0 API Activity (class_uid 6003).
+# AWS CloudTrail JSON -> OCSF 1.9.0 API Activity (class_uid 6003).
 raw_log = string!(.message)
 parsed, err = parse_json(raw_log)
 
@@ -21,8 +24,9 @@ if err != null || !is_object(parsed) {
         "status_id": 0,
         "time": 0,
         "message": raw_log,
+        "raw_data": raw_log,
         "metadata": {
-            "version": "1.8.0",
+            "version": "1.9.0",
             "uid": uuid_v4(),
             "log_level": "error",
             "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
@@ -45,6 +49,10 @@ if err != null || !is_object(parsed) {
     if change == "update" { activity_id = 3; activity_name = "Update" }
     if change == "delete" { activity_id = 4; activity_name = "Delete" }
     if activity_id == 99 && read_only { activity_id = 2; activity_name = "Read" }
+    if activity_id == 99 {
+        operation = string(p.eventName) ?? ""
+        if operation != "" { activity_name = operation }
+    }
 
     # ---- AWS service token out of eventSource ("ec2.amazonaws.com" -> "ec2") ----
     event_source = string(p.eventSource) ?? ""
@@ -88,8 +96,6 @@ if err != null || !is_object(parsed) {
     caller = string(nano.callerName) ?? string(ui.userName) ?? ""
     caller_uid = string(ui.arn) ?? string(ui.principalId) ?? ""
 
-    mfa = if is_boolean(nano.mfaAuthenticated) { bool(nano.mfaAuthenticated) ?? false } else { false }
-
     ocsf = {
         "class_uid": class_uid,
         "class_name": "API Activity",
@@ -104,8 +110,10 @@ if err != null || !is_object(parsed) {
         "status": status_str,
         "time": time_ms,
         "message": raw_log,
+        "raw_data": raw_log,
         "metadata": {
-            "version": "1.8.0",
+            "version": "1.9.0",
+            "profiles": ["cloud"],
             "uid": string(p.eventID) ?? uuid_v4(),
             "log_name": "CloudTrail",
             "log_provider": "AWS CloudTrail",
@@ -133,6 +141,10 @@ if err != null || !is_object(parsed) {
         }
     }
 
+    if is_boolean(nano.mfaAuthenticated) {
+        ocsf.actor.session = { "is_mfa": bool(nano.mfaAuthenticated) ?? false }
+    }
+
     # src_endpoint is REQUIRED on API Activity 6003 — always emit it.
     ocsf.src_endpoint = { "ip": downcase(string(p.sourceIPAddress) ?? "") }
 
@@ -141,24 +153,22 @@ if err != null || !is_object(parsed) {
 
     if length(resources) > 0 { ocsf.resources = resources }
 
-    # is_mfa is NOT an API Activity attribute (it's auth-specific) -> unmapped.
-    unmapped = { "mfa_authenticated": mfa }
     if error_code != "" {
-        unmapped.error_code = error_code
-        unmapped.error_message = string(p.errorMessage) ?? null
+        ocsf.status_code = error_code
+        ocsf.status_detail = string(p.errorMessage) ?? ""
     }
-    ocsf.unmapped = unmapped
 
     . = ocsf
 }
-
 '''
 
 [transforms.aws_cloudtrail__ocsf__ocsf_split]
 type = "route"
 inputs = ["aws_cloudtrail__ocsf__parse"]
 [transforms.aws_cloudtrail__ocsf__ocsf_split.route]
-ocsf = 'exists(.class_uid)'
+# Explicit parser failures must stay on the UDM recovery path so
+# metadata.parse_error remains searchable and countable.
+ocsf = 'exists(.class_uid) && !exists(.parse_error) && !exists(.metadata.parse_error)'
 
 [transforms.aws_cloudtrail__ocsf__ocsf_prepare]
 type = "remap"
@@ -171,11 +181,15 @@ if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
 src_type = downcase(to_string(%source_type) ?? "unknown")
 if src_type == "" { src_type = "unknown" }
 . = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+# Protected identity for the pre-sampling parser-health branch.
+# The OCSF ClickHouse sink ignores this internal field.
+._nano_parser_id = "e115392e-eb1e-4560-8efe-39f6af773deb"
+._nano_parser_failure = false
 '''
 
 [transforms.aws_cloudtrail__ocsf__output]
 type = "remap"
-inputs = ["aws_cloudtrail__ocsf__ocsf_split._unmatched"]
+inputs = ["aws_cloudtrail__ocsf__ocsf_split._unmatched", "aws_cloudtrail__ocsf__parse.dropped"]
 source = '''
 # Flatten for ClickHouse - standard NanoSIEM format
 # Spread all .udm fields to top level, preserve .ext
@@ -189,9 +203,27 @@ ts_val = now()
 
 # Handle metadata - ensure it's an object
 meta_val = .metadata
-if meta_val == null {
+if !is_object(meta_val) {
 meta_val = {}
 }
+# Vector annotates rerouted runtime failures under
+# `.metadata.dropped`. Preserve the full diagnostic and promote
+# stable fields that ClickHouse health queries can aggregate.
+if exists(.metadata.dropped.message) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.metadata.dropped.message) ?? "Parser runtime error"
+meta_val.parse_stage = to_string(.metadata.dropped.component_id) ?? "parser"
+} else if exists(.parse_error) {
+meta_val.parse_failure = true
+meta_val.parse_error = to_string(.parse_error) ?? "Unknown parse error"
+} else if exists(.metadata.parse_error) {
+meta_val.parse_failure = true
+}
+# Protected deployment identity: parser-authored VRL cannot spoof
+# attribution because this is assigned after the parser runs.
+meta_val.parser_id = "e115392e-eb1e-4560-8efe-39f6af773deb"
+meta_val.parser_name = "AWS CloudTrail (OCSF)"
+parse_failure_val = to_bool(meta_val.parse_failure) ?? false
 
 # Handle ext - preserve source-specific queryable fields
 # Parser sets fields like .ext.principal_id, .ext.bucket_name
@@ -218,6 +250,7 @@ udm_val = {}
 "timestamp": ts_val,
 "message": msg_val,
 "metadata": encode_json(meta_val),
+"_nano_parser_failure": parse_failure_val,
 "ext": ext_val,
 "source_type": st_val
 }

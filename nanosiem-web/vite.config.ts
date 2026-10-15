@@ -1,4 +1,5 @@
 import path from 'path';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'fs';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
@@ -118,7 +119,18 @@ export default defineConfig(({ mode }) => {
   );
 
   return {
-  plugins: [cspPlugin(), tailwindcss(), react()],
+  plugins: [cspPlugin(), tailwindcss(), react(), {
+    name: 'build-id',
+    apply: 'build',
+    transformIndexHtml: {
+      order: 'post',
+      handler(html) {
+        // Final HTML includes content-hashed entry/preload URLs, unlike package version.
+        const id = createHash('sha256').update(html).digest('hex');
+        return [{ tag: 'meta', attrs: { name: 'nano-build-id', content: id }, injectTo: 'head' }];
+      },
+    },
+  }],
   define: {
     __APP_VERSION__: JSON.stringify(pkgVersion),
     __EDITION__: JSON.stringify(edition),

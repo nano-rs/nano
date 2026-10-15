@@ -4,11 +4,11 @@
 
 use uuid::Uuid;
 
-use crate::models::{
-    AlertMode, DetectionMode, DetectionRule, NewDetectionRule, RuleMode, UpdateDetectionRule,
-};
 use crate::mitre::mapping::{
     canonicalize_mitre_mappings, canonicalize_tactic_ids, canonicalize_technique_ids,
+};
+use crate::models::{
+    AlertMode, DetectionMode, DetectionRule, NewDetectionRule, RuleMode, UpdateDetectionRule,
 };
 
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
@@ -19,18 +19,44 @@ impl DetectionRuleRepository {
         &self,
         rule: &NewDetectionRule,
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        let result = Self::create_in_transaction_impl(&mut transaction, None, rule).await?;
+        transaction.commit().await?;
+        Ok(result)
+    }
+
+    /// Persist canonical rule fields in a caller-owned transaction.
+    ///
+    /// Shared callers must install a signed tenant context and revalidate
+    /// authority before calling this primitive. They can then write source
+    /// assignments, the schedule and audit before committing the same
+    /// transaction. This method performs no authorization or commit itself.
+    pub async fn create_in_transaction(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant: &crate::auth::TrustedTenantContext,
+        rule: &NewDetectionRule,
+    ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
+        Self::create_in_transaction_impl(transaction, Some(tenant.tenant_id), rule).await
+    }
+
+    async fn create_in_transaction_impl(
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant_id: Option<Uuid>,
+        rule: &NewDetectionRule,
+    ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
         let mappings = canonicalize_mitre_mappings(
             rule.mitre_tactics.as_deref().unwrap_or_default(),
             rule.mitre_techniques.as_deref().unwrap_or_default(),
         )
         .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
-        let result = sqlx::query_as::<_, DetectionRule>(
-            r#"
-            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url, alert_cooldown_minutes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
+        let tenant_column = if tenant_id.is_some() { "tenant_id, " } else { "" };
+        let tenant_value = if tenant_id.is_some() { "$34, " } else { "" };
+        let statement = format!(r#"
+            INSERT INTO detection_rules ({tenant_column}name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url, alert_cooldown_minutes)
+            VALUES ({tenant_value}$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
             RETURNING *
-            "#,
-        )
+            "#);
+        let query = sqlx::query_as::<_, DetectionRule>(&statement)
         .bind(&rule.name)
         .bind(&rule.description)
         .bind(&rule.query)
@@ -42,12 +68,12 @@ impl DetectionRuleRepository {
         .bind(&rule.narrative)
         .bind(&rule.reference_url)
         .bind(&rule.author)
-        .bind(rule.tags.as_ref().unwrap_or(&vec![]))
+        .bind(rule.tags.as_deref().unwrap_or(&[]))
         .bind(rule.ai_generated.unwrap_or(false))
         .bind(rule.realtime_enabled.unwrap_or(false))
         .bind(&rule.risk_score)
         .bind(&rule.risk_entity_field)
-        .bind(sqlx::types::Json(rule.risk_modifiers.as_ref().unwrap_or(&vec![])))
+        .bind(sqlx::types::Json(rule.risk_modifiers.as_deref().unwrap_or(&[])))
         // detection_mode is NOT NULL with a DB default of 'scheduled'; binding the
         // raw Option would send an explicit NULL (overriding the default) and 500 on
         // a create that omits it. Default it here like alert_mode/realtime_enabled (NAN-1665).
@@ -69,25 +95,27 @@ impl DetectionRuleRepository {
         .bind(&rule.source_path)
         .bind(&rule.source_repo_url)
         // NAN-1805: per-(rule, entity) alert cooldown; NULL/0 = off.
-        .bind(&rule.alert_cooldown_minutes)
-        .fetch_one(&self.pool)
+        .bind(&rule.alert_cooldown_minutes);
+        let query = if let Some(tenant_id) = tenant_id { query.bind(tenant_id) } else { query };
+        let result = query.fetch_one(&mut **transaction)
         .await
         .map_err(map_rule_write_error)?;
 
-        // If case_visibility is 'group', add the group associations (batch insert)
+        // If case_visibility is 'group', add the group associations (batch insert).
+        // `detection_rule_case_groups` belongs to Cases and exists only under
+        // the enterprise overlay (NAN-3463).
+        #[cfg(feature = "enterprise")]
         if rule.case_visibility.as_deref() == Some("group") {
             if let Some(ref group_ids) = rule.case_group_ids {
                 if !group_ids.is_empty() {
-                    sqlx::query(
-                        r#"
-                        INSERT INTO detection_rule_case_groups (rule_id, group_id)
-                        SELECT $1, unnest($2::uuid[])
-                        ON CONFLICT DO NOTHING
-                        "#,
-                    )
-                    .bind(result.id)
-                    .bind(group_ids)
-                    .execute(&self.pool)
+                    let statement = if tenant_id.is_some() {
+                        "INSERT INTO detection_rule_case_groups (tenant_id,rule_id,group_id) SELECT $3,$1,unnest($2::uuid[]) ON CONFLICT DO NOTHING"
+                    } else {
+                        "INSERT INTO detection_rule_case_groups (rule_id,group_id) SELECT $1,unnest($2::uuid[]) ON CONFLICT DO NOTHING"
+                    };
+                    let query = sqlx::query(statement).bind(result.id).bind(group_ids);
+                    let query = if let Some(tenant_id) = tenant_id { query.bind(tenant_id) } else { query };
+                    query.execute(&mut **transaction)
                     .await?;
                 }
             }
@@ -126,13 +154,17 @@ impl DetectionRuleRepository {
             .as_deref()
             .map(canonicalize_tactic_ids)
             .transpose()
-            .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
+            .map_err(|error| {
+                DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string())
+            })?;
         let canonical_techniques = update
             .mitre_techniques
             .as_deref()
             .map(canonicalize_technique_ids)
             .transpose()
-            .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
+            .map_err(|error| {
+                DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string())
+            })?;
 
         // First fetch the rule to get its current updated_at for optimistic locking
         let existing = self.find_by_id(id).await?;
@@ -239,7 +271,11 @@ impl DetectionRuleRepository {
         .ok_or(DetectionRuleRepositoryError::ConcurrentModification(id))?;
 
         // If case_group_ids is provided, update the group associations atomically
-        // Uses a CTE to delete and insert in a single atomic operation (race-condition safe)
+        // Uses a CTE to delete and insert in a single atomic operation (race-condition safe).
+        // NAN-3463: Cases-only table, absent from the open schema. The rule
+        // editor sends `case_group_ids: []` on every save, so in the open
+        // edition this DELETE turned every rule save into a 500.
+        #[cfg(feature = "enterprise")]
         if let Some(ref group_ids) = update.case_group_ids {
             let visibility = update
                 .case_visibility
@@ -273,7 +309,44 @@ impl DetectionRuleRepository {
         Ok(result)
     }
 
-    /// Delete a detection rule
+    /// Archive a rule as the user-facing delete (NAN-3816, parity with the
+    /// hosted NAN-2722 archive).
+    ///
+    /// The row stays so `detection_matches`, `alerts`, statistics and versions
+    /// keep their rule reference: deleting a rule must never erase the record
+    /// of every time it fired. The rule is parked in staging with no schedule,
+    /// so neither the scheduler nor the late-replay lane can claim it again.
+    ///
+    /// Returns `false` when nothing was archived: the rule is missing, already
+    /// archived, or still claimed by a scheduler node.
+    pub async fn archive_for_delete(
+        &self,
+        id: Uuid,
+    ) -> Result<bool, DetectionRuleRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE detection_rules
+            SET archived = TRUE,
+                mode = 'staging',
+                next_run_at = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND archived = FALSE
+              AND claimed_by IS NULL
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Hard-delete a detection rule row.
+    ///
+    /// Internal cleanup only (rolling back a rule whose create failed half-way).
+    /// `DELETE /api/rules/{id}` archives through [`Self::archive_for_delete`];
+    /// this cascade erases the rule's match history.
     pub async fn delete(&self, id: Uuid) -> Result<(), DetectionRuleRepositoryError> {
         let result = sqlx::query(r#"DELETE FROM detection_rules WHERE id = $1"#)
             .bind(id)

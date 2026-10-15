@@ -40,8 +40,8 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use crate::entity_extraction::ExtractedEntity;
 use super::models::PlaybookStep;
+use crate::entity_extraction::ExtractedEntity;
 
 // ---------------------------------------------------------------------------
 // RunContext
@@ -280,7 +280,10 @@ fn parse_path(raw: &str) -> Option<Path> {
             segs.extend(extra);
         }
     }
-    Some(Path { root, segments: segs })
+    Some(Path {
+        root,
+        segments: segs,
+    })
 }
 
 /// Strip trailing `[N]` brackets off `piece`, returning the bare key + any
@@ -442,11 +445,7 @@ fn resolve_path(path: &Path, ctx: &RunContext, unresolved: &mut Vec<String>) -> 
         "case" => match ctx.case.as_ref() {
             Some(c) => match first_segment_key(segs) {
                 Some("id") => RVal::Scalar(c.id.clone()),
-                Some("title") => c
-                    .title
-                    .clone()
-                    .map(RVal::Scalar)
-                    .unwrap_or(RVal::Missing),
+                Some("title") => c.title.clone().map(RVal::Scalar).unwrap_or(RVal::Missing),
                 Some("severity") => c
                     .severity
                     .clone()
@@ -542,11 +541,19 @@ fn resolve_entity_path(
     if single {
         // {{entity.<kind>}} → index 0 unless [N] was given
         let i = idx.unwrap_or(0);
-        bucket.get(i).cloned().map(RVal::Scalar).unwrap_or(RVal::Missing)
+        bucket
+            .get(i)
+            .cloned()
+            .map(RVal::Scalar)
+            .unwrap_or(RVal::Missing)
     } else {
         // {{entities.<kind>}} → array
         if let Some(i) = idx {
-            bucket.get(i).cloned().map(RVal::Scalar).unwrap_or(RVal::Missing)
+            bucket
+                .get(i)
+                .cloned()
+                .map(RVal::Scalar)
+                .unwrap_or(RVal::Missing)
         } else if bucket.is_empty() {
             RVal::Array(Vec::new())
         } else {
@@ -584,7 +591,13 @@ fn path_to_string(p: &Path) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn apply_helper(helper: &str, base: RVal, args: &[Arg], ctx: &RunContext, unresolved: &mut Vec<String>) -> String {
+fn apply_helper(
+    helper: &str,
+    base: RVal,
+    args: &[Arg],
+    ctx: &RunContext,
+    unresolved: &mut Vec<String>,
+) -> String {
     match helper {
         "lower" => base.into_string().to_lowercase(),
         "upper" => base.into_string().to_uppercase(),
@@ -747,9 +760,18 @@ mod tests {
             "process_name": "aws-cli",
         }));
         ctx.set_entities(&[
-            ExtractedEntity { entity_type: "user".into(), value: "alice".into() },
-            ExtractedEntity { entity_type: "user".into(), value: "bob".into() },
-            ExtractedEntity { entity_type: "src_ip".into(), value: "10.0.0.5".into() },
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "alice".into(),
+            },
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "bob".into(),
+            },
+            ExtractedEntity {
+                entity_type: "src_ip".into(),
+                value: "10.0.0.5".into(),
+            },
         ]);
         ctx
     }
@@ -799,7 +821,10 @@ mod tests {
     #[test]
     fn lower_upper_helpers() {
         let ctx = alice_ctx();
-        assert_eq!(resolve_string("{{lower rule.name}}", &ctx).out, "root key use");
+        assert_eq!(
+            resolve_string("{{lower rule.name}}", &ctx).out,
+            "root key use"
+        );
         assert_eq!(resolve_string("{{upper entity.user}}", &ctx).out, "ALICE");
     }
 
@@ -909,9 +934,18 @@ mod tests {
     fn set_entities_dedups_within_type() {
         let mut ctx = RunContext::default();
         ctx.set_entities(&[
-            ExtractedEntity { entity_type: "user".into(), value: "alice".into() },
-            ExtractedEntity { entity_type: "user".into(), value: "alice".into() }, // dup
-            ExtractedEntity { entity_type: "user".into(), value: "bob".into() },
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "alice".into(),
+            },
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "alice".into(),
+            }, // dup
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "bob".into(),
+            },
         ]);
         assert_eq!(ctx.entities.get("user").unwrap(), &vec!["alice", "bob"]);
     }
@@ -926,16 +960,46 @@ mod tests {
         // them to user / host / ip / domain / hash / url / file / process /
         // email).
         vec![
-            ExtractedEntity { entity_type: "user".into(),    value: "alice".into() },
-            ExtractedEntity { entity_type: "user".into(),    value: "bob".into() },
-            ExtractedEntity { entity_type: "host".into(),    value: "web-01".into() },
-            ExtractedEntity { entity_type: "ip".into(),      value: "10.0.0.5".into() },
-            ExtractedEntity { entity_type: "domain".into(),  value: "evil.example".into() },
-            ExtractedEntity { entity_type: "hash".into(),    value: "abc123".into() },
-            ExtractedEntity { entity_type: "url".into(),     value: "https://evil/x".into() },
-            ExtractedEntity { entity_type: "file".into(),    value: "/tmp/malware".into() },
-            ExtractedEntity { entity_type: "process".into(), value: "powershell.exe".into() },
-            ExtractedEntity { entity_type: "email".into(),   value: "alice@example.com".into() },
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "alice".into(),
+            },
+            ExtractedEntity {
+                entity_type: "user".into(),
+                value: "bob".into(),
+            },
+            ExtractedEntity {
+                entity_type: "host".into(),
+                value: "web-01".into(),
+            },
+            ExtractedEntity {
+                entity_type: "ip".into(),
+                value: "10.0.0.5".into(),
+            },
+            ExtractedEntity {
+                entity_type: "domain".into(),
+                value: "evil.example".into(),
+            },
+            ExtractedEntity {
+                entity_type: "hash".into(),
+                value: "abc123".into(),
+            },
+            ExtractedEntity {
+                entity_type: "url".into(),
+                value: "https://evil/x".into(),
+            },
+            ExtractedEntity {
+                entity_type: "file".into(),
+                value: "/tmp/malware".into(),
+            },
+            ExtractedEntity {
+                entity_type: "process".into(),
+                value: "powershell.exe".into(),
+            },
+            ExtractedEntity {
+                entity_type: "email".into(),
+                value: "alice@example.com".into(),
+            },
         ]
     }
 
@@ -954,7 +1018,10 @@ mod tests {
 
         let case = ctx.case.expect("case present");
         assert_eq!(case.id, "case_01hzcaseabc");
-        assert_eq!(case.title.as_deref(), Some("Suspicious PowerShell on web-01"));
+        assert_eq!(
+            case.title.as_deref(),
+            Some("Suspicious PowerShell on web-01")
+        );
         assert_eq!(case.severity.as_deref(), Some("p2"));
 
         // No alert / event / rule on the manual path — those keys must stay
@@ -1025,12 +1092,7 @@ mod tests {
         // A freshly-created case with no entities yet should still produce a
         // useful snapshot — case.id / case.title resolve, entity buckets
         // render as empty.
-        let snap = build_snapshot_from_case(
-            "case_01hzempty",
-            Some("Empty case"),
-            Some("low"),
-            &[],
-        );
+        let snap = build_snapshot_from_case("case_01hzempty", Some("Empty case"), Some("low"), &[]);
         let ctx: RunContext = serde_json::from_value(snap).unwrap();
         assert_eq!(
             resolve_string("{{case.id}} / {{entity.user}}", &ctx).out,

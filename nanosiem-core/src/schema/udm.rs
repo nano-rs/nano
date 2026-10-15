@@ -313,7 +313,10 @@ impl UdmProfile {
         if std::ptr::eq(normalized, name) || Self::is_known_raw(name) {
             return None;
         }
-        lookups().explicit.contains(normalized).then_some(normalized)
+        lookups()
+            .explicit
+            .contains(normalized)
+            .then_some(normalized)
     }
 }
 

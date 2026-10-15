@@ -58,8 +58,8 @@ pub fn split_frontmatter(src: &str) -> Result<(Option<PlaybookFrontmatter>, &str
     let body = &yaml_and_rest[close_end..];
 
     // Parse YAML
-    let fm: PlaybookFrontmatter = serde_yaml::from_str(yaml_text)
-        .map_err(|e| PlaybookError::Frontmatter(e.to_string()))?;
+    let fm: PlaybookFrontmatter =
+        serde_yaml::from_str(yaml_text).map_err(|e| PlaybookError::Frontmatter(e.to_string()))?;
 
     Ok((Some(fm), body))
 }

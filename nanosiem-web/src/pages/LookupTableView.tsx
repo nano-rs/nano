@@ -23,7 +23,6 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import {
-  Loader2,
   Database,
   Key,
   Search,
@@ -45,9 +44,11 @@ import {
   Download,
   PanelRight,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
 import { parseValueForType } from '@/lib/lookup-utils';
 import { formatUTC } from '@/lib/date-utils';
+import { urlFirstRowIsHeader } from '@/lib/lookup-header';
 import type { FileFormat, UpsertLookupIngestionRequest } from '@/lib/api';
 import { SourceTag, type LookupSource } from '@/components/lookup/shared';
 import {
@@ -99,7 +100,7 @@ function getStatusIcon(status?: string) {
     case 'failed':
       return <XCircle className="w-3.5 h-3.5 text-destructive" strokeWidth={2} />;
     case 'running':
-      return <Loader2 className="w-3.5 h-3.5 text-primary animate-spin" strokeWidth={2} />;
+      return <LoadingIcon className="w-3.5 h-3.5 text-primary" strokeWidth={2} />;
     default:
       return <Clock className="w-3.5 h-3.5 text-muted-foreground" strokeWidth={2} />;
   }
@@ -136,9 +137,10 @@ export function LookupTableView() {
 
   const [ingestionOpen, setIngestionOpen] = useState(false);
   const [ingestionForm, setIngestionForm] = useState<{
-    url: string; cron_expression: string; format: FileFormat; mode: 'replace' | 'append'; enabled: boolean;
+    url: string; cron_expression: string; format: FileFormat; mode: 'replace' | 'append'; enabled: boolean; hasHeader: boolean;
   } | null>(null);
   const [ingestionDirty, setIngestionDirty] = useState(false);
+  const [ingestionHeaderEdited, setIngestionHeaderEdited] = useState(false);
   const [cronDescription, setCronDescription] = useState('');
   const [cronError, setCronError] = useState('');
   const [deleteIngestionDialog, setDeleteIngestionDialog] = useState(false);
@@ -163,10 +165,12 @@ export function LookupTableView() {
   // Initialize ingestion form when data loads
   useEffect(() => {
     if (ingestion && !ingestionForm) {
+      setIngestionHeaderEdited(ingestion.parser_config.has_header != null);
       setIngestionForm({
         url: ingestion.url,
         cron_expression: ingestion.cron_expression,
         format: ingestion.parser_config.format,
+        hasHeader: ingestion.parser_config.has_header ?? ingestion.parser_config.csv_has_headers ?? true,
         mode: ingestion.destination.mode || 'replace',
         enabled: ingestion.enabled,
       });
@@ -196,7 +200,7 @@ export function LookupTableView() {
     const request: UpsertLookupIngestionRequest = {
       url: ingestionForm.url,
       cron_expression: ingestionForm.cron_expression,
-      parser_config: { format: ingestionForm.format, csv_has_headers: true },
+      parser_config: { format: ingestionForm.format, has_header: ingestionHeaderEdited ? ingestionForm.hasHeader : undefined },
       mode: ingestionForm.mode,
       enabled: ingestionForm.enabled,
     };
@@ -247,6 +251,7 @@ export function LookupTableView() {
       setDeleteIngestionDialog(false);
       setIngestionForm(null);
       setIngestionDirty(false);
+      setIngestionHeaderEdited(false);
       refetchIngestion();
     } catch (err) {
       toast({ title: 'Failed to remove', description: err instanceof Error ? err.message : 'Unknown error', variant: 'destructive' });
@@ -254,7 +259,8 @@ export function LookupTableView() {
   };
 
   const startNewIngestion = () => {
-    setIngestionForm({ url: '', cron_expression: '0 0 * * *', format: 'csv', mode: 'replace', enabled: true });
+    setIngestionHeaderEdited(false);
+    setIngestionForm({ url: '', cron_expression: '0 0 * * *', format: 'csv', mode: 'replace', enabled: true, hasHeader: true });
     setIngestionDirty(true);
     setIngestionOpen(true);
   };
@@ -583,7 +589,7 @@ export function LookupTableView() {
     return (
       <div className="p-8">
         <div className="flex items-center justify-center py-12">
-          <Loader2 className="w-8 h-8 animate-spin text-primary" />
+          <LoadingIcon className="w-8 h-8 text-primary" />
         </div>
       </div>
     );
@@ -740,7 +746,7 @@ export function LookupTableView() {
                             disabled={triggering}
                             className="h-[26px] px-2 rounded-md border border-border text-[11px] font-mono text-foreground/80 hover:text-foreground hover:border-border/80 inline-flex items-center gap-1 disabled:opacity-50"
                           >
-                            {triggering ? <Loader2 className="w-3 h-3 animate-spin" strokeWidth={2} /> : <Play className="w-3 h-3" strokeWidth={2} />}
+                            {triggering ? <LoadingIcon className="w-3 h-3" strokeWidth={2} /> : <Play className="w-3 h-3" strokeWidth={2} />}
                             Run now
                           </button>
                           <button
@@ -777,7 +783,10 @@ export function LookupTableView() {
                             <Globe className="w-3.5 h-3.5 text-muted-foreground shrink-0" strokeWidth={2} />
                             <Input
                               value={ingestionForm.url}
-                              onChange={(e) => updateIngestionField('url', e.target.value)}
+                              onChange={(e) => {
+                                updateIngestionField('url', e.target.value);
+                                if (!ingestionHeaderEdited) updateIngestionField('hasHeader', urlFirstRowIsHeader(e.target.value));
+                              }}
                               placeholder="https://example.com/data.csv"
                               className="border-border rounded-md h-[30px] text-[12px] font-mono"
                             />
@@ -839,6 +848,11 @@ export function LookupTableView() {
                         </div>
 
                         <div className="flex items-center justify-between">
+                          <Label className="text-[11px] text-foreground/80">First row is header</Label>
+                          <Switch checked={ingestionForm.hasHeader} onCheckedChange={(v) => { updateIngestionField('hasHeader', v); setIngestionHeaderEdited(true); }} />
+                        </div>
+
+                        <div className="flex items-center justify-between">
                           <Label className="text-[11px] text-foreground/80">Enabled</Label>
                           <Switch
                             checked={ingestionForm.enabled}
@@ -852,14 +866,17 @@ export function LookupTableView() {
                               type="button"
                               onClick={() => {
                                 if (ingestion) {
+                                  setIngestionHeaderEdited(ingestion.parser_config.has_header != null);
                                   setIngestionForm({
                                     url: ingestion.url,
                                     cron_expression: ingestion.cron_expression,
                                     format: ingestion.parser_config.format,
+                                    hasHeader: ingestion.parser_config.has_header ?? ingestion.parser_config.csv_has_headers ?? true,
                                     mode: ingestion.destination.mode || 'replace',
                                     enabled: ingestion.enabled,
                                   });
                                 } else {
+                                  setIngestionHeaderEdited(false);
                                   setIngestionForm(null);
                                 }
                                 setIngestionDirty(false);
@@ -876,7 +893,7 @@ export function LookupTableView() {
                               disabled={savingIngestion || !ingestionForm.url || !ingestionForm.cron_expression}
                               className="flex-1 h-[30px] px-3 rounded-md bg-primary text-[var(--brand-ink)] hover:bg-primary/90 text-[12px] font-semibold inline-flex items-center justify-center gap-1.5 disabled:opacity-50"
                             >
-                              {savingIngestion ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={2} /> : <Save className="w-3.5 h-3.5" strokeWidth={2} />}
+                              {savingIngestion ? <LoadingIcon className="w-3.5 h-3.5" strokeWidth={2} /> : <Save className="w-3.5 h-3.5" strokeWidth={2} />}
                               Save
                             </button>
                           </div>
@@ -921,7 +938,7 @@ export function LookupTableView() {
           disabled={queryLoading || !searchValue.trim()}
           className="h-[30px] px-3 rounded-md bg-primary text-[var(--brand-ink)] hover:bg-primary/90 text-[12px] font-semibold inline-flex items-center disabled:opacity-50"
         >
-          {queryLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={2} /> : 'Search'}
+          {queryLoading ? <LoadingIcon className="w-3.5 h-3.5" strokeWidth={2} /> : 'Search'}
         </button>
         {searched && (
           <button
@@ -1340,7 +1357,7 @@ function DetailInspector({
               disabled={triggering}
               className="mt-2 w-full h-[26px] rounded-md border border-border text-[11px] font-mono text-foreground/80 hover:text-foreground hover:border-border/80 inline-flex items-center justify-center gap-1.5 disabled:opacity-50"
             >
-              {triggering ? <Loader2 className="w-3 h-3 animate-spin" strokeWidth={2} /> : <RefreshCw className="w-3 h-3" strokeWidth={2} />}
+              {triggering ? <LoadingIcon className="w-3 h-3" strokeWidth={2} /> : <RefreshCw className="w-3 h-3" strokeWidth={2} />}
               refresh now
             </button>
           )}

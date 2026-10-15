@@ -18,6 +18,43 @@ use super::types::*;
 use crate::crypto::EncryptionService;
 use crate::inputlookup::SsrfValidator;
 
+/// NAN-3490: a connector-runtime entry runs on the nano-connector engine,
+/// which ships in every edition, so the Deno/collector edition gate does not
+/// apply to it. Everything else must pass `ensure_backend_available`.
+fn ensure_installable(
+    entry: &MarketplaceCatalogEntry,
+    backend: ExecutionBackend,
+    slug: &str,
+) -> Result<(), MarketplaceError> {
+    if entry.is_connector_runtime() {
+        return Ok(());
+    }
+    ensure_backend_available(backend, slug)
+}
+
+/// Refuse to install an entry whose backend this edition cannot run.
+///
+/// NAN-3463: a Deno-backed feed is stored in `custom_enrichments` and executed
+/// by the enterprise custom-enrichment sandbox, and a collector runs from
+/// `integration_instances`, which only the enterprise integrations routes
+/// create. None of these exists in the open edition, so the install, sync or
+/// uninstall used to fail with a 500 (`relation ... does not exist`). Native
+/// and identity backends are open.
+fn ensure_backend_available(backend: ExecutionBackend, slug: &str) -> Result<(), MarketplaceError> {
+    if cfg!(feature = "enterprise") {
+        return Ok(());
+    }
+    match backend {
+        ExecutionBackend::Deno => Err(MarketplaceError::BackendUnavailable(format!(
+            "'{slug}' is a custom-enrichment feed, which requires the enterprise edition"
+        ))),
+        ExecutionBackend::Collector => Err(MarketplaceError::BackendUnavailable(format!(
+            "'{slug}' is a pull collector, which requires the enterprise edition"
+        ))),
+        ExecutionBackend::Native | ExecutionBackend::Identity => Ok(()),
+    }
+}
+
 /// Service for installing/uninstalling enrichments from the marketplace
 pub struct MarketplaceInstallService {
     repository: MarketplaceRepository,
@@ -61,6 +98,9 @@ impl MarketplaceInstallService {
             .parse()
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
+        let connector = entry.is_connector_runtime();
+        ensure_installable(&entry, backend, slug)?;
+
         // Check credential requirements
         let req: CredentialRequirement = entry
             .requires_credential
@@ -95,6 +135,9 @@ impl MarketplaceInstallService {
         };
 
         match backend {
+            // NAN-3490: nothing to provision. The connector service reads the
+            // spec from this row's config when an operator configures a feed.
+            _ if connector => {}
             ExecutionBackend::Deno => {
                 self.install_deno_enrichment(&entry, request, user_id)
                     .await?;
@@ -147,6 +190,12 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
+            // NAN-3490: the connector service owns its feeds and stops
+            // running them once the catalog row is no longer installed. Where
+            // this edition has the Deno/collector tables, fall through anyway:
+            // an entry installed under Deno and later switched to the
+            // connector runtime still has legacy rows to disable.
+            _ if entry.is_connector_runtime() && ensure_backend_available(backend, slug).is_err() => {}
             ExecutionBackend::Deno => {
                 // Disable the custom enrichment
                 if let Some(ce_id) = entry.custom_enrichment_id {
@@ -161,13 +210,7 @@ impl MarketplaceInstallService {
             ExecutionBackend::Native => {
                 if let Some(ref source_id) = entry.native_source_id {
                     // Try agent_enrichment_providers first, then enrichment_sources
-                    let rows = sqlx::query(
-                        "UPDATE agent_enrichment_providers SET enabled = false WHERE id = $1",
-                    )
-                    .bind(source_id)
-                    .execute(&self.pool)
-                    .await?
-                    .rows_affected();
+                    let rows = self.set_agent_provider_enabled(source_id, false).await?;
 
                     if rows == 0 {
                         sqlx::query("UPDATE enrichment_sources SET enabled = false WHERE id = $1")
@@ -222,6 +265,11 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
+            // NAN-3490: connector runs go through the connector service's
+            // scheduler, not the Deno run tables.
+            _ if entry.is_connector_runtime() => {
+                info!(slug = %slug, "Connector-runtime entry: runs are scheduled by the connector service");
+            }
             ExecutionBackend::Deno => {
                 if let Some(ce_id) = entry.custom_enrichment_id {
                     // Trigger a run via custom_enrichment_runs
@@ -296,6 +344,9 @@ impl MarketplaceInstallService {
             .map_err(|e: String| MarketplaceError::Internal(e))?;
 
         match backend {
+            // NAN-3490: sync already wrote the new spec into the catalog row,
+            // which is where the connector service reads it.
+            _ if entry.is_connector_runtime() => {}
             ExecutionBackend::Deno => {
                 // Re-deploy code from catalog to custom_enrichments
                 if let Some(ce_id) = entry.custom_enrichment_id {
@@ -377,7 +428,7 @@ impl MarketplaceInstallService {
             // breadcrumb so the next regression is loud, not silent.
             tracing::warn!(
                 slug = %slug,
-                "Skipping credential update — payload contains only empty values or masked placeholders (NAN-1107)"
+                "Skipping credential update — payload contains only empty values or masked placeholders"
             );
             return Ok(());
         }
@@ -449,7 +500,12 @@ impl MarketplaceInstallService {
         }
 
         // Agent providers use api_key on agent_enrichment_providers
-        // The column stores JSON-encoded {"ciphertext": "...", "nonce": "..."} bytes
+        // The column stores JSON-encoded {"ciphertext": "...", "nonce": "..."} bytes.
+        // That table is enterprise-only (NAN-3463); the open edition keeps the
+        // key only in the catalog row's encrypted credentials.
+        if !cfg!(feature = "enterprise") {
+            return Ok(());
+        }
         if let Some(api_key) = credentials.get("API_KEY").and_then(|v| v.as_str()) {
             let encrypted = self.encryption.encrypt(api_key.as_bytes()).map_err(|e| {
                 MarketplaceError::Internal(format!("Failed to encrypt API key: {}", e))
@@ -574,6 +630,28 @@ impl MarketplaceInstallService {
         Ok(())
     }
 
+    /// Enable or disable a native agent enrichment provider; returns the rows
+    /// changed. `agent_enrichment_providers` is created by the enterprise
+    /// overlay only, so the open edition has none and native entries resolve
+    /// to `enrichment_sources` (NAN-3463).
+    async fn set_agent_provider_enabled(
+        &self,
+        source_id: &str,
+        enabled: bool,
+    ) -> Result<u64, MarketplaceError> {
+        if !cfg!(feature = "enterprise") {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query("UPDATE agent_enrichment_providers SET enabled = $2 WHERE id = $1")
+                .bind(source_id)
+                .bind(enabled)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
     /// Install a native-backed enrichment by enabling the underlying source
     async fn install_native_enrichment(
         &self,
@@ -581,12 +659,7 @@ impl MarketplaceInstallService {
     ) -> Result<(), MarketplaceError> {
         if let Some(ref source_id) = entry.native_source_id {
             // Try agent_enrichment_providers first
-            let rows =
-                sqlx::query("UPDATE agent_enrichment_providers SET enabled = true WHERE id = $1")
-                    .bind(source_id)
-                    .execute(&self.pool)
-                    .await?
-                    .rows_affected();
+            let rows = self.set_agent_provider_enabled(source_id, true).await?;
 
             if rows == 0 {
                 // Try enrichment_sources — also clear last_sync_status so the

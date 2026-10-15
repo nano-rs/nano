@@ -51,7 +51,7 @@ pub struct MitreTechnique {
     ///
     /// Always `false` on anything the sync produces: `parse_catalog` drops
     /// `revoked` and `x_mitre_deprecated` objects, so a technique that reaches
-    /// this struct is current by construction (NAN-1921). The field and its
+    /// this struct is current by construction. The field and its
     /// database column exist for rows written before catalog enforcement, which
     /// the validation trigger still screens. Do not "simplify" it away.
     pub deprecated: bool,

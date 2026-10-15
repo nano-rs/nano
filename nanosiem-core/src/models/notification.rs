@@ -25,6 +25,8 @@ pub enum NotificationType {
     CaseShared,
     AiProviderDown,
     DataFeedStale,
+    /// NAN-3207: one high-volume segment of a still-flowing source dropped.
+    DataFeedSegmentDrop,
     System,
     TuningTriggered,
     TuningValidationComplete,
@@ -42,6 +44,9 @@ pub enum NotificationType {
     ReportReady,
     /// A cancelled ClickHouse query is still running and holding a CPU core.
     StuckQueryDetected,
+    /// NAN-3230: the tenant's internal DNS suffix list changed (sent to every
+    /// `settings:system` holder; not source-linked).
+    InternalDomainsChanged,
 }
 
 impl std::fmt::Display for NotificationType {
@@ -56,6 +61,7 @@ impl std::fmt::Display for NotificationType {
             NotificationType::CaseShared => write!(f, "case_shared"),
             NotificationType::AiProviderDown => write!(f, "ai_provider_down"),
             NotificationType::DataFeedStale => write!(f, "data_feed_stale"),
+            NotificationType::DataFeedSegmentDrop => write!(f, "data_feed_segment_drop"),
             NotificationType::System => write!(f, "system"),
             NotificationType::TuningTriggered => write!(f, "tuning_triggered"),
             NotificationType::TuningValidationComplete => write!(f, "tuning_validation_complete"),
@@ -73,6 +79,7 @@ impl std::fmt::Display for NotificationType {
             NotificationType::CaseEscalated => write!(f, "case_escalated"),
             NotificationType::ReportReady => write!(f, "report_ready"),
             NotificationType::StuckQueryDetected => write!(f, "stuck_query_detected"),
+            NotificationType::InternalDomainsChanged => write!(f, "internal_domains_changed"),
         }
     }
 }

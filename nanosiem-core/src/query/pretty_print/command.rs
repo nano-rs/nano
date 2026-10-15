@@ -62,7 +62,12 @@ impl PrettyPrint for Command {
                 parts.join(" ")
             }
             Command::Where { condition } => {
-                format!("where {}", condition.pretty_print())
+                let search = super::search_expr::requires_search_spelling(condition);
+                format!(
+                    "{} {}",
+                    if search { "search" } else { "where" },
+                    super::search_expr::print_search_expr(condition, !search)
+                )
             }
             Command::Sort { fields, limit } => {
                 let field_strs: Vec<String> = fields
@@ -88,22 +93,28 @@ impl PrettyPrint for Command {
             }
             Command::Timechart {
                 span,
+                bins,
                 aggregations,
                 split_by,
                 limit,
                 cont,
+                useother,
             } => {
                 let aggs = aggregations
                     .iter()
                     .map(|a| a.pretty_print())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let span_str = format_duration(*span);
+                // Unresolved `bins=N` re-prints as written (NAN-3385).
+                let span_str = match bins {
+                    Some(n) => format!("bins={n}"),
+                    None => format!("span={}", format_duration(*span)),
+                };
                 let mut result = if split_by.is_empty() {
-                    format!("timechart span={} {}", span_str, aggs)
+                    format!("timechart {} {}", span_str, aggs)
                 } else {
                     format!(
-                        "timechart span={} {} by {}",
+                        "timechart {} {} by {}",
                         span_str,
                         aggs,
                         split_by.join(", ")
@@ -111,6 +122,9 @@ impl PrettyPrint for Command {
                 };
                 if let Some(n) = limit {
                     result.push_str(&format!(" limit={}", n));
+                }
+                if !*useother {
+                    result.push_str(" useother=false");
                 }
                 if *cont {
                     result.push_str(" cont=true");
@@ -143,13 +157,31 @@ impl PrettyPrint for Command {
             }
             Command::Lookup {
                 table_name,
+                event_field,
                 key_field,
                 output_fields,
+                output_renames,
+                output_new,
                 case_insensitive,
             } => {
                 let mut result = format!("lookup {} {}", table_name, key_field);
+                if key_field != event_field {
+                    result.push_str(&format!(" AS {}", event_field));
+                }
                 if let Some(fields) = output_fields {
-                    result.push_str(&format!(" OUTPUT {}", fields.join(", ")));
+                    let fields = fields
+                        .iter()
+                        .map(|field| match output_renames.iter().find(|r| &r.from == field) {
+                            Some(rename) => format!("{} AS {}", field, rename.to),
+                            None => field.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    result.push_str(&format!(
+                        " {} {}",
+                        if *output_new { "OUTPUTNEW" } else { "OUTPUT" },
+                        fields
+                    ));
                 }
                 if *case_insensitive {
                     result.push_str(" CASE_INSENSITIVE");
@@ -178,10 +210,11 @@ impl PrettyPrint for Command {
                 window_type,
             } => {
                 let span_str = match span {
-                    BinSpan::Time(duration) => format_duration(*duration),
-                    BinSpan::Numeric(value) => value.to_string(),
+                    BinSpan::Time(duration) => format!("span={}", format_duration(*duration)),
+                    BinSpan::Numeric(value) => format!("span={}", value),
+                    BinSpan::Bins(n) => format!("bins={}", n),
                 };
-                let mut result = format!("bin span={}", span_str);
+                let mut result = format!("bin {}", span_str);
                 // Add window type if not tumbling (default)
                 match window_type {
                     WindowType::Tumbling => {}
@@ -265,13 +298,21 @@ impl PrettyPrint for Command {
                 field,
                 limit,
                 by_fields,
-                show_count: _,
-                show_percent: _,
+                show_count,
+                show_percent,
                 inject_bounds,
             } => {
                 let mut result = format!("top limit={} {}", limit, field);
                 if !by_fields.is_empty() {
                     result.push_str(&format!(" by {}", by_fields.join(", ")));
+                }
+                // NAN-3329: hosted search re-prints the query (source-scope
+                // rewrite); dropping these flags re-enabled the columns.
+                if !*show_count {
+                    result.push_str(" showcount=false");
+                }
+                if !*show_percent {
+                    result.push_str(" showperc=false");
                 }
                 if *inject_bounds {
                     // Internal token (NAN-1711 / audit D15): keeps the detection
@@ -285,13 +326,21 @@ impl PrettyPrint for Command {
                 field,
                 limit,
                 by_fields,
-                show_count: _,
-                show_percent: _,
+                show_count,
+                show_percent,
                 inject_bounds,
             } => {
                 let mut result = format!("rare limit={} {}", limit, field);
                 if !by_fields.is_empty() {
                     result.push_str(&format!(" by {}", by_fields.join(", ")));
+                }
+                // NAN-3329: hosted search re-prints the query (source-scope
+                // rewrite); dropping these flags re-enabled the columns.
+                if !*show_count {
+                    result.push_str(" showcount=false");
+                }
+                if !*show_percent {
+                    result.push_str(" showperc=false");
                 }
                 if *inject_bounds {
                     // Internal token (NAN-1711 / audit D15) — see the `top` arm.
@@ -311,10 +360,16 @@ impl PrettyPrint for Command {
                 // a bare `startswith=login` lets the parser's greedy `search_expr` swallow the
                 // following `endswith=…`/`maxspan=…` params; the `(…)` form is bounded.
                 if let Some(expr) = startswith {
-                    result.push_str(&format!(" startswith=({})", expr.pretty_print()));
+                    result.push_str(&format!(
+                        " startswith=({})",
+                        super::search_expr::print_search_expr(expr, true)
+                    ));
                 }
                 if let Some(expr) = endswith {
-                    result.push_str(&format!(" endswith=({})", expr.pretty_print()));
+                    result.push_str(&format!(
+                        " endswith=({})",
+                        super::search_expr::print_search_expr(expr, true)
+                    ));
                 }
                 if let Some(span) = maxspan {
                     result.push_str(&format!(" maxspan={}", format_duration(*span)));
@@ -351,7 +406,11 @@ impl PrettyPrint for Command {
                     result.push_str(&format!(" output={}", o));
                 }
                 if let Some(p) = path {
-                    result.push_str(&format!(" path={}", p));
+                    // `path` accepts quoted strings specifically because JSON
+                    // paths can contain punctuation (`Content-Type`, `{}`).
+                    // Always preserve it as a literal so parse -> print ->
+                    // parse cannot reinterpret path characters as nPL syntax.
+                    result.push_str(&format!(" path={}", super::helpers::npl_quoted_literal(p)));
                 }
                 result
             }
@@ -376,11 +435,14 @@ impl PrettyPrint for Command {
                 if *join_type != JoinType::Inner {
                     result.push_str(&format!(" type={}", join_type.as_str()));
                 }
-                if *max != 1 {
-                    result.push_str(&format!(" max={}", max));
-                }
+                // NAN-3335: the join parser takes `maxout=` before `max=`;
+                // printing them the other way round made the source-scope
+                // rewrite emit a query the parser rejects.
                 if let Some(mo) = maxout {
                     result.push_str(&format!(" maxout={}", mo));
+                }
+                if *max != 1 {
+                    result.push_str(&format!(" max={}", max));
                 }
                 if !*overwrite {
                     result.push_str(" overwrite=false");
@@ -432,13 +494,18 @@ impl PrettyPrint for Command {
                 result
             }
             Command::Prevalence {
+                artifact_fields,
                 conditions,
                 time_window,
                 enrich,
             } => {
                 if *enrich {
                     // Enrichment mode
-                    let mut result = "prevalence enrich=true".to_string();
+                    let mut result = if artifact_fields.is_empty() {
+                        "prevalence enrich=true".to_string()
+                    } else {
+                        format!("prevalence {}", artifact_fields.join(", "))
+                    };
                     if let Some(tw) = time_window {
                         result.push_str(&format!(" window={}", tw.as_str()));
                     }
@@ -497,7 +564,10 @@ impl PrettyPrint for Command {
                     parts.push(format!("fields({})", capture_fields.join(", ")));
                 }
                 for condition in conditions {
-                    parts.push(format!("[{}]", condition.pretty_print()));
+                    parts.push(format!(
+                        "[{}]",
+                        super::search_expr::print_search_expr(condition, true)
+                    ));
                 }
                 parts.join(" ")
             }
@@ -514,7 +584,11 @@ impl PrettyPrint for Command {
                 // (wrapping the printed condition in quotes) produces broken nested quotes
                 // that fail the re-parse; `step1=(action="login")` round-trips cleanly.
                 for (name, condition) in steps {
-                    parts.push(format!("{}=({})", name, condition.pretty_print()));
+                    parts.push(format!(
+                        "{}=({})",
+                        name,
+                        super::search_expr::print_search_expr(condition, true)
+                    ));
                 }
                 parts.join(" ")
             }
@@ -569,6 +643,7 @@ impl PrettyPrint for Command {
                 parts.join(" ")
             }
             Command::Tree {
+                preset,
                 parent_field,
                 child_field,
                 label_field,
@@ -576,6 +651,16 @@ impl PrettyPrint for Command {
                 prevalence_field,
                 root_filter,
             } => {
+                if let Some(preset) = preset {
+                    let mut parts = vec![match preset {
+                        TreePreset::Process => "tree process".to_string(),
+                        TreePreset::Web => "tree web".to_string(),
+                    }];
+                    if let Some(root) = root_filter {
+                        parts.push(format!("root=\"{}\"", root));
+                    }
+                    return parts.join(" ");
+                }
                 // Positional form: the parser's `tree <field>` syntax leaves `parent_field`
                 // empty and sets child==label. Emitting the named form with an empty
                 // `parent=` produces invalid nPL (`tree parent= child=…`) that fails the
@@ -604,9 +689,13 @@ impl PrettyPrint for Command {
                 }
                 parts.join(" ")
             }
-            Command::ResolveIdentity { field, max_age } => {
+            Command::ResolveIdentity {
+                field,
+                field_is_default,
+                max_age,
+            } => {
                 let mut parts = vec!["resolve_identity".to_string()];
-                if field != "src_ip" {
+                if !field_is_default {
                     parts.push(format!("field={}", field));
                 }
                 let default_max_age = std::time::Duration::from_secs(24 * 3600);

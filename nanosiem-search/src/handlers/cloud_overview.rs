@@ -21,6 +21,9 @@ use crate::{error::SearchError, metrics::record_search_query, SearchState};
 /// Request for the cloud overview aggregate
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CloudOverviewRequest {
+    /// "page", "identities", "services", "changes", "denied", or default "full".
+    #[serde(default)]
+    pub fetch: Option<String>,
     /// Optional provider filter ("aws", "gcp", "azure") — omit for all
     #[serde(default)]
     pub provider: Option<String>,
@@ -59,22 +62,39 @@ pub async fn get_cloud_overview(
         ));
     }
 
+    let fetch = request.fetch.as_deref().unwrap_or("full");
+    if !matches!(fetch, "full" | "page" | "identities" | "services" | "changes" | "denied") {
+        return Err(SearchError::BadRequest("Unknown Cloud overview fetch section".into()));
+    }
     // NAN-1801: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup — it changes the executed SQL, so it
     // is part of result identity and MUST be folded into the cache key.
     let scope = super::search::effective_scope(&auth);
+    let search = super::product_view_search(&state, &auth)?;
 
     // NAN-1593: the cloud overview landing aggregate fires on every load /
     // shared-link follow and runs many parallel ClickHouse aggregates — cache
     // it through the same Dragonfly layer. Keyed on the provider / account
     // scope, the time range, and the caller's effective source scope.
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "coverview",
         &[
+            fetch.as_bytes(),
             request.provider.as_deref().unwrap_or("").as_bytes(),
             request.account.as_deref().unwrap_or("").as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
         ],
         &scope,
     );
@@ -83,6 +103,7 @@ pub async fn get_cloud_overview(
             if let Some(cached) = cache.get_cached::<CloudOverview>(&cache_key).await {
                 record_search_query("cloud_overview_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -93,23 +114,55 @@ pub async fn get_cloud_overview(
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
-    let result = state
-        .search
+    let result = if fetch != "full" {
+        search.query_cloud_overview_section(fetch, request.provider.as_deref(), request.account.as_deref(), &time_range, &scope).await
+    } else { search
         .query_cloud_overview(
             request.provider.as_deref(),
             request.account.as_deref(),
             &time_range,
             &scope,
         )
-        .await;
+        .await };
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if matches!(
+        &result,
+        Err(nanosiem_core::SearchError::ResourceExhausted(_))
+    ) {
+        if fetch != "full" {
+            super::require_current_shared_authority(&state, &auth).await?;
+            return Ok((crate::cache::cache_status_headers(false, None), Json(CloudOverview {
+                section: Some(fetch.into()), requires_durable: true, ..Default::default()
+            })));
+        }
+        let job_id = search
+            .enqueue_durable_cloud_overview(
+                request.provider.as_deref(),
+                request.account.as_deref(),
+                &time_range,
+                &scope,
+                auth.claims.sub,
+                auth.durable_search_authority().as_ref(),
+            )
+            .await?;
+        record_search_query("cloud_overview_queued", duration_ms, true);
+        super::require_current_shared_authority(&state, &auth).await?;
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(CloudOverview {
+                durable_job: Some(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                }),
+                ..Default::default()
+            }),
+        ));
+    }
     record_search_query("cloud_overview", duration_ms, result.is_ok());
 
-    let response = result.map_err(|e| {
-        tracing::error!(error = %e, "Cloud overview query failed");
-        SearchError::QueryError("Failed to fetch cloud overview".to_string())
-    })?;
+    let response = result
+        .map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch cloud overview"))?;
 
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
@@ -119,5 +172,9 @@ pub async fn get_cloud_overview(
         });
     }
 
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }

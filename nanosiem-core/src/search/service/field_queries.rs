@@ -13,9 +13,166 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use crate::query::MATERIALIZED_COLUMNS;
 
+/// The base the field sidebar plans its rollup decision on (NAN-3166): the
+/// text the drill-in's searches plan on once `search` has injected the
+/// caller's lake source-scope gate and NAN-3163 has removed it again for the
+/// count rollups. For an empty deny set that is `base_query` itself; for a
+/// strippable deny set (`{audit}`) it is `base_query` round-tripped; for a
+/// deny set naming Unattributed the gate stays, so the decision matches the
+/// gated scan those searches run instead of the rollup.
+fn lake_field_values_planning_base(base_query: &str, deny_set: &BTreeSet<String>) -> String {
+    let Ok(gated) = crate::search::query_processing::enforce_source_scope_with_field(
+        base_query,
+        deny_set,
+        crate::search::query_processing::LAKE_SOURCE_FIELD,
+    ) else {
+        return base_query.to_string();
+    };
+    parse_query(&gated)
+        .ok()
+        .and_then(|parsed| {
+            crate::search::query_processing::strip_lake_source_scope_gate(&parsed, deny_set)
+        })
+        .map(|stripped| stripped.pretty_print())
+        .unwrap_or(gated)
+}
+
+fn lake_field_values_sampled_window(
+    profile: &dyn crate::schema::SchemaProfile,
+    base_query: &str,
+    field: &str,
+    time_range: &TimeRangeInput,
+    allow_sample: bool,
+    deny_set: &BTreeSet<String>,
+) -> Option<TimeRangeInput> {
+    (allow_sample
+        && (time_range.end - time_range.start).num_seconds()
+            > SearchService::LAKE_FIELD_VALUES_EXACT_WINDOW_SECS
+        && (profile.is_string_array_field(field)
+            || !super::core_search::lake_field_values_rollup_served(
+                profile,
+                &lake_field_values_planning_base(base_query, deny_set),
+                field,
+            )))
+        .then(|| TimeRangeInput {
+            start: time_range.end
+                - chrono::Duration::seconds(SearchService::LAKE_FIELD_VALUES_EXACT_WINDOW_SECS),
+            end: time_range.end,
+        })
+}
+
+/// NAN-3566: the base a field's value list is counted over. `F=*` grouped by
+/// `F` lists exactly the values `*` grouped by `F` lists once empty values are
+/// dropped (which every caller does), and `*` is served by the exact count
+/// rollups while `F=*` is not: without this, `metadata.log_source=*` over a
+/// 12h window was counted over its newest hour only and hid a source whose
+/// only event was older. `None` when the base is anything else.
+fn lake_field_values_presence_base(base_query: &str, field: &str) -> Option<&'static str> {
+    use crate::query::{Comparator, SearchExpr, Value};
+    match parse_query(base_query).ok()? {
+        Query::Search(SearchExpr::FieldFilter {
+            field: filtered,
+            op: Comparator::Eq,
+            value: Value::String(value),
+            ..
+        }) if filtered == field && value == "*" => Some("*"),
+        _ => None,
+    }
+}
+
+/// NAN-3566: low-cardinality fields the lake field list counts exactly over
+/// the whole window (from the count rollups, memoized per part on the worker)
+/// instead of from the newest-rows sample, so a low-volume value — a rare log
+/// source, a rare class — is never missing from the rail. Every field here
+/// is a scalar count-rollup field (`LAKE_COUNT_ROLLUP_FIELDS`).
+const LAKE_EXACT_FIELD_LIST_FIELDS: &[&str] = &[
+    "metadata.log_source",
+    "metadata.product.name",
+    "metadata.product.vendor_name",
+    "class_uid",
+    "class_name",
+    "category_name",
+    "activity_name",
+    "severity",
+    "status",
+];
+
+/// Values kept per exact field: the drill-in's own bound (`limit: 100`).
+const LAKE_EXACT_FIELD_LIST_LIMIT: usize = 100;
+
+/// How long the field-stats answer waits for one exact field before keeping
+/// its sampled values (flagged as sampled). The exact reads run beside the
+/// row sample, so on a warm worker they add nothing; this caps a cold
+/// rollup read on a large tenant.
+const LAKE_EXACT_FIELD_LIST_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// Merge exact per-field values into a lake field-stats sample: an exact
+/// field replaces its sampled entry (or is added when the sample never saw
+/// it); every other field is flagged with the sample size.
+fn merge_exact_field_values(
+    sampled: Vec<FieldInfo>,
+    exact: Vec<(String, Vec<(String, u64)>)>,
+    sampled_rows: u64,
+) -> Vec<FieldInfo> {
+    let mut fields: Vec<FieldInfo> = sampled
+        .into_iter()
+        .map(|mut field| {
+            field.sampled_rows = Some(sampled_rows);
+            field
+        })
+        .collect();
+    for (name, values) in exact {
+        if values.is_empty() {
+            // No event in the window carries the field: nothing to list.
+            fields.retain(|field| field.name != name);
+            continue;
+        }
+        let field_type = fields
+            .iter()
+            .find(|field| field.name == name)
+            .map(|field| field.field_type.clone())
+            .unwrap_or_else(|| {
+                if values.iter().all(|(value, _)| value.parse::<i64>().is_ok()) {
+                    "number".to_string()
+                } else {
+                    "string".to_string()
+                }
+            });
+        let info = FieldInfo {
+            count: values.iter().map(|(_, count)| *count).sum(),
+            cardinality: Some(values.len() as u64),
+            top_values: values,
+            sampled_rows: None,
+            ..FieldInfo::new(name.clone(), field_type)
+        };
+        match fields.iter_mut().find(|field| field.name == name) {
+            Some(field) => *field = info,
+            None => fields.push(info),
+        }
+    }
+    fields
+}
+
 impl SearchService {
+    /// Row bound for the primary lake's field-stats sample. The lake has no
+    /// column inventory to aggregate over, so field stats are computed from
+    /// up to this many recent matching rows, for every request: with no
+    /// `columns` (the web's "Show all fields" / "Index all fields", pivt
+    /// inventory reads) over full rows, and with `columns` projected to the
+    /// requested canonical fields when they are all known (NAN-2771).
+    /// NAN-3216: a `columns` request used to return an empty answer unless it
+    /// opted in with `sample_columns`; that silent empty was indistinguishable
+    /// from "no data" and left the web Search page's field rail (which always
+    /// sends `columns`) and every API caller with no field stats on a shared
+    /// tenant. The projected sample is cheap (sub-second live) and cached by
+    /// the search service's companion cache. Transferring ClickHouse's
+    /// 100k-row field-stat bound across the worker boundary would dwarf the
+    /// visible result payload; per-field expansion stays exact over the full
+    /// window.
+    const LAKE_FIELD_STATS_SAMPLE_ROWS: usize = 1_000;
+
     /// Get field statistics for a query, gated by the admission controller
-    /// (NAN-1427).
+    ///
     ///
     /// The field-stats companion is the heaviest query a search fans out to
     /// (measured 8.4x the data query's read bytes for the full ~90-column
@@ -27,7 +184,7 @@ impl SearchService {
     ///    concurrent unbounded all-column scans),
     /// 2. Applies the priority's `ClickHouseQuerySettings`,
     /// 3. Runs the stats query under the derived `{request_id}-fstats` id so
-    ///    `DELETE /api/search/{request_id}` cancels it (NAN-1428).
+    ///    `DELETE /api/search/{request_id}` cancels it.
     pub async fn get_field_stats_with_admission(
         &self,
         query: &str,
@@ -38,12 +195,12 @@ impl SearchService {
         priority: super::admission::QueryPriority,
         dataset: Option<&str>,
         scope: &ScopeSet,
-    ) -> Result<Vec<FieldInfo>, SearchError> {
+    ) -> Result<FieldStatsResult, SearchError> {
         let derived_qid = request_id.map(|r| format!("{r}-fstats"));
 
         // No controller wired up → no gating, run directly (tests,
         // single-tenant deployments) — mirrors `search_with_admission`.
-        let Some(controller) = self.admission_controller.clone() else {
+        let Some(controller) = self.required_admission_controller()? else {
             return self
                 .get_field_stats_for_query(
                     query,
@@ -57,10 +214,10 @@ impl SearchService {
         };
 
         let job_id = uuid::Uuid::now_v7().to_string();
-        let _permit = controller
-            .acquire(&job_id, user_id, priority)
+        let _permit = self
+            .acquire_auxiliary_search_admission(&controller, &job_id, user_id, priority)
             .await
-            .map_err(|e| SearchError::AdmissionDenied(e.to_string()))?;
+            .map_err(SearchError::from)?;
 
         let mut service = self.clone();
         service.active_ch_settings = Some(service.ch_settings_for_priority(priority));
@@ -91,6 +248,11 @@ impl SearchService {
     /// table inventory — unknown names are dropped, and an empty intersection
     /// falls back to the full inventory so a stale client column list cannot
     /// blank the field panel. `None` keeps today's full-inventory behavior.
+    ///
+    /// On the primary lake every request runs the bounded sample (see
+    /// [`Self::LAKE_FIELD_STATS_SAMPLE_ROWS`]). [`FieldStatsResult::sampled_rows`]
+    /// carries the lake sample's row count so `total_events` never depends on
+    /// which columns were requested; ClickHouse leaves it `None`.
     pub async fn get_field_stats_for_query(
         &self,
         query: &str,
@@ -99,10 +261,113 @@ impl SearchService {
         query_id: Option<&str>,
         dataset: Option<&str>,
         scope: &ScopeSet,
-    ) -> Result<Vec<FieldInfo>, SearchError> {
-        // Only supported for ClickHouse backend
+    ) -> Result<FieldStatsResult, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_input_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(FieldStatsResult::default());
+        };
+        let time_range = &retention_time_range;
+
+        // The primary lake has no column inventory to aggregate over: field
+        // stats come from a bounded row sample (`LAKE_FIELD_STATS_SAMPLE_ROWS`)
+        // whose rows flatten to canonical dotted OCSF paths
+        // (`metadata.log_source`, `src_endpoint.ip`, ...).
+        //
+        // A `columns` request is projected to exactly those fields when every
+        // name is a known canonical field (otherwise full rows, so
+        // unknown/unmapped names keep the ClickHouse contract: dropped, empty
+        // intersection = full sample). NAN-3216: never answer a `columns`
+        // request with an empty list — that read as "no fields" on a window
+        // carrying ~1.4M events/hour.
+        let is_log_request = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"))
+            == crate::query::Dataset::Logs;
+        if self.lake_query.mode == LakeQueryMode::Primary && is_log_request {
+            let parsed_query = parse_query(query).map_err(convert_parse_error)?;
+            let base_query = extract_base_search(&parsed_query).pretty_print();
+            let profile = self.dataset_profile(Some("logs"));
+            let projection = requested_columns
+                .and_then(|columns| lake_field_stats_projection(columns, profile.as_ref()));
+            let sample_query = match &projection {
+                Some(columns) => format!("{base_query} | table {}", columns.join(", ")),
+                None => base_query.clone(),
+            };
+            let request = SearchRequest {
+                query: sample_query,
+                time_range: time_range.clone(),
+                limit: Some(Self::LAKE_FIELD_STATS_SAMPLE_ROWS),
+                offset: Some(0),
+                include_sql: Some(false),
+                skip_histogram: true,
+                skip_field_stats: true,
+                use_cache: true,
+                table_view: false,
+                request_id: query_id.map(ToOwned::to_owned),
+                async_mode: false,
+                priority: None,
+                dataset: Some("logs".to_string()),
+            };
+            // NAN-3566: the low-cardinality fields are counted exactly beside
+            // the sample (each bounded by its own budget), so a rare value is
+            // never lost to the newest-rows sample.
+            let exact_columns = requested_columns.filter(|columns| {
+                columns.iter().any(|column| profile.is_known_field(column))
+            });
+            let exact_fields: Vec<&str> = LAKE_EXACT_FIELD_LIST_FIELDS
+                .iter()
+                .copied()
+                .filter(|field| {
+                    exact_columns
+                        .is_none_or(|columns| columns.iter().any(|column| column == field))
+                })
+                .collect();
+            let base_query = base_query.as_str();
+            let exact_reads = futures::future::join_all(exact_fields.iter().map(|&field| {
+                async move {
+                    let read = self.lake_exact_field_values(field, base_query, time_range, scope);
+                    match tokio::time::timeout(LAKE_EXACT_FIELD_LIST_BUDGET, read).await {
+                        Ok(Ok(Some(values))) => Some((field.to_string(), values)),
+                        Ok(Ok(None)) => None,
+                        Ok(Err(error)) => {
+                            warn!(%error, field, "exact field-list values failed; keeping the sample");
+                            None
+                        }
+                        Err(_) => {
+                            info!(field, "exact field-list values over budget; keeping the sample");
+                            None
+                        }
+                    }
+                }
+            }));
+            // Search futures are large; keep concurrent companions on the heap
+            // instead of multiplying the caller's stack frame.
+            let (response, exact) = tokio::join!(Box::pin(self.search(request, scope)), exact_reads);
+            let response = response?;
+            let exact: Vec<_> = exact.into_iter().flatten().collect();
+            let sampled_rows = u64::try_from(response.results.len()).unwrap_or(u64::MAX);
+            let sampled = if projection.is_some() {
+                // A projection emits every requested column on every row, null
+                // where the event lacks it; count only populated values so a
+                // sparse field's count matches the full-row sample.
+                let mut statistics = FieldStatistics::new();
+                for row in &response.results {
+                    statistics.process_row(&strip_null_fields(row));
+                }
+                statistics.get_field_info(self.config.top_values_count)
+            } else {
+                response.fields
+            };
+            return Ok(FieldStatsResult {
+                fields: merge_exact_field_values(
+                    select_lake_field_stats(sampled, requested_columns),
+                    exact,
+                    sampled_rows,
+                ),
+                sampled_rows: Some(sampled_rows),
+            });
+        }
         if self.backend != SearchBackend::ClickHouse {
-            return Ok(Vec::new());
+            return Ok(FieldStatsResult::default());
         }
 
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
@@ -226,8 +491,11 @@ impl SearchService {
                 .await
             {
                 Ok(stats) => {
-                    info!("Async field stats returned {} fields with data", stats.len());
-                    return Ok(stats);
+                    info!(
+                        "Async field stats returned {} fields with data",
+                        stats.len()
+                    );
+                    return Ok(FieldStatsResult { fields: stats, sampled_rows: None });
                 }
                 Err(SearchError::FieldNotFound { field, .. })
                     if columns.iter().any(|c| c == &field) =>
@@ -239,7 +507,7 @@ impl SearchService {
                     );
                     columns.retain(|c| c != &field);
                     if columns.is_empty() {
-                        return Ok(Vec::new());
+                        return Ok(FieldStatsResult::default());
                     }
                 }
                 Err(e) => return Err(e),
@@ -247,9 +515,14 @@ impl SearchService {
         }
     }
 
+    /// Widest window whose field-sidebar drill-in scans every raw row when
+    /// the parts' count rollups cannot answer it (NAN-3093). A wider window is
+    /// answered from its newest slice this long and flagged as a sample.
+    pub const LAKE_FIELD_VALUES_EXACT_WINDOW_SECS: i64 = 3_600;
+
     /// Get top values for a single field (on-demand, Kibana-style).
     /// This is much more efficient than querying all fields at once.
-    #[instrument(skip(self, scope), fields(field = %field, query = %query))]
+    /// Always exact over the whole window.
     pub async fn get_field_values(
         &self,
         field: &str,
@@ -259,9 +532,213 @@ impl SearchService {
         dataset: Option<&str>,
         scope: &ScopeSet,
     ) -> Result<Vec<FieldValueInfo>, SearchError> {
-        // Only supported for ClickHouse backend
+        Ok(self
+            .field_values_inner(field, query, time_range, limit, dataset, scope, false)
+            .await?
+            .values)
+    }
+
+    /// NAN-3566: `field`'s values over the whole window, exactly, when the
+    /// count rollups answer `base_query` grouped by `field`; `None` when they
+    /// do not (the caller keeps its sample rather than scan the window).
+    /// One rollup read with no full-window scan fallback; the worker counts
+    /// ragged time-window edges exactly and memoizes per-part rollups.
+    async fn lake_exact_field_values(
+        &self,
+        field: &str,
+        base_query: &str,
+        time_range: &TimeRangeInput,
+        scope: &ScopeSet,
+    ) -> Result<Option<Vec<(String, u64)>>, SearchError> {
+        let profile = self.active_profile.as_ref();
+        if !profile.is_known_field(field)
+            || profile.is_string_array_field(field)
+            || crate::search::lake::lake_count_rollup_field_multi_value(field) != Some(false)
+        {
+            return Ok(None);
+        }
+        let base_query = lake_field_values_presence_base(base_query, field).unwrap_or(base_query);
+        let planning_base = lake_field_values_planning_base(base_query, scope.deny_set());
+        let Some(rows) = self
+            .lake_field_list_rollup_rows(&planning_base, field, time_range, scope)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut values = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(value) = row.get(field).and_then(lake_field_value_string) else {
+                return Err(SearchError::SqlValidationError(
+                    "field-list rollup omitted its grouped value".to_string(),
+                ));
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let count = row
+                .get("count")
+                .and_then(|value| {
+                    value.as_u64().or_else(|| value.as_str().and_then(|v| v.parse().ok()))
+                })
+                .ok_or_else(|| SearchError::SqlValidationError(
+                    "field-list rollup omitted its UInt64 count".to_string(),
+                ))?;
+            values.push((value, count));
+        }
+        // A capped list cannot supply an exact count or cardinality. Unusual
+        // metadata with more values keeps the explicitly marked row sample.
+        if values.len() > LAKE_EXACT_FIELD_LIST_LIMIT {
+            return Ok(None);
+        }
+        values.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        Ok(Some(values))
+    }
+
+    /// The field sidebar's drill-in (NAN-3093). On the primary lake a window
+    /// wider than [`Self::LAKE_FIELD_VALUES_EXACT_WINDOW_SECS`] that the count
+    /// rollups cannot answer (a non-rollup field, a repeated field, a base with
+    /// row-level filters) is sampled: counted over its newest slice of that
+    /// length, and the result names the slice so the panel can say so.
+    /// Everything else is exact, as [`Self::get_field_values`].
+    pub async fn get_field_values_for_panel(
+        &self,
+        field: &str,
+        query: &str,
+        time_range: &TimeRangeInput,
+        limit: usize,
+        dataset: Option<&str>,
+        scope: &ScopeSet,
+    ) -> Result<FieldValuesResult, SearchError> {
+        self.field_values_inner(field, query, time_range, limit, dataset, scope, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(self, scope, query), fields(field = %field, query = %crate::inputlookup::storage_policy::redact_url_credentials(query)))]
+    async fn field_values_inner(
+        &self,
+        field: &str,
+        query: &str,
+        time_range: &TimeRangeInput,
+        limit: usize,
+        dataset: Option<&str>,
+        scope: &ScopeSet,
+        allow_sample: bool,
+    ) -> Result<FieldValuesResult, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_input_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(FieldValuesResult::default());
+        };
+        let time_range = &retention_time_range;
+
+        let is_log_request = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"))
+            == crate::query::Dataset::Logs;
+        if self.lake_query.mode == LakeQueryMode::Primary && is_log_request {
+            let safe_field = field.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment
+                        .chars()
+                        .next()
+                        .is_some_and(|value| value == '_' || value.is_ascii_alphabetic())
+                    && segment
+                        .chars()
+                        .all(|value| value == '_' || value.is_ascii_alphanumeric())
+            });
+            if !safe_field || !self.active_profile.is_known_field(field) {
+                return Err(SearchError::FieldNotFound {
+                    field: field.to_string(),
+                    suggestions: Vec::new(),
+                    message: "field values require a canonical OCSF or explicit unmapped path"
+                        .to_string(),
+                });
+            }
+            let parsed_query = parse_query(query).map_err(convert_parse_error)?;
+            let base_query = extract_base_search(&parsed_query).pretty_print();
+            // NAN-3566: `F=*` lists F's values as `*` does, from the rollups.
+            // Keep repeated-field presence/percentage semantics unchanged:
+            // summing expanded value counts can count an event more than once.
+            let repeated = self.active_profile.is_string_array_field(field);
+            let presence_base = (!repeated)
+                .then(|| lake_field_values_presence_base(&base_query, field))
+                .flatten();
+            let base_query = presence_base.map(str::to_string).unwrap_or(base_query);
+            let field_values_query = lake_field_values_query(&base_query, field, limit, repeated);
+            let sampled_window = lake_field_values_sampled_window(
+                self.active_profile.as_ref(), &base_query, field, time_range, allow_sample,
+                scope.deny_set(),
+            );
+            let request = SearchRequest {
+                query: field_values_query,
+                time_range: sampled_window.clone().unwrap_or_else(|| time_range.clone()),
+                limit: Some(limit),
+                offset: None,
+                include_sql: Some(false),
+                skip_histogram: true,
+                skip_field_stats: true,
+                use_cache: true,
+                table_view: false,
+                request_id: None,
+                async_mode: false,
+                priority: None,
+                dataset: Some("logs".to_string()),
+            };
+            // The percentage is "share of all matching events" (the UI's
+            // contract, FieldsPanel.tsx). The top-N rows alone only give the
+            // share of the returned values (audit #14: 10.7% for a value
+            // that is 0.09% of the events). The base count runs beside the
+            // values query and is rollup-served when the base allows it.
+            let total_request = SearchRequest {
+                query: format!("{base_query} | stats count() as count"),
+                limit: Some(1),
+                ..request.clone()
+            };
+            let (response, total) = tokio::join!(
+                Box::pin(self.search(request, scope)),
+                Box::pin(self.search(total_request, scope))
+            );
+            let response = response?;
+            let matching_events = match total {
+                Ok(total) => total
+                    .results
+                    .first()
+                    .and_then(|row| row.get("count"))
+                    .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|v| v as u64))),
+                Err(error) => {
+                    tracing::warn!(%error, field, "lake field-values total failed; percentages are relative to the returned values");
+                    None
+                }
+            };
+            let mut values = Vec::with_capacity(response.results.len());
+            for row in response.results {
+                let Some(value) = row.get(field).and_then(lake_field_value_string) else {
+                    continue;
+                };
+                if value.is_empty() {
+                    continue;
+                }
+                let count = row
+                    .get("count")
+                    .and_then(|value| value.as_u64().or_else(|| value.as_f64().map(|v| v as u64)))
+                    .unwrap_or(0);
+                values.push(FieldValueInfo {
+                    value,
+                    count,
+                    percentage: 0.0,
+                });
+            }
+            // Under the presence rewrite the matching events are the rows
+            // that carry a value: all of them are listed below the limit.
+            let matching_events = if presence_base.is_some() && values.len() < limit {
+                Some(values.iter().map(|value| value.count).sum())
+            } else {
+                matching_events
+            };
+            apply_field_value_percentages(&mut values, matching_events);
+            return Ok(FieldValuesResult { values, sampled_window });
+        }
         if self.backend != SearchBackend::ClickHouse {
-            return Ok(Vec::new());
+            return Ok(FieldValuesResult::default());
         }
 
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
@@ -322,7 +799,7 @@ impl SearchService {
             .await?;
         info!(field = %field, count = values.len(), "Field values query complete");
 
-        Ok(values)
+        Ok(FieldValuesResult { values, sampled_window: None })
     }
 
     /// Fetch a single log event by ID
@@ -352,6 +829,24 @@ impl SearchService {
         source_type: Option<&str>,
         scope: &ScopeSet,
     ) -> Result<Option<serde_json::Value>, SearchError> {
+        let (retention_time_range, fully_expired) =
+            self.retention_bound_optional_input_range(time_range, chrono::Utc::now())?;
+        if fully_expired {
+            return Ok(None);
+        }
+        let time_range = retention_time_range.as_ref();
+
+        if self.lake_query.mode == LakeQueryMode::Primary {
+            let client = self.lake_query.client.as_ref().ok_or_else(|| {
+                SearchError::SqlValidationError(
+                    "lake query backend is enabled without a worker client".to_string(),
+                )
+            })?;
+            return client
+                .fetch_log_by_id(id, time_range, source_type, scope.deny_set())
+                .await;
+        }
+
         // Profile-aware (NAN-1241): resolve the active schema's logs table
         // (`ocsf_logs` under OCSF) and re-add that profile's materialized columns,
         // not the UDM set. UDM behavior is unchanged (same key, same columns).
@@ -392,7 +887,14 @@ impl SearchService {
             ch_executor.execute_sql_to_json(&sql).await?
         };
 
-        Ok(results.into_iter().next())
+        // NAN-3245: the expanded row is the event's populated fields; the
+        // explicit-column table pads every unset UDM/OCSF column with
+        // null/"". `raw_data` is kept verbatim; a JSON-string `unmapped`/`ext`
+        // is a non-empty value and is kept as is (NAN-3458).
+        Ok(results.into_iter().next().map(|mut row| {
+            crate::search::sparse_event::sparse_full_event(&mut row);
+            row
+        }))
     }
 
     /// Query logs by a specific UDM field value
@@ -403,13 +905,19 @@ impl SearchService {
     #[instrument(skip(self, scope))]
     pub async fn query_udm_field(
         &self,
-        request: UdmFieldQueryRequest,
+        mut request: UdmFieldQueryRequest,
         scope: &ScopeSet,
     ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
 
         // Validate time range
         request.time_range.validate()?;
+        let Some(retention_time_range) =
+            self.retention_bound_input_range(&request.time_range, chrono::Utc::now())?
+        else {
+            return Ok(SearchResponse::empty());
+        };
+        request.time_range = retention_time_range;
 
         // Build the SQL query for the UDM field
         let sql = self.build_udm_field_query(&request, scope.deny_set())?;
@@ -463,8 +971,11 @@ impl SearchService {
         // UDM field queries don't get cost analysis (they're simple field lookups)
         // Display type is always Events for UDM field queries
         Ok(SearchResponse {
+            server_wall_ms: None,
             results,
             total_count,
+            // Field lookups run their own exact count companion.
+            total_count_exact: true,
             execution_time_ms,
             fields,
             generated_sql: if request.include_sql.unwrap_or(false) {
@@ -477,6 +988,7 @@ impl SearchService {
             cost_score: None,
             display_type: Some(DisplayType::Events),
             column_order: None, // UDM field queries don't have column order
+            completeness: None,
         })
     }
 
@@ -505,6 +1017,35 @@ impl SearchService {
         time_range: Option<&TimeRangeInput>,
         scope: &ScopeSet,
     ) -> Result<Vec<String>, SearchError> {
+        let (retention_time_range, fully_expired) =
+            self.retention_bound_optional_input_range(time_range, chrono::Utc::now())?;
+        if fully_expired {
+            return Ok(Vec::new());
+        }
+        let time_range = retention_time_range.as_ref();
+
+        if self.lake_query.mode == LakeQueryMode::Primary {
+            // Strict OCSF has no `ext` namespace. The route name remains for
+            // the existing frontend transport. The worker's immutable source
+            // manifest describes POSSIBLE `unmapped.*` paths, not paths with a
+            // non-null value in this search. It is useful for context-free
+            // query autocomplete, but must not populate a query-scoped field
+            // rail with empty schema placeholders. Populated spill leaves in a
+            // search are discovered from the same sampled rows as other nested
+            // OCSF leaves and remain available for exact per-field expansion.
+            if query.is_some() || time_range.is_some() {
+                return Ok(Vec::new());
+            }
+            // Serving objects can mix sources, and the current manifest does
+            // not attribute each sparse path to a source. Returning the union
+            // to a restricted caller would disclose fields that exist only in
+            // denied/audit sources, so fail closed until the manifest carries
+            // per-source path coverage.
+            if !lake_unmapped_field_discovery_allowed(scope) {
+                return Ok(Vec::new());
+            }
+            return self.lake_unmapped_field_names().await;
+        }
         if self.backend != SearchBackend::ClickHouse {
             return Ok(Vec::new());
         }
@@ -552,10 +1093,12 @@ impl SearchService {
                     return Ok(Vec::new());
                 };
                 match extract_base_search(&parsed) {
-                    Query::Search(expr) => match self.ch_sql_generator.generate_search_expr(&expr) {
-                        Ok(filter) => format!("{} AND ({})", time_only(tr), filter),
-                        Err(_) => return Ok(Vec::new()),
-                    },
+                    Query::Search(expr) => {
+                        match self.ch_sql_generator.generate_search_expr(&expr) {
+                            Ok(filter) => format!("{} AND ({})", time_only(tr), filter),
+                            Err(_) => return Ok(Vec::new()),
+                        }
+                    }
                     // extract_base_search always yields Query::Search; defensively
                     // fall back to the window scope rather than erroring.
                     _ => time_only(tr),
@@ -586,11 +1129,10 @@ impl SearchService {
         // NAN-1799: append the caller's source-scope exclusion to whichever
         // branch built the predicate (query-scoped, time-only, or the 3h
         // fallback). Empty deny-set → predicate unchanged (byte-identical).
-        let where_predicate =
-            match source_scope_sql_predicate("source_type", scope.deny_set()) {
-                Some(pred) => format!("{where_predicate} AND {pred}"),
-                None => where_predicate,
-            };
+        let where_predicate = match source_scope_sql_predicate("source_type", scope.deny_set()) {
+            Some(pred) => format!("{where_predicate} AND {pred}"),
+            None => where_predicate,
+        };
 
         ch_executor
             .get_ext_field_names(&table, json_col, is_ocsf, &where_predicate)
@@ -739,6 +1281,55 @@ impl SearchService {
     }
 }
 
+fn lake_unmapped_field_discovery_allowed(scope: &ScopeSet) -> bool {
+    !scope.is_restricted()
+}
+
+fn lake_field_value_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string(value).ok()
+        }
+    }
+}
+
+/// Build the primary-lake on-demand value query at the same logical grain the
+/// event inspector renders. Repeated OCSF objects are stored as parallel array
+/// leaves (`enrichments.data.detector`, hashes, resources, ...). Grouping the
+/// physical leaf directly groups whole array combinations and leaks JSON such
+/// as `["dga_entropy","suspicious_tld"]` into the filter rail. Expand only
+/// schema-declared array leaves first so each displayed/filterable scalar gets
+/// its own count. Scalar fields keep the existing byte shape.
+///
+/// The maximum `usize` is deliberate: this internal companion must not silently
+/// sample a user's result window at the normal interactive `mvexpand` row cap.
+/// The worker's scan, time, and memory admission fences still apply, so an
+/// oversized drill-in fails explicitly instead of returning plausible partial
+/// counts.
+/// Percent of all matching events. Falls back to the returned values' sum
+/// when the base count is unavailable, and never below it (a stale count must
+/// not produce shares above 100%).
+fn apply_field_value_percentages(values: &mut [FieldValueInfo], matching_events: Option<u64>) {
+    let returned_total: u64 = values.iter().map(|item| item.count).sum();
+    let denominator = matching_events.unwrap_or(0).max(returned_total);
+    if denominator > 0 {
+        for item in values.iter_mut() {
+            item.percentage = item.count as f64 * 100.0 / denominator as f64;
+        }
+    }
+}
+
+fn lake_field_values_query(base_query: &str, field: &str, limit: usize, repeated: bool) -> String {
+    let expand = repeated
+        .then(|| format!(" | mvexpand {field} limit={}", usize::MAX))
+        .unwrap_or_default();
+    format!("{base_query}{expand} | stats count() as count by {field} | sort -count | head {limit}")
+}
+
 /// Select the column set for a field-stats query (NAN-1427).
 ///
 /// - `requested = None` → the full table inventory (today's behavior — API
@@ -749,10 +1340,7 @@ impl SearchService {
 ///   generated SQL, so a client cannot inject identifiers.
 /// - An empty intersection falls back to the FULL inventory: a stale client
 ///   column list must not silently blank the field panel.
-fn select_field_stats_columns(
-    inventory: Vec<String>,
-    requested: Option<&[String]>,
-) -> Vec<String> {
+fn select_field_stats_columns(inventory: Vec<String>, requested: Option<&[String]>) -> Vec<String> {
     let Some(requested) = requested else {
         return inventory;
     };
@@ -773,6 +1361,88 @@ fn select_field_stats_columns(
     } else {
         reduced
     }
+}
+
+/// Top values of one field (NAN-3093): exact over the requested window, or
+/// counted over `sampled_window` only (see
+/// [`SearchService::get_field_values_for_panel`]).
+#[derive(Debug, Clone, Default)]
+pub struct FieldValuesResult {
+    pub values: Vec<FieldValueInfo>,
+    /// The slice of the window the values were counted over, when sampled.
+    pub sampled_window: Option<TimeRangeInput>,
+}
+
+/// Field statistics plus, on the primary lake, the size of the row sample
+/// they were computed from (NAN-2771). `sampled_rows` is independent of the
+/// requested columns, so it is the honest `total_events` for a sample;
+/// ClickHouse aggregates over the window and leaves it `None`.
+#[derive(Debug, Clone, Default)]
+pub struct FieldStatsResult {
+    pub fields: Vec<FieldInfo>,
+    pub sampled_rows: Option<u64>,
+}
+
+/// NAN-2771: the canonical fields to project a lake field-stats sample to, or
+/// `None` to sample full rows. Projection happens only when the profile
+/// enforces canonical fields and EVERY requested name is a known scalar
+/// field of it; any unknown/unmapped/array name keeps the full-row sample so
+/// the selection contract (drop unknown, empty intersection = full) holds.
+fn lake_field_stats_projection(
+    requested: &[String],
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Option<Vec<String>> {
+    if requested.is_empty() || !profile.uses_strict_canonical_fields() {
+        return None;
+    }
+    let mut columns: Vec<String> = Vec::with_capacity(requested.len());
+    for name in requested {
+        if !profile.is_known_field(name) || profile.is_string_array_field(name) {
+            return None;
+        }
+        if !columns.contains(name) {
+            columns.push(name.clone());
+        }
+    }
+    Some(columns)
+}
+
+/// Drop null-valued keys (recursively through objects) from a projected row.
+fn strip_null_fields(row: &serde_json::Value) -> serde_json::Value {
+    match row {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key.clone(), strip_null_fields(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// NAN-2771: reduce a lake field-stats sample to the requested canonical
+/// names, mirroring [`select_field_stats_columns`] (exact-name intersection;
+/// an empty intersection keeps the full sample so a stale client column list
+/// cannot blank the field panel). Sample order is preserved.
+fn select_lake_field_stats(sampled: Vec<FieldInfo>, requested: Option<&[String]>) -> Vec<FieldInfo> {
+    let Some(requested) = requested else {
+        return sampled;
+    };
+    let requested: std::collections::HashSet<&str> = requested.iter().map(String::as_str).collect();
+    if !sampled.iter().any(|field| requested.contains(field.name.as_str())) {
+        if !requested.is_empty() {
+            warn!(
+                "Requested lake field-stats columns ({}) matched no sampled field; \
+                 returning the full sample inventory",
+                requested.len()
+            );
+        }
+        return sampled;
+    }
+    sampled
+        .into_iter()
+        .filter(|field| requested.contains(field.name.as_str()))
+        .collect()
 }
 
 /// Build the SQL for `fetch_log_by_id`.
@@ -868,6 +1538,117 @@ fn build_fetch_log_sql(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lake_field_values_rollup_served_contract() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        for (base, field, expected) in [
+            ("metadata.log_source=windows_sysmon", "src_endpoint.hostname", true),
+            ("*", "actor.user.name", true),
+            ("*", "src_endpoint.ip", false),
+            ("*", "unmapped.custom_field", false),
+            ("*", "enrichments.data.detector", false),
+        ] {
+            assert_eq!(super::super::core_search::lake_field_values_rollup_served(
+                &profile, base, field,
+            ), expected, "{base}: {field}");
+        }
+    }
+
+    #[test]
+    fn lake_field_values_panel_samples_only_wide_non_rollup_windows() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        let end = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap();
+        let wide = TimeRangeInput { start: end - chrono::Duration::hours(24), end };
+        for field in ["src_endpoint.ip", "unmapped.custom_field", "enrichments.data.detector"] {
+            let sampled = lake_field_values_sampled_window(&profile, "*", field, &wide, true, &BTreeSet::new()).unwrap();
+            assert_eq!(sampled.start, end - chrono::Duration::hours(1));
+            assert_eq!(sampled.end, end);
+            assert!(lake_field_values_sampled_window(&profile, "*", field, &wide, false, &BTreeSet::new()).is_none());
+            let exact = TimeRangeInput { start: sampled.start, end };
+            assert!(lake_field_values_sampled_window(&profile, "*", field, &exact, true, &BTreeSet::new()).is_none());
+        }
+        assert!(lake_field_values_sampled_window(&profile, "*", "actor.user.name", &wide, true, &BTreeSet::new()).is_none());
+        assert!(lake_field_values_sampled_window(&profile, "metadata.log_source=windows_sysmon", "src_endpoint.hostname", &wide, true, &BTreeSet::new()).is_none());
+    }
+
+    /// NAN-3166: a scoped caller's sidebar makes the same exact-vs-sampled
+    /// decision as an unrestricted one, because the drill-in's searches plan
+    /// their rollups without the injected gate and carry the deny set to the
+    /// worker. A deny set naming Unattributed keeps the gated (scanning)
+    /// plan, so its wide windows are sampled rather than scanned in full.
+    #[test]
+    fn scoped_field_values_panel_decides_like_an_unrestricted_one() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        let end = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap();
+        let wide = TimeRangeInput { start: end - chrono::Duration::hours(24), end };
+        let set = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<BTreeSet<_>>();
+        let cases = [
+            ("*", "actor.user.name"),
+            ("*", "device.hostname"),
+            ("metadata.log_source=windows_sysmon", "src_endpoint.hostname"),
+            (r#"device.hostname="ws-hr-132.corp.local""#, "metadata.log_source"),
+            ("*", "src_endpoint.ip"),
+            ("*", "unmapped.custom_field"),
+            ("powershell", "actor.user.name"),
+        ];
+        for deny in [&["audit"][..], &["windows_sysmon"], &["audit", "conduit_proxy"]] {
+            for (base, field) in cases {
+                let window = |deny: &BTreeSet<String>| {
+                    lake_field_values_sampled_window(&profile, base, field, &wide, true, deny)
+                        .map(|window| (window.start, window.end))
+                };
+                assert_eq!(
+                    window(&set(deny)),
+                    window(&BTreeSet::new()),
+                    "{deny:?} {base}: {field}"
+                );
+                // The planning base is the user's base, user-written source
+                // filters included; only the injected gate is gone.
+                assert_eq!(
+                    parse_query(&lake_field_values_planning_base(base, &set(deny))).unwrap(),
+                    parse_query(&parse_query(base).unwrap().pretty_print()).unwrap(),
+                    "{deny:?} {base}"
+                );
+            }
+        }
+        // The rollup-served cases really are exact for the scoped caller.
+        assert!(lake_field_values_sampled_window(&profile, "*", "actor.user.name", &wide, true, &set(&["audit"])).is_none());
+        // A user-written exclusion of a denied source is not stripped.
+        let user = r#"metadata.log_source!="audit" device.hostname="h1""#;
+        assert_eq!(
+            parse_query(&lake_field_values_planning_base(user, &set(&["audit"]))).unwrap(),
+            parse_query(&parse_query(user).unwrap().pretty_print()).unwrap()
+        );
+        // Unattributed deny sets keep the gate: the decision follows the
+        // gated scan, which the rollups cannot answer.
+        for deny in [&["default"][..], &["unknown"], &["audit", "Default"]] {
+            let planning = lake_field_values_planning_base("*", &set(deny));
+            assert!(planning.contains("metadata.log_source"), "{deny:?} {planning}");
+            assert!(
+                lake_field_values_sampled_window(&profile, "*", "actor.user.name", &wide, true, &set(deny)).is_some(),
+                "{deny:?}"
+            );
+        }
+    }
+
+    /// Audit #14: shares are of all matching events, not of the top-N sum.
+    #[test]
+    fn lake_field_value_percentages_use_the_matching_event_count() {
+        use super::FieldValueInfo;
+        let value = |count| FieldValueInfo { value: format!("v{count}"), count, percentage: 0.0 };
+        let mut values = vec![value(44), value(300), value(68)];
+        super::apply_field_value_percentages(&mut values, Some(50_588));
+        assert!((values[0].percentage - 44.0 * 100.0 / 50_588.0).abs() < 1e-9);
+        // No count: relative to the returned values (the old behaviour).
+        let mut values = vec![value(1), value(3)];
+        super::apply_field_value_percentages(&mut values, None);
+        assert_eq!(values[1].percentage, 75.0);
+        // A stale/short count never yields shares above 100%.
+        let mut values = vec![value(10)];
+        super::apply_field_value_percentages(&mut values, Some(4));
+        assert_eq!(values[0].percentage, 100.0);
+    }
+
     use super::*;
     use chrono::{TimeZone, Utc};
 
@@ -885,26 +1666,54 @@ mod tests {
         BTreeSet::new()
     }
 
+    #[test]
+    fn lake_unmapped_discovery_fails_closed_for_restricted_callers() {
+        assert!(lake_unmapped_field_discovery_allowed(
+            &ScopeSet::unrestricted()
+        ));
+        assert!(!lake_unmapped_field_discovery_allowed(
+            &ScopeSet::from_denied(BTreeSet::from(["audit".to_string()]))
+        ));
+    }
+
+    #[test]
+    fn lake_field_values_expand_repeated_ocsf_leaves_before_grouping() {
+        assert_eq!(
+            lake_field_values_query(
+                "metadata.log_source=conduit_proxy",
+                "enrichments.data.detector",
+                100,
+                true,
+            ),
+            format!(
+                "metadata.log_source=conduit_proxy | mvexpand enrichments.data.detector \
+                 limit={} | stats count() as count by enrichments.data.detector | sort \
+                 -count | head 100",
+                usize::MAX
+            )
+        );
+    }
+
+    #[test]
+    fn lake_field_values_leave_scalar_fields_unexpanded() {
+        assert_eq!(
+            lake_field_values_query("metadata.log_source=windows_sysmon", "action", 25, false,),
+            "metadata.log_source=windows_sysmon | stats count() as count by action | sort -count | head 25"
+        );
+    }
+
     /// The handler-composed deny-set for a caller without `audit:view`
     /// (the old `exclude_audit: true`).
     fn audit_scope() -> BTreeSet<String> {
         std::iter::once("audit".to_string()).collect()
     }
 
-    fn field_values_sql(
-        generator: &ClickHouseSqlGenerator,
-        table: &str,
-        field: &str,
-    ) -> String {
+    fn field_values_sql(generator: &ClickHouseSqlGenerator, table: &str, field: &str) -> String {
         let executor = ClickHouseExecutor::new(clickhouse::Client::default());
         let base_sql = format!(
             "SELECT * FROM {table} ORDER BY timestamp DESC SETTINGS optimize_read_in_order=1"
         );
-        executor.build_field_values_sql(
-            &base_sql,
-            &generator.field_values_display_expr(field),
-            25,
-        )
+        executor.build_field_values_sql(&base_sql, &generator.field_values_display_expr(field), 25)
     }
 
     /// NAN-2149 endpoint-path snapshot: both POST /api/search/field-values and
@@ -912,9 +1721,8 @@ mod tests {
     /// alias must aggregate the indexed class-spanning value, not `user.name`.
     #[test]
     fn ocsf_field_values_sql_groups_class_split_user_on_unified_value() {
-        let generator = ClickHouseSqlGenerator::new().with_profile(std::sync::Arc::new(
-            crate::schema::OcsfProfile::new(),
-        ));
+        let generator = ClickHouseSqlGenerator::new()
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
         assert_eq!(
             field_values_sql(&generator, "ocsf_logs", "user"),
             "SELECT toString(user_unified) as value, count() as cnt FROM \
@@ -927,9 +1735,8 @@ mod tests {
     /// human sibling label. The already-native label spelling is identical.
     #[test]
     fn ocsf_field_values_sql_groups_event_type_and_activity_on_label() {
-        let generator = ClickHouseSqlGenerator::new().with_profile(std::sync::Arc::new(
-            crate::schema::OcsfProfile::new(),
-        ));
+        let generator = ClickHouseSqlGenerator::new()
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
         let expected = "SELECT toString(activity) as value, count() as cnt FROM \
                         (SELECT * FROM ocsf_logs) AS _fv WHERE activity IS NOT NULL AND \
                         toString(activity) != '' GROUP BY value ORDER BY cnt DESC LIMIT 25";
@@ -948,9 +1755,8 @@ mod tests {
     /// are combined by the returned display value.
     #[test]
     fn ocsf_field_values_sql_groups_severity_ids_on_labels() {
-        let generator = ClickHouseSqlGenerator::new().with_profile(std::sync::Arc::new(
-            crate::schema::OcsfProfile::new(),
-        ));
+        let generator = ClickHouseSqlGenerator::new()
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
         let transform = "transform(severity_id, [0, 1, 2, 3, 4, 5, 6, 99], \
                          ['unknown', 'informational', 'low', 'medium', 'high', \
                          'critical', 'fatal', 'other'], toString(severity_id))";
@@ -1023,7 +1829,15 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_without_audit_exclusion_omits_source_type_filter() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            None,
+            &no_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         assert!(
             sql.starts_with("SELECT * EXCEPT (action), action AS event_type, "),
             "must rewrite action->event_type and re-add materialized cols: {sql}"
@@ -1062,20 +1876,39 @@ mod tests {
     fn fetch_log_sql_reads_materialized_enrichment_columns() {
         // NAN-1147 regression: `SELECT *` excludes MATERIALIZED columns, so the
         // row-expand inspector showed no enrichment. The fetch must name them.
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            None,
+            &no_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         for col in [
             "user_identity_department",
             "enriched_src_country",
             "ioc_confidence",
             "prevalence_dest_ip",
         ] {
-            assert!(sql.contains(col), "missing materialized column {col}: {sql}");
+            assert!(
+                sql.contains(col),
+                "missing materialized column {col}: {sql}"
+            );
         }
     }
 
     #[test]
     fn fetch_log_sql_with_audit_exclusion_filters_audit_rows() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            None,
+            &audit_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         assert!(
             sql.starts_with("SELECT * EXCEPT (action), action AS event_type, "),
             "must rewrite action->event_type and re-add materialized cols: {sql}"
@@ -1096,8 +1929,15 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let sql =
-            build_fetch_log_sql("logs", "abc-123", None, None, &deny, MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            None,
+            &deny,
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         assert!(
             sql.ends_with(
                 "FROM logs WHERE id = 'abc-123' AND lower(source_type) NOT IN \
@@ -1113,7 +1953,15 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 1, 2, 4, 5, 6).unwrap(),
         };
-        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            Some(&tr),
+            None,
+            &audit_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         assert!(
             sql.contains("AND lower(source_type) != 'audit'"),
             "audit exclusion missing: {sql}"
@@ -1126,7 +1974,15 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_id() {
-        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, &audit_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc'; DROP--",
+            None,
+            None,
+            &audit_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         assert!(
             sql.contains("WHERE id = 'abc''; DROP--'"),
             "id quotes not escaped: {sql}"
@@ -1141,7 +1997,15 @@ mod tests {
         // as tuple sub-column access. `WHERE id =` is unchanged — OCSF now has a
         // real `id` UUID column too.
         let ocsf_cols: &[&str] = &["src_endpoint.ip", "http_response.code", "class_uid"];
-        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, &no_scope(), ocsf_cols, &[]);
+        let sql = build_fetch_log_sql(
+            "ocsf_logs",
+            "abc-123",
+            None,
+            None,
+            &no_scope(),
+            ocsf_cols,
+            &[],
+        );
         assert!(
             sql.contains("\"src_endpoint.ip\""),
             "dotted col must be quoted: {sql}"
@@ -1234,7 +2098,15 @@ mod tests {
     /// payloads disagree again the moment either side changes.
     #[test]
     fn fetch_log_sql_rename_shape_matches_default_view_base() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, &no_scope(), &[], UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            None,
+            &no_scope(),
+            &[],
+            UDM_VIEW_RENAMES,
+        );
         assert_eq!(
             sql,
             "SELECT * EXCEPT (action), action AS event_type FROM logs WHERE id = 'abc-123' LIMIT 1",
@@ -1247,10 +2119,21 @@ mod tests {
     #[test]
     fn fetch_log_sql_ocsf_no_renames_keeps_bare_star() {
         let ocsf_cols: &[&str] = &["src_endpoint.ip", "class_uid"];
-        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, &no_scope(), ocsf_cols, &[]);
+        let sql = build_fetch_log_sql(
+            "ocsf_logs",
+            "abc-123",
+            None,
+            None,
+            &no_scope(),
+            ocsf_cols,
+            &[],
+        );
         assert!(sql.starts_with("SELECT *, "), "{sql}");
         assert!(!sql.contains("EXCEPT"), "OCSF must not emit EXCEPT: {sql}");
-        assert!(!sql.contains("event_type"), "OCSF must not emit UDM names: {sql}");
+        assert!(
+            !sql.contains("event_type"),
+            "OCSF must not emit UDM names: {sql}"
+        );
     }
 
     /// Pins the literal used above to the real UDM profile, so a profile change
@@ -1264,11 +2147,778 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_source_type() {
-        let sql =
-            build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), &no_scope(), MATERIALIZED_COLUMNS, UDM_VIEW_RENAMES);
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            None,
+            Some("evil'; DROP--"),
+            &no_scope(),
+            MATERIALIZED_COLUMNS,
+            UDM_VIEW_RENAMES,
+        );
         assert!(
             sql.contains("source_type = 'evil''; DROP--'"),
             "source_type quotes not escaped: {sql}"
         );
+    }
+
+    // ── NAN-2771: lake field-stats honor a requested column subset ─────────
+
+    /// A lake worker double that echoes the request/tenant/route binding the
+    /// client validates, and answers every `/v1/query` with fixed OCSF rows.
+    struct EchoLakeWorker {
+        tenant: String,
+        rows: serde_json::Value,
+    }
+
+    impl wiremock::Respond for EchoLakeWorker {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "ok": true,
+                    "tenant_id": self.tenant,
+                    "request_id": body["request_id"],
+                    "route": body["route"],
+                    "result": {
+                        "rows": self.rows,
+                        "result_rows": self.rows.as_array().map(|rows| rows.len()),
+                        "page_has_more": false,
+                    },
+                }))
+                .insert_header("x-nano-worker-assignment-id", "field-stats-worker")
+                .insert_header("x-nano-worker-assignment-revision", "1")
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn lake_tenant_view(
+        server: &wiremock::MockServer,
+        tenant: uuid::Uuid,
+        dir: &std::path::Path,
+    ) -> SearchService {
+        let credential = dir.join("worker-token");
+        std::fs::write(&credential, "field-stats-worker-token-0123456789abcdef").unwrap();
+        let assignment = crate::search::SharedLakeWorkerAssignment {
+            tenant_id: tenant,
+            internal_endpoint: server.uri(),
+            credential_file: credential,
+            expected_worker_identity: "field-stats-worker".to_string(),
+            expected_worker_revision: 1,
+            timeout_secs: 10,
+            prevalence_snapshots: crate::prevalence::LakePrevalenceSnapshots {
+                one_hour: "p1".into(),
+                twenty_four_hours: "p24".into(),
+                seven_days: "p7".into(),
+                thirty_days: "p30".into(),
+            },
+            prevalence_rarity_threshold: 3,
+            prevalence_timeout_secs: 10,
+            enrichment_coordinator: None,
+            otel_ingest: None,
+            erasure_executor: None,
+        };
+        // Never connects: a request that escaped the lake into PostgreSQL or
+        // ClickHouse would fail rather than silently succeed.
+        let dual_pool = crate::db::DualPool::new_lake_control_plane(
+            &crate::db::DualPoolConfig::with_auth(
+                "postgres://fixture:fixture@127.0.0.1:1/never_connect",
+                "http://127.0.0.1:1",
+                "fixture",
+                "fixture",
+                "fixture",
+            ),
+        )
+        .await
+        .unwrap();
+        // The lake's strict canonical OCSF 1.9 profile, as shared deployments run.
+        SearchService::with_dual_pool_and_profile_unrouted(
+            &dual_pool,
+            std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()),
+        )
+            .enterprise_shared_tenant_view(
+                &assignment,
+                crate::search::SearchTenantScope::enterprise_shared_retained(tenant, 1, 90, 0)
+                    .unwrap(),
+                std::sync::Arc::new(crate::search::InMemoryJobStore::new()),
+            )
+            .unwrap()
+    }
+
+    fn ocsf_rows() -> serde_json::Value {
+        serde_json::json!([
+            {"time": "2026-09-24T10:00:00Z", "class_uid": 4002, "metadata": {"log_source": "conduit_proxy", "product": {"name": "conduit"}}, "src_endpoint": {"ip": "10.0.0.1"}, "http_request": {"url": {"hostname": "a.example"}}},
+            {"time": "2026-09-24T10:01:00Z", "class_uid": 4002, "metadata": {"log_source": "conduit_proxy", "product": {"name": "conduit"}}, "src_endpoint": {"ip": "10.0.0.2"}, "http_request": {"url": {"hostname": "b.example"}}},
+            {"time": "2026-09-24T10:02:00Z", "class_uid": 1007, "metadata": {"log_source": "windows_sysmon", "product": {"name": "sysmon"}}, "src_endpoint": {"ip": "10.0.0.1"}}
+        ])
+    }
+
+    #[test]
+    fn lake_field_stats_selection_keeps_sample_order_and_exact_names() {
+        let sample: Vec<FieldInfo> = ["class_uid", "metadata.log_source", "metadata.log_source_uid", "src_endpoint.ip"]
+            .iter()
+            .map(|name| FieldInfo::new(name.to_string(), "string".into()))
+            .collect();
+        let names = |fields: Vec<FieldInfo>| fields.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        assert_eq!(names(select_lake_field_stats(sample.clone(), None)).len(), 4);
+        // Exact dotted-path match only: `metadata.log_source` is not a prefix
+        // selector for `metadata.log_source_uid`.
+        assert_eq!(
+            names(select_lake_field_stats(sample.clone(), Some(&["src_endpoint.ip".to_string(), "metadata.log_source".to_string()][..]))),
+            vec!["metadata.log_source", "src_endpoint.ip"]
+        );
+        // No intersection (or an empty list) keeps the full sample.
+        assert_eq!(names(select_lake_field_stats(sample.clone(), Some(&["src_ip".to_string()][..]))).len(), 4);
+        assert_eq!(names(select_lake_field_stats(sample, Some(&[][..]))).len(), 4);
+    }
+
+    fn ocsf_window() -> TimeRangeInput {
+        let now = chrono::Utc::now();
+        TimeRangeInput::new(now - chrono::Duration::hours(1), now)
+    }
+
+    async fn mounted_worker(tenant: uuid::Uuid) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/query"))
+            .respond_with(EchoLakeWorker { tenant: tenant.to_string(), rows: ocsf_rows() })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn worker_queries(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            // NAN-3566: exact field-list reads go to the count route.
+            .filter(|request| request.url.path().ends_with("/v1/query"))
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["query"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// NAN-3216 regression: the web Search page (and every API caller) sends
+    /// `columns` without any opt-in. On a data-bearing lake window that must
+    /// answer with real, projected field stats — never the silent
+    /// `{"fields":[],"total_events":0}` that blanked the field rail on shared.
+    #[tokio::test]
+    async fn lake_field_stats_columns_request_is_never_empty_for_a_data_bearing_window() {
+        let tenant = uuid::Uuid::from_u128(0x3216);
+        let server = mounted_worker(tenant).await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = lake_tenant_view(&server, tenant, dir.path()).await;
+        // The web's reduced request: pinned + visible-row canonical columns.
+        let requested = vec!["metadata.log_source".to_string(), "class_uid".to_string()];
+        let result = view
+            .get_field_stats_for_query("*", &ocsf_window(), Some(&requested), None, None, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        let names: BTreeSet<&str> = result.fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, BTreeSet::from(["metadata.log_source", "class_uid"]));
+        assert!(result.fields.iter().all(|field| field.count > 0 && !field.top_values.is_empty()));
+        assert_eq!(result.sampled_rows, Some(3));
+        let queries = worker_queries(&server).await;
+        assert_eq!(queries.len(), 1, "one projected sample scan");
+        assert!(queries[0].ends_with("| table metadata.log_source, class_uid"), "{}", queries[0]);
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// The live repro (`columns` of canonical dotted OCSF paths returned
+    /// `{"fields":[],"total_events":0}`), now answered by default (NAN-3216): real
+    /// counts, projected to exactly the requested fields.
+    #[tokio::test]
+    async fn lake_field_stats_opt_in_counts_requested_columns() {
+        let tenant = uuid::Uuid::from_u128(0x2771);
+        let server = mounted_worker(tenant).await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = lake_tenant_view(&server, tenant, dir.path()).await;
+        let scope = ScopeSet::unrestricted();
+
+        let full = view
+            .get_field_stats_for_query("*", &ocsf_window(), None, None, None, &scope)
+            .await
+            .unwrap();
+        assert_eq!(full.sampled_rows, Some(3));
+        let full_log_source = full
+            .fields
+            .iter()
+            .find(|field| field.name == "metadata.log_source")
+            .expect("full inventory carries the canonical OCSF leaf")
+            .clone();
+
+        let requested = vec![
+            "metadata.log_source".to_string(),
+            "src_endpoint.ip".to_string(),
+            "class_uid".to_string(),
+        ];
+        let reduced = view
+            .get_field_stats_for_query("*", &ocsf_window(), Some(&requested), None, None, &scope)
+            .await
+            .unwrap();
+        let names: BTreeSet<&str> = reduced.fields.iter().map(|field| field.name.as_str()).collect();
+        assert_eq!(names, BTreeSet::from(["metadata.log_source", "src_endpoint.ip", "class_uid"]));
+        let log_source = reduced.fields.iter().find(|field| field.name == "metadata.log_source").unwrap();
+        assert_eq!(log_source.count, full_log_source.count);
+        assert_eq!(log_source.top_values, full_log_source.top_values);
+        assert_eq!(reduced.sampled_rows, Some(3));
+
+        // Known canonical fields are projected at the worker, not fetched as
+        // full rows.
+        let queries = worker_queries(&server).await;
+        assert_eq!(queries.len(), 2);
+        assert!(!queries[0].contains("| table"), "{}", queries[0]);
+        assert!(
+            queries[1].ends_with("| table metadata.log_source, src_endpoint.ip, class_uid"),
+            "{}",
+            queries[1]
+        );
+    }
+
+    /// NAN-3566 worker: the newest-rows sample holds only source A; the
+    /// exact grouped count (whichever route search plans it on) holds A and
+    /// the one event of source B.
+    struct RareSourceWorker {
+        tenant: String,
+    }
+
+    const RARE_SOURCE_A_EVENTS: u64 = 1_500;
+
+    #[cfg(feature = "enterprise")]
+    async fn rare_source_cell_view(
+        server: &wiremock::MockServer,
+        tenant: uuid::Uuid,
+        dir: &std::path::Path,
+    ) -> SearchService {
+        let token_file = dir.join("router.token");
+        std::fs::write(&token_file, "nan3566-fixture-router-token-1234567890").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        let pool = crate::db::DualPool::new_lake_control_plane(
+            &crate::db::DualPoolConfig::with_auth(
+                "postgres://fixture:fixture@127.0.0.1:1/never_connect",
+                "http://127.0.0.1:1", "fixture", "fixture", "fixture",
+            ),
+        ).await.unwrap();
+        SearchService::with_dual_pool_and_profile_unrouted(
+            &pool, std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()),
+        ).enterprise_shared_cell_tenant_view(
+            &crate::search::LakeCellRoute {
+                tenant_id: tenant, assignment_generation: 1, part_log_writer_epoch: 1,
+                worker_revision: 1, assignment_fenced: true, cell_origin: server.uri(),
+                query_base_url: format!("{}/v1/tenants/{tenant}/query", server.uri()),
+                router_token_file: token_file,
+            },
+            crate::search::SearchTenantScope::enterprise_shared_retained(tenant, 1, 90, 0).unwrap(),
+            std::sync::Arc::new(crate::search::InMemoryJobStore::new()),
+        ).unwrap()
+    }
+
+    fn rare_source_counts() -> serde_json::Value {
+        serde_json::json!([
+            {"metadata.log_source": "audit", "count": RARE_SOURCE_A_EVENTS},
+            {"metadata.log_source": "otlp_log", "count": 1}
+        ])
+    }
+
+    impl wiremock::Respond for RareSourceWorker {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let query = body["query"].as_str().unwrap_or_default();
+            let count_route = request.url.path().ends_with("/v1/aggregate/count");
+            let rows = if body["group_field"] == "class_uid"
+                || query.contains("stats count() as count by class_uid")
+            {
+                serde_json::json!([{"class_uid": 6003, "count": RARE_SOURCE_A_EVENTS + 1}])
+            } else if (count_route && body["group_results"] == true)
+                || query.contains("stats count() as count by metadata.log_source")
+            {
+                rare_source_counts()
+            } else if count_route || query.contains("stats count() as count") {
+                serde_json::json!([{"count": RARE_SOURCE_A_EVENTS + 1}])
+            } else {
+                // The newest 1,000 rows: all source A.
+                serde_json::Value::Array(
+                    (0..1_000)
+                        .map(|i| serde_json::json!({"time": "2026-09-24T10:00:00Z", "class_uid": 6003,
+                            "metadata": {"uid": format!("a-{i}"), "log_source": "audit"}}))
+                        .collect(),
+                )
+            };
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "ok": true,
+                    "tenant_id": self.tenant,
+                    "request_id": body["request_id"],
+                    "route": body["route"].as_str().unwrap_or(if count_route { "count_aggregate" } else { "broad_npl" }),
+                    "source_mode": "parts",
+                    "log_head": {"seq": 1, "sha256": "ab".repeat(32)},
+                    "generation_id": "nan3566",
+                    "snapshot_id": "1",
+                    "result": {
+                        "rows": rows,
+                        "result_rows": rows.as_array().map(|rows| rows.len()),
+                        "page_has_more": false,
+                    },
+                }))
+                .insert_header("x-nano-worker-assignment-id", "field-stats-worker")
+                .insert_header("x-nano-worker-assignment-revision", "1")
+        }
+    }
+
+    fn twelve_hours() -> TimeRangeInput {
+        let now = chrono::Utc::now();
+        TimeRangeInput::new(now - chrono::Duration::hours(12), now)
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// NAN-3566 regression: N events of source A and one of source B in a
+    /// 12h window. The field rail's `metadata.log_source` lists both and is
+    /// exact, though the row sample saw only A; every other field is
+    /// flagged with the sample size.
+    #[tokio::test]
+    async fn lake_field_list_lists_a_one_event_source_beside_a_large_one() {
+        let tenant = uuid::Uuid::from_u128(0x3566);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(RareSourceWorker { tenant: tenant.to_string() })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = rare_source_cell_view(&server, tenant, dir.path()).await;
+        let requested = vec!["metadata.log_source".to_string(), "class_uid".to_string()];
+        for query in ["*", "metadata.log_source=*"] {
+            let result = view
+                .get_field_stats_for_query(query, &twelve_hours(), Some(&requested), None, None, &ScopeSet::unrestricted())
+                .await
+                .unwrap();
+            let source = result.fields.iter().find(|field| field.name == "metadata.log_source").unwrap();
+            assert_eq!(
+                source.top_values,
+                vec![("audit".to_string(), RARE_SOURCE_A_EVENTS), ("otlp_log".to_string(), 1)],
+                "{query}"
+            );
+            assert_eq!(source.cardinality, Some(2), "{query}");
+            assert_eq!(source.count, RARE_SOURCE_A_EVENTS + 1, "{query}");
+            assert_eq!(source.sampled_rows, None, "{query}: exact");
+            assert_eq!(result.sampled_rows, Some(1_000));
+            if query == "*" {
+                let class = result.fields.iter().find(|field| field.name == "class_uid").unwrap();
+                assert_eq!(class.top_values, vec![("6003".to_string(), RARE_SOURCE_A_EVENTS + 1)]);
+                assert_eq!(class.sampled_rows, None);
+            }
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// NAN-3566: the drill-in for `F=*` grouped by F is the exact rollup
+    /// read of `*`, never the newest-hour sample.
+    #[tokio::test]
+    async fn lake_field_values_presence_base_is_exact_over_the_whole_window() {
+        let tenant = uuid::Uuid::from_u128(0x3567);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(RareSourceWorker { tenant: tenant.to_string() })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = rare_source_cell_view(&server, tenant, dir.path()).await;
+        let result = view
+            .get_field_values_for_panel(
+                "metadata.log_source",
+                "metadata.log_source=*",
+                &twelve_hours(),
+                100,
+                None,
+                &ScopeSet::unrestricted(),
+            )
+            .await
+            .unwrap();
+        assert!(result.sampled_window.is_none(), "exact, not the newest-hour slice");
+        let values: Vec<(String, u64)> =
+            result.values.iter().map(|value| (value.value.clone(), value.count)).collect();
+        assert_eq!(values, vec![("audit".to_string(), RARE_SOURCE_A_EVENTS), ("otlp_log".to_string(), 1)]);
+        let otlp = &result.values[1];
+        assert!((otlp.percentage - 100.0 / (RARE_SOURCE_A_EVENTS + 1) as f64).abs() < 1e-9);
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// NAN-3716: both field-value drill-ins (`get_field_values`, which
+    /// backs `/api/fields/{name}/values`, and the sidebar's
+    /// `get_field_values_for_panel`) are retention-bound on the shared lake.
+    /// A wholly expired window answers empty without reaching the worker; a
+    /// window straddling the cutoff reaches it only with `start >= cutoff`.
+    /// On the lake the guarantee holds at two layers: `field_values_inner`'s
+    /// own clamp (pinned by the search-retention static contract) and the
+    /// clamped `search` it delegates to, so this proves the end-to-end
+    /// behavior, not one layer alone.
+    #[tokio::test]
+    async fn field_values_never_read_past_the_tenant_retention_cutoff() {
+        let tenant = uuid::Uuid::from_u128(0x3716);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(RareSourceWorker { tenant: tenant.to_string() })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        // Fixture retention: 90 days.
+        let view = rare_source_cell_view(&server, tenant, dir.path()).await;
+        let now = chrono::Utc::now();
+        let cutoff = view.retention_cutoff_at(now).unwrap().expect("shared view is retained");
+        assert!(cutoff < now - chrono::Duration::days(89) && cutoff > now - chrono::Duration::days(91));
+
+        let expired = TimeRangeInput::new(now - chrono::Duration::days(200), now - chrono::Duration::days(100));
+        let values = view
+            .get_field_values("metadata.log_source", "*", &expired, 100, None, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        assert!(values.is_empty(), "expired window must answer empty");
+        let panel = view
+            .get_field_values_for_panel("metadata.log_source", "*", &expired, 100, None, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        assert!(panel.values.is_empty() && panel.sampled_window.is_none());
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "an expired field-values window must not reach the lake worker"
+        );
+
+        let straddling = TimeRangeInput::new(now - chrono::Duration::days(120), now);
+        view.get_field_values("metadata.log_source", "*", &straddling, 100, None, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        view.get_field_values_for_panel("metadata.log_source", "*", &straddling, 100, None, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty(), "a live window reaches the worker");
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            // `/v1/query` nests the window; `/v1/aggregate/count` flattens it.
+            let start = body["time_range"]["start"]
+                .as_str()
+                .or_else(|| body["start"].as_str())
+                .unwrap_or_else(|| panic!("worker request without a start bound: {body}"));
+            let start = chrono::DateTime::parse_from_rfc3339(start).unwrap().with_timezone(&chrono::Utc);
+            assert!(
+                start >= cutoff - chrono::Duration::seconds(1),
+                "{} read from {start}, before the retention cutoff {cutoff}",
+                request.url.path()
+            );
+        }
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn exact_field_list_refuses_another_tenants_rollup() {
+        let tenant = uuid::Uuid::from_u128(0x3568);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/v1/tenants/{tenant}/query/v1/query")))
+            .respond_with(RareSourceWorker { tenant: tenant.to_string() })
+            .mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/v1/tenants/{tenant}/query/v1/aggregate/count")))
+            .respond_with(RareSourceWorker { tenant: uuid::Uuid::from_u128(0x356a).to_string() })
+            .expect(1).mount(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = rare_source_cell_view(&server, tenant, dir.path()).await;
+        let requested = vec!["metadata.log_source".to_string()];
+        let result = view.get_field_stats_for_query(
+            "*", &twelve_hours(), Some(&requested), None, None, &ScopeSet::unrestricted(),
+        ).await.unwrap();
+        let source = &result.fields[0];
+        assert_eq!(source.sampled_rows, Some(1000));
+        assert_eq!(source.top_values, vec![("audit".to_string(), 1000)]);
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn exact_field_list_timeout_keeps_the_marked_sample() {
+        let tenant = uuid::Uuid::from_u128(0x3569);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/v1/tenants/{tenant}/query/v1/query")))
+            .respond_with(RareSourceWorker { tenant: tenant.to_string() })
+            .mount(&server).await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(format!("/v1/tenants/{tenant}/query/v1/aggregate/count")))
+            .respond_with(wiremock::ResponseTemplate::new(500)
+                .set_delay(std::time::Duration::from_secs(5)))
+            .expect(2).mount(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = rare_source_cell_view(&server, tenant, dir.path()).await;
+        let requested = vec!["metadata.log_source".to_string(), "class_uid".to_string()];
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3),
+            view.get_field_stats_for_query(
+                "*", &twelve_hours(), Some(&requested), None, None, &ScopeSet::unrestricted(),
+            )).await.expect("concurrent rollup timeouts must not add up").unwrap();
+        assert_eq!(result.fields.len(), 2);
+        assert!(result.fields.iter().all(|field| field.sampled_rows == Some(1000)));
+    }
+
+    #[test]
+    fn presence_base_rewrites_only_the_grouped_fields_wildcard() {
+        assert_eq!(lake_field_values_presence_base("metadata.log_source=*", "metadata.log_source"), Some("*"));
+        assert_eq!(lake_field_values_presence_base("metadata.log_source=\"*\"", "metadata.log_source"), Some("*"));
+        assert_eq!(lake_field_values_presence_base("class_uid=*", "metadata.log_source"), None);
+        assert_eq!(lake_field_values_presence_base("metadata.log_source=audit*", "metadata.log_source"), None);
+        assert_eq!(lake_field_values_presence_base("metadata.log_source!=*", "metadata.log_source"), None);
+        assert_eq!(lake_field_values_presence_base("metadata.log_source=* user.name=bob", "metadata.log_source"), None);
+        assert_eq!(lake_field_values_presence_base("*", "metadata.log_source"), None);
+    }
+
+    #[test]
+    fn exact_values_replace_the_sample_and_the_rest_are_flagged_sampled() {
+        let mut source = FieldInfo::new("metadata.log_source".into(), "string".into());
+        source.count = 1_000;
+        source.top_values = vec![("audit".into(), 1_000)];
+        source.cardinality = Some(1);
+        let mut user = FieldInfo::new("user.name".into(), "string".into());
+        user.count = 10;
+        user.top_values = vec![("bob".into(), 10)];
+        let merged = merge_exact_field_values(
+            vec![source, user],
+            vec![
+                ("metadata.log_source".into(), vec![("audit".into(), 1_500), ("otlp_log".into(), 1)]),
+                ("class_uid".into(), vec![("6003".into(), 1_501)]),
+                ("status".into(), vec![]),
+            ],
+            1_000,
+        );
+        let by_name = |name: &str| merged.iter().find(|field| field.name == name).unwrap();
+        assert_eq!(by_name("metadata.log_source").top_values.len(), 2);
+        assert_eq!(by_name("metadata.log_source").count, 1_501);
+        assert_eq!(by_name("metadata.log_source").cardinality, Some(2));
+        assert_eq!(by_name("metadata.log_source").sampled_rows, None);
+        assert_eq!(by_name("class_uid").field_type, "number");
+        assert_eq!(by_name("class_uid").sampled_rows, None);
+        assert_eq!(by_name("user.name").sampled_rows, Some(1_000));
+        assert!(merged.iter().all(|field| field.name != "status"));
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// `total_events` must not depend on which columns were requested: a
+    /// sparse field present on 2 of 3 sampled rows still reports 3 rows.
+    #[tokio::test]
+    async fn lake_field_stats_sample_size_is_independent_of_sparse_columns() {
+        let tenant = uuid::Uuid::from_u128(0x2773);
+        let server = mounted_worker(tenant).await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = lake_tenant_view(&server, tenant, dir.path()).await;
+        let sparse = vec!["http_request.url.hostname".to_string()];
+        let result = view
+            .get_field_stats_for_query("*", &ocsf_window(), Some(&sparse), None, None, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(result.fields[0].name, "http_request.url.hostname");
+        assert_eq!(result.fields[0].count, 2, "only populated rows count");
+        assert_eq!(result.sampled_rows, Some(3), "sample size, not the sparse field's count");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn lake_field_stats_unknown_columns_fall_back_to_full_inventory() {
+        let tenant = uuid::Uuid::from_u128(0x2772);
+        let server = mounted_worker(tenant).await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = lake_tenant_view(&server, tenant, dir.path()).await;
+        let scope = ScopeSet::unrestricted();
+        let full = view
+            .get_field_stats_for_query("*", &ocsf_window(), None, None, None, &scope)
+            .await
+            .unwrap();
+        // Same contract as the ClickHouse path: a stale client column list that
+        // intersects nothing must not blank the field panel. Unknown names are
+        // never projected, so the sample is full rows.
+        let stale = vec!["src_ip".to_string(), "no_such_field".to_string()];
+        let fallback = view
+            .get_field_stats_for_query("*", &ocsf_window(), Some(&stale), None, None, &scope)
+            .await
+            .unwrap();
+        // The sample inventory's order is not stable across runs (hash-map
+        // backed), so compare the name sets.
+        let full_names: BTreeSet<&str> = full.fields.iter().map(|field| field.name.as_str()).collect();
+        let fallback_names: BTreeSet<&str> = fallback.fields.iter().map(|field| field.name.as_str()).collect();
+        assert!(!fallback_names.is_empty());
+        assert_eq!(fallback_names, full_names);
+        assert!(worker_queries(&server).await.iter().all(|query| !query.contains("| table")));
+    }
+
+    #[test]
+    fn lake_projection_requires_every_name_to_be_a_known_canonical_field() {
+        let lake = crate::schema::OcsfProfile::lake_1_9();
+        let cols = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            lake_field_stats_projection(&cols(&["metadata.log_source", "src_endpoint.ip", "metadata.log_source"]), &lake),
+            Some(cols(&["metadata.log_source", "src_endpoint.ip"]))
+        );
+        assert_eq!(lake_field_stats_projection(&cols(&["metadata.log_source", "no_such_field"]), &lake), None);
+        assert_eq!(lake_field_stats_projection(&[], &lake), None);
+        assert_eq!(
+            lake_field_stats_projection(&cols(&["src_ip"]), &crate::schema::UdmProfile::new()),
+            None,
+            "legacy profiles never project"
+        );
+    }
+
+    // ── NAN-3458: open core's full events drop union-padded struct members ──
+
+    /// The CT 106 conduit_proxy row: the lake `unmapped` struct carries the
+    /// union of every key the tenant ever stored, null except the event's 4.
+    fn padded_conduit_rows() -> serde_json::Value {
+        serde_json::json!([{
+            "time": "2026-10-09T12:00:00.000000Z",
+            "class_uid": 4002,
+            "severity_id": 0,
+            "metadata": {"uid": "evt-3458", "log_source": "conduit_proxy", "labels": []},
+            "raw_data": "{\"user\":\"alice\"}",
+            "ext": {"note": null},
+            "enrichments": [{"name": "geo", "value": null}],
+            "unmapped": {
+                "_timestamp": null, "foo": null, "Image": null,
+                "winlog.event_data.TargetFilename": null,
+                "winlog": {"event_data": {"Image": null}, "channel": null},
+                "bytes_out": "1824", "status": "200", "url": "https://a.example/login", "user": "alice",
+            },
+        }])
+    }
+
+    fn sparse_conduit_row() -> serde_json::Value {
+        serde_json::json!({
+            "time": "2026-10-09T12:00:00.000000Z",
+            "class_uid": 4002,
+            "severity_id": 0,
+            "metadata": {"uid": "evt-3458", "log_source": "conduit_proxy"},
+            "raw_data": "{\"user\":\"alice\"}",
+            "enrichments": [{"name": "geo"}],
+            "unmapped": {"bytes_out": "1824", "status": "200", "url": "https://a.example/login", "user": "alice"},
+        })
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// Open core's search process: a DEDICATED (non-shared) SearchService
+    /// whose log reads are the primary lake (`NANO_LOG_QUERY_BACKEND=lake`,
+    /// served by the generation manager's query worker).
+    async fn open_core_dedicated_lake_view(server: &wiremock::MockServer, dir: &std::path::Path) -> SearchService {
+        let tenant = uuid::Uuid::from_u128(0x3458);
+        let credential = dir.join("worker-token");
+        std::fs::write(&credential, "field-stats-worker-token-0123456789abcdef").unwrap();
+        let assignment = crate::search::SharedLakeWorkerAssignment {
+            tenant_id: tenant,
+            internal_endpoint: server.uri(),
+            credential_file: credential,
+            expected_worker_identity: "field-stats-worker".to_string(),
+            expected_worker_revision: 1,
+            timeout_secs: 10,
+            prevalence_snapshots: crate::prevalence::LakePrevalenceSnapshots {
+                one_hour: "p1".into(),
+                twenty_four_hours: "p24".into(),
+                seven_days: "p7".into(),
+                thirty_days: "p30".into(),
+            },
+            prevalence_rarity_threshold: 3,
+            prevalence_timeout_secs: 10,
+            enrichment_coordinator: None,
+            otel_ingest: None,
+            erasure_executor: None,
+        };
+        let dual_pool = crate::db::DualPool::new_lake_control_plane(
+            &crate::db::DualPoolConfig::with_auth(
+                "postgres://fixture:fixture@127.0.0.1:1/never_connect",
+                "http://127.0.0.1:1",
+                "fixture",
+                "fixture",
+                "fixture",
+            ),
+        )
+        .await
+        .unwrap();
+        let mut service = SearchService::with_dual_pool_and_profile_unrouted(
+            &dual_pool,
+            std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()),
+        );
+        service.lake_query =
+            crate::search::lake::LakeQueryRuntime::from_enterprise_shared_assignment(&assignment).unwrap();
+        server
+            .register(
+                wiremock::Mock::given(wiremock::matchers::method("POST"))
+                    .and(wiremock::matchers::path("/v1/query"))
+                    .respond_with(EchoLakeWorker { tenant: tenant.to_string(), rows: padded_conduit_rows() }),
+            )
+            .await;
+        service
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// `POST /api/search/log` -> `fetch_log_by_id` on open core.
+    #[tokio::test]
+    async fn open_core_expanded_full_event_drops_padded_unmapped_members() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let service = open_core_dedicated_lake_view(&server, dir.path()).await;
+        let event = service
+            .fetch_log_by_id("evt-3458", Some(&ocsf_window()), Some("conduit_proxy"), &ScopeSet::unrestricted())
+            .await
+            .unwrap()
+            .expect("one event");
+        assert_eq!(event, sparse_conduit_row());
+    }
+
+    #[cfg(feature = "enterprise")]
+    /// Non-table-view `POST /api/search` -> `search_with_admission` on open
+    /// core: the rows the web marks `fullEvent` and shows in the inspector.
+    /// Table-view rows keep their shape. Run on a 32 MiB stack: the debug
+    /// `search` future outgrows the 2 MiB test thread.
+    #[test]
+    fn open_core_full_event_result_rows_drop_padded_unmapped_members() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(open_core_full_event_result_rows_case())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn open_core_full_event_result_rows_case() {
+        let server = wiremock::MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let service = open_core_dedicated_lake_view(&server, dir.path()).await;
+        let mut request: crate::search::SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "user=alice",
+            "time_range": {"start": chrono::Utc::now() - chrono::Duration::hours(1), "end": chrono::Utc::now()},
+            "skip_histogram": true,
+            "skip_field_stats": true,
+            "table_view": false,
+        }))
+        .unwrap();
+        let response = service
+            .search_with_admission(request.clone(), uuid::Uuid::nil(), crate::search::QueryPriority::Interactive, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        assert_eq!(response.results, vec![sparse_conduit_row()]);
+
+        request.table_view = true;
+        let response = service
+            .search_with_admission(request, uuid::Uuid::nil(), crate::search::QueryPriority::Interactive, &ScopeSet::unrestricted())
+            .await
+            .unwrap();
+        assert_eq!(serde_json::Value::Array(response.results), padded_conduit_rows());
     }
 }

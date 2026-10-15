@@ -80,7 +80,8 @@ pub enum SchemaValidationError {
 }
 
 /// The columns the active profile *must* find in its table for queries to work:
-/// its PREWHERE-eligible (indexed) set plus `timestamp`. These are the hot
+/// its PREWHERE-eligible (indexed) set plus the profile's event-time column.
+/// These are the hot
 /// columns every search filters on; if they are absent the profile is pointed at
 /// the wrong table. Kept intentionally minimal (not the full field universe) so
 /// a benign column rename in the long tail does not fail boot.
@@ -102,10 +103,13 @@ fn required_columns(profile: &dyn SchemaProfile) -> Vec<String> {
             }
         }
     }
-    // The ordering-key timestamp is required by every time-bounded query but is
-    // not always a member of prewhere_fields(), so assert it explicitly.
-    if !cols.iter().any(|c| c == "timestamp") {
-        cols.push("timestamp".to_string());
+    // Event time is required by every time-bounded query but is not always a
+    // member of prewhere_fields(), so assert the profile's physical expression
+    // explicitly. Strict OCSF 1.9 uses `time`; legacy UDM/ClickHouse OCSF use
+    // `timestamp`.
+    let time_column = profile.timestamp_expr();
+    if !cols.iter().any(|c| c == time_column) {
+        cols.push(time_column.to_string());
     }
     cols
 }
@@ -156,12 +160,12 @@ pub async fn validate_active_schema_table(
         None => ("nanosiem", local_table),
     };
 
-    let actual = fetch_columns(client, db, table)
-        .await
-        .map_err(|message| SchemaValidationError::ProbeFailed {
+    let actual = fetch_columns(client, db, table).await.map_err(|message| {
+        SchemaValidationError::ProbeFailed {
             table: local_table.to_string(),
             message,
-        })?;
+        }
+    })?;
 
     if actual.is_empty() {
         return Err(SchemaValidationError::TableMissing {
@@ -171,8 +175,7 @@ pub async fn validate_active_schema_table(
         });
     }
 
-    let actual_set: std::collections::HashSet<&str> =
-        actual.iter().map(String::as_str).collect();
+    let actual_set: std::collections::HashSet<&str> = actual.iter().map(String::as_str).collect();
     let missing: Vec<String> = required_columns(profile)
         .into_iter()
         .filter(|c| !actual_set.contains(c.as_str()))
@@ -224,6 +227,13 @@ mod tests {
                 "required column {c} must be a physical ExplicitColumn"
             );
         }
+    }
+
+    #[test]
+    fn strict_lake_ocsf_requires_canonical_event_time() {
+        let cols = required_columns(&OcsfProfile::lake_1_9());
+        assert!(cols.iter().any(|c| c == "time"));
+        assert!(!cols.iter().any(|c| c == "timestamp"));
     }
 
     #[test]

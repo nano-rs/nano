@@ -8,13 +8,33 @@ use chrono::{Duration, Utc};
 use metrics::{counter, histogram};
 use tracing::{debug, info, instrument, warn};
 
-use crate::detection::query_enrichment::inject_timestamp_bounds;
+use crate::detection::query_enrichment::inject_time_bounds;
 use crate::models::{Alert, AlertMode, DetectionRule, RuleMode};
 use crate::query::{parse_query, PrettyPrint, Query};
-use crate::search::{SearchExecutionLimits, SearchRequest, TimeRangeInput};
+use crate::search::{SearchExecutionLimits, SearchRequest, SearchResponse, TimeRangeInput};
 
 use super::DetectionError;
 use super::DetectionService;
+
+/// View name of the per-run memory ledger (NAN-3492); it appears in the
+/// refusal a rule run reports when its window is too large to hold.
+const DETECTION_RULE_MEMORY_VIEW: &str = "detection rule";
+
+/// Whether this process charges rule runs to the view memory budget
+/// (NAN-3492). Off by default: only nano-jobs, the scheduled-rule process,
+/// turns it on ([`DetectionService::enable_rule_memory_ledger`]); nano-api's
+/// interactive rule triggers keep their unbudgeted behaviour.
+static RULE_MEMORY_LEDGER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run one rule window under its own memory ledger when `enabled`, keeping
+/// an enclosing view's ledger if there is one; otherwise run it as is.
+async fn run_under_rule_ledger<F: std::future::Future>(enabled: bool, window: F) -> F::Output {
+    if enabled {
+        crate::search::view_memory::scoped_if_absent(DETECTION_RULE_MEMORY_VIEW, window).await
+    } else {
+        window.await
+    }
+}
 
 /// How a rule's dataset relates to the `source_type` provenance dimension
 /// (NAN-2024, refined by NAN-2227).
@@ -62,6 +82,44 @@ pub(super) fn dataset_provenance(dataset: Option<&str>) -> DatasetProvenance {
     }
 }
 
+/// Did this result touch the edge of its safety envelope?
+///
+/// A scheduled detection may only advance its window over a result set the
+/// search proved complete. Two ways it is not: the page filled the requested
+/// row limit, or the backend reported that `total_count` is a lower bound.
+///
+/// NAN-2550: the second half used to grep `warnings[]` for
+/// `LAKE_PAGE_BOUND_COUNT`. It now reads [`SearchResponse::total_count_exact`],
+/// which carries the same fact as data. The behaviour is identical for the lake
+/// (the flag is set from exactly the predicate that used to push the warning)
+/// and is now also correct for every other backend that can return a bounded
+/// count -- native OTLP paging and the ClickHouse `max_limit` clamp both used to
+/// slip past this gate because neither emits that warning code.
+fn detection_result_reached_envelope(response: &SearchResponse, result_limit: usize) -> bool {
+    response.results.len() >= result_limit || !response.total_count_exact
+}
+
+fn scheduled_detection_requires_complete_results(backend: crate::search::SearchBackend) -> bool {
+    backend == crate::search::SearchBackend::Lake
+}
+
+/// Event-time field carried by the selected query dataset.
+///
+/// The boot-time schema profile describes only the logs table. Native OTLP
+/// spans and metrics are per-query datasets with their own time columns, so
+/// detection enrichment must not reuse the OCSF logs field for them.
+pub(super) fn detection_time_field<'a>(
+    active_log_time_field: &'a str,
+    dataset: Option<&str>,
+) -> &'a str {
+    match crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) {
+        crate::query::Dataset::Logs => active_log_time_field,
+        crate::query::Dataset::Spans => "start_time",
+        crate::query::Dataset::Metrics => "timestamp",
+        crate::query::Dataset::Risk => "last_finding_at",
+    }
+}
+
 /// NAN-2155: what the `… | stats count by source_type` companion proved about a
 /// window's provenance.
 #[derive(Debug, PartialEq, Eq)]
@@ -106,12 +164,27 @@ pub(super) enum CompanionProvenance {
 ///
 /// A window mixing a real source with a reserved one is `Attributed` on the real
 /// source's strength, so a forged value can never mask a restricted source.
+#[cfg(test)]
 pub(super) fn classify_companion_rows(rows: &[serde_json::Value]) -> CompanionProvenance {
+    classify_companion_rows_with_field(rows, "source_type")
+}
+
+fn value_at_path<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a serde_json::Value> {
+    value.get(field).or_else(|| {
+        field
+            .split('.')
+            .try_fold(value, |current, component| current.get(component))
+    })
+}
+
+pub(super) fn classify_companion_rows_with_field(
+    rows: &[serde_json::Value],
+    source_field: &str,
+) -> CompanionProvenance {
     let mut named: Vec<String> = Vec::new();
     let mut any_unattributed = false;
     for row in rows {
-        match row
-            .get("source_type")
+        match value_at_path(row, source_field)
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
@@ -183,6 +256,10 @@ pub(super) fn fail_closed_stamp(
 }
 
 impl DetectionService {
+    pub(super) fn primary_lake_detection_backend(&self) -> bool {
+        self.search_service.backend() == crate::search::SearchBackend::Lake
+    }
+
     // ========================================================================
     // Rule Execution
     // ========================================================================
@@ -211,11 +288,21 @@ impl DetectionService {
         // `ScopeSet::unrestricted()`; the Test Rule path passes the caller scope.
         scope: &crate::auth::ScopeSet,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
-        self.evaluate_window_with_limit(
+        // The lake backend must fail closed at its page envelope until the
+        // durable sliced evaluator owns the remaining window. Legacy
+        // ClickHouse has no such drain lane; preserving its established
+        // warn-and-truncate behavior avoids pinning an existing tenant's
+        // watermark forever when a pathological rule reaches 1M rows.
+        let require_complete =
+            scheduled_detection_requires_complete_results(self.search_service.backend());
+        self.evaluate_window_with_options(
             query,
             time_range,
             dataset,
             crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT,
+            None,
+            None,
+            require_complete,
             scope,
         )
         .await
@@ -233,8 +320,17 @@ impl DetectionService {
         result_limit: usize,
         scope: &crate::auth::ScopeSet,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
-        self.evaluate_window_with_options(query, time_range, dataset, result_limit, None, None, scope)
-            .await
+        self.evaluate_window_with_options(
+            query,
+            time_range,
+            dataset,
+            result_limit,
+            None,
+            None,
+            false,
+            scope,
+        )
+        .await
     }
 
     /// Autonomous counterpart with an evaluator-owned query ID, no interactive
@@ -259,6 +355,7 @@ impl DetectionService {
             result_limit,
             Some(query_id),
             Some(execution_limits),
+            false,
             // Autonomous tuning is a SYSTEM caller — unrestricted like scheduled
             // execution (NAN-2047).
             &crate::auth::ScopeSet::unrestricted(),
@@ -275,6 +372,7 @@ impl DetectionService {
         result_limit: usize,
         request_id: Option<String>,
         execution_limits: Option<SearchExecutionLimits>,
+        require_complete: bool,
         // NAN-2047: the source-scope the window search runs under. Scheduled /
         // real-time / tuning execution is SYSTEM and passes
         // `ScopeSet::unrestricted()` (a rule must match across ALL sources,
@@ -285,8 +383,12 @@ impl DetectionService {
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
         // Enrich aggregation queries with timestamp bounds so results always carry
         // _first_seen/_last_seen for detection latency calculation.
+        let time_field = detection_time_field(
+            self.search_service.active_profile().timestamp_expr(),
+            dataset.as_deref(),
+        );
         let enriched_query = match parse_query(query) {
-            Ok(parsed) => inject_timestamp_bounds(&parsed).pretty_print(),
+            Ok(parsed) => inject_time_bounds(&parsed, time_field).pretty_print(),
             Err(_) => query.to_string(),
         };
 
@@ -313,14 +415,19 @@ impl DetectionService {
             || self.search_service.clone(),
             |limits| self.search_service.clone().with_execution_limits(limits),
         );
-        search_service
+        let response = search_service
             // NAN-2047: run under the caller-supplied scope. SYSTEM callers pass
             // `ScopeSet::unrestricted()` (match across ALL sources); the Test
             // Rule path passes the caller's effective deny set.
             .search(request, scope)
             .await
-            .map(|r| r.results)
-            .map_err(|e| DetectionError::SearchError(e.to_string()))
+            .map_err(|e| DetectionError::SearchError(e.to_string()))?;
+        if require_complete && detection_result_reached_envelope(&response, result_limit) {
+            return Err(DetectionError::QueryExecutionError(format!(
+                "detection window reached its {result_limit}-row safety envelope; the window remains pending for exact sliced execution"
+            )));
+        }
+        Ok(response.results)
     }
 
     /// NAN-1800: derive the companion query that lists the DISTINCT
@@ -336,7 +443,7 @@ impl DetectionService {
     /// OVER-inclusive (pre-aggregation filters could only narrow the set):
     /// over-stamping hides the alert from more scoped viewers, never fewer —
     /// the fail-closed direction.
-    fn source_type_companion_query(rule_query: &str) -> Option<String> {
+    fn source_companion_query(rule_query: &str, source_field: &str) -> Option<String> {
         let parsed = parse_query(rule_query).ok()?;
         let mut node: &Query = &parsed;
         loop {
@@ -344,8 +451,9 @@ impl DetectionService {
                 Query::Piped { source, .. } => node = source,
                 Query::Search(expr) => {
                     return Some(format!(
-                        "{} | stats count by source_type",
-                        expr.pretty_print()
+                        "{} | stats count by {}",
+                        expr.pretty_print(),
+                        source_field
                     ));
                 }
             }
@@ -389,9 +497,17 @@ impl DetectionService {
         results: &mut [serde_json::Value],
         time_range: &TimeRangeInput,
     ) {
+        let source_field = if self
+            .search_service
+            .active_profile()
+            .uses_strict_canonical_fields()
+        {
+            "metadata.log_source"
+        } else {
+            "source_type"
+        };
         let lacks_source_type = |event: &serde_json::Value| {
-            event
-                .get("source_type")
+            value_at_path(event, source_field)
                 .and_then(|v| v.as_str())
                 .map_or(true, |s| s.trim().is_empty())
         };
@@ -429,7 +545,7 @@ impl DetectionService {
                     // and distinguishable from a legitimately sourceless row so
                     // it can be re-triaged later.
                     warn!(rule_id = %rule.id, error = %e,
-                        "NAN-2155: restricted registry unavailable for aggregate stamping; \
+                        "restricted registry unavailable for aggregate stamping; \
                          stamping unresolved-provenance marker (fail closed)");
                     apply(
                         results,
@@ -481,7 +597,7 @@ impl DetectionService {
                 // value — visible to everyone, and egressable, exactly as these
                 // alerts behaved before NAN-2155 put the sentinel in the stamp.
                 debug!(rule_id = %rule.id, dataset = ?rule.dataset,
-                    "NAN-2227: dataset has no source_type dimension; stamping an empty manifest (companion skipped)");
+                    "dataset has no source_type dimension; stamping an empty manifest (companion skipped)");
                 apply(results, &serde_json::Value::Array(Vec::new()));
                 return;
             }
@@ -489,16 +605,16 @@ impl DetectionService {
                 // Risk: aggregated from findings that DO have origins we cannot
                 // recover here. Genuinely unknown ⇒ fail closed.
                 debug!(rule_id = %rule.id, dataset = ?rule.dataset,
-                    "NAN-2024: risk grain cannot resolve origin; failing closed (companion skipped)");
+                    "risk grain cannot resolve origin; failing closed (companion skipped)");
                 apply(results, &restricted_stamp());
                 return;
             }
             DatasetProvenance::SourceDerived => {}
         }
 
-        let Some(companion) = Self::source_type_companion_query(&rule.query) else {
+        let Some(companion) = Self::source_companion_query(&rule.query, source_field) else {
             warn!(rule_id = %rule.id,
-                "NAN-1800: could not derive source_type companion query; failing closed with the full restricted set");
+                "could not derive source_type companion query; failing closed with the full restricted set");
             apply(results, &restricted_stamp());
             return;
         };
@@ -514,18 +630,18 @@ impl DetectionService {
             .await
         {
             Ok(rows) => {
-                let stamp = match classify_companion_rows(&rows) {
+                let stamp = match classify_companion_rows_with_field(&rows, source_field) {
                     CompanionProvenance::Attributed(types) => serde_json::Value::Array(
                         types.into_iter().map(serde_json::Value::String).collect(),
                     ),
                     CompanionProvenance::Unresolved { any_unattributed } => {
                         warn!(rule_id = %rule.id, any_unattributed,
-                            "NAN-1800: source_type companion did not fully attribute the window; failing closed with the full restricted set");
+                            "source_type companion did not fully attribute the window; failing closed with the full restricted set");
                         restricted_stamp()
                     }
                     CompanionProvenance::ReservedOnly => {
                         warn!(rule_id = %rule.id,
-                            "NAN-2155: source_type companion attributed the window ONLY to reserved \
+                            "source_type companion attributed the window ONLY to reserved \
                              marker values (forged X-Source-Type?); treating it as \
                              attributed-but-unrestricted rather than failing closed, which would be a \
                              detection-suppression primitive");
@@ -536,7 +652,7 @@ impl DetectionService {
             }
             Err(e) => {
                 warn!(rule_id = %rule.id, error = %e,
-                    "NAN-1800: source_type companion query failed; failing closed with the full restricted set");
+                    "source_type companion query failed; failing closed with the full restricted set");
                 apply(results, &restricted_stamp());
             }
         }
@@ -570,6 +686,35 @@ impl DetectionService {
             return self.execute_retro_hunt_rule(rule).await;
         }
 
+        // NAN-3492: a window's matched rows are read from the lake into this
+        // process and decoded to `serde_json::Value`; unbudgeted, one wide
+        // window (up to the 256 MiB paged gather, a few times that decoded)
+        // times the scheduler's rule concurrency OOM-killed nano-jobs at its
+        // 512M limit (and its auto-restart died again within seconds).
+        // Charge every lake read of the run to the process-wide view budget
+        // (40 % of the cgroup limit, a third per rule): an oversized window
+        // now fails this run and keeps its watermark instead of the process.
+        // The ledger lives until alerts are written, which still hold the rows.
+        // Only in nano-jobs (`enable_rule_memory_ledger`); nano-api is unchanged.
+        run_under_rule_ledger(
+            RULE_MEMORY_LEDGER.load(std::sync::atomic::Ordering::Relaxed),
+            Box::pin(self.execute_window_rule(rule, time_range)),
+        )
+        .await
+    }
+
+    /// Charge every rule run in THIS process to the view memory budget
+    /// (NAN-3492). Called once by nano-jobs at boot; never by nano-api.
+    pub fn enable_rule_memory_ledger() {
+        RULE_MEMORY_LEDGER.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The window body of [`Self::execute_rule`], run under its memory ledger.
+    async fn execute_window_rule(
+        &self,
+        rule: &DetectionRule,
+        time_range: Option<TimeRangeInput>,
+    ) -> Result<Option<Alert>, DetectionError> {
         // Don't execute paused rules
         if rule.mode == RuleMode::Paused {
             warn!("Attempted to execute paused rule: {}", rule.id);
@@ -634,17 +779,6 @@ impl DetectionService {
             )
             .await?;
 
-        // Audit D19: if a single window hit the 1M safety cap the rule is far too
-        // broad — matches beyond 1M are still truncated, but now VISIBLY (a warn)
-        // instead of silently at 100.
-        if results.len() >= crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT {
-            warn!(
-                rule_id = %rule.id,
-                "Rule {} hit the 1M result cap in a single window — the query is too broad; some matches are truncated",
-                rule.name
-            );
-        }
-
         // Dedup namespace: Live bake-in and Alerting record/filter separately so
         // a rule promoted Live→Alerting isn't suppressed by bake-in records (D17).
         let matched_kind = super::helpers::MatchedEventKind::for_mode(rule.mode);
@@ -672,6 +806,35 @@ impl DetectionService {
             }
         }
 
+        // Per-event alerting uses a durable, bounded drain rather than either
+        // dropping the tail or attempting an unbounded alert storm. The fixed
+        // window is re-run until its matched-event ledger has consumed every
+        // batch; only the final batch lets the scheduler advance the watermark.
+        let per_event_remaining = if rule.mode == RuleMode::Alerting
+            && rule.alert_mode == AlertMode::PerEvent
+        {
+            let plan = super::alerts::plan_per_event_batch(
+                results.len(),
+                self.config.max_events_per_alert,
+            )?;
+            results.truncate(plan.batch_len);
+            if self.primary_lake_detection_backend() {
+                plan.remaining
+            } else {
+                if plan.remaining > 0 {
+                    warn!(
+                        rule_id = %rule.id,
+                        retained = plan.batch_len,
+                        dropped = plan.remaining,
+                        "Legacy ClickHouse per-event alert window exceeded its configured storm cap"
+                    );
+                }
+                0
+            }
+        } else {
+            0
+        };
+
         // Inject _nano_detected_at into all matched events for frontend latency calculation
         let detected_at = Utc::now();
         super::helpers::inject_detected_at(&mut results, detected_at);
@@ -698,9 +861,16 @@ impl DetectionService {
             // RFC-3339 fallback can't parse the offset-less CH format either), so
             // MTTD never recorded for the normal CH timestamp format.
             let detection_time = Utc::now();
+            let event_time_field = detection_time_field(
+                self.search_service.active_profile().timestamp_expr(),
+                rule.dataset.as_deref(),
+            );
             let earliest_ts = results
                 .iter()
-                .filter_map(|e| Self::event_field_time(e, "timestamp"))
+                .filter_map(|e| {
+                    Self::event_field_time(e, "_first_seen")
+                        .or_else(|| Self::event_field_time(e, event_time_field))
+                })
                 .min();
 
             if let Some(earliest) = earliest_ts {
@@ -822,6 +992,7 @@ impl DetectionService {
                                 match_count,
                                 today,
                                 global_weight,
+                                matched_kind,
                             )
                             .await?
                         }
@@ -833,8 +1004,17 @@ impl DetectionService {
                     // the next run re-evaluates them instead of dropping the
                     // detection forever. Unconditional (audit D29): the 5s overlap
                     // dedups even lookback-NULL rules.
-                    self.record_matched_events(rule.id, matched_kind, &results)
-                        .await?;
+                    if rule.alert_mode != AlertMode::PerEvent {
+                        self.record_matched_events(rule.id, matched_kind, &results)
+                            .await?;
+                    }
+
+                    if per_event_remaining > 0 {
+                        return Err(DetectionError::WindowDrainPending {
+                            processed: results.len(),
+                            remaining_at_least: per_event_remaining,
+                        });
+                    }
 
                     Ok(alert)
                 } else {
@@ -853,7 +1033,76 @@ impl DetectionService {
 
 #[cfg(test)]
 mod tests {
-    use super::{dataset_provenance, DatasetProvenance};
+    use super::{
+        dataset_provenance, detection_result_reached_envelope, detection_time_field,
+        run_under_rule_ledger, scheduled_detection_requires_complete_results, DatasetProvenance,
+    };
+
+    /// NAN-3492: the rule memory ledger applies only where it is enabled
+    /// (nano-jobs); elsewhere (nano-api triggers) a rule runs unscoped, and an
+    /// enclosing view keeps its own ledger either way.
+    #[tokio::test]
+    async fn rule_memory_ledger_scopes_only_when_enabled() {
+        use crate::search::view_memory;
+        let view = || async { view_memory::current().map(|ledger| ledger.view().to_string()) };
+        assert_eq!(run_under_rule_ledger(false, view()).await, None);
+        assert_eq!(run_under_rule_ledger(true, view()).await.as_deref(), Some("detection rule"));
+        // The process default is off: nothing in this test binary enabled it.
+        assert!(!super::RULE_MEMORY_LEDGER.load(std::sync::atomic::Ordering::Relaxed));
+        let outer = view_memory::scoped("asset-dossier", run_under_rule_ledger(true, view())).await;
+        assert_eq!(outer.as_deref(), Some("asset-dossier"));
+    }
+
+    #[test]
+    fn detection_time_field_tracks_the_selected_dataset() {
+        assert_eq!(detection_time_field("time", None), "time");
+        assert_eq!(detection_time_field("time", Some("logs")), "time");
+        assert_eq!(detection_time_field("time", Some("spans")), "start_time");
+        assert_eq!(detection_time_field("time", Some("metrics")), "timestamp");
+        assert_eq!(
+            detection_time_field("time", Some("risk")),
+            "last_finding_at"
+        );
+    }
+
+    #[test]
+    fn scheduled_detection_rejects_page_bound_results_before_advancing_its_window() {
+        let mut response = crate::search::SearchResponse::empty();
+        response.results = vec![serde_json::json!({"metadata": {"uid": "event-1"}})];
+        // NAN-2550: the fact rides on the result, not on a warning string. One
+        // row well under a 1M envelope still blocks the window when the backend
+        // will not vouch for the count.
+        response.total_count_exact = false;
+        assert!(detection_result_reached_envelope(&response, 1_000_000));
+
+        response.total_count_exact = true;
+        assert!(!detection_result_reached_envelope(&response, 2));
+        assert!(detection_result_reached_envelope(&response, 1));
+
+        // A response deserialized from a peer that predates the field decodes as
+        // `total_count_exact: false`, so the gate stays closed rather than
+        // advancing a detection window over a possibly-partial result.
+        let legacy: crate::search::SearchResponse = serde_json::from_value(serde_json::json!({
+            "results": [{"metadata": {"uid": "event-1"}}],
+            "total_count": 1,
+            "execution_time_ms": 1,
+            "fields": [],
+            "generated_sql": null,
+        }))
+        .expect("legacy search response without total_count_exact");
+        assert!(!legacy.total_count_exact);
+        assert!(detection_result_reached_envelope(&legacy, 1_000_000));
+    }
+
+    #[test]
+    fn only_the_lake_backend_requires_a_complete_scheduled_result_envelope() {
+        assert!(scheduled_detection_requires_complete_results(
+            crate::search::SearchBackend::Lake
+        ));
+        assert!(!scheduled_detection_requires_complete_results(
+            crate::search::SearchBackend::ClickHouse
+        ));
+    }
 
     /// NAN-2024: only the logs dataset carries a per-event `source_type`, so the
     /// companion runs there and is skipped everywhere else.

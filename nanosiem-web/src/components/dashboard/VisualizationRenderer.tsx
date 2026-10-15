@@ -36,25 +36,22 @@ import { TreeVisualization, type TreeNode } from '@/components/search/TreeVisual
 import { RankedBarChart } from '@/components/search/RankedBarChart';
 import { TransactionCards } from '@/components/search/TransactionCards';
 import { FlowVisualization } from '@/components/search/FlowVisualization';
+import {
+  CHART_AXIS_LINE,
+  CHART_AXIS_TEXT,
+  CHART_SERIES,
+  CHART_VALUE_TEXT,
+} from '@/lib/chart-colors';
 
 // Chart color palette matching the dark theme
 // Uses CSS variable colors from index.css for consistency
 // Primary colors: blue, green, yellow, red (matching chart-1 through chart-5)
 // Extended palette for additional series
-const CHART_COLORS = [
-  '#3b82f6', // blue-500 (primary)
-  '#22c55e', // green-500
-  '#eab308', // yellow-500
-  '#ef4444', // red-500
-  '#a855f7', // purple-500
-  '#06b6d4', // cyan-500
-  '#f97316', // orange-500
-  '#ec4899', // pink-500
-];
+const CHART_COLORS = CHART_SERIES;
 
 // Consistent axis styling for dark theme
 const AXIS_STYLE = {
-  stroke: '#6b7280', // gray-500
+  stroke: CHART_AXIS_LINE,
   fontSize: 10,
   fontFamily: 'var(--font-mono)',
   tickLine: false,
@@ -143,7 +140,7 @@ function isZeroFillAgg(key: string): boolean {
 // Ordered column keys: honor `column_order` for the columns it names, then
 // append any present-but-unlisted keys (e.g. eval outputs) in their natural order.
 function orderedColumns(sample: Record<string, unknown>, columnOrder?: string[]): string[] {
-  const present = Object.keys(sample ?? {});
+  const present = Object.keys(sample ?? {}).filter(k => k !== '_timechart');
   if (!columnOrder || columnOrder.length === 0) return present;
   const inOrder = columnOrder.filter(k => k in sample);
   const rest = present.filter(k => !inOrder.includes(k));
@@ -275,7 +272,7 @@ function densifyTimeBuckets(
  * (DSH6). Absent split combos and missing whole buckets are filled per the
  * aggregate type (DSH30).
  */
-function pivotSplitByData(
+export function pivotSplitByData(
   data: Record<string, unknown>[],
   columnOrder?: string[]
 ): {
@@ -291,6 +288,10 @@ function pivotSplitByData(
     return { data: [], labelKey: '', valueKeys: [], wasPivoted: false, isTimeSeries: false };
   }
 
+  if (data[0]._timechart) {
+    const metadata = data[0]._timechart as { span_seconds: number };
+    return { data, labelKey: 'time_bucket', valueKeys: Object.keys(data[0]).filter(k => k !== 'time_bucket' && typeof data[0][k] === 'number'), wasPivoted: false, isTimeSeries: true, timeKey: 'time_bucket', spanMs: metadata.span_seconds * 1000 };
+  }
   const { keys, labelKey, timeKey, isTimeSeries, spanMs } = classifyColumns(data, columnOrder);
   const sample = data[0];
   const isNum = (k: string) => typeof sample[k] === 'number';
@@ -528,7 +529,7 @@ function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
                 <XAxis
                   type="number"
                   {...AXIS_STYLE}
-                  tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+                  tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
                   tickFormatter={formatCompactNumber}
                 />
                 <YAxis
@@ -536,7 +537,7 @@ function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
                   type="category"
                   {...AXIS_STYLE}
                   width={yAxisWidth}
-                  tick={{ fill: '#9ca3af', fontSize: 10, fontFamily: 'var(--font-mono)' }}
+                  tick={{ fill: CHART_AXIS_TEXT, fontSize: 10, fontFamily: 'var(--font-mono)' }}
                   tickFormatter={(value) => String(value).length > 25 ? String(value).substring(0, 22) + '...' : String(value)}
                 />
               </>
@@ -545,7 +546,7 @@ function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
                 <XAxis
                   dataKey={labelKey}
                   {...AXIS_STYLE}
-                  tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+                  tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
                   interval="preserveStartEnd"
                   angle={-30}
                   textAnchor="end"
@@ -553,14 +554,14 @@ function BarVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
                 />
                 <YAxis
                   {...AXIS_STYLE}
-                  tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+                  tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
                   tickFormatter={formatCompactNumber}
                   width={56}
                 />
               </>
             )}
             <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} cursor={false} />
-            {valueKeys.length > 1 && <Legend wrapperStyle={{ color: '#9ca3af', fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
+            {valueKeys.length > 1 && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
             {valueKeys.map((key, i) => (
               <Bar
                 key={key}
@@ -614,18 +615,18 @@ function LineVisualization({ data, config, onDrilldown, columnOrder }: ChartVisu
         <XAxis
           dataKey={labelKey}
           {...AXIS_STYLE}
-          tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+          tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
           interval="preserveStartEnd"
           minTickGap={32}
         />
         <YAxis
           {...AXIS_STYLE}
-          tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+          tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
           tickFormatter={formatCompactNumber}
           width={56}
         />
         <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} />
-        {valueKeys.length > 1 && <Legend wrapperStyle={{ color: '#9ca3af', fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
+        {valueKeys.length > 1 && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
         {valueKeys.map((key, i) => (
           <Line
             key={key}
@@ -684,18 +685,18 @@ function AreaVisualization({ data, config, onDrilldown, columnOrder }: ChartVisu
         <XAxis
           dataKey={labelKey}
           {...AXIS_STYLE}
-          tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+          tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
           interval="preserveStartEnd"
           minTickGap={32}
         />
         <YAxis
           {...AXIS_STYLE}
-          tick={{ fill: '#9ca3af', fontFamily: 'var(--font-mono)' }}
+          tick={{ fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)' }}
           tickFormatter={formatCompactNumber}
           width={56}
         />
         <Tooltip contentStyle={TOOLTIP_STYLE} labelStyle={TOOLTIP_LABEL_STYLE} />
-        {valueKeys.length > 1 && <Legend wrapperStyle={{ color: '#9ca3af', fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
+        {valueKeys.length > 1 && <Legend wrapperStyle={{ color: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }} />}
         {valueKeys.map((key, i) => (
           <Area
             key={key}
@@ -774,7 +775,7 @@ function PieVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
       <text
         x={x}
         y={y}
-        fill="#f3f4f6"
+        fill={CHART_VALUE_TEXT}
         textAnchor={x > cx ? 'start' : 'end'}
         dominantBaseline="central"
         style={{ fontSize: '11px' }}
@@ -808,7 +809,7 @@ function PieVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
         </Pie>
         <Tooltip 
           contentStyle={TOOLTIP_STYLE} 
-          itemStyle={{ color: '#f3f4f6', fontFamily: 'var(--font-mono)', fontSize: '11px' }}
+          itemStyle={{ color: CHART_VALUE_TEXT, fontFamily: 'var(--font-mono)', fontSize: '11px' }}
           formatter={(value, name) => {
             const coerced = typeof value === 'number' ? value : Number(value);
             const n = Number.isFinite(coerced) ? coerced : 0;
@@ -826,7 +827,7 @@ function PieVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
           y="46%"
           textAnchor="middle"
           dominantBaseline="middle"
-          style={{ fontSize: '24px', fontWeight: 'bold', fill: '#f3f4f6', fontFamily: 'var(--font-mono)' }}
+          style={{ fontSize: '24px', fontWeight: 'bold', fill: CHART_VALUE_TEXT, fontFamily: 'var(--font-mono)' }}
         >
           {formatCompactNumber(total)}
         </text>
@@ -835,7 +836,7 @@ function PieVisualization({ data, config, onDrilldown, columnOrder }: ChartVisua
           y="56%"
           textAnchor="middle"
           dominantBaseline="middle"
-          style={{ fontSize: '11px', fill: '#9ca3af', fontFamily: 'var(--font-mono)', letterSpacing: '0.08em', textTransform: 'uppercase' }}
+          style={{ fontSize: '11px', fill: CHART_AXIS_TEXT, fontFamily: 'var(--font-mono)', letterSpacing: '0.08em', textTransform: 'uppercase' }}
         >
           Total
         </text>

@@ -72,7 +72,7 @@ fn interactive_session_only() -> (StatusCode, Json<FeedbackApiError>) {
     )
 }
 
-/// Submitter-facing feedback view (NAN-2093).
+/// Submitter-facing feedback view.
 ///
 /// Deliberately omits `admin_notes` — an administrator-only field written via the
 /// `users:edit`-gated update route. Reusing the internal `Feedback` model in
@@ -127,7 +127,7 @@ pub struct FeedbackListResponse {
 /// Response for user's own feedback list.
 ///
 /// Uses `SubmitterFeedback` (not the internal `Feedback` model) so `admin_notes`
-/// is never serialized back to the submitter (NAN-2093).
+/// is never serialized back to the submitter.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MyFeedbackResponse {
     pub feedback: Vec<SubmitterFeedback>,

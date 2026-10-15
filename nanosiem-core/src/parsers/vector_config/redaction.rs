@@ -20,7 +20,17 @@
 
 /// Scalar-string TOML keys whose values are bearer secrets and must not
 /// appear in any persisted snapshot.
-const SCALAR_SECRET_KEYS: &[&str] = &["password", "secret_access_key", "session_token"];
+///
+/// NAN-3764: `connection_string` (Event Hubs SAS and Blob Storage account-key
+/// connection strings) and `azure_client_secret` (Entra service principal) are
+/// emitted by the `azure_event_hubs` source generator.
+const SCALAR_SECRET_KEYS: &[&str] = &[
+    "password",
+    "secret_access_key",
+    "session_token",
+    "connection_string",
+    "azure_client_secret",
+];
 
 /// Array-of-string TOML keys whose values are bearer secrets and must not
 /// appear in any persisted snapshot.
@@ -180,6 +190,9 @@ mod tests {
     #[test]
     fn handles_missing_trailing_newline() {
         let toml = "password = \"x\"";
-        assert_eq!(redact_config_snapshot(toml), "password = \"***REDACTED***\"");
+        assert_eq!(
+            redact_config_snapshot(toml),
+            "password = \"***REDACTED***\""
+        );
     }
 }

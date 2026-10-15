@@ -45,6 +45,7 @@ impl LibraryQueryRow {
 #[derive(Clone)]
 pub struct QueryLibraryRepository {
     pool: PgPool,
+    lake_builtins: bool,
     table_verified: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -52,8 +53,26 @@ impl QueryLibraryRepository {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            lake_builtins: false,
             table_verified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Serve lake variants of unchanged product templates without migrating
+    /// the global catalog or rewriting user-authored saved searches.
+    pub fn with_lake_builtins(mut self) -> Self {
+        self.lake_builtins = true;
+        self
+    }
+
+    fn map_row(&self, row: LibraryQueryRow) -> LibraryQuery {
+        let mut query = row.into_library_query();
+        if self.lake_builtins {
+            if let Some(rewritten) = super::lake_builtins::rewrite(&query.query, query.is_builtin) {
+                query.query = rewritten.to_string();
+            }
+        }
+        query
     }
 
     /// Check if the query_library table exists
@@ -109,7 +128,7 @@ impl QueryLibraryRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| r.into_library_query()).collect())
+        Ok(rows.into_iter().map(|r| self.map_row(r)).collect())
     }
 
     /// Get a query by ID
@@ -130,7 +149,7 @@ impl QueryLibraryRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| r.into_library_query()))
+        Ok(row.map(|r| self.map_row(r)))
     }
 
     /// Get a query by name
@@ -151,7 +170,7 @@ impl QueryLibraryRepository {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| r.into_library_query()))
+        Ok(row.map(|r| self.map_row(r)))
     }
 
     /// Create a new query

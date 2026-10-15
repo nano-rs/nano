@@ -1,0 +1,198 @@
+name: Google Workspace
+slug: google_workspace
+category: collector
+description: "Pull login, admin and OAuth-grant audit events from the Google Workspace Reports API"
+icon: shield
+author: nano
+version: 8
+changelog: >-
+  v8: new Directory component (NAN-3503): Workspace users and group
+  memberships synced into nano's identity registry from the Admin SDK
+  Directory API (directory.connector.yaml, hosted
+  directory.connector.hosted.yaml). It needs two more read-only scopes on the
+  SAME domain-wide delegation entry: admin.directory.user.readonly and
+  admin.directory.group.readonly. Edit the existing entry and keep the reports
+  scope; replacing it stops the audit logs. Audit log streams are unchanged.
+  New optional PRIVILEGED_GROUPS config field (directory only).
+  v7: hosted feeds are keyless (NAN-3490). nano's hosted runner reads
+  connector.hosted.yaml: the tenant's own nano service account signs the
+  domain-wide-delegation assertion through the pull broker (no key file
+  anywhere), and the hosted install asks for no credential. The Workspace admin
+  authorizes the client ID nano shows for the
+  admin.reports.audit.readonly scope. Dedicated (Deno) and self-hosted
+  connector.yaml keep the service-account key fields unchanged.
+  v6: opt into tenant-scoped hosted Marketplace connector feeds with
+  explicit OCSF parser linkage. Dedicated Deno execution stays unchanged.
+  v5: streams name the OCSF parser (google_workspace_ocsf) instead of the
+  pre-OCSF google_workspace parser. Parser lookup is by name, and OCSF tenants
+  only carry the *_ocsf parsers, so every stream provisioned on an OCSF tenant
+  arrived unparsed (NAN-3483). A stream that is already linked keeps its log
+  source: disable and re-enable it to provision against the OCSF parser.
+  v4: keep older audit events reachable when a walk hits the 500-page ceiling
+  or the run budget. Results arrive newest-first, so committing the newest event
+  from an incomplete walk permanently skipped every page still below it. A
+  truncated walk now pins the existing inclusive lower boundary and checkpoints
+  an overlapping upper-bound continuation; consecutive runs work down through
+  the backlog, then collapse back to the normal newest-event cursor once it is
+  drained. The overlap can re-deliver acknowledged events, preserving
+  at-least-once delivery rather than risking a same-timestamp gap. Existing v3
+  JSON cursors and v1/v2 timestamp cursors remain compatible; the continuation
+  fields only appear temporarily while a backlog is being drained.
+  v3: stop re-delivering the event on the watermark. The Reports API startTime
+  is inclusive, so the newest event came back every run, and the guard that
+  advanced the cursor ("newest > startTime") was then false — so it never
+  advanced and the same record shipped on every poll indefinitely. Quiet streams
+  amplified hardest: admin reached 547 rows for 6 real events in five days. The
+  cursor now records which identities sat on the boundary instant and filters
+  exactly those, so the boundary stays inclusive (no event sharing that
+  timestamp is dropped) without the repeat. Cursors written by v1/v2 are read
+  as-is and upgrade after one run. Duplicates ALREADY ingested are not removed
+  by this — dedupe downstream if the counts matter.
+  v2: each stream now names the parser it needs (parser: google_workspace)
+  instead of relying on the parser to claim all four gws_* source types.
+  Resolution no longer depends on the parsers repo keeping those aliases, so a
+  parser-repo tidy-up can't silently leave streams collecting unparsed. No
+  behaviour change on its own; update before the parsers repo drops the aliases.
+  v1: initial release — login, admin, token and drive activity streams.
+
+# Service-account JWT with domain-wide delegation. nano builds the assertion,
+# signs it, and exchanges it for a bearer — the collector never touches the key.
+auth_type: service_account_jwt
+auth:
+  token_url: "https://oauth2.googleapis.com/token"
+  private_key_field: PRIVATE_KEY
+  client_email_field: CLIENT_EMAIL
+  subject_field: ADMIN_EMAIL
+  scope: "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+
+requires_credential: required
+credential_fields:
+  - name: PRIVATE_KEY
+    label: Service account private key
+    field_type: secret
+    required: true
+    help: >-
+      The `private_key` value from the service account's JSON key file, including
+      the BEGIN/END PRIVATE KEY lines. Paste it as-is — the escaped \n sequences
+      Google's JSON uses are handled, as are real newlines.
+  - name: CLIENT_EMAIL
+    label: Service account email
+    field_type: secret
+    required: true
+    help: >-
+      The `client_email` from the same JSON file, ending in
+      .iam.gserviceaccount.com.
+
+config_fields:
+  - name: ADMIN_EMAIL
+    label: Admin to impersonate
+    field_type: string
+    required: true
+    placeholder: "admin@yourdomain.com"
+    help: >-
+      A Workspace super-admin whose identity the service account assumes.
+      Domain-wide delegation authenticates AS this user; without it the service
+      account has no domain data to read and the API returns a bare 403 that
+      never mentions delegation. In the Admin console: Security → Access and
+      data control → API controls → Domain-wide delegation → add the service
+      account's client ID with the admin.reports.audit.readonly scope.
+  - name: PRIVILEGED_GROUPS
+    label: Privileged groups (directory)
+    field_type: string
+    required: false
+    placeholder: "admins@yourdomain.com, security@yourdomain.com"
+    help: >-
+      Directory component only, optional. Comma-separated group emails or
+      names whose members nano treats as administrators, in addition to
+      Workspace super admins and delegated admins.
+
+# Both hosts are fixed — Google is not per-tenant, so no suffix allowlist is
+# needed. The token endpoint must be listed too: the assertion exchange is an
+# outbound call like any other.
+allowed_domains:
+  - admin.googleapis.com
+  - oauth2.googleapis.com
+
+streams:
+  - id: login
+    label: Login events
+    source_type: gws_login
+    parser: google_workspace_ocsf
+    default: true
+    description: "Sign-ins, failures, suspicious-login flags and logout"
+  - id: admin
+    label: Admin console actions
+    source_type: gws_admin
+    parser: google_workspace_ocsf
+    default: true
+    description: "Every change an administrator made, and who made it"
+  - id: token
+    label: OAuth token grants
+    source_type: gws_token
+    parser: google_workspace_ocsf
+    default: true
+    description: "Third-party apps users authorized, and the scopes they hold"
+  - id: drive
+    label: Drive activity
+    source_type: gws_drive
+    parser: google_workspace_ocsf
+    default: false
+    description: "File access and sharing. Very high volume — enable deliberately."
+
+config:
+  # Hosted UI uses source-bound connector feeds; dedicated Deno remains unchanged.
+  hosted_connector: true
+  poll_schedule: "*/5 * * * *"
+  max_run_secs: 600
+  max_events_per_emit: 1000
+
+tags:
+  - saas
+  - authentication
+  - google
+  - identity
+
+# NAN-3503 marketplace layout: one Google Workspace card with two components.
+categories:
+  - logs
+  - identity
+
+components:
+  - id: audit_logs
+    label: Audit logs
+    kind: logs
+    description: "Login, admin, OAuth-grant and Drive activity from the Reports API"
+    streams: [login, admin, token, drive]
+    default: true
+    setup:
+      scopes:
+        - "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+      steps:
+        - "In the Google Admin console open **Security → Access and data control → API controls → Manage Domain Wide Delegation**."
+        - "Add the client ID nano shows on this page with the scope `https://www.googleapis.com/auth/admin.reports.audit.readonly`."
+        - "Enter a super admin's email in Admin to impersonate."
+  - id: directory
+    label: Directory
+    kind: identity
+    description: "Users, managers, 2-Step Verification, admin flags and group memberships from the Directory API"
+    connector_spec: directory.connector.yaml
+    hosted_connector_spec: directory.connector.hosted.yaml
+    config_fields: [ADMIN_EMAIL, PRIVILEGED_GROUPS]
+    default: false
+    setup:
+      scopes:
+        - "https://www.googleapis.com/auth/admin.directory.user.readonly"
+        - "https://www.googleapis.com/auth/admin.directory.group.readonly"
+      steps:
+        - "In the Google Admin console open **Security → Access and data control → API controls → Manage Domain Wide Delegation**."
+        - "**Edit the existing entry** for nano's client ID (the one audit logs already use). Do not add a second entry and do not remove the reports scope: Google keeps one scope list per client ID, and replacing it stops the audit logs."
+        - "Append `https://www.googleapis.com/auth/admin.directory.user.readonly,https://www.googleapis.com/auth/admin.directory.group.readonly` to the comma-separated scope list and click **Authorize**. Changes can take a few minutes to apply."
+        - "The admin in Admin to impersonate must be able to read users and groups (a super admin can)."
+
+# NAN-3490: connector.yaml is the declarative nano-connector spec that
+# replaces code.ts. `runtime` picks which one nano runs; it stays `deno` until
+# cutover, and the shadow-run harness keeps the two event-for-event identical.
+runtime: deno
+connector_spec: connector.yaml
+# Hosted runner only: keyless DWD via nano's pull broker (no credential fields).
+hosted_connector_spec: connector.hosted.yaml

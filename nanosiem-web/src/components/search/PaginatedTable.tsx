@@ -8,6 +8,8 @@ import { IpIdentityPopover } from './IpIdentityPopover';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { cn, isClickHouseDefault } from '@/lib/utils';
 import { isPrevalenceSentinelField, prevalenceSentinelLabel } from '@/lib/prevalence-sentinels';
+import { localResultStart } from '@/lib/durable-result-paging';
+import { formatCellValue as formatCellValueShared } from '@/lib/format-cell-value';
 
 /** Try to coerce a value into a numeric array for sparkline rendering.
  *  Handles: native arrays, JSON-encoded strings like "[1,2,3]", and
@@ -241,6 +243,8 @@ interface PaginatedTableProps {
   totalCount: number;
   currentPage: number;
   pageSize: number;
+  /** Absolute row offset represented by results[0] for durable artifact pages. */
+  resultRowOffset?: number;
   onPageChange?: (page: number) => void;
   onPageSizeChange?: (size: number) => void;
   onDrilldown?: (filters: Record<string, unknown>) => void;
@@ -292,6 +296,7 @@ export function PaginatedTable({
   totalCount,
   currentPage,
   pageSize,
+  resultRowOffset = 0,
   onPageChange,
   onPageSizeChange,
   onDrilldown,
@@ -486,10 +491,7 @@ export function PaginatedTable({
     if (fieldName && isPrevalenceSentinelField(fieldName, value)) {
       return prevalenceSentinelLabel(fieldName, value) ?? '-';
     }
-    if (typeof value === 'object') {
-      return JSON.stringify(value);
-    }
-    return String(value);
+    return formatCellValueShared(value);
   };
 
   // Pagination — use local result count so client-side pagination works
@@ -502,7 +504,9 @@ export function PaginatedTable({
   const canGoNext = currentPage < totalPages - 1;
 
   // Only render the current page's rows — avoids dumping thousands of DOM nodes
-  const pageRows = flattenedResults.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const absoluteStart = currentPage * pageSize;
+  const localStart = localResultStart(absoluteStart, resultRowOffset);
+  const pageRows = flattenedResults.slice(localStart, localStart + pageSize);
 
   const handleResizeStart = (columnKey: string, event: React.PointerEvent<HTMLSpanElement>) => {
     event.preventDefault();

@@ -132,9 +132,7 @@ pub fn validate_sql_query(sql: &str) -> Result<(), SearchError> {
 fn is_comment_token(token: &Token) -> bool {
     matches!(
         token,
-        Token::Whitespace(
-            Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
-        )
+        Token::Whitespace(Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_))
     )
 }
 
@@ -264,13 +262,11 @@ mod tests {
             "SELECT message FROM logs UNION ALL SELECT message FROM signals"
         )
         .is_ok());
+        assert!(validate_sql_query("WITH base AS (SELECT * FROM logs) SELECT * FROM base").is_ok());
         assert!(
-            validate_sql_query("WITH base AS (SELECT * FROM logs) SELECT * FROM base").is_ok()
+            validate_sql_query("SELECT * FROM logs PREWHERE timestamp > '2026-01-01' LIMIT 1")
+                .is_ok()
         );
-        assert!(validate_sql_query(
-            "SELECT * FROM logs PREWHERE timestamp > '2026-01-01' LIMIT 1"
-        )
-        .is_ok());
     }
 
     #[test]
@@ -279,14 +275,14 @@ mod tests {
         // Analysts must be able to hunt for these words in message/command content.
         assert!(validate_sql_query("SELECT * FROM logs WHERE message ILIKE '%delete%'").is_ok());
         assert!(validate_sql_query("SELECT * FROM logs WHERE message ILIKE '%hostname%'").is_ok());
-        assert!(
-            validate_sql_query("SELECT * FROM logs WHERE lower(message) LIKE '%grant access%'")
-                .is_ok()
-        );
-        assert!(
-            validate_sql_query("SELECT * FROM logs WHERE command_line = 'sleep 5; drop table'")
-                .is_ok()
-        );
+        assert!(validate_sql_query(
+            "SELECT * FROM logs WHERE lower(message) LIKE '%grant access%'"
+        )
+        .is_ok());
+        assert!(validate_sql_query(
+            "SELECT * FROM logs WHERE command_line = 'sleep 5; drop table'"
+        )
+        .is_ok());
     }
 
     // =========================================================================
@@ -308,10 +304,10 @@ mod tests {
             "SELECT * FROM logs WHERE id IN (SELECT query_id FROM system.processes)"
         )
         .is_err());
-        assert!(validate_sql_query(
-            "SELECT (SELECT count() FROM system.tables) AS x FROM logs"
-        )
-        .is_err());
+        assert!(
+            validate_sql_query("SELECT (SELECT count() FROM system.tables) AS x FROM logs")
+                .is_err()
+        );
         assert!(
             validate_sql_query("SELECT id FROM logs UNION SELECT id FROM system.tables").is_err()
         );
@@ -398,10 +394,9 @@ mod tests {
         // "in string" and swallow the trailing `hostName()` / `system.*` ref.
         assert!(validate_sql_query("SELECT 1 AS `a'`, hostName() FROM logs").is_err());
         assert!(validate_sql_query("SELECT * FROM `system`.`tables`").is_err());
-        assert!(validate_sql_query(
-            r#"SELECT "col'x", getSetting('max_threads') FROM logs"#
-        )
-        .is_err());
+        assert!(
+            validate_sql_query(r#"SELECT "col'x", getSetting('max_threads') FROM logs"#).is_err()
+        );
     }
 
     #[test]

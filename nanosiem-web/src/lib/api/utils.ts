@@ -43,6 +43,8 @@ export function getServiceUrl(path: string): string {
       path.startsWith('/api/search/services?') ||
       path.startsWith('/api/search/saved') ||
       path.startsWith('/api/search/jobs') ||
+      // NAN-3088: lean Prevalence export / rare list (durable cell jobs).
+      path.startsWith('/api/search/prevalence/') ||
       path.startsWith('/api/search/admin')) {
     return SEARCH_URL;
   }

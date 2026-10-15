@@ -450,12 +450,16 @@ async fn recon_service(state: &AppState) -> ReconService {
     #[cfg(not(feature = "enterprise"))]
     let ai = None;
 
-    ReconService::new(
-        state.pool.clone(),
-        state.dual_pool().clickhouse().clone(),
-        state.dual_pool().table_names(),
-        ai,
-    )
+    if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        ReconService::new_lake(state.pool.clone(), state.search_service.clone(), ai)
+    } else {
+        ReconService::new(
+            state.pool.clone(),
+            state.dual_pool().clickhouse().clone(),
+            state.dual_pool().table_names(),
+            ai,
+        )
+    }
 }
 
 #[cfg(test)]

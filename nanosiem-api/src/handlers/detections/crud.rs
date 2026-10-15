@@ -49,7 +49,13 @@ pub async fn list_detections(
 ) -> Result<Json<Vec<DetectionRule>>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
-    let mut rules = if let Some(severity) = query.severity {
+    let mut rules = if query.include_archived {
+        let mut all = state.detection_service.list_all_rules().await?;
+        if let Some(severity) = query.severity {
+            all.retain(|r| r.severity == severity);
+        }
+        all
+    } else if let Some(severity) = query.severity {
         state
             .detection_service
             .list_rules_by_severity(severity)
@@ -202,7 +208,14 @@ pub async fn create_detection(
             .list_rules()
             .await
             .map(|r| r.len() as u32)
-            .unwrap_or(0);
+            // Fail closed (NAN-2761): an unreadable count must not read as 0
+            // and wave the create past the cap.
+            .map_err(|e| {
+                tracing::error!(error = %e, "detection rule count unavailable for tier limit");
+                ApiError::ServiceUnavailable(
+                    "Detection rule limit could not be verified; retry shortly".to_string(),
+                )
+            })?;
         nanosiem_core::check_limit(
             "detection rules",
             rule_count,
@@ -551,11 +564,14 @@ pub async fn update_detection(
     Ok(Json(DetectionResponse { rule, warning }))
 }
 
-/// Delete a detection rule
+// NAN-3816: delete archives instead of erasing, parity with hosted.
+/// Delete (archive) a detection rule
 ///
-/// Cleans up the appropriate execution tier before deleting the rule.
-///
-/// Requirements: 4.5
+/// Tears down the rule's execution tier, then archives it (same as hosted):
+/// the rule never runs again and is hidden from default lists
+/// (`GET /api/rules?include_archived=true` shows it), while its matches,
+/// alerts and statistics keep their rule reference. Deleting an archived
+/// rule returns 404 and changes nothing.
 #[utoipa::path(
     delete,
     path = "/api/rules/{id}",
@@ -564,9 +580,10 @@ pub async fn update_detection(
         ("id" = String, Path, description = "Detection rule ID")
     ),
     responses(
-        (status = 200, description = "Detection rule deleted successfully", body = inline(Object)),
+        (status = 200, description = "Detection rule archived; match and alert history kept", body = inline(Object)),
         (status = 403, description = "Missing permission: detections:delete", body = ErrorResponse),
-        (status = 404, description = "Rule not found", body = ErrorResponse),
+        (status = 404, description = "Rule not found or already archived", body = ErrorResponse),
+        (status = 409, description = "Rule is finishing an active execution; retry deletion", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -578,15 +595,15 @@ pub async fn delete_detection(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_DELETE)?;
 
-    // Get the rule name before deleting for audit
-    let rule_name = state
+    // Get the rule name and mode before archiving for audit
+    let (rule_name, rule_mode) = state
         .detection_service
         .get_rule(*id)
         .await
-        .map(|r| r.name)
-        .unwrap_or_else(|_| "unknown".to_string());
+        .map(|r| (r.name, Some(r.mode)))
+        .unwrap_or_else(|_| ("unknown".to_string(), None));
 
-    // Delete rule with mode-based cleanup (row deletion clears next_run_at)
+    // Tear down the execution tier, then archive (history is kept)
     state
         .detection_service
         .delete_rule_with_mode(*id, state.materialized_view_generator.as_ref())
@@ -599,10 +616,11 @@ pub async fn delete_detection(
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .resource("detection_rule", Some(*id), Some(rule_name))
             .client_context(&client)
+            .details(serde_json::json!({"mode": rule_mode, "archived": true}))
             .build(),
     );
 
-    Ok(Json(serde_json::json!({"deleted": true})))
+    Ok(Json(serde_json::json!({"deleted": true, "archived": true})))
 }
 
 fn severity_rank(s: Severity) -> u8 {
@@ -727,6 +745,8 @@ mod tests {
             realtime_enabled: false,
             detection_mode: DetectionMode::Scheduled,
             materialized_view_name: None,
+            near_real_time_interval_seconds: None,
+            execution_mode: None,
             risk_score: None,
             risk_entity_field: None,
             risk_modifiers: sqlx::types::Json(vec![]),

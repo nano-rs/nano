@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "4427d40249bdcdc5894c640379fa4f029b70abd4dc0403b083787a703b5a7ebc",
+  "start": "2026-09-21T13:15:00Z",
+  "end": "2026-09-21T14:15:00Z",
+  "limit": 101,
+  "table_view": true,
+  "newest_first_event_rows": true,
+  "required_columns": [
+    {
+      "name": "activity_name",
+      "field_type": "string"
+    },
+    {
+      "name": "actor.process.name",
+      "field_type": "string"
+    },
+    {
+      "name": "actor.user.name",
+      "field_type": "string"
+    },
+    {
+      "name": "class_uid",
+      "field_type": "long"
+    },
+    {
+      "name": "connection_info.protocol_num",
+      "field_type": "integer"
+    },
+    {
+      "name": "dst_endpoint.autonomous_system.name",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.autonomous_system.number",
+      "field_type": "integer"
+    },
+    {
+      "name": "dst_endpoint.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.ip",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.location.country",
+      "field_type": "string"
+    },
+    {
+      "name": "dst_endpoint.port",
+      "field_type": "integer"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "process.name",
+      "field_type": "string"
+    },
+    {
+      "name": "severity",
+      "field_type": "string"
+    },
+    {
+      "name": "src_endpoint.autonomous_system.name",
+      "field_type": "string"
+    },
+    {
+      "name": "src_endpoint.autonomous_system.number",
+      "field_type": "integer"
+    },
+    {
+      "name": "src_endpoint.hostname",
+      "field_type": "string"
+    },
+    {
+      "name": "src_endpoint.ip",
+      "field_type": "string"
+    },
+    {
+      "name": "src_endpoint.location.country",
+      "field_type": "string"
+    },
+    {
+      "name": "src_endpoint.port",
+      "field_type": "integer"
+    },
+    {
+      "name": "status",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    },
+    {
+      "name": "user.name",
+      "field_type": "string"
+    }
+  ],
+  "projected_scan_columns": [
+    "actor.user.name",
+    "time",
+    "user.name"
+  ],
+  "sql": "SELECT activity_name, \"actor.process.name\", \"actor.user.name\", class_uid, \"connection_info.protocol_num\", \"dst_endpoint.autonomous_system.name\", \"dst_endpoint.autonomous_system.number\", \"dst_endpoint.hostname\", \"dst_endpoint.ip\", \"dst_endpoint.location.country\", \"dst_endpoint.port\", message, \"metadata.log_source\", \"metadata.uid\", \"process.name\", severity, \"src_endpoint.autonomous_system.name\", \"src_endpoint.autonomous_system.number\", \"src_endpoint.hostname\", \"src_endpoint.ip\", \"src_endpoint.location.country\", \"src_endpoint.port\", status, time, \"user.name\" FROM __nano_lake_source__ WHERE time BETWEEN '2026-09-21 13:15:00.000000' AND '2026-09-21 14:15:00.000000' AND (((lower(\"actor.user.name\") = 'jsmith' OR lower(\"user.name\") = 'jsmith'))) ORDER BY time DESC LIMIT 101 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=1, optimize_aggregation_in_order=1"
+}

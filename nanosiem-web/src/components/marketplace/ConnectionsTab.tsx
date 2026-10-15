@@ -24,18 +24,17 @@ import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
-  AlertTriangle, CheckCircle2, Clock, Loader2, Play, Plus,
+  AlertTriangle, CheckCircle2, Clock, Play, Plus,
   RefreshCw, Trash2, XCircle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Checkbox } from '@/components/ui/checkbox';
-import {
-  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
-} from '@/components/ui/dialog';
+import { FormSheet } from '@/components/ui/detail-sheet';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { api, collectorManifest, streamNeedsAttention } from '@/lib/api';
 import type {
@@ -78,7 +77,7 @@ function RunStatusBadge({ instance }: { instance: IntegrationInstance }) {
   if (instance.running) {
     return (
       <span className="inline-flex items-center gap-1 font-mono text-[10.5px] text-blue-600 dark:text-blue-400">
-        <Loader2 className="h-3 w-3 animate-spin" /> running
+        <LoadingIcon className="h-3 w-3" /> running
       </span>
     );
   }
@@ -178,7 +177,7 @@ function InstanceDialog({
   const isEdit = Boolean(instance);
 
   const [name, setName] = useState(instance?.name ?? integration.name);
-  const [config, setConfig] = useState<Record<string, unknown>>(() => {
+  const [initialConfig] = useState<Record<string, unknown>>(() => {
     const initial: Record<string, unknown> = {};
     for (const field of manifest.configFields) {
       const value = instance?.config?.[field.name];
@@ -192,10 +191,12 @@ function InstanceDialog({
     }
     return initial;
   });
+  const [config, setConfig] = useState<Record<string, unknown>>(initialConfig);
   const [credentials, setCredentials] = useState<Record<string, string>>({});
-  const [streams, setStreams] = useState<string[]>(
-    instance?.enabled_streams ?? manifest.streams.filter((s) => s.default).map((s) => s.id),
+  const [initialStreams] = useState<string[]>(
+    () => instance?.enabled_streams ?? manifest.streams.filter((s) => s.default).map((s) => s.id),
   );
+  const [streams, setStreams] = useState<string[]>(initialStreams);
   const [schedule, setSchedule] = useState(instance?.schedule ?? '');
   const [enabled, setEnabled] = useState(instance?.enabled ?? true);
 
@@ -251,18 +252,30 @@ function InstanceDialog({
     !isEdit &&
     integration.credential_fields.some((f) => f.required && (credentials[f.name] ?? '').trim() === '');
 
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle className="text-[15px]">
-            {isEdit ? 'Edit' : 'Connect'} {integration.name}
-          </DialogTitle>
-          <DialogDescription className="text-[12px]">
-            One instance per vendor tenant. Credentials are encrypted at rest and never returned by the API.
-          </DialogDescription>
-        </DialogHeader>
+  const dirty =
+    name !== (instance?.name ?? integration.name) ||
+    schedule !== (instance?.schedule ?? '') ||
+    enabled !== (instance?.enabled ?? true) ||
+    Object.values(credentials).some((v) => v !== '') ||
+    Object.keys(config).some((k) => config[k] !== initialConfig[k]) ||
+    streams.length !== initialStreams.length ||
+    streams.some((id) => !initialStreams.includes(id));
 
+  return (
+    <FormSheet
+      open={open}
+      onOpenChange={onOpenChange}
+      size="md"
+      breadcrumb={['Marketplace', 'Connections']}
+      title={`${isEdit ? 'Edit' : 'Connect'} ${integration.name}`}
+      description="One instance per vendor tenant. Credentials are encrypted at rest and never returned by the API."
+      meta={instance ? <span>{instance.id}</span> : <span>{integration.slug}</span>}
+      guardDirty={dirty && !save.isPending}
+      onSubmit={() => save.mutate()}
+      submitLabel={isEdit ? 'Save' : 'Connect'}
+      pending={save.isPending}
+      submitDisabled={name.trim() === '' || missingRequiredConfig || missingCredentials}
+    >
         <div className="space-y-4">
           <div className="space-y-1.5">
             <Label className="text-[11px]">Name</Label>
@@ -407,24 +420,7 @@ function InstanceDialog({
             <Switch checked={enabled} onCheckedChange={setEnabled} />
           </div>
         </div>
-
-        <DialogFooter>
-          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            size="sm"
-            disabled={
-              save.isPending || name.trim() === '' || missingRequiredConfig || missingCredentials
-            }
-            onClick={() => save.mutate()}
-          >
-            {save.isPending && <Loader2 className=" h-3 w-3 animate-spin" />}
-            {isEdit ? 'Save' : 'Connect'}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    </FormSheet>
   );
 }
 
@@ -627,7 +623,7 @@ export function ConnectionsTab({ entry }: ConnectionsTabProps) {
 
       {instancesQuery.isLoading ? (
         <div className="flex items-center gap-2 px-3 py-4 text-[12px] text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
+          <LoadingIcon className="h-3.5 w-3.5" /> Loading…
         </div>
       ) : instances.length === 0 ? (
         <p className="px-3 py-4 text-[12px] text-muted-foreground">

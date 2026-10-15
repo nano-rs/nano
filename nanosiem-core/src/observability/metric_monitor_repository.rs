@@ -96,7 +96,7 @@ pub struct MetricMonitor {
     /// API layer against [`crate::query::MetricAgg::from_str`].
     pub agg: String,
     /// Optional service scope (the promoted `otel_metrics.service_name` column,
-    /// NAN-1564). NULL evaluates the metric fleet-wide (all services).
+    ///). NULL evaluates the metric fleet-wide (all services).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
     /// Optional tag/attribute key to split into per-series evaluation.

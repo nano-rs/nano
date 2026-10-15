@@ -13,7 +13,7 @@ use crate::query::{AggFunc, Aggregation};
 use crate::search::evaluator::helpers::parse_datetime_flexible;
 use crate::search::SearchError;
 
-use super::helpers::json_value_to_raw_string;
+use super::helpers::{get_nested_value, json_value_to_raw_string};
 
 // ============================================================================
 // Stats Aggregation
@@ -64,12 +64,7 @@ pub fn apply_stats_post_processing_with_limit(
         let mut fields = HashSet::new();
         // Add explicit aggregation output fields
         for agg in aggregations {
-            let default_name = agg
-                .field
-                .clone()
-                .unwrap_or_else(|| format!("{:?}", agg.func));
-            let output_name = agg.alias.as_ref().unwrap_or(&default_name);
-            fields.insert(output_name.clone());
+            fields.insert(agg.output_alias());
         }
         // Add group_by fields
         if let Some(gb) = group_by {
@@ -116,7 +111,11 @@ pub fn apply_stats_post_processing_with_limit(
             Some(fields) => {
                 let values: Vec<serde_json::Value> = fields
                     .iter()
-                    .map(|f| row.get(f).cloned().unwrap_or(serde_json::Value::Null))
+                    .map(|f| {
+                        get_nested_value(row, f)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
                     .collect();
                 let key = values
                     .iter()
@@ -162,12 +161,12 @@ pub fn apply_stats_post_processing_with_limit(
         // Compute each explicit aggregation
         for agg in aggregations {
             let agg_value = compute_aggregation(&rows, agg);
-            let default_name = agg
-                .field
-                .clone()
-                .unwrap_or_else(|| format!("{:?}", agg.func));
-            let output_name = agg.alias.as_ref().unwrap_or(&default_name);
-            result_obj.insert(output_name.clone(), agg_value);
+            // The SQL generator's column name (`count`, `sum`, `avg`,
+            // `values_<field>`, …). The old default was the input field name
+            // or `{:?}` of the function, so `stats count by a | stats
+            // avg(count), max(count)` wrote both into `count` and `stats
+            // count` came back as `Count`.
+            result_obj.insert(agg.output_alias(), agg_value);
         }
 
         // Compute auto-added prevalence aggregations
@@ -193,12 +192,75 @@ pub fn apply_stats_post_processing_with_limit(
 /// # Returns
 /// * `serde_json::Value` - The aggregated value
 pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> serde_json::Value {
+    // NAN-2361: honour CONDITIONAL aggregation (`func(eval(<predicate>))`).
+    //
+    // The parser builds these as `Aggregation.condition` and the ClickHouse
+    // generator compiles them to `countIf`/`sumIf`/`avgIf` — but this
+    // post-processing path ignored `condition` entirely, so `count(eval(x))`
+    // returned `rows.len()`: the TOTAL row count, whatever the predicate said.
+    // Measured live on 2,345 proxy events, `count(eval(query.hostname=<value>))`
+    // returned 2,345 for a column that is NULL on every one of those rows,
+    // while the same predicate in a `| where` correctly returned 0.
+    //
+    // Every branch below reads `agg.field`; none consulted `condition`. Rather
+    // than special-case `Count`, restrict the row set ONCE up front so all
+    // aggregates (sum/avg/min/max/dc/…) become conditional together and no
+    // future variant can silently miss it.
+    //
+    // Truthiness matches the `where` seam (`condition.rs`): a row counts only
+    // when the predicate evaluates to boolean true. A row whose fields are
+    // missing evaluates to `None` and is EXCLUDED — the same "not proven true"
+    // rule the filter path uses, so the two never disagree.
+    let filtered: Vec<&serde_json::Value>;
+    let rows = match &agg.condition {
+        // Only the functions the SQL generator will actually compile
+        // conditionally. `aggregation.rs` returns `UnsupportedOperation` for
+        // every other `AggFunc` with a condition; honouring it here too would
+        // make `min(eval(...))` succeed on this path and error on the compiled
+        // one — the same nPL answering two different ways depending on which
+        // lane ran it. Ignoring the predicate is the safe divergence (an
+        // over-broad aggregate) versus inventing a result the other lane
+        // refuses to produce.
+        Some(_) if !matches!(agg.func, AggFunc::Count | AggFunc::Sum | AggFunc::Avg) => rows,
+        None => rows,
+        Some(condition) => {
+            filtered =
+                rows.iter()
+                    .copied()
+                    .filter(|row| {
+                        row.as_object().is_some_and(|object| {
+                            crate::search::processing::post_processing::eval::
+                            evaluate_eval_expression(condition, object)
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        })
+                    })
+                    .collect();
+            &filtered
+        }
+    };
     match &agg.func {
         AggFunc::Count => serde_json::Value::Number(serde_json::Number::from(rows.len())),
+        // NAN-2361: a CONDITIONAL aggregate with no field aggregates the
+        // constant 1 per matching row, exactly as the ClickHouse generator
+        // emits (`sumIf(1, cond)` / `avgIf(1, cond)`). `rows` is already
+        // restricted to matches above. Without this, sum returned 0 and avg
+        // returned null here while ClickHouse returned a count and 1.0 — the
+        // same query answering differently per backend, silently.
+        AggFunc::Sum if agg.condition.is_some() && agg.field.is_none() => {
+            serde_json::json!(rows.len() as f64)
+        }
+        AggFunc::Avg if agg.condition.is_some() && agg.field.is_none() => {
+            if rows.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(1.0)
+            }
+        }
         AggFunc::Sum => {
             let sum: f64 = rows
                 .iter()
-                .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+                .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
                 .filter_map(|v| v.as_f64())
                 .sum();
             serde_json::json!(sum)
@@ -206,7 +268,7 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
         AggFunc::Avg => {
             let values: Vec<f64> = rows
                 .iter()
-                .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+                .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
                 .filter_map(|v| v.as_f64())
                 .collect();
             if values.is_empty() {
@@ -217,14 +279,14 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
         }
         AggFunc::Min => rows
             .iter()
-            .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+            .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
             .filter_map(|v| v.as_f64())
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|v| serde_json::json!(v))
             .unwrap_or(serde_json::Value::Null),
         AggFunc::Max => rows
             .iter()
-            .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+            .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
             .filter_map(|v| v.as_f64())
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|v| serde_json::json!(v))
@@ -234,7 +296,7 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
         AggFunc::Dc | AggFunc::EstDc => {
             let unique: std::collections::HashSet<String> = rows
                 .iter()
-                .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+                .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
                 .map(|v| v.to_string())
                 .collect();
             serde_json::Value::Number(serde_json::Number::from(unique.len()))
@@ -244,7 +306,7 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
             let mut seen = std::collections::HashSet::new();
             let values: Vec<String> = rows
                 .iter()
-                .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+                .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
                 .filter_map(|v| {
                     let s = json_value_to_raw_string(v);
                     if !s.is_empty() && seen.insert(s.clone()) {
@@ -258,18 +320,26 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
         }
         AggFunc::First => rows
             .first()
-            .and_then(|r| agg.field.as_ref().and_then(|f| r.get(f).cloned()))
+            .and_then(|r| {
+                agg.field
+                    .as_ref()
+                    .and_then(|f| get_nested_value(r, f).cloned())
+            })
             .unwrap_or(serde_json::Value::Null),
         AggFunc::Last => rows
             .last()
-            .and_then(|r| agg.field.as_ref().and_then(|f| r.get(f).cloned()))
+            .and_then(|r| {
+                agg.field
+                    .as_ref()
+                    .and_then(|f| get_nested_value(r, f).cloned())
+            })
             .unwrap_or(serde_json::Value::Null),
         AggFunc::List => {
             // Return comma-separated values as a string (matching ClickHouse behavior)
             // Unlike values(), this includes duplicates
             let values: Vec<String> = rows
                 .iter()
-                .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))
+                .filter_map(|r| agg.field.as_ref().and_then(|f| get_nested_value(r, f)))
                 .map(|v| json_value_to_raw_string(v))
                 .filter(|s| !s.is_empty())
                 .collect();
@@ -308,17 +378,20 @@ pub fn apply_top_rare_post_processing(
 ) -> Result<(Vec<serde_json::Value>, bool), SearchError> {
     use std::collections::HashMap;
 
-    // Count occurrences (cap at 1M unique values to prevent OOM)
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    // Count occurrences (cap at 1M unique values to prevent OOM). Keyed by
+    // the JSON encoding so values keep their type in the output: the SQL
+    // path returns `404` as a number and NULL as null, and so must this one
+    // (it used to stringify both, `"404"` / `"null"`).
+    let mut counts: HashMap<String, (serde_json::Value, usize)> = HashMap::new();
     let mut counts_capped = false;
     for row in results {
-        if let Some(val) = row.get(field) {
+        if let Some(val) = get_nested_value(row, field) {
             let key = val.to_string();
             if !counts.contains_key(&key) && counts.len() >= DEFAULT_MAX_POST_PROCESSING_GROUPS {
                 counts_capped = true;
                 continue;
             }
-            *counts.entry(key).or_default() += 1;
+            counts.entry(key).or_insert_with(|| (val.clone(), 0)).1 += 1;
         }
     }
     if counts_capped {
@@ -329,12 +402,12 @@ pub fn apply_top_rare_post_processing(
         );
     }
 
-    // Sort by count
-    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+    // Sort by count, ties by value for a deterministic page.
+    let mut sorted: Vec<(String, (serde_json::Value, usize))> = counts.into_iter().collect();
     if is_rare {
-        sorted.sort_by(|a, b| a.1.cmp(&b.1)); // Ascending for rare
+        sorted.sort_by(|a, b| a.1 .1.cmp(&b.1 .1).then_with(|| a.0.cmp(&b.0)));
     } else {
-        sorted.sort_by(|a, b| b.1.cmp(&a.1)); // Descending for top
+        sorted.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(&b.0)));
     }
     sorted.truncate(limit);
 
@@ -342,19 +415,15 @@ pub fn apply_top_rare_post_processing(
     let total: usize = results.len();
     let output: Vec<serde_json::Value> = sorted
         .into_iter()
-        .map(|(value, count)| {
+        .map(|(_, (value, count))| {
             let mut obj = serde_json::Map::new();
-            // Remove quotes from string values
-            let clean_value = value.trim_matches('"');
-            obj.insert(
-                field.to_string(),
-                serde_json::Value::String(clean_value.to_string()),
-            );
+            obj.insert(field.to_string(), value);
             if show_count {
                 obj.insert("count".to_string(), serde_json::Value::Number(count.into()));
             }
             if show_percent && total > 0 {
-                let percent = (count as f64 / total as f64) * 100.0;
+                // Same rounding as the SQL path (`round(…, 2)`).
+                let percent = (count as f64 * 100.0 / total as f64 * 100.0).round() / 100.0;
                 obj.insert("percent".to_string(), serde_json::json!(percent));
             }
             serde_json::Value::Object(obj)
@@ -403,6 +472,7 @@ pub fn apply_timechart_post_processing(
         let timestamp_str = row
             .get("timestamp")
             .or_else(|| row.get("_time"))
+            .or_else(|| row.get("time"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 SearchError::ParseError("Timechart requires timestamp field".to_string())
@@ -418,7 +488,7 @@ pub fn apply_timechart_post_processing(
 
         // Get split value if specified (use first split_by field)
         let split_value = split_by.first().and_then(|field| {
-            row.get(field.as_str())
+            get_nested_value(row, field.as_str())
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         });
@@ -544,6 +614,71 @@ fn round_to_bucket(dt: DateTime<Utc>, span: std::time::Duration) -> DateTime<Utc
 
 #[cfg(test)]
 mod tests {
+    /// NAN-2361: `count(eval(<predicate>))` must count only MATCHING rows.
+    ///
+    /// This path ignored `Aggregation.condition` and returned `rows.len()`, so
+    /// every conditional aggregate reported the total. Live proof before the
+    /// fix: 2,345 proxy events, and `count(eval(query.hostname=<value>))`
+    /// returned 2,345 for a column NULL on all of them — while the identical
+    /// predicate in `| where` returned 0.
+    ///
+    /// The aggregation is built by PARSING REAL nPL rather than hand-assembled:
+    /// an earlier version of this test constructed an `Aggregation` carrying
+    /// both a field and a condition, which the parser cannot produce
+    /// (`func(eval(..))` always yields `field: None`), so it proved nothing
+    /// about real queries.
+    #[test]
+    fn nan2361_conditional_aggregation_counts_only_matching_rows() {
+        use crate::query::{parse_query, Command, Query};
+
+        fn aggregation_of(npl: &str) -> Aggregation {
+            let query = parse_query(npl).expect("parses");
+            let Query::Piped { command, .. } = query else {
+                panic!("expected a piped query");
+            };
+            let Command::Stats { aggregations, .. } = command else {
+                panic!("expected stats");
+            };
+            aggregations.into_iter().next().expect("one aggregation")
+        }
+
+        let rows = vec![
+            serde_json::json!({"kind": "dns"}),
+            serde_json::json!({"kind": "proxy"}),
+            serde_json::json!({"kind": "proxy"}),
+            serde_json::json!({"other": true}),
+        ];
+        let refs = rows.iter().collect::<Vec<_>>();
+
+        // Sanity: the parser really does give us a condition and no field.
+        let proxy_agg = aggregation_of(r#"* | stats count(eval(kind="proxy")) as c"#);
+        assert!(
+            proxy_agg.condition.is_some(),
+            "parser must carry the predicate"
+        );
+        assert!(proxy_agg.field.is_none(), "func(eval(..)) yields no field");
+
+        assert_eq!(
+            compute_aggregation(&refs, &proxy_agg),
+            serde_json::json!(2),
+            "must count matching rows, not the row total"
+        );
+
+        // A predicate true for NO row yields 0 — the exact failure that made
+        // matched_fields report every path at the full hit count.
+        let never = aggregation_of(r#"* | stats count(eval(kind="nothing-matches")) as c"#);
+        assert_eq!(compute_aggregation(&refs, &never), serde_json::json!(0));
+
+        // A row missing the field entirely is NOT proven true, so it is excluded
+        // — matching the `where` seam rather than diverging from it.
+        let unconditional = aggregation_of("* | stats count() as c");
+        assert_eq!(
+            compute_aggregation(&refs, &unconditional),
+            serde_json::json!(4),
+            "unconditional count is unchanged"
+        );
+    }
+
     use super::*;
     use chrono::TimeZone;
 
@@ -552,12 +687,8 @@ mod tests {
     #[test]
     fn timechart_span_zero_is_rejected() {
         let rows = vec![serde_json::json!({ "timestamp": "2024-01-01T00:00:00Z" })];
-        let out = apply_timechart_post_processing(
-            &rows,
-            std::time::Duration::from_secs(0),
-            &[],
-            &[],
-        );
+        let out =
+            apply_timechart_post_processing(&rows, std::time::Duration::from_secs(0), &[], &[]);
         assert!(out.is_err(), "timechart span=0 must error, not panic");
     }
 

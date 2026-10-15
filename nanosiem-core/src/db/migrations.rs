@@ -6,7 +6,7 @@
 //! introduced by NAN-747 (overlay split) and NAN-749 (fresh-init snapshot).
 //! Callers in `nanosiem-api` invoke [`run_postgres_migrations`] in place of
 //! `sqlx::migrate!("../migrations/postgres").run(pool)`. The enterprise
-//! overlay (`migrations/postgres-enterprise/`) stays at the call site under
+//! overlay (the enterprise migrations) stays at the call site under
 //! its `#[cfg(feature = "enterprise")]` block — this helper only deals with
 //! the open-tier path because `nanosiem-core` does not see the enterprise
 //! feature flag.
@@ -223,11 +223,10 @@ pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Erro
         return Ok(());
     }
 
-    let row_185: Option<(String,)> = sqlx::query_as(
-        "SELECT description FROM public._sqlx_migrations WHERE version = 185",
-    )
-    .fetch_optional(pool)
-    .await?;
+    let row_185: Option<(String,)> =
+        sqlx::query_as("SELECT description FROM public._sqlx_migrations WHERE version = 185")
+            .fetch_optional(pool)
+            .await?;
     let Some((description_185,)) = row_185 else {
         return Ok(());
     };
@@ -245,9 +244,9 @@ pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Erro
     }
 
     warn!(
-        "NAN-922 collision detected: removing poisoned _sqlx_migrations row \
+        "Migration version collision detected: removing poisoned _sqlx_migrations row \
          (version=185, description='{}') so the renamed brand-rename can \
-         re-land at version=187. See NAN-926.",
+         re-land at version=187.",
         NAN922_BRAND_RENAME_DESCRIPTION
     );
     sqlx::query(
@@ -331,9 +330,7 @@ async fn backfill_legacy_migration_history(
 ///
 /// Extracted so the cutoff logic can be unit-tested without a real PG
 /// (NAN-791).
-fn migrations_to_backfill(
-    migrator: &Migrator,
-) -> impl Iterator<Item = &sqlx::migrate::Migration> {
+fn migrations_to_backfill(migrator: &Migrator) -> impl Iterator<Item = &sqlx::migrate::Migration> {
     migrator
         .iter()
         .filter(|m| m.version <= OPEN_INIT_BASELINE_VERSION)
@@ -344,7 +341,7 @@ fn migrations_to_backfill(
 /// Decides between the legacy path (today's behavior) and the fresh-init
 /// path (NAN-749) based on [`MigrationMode::from_env`] and, when in
 /// `Auto` mode, runtime detection via [`is_fresh_database`]. The enterprise
-/// overlay (`migrations/postgres-enterprise/`) is NOT applied here — call
+/// overlay (the enterprise migrations) is NOT applied here — call
 /// sites layer it under their own `#[cfg(feature = "enterprise")]` block
 /// because `nanosiem-core` does not see the enterprise feature flag.
 pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError> {
@@ -373,10 +370,7 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
         }
         MigrationMode::Auto => match is_fresh_database(pool).await {
             Ok(fresh) => {
-                info!(
-                    fresh,
-                    "Detected database state for migration mode (auto)"
-                );
+                info!(fresh, "Detected database state for migration mode (auto)");
                 fresh
             }
             Err(err) => {
@@ -638,9 +632,7 @@ mod tests {
             r"(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?([a-z_][a-z0-9_]*)",
         )
         .unwrap();
-        re.captures_iter(sql)
-            .map(|c| c[1].to_lowercase())
-            .collect()
+        re.captures_iter(sql).map(|c| c[1].to_lowercase()).collect()
     }
 
     /// Bare table names a chunk of SQL READS/WRITES in a way that requires the
@@ -704,7 +696,7 @@ mod tests {
     /// This bit us as NAN-1251 (cases, → NAN-1265) and again as NAN-1488
     /// (shadow_investigations, migrations 204/205/206) + the NAN-1501 bedrock
     /// fix (agent_model_config, 207) → NAN-1502. The fix for each was to move
-    /// the migration into `migrations/postgres-enterprise/`.
+    /// the migration into the enterprise migrations.
     ///
     /// This guard models a fresh open DB (snapshot tables only) and walks the
     /// post-baseline core migrations, asserting every table they touch is
@@ -720,16 +712,28 @@ mod tests {
         let line_comment = "-- that already references one, only when it holds x\n\
              INSERT INTO permissions (id) VALUES ('a') ON CONFLICT DO NOTHING;";
         let refs = referenced_tables(line_comment);
-        assert!(!refs.contains("one"), "prose in a -- comment read as a table: {refs:?}");
-        assert!(refs.contains("permissions"), "real INSERT target lost: {refs:?}");
+        assert!(
+            !refs.contains("one"),
+            "prose in a -- comment read as a table: {refs:?}"
+        );
+        assert!(
+            refs.contains("permissions"),
+            "real INSERT target lost: {refs:?}"
+        );
 
         // String literal: "references live exclusively in …" is English too.
         let in_literal = "COMMENT ON TABLE log_sources IS \
              'Transport connections and credential references live exclusively here';\n\
              ALTER TABLE log_sources DROP COLUMN foo;";
         let refs = referenced_tables(in_literal);
-        assert!(!refs.contains("live"), "prose in a literal read as a table: {refs:?}");
-        assert!(refs.contains("log_sources"), "real ALTER target lost: {refs:?}");
+        assert!(
+            !refs.contains("live"),
+            "prose in a literal read as a table: {refs:?}"
+        );
+        assert!(
+            refs.contains("log_sources"),
+            "real ALTER target lost: {refs:?}"
+        );
 
         // Block comments too.
         let block = "/* REFERENCES nope */ CREATE TABLE real_one (id int);";
@@ -745,7 +749,10 @@ mod tests {
              ALTER TABLE alerts ADD COLUMN x int;";
         let refs = referenced_tables(sql);
         assert!(refs.contains("settings"), "{refs:?}");
-        assert!(refs.contains("alerts"), "statement after the literal was swallowed: {refs:?}");
+        assert!(
+            refs.contains("alerts"),
+            "statement after the literal was swallowed: {refs:?}"
+        );
     }
 
     /// `guarded_tables` must keep reading names OUT of literals — that is how
@@ -786,7 +793,9 @@ mod tests {
                      (see ENTERPRISE_TABLES in tools/nan749_split_open_overlay.py), move this \
                      migration to migrations/postgres-enterprise/; otherwise add the table to \
                      the open snapshot.",
-                    m.version, t, t
+                    m.version,
+                    t,
+                    t
                 );
             }
             available.extend(created);

@@ -4,9 +4,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   AlertTriangle, Check, CheckCircle, Code as CodeIcon, Copy, Download,
-  Eye, EyeOff, FileDown, Info, KeyRound, Loader2, Lock, Plug, RefreshCw, Save,
+  Eye, EyeOff, FileDown, Info, KeyRound, Lock, Plug, RefreshCw, Save,
   Settings as SettingsIcon, Trash2, Zap,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Link } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -24,6 +25,7 @@ import { cn } from '@/lib/utils';
 import { isDataFeed, isIpInfoEntry } from '@/lib/api/marketplace';
 import { ConnectionsTab } from './ConnectionsTab';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
+import { humanizeEnum } from '@/lib/marketplace-labels';
 import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
 
 const TABS = [
@@ -429,7 +431,7 @@ export function MarketplaceDrawer({
         >
           {loading || !entry ? (
             <div className="flex-1 flex items-center justify-center">
-              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-6 h-6 text-muted-foreground" />
             </div>
           ) : (
             <DrawerInner
@@ -554,7 +556,7 @@ function DrawerInner(props: DrawerInnerProps) {
           </div>
           <div className="mt-2 flex items-center gap-1.5 text-[10px] font-mono text-muted-foreground">
             <span className="px-1.5 py-px rounded bg-muted/40 border border-border/60 uppercase tracking-[0.08em]">
-              {entry.category}
+              {humanizeEnum(entry.category)}
             </span>
             <span>·</span>
             <span>{entry.author || 'core-enrichments'}@v{entry.installed_version ?? entry.manifest_version}</span>
@@ -758,7 +760,7 @@ function ConfigTab(props: ConfigTabProps) {
             )}
           </div>
           <Button size="sm" className="h-7 rounded-md flex-shrink-0" onClick={handleUpdate} disabled={updating}>
-            {updating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+            {updating ? <LoadingIcon className="w-3.5 h-3.5" /> : <RefreshCw className="w-3.5 h-3.5" />}
             Update
           </Button>
         </div>
@@ -888,7 +890,7 @@ function ConfigTab(props: ConfigTabProps) {
           )}
           {credsDirty && (
             <Button size="sm" className="mt-3 h-8 rounded-md" onClick={handleSaveCredentials} disabled={savingCreds}>
-              {savingCreds ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              {savingCreds ? <LoadingIcon className="w-3.5 h-3.5" /> : <Save className="w-3.5 h-3.5" />}
               Save credentials
             </Button>
           )}
@@ -979,7 +981,7 @@ function ConfigTab(props: ConfigTabProps) {
                 </Link>
               ) : (
                 <Button variant="outline" size="sm" className="h-8 rounded-md" onClick={handleSync} disabled={syncing}>
-                  {syncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                  {syncing ? <LoadingIcon className="w-3.5 h-3.5" /> : <RefreshCw className="w-3.5 h-3.5" />}
                   Sync now
                 </Button>
               )
@@ -1001,7 +1003,7 @@ function ConfigTab(props: ConfigTabProps) {
             }
           >
             {checkingDelete
-              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ? <LoadingIcon className="w-3.5 h-3.5" />
               : <Trash2 className="w-3.5 h-3.5" />}
             Delete integration
           </Button>
@@ -1060,7 +1062,7 @@ function CodeTab({ entry, handleExport, exporting }: CodeTabProps) {
             onClick={handleExport}
             disabled={exporting}
           >
-            {exporting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+            {exporting ? <LoadingIcon className="w-3 h-3" /> : <Download className="w-3 h-3" />}
             export
           </Button>
         )}

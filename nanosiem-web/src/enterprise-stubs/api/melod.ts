@@ -13,10 +13,13 @@ import type {
   MelodSummarizeRequest,
   MelodEditParserRequest,
   GenerateDashboardRequest,
+  DraftPlaybookRequest,
   RefineDashboardRequest,
   FetchUrlForDetectionResponse,
   GenerateDetectionHintsRequest,
   AiAvailability,
+  TenantAiSettings,
+  UpdateTenantAiSettingsRequest,
   ProviderCredentials,
   UpdateProviderCredentialsRequest,
   AgentModelConfig,
@@ -95,6 +98,9 @@ export class MelodApi {
   ): Promise<MelodJobStartResponse> {
     return ENTERPRISE_ONLY();
   }
+  melodDraftPlaybook(_request: DraftPlaybookRequest): Promise<MelodJobStartResponse> {
+    return ENTERPRISE_ONLY();
+  }
   melodGetDashboardJob(_jobId: string): Promise<MelodJobStatusResponse> {
     return ENTERPRISE_ONLY();
   }
@@ -112,6 +118,12 @@ export class MelodApi {
     return ENTERPRISE_ONLY();
   }
   getAiAvailability(): Promise<AiAvailability> {
+    return ENTERPRISE_ONLY();
+  }
+  getTenantAiSettings(): Promise<TenantAiSettings> {
+    return ENTERPRISE_ONLY();
+  }
+  updateTenantAiSettings(_request: UpdateTenantAiSettingsRequest): Promise<TenantAiSettings> {
     return ENTERPRISE_ONLY();
   }
   listAiProviders(): Promise<ProviderCredentials[]> {

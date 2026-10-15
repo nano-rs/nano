@@ -68,6 +68,7 @@ async fn create_definition(repo: &ReportRepository, owner: Uuid, sfx: &str) -> U
 
 fn csv_artifact() -> Vec<RenderedArtifact> {
     vec![RenderedArtifact {
+                platform_read_fence: None,
         kind: "csv".to_string(),
         filename: "report.csv".to_string(),
         content_type: "text/csv; charset=utf-8".to_string(),

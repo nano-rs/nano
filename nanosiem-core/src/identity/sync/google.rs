@@ -9,9 +9,7 @@ use async_trait::async_trait;
 use tracing::{info, instrument};
 
 use super::{SyncError, SyncProvider};
-use crate::identity::types::{
-    ConnectionTestResult, DeltaSyncResult, GoogleWorkspaceCredentials,
-};
+use crate::identity::types::{ConnectionTestResult, DeltaSyncResult, GoogleWorkspaceCredentials};
 
 pub struct GoogleWorkspaceSync;
 
@@ -123,8 +121,7 @@ impl GoogleWorkspaceSync {
             url.push_str(&format!("&pageToken={}", pt));
         }
 
-        let (client, url) =
-            super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
+        let (client, url) = super::guarded_client(&url, std::time::Duration::from_secs(30)).await?;
         let resp = client
             .get(url)
             .bearer_auth(token)
@@ -133,8 +130,13 @@ impl GoogleWorkspaceSync {
             .map_err(|e| SyncError::NetworkError(e.to_string()))?;
 
         if resp.status() == 429 {
+            // NAN-3483: honour Retry-After when Google sends one.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             return Err(SyncError::RateLimited {
-                retry_after_secs: Some(60),
+                retry_after_secs: super::rate_limit_wait_secs(resp.headers(), now).or(Some(60)),
             });
         }
 
@@ -186,9 +188,10 @@ impl SyncProvider for GoogleWorkspaceSync {
         let mut page_token: Option<String> = None;
 
         loop {
-            let (page, next) = self
-                .fetch_page(&token, &domain, page_token.as_deref())
-                .await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&token, &domain, page_token.as_deref())
+            })
+            .await?;
             all_users.extend(page);
             match next {
                 Some(t) => page_token = Some(t),
@@ -224,9 +227,10 @@ impl SyncProvider for GoogleWorkspaceSync {
         let mut page_token: Option<String> = None;
 
         loop {
-            let (page, next) = self
-                .fetch_page(&token, &domain, page_token.as_deref())
-                .await?;
+            let (page, next) = super::retry_rate_limited(super::RateLimitPolicy::default(), || {
+                self.fetch_page(&token, &domain, page_token.as_deref())
+            })
+            .await?;
             let page_size = page.len();
             total += on_page(page).await?;
 

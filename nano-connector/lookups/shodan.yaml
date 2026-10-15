@@ -1,0 +1,46 @@
+# NAN-3763 official lookup spec. Matches the nano-enrichments `shodan`
+# agent catalog entry (host information). Shodan describes exposure, not
+# reputation: a verdict is only set for C2 / compromise tags or known CVEs.
+version: 1
+name: shodan
+display_name: Shodan
+description: Open ports, services, banners and known vulnerabilities of an internet-facing IP.
+homepage: https://account.shodan.io/
+allow:
+  - host: api.shodan.io
+    path_prefixes: ["/shodan/host"]
+auth: { type: api_key_query, param: key, credential: API_KEY }
+credentials:
+  - { name: API_KEY, label: API key }
+defaults: { cache_ttl_secs: 86400, per_minute: 30, per_day: 100 }
+types:
+  ip:
+    request:
+      url: "https://api.shodan.io/shodan/host/{{input.artifact}}"
+      query: { minify: "true" }
+    link: "https://www.shodan.io/host/{{input.artifact}}"
+    result:
+      rules:
+        - when: [{ path: tags, contains: c2 }]
+          verdict: malicious
+          score: 90
+        - when: [{ path: tags, contains: compromised }]
+          verdict: malicious
+          score: 80
+        - when: [{ path: tags, contains: malware }]
+          verdict: malicious
+          score: 80
+        - when: [{ path: vulns, non_empty: true }]
+          verdict: suspicious
+          score: 40
+      default_verdict: unknown
+      summary:
+        org: org
+        isp: isp
+        country: country_code
+        os: os
+        ports: ports
+        hostnames: hostnames
+        vulns: vulns
+        last_update: last_update
+      tags: [tags]

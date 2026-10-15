@@ -220,7 +220,7 @@ export function RepoPreview({
   };
 
   return (
-    <div className="h-full flex flex-col border-l border-border bg-card/30 min-w-0">
+    <div className="h-full flex flex-col border-l border-border bg-card/30 min-w-0 min-h-0">
       {/* Header */}
       <div className="px-4 pt-3 pb-0 shrink-0">
         <div className="flex items-start gap-2.5">
@@ -299,7 +299,11 @@ export function RepoPreview({
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto border-t border-border min-w-0">
+      {/* NAN-2361: `min-h-0` is what makes this scroll. A flex child defaults to
+          `min-height: auto`, so `flex-1 overflow-auto` grows to its content
+          instead of scrolling — the panel just clipped and long rules (query +
+          MITRE + triage hints) were unreachable. */}
+      <div className="flex-1 min-h-0 overflow-auto border-t border-border min-w-0">
         {tab === 'overview' && (
           <OverviewTab
             rule={rule}

@@ -12,11 +12,11 @@ import {
   GitCommit,
   Info,
   Link as LinkIcon,
-  Loader2,
   Eye,
   X,
   GitFork,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { PermissionAction } from '@/components/repositories/PermissionAction';
@@ -25,6 +25,8 @@ import type { SourceConfiguration } from '@/lib/api/types';
 import type { ParserImportPreview } from '@/lib/api/parser-repositories';
 import { CategoryChip, StatusChip, TransportChip } from './chips';
 import type { RepoParserView, RepoTransport } from './helpers';
+import { VrlLine } from '@/components/editor/VrlHighlight';
+import { useVrlHighlight } from '@/components/editor/use-vrl-highlight';
 
 interface PreviewProps {
   parser: RepoParserView;
@@ -294,7 +296,7 @@ export function ParserRepoPreview({
                 )}
               >
                 {importing ? (
-                  <Loader2 className="w-[12px] h-[12px] animate-spin" strokeWidth={2} />
+                  <LoadingIcon className="w-[12px] h-[12px]" strokeWidth={2} />
                 ) : null}
                 Import
               </button>
@@ -665,7 +667,7 @@ function DispatchFromField({
 }
 
 // ==================================================================
-// VRL tab — light syntax highlighting
+// VRL tab — shared VRL highlighter (NAN-3195)
 // ==================================================================
 
 function VrlPane({ parser }: { parser: RepoParserView }) {
@@ -673,7 +675,7 @@ function VrlPane({ parser }: { parser: RepoParserView }) {
   // mapping emitted into the enrichment lane), not a log `parser_vrl`.
   const isEnrichment = parser.raw.kind === 'enrichment';
   const vrl = (isEnrichment ? parser.raw.normalize_vrl : parser.raw.parser_vrl) ?? '';
-  const tokens = useMemo(() => tokenizeVrl(vrl), [vrl]);
+  const lines = useVrlHighlight(vrl);
   if (!vrl) {
     return (
       <div className="p-4 text-[11.5px] text-muted-foreground">
@@ -685,100 +687,13 @@ function VrlPane({ parser }: { parser: RepoParserView }) {
   }
   return (
     <pre className="text-[11.5px] font-mono leading-relaxed text-foreground p-4 whitespace-pre overflow-x-auto">
-      {tokens}
+      {lines.map((segments, i) => (
+        <div key={i}>
+          <VrlLine segments={segments} text={segments.length ? segments.map((s) => s.text).join('') : ' '} />
+        </div>
+      ))}
     </pre>
   );
-}
-
-const VRL_KEYWORDS = new Set([
-  'if',
-  'else',
-  'for',
-  'return',
-  'null',
-  'true',
-  'false',
-  'exists',
-  'downcase',
-  'upcase',
-  'del',
-  'parse_timestamp',
-  'parse_regex',
-  'parse_json',
-  'from_unix_timestamp',
-  'to_int',
-  'to_string',
-  'is_string',
-  'flatten',
-  'match',
-]);
-
-function tokenizeVrl(src: string): React.ReactNode {
-  if (!src) return null;
-  const lines = src.split('\n');
-  return lines.map((line, i) => {
-    if (!line) return <div key={i}>{' '}</div>;
-    const parts: React.ReactNode[] = [];
-    let rem = line;
-
-    const lead = rem.match(/^\s*/)![0];
-    if (lead) parts.push(<span key="w">{lead}</span>);
-    rem = rem.slice(lead.length);
-
-    if (rem.startsWith('#')) {
-      parts.push(
-        <span key="c" style={{ color: 'var(--color-muted-foreground)' }}>
-          {rem}
-        </span>,
-      );
-      return <div key={i}>{parts}</div>;
-    }
-
-    const tokens = rem.split(
-      /("[^"]*"|'[^']*'|r'[^']*'|\b[a-zA-Z_][a-zA-Z0-9_]*!?|\.[a-zA-Z_][a-zA-Z0-9_.]*|[{}()[\],|=!<>+\-*/])/g,
-    );
-    tokens.forEach((t, j) => {
-      if (!t) return;
-      const k = `t${j}`;
-      if (/^["']/.test(t) || /^r'/.test(t))
-        parts.push(
-          <span key={k} style={{ color: 'oklch(72% 0.13 140)' }}>
-            {t}
-          </span>,
-        );
-      else if (/^\.[a-zA-Z_]/.test(t))
-        parts.push(
-          <span key={k} style={{ color: 'var(--color-primary)' }}>
-            {t}
-          </span>,
-        );
-      else if (/!$/.test(t))
-        parts.push(
-          <span key={k} style={{ color: 'oklch(78% 0.13 60)' }}>
-            {t}
-          </span>,
-        );
-      else if (VRL_KEYWORDS.has(t))
-        parts.push(
-          <span key={k} style={{ color: 'oklch(72% 0.14 290)' }}>
-            {t}
-          </span>,
-        );
-      else if (/^[0-9]+$/.test(t))
-        parts.push(
-          <span key={k} style={{ color: 'oklch(72% 0.13 60)' }}>
-            {t}
-          </span>,
-        );
-      else
-        parts.push(
-          <span key={k} style={{ color: 'var(--color-foreground)' }}>
-            {t}
-          </span>,
-        );
-    });
-    return <div key={i}>{parts}</div>;
-  });
 }
 
 // ==================================================================
@@ -877,7 +792,7 @@ function ImportOptionsPane({
     <div className="p-4 space-y-4">
       {previewLoading && (
         <div className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
-          <Loader2 className="w-[13px] h-[13px] animate-spin" strokeWidth={1.5} />
+          <LoadingIcon className="w-[13px] h-[13px]" strokeWidth={1.5} />
           Loading import preview…
         </div>
       )}
@@ -1030,7 +945,7 @@ function isTransportCompat(transport: RepoTransport | null, configType: string):
   if (transport === 'pubsub') return t.includes('pubsub') || t.includes('gcp');
   if (transport === 'kafka') return t === 'kafka';
   if (transport === 'syslog') return t === 'syslog';
-  if (transport === 'splunk_hec') return t.includes('splunk');
+  if (transport === 'splunk_hec') return t.includes('splunk_hec');
   if (transport === 'vector') return t === 'vector';
   if (transport === 'http') return t === 'http' || t === 'routed';
   return false;

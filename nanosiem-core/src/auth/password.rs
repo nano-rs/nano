@@ -11,6 +11,16 @@
 
 use thiserror::Error;
 
+/// Maximum accepted plaintext password length, in BYTES.
+///
+/// bcrypt cost is paid per hash invocation, but the caller still copies and
+/// moves the plaintext, and an unbounded body lets one request dictate how much
+/// work the hashing thread pool does. Every entry point that accepts a new
+/// plaintext password bounds it here so the limit cannot drift between the
+/// activation, reset, change and admin paths. Measured in bytes to match
+/// `validate_password_complexity`, which uses `str::len()`.
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+
 /// Password-related errors
 #[derive(Debug, Error)]
 pub enum PasswordError {
@@ -22,6 +32,11 @@ pub enum PasswordError {
 
     #[error("Password does not meet complexity requirements: {0}")]
     ComplexityNotMet(String),
+
+    /// The plaintext exceeded [`MAX_PASSWORD_BYTES`]. Carries only the limit —
+    /// never the password or its actual length.
+    #[error("Password must be at most {0} bytes long")]
+    TooLong(usize),
 }
 
 /// Result of password complexity validation
@@ -202,7 +217,15 @@ fn is_special_char(c: char) -> bool {
 ///
 /// This is a convenience function that uses default requirements and returns
 /// a PasswordError if the password doesn't meet them.
+///
+/// It also enforces the upper bound ([`MAX_PASSWORD_BYTES`]): this is the single
+/// function every new-password path funnels through, so the cap belongs here
+/// rather than being restated at each call site.
 pub fn validate_password(password: &str) -> Result<(), PasswordError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(PasswordError::TooLong(MAX_PASSWORD_BYTES));
+    }
+
     let requirements = PasswordRequirements::default();
     let result = validate_password_complexity(password, &requirements);
 
@@ -310,6 +333,70 @@ mod tests {
 
         // Invalid password
         assert!(validate_password("weak").is_err());
+    }
+
+    #[test]
+    fn test_validate_password_rejects_over_max_bytes() {
+        // Complexity-compliant prefix, but one byte past the cap.
+        let password = format!("Aa1!{}", "x".repeat(MAX_PASSWORD_BYTES));
+        assert!(password.len() > MAX_PASSWORD_BYTES);
+
+        match validate_password(&password) {
+            Err(PasswordError::TooLong(limit)) => assert_eq!(limit, MAX_PASSWORD_BYTES),
+            other => panic!("expected TooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_password_accepts_exactly_max_bytes() {
+        let password = format!("Aa1!{}", "x".repeat(MAX_PASSWORD_BYTES - 4));
+        assert_eq!(password.len(), MAX_PASSWORD_BYTES);
+        assert!(validate_password(&password).is_ok());
+    }
+
+    #[test]
+    fn test_validate_password_max_is_measured_in_bytes() {
+        // Each em-dash is 3 bytes: 342 of them + "Aa1!" exceeds the cap while
+        // the char count (346) stays far below it.
+        let password = format!("Aa1!{}", "—".repeat(342));
+        assert!(password.chars().count() < MAX_PASSWORD_BYTES);
+        assert!(password.len() > MAX_PASSWORD_BYTES);
+        assert!(matches!(
+            validate_password(&password),
+            Err(PasswordError::TooLong(_))
+        ));
+    }
+
+    #[test]
+    fn test_special_char_set_is_complete() {
+        // The browser mirrors this set character-for-character
+        // (nanosiem-web/src/lib/password.ts). Any addition here must be added
+        // there too.
+        for c in "!@#$%^&*()-_=+[]{}|\\;:'\",.<>/?`~".chars() {
+            assert!(is_special_char(c), "{c:?} should count as special");
+        }
+        for c in "abzABZ09 \t\u{00e9}".chars() {
+            assert!(!is_special_char(c), "{c:?} should not count as special");
+        }
+    }
+
+    /// Documents why `MAX_PASSWORD_BYTES` is a resource bound, not a strength
+    /// bound: bcrypt uses only the first 72 bytes and silently ignores the rest,
+    /// so anything past 72 adds no entropy. If a future bcrypt release starts
+    /// returning an error instead of truncating, this test fails and the cap
+    /// must be revisited (an accepted password would otherwise 500 at hash
+    /// time).
+    #[test]
+    fn hashing_accepts_every_length_the_policy_admits() {
+        for length in [12usize, 72, 73, 200, MAX_PASSWORD_BYTES] {
+            let password = format!("Aa1!{}", "x".repeat(length - 4));
+            assert_eq!(password.len(), length);
+            assert!(validate_password(&password).is_ok(), "len {length} must validate");
+            assert!(
+                hash_password(&password).is_ok(),
+                "len {length} must hash without error"
+            );
+        }
     }
 
     #[test]

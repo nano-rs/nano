@@ -115,6 +115,15 @@ impl DeveloperSettingsRepository {
         Ok(enabled)
     }
 
+    /// NAN-3219: the deployment's tenant-wide AI tuning mode
+    /// (`system_settings.ai_tuning_mode`, default `on`). ANDed with
+    /// [`Self::is_tuning_scheduler_enabled`] by the tuning scheduler.
+    pub async fn ai_tuning_mode(
+        &self,
+    ) -> Result<crate::tuning::AiTuningMode, DeveloperSettingsError> {
+        Ok(crate::tuning::read_deployment_ai_tuning_mode(&self.pool).await?)
+    }
+
     /// Check if the enrichment sync scheduler is enabled
     pub async fn is_enrichment_sync_scheduler_enabled(
         &self,

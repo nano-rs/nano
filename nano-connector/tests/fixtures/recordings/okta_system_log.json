@@ -1,0 +1,20 @@
+[
+  {
+    "host": "acme.okta.com",
+    "path": "/api/v1/logs",
+    "headers": {"content-type": "application/json", "link": "<https://acme.okta.com/api/v1/logs?after=2&limit=1000&sortOrder=ASCENDING>; rel=\"next\""},
+    "body": [
+      {"uuid": "0c7a0000-0000-4000-8000-000000000001", "published": "2026-10-10T11:58:00.000Z", "eventType": "user.session.start", "outcome": {"result": "SUCCESS"}},
+      {"uuid": "0c7a0000-0000-4000-8000-000000000002", "published": "2026-10-10T11:58:01.000Z", "eventType": "user.session.start", "outcome": {"result": "FAILURE"}}
+    ]
+  },
+  {
+    "host": "acme.okta.com",
+    "path": "/api/v1/logs",
+    "query": {"after": "2"},
+    "headers": {"content-type": "application/json"},
+    "body": [
+      {"uuid": "0c7a0000-0000-4000-8000-000000000003", "published": "2026-10-10T11:58:02.000Z", "eventType": "user.session.end"}
+    ]
+  }
+]

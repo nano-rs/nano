@@ -16,6 +16,7 @@ import type {
   ClearEntityRiskRequest,
   ClearRiskResponse,
   EntityContextResponse,
+  EntityRiskTimelineResponse,
   EntityActivityResponse,
 } from '@/lib/api/types';
 
@@ -73,7 +74,16 @@ export class RiskApi {
     _entityType: string,
     _entityValue: string,
     _identities?: string[],
+    _signal?: AbortSignal,
   ): Promise<EntityContextResponse> {
+    return ENTERPRISE_ONLY();
+  }
+  getEntityRiskTimeline(
+    _entityType: string,
+    _entityValue: string,
+    _opts?: { identities?: string[]; at?: string },
+    _signal?: AbortSignal,
+  ): Promise<EntityRiskTimelineResponse> {
     return ENTERPRISE_ONLY();
   }
 }

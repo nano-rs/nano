@@ -222,11 +222,12 @@ pub async fn count_for_repository(
     table: &str,
     repository_id: Uuid,
 ) -> Result<i64, sqlx::Error> {
-    let count: (i64,) =
-        sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} WHERE repository_id = $1"))
-            .bind(repository_id)
-            .fetch_one(pool)
-            .await?;
+    let count: (i64,) = sqlx::query_as(&format!(
+        "SELECT COUNT(*) FROM {table} WHERE repository_id = $1"
+    ))
+    .bind(repository_id)
+    .fetch_one(pool)
+    .await?;
 
     Ok(count.0)
 }
@@ -293,7 +294,10 @@ mod tests {
     #[test]
     fn list_select_sql_byte_identical() {
         assert_eq!(
-            format!("SELECT * FROM {} ORDER BY name ASC", "playbook_repositories"),
+            format!(
+                "SELECT * FROM {} ORDER BY name ASC",
+                "playbook_repositories"
+            ),
             "SELECT * FROM playbook_repositories ORDER BY name ASC"
         );
     }
@@ -383,7 +387,10 @@ mod tests {
     #[test]
     fn slug_from_url_matches_legacy() {
         // Explicit slug is used verbatim.
-        assert_eq!(slug_from_url("https://x", "Name", Some("explicit")), "explicit");
+        assert_eq!(
+            slug_from_url("https://x", "Name", Some("explicit")),
+            "explicit"
+        );
         // Derived from github URL, lowercased, .git and trailing slash stripped.
         assert_eq!(
             slug_from_url("https://github.com/Owner/Repo.git/", "Fallback", None),
@@ -401,11 +408,17 @@ mod tests {
     #[test]
     fn items_sql_byte_identical() {
         assert_eq!(
-            format!("SELECT COUNT(*) FROM {} WHERE repository_id = $1", "repository_parsers"),
+            format!(
+                "SELECT COUNT(*) FROM {} WHERE repository_id = $1",
+                "repository_parsers"
+            ),
             "SELECT COUNT(*) FROM repository_parsers WHERE repository_id = $1"
         );
         assert_eq!(
-            format!("DELETE FROM {} WHERE repository_id = $1", "repository_rules"),
+            format!(
+                "DELETE FROM {} WHERE repository_id = $1",
+                "repository_rules"
+            ),
             "DELETE FROM repository_rules WHERE repository_id = $1"
         );
         assert_eq!(

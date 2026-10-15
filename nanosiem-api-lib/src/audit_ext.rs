@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! [`AuditExt`] — convenience trait for fire-and-forget audit-event emission
 //! from request handlers.
 //!
 //! Lives in `nanosiem-api-lib` (not `nanosiem-api`) so that enterprise handler
-//! modules in `nanosiem-enterprise` can import it directly. Before this lift
+//! modules in the enterprise crate can import it directly. Before this lift
 //! the trait sat in `nanosiem-api/src/handlers/mod.rs` and the OIDC
 //! `OidcAppState::emit_audit` impl had to use a fully-qualified call as a
 //! workaround. With the trait here, every per-module `*AppState` trait can
@@ -13,6 +15,7 @@
 //! crate just defines the trait surface.
 
 use nanosiem_core::audit::AuditEvent;
+use nanosiem_core::auth::TrustedTenantContext;
 
 /// Extension trait for convenient audit event emission from handlers.
 ///
@@ -34,4 +37,24 @@ pub trait AuditExt {
     /// waiting on the audit pipeline. When no audit emitter is configured
     /// (open-core / no-ClickHouse mode), the event drops on the floor.
     fn emit_audit(&self, event: AuditEvent);
+
+    /// Emit auth events that `actor` completed in `tenant` (fire-and-forget).
+    ///
+    /// NAN-3790: on the hosted shared deployment `emit_audit` cannot persist
+    /// anything (the shared emitter refuses tenantless writes), so auth flows
+    /// that know their tenant and verified account call this instead. The
+    /// `nanosiem-api` implementation writes the events together in one signed
+    /// tenant + actor transaction there; elsewhere, and by default, each
+    /// event goes through [`Self::emit_audit`] unchanged.
+    fn emit_tenant_auth_audit(
+        &self,
+        tenant: TrustedTenantContext,
+        actor: uuid::Uuid,
+        events: Vec<AuditEvent>,
+    ) {
+        let _ = (tenant, actor);
+        for event in events {
+            self.emit_audit(event);
+        }
+    }
 }

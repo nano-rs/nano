@@ -9,7 +9,7 @@
 //! [`fallback_report`] on `Err`.
 //!
 //! The AI-driven path (system prompt + AI invocation + JSON parsing) lives
-//! in `nanosiem-enterprise::siem_health::ai_analyzer` (lifted in Phase 3.6
+//! in `enterprise::siem_health::ai_analyzer` (lifted in Phase 3.6
 //! of NAN-744).
 
 use super::types::*;
@@ -71,11 +71,27 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
     let enrichment_score = score_enrichment(&metrics.enrichment);
     let detection_score = score_detection(&metrics.detection);
     let alerting_score = score_alerting(&metrics.alerting, &metrics.detection);
-    let overall_score = (ingestion_score as f64 * 0.25
+    let weighted_overall_score = (ingestion_score as f64 * 0.25
         + parsing_score as f64 * 0.20
         + enrichment_score as f64 * 0.15
         + detection_score as f64 * 0.25
         + alerting_score as f64 * 0.15) as i32;
+    // A weighted average must not turn a confirmed critical outage in one
+    // dimension into a green top-level report. Build deterministic findings
+    // first, then keep the headline score in the critical band whenever any
+    // of those findings is critical.
+    let mut recommendations = insert_integrity_recommendations(&metrics.ingestion.insert_integrity);
+    recommendations.extend(lake_publication_recommendations(&metrics.ingestion));
+    recommendations.extend(lowercase_invariant_recommendations(&metrics.parsing));
+    recommendations.extend(late_replay_recommendations(&metrics.detection));
+    let overall_score = if recommendations
+        .iter()
+        .any(|recommendation| recommendation.priority == "critical")
+    {
+        weighted_overall_score.min(49)
+    } else {
+        weighted_overall_score
+    };
 
     let alerting_summary_total: i64 = metrics.alerting.total_alerts_24h;
 
@@ -121,12 +137,11 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
         // depend on an LLM being reachable to surface.
         // NAN-1643: same posture for ingest-lowercase invariant drift — silent
         // query divergence must not depend on an LLM either.
-        recommendations: {
-            let mut recs =
-                insert_integrity_recommendations(&metrics.ingestion.insert_integrity);
-            recs.extend(lowercase_invariant_recommendations(&metrics.parsing));
-            recs
-        },
+        // NAN-2361: the binding built above is a superset of the two helpers
+        // main inlined here — it adds lake publication and late replay — and it
+        // is the same value the overall score is derived from, so the heuristic
+        // report and its score cannot disagree about what is critical.
+        recommendations,
         // NAN-2357: same framing problem as the summary heading. The scores and
         // findings for every dimension are real; only the prose narrative is
         // absent. The open-edition page hides this block entirely rather than
@@ -192,8 +207,7 @@ fn fresh_deployment_report() -> AnalysisResult {
             .to_string(),
         recommendations: vec![],
         dimension_details: DimensionDetails {
-            ingestion: "No events ingested yet — this is a fresh deployment."
-                .to_string(),
+            ingestion: "No events ingested yet — this is a fresh deployment.".to_string(),
             parsing: "No events to parse.".to_string(),
             enrichment: "No events to enrich.".to_string(),
             detection: "No detection rules configured yet.".to_string(),
@@ -240,8 +254,7 @@ fn stalled_ingestion_report(metrics: &CollectedMetrics) -> AnalysisResult {
              sources, Vector / agent connectivity, and upstream filtering."
         ),
         recommendations: vec![Recommendation {
-            title: "Investigate stalled ingestion: zero events in the last 48h"
-                .to_string(),
+            title: "Investigate stalled ingestion: zero events in the last 48h".to_string(),
             description: format!(
                 "This tenant has {configured_summary} but no events have \
                  been ingested in the last 48 hours. Check that Vector and \
@@ -264,8 +277,7 @@ fn stalled_ingestion_report(metrics: &CollectedMetrics) -> AnalysisResult {
                 "{rules} rule(s) are enabled but cannot fire without \
                  ingestion."
             ),
-            alerting: "No alerts will be generated until ingestion resumes."
-                .to_string(),
+            alerting: "No alerts will be generated until ingestion resumes.".to_string(),
         },
     }
 }
@@ -287,6 +299,24 @@ fn has_critical_insert_integrity(ii: &InsertIntegrityMetrics) -> bool {
 
 // Simple heuristic scorers for fallback mode
 fn score_ingestion(m: &IngestionMetrics) -> i32 {
+    let lake_publication_penalty = m
+        .lake_publication
+        .as_ref()
+        .map(|health| {
+            if health.last_reconciled_age_seconds.is_none()
+                || health
+                    .last_reconciled_age_seconds
+                    .is_some_and(|age| age > 30)
+                || health
+                    .oldest_unpublished_age_seconds
+                    .is_some_and(|age| age > 30)
+            {
+                40
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
     // NAN-1405: insert-path integrity first — these signals mean rows are
     // being discarded RIGHT NOW, regardless of what the 24h volume windows
     // show (during the first hours of a NAN-1404-style outage the 24h totals
@@ -298,7 +328,7 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     }
 
     if m.source_volumes.is_empty() {
-        return 50;
+        return (50 - lake_publication_penalty).clamp(0, 100);
     }
     let silent_penalty = (m.silent_sources.len() as i32) * 15;
     let volume_change = if m.total_events_prior_24h > 0 {
@@ -333,7 +363,43 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     if !ii.stale_dict_refreshes.is_empty() {
         integrity_penalty += 15;
     }
-    (100 - silent_penalty - volume_change - integrity_penalty).clamp(0, 100)
+    (100 - silent_penalty - volume_change - integrity_penalty - lake_publication_penalty)
+        .clamp(0, 100)
+}
+
+fn lake_publication_recommendations(m: &IngestionMetrics) -> Vec<Recommendation> {
+    let Some(health) = &m.lake_publication else {
+        return Vec::new();
+    };
+    let reconciler_stale = health
+        .last_reconciled_age_seconds
+        .is_none_or(|age| age > 30);
+    let backlog_stale = health
+        .oldest_unpublished_age_seconds
+        .is_some_and(|age| age > 30);
+    if !reconciler_stale && !backlog_stale {
+        return Vec::new();
+    }
+    vec![Recommendation {
+        title: "Object-lake freshness publication is stalled".to_string(),
+        description: format!(
+            "The signed hot-tail publisher last reconciled {} seconds ago; {} visibility-ledger \
+             revision(s) are newer than its last successful publication and the oldest has waited \
+             {} seconds. Ingest bytes remain durable, but Search and scheduled detections may not \
+             see the newest events until publication recovers. Check the staged-tail singleton, \
+             PostgreSQL lease/connectivity, signed-manifest volume, and query-worker tail health.",
+            health
+                .last_reconciled_age_seconds
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            health.unpublished_revisions,
+            health
+                .oldest_unpublished_age_seconds
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        priority: "critical".to_string(),
+    }]
 }
 
 /// Recommendations for fired insert-integrity signals (NAN-1405). Used by the
@@ -354,9 +420,9 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             description: format!(
                 "The logs table's MATERIALIZED columns call dictGetOrDefault on {dicts}, and an \
                  unhealthy dictionary makes that call THROW on every insert flush — all incoming \
-                 batches are being discarded while every upstream ACK stays green (NAN-1404). \
+                 batches are being discarded while every upstream ACK stays green. \
                  This is either FAILED status OR a degraded CACHE dict (e.g. a prevalence dict) \
-                 that reports LOADED while its source errors and every lookup throws (NAN-1667). \
+                 that reports LOADED while its source errors and every lookup throws. \
                  Inspect system.dictionaries.last_exception, fix the dictionary source, then \
                  SYSTEM RELOAD DICTIONARY to restore ingestion."
             ),
@@ -371,7 +437,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             ),
             description: "INSERTs into the logs table keep finishing (the ingest chain is \
                  ACKing), but part_log shows no new parts reaching storage — async-insert \
-                 flushes are discarding every batch (the NAN-1404 silent-loss fingerprint). \
+                 flushes are discarding every batch (the silent-loss fingerprint). \
                  Check system.dictionaries for FAILED dictionaries, system.errors for \
                  MEMORY_LIMIT_EXCEEDED, and system.asynchronous_insert_log for flush \
                  exceptions."
@@ -396,7 +462,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             title: "ClickHouse is hitting its memory limit".to_string(),
             description: format!(
                 "system.errors shows {} MEMORY_LIMIT_EXCEEDED occurrences with activity in the \
-                 last 24h. On a memory-capped deployment this is the NAN-1404 trigger: \
+                 last 24h. On a memory-capped deployment this is the silent-loss trigger: \
                  dictionary loads / insert flushes OOM and ingestion fails. Check dictionary \
                  source queries and merge pressure before it escalates.",
                 ii.memory_limit_errors
@@ -442,7 +508,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
                 "The dictionary-staging refresh views ({views}) are failing, disabled, or \
                  overdue past their refresh schedule (system.view_refreshes). Ingestion is NOT \
                  affected — the dictionaries keep serving the last good staging snapshot \
-                 (NAN-1407) — but enrichment values (GeoIP/IOC/identity/prevalence) are \
+                 — but enrichment values (GeoIP/IOC/identity/prevalence) are \
                  drifting stale. Inspect system.view_refreshes.exception, fix the \
                  underlying source query/table, then SYSTEM REFRESH VIEW to catch up.{detail}"
             ),
@@ -546,7 +612,67 @@ fn score_detection(m: &DetectionMetrics) -> i32 {
         (stale_pct * 40.0) as i32
     };
     let noise_penalty = (m.noisy_rules.len() as i32) * 5;
-    (100 - stale_penalty - noise_penalty).clamp(0, 100)
+    let replay_penalty = if m.late_replay.dead_letter_jobs > 0 {
+        40
+    } else if m
+        .late_replay
+        .oldest_unplanned_age_seconds
+        .is_some_and(|age| age > 60)
+        || m.late_replay
+            .oldest_outstanding_job_age_seconds
+            .is_some_and(|age| age > 300)
+    {
+        25
+    } else {
+        0
+    };
+    (100 - stale_penalty - noise_penalty - replay_penalty).clamp(0, 100)
+}
+
+fn late_replay_recommendations(m: &DetectionMetrics) -> Vec<Recommendation> {
+    if m.late_replay.dead_letter_jobs > 0 {
+        return vec![Recommendation {
+            title: "Late-arrival detection replay has dead-lettered work".to_string(),
+            description: format!(
+                "{} replay job(s) exhausted their retry budget. The underlying events remain \
+                 searchable, but scheduled rules may have missed them. Inspect the stored replay \
+                 errors, repair the rule/query failure, and explicitly requeue the affected \
+                 immutable publication windows.",
+                m.late_replay.dead_letter_jobs
+            ),
+            priority: "critical".to_string(),
+        }];
+    }
+    let stalled = m
+        .late_replay
+        .oldest_unplanned_age_seconds
+        .is_some_and(|age| age > 60)
+        || m.late_replay
+            .oldest_outstanding_job_age_seconds
+            .is_some_and(|age| age > 300);
+    if !stalled {
+        return Vec::new();
+    }
+    vec![Recommendation {
+        title: "Late-arrival detection replay is falling behind".to_string(),
+        description: format!(
+            "{} publication(s) remain unplanned and {} replay job(s) are pending/running. The \
+             oldest unplanned publication is {} seconds old and the oldest outstanding replay is \
+             {} seconds old. Normal rule watermarks remain safe, but late events will not receive \
+             complete detection coverage until this durable backlog drains.",
+            m.late_replay.unplanned_publications,
+            m.late_replay.pending_jobs + m.late_replay.running_jobs,
+            m.late_replay
+                .oldest_unplanned_age_seconds
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            m.late_replay
+                .oldest_outstanding_job_age_seconds
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        priority: "high".to_string(),
+    }]
 }
 
 fn score_alerting(m: &AlertingMetrics, d: &DetectionMetrics) -> i32 {
@@ -713,6 +839,7 @@ mod tests {
                 total_events_prior_24h: 0,
                 silent_sources: vec![],
                 insert_integrity: Default::default(),
+                lake_publication: None,
             },
             parsing: ParsingMetrics {
                 field_coverage: vec![],
@@ -736,6 +863,7 @@ mod tests {
                 stale_rules: vec![],
                 noisy_rules: vec![],
                 alerts_24h_by_severity: vec![],
+                late_replay: Default::default(),
             },
             alerting: AlertingMetrics {
                 total_alerts_24h: 0,
@@ -825,6 +953,7 @@ mod tests {
             stale_rules: vec![],
             noisy_rules: vec![],
             alerts_24h_by_severity: vec![],
+            late_replay: Default::default(),
         }
     }
 
@@ -901,7 +1030,10 @@ mod tests {
         // And a real geo gap still drags the score down.
         m.geoip_fill_pct = 10.0;
         m.asn_fill_pct = 10.0;
-        assert!(score_enrichment(&m) < 50, "genuinely low geo/asn is still bad");
+        assert!(
+            score_enrichment(&m) < 50,
+            "genuinely low geo/asn is still bad"
+        );
     }
 
     /// NAN-1405: a healthy ingestion fixture for the insert-integrity tests —
@@ -921,6 +1053,7 @@ mod tests {
                 probes_available: true,
                 ..Default::default()
             },
+            lake_publication: None,
         }
     }
 
@@ -946,6 +1079,63 @@ mod tests {
                 .any(|r| r.priority == "critical" && r.title.contains("ip_enrichment_dict")),
             "must raise a critical recommendation naming the dict; got {recs:?}"
         );
+    }
+
+    #[test]
+    fn frozen_lake_tail_is_visible_even_while_event_volume_looks_healthy() {
+        let mut ingestion = healthy_ingestion();
+        ingestion.lake_publication = Some(LakePublicationHealth {
+            last_reconciled_age_seconds: Some(45),
+            unpublished_revisions: 7,
+            oldest_unpublished_age_seconds: Some(41),
+            visible_objects: 12,
+            visible_bytes: 42_000,
+            manifest_sha256: Some("a".repeat(64)),
+            newest_visible_event_time: Some(chrono::Utc::now()),
+        });
+        assert!(score_ingestion(&ingestion) <= 60);
+        let recommendations = lake_publication_recommendations(&ingestion);
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(recommendations[0].priority, "critical");
+        assert!(recommendations[0]
+            .description
+            .contains("7 visibility-ledger"));
+    }
+
+    #[test]
+    fn critical_lake_tail_finding_cannot_leave_overall_health_green() {
+        let mut metrics = base_zero_metrics_fixture();
+        metrics.ingestion = healthy_ingestion();
+        metrics.ingestion.lake_publication = Some(LakePublicationHealth {
+            last_reconciled_age_seconds: Some(45),
+            unpublished_revisions: 7,
+            oldest_unpublished_age_seconds: Some(41),
+            visible_objects: 12,
+            visible_bytes: 42_000,
+            manifest_sha256: Some("a".repeat(64)),
+            newest_visible_event_time: Some(chrono::Utc::now()),
+        });
+
+        let report = fallback_report(&metrics);
+        assert!(report
+            .recommendations
+            .iter()
+            .any(|recommendation| recommendation.priority == "critical"));
+        assert!(
+            report.overall_score < 50,
+            "a critical tail-publication outage cannot report healthy overall: {}",
+            report.overall_score
+        );
+    }
+
+    #[test]
+    fn late_replay_dead_letter_is_a_detection_health_failure() {
+        let mut detection = detection_with(1, 10);
+        detection.late_replay.dead_letter_jobs = 2;
+        assert!(score_detection(&detection) <= 60);
+        let recommendations = late_replay_recommendations(&detection);
+        assert_eq!(recommendations.len(), 1);
+        assert_eq!(recommendations[0].priority, "critical");
     }
 
     #[test]
@@ -1023,8 +1213,8 @@ mod tests {
         );
         let recs = insert_integrity_recommendations(&m.insert_integrity);
         assert!(
-            recs.iter().any(|r| r.priority == "critical"
-                && r.title.contains("flush failures")),
+            recs.iter()
+                .any(|r| r.priority == "critical" && r.title.contains("flush failures")),
             "flush failures are confirmed loss — critical; got {recs:?}"
         );
         assert!(

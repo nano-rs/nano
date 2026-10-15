@@ -37,7 +37,12 @@ const BASELINE = path.join(HERE, 'dead-links-baseline.json');
 const UPDATE = process.argv.includes('--update-baseline');
 
 const FE_ROOTS = ['nanosiem-web/src'];
-const BE_ROOTS = ['nanosiem-core/src', 'nanosiem-api/src', 'nanosiem-enterprise/src', 'nanosiem-search/src'];
+// Backend crates that register routes; edition crates (`*-enterprise`) only
+// where present.
+const BE_ROOTS = ['nanosiem-core/src', 'nanosiem-api/src', 'nanosiem-search/src', ...fs
+  .readdirSync(REPO)
+  .filter((dir) => dir.endsWith('-enterprise'))
+  .map((dir) => `${dir}/src`)];
 const SKIP_DIRS = new Set(['node_modules', 'target', '.git', 'dist', 'build', '.next']);
 
 // Valid non-SPA destinations that intentionally leave the router (served by the

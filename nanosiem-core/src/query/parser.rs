@@ -113,7 +113,7 @@ fn check_chain_len(input: &str, len: usize) -> Result<(), nom::Err<nom::error::E
 /// Handles:
 /// - Single-line comments: // comment (to end of line)
 /// - Block comments: /* comment */
-fn strip_comments(input: &str) -> String {
+pub(crate) fn strip_comments(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut in_string = false;
@@ -189,6 +189,64 @@ fn strip_time_modifiers(input: &str) -> String {
     split_time_modifiers(input).0
 }
 
+/// NAN-3337: the first `earliest=`/`latest=` token that sits inside a
+/// `[...]` subsearch. Only the OUTER query's modifiers set the search time
+/// range; a subsearch has no time range of its own, so a modifier there used
+/// to be stripped silently (the subsearch ran over the outer range) while the
+/// service applied it to the OUTER range. Both were wrong answers.
+pub(crate) fn subsearch_time_modifier(input: &str) -> Option<String> {
+    split_time_modifiers(input).2.into_iter().next()
+}
+
+/// Effective `[...]` nesting depth at every byte of `input`, quote-aware.
+/// A whole-query wrapper (`[search …]`, accepted by the parser as a standalone
+/// subsearch) is not a subsearch and does not count.
+pub(crate) fn subsearch_depths(input: &str) -> Vec<u32> {
+    let bytes = input.as_bytes();
+    let mut depths = vec![0u32; bytes.len()];
+    let mut depth = 0u32;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // A backslash escapes the next byte, inside or outside quotes.
+        if b == b'\\' && i + 1 < bytes.len() {
+            depths[i] = depth;
+            depths[i + 1] = depth;
+            i += 2;
+            continue;
+        }
+        if let Some(q) = quote {
+            depths[i] = depth;
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        depths[i] = depth;
+        i += 1;
+    }
+    let start = input.len() - input.trim_start().len();
+    let end = input.trim_end().len();
+    let wrapped = end > start + 1
+        && bytes[start] == b'['
+        && bytes[end - 1] == b']'
+        && depths[start..end - 1].iter().all(|d| *d >= 1);
+    if wrapped {
+        for d in &mut depths {
+            *d = d.saturating_sub(1);
+        }
+    }
+    depths
+}
+
 /// Extract the literal `earliest=`/`latest=` modifier tokens from query input,
 /// preserving their original text (e.g. `earliest=-12h`).
 ///
@@ -207,9 +265,15 @@ pub(crate) fn extract_time_modifier_tokens(input: &str) -> Vec<String> {
 /// quote-aware so it never strips a modifier-looking substring that lives inside
 /// a quoted value. Capture and strip share this single implementation so the two
 /// can never drift out of sync.
-fn split_time_modifiers(input: &str) -> (String, Vec<String>) {
+///
+/// Modifiers inside a `[...]` subsearch are NOT stripped: they are returned
+/// in the third element and left in place, and `parse_query` rejects them
+/// (NAN-3337).
+fn split_time_modifiers(input: &str) -> (String, Vec<String>, Vec<String>) {
     let mut result = String::with_capacity(input.len());
     let mut tokens = Vec::new();
+    let mut nested = Vec::new();
+    let depths = subsearch_depths(input);
     let mut remaining = input;
 
     while !remaining.is_empty() {
@@ -235,17 +299,43 @@ fn split_time_modifiers(input: &str) -> (String, Vec<String>) {
             continue;
         }
 
-        // Check for earliest= or latest= (case-insensitive)
-        let lower = remaining.to_lowercase();
-        if lower.starts_with("earliest=") || lower.starts_with("latest=") {
+        // A backslash escapes the next character outside quotes too (`\[`,
+        // `\"`): it can neither open a quote nor start a modifier.
+        if remaining.starts_with('\\') {
+            let mut chars = remaining.chars();
+            let escaped: String = chars.by_ref().take(2).collect();
+            result.push_str(&escaped);
+            remaining = chars.as_str();
+            continue;
+        }
+
+        // Check for earliest= or latest= (case-insensitive), only at a word
+        // boundary: `is_latest=true` / `x.earliest=1` are ordinary filters.
+        let at_boundary = result
+            .chars()
+            .next_back()
+            .is_none_or(|prev| !(prev.is_alphanumeric() || prev == '_' || prev == '.'));
+        let starts_modifier = |prefix: &str| {
+            remaining
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        if at_boundary && (starts_modifier("earliest=") || starts_modifier("latest=")) {
             let eq_pos = remaining.find('=').unwrap();
             let after_eq = &remaining[eq_pos + 1..];
             // Consume the value: everything up to the next whitespace, pipe, or closing bracket
             let value_end = after_eq
                 .find(|c: char| c.is_whitespace() || c == '|' || c == ']')
                 .unwrap_or(after_eq.len());
+            let token = &remaining[..eq_pos + 1 + value_end];
+            if depths[input.len() - remaining.len()] > 0 {
+                nested.push(token.to_string());
+                result.push_str(token);
+                remaining = &after_eq[value_end..];
+                continue;
+            }
             // Capture the full literal token (`earliest=-12h`) before advancing.
-            tokens.push(remaining[..eq_pos + 1 + value_end].to_string());
+            tokens.push(token.to_string());
             remaining = &after_eq[value_end..];
             // Add a space to keep tokens separated
             result.push(' ');
@@ -258,11 +348,29 @@ fn split_time_modifiers(input: &str) -> (String, Vec<String>) {
         remaining = &remaining[c.len_utf8()..];
     }
 
-    (result, tokens)
+    (result, tokens, nested)
 }
 
 /// Parse a piped query string into an AST
 pub fn parse_query(input: &str) -> Result<Query, ParseError> {
+    parse_query_inner(input).map_err(|mut error| {
+        if input.len() > MAX_QUERY_LEN { return error; }
+        let safe = crate::inputlookup::storage_policy::redact_url_credentials(input);
+        if safe != input {
+            // Error snippets can start inside a signature without its URL prefix.
+            // Suppress all derived fragments, retaining only redacted full text.
+            error.message = "Invalid query containing a redacted URL".into();
+            error.full_query = Some(safe);
+            error.token = None;
+            error.context_before = None;
+            error.suggestions.clear();
+            error.expected.clear();
+        }
+        error
+    })
+}
+
+fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
     // Reset nesting depth counter at the start of each parse
     NESTING_DEPTH.with(|d| d.set(0));
 
@@ -297,6 +405,23 @@ pub fn parse_query(input: &str) -> Result<Query, ParseError> {
         .collect();
     // Strip earliest=X / latest=X time modifiers — handled by the search UI/API
     // via TimeRange, not by the query parser.
+    if let Some(token) = subsearch_time_modifier(&normalized) {
+        return Err(ParseError {
+            message: format!(
+                "`{token}` inside a [ ... ] subsearch is not supported: a subsearch runs over the \
+                 search's own time range. Remove it, or bound the subsearch with `where` stages such as \
+                 `| where time >= now() - INTERVAL 3 HOUR | where time < now() - INTERVAL 2 HOUR`."
+            ),
+            position: 0,
+            line: 1,
+            column: 1,
+            token: Some(token),
+            context_before: None,
+            expected: vec![],
+            suggestions: vec![],
+            full_query: Some(input.to_string()),
+        });
+    }
     let normalized = strip_time_modifiers(&normalized);
     let normalized = normalized.trim();
 
@@ -402,7 +527,8 @@ fn validate_pipe_depth(parsed_query: Query, input: &str) -> Result<Query, ParseE
 fn query(input: &str) -> ParseResult<'_, Query> {
     // Optionally consume leading "search" keyword (common in subsearches)
     // e.g., [search status=500] or just [status=500]
-    let (input, explicit_search) = opt(terminated(tag_no_case("search"), multispace1)).parse(input)?;
+    let (input, explicit_search) =
+        opt(terminated(tag_no_case("search"), multispace1)).parse(input)?;
 
     // Three entry shapes:
     //   | stats ...   generating command, explicit leading pipe
@@ -478,12 +604,7 @@ fn query(input: &str) -> ParseResult<'_, Query> {
 /// Two escapes force the search reading: quote it (`"top user"`) or say so
 /// (`search top user`).
 fn leading_command(input: &str) -> ParseResult<'_, Command> {
-    let reject = || {
-        nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Verify,
-        ))
-    };
+    let reject = || nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Verify));
 
     let (rest, cmd) = command(input)?;
 

@@ -375,7 +375,7 @@ pub(super) fn reload_outcome(
             tracing::warn!(
                 delivery = delivered.unwrap_or("none — relied on Vector's config watcher"),
                 "Reload acceptance checking is disabled (VECTOR_RELOAD_ACK_TIMEOUT_SECS=0) — this \
-                 deploy is reported successful without any evidence Vector loaded it (NAN-2305)"
+                 deploy is reported successful without any evidence Vector loaded it"
             );
             Ok(())
         }
@@ -426,9 +426,9 @@ pub(super) fn enrichment_lane_backpressure_violations(
     // shared LOG ingest source like http/vector/hec, so an enrichment-lane sink
     // that backpressures into it would stall OTLP ingestion (NAN-1120 class).
     const INGEST_SOURCE_TYPES: &[&str] = &["http_server", "vector", "splunk_hec", "opentelemetry"];
-    // Sources with their own backpressure domain (none today; add the dedicated
-    // enrichment `:8090` source here if it ships).
-    const DEDICATED_ENRICHMENT_SOURCES: &[&str] = &[];
+    // The dedicated enrichment ingress has its own backpressure domain, so its
+    // durable lake sink can block rather than silently dropping directory rows.
+    const DEDICATED_ENRICHMENT_SOURCES: &[&str] = &["enrichment_ingest"];
 
     // Vector substitutes `${VAR:-default}` before parsing TOML, so mirror that
     // (value after `:-`, else empty) to make the raw configs parseable.
@@ -645,6 +645,80 @@ fn is_safe_enrich_source(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
+/// NAN-3767: the lean coordinator's NDJSON identity route (stage / delta
+/// lines). The gen1 `/v1/identity/users/batch` route does not exist on the
+/// lean coordinator: every batch sent there was a 404.
+pub(crate) const IDENTITY_INGEST_PATH: &str = "/v1/identity/directory/ingest";
+/// Validates `kind: identity_directory` records (the connector runner's
+/// stage / delta envelopes) into coordinator lines.
+pub(crate) const IDENTITY_ENVELOPE_TRANSFORM: &str = "enrichment_identity_envelope";
+/// Turns user_registry-shaped rows from the identity normalizers (provider
+/// sync, Cribl / HEC push) into coordinator `delta` lines.
+pub(crate) const IDENTITY_LINES_TRANSFORM: &str = "enrichment_identity_lines";
+
+/// [`IDENTITY_ENVELOPE_TRANSFORM`]: a runner envelope to one coordinator
+/// line. Only the shape is checked here; the coordinator validates every
+/// row and refuses the whole request (so the sender sees the failure).
+const IDENTITY_ENVELOPE_VRL: &str = r#"op = to_string(.op) ?? ""
+if op == "stage" {
+    . = {"op": "stage", "feed_id": .feed_id, "run_id": .run_id, "row": .row}
+} else if op == "delta" {
+    line = {"op": "delta", "row": .row, "patch": to_bool(.patch) ?? false}
+    if is_object(.manager_ref) {
+        line.manager_ref = .manager_ref
+    }
+    . = line
+} else {
+    log("nano_enrich identity_directory record without a stage/delta op; dead-lettering", level: "warn")
+    abort
+}"#;
+
+/// [`IDENTITY_LINES_TRANSFORM`]: a normalizer's user_registry row (provider
+/// sync, Cribl / HEC push) to a coordinator `delta` line of feed
+/// `push:<provider>`. `account_status = deleted` is a tombstone.
+const IDENTITY_LINES_VRL: &str = r#"provider = to_string(.provider_id) ?? ""
+provider = replace(provider, r'[^A-Za-z0-9_.:-]', "_")
+if provider == "" { provider = "directory" }
+external_id = to_string(.external_id) ?? ""
+if external_id == "" {
+    log("nano_enrich identity row missing external_id; dead-lettering", level: "warn")
+    abort
+}
+version = to_int(.version) ?? 0
+if version <= 0 { version = to_unix_timestamp(now(), unit: "milliseconds") }
+status = downcase(to_string(.account_status) ?? "")
+groups = array(.groups) ?? []
+groups = filter(groups) -> |_index, group| { is_string(group) && group != "" }
+row = {
+    "feed_id": truncate("push:" + provider, 256),
+    "external_id": external_id,
+    "source_kind": "push",
+    "version": version,
+    "deleted": status == "deleted",
+    "username": to_string(.username) ?? "",
+    "upn": to_string(.upn) ?? "",
+    "email": to_string(.email) ?? "",
+    "display_name": to_string(.display_name) ?? "",
+    "first_name": to_string(.first_name) ?? "",
+    "last_name": to_string(.last_name) ?? "",
+    "department": to_string(.department) ?? "",
+    "title": to_string(.title) ?? "",
+    "manager_upn": to_string(.manager_upn) ?? "",
+    "manager_display_name": to_string(.manager_display_name) ?? "",
+    "company": to_string(.company) ?? "",
+    "office_location": to_string(.office_location) ?? "",
+    "city": to_string(.city) ?? "",
+    "country": to_string(.country) ?? "",
+    "groups": groups,
+    "account_enabled": (to_int(.account_enabled) ?? 1) != 0,
+    "account_status": status,
+    "mfa_enabled": (to_int(.mfa_enabled) ?? 0) != 0,
+    "phone": to_string(.phone) ?? "",
+    "employee_id": to_string(.employee_id) ?? "",
+    "employee_type": to_string(.employee_type) ?? ""
+}
+. = {"op": "delta", "row": row}"#;
+
 /// NAN-1197: assert the generated enrichment lane contains only the components
 /// `generate_enrichment_lane` is supposed to emit. This is the defense-in-depth
 /// backstop to the per-parser source-text checks: even if a future escaping bug
@@ -663,7 +737,12 @@ fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
 
     if let Some(transforms) = doc.get("transforms").and_then(|v| v.as_table()) {
         for (name, def) in transforms {
-            if !name.starts_with("enrichment_normalize_") {
+            // NAN-3483: the dead-letter report remap is generator-owned too.
+            if !name.starts_with("enrichment_normalize_")
+                && name != "enrichment_dead_letter_report"
+                && name != IDENTITY_ENVELOPE_TRANSFORM
+                && name != IDENTITY_LINES_TRANSFORM
+            {
                 return Err(format!("unexpected transform '{name}'"));
             }
             let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or_default();
@@ -676,8 +755,34 @@ fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
     if let Some(sinks) = doc.get("sinks").and_then(|v| v.as_table()) {
         for (name, def) in sinks {
             let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            let fixed_lake_sink =
+                matches!(name.as_str(), "lake_identity_directory" | "lake_ip_context")
+                    && ty == "http"
+                    && def
+                        .get("uri")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|uri| {
+                            uri.starts_with("${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-")
+                                && uri.rsplit_once('}').map(|(_, path)| path)
+                                    == Some(if name == "lake_identity_directory" {
+                                        IDENTITY_INGEST_PATH
+                                    } else {
+                                        "/v1/ip-context/batch"
+                                    })
+                        });
+            // NAN-3483: the dead-letter sink reports to the collector-error
+            // channel (fixed coordinator path, or ClickHouse).
+            let dead_letter = name == "enrichment_dead_letter"
+                && (ty == "clickhouse"
+                    || (ty == "http"
+                        && def.get("uri").and_then(|v| v.as_str()).is_some_and(|uri| {
+                            uri.starts_with("${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-")
+                                && uri.rsplit_once('}').map(|(_, path)| path)
+                                    == Some("/v1/collector-errors/batch")
+                        })));
             let ok = (name.starts_with("clickhouse_") && ty == "clickhouse")
-                || (name == "enrichment_dead_letter" && ty == "blackhole");
+                || fixed_lake_sink
+                || dead_letter;
             if !ok {
                 return Err(format!("unexpected sink '{name}' (type '{ty}')"));
             }
@@ -685,6 +790,14 @@ fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// NAN-3807: the canonical object-lake sink text exactly as a lean install's
+/// Vector receives it (static credential references, one placeholder input).
+/// The landing converter runs this text's `ocsf_lake_storage_prepare` stage
+/// itself, so a landed row and a Vector row come out of the same VRL.
+pub(crate) fn lake_ocsf_sink_text() -> String {
+    VectorConfigManager::lake_ocsf_sink_content(&["\"landing_ocsf\"".to_string()], true)
 }
 
 impl VectorConfigManager {
@@ -927,9 +1040,185 @@ impl VectorConfigManager {
         v
     }
 
-    /// NAN-1584: render the `clickhouse_ocsf_logs` sink TOML for the given inputs.
-    /// Shared by the active and staged writers.
+    /// Render the OCSF sink selected by the event-storage backend. The legacy
+    /// lane remains byte-identical for ClickHouse deployments; primary-lake
+    /// deployments write canonical OCSF roots as zstd Parquet bronze objects.
     pub(super) fn ocsf_sink_content(inputs: &[String]) -> String {
+        if Self::lake_mode() {
+            let static_auth = std::env::var("NANO_LAKE_SINK_STATIC_AUTH")
+                .is_ok_and(|value| value.eq_ignore_ascii_case("true") || value == "1");
+            return Self::lake_ocsf_sink_content(inputs, static_auth);
+        }
+        Self::clickhouse_ocsf_sink_content(inputs)
+    }
+
+    fn lake_ocsf_sink_content(inputs: &[String], static_auth: bool) -> String {
+        let auth = if static_auth {
+            "auth.access_key_id = \"${NANO_LAKE_ACCESS_KEY_ID}\"\n\
+             auth.secret_access_key = \"${NANO_LAKE_SECRET_ACCESS_KEY}\"\n"
+        } else {
+            "# Authentication is supplied by the pod/instance workload role.\n"
+        };
+        format!(
+            "# Auto-generated canonical OCSF object-lake sink (NAN-2361)\n\
+             # DO NOT EDIT - regenerated on every parser deploy.\n\
+             # Vector performs real source parsing, then durably writes Parquet\n\
+             # bronze objects. The coordinator compacts and commits them to the\n\
+             # tenant's Iceberg table; no ClickHouse event copy is written.\n\
+             [transforms.ocsf_lake_storage_prepare]\n\
+             type = \"remap\"\n\
+             inputs = [{inputs}]\n\
+             drop_on_abort = true\n\
+             drop_on_error = true\n\
+             reroute_dropped = true\n\
+             source = '''\n\
+             source_type = downcase(to_string(.source_type) ?? to_string(%source_type) ?? \"unknown\")\n\
+             if source_type == \"\" {{ source_type = \"unknown\" }}\n\
+             tenant_id = downcase(to_string(%tenant_id) ?? \"\")\n\
+             if tenant_id == \"\" {{ tenant_id = downcase(get_env_var(\"NANO_TENANT_ID\") ?? \"\") }}\n\
+             if tenant_id == \"\" {{ abort }}\n\
+             event = .event\n\
+             if is_object(event) {{ . = event }}\n\
+             del(._nano_parser_id)\n\
+             del(._nano_parser_failure)\n\
+             # Preserve the verbatim source payload in canonical OCSF 1.9.\n\
+             # The imported parsers currently carry it in `message`; future\n\
+             # parsers can provide `raw_data` directly and retain precedence.\n\
+             raw_data = to_string(.raw_data) ?? \"\"\n\
+             if raw_data == \"\" {{ raw_data = to_string(.message) ?? \"\" }}\n\
+             if raw_data != \"\" {{\n\
+                 .raw_data = raw_data\n\
+                 .raw_data_size = length(raw_data)\n\
+             }}\n\
+             time_ms = to_int(.time) ?? 0\n\
+             event_time = now()\n\
+             if time_ms > 0 {{ event_time = from_unix_timestamp!(time_ms, unit: \"milliseconds\") }}\n\
+             metadata = .metadata\n\
+             if !is_object(metadata) {{ metadata = {{}} }}\n\
+             metadata.version = \"1.9.0\"\n\
+             metadata.log_source = source_type\n\
+             # NAN-2361 wave 8: the ingress lane the row arrived on (nano extension like\n\
+             # log_source): nano_https | hec | otlp | vector. Absent on rows from a lane\n\
+             # that does not stash `%ingress_transport`; the Bronze publisher's\n\
+             # per-source counters then assume the conventional HEC path.\n\
+             ingress_transport = downcase(to_string(%ingress_transport) ?? \"\")\n\
+             if ingress_transport != \"\" {{ metadata.ingress_transport = ingress_transport }}\n\
+             metadata.tenant_uid = tenant_id\n\
+             # NAN-3770: the named ingest token (Ingestion -> Credentials) the sender\n\
+             # authenticated with, stamped by the nano-rs/vector `valid_tokens_file` check.\n\
+             # Only the canonical credential id is stored, never the token. A value a\n\
+             # parser copied from the payload is dropped so attribution cannot be forged.\n\
+             nano_sender_credential = downcase(to_string(%nano_credential_id) ?? \"\")\n\
+             if match(nano_sender_credential, r'^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[1-8][0-9a-f]{{3}}-[89ab][0-9a-f]{{3}}-[0-9a-f]{{12}}$') {{\n\
+             metadata.nano_credential_id = nano_sender_credential\n\
+             }} else {{\n\
+             metadata = remove!(metadata, [\"nano_credential_id\"])\n\
+             }}\n\
+             processed_time = to_unix_timestamp(now(), unit: \"milliseconds\")\n\
+             metadata.processed_time = processed_time\n\
+             metadata.logged_time = processed_time\n\
+             # NAN-2992: a deterministic event uid ONLY from the edge Worker's signed\n\
+             # per-event key (`%nano_event_key` = receipt digest + ordinal, verified by\n\
+             # hec_normalize), so a redelivered batch carries the same uids and the\n\
+             # ingest uid ledger drops it. A uid the event supplied (or a parser derived\n\
+             # from it) is kept: anything that is not a UUIDv4, or a UUIDv4 that appears\n\
+             # verbatim in the raw payload. Without a key nothing is derived from content:\n\
+             # the parser's random uid stays (identical real events are never collapsed).\n\
+             # The derived uid is UUID-shaped with version 8, so this stage is idempotent.\n\
+             uid = to_string(metadata.uid) ?? \"\"\n\
+             event_key = to_string(%nano_event_key) ?? \"\"\n\
+             uid_minted = uid == \"\" || (match(uid, r'^[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-4[0-9a-fA-F]{{3}}-[89abAB][0-9a-fA-F]{{3}}-[0-9a-fA-F]{{12}}$') && !contains(raw_data, uid, case_sensitive: false))\n\
+             if event_key != \"\" && uid_minted {{\n\
+             uid_digest = sha2(\"nano-uid-v1:key:\" + tenant_id + \":\" + event_key, variant: \"SHA-256\")\n\
+             metadata.uid = slice!(uid_digest, 0, 8) + \"-\" + slice!(uid_digest, 8, 12) + \"-8\" + slice!(uid_digest, 13, 16) + \"-a\" + slice!(uid_digest, 17, 20) + \"-\" + slice!(uid_digest, 20, 32)\n\
+             }} else if uid == \"\" {{\n\
+             metadata.uid = uuid_v4()\n\
+             }}\n\
+             # One Vector sink can feed independently owned Bronze publisher\n\
+             # partitions without changing the event body. A single-shard\n\
+             # deployment keeps the historic tenant prefix byte-for-byte;\n\
+             # multi-shard deployments route a stable UID hash into one of the\n\
+             # bounded prefixes accepted by lake_bronze_publish.\n\
+             bronze_shards = ${{NANO_LAKE_BRONZE_SHARDS:-1}}\n\
+             if bronze_shards < 1 || bronze_shards > 128 {{ abort }}\n\
+             ._nano_bronze_partition = if bronze_shards > 1 {{\n\
+                 bronze_digest = sha2!(to_string!(metadata.uid), variant: \"SHA-256\")\n\
+                 bronze_hash_prefix = slice!(bronze_digest, 0, 8)\n\
+                 bronze_hash_value = parse_int!(bronze_hash_prefix, base: 16)\n\
+                 bronze_shard = mod!(bronze_hash_value, bronze_shards)\n\
+                 \"shard=\" + to_string!(bronze_shard) + \"/\"\n\
+             }} else {{\n\
+                 \"\"\n\
+             }}\n\
+             .metadata = metadata\n\
+             .time = event_time\n\
+             %tenant_id = tenant_id\n\
+             %source_type = source_type\n\
+             %class_uid = to_int(.class_uid) ?? 0\n\
+             %event_day = format_timestamp!(event_time, \"%Y%m%d\")\n\
+             # Bronze is the durable handoff, not the serving partition layout.\n\
+             # Each selected Bronze partition remains lexically append-only;\n\
+             # Vector's timestamped filenames preserve arrival order and the\n\
+             # Rust publisher writes\n\
+             # canonical event-hour Iceberg partitions.\n\
+             {bronze_row}'''\n\
+             \n\
+             [sinks.ocsf_parquet_bronze]\n\
+             type = \"aws_s3\"\n\
+             inputs = [\"ocsf_lake_storage_prepare\"]\n\
+             bucket = \"${{NANO_LAKE_BRONZE_BUCKET}}\"\n\
+             region = \"${{AWS_REGION:-us-east-1}}\"\n\
+             endpoint = \"${{NANO_LAKE_OBJECT_ENDPOINT:-https://s3.amazonaws.com}}\"\n\
+             force_path_style = ${{NANO_LAKE_FORCE_PATH_STYLE:-false}}\n\
+             {auth}\
+             key_prefix = \"bronze-v2/{{{{ _nano_bronze_partition }}}}tenant_id={{{{ %tenant_id }}}}/\"\n\
+             filename_extension = \"parquet\"\n\
+             filename_append_uuid = true\n\
+             acknowledgements.enabled = true\n\
+             \n\
+             [sinks.ocsf_parquet_bronze.encoding]\n\
+             codec = \"json\"\n\
+             except_fields = [\"_nano_bronze_partition\"]\n\
+             \n\
+             [sinks.ocsf_parquet_bronze.batch]\n\
+             max_bytes = ${{VECTOR_LAKE_BATCH_MAX_BYTES:-33554432}}\n\
+             max_events = ${{VECTOR_LAKE_BATCH_MAX_EVENTS:-10000}}\n\
+             # The byte/event thresholds still produce sized objects under load. The\n\
+             # short timeout bounds low-rate source visibility; it is not a tenant EPS cap.\n\
+             timeout_secs = ${{VECTOR_LAKE_BATCH_TIMEOUT_SECS:-1}}\n\
+             \n\
+             [sinks.ocsf_parquet_bronze.batch_encoding]\n\
+             codec = \"parquet\"\n\
+             schema_mode = \"auto_infer\"\n\
+             \n\
+             [sinks.ocsf_parquet_bronze.batch_encoding.compression]\n\
+             algorithm = \"zstd\"\n\
+             # Bronze is retained only for replay and is re-encoded into the serving layout.\n\
+             level = ${{VECTOR_LAKE_BRONZE_ZSTD_LEVEL:-6}}\n\
+             \n\
+             [sinks.ocsf_parquet_bronze.buffer]\n\
+             # NAN-3523: bounded by in-memory BYTES, not events: an event may be up to\n\
+             # 4 MiB, so 20000 events could hold ~80 GiB. 64 MiB is four of the hosted\n\
+             # Worker's 16 MiB batches, a small slice of the smallest Container. Memory\n\
+             # (never disk) keeps the source ACK behind the completed PUT; when full it\n\
+             # blocks, pushing back on the source and the durable raw handoff upstream.\n\
+             type = \"memory\"\n\
+             max_size = ${{VECTOR_LAKE_BUFFER_MAX_BYTES:-67108864}}\n\
+             when_full = \"block\"\n\
+             \n\
+             [sinks.ocsf_parquet_bronze.request]\n\
+             concurrency = \"adaptive\"\n\
+             timeout_secs = 120\n\
+             retry_initial_backoff_secs = 1\n\
+             retry_max_duration_secs = 300\n",
+            inputs = inputs.join(", "),
+            // NAN-3339: every bronze row has the same two columns, so one
+            // row's shape can never fail (and drop) the batch's Parquet encode.
+            bronze_row = crate::parsers::lake_bronze_row::LAKE_BRONZE_ROW_VRL,
+        )
+    }
+
+    fn clickhouse_ocsf_sink_content(inputs: &[String]) -> String {
         format!(
             "# Auto-generated OCSF ingestion sink (NAN-1246)\n\
              # DO NOT EDIT - regenerated on every parser deploy.\n\
@@ -1646,9 +1935,10 @@ retry_max_duration_secs = 300
     /// they reach the UDM `logs` table but never `ocsf_logs`. Since OCSF search reads
     /// `ocsf_logs`, that unconfigured/early/unknown data was silently invisible
     /// (UDM keeps it searchable in its `unknown` bucket). This transform forks off
-    /// `generic_parser` and shapes a minimal Base Event (`class_uid = 0`, the raw
-    /// record preserved in `event`, a `message`, `source_type`, `timestamp`) — the
-    /// row shape `clickhouse_ocsf_logs` expects (mirrors `OCSF_PREPARE_VRL`). The
+    /// `generic_parser` and shapes a valid OCSF 1.9 Base Event (`class_uid = 0`).
+    /// The source-native record is encoded under `unmapped.raw_event` and
+    /// `raw_data`; unknown source fields never leak into the canonical root or
+    /// force an unbounded physical Iceberg schema. The
     /// sink wires `generic_ocsf_prepare` into its inputs. Appended only under OCSF
     /// (UDM deployments get the static config verbatim — byte-identical).
     const GENERIC_OCSF_PREPARE_BLOCK: &'static str = r#"
@@ -1662,47 +1952,152 @@ inputs = ["generic_parser"]
 drop_on_abort = false
 drop_on_error = false
 source = '''
-ocsf_event = .
-src_type = downcase(to_string(.metadata.original_source_type) ?? to_string(.source_type) ?? "unknown")
+raw_event = .
+# NAN-2612: the storage label (`metadata.log_source`, which source-visibility
+# RBAC keys on) must be the row's real source, never a blanket `unknown`.
+# Two inputs feed this lane, with different metadata shapes:
+#   * `generic_parser` keeps `.metadata` an object and stashes the pre-parser
+#     routing key in `.metadata.original_source_type`, because a parse error
+#     rewrites the top-level `source_type` to `parse_failure`.
+#   * `db_parsers_combined` (lake mode: every parser runtime failure and any
+#     parser output without a root `class_uid`) carries `.metadata` as a JSON
+#     STRING, and `<parser>_output` has already resolved `.source_type`.
+#     `.metadata.original_source_type` is null there and `to_string(null)` is
+#     `""` without an error, so a `??` fallback never reached `.source_type`
+#     and every such row was stored as `unknown`. The string is parser-authored,
+#     so it is never read for the label.
+# `unknown` stays only for an event that declared no source (design §10.5).
+src_type = ""
+if is_object(.metadata) {
+    src_type = to_string(.metadata.original_source_type) ?? ""
+}
+if src_type == "" {
+    src_type = to_string(.source_type) ?? ""
+}
+if src_type == "parse_failure" { src_type = "" }
+src_type = downcase(src_type)
 if src_type == "" { src_type = "unknown" }
 msg = to_string(.message) ?? ""
-if msg == "" { msg = encode_json(ocsf_event) }
-ocsf_event.class_uid = 0
-ocsf_event.message = msg
+raw_json = encode_json(raw_event)
+if msg == "" { msg = raw_json }
+
+event_time = now()
+source_time = .timestamp
+if source_time == null { source_time = .created_at }
+if source_time == null && is_object(.id) { source_time = .id.time }
+if is_timestamp(source_time) {
+    event_time = source_time
+} else if is_integer(source_time) {
+    parsed_time, time_err = from_unix_timestamp(source_time, unit: "milliseconds")
+    if time_err == null { event_time = parsed_time }
+} else {
+    raw_time = to_string(source_time) ?? ""
+    if raw_time != "" {
+        parsed_time, time_err = parse_timestamp(raw_time, "%+")
+        if time_err != null {
+            candidate_time = replace(raw_time, " ", "T")
+            if !match(candidate_time, r'(Z|[+-]\d{2}:?\d{2})$') {
+                candidate_time = candidate_time + "Z"
+            }
+            parsed_time, time_err = parse_timestamp(candidate_time, "%+")
+        }
+        if time_err == null { event_time = parsed_time }
+    }
+}
+
+severity = strip_whitespace(to_string(.severity) ?? "")
+if severity == "" { severity = "Unknown" }
+severity_lower = downcase(severity)
+severity_id = if severity_lower == "fatal" { 6 } else if severity_lower == "critical" { 5 } else if severity_lower == "error" { 4 } else if severity_lower == "warn" || severity_lower == "warning" { 3 } else if severity_lower == "info" || severity_lower == "informational" || severity_lower == "debug" || severity_lower == "trace" { 1 } else { 0 }
+
+# OCSF Base Event does not carry the Trace Profile. Preserve OTLP correlation
+# identifiers as typed unmapped leaves instead of leaving them stranded inside
+# raw_data. Parsers that emit a trace-profile-bearing OCSF class can map these
+# to trace.uid / trace.span.uid directly.
+# NAN-2370: `source_type` is retired UDM vocabulary and must not be persisted
+# into new OCSF lake rows. The value is not lost: it is already on
+# `metadata.log_name` below, and the lake sink stamps `metadata.log_source`
+# from the same routing key. Carrying it a third time under `unmapped` only
+# taught analysts a field name the strict OCSF validator rejects.
+unmapped = { "raw_event": raw_json }
+otlp_trace_id = downcase(to_string(.trace_id) ?? "")
+otlp_span_id = downcase(to_string(.span_id) ?? "")
+if otlp_trace_id != "" { unmapped.trace_id = otlp_trace_id }
+if otlp_span_id != "" { unmapped.span_id = otlp_span_id }
+
+ocsf_event = {
+    "activity_id": 0,
+    "activity_name": "Unknown",
+    "category_name": "Uncategorized",
+    "category_uid": 0,
+    "class_name": "Base Event",
+    "class_uid": 0,
+    "message": msg,
+    "metadata": {
+        "log_name": src_type,
+        "product": { "name": "Nano Generic Source", "vendor_name": "Nano" },
+        "version": "1.9.0"
+    },
+    "raw_data": raw_json,
+    "raw_data_size": length(raw_json),
+    "severity": severity,
+    "severity_id": severity_id,
+    "time": to_unix_timestamp!(event_time, unit: "milliseconds"),
+    "type_name": "Base Event: Unknown",
+    "type_uid": 0,
+    "unmapped": unmapped
+}
 
 # NAN-1556: OTLP LogRecords (source_type=otlp_log) reach this generic lane with
 # canonical fields already set by otlp_logs_prep (.severity, .metadata.src_host
-# from resource service.name, .trace_id/.span_id). Promote them to OCSF Base
-# Event keys inside `event` so the ocsf_logs MATERIALIZED columns
-# (severity_id / severity / src_endpoint.hostname / time, all JSONExtract'd from
-# `event`) populate. Each map is gated on presence, so non-OTLP parserless
-# events are byte-unchanged (their severity/src_host are unset).
-sev_str = to_string(.severity) ?? ""
-if sev_str != "" {
-    ocsf_event.severity = sev_str
-    sl = downcase(sev_str)
-    ocsf_event.severity_id = if sl == "fatal" { 6 } else if sl == "critical" { 5 } else if sl == "error" { 4 } else if sl == "warn" || sl == "warning" { 3 } else if sl == "info" || sl == "informational" || sl == "debug" || sl == "trace" { 1 } else { 0 }
-}
-otlp_host = to_string(.metadata.src_host) ?? ""
-if otlp_host != "" {
-    ocsf_event.src_endpoint.hostname = downcase(otlp_host)
-}
-otlp_time = to_string(.timestamp) ?? ""
-if otlp_time != "" {
-    ocsf_event.time = otlp_time
+# from resource service.name, .trace_id/.span_id).
+# NAN-3242: the OTLP resource `service.name` is a logical service, not a host,
+# and `device` is a Host-profile attribute that a class 0 Base Event without
+# `metadata.profiles: ["host"]` may not carry: the strict OCSF 1.9 lake refused
+# every such row. Map it to `metadata.product.feature.name`, valid on every
+# class without a profile and the slot the OTLP OCSF parsers already use for
+# service identity. Gated on the OTLP lane's provenance stamp (set by
+# otlp_logs_prep), so other parserless events are byte-unchanged.
+if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
+    otlp_service = strip_whitespace(to_string(.metadata.src_host) ?? "")
+    if otlp_service != "" {
+        ocsf_event.metadata.product.feature = { "name": otlp_service }
+    }
 }
 
-. = { "event": ocsf_event, "timestamp": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+. = { "event": ocsf_event, "timestamp": event_time, "source_type": src_type }
 '''
 "#;
 
-    /// The pipeline config for the ACTIVE schema: the static content plus, under
-    /// OCSF, the generic Base Event lane ([`Self::GENERIC_OCSF_PREPARE_BLOCK`]). UDM
-    /// returns the static content unchanged (byte-identical).
+    /// The pipeline config for the active schema and storage backend. The
+    /// ClickHouse/UDM branch stays byte-identical. A primary-lake branch has no
+    /// ClickHouse terminal sinks: leaving those dead sinks connected caused
+    /// acknowledged HTTP batches to time out, retry, and publish duplicate
+    /// bronze objects even though the S3 write had succeeded.
     pub(super) fn full_pipeline_config_content() -> String {
+        Self::pipeline_config_content_for(Self::ocsf_mode(), Self::lake_mode())
+    }
+
+    pub(super) fn pipeline_config_content_for(ocsf: bool, lake: bool) -> String {
         let mut content = Self::pipeline_config_content().to_string();
-        if Self::ocsf_mode() {
-            content.push_str(Self::GENERIC_OCSF_PREPARE_BLOCK);
+        if lake {
+            let marker = "# =============================================================================\n# ClickHouse Sink\n";
+            let boundary = content
+                .find(marker)
+                .expect("static Vector pipeline lost its ClickHouse sink boundary");
+            content.truncate(boundary);
+        }
+        if ocsf {
+            let generic = if lake {
+                Self::GENERIC_OCSF_PREPARE_BLOCK.replacen(
+                    "inputs = [\"generic_parser\"]",
+                    "inputs = [\"generic_parser\", \"db_parsers_combined\"]",
+                    1,
+                )
+            } else {
+                Self::GENERIC_OCSF_PREPARE_BLOCK.to_string()
+            };
+            content.push_str(&generic);
         }
         content
     }
@@ -1725,12 +2120,13 @@ if otlp_time != "" {
     /// Returns the push enrichment lane config (NAN-1124): per-kind normalize
     /// transforms + dedicated ClickHouse sinks consuming the
     /// `enrichment_router.<kind>` outputs. Single source of truth is the
-    /// committed `_enrichment.toml`, embedded via `include_str!` so it ships in
-    /// the binary and reaches every deployment (dev/compose mounted, Rackspace
-    /// GCS-synced, SaaS dynamic ConfigMap) through the same path as
-    /// `_pipeline.toml`. No drift: the const IS the file.
+    /// immutable legacy template embedded beside this module. The live
+    /// `_enrichment.toml` is a generated runtime artifact and must never be an
+    /// `include_str!` input: a lake-mode API run rewrites that file, and a later
+    /// build would otherwise compile the generated lake output back in as the
+    /// legacy source template.
     pub(super) fn enrichment_lane_content() -> &'static str {
-        include_str!("../../../../config/vector/sources/parsers/_enrichment.toml")
+        include_str!("enrichment_legacy.toml")
     }
 
     /// Write the push enrichment lane config alongside the static pipeline.
@@ -1747,7 +2143,8 @@ if otlp_time != "" {
         enrichment_parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
         let enrichment_path = self.parsers_dir.join("_enrichment.toml");
-        let content = Self::enrichment_lane_config(enrichment_parsers);
+        let content =
+            Self::enrichment_lane_config_for_backend(enrichment_parsers, Self::lake_mode());
 
         // NAN-1150: deploy-time guardrails — reject a malformed enrichment lane
         // BEFORE Vector reloads, so a bad parser can never corrupt the dict and
@@ -1768,9 +2165,9 @@ if otlp_time != "" {
     /// security checks (`'''` / TOML-header / blocked-function breakout) AND
     /// compile + satisfy the `user_registry` encoding contract (NAN-1123),
     /// (2) `target_table` / `enrich_source` are interpolated into the generated
-    /// TOML/VRL, so they must be safe identifiers (NAN-1197), (3) the generated
+    /// TOML/VRL, so they must be safe identifiers, (3) the generated
     /// lane's component topology must be exactly what the generator intended —
-    /// no injected transform/sink (NAN-1197), and (4) the candidate lane TOML
+    /// no injected transform/sink, and (4) the candidate lane TOML
     /// must not introduce a sink that backpressures the shared ingest upstream
     /// (NAN-1114/1128). Returns `ValidationFailed` with a clear, parser-named
     /// reason on the first violation.
@@ -1804,6 +2201,20 @@ if otlp_time != "" {
                         p.name
                     )));
                 }
+                if Self::lake_mode()
+                    && !matches!(
+                        table,
+                        "user_registry"
+                            | "nanosiem.user_registry"
+                            | "ip_enrichments"
+                            | "nanosiem.ip_enrichments"
+                    )
+                {
+                    return Err(VectorConfigError::ValidationFailed(format!(
+                        "enrichment parser '{}' targets unsupported lake payload {table:?}",
+                        p.name
+                    )));
+                }
             }
 
             // NAN-1197: `enrich_source` is interpolated into the router VRL
@@ -1812,6 +2223,16 @@ if otlp_time != "" {
                 if !src.is_empty() && !is_safe_enrich_source(src) {
                     return Err(VectorConfigError::ValidationFailed(format!(
                         "enrichment parser '{}' rejected at deploy: unsafe enrich_source {src:?}",
+                        p.name
+                    )));
+                }
+                // NAN-3483: the dead-letter route for sources without a
+                // normalizer owns this name.
+                if super::router::enrichment_route_name(src)
+                    == super::router::UNROUTED_IDENTITY_ROUTE
+                {
+                    return Err(VectorConfigError::ValidationFailed(format!(
+                        "enrichment parser '{}' rejected at deploy: enrich_source {src:?} is reserved",
                         p.name
                     )));
                 }
@@ -1830,13 +2251,13 @@ if otlp_time != "" {
 
         // NAN-1197: defense-in-depth — on the GENERATED path, assert the lane's
         // component topology matches exactly what `generate_enrichment_lane`
-        // emits (only `enrichment_normalize_*` remaps and ClickHouse/blackhole
-        // sinks). Skipped for the trusted committed static fallback (no enabled
+        // emits (only `enrichment_normalize_*` remaps, the dead-letter report,
+        // and the directory / collector-error sinks). Skipped for the trusted committed static fallback (no enabled
         // parsers), whose shape is fixed at build time.
         if enrichment_parsers.iter().any(|p| p.enabled) {
             assert_enrichment_lane_topology(candidate_toml).map_err(|e| {
                 VectorConfigError::ValidationFailed(format!(
-                    "enrichment lane failed topology check (NAN-1197): {e}"
+                    "enrichment lane failed topology check: {e}"
                 ))
             })?;
         }
@@ -1844,7 +2265,7 @@ if otlp_time != "" {
         let backpressure = enrichment_lane_backpressure_violations(candidate_toml);
         if !backpressure.is_empty() {
             return Err(VectorConfigError::ValidationFailed(format!(
-                "enrichment lane would backpressure shared ingest (NAN-1114): {}",
+                "enrichment lane would backpressure shared ingest: {}",
                 backpressure.join("; ")
             )));
         }
@@ -1860,11 +2281,22 @@ if otlp_time != "" {
     /// the `/deploy` endpoint promoted the static lane and silently reverted
     /// per-source enrichment parsers.
     pub(super) fn enrichment_lane_config(enrichment_parsers: &[Parser]) -> String {
+        Self::enrichment_lane_config_for_backend(enrichment_parsers, false)
+    }
+
+    pub(super) fn enrichment_lane_config_for_backend(
+        enrichment_parsers: &[Parser],
+        lake: bool,
+    ) -> String {
         let enabled: Vec<&Parser> = enrichment_parsers.iter().filter(|p| p.enabled).collect();
         if enabled.is_empty() {
-            Self::enrichment_lane_content().to_string()
+            Self::static_enrichment_lane(lake)
         } else {
-            Self::generate_enrichment_lane(&enabled)
+            // NAN-3483: plus a built-in normalizer for every identity source
+            // no enabled parser covers (the router emits the same set).
+            let effective = super::router::effective_enrichment_parsers(&enabled);
+            let effective: Vec<&Parser> = effective.iter().collect();
+            Self::generate_enrichment_lane_for_backend(&effective, lake)
         }
     }
 
@@ -1875,10 +2307,14 @@ if otlp_time != "" {
     /// dead-letter sink unioning every normalize's `.dropped` output. The sink
     /// discipline (memory buffer + `drop_newest` + acks off) matches
     /// `clickhouse_logs` so an enrichment sink can never backpressure the shared
-    /// ingest upstream (NAN-1114); the `shared_ingest_source_sinks_must_not_backpressure`
+    /// ingest upstream; the `shared_ingest_source_sinks_must_not_backpressure`
     /// lint covers this. Shape mirrors the committed `_enrichment.toml` so a
     /// single identity parser regenerates an equivalent lane.
     fn generate_enrichment_lane(parsers: &[&Parser]) -> String {
+        Self::generate_enrichment_lane_for_backend(parsers, false)
+    }
+
+    fn generate_enrichment_lane_for_backend(parsers: &[&Parser], lake: bool) -> String {
         use std::collections::BTreeMap;
 
         let mut out = String::from(
@@ -1890,6 +2326,8 @@ if otlp_time != "" {
 
         // target_table -> normalize transforms feeding its sink.
         let mut by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // Lake: identity normalizers feeding the coordinator lines transform.
+        let mut identity_inputs: Vec<String> = Vec::new();
         let mut dropped_inputs: Vec<String> = Vec::new();
         let mut seen_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -1914,8 +2352,11 @@ if otlp_time != "" {
             };
             let route = super::router::enrichment_route_name(source);
             // Skip duplicate sources rather than emit a duplicate transform name
-            // that would break the Vector reload.
-            if !seen_sources.insert(route.clone()) {
+            // that would break the Vector reload. NAN-3767: the runner's
+            // envelope route owns `identity_directory` (no router output).
+            if route == super::router::IDENTITY_DIRECTORY_ROUTE
+                || !seen_sources.insert(route.clone())
+            {
                 continue;
             }
             let transform = format!("enrichment_normalize_{route}");
@@ -1926,15 +2367,7 @@ if otlp_time != "" {
                 .unwrap_or("user_registry")
                 .to_string();
 
-            out.push_str(&format!(
-                "[transforms.{transform}]\n\
-                 type = \"remap\"\n\
-                 inputs = [\"enrichment_router.{route}\"]\n\
-                 drop_on_abort = true\n\
-                 drop_on_error = true\n\
-                 reroute_dropped = true\n\
-                 source = '''\n{vrl}\n'''\n\n"
-            ));
+            out.push_str(&Self::normalize_transform_block(&transform, &route, vrl));
 
             by_table
                 .entry(table)
@@ -1944,6 +2377,28 @@ if otlp_time != "" {
         }
 
         for (table, inputs) in &by_table {
+            if lake {
+                let (sink, path) = match table.as_str() {
+                    "user_registry" | "nanosiem.user_registry" => {
+                        identity_inputs.extend(inputs.iter().cloned());
+                        continue;
+                    }
+                    "ip_enrichments" | "nanosiem.ip_enrichments" => {
+                        ("lake_ip_context", "/v1/ip-context/batch")
+                    }
+                    _ => {
+                        let sink = format!("lake_{}", Self::safe_name(table));
+                        out.push_str(&Self::lake_enrichment_sink(
+                            &sink,
+                            inputs,
+                            "/v1/enrichment/unsupported",
+                        ));
+                        continue;
+                    }
+                };
+                out.push_str(&Self::lake_enrichment_sink(sink, inputs, path));
+                continue;
+            }
             // Sanitize the sink component id (a db-qualified or hyphenated
             // target_table would otherwise produce an invalid Vector component
             // name). `user_registry` is unchanged; the `table =` value stays raw.
@@ -1961,6 +2416,7 @@ if otlp_time != "" {
                  compression = \"gzip\"\n\
                  date_time_best_effort = true\n\
                  skip_unknown_fields = true\n\n\
+                 healthcheck.enabled = false\n\n\
                  [sinks.{sink}.buffer]\n\
                  type = \"memory\"\n\
                  max_events = 50000\n\
@@ -1979,15 +2435,339 @@ if otlp_time != "" {
             ));
         }
 
-        out.push_str(&format!(
-            "[sinks.enrichment_dead_letter]\n\
-             type = \"blackhole\"\n\
-             inputs = [{}]\n\
-             print_interval_secs = 0\n",
-            dropped_inputs.join(", ")
-        ));
+        if lake {
+            out.push_str(&Self::lake_identity_lane(&identity_inputs));
+            dropped_inputs.extend(Self::lake_identity_dead_letter_inputs(&identity_inputs));
+        }
+        out.push_str(&Self::unrouted_identity_transform_block());
+        dropped_inputs.extend(Self::unrouted_identity_dead_letter_inputs());
+        out.push_str(&Self::dead_letter_block(&dropped_inputs, lake));
 
         out
+    }
+
+    /// NAN-3767: the lake identity lane. Every identity record reaches the
+    /// lean coordinator through `lake_identity_directory` as an NDJSON line
+    /// of [`IDENTITY_INGEST_PATH`]:
+    /// - `kind: identity_directory` (the connector runner's directory sync):
+    ///   already normalized `stage` / `delta` envelopes, checked by
+    ///   [`IDENTITY_ENVELOPE_TRANSFORM`];
+    /// - `kind: identity` (provider sync, Cribl / HEC push): the per-source
+    ///   normalizers' user_registry rows, turned into `delta` lines of feed
+    ///   `push:<provider>` by [`IDENTITY_LINES_TRANSFORM`].
+    ///
+    /// The sink keeps a memory buffer so its acknowledgement reaches the
+    /// sender only once the coordinator answered (a disk buffer acks on
+    /// write): the runner's 200 from Vector means the rows are staged.
+    fn lake_identity_lane(normalized: &[String]) -> String {
+        let mut out = Self::normalize_transform_block(
+            IDENTITY_ENVELOPE_TRANSFORM,
+            super::router::IDENTITY_DIRECTORY_ROUTE,
+            IDENTITY_ENVELOPE_VRL,
+        );
+        let mut inputs = vec![format!("\"{IDENTITY_ENVELOPE_TRANSFORM}\"")];
+        if !normalized.is_empty() {
+            out.push_str(&format!(
+                "[transforms.{IDENTITY_LINES_TRANSFORM}]\n\
+                 type = \"remap\"\n\
+                 inputs = [{}]\n\
+                 drop_on_abort = true\n\
+                 drop_on_error = true\n\
+                 reroute_dropped = true\n\
+                 source = '''\n{IDENTITY_LINES_VRL}\n'''\n\n",
+                normalized.join(", ")
+            ));
+            inputs.push(format!("\"{IDENTITY_LINES_TRANSFORM}\""));
+        }
+        out.push_str(&format!(
+            "[sinks.lake_identity_directory]\n\
+             type = \"http\"\n\
+             inputs = [{inputs}]\n\
+             uri = \"${{NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}}{IDENTITY_INGEST_PATH}\"\n\
+             method = \"post\"\n\
+             encoding.codec = \"json\"\n\
+             framing.method = \"newline_delimited\"\n\
+             acknowledgements.enabled = true\n\n\
+             [sinks.lake_identity_directory.buffer]\n\
+             type = \"memory\"\n\
+             max_events = 200000\n\
+             when_full = \"block\"\n\n\
+             [sinks.lake_identity_directory.batch]\n\
+             max_bytes = 16777216\n\
+             max_events = 20000\n\
+             timeout_secs = 1\n\n\
+             [sinks.lake_identity_directory.request]\n\
+             concurrency = 1\n\
+             timeout_secs = 600\n\
+             retry_initial_backoff_secs = 1\n\
+             retry_max_duration_secs = 300\n\n\
+             [sinks.lake_identity_directory.request.headers]\n\
+             Authorization = \"Bearer ${{NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}}\"\n\
+             Content-Type = \"application/x-ndjson\"\n\
+             X-Nano-Tenant-ID = \"${{NANO_LAKE_TENANT_ID:-default}}\"\n\n\
+             [sinks.lake_identity_directory.healthcheck]\n\
+             enabled = false\n\n",
+            inputs = inputs.join(", "),
+        ));
+        out
+    }
+
+    fn lake_identity_dead_letter_inputs(normalized: &[String]) -> Vec<String> {
+        let mut out = vec![format!("\"{IDENTITY_ENVELOPE_TRANSFORM}.dropped\"")];
+        if !normalized.is_empty() {
+            out.push(format!("\"{IDENTITY_LINES_TRANSFORM}.dropped\""));
+        }
+        out
+    }
+
+
+    /// One per-source normalize remap consuming `enrichment_router.<route>`.
+    /// Aborts/errors are rerouted to `.dropped` (the dead-letter sink).
+    fn normalize_transform_block(transform: &str, route: &str, vrl: &str) -> String {
+        format!(
+            "[transforms.{transform}]\n\
+             type = \"remap\"\n\
+             inputs = [\"enrichment_router.{route}\"]\n\
+             drop_on_abort = true\n\
+             drop_on_error = true\n\
+             reroute_dropped = true\n\
+             source = '''\n{vrl}\n'''\n\n"
+        )
+    }
+
+    fn unrouted_identity_transform_name() -> String {
+        format!(
+            "enrichment_normalize_{}",
+            super::router::UNROUTED_IDENTITY_ROUTE
+        )
+    }
+
+    /// NAN-3483: consumes `enrichment_router.unrouted_identity` (identity
+    /// records whose `.source` has no normalizer) and dead-letters each with an
+    /// error naming the source, instead of the router dropping it silently or
+    /// another source's normalizer mis-mapping it.
+    fn unrouted_identity_transform_block() -> String {
+        Self::normalize_transform_block(
+            &Self::unrouted_identity_transform_name(),
+            super::router::UNROUTED_IDENTITY_ROUTE,
+            "source = to_string(.source) ?? \"\"\n\
+             log(\"nano_enrich identity record has no normalizer for source '\" + source + \"'; dead-lettering\", level: \"error\")\n\
+             abort",
+        )
+    }
+
+    /// The unrouted transform always aborts; both outputs go to the
+    /// dead-letter sink so neither is left unconsumed.
+    fn unrouted_identity_dead_letter_inputs() -> [String; 2] {
+        let name = Self::unrouted_identity_transform_name();
+        [format!("\"{name}\""), format!("\"{name}.dropped\"")]
+    }
+
+    /// Built-in identity normalizers the static lane adds beside its legacy AD
+    /// transform (which keeps the `identity` route): `(transform, block)`.
+    fn static_builtin_identity_transforms() -> Vec<(String, String)> {
+        crate::identity::normalizers::BUILTIN_IDENTITY_NORMALIZERS
+            .iter()
+            .filter(|b| b.source != "ad")
+            .map(|b| {
+                let route = super::router::enrichment_route_name(b.source);
+                let transform = format!("enrichment_normalize_{route}");
+                let block = Self::normalize_transform_block(&transform, &route, b.normalize_vrl);
+                (transform, block)
+            })
+            .collect()
+    }
+
+    /// The lane deployed when no enrichment parser is enabled: the committed
+    /// static lane (AD identity + custom ip_context, routed per kind) plus,
+    /// since NAN-3483, a built-in normalizer per other identity source and
+    /// the unrouted-identity dead-letter, all feeding the same directory sink.
+    fn static_enrichment_lane(lake: bool) -> String {
+        let builtins = Self::static_builtin_identity_transforms();
+        let mut identity_inputs = vec!["\"enrichment_normalize_ad\"".to_string()];
+        identity_inputs.extend(builtins.iter().map(|(t, _)| format!("\"{t}\"")));
+        let mut dead_letter_inputs = vec![
+            "\"enrichment_normalize_ad.dropped\"".to_string(),
+            "\"enrichment_normalize_custom.dropped\"".to_string(),
+        ];
+        dead_letter_inputs.extend(builtins.iter().map(|(t, _)| format!("\"{t}.dropped\"")));
+        dead_letter_inputs.extend(Self::unrouted_identity_dead_letter_inputs());
+        if lake {
+            dead_letter_inputs.extend(Self::lake_identity_dead_letter_inputs(&identity_inputs));
+        }
+
+        let source = Self::enrichment_lane_content();
+        let mut out = if lake {
+            let marker = "# NAN-1728: `ip_enrichments`";
+            let boundary = source
+                .find(marker)
+                .expect("static enrichment lane lost its sink boundary");
+            let mut out = source[..boundary].to_string();
+            out.push_str(&Self::lake_enrichment_sink(
+                "lake_ip_context",
+                &["\"enrichment_normalize_custom\"".to_string()],
+                "/v1/ip-context/batch",
+            ));
+            out.push_str(&Self::lake_identity_lane(&identity_inputs));
+            out
+        } else {
+            // Committed ClickHouse lane up to its dead-letter sink, with the
+            // user_registry sink fed by every identity normalizer.
+            let dead_letter = "[sinks.enrichment_dead_letter]";
+            let boundary = source
+                .find(dead_letter)
+                .expect("static enrichment lane lost its dead-letter sink");
+            let sink_inputs = "[sinks.clickhouse_user_registry]\ntype = \"clickhouse\"\ninputs = [\"enrichment_normalize_ad\"]";
+            assert_eq!(
+                source[..boundary].matches(sink_inputs).count(),
+                1,
+                "static enrichment lane lost its user_registry sink inputs"
+            );
+            source[..boundary].replacen(
+                sink_inputs,
+                &format!(
+                    "[sinks.clickhouse_user_registry]\ntype = \"clickhouse\"\ninputs = [{}]",
+                    identity_inputs.join(", ")
+                ),
+                1,
+            )
+        };
+        out.push_str(
+            "# NAN-3483: built-in identity normalizers (one per provider source)\n\
+             # and the dead-letter for identity sources without one.\n",
+        );
+        for (_, block) in &builtins {
+            out.push_str(block);
+        }
+        out.push_str(&Self::unrouted_identity_transform_block());
+        out.push_str(&Self::dead_letter_block(&dead_letter_inputs, lake));
+        out
+    }
+
+    /// NAN-3483: where dead-lettered enrichment records go. They used to land
+    /// in a `blackhole` (`print_interval_secs = 0`), so a lane that dropped
+    /// every record looked exactly like a quiet one. Now each one becomes a
+    /// collector diagnostic (WARN, `error_type = enrichment_dead_letter`, the
+    /// kind / source / provider, never the record's payload) on the existing
+    /// collector-error channel: the coordinator's `/v1/collector-errors/batch`
+    /// on the lake (reads `metadata.level` / `vector.component_*`), the
+    /// `collector_errors` table on ClickHouse (flat `level` / `component_*`
+    /// columns), so the report carries both shapes. The count is
+    /// also Vector's `component_received_events_total{component_id=
+    /// "enrichment_dead_letter"}` on the metrics exporter. Like the 92-metrics
+    /// diagnostics sinks it never backpressures: memory buffer, `drop_newest`,
+    /// no acknowledgements.
+    fn dead_letter_block(dropped_inputs: &[String], lake: bool) -> String {
+        let report = "kind = truncate(to_string(.kind) ?? \"\", 64)\n\
+             src = truncate(to_string(.source) ?? \"\", 128)\n\
+             provider = truncate(to_string(.provider_id) ?? \"\", 128)\n\
+             . = {\n\
+             \x20   \"timestamp\": format_timestamp!(now(), \"%Y-%m-%dT%H:%M:%S%.3fZ\", timezone: \"UTC\"),\n\
+             \x20   \"level\": \"WARN\",\n\
+             \x20   \"metadata\": {\"level\": \"WARN\"},\n\
+             \x20   \"message\": \"nano_enrich \" + kind + \" record from source '\" + src + \"' (provider '\" + provider + \"') was dead-lettered by its normalizer and not applied\",\n\
+             \x20   \"error_code\": \"enrichment_dead_letter\",\n\
+             \x20   \"error_type\": \"enrichment_dead_letter\",\n\
+             \x20   \"stage\": \"processing\",\n\
+             \x20   \"vector\": {\"component_id\": \"enrichment_dead_letter\", \"component_kind\": \"transform\", \"component_type\": \"remap\"},\n\
+             \x20   \"component_id\": \"enrichment_dead_letter\",\n\
+             \x20   \"component_kind\": \"transform\",\n\
+             \x20   \"component_type\": \"remap\",\n\
+             \x20   \"host\": get_hostname() ?? \"\"\n\
+             }";
+        let mut out = format!(
+            "[transforms.enrichment_dead_letter_report]\n\
+             type = \"remap\"\n\
+             inputs = [{}]\n\
+             source = '''\n{report}\n'''\n\n",
+            dropped_inputs.join(", ")
+        );
+        if lake {
+            out.push_str(
+                "[sinks.enrichment_dead_letter]\n\
+                 type = \"http\"\n\
+                 inputs = [\"enrichment_dead_letter_report\"]\n\
+                 uri = \"${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/collector-errors/batch\"\n\
+                 method = \"post\"\n\
+                 encoding.codec = \"json\"\n\
+                 framing.method = \"newline_delimited\"\n\
+                 healthcheck.enabled = false\n\n\
+                 [sinks.enrichment_dead_letter.buffer]\n\
+                 type = \"memory\"\n\
+                 max_events = 1000\n\
+                 when_full = \"drop_newest\"\n\n\
+                 [sinks.enrichment_dead_letter.acknowledgements]\n\
+                 enabled = false\n\n\
+                 [sinks.enrichment_dead_letter.batch]\n\
+                 max_events = 1000\n\
+                 timeout_secs = 2\n\n\
+                 [sinks.enrichment_dead_letter.request]\n\
+                 concurrency = 1\n\
+                 timeout_secs = 10\n\
+                 retry_initial_backoff_secs = 1\n\
+                 retry_max_duration_secs = 30\n\n\
+                 [sinks.enrichment_dead_letter.request.headers]\n\
+                 Authorization = \"Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}\"\n\
+                 Content-Type = \"application/x-ndjson\"\n\
+                 X-Nano-Tenant-ID = \"${NANO_LAKE_TENANT_ID:-default}\"\n",
+            );
+        } else {
+            out.push_str(
+                "[sinks.enrichment_dead_letter]\n\
+                 type = \"clickhouse\"\n\
+                 inputs = [\"enrichment_dead_letter_report\"]\n\
+                 endpoint = \"${CLICKHOUSE_URL:-http://clickhouse:8123}\"\n\
+                 database = \"${CLICKHOUSE_DATABASE:-nanosiem}\"\n\
+                 table = \"${CLICKHOUSE_COLLECTOR_ERRORS_TABLE:-collector_errors}\"\n\
+                 auth.strategy = \"basic\"\n\
+                 auth.user = \"${CLICKHOUSE_USER:-nanosiem}\"\n\
+                 auth.password = \"${CLICKHOUSE_PASSWORD:-nanosiem}\"\n\
+                 compression = \"gzip\"\n\
+                 date_time_best_effort = true\n\
+                 skip_unknown_fields = true\n\
+                 healthcheck.enabled = false\n\n\
+                 [sinks.enrichment_dead_letter.buffer]\n\
+                 type = \"memory\"\n\
+                 max_events = 1000\n\
+                 when_full = \"drop_newest\"\n\n\
+                 [sinks.enrichment_dead_letter.acknowledgements]\n\
+                 enabled = false\n",
+            );
+        }
+        out
+    }
+
+    fn lake_enrichment_sink(sink: &str, inputs: &[String], path: &str) -> String {
+        format!(
+            "[sinks.{sink}]\n\
+             type = \"http\"\n\
+             inputs = [{inputs}]\n\
+             uri = \"${{NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}}{path}\"\n\
+             method = \"post\"\n\
+             encoding.codec = \"json\"\n\
+             framing.method = \"newline_delimited\"\n\
+             acknowledgements.enabled = true\n\n\
+             [sinks.{sink}.buffer]\n\
+             type = \"disk\"\n\
+             max_size = 1073741824\n\
+             when_full = \"block\"\n\n\
+             [sinks.{sink}.batch]\n\
+             max_bytes = 33554432\n\
+             max_events = 100000\n\
+             timeout_secs = 2\n\n\
+             [sinks.{sink}.request]\n\
+             concurrency = 1\n\
+             timeout_secs = 300\n\
+             retry_initial_backoff_secs = 1\n\
+             retry_max_duration_secs = 3600\n\n\
+             [sinks.{sink}.request.headers]\n\
+             Authorization = \"Bearer ${{NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}}\"\n\
+             Content-Type = \"application/x-ndjson\"\n\
+             X-Nano-Tenant-ID = \"${{NANO_LAKE_TENANT_ID:-default}}\"\n\n\
+             [sinks.{sink}.healthcheck]\n\
+             enabled = false\n\n",
+            inputs = inputs.join(", "),
+        )
     }
 
     /// Send Vector a reload signal, best effort.
@@ -2198,7 +2978,7 @@ if otlp_time != "" {
             std::time::Duration::from_secs(10),
             "docker exec pgrep vector (health)",
         )
-            .await
+        .await
         {
             if output.status.success() {
                 return true;

@@ -26,6 +26,7 @@ use crate::{error::ApiError, state::AppState};
     ),
     responses(
         (status = 200, description = "Sync started", body = SyncStartResponse),
+        (status = 202, description = "Shared tenant sync accepted; poll the repository", body = nanosiem_core::rule_repository::SyncAccepted),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),

@@ -52,6 +52,9 @@ if !exists(.metadata) || !is_object(.metadata) {
 
 # Mark as forwarded from Vector
 .metadata.forwarded_via = "vector_native"
+# NAN-2361 wave 8: ingress lane for the lake sink's `metadata.ingress_transport`
+# (see 00-base.toml `source_type_extract`).
+%ingress_transport = "vector"
 '''
 
 # =============================================================================

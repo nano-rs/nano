@@ -1,0 +1,598 @@
+use crate::batch::WriteBatchIterator;
+use crate::bytes_range::BytesRange;
+use crate::error::SlateDBError;
+use crate::filter_iterator::FilterIterator;
+use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
+use crate::manifest::LsmTreeState;
+use crate::merge_iterator::MergeIterator;
+use crate::merge_operator::{
+    MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
+};
+use crate::segment_iterator::{build_l0_point_iters, build_sr_point_iters, SegmentScanContext};
+use crate::types::{KeyValue, RowEntry, ValueDeletable};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use std::collections::VecDeque;
+use std::ops::RangeBounds;
+
+/// [`DbIteratorRangeTracker`] records the *requested* scan range of a
+/// [`DbIterator`] so that the transaction manager can detect read-write
+/// conflicts under Serializable Snapshot Isolation.
+///
+/// The tracker holds the range the caller asked to scan — not the bounding
+/// box of keys the iterator happened to yield. Tracking the requested range
+/// is required for correctness: an empty scan still establishes a read
+/// dependency on every key in that range (and a concurrent insert anywhere
+/// inside it is a phantom), and a partial scan or a scan whose tombstones
+/// were skipped likewise depends on the whole requested range.
+///
+/// Early termination via [`DbIterator::seek`] does not narrow the registered
+/// range: the transaction has already taken a logical read dependency on the
+/// whole requested range when the scan was issued.
+#[derive(Debug)]
+pub(crate) struct DbIteratorRangeTracker {
+    requested_range: BytesRange,
+}
+
+impl DbIteratorRangeTracker {
+    pub(crate) fn new(requested_range: BytesRange) -> Self {
+        Self { requested_range }
+    }
+
+    pub(crate) fn get_range(&self) -> BytesRange {
+        self.requested_range.clone()
+    }
+}
+
+pub(crate) struct GetIterator {
+    key: Bytes,
+    iters: Vec<Box<dyn RowEntryIterator + 'static>>,
+    idx: usize,
+}
+
+impl GetIterator {
+    pub(crate) fn new(
+        key: Bytes,
+        write_batch_iter: Box<dyn RowEntryIterator + 'static>,
+        mem_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
+        segment_iter: Box<dyn RowEntryIterator + 'static>,
+    ) -> Self {
+        let iters = vec![write_batch_iter]
+            .into_iter()
+            .chain(mem_iters)
+            .chain(std::iter::once(segment_iter))
+            .collect();
+
+        Self { key, iters, idx: 0 }
+    }
+
+    /// Build a per-tree `GetIterator` over the L0 + sorted-run iterators
+    /// produced by `tree`. The chain stays flat (no `MergeIterator`) so a
+    /// bloom-positive hit in the newest L0 SST short-circuits without
+    /// opening any older SSTs — the same laziness the pre-segment GET path
+    /// had, scoped to one segment.
+    ///
+    /// `max_seq` is applied per leaf via `FilterIterator` so above-bound
+    /// tombstones are dropped before the outer flat-walk encounters them
+    /// and stops the search.
+    pub(crate) fn from_lsm_tree(
+        key: Bytes,
+        tree: &LsmTreeState,
+        ctx: &SegmentScanContext,
+        max_seq: Option<u64>,
+    ) -> Result<Self, SlateDBError> {
+        let l0 = build_l0_point_iters(&tree.l0, ctx)?;
+        let sr = build_sr_point_iters(&key, &tree.compacted, ctx)?;
+        let iters = apply_filters(l0.into_iter().chain(sr), max_seq);
+        Ok(Self { key, iters, idx: 0 })
+    }
+}
+
+#[async_trait]
+impl RowEntryIterator for GetIterator {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        // GetIterator departs from the normal convention for RowEntryIterator
+        // in that it lazily initializes the iterators only when necessary -
+        // this is because it is used in a way that will early exit before all
+        // iterators are used.
+        Ok(())
+    }
+
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        while self.idx < self.iters.len() {
+            // initialization is idempotent, so we can call it multiple times
+            self.iters[self.idx].init().await?;
+            let result = self.iters[self.idx].next().await?;
+            if let Some(entry) = result {
+                // Note: The Get iterator should not advance past tombstones, which is
+                // why we filter them out here. When a tombstone is encountered, we return None
+                // so the iterator stops without advancing to the next iterator in the chain.
+                match &entry.value {
+                    ValueDeletable::Tombstone => {
+                        return Ok(None);
+                    }
+                    _ => {
+                        return Ok(Some(entry));
+                    }
+                }
+            }
+            self.idx += 1;
+        }
+
+        Ok(None)
+    }
+
+    async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        // we expect the GetIterator to only cover a single key, so if we seek
+        // to something other than that key we should just return an error
+        if next_key != self.key {
+            return Err(SlateDBError::SeekKeyOutOfRange {
+                key: next_key.to_vec(),
+                range: BytesRange::from(self.key.clone()..=self.key.clone()),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+struct ScanIterator {
+    delegate: Box<dyn RowEntryIterator + 'static>,
+}
+
+impl ScanIterator {
+    pub(crate) fn new(
+        write_batch_iter: Box<dyn RowEntryIterator + 'static>,
+        mem_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
+        segment_iter: Box<dyn RowEntryIterator + 'static>,
+        order: IterationOrder,
+    ) -> Result<Self, SlateDBError> {
+        // Three-arm top-level merge: write batch (transaction-only),
+        // memtables, and the on-disk LSM chain. The chain itself
+        // already merges each segment's L0 + sorted runs internally.
+        let iters = vec![
+            write_batch_iter,
+            Box::new(MergeIterator::new_with_order(mem_iters, order)?),
+            segment_iter,
+        ];
+
+        Ok(Self {
+            delegate: Box::new(MergeIterator::new_with_order(iters, order)?),
+        })
+    }
+}
+
+#[async_trait]
+impl RowEntryIterator for ScanIterator {
+    async fn init(&mut self) -> Result<(), SlateDBError> {
+        self.delegate.init().await
+    }
+
+    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        self.delegate.next().await
+    }
+
+    async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
+        self.delegate.seek(next_key).await
+    }
+}
+
+pub struct DbIterator {
+    range: BytesRange,
+    iter: Box<dyn RowEntryIterator + 'static>,
+    invalidated_error: Option<SlateDBError>,
+    last_key: Option<Bytes>,
+}
+
+impl DbIterator {
+    pub(crate) async fn new(
+        range: BytesRange,
+        write_batch_iter: Option<WriteBatchIterator>,
+        mem_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
+        segment_iter: Box<dyn RowEntryIterator + 'static>,
+        max_seq: Option<u64>,
+        merge_operator: Option<MergeOperatorType>,
+        order: IterationOrder,
+    ) -> Result<Self, SlateDBError> {
+        // The write_batch iterator is provided only when operating within a Transaction. It represents the uncommitted
+        // writes made during the transaction. We do not need to apply the max_seq filter to them, because they do
+        // not have an real committed sequence number yet.
+        let write_batch_iter = write_batch_iter
+            .map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'static>)
+            .unwrap_or_else(|| Box::new(EmptyIterator::new()));
+
+        // Apply the max_seq filter before any deduping merge. The
+        // per-segment merge inside `segment_iter` runs with dedup disabled,
+        // so wrapping the chain as a whole is equivalent to wrapping
+        // each leaf — versions > max_seq are dropped before the
+        // top-level merge dedups.
+        //
+        // Example: a leaf carries [(key1, seq=96), (key1, seq=110)]
+        // and another carries [(key1, seq=95)]. With max_seq=100,
+        // filtering after a deduping merge would let seq=110 win and
+        // then drop it, losing the correct seq=96 answer. Filter first.
+        let mem_iters = apply_filters(mem_iters, max_seq);
+        let segment_iter = Box::new(FilterIterator::new_with_max_seq(segment_iter, max_seq))
+            as Box<dyn RowEntryIterator + 'static>;
+
+        let mut iter = match range.as_point() {
+            Some(key) => Box::new(GetIterator::new(
+                key.clone(),
+                write_batch_iter,
+                mem_iters,
+                segment_iter,
+            )) as Box<dyn RowEntryIterator + 'static>,
+            None => Box::new(ScanIterator::new(
+                write_batch_iter,
+                mem_iters,
+                segment_iter,
+                order,
+            )?) as Box<dyn RowEntryIterator + 'static>,
+        };
+
+        if let Some(merge_operator) = merge_operator {
+            iter = Box::new(MergeOperatorIterator::new(
+                merge_operator,
+                iter,
+                true,
+                // Its important not to set a snapshot seq num barrier for this merge iterator
+                // The entries in the write batch iterator have seq num u64::MAX and any merges
+                // there need to be merged with the entries from the other iterators.
+                None,
+            ));
+        } else {
+            // When no merge operator is configured, wrap with iterator that errors on merge operands
+            iter = Box::new(MergeOperatorRequiredIterator::new(iter));
+        }
+
+        iter.init().await?;
+
+        Ok(DbIterator {
+            range,
+            iter,
+            invalidated_error: None,
+            last_key: None,
+        })
+    }
+
+    /// Get the next key-value pair.
+    ///
+    /// This method filters out tombstones and returns the user-facing [`KeyValue`] struct,
+    /// which contains only the key and value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the iterator has been invalidated due to an underlying error.
+    pub async fn next(&mut self) -> Result<Option<KeyValue>, crate::Error> {
+        let entry_opt = self.next_entry().await?;
+        match entry_opt {
+            Some(entry) => {
+                if entry.value.is_tombstone() {
+                    return Err(crate::Error::from(
+                        crate::error::SlateDBError::UnexpectedTombstone,
+                    ));
+                }
+                Ok(Some(KeyValue::from(entry)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn next_entry(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
+        if let Some(error) = self.invalidated_error.clone() {
+            Err(error)
+        } else {
+            let result = loop {
+                match self.iter.next().await {
+                    Ok(Some(entry)) => match entry.value {
+                        ValueDeletable::Tombstone => continue,
+                        _ => break Ok(Some(entry)),
+                    },
+                    Ok(None) => break Ok(None),
+                    Err(e) => break Err(e),
+                }
+            };
+            let result = self.maybe_invalidate(result);
+            if let Ok(Some(ref entry)) = result {
+                self.last_key = Some(entry.key.clone());
+            }
+            result
+        }
+    }
+
+    fn maybe_invalidate<T: Clone>(
+        &mut self,
+        result: Result<T, SlateDBError>,
+    ) -> Result<T, SlateDBError> {
+        if let Err(error) = &result {
+            self.invalidated_error = Some(error.clone());
+        }
+        result
+    }
+
+    /// Seek ahead to the next key. The next key must be larger than the
+    /// last key returned by the iterator and less than the end bound specified
+    /// in the `scan` arguments.
+    ///
+    /// After a successful seek, the iterator will return the next record
+    /// with a key greater than or equal to `next_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid argument error in the following cases:
+    ///
+    /// - if `next_key` comes before the current iterator position
+    /// - if `next_key` is beyond the upper bound specified in the original
+    ///   [`crate::db::Db::scan`] parameters
+    ///
+    /// Returns [`Error`] if the iterator has been invalidated in order to reclaim resources.
+    pub async fn seek<K: AsRef<[u8]>>(&mut self, next_key: K) -> Result<(), crate::Error> {
+        let next_key = next_key.as_ref();
+        if let Some(error) = self.invalidated_error.clone() {
+            Err(error.into())
+        } else if !self.range.contains(&next_key) {
+            Err(SlateDBError::SeekKeyOutOfRange {
+                key: next_key.to_vec(),
+                range: self.range.clone(),
+            }
+            .into())
+        } else if self
+            .last_key
+            .clone()
+            .is_some_and(|last_key| next_key <= last_key)
+        {
+            Err(SlateDBError::SeekKeyLessThanLastReturnedKey.into())
+        } else {
+            let result = self.iter.seek(next_key).await;
+            self.maybe_invalidate(result).map_err(Into::into)
+        }
+    }
+}
+
+pub(crate) fn apply_filters<T>(
+    iters: impl IntoIterator<Item = T>,
+    max_seq: Option<u64>,
+) -> Vec<Box<dyn RowEntryIterator>>
+where
+    T: RowEntryIterator + 'static,
+{
+    match max_seq {
+        Some(max_seq) => iters
+            .into_iter()
+            .map(|iter| {
+                Box::new(FilterIterator::new_with_max_seq(iter, Some(max_seq)))
+                    as Box<dyn RowEntryIterator + 'static>
+            })
+            .collect(),
+        None => iters
+            .into_iter()
+            .map(|iter| Box::new(iter) as Box<dyn RowEntryIterator + 'static>)
+            .collect(),
+    }
+}
+
+/// See [`crate::Db::scan_prefix_by_recency`] for the full contract.
+pub struct DbRecencyIterator {
+    /// Source iterators ordered from most recent to least recent. The
+    /// front of the deque is the source currently being drained;
+    /// exhausted sources are popped off as the walk proceeds. Each
+    /// source has already been wrapped with the sequence-number filter
+    /// at construction time.
+    iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
+    /// Whether the current front-of-deque iterator has had `init`
+    /// called. Reset to false whenever the front is popped, so the
+    /// next source's `init` is invoked lazily on the next pull.
+    current_initialized: bool,
+    /// Sticky error. Once any underlying `init` or `next` call fails,
+    /// the error is stashed here and every subsequent `next_entry`
+    /// returns it instead of advancing, since after a failure the
+    /// iterator's underlying state is unsafe to keep using.
+    invalidated_error: Option<SlateDBError>,
+}
+
+impl DbRecencyIterator {
+    pub(crate) fn new(iters: VecDeque<Box<dyn RowEntryIterator + 'static>>) -> Self {
+        Self {
+            iters,
+            current_initialized: false,
+            invalidated_error: None,
+        }
+    }
+
+    /// Returns the next raw [`RowEntry`] in recency order, advancing to the
+    /// next source when the current one is exhausted. Tombstones and merge
+    /// operands are not filtered. See [`crate::Db::scan_prefix_by_recency`]
+    /// for the full contract.
+    pub async fn next_entry(&mut self) -> Result<Option<RowEntry>, crate::Error> {
+        if let Some(error) = &self.invalidated_error {
+            return Err(error.clone().into());
+        }
+
+        loop {
+            let Some(iter) = self.iters.front_mut() else {
+                return Ok(None);
+            };
+
+            if !self.current_initialized {
+                if let Err(e) = iter.init().await {
+                    self.invalidated_error = Some(e.clone());
+                    return Err(e.into());
+                }
+                self.current_initialized = true;
+            }
+
+            match iter.next().await {
+                Ok(Some(entry)) => return Ok(Some(entry)),
+                Ok(None) => {
+                    self.iters.pop_front();
+                    self.current_initialized = false;
+                }
+                Err(e) => {
+                    self.invalidated_error = Some(e.clone());
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::batch::{WriteBatch, WriteBatchIterator};
+    use crate::bytes_range::BytesRange;
+    use crate::db_iter::DbIterator;
+    use crate::error::SlateDBError;
+    use crate::iter::{EmptyIterator, IterationOrder, RowEntryIterator};
+    use crate::test_utils::TestIterator;
+    use bytes::Bytes;
+    use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn test_invalidated_iterator() {
+        let mem_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            mem_iters,
+            Box::new(EmptyIterator::new()),
+            None,
+            None,
+            IterationOrder::Ascending,
+        )
+        .await
+        .unwrap();
+
+        iter.invalidated_error = Some(SlateDBError::ChecksumMismatch { path: None });
+
+        let result = iter.next().await;
+        let err = result.expect_err("Failed to return invalidated iterator");
+        assert_invalidated_iterator_error(err);
+
+        let result = iter.seek(Bytes::new()).await;
+        let err = result.expect_err("Failed to return invalidated iterator");
+        assert_invalidated_iterator_error(err);
+    }
+
+    fn assert_invalidated_iterator_error(err: crate::Error) {
+        assert_eq!(err.to_string(), "Data error: checksum mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_sequence_number_filtering() {
+        // Create two test iterators with overlapping keys but different sequence numbers
+        let mem_iter1 = TestIterator::new()
+            .with_entry(b"key1", b"value1", 96)
+            .with_entry(b"key1", b"value2", 110);
+
+        let mem_iter2 = TestIterator::new().with_entry(b"key1", b"value3", 95);
+
+        // Create DbIterator with max_seq = 100
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![
+                Box::new(mem_iter1) as Box<dyn RowEntryIterator + 'static>,
+                Box::new(mem_iter2) as Box<dyn RowEntryIterator + 'static>,
+            ],
+            Box::new(EmptyIterator::new()),
+            Some(100),
+            None,
+            IterationOrder::Ascending,
+        )
+        .await
+        .unwrap();
+
+        // The iterator should return the entry with seq=96 from the first memtable
+        // and not the one with seq=95 from the second memtable
+        let result = iter.next().await.unwrap();
+        assert!(result.is_some());
+        let kv = result.unwrap();
+        assert_eq!(kv.key, Bytes::from("key1"));
+        assert_eq!(kv.value, Bytes::from("value1"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_seek_cannot_rewind() {
+        // Build a simple test iterator with two keys
+        let mem_iter = TestIterator::new()
+            .with_entry(b"key1", b"value1", 1)
+            .with_entry(b"key2", b"value2", 2);
+
+        // Create a DbIterator over the whole range
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            None,
+            vec![Box::new(mem_iter) as Box<dyn RowEntryIterator + 'static>],
+            Box::new(EmptyIterator::new()),
+            None,
+            None,
+            IterationOrder::Ascending,
+        )
+        .await
+        .unwrap();
+
+        // Consume the first record
+        let first = iter.next().await.unwrap().unwrap();
+        assert_eq!(first.key, Bytes::from_static(b"key1"));
+
+        // Seeking to the current key or a prior key should fail
+        let err = iter.seek(b"key1").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid error: cannot seek to a key less than the last returned key"
+        );
+
+        let err = iter.seek(b"key0").await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid error: cannot seek to a key less than the last returned key"
+        );
+
+        // Seeking forward succeeds and allows reading the next key
+        iter.seek(b"key2").await.unwrap();
+        let kv = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv.key, Bytes::from_static(b"key2"));
+        assert!(iter.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dbiterator_with_writebatch() {
+        // Create a WriteBatch with some data
+        let mut batch = WriteBatch::new();
+        batch.put(b"key1", b"value1");
+        batch.put(b"key3", b"value3");
+
+        // Create WriteBatchIterator
+        let wb_iter =
+            WriteBatchIterator::new(&batch, .., IterationOrder::Ascending, u64::MAX, None, None);
+
+        // Create DbIterator with WriteBatch
+        let mem_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();
+        let mut iter = DbIterator::new(
+            BytesRange::from(..),
+            Some(wb_iter),
+            mem_iters,
+            Box::new(EmptyIterator::new()),
+            None,
+            None,
+            IterationOrder::Ascending,
+        )
+        .await
+        .unwrap();
+
+        // Should get data from WriteBatch in sorted order
+        let kv1 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv1.key, Bytes::from_static(b"key1"));
+        assert_eq!(kv1.value, Bytes::from_static(b"value1"));
+
+        let kv2 = iter.next().await.unwrap().unwrap();
+        assert_eq!(kv2.key, Bytes::from_static(b"key3"));
+        assert_eq!(kv2.value, Bytes::from_static(b"value3"));
+
+        // Should be done
+        let kv3 = iter.next().await.unwrap();
+        assert!(kv3.is_none());
+    }
+}

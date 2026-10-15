@@ -234,6 +234,12 @@ pub struct ReportRun {
     /// Artifact metadata (never bytes); populated on run-detail reads.
     #[serde(default)]
     pub artifacts: Vec<ReportArtifactMeta>,
+    /// the tenant system AI narrative of a hosted-shared run
+    /// (`{state: completed|skipped|failed, narrative?, key_findings[], reason?,
+    /// model_id?, generated_at}`). Absent on dedicated deployments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub ai_summary: Option<serde_json::Value>,
     /// F-31: DISTINCT `source_type` manifest of this run's artifacts. Internal —
     /// the download/metadata authorization predicate reads it; never serialized
     /// (would leak restricted-source names to a scoped viewer).
@@ -280,6 +286,9 @@ pub struct ReportRunRow {
     pub requires_search_sql: bool,
     #[sqlx(default)]
     pub search_sql_requirement_complete: bool,
+    /// NAN-2361 wave 7 (enterprise overlay 9000840); absent on open schemas.
+    #[sqlx(default)]
+    pub ai_summary: Option<serde_json::Value>,
 }
 
 impl From<ReportRunRow> for ReportRun {
@@ -301,6 +310,7 @@ impl From<ReportRunRow> for ReportRun {
             source_types_complete: row.source_types_complete,
             requires_search_sql: row.requires_search_sql,
             search_sql_requirement_complete: row.search_sql_requirement_complete,
+            ai_summary: row.ai_summary,
         }
     }
 }
@@ -363,6 +373,7 @@ pub struct ReportArtifactContent {
 /// A rendered artifact produced by the renderer, ready to persist.
 #[derive(Debug, Clone)]
 pub struct RenderedArtifact {
+    pub platform_read_fence: Option<crate::platform_enrichment::read::ReadFence>,
     pub kind: String,
     pub filename: String,
     pub content_type: String,

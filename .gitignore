@@ -59,12 +59,47 @@ deploy/k8s/**/.env
 # Runtime data (cloned enrichment repos, etc.)
 data/
 
+# Local lake validation runtime output.
+/logs/
+/results/
+
+# Standalone benchmark crates share the repository's normal Rust artifact
+# policy. Their sources are reviewable; their local build outputs are not.
+**/target/
+
+# API-delivered Vector generations are runtime state. Canonical source parser
+# templates remain tracked; publication copies and ownership markers do not.
+/config/vector/publications/
+/config/vector/backup/.backup-complete
+/config/vector/backup/.nano-generated
+/config/vector/sources/parsers/.nano-generated
+
 # Build artifacts
 *.log
 *.tmp
+
+# Hosted build/render scratch (NAN-3491: formerly scale04/.state). Curated digest evidence is kept
+# beside the runbook; archives, rendered manifests, and credentials are not.
+/deploy/.state/
 
 # Backups
 website-backup-*.tar.gz
 *.zip
 ludus/secrets/
 ludus/roles/nanosiem_stack/files/gcr-key.json
+
+# NAN-2361: local working state (multi-GB evidence, proofs, build contexts) — never commit
+.state/
+**/.state/
+.artifacts/
+**/.artifacts/
+core.[0-9]*
+nano-desktop/linux/pkg/
+nano-desktop/linux/*.pkg.tar.zst
+
+# NAN-2990: lean launch-gate evidence (scripts/lean-gate); keep curated runs outside the repo
+lean-gate-evidence/
+
+# Trusted-local identity and bootstrap secrets.
+.nano-lean/
+.nano-tenzir/

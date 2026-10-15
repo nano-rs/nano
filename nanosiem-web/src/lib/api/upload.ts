@@ -7,6 +7,7 @@ import type {
   UploadHistoryFilter,
 } from './types';
 import { getServiceUrl } from './utils';
+import { requestCredentials } from '@/lib/request-credentials';
 
 export class UploadApi {
   constructor(
@@ -14,18 +15,19 @@ export class UploadApi {
     private getAccessToken?: () => string | null
   ) {}
 
-  async previewUpload(file: File, format?: FileFormat, delimiter?: string): Promise<PreviewResult> {
+  async previewUpload(file: File, format?: FileFormat, delimiter?: string, hasHeader?: boolean): Promise<PreviewResult> {
     // Use FormData for multipart upload - must bypass the standard request function
     const formData = new FormData();
     formData.append('file', file);
 
-    if (format || delimiter) {
+    if (format || delimiter || hasHeader !== undefined) {
       const config: Record<string, unknown> = {
         destination_type: 'lookup',
         destination_name: 'preview',
       };
       if (format) config.format = format;
       if (delimiter) config.csv_delimiter = delimiter;
+      if (hasHeader !== undefined) config.has_header = hasHeader;
       formData.append('config', JSON.stringify(config));
     }
 
@@ -44,6 +46,7 @@ export class UploadApi {
     const response = await fetch(url, {
       method: 'POST',
       headers,
+      credentials: requestCredentials(endpoint, headers),
       body: formData,
     });
 

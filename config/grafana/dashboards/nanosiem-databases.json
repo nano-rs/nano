@@ -1073,7 +1073,7 @@
       "pluginVersion": "10.2.2",
       "targets": [
         {
-          "expr": "nanosiem_vector_buffer_byte_size{job=\"vector\"}",
+          "expr": "nanosiem_vector_buffer_size_bytes{job=\"vector\"}",
           "legendFormat": "{{ component_id }}",
           "refId": "A"
         }

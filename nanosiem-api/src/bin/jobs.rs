@@ -19,6 +19,11 @@ use std::future::Future;
 #[cfg(feature = "enterprise")]
 use std::sync::Arc;
 
+/// How often nano-jobs returns freed allocator pages (NAN-3492).
+const ALLOCATOR_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Below this RSS (idle jobs sits near 100 MiB) a trim is not worth a syscall.
+const ALLOCATOR_TRIM_MINIMUM_RSS_BYTES: u64 = 192 * 1024 * 1024;
+
 async fn abort_and_await_leader_tasks(handles: &mut Vec<tokio::task::JoinHandle<()>>) {
     if handles.is_empty() {
         return;
@@ -51,17 +56,53 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if nanosiem_core::app_features::print_if_requested(nanosiem_api::APP_FEATURES) {
+        return Ok(());
+    }
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
 
     tracing::info!("Starting NanoSIEM Jobs Service");
+
+    // NAN-3492: charge rule windows to this process's view memory budget
+    // before any scheduler starts, so an oversized window fails its run
+    // instead of OOM-killing jobs. nano-api never enables it (its
+    // interactive rule triggers stay unbudgeted).
+    nanosiem_core::detection::DetectionService::enable_rule_memory_ledger();
 
     // Load configuration (reuses API config — same env vars)
     let config = ApiConfig::from_env();
     tracing::info!("Configuration loaded");
     let leader_election_enabled = leader_election_configuration()?;
 
-    // Initialize AppState with DualPool. Both ClickHouse and PostgreSQL are
-    // required; the historical PG-only fallback was removed in NAN-800.
+    // Jobs validates rules and scheduled searches against the same canonical
+    // field inventory as API/Search. Hosted/shared jobs cannot read a query
+    // worker's local generation volume, so install its authenticated schema
+    // before AppState performs the fail-closed profile build.
+    // NAN-2718: shared mode refuses a process-global schema URL outright
+    // (`install_from_env` errors on it) and loads each tenant's schema from its
+    // own registry-assigned worker, cached by tenant UUID.
+    #[cfg(feature = "enterprise")]
+    if config.deployment_mode.is_enterprise_shared() {
+        nanosiem_core::schema::worker_schema::refuse_global_schema_in_shared_mode(&|name: &str| {
+            std::env::var(name).ok()
+        })
+        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
+    }
+    let worker_schema_source = if config.canonical_lake_ocsf {
+        nanosiem_core::schema::worker_schema::WorkerSchemaSource::install_from_env()
+            .await
+            .map_err(|error| anyhow::anyhow!("lake schema source unavailable: {error}"))?
+    } else {
+        None
+    };
+    #[cfg(feature = "enterprise")]
+    if config.canonical_lake_ocsf && config.deployment_mode.is_enterprise_shared() {
+        nanosiem_core::schema::tenant_lake_schema::start_for_shared_process().await;
+    }
+
+    // Initialize AppState. PostgreSQL is always required; legacy mode also
+    // requires ClickHouse, while canonical lake mode connects to no ClickHouse
+    // process.
     // SchemaBehind is a hard failure — refuse to start rather than risking
     // corruption against an out-of-date schema. (NAN-607)
     let mut state = match AppState::try_with_dual_pool(config.clone()).await {
@@ -75,6 +116,54 @@ async fn main() -> Result<()> {
             return Err(anyhow::anyhow!("DualPool initialization failed: {}", e));
         }
     };
+
+    // NAN-3492: a trusted-local install's lake tenant must exist in
+    // `tenants` before any finding is stamped with it.
+    if let Some(tenant) = nanosiem_core::search::lake_cell::ensure_trusted_local_tenant(&state.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?
+    {
+        tracing::info!(%tenant, "trusted-local tenant registered");
+    }
+
+    // Jobs owns tenant-scoped schedulers and mutation paths independently of
+    // the HTTP API. Attest the exact live RLS catalog before any task starts;
+    // another pod's readiness cannot vouch for this process or connection
+    // pool.
+    #[cfg(feature = "enterprise")]
+    if config.deployment_mode.is_enterprise_shared() {
+        // Jobs mounts the same unauthenticated-by-default /metrics router as
+        // the API; refuse to expose it token-less in the shared deployment.
+        nanosiem_api::metrics::require_metrics_auth_token_for_enterprise_shared(true)?;
+        let runtime_role = std::env::var("NANOSIEM_SHARED_RLS_RUNTIME_ROLE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NANOSIEM_SHARED_RLS_RUNTIME_ROLE is required in enterprise_shared mode"
+                )
+            })?;
+        let owner_role = std::env::var("NANOSIEM_SHARED_RLS_OWNER_ROLE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NANOSIEM_SHARED_RLS_OWNER_ROLE is required in enterprise_shared mode"
+                )
+            })?;
+        nanosiem_core::tenant_db::require_tenant_rls_catalog(
+            &state.pool,
+            &runtime_role,
+            &owner_role,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "enterprise-shared RLS catalog verification failed; refusing jobs startup: {error}"
+            )
+        })?;
+        tracing::info!("Enterprise-shared jobs RLS catalog verification is green");
+    }
 
     // Initialize demo service if DEPLOYMENT_MODE=demo
     if let Err(e) = state.init_demo_if_enabled().await {
@@ -125,6 +214,19 @@ async fn main() -> Result<()> {
 
     // === Per-instance tasks ===
 
+    if let Some(source) = worker_schema_source {
+        // NAN-3492: republish each new worker-served field set into the
+        // state's profile; installing it alone changes nothing state reads.
+        let adopt = state.schema_profile.clone();
+        let worker_schema_handle = tokio::spawn(source.run_refresh_loop_with(move || {
+            if adopt.adopt_installed_lake_profile() {
+                tracing::info!("lake schema profile republished from the worker-served schema");
+            }
+        }));
+        state.add_task_handle(worker_schema_handle).await;
+        tracing::info!("Worker-served lake schema refresher started");
+    }
+
     tracing::info!(node_id = %state.node_id, "Node ID for distributed scheduling");
 
     // AI usage recorder (NAN-1519) — the jobs node runs shadow investigations,
@@ -132,9 +234,18 @@ async fn main() -> Result<()> {
     // the ai_usage_events ledger too. Per-instance init (enterprise-only).
     #[cfg(feature = "enterprise")]
     {
-        nanosiem_enterprise::melod::usage_recorder::init(state.pool.clone());
+        nanosiem_enterprise::melod::usage_recorder::init(
+            state.pool.clone(),
+            state.tenant_ai_rls_runtime.clone(),
+        );
         tracing::info!("AI usage recorder started");
     }
+
+    // NAN-3080: install the Prometheus recorder BEFORE any scheduler starts.
+    // `metrics` macros bind to whatever recorder is global at call time; the
+    // tenant detection runtime's gauges and counters emitted before this
+    // point went to the no-op recorder and never reached /metrics.
+    let (app_metrics, prometheus_layer) = AppMetrics::new();
 
     // Distributed schedulers: detection rules + scheduled jobs via SKIP LOCKED
     tracing::info!("Starting distributed schedulers (detection rules + scheduled jobs)...");
@@ -152,14 +263,7 @@ async fn main() -> Result<()> {
         state.add_task_handle(melod_handle).await;
     }
 
-    // Case change listener (SSE broadcast via pg_notify).
-    // Phase 3.2 (NAN-744): cases moved to enterprise; only register when
-    // the enterprise feature is enabled.
-    #[cfg(feature = "enterprise")]
-    {
-        let case_listener_handle = state.start_case_change_listener();
-        state.add_task_handle(case_listener_handle).await;
-    }
+    // Case SSE clients periodically refetch through authorized endpoints.
 
     // === Leader-only tasks ===
     if leader_election_enabled {
@@ -196,7 +300,11 @@ async fn main() -> Result<()> {
                 }
 
                 if *rx.borrow() {
-                    leader_handles = leader_state.start_leader_schedulers().await;
+                    // NAN-3080: supervised like every registered loop (a
+                    // panicking leader scheduler exits the process); the
+                    // abort on leadership loss aborts them without exiting.
+                    let started = leader_state.start_leader_schedulers().await;
+                    leader_handles = leader_state.supervise_tasks("leader_scheduler", started);
                 }
             }
         });
@@ -214,17 +322,26 @@ async fn main() -> Result<()> {
     // accumulate forever.
     {
         let oidc_repo = state.oidc_repo.clone();
+        let shutdown = state.shutdown_token();
         let oidc_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
-            interval.tick().await; // skip the immediate tick
-            loop {
-                interval.tick().await;
-                match oidc_repo.delete_expired_auth_transactions().await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(cleaned = n, "OIDC auth-transaction cleanup completed"),
-                    Err(e) => tracing::warn!(error = %e, "OIDC auth-transaction cleanup failed"),
+            let cleanup = async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+                interval.tick().await; // skip the immediate tick
+                loop {
+                    interval.tick().await;
+                    match oidc_repo.delete_expired_auth_transactions().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            tracing::info!(cleaned = n, "OIDC auth-transaction cleanup completed")
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "OIDC auth-transaction cleanup failed")
+                        }
+                    }
                 }
-            }
+            };
+
+            let _ = shutdown.run_until_cancelled(cleanup).await;
         });
         state.add_task_handle(oidc_handle).await;
         tracing::info!("OIDC auth-transaction cleanup task started (15m interval)");
@@ -233,20 +350,36 @@ async fn main() -> Result<()> {
     // Demo cleanup task
     if let Some(ref demo_service) = state.demo_service {
         let demo_svc = demo_service.clone();
+        let shutdown = state.shutdown_token();
         let demo_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
-            loop {
-                interval.tick().await;
-                match demo_svc.cleanup_expired_sessions().await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(cleaned = n, "Demo session cleanup completed"),
-                    Err(e) => tracing::warn!(error = %e, "Demo session cleanup failed"),
+            let cleanup = async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+                loop {
+                    interval.tick().await;
+                    match demo_svc.cleanup_expired_sessions().await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(cleaned = n, "Demo session cleanup completed"),
+                        Err(e) => tracing::warn!(error = %e, "Demo session cleanup failed"),
+                    }
                 }
-            }
+            };
+
+            let _ = shutdown.run_until_cancelled(cleanup).await;
         });
         state.add_task_handle(demo_handle).await;
         tracing::info!("Demo session cleanup task started (15m interval)");
     }
+
+    // NAN-3492: rule windows, lake pages and finding reads free large JSON trees
+    // back to glibc, not to the kernel; without a trim the cgroup keeps the
+    // peak charged and the next burst stacks on it (nano-search does the same).
+    let trim_handle = tokio::spawn(nanosiem_core::allocator_trim::run_allocator_trim_loop(
+        "nanosiem-jobs",
+        ALLOCATOR_TRIM_INTERVAL,
+        ALLOCATOR_TRIM_MINIMUM_RSS_BYTES,
+        state.shutdown_token(),
+    ));
+    state.add_task_handle(trim_handle).await;
 
     // === Health + metrics endpoint ===
     let jobs_port: u16 = std::env::var("JOBS_PORT")
@@ -254,11 +387,10 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3001);
 
-    let (app_metrics, prometheus_layer) = AppMetrics::new();
-
     let health_router = axum::Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
         .merge(app_metrics.metrics_router())
+        .merge(nanosiem_api::hosted_config_router())
         .layer(prometheus_layer);
 
     let wait_for_shutdown = async {

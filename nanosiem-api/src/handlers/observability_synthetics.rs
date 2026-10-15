@@ -2,23 +2,24 @@
 
 //! Synthetic-check CRUD for the Observability console (NAN-1538).
 //!
-//! Synthetic-check *definitions* are PostgreSQL-backed
-//! (`observability_synthetic_checks`, migration 210). Their probe *results*
-//! live in ClickHouse (`nanosiem.synthetic_check_results`, migration 142),
-//! written by the nanosiem-jobs synthetics runner. The live summary
+//! Synthetic-check *definitions* and their atomic scheduling watermark are
+//! PostgreSQL-backed (`observability_synthetic_checks`, migrations 210/311).
+//! Probe *results* live in the selected observability store: native OTLP
+//! metrics in Iceberg for the lake profile, or ClickHouse for the retiring
+//! legacy profile. The live summary
 //! (`uptime_pct`, `p50_latency_ms`) and the last-N `history` are NOT stored on
-//! the definition — they are computed on read from ClickHouse via the search
+//! the definition — they are computed on read via the search
 //! service's `observability_synthetics_summary` / `observability_synthetic_history`
 //! glue and merged onto each definition here. This mirrors the SLO subsystem
 //! (`observability_slos.rs`): keeping only the definition persisted means the
 //! numbers are always consistent with the recorded probe results.
 //!
-//! The list endpoint computes the live summary + history from ClickHouse, so it
+//! The list endpoint computes the live summary + history from telemetry, so it
 //! requires `search:view` AND `search:execute` (NAN-2084): a view-only principal
 //! that is denied canonical search must not be able to run these
 //! summary/history reads through the wrapper. Mutations require
 //! `settings:system` (checks are configuration) and return only the persisted
-//! definition, so they never execute ClickHouse reads as a side effect
+//! definition, so they never execute telemetry reads as a side effect
 //! (NAN-2139).
 
 use axum::{
@@ -33,8 +34,8 @@ use crate::middleware::{AuthContext, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::observability::{
-    SYNTHETIC_CHECK_TYPES, SYNTHETIC_MAX_INTERVAL_SECS, SYNTHETIC_MIN_INTERVAL_SECS, SyntheticCheck,
-    SyntheticCheckRepository, SyntheticCheckRepositoryError,
+    SYNTHETIC_CHECK_TYPES, SYNTHETIC_MAX_INTERVAL_SECS, SYNTHETIC_MIN_INTERVAL_SECS,
+    SyntheticCheck, SyntheticCheckRepository, SyntheticCheckRepositoryError,
 };
 use nanosiem_core::query::TimeRange;
 use nanosiem_core::typeid::TypeIdParam;
@@ -48,7 +49,7 @@ const DEFAULT_TIMEOUT_SECS: i32 = 10;
 const HISTORY_LIMIT: u32 = 90;
 /// How far back to look for results when computing the summary / history. The
 /// runner writes a row every `interval_secs` (≤ 3600s), so a 7-day window
-/// always covers the last 90 runs and keeps the ClickHouse scan bounded.
+/// always covers the last 90 runs and keeps the telemetry scan bounded.
 const SUMMARY_WINDOW_DAYS: i64 = 7;
 
 /// A synthetic check with its live summary merged in. Flattens the stored
@@ -106,7 +107,7 @@ pub struct CheckRequest {
 /// Every field is optional: the console fires a body of only `{ "enabled": … }`
 /// for the pause/resume toggle, while the editor sends the full set. Omitted
 /// fields are merged from the persisted definition before validation, so a
-/// partial body never blanks the other columns. (NAN-1537 contract fix — the
+/// partial body never blanks the other columns. (the contract fix — the
 /// create-shaped `CheckRequest` rejected the toggle's partial body with a 422.)
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCheckRequest {
@@ -181,7 +182,8 @@ impl CheckRequest {
                 "target_url must be an http(s) URL".to_string(),
             ));
         }
-        if !(SYNTHETIC_MIN_INTERVAL_SECS..=SYNTHETIC_MAX_INTERVAL_SECS).contains(&self.interval_secs)
+        if !(SYNTHETIC_MIN_INTERVAL_SECS..=SYNTHETIC_MAX_INTERVAL_SECS)
+            .contains(&self.interval_secs)
         {
             return Err(ApiError::BadRequest(format!(
                 "interval_secs must be in {SYNTHETIC_MIN_INTERVAL_SECS}..={SYNTHETIC_MAX_INTERVAL_SECS}"
@@ -220,7 +222,8 @@ fn map_repo_err(e: SyntheticCheckRepositoryError) -> ApiError {
     }
 }
 
-/// Merge the live summary + history (from ClickHouse) onto one definition.
+/// Merge the live summary + history from the active observability store onto
+/// one definition.
 /// `summaries` is keyed by the check's UUID-string (the search-layer key). The
 /// summary only carries an entry for a check that has ≥1 run in the window
 /// (`observability_synthetics_summary` GROUP BYs check_id), so a missing entry
@@ -283,7 +286,7 @@ pub async fn list_synthetics(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListChecksResponse>, ApiError> {
-    // NAN-2084: this endpoint runs a fleet-wide `synthetic_check_results` summary
+    // NAN-2084: this endpoint runs a fleet-wide synthetic-result summary
     // plus a per-check history read. Gate on `search:execute` (not just the view
     // capability) before any query, so a view-only principal cannot reach probe
     // results through this wrapper. The summary query must not run on a denied
@@ -293,6 +296,13 @@ pub async fn list_synthetics(
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
     let defs = repo.list().await.map_err(map_repo_err)?;
+
+    // The definition list is authoritative in PostgreSQL. Avoid a result-store
+    // query when there are no checks. In canonical lake mode the same methods
+    // below read synthetic probe metrics from the native OTLP Iceberg table.
+    if defs.is_empty() {
+        return Ok(Json(ListChecksResponse { checks: Vec::new() }));
+    }
 
     let time_range = summary_time_range();
     let summaries = state
@@ -460,7 +470,7 @@ pub async fn delete_synthetic(
     // O49: the delete removes only the PG *definition*. Any probe already in
     // flight for this check re-checks existence before it writes its result or
     // raises an alert (see `SyntheticRunner::probe_and_record`), so a mid-tick
-    // delete can't emit a late result/alert. The check's ClickHouse result rows
+    // delete can't emit a late result/alert. The check's immutable result rows
     // are left to age out under the table's 30d TTL (migration 142) rather than
     // deleted synchronously here — an explicit CH `ALTER … DELETE` on delete is a
     // possible follow-up but not needed for correctness.
@@ -470,7 +480,13 @@ pub async fn delete_synthetic(
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(list_synthetics, create_synthetic, update_synthetic, delete_synthetic),
-    components(schemas(Check, ListChecksResponse, CheckRequest, UpdateCheckRequest, SyntheticCheck))
+    components(schemas(
+        Check,
+        ListChecksResponse,
+        CheckRequest,
+        UpdateCheckRequest,
+        SyntheticCheck
+    ))
 )]
 pub struct ObservabilitySyntheticsApiDoc;
 

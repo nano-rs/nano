@@ -437,7 +437,9 @@ const METRIC_CUMULATIVE_WINDOW_DELTA_EXPR: &str = "arraySum(arrayMap(d -> if(d >
 /// on raw `otel_metrics` (which the metrics-v2 builders read); never used against
 /// the rollup tables (which lack it).
 fn metric_sum_expr() -> String {
-    format!("if(max(aggregation_temporality) = 2, {METRIC_CUMULATIVE_WINDOW_DELTA_EXPR}, sum(value))")
+    format!(
+        "if(max(aggregation_temporality) = 2, {METRIC_CUMULATIVE_WINDOW_DELTA_EXPR}, sum(value))"
+    )
 }
 
 /// Temporality-aware per-second `rate` for the metrics dataset (NAN-1721 O15 +
@@ -650,7 +652,11 @@ pub fn metric_timeseries_v2_sql(
 /// rows for a vanished series, which the scheduler already treats as no-data.
 /// (The `rate` denominator is the grouping's observed `min/max(timestamp)` — see
 /// [`metric_rate_expr`] — so no window seconds are threaded here anymore.)
-pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange, is_clustered: bool) -> String {
+pub fn metric_scalar_sql(
+    query: &MetricQuery,
+    time_range: &TimeRange,
+    is_clustered: bool,
+) -> String {
     let name = escape_string(query.metric_name);
     let value_expr = query.agg.value_expr();
     let table = otel_read_table("otel_metrics", is_clustered);
@@ -700,7 +706,11 @@ pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange, is_cluster
 /// keys of `attributes` and `resource_attributes` via `arrayJoin(mapKeys(...))`.
 /// `metric_name` is escaped; bounded `LIMIT 1000` (attribute cardinality is
 /// instrumentation-bounded). A `time_range` keeps the scan partition-pruned.
-pub fn metric_tag_keys_sql(metric_name: &str, time_range: &TimeRange, is_clustered: bool) -> String {
+pub fn metric_tag_keys_sql(
+    metric_name: &str,
+    time_range: &TimeRange,
+    is_clustered: bool,
+) -> String {
     let name = escape_string(metric_name);
     let table = otel_read_table("otel_metrics", is_clustered);
     format!(
@@ -1066,7 +1076,11 @@ pub fn services_overview_sql(
 /// (service, bucket). `step_secs` is clamped to ≥1; the rollup grain is 1 minute,
 /// so a sub-minute step collapses onto the minute bucket (the rollup's finest
 /// resolution) — fine for a sparkline.
-pub fn services_sparkline_sql(time_range: &TimeRange, step_secs: u64, is_clustered: bool) -> String {
+pub fn services_sparkline_sql(
+    time_range: &TimeRange,
+    step_secs: u64,
+    is_clustered: bool,
+) -> String {
     let step = step_secs.max(1);
     let table = otel_read_table("otel_service_red_1m", is_clustered);
     let table_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
@@ -1420,7 +1434,11 @@ pub fn infra_hosts_sql(
 /// data"). Single time-bound WHERE, no GROUP BY (one row), `LIMIT 1`.
 /// NAN-1543: an `env` filter (from [`RumFilters`]) scopes the vitals; page /
 /// browser don't apply to metric rows (they carry no such attribute).
-pub fn rum_web_vitals_sql(time_range: &TimeRange, filters: &RumFilters, is_clustered: bool) -> String {
+pub fn rum_web_vitals_sql(
+    time_range: &TimeRange,
+    filters: &RumFilters,
+    is_clustered: bool,
+) -> String {
     let table = otel_read_table("otel_metrics", is_clustered);
     let table_ref = otel_read_table_ref("otel_metrics", is_clustered);
     format!(

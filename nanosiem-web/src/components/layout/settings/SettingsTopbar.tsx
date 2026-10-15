@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
- * Settings topbar — breadcrumb + Recent Changes button + theme/PIVT/bell.
+ * Settings topbar — breadcrumb + Recent Changes button + theme/pivt/bell.
  * Mirrors `design-ref/shadcn/settings-shell.jsx` `SettingsTopbar`.
  */
 
@@ -16,12 +16,14 @@ import {
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import { useTheme } from 'next-themes';
+
+import { isDarkAppearance } from '@/lib/theme';
 import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import type { PivtState } from '@/enterprise/hooks/use-pivt-state';
 import { NotificationBell } from '@/components/NotificationBell';
 import { GROUP_LABEL, SECTION_BY_ID, resolveActiveSection } from './sections';
-import { useAuditLog } from '@/hooks/use-api';
+import { useRecentAuditChanges } from '@/hooks/use-api';
 
 interface SettingsTopbarProps {
   onOpenAudit: () => void;
@@ -33,15 +35,16 @@ export function SettingsTopbar({ onOpenAudit, auditOpen, pivt }: SettingsTopbarP
   const location = useLocation();
   const { capabilities } = useCapabilities();
   const { resolvedTheme, setTheme } = useTheme();
-  const theme = resolvedTheme === 'light' ? 'light' : 'dark';
+  // Binary toggle: matte reads as dark (see AppLayout for the same reasoning).
+  const theme = isDarkAppearance(resolvedTheme) ? 'dark' : 'light';
 
   const { sectionId, parentId } = resolveActiveSection(location.pathname, location.search);
   const section = sectionId ? SECTION_BY_ID[sectionId] : null;
   const parent = parentId ? SECTION_BY_ID[parentId] : null;
   const groupLabel = section ? GROUP_LABEL[section.group] : null;
 
-  // Pull a count for the "Recent changes" button. Cheap query — last 24h, 50 entries.
-  const { data: auditData } = useAuditLog({ limit: 50 });
+  // Pull a count for the "Recent changes" button: the last 50 changes, without routine key-auth rows.
+  const { data: auditData } = useRecentAuditChanges({ limit: 50 });
   const auditCount = auditData?.logs?.length ?? 0;
 
   return (

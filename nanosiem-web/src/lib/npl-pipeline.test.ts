@@ -13,6 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  hasStatsPipeline,
   buildGroupByQuery,
   getBaseSearch,
   getPipeCommands,
@@ -137,4 +138,21 @@ test('the base search is preserved verbatim, including quoted values', () => {
     buildGroupByQuery('src_host="web-01" dest_port=443', 'user'),
     `src_host="web-01" dest_port=443 | stats count by user | sort -count | head ${GROUP_BY_ROW_LIMIT}`
   );
+});
+
+// NAN-3077: quoted/regex pipes are data; stats anywhere in the pipeline
+// suppresses the duplicate full-window histogram scan.
+test('stats companion classification respects pipeline boundaries', () => {
+  for (const query of [
+    '* | stats count by dst_endpoint.ip, actor.process.name',
+    '* | eval p=1 | stats count by p | sort -count | head 10',
+    '* | STATS count | table count',
+  ]) assert.equal(hasStatsPipeline(query), true, query);
+  for (const query of [
+    'message="literal | stats count"',
+    'user=/admin|stats count/ | table user',
+    '* | eval text="literal | stats count" | table text',
+    '* | table time, user',
+    '* | timechart count',
+  ]) assert.equal(hasStatsPipeline(query), false, query);
 });

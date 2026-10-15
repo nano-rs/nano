@@ -20,6 +20,7 @@ import { useMemo } from 'react';
 import { REDChart, Sparkline, type RedSeries } from './charts';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { MetricSeries } from '@/lib/api/types';
+import { CHART_SERIES } from '@/lib/chart-colors';
 
 export type MetricVizMode =
   | 'timeseries'
@@ -31,17 +32,10 @@ export type MetricVizMode =
   | 'heatmap';
 
 // Shared palette (matches ObsMetricWidget / VisualizationRenderer so a metric
-// reads the same on the explorer and on a dashboard).
-export const METRIC_SERIES_COLORS = [
-  '#3b82f6',
-  '#22c55e',
-  '#eab308',
-  '#ef4444',
-  '#a855f7',
-  '#06b6d4',
-  '#f97316',
-  '#ec4899',
-];
+// reads the same on the explorer and on a dashboard). Re-exported from the one
+// palette in `@/lib/chart-colors` — this name is kept because it is the import
+// other observability modules already reach for.
+export const METRIC_SERIES_COLORS = CHART_SERIES;
 
 export function fmtMetric(v: number, unit?: string): string {
   const a = Math.abs(v);

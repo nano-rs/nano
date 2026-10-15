@@ -184,10 +184,16 @@ mod tests {
 
     #[test]
     fn trailing_slash_is_trimmed() {
-        let ep = direct_endpoint("openai", &json!({ "base_url": "http://vllm.internal:8000/v1/" }))
-            .expect("endpoint");
+        let ep = direct_endpoint(
+            "openai",
+            &json!({ "base_url": "http://vllm.internal:8000/v1/" }),
+        )
+        .expect("endpoint");
         assert_eq!(ep.base_url, "http://vllm.internal:8000/v1");
-        assert_eq!(ep.chat_url(), "http://vllm.internal:8000/v1/chat/completions");
+        assert_eq!(
+            ep.chat_url(),
+            "http://vllm.internal:8000/v1/chat/completions"
+        );
     }
 
     /// The headline NAN-2231 case: BYO Anthropic key, no Cloudflare.
@@ -238,7 +244,11 @@ mod tests {
             "https://anthropic.com.co/v1",
         ] {
             let ep = direct_endpoint("anthropic", &json!({ "base_url": host })).expect("endpoint");
-            assert_eq!(ep.style, DirectApiStyle::OpenAi, "host {host} must not infer native");
+            assert_eq!(
+                ep.style,
+                DirectApiStyle::OpenAi,
+                "host {host} must not infer native"
+            );
         }
     }
 
@@ -259,7 +269,10 @@ mod tests {
         )
         .expect("endpoint");
         assert_eq!(forced_native.style, DirectApiStyle::Anthropic);
-        assert_eq!(forced_native.chat_url(), "https://claude.internal/v1/messages");
+        assert_eq!(
+            forced_native.chat_url(),
+            "https://claude.internal/v1/messages"
+        );
     }
 
     /// The UI's "auto" option, and any value we do not recognise, must fall

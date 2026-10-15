@@ -2,14 +2,16 @@
 
 import { Layers } from 'lucide-react';
 import type { AssetDossierProcesses } from '@/lib/api/types';
-import { SectionCard, EmptyCell } from './_shared';
+import { SectionCard, EmptyCell, PendingCell } from './_shared';
 
 interface ProcessesCardProps {
+  /** NAN-3291: the dossier is still reading; an empty section is not yet known to be empty. */
+  pending?: boolean;
   processes: AssetDossierProcesses;
   onOpenTree?: () => void;
 }
 
-export function ProcessesCard({ processes, onOpenTree }: ProcessesCardProps) {
+export function ProcessesCard({ processes, onOpenTree, pending = false }: ProcessesCardProps) {
   const { unique, rare, from_office, top, rare_list } = processes;
   const maxCount = Math.max(1, ...top.map((t) => t.count));
 
@@ -29,7 +31,7 @@ export function ProcessesCard({ processes, onOpenTree }: ProcessesCardProps) {
       icon={<Layers className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       {unique === 0 ? (
-        <EmptyCell>No process events for this entity in range</EmptyCell>
+        pending ? <PendingCell /> : <EmptyCell>No process events for this entity in range</EmptyCell>
       ) : (
         <div className="space-y-3">
           <div className="text-[11px] text-muted-foreground/70">

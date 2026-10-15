@@ -17,7 +17,7 @@ impl LogSourceService {
     pub(super) async fn resolve_dispatch_route_names(
         &self,
         parsers: &mut [Parser],
-    ) -> Result<(), LogSourceServiceError> {
+    ) -> Result<Vec<crate::parsers::WaitingParser>, LogSourceServiceError> {
         crate::parsers::resolve_parser_dispatch_routes(&self.pool, parsers)
             .await
             .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))
@@ -40,6 +40,35 @@ impl LogSourceService {
         self.resolve_dispatch_route_names(&mut parsers).await?;
         Ok(parsers)
     }
+
+    /// NAN-3765: why this enabled log source is not part of the rendered
+    /// Vector configuration (its source configuration is not deployed, or
+    /// there is no listener for its transport). `None` when it renders.
+    pub async fn deploy_pending_reason(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<String>, LogSourceServiceError> {
+        let mut parsers: Vec<Parser> = crate::parsers::list_effective_deployed_parsers(&self.pool)
+            .await
+            .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))?
+            .into_iter()
+            .filter(|p| p.id == id)
+            .collect();
+        let waiting = self.resolve_dispatch_route_names(&mut parsers).await?;
+        Ok(waiting.into_iter().next().map(|w| w.reason))
+    }
+
+    /// [`Self::effective_deployed_parsers`] plus the parsers it held back
+    /// because their upstream is not part of the set (NAN-3765).
+    pub(super) async fn effective_deployed_parsers_with_waiting(
+        &self,
+    ) -> Result<(Vec<Parser>, Vec<crate::parsers::WaitingParser>), LogSourceServiceError> {
+        let mut parsers = crate::parsers::list_effective_deployed_parsers(&self.pool)
+            .await
+            .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))?;
+        let waiting = self.resolve_dispatch_route_names(&mut parsers).await?;
+        Ok((parsers, waiting))
+    }
 }
 
 // ============================================================================
@@ -53,4 +82,3 @@ pub(super) fn truncate(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len])
     }
 }
-

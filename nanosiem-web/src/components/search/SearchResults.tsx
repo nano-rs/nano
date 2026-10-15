@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { CompletenessWatermark } from './CompletenessWatermark';
+import type { EventCompleteness } from '@/lib/api/types';
 import React, { useRef, useCallback, useEffect, useState, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
@@ -19,7 +21,6 @@ import {
   Minus,
   Copy,
   Check,
-  Loader2,
   Download,
   BookOpen,
   GitBranch,
@@ -29,9 +30,15 @@ import {
   Rows3,
   ExternalLink,
   Group as GroupIcon,
+  ScanSearch,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { cn } from '@/lib/utils';
+import { enrichTypeFor, openEnrich } from '@/components/threat-intel/enrich-event';
+import { useEnrichEnabled } from '@/components/threat-intel/use-threat-intel';
+import { formatCellValue } from '@/lib/format-cell-value';
+import { searchCsvCell as escapeCSV } from '@/lib/search-csv';
 import { EventInspectorPanel } from './EventInspectorPanel';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -51,7 +58,7 @@ import { formatUTCShort, formatCompactNumber } from '@/lib/date-utils';
 import type { TreeNode, TreeConfig } from './TreeVisualization';
 
 // Heavy visualization components — lazy-loaded since only one renders at a time
-const TreeVisualization = lazy(() => import('./TreeVisualization').then(m => ({ default: m.TreeVisualization })));
+const TreeVisualization = lazy(() => import('./PagedTreeView').then(m => ({ default: m.PagedTreeView })));
 const PaginatedTable = lazy(() => import('./PaginatedTable').then(m => ({ default: m.PaginatedTable })));
 const TimechartView = lazy(() => import('./TimechartView').then(m => ({ default: m.TimechartView })));
 const RankedBarChart = lazy(() => import('./RankedBarChart').then(m => ({ default: m.RankedBarChart })));
@@ -100,16 +107,37 @@ function getDetailViewMode(): DetailViewMode {
 // spill — that's exactly what sharing prevents).
 
 import { extractKeywordsFromQuery, highlightText } from './keyword-highlight';
+import { buildEventRowLine } from './event-row-line';
 
 interface SearchResult {
   id: string;
   timestamp: Date;
   source: string;
   fields: Record<string, unknown>;
+  fullEvent?: boolean;
+}
+
+function eventField(fields: Record<string, unknown> | undefined, path: string): unknown {
+  if (!fields) return undefined;
+  if (Object.prototype.hasOwnProperty.call(fields, path)) return fields[path];
+  return path.split('.').reduce<unknown>((value, segment) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    return (value as Record<string, unknown>)[segment];
+  }, fields);
+}
+
+function eventFetchIdentity(event: SearchResult): { id?: string; source?: string } {
+  return {
+    id: (eventField(event.fields, 'metadata.uid') as string | undefined)
+      ?? (event.fields?.id as string | undefined),
+    source: (eventField(event.fields, 'metadata.log_source') as string | undefined)
+      ?? (event.fields?.source_type as string | undefined),
+  };
 }
 
 import type { DisplayType } from '@/lib/api/types';
 import { nplQuotedBody } from '@/lib/npl-quote';
+import { backgroundJobPhaseLabel, coldScanLabel, formatJobElapsed, hasMeasuredProgress, isColdScanProgress } from '@/lib/cold-scan-progress';
 // NAN-2209: the single regex-aware base-search extractor. SearchResults
 // previously carried a quote-only copy that split inside `field=/re|gex/`.
 import { getBaseSearch, buildGroupByQuery } from '@/lib/npl-pipeline';
@@ -121,8 +149,23 @@ function formatCacheAge(timestamp: number): string {
 }
 
 interface SearchResultsProps {
+  completeness?: EventCompleteness;
   results: SearchResult[];
   totalCount: number;
+  /**
+   * NAN-2550: false when `totalCount` is a proven lower bound rather than a
+   * total. Infinite scroll must keep loading in that case — the count no longer
+   * over-reports by one to signal "more exists". Defaults to `true`.
+   */
+  totalCountExact?: boolean;
+  /**
+   * NAN-2550 x NAN-2551: how many of `results` are live-tail arrivals prepended
+   * in front of the paged set. `totalCount` is summed the same way, so the
+   * `results.length < totalCount` bound is unaffected — but "the count is only
+   * a lower bound" is a statement about the PAGED set, so it must be evaluated
+   * against `results.length - prependedRowCount`.
+   */
+  prependedRowCount?: number;
   isSearching: boolean;
   hasSearched: boolean;
   /** @deprecated Use displayType instead */
@@ -137,10 +180,14 @@ interface SearchResultsProps {
   /** Replace the running query AND jump the time window in one search (retro entity drill-down). */
   onSetQueryWithTime?: (query: string, startIso: string, endIso: string) => void;
   onLoadMore: () => void;
+  onVisibleRowsChange?: (visibleEnd: number, visibleStart?: number) => void;
+  pagingComplete?: boolean;
   onDrilldown?: (filters: Record<string, unknown>) => void;
   // Pagination for tabular views
   currentPage?: number;
   pageSize?: number;
+  /** Absolute row offset represented by results[0] for durable artifact pages. */
+  resultRowOffset?: number;
   onPageChange?: (page: number) => void;
   onPageSizeChange?: (size: number) => void;
   // Notebook integration
@@ -165,10 +212,12 @@ interface SearchResultsProps {
   // Async job state
   asyncJobId?: string | null;
   asyncJobStatus?: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | null;
-  asyncJobProgress?: { rows_scanned: number; rows_total: number; percent: number; elapsed_ms: number } | null;
+  asyncJobProgress?: import('@/lib/api/types').SearchJobProgress | null;
   queuePosition?: number | null;
   estimatedWait?: number | null;
   onCancelAsyncJob?: () => void;
+  /** Open the existing Search Jobs manager for product-view escalations. */
+  onOpenJobs?: () => void;
   // SSE streaming state (results arriving incrementally)
   isStreamingResults?: boolean;
   // Cached results indicator
@@ -191,20 +240,15 @@ function flattenForCSV(obj: Record<string, unknown>, prefix = ''): Record<string
     } else if (typeof value === 'object' && !Array.isArray(value)) {
       Object.assign(result, flattenForCSV(value as Record<string, unknown>, fullKey));
     } else if (Array.isArray(value)) {
-      result[fullKey] = JSON.stringify(value);
+      // NAN-1466: comma-join a scalar array (a hash is `["abc123"]` on the
+      // wire) rather than emit a JSON blob that then needs its own quotes
+      // escaped inside the CSV cell's quotes.
+      result[fullKey] = formatCellValue(value);
     } else {
       result[fullKey] = String(value);
     }
   }
   return result;
-}
-
-// Escape CSV value (handle commas, quotes, newlines)
-function escapeCSV(value: string): string {
-  if (value.includes(',') || value.includes('"') || value.includes('\n') || value.includes('\r')) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
 }
 
 // Export results to CSV
@@ -280,6 +324,24 @@ type FieldType = 'ip' | 'hostname' | 'user' | 'hash' | 'domain' | 'process' | 'u
 // Detect field type based on field name
 function getFieldType(fieldName: string): FieldType {
   const lower = fieldName.toLowerCase();
+  // NAN-2361: these rules were written for FLAT UDM names, but OCSF fields are
+  // dotted paths. `src_endpoint.hostname` contains no `_host`, so it fell all
+  // the way through to `generic` and lost every host action; likewise
+  // `actor.process.name` for process actions. `useSchemaEntityMap` only rescues
+  // ENTITY resolution (asset view / notebook), not the action gating below, so
+  // an OCSF tenant simply saw fewer actions than a UDM one.
+  //
+  // Classify the LEAF segment first and fall back to the whole name. Additive:
+  // a flat UDM name is its own leaf, so every existing verdict is unchanged.
+  const leaf = lower.includes('.') ? lower.slice(lower.lastIndexOf('.') + 1) : lower;
+  if (leaf !== lower) {
+    const leafType = classifyFieldName(leaf);
+    if (leafType !== 'generic') return leafType;
+  }
+  return classifyFieldName(lower);
+}
+
+function classifyFieldName(lower: string): FieldType {
 
   // IDs are generic - no special actions (process_id, parent_process_id, session_id, etc.)
   if (lower.endsWith('_id') || lower === 'id' || lower.endsWith('_guid')) return 'generic';
@@ -343,10 +405,15 @@ const ASSET_VIEW_ENTITY_TYPES = new Set(['ip', 'host', 'user']);
 // entity type to its canonical field and pass `field=<canonical>` so the backend
 // fast-path resolves identity via the profile-aware `udm_column_sql` (works in
 // OCSF). Matches `| lateral` and the retired EntityPage. NAN-1452.
-const ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
+const UDM_ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
   ip: 'src_ip',
   host: 'src_host',
   user: 'user',
+};
+const OCSF_ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
+  ip: 'src_endpoint.ip',
+  host: 'src_endpoint.hostname',
+  user: 'actor.user.name',
 };
 
 // Fallback window for the asset-view drilldown when there's no event timestamp
@@ -360,6 +427,31 @@ const ASSET_VIEW_TIME_PRESET = 'Last 4 hours';
 // Centering keeps the asset view populated around the event the analyst clicked
 // instead of an empty now-anchored window. NAN-1451.
 const ASSET_VIEW_EVENT_HALF_WINDOW_MS = 3 * 60 * 60 * 1000;
+
+// NAN-3220: a click that ends a text selection must not act like a click.
+// Analysts drag, double-click or triple-click raw event text to copy values,
+// and the browser fires `click` at the end of each of those gestures.
+const DRAG_THRESHOLD_PX = 4;
+let lastPointerDown: { x: number; y: number } | null = null;
+
+function recordPointerDown(e: React.MouseEvent) {
+  lastPointerDown = { x: e.clientX, y: e.clientY };
+}
+
+/** True when this click finished a selection gesture rather than a plain click. */
+function isTextSelectionGesture(e: React.MouseEvent): boolean {
+  // Keyboard activation (Enter/Space on a button) reports detail 0.
+  if (e.detail === 0) return false;
+  // The second and third clicks of a double/triple click select a word/line.
+  if (e.detail > 1) return true;
+  if (lastPointerDown) {
+    const dx = Math.abs(e.clientX - lastPointerDown.x);
+    const dy = Math.abs(e.clientY - lastPointerDown.y);
+    if (dx > DRAG_THRESHOLD_PX || dy > DRAG_THRESHOLD_PX) return true;
+  }
+  const selection = typeof window !== 'undefined' ? window.getSelection() : null;
+  return !!selection && !selection.isCollapsed && selection.toString().length > 0;
+}
 
 // NAN-955: exported so StatsView (sibling component) can reuse the same
 // popover on aggregated GROUP BY cells. Same affordances (Add to filter /
@@ -392,6 +484,9 @@ export function FieldValueMenu({
       ? JSON.stringify(value)
       : String(value);
   const fieldType = getFieldType(fieldName);
+  // On-demand threat-intel enrichment for external IPs, hashes, domains and URLs.
+  const threatIntel = useEnrichEnabled();
+  const enrichType = threatIntel ? enrichTypeFor(fieldType === 'generic' ? null : fieldType, stringValue) : null;
   const entityType = resolveEntityType(fieldName);
   const canOpenAssetView =
     !!entityType &&
@@ -619,17 +714,30 @@ export function FieldValueMenu({
 
   return (
     <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+      {/* NAN-3220: Radix opens a trigger on pointerdown and cancels it, which
+          blocks text selection. The trigger is a zero-width anchor that only
+          positions the menu; the visible value opens it on a plain click, so a
+          drag or double-click selects the text instead. */}
       <DropdownMenuTrigger asChild>
-        <span
-          className={`cursor-pointer hover:underline ${className}`}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setMenuOpen(true);
-          }}
-        >
-          {highlightKeywords.length > 0 ? highlightText(displayValue, highlightKeywords) : displayValue}
-        </span>
+        <span tabIndex={-1} className="inline-block w-0 overflow-hidden align-baseline" />
       </DropdownMenuTrigger>
+      <span
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        data-stop-row-toggle
+        className={`cursor-pointer hover:underline ${className}`}
+        onMouseDown={recordPointerDown}
+        onClick={(e) => {
+          if (isTextSelectionGesture(e)) return;
+          setMenuOpen(true);
+        }}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenuOpen(true);
+        }}
+      >
+        {highlightKeywords.length > 0 ? highlightText(displayValue, highlightKeywords) : displayValue}
+      </span>
       <DropdownMenuContent align="start" className="min-w-[200px] p-1">
         <DropdownMenuLabel className="px-2 py-1 text-[11px] tracking-normal normal-case text-muted-foreground font-normal break-all">
           {fieldName} ={' '}
@@ -685,7 +793,10 @@ export function FieldValueMenu({
             onClick={() => {
               // Filter on the canonical identifier field, not the clicked OCSF
               // field, so `| asset` can resolve the identifier (NAN-1452).
-              const assetField = ENTITY_TYPE_TO_ASSET_FIELD[entityType ?? ''] ?? fieldName;
+              const fieldMap = schemaFields?.schema === 'ocsf'
+                ? OCSF_ENTITY_TYPE_TO_ASSET_FIELD
+                : UDM_ENTITY_TYPE_TO_ASSET_FIELD;
+              const assetField = fieldMap[entityType ?? ''] ?? fieldName;
               const params = new URLSearchParams({
                 q: `${assetField}="${escapeValue(stringValue)}" | asset field=${assetField}`,
                 run: 'true',
@@ -706,6 +817,17 @@ export function FieldValueMenu({
           >
             <ExternalLink className="w-[13px] h-[13px]" />
             <span>Open asset view</span>
+          </DropdownMenuItem>
+        )}
+
+        {enrichType && (
+          <DropdownMenuItem
+            data-enrich-action
+            onClick={() => openEnrich({ artifact: stringValue, artifactType: enrichType, origin: 'analyst' })}
+            className="gap-1.5 px-2 py-1 text-[12px]"
+          >
+            <ScanSearch className="w-[13px] h-[13px]" />
+            <span>Enrich</span>
           </DropdownMenuItem>
         )}
 
@@ -772,8 +894,11 @@ function extractEntitiesFromResults(
 }
 
 export function SearchResults({
+  completeness,
   results,
   totalCount,
+  totalCountExact = true,
+  prependedRowCount = 0,
   isSearching,
   hasSearched,
   isAggregateQuery,
@@ -785,9 +910,12 @@ export function SearchResults({
   onSetQuery,
   onSetQueryWithTime,
   onLoadMore,
+  onVisibleRowsChange,
+  pagingComplete,
   onDrilldown,
   currentPage,
   pageSize,
+  resultRowOffset,
   onPageChange,
   onPageSizeChange,
   notebookActive,
@@ -805,6 +933,7 @@ export function SearchResults({
   queuePosition,
   estimatedWait,
   onCancelAsyncJob,
+  onOpenJobs,
   isStreamingResults: _isStreamingResults,
   cachedAt,
   onRefreshCache,
@@ -877,6 +1006,11 @@ export function SearchResults({
   // sourceType (NAN-1032) lets the backend use the (source_type, timestamp, ...) PK
   // for a tight range read on S3-backed historical partitions.
   const sharedPrefetchLog = React.useCallback((id: string, logId?: string, timestamp?: Date, sourceType?: string) => {
+    const event = results.find(event => event.id === id);
+    if (event?.fullEvent) {
+      setSharedFullLogData(prev => prev.has(id) ? prev : new Map(prev).set(id, event.fields));
+      return;
+    }
     if (!onFetchLog || !logId || !timestamp || sharedFullLogDataRef.current.has(id) || sharedLoadingLogsRef.current.has(id)) return;
     setSharedLoadingLogs(prev => new Set(prev).add(id));
     onFetchLog(logId, timestamp, sourceType)
@@ -895,13 +1029,14 @@ export function SearchResults({
           return next;
         });
       });
-  }, [onFetchLog]);
+  }, [onFetchLog, results]);
 
   const handleSelectEvent = React.useCallback((event: SearchResult, index: number) => {
     setSelectedEvent(event);
     setSelectedEventIndex(index);
     // Trigger full data fetch for the selected event
-    sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp, event.fields?.source_type as string | undefined);
+    const fetchIdentity = eventFetchIdentity(event);
+    sharedPrefetchLog(event.id, fetchIdentity.id, event.timestamp, fetchIdentity.source);
   }, [sharedPrefetchLog]);
 
   const handleCloseInspector = React.useCallback(() => {
@@ -916,7 +1051,8 @@ export function SearchResults({
       const event = results[newIndex];
       setSelectedEvent(event);
       setSelectedEventIndex(newIndex);
-      sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp, event.fields?.source_type as string | undefined);
+      const fetchIdentity = eventFetchIdentity(event);
+      sharedPrefetchLog(event.id, fetchIdentity.id, event.timestamp, fetchIdentity.source);
     }
   }, [selectedEventIndex, results, sharedPrefetchLog]);
 
@@ -1003,6 +1139,7 @@ export function SearchResults({
         {!embeddedHeaderView && (
         <div className="py-2 px-3 border-b border-border flex flex-wrap items-center gap-1.5 font-mono text-[10.5px] tracking-[0.12em] uppercase text-foreground/70 font-semibold">
           <span className="mr-1">Results</span>
+          <CompletenessWatermark completeness={completeness} />
           {fieldsCollapsed && onExpandFields && (
             <button
               onClick={onExpandFields}
@@ -1077,6 +1214,7 @@ export function SearchResults({
                 </Tooltip>
               </TooltipProvider>
             )}
+            {/* Client-side display toggles (localStorage) — no backend, every profile. */}
             {effectiveDisplayType === 'events' && (
               <Popover>
                 <PopoverTrigger asChild>
@@ -1217,7 +1355,7 @@ export function SearchResults({
             ? 'flex flex-col min-h-0 overflow-hidden'
             : 'p-3 space-y-0 overflow-x-auto md:overflow-x-hidden',
         )}>
-          {((isSearching || asyncJobId) && results.length === 0) ? (
+          {((isSearching || (asyncJobId && asyncJobStatus !== 'failed' && asyncJobStatus !== 'cancelled')) && results.length === 0) ? (
             // Loading state while searching (includes async job progress and queue status)
             <div className="text-center py-16 bg-muted/50 rounded-xl border border-border">
               {asyncJobStatus === 'queued' ? (
@@ -1239,11 +1377,15 @@ export function SearchResults({
                 </>
               ) : (
                 <>
-                  <Loader2 className="w-12 h-12 text-primary/50 mx-auto mb-3 animate-spin" />
+                  <LoadingIcon className="w-12 h-12 text-primary/50 mx-auto mb-3" />
                   <p className="text-foreground text-base font-medium">Processing query...</p>
                   <p className="text-muted-foreground text-sm mt-2">
-                    {asyncJobProgress ? (
-                      asyncJobProgress.rows_total > 0 ? (
+                    {asyncJobId && !hasMeasuredProgress(asyncJobProgress) && !isColdScanProgress(asyncJobProgress) ? (
+                      <>{backgroundJobPhaseLabel(asyncJobProgress)}</>
+                    ) : asyncJobProgress ? (
+                      isColdScanProgress(asyncJobProgress) ? (
+                        <span className="font-mono tabular-nums">{coldScanLabel(asyncJobProgress)}</span>
+                      ) : asyncJobProgress.rows_total > 0 ? (
                         <>{formatCompactNumber(asyncJobProgress.rows_scanned)} of {formatCompactNumber(asyncJobProgress.rows_total)} rows scanned</>
                       ) : (
                         <>Scanning rows...</>
@@ -1254,7 +1396,23 @@ export function SearchResults({
                       <>Starting search...</>
                     )}
                   </p>
-                  {asyncJobProgress && (
+                  {asyncJobId && asyncJobProgress && !hasMeasuredProgress(asyncJobProgress) && (
+                    <p className="mt-3 text-xs text-muted-foreground font-mono tabular-nums" data-testid="async-job-elapsed">
+                      {formatJobElapsed(asyncJobProgress.elapsed_ms)} elapsed
+                    </p>
+                  )}
+                  {/* NAN-3883: a long search keeps running as a job; nothing to re-run. */}
+                  {asyncJobId && (
+                    <p className="text-xs text-muted-foreground/80 mt-3 max-w-sm mx-auto leading-relaxed" data-testid="async-job-background-note">
+                      Running as a background job. Results appear here when it finishes. You can leave this page; reopen it from{' '}
+                      {onOpenJobs ? (
+                        <button type="button" onClick={onOpenJobs} className="underline underline-offset-2 hover:text-foreground">Running jobs</button>
+                      ) : (
+                        <>Running jobs</>
+                      )}.
+                    </p>
+                  )}
+                  {asyncJobProgress && (!asyncJobId || hasMeasuredProgress(asyncJobProgress)) && (
                     <div className="mt-4 flex flex-col items-center gap-2">
                       <div className="w-64 h-2 bg-muted rounded-full overflow-hidden">
                         <div
@@ -1294,10 +1452,11 @@ export function SearchResults({
               query={query}
             />
           ) : (
-            <Suspense fallback={<div className="flex items-center justify-center py-12"><Loader2 className="w-5 h-5 animate-spin text-muted-foreground" /></div>}>
+            <Suspense fallback={<div className="flex items-center justify-center py-12"><LoadingIcon className="w-5 h-5 text-muted-foreground" /></div>}>
             {effectiveDisplayType === 'tree' || results[0]?.fields?._display_type === 'tree' ? (
             // Tree visualization mode
             <TreeVisualization
+              marker={results[0]?.fields ?? {}}
               nodes={(results[0]?.fields?._tree_nodes as TreeNode[]) || []}
               config={(results[0]?.fields?._tree_config as TreeConfig) || { parent_field: '', child_field: '', label_field: '' }}
               onFilter={(field, value) => {
@@ -1382,6 +1541,7 @@ export function SearchResults({
               prevalenceFilter={assetPrevalenceFilter}
               timeRange={timeRange}
               onFetchLog={onFetchLog}
+              onOpenJobs={onOpenJobs}
             />
           ) : effectiveDisplayType === 'cloud' || results[0]?.fields?._display_type === 'cloud' ? (
             // Cloud: overview (NAN-394) when no principal is scoped, otherwise
@@ -1399,15 +1559,20 @@ export function SearchResults({
                 onExpandFields={onExpandFields}
                 onAddToQuery={onAddToQuery}
                 onSetQuery={onSetQuery}
+                initialDossier={(results[0]?.fields?._cloud_durable_dossier as import('@/lib/api/types').CloudDossierResponse | null) ?? null}
+                onOpenJobs={onOpenJobs}
               />
             ) : (
               <CloudOverviewView
                 timeRange={timeRange}
                 query={executedQuery ?? query}
+                account={(results[0]?.fields?._cloud_account as string | null) ?? null}
+                initialOverview={(results[0]?.fields?._cloud_durable_overview as import('@/lib/api/types').CloudOverviewResponse | null) ?? null}
                 fieldsCount={fieldsCollapsed ? fieldsCount : undefined}
                 onExpandFields={onExpandFields}
                 onAddToQuery={onAddToQuery}
                 onSetQuery={onSetQuery}
+                onOpenJobs={onOpenJobs}
               />
             )
           ) : effectiveDisplayType === 'lateral' || results[0]?.fields?._display_type === 'lateral' ? (
@@ -1434,6 +1599,7 @@ export function SearchResults({
               onSetQuery={onSetQuery}
               onSetQueryWithTime={onSetQueryWithTime}
               onAddToQuery={onAddToQuery}
+              onOpenJobs={onOpenJobs}
             />
           ) : effectiveDisplayType === 'baseline' || results[0]?.fields?._display_type === 'baseline' ? (
             // Entity baseline for `… | baseline` (NAN-1868/1873). Unlike the marker
@@ -1504,6 +1670,7 @@ export function SearchResults({
               totalCount={totalCount}
               currentPage={currentPage ?? 0}
               pageSize={pageSize ?? 50}
+              resultRowOffset={resultRowOffset}
               onPageChange={onPageChange}
               onPageSizeChange={onPageSizeChange}
               onDrilldown={onDrilldown}
@@ -1524,8 +1691,12 @@ export function SearchResults({
               notebookActive={notebookActive}
               onAddToNotebook={onAddToNotebook}
               totalCount={totalCount}
+              totalCountExact={totalCountExact}
+              prependedRowCount={prependedRowCount}
               isSearching={isSearching}
               onLoadMore={onLoadMore}
+              onVisibleRowsChange={onVisibleRowsChange}
+              pagingComplete={pagingComplete}
               onFetchLog={onFetchLog}
               selectedEventId={selectedEvent?.id}
               onSelectEvent={handleSelectEvent}
@@ -1657,30 +1828,6 @@ function formatValue(value: unknown): string {
   return String(value);
 }
 
-/**
- * Build a compact JSON line from a STRUCTURED result row that has no `message`
- * field (OTLP spans/metrics). Uses only the row's REAL ingested fields — internal
- * `_*` markers, `id`, and `timestamp` (already shown) are excluded. Nothing is
- * stored or fabricated; this is the same record the Fields tab lists, rendered
- * where the raw `message` line would go so the event stream isn't blank for
- * spans/metrics. Returns null if there's nothing to show. `pretty` produces the
- * indented form for the inspector; the compact form is for the row line.
- */
-function synthesizeStructuredLine(
-  fields: Record<string, unknown> | undefined,
-  pretty = false,
-): string | null {
-  if (!fields) return null;
-  const obj: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(fields)) {
-    if (k.startsWith('_') || k === 'id' || k === 'timestamp') continue;
-    if (v == null || v === '') continue;
-    obj[k] = v;
-  }
-  if (Object.keys(obj).length === 0) return null;
-  return pretty ? JSON.stringify(obj, null, 2) : JSON.stringify(obj);
-}
-
 function RawView({
   results,
   onAddToQuery,
@@ -1691,8 +1838,12 @@ function RawView({
   notebookActive,
   onAddToNotebook,
   totalCount,
+  totalCountExact = true,
+  prependedRowCount = 0,
   isSearching,
   onLoadMore,
+  onVisibleRowsChange,
+  pagingComplete,
   onFetchLog: _onFetchLog,
   selectedEventId,
   onSelectEvent,
@@ -1710,8 +1861,12 @@ function RawView({
   notebookActive?: boolean;
   onAddToNotebook?: (entityType: string, value: string) => void;
   totalCount?: number;
+  totalCountExact?: boolean;
+  prependedRowCount?: number;
   isSearching?: boolean;
   onLoadMore?: () => void;
+  onVisibleRowsChange?: (visibleEnd: number, visibleStart?: number) => void;
+  pagingComplete?: boolean;
   onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
   /** Currently selected event ID (for inspector panel highlighting) */
   selectedEventId?: string;
@@ -1731,6 +1886,9 @@ function RawView({
   const [expandedFields, setExpandedFields] = React.useState<Set<string>>(new Set());
   const [expandedDetailValues, setExpandedDetailValues] = React.useState<Set<string>>(new Set());
   const [copiedInlineField, setCopiedInlineField] = React.useState<string | null>(null);
+  // Set when Enter/Space on a row chevron already toggled, so the browser's
+  // synthesized click for that key press does not toggle it back.
+  const keyActivatedRef = useRef(false);
   const isInlineMode = detailViewMode === 'inline';
 
   // Active schema profile drives the per-event "key fields" summary chips
@@ -1748,12 +1906,15 @@ function RawView({
   const keyChipSpecs: Array<{ label: string; field: string; accent?: boolean }> =
     schemaFields?.schema === 'ocsf'
       ? [
-          { label: 'sourcetype', field: 'source_type' },
+          { label: 'log source', field: 'metadata.log_source' },
+          { label: 'host', field: 'device.hostname' },
           { label: 'src_ip', field: 'src_endpoint.ip' },
+          { label: 'src_host', field: 'src_endpoint.hostname' },
           { label: 'dest_ip', field: 'dst_endpoint.ip' },
+          { label: 'dest_host', field: 'dst_endpoint.hostname' },
           { label: 'user', field: 'user.name' },
           { label: 'status', field: 'status' },
-          { label: 'activity', field: 'activity', accent: true },
+          { label: 'activity', field: 'activity_name', accent: true },
         ]
       : [
           { label: 'sourcetype', field: 'source_type' },
@@ -1774,9 +1935,14 @@ function RawView({
   const loadingLogsRef = useRef(loadingLogsSet);
   loadingLogsRef.current = loadingLogsSet;
 
-  // Expand message - one way only, can't collapse
-  const expandMessage = (id: string) => {
-    setExpandedMessages(prev => new Set(prev).add(id));
+  // Expand / collapse a long message (the "…" / "less" control).
+  const toggleMessage = (id: string) => {
+    setExpandedMessages(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
 
   // Prefetch: delegate to shared parent handler.
@@ -1828,12 +1994,12 @@ function RawView({
 
   // Handle row click - select event for inspector panel or toggle inline expand
   const handleRowClick = useCallback((result: SearchResult, index: number) => {
-    const sourceType = result.fields?.source_type as string | undefined;
+    const fetchIdentity = eventFetchIdentity(result);
     if (isInlineMode) {
-      toggleFields(result.id, result.fields?.id as string, result.timestamp, sourceType);
+      toggleFields(result.id, fetchIdentity.id, result.timestamp, fetchIdentity.source);
     } else if (onSelectEvent) {
       onSelectEvent(result, index);
-      prefetchLog(result.id, result.fields?.id as string, result.timestamp, sourceType);
+      prefetchLog(result.id, fetchIdentity.id, result.timestamp, fetchIdentity.source);
     }
   }, [isInlineMode, toggleFields, onSelectEvent, prefetchLog]);
 
@@ -1886,9 +2052,19 @@ function RawView({
   });
 
   const virtualItems = virtualizer.getVirtualItems();
+  const visibleEnd = (virtualizer.range?.endIndex ?? -1) + 1;
+  // NAN-2551: the range start tells the page whether the analyst is still at
+  // the top, which is what decides between prepending live-tail arrivals and
+  // holding them behind an "N new" chip.
+  const visibleStart = virtualizer.range?.startIndex ?? 0;
+  useEffect(() => {
+    onVisibleRowsChange?.(visibleEnd, visibleStart);
+  }, [visibleEnd, visibleStart, results.length, onVisibleRowsChange]);
 
-  // Infinite scroll - load more when near bottom
-  const hasMore = totalCount !== undefined && results.length < totalCount;
+  // Explicit page exhaustion takes precedence over the independent count companion.
+  const pagedRowCount = Math.max(0, results.length - prependedRowCount);
+  const hasMore = pagingComplete !== undefined ? !pagingComplete : totalCount !== undefined
+    && (results.length < totalCount || (!totalCountExact && pagedRowCount > 0));
   useEffect(() => {
     if (!hasMore || isSearching || !onLoadMore) return;
 
@@ -1933,7 +2109,7 @@ function RawView({
           const raw =
             spec.field === 'event_type'
               ? (displayFields?.event_type ?? displayFields?.action)
-              : displayFields?.[spec.field];
+              : eventField(displayFields, spec.field);
           return {
             label: spec.label,
             apiField: spec.field,
@@ -1942,6 +2118,7 @@ function RawView({
           };
         });
         const hasKeyFields = keyChips.some((c) => c.value !== undefined && c.value !== null && c.value !== '');
+        const isRowOpen = isInlineMode ? expandedFields.has(result.id) : selectedEventId === result.id;
 
         return (
           <div
@@ -1958,57 +2135,101 @@ function RawView({
           >
             <div
               className={`border-b border-border cursor-pointer transition-colors ${
-                (isInlineMode ? expandedFields.has(result.id) : selectedEventId === result.id)
+                isRowOpen
                   ? 'border-l-2 border-l-primary'
                   : 'hover:bg-muted/20'
               }`}
-              onMouseEnter={() => handleRowMouseEnter(result.id, result.fields?.id as string, result.timestamp, result.fields?.source_type as string | undefined)}
+              onMouseEnter={() => {
+                const fetchIdentity = eventFetchIdentity(result);
+                handleRowMouseEnter(result.id, fetchIdentity.id, result.timestamp, fetchIdentity.source);
+              }}
               onMouseLeave={handleRowMouseLeave}
+              onMouseDown={recordPointerDown}
               onClick={(e) => {
                 // Don't toggle/select the row when the click came from an
                 // interactive child — the message "…" expander, value chips
                 // (Radix menu triggers), copy buttons, etc. Those handle their
                 // own action; without this guard they also fall through to the
                 // row and (in inline mode) toggle the parsed-field breakdown.
-                if ((e.target as HTMLElement).closest('button, a, input, [aria-haspopup], [role="menuitem"], [data-stop-row-toggle]')) {
+                // NAN-3220: the raw text body and the expanded field table
+                // ([data-row-text]) never toggle, so they stay selectable; the
+                // timestamp/gutter toggles only on a plain click, never at the
+                // end of a drag, double-click or while text is selected.
+                if ((e.target as HTMLElement).closest('button, a, input, [aria-haspopup], [role="menuitem"], [data-stop-row-toggle], [data-row-text]')) {
                   return;
                 }
+                if (isTextSelectionGesture(e)) return;
                 handleRowClick(result, virtualRow.index);
               }}
             >
             <div className="px-3 py-2">
                 {/* Timestamp row on top — expand chevron + date */}
                 <div className="text-muted-foreground text-[11.5px] font-mono mb-1 flex items-center gap-1">
-                  <ChevronRight className={`w-3 h-3 flex-shrink-0 transition-transform ${(isInlineMode ? expandedFields.has(result.id) : selectedEventId === result.id) ? 'rotate-90 text-primary' : ''}`} />
+                  <button
+                    type="button"
+                    aria-expanded={isRowOpen}
+                    aria-label={isInlineMode
+                      ? (isRowOpen ? 'Collapse event' : 'Expand event')
+                      : 'Open event in inspector'}
+                    className="-ml-0.5 inline-flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-foreground/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      // Enter/Space were already handled on keydown.
+                      if (e.detail === 0 && keyActivatedRef.current) {
+                        keyActivatedRef.current = false;
+                        return;
+                      }
+                      handleRowClick(result, virtualRow.index);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key !== 'Enter' && e.key !== ' ') return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.repeat) return;
+                      keyActivatedRef.current = true;
+                      handleRowClick(result, virtualRow.index);
+                    }}
+                    onKeyUp={(e) => {
+                      // Space's synthesized click (if any) runs right after keyup;
+                      // clear the flag once it has passed so it can never swallow
+                      // a later assistive-tech click.
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        setTimeout(() => { keyActivatedRef.current = false; }, 0);
+                      }
+                    }}
+                    onBlur={() => { keyActivatedRef.current = false; }}
+                  >
+                    <ChevronRight className={`w-3 h-3 transition-transform ${isRowOpen ? 'rotate-90 text-primary' : ''}`} />
+                  </button>
                   <span>{formatUTCShort(result.timestamp)}</span>
                 </div>
                 {/* Event body below */}
                 {(() => {
-                  const messageValue = displayFields?.message;
-                  // OTLP/structured rows (spans/metrics) carry no `message`, so
-                  // synthesize a JSON line from the row's REAL fields rather than
-                  // leaving the event body blank (NAN-1568). Frontend-only.
-                  const displayValue = messageValue
-                    ? formatValue(messageValue)
-                    : synthesizeStructuredLine(displayFields);
+                  // Every source renders the same JSON line; `message` is a
+                  // normal key inside it, never promoted to the row (NAN-3010).
+                  const displayValue = buildEventRowLine(displayFields);
                   if (!displayValue) return null;
                   const isMessageExpanded = expandedMessages.has(result.id);
-                  const shouldTruncate = !isMessageExpanded && displayValue.length > 500;
+                  const isLongMessage = displayValue.length > 500;
+                  const shouldTruncate = !isMessageExpanded && isLongMessage;
                   const messageDisplayValue = shouldTruncate
                     ? displayValue.substring(0, 500)
                     : displayValue;
                   return (
-                    <div className="text-foreground font-mono text-[12px] leading-[1.55] break-words whitespace-pre-wrap">
+                    <div data-row-text className="text-foreground font-mono text-[12px] leading-[1.55] break-words whitespace-pre-wrap cursor-text select-text">
                       {highlightKeywords.length > 0
                         ? highlightText(messageDisplayValue, highlightKeywords)
                         : messageDisplayValue}
-                      {shouldTruncate && (
+                      {isLongMessage && (
                         <button
-                          onClick={(e) => { e.stopPropagation(); expandMessage(result.id); }}
-                          className="ml-1 inline-flex items-center px-1 rounded-sm align-baseline whitespace-nowrap text-muted-foreground hover:text-primary hover:bg-foreground/10 cursor-pointer"
-                          title="Expand"
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); toggleMessage(result.id); }}
+                          className="ml-1 inline-flex items-center px-1 rounded-sm align-baseline whitespace-nowrap text-muted-foreground hover:text-primary hover:bg-foreground/10 cursor-pointer select-none"
+                          aria-expanded={isMessageExpanded}
+                          aria-label={isMessageExpanded ? 'Collapse message' : 'Expand message'}
+                          title={isMessageExpanded ? 'Collapse' : 'Expand'}
                         >
-                          …
+                          {isMessageExpanded ? 'less' : '…'}
                         </button>
                       )}
                     </div>
@@ -2071,7 +2292,7 @@ function RawView({
                   // Same grouped categories / colors / tooltips as the Event Inspector.
                   const categories = buildFieldCategories(flattenedFields, knownSchemaFields, isOcsf);
                   return (
-                    <div className="mt-3 pt-3 border-t border-border/30 -mx-3 px-3 md:mx-0 md:px-0">
+                    <div data-row-text className="mt-3 pt-3 border-t border-border/30 -mx-3 px-3 md:mx-0 md:px-0 cursor-auto">
                       {isLoadingFullData && !fullData ? (
                         <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
                           <div className="w-3 h-3 border-2 border-muted-foreground/30 border-t-muted-foreground rounded-full animate-spin" />
@@ -2187,17 +2408,17 @@ function RawView({
           <div className="flex items-center justify-center py-4 text-sm text-muted-foreground">
             {isSearching ? (
               <>
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                <LoadingIcon className="w-4 h-4 mr-2" />
                 Loading more...
               </>
             ) : (
-              <span>Scroll for more ({results.length} of {totalCount})</span>
+              <span>Scroll for more ({results.length} of {totalCount}{totalCountExact ? '' : '+'})</span>
             )}
           </div>
         )}
         {!hasMore && results.length > 0 && totalCount !== undefined && (
           <div className="flex items-center justify-center py-4 text-sm text-muted-foreground">
-            All {totalCount} results loaded
+            All {pagedRowCount} results loaded
           </div>
         )}
       </div>

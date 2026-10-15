@@ -9,14 +9,19 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use tracing::error;
 
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::Query as ParsedQuery;
 use nanosiem_core::auth::permissions;
-use nanosiem_core::prevalence::{PrevalenceScatterData, PrevalenceSettings, TimeWindow};
-use nanosiem_core::query::{ClickHouseSqlGenerator, SearchExpr};
+use nanosiem_core::prevalence::{
+    ArtifactExplorerItem, PrevalenceData, PrevalenceScatterData, PrevalenceScatterPoint,
+    PrevalenceLookup, PrevalenceSettings, TimeWindow,
+};
+use nanosiem_core::query::{ClickHouseSqlGenerator, PrettyPrint, SearchExpr};
+use nanosiem_core::{SearchRequest, TimeRangeInput};
 
 use super::settings::prevalence_settings_error_to_response;
 use nanosiem_core::prevalence::{ArtifactDetailResponse, ArtifactExplorerResponse, ArtifactType};
@@ -57,22 +62,53 @@ pub async fn get_rare_artifacts(
         )
     })?;
 
-    let dual_pool = state.dual_pool();
-
-    // Create service with database config for hot-reload support (Requirement 8.5)
-    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
-        dual_pool.table_names(),
-        &state.pool,
-    )
-    .await;
-
     let time_window = parse_time_window(params.window.as_deref());
     let artifact_type = parse_artifact_type(params.artifact_type.as_deref());
     // Default 25, max 100
     let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
         .resolved_capped_floored_offset(25, 100);
     let scope = effective_artifact_scope(&auth);
+
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        return match client
+            .explore(
+                artifact_type,
+                time_window,
+                Some("rare"),
+                None,
+                None,
+                limit,
+                offset,
+                None,
+                &scope,
+            )
+            .await
+        {
+            Ok(response) => Ok(Json(ArtifactListResponse {
+                artifacts: response
+                    .artifacts
+                    .into_iter()
+                    .map(explorer_item_into_prevalence)
+                    .collect(),
+                total: response.total,
+                limit: response.limit,
+                offset: response.offset,
+                has_more: response.has_more,
+            })),
+            Err(error) => {
+                error!("Lake rare-artifact lookup failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
+    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
+        dual_pool.clickhouse().clone(),
+        dual_pool.table_names(),
+        &state.pool,
+    )
+    .await;
 
     // Fetch one extra to determine if there are more results
     match prevalence_service
@@ -132,16 +168,6 @@ pub async fn get_new_artifacts(
         )
     })?;
 
-    let dual_pool = state.dual_pool();
-
-    // Create service with database config for hot-reload support (Requirement 8.5)
-    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
-        dual_pool.table_names(),
-        &state.pool,
-    )
-    .await;
-
     // Parse since parameter (default to 24 hours ago)
     let since = params
         .since
@@ -155,6 +181,67 @@ pub async fn get_new_artifacts(
     let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
         .resolved_capped_floored_offset(25, 100);
     let scope = effective_artifact_scope(&auth);
+
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        let age = Utc::now().signed_duration_since(since);
+        // Allow a small request/dispatch skew at the preset boundaries. The
+        // default is computed as `now - 24h` above, so a second `now()` here
+        // will naturally be a few microseconds older than exactly 24 hours.
+        let boundary_skew = Duration::minutes(5);
+        let window = if age <= Duration::hours(1) + boundary_skew {
+            TimeWindow::OneHour
+        } else if age <= Duration::hours(24) + boundary_skew {
+            TimeWindow::TwentyFourHours
+        } else if age <= Duration::days(7) + boundary_skew {
+            TimeWindow::SevenDays
+        } else if age <= Duration::days(30) + boundary_skew {
+            TimeWindow::ThirtyDays
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "lake prevalence new-artifact discovery is bounded to the last 30 days"
+                    .to_string(),
+            ));
+        };
+        return match client
+            .explore(
+                artifact_type,
+                window,
+                None,
+                Some(since),
+                None,
+                limit,
+                offset,
+                None,
+                &scope,
+            )
+            .await
+        {
+            Ok(response) => Ok(Json(ArtifactListResponse {
+                artifacts: response
+                    .artifacts
+                    .into_iter()
+                    .map(explorer_item_into_prevalence)
+                    .collect(),
+                total: response.total,
+                limit: response.limit,
+                offset: response.offset,
+                has_more: response.has_more,
+            })),
+            Err(error) => {
+                error!("Lake new-artifact lookup failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
+    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
+        dual_pool.clickhouse().clone(),
+        dual_pool.table_names(),
+        &state.pool,
+    )
+    .await;
 
     // Fetch extra to determine if there are more results
     match prevalence_service
@@ -213,26 +300,75 @@ pub async fn get_artifact_explorer(
         )
     })?;
 
-    let dual_pool = state.dual_pool();
-
-    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
-        dual_pool.table_names(),
-        &state.pool,
-    )
-    .await;
-
     let time_window = parse_time_window(params.window.as_deref());
     let artifact_type = parse_artifact_type(params.artifact_type.as_deref());
     let risk_filter = params.risk_level.as_deref();
     let search = params.search.as_deref();
     let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
         .resolved_capped_floored_offset(50, 200);
+    let cursor = match (
+        params.cursor_last_seen.as_ref(),
+        params.cursor_kind.as_ref(),
+        params.cursor_artifact.as_ref(),
+    ) {
+        (None, None, None) => None,
+        (Some(last_seen), Some(kind), Some(artifact)) => {
+            Some(nanosiem_core::prevalence::PrevalenceExplorerCursor {
+                last_seen: last_seen.clone(),
+                kind: kind.clone(),
+                artifact: artifact.clone(),
+            })
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "prevalence explorer cursor components must be supplied together".to_string(),
+            ));
+        }
+    };
+    let offset = if cursor.is_some() { 0 } else { offset };
+    let artifact_scope = effective_artifact_scope(&auth);
+
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        return match client
+            .explore(
+                artifact_type,
+                time_window,
+                risk_filter,
+                None,
+                search,
+                limit,
+                offset,
+                cursor.as_ref(),
+                &artifact_scope,
+            )
+            .await
+        {
+            Ok(mut response) => {
+                // Geo/ASN remains PostgreSQL-backed and storage-neutral. Raw-log
+                // subtitle/detail enrichment is intentionally not allowed to
+                // fall through to ClickHouse in primary lake mode.
+                enrich_ips_with_geo(&state, &mut response.artifacts).await;
+                Ok(Json(response))
+            }
+            Err(error) => {
+                error!("Lake prevalence explorer failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
+    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
+        dual_pool.clickhouse().clone(),
+        dual_pool.table_names(),
+        &state.pool,
+    )
+    .await;
     let logs_table = dual_pool
         .table_names()
         .read(nanosiem_core::schema::active_logs_table());
     let viewer_scope = auth.effective_viewer_scope();
-    let artifact_scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_artifact_explorer(
@@ -363,27 +499,48 @@ pub async fn get_artifact_detail(
         )
     })?;
 
-    let dual_pool = state.dual_pool();
-
-    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
-        dual_pool.clickhouse().clone(),
-        dual_pool.table_names(),
-        &state.pool,
-    )
-    .await;
-
     let time_window = parse_time_window(params.window.as_deref());
-    let artifact_type = ArtifactType::detect(&params.artifact);
-    let logs_table = dual_pool
-        .table_names()
-        .read(nanosiem_core::schema::active_logs_table());
-
     // NAN-1801 (P3 side-doors): the detail drilldown runs seven raw-logs
     // sub-queries (including a `source_type` GROUP BY — a direct existence
     // leak) that bypass the nPL scope injector. Pass the caller's effective
     // source scope (per-source RBAC ∪ audit unless `audit:view`) so denied
     // sources contribute nothing. Empty scope is byte-identical.
     let scope = auth.effective_viewer_scope();
+
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        return match client
+            .detail(&params.artifact, time_window, scope.deny_set())
+            .await
+        {
+            Ok(mut response) => {
+                // Both optional enrichments are storage-neutral in lake mode:
+                // geo/ASN remains in PostgreSQL metadata, while IOC verdicts
+                // come from the same tenant-pinned immutable snapshot used by
+                // ingest decoration. There is no ClickHouse fallback.
+                populate_lake_threat_intel(&mut response).await;
+                if response.artifact_type.is_ip() {
+                    populate_ip_geo_detail(&state, &mut response).await;
+                }
+                Ok(Json(response))
+            }
+            Err(error) => {
+                error!("Lake prevalence artifact detail failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
+    let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
+        dual_pool.clickhouse().clone(),
+        dual_pool.table_names(),
+        &state.pool,
+    )
+    .await;
+    let artifact_type = ArtifactType::detect(&params.artifact);
+    let logs_table = dual_pool
+        .table_names()
+        .read(nanosiem_core::schema::active_logs_table());
 
     match prevalence_service
         .get_artifact_detail(
@@ -434,7 +591,6 @@ async fn populate_threat_intel(
     response: &mut nanosiem_core::prevalence::ArtifactDetailResponse,
 ) {
     use nanosiem_core::enrichment::ioc::lookup_ioc_all_sources;
-    use nanosiem_core::prevalence::ArtifactThreatIntelEntry;
 
     let ch = state.dual_pool.clickhouse();
     let hits = match lookup_ioc_all_sources(ch, &response.artifact).await {
@@ -444,6 +600,34 @@ async fn populate_threat_intel(
             return;
         }
     };
+
+    attach_threat_intel_hits(response, hits);
+}
+
+async fn populate_lake_threat_intel(
+    response: &mut nanosiem_core::prevalence::ArtifactDetailResponse,
+) {
+    use nanosiem_core::enrichment::ioc::LakeIocClient;
+
+    let client = match LakeIocClient::from_env() {
+        Ok(Some(client)) => client,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, "immutable IOC lookup is misconfigured");
+            return;
+        }
+    };
+    match client.lookup(&response.artifact).await {
+        Ok(hits) => attach_threat_intel_hits(response, hits),
+        Err(error) => tracing::debug!(%error, "immutable IOC lookup failed (best-effort)"),
+    }
+}
+
+fn attach_threat_intel_hits(
+    response: &mut nanosiem_core::prevalence::ArtifactDetailResponse,
+    hits: Vec<nanosiem_core::enrichment::ioc::IocLookupResult>,
+) {
+    use nanosiem_core::prevalence::ArtifactThreatIntelEntry;
 
     for hit in hits {
         // Build a compact human-readable verdict line; the raw fields ride
@@ -550,18 +734,49 @@ pub async fn get_scatter_data(
         ));
     }
 
-    let dual_pool = state.dual_pool();
+    let time_window = parse_time_window(request.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
-    // Create service with database config for hot-reload support (Requirement 8.5)
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        let mut artifacts = Vec::with_capacity(total_artifacts);
+        artifacts.extend(request.artifacts.hashes.iter().cloned());
+        artifacts.extend(request.artifacts.domains.iter().cloned());
+        artifacts.extend(request.artifacts.ips.iter().cloned());
+        return match client.lookup(&artifacts, time_window, &scope).await {
+            Ok(data) => {
+                let mut response = PrevalenceScatterData {
+                    hash_points: Vec::new(),
+                    domain_points: Vec::new(),
+                    ip_points: Vec::new(),
+                    rarity_threshold: client.rarity_threshold().await,
+                };
+                for item in data {
+                    let artifact_type = item.artifact_type;
+                    let point = PrevalenceScatterPoint::from(item);
+                    if artifact_type.is_hash() {
+                        response.hash_points.push(point);
+                    } else if artifact_type.is_domain() {
+                        response.domain_points.push(point);
+                    } else if artifact_type.is_ip() {
+                        response.ip_points.push(point);
+                    }
+                }
+                Ok(Json(response))
+            }
+            Err(error) => {
+                error!("Lake prevalence scatter lookup failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
     .await;
-
-    let time_window = parse_time_window(request.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_scatter_data(
@@ -578,6 +793,20 @@ pub async fn get_scatter_data(
             error!("Failed to get scatter plot data: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
         }
+    }
+}
+
+fn explorer_item_into_prevalence(item: ArtifactExplorerItem) -> PrevalenceData {
+    PrevalenceData {
+        artifact: item.artifact,
+        artifact_type: item.artifact_type,
+        host_count: item.host_count,
+        host_count_saturated: item.host_count_saturated,
+        total_occurrences: item.total_occurrences,
+        first_seen: item.first_seen,
+        last_seen: item.last_seen,
+        is_rare: item.is_rare,
+        prevalence_score: item.prevalence_score,
     }
 }
 
@@ -627,6 +856,93 @@ pub async fn get_query_artifacts(
             "Missing permission: search:execute".to_string(),
         )
     })?;
+
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        let parsed_query = nanosiem_core::parse_query(&request.query)
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("Invalid query: {error}")))?;
+        let search_expr = extract_search_expr(&parsed_query).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid query: no search expression to filter on".to_string(),
+            )
+        })?;
+        let query = format!(
+            "{} | table file.hashes.value, process.file.hashes.value, actor.process.file.hashes.value, dst_endpoint.hostname, url.hostname, http_request.url.hostname, query.hostname",
+            search_expr.pretty_print()
+        );
+        let (start, end) = parse_time_range_value(&request.time_range)
+            .unwrap_or_else(|| (Utc::now() - Duration::hours(24), Utc::now()));
+        let search_request = SearchRequest {
+            query,
+            time_range: TimeRangeInput::new(start, end),
+            limit: Some(MAX_BULK_ARTIFACTS + 1),
+            offset: None,
+            include_sql: Some(false),
+            skip_histogram: true,
+            skip_field_stats: true,
+            use_cache: true,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: Some("logs".to_string()),
+        };
+        let viewer_scope = auth.effective_viewer_scope();
+        let search_response = state
+            .search_service
+            .search(search_request, &viewer_scope)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        let mut hashes = BTreeSet::new();
+        let mut domains = BTreeSet::new();
+        for row in &search_response.results {
+            for field in [
+                "file.hashes.value",
+                "process.file.hashes.value",
+                "actor.process.file.hashes.value",
+            ] {
+                collect_typed_artifacts(row.get(field), true, &mut hashes);
+            }
+            for field in [
+                "dst_endpoint.hostname",
+                "url.hostname",
+                "http_request.url.hostname",
+                "query.hostname",
+            ] {
+                collect_typed_artifacts(row.get(field), false, &mut domains);
+            }
+        }
+        // NAN-3226: names under an internal suffix (built-in or tenant) are
+        // internal hosts, never domain prevalence artifacts.
+        let internal = nanosiem_core::internal_domains::dedicated_cached(&state.pool).await;
+        domains.retain(|domain| !internal.is_internal(domain));
+        let mut artifacts_truncated = search_response.results.len() > MAX_BULK_ARTIFACTS;
+        let hash_results = cap_artifacts(hashes, &mut artifacts_truncated);
+        let domain_results = cap_artifacts(domains, &mut artifacts_truncated);
+        let prevalence_scope = effective_artifact_scope(&auth);
+        let hash_data = client
+            .lookup(
+                &hash_results,
+                TimeWindow::ThirtyDays,
+                &prevalence_scope,
+            )
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+        let domain_data = client
+            .lookup(
+                &domain_results,
+                TimeWindow::ThirtyDays,
+                &prevalence_scope,
+            )
+            .await
+            .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()))?;
+        return Ok(Json(QueryArtifactsResponse {
+            hash_points: hash_data.into_iter().map(prevalence_point).collect(),
+            domain_points: domain_data.into_iter().map(prevalence_point).collect(),
+            rarity_threshold: client.rarity_threshold().await,
+            artifacts_truncated,
+        }));
+    }
 
     let dual_pool = state.dual_pool();
 
@@ -740,7 +1056,7 @@ pub async fn get_query_artifacts(
     // `udm_column_sql` returns `None` when the schema has no column for that UDM
     // concept — we then skip that artifact class rather than emit an
     // unknown-column 500.
-    let profile = state.config.schema_profile();
+    let profile = state.schema_profile();
     let logs_table = dual_pool
         .table_names()
         .read(profile.table_name().trim_start_matches("nanosiem."));
@@ -781,6 +1097,14 @@ pub async fn get_query_artifacts(
     } else {
         Vec::new()
     };
+
+    // NAN-3226: drop names under a tenant internal suffix (the SQL above only
+    // excludes the two historical built-ins).
+    let internal = nanosiem_core::internal_domains::dedicated_cached(&state.pool).await;
+    let domain_results: Vec<String> = domain_results
+        .into_iter()
+        .filter(|domain| !internal.is_internal(domain))
+        .collect();
 
     // Truncate each class down to the bulk cap before scoring; flag if either
     // class overflowed so the client knows the result is partial.
@@ -852,6 +1176,73 @@ pub async fn get_query_artifacts(
         rarity_threshold,
         artifacts_truncated,
     }))
+}
+
+fn collect_typed_artifacts(
+    value: Option<&serde_json::Value>,
+    require_hash: bool,
+    output: &mut BTreeSet<String>,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_typed_artifacts(Some(value), require_hash, output);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_typed_artifacts(Some(value), require_hash, output);
+            }
+        }
+        serde_json::Value::String(raw) => {
+            let raw = raw.trim();
+            if raw.starts_with('[') {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                    collect_typed_artifacts(Some(&parsed), require_hash, output);
+                    return;
+                }
+            }
+            let normalized = raw.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return;
+            }
+            let artifact_type = ArtifactType::detect(&normalized);
+            let accepted = if require_hash {
+                artifact_type.is_hash()
+                    && matches!(artifact_type, ArtifactType::HashMd5 | ArtifactType::HashSha256)
+            } else {
+                artifact_type.is_domain()
+                    && !normalized.ends_with(".internal")
+                    && !normalized.ends_with(".local")
+            };
+            if accepted {
+                output.insert(normalized);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cap_artifacts(values: BTreeSet<String>, truncated: &mut bool) -> Vec<String> {
+    if values.len() > MAX_BULK_ARTIFACTS {
+        *truncated = true;
+    }
+    values.into_iter().take(MAX_BULK_ARTIFACTS).collect()
+}
+
+fn prevalence_point(data: PrevalenceData) -> ArtifactPoint {
+    ArtifactPoint {
+        artifact: data.artifact,
+        host_count: data.host_count,
+        first_seen: data.first_seen.to_rfc3339(),
+        last_seen: data.last_seen.to_rfc3339(),
+        total_occurrences: data.total_occurrences,
+        is_rare: data.is_rare,
+        prevalence_score: data.prevalence_score,
+    }
 }
 
 /// Extract the root SearchExpr from a ParsedQuery, handling piped queries

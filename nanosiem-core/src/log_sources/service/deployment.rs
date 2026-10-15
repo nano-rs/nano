@@ -14,6 +14,17 @@ use crate::log_sources::types::{
 impl LogSourceService {
     /// Deploy a log source to Vector
     pub async fn deploy(&self, id: Uuid) -> Result<DeploymentResult, LogSourceServiceError> {
+        self.deploy_with_ocsf_samples(id, &[]).await
+    }
+
+    /// Deploy with optional representative samples for a new OCSF parser
+    /// generation. Existing callers can use [`Self::deploy`] and reuse a
+    /// current hash-bound receipt.
+    pub async fn deploy_with_ocsf_samples(
+        &self,
+        id: Uuid,
+        ocsf_samples: &[String],
+    ) -> Result<DeploymentResult, LogSourceServiceError> {
         // NAN-2297: stage → validate → backup → promote → reload is ONE critical
         // section against a single on-disk staging directory. Held for the whole
         // sequence, not per-step, so a concurrent deploy cannot clean this one's
@@ -26,6 +37,12 @@ impl LogSourceService {
         let _deploy_guard = self.vector_config.lock_deploys().await;
 
         let log_source = self.repository().find_by_id(id).await?;
+
+        // This is deliberately inside the same deploy critical section and
+        // before any enable/stage/promote side effect. It also protects direct
+        // API callers; the Add Feed browser gate is only an early UX check.
+        self.enforce_ocsf_deploy_attestation(&log_source, ocsf_samples)
+            .await?;
 
         tracing::info!(
             "Starting deployment for log source '{}' ({})",
@@ -104,7 +121,37 @@ impl LogSourceService {
         // NAN-928: the helper also resolves dispatch source-config route names
         // so the generator wires fetch-source parsers to the user's
         // source-config route instead of creating a parser-owned Vector source.
-        let parsers = self.effective_deployed_parsers().await?;
+        let (parsers, waiting) = self.effective_deployed_parsers_with_waiting().await?;
+
+        // NAN-3765: this log source cannot be rendered yet (its source
+        // configuration is not deployed, or there is no listener for its
+        // transport). It stays enabled and is rendered by the next
+        // publication once its upstream exists; say so instead of reporting
+        // a deploy that renders nothing for it.
+        if let Some(held) = waiting.iter().find(|w| w.parser_id == id) {
+            let error_msg = format!(
+                "Log source '{}' is enabled but not deployed yet: {}",
+                log_source.name, held.reason
+            );
+            let _ = self
+                .repository()
+                .record_deployment(
+                    id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    None,
+                )
+                .await;
+            return Ok(DeploymentResult {
+                success: false,
+                log_source_id: id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: None,
+                deployment_id: None,
+            });
+        }
 
         // Stage and validate
         if let Err(e) = self.vector_config.stage_parsers(&parsers).await {
@@ -330,13 +377,7 @@ impl LogSourceService {
             };
             let _ = self
                 .repository()
-                .record_deployment(
-                    id,
-                    action.as_str(),
-                    status.as_str(),
-                    Some(&error_msg),
-                    None,
-                )
+                .record_deployment(id, action.as_str(), status.as_str(), Some(&error_msg), None)
                 .await;
 
             let message = if failure.rolled_back {
@@ -391,11 +432,62 @@ impl LogSourceService {
             id
         );
 
+        // NAN-2370: deploy renders the ACTIVE VERSION, not the working copy
+        // (see versioning.rs `list_enabled_for_deploy`), but it validates the
+        // working copy — so editing `parser_vrl` and deploying returns
+        // `success: true, "deployed successfully"` while the OLD VRL stays on
+        // disk. Observed live: three consecutive successful deploys left a
+        // superseded parser running, and the only way to notice was to grep the
+        // rendered TOML inside the Vector container.
+        //
+        // Deploy still ships the active version (refusing would break the
+        // create → deploy path, where a source with no versions legitimately
+        // falls back to the working copy). But it must not CLAIM to have
+        // shipped an edit it did not: say so in the message that callers,
+        // scripts and the UI all surface.
+        let draft_notice = match self.get_draft_status(id).await {
+            Ok(status) if status.has_draft_changes && status.active_version_number.is_some() => {
+                Some(format!(
+                    " — WARNING: unpublished draft changes were NOT deployed; \
+                     Vector is running active version {}. Publish to make the edit live.",
+                    status
+                        .active_version_number
+                        .map(|number| number.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ))
+            }
+            Ok(_) => None,
+            // Never fail a successful deploy over the advisory check; a missing
+            // notice is a smaller harm than a spurious failure, but it must be
+            // visible in logs rather than swallowed.
+            Err(error) => {
+                tracing::warn!(
+                    "could not determine draft status for log source {id} after deploy, \
+                     so the response cannot report whether an unpublished edit was skipped: {error}"
+                );
+                None
+            }
+        };
+
+        if let Some(ref notice) = draft_notice {
+            tracing::warn!(
+                "log source '{}' ({}) deployed its ACTIVE version while unpublished draft \
+                 changes remain in the working copy{}",
+                log_source.name,
+                id,
+                notice
+            );
+        }
+
         Ok(DeploymentResult {
             success: true,
             log_source_id: id,
             action: DeploymentAction::Deploy.as_str().to_string(),
-            message: format!("Log source '{}' deployed successfully", log_source.name),
+            message: format!(
+                "Log source '{}' deployed successfully{}",
+                log_source.name,
+                draft_notice.unwrap_or_default()
+            ),
             validation_result: None,
             deployment_id: Some(deployment_id),
         })
@@ -493,6 +585,10 @@ impl LogSourceService {
 
     /// Deploy all enabled log sources (using active version VRL)
     pub async fn deploy_all(&self) -> Result<(), LogSourceServiceError> {
+        for log_source in self.repository().list_enabled().await? {
+            self.enforce_ocsf_deploy_attestation(&log_source, &[])
+                .await?;
+        }
         let parsers = self.effective_deployed_parsers().await?;
 
         self.vector_config.deploy_and_reload(&parsers).await?;

@@ -3,18 +3,20 @@
 import { Globe } from 'lucide-react';
 import type { AssetDossierNetwork } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
-import { SectionCard, EmptyCell, StatCell } from './_shared';
+import { SectionCard, EmptyCell, PendingCell, StatCell } from './_shared';
 import { formatBytes, formatCompact } from '../helpers';
 
 export type NetworkStatKey = 'UNIQ_DSTS' | 'NEW_DOMAINS' | 'RARE_COUNTRY' | 'LATERAL';
 
 interface NetworkCardProps {
+  /** NAN-3291: the dossier is still reading; an empty section is not yet known to be empty. */
+  pending?: boolean;
   network: AssetDossierNetwork;
   onOpenTopDestinations?: () => void;
   onStatClick?: (key: NetworkStatKey, ctx?: { country?: string }) => void;
 }
 
-export function NetworkCard({ network, onOpenTopDestinations, onStatClick }: NetworkCardProps) {
+export function NetworkCard({ network, onOpenTopDestinations, onStatClick, pending = false }: NetworkCardProps) {
   const { total_conns, bytes_in, bytes_out, unique_dsts, new_domains, top_dsts, rare_countries } =
     network;
 
@@ -26,7 +28,7 @@ export function NetworkCard({ network, onOpenTopDestinations, onStatClick }: Net
         onActionClick={onOpenTopDestinations}
         icon={<Globe className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
-        <EmptyCell>No network events for this entity in range</EmptyCell>
+        {pending ? <PendingCell /> : <EmptyCell>No network events for this entity in range</EmptyCell>}
       </SectionCard>
     );
   }

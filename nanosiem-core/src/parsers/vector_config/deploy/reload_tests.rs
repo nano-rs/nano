@@ -112,7 +112,10 @@ async fn the_first_ever_reload_registers_against_an_absent_counter() {
         .mount(&server)
         .await;
 
-    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
+    assert_eq!(
+        probe_for(&server).await_ack(before).await,
+        ReloadAck::Accepted
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +137,10 @@ async fn a_moved_success_counter_is_an_acceptance() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
+    assert_eq!(
+        probe_for(&server).await_ack(before).await,
+        ReloadAck::Accepted
+    );
 }
 
 /// Vector answering, staying up, and doing nothing is the exact failure this
@@ -175,7 +181,10 @@ async fn a_moved_failure_counter_is_a_rejection() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Rejected);
+    assert_eq!(
+        probe_for(&server).await_ack(before).await,
+        ReloadAck::Rejected
+    );
 }
 
 /// One promotion writes many files, and a `--watch-config` Vector can fire on a
@@ -202,7 +211,10 @@ async fn a_success_after_a_rejection_wins() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
+    assert_eq!(
+        probe_for(&server).await_ack(before).await,
+        ReloadAck::Accepted
+    );
 }
 
 /// Vector ages out counters that stop being updated, and these tick once per
@@ -228,7 +240,10 @@ async fn a_counter_that_aged_out_and_restarted_is_still_an_acceptance() {
         reloads: 3.0,
         config_failures: 0.0,
     };
-    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
+    assert_eq!(
+        probe_for(&server).await_ack(before).await,
+        ReloadAck::Accepted
+    );
 }
 
 /// The other half: a series that is alive and unchanged is NOT an
@@ -277,7 +292,10 @@ async fn acknowledgement_is_awaited_across_scrape_lag() {
         reloads: 4.0,
         config_failures: 0.0,
     };
-    assert_eq!(probe_for(&server).await_ack(before).await, ReloadAck::Accepted);
+    assert_eq!(
+        probe_for(&server).await_ack(before).await,
+        ReloadAck::Accepted
+    );
 }
 
 /// An endpoint that stops answering mid-window (Vector died applying the
@@ -326,7 +344,8 @@ async fn an_unreachable_endpoint_reads_as_no_evidence() {
 #[test]
 fn nothing_delivered_and_nothing_observed_is_a_failure() {
     let outcome = reload_outcome(None, ReloadAck::Unverifiable);
-    let err = outcome.expect_err("a reload with no delivery and no evidence must not report success");
+    let err =
+        outcome.expect_err("a reload with no delivery and no evidence must not report success");
     assert!(
         matches!(err, VectorConfigError::ReloadFailed(_)),
         "expected ReloadFailed, got {err:?}"

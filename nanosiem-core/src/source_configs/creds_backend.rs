@@ -125,9 +125,7 @@ impl CredsBackend {
     pub async fn remove_creds(&self, key: &str) -> Result<(), CredsBackendError> {
         match self {
             Self::Disk { config_dir, .. } => {
-                let path = config_dir
-                    .join("sources")
-                    .join(format!("configs__{}", key));
+                let path = config_dir.join("sources").join(format!("configs__{}", key));
                 if tokio::fs::try_exists(&path).await.unwrap_or(false) {
                     tokio::fs::remove_file(&path).await?;
                 }
@@ -177,7 +175,11 @@ mod tests {
         assert_eq!(path, "/etc/vector/sources/configs__gcp_my_source.creds");
         // File on disk lives at the same flat layout under config_dir/sources/.
         let on_disk = tmp.path().join("sources/configs__gcp_my_source.creds");
-        assert!(on_disk.exists(), "expected creds file at {}", on_disk.display());
+        assert!(
+            on_disk.exists(),
+            "expected creds file at {}",
+            on_disk.display()
+        );
         assert_eq!(
             tokio::fs::read_to_string(&on_disk).await.unwrap(),
             "{\"k\":\"v\"}"

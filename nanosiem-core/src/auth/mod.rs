@@ -25,9 +25,18 @@ pub mod permissions;
 pub mod repository;
 pub mod route_policy;
 pub mod scope;
+/// NAN-3231: one-snapshot enterprise-shared Search admission.
+pub mod search_admission;
 pub mod service;
 pub mod session;
+pub mod session_cookies;
 pub mod source_scope_resolver;
+/// NAN-2361 wave 8: the explicit visibility a shared-lake read runs under
+/// (member deny set, detection runtime / runner, case-scoped evidence).
+pub mod source_visibility;
+pub mod tenant;
+pub mod tenant_auth_methods;
+pub mod tenant_oidc;
 pub mod token;
 pub mod types;
 pub mod user_status_cache;
@@ -52,6 +61,9 @@ pub use scope::*;
 pub use service::*;
 pub use session::*;
 pub use source_scope_resolver::*;
+pub use tenant::*;
+pub use tenant_auth_methods::*;
+pub use tenant_oidc::*;
 pub use token::*;
 pub use types::*;
 pub use user_status_cache::*;

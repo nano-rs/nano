@@ -24,7 +24,8 @@ import {
   type ChangeEvent,
   type ReactNode,
 } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
   ArrowRight,
@@ -39,6 +40,7 @@ import {
   Database,
   FileText,
   Globe,
+  Network,
   Info,
   Pencil,
   Play,
@@ -67,6 +69,24 @@ import type {
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { VrlEditor } from '@/components/editor/VrlEditor';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
+import type { TenantIngestEndpoint, TenantParserRollout } from '@/lib/api/types';
+import { RolloutStatus } from '@/components/parser-rollout/RolloutStrip';
+import { PARSER_ROLLOUTS_QUERY_KEY, latestRolloutFor, rolloutPollInterval } from '@/lib/parser-rollout';
+import {
+  INGEST_CREDENTIALS_QUERY_KEY,
+  INGEST_ENDPOINT_QUERY_KEY,
+  PROTOCOL_LABEL,
+  ADD_DATA_SOURCE_PARAM,
+  addDataSources,
+  preselectedAddDataSource,
+  type AddDataSource,
+} from '@/lib/add-data-sources';
+import { describeIngestCredentialError } from '@/lib/ingest-credential-errors';
+import { IngestEndpointCard } from '@/components/add-data/IngestEndpointCard';
+import { IssueCredentialPanel } from '@/components/add-data/IssueCredentialPanel';
+import { INGEST_CREDENTIALS_PATH } from '@/components/add-data/LogSourcesTabs';
+import { Checkbox } from '@/components/ui/checkbox';
 
 // ------------------------------------------------------------------
 // Constants — lifted verbatim from design-ref/shadcn/add-feed-view.jsx
@@ -181,7 +201,7 @@ function formatEventsCount(n: number | null | undefined): string | null {
 
 const SOURCE_ICON_FOR_TYPE = (type: string) => {
   if (type === 'http' || type === 'vector') return Globe;
-  if (type === 'aws_s3' || type === 'aws_sqs' || type === 'gcp_pubsub') return Cloud;
+  if (type === 'aws_s3' || type === 'aws_sqs' || type === 'gcp_pubsub' || type === 'azure_event_hubs') return Cloud;
   if (type === 'kafka') return Database;
   return Rss;
 };
@@ -191,9 +211,10 @@ const SOURCE_TYPE_LABEL: Record<string, string> = {
   kafka: 'Kafka',
   aws_s3: 'AWS S3',
   gcp_pubsub: 'GCP Pub/Sub',
-  splunk_hec: 'Splunk HEC',
+  splunk_hec: 'HEC',
   vector: 'Vector',
   aws_sqs: 'AWS SQS',
+  azure_event_hubs: 'Azure Event Hubs',
 };
 
 // ------------------------------------------------------------------
@@ -201,10 +222,29 @@ const SOURCE_TYPE_LABEL: Record<string, string> = {
 // ------------------------------------------------------------------
 type SourceConfigWithEvents = SourceConfiguration & { events_24h?: number | null };
 
+/** Hosted-shared Step 1: pick an enrolled source, or build a custom one (Step 2). */
+type SharedSourceMode = 'existing' | 'custom';
+/** Hosted-shared arrival: one token per source, or one collector token for many (NAN-2597). */
+type SharedArrivalMode = 'direct' | 'collector';
+
 export function AddFeed() {
-  useDocumentTitle('Add Feed');
+  // NAN-2593: hosted-shared tenants get the "Add data" branch of this wizard.
+  // Data arrives at the tenant's own ingest endpoint with a per-source
+  // credential, so Step 1 picks how data arrives and which source (instead of
+  // a source configuration), Step 3 skips routing rules and source configs,
+  // and a Step 4 issues the credential. Dedicated deployments are unchanged.
+  const shared = useSharedTenant();
+  useDocumentTitle(shared ? 'Add data' : 'Add Feed');
   const navigate = useNavigate();
   const { toast } = useToast();
+  const queryClient = useQueryClient();
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const strictOcsf = activeSchema?.schema === 'ocsf';
 
   // ------------ Step 1 state ------------
   const [feedId, setFeedId] = useState('');
@@ -218,6 +258,52 @@ export function AddFeed() {
   const [vendor, setVendor] = useState('');
   const [product, setProduct] = useState('');
   const [description, setDescription] = useState('');
+
+  // ------------ Shared (hosted) state — NAN-2593 ------------
+  const endpointQuery = useQuery({
+    queryKey: INGEST_ENDPOINT_QUERY_KEY,
+    queryFn: () => api.getIngestEndpoint(),
+    enabled: shared,
+    staleTime: 60 * 1000,
+  });
+  const registryQuery = useQuery({
+    queryKey: ['add-data', 'log-sources'],
+    queryFn: () => api.listLogSources(),
+    enabled: shared,
+    staleTime: 30 * 1000,
+  });
+  const addSources = useMemo(
+    () => addDataSources(endpointQuery.data, registryQuery.data),
+    [endpointQuery.data, registryQuery.data],
+  );
+  const [sharedModeChoice, setSharedMode] = useState<SharedSourceMode>('existing');
+  const [selectedSlug, setSelectedSlug] = useState('');
+  // NAN-2597: a collector token spans existing sources; custom sources are built (and rolled out) first.
+  const [arrivalChoice, setArrival] = useState<SharedArrivalMode>('direct');
+  // NAN-2617: collectors exist only once the tenant's Worker speaks ingress v2
+  // (`ingress_contract.collector_credentials`, derived per tenant by the API).
+  const collectorsEnabled = endpointQuery.data?.ingress_contract?.collector_credentials === true;
+  const arrival: SharedArrivalMode = collectorsEnabled ? arrivalChoice : 'direct';
+  const [selectedSlugs, setSelectedSlugs] = useState<string[]>([]);
+  const collectorArrival = shared && arrival === 'collector';
+  const sharedMode: SharedSourceMode = collectorArrival ? 'existing' : sharedModeChoice;
+  const collectorTargets = useMemo(
+    () => selectedSlugs.map((slug) => addSources.find((s) => s.slug === slug)).filter((s): s is AddDataSource => !!s),
+    [addSources, selectedSlugs],
+  );
+  const toggleSlug = useCallback(
+    (slug: string) => setSelectedSlugs((prev) => (prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug])),
+    [],
+  );
+  // The source the Issue step issues for: the picked source, or the custom
+  // source once Step 3 activated it.
+  const [issueSource, setIssueSource] = useState<AddDataSource | null>(null);
+  const [issueLogSourceId, setIssueLogSourceId] = useState<string | undefined>(undefined);
+  // NAN-2607: the parser rollout the custom source's activation filed.
+  const [sharedRollout, setSharedRollout] = useState<TenantParserRollout | null>(null);
+  const issueTarget: AddDataSource | null =
+    sharedMode === 'existing' ? addSources.find((s) => s.slug === selectedSlug) ?? null : issueSource;
+  const issueTargetLogSourceId = sharedMode === 'existing' ? issueTarget?.logSource?.id : issueLogSourceId;
 
   // ------------ Step 2 state ------------
   const [entryPath, setEntryPath] = useState<'paste' | 'existing' | 'manual'>('paste');
@@ -240,9 +326,10 @@ export function AddFeed() {
 
   // Per-sample test results (one entry per non-empty sample line).
   const [tests, setTests] = useState<Array<{ name: string; status: 'pass' | 'fail'; extracted: number; error?: string }>>([]);
+  const [testedInputKey, setTestedInputKey] = useState<string | null>(null);
   const [isTesting, setIsTesting] = useState(false);
 
-  // PIVT (AI tab) state — stable session id per page load.
+  // pivt (AI tab) state — stable session id per page load.
   const sessionIdRef = useRef<string>(`add-feed-${Date.now()}`);
   const [pivtMessage, setPivtMessage] = useState('');
   const [pivtPending, setPivtPending] = useState(false);
@@ -282,6 +369,25 @@ export function AddFeed() {
 
   // ------------ Cross-cutting state ------------
   const [activeStep, setActiveStep] = useState(1);
+
+  // NAN-2946: `?source=<slug>` (Log Source detail "Issue credential", Log
+  // Sources platform rows) preselects that source as a direct credential and
+  // opens the Issue step. Applied once, after the source list has loaded; an
+  // unknown slug leaves the wizard on Step 1.
+  const [searchParams] = useSearchParams();
+  const requestedSource = shared ? searchParams.get(ADD_DATA_SOURCE_PARAM) : null;
+  const deepLinkApplied = useRef(false);
+  useEffect(() => {
+    if (deepLinkApplied.current || !requestedSource) return;
+    if (endpointQuery.isLoading || registryQuery.isLoading) return;
+    deepLinkApplied.current = true;
+    const target = preselectedAddDataSource(addSources, requestedSource);
+    if (!target) return;
+    setArrival('direct');
+    setSharedMode('existing');
+    setSelectedSlug(target.slug);
+    setActiveStep(4);
+  }, [requestedSource, addSources, endpointQuery.isLoading, registryQuery.isLoading]);
   const [railCollapsed, setRailCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem(RAIL_COLLAPSED_KEY) === '1';
@@ -306,6 +412,11 @@ export function AddFeed() {
   const [existingRules, setExistingRules] = useState<RoutingRule[]>([]);
 
   useEffect(() => {
+    // Hosted-shared tenants have no source configurations (platform-managed).
+    if (shared) {
+      setLoadingConfigs(false);
+      return;
+    }
     let cancelled = false;
     const load = async () => {
       try {
@@ -327,7 +438,7 @@ export function AddFeed() {
     return () => {
       cancelled = true;
     };
-  }, [toast]);
+  }, [shared, toast]);
 
   // Fetch routing rules whenever the selected source config changes — used
   // for the "Existing routing targets" picker (NAN-522 step 4 behavior).
@@ -367,7 +478,8 @@ export function AddFeed() {
   const warnings = validation.diagnostics.filter((d) => d.severity === 'warn').length;
   const passingTests = tests.filter((t) => t.status === 'pass').length;
   const failingTests = tests.length - passingTests;
-  const testsRun = tests.length > 0;
+  const currentTestKey = `${strictOcsf ? 'ocsf' : 'udm'}\0${vrl}\0${sampleText}`;
+  const testsRun = tests.length > 0 && testedInputKey === currentTestKey;
 
   const sourceConfig = sourceConfigs.find((c) => c.id === sourceConfigId);
   const namespaceFull =
@@ -383,15 +495,18 @@ export function AddFeed() {
 
   const canDeploy =
     !!feedId &&
-    !!sourceConfigId &&
+    (shared || !!sourceConfigId) &&
     !!name &&
     errors === 0 &&
     (warnings === 0 || acceptWarnings) &&
-    (failingTests === 0 || entryPath === 'manual') &&
+    // OCSF deployment requires at least one sample that passed both stages:
+    // VRL first, then the schema contract. Expert mode cannot bypass it.
+    (!strictOcsf || (sampleCount > 0 && testsRun)) &&
+    (failingTests === 0 || (entryPath === 'manual' && !strictOcsf)) &&
     // Transport readiness can be soft-acknowledged like other warnings.
     // (If user overrides, they can deploy then enable/deploy the source
     // config separately — meloD concierge does the same defensive sequence.)
-    (reachability?.transportReady !== false || acceptWarnings) &&
+    (shared || reachability?.transportReady !== false || acceptWarnings) &&
     namespaceCheck?.valid !== false;
 
   // ------------ Validation runner ------------
@@ -449,14 +564,16 @@ export function AddFeed() {
     const samples = splitSamples(sampleText);
     if (!vrl.trim() || samples.length === 0) {
       setTests([]);
+      setTestedInputKey(null);
       return;
     }
+    const inputKey = currentTestKey;
     setIsTesting(true);
     try {
       const results = await Promise.all(
         samples.map(async (sample, i) => {
           try {
-            const r = await api.testLogSourceVrl(vrl, sample);
+            const r = await api.testLogSourceVrl(vrl, sample, undefined, strictOcsf);
             const extracted =
               r.extracted_field_count ??
               (r.output ? Object.keys(r.output).length : 0);
@@ -477,10 +594,11 @@ export function AddFeed() {
         }),
       );
       setTests(results);
+      setTestedInputKey(inputKey);
     } finally {
       setIsTesting(false);
     }
-  }, [sampleText, vrl]);
+  }, [currentTestKey, sampleText, strictOcsf, vrl]);
 
   // Run validate + tests automatically when VRL settles (small debounce).
   useEffect(() => {
@@ -524,7 +642,9 @@ export function AddFeed() {
         ...(sessionIdRef.current ? { session_id: sessionIdRef.current } : {}),
         log_source_type: feedId,
         sample_logs: samples,
-        message: `Generate a VRL parser for "${feedId}" logs from these ${samples.length} sample event(s). The .source_type field is ALREADY SET — do NOT modify it. Extract all useful fields into the UDM schema.`,
+        message: strictOcsf
+          ? `Generate a complete OCSF 1.9 VRL parser for "${feedId}" from these ${samples.length} sample event(s). Emit canonical OCSF fields at the event root, set metadata.log_source to "${feedId}", and place only source fields that have no OCSF mapping under unmapped.*. Do not emit .udm, .ext, source_type, or Nano serving aliases.`
+          : `Generate a VRL parser for "${feedId}" logs from these ${samples.length} sample event(s). The .source_type field is ALREADY SET — do NOT modify it. Extract all useful fields into the UDM schema.`,
       },
       (event: ParserProgressEvent) => {
         switch (event.type) {
@@ -550,7 +670,7 @@ export function AddFeed() {
             break;
           case 'udm_validation_result':
             setGenProgress(95);
-            setGenStatus('Finalizing · UDM validation…');
+            setGenStatus(strictOcsf ? 'Finalizing · OCSF 1.9 validation…' : 'Finalizing · UDM validation…');
             break;
           case 'retrying_with_feedback':
             setGenProgress(50);
@@ -583,7 +703,7 @@ export function AddFeed() {
         setGenStatus('Done');
       },
     );
-  }, [entryPath, feedId, sampleText, toast]);
+  }, [entryPath, feedId, sampleText, strictOcsf, toast]);
 
   // Cancel any in-flight stream on unmount.
   useEffect(() => {
@@ -592,7 +712,7 @@ export function AddFeed() {
     };
   }, []);
 
-  // ------------ PIVT edit-parser submit ------------
+  // ------------ pivt edit-parser submit ------------
   const sendPivtMessage = useCallback(
     async (message: string) => {
       if (!message.trim() || !vrl.trim()) {
@@ -653,7 +773,7 @@ export function AddFeed() {
   }, [activeStep, namespaceFull]);
 
   useEffect(() => {
-    if (activeStep !== 3 || !sourceConfigId || !feedId) return;
+    if (shared || activeStep !== 3 || !sourceConfigId || !feedId) return;
     let cancelled = false;
     (async () => {
       try {
@@ -686,7 +806,7 @@ export function AddFeed() {
     return () => {
       cancelled = true;
     };
-  }, [activeStep, sourceConfigId, feedId]);
+  }, [shared, activeStep, sourceConfigId, feedId]);
 
   // NAN-1920: await any in-flight auto-persist create and return the resulting
   // draft id (synchronously via ref). Callers use this to reuse the auto-saved
@@ -836,8 +956,77 @@ export function AddFeed() {
     return () => window.removeEventListener('beforeunload', handler);
   }, [draftId, feedId, name, vrl, sampleText]);
 
+  // ------------ Deploy (hosted-shared, NAN-2593) ------------
+  // No routing rule and no source configuration: the registry entry is
+  // created and activated, and the parser reaches the tenant's parser cell
+  // through the parser-bundle rollout (NAN-2607). The flow then continues to
+  // the Issue step; the credential can be requested at once and is issued
+  // when the rollout enrolls the slug.
+  const handleSharedDeploy = useCallback(async () => {
+    if (!canDeploy) return;
+    setDeploying(true);
+    try {
+      const payload = {
+        name,
+        description: description || undefined,
+        namespace: namespaceFull,
+        timezone,
+        source_type: 'routed',
+        parser_vrl: vrl,
+        category: category || undefined,
+        vendor: vendor || undefined,
+        product: product || undefined,
+        match_values: [feedId],
+      };
+      const existingId = await settleAutoPersist();
+      let createdId = existingId;
+      if (existingId) {
+        await api.updateLogSource(existingId, payload);
+      } else {
+        const created = await api.createLogSource(payload);
+        createdId = created.id;
+        draftIdRef.current = created.id;
+        setDraftId(created.id);
+      }
+      let rollout: TenantParserRollout | null = null;
+      if (createdId) {
+        // The wizard samples are stored with the published version and run
+        // through `vector test` in the sandboxed bundle build (NAN-2607).
+        const samples = splitSamples(sampleText);
+        const result = await api.deployLogSource(createdId, strictOcsf ? samples : undefined, samples);
+        rollout = result.rollout ?? null;
+      }
+      setSharedRollout(rollout);
+      if (rollout) void queryClient.invalidateQueries({ queryKey: PARSER_ROLLOUTS_QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: ['add-data', 'log-sources'] });
+      void queryClient.invalidateQueries({ queryKey: INGEST_ENDPOINT_QUERY_KEY });
+      const enrolled = addSources.find((s) => s.slug === feedId);
+      setIssueSource(enrolled ?? { slug: feedId, protocols: [], enrolled: false });
+      setIssueLogSourceId(createdId ?? undefined);
+      setActiveStep(4);
+      toast({
+        title: 'Source activated',
+        description: rollout
+          ? `${name} is rolling out to your parser cell. Issue its credential now; it is delivered once the source is enrolled.`
+          : `${name} is active. Issue its credential now.`,
+      });
+    } catch (err) {
+      toast({
+        title: 'Activation failed',
+        description: err instanceof Error ? err.message : 'Unknown error',
+        variant: 'destructive',
+      });
+    } finally {
+      setDeploying(false);
+    }
+  }, [addSources, canDeploy, category, description, feedId, name, namespaceFull, product, queryClient, sampleText, settleAutoPersist, strictOcsf, timezone, toast, vendor, vrl]);
+
   // ------------ Deploy ------------
   const handleDeploy = useCallback(async () => {
+    if (shared) {
+      await handleSharedDeploy();
+      return;
+    }
     if (!canDeploy || !sourceConfigId) return;
     setDeploying(true);
     try {
@@ -916,7 +1105,10 @@ export function AddFeed() {
       }
       if (createdId) {
         try {
-          await api.deployLogSource(createdId);
+          await api.deployLogSource(
+            createdId,
+            strictOcsf ? splitSamples(sampleText) : undefined,
+          );
         } catch (err) {
           toast({
             title: 'Log source deploy failed',
@@ -942,12 +1134,16 @@ export function AddFeed() {
     } finally {
       setDeploying(false);
     }
-  }, [canDeploy, category, description, feedId, name, namespaceFull, navigate, product, settleAutoPersist, sourceConfigId, timezone, toast, vendor, vrl]);
+  }, [canDeploy, category, description, feedId, handleSharedDeploy, name, namespaceFull, navigate, product, sampleText, settleAutoPersist, shared, sourceConfigId, strictOcsf, timezone, toast, vendor, vrl]);
 
   // ------------ Render ------------
   return (
     <div className="col-start-2 row-start-2 min-h-0 relative flex flex-col bg-background">
-      <AddFeedHero feedId={feedId} sourceConfig={sourceConfig} />
+      <AddFeedHero
+        feedId={collectorArrival ? `${selectedSlugs.length} sources` : shared && sharedMode === 'existing' ? selectedSlug : feedId}
+        sourceConfig={sourceConfig}
+        shared={shared ? { hostname: endpointQuery.data?.hostname } : undefined}
+      />
 
       <div
         className={cn(
@@ -960,6 +1156,18 @@ export function AddFeed() {
           onJump={setActiveStep}
           collapsed={railCollapsed}
           onToggleCollapsed={toggleRail}
+          shared={
+            shared
+              ? {
+                  mode: sharedMode,
+                  slug: collectorArrival
+                    ? selectedSlugs.length > 0 ? `${selectedSlugs.length} sources` : ''
+                    : sharedMode === 'existing' ? selectedSlug : feedId,
+                  issueReady: collectorArrival ? collectorTargets.length > 0 : !!issueTarget,
+                  hostname: endpointQuery.data?.hostname,
+                }
+              : undefined
+          }
           state={{
             feedId,
             sourceConfigId,
@@ -979,7 +1187,25 @@ export function AddFeed() {
             <Step1Identify
               expanded={activeStep === 1}
               onActivate={() => setActiveStep(1)}
-              onContinue={() => setActiveStep(2)}
+              onContinue={() => setActiveStep(shared && sharedMode === 'existing' ? 4 : 2)}
+              shared={
+                shared
+                  ? {
+                      endpoint: endpointQuery.data,
+                      endpointError: endpointQuery.error,
+                      endpointLoading: endpointQuery.isLoading || registryQuery.isLoading,
+                      sources: addSources,
+                      mode: sharedMode,
+                      setMode: setSharedMode,
+                      selectedSlug,
+                      setSelectedSlug,
+                      arrival,
+                      setArrival,
+                      selectedSlugs,
+                      toggleSlug,
+                    }
+                  : undefined
+              }
               feedId={feedId}
               setFeedId={setFeedId}
               sourceConfigId={sourceConfigId}
@@ -1005,12 +1231,14 @@ export function AddFeed() {
               loadingConfigs={loadingConfigs}
               otherTargets={otherTargets}
             />
+            {(!shared || sharedMode === 'custom') && (
             <Step2Parse
               expanded={activeStep === 2}
               onActivate={() => setActiveStep(2)}
               onContinue={() => setActiveStep(3)}
               entryPath={entryPath}
               setEntryPath={setEntryPath}
+              strictOcsf={strictOcsf}
               sampleText={sampleText}
               setSampleText={setSampleText}
               sampleCount={sampleCount}
@@ -1043,7 +1271,10 @@ export function AddFeed() {
               }}
               draftSaved={!!draftId}
             />
+            )}
+            {(!shared || sharedMode === 'custom') && (
             <Step3Deploy
+              shared={shared}
               expanded={activeStep === 3}
               onActivate={() => setActiveStep(3)}
               feedId={feedId}
@@ -1069,7 +1300,22 @@ export function AddFeed() {
               onDeploy={handleDeploy}
               savingDraft={savingDraft}
               deploying={deploying}
+              rollout={shared ? sharedRollout : undefined}
             />
+            )}
+            {shared && (
+              <Step4Issue
+                n={sharedMode === 'custom' ? 4 : 2}
+                expanded={activeStep === 4}
+                onActivate={() => setActiveStep(4)}
+                endpoint={endpointQuery.data}
+                source={issueTarget}
+                collectorSources={collectorArrival ? collectorTargets : undefined}
+                logSourceId={issueTargetLogSourceId}
+                rollout={sharedMode === 'custom' ? sharedRollout : undefined}
+                onIssued={() => void queryClient.invalidateQueries({ queryKey: INGEST_CREDENTIALS_QUERY_KEY })}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -1082,7 +1328,16 @@ export default AddFeed;
 // ==================================================================
 // Hero
 // ==================================================================
-function AddFeedHero({ feedId, sourceConfig }: { feedId: string; sourceConfig?: SourceConfigWithEvents }) {
+function AddFeedHero({
+  feedId,
+  sourceConfig,
+  shared,
+}: {
+  feedId: string;
+  sourceConfig?: SourceConfigWithEvents;
+  /** Hosted-shared tenants: "Add data", and the tenant's ingest host in place of the transport. */
+  shared?: { hostname?: string };
+}) {
   return (
     <div className="shrink-0 border-b border-border bg-card/40 px-5 py-4 flex items-start gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-primary/30 bg-primary/[0.08] flex items-center justify-center shrink-0">
@@ -1090,24 +1345,30 @@ function AddFeedHero({ feedId, sourceConfig }: { feedId: string; sourceConfig?: 
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2.5 flex-wrap">
-          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">Add a new feed</div>
+          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">{shared ? 'Add data' : 'Add a new feed'}</div>
           <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground border border-border rounded px-1.5 py-px whitespace-nowrap">
             Wizard
           </span>
         </div>
         <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-          Define a feed identifier, parse incoming events with VRL, and route them to a repository. pivt will draft the parser from your samples — review, validate, and deploy in one place.
+          {shared
+            ? 'Pick how data arrives and which source it is, then issue a credential for your ingest endpoint. For a source nano does not parse yet, build a custom parser first; pivt drafts it from your samples.'
+            : 'Define a feed identifier, parse incoming events with VRL, and route them to a repository. pivt will draft the parser from your samples — review, validate, and deploy in one place.'}
         </div>
       </div>
       <div className="hidden md:flex items-center gap-3 shrink-0">
         <div className="flex flex-col items-end">
-          <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground/60">DRAFT</span>
+          <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground/60">{shared ? 'SOURCE' : 'DRAFT'}</span>
           <span className="text-[12.5px] font-mono text-foreground">{feedId || '—'}</span>
         </div>
         <div className="w-px h-8 bg-border" />
         <div className="flex flex-col items-end">
           <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground/60">VIA</span>
-          <span className="text-[12.5px] text-foreground">{sourceConfig ? sourceConfig.name : '—'}</span>
+          {shared ? (
+            <span className="text-[12.5px] font-mono text-foreground">{shared.hostname ?? '—'}</span>
+          ) : (
+            <span className="text-[12.5px] text-foreground">{sourceConfig ? sourceConfig.name : '—'}</span>
+          )}
         </div>
       </div>
     </div>
@@ -1137,14 +1398,17 @@ function StepRail({
   collapsed,
   onToggleCollapsed,
   state,
+  shared,
 }: {
   activeStep: number;
   onJump: (n: number) => void;
   collapsed: boolean;
   onToggleCollapsed: () => void;
   state: RailState;
+  /** Hosted-shared tenants (NAN-2593): arrival + source, then parse/deploy for a custom source, then Issue. */
+  shared?: { mode: SharedSourceMode; slug: string; issueReady: boolean; hostname?: string };
 }) {
-  const steps: Array<{
+  const allSteps: Array<{
     n: number;
     id: number;
     label: string;
@@ -1191,6 +1455,31 @@ function StepRail({
       ok: state.canDeploy,
     },
   ];
+  if (shared) {
+    allSteps[0] = {
+      ...allSteps[0],
+      label: 'Arrival & source',
+      sub: shared.slug ? (
+        <span className="font-mono text-foreground">{shared.slug}</span>
+      ) : (
+        <span className="text-muted-foreground/60">unset</span>
+      ),
+      ok: !!shared.slug && (shared.mode === 'existing' || !!state.feedId),
+    };
+    allSteps[2] = { ...allSteps[2], label: 'Review & activate' };
+    allSteps.push({
+      n: 4,
+      id: 4,
+      label: 'Issue credential',
+      sub: shared.issueReady ? <span className="text-foreground">ready</span> : <span className="text-muted-foreground/60">after source</span>,
+      ok: false,
+    });
+  }
+  // An existing hosted source needs no parser work: Step 1 → Issue.
+  const steps = (shared?.mode === 'existing' ? allSteps.filter((s) => s.id === 1 || s.id === 4) : allSteps).map((s, i) => ({
+    ...s,
+    n: i + 1,
+  }));
 
   if (collapsed) {
     return (
@@ -1237,7 +1526,7 @@ function StepRail({
     <div className="overflow-auto scrollbar-thin">
       <div className="px-3 py-4">
         <div className="flex items-center justify-between px-2 mb-2">
-          <div className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60">Onboarding · 3 steps</div>
+          <div className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60">Onboarding · {steps.length} steps</div>
           <button
             onClick={onToggleCollapsed}
             title="Collapse step list"
@@ -1278,16 +1567,33 @@ function StepRail({
         </div>
 
         <div className="mt-5 px-2 pt-3 border-t border-border">
-          <div className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60 mb-1.5">Routing preview</div>
+          <div className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60 mb-1.5">
+            {shared ? 'Credential preview' : 'Routing preview'}
+          </div>
           <div className="text-[10.5px] font-mono text-muted-foreground leading-[1.6] space-y-0.5">
-            <div className="flex gap-1.5">
-              <span className="text-muted-foreground/60 w-[60px] shrink-0">match</span>
-              <span className="text-foreground">source_type</span>
-            </div>
-            <div className="flex gap-1.5">
-              <span className="text-muted-foreground/60 w-[60px] shrink-0">value</span>
-              <span className="text-primary truncate">{state.feedId || '—'}</span>
-            </div>
+            {shared ? (
+              <>
+                <div className="flex gap-1.5">
+                  <span className="text-muted-foreground/60 w-[60px] shrink-0">source</span>
+                  <span className="text-primary truncate">{shared.slug || '—'}</span>
+                </div>
+                <div className="flex gap-1.5">
+                  <span className="text-muted-foreground/60 w-[60px] shrink-0">host</span>
+                  <span className="text-foreground truncate" title={shared.hostname}>{shared.hostname ?? '—'}</span>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex gap-1.5">
+                  <span className="text-muted-foreground/60 w-[60px] shrink-0">match</span>
+                  <span className="text-foreground">source_type</span>
+                </div>
+                <div className="flex gap-1.5">
+                  <span className="text-muted-foreground/60 w-[60px] shrink-0">value</span>
+                  <span className="text-primary truncate">{state.feedId || '—'}</span>
+                </div>
+              </>
+            )}
             <div className="flex gap-1.5">
               <span className="text-muted-foreground/60 w-[60px] shrink-0">ns</span>
               <span className="text-foreground/80 truncate">{state.namespaceFull}</span>
@@ -1328,6 +1634,7 @@ function StepCard({
   summary,
   footer,
   children,
+  keepMounted,
 }: {
   n: number;
   title: string;
@@ -1338,6 +1645,8 @@ function StepCard({
   summary?: ReactNode;
   footer?: ReactNode;
   children?: ReactNode;
+  /** Keep the body mounted while collapsed (it holds state that must survive, e.g. a one-time token). */
+  keepMounted?: boolean;
 }) {
   return (
     <div
@@ -1375,13 +1684,13 @@ function StepCard({
         </div>
         {!expanded && summary}
       </button>
-      {expanded && (
-        <>
+      {(expanded || keepMounted) && (
+        <div hidden={!expanded}>
           <div className="border-t border-border px-4 py-4">{children}</div>
           {footer && (
             <div className="border-t border-border px-4 py-2.5 bg-card/40 flex items-center gap-2 rounded-b-lg">{footer}</div>
           )}
-        </>
+        </div>
       )}
     </div>
   );
@@ -1440,6 +1749,7 @@ function Step1Identify({
   sourceConfigs,
   loadingConfigs,
   otherTargets,
+  shared,
 }: {
   expanded: boolean;
   onActivate: () => void;
@@ -1465,11 +1775,39 @@ function Step1Identify({
   sourceConfigs: SourceConfigWithEvents[];
   loadingConfigs: boolean;
   otherTargets: RoutingRule[];
+  /** Hosted-shared tenants (NAN-2593): arrival + source picker instead of a source configuration. */
+  shared?: SharedStep1Props;
 }) {
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const searchSourceField = activeSchema?.schema === 'ocsf'
+    ? 'metadata.log_source'
+    : 'source_type';
   const sourceConfig = sourceConfigs.find((c) => c.id === sourceConfigId);
-  const ok = !!feedId && !!sourceConfigId && !!name;
+  const sharedExisting = shared?.mode === 'existing';
+  const sharedCollector = shared?.arrival === 'collector';
+  const sharedPick = sharedCollector
+    ? shared.selectedSlugs.length > 0 ? `${shared.selectedSlugs.length} sources` : ''
+    : shared?.selectedSlug ?? '';
+  const ok = shared
+    ? sharedCollector
+      ? shared.selectedSlugs.length > 0
+      : sharedExisting
+        ? !!shared.selectedSlug
+        : !!feedId && !!name
+    : !!feedId && !!sourceConfigId && !!name;
 
-  const summary = (
+  const summary = shared ? (
+    <div className="hidden md:flex items-center gap-3 text-[11px] text-muted-foreground shrink-0">
+      <span className="font-mono text-foreground">{(sharedExisting ? sharedPick : feedId) || '—'}</span>
+      <span className="w-px h-4 bg-border" />
+      <span>{sharedCollector ? 'collector' : sharedExisting ? 'existing source' : 'custom source'}</span>
+    </div>
+  ) : (
     <div className="hidden md:flex items-center gap-3 text-[11px] text-muted-foreground shrink-0">
       <span className="font-mono text-foreground">{feedId || '—'}</span>
       <span className="w-px h-4 bg-border" />
@@ -1484,8 +1822,8 @@ function Step1Identify({
   return (
     <StepCard
       n={1}
-      title="Identify the feed"
-      eyebrow="STEP 1 · Identify"
+      title={shared ? 'How will this data arrive?' : 'Identify the feed'}
+      eyebrow={shared ? 'STEP 1 · Arrival & source' : 'STEP 1 · Identify'}
       expanded={expanded}
       ok={ok}
       onActivate={onActivate}
@@ -1493,17 +1831,23 @@ function Step1Identify({
       footer={
         <>
           <span className="text-[10.5px] font-mono text-muted-foreground/60 ml-1">
-            appears as <span className="text-foreground/80">source_type={feedId || '—'}</span> in queries
+            appears as{' '}
+            <span className="text-foreground/80">
+              {searchSourceField}={(sharedCollector ? 'declared per event' : sharedExisting ? shared?.selectedSlug : feedId) || '—'}
+            </span>{' '}
+            in queries
           </span>
           <div className="flex-1" />
           <Button variant="default" size="sm" className="h-8 gap-1.5" onClick={onContinue} disabled={!ok}>
-            Continue · sample & parse
+            {sharedCollector ? 'Continue · issue collector' : sharedExisting ? 'Continue · issue credential' : 'Continue · sample & parse'}
             <ArrowRight className="w-3.5 h-3.5" />
           </Button>
         </>
       }
     >
-      <div className="grid grid-cols-12 gap-4">
+      {shared && <SharedArrival {...shared} />}
+      {!sharedExisting && (
+      <div className={cn('grid grid-cols-12 gap-4', shared && 'mt-4 pt-4 border-t border-border')}>
         {/* Feed identifier */}
         <div className="col-span-12 md:col-span-7">
           <FieldLabel required>Feed identifier</FieldLabel>
@@ -1521,14 +1865,21 @@ function Step1Identify({
             />
           </div>
           <FieldHint>
-            Lowercase letters, numbers, <span className="font-mono">_</span> and <span className="font-mono">-</span>. Used as the routing key, parser name, and search filter.
+            Lowercase letters, numbers, <span className="font-mono">_</span> and <span className="font-mono">-</span>. Used as the transport routing key, parser name, and OCSF log source.
           </FieldHint>
 
           {feedId && (
             <div className="mt-3 rounded-md border border-emerald-500/25 bg-emerald-500/[0.04] p-2.5 space-y-1">
-              <UsageRow label="HTTP header" value={`X-Source-Type: ${feedId}`} />
-              <UsageRow label="Routing rule" value={`source_type = "${feedId}"`} />
-              <UsageRow label="Search query" value={`source_type=${feedId}`} />
+              {shared ? (
+                <UsageRow label="Credential" value={`source = ${feedId}`} />
+              ) : (
+                <>
+                  {/* NAN-3806: the ingest token decides the source, never a header. */}
+                  <UsageRow label="Ingest token" value="one bound to this source · Ingestion → Credentials" />
+                  <UsageRow label="Transport route" value={`source_type = "${feedId}"`} />
+                </>
+              )}
+              <UsageRow label="Search query" value={`${searchSourceField}=${feedId}`} />
             </div>
           )}
         </div>
@@ -1542,7 +1893,8 @@ function Step1Identify({
           </FieldHint>
         </div>
 
-        {/* Ingestion source */}
+        {/* Ingestion source (dedicated only; hosted-shared transports are platform-managed) */}
+        {!shared && (
         <div className="col-span-12">
           <FieldLabel required>Ingestion source</FieldLabel>
           <FieldHint className="mt-0 mb-2">
@@ -1583,6 +1935,7 @@ function Step1Identify({
             />
           )}
         </div>
+        )}
 
         {/* Display details */}
         <div className="col-span-12 mt-1 pt-3 border-t border-border">
@@ -1645,7 +1998,217 @@ function Step1Identify({
           </div>
         </div>
       </div>
+      )}
     </StepCard>
+  );
+}
+
+// ==================================================================
+// Hosted-shared Step 1 body — arrival + source (NAN-2593)
+// ==================================================================
+type SharedStep1Props = {
+  endpoint?: TenantIngestEndpoint;
+  endpointError: unknown;
+  endpointLoading: boolean;
+  sources: AddDataSource[];
+  mode: SharedSourceMode;
+  setMode: (m: SharedSourceMode) => void;
+  selectedSlug: string;
+  setSelectedSlug: (slug: string) => void;
+  /** NAN-2597: direct (one token per source) or collector (one token, many sources). */
+  arrival: SharedArrivalMode;
+  setArrival: (a: SharedArrivalMode) => void;
+  selectedSlugs: string[];
+  toggleSlug: (slug: string) => void;
+};
+
+/**
+ * Collector credentials (one token, many sources, NAN-2597). The option shows
+ * only when the tenant's ingest contract accepts them
+ * (`ingress_contract.collector_credentials`).
+ */
+const COLLECTOR_FLOW_AVAILABLE = true;
+
+function SharedArrival({
+  endpoint,
+  endpointError,
+  endpointLoading,
+  sources,
+  mode,
+  setMode,
+  selectedSlug,
+  setSelectedSlug,
+  arrival,
+  setArrival,
+  selectedSlugs,
+  toggleSlug,
+}: SharedStep1Props) {
+  const collectorOffered = COLLECTOR_FLOW_AVAILABLE && endpoint?.ingress_contract?.collector_credentials === true;
+  const collector = collectorOffered && arrival === 'collector';
+  // The contract can withdraw collectors (e.g. an endpoint re-read): fall back to Direct.
+  useEffect(() => {
+    if (!collectorOffered && arrival === 'collector') setArrival('direct');
+  }, [arrival, collectorOffered, setArrival]);
+  if (endpointLoading) {
+    return <div className="text-[11.5px] text-muted-foreground">Loading your ingest endpoint…</div>;
+  }
+  if (!endpoint) {
+    const problem = describeIngestCredentialError(endpointError);
+    return (
+      <div className="rounded-md border border-red-500/40 bg-red-500/[0.04] px-3 py-2 text-[11.5px]" role="alert">
+        <div className="text-foreground font-medium">Your ingest endpoint is unavailable</div>
+        <div className="text-muted-foreground">{problem.detail}</div>
+      </div>
+    );
+  }
+  return (
+    <div className="grid grid-cols-12 gap-4" data-testid="shared-arrival">
+      <div className="col-span-12 lg:col-span-5 space-y-2">
+        <FieldLabel>Arrival</FieldLabel>
+        <div role="radiogroup" aria-label="Arrival" className="space-y-2">
+          <button
+            type="button"
+            role="radio"
+            aria-checked={!collector}
+            aria-label="Direct"
+            onClick={() => setArrival('direct')}
+            className={cn(
+              'w-full text-left rounded-md border px-3 py-2',
+              !collector ? 'border-primary bg-primary/[0.06]' : 'border-border hover:bg-foreground/[0.03]',
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <Globe className={cn('w-3.5 h-3.5', !collector ? 'text-primary' : 'text-muted-foreground')} strokeWidth={1.5} />
+              <span className="text-[12px] font-medium text-foreground">Direct</span>
+              <span className="font-mono text-[10.5px] text-muted-foreground">HEC · HTTPS JSON · OTLP</span>
+            </div>
+            <div className="text-[11px] text-muted-foreground mt-1 leading-relaxed">
+              A device, app or agent sends one source with its own token. The token fixes the source; nothing to declare per event.
+            </div>
+          </button>
+          {collectorOffered && (
+            <button
+              type="button"
+              role="radio"
+              aria-checked={collector}
+              aria-label="Collector"
+              onClick={() => setArrival('collector')}
+              className={cn(
+                'w-full text-left rounded-md border px-3 py-2',
+                collector ? 'border-primary bg-primary/[0.06]' : 'border-border hover:bg-foreground/[0.03]',
+              )}
+            >
+              <div className="flex items-center gap-2">
+                <Network className={cn('w-3.5 h-3.5', collector ? 'text-primary' : 'text-muted-foreground')} strokeWidth={1.5} />
+                <span className="text-[12px] font-medium text-foreground">Collector</span>
+                <span className="font-mono text-[10.5px] text-muted-foreground">Cribl · Vector · Fluent Bit · OTel</span>
+              </div>
+              <div className="text-[11px] text-muted-foreground mt-1 leading-relaxed">
+                One pipeline, one token, many sources. Each event declares its source; undeclared events land as{' '}
+                <span className="font-mono">unknown</span>.
+              </div>
+            </button>
+          )}
+        </div>
+        {collectorOffered ? null : (
+          <div className="text-[10.5px] text-muted-foreground/70 leading-relaxed">
+            Collector (Cribl, Vector, Fluent Bit, OTel Collector: one token for many sources) is not enabled for this
+            tenant yet. Use one direct credential per source meanwhile.
+          </div>
+        )}
+        <IngestEndpointCard endpoint={endpoint} />
+      </div>
+
+      <div className="col-span-12 lg:col-span-7">
+        <div className="flex items-center gap-2 mb-1.5">
+          <FieldLabel>{collector ? 'Sources this pipeline sends' : 'Source'}</FieldLabel>
+          {collector && (
+            <span className="font-mono text-[10.5px] text-muted-foreground mb-1.5" data-testid="collector-selected-count">
+              {selectedSlugs.length} selected
+            </span>
+          )}
+          <span className="flex-1" />
+          {!collector && (
+          <div className="inline-flex items-center rounded-md border border-border bg-card p-0.5 mb-1.5" role="tablist" aria-label="Source kind">
+            {(['existing', 'custom'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                role="tab"
+                aria-selected={mode === m}
+                onClick={() => setMode(m)}
+                className={cn(
+                  'h-6 px-2.5 rounded text-[11.5px]',
+                  mode === m ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {m === 'existing' ? 'Existing source' : 'New custom source'}
+              </button>
+            ))}
+          </div>
+          )}
+        </div>
+        {!collector && mode === 'custom' ? (
+          <div className="rounded-md border border-dashed border-border px-3 py-2.5 text-[11.5px] text-muted-foreground leading-relaxed">
+            Name the new source below, then build its parser in Step 2 from your samples. Activating it in Step 3 rolls it
+            out to your parser cell; you can issue its credential right away and it is delivered once the source is enrolled.
+          </div>
+        ) : sources.length === 0 ? (
+          <div className="rounded-md border border-dashed border-border px-3 py-2.5 text-[11.5px] text-muted-foreground">
+            No sources are enrolled for this tenant yet. Build a custom source instead.
+          </div>
+        ) : (
+          <div
+            className="rounded-md border border-border overflow-hidden"
+            role={collector ? 'group' : 'radiogroup'}
+            aria-label={collector ? 'Collector sources' : 'Existing source'}
+          >
+            <div className="grid grid-cols-[20px_minmax(0,1.1fr)_minmax(0,1fr)_minmax(0,1fr)_64px] gap-2 px-2.5 h-6 items-center border-b border-border bg-card/60 text-[9.5px] font-mono uppercase tracking-[0.1em] text-muted-foreground">
+              <span />
+              <span>Source</span>
+              <span>Name</span>
+              <span>Protocols</span>
+              <span className="text-right">24h</span>
+            </div>
+            <div className="max-h-[260px] overflow-auto scrollbar-thin">
+              {sources.map((src) => {
+                const selected = collector ? selectedSlugs.includes(src.slug) : src.slug === selectedSlug;
+                return (
+                  <button
+                    key={src.slug}
+                    type="button"
+                    role={collector ? 'checkbox' : 'radio'}
+                    aria-checked={selected}
+                    aria-label={src.slug}
+                    onClick={() => (collector ? toggleSlug(src.slug) : setSelectedSlug(src.slug))}
+                    className={cn(
+                      'w-full grid grid-cols-[20px_minmax(0,1.1fr)_minmax(0,1fr)_minmax(0,1fr)_64px] gap-2 px-2.5 h-7 items-center text-left border-b border-border/60 last:border-b-0',
+                      selected ? 'bg-primary/[0.08]' : 'hover:bg-foreground/[0.03]',
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'w-3 h-3 border',
+                        collector ? 'rounded-sm' : 'rounded-full',
+                        selected ? 'border-primary bg-primary' : 'border-input',
+                      )}
+                    />
+                    <span className="font-mono text-[11.5px] text-foreground truncate">{src.slug}</span>
+                    <span className="text-[11.5px] text-foreground/80 truncate">{src.logSource?.name ?? '—'}</span>
+                    <span className="font-mono text-[10.5px] text-muted-foreground truncate">
+                      {src.enrolled ? src.protocols.map((p) => PROTOCOL_LABEL[p] ?? p).join(' · ') : 'rolling out'}
+                    </span>
+                    <span className="font-mono text-[10.5px] text-muted-foreground text-right tabular-nums">
+                      {formatEventsCount(src.events24h) ?? '—'}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -1828,6 +2391,7 @@ type Step2Props = {
   onContinue: () => void;
   entryPath: 'paste' | 'existing' | 'manual';
   setEntryPath: (v: 'paste' | 'existing' | 'manual') => void;
+  strictOcsf: boolean;
   sampleText: string;
   setSampleText: (v: string) => void;
   sampleCount: number;
@@ -1863,6 +2427,7 @@ function Step2Parse(props: Step2Props) {
     onContinue,
     entryPath,
     setEntryPath,
+    strictOcsf,
     sampleText,
     setSampleText,
     sampleCount,
@@ -1961,7 +2526,16 @@ function Step2Parse(props: Step2Props) {
           {entryPath === 'existing' && (
             <SamplesExisting feedId={feedId} setSampleText={setSampleText} setFeedId={undefined} />
           )}
-          {entryPath === 'manual' && <SamplesManual feedId={feedId} />}
+          {entryPath === 'manual' &&
+            (strictOcsf ? (
+              <SamplesPaste
+                sampleText={sampleText}
+                setSampleText={setSampleText}
+                sampleCount={sampleCount}
+              />
+            ) : (
+              <SamplesManual feedId={feedId} />
+            ))}
         </div>
 
         {/* "samples → parser" arrow indicator. Pulses primary while generating. */}
@@ -2147,6 +2721,15 @@ function SamplesExisting({
   setFeedId?: (v: string) => void;
 }) {
   const { toast } = useToast();
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const searchSourceField = activeSchema?.schema === 'ocsf'
+    ? 'metadata.log_source'
+    : 'source_type';
   const [rows, setRows] = useState<Array<{ st: string; events: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('');
@@ -2184,7 +2767,7 @@ function SamplesExisting({
         const now = new Date();
         const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
         const response = await api.search({
-          query: `source_type="${st}"`,
+          query: `${searchSourceField}="${st}"`,
           time_range: { start: yesterday.toISOString(), end: now.toISOString() },
           limit: 10,
           skip_field_stats: true,
@@ -2200,13 +2783,13 @@ function SamplesExisting({
         if (samples.length === 0) {
           toast({
             title: 'No samples',
-            description: `No events found for source_type="${st}".`,
+            description: `No events found for ${searchSourceField}="${st}".`,
             variant: 'destructive',
           });
           return;
         }
         setSampleText(samples.join('\n'));
-        toast({ title: 'Samples loaded', description: `${samples.length} event${samples.length === 1 ? '' : 's'} from source_type=${st}` });
+        toast({ title: 'Samples loaded', description: `${samples.length} event${samples.length === 1 ? '' : 's'} from ${searchSourceField}=${st}` });
       } catch (err) {
         toast({
           title: 'Failed to fetch samples',
@@ -2217,7 +2800,7 @@ function SamplesExisting({
         setFetchingSamples(false);
       }
     },
-    [setSampleText, toast],
+    [searchSourceField, setSampleText, toast],
   );
 
   return (
@@ -2285,8 +2868,8 @@ function SamplesExisting({
         {fetchingSamples
           ? 'Fetching 10 most-recent events…'
           : selected
-            ? `Picks 10 most-recent events · source_type=${selected}`
-            : `Click a source_type to pull 10 sample events${feedId ? ` for ${feedId}` : ''}`}
+            ? `Picks 10 most-recent events · ${searchSourceField}=${selected}`
+            : `Click a log source to pull 10 sample events${feedId ? ` for ${feedId}` : ''}`}
       </div>
     </div>
   );
@@ -2296,6 +2879,15 @@ function SamplesExisting({
 // SamplesManual — expert mode (no samples)
 // ==================================================================
 function SamplesManual({ feedId }: { feedId: string }) {
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const starter = activeSchema?.schema === 'ocsf'
+    ? `# Minimal canonical OCSF 1.9 Base Event\nraw_log = string(.message) ?? ""\n. = {\n  "class_uid": 0,\n  "category_uid": 0,\n  "activity_id": 0,\n  "type_uid": 0,\n  "time": to_unix_timestamp!(now(), unit: "milliseconds"),\n  "message": raw_log,\n  "metadata": { "version": "1.9.0", "log_source": "${feedId || '<feed_id>'}" }\n}`
+    : `# Minimum: set source_type and timestamp\n.source_type = "${feedId || '<feed_id>'}"\n.timestamp = parse_timestamp!(.message, format: "%+")`;
   return (
     <div className="rounded-md border border-border bg-background flex flex-col h-[calc(100vh-320px)] p-4">
       <div className="flex items-start gap-2.5">
@@ -2305,7 +2897,9 @@ function SamplesManual({ feedId }: { feedId: string }) {
         <div>
           <div className="text-[12.5px] font-medium text-foreground">Expert mode</div>
           <div className="text-[11px] text-muted-foreground leading-relaxed mt-0.5">
-            Skip samples and write VRL by hand. We can't validate against real events, so deploy will warn but not block.{' '}
+            {activeSchema?.schema === 'ocsf'
+              ? 'Write VRL by hand, then provide at least one sample before deployment so Nano can run VRL and validate the resulting OCSF 1.9 event. '
+              : "Skip samples and write VRL by hand. We can't validate against real events, so deploy will warn but not block. "}
             <a
               href="https://vector.dev/docs/reference/vrl/"
               target="_blank"
@@ -2319,11 +2913,7 @@ function SamplesManual({ feedId }: { feedId: string }) {
       </div>
       <div className="mt-4 rounded border border-border bg-muted p-2.5">
         <div className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground/60 mb-1">Starter snippet</div>
-        <pre className="font-mono text-[11px] leading-[1.55] text-foreground/80 whitespace-pre">
-{`# Minimum: set source_type and timestamp
-.source_type = "${feedId || '<feed_id>'}"
-.timestamp = parse_timestamp!(.message, format: "%+")`}
-        </pre>
+        <pre className="font-mono text-[11px] leading-[1.55] text-foreground/80 whitespace-pre">{starter}</pre>
       </div>
     </div>
   );
@@ -2906,6 +3496,10 @@ type Step3Props = {
   onDeploy: () => void;
   savingDraft: boolean;
   deploying: boolean;
+  /** Hosted-shared tenants (NAN-2593): activate the registry entry; no routing rule or transport. */
+  shared?: boolean;
+  /** Hosted-shared (NAN-2607): the parser rollout the activation filed. */
+  rollout?: TenantParserRollout | null;
 };
 
 function Step3Deploy(props: Step3Props) {
@@ -2935,7 +3529,18 @@ function Step3Deploy(props: Step3Props) {
     onDeploy,
     savingDraft,
     deploying,
+    shared,
+    rollout,
   } = props;
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const searchSourceField = activeSchema?.schema === 'ocsf'
+    ? 'metadata.log_source'
+    : 'source_type';
 
   const ok = canDeploy;
   const totalTests = passingTests + failingTests;
@@ -2952,8 +3557,8 @@ function Step3Deploy(props: Step3Props) {
   return (
     <StepCard
       n={3}
-      title="Review & deploy"
-      eyebrow="STEP 3 · Deploy"
+      title={shared ? 'Review & activate' : 'Review & deploy'}
+      eyebrow={shared ? 'STEP 3 · Activate' : 'STEP 3 · Deploy'}
       expanded={expanded}
       ok={ok}
       onActivate={onActivate}
@@ -2961,7 +3566,9 @@ function Step3Deploy(props: Step3Props) {
       footer={
         <>
           <span className="text-[10.5px] text-muted-foreground/70">
-            Creates the parser + routing rule, then deploys both.
+            {shared
+              ? 'Creates the log source and activates it; the parser then rolls out to your parser cell.'
+              : 'Creates the parser + routing rule, then deploys both.'}
           </span>
           <div className="flex-1" />
           <Button variant="outline" size="sm" className="h-8" onClick={onSaveDraft} disabled={savingDraft}>
@@ -2969,7 +3576,7 @@ function Step3Deploy(props: Step3Props) {
           </Button>
           <Button variant="default" size="sm" className="h-8 gap-1.5" disabled={!canDeploy || deploying} onClick={onDeploy}>
             <Zap className="w-3.5 h-3.5" />
-            {deploying ? 'Deploying…' : 'Deploy feed'}
+            {shared ? (deploying ? 'Activating…' : 'Activate source') : deploying ? 'Deploying…' : 'Deploy feed'}
           </Button>
         </>
       }
@@ -2992,6 +3599,7 @@ function Step3Deploy(props: Step3Props) {
             ]}
             description={description}
           />
+          {!shared && (
           <ArtifactCard
             kind="Routing rule"
             icon={RouteIcon}
@@ -3005,6 +3613,7 @@ function Step3Deploy(props: Step3Props) {
               ['target', feedId || '—'],
             ]}
           />
+          )}
           <ArtifactCard
             kind="VRL parser"
             icon={Code}
@@ -3030,6 +3639,7 @@ function Step3Deploy(props: Step3Props) {
                 warn={warnings > 0 && acceptWarnings}
                 label={`Diagnostics · ${warnings === 0 ? 'no warnings' : `${warnings} warning${warnings === 1 ? '' : 's'}`}`}
               />
+              {!shared && (
               <GateRow
                 ok={reachability?.transportReady !== false}
                 warn={reachability?.transportReady === false && acceptWarnings}
@@ -3045,6 +3655,7 @@ function Step3Deploy(props: Step3Props) {
                           : 'Transport · not ready'
                 }
               />
+              )}
               <GateRow
                 ok={namespaceCheck?.valid !== false}
                 label={
@@ -3056,14 +3667,24 @@ function Step3Deploy(props: Step3Props) {
                 }
               />
             </div>
-            {(warnings > 0 || reachability?.transportReady === false) && (
+            {shared && (
+              <div className="px-3 pb-3 -mt-1 text-[10.5px] text-muted-foreground leading-relaxed">
+                After activation the parser is built and validated against your parser cell&apos;s exact Vector
+                before it goes live; a failing build never reaches your cell.
+              </div>
+            )}
+            {shared && rollout && (
+              <div className="px-3 pb-3" data-testid="step3-rollout">
+                <RolloutStatus rolloutId={rollout.id} initial={rollout} />
+              </div>
+            )}
+            {(warnings > 0 || (!shared && reachability?.transportReady === false)) && (
               <div className="px-3 py-3 border-t border-border bg-amber-500/[0.04]">
                 <label className="flex items-start gap-2.5 cursor-pointer group">
-                  <input
-                    type="checkbox"
+                  <Checkbox
                     checked={acceptWarnings}
-                    onChange={(e) => setAcceptWarnings(e.target.checked)}
-                    className="mt-0.5 w-3.5 h-3.5 rounded border-input bg-card accent-primary cursor-pointer"
+                    onCheckedChange={(checked) => setAcceptWarnings(checked === true)}
+                    className="mt-0.5 h-3.5 w-3.5 cursor-pointer"
                   />
                   <div>
                     <div className="text-[11.5px] text-foreground group-hover:text-foreground leading-snug">
@@ -3115,11 +3736,17 @@ function Step3Deploy(props: Step3Props) {
             <ul className="space-y-1 text-[10.5px] text-muted-foreground">
               <li className="flex gap-1.5">
                 <ArrowRight className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground/60" />
-                Routing rule activates within 2s
+                {shared ? 'The parser rolls out to your parser cell (minutes, not seconds)' : 'Routing rule activates within 2s'}
               </li>
+              {shared && (
+                <li className="flex gap-1.5">
+                  <ArrowRight className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground/60" />
+                  Issue the source&apos;s credential in the next step
+                </li>
+              )}
               <li className="flex gap-1.5">
                 <ArrowRight className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground/60" />
-                First event appears in <span className="font-mono text-foreground/80">source_type={feedId || '—'}</span>
+                First event appears in <span className="font-mono text-foreground/80">{searchSourceField}={feedId || '—'}</span>
               </li>
               <li className="flex gap-1.5">
                 <ArrowRight className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground/60" />
@@ -3129,6 +3756,102 @@ function Step3Deploy(props: Step3Props) {
           </div>
         </div>
       </div>
+    </StepCard>
+  );
+}
+
+// ==================================================================
+// Step 4 — Issue credential (hosted-shared, NAN-2593)
+// ==================================================================
+function Step4Issue({
+  n,
+  expanded,
+  onActivate,
+  endpoint,
+  source,
+  collectorSources,
+  logSourceId,
+  rollout,
+  onIssued,
+}: {
+  n: number;
+  expanded: boolean;
+  onActivate: () => void;
+  endpoint?: TenantIngestEndpoint;
+  source: AddDataSource | null;
+  /** NAN-2597: set for a collector credential (the allowlist picked in Step 1). */
+  collectorSources?: AddDataSource[];
+  logSourceId?: string;
+  /** NAN-2607: the rollout the custom source's activation filed (else looked up by log source). */
+  rollout?: TenantParserRollout | null;
+  onIssued: () => void;
+}) {
+  const collector = collectorSources !== undefined;
+  // A slug that is not enrolled yet is still rolling out to the parser cell:
+  // show where that rollout is (the credential is delivered once it is live).
+  const rolling = !!source && !source.enrolled;
+  const rolloutsQuery = useQuery({
+    queryKey: PARSER_ROLLOUTS_QUERY_KEY,
+    queryFn: () => api.listParserRollouts({ limit: 50 }),
+    enabled: rolling && !rollout && !!logSourceId,
+    refetchInterval: (q) => {
+      const latest = latestRolloutFor(q.state.data, logSourceId);
+      return latest ? rolloutPollInterval(latest) : false;
+    },
+  });
+  const liveRollout = rollout ?? latestRolloutFor(rolloutsQuery.data, logSourceId) ?? null;
+  return (
+    <StepCard
+      keepMounted
+      n={n}
+      title={collector ? 'Issue a collector credential' : 'Issue a credential'}
+      eyebrow={`STEP ${n} · Issue`}
+      expanded={expanded}
+      ok={false}
+      onActivate={onActivate}
+      summary={
+        collector && collectorSources.length > 0 ? (
+          <span className="hidden md:inline font-mono text-[11px] text-foreground">{collectorSources.length} sources</span>
+        ) : !collector && source ? (
+          <span className="hidden md:inline font-mono text-[11px] text-foreground">{source.slug}</span>
+        ) : (
+          <span className="hidden md:inline text-[11px] text-muted-foreground/60">pick a source first</span>
+        )
+      }
+      footer={
+        <>
+          <span className="text-[10.5px] text-muted-foreground/70">
+            The token is sealed to this browser and shown once. Manage and revoke credentials under{' '}
+            <a href={INGEST_CREDENTIALS_PATH} className="text-primary hover:underline">Log Sources → Credentials</a>.
+          </span>
+        </>
+      }
+    >
+      {!endpoint ? (
+        <div className="text-[11.5px] text-muted-foreground">Loading your ingest endpoint…</div>
+      ) : collector ? (
+        collectorSources.length === 0 ? (
+          <div className="text-[11.5px] text-muted-foreground">Pick the sources this pipeline sends in Step 1.</div>
+        ) : (
+          <IssueCredentialPanel endpoint={endpoint} collectorSources={collectorSources} onIssued={onIssued} />
+        )
+      ) : !source ? (
+        <div className="text-[11.5px] text-muted-foreground">Pick an existing source in Step 1, or activate a custom one in Step 3.</div>
+      ) : (
+        <div className="space-y-3">
+          {rolling && liveRollout && (
+            <div data-testid="issue-rollout">
+              <RolloutStatus rolloutId={liveRollout.id} initial={liveRollout} compact />
+            </div>
+          )}
+          <IssueCredentialPanel
+            endpoint={endpoint}
+            source={source}
+            logSourceId={logSourceId}
+            onIssued={onIssued}
+          />
+        </div>
+      )}
     </StepCard>
   );
 }

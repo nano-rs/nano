@@ -14,6 +14,9 @@ use axum::{
     response::Response,
 };
 use uuid::Uuid;
+use std::sync::Arc;
+use nanosiem_core::request_timing::RequestTiming;
+use tracing::Instrument;
 
 /// Header name for request ID
 pub const REQUEST_ID_HEADER: &str = "X-Request-ID";
@@ -84,10 +87,9 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
 
     // Process the request within the span, measuring duration
     let start = std::time::Instant::now();
-    let response = {
-        let _guard = span.enter();
-        next.run(request).await
-    };
+    let timing = Arc::new(RequestTiming::default());
+    request.extensions_mut().insert(timing.clone());
+    let response = timing.clone().scope(next.run(request).instrument(span.clone())).await;
     let duration_ms = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
     {
@@ -101,6 +103,9 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
 
     // Add request ID to response headers
     let mut response = response;
+    if let Ok(value) = HeaderValue::from_str(&timing.server_timing(start.elapsed().as_secs_f64() * 1000.0)) {
+        response.headers_mut().append(HeaderName::from_static("server-timing"), value);
+    }
     if let Ok(header_value) = HeaderValue::from_str(request_id.as_str()) {
         response
             .headers_mut()
@@ -108,4 +113,30 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, routing::get, Router};
+    use nanosiem_core::request_timing::{timed, Phase};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn health_response_reports_dependency_time_and_preserves_request_id() {
+        let app = Router::new().route("/health", get(|| async {
+            timed(Phase::Authority, tokio::time::sleep(std::time::Duration::from_millis(2))).await;
+            "ok"
+        })).layer(axum::middleware::from_fn(request_id_middleware));
+        let response = app.oneshot(Request::builder().uri("/health")
+            .header("x-request-id", "health-timing-test").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(response.headers()["x-request-id"], "health-timing-test");
+        let timing = response.headers()["server-timing"].to_str().unwrap();
+        let duration = |name: &str| timing.split(", ").find_map(|entry| {
+            entry.strip_prefix(&format!("{name};dur=")).and_then(|value| value.parse::<f64>().ok())
+        }).unwrap();
+        assert!(duration("authority") >= 2.0);
+        assert!(duration("total") >= duration("authority"));
+    }
 }

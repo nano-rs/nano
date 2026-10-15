@@ -2,7 +2,7 @@
 
 //! Asset and cloud event endpoints: pagination, timeline, pivot, time range, artifacts.
 
-use axum::{Json, extract::State};
+use axum::{extract::State, Json};
 use nanosiem_core::TimeRangeInput;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -11,11 +11,23 @@ use std::time::Instant;
 // they share the one gate defined in `handlers/mod.rs` (was a local duplicate).
 use super::require_search_execute;
 use crate::error::ErrorResponse;
-use crate::{SearchState, error::SearchError, metrics::record_search_query};
+use crate::{error::SearchError, metrics::record_search_query, SearchState};
 
 // ============================================================================
 // Asset Events Pagination
 // ============================================================================
+
+/// Which portion of a product view the caller needs. Lake-backed UI clients
+/// request the visible page first, then load the exact summary independently.
+/// `full` preserves the legacy one-response contract for older clients.
+#[derive(Debug, Clone, Copy, Default, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductViewFetchMode {
+    #[default]
+    Full,
+    Page,
+    Summary,
+}
 
 /// Request for fetching paginated asset events
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -31,12 +43,19 @@ pub struct AssetEventsRequest {
     /// Offset for pagination
     #[serde(default)]
     pub offset: usize,
+    /// Stable continuation key returned by the preceding lake page. Modern
+    /// clients should send this instead of relying on deep offsets.
+    #[serde(default)]
+    pub cursor: Option<nanosiem_core::search::ProductViewCursor>,
     /// Limit for pagination (default 500)
     #[serde(default = "default_asset_limit")]
     pub limit: usize,
     /// Optional filters
     #[serde(default)]
     pub filters: Option<nanosiem_core::search::AssetEventFilters>,
+    /// Fetch the full response, only paintable rows, or only exact summaries.
+    #[serde(default)]
+    pub fetch: ProductViewFetchMode,
 }
 
 fn default_asset_limit() -> usize {
@@ -50,6 +69,9 @@ pub struct AssetEventsResponse {
     pub events: Vec<serde_json::Value>,
     /// Total count of matching events
     pub total_count: u64,
+    /// False only for a page-first response, where `total_count` is a proven
+    /// lower bound until the exact summary companion arrives.
+    pub total_count_exact: bool,
     /// Facet counts for filtering UI
     pub facets: nanosiem_core::search::AssetFacets,
     /// Current offset
@@ -58,6 +80,19 @@ pub struct AssetEventsResponse {
     pub limit: usize,
     /// Whether more events are available
     pub has_more: bool,
+    /// Stable continuation key for the next immutable lake page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<nanosiem_core::search::ProductViewCursor>,
+    /// Durable job handle when only the exact summary exceeded the
+    /// interactive resource envelope. The already-painted event page remains
+    /// usable while this task runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<nanosiem_core::search::AsyncSearchResponse>,
+    /// present on a lean summary still being built; while
+    /// `complete` is false the counts cover `covered_start..` so far and the
+    /// client asks again after `retry_after_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<nanosiem_core::search::ProductViewProgress>,
 }
 
 /// Fetch paginated asset events
@@ -88,7 +123,9 @@ pub async fn get_asset_events(
     // NAN-1801: the caller's effective source scope changes the executed SQL,
     // so it is part of result identity — fold it into the cache key.
     let scope = super::search::effective_scope(&auth);
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let search = super::product_view_search(&state, &auth)?;
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "aevents",
         &[
             request.identifier_field.as_bytes(),
@@ -96,13 +133,27 @@ pub async fn get_asset_events(
             serde_json::to_string(&request.identities)
                 .unwrap_or_default()
                 .as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
             request.offset.to_string().as_bytes(),
+            serde_json::to_string(&request.cursor)
+                .unwrap_or_default()
+                .as_bytes(),
             request.limit.to_string().as_bytes(),
             serde_json::to_string(&request.filters)
                 .unwrap_or_default()
                 .as_bytes(),
+            format!("{:?}", request.fetch).as_bytes(),
         ],
         &scope,
     );
@@ -111,6 +162,7 @@ pub async fn get_asset_events(
             if let Some(cached) = cache.get_cached::<AssetEventsResponse>(&cache_key).await {
                 record_search_query("asset_events_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -120,46 +172,151 @@ pub async fn get_asset_events(
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
-    let result = state
-        .search
-        .query_asset_events_paginated(
-            &request.identifier_field,
-            &request.identifier_value,
-            &request.identities,
-            &time_range,
-            request.offset,
-            request.limit,
-            request.filters.as_ref(),
-            &scope,
-        )
-        .await;
+    let result = match request.fetch {
+        ProductViewFetchMode::Full => search
+            .query_asset_events_paginated(
+                &request.identifier_field,
+                &request.identifier_value,
+                &request.identities,
+                &time_range,
+                request.offset,
+                request.limit,
+                request.filters.as_ref(),
+                &scope,
+            )
+            .await
+            .map(|(events, total_count, facets)| {
+                let has_more = request.offset.saturating_add(events.len()) < total_count as usize;
+                (events, total_count, true, facets, has_more, None, None)
+            }),
+        ProductViewFetchMode::Page => search
+            .query_asset_events_page(
+                &request.identifier_field,
+                &request.identifier_value,
+                &request.identities,
+                &time_range,
+                request.offset,
+                request.limit,
+                request.cursor.as_ref(),
+                request.filters.as_ref(),
+                &scope,
+            )
+            .await
+            .map(|(events, has_more, next_cursor)| {
+                let lower_bound = request
+                    .offset
+                    .saturating_add(events.len())
+                    .saturating_add(usize::from(has_more)) as u64;
+                (
+                    events,
+                    lower_bound,
+                    !has_more,
+                    nanosiem_core::search::AssetFacets::default(),
+                    has_more,
+                    next_cursor,
+                    None,
+                )
+            }),
+        ProductViewFetchMode::Summary => search
+            .query_asset_events_summary(
+                &request.identifier_field,
+                &request.identifier_value,
+                &request.identities,
+                &time_range,
+                request.filters.as_ref(),
+                &scope,
+            )
+            .await
+            .map(|(total_count, facets, progress)| {
+                let exact = progress
+                    .as_ref()
+                    .is_none_or(|progress| progress.complete && progress.note.is_none());
+                (
+                    Vec::new(),
+                    total_count,
+                    exact,
+                    facets,
+                    request.offset < total_count as usize,
+                    None,
+                    progress,
+                )
+            }),
+    };
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if matches!(request.fetch, ProductViewFetchMode::Summary)
+        && matches!(
+            &result,
+            Err(nanosiem_core::SearchError::ResourceExhausted(_))
+        )
+    {
+        let job_id = search
+            .enqueue_durable_asset_summary(
+                &request.identifier_field,
+                &request.identifier_value,
+                &request.identities,
+                &time_range,
+                request.filters.as_ref(),
+                &scope,
+                auth.claims.sub,
+                auth.durable_search_authority().as_ref(),
+            )
+            .await?;
+        record_search_query("asset_events_queued", duration_ms, true);
+        super::require_current_shared_authority(&state, &auth).await?;
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(AssetEventsResponse {
+                events: Vec::new(),
+                total_count: 0,
+                total_count_exact: false,
+                facets: nanosiem_core::search::AssetFacets::default(),
+                offset: request.offset,
+                limit: request.limit,
+                has_more: false,
+                next_cursor: None,
+                durable_job: Some(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                }),
+                progress: None,
+            }),
+        ));
+    }
     record_search_query("asset_events", duration_ms, result.is_ok());
 
-    let (events, total_count, facets) = result.map_err(|e| {
-        tracing::error!(error = %e, "Asset events query failed");
-        SearchError::QueryError("Failed to fetch asset events".to_string())
-    })?;
-
-    let has_more = request.offset + events.len() < total_count as usize;
+    let (events, total_count, total_count_exact, facets, has_more, next_cursor, progress) =
+        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch asset events"))?;
 
     let response = AssetEventsResponse {
         events,
         total_count,
+        total_count_exact,
         facets,
         offset: request.offset,
         limit: request.limit,
         has_more,
+        next_cursor,
+        durable_job: None,
+        progress,
     };
-    if let Some(cache) = state.result_cache.as_ref() {
+    if let Some(cache) = state.result_cache.as_ref().filter(|_| {
+        response
+            .progress
+            .as_ref()
+            .is_none_or(|progress| progress.complete)
+    }) {
         let cache = cache.clone();
         let resp = response.clone();
         tokio::spawn(async move {
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }
 
 // ============================================================================
@@ -176,12 +333,18 @@ pub struct CloudEventsRequest {
     /// Offset for pagination
     #[serde(default)]
     pub offset: usize,
+    /// Stable continuation key returned by the preceding lake page.
+    #[serde(default)]
+    pub cursor: Option<nanosiem_core::search::ProductViewCursor>,
     /// Limit for pagination (default 200)
     #[serde(default = "default_cloud_limit")]
     pub limit: usize,
     /// Optional filters
     #[serde(default)]
     pub filters: Option<nanosiem_core::search::CloudEventFilters>,
+    /// Fetch the full response, only paintable rows, or only exact summaries.
+    #[serde(default)]
+    pub fetch: ProductViewFetchMode,
 }
 
 fn default_cloud_limit() -> usize {
@@ -195,6 +358,9 @@ pub struct CloudEventsResponse {
     pub events: Vec<serde_json::Value>,
     /// Total count of matching events
     pub total_count: u64,
+    /// False only for a page-first response; the summary companion supplies the
+    /// exact count without delaying visible events.
+    pub total_count_exact: bool,
     /// Facet counts for filtering UI
     pub facets: nanosiem_core::search::CloudFacets,
     /// Current offset
@@ -203,12 +369,18 @@ pub struct CloudEventsResponse {
     pub limit: usize,
     /// Whether more events are available
     pub has_more: bool,
+    /// Stable continuation key for the next immutable lake page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<nanosiem_core::search::ProductViewCursor>,
     /// Filtered resources (only present when offset=0 and filters active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<Vec<serde_json::Value>>,
     /// Filtered user activity (only present when offset=0 and filters active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_activity: Option<Vec<nanosiem_core::search::CloudUserActivity>>,
+    /// Present when exact summary work was promoted to the durable lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<nanosiem_core::search::AsyncSearchResponse>,
 }
 
 /// Fetch paginated cloud events
@@ -237,17 +409,33 @@ pub async fn get_cloud_events(
     require_search_execute(&auth)?;
 
     let scope = super::search::effective_scope(&auth);
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let search = super::product_view_search(&state, &auth)?;
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "cevents",
         &[
             request.query.as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
             request.offset.to_string().as_bytes(),
+            serde_json::to_string(&request.cursor)
+                .unwrap_or_default()
+                .as_bytes(),
             request.limit.to_string().as_bytes(),
             serde_json::to_string(&request.filters)
                 .unwrap_or_default()
                 .as_bytes(),
+            format!("{:?}", request.fetch).as_bytes(),
         ],
         &scope,
     );
@@ -256,6 +444,7 @@ pub async fn get_cloud_events(
             if let Some(cached) = cache.get_cached::<CloudEventsResponse>(&cache_key).await {
                 record_search_query("cloud_events_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -264,37 +453,145 @@ pub async fn get_cloud_events(
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
-    let result = state
-        .search
-        .query_cloud_events_paginated(
-            &request.query,
-            &time_range,
-            request.offset,
-            request.limit,
-            request.filters.as_ref(),
-            &scope,
-        )
-        .await;
+    let result = match request.fetch {
+        ProductViewFetchMode::Full => search
+            .query_cloud_events_paginated(
+                &request.query,
+                &time_range,
+                request.offset,
+                request.limit,
+                request.filters.as_ref(),
+                &scope,
+            )
+            .await
+            .map(|(events, total_count, facets, resources, user_activity)| {
+                let has_more = request.offset.saturating_add(events.len()) < total_count as usize;
+                (
+                    events,
+                    total_count,
+                    true,
+                    facets,
+                    resources,
+                    user_activity,
+                    has_more,
+                    None,
+                )
+            }),
+        ProductViewFetchMode::Page => search
+            .query_cloud_events_page(
+                &request.query,
+                &time_range,
+                request.offset,
+                request.limit,
+                request.cursor.as_ref(),
+                request.filters.as_ref(),
+                &scope,
+            )
+            .await
+            .map(|(events, has_more, next_cursor)| {
+                let lower_bound = request
+                    .offset
+                    .saturating_add(events.len())
+                    .saturating_add(usize::from(has_more)) as u64;
+                (
+                    events,
+                    lower_bound,
+                    !has_more,
+                    nanosiem_core::search::CloudFacets::default(),
+                    None,
+                    None,
+                    has_more,
+                    next_cursor,
+                )
+            }),
+        ProductViewFetchMode::Summary => search
+            .query_cloud_events_summary(
+                &request.query,
+                &time_range,
+                request.filters.as_ref(),
+                &scope,
+                request.offset == 0,
+            )
+            .await
+            .map(|(total_count, facets, resources, user_activity)| {
+                (
+                    Vec::new(),
+                    total_count,
+                    true,
+                    facets,
+                    resources,
+                    user_activity,
+                    request.offset < total_count as usize,
+                    None,
+                )
+            }),
+    };
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if matches!(request.fetch, ProductViewFetchMode::Summary)
+        && matches!(
+            &result,
+            Err(nanosiem_core::SearchError::ResourceExhausted(_))
+        )
+    {
+        let job_id = search
+            .enqueue_durable_cloud_events_summary(
+                &request.query,
+                &time_range,
+                request.filters.as_ref(),
+                request.offset == 0,
+                &scope,
+                auth.claims.sub,
+                auth.durable_search_authority().as_ref(),
+            )
+            .await?;
+        record_search_query("cloud_events_summary_queued", duration_ms, true);
+        super::require_current_shared_authority(&state, &auth).await?;
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(CloudEventsResponse {
+                events: Vec::new(),
+                total_count: 0,
+                total_count_exact: false,
+                facets: nanosiem_core::search::CloudFacets::default(),
+                offset: request.offset,
+                limit: request.limit,
+                has_more: false,
+                next_cursor: None,
+                resources: None,
+                user_activity: None,
+                durable_job: Some(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                }),
+            }),
+        ));
+    }
     record_search_query("cloud_events", duration_ms, result.is_ok());
 
-    let (events, total_count, facets, resources, user_activity) = result.map_err(|e| {
-        tracing::error!(error = %e, "Cloud events query failed");
-        SearchError::QueryError("Failed to fetch cloud events".to_string())
-    })?;
-
-    let has_more = request.offset + events.len() < total_count as usize;
+    let (
+        events,
+        total_count,
+        total_count_exact,
+        facets,
+        resources,
+        user_activity,
+        has_more,
+        next_cursor,
+    ) = result.map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch cloud events"))?;
 
     let response = CloudEventsResponse {
         events,
         total_count,
+        total_count_exact,
         facets,
         offset: request.offset,
         limit: request.limit,
         has_more,
+        next_cursor,
         resources,
         user_activity,
+        durable_job: None,
     };
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
@@ -303,7 +600,11 @@ pub async fn get_cloud_events(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }
 
 // ============================================================================
@@ -328,6 +629,9 @@ pub struct CloudUserTimelineResponse {
     pub events: Vec<serde_json::Value>,
     /// Session summary with risk indicators
     pub summary: nanosiem_core::search::CloudUserSessionSummary,
+    /// Present when the complete timeline moved to the durable query lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<nanosiem_core::search::AsyncSearchResponse>,
 }
 
 /// Get a cloud user's activity timeline
@@ -356,12 +660,24 @@ pub async fn get_cloud_user_timeline(
     require_search_execute(&auth)?;
 
     let scope = super::search::effective_scope(&auth);
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let search = super::product_view_search(&state, &auth)?;
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "cusertl",
         &[
             request.query.as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
             request.user.as_bytes(),
         ],
         &scope,
@@ -374,6 +690,7 @@ pub async fn get_cloud_user_timeline(
             {
                 record_search_query("cloud_user_timeline_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -382,20 +699,49 @@ pub async fn get_cloud_user_timeline(
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
-    let result = state
-        .search
+    let result = search
         .query_cloud_user_timeline(&request.query, &time_range, &request.user, &scope)
         .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if matches!(
+        &result,
+        Err(nanosiem_core::SearchError::ResourceExhausted(_))
+    ) {
+        let job_id = search
+            .enqueue_durable_cloud_user_timeline(
+                &request.query,
+                &time_range,
+                &request.user,
+                &scope,
+                auth.claims.sub,
+                auth.durable_search_authority().as_ref(),
+            )
+            .await?;
+        record_search_query("cloud_user_timeline_queued", duration_ms, true);
+        super::require_current_shared_authority(&state, &auth).await?;
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(CloudUserTimelineResponse {
+                events: Vec::new(),
+                summary: nanosiem_core::search::CloudUserSessionSummary::default(),
+                durable_job: Some(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                }),
+            }),
+        ));
+    }
     record_search_query("cloud_user_timeline", duration_ms, result.is_ok());
 
-    let (events, summary) = result.map_err(|e| {
-        tracing::error!(error = %e, "Cloud user timeline query failed");
-        SearchError::QueryError("Failed to fetch cloud user timeline".to_string())
-    })?;
+    let (events, summary) = result
+        .map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch cloud user timeline"))?;
 
-    let response = CloudUserTimelineResponse { events, summary };
+    let response = CloudUserTimelineResponse {
+        events,
+        summary,
+        durable_job: None,
+    };
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
         let resp = response.clone();
@@ -403,7 +749,11 @@ pub async fn get_cloud_user_timeline(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }
 
 // ============================================================================
@@ -432,6 +782,9 @@ pub struct CloudEntityPivotResponse {
     pub cross_references: Vec<nanosiem_core::search::EntityCrossReference>,
     /// Entity summary (event_count, fail_count, first/last seen, change_types, services)
     pub entity_summary: serde_json::Value,
+    /// Present when the complete pivot moved to the durable query lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<nanosiem_core::search::AsyncSearchResponse>,
 }
 
 /// Get entity cross-references (pivot from user/IP/resource)
@@ -460,12 +813,24 @@ pub async fn get_cloud_entity_pivot(
     require_search_execute(&auth)?;
 
     let scope = super::search::effective_scope(&auth);
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let search = super::product_view_search(&state, &auth)?;
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "centity",
         &[
             request.query.as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
             request.entity_type.as_bytes(),
             request.entity_value.as_bytes(),
         ],
@@ -479,6 +844,7 @@ pub async fn get_cloud_entity_pivot(
             {
                 record_search_query("cloud_entity_pivot_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -487,8 +853,7 @@ pub async fn get_cloud_entity_pivot(
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
-    let result = state
-        .search
+    let result = search
         .query_cloud_entity_pivot(
             &request.query,
             &time_range,
@@ -499,17 +864,46 @@ pub async fn get_cloud_entity_pivot(
         .await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if matches!(
+        &result,
+        Err(nanosiem_core::SearchError::ResourceExhausted(_))
+    ) {
+        let job_id = search
+            .enqueue_durable_cloud_entity_pivot(
+                &request.query,
+                &time_range,
+                &request.entity_type,
+                &request.entity_value,
+                &scope,
+                auth.claims.sub,
+                auth.durable_search_authority().as_ref(),
+            )
+            .await?;
+        record_search_query("cloud_entity_pivot_queued", duration_ms, true);
+        super::require_current_shared_authority(&state, &auth).await?;
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(CloudEntityPivotResponse {
+                events: Vec::new(),
+                cross_references: Vec::new(),
+                entity_summary: serde_json::json!({}),
+                durable_job: Some(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                }),
+            }),
+        ));
+    }
     record_search_query("cloud_entity_pivot", duration_ms, result.is_ok());
 
-    let (events, cross_references, entity_summary) = result.map_err(|e| {
-        tracing::error!(error = %e, "Cloud entity pivot query failed");
-        SearchError::QueryError("Failed to fetch entity pivot".to_string())
-    })?;
+    let (events, cross_references, entity_summary) =
+        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch entity pivot"))?;
 
     let response = CloudEntityPivotResponse {
         events,
         cross_references,
         entity_summary,
+        durable_job: None,
     };
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
@@ -518,7 +912,11 @@ pub async fn get_cloud_entity_pivot(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }
 
 // ============================================================================
@@ -574,7 +972,9 @@ pub async fn get_asset_true_time_range(
     // caller. Restricted callers are routed by the service to a scoped raw
     // scan, so the effective scope is both execution input and cache identity.
     let scope = super::search::effective_scope(&auth);
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let search = super::product_view_search(&state, &auth)?;
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "atruerange",
         &[
             request.identifier_field.as_bytes(),
@@ -593,13 +993,13 @@ pub async fn get_asset_true_time_range(
             {
                 record_search_query("asset_true_time_range_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
     }
 
-    let (first_seen, last_seen) = state
-        .search
+    let (first_seen, last_seen) = search
         .query_asset_true_time_range(
             &request.identifier_field,
             &request.identifier_value,
@@ -627,7 +1027,11 @@ pub async fn get_asset_true_time_range(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }
 
 // ============================================================================
@@ -683,8 +1087,32 @@ pub struct ArtifactPrevalence {
     pub prevalence_score: u8,
     /// Total occurrences across the environment
     pub total_occurrences: u64,
-    /// First seen in the environment
+    /// First seen WITHIN the searched window for THIS asset (min event
+    /// timestamp over the asset's rows) -- NOT an environment-wide first-seen.
+    /// Novelty ("new to env") must key off `env_first_seen` instead.
     pub first_seen: String,
+    /// REAL environment-wide first-seen from the prevalence baseline
+    /// (all-time min), when the baseline knows the artifact. Absent on a
+    /// baseline miss -- clients must not substitute `first_seen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_first_seen: Option<String>,
+    /// where `host_count` came from -- "baseline" (immutable snapshot),
+    /// "in-window" (distinct hosts in the queried window only, a strict lower
+    /// bound used when the lagging snapshot has nothing), or "none".
+    ///
+    /// Defaults to "baseline" so older clients and the ClickHouse path
+    /// deserialize unchanged.
+    #[serde(default = "default_prevalence_source")]
+    pub prevalence_source: String,
+    /// Distinct hosts observed in the queried window, when known. Reported
+    /// alongside the baseline rather than replacing it: it cannot see an asset
+    /// that touched the artifact before the window opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_window_hosts: Option<u64>,
+}
+
+fn default_prevalence_source() -> String {
+    "baseline".to_string()
 }
 
 /// Response with per-event occurrences and prevalence metadata
@@ -700,6 +1128,20 @@ pub struct AssetArtifactsResponse {
     pub domain_prevalence: Vec<ArtifactPrevalence>,
     /// The rarity threshold from prevalence settings
     pub rarity_threshold: u64,
+    /// True number of unique artifacts (hashes + domains) matched before any
+    /// per-class summary LIMIT. When it exceeds the returned prevalence rows,
+    /// the summary was truncated.
+    #[serde(default)]
+    pub total_artifacts: u64,
+    /// The per-class summary queries cap at 50 artifacts by recency; when a
+    /// class had more, this is true and `total_artifacts` carries the real
+    /// count. Mirrors `artifacts_truncated` on /api/prevalence/query-artifacts.
+    #[serde(default)]
+    pub artifacts_truncated: bool,
+    /// present on a lean summary still being built; poll again
+    /// after `retry_after_ms` while `complete` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<nanosiem_core::search::ProductViewProgress>,
 }
 
 /// Fetch per-event artifact occurrences with server-side prevalence filtering
@@ -732,8 +1174,12 @@ pub async fn get_asset_artifacts(
     let start = Instant::now();
     require_search_execute(&auth)?;
 
+    // Artifact prevalence is the tenant's prevalence plan component.
+    super::require_shared_prevalence_component(&auth)?;
     let scope = super::search::effective_scope(&auth);
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let search = super::product_view_search(&state, &auth)?;
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "aartifacts",
         &[
             request.identifier_field.as_bytes(),
@@ -741,8 +1187,18 @@ pub async fn get_asset_artifacts(
             serde_json::to_string(&request.identities)
                 .unwrap_or_default()
                 .as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
             request.max_host_count.to_string().as_bytes(),
             request.prevalence_window.as_bytes(),
         ],
@@ -750,12 +1206,10 @@ pub async fn get_asset_artifacts(
     );
     if !bypass {
         if let Some(cache) = state.result_cache.as_ref() {
-            if let Some(cached) = cache
-                .get_cached::<AssetArtifactsResponse>(&cache_key)
-                .await
-            {
+            if let Some(cached) = cache.get_cached::<AssetArtifactsResponse>(&cache_key).await {
                 record_search_query("asset_artifacts_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -765,8 +1219,7 @@ pub async fn get_asset_artifacts(
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
     // Step 1: Get unique artifacts with pre-computed prevalence from event enrichment
-    let summary = state
-        .search
+    let summary = search
         .query_asset_artifact_summary(
             &request.identifier_field,
             &request.identifier_value,
@@ -776,13 +1229,23 @@ pub async fn get_asset_artifacts(
         )
         .await?;
 
-    let rarity_threshold = state.prevalence.get_config().await.rarity_threshold;
+    // The process prevalence settings belong to the dedicated deployment. A
+    // shared tenant's rarity comes from its own cell prevalence client, whose
+    // threshold is the fixed lean-lake contract.
+    let rarity_threshold = if crate::is_shared_scope(auth.tenant_scope) {
+        nanosiem_core::search::lake_cell::LAKE_CELL_PREVALENCE_RARITY_THRESHOLD
+    } else {
+        state.prevalence.get_config().await.rarity_threshold
+    };
 
     // Parse summary into (artifact, host_count) pairs
     struct ArtifactSummary {
         artifact: String,
         host_count: u64,
         first_seen: String,
+        env_first_seen: Option<String>,
+        prevalence_source: String,
+        in_window_hosts: Option<u64>,
     }
     let parse_summaries = |key: &str| -> Vec<ArtifactSummary> {
         summary
@@ -801,6 +1264,21 @@ pub async fn get_asset_artifacts(
                                 v => v,
                             },
                             first_seen: v.get("first_ts")?.as_str().unwrap_or_default().to_string(),
+                            // Both paths emit this only when the prevalence
+                            // baseline actually knows the artifact.
+                            env_first_seen: v
+                                .get("env_first_seen")
+                                .and_then(|s| s.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
+                            // Absent on the ClickHouse path, which emits no
+                            // provenance -- a real count there is a baseline.
+                            prevalence_source: v
+                                .get("prevalence_source")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("baseline")
+                                .to_string(),
+                            in_window_hosts: v.get("in_window_hosts").and_then(|n| n.as_u64()),
                         })
                     })
                     .collect()
@@ -811,7 +1289,28 @@ pub async fn get_asset_artifacts(
     let hash_summaries = parse_summaries("hashes");
     let domain_summaries = parse_summaries("domains");
 
+    // True pre-LIMIT group counts. Absent on a pre-truncation-fix service
+    // (mixed deploy) -> fall back to the returned lengths (never claims
+    // truncation it cannot prove).
+    let hash_total = summary
+        .get("hash_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(hash_summaries.len() as u64);
+    let domain_total = summary
+        .get("domain_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(domain_summaries.len() as u64);
+    let artifacts_truncated =
+        hash_total > hash_summaries.len() as u64 || domain_total > domain_summaries.len() as u64;
+    let progress = summary.get("progress").cloned().and_then(|value| {
+        serde_json::from_value::<nanosiem_core::search::ProductViewProgress>(value).ok()
+    });
+    let cacheable = progress
+        .as_ref()
+        .is_none_or(|progress| progress.cacheable());
+
     if hash_summaries.is_empty() && domain_summaries.is_empty() {
+        super::require_current_shared_authority(&state, &auth).await?;
         return Ok((
             crate::cache::cache_status_headers(false, None),
             Json(AssetArtifactsResponse {
@@ -820,6 +1319,9 @@ pub async fn get_asset_artifacts(
                 hash_prevalence: vec![],
                 domain_prevalence: vec![],
                 rarity_threshold: 0,
+                total_artifacts: 0,
+                artifacts_truncated: false,
+                progress,
             }),
         ));
     }
@@ -845,6 +1347,9 @@ pub async fn get_asset_artifacts(
                     prevalence_score: score,
                     total_occurrences: 0, // per-asset occurrences filled in Step 4
                     first_seen: s.first_seen.clone(),
+                    env_first_seen: s.env_first_seen.clone(),
+                    prevalence_source: s.prevalence_source.clone(),
+                    in_window_hosts: s.in_window_hosts,
                 }
             })
             .collect()
@@ -866,8 +1371,7 @@ pub async fn get_asset_artifacts(
         .collect();
 
     // Step 4: Fetch per-event occurrences for only the filtered artifacts
-    let raw = state
-        .search
+    let raw = search
         .query_asset_artifact_occurrences(
             &request.identifier_field,
             &request.identifier_value,
@@ -927,15 +1431,22 @@ pub async fn get_asset_artifacts(
         hash_prevalence: all_hash_prevalence,
         domain_prevalence: all_domain_prevalence,
         rarity_threshold: rarity_threshold,
+        total_artifacts: hash_total + domain_total,
+        artifacts_truncated,
+        progress,
     };
-    if let Some(cache) = state.result_cache.as_ref() {
+    if let Some(cache) = state.result_cache.as_ref().filter(|_| cacheable) {
         let cache = cache.clone();
         let resp = response.clone();
         tokio::spawn(async move {
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }
 
 #[cfg(test)]

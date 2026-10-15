@@ -9,7 +9,7 @@
 //! `search/service/cloud_overview.rs`).
 //!
 //! The analytics service (`RiskAnalyticsService` + `RiskRepository`) lives in
-//! `nanosiem-enterprise::risk` (lifted in Phase 3.4 of NAN-744). Open-core
+//! `enterprise::risk` (lifted in Phase 3.4 of NAN-744). Open-core
 //! builds wire `NoopCloudRiskProvider` so cloud overview / dossier surfaces
 //! render without risk badges.
 //!
@@ -24,6 +24,10 @@
 
 pub mod clickhouse_sql;
 pub mod config_provider;
+pub mod timeline;
 pub mod types;
+pub mod watchlist;
+pub mod watchlist_suggest;
+pub mod wire;
 
 pub use types::*;

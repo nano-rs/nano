@@ -52,7 +52,9 @@ pub(crate) fn filter_value(input: &str) -> ParseResult<'_, Value> {
 
 /// True when a value token ended — i.e. what follows can't extend it.
 fn ends_value_token(rest: &str) -> bool {
-    rest.chars().next().is_none_or(|c| !is_unquoted_value_char(c))
+    rest.chars()
+        .next()
+        .is_none_or(|c| !is_unquoted_value_char(c))
 }
 
 /// Parse IP address value
@@ -200,13 +202,30 @@ pub(crate) fn is_unquoted_value_char(c: char) -> bool {
 
 /// Parse unquoted string value (includes wildcards, paths, and common chars)
 pub(crate) fn unquoted_string(input: &str) -> ParseResult<'_, String> {
-    map(take_while1(is_unquoted_value_char), |s: &str| {
-        s.to_string()
-    })
-    .parse(input)
+    map(take_while1(is_unquoted_value_char), |s: &str| s.to_string()).parse(input)
 }
 
-/// Parse field name (supports dot notation and metadata_ prefix)
+/// Consume a repeated-object marker (`[]`) if one starts at `input`.
+///
+/// NAN-2379: the OCSF field universe advertises repeated attributes with their
+/// spec spelling — `answers[].rdata`, `email.to[]`, `resources[].name`. That is
+/// the name `GET /api/schema/fields` publishes, so it is the name analysts type,
+/// but the grammar rejected `[` outright ("Unexpected token '['") while the
+/// bare form was rejected by canonical validation — a closed loop with no way to
+/// address the field at all.
+///
+/// `[]` carries no addressing information (it says "the parent repeats", which
+/// the schema already knows), so the tokenizer ACCEPTS and DROPS it: the AST
+/// carries the flat dotted path, which is what every downstream consumer —
+/// resolution, array-predicate codegen, projection — already understands. Only
+/// the exact empty-bracket pair is consumed, so `field IN [search …]` and every
+/// other bracket form are untouched.
+fn strip_repeated_marker(input: &str) -> Option<&str> {
+    input.strip_prefix("[]")
+}
+
+/// Parse field name (supports dot notation, `[]` repeated markers, and the
+/// metadata_ prefix)
 pub(crate) fn field_name(input: &str) -> ParseResult<'_, String> {
     // Parse initial field name (letters/underscore, then alphanumeric/underscore)
     let (mut remaining, base) = recognize(pair(
@@ -228,6 +247,12 @@ pub(crate) fn field_name(input: &str) -> ParseResult<'_, String> {
     // Handle dots for nested fields (e.g., user.name)
     // But stop if dot is followed by a quote (string concatenation)
     loop {
+        // A repeated-object marker may follow any segment (`answers[].rdata`,
+        // `email.to[]`); it is consumed and dropped — see `strip_repeated_marker`.
+        if let Some(rest) = strip_repeated_marker(remaining) {
+            remaining = rest;
+            continue;
+        }
         // Check if we have a dot
         if remaining.starts_with('.') {
             // Peek at what comes after the dot
@@ -281,11 +306,36 @@ pub(crate) fn field_name_with_wildcard(input: &str) -> ParseResult<'_, String> {
                 // Regular start: src_*, field, field*
                 take_while1(|c: char| c.is_alphabetic() || c == '_'),
             )),
+            // Trailing segment characters. Brackets are deliberately NOT in this
+            // set: accepting a bare `]` made `| table user, department, manager]`
+            // parse `manager]` as a field name, swallowing the closing bracket of
+            // an enclosing subsearch — `… | join type=left user [search … | table
+            // a, b, c]` then failed to parse at all. Only the exact `[]` pair is
+            // a repeated marker, and it is consumed by the loop below.
             take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '*'),
         )),
         |s: &str| s.to_string(),
     )
     .parse(input)
+    .and_then(|(mut remaining, mut name)| {
+        // `[]` repeated markers, consumed and dropped for the same reason as in
+        // `field_name` (NAN-2379): `| table answers[].rdata` must address the
+        // same column as `| where answers[].rdata = …`. Only an exact adjacent
+        // pair is taken, and only followed by more field characters, so a lone
+        // `]` closing a subsearch is left for the enclosing parser.
+        loop {
+            let Some(rest) = remaining.strip_prefix("[]") else {
+                break;
+            };
+            remaining = rest;
+            let end = remaining
+                .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '*'))
+                .unwrap_or(remaining.len());
+            name.push_str(&remaining[..end]);
+            remaining = &remaining[end..];
+        }
+        Ok((remaining, name))
+    })
 }
 
 /// Parse comparison operator (excludes regex which uses /pattern/ syntax)

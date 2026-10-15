@@ -3,6 +3,8 @@
 import { useState } from 'react';
 import { Search, Filter, Bookmark, Share2, ChevronDown } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { RiskSheetLauncher } from '@/enterprise/components/risk/RiskSheetLauncher';
+import { AddToWatchlistMenu } from '@/enterprise/components/risk/watchlists/AddToWatchlistMenu';
 import type { AssetDossierIdentity } from '@/lib/api/types';
 import type { EntityRiskSummary } from '@/lib/api/types';
 import {
@@ -161,8 +163,16 @@ export function AssetIdentityHeader({
 
         <div className="flex flex-col items-end gap-3 shrink-0 w-[260px]">
           {risk ? (
+            // NAN-3225: in enterprise builds the score opens the risk-object
+            // sheet (contributions, tactics, timeline, findings); open-edition
+            // keeps the inline summary toggle.
+            <RiskSheetLauncher entity={entityValue} entityType={kind} score={risk.risk_score}>
+              {(openRiskSheet) => (
             <button
-              onClick={() => setScoreOpen((o) => !o)}
+              type="button"
+              data-testid="asset-risk-score"
+              onClick={openRiskSheet ?? (() => setScoreOpen((o) => !o))}
+              title={openRiskSheet ? 'Why this score' : undefined}
               className={cn(
                 'w-full rounded-lg border px-3 py-2.5 flex items-center gap-3 text-left transition-colors hover:bg-opacity-80',
                 tone.border,
@@ -189,10 +199,13 @@ export function AssetIdentityHeader({
               <ChevronDown
                 className={cn(
                   'w-3 h-3 transition-transform text-muted-foreground/70',
-                  scoreOpen && 'rotate-180'
+                  scoreOpen && 'rotate-180',
+                  openRiskSheet && '-rotate-90'
                 )}
               />
             </button>
+              )}
+            </RiskSheetLauncher>
           ) : (
             <div className="w-full rounded-lg border border-border bg-foreground/3 px-3 py-2.5 flex items-center gap-3">
               <RiskGauge score={0} band="none" />
@@ -225,12 +238,20 @@ export function AssetIdentityHeader({
               title="Scoped filters — not yet wired"
               disabled
             />
-            <HeaderAction
-              icon={<Bookmark className="w-[12px] h-[12px]" />}
-              label=""
-              title="Watchlist — not yet wired"
-              disabled
-            />
+            {/* NAN-3228: add / remove this entity on risk watchlists. */}
+            <AddToWatchlistMenu
+              entity={entityValue}
+              entityType={/ip$/.test(entityField) ? 'ip' : kind}
+            >
+              <button
+                type="button"
+                title="Add to watchlist"
+                aria-label="Add to watchlist"
+                className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-border text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+              >
+                <Bookmark className="w-[12px] h-[12px]" />
+              </button>
+            </AddToWatchlistMenu>
             <HeaderAction
               icon={<Share2 className="w-[12px] h-[12px]" />}
               label={shareCopied ? 'Copied' : ''}

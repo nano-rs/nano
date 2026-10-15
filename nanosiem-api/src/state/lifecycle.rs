@@ -123,125 +123,35 @@ impl AppState {
         #[cfg(not(feature = "enterprise"))]
         let ai_checker: Option<Arc<dyn AiProviderConnectivityChecker>> = None;
 
-        let scheduler = Arc::new(HealthScheduler::with_dual_pool(
+        let mut scheduler = HealthScheduler::with_dual_pool(
             self.pool.clone(),
             self.dual_pool.clone(),
             config,
             ai_checker,
             self.config.airgap,
-        ));
+        );
+        // NAN-3464: a lake deployment has no ClickHouse/PostgreSQL `logs`
+        // table; feed staleness reads the lake's last event per source (the
+        // same read `/api/log-sources/{id}/health` serves).
+        if self.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+            scheduler = scheduler.with_lake_feed_freshness(Arc::new(self.search_service.clone()));
+        }
 
-        scheduler.start()
+        Arc::new(scheduler).start()
     }
 
     /// Drain the durable system-health outbox through the existing notification
     /// channel delivery spine. Leader-only invocation prevents duplicate work;
     /// row claims remain fenced with `FOR UPDATE SKIP LOCKED` for safe handover.
     pub fn start_system_health_dispatcher(&self) -> tokio::task::JoinHandle<()> {
-        let repository = nanosiem_core::system_health::SystemHealthRepository::new(
-            self.pool.clone(),
-        );
-        let dispatcher = std::sync::Arc::new(
-            nanosiem_core::system_health::SystemHealthDispatcher::new(
+        let repository =
+            nanosiem_core::system_health::SystemHealthRepository::new(self.pool.clone());
+        let dispatcher =
+            std::sync::Arc::new(nanosiem_core::system_health::SystemHealthDispatcher::new(
                 repository,
                 self.node_id.clone(),
-            ),
-        );
+            ));
         dispatcher.start(std::time::Duration::from_secs(2))
-    }
-
-    /// Start the case change listener for real-time SSE notifications.
-    ///
-    /// Listens on the PostgreSQL `case_changes` channel. When a case is created
-    /// or updated on any node, the event is broadcast to all SSE subscribers.
-    /// Runs on ALL nodes (not leader-only) so every API instance serves SSE.
-    ///
-    /// Phase 3.2 (NAN-744): cases SSE moved to enterprise; the listener +
-    /// broadcast channel only ship in enterprise builds.
-    #[cfg(feature = "enterprise")]
-    pub fn start_case_change_listener(&self) -> tokio::task::JoinHandle<()> {
-        let pool = self.pool.clone();
-        let tx = self.case_events_tx.clone();
-
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-
-            loop {
-                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                    Ok(l) => {
-                        backoff_secs = 1;
-                        l
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to create PgListener for case_changes: {}, retrying in {}s",
-                            e,
-                            backoff_secs
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                        continue;
-                    }
-                };
-
-                if let Err(e) = listener.listen("case_changes").await {
-                    tracing::error!(
-                        "Failed to listen on case_changes channel: {}, retrying in {}s",
-                        e,
-                        backoff_secs
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue;
-                }
-
-                tracing::info!("Listening for case_changes notifications");
-
-                loop {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(300),
-                        listener.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(notification)) => {
-                            match serde_json::from_str::<super::CaseChangeEvent>(
-                                notification.payload(),
-                            ) {
-                                Ok(event) => {
-                                    tracing::debug!(
-                                        case_id = %event.case_id,
-                                        event = %event.event,
-                                        "Broadcasting case change event"
-                                    );
-                                    // Ignore send errors — means no active subscribers
-                                    let _ = tx.send(event);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        payload = %notification.payload(),
-                                        error = %e,
-                                        "Failed to parse case_changes payload"
-                                    );
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                "PgListener error on case_changes: {}, reconnecting...",
-                                e
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            break;
-                        }
-                        Err(_) => {
-                            tracing::debug!("PgListener case_changes keepalive timeout, reconnecting");
-                            break;
-                        }
-                    }
-                }
-            }
-        })
     }
 
     /// Start leader-only schedulers (signal processor, enrichment, tuning, disk pressure).
@@ -254,14 +164,81 @@ impl AppState {
     pub async fn start_leader_schedulers(&self) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
 
-        // Signal processor (bridges ClickHouse signals to PostgreSQL alerts)
-        // Must be single-leader: serial watermark processing
-        match self.signal_processor.start().await {
-            Ok(handle) => {
-                handles.push(handle);
-                tracing::info!("Signal processor started (leader-only)");
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            // None of the legacy leader loops below has a complete signed
+            // tenant authority/data-plane contract. Shared starts only private
+            // tenant runtimes from their explicit startup owners; the platform
+            // catalog allowlist here leaves dedicated/open behavior
+            // byte-compatible.
+            tracing::info!("Enterprise-shared legacy/global leader schedulers remain disabled");
+            // NAN-2361 Observability: the synthetic-check runner, metric-monitor
+            // evaluator and SLO burn-rate evaluator are refused here by name.
+            // The shared profile has no per-tenant OTLP data path (the native
+            // OTLP lake is tenant-pinned and the hosted ingest Worker does not
+            // deliver spans/metrics), so evaluating tenant rows would read an
+            // empty dataset, and the synthetic runner would additionally probe
+            // tenant-authored URLs from the control plane. Definitions stay
+            // persisted per tenant; the console reports `telemetry.available=false`.
+            tracing::info!(
+                refused = "synthetics_runner,metric_monitor_evaluator,slo_evaluator",
+                "Enterprise-shared observability evaluators are not started: no per-tenant telemetry data path"
+            );
+            // NAN-3196: the legacy HealthScheduler stays off (global admins,
+            // tenant-blind issue tracker, ClickHouse). Shared feed staleness
+            // runs through signed tenant transactions over the lake counters
+            // and writes tenant-scoped inbox rows; internal, so not egress-gated.
+            if let Some(runtime) = self.tenant_feed_staleness_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared feed-staleness monitor started (leader-only)");
+            } else {
+                tracing::warn!("Enterprise-shared feed-staleness monitor unavailable; stale-source notifications are off");
             }
-            Err(e) => tracing::error!("Failed to start signal processor: {}", e),
+            // NAN-2361 wave 3: the MITRE ATT&CK catalog is tenant-blind
+            // PLATFORM data (9000262 reads it on the control connection for
+            // every tenant), so its sync is a platform-only leader loop the
+            // shared API does run — catalog only, no tenant-rule reconcile
+            // (`MitreSync::platform_catalog_only`), writes granted to the
+            // control login by 9000462. Without it the live catalog stayed
+            // empty and every tenant's Coverage page spun forever.
+            if self.config.egress_jobs_enabled() {
+                handles.push(self.start_rule_repo_sync_scheduler());
+                tracing::info!("Hosted rule repository sync scheduler started (leader-only, signed tenant transactions)");
+                // NAN-2975: the platform catalog mirror every tenant follows.
+                handles.push(self.start_parser_repo_sync_scheduler());
+                tracing::info!("Platform catalog follow scheduler started (leader-only mirror refresh + tenant fan-out)");
+                handles.push(self.start_mitre_sync_scheduler());
+                #[cfg(feature = "enterprise")]
+                handles.push(self.start_model_catalog_sync_scheduler());
+                handles.push(self.start_marketplace_sync_scheduler());
+                tracing::info!("Marketplace platform catalog sync scheduler started (leader-only, enterprise-shared)");
+                tracing::info!(
+                    "MITRE catalog platform sync scheduler started (leader-only, enterprise-shared, catalog only)"
+                );
+            } else {
+                tracing::info!("AIRGAP_MODE: MITRE catalog platform sync not started");
+            }
+            // NAN-3211: per-tenant auto-tuning (signed tenant transactions).
+            handles.extend(self.start_shared_auto_tuning_scheduler());
+            return handles;
+        }
+
+        // The signal processor is the legacy ClickHouse materialized-view
+        // bridge. Lake detections emit alerts/findings directly through the
+        // scheduled engine and durable PostgreSQL outbox, so polling the inert
+        // compatibility client would only create an error loop.
+        if self.dual_pool.clickhouse_required() {
+            match self.signal_processor.start().await {
+                Ok(handle) => {
+                    handles.push(handle);
+                    tracing::info!("Signal processor started (leader-only)");
+                }
+                Err(e) => tracing::error!("Failed to start signal processor: {}", e),
+            }
+        } else {
+            tracing::info!(
+                "Legacy ClickHouse signal processor disabled; lake detections use the durable finding outbox"
+            );
         }
 
         // Health monitoring can create notifications and perform paid AI
@@ -289,7 +266,7 @@ impl AppState {
 
             // Custom enrichment scheduler — runs Deno data enrichments on their
             // cron schedules. Enterprise only after Phase 3.3 of NAN-744 (the
-            // sandbox runtime + scheduler live in nanosiem-enterprise).
+            // sandbox runtime + scheduler live in the enterprise crate).
             #[cfg(feature = "enterprise")]
             {
                 handles.push(self.start_custom_enrichment_scheduler());
@@ -299,25 +276,35 @@ impl AppState {
                 // ingest lane. Sits under the egress gate deliberately: a
                 // collector's whole job is reaching a vendor API, so it has no
                 // meaning in an air-gapped install.
-                handles.push(self.start_collector_scheduler());
-                tracing::info!("Collector scheduler started (leader-only)");
+                // NAN-2361 wave 5: the collector loop selects integration_instances
+                // over the control pool; it is not a tenant runner on the shared lake.
+                if self.config.deployment_mode.is_enterprise_shared() {
+                    tracing::info!("Collector scheduler skipped on the shared lake");
+                } else {
+                    handles.push(self.start_collector_scheduler());
+                    tracing::info!("Collector scheduler started (leader-only)");
+                }
             }
 
             // Identity provider sync scheduler
             handles.push(self.start_identity_sync_scheduler());
             tracing::info!("Identity sync scheduler started (leader-only)");
 
-            // Repository auto-sync schedulers — staggered to avoid concurrent GitHub clones:
-            //   Parsers: 10 min delay (needed first for rule evaluation)
-            //   Rules: 20 min delay
+            // Repository auto-sync schedulers. Both first reconcile the
+            // first-party nano-rs catalogs (NAN-3758); staggered so the first
+            // GitHub pulls do not overlap:
+            //   Parsers: immediately (needed first for rule evaluation)
+            //   Rules: 30 s
             //   Marketplace: 30 min delay
             handles.push(self.start_parser_repo_sync_scheduler());
             tracing::info!(
-                "Parser repo auto-sync scheduler started (leader-only, 10m initial delay)"
+                "Parser repo auto-sync scheduler started (leader-only, first-party catalogs reconciled)"
             );
 
             handles.push(self.start_rule_repo_sync_scheduler());
-            tracing::info!("Rule repo auto-sync scheduler started (leader-only, 20m initial delay)");
+            tracing::info!(
+                "Rule repo auto-sync scheduler started (leader-only)"
+            );
 
             handles.push(self.start_marketplace_sync_scheduler());
             tracing::info!(
@@ -354,9 +341,15 @@ impl AppState {
         handles.extend(self.start_tuning_scheduler());
         tracing::info!("Tuning scheduler started (leader-only)");
 
-        // Disk pressure scheduler
-        handles.push(Arc::clone(&self.disk_pressure_service).start());
-        tracing::info!("Disk pressure scheduler started (leader-only)");
+        // This scheduler manages ClickHouse partitions and TTLs. Object-store
+        // retention/capacity is a separate lake maintenance concern; never run
+        // CH mutations against the inert compatibility client.
+        if self.dual_pool.clickhouse_required() {
+            handles.push(Arc::clone(&self.disk_pressure_service).start());
+            tracing::info!("Disk pressure scheduler started (leader-only)");
+        } else {
+            tracing::info!("ClickHouse disk-pressure scheduler disabled in canonical lake mode");
+        }
 
         // SIEM health check (AI-driven data quality analysis, every 12 hours)
         handles.push(self.start_siem_health_check_scheduler());
@@ -385,7 +378,7 @@ impl AppState {
 
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).
         // Job store / wizard session / melod session cleanups are enterprise-only —
-        // the underlying repos live in nanosiem-enterprise::melod.
+        // the underlying repos live in enterprise::melod.
         #[cfg(feature = "enterprise")]
         {
             handles.push(self.start_job_store_cleanup());

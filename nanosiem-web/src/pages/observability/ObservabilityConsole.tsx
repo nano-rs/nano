@@ -13,7 +13,6 @@
 import { lazy, Suspense, useMemo, useState, type ReactNode } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
-  Loader2,
   Box,
   GitBranch,
   LineChart,
@@ -23,6 +22,7 @@ import {
   MonitorSmartphone,
   Radar,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
@@ -30,6 +30,11 @@ import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { cn } from '@/lib/utils';
 import type { ObservabilityTab, ObservabilityTabProps } from './types';
 import { ServiceDetail } from './ServiceDetail';
+import {
+  TelemetryUnavailable,
+  TelemetryUnavailableNotice,
+} from '@/components/observability/TelemetryUnavailable';
+import { useTelemetryAvailability } from '@/hooks/use-telemetry-availability';
 
 // Lazy tab bodies — surface agents fill these; the shell only wires them.
 const ServicesTab = lazy(() => import('./tabs/ServicesTab'));
@@ -40,6 +45,21 @@ const RumTab = lazy(() => import('./tabs/RumTab'));
 const SyntheticsTab = lazy(() => import('./tabs/SyntheticsTab'));
 const AlertsTab = lazy(() => import('./tabs/AlertsTab'));
 const SlosTab = lazy(() => import('./tabs/SlosTab'));
+// Shared-lake tenants without telemetry still manage monitors (NAN-2361).
+const MetricMonitorsList = lazy(() =>
+  import('@/components/observability/MetricMonitorsList').then((m) => ({
+    default: m.MetricMonitorsList,
+  }))
+);
+
+/** What each data tab would have shown; names the empty state honestly. */
+const DATA_TAB_SUBJECT: Partial<Record<ObservabilityTab, string>> = {
+  services: 'Service RED metrics',
+  traces: 'Traces',
+  metrics: 'Metrics',
+  infrastructure: 'Host metrics',
+  rum: 'Real-user monitoring',
+};
 
 const TABS: Array<{ id: ObservabilityTab; label: string; icon: typeof Box }> = [
   { id: 'services', label: 'Services', icon: Box },
@@ -57,7 +77,7 @@ const VALID_TABS = new Set<string>(TABS.map((t) => t.id));
 function TabFallback() {
   return (
     <div className="flex items-center justify-center py-16">
-      <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+      <LoadingIcon className="w-5 h-5 text-muted-foreground" />
     </div>
   );
 }
@@ -72,9 +92,9 @@ export function ObservabilityConsole() {
   const service = searchParams.get('service') ?? undefined;
 
   useDocumentTitle(service ? `Observability · ${service}` : 'Observability');
-  useBreadcrumbTitle(
-    service ? `Observability / ${service}` : 'Observability'
-  );
+  // AppBreadcrumbs renders "Observability" as the parent on /observability/:tab;
+  // the :dynamic leaf (the TopBar title) is the drilled-in service or the tab.
+  useBreadcrumbTitle(service ?? TABS.find((t) => t.id === tab)?.label ?? 'Observability');
 
   // The console keeps a single shared time range; default to last hour to match
   // the design's topbar default. (Per-tab refinement can layer on later.)
@@ -113,11 +133,30 @@ export function ObservabilityConsole() {
     onOpenTrace: openTrace,
   };
 
+  // NAN-2361: a shared-lake tenant asks once whether spans/metrics exist. When
+  // they do not, the data tabs render the honest empty state and never call
+  // the fenced search routes; definition tabs keep working with a notice.
+  const { loading: telemetryLoading, telemetry, unavailable } = useTelemetryAvailability();
+
   // Service drill-in takes over the body (only meaningful on the Services tab).
   const showServiceDetail = tab === 'services' && !!service;
 
   let body: ReactNode;
-  if (showServiceDetail && service) {
+  const dataSubject = DATA_TAB_SUBJECT[tab];
+  if (telemetryLoading && (dataSubject || tab === 'synthetics' || tab === 'slos')) {
+    body = <TabFallback />;
+  } else if (unavailable && dataSubject) {
+    body = (
+      <>
+        <TelemetryUnavailable telemetry={telemetry} subject={dataSubject} />
+        {tab === 'metrics' && (
+          <Suspense fallback={<TabFallback />}>
+            <MetricMonitorsList />
+          </Suspense>
+        )}
+      </>
+    );
+  } else if (showServiceDetail && service) {
     body = (
       <ServiceDetail
         service={service}
@@ -134,9 +173,21 @@ export function ObservabilityConsole() {
         {tab === 'metrics' && <MetricsTab {...tabProps} />}
         {tab === 'infrastructure' && <InfraTab {...tabProps} />}
         {tab === 'rum' && <RumTab {...tabProps} />}
-        {tab === 'synthetics' && <SyntheticsTab {...tabProps} />}
+        {tab === 'synthetics' && (
+          <>
+            {unavailable && (
+              <TelemetryUnavailableNotice telemetry={telemetry} subject="Synthetic checks" />
+            )}
+            <SyntheticsTab {...tabProps} />
+          </>
+        )}
         {tab === 'alerts' && <AlertsTab {...tabProps} />}
-        {tab === 'slos' && <SlosTab {...tabProps} />}
+        {tab === 'slos' && (
+          <>
+            {unavailable && <TelemetryUnavailableNotice telemetry={telemetry} subject="SLOs" />}
+            <SlosTab {...tabProps} />
+          </>
+        )}
       </Suspense>
     );
   }

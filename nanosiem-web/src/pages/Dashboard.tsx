@@ -5,7 +5,7 @@
  *
  * Ported from design-ref/shadcn/home-view.jsx. Real-data SIEM home:
  *  - 4-card pulse strip (state of the house)
- *  - Hero with greeting + PIVT intake + suggestion chips (preserved from
+ *  - Hero with greeting + pivt intake + suggestion chips (preserved from
  *    the prior "AI Concierge" implementation — types text, AI routes to
  *    a notebook or search)
  *  - Two columns: My Work (cases, notebooks) + Fleet signal (audit feed,
@@ -20,7 +20,6 @@ import { useState, useRef, useEffect, useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowRight,
-  Loader2,
   ArrowUpRight,
   ChevronRight,
   Sparkles,
@@ -31,6 +30,7 @@ import {
   BookOpen,
   ActivitySquare,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
@@ -45,7 +45,7 @@ import {
   useDetectionHealthSummary,
   useNoisyRules,
   useIngestionHistory,
-  useAuditLog,
+  useRecentAuditChanges,
 } from '@/hooks/use-api';
 import { useMitreCoverage } from '@/hooks/useMitreData';
 import {
@@ -251,7 +251,7 @@ function PulseStrip() {
 }
 
 // ============================================================================
-// Hero (greeting + PIVT intake + chips) — preserved from prior implementation
+// Hero (greeting + pivt intake + chips) — preserved from prior implementation
 // ============================================================================
 
 function greetingFor() {
@@ -286,7 +286,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
   // Accepts an override so "Catch me up" (and chips in future) can submit atomically
   // without racing against the input setState.
   //
-  // AI path delegates to PIVT via `pivt:chat-message`. PivtPanelBody owns
+  // AI path delegates to pivt via `pivt:chat-message`. PivtPanelBody owns
   // the round trip (notebook create + chat poll + thread continuity) and
   // pops the panel open via its own `setOpen(true)` so the response
   // streams in visibly. Earlier this page reimplemented that flow inline
@@ -302,7 +302,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
           detail: { text },
         })
       );
-      // Brief visual ack — the heavy lifting now happens inside PIVT,
+      // Brief visual ack — the heavy lifting now happens inside pivt,
       // so we just clear the input and let the panel surface progress.
       setIsProcessing(true);
       setInput('');
@@ -317,7 +317,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
   // "Catch me up" wants a guaranteed destination — falling back through the
   // generic submit() lands the user on /search when AI is off, which is the
   // wrong surface for a "what's in my queue" question. NAN-916 F-33: take the
-  // user straight to their cases when AI is unavailable. The PIVT path is
+  // user straight to their cases when AI is unavailable. The pivt path is
   // unchanged.
   const handleCatchMeUp = () => {
     if (canUseAi && aiAvailable) {
@@ -371,7 +371,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
       <div className="w-full max-w-[640px]">
         <div className="rounded-xl border border-border bg-card overflow-hidden">
           <div className="px-3 py-1.5 border-b border-border flex items-center gap-2">
-            <span className="text-[10px] uppercase tracking-[0.12em] font-medium text-primary">PIVT intake</span>
+            <span className="text-[10px] uppercase tracking-[0.12em] font-medium text-primary">pivt intake</span>
             <span className="text-muted-foreground/60">::</span>
             <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground">Notebook or Search</span>
             <span className="ml-auto text-[10px] font-mono text-muted-foreground/60">⌘K</span>
@@ -396,7 +396,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
               disabled={!input.trim() || isProcessing}
               className="w-7 h-7 rounded-md bg-primary/15 hover:bg-primary/25 flex items-center justify-center transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
             >
-              {isProcessing ? <Loader2 className="w-3.5 h-3.5 text-primary animate-spin" /> : <ArrowRight className="w-3.5 h-3.5 text-primary" />}
+              {isProcessing ? <LoadingIcon className="w-3.5 h-3.5 text-primary" /> : <ArrowRight className="w-3.5 h-3.5 text-primary" />}
             </button>
           </div>
         </div>
@@ -640,7 +640,7 @@ function FleetColumn() {
     d.setHours(d.getHours() - 24);
     return d.toISOString();
   }, []);
-  const { data: audit } = useAuditLog({ start_time: since, limit: 6 });
+  const { data: audit } = useRecentAuditChanges({ start_time: since, limit: 6 });
   const { data: noisy } = useNoisyRules(5);
 
   const changes = audit?.logs ?? [];
@@ -749,7 +749,7 @@ function ActivityRow({ a }: { a: AuditLogEntry }) {
 }
 
 function ActivityFeed() {
-  const { data: audit } = useAuditLog({ limit: 7 });
+  const { data: audit } = useRecentAuditChanges({ limit: 7 });
   const rows = audit?.logs ?? [];
 
   return (

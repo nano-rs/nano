@@ -162,3 +162,59 @@ export const EVAL_FUNCTIONS_PATTERN = new RegExp(
 export const BOOLEAN_VALUES_PATTERN = new RegExp(
   `^(${BOOLEAN_VALUES.join('|')})\\b`, 'i'
 );
+
+// ---------------------------------------------------------------------------
+// Dotted field paths (NAN-3383)
+// ---------------------------------------------------------------------------
+
+/**
+ * A dotted field path such as `metadata.log_source` or `actor.user.name`.
+ * Every `.` must be followed by an identifier start, so a trailing `a.` or a
+ * numeric `a.1` never swallows the dot, and IPs (`10.0.0.1`) never match
+ * because they start with a digit. Requires at least one dot — plain
+ * identifiers keep their existing classification.
+ */
+export const DOTTED_FIELD_PATH_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)+/;
+
+/** Comparison operators after which a bare token is a value, not a field. */
+export const COMPARISON_OPERATORS_SET: Set<string> = new Set(['=', '!=', '>', '<', '>=', '<=', '~', '=~']);
+
+/**
+ * Pipe commands whose comparison right-hand side is an expression, where a bare
+ * dotted path is a field reference (`| eval x=a.b`, `| where a.b = c.d`).
+ */
+const EXPRESSION_COMMANDS_SET: Set<string> = new Set(['eval', 'where']);
+
+/** Lookahead: the text after a path starts with a comparison operator or operator keyword. */
+const FOLLOWED_BY_OPERATOR = /^\s*(?:[!=<>~]|(?:IN|CONTAINS|LIKE|STARTSWITH|ENDSWITH)\b)/i;
+
+export interface DottedPathContext {
+  /** Pipe command of the current segment (lowercase), or null in the leading search segment. */
+  command: string | null;
+  /** The previous significant token was a comparison operator. */
+  afterComparison: boolean;
+  /** Source text immediately after the path (used for operator lookahead). */
+  rest: string;
+  /** Known field names (UDM + registered schema fields). */
+  knownFields: Set<string>;
+}
+
+/**
+ * Decide whether a dotted path is a field reference (highlight the whole path
+ * as a field) or a bare value such as a domain (`dest_host=evil.com`, or a
+ * free-text term `evil.com`).
+ *
+ * - After a comparison operator in a search segment → value.
+ * - In a search segment otherwise → field only if it's a known field or is
+ *   followed by an operator (`a.b=`, `a.b != …`, `a.b IN (…)`); a bare
+ *   `evil.com` keyword stays plain text.
+ * - Inside any other pipe command (`stats … by a.b`, `table a.b`,
+ *   `where a.b > 1`, `eval x=a.b`) → field.
+ */
+export function isDottedFieldReference(path: string, ctx: DottedPathContext): boolean {
+  const inSearchSegment = ctx.command === null || ctx.command === 'search';
+  const isExpression = ctx.command !== null && EXPRESSION_COMMANDS_SET.has(ctx.command);
+  if (ctx.afterComparison && !isExpression) return false;
+  if (!inSearchSegment) return true;
+  return ctx.knownFields.has(path) || FOLLOWED_BY_OPERATOR.test(ctx.rest);
+}

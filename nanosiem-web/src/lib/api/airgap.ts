@@ -8,6 +8,7 @@
 // FormData + manual-fetch pattern used by `UploadApi.previewUpload`.
 
 import { getServiceUrl } from './utils';
+import { requestCredentials } from '@/lib/request-credentials';
 import { getAccessToken } from '../auth-token';
 
 /**
@@ -38,7 +39,9 @@ async function postBundle<T>(endpoint: string, file: File): Promise<T> {
     method: 'POST',
     headers,
     body: formData,
-    credentials: 'include',
+    // Bearer and cookie must not travel together (shared auth refuses two
+    // credentials with 401); mirror the JSON transport's rule.
+    credentials: requestCredentials(endpoint, headers),
   });
 
   if (!response.ok) {

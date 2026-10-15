@@ -7,6 +7,9 @@
 
 pub mod repository;
 pub mod service;
+pub mod tenant;
+#[cfg(feature = "enterprise")]
+pub mod tenant_operator;
 pub mod types;
 
 pub use repository::{IpAllowlistRepository, IpAllowlistRepositoryError};

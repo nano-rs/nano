@@ -7,8 +7,100 @@
 //! `host_count < N` rarity test. A miss must instead fail every comparison,
 //! mirroring the JOIN path's NULL-drop semantics.
 
-use super::prevalence_passes_filter;
-use crate::query::PrevalenceOperator;
+use super::{
+    collect_lake_domains, collect_lake_hashes, collect_lake_ips, extract_prevalence_artifact,
+    lake_prevalence_artifact_paths, lake_prevalence_filter_prefix, prevalence_passes_filter,
+    enrich_rows_with_prevalence, lake_positional_artifact_keys, result_field_strings,
+    LAKE_DOMAIN_ARTIFACT_PATHS,
+    LAKE_HASH_ARTIFACT_PATHS, LAKE_IP_ARTIFACT_PATHS,
+};
+use crate::query::{parse_query, PrettyPrint, PrevalenceOperator};
+
+#[test]
+fn explicit_prevalence_field_accepts_sequence_array_output() {
+    let row = serde_json::json!({
+        "step2_file_hashes_value": [
+            "eb7533166139d123fa4e5ca321ae69af0bc743aa0bd698e49f66fb730054a6bc"
+        ]
+    });
+    assert_eq!(
+        result_field_strings(&row, "step2_file_hashes_value"),
+        vec!["eb7533166139d123fa4e5ca321ae69af0bc743aa0bd698e49f66fb730054a6bc"]
+    );
+}
+
+/// NAN-3492: `prevalence file_hash` on the lean gate decorated nothing, so
+/// the row's ingest-time `prevalence_file_hash` (1, a first sighting) read as
+/// the answer for a hash on 4 hosts. A UDM alias must reach the native OCSF
+/// path the lake row carries; the given name stays first for derived fields.
+#[test]
+fn lake_positional_prevalence_fields_reach_the_native_ocsf_path() {
+    let profile = crate::schema::OcsfProfile::lake_1_9();
+    let keys = |fields: &[&str]| {
+        lake_positional_artifact_keys(
+            &profile,
+            &fields.iter().map(|field| field.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(keys(&["file_hash"]), vec!["file_hash", "file.hashes.value"]);
+    assert_eq!(keys(&["file.hashes.value"]), vec!["file.hashes.value"]);
+    assert_eq!(keys(&["step2_file_hashes_value"]), vec!["step2_file_hashes_value"]);
+
+    let hash = "ccf2eae33fa64f050f860cf367caa80ff8f27e7b5439c457f1aaf32032147b16";
+    let row = serde_json::json!({"file": {"hashes": [{"algorithm_id": 3, "value": hash}]}});
+    let found = keys(&["file_hash"])
+        .iter()
+        .map(|key| result_field_strings(&row, key))
+        .find(|values| !values.is_empty());
+    assert_eq!(found, Some(vec![hash]));
+}
+
+#[test]
+fn lake_scatter_keeps_only_leading_raw_row_filters() {
+    let query = parse_query(
+        "metadata.log_source=\"windows_sysmon\" | where severity_id >= 2 | eval score=severity_id * 2 | where score > 4 | head 5",
+    )
+    .unwrap();
+
+    assert_eq!(
+        lake_prevalence_filter_prefix(&query).pretty_print(),
+        "metadata.log_source=\"windows_sysmon\" | where severity_id>=2"
+    );
+}
+
+#[test]
+fn lake_scatter_candidate_parser_handles_current_and_future_aggregate_shapes() {
+    use std::collections::BTreeSet;
+
+    let sha256 = "EB7533166139D123FA4E5CA321AE69AF0BC743AA0BD698E49F66FB730054A6BC";
+    let sha1 = "0123456789ABCDEF0123456789ABCDEF01234567";
+    let hashes = serde_json::json!(format!("['{sha256}'], [], ['{sha1}']"));
+    let ips = serde_json::json!(["10.1.2.3", "2001:db8::1, invalid"]);
+    let domains = serde_json::json!("EXAMPLE.COM, srv-web02.corp.local, 10.1.2.3, invalid");
+
+    let mut parsed_hashes = BTreeSet::new();
+    let mut parsed_ips = BTreeSet::new();
+    let mut parsed_domains = BTreeSet::new();
+    collect_lake_hashes(Some(&hashes), &mut parsed_hashes);
+    collect_lake_ips(Some(&ips), &mut parsed_ips);
+    collect_lake_domains(Some(&domains), &mut parsed_domains);
+
+    assert_eq!(
+        parsed_hashes,
+        BTreeSet::from([sha1.to_ascii_lowercase(), sha256.to_ascii_lowercase()])
+    );
+    assert_eq!(
+        parsed_ips,
+        BTreeSet::from(["10.1.2.3".to_string(), "2001:db8::1".to_string()])
+    );
+    assert_eq!(
+        parsed_domains,
+        BTreeSet::from([
+            "example.com".to_string(),
+            "srv-web02.corp.local".to_string()
+        ])
+    );
+}
 
 #[test]
 fn dict_miss_fails_every_comparison() {
@@ -127,7 +219,10 @@ mod filter_pushdown {
                 PrevalenceThreshold::Count(5),
             ))
             .expect("count field must push down");
-            assert_eq!(sql, format!("(_hp_host_count < 9999 AND _hp_host_count {glyph} 5)"));
+            assert_eq!(
+                sql,
+                format!("(_hp_host_count < 9999 AND _hp_host_count {glyph} 5)")
+            );
         }
     }
 
@@ -330,10 +425,19 @@ mod rescue {
         // NAN-1723: the outer timestamp aliases MUST be fs_raw/ls_raw (NOT
         // first_seen/last_seen) so `execute_dynamic_query`'s normaliser leaves
         // the space format intact for `toDateTime64`.
-        assert!(sql.contains("toString(_fs) AS fs_raw"), "probe must alias first_seen away from the normaliser: {sql}");
+        assert!(
+            sql.contains("toString(_fs) AS fs_raw"),
+            "probe must alias first_seen away from the normaliser: {sql}"
+        );
         assert!(sql.contains("toString(_ls) AS ls_raw"));
-        assert!(!sql.contains("AS first_seen"), "outer alias must not be `first_seen`: {sql}");
-        assert!(!sql.contains("AS last_seen"), "outer alias must not be `last_seen`: {sql}");
+        assert!(
+            !sql.contains("AS first_seen"),
+            "outer alias must not be `first_seen`: {sql}"
+        );
+        assert!(
+            !sql.contains("AS last_seen"),
+            "outer alias must not be `last_seen`: {sql}"
+        );
     }
 
     /// NAN-1723 regression: the rescue timestamps must survive
@@ -380,9 +484,18 @@ mod rescue {
             let sql = rescue_transform_sql("<BASE>", "ifNull(_hash_lookup, '')", &rescued, attr);
             // Space-format literal present; no rfc3339 `T`-separator or `Z`-suffix
             // inside the quoted timestamp (the exact CANNOT_PARSE_TEXT signature).
-            assert!(sql.contains("toDateTime64('2026-07-06 10:0"), "space-format literal expected: {sql}");
-            assert!(!sql.contains("2026-07-06T"), "no rfc3339 T-separator in the literal: {sql}");
-            assert!(!sql.contains(".000000Z"), "no rfc3339 Z-suffix in the literal: {sql}");
+            assert!(
+                sql.contains("toDateTime64('2026-07-06 10:0"),
+                "space-format literal expected: {sql}"
+            );
+            assert!(
+                !sql.contains("2026-07-06T"),
+                "no rfc3339 T-separator in the literal: {sql}"
+            );
+            assert!(
+                !sql.contains(".000000Z"),
+                "no rfc3339 Z-suffix in the literal: {sql}"
+            );
         }
     }
 
@@ -484,7 +597,10 @@ mod rescue {
             &[rescued("abc123", 1)],
             RescueAttr::HostCount,
         );
-        assert!(sql.ends_with(&format!("{base})")), "base expr must be the transform default: {sql}");
+        assert!(
+            sql.ends_with(&format!("{base})")),
+            "base expr must be the transform default: {sql}"
+        );
     }
 
     #[test]
@@ -511,8 +627,17 @@ mod rescue {
         // OVER () branch. (The probe SQL, which does aggregate, runs outside the
         // paginated executor.) Token list mirrored from is_aggregation_query.
         const SNIFFED_TOKENS: [&str; 11] = [
-            "GROUP BY", "COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "UNIQ(", "QUANTILE(", "TOPK(",
-            "ARGMAX(", "ARGMIN(",
+            "GROUP BY",
+            "COUNT(",
+            "SUM(",
+            "AVG(",
+            "MIN(",
+            "MAX(",
+            "UNIQ(",
+            "QUANTILE(",
+            "TOPK(",
+            "ARGMAX(",
+            "ARGMIN(",
         ];
         // A benign base expr (no agg tokens) + a rescued list → the wrapper must
         // add only `transform(...)`, `toUInt16(...)`, literals.
@@ -572,6 +697,7 @@ mod decorated_filter {
                 field: field.to_string(),
                 op,
                 value,
+                rhs: crate::query::RhsSyntax::Literal,
             },
         }
     }
@@ -586,7 +712,11 @@ mod decorated_filter {
     fn host_count_lte_and_eq_trigger() {
         assert_eq!(
             decorated_filter_rescue_threshold(
-                &[where_cmd("host_count", Comparator::Lte, Value::Number(10.0))],
+                &[where_cmd(
+                    "host_count",
+                    Comparator::Lte,
+                    Value::Number(10.0)
+                )],
                 3
             ),
             Some(10)
@@ -609,10 +739,7 @@ mod decorated_filter {
             Value::String("true".into()),
         ] {
             assert_eq!(
-                decorated_filter_rescue_threshold(
-                    &[where_cmd("is_rare", Comparator::Eq, v)],
-                    5
-                ),
+                decorated_filter_rescue_threshold(&[where_cmd("is_rare", Comparator::Eq, v)], 5),
                 Some(4)
             );
         }
@@ -623,7 +750,11 @@ mod decorated_filter {
         // host_count > N (common hunt) — masked rows pass, different bug.
         assert_eq!(
             decorated_filter_rescue_threshold(
-                &[where_cmd("host_count", Comparator::Gt, Value::Number(100.0))],
+                &[where_cmd(
+                    "host_count",
+                    Comparator::Gt,
+                    Value::Number(100.0)
+                )],
                 3
             ),
             None
@@ -639,7 +770,11 @@ mod decorated_filter {
         // prevalence_score < X — masked row scores 0, `0 < X` keeps it (no drop-bug).
         assert_eq!(
             decorated_filter_rescue_threshold(
-                &[where_cmd("prevalence_score", Comparator::Lt, Value::Number(20.0))],
+                &[where_cmd(
+                    "prevalence_score",
+                    Comparator::Lt,
+                    Value::Number(20.0)
+                )],
                 3
             ),
             None
@@ -647,7 +782,11 @@ mod decorated_filter {
         // A non-decorated column filter never triggers.
         assert_eq!(
             decorated_filter_rescue_threshold(
-                &[where_cmd("src_ip", Comparator::Eq, Value::String("1.2.3.4".into()))],
+                &[where_cmd(
+                    "src_ip",
+                    Comparator::Eq,
+                    Value::String("1.2.3.4".into())
+                )],
                 3
             ),
             None
@@ -670,11 +809,13 @@ mod decorated_filter {
                     field: "host_count".into(),
                     op: Comparator::Lt,
                     value: Value::Number(5.0),
+                    rhs: crate::query::RhsSyntax::Literal,
                 }),
                 Box::new(SearchExpr::FieldFilter {
                     field: "host_count".into(),
                     op: Comparator::Lt,
                     value: Value::Number(10.0),
+                    rhs: crate::query::RhsSyntax::Literal,
                 }),
             ),
         };
@@ -691,6 +832,7 @@ mod decorated_filter {
                 field: "host_count".into(),
                 op: Comparator::Lt,
                 value: Value::Number(5.0),
+                rhs: crate::query::RhsSyntax::Literal,
             })),
         };
         assert_eq!(decorated_filter_rescue_threshold(&[not_lt], 3), None);
@@ -702,6 +844,7 @@ mod decorated_filter {
                 field: "is_rare".into(),
                 op: Comparator::Eq,
                 value: Value::Bool(false),
+                rhs: crate::query::RhsSyntax::Literal,
             })),
         };
         assert_eq!(
@@ -717,15 +860,20 @@ mod decorated_filter {
                     field: "host_count".into(),
                     op: Comparator::Lt,
                     value: Value::Number(5.0),
+                    rhs: crate::query::RhsSyntax::Literal,
                 }),
                 Box::new(SearchExpr::Not(Box::new(SearchExpr::FieldFilter {
                     field: "host_count".into(),
                     op: Comparator::Lt,
                     value: Value::Number(9.0),
+                    rhs: crate::query::RhsSyntax::Literal,
                 }))),
             ),
         };
-        assert_eq!(decorated_filter_rescue_threshold(&[and_with_not], 3), Some(5));
+        assert_eq!(
+            decorated_filter_rescue_threshold(&[and_with_not], 3),
+            Some(5)
+        );
     }
 
     #[test]
@@ -875,5 +1023,224 @@ mod coalesce_extraction {
             .collect();
         let row = json!({ "process_name": "evil.exe" });
         assert_eq!(extract_prevalence_artifact(&row, &fields), None);
+    }
+}
+
+/// NAN-2373 — the primary-lake defect.
+///
+/// A lake row is native nested OCSF JSON, not a flat map of SELECT aliases, and
+/// its hashes live in the repeated `file.hashes[]` object. The flat-key-only
+/// reader found nothing on such a row, so `| prevalence` extracted no artifact,
+/// decorated no row, emitted no `host_count`, and the downstream
+/// `| where host_count < 10` dropped every row without a word.
+mod lake_row_shape {
+    use super::*;
+
+    fn lake_row() -> serde_json::Value {
+        serde_json::json!({
+            "class_uid": 1007,
+            "activity_id": 1,
+            "actor": {
+                "process": {
+                    "name": "keylogger.exe",
+                    "file": {
+                        "hashes": [
+                            {"algorithm_id": 1, "value": "d41d8cd98f00b204e9800998ecf8427e"},
+                            {"algorithm_id": 3, "value": "AB12CD34"}
+                        ]
+                    }
+                }
+            },
+            "device": {"hostname": "WS-014"},
+            "src_endpoint": {"ip": "10.1.2.3"},
+            "dst_endpoint": {"hostname": "evil.example.test"}
+        })
+    }
+
+    #[test]
+    fn nested_ocsf_scalar_paths_resolve() {
+        let row = lake_row();
+        assert_eq!(
+            result_field_strings(&row, "src_endpoint.ip"),
+            vec!["10.1.2.3"]
+        );
+        assert_eq!(
+            result_field_strings(&row, "dst_endpoint.hostname"),
+            vec!["evil.example.test"]
+        );
+        assert_eq!(
+            result_field_strings(&row, "device.hostname"),
+            vec!["WS-014"]
+        );
+    }
+
+    #[test]
+    fn repeated_hash_objects_resolve_element_wise() {
+        let row = lake_row();
+        assert_eq!(
+            result_field_strings(&row, "actor.process.file.hashes.value"),
+            vec!["d41d8cd98f00b204e9800998ecf8427e", "AB12CD34"]
+        );
+    }
+
+    #[test]
+    fn every_lake_artifact_path_is_reachable_on_a_lake_row() {
+        // Whatever the concept, the configured path must be *readable* on the
+        // native row shape — the property whose absence made the command a
+        // silent pass-through.
+        let row = lake_row();
+        let reachable = lake_prevalence_artifact_paths()
+            .filter(|path| !result_field_strings(&row, path).is_empty())
+            .count();
+        // NAN-3070: the fixture's `device.hostname` (the reporting host) is
+        // deliberately no longer an artifact path.
+        assert!(
+            reachable >= 3,
+            "lake artifact paths must resolve on native OCSF rows, only {reachable} did"
+        );
+    }
+
+    #[test]
+    fn flat_clickhouse_rows_still_win_first() {
+        // The ClickHouse lanes key rows by SELECT alias, so the dotted name is
+        // one literal key. That lookup must stay byte-identical.
+        let row = serde_json::json!({"file.hashes.sha256": "AB12CD34", "dest_ip": "10.9.9.9"});
+        assert_eq!(
+            result_field_strings(&row, "file.hashes.sha256"),
+            vec!["AB12CD34"]
+        );
+        assert_eq!(result_field_strings(&row, "dest_ip"), vec!["10.9.9.9"]);
+    }
+
+    #[test]
+    fn missing_paths_stay_empty() {
+        let row = lake_row();
+        assert!(result_field_strings(&row, "file.hashes.value").is_empty());
+        assert!(result_field_strings(&row, "nope.not.here").is_empty());
+    }
+
+    #[test]
+    fn coalesce_artifact_extraction_reads_nested_paths() {
+        let row = lake_row();
+        let fields = LAKE_HASH_ARTIFACT_PATHS
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extract_prevalence_artifact(&row, &fields).as_deref(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
+    }
+
+    #[test]
+    fn artifact_path_lists_are_canonical_ocsf_1_9_fields() {
+        // A typo here is invisible at runtime — it just extracts nothing, which
+        // is exactly the failure mode being fixed. Pin the paths against the
+        // lake profile's own field universe.
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        for path in LAKE_HASH_ARTIFACT_PATHS
+            .iter()
+            .chain(LAKE_DOMAIN_ARTIFACT_PATHS)
+            .chain(LAKE_IP_ARTIFACT_PATHS)
+        {
+            assert!(
+                crate::schema::SchemaProfile::is_known_field(&profile, path),
+                "{path} is not a field of the OCSF 1.9 lake schema"
+            );
+        }
+    }
+}
+
+
+/// NAN-3070: the default lake enrichment must key `host_count` on what the
+/// event touched (hash / destination), never on the event's own host.
+mod nan3070_self_hostname {
+    use super::*;
+    use crate::prevalence::{ArtifactType, PrevalenceData};
+    use std::collections::HashMap;
+
+    fn data(artifact: &str, artifact_type: ArtifactType, host_count: u64) -> PrevalenceData {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-28T18:28:11Z").unwrap().with_timezone(&chrono::Utc);
+        PrevalenceData {
+            artifact: artifact.to_string(),
+            artifact_type,
+            host_count,
+            host_count_saturated: host_count >= 1000,
+            total_occurrences: host_count * 3,
+            first_seen: at,
+            last_seen: at,
+            is_rare: host_count < 5,
+            prevalence_score: 50,
+        }
+    }
+
+    fn lists() -> (Vec<String>, Vec<String>, Vec<String>) {
+        let own = |paths: &[&str]| paths.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        (own(LAKE_HASH_ARTIFACT_PATHS), own(LAKE_DOMAIN_ARTIFACT_PATHS), own(LAKE_IP_ARTIFACT_PATHS))
+    }
+
+    const HASH: &str = "f447ae2e838d4de71ca4baba321fea67dabb38aa4321efac81f3ff03cf55fe0a";
+    const HOST: &str = "ws-exec-052.corp.local";
+
+    /// The live the pooled host case: a process hash seen on 1000 hosts came back
+    /// `host_count 1` (the reporting host's own hostname) through
+    /// `prevalence enrich=true`, so `newly_seen_rare_process` matched 6,574
+    /// rows an hour.
+    #[test]
+    fn process_hash_host_count_is_not_the_reporting_hosts_own_hostname() {
+        let (h, d, i) = lists();
+        let hashes = HashMap::from([(HASH.to_string(), data(HASH, ArtifactType::HashSha256, 1000))]);
+        let domains = HashMap::from([(HOST.to_string(), data(HOST, ArtifactType::Subdomain, 1))]);
+        for mut row in [
+            // The table-projected shape the rule's result rows carry.
+            serde_json::json!({"device.hostname": HOST, "process.file.hashes.value": HASH, "process.name": "svchost.exe"}),
+            // The native nested OCSF shape.
+            serde_json::json!({"device": {"hostname": HOST}, "process": {"file": {"hashes": [{"algorithm_id": 3, "value": HASH}]}}}),
+        ] {
+            let mut rows = vec![row.take()];
+            enrich_rows_with_prevalence(&mut rows, &h, &d, &i, &hashes, &domains, &HashMap::new());
+            assert_eq!(rows[0]["host_count"], serde_json::json!(1000), "{}", rows[0]);
+            assert_eq!(rows[0]["is_rare"], serde_json::json!(false));
+            assert_eq!(rows[0]["prevalence_type"], serde_json::json!("hash"));
+        }
+    }
+
+    #[test]
+    fn outbound_flow_is_keyed_on_the_destination_not_the_source_host() {
+        let (h, d, i) = lists();
+        let domains = HashMap::from([("ws1.corp.local".to_string(), data("ws1.corp.local", ArtifactType::Subdomain, 1))]);
+        let ips = HashMap::from([("203.0.113.9".to_string(), data("203.0.113.9", ArtifactType::IpAddress, 40))]);
+        let mut rows = vec![serde_json::json!({"src_endpoint.hostname": "ws1.corp.local", "dst_endpoint.ip": "203.0.113.9"})];
+        enrich_rows_with_prevalence(&mut rows, &h, &d, &i, &HashMap::new(), &domains, &ips);
+        assert_eq!(rows[0]["host_count"], serde_json::json!(40), "{}", rows[0]);
+        assert_eq!(rows[0]["prevalence_type"], serde_json::json!("ip"));
+    }
+
+    #[test]
+    fn a_destination_domain_still_outranks_the_hash() {
+        let (h, d, i) = lists();
+        let hashes = HashMap::from([(HASH.to_string(), data(HASH, ArtifactType::HashSha256, 1000))]);
+        let domains = HashMap::from([("evil.example.test".to_string(), data("evil.example.test", ArtifactType::Subdomain, 2))]);
+        let mut rows = vec![serde_json::json!({"device.hostname": HOST, "dst_endpoint.hostname": "evil.example.test", "process.file.hashes.value": HASH})];
+        enrich_rows_with_prevalence(&mut rows, &h, &d, &i, &hashes, &domains, &HashMap::new());
+        assert_eq!(rows[0]["host_count"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn an_explicit_own_host_field_is_still_honoured() {
+        // `| prevalence src_endpoint.hostname`: the positional contract uses
+        // exactly the named field for every artifact class.
+        let named = vec!["src_endpoint.hostname".to_string()];
+        let domains = HashMap::from([("ws1.corp.local".to_string(), data("ws1.corp.local", ArtifactType::Subdomain, 1))]);
+        let mut rows = vec![serde_json::json!({"src_endpoint.hostname": "ws1.corp.local"})];
+        enrich_rows_with_prevalence(&mut rows, &named, &named, &named, &HashMap::new(), &domains, &HashMap::new());
+        assert_eq!(rows[0]["host_count"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn default_domain_list_excludes_the_events_own_hosts() {
+        assert!(!LAKE_DOMAIN_ARTIFACT_PATHS.contains(&"device.hostname"));
+        assert!(!LAKE_DOMAIN_ARTIFACT_PATHS.contains(&"src_endpoint.hostname"));
+        assert_eq!(LAKE_DOMAIN_ARTIFACT_PATHS[0], "dst_endpoint.hostname");
     }
 }

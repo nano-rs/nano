@@ -85,7 +85,10 @@ mod tests {
 
     #[test]
     fn redact_masks_values_keeps_keys() {
-        let mut headers = Some(map(&[("Authorization", "Bearer sekret"), ("X-Api", "abc123")]));
+        let mut headers = Some(map(&[
+            ("Authorization", "Bearer sekret"),
+            ("X-Api", "abc123"),
+        ]));
         redact_auth_headers(&mut headers);
         let h = headers.unwrap();
         assert_eq!(h["Authorization"], REDACTED_PLACEHOLDER);
@@ -103,30 +106,45 @@ mod tests {
     #[test]
     fn merge_none_preserves_stored() {
         // Request omitted headers entirely -> leave stored unchanged.
-        assert_eq!(merge_auth_headers(None, Some(&map(&[("Authorization", "real")]))), None);
+        assert_eq!(
+            merge_auth_headers(None, Some(&map(&[("Authorization", "real")]))),
+            None
+        );
     }
 
     #[test]
     fn merge_placeholder_keeps_stored_secret() {
         let existing = map(&[("Authorization", "Bearer real-secret")]);
         let incoming = map(&[("Authorization", REDACTED_PLACEHOLDER)]);
-        let merged = merge_auth_headers(Some(incoming), Some(&existing)).unwrap().unwrap();
-        assert_eq!(merged["Authorization"], "Bearer real-secret", "secret preserved on round-trip");
+        let merged = merge_auth_headers(Some(incoming), Some(&existing))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            merged["Authorization"], "Bearer real-secret",
+            "secret preserved on round-trip"
+        );
     }
 
     #[test]
     fn merge_real_value_updates_and_drops_missing_keys() {
         let existing = map(&[("Authorization", "old"), ("X-Old", "gone")]);
         let incoming = map(&[("Authorization", "new-secret")]);
-        let merged = merge_auth_headers(Some(incoming), Some(&existing)).unwrap().unwrap();
+        let merged = merge_auth_headers(Some(incoming), Some(&existing))
+            .unwrap()
+            .unwrap();
         assert_eq!(merged["Authorization"], "new-secret", "real value updates");
-        assert!(!merged.contains_key("X-Old"), "key absent from request is dropped");
+        assert!(
+            !merged.contains_key("X-Old"),
+            "key absent from request is dropped"
+        );
     }
 
     #[test]
     fn merge_empty_map_clears() {
         let existing = map(&[("Authorization", "real")]);
-        let merged = merge_auth_headers(Some(HashMap::new()), Some(&existing)).unwrap().unwrap();
+        let merged = merge_auth_headers(Some(HashMap::new()), Some(&existing))
+            .unwrap()
+            .unwrap();
         assert!(merged.is_empty(), "empty map clears all headers");
     }
 
@@ -134,6 +152,9 @@ mod tests {
     fn merge_placeholder_for_unknown_key_is_dropped() {
         let incoming = map(&[("X-Ghost", REDACTED_PLACEHOLDER)]);
         let merged = merge_auth_headers(Some(incoming), None).unwrap().unwrap();
-        assert!(merged.is_empty(), "masked value with no stored secret is dropped");
+        assert!(
+            merged.is_empty(),
+            "masked value with no stored secret is dropped"
+        );
     }
 }

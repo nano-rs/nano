@@ -51,18 +51,18 @@ impl RetroHuntRepository {
         max_indicators_per_run: i32,
     ) -> Result<RetroHuntConfig, RetroHuntRepositoryError> {
         let config = sqlx::query_as::<_, RetroHuntConfig>(
-            r#"
+            concat!(r#"
             INSERT INTO retro_hunt_rule_config
                 (rule_id, feeds, artifact_types, lookback_days, max_indicators_per_run)
             VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (rule_id) DO UPDATE SET
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
                 feeds = EXCLUDED.feeds,
                 artifact_types = EXCLUDED.artifact_types,
                 lookback_days = EXCLUDED.lookback_days,
                 max_indicators_per_run = EXCLUDED.max_indicators_per_run,
                 updated_at = now()
             RETURNING *
-            "#,
+            "#),
         )
         .bind(rule_id)
         .bind(feeds)
@@ -145,16 +145,16 @@ impl RetroHuntRepository {
         last_run_at: DateTime<Utc>,
     ) -> Result<(), RetroHuntRepositoryError> {
         sqlx::query(
-            r#"
+            concat!(r#"
             INSERT INTO retro_hunt_rule_state
                 (rule_id, watermark, watermark_value, last_run_at, updated_at)
             VALUES ($1, $2, $3, $4, now())
-            ON CONFLICT (rule_id) DO UPDATE SET
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
                 watermark = EXCLUDED.watermark,
                 watermark_value = EXCLUDED.watermark_value,
                 last_run_at = EXCLUDED.last_run_at,
                 updated_at = now()
-            "#,
+            "#),
         )
         .bind(rule_id)
         .bind(watermark)
@@ -209,7 +209,7 @@ impl RetroHuntRepository {
         qb.push_values(indicators, |mut b, (value, ty)| {
             b.push_bind(rule_id).push_bind(value).push_bind(ty);
         });
-        qb.push(" ON CONFLICT (rule_id, indicator_value) DO NOTHING");
+        qb.push(concat!(" ON CONFLICT (", crate::tenant_key!(), "rule_id, indicator_value) DO NOTHING"));
         qb.build().execute(&self.pool).await?;
         Ok(())
     }

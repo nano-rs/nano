@@ -738,9 +738,29 @@ fn transaction_startswith_endswith_sessionizes() {
         "start/end eviction filters must be applied:\n{sql}"
     );
     // Transactions group per session, not per bare group key.
+    //
+    // The group key is emitted through a stable internal alias
+    // (`__nano_txn_group_0`, projected as `… AS "user"`) rather than the raw
+    // column name: grouping by a name that the same SELECT also aliases is the
+    // ClickHouse alias-shadowing trap. Assert the SEMANTICS — session is part of
+    // the grouping, and the group key is carried — not the spelling, so the next
+    // codegen refactor does not fail a test that is still satisfied.
+    let group_by = sql
+        .split("GROUP BY ")
+        .nth(1)
+        .map(|tail| tail.lines().next().unwrap_or_default().to_string())
+        .unwrap_or_default();
     assert!(
-        sql.contains(r#"GROUP BY "user", _txn_session"#),
+        group_by.contains("_txn_session"),
         "must GROUP BY the session, not just the transaction fields:\n{sql}"
+    );
+    assert!(
+        group_by.contains(r#""user""#) || group_by.contains("__nano_txn_group_"),
+        "must carry the transaction group key into the GROUP BY:\n{sql}"
+    );
+    assert!(
+        sql.contains(r#"AS "user""#),
+        "the group key must still be projected under its user-facing name:\n{sql}"
     );
 }
 

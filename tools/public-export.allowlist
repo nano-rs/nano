@@ -1,0 +1,87 @@
+# Public root files: no wildcard for root Markdown, archives or executables.
+/Cargo.toml
+/Cargo.lock
+/Dockerfile
+/Dockerfile.search
+/docker-compose.opensource.yml
+/install.sh
+/LICENSE
+/LICENSING.md
+/README.md
+/CONTRIBUTING.md
+/CODE_OF_CONDUCT.md
+/SECURITY.md
+/images.lock
+/.env.example
+/.env.opensource.example
+/.gitleaks.toml
+/.gitignore
+/.gitattributes
+/.dockerignore
+/.cargo/***
+/.github/
+/.github/ICLA.md
+/.github/ISSUE_TEMPLATE/***
+/nano-connector/***
+/nanosiem-core/***
+/nanosiem-api/***
+/nanosiem-api-lib/***
+/nanosiem-search/***
+/nanosiem-lake-worker/***
+/nanosiem-lake-cell/***
+/nanosiem-web/***
+/vendor/***
+/clickhouse/***
+/migrations/
+/migrations/postgres/***
+/migrations/postgres-open/***
+/config/***
+# Starter pipeline the compose `tenzir` profile bind-mounts (./tenzir/pipeline.tql).
+/tenzir/
+/tenzir/pipeline.tql
+# NAN-3807/NAN-3853: the Tenzir guide README and install.sh point users at, and
+# the lean example pipelines install.sh seeds .nano-tenzir/pipeline.tql from
+# (--tenzir and the default bucket drop). Without them the seed is silently
+# skipped and the printed paths do not exist in the public checkout.
+/tenzir/AGENTS.md
+/tenzir/lean/***
+# Synthetic nPL corpus embedded by the public query compiler tests.
+/benchmarks/
+/benchmarks/results/
+/benchmarks/results/soc_ir_corpus.json
+/docs/
+/docs/img/***
+/docs/getting-started/
+/docs/getting-started/open-core-operations.md
+# Open lean install guide (install.sh points operators at it).
+/docs/deployment/
+/docs/deployment/open-lean-install.md
+/scripts/
+/scripts/start-microservices-dev.sh
+/scripts/rollout-lake-runtime.sh
+/scripts/preflight-postgres-major.sh
+/scripts/upgrade-postgres-major.sh
+/scripts/smoke-open-core.sh
+/scripts/bootstrap-local-lake.sh
+/scripts/refresh-host-lake-schema.sh
+/scripts/check-opensource-pins.sh
+/scripts/check-build-context-includes.sh
+/scripts/test-install-image-verification.sh
+# Release pin for dev/CI compose paths (bootstrap-local-lake.sh, check-opensource-pins.sh).
+/scripts/nano-release-pin.sh
+# Called by smoke-open-core.sh.
+/scripts/smoke-open-core-prevalence.sh
+# Bind-mounted by the lean compose (lean-init configure step).
+/scripts/lean/
+/scripts/lean/configure-open.py
+# Bind-mounted by the lean compose (open audit Vector).
+/deploy/
+/deploy/vector/
+/deploy/vector/open-lean-audit.toml
+/tools/
+/tools/log-blaster/***
+/tools/event-core/***
+/tools/injector/***
+/tools/scan-mirror-secrets.sh
+/tools/check-oss-feature-graph.py
+/tools/public-export.allowlist

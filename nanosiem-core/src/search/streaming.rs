@@ -8,6 +8,12 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+// Scoped to one authenticated request; never stored on a shared SearchService.
+tokio::task_local! {
+    pub static DEFER_LATERAL_VIEW: bool;
+    pub static LATERAL_VIEW_SINK: tokio::sync::mpsc::Sender<SearchStreamEvent>;
+}
+
 /// SSE event types sent during a streaming search
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", content = "data")]
@@ -36,6 +42,23 @@ pub enum SearchStreamEvent {
         elapsed_ms: u64,
     },
 
+    /// NAN-3644: a lean-cell read is fetching uncached data (or waiting for
+    /// the cell's heavy cold-read slot). Sent as a `progress` event whose
+    /// `phase` is `cold_scan`, so a client that only knows the row fields
+    /// still shows a percent; `cold_bytes_total` is the bytes the admitted
+    /// leases will read and may grow as later chunks are admitted.
+    #[serde(rename = "progress")]
+    ColdScanProgress {
+        phase: &'static str,
+        cold_bytes_read: u64,
+        cold_bytes_total: u64,
+        queued: bool,
+        rows_scanned: u64,
+        rows_total: u64,
+        percent: u8,
+        elapsed_ms: u64,
+    },
+
     /// A batch of result rows
     #[serde(rename = "rows")]
     Rows {
@@ -44,10 +67,26 @@ pub enum SearchStreamEvent {
         cumulative_count: u64,
     },
 
+    /// Cumulative product graph. Replaces the previous snapshot, not raw rows.
+    #[serde(rename = "view_update")]
+    ViewUpdate {
+        view: String,
+        rows: Vec<serde_json::Value>,
+        completed_hops: usize,
+        complete: bool,
+    },
+
     /// Query metadata (sent after all rows, or with the single batch for non-streaming)
     #[serde(rename = "metadata")]
     Metadata {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completeness: Option<super::types::EventCompleteness>,
         total_count: u64,
+        /// NAN-2550: whether `total_count` is exact rather than a proven lower
+        /// bound. `#[serde(default)]` decodes a missing field as `false`
+        /// ("assume not exact"), matching [`crate::search::SearchResponse`].
+        #[serde(default)]
+        total_count_exact: bool,
         execution_time_ms: u64,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         fields: Vec<crate::search::FieldInfo>,
@@ -65,6 +104,15 @@ pub enum SearchStreamEvent {
         generated_sql: Option<String>,
     },
 
+    /// Follow-stream liveness (NAN-3264). A follow emits this from its own
+    /// head loop whenever it has sent nothing else for a few seconds, so a
+    /// client can tell a follow that is still advancing from one whose
+    /// executor is stuck (the transport keepalive comment cannot: it is
+    /// written by the HTTP handler even while the follow is wedged).
+    /// Carries no tenant data.
+    #[serde(rename = "heartbeat")]
+    Heartbeat { delivered: u64 },
+
     /// Search completed successfully
     #[serde(rename = "completed")]
     Completed { total_rows_delivered: u64 },
@@ -72,6 +120,19 @@ pub enum SearchStreamEvent {
     /// Search failed
     #[serde(rename = "error")]
     Error { code: String, message: String },
+    /// NAN-3644: the reader's cold-read ceiling (an OOM safety net) with
+    /// exact byte metadata. A cold read under it is never refused.
+    #[serde(rename = "error")]
+    ColdScanError {
+        code: &'static str,
+        message: String,
+        reason: &'static str,
+        needed_bytes: u64,
+        ceiling_bytes: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        background_ceiling_bytes: Option<u64>,
+        retryable: bool,
+    },
 }
 
 /// Chunk emitted by the streaming ClickHouse executor
@@ -199,6 +260,37 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[test]
+    fn metadata_serializes_the_worker_completeness_display_decision() {
+        for notice in [false, true] {
+            let completeness = serde_json::from_value(serde_json::json!({
+                "status": "stale",
+                "reason": "publication_consumer_lag",
+                "events_complete_through_ms": 1_755_000_000_000_i64,
+                "freshness_notice_required": notice,
+            })).unwrap();
+            let metadata = SearchStreamEvent::Metadata {
+                completeness: Some(completeness),
+                total_count: 0,
+                total_count_exact: true,
+                execution_time_ms: 1,
+                fields: vec![],
+                histogram: None,
+                warnings: None,
+                cost_score: None,
+                display_type: None,
+                column_order: None,
+                generated_sql: None,
+            };
+            let json = serde_json::to_value(metadata).unwrap();
+            assert_eq!(json["data"]["completeness"]["freshness_notice_required"], notice);
+            assert_eq!(
+                json["data"]["completeness"]["events_complete_through_ms"],
+                1_755_000_000_000_i64,
+            );
+        }
+    }
+
     fn utc(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, min, s).unwrap()
     }
@@ -324,5 +416,25 @@ mod tests {
         // First chunk ends at overall end, last chunk starts at overall start
         assert_eq!(chunks.first().unwrap().1, end);
         assert_eq!(chunks.last().unwrap().0, start);
+    }
+}
+
+/// NAN-3644: the `progress` event for a cold read's live bytes. `percent`
+/// stays below 100 until the stream completes.
+pub fn cold_scan_progress_event(cold_bytes_read: u64, cold_bytes_total: u64, queued: bool, elapsed_ms: u64) -> SearchStreamEvent {
+    let percent = if cold_bytes_total == 0 {
+        0
+    } else {
+        ((cold_bytes_read.min(cold_bytes_total) as f64 / cold_bytes_total as f64) * 100.0).min(99.0) as u8
+    };
+    SearchStreamEvent::ColdScanProgress {
+        phase: "cold_scan",
+        cold_bytes_read,
+        cold_bytes_total,
+        queued,
+        rows_scanned: 0,
+        rows_total: 0,
+        percent,
+        elapsed_ms,
     }
 }

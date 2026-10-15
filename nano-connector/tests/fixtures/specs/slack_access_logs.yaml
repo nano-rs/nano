@@ -1,0 +1,64 @@
+# Frozen fixture for nano-connector's own tests (point_forward.rs). The shipped spec lives in
+# nano-rs/nano-integrations integrations/slack/connector.yaml (NAN-3697 branch).
+# nano-connector spec that replaces code.ts in this directory (NAN-3490). The API is
+# newest-first with no time filter, so VRL stops at the saved watermark and
+# moves it only on the last page (the engine persists state per page; `wm`
+# stays fixed until the walk completes). A stream with no state starts
+# point-forward at `.initial_cursor` (NAN-3697); the first walk persists that
+# start as `wm` even when it ships nothing.
+version: 1
+name: slack_access_logs
+kind: collector
+allow:
+  - host: slack.com
+    path_prefixes: ["/api/team.accessLogs"]
+auth: { type: bearer, credential: USER_TOKEN }
+schedule: "0 * * * *"
+limits: { max_run_secs: 300, max_pages: 100 }
+rate_limit: { min_interval_ms: 3000, max_retries_429: 5, max_wait_ms: 60000 }
+streams:
+  - id: access_logs
+    source_type: slack_access_log
+    request:
+      url: "https://slack.com/api/team.accessLogs"
+      query: { limit: "200", team_id: "{{config.TEAM_ID}}" }
+      headers: { Accept: application/json }
+    # An access-log row is a mutable aggregate keyed by (user, ip, user agent);
+    # date_last is its version, so a re-served copy keeps its id and an updated
+    # aggregate gets a new one (matches the slack_access_ocsf parser's uid).
+    ingest_id: { fields: [user_id, ip, user_agent, date_last] }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Slack returned " + to_string(status)}
+      } else if .response.body.ok == false {
+        {"error": "Slack returned an error: " + (string(.response.body.error) ?? "unknown")}
+      } else {
+        wm = to_int(.state.wm) ?? 0
+        if wm == 0 {
+          # No saved watermark: start point-forward at the engine's initial
+          # cursor (NAN-3697). `.backfill_from` is its deprecated alias on older
+          # engines; with neither, now - 300 s. Never 0 / all history.
+          ic = string(.initial_cursor) ?? string(.backfill_from) ?? ""
+          start = parse_timestamp(ic, "%+") ?? from_unix_timestamp(to_unix_timestamp(now(), unit: "seconds") - 300) ?? now()
+          wm = to_unix_timestamp(start, unit: "seconds")
+        }
+        newest = to_int(.state.newest) ?? 0
+        if newest < wm { newest = wm }
+        logins = if is_array(.response.body.logins) { array!(.response.body.logins) } else { [] }
+        fresh = []
+        reached = false
+        for_each(logins) -> |_i, l| {
+          if !reached {
+            last = to_int(l.date_last) ?? to_int(l.date_first) ?? 0
+            if last > newest { newest = last }
+            if last <= wm { reached = true } else { fresh = push(fresh, l) }
+          }
+        }
+        cur = string(.response.body.response_metadata.next_cursor) ?? ""
+        if length(logins) == 0 || reached || cur == "" {
+          {"events": fresh, "state": {"wm": newest}}
+        } else {
+          {"events": fresh, "state": {"wm": wm, "newest": newest}, "next_request": {"query": {"cursor": cur}}}
+        }
+      }

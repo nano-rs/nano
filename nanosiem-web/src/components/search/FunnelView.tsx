@@ -8,6 +8,7 @@ import {
   Filter as FilterIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isPlaceholderValue } from '@/lib/is-placeholder-value';
 
 // ─────────────────────────── types ───────────────────────────
 
@@ -110,7 +111,8 @@ function parseDropperAttrs(raw: unknown): DropperAttr[] {
       const value = typeof o.value === 'string' ? o.value : null;
       const count = typeof o.count === 'number' ? o.count : Number(o.count ?? 0);
       const pct = typeof o.pct === 'number' ? o.pct : Number(o.pct ?? 0);
-      if (!field || value == null) return null;
+      // "-"/"--" are OCSF "no value" placeholders — not real dropper attrs.
+      if (!field || value == null || isPlaceholderValue(value)) return null;
       return { field, value, count, pct };
     })
     .filter((x): x is DropperAttr => x !== null);
@@ -148,10 +150,10 @@ function adaptStages(results: SearchResult[], conditions: string[]): Stage[] {
         ? condition.length > 40 ? `${condition.slice(0, 39)}…` : condition
         : `Stage ${level}`;
 
-    // Sub: prefer backend step_name when it's not the "none" placeholder,
-    // else strip event_id from the condition for a cleaner read.
+    // Sub: prefer backend step_name when it's not a placeholder ("none",
+    // "-", "--"), else strip event_id from the condition for a cleaner read.
     let sub: string;
-    if (stepName && stepName !== 'none' && String(stepName).length > 0) {
+    if (stepName && stepName !== 'none' && !isPlaceholderValue(stepName) && String(stepName).length > 0) {
       sub = String(stepName);
     } else if (condition) {
       sub = condition.replace(/event_id\s*=\s*\d+\s*/i, '').trim() || `Stage ${level}`;

@@ -104,7 +104,7 @@ impl ParserService {
         // NAN-1124: reserve the `nano_` source_type namespace for enrichment routing.
         if let Some(claim) = reserved_route_claim(&new_parser.name) {
             return Err(ParserServiceError::InvalidSourceType(format!(
-                "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
+                "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing. Rename the parser."
             )));
         }
 
@@ -115,7 +115,7 @@ impl ParserService {
 
         if matches!(
             new_parser.source_type.as_str(),
-            "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub"
+            "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" | "azure_event_hubs"
         ) && new_parser.dispatch_source_config_id.is_none()
         {
             return Err(ParserServiceError::InvalidSourceType(
@@ -167,7 +167,7 @@ impl ParserService {
         if let Some(ref name) = update.name {
             if let Some(claim) = reserved_route_claim(name) {
                 return Err(ParserServiceError::InvalidSourceType(format!(
-                    "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
+                    "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing. Rename the parser."
                 )));
             }
 
@@ -186,8 +186,10 @@ impl ParserService {
                 return Err(ParserServiceError::InvalidSourceType(source_type.clone()));
             }
 
-            if matches!(source_type.as_str(), "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub")
-                && update.dispatch_source_config_id.is_none()
+            if matches!(
+                source_type.as_str(),
+                "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" | "azure_event_hubs"
+            ) && update.dispatch_source_config_id.is_none()
             {
                 let existing = self.get(id).await?;
                 if existing.dispatch_source_config_id.is_none() {

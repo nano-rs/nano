@@ -33,7 +33,6 @@ import {
 } from '@/components/ui/accordion';
 import {
   ArrowLeft,
-  Loader2,
   Key,
   AlertTriangle,
   Copy,
@@ -42,6 +41,7 @@ import {
   Square,
   RefreshCw,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
 import { api, ApiKeySummary, CreateApiKeyRequest, UpdateApiKeyRequest } from '@/lib/api';
 import type { PermissionInfo } from '@/lib/api/types';
@@ -258,7 +258,7 @@ export function ApiKeyForm() {
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
-        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+        <LoadingIcon className="w-8 h-8 text-primary" />
       </div>
     );
   }
@@ -308,7 +308,7 @@ export function ApiKeyForm() {
             disabled={saving}
             className="bg-primary hover:bg-primary/90 rounded-xl"
           >
-            {saving && <Loader2 className="w-4 h-4 animate-spin" />}
+            {saving && <LoadingIcon className="w-4 h-4" />}
             {isEditing ? 'Save Changes' : 'Create API Key'}
           </Button>
         </div>

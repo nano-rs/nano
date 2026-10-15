@@ -22,6 +22,57 @@ import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
 
 const MAX_DEPTH = 12;
 
+function isEmptyDisplayValue(value: unknown, fieldName?: string, depth = 0): boolean {
+  if (isClickHouseDefault(value, fieldName)) return true;
+  if (depth >= MAX_DEPTH) return false;
+  if (Array.isArray(value)) {
+    return value.length === 0 || value.every((item) => isEmptyDisplayValue(item, fieldName, depth + 1));
+  }
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.length === 0 || entries.every(([key, item]) =>
+      isEmptyDisplayValue(item, fieldName ? `${fieldName}.${key}` : key, depth + 1),
+    );
+  }
+  return false;
+}
+
+function flattenNestedLeaves(
+  node: unknown,
+  path: string,
+  skip: (path: string) => boolean,
+): [string, unknown][] {
+  const values = new Map<string, unknown[]>();
+
+  const append = (leafPath: string, value: unknown) => {
+    if (!leafPath || skip(leafPath) || isEmptyDisplayValue(value, leafPath)) return;
+    const existing = values.get(leafPath);
+    if (existing) {
+      if (!existing.some((item) => Object.is(item, value))) existing.push(value);
+    } else {
+      values.set(leafPath, [value]);
+    }
+  };
+
+  const walk = (value: unknown, leafPath: string, depth: number) => {
+    if (isEmptyDisplayValue(value, leafPath, depth)) return;
+    if (depth < MAX_DEPTH && Array.isArray(value)) {
+      for (const item of value) walk(item, leafPath, depth + 1);
+      return;
+    }
+    if (depth < MAX_DEPTH && value !== null && typeof value === 'object') {
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+        walk(item, leafPath ? `${leafPath}.${key}` : key, depth + 1);
+      }
+      return;
+    }
+    append(leafPath, value);
+  };
+
+  walk(node, path, 0);
+  return [...values].map(([leafPath, items]) => [leafPath, items.length === 1 ? items[0] : items]);
+}
+
 // NAN-1276: OCSF enum/array siblings that a promoted Core column derives from
 // under a DIFFERENT name/shape, so the raw `event` leaf isn't caught by a plain
 // name match. `activity_name` is the lone scalar rename (Core column `activity`
@@ -57,11 +108,9 @@ function buildPromotedExclusions(promotedNames: Iterable<string>): Set<string> {
  * Flatten an OCSF `event` object into dotted leaf-path entries.
  *
  * - Nested objects recurse with a `.`-joined path.
- * - Arrays are emitted as a single JSON-stringified value at their path (matches
- *   the way the existing ext-derived array fields render: `formatValue` JSON-
- *   stringifies objects/arrays anyway, and keeping the array intact lets the
- *   FieldValueMenu treat it as one value).
- * - Scalars (string/number/boolean/null) are emitted directly.
+ * - Arrays of objects are flattened to their query-facing leaf path and
+ *   repeated values are combined. Scalar arrays remain one scalar-list field.
+ * - Empty/null sparse-schema values are omitted.
  *
  * @param event   the parsed OCSF `event` object
  * @param existing top-level row keys already present (promoted columns); leaf
@@ -76,37 +125,10 @@ export function expandEventLeaves(
   existing: Set<string>,
   promotedNames?: Iterable<string>,
 ): [string, unknown][] {
-  const out: [string, unknown][] = [];
   const promotedExcl = promotedNames ? buildPromotedExclusions(promotedNames) : null;
   const skip = (path: string) =>
     existing.has(path) || (promotedExcl !== null && promotedExcl.has(path));
-
-  const walk = (node: unknown, path: string, depth: number) => {
-    if (
-      depth < MAX_DEPTH &&
-      node !== null &&
-      typeof node === 'object' &&
-      !Array.isArray(node)
-    ) {
-      const obj = node as Record<string, unknown>;
-      const keys = Object.keys(obj);
-      if (keys.length === 0) {
-        // Empty object — emit as a leaf so it isn't silently dropped.
-        if (path && !skip(path)) out.push([path, obj]);
-        return;
-      }
-      for (const key of keys) {
-        const childPath = path ? `${path}.${key}` : key;
-        walk(obj[key], childPath, depth + 1);
-      }
-      return;
-    }
-    // Leaf (scalar, array, or object at max depth).
-    if (path && !skip(path)) out.push([path, node]);
-  };
-
-  walk(event, '', 0);
-  return out;
+  return flattenNestedLeaves(event, '', skip);
 }
 
 /**
@@ -153,16 +175,7 @@ export function flattenUnmapped(
   obj: Record<string, unknown>,
   prefix = 'unmapped',
 ): [string, unknown][] {
-  const out: [string, unknown][] = [];
-  for (const [k, v] of Object.entries(obj)) {
-    const key = `${prefix}.${k}`;
-    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-      out.push(...flattenUnmapped(v as Record<string, unknown>, key));
-    } else {
-      out.push([key, v]);
-    }
-  }
-  return out;
+  return flattenNestedLeaves(obj, prefix, () => false);
 }
 
 /**
@@ -207,9 +220,11 @@ export function flattenEventFields(
     const isPrevalence = key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
                          key === 'prevalence_type' || key === 'total_occurrences' ||
                          key === '_prevalence' || key.startsWith('_prevalence.');
-    if (!isPrevalence && isClickHouseDefault(value, key)) continue;
+    if (!isPrevalence && isEmptyDisplayValue(value, fullKey)) continue;
 
-    if (key === 'metadata') {
+    if (isOcsf && prefix === '' && value !== null && typeof value === 'object') {
+      result.push(...flattenNestedLeaves(value, key, (path) => topLevelKeys.has(path)));
+    } else if (key === 'metadata') {
       let metadataObj: Record<string, unknown> | null = null;
       if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
         metadataObj = value as Record<string, unknown>;
@@ -385,7 +400,7 @@ export function buildFieldCategories(
     else if (isPrevalenceField(k)) categories[4].fields.push(field);
     else if (isLookupField(k)) categories[5].fields.push(field);
     else if (k.startsWith('enriched_')) categories[6].fields.push(field);
-    else if (k.startsWith('metadata_')) categories[7].fields.push(field);
+    else if (k.startsWith('metadata_') || k.startsWith('metadata.')) categories[7].fields.push(field);
     // Core = known to the ACTIVE schema profile (OCSF promoted fields) OR a base
     // UDM column (shared operational fields not in the OCSF universe). NAN-1241.
     else if (knownSchemaFields.has(k) || UDM_COLUMNS.has(k)) categories[0].fields.push(field);

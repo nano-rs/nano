@@ -31,12 +31,12 @@ import {
   CircleCheck,
   Clock,
   Eye,
-  Loader2,
   RefreshCw,
   Search as SearchIcon,
   UserPlus,
   X,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
@@ -72,6 +72,7 @@ import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { Alert as ApiAlert, AlertCounts, UserDetail } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
+import { trailingWindowTitle } from '@/lib/time-range';
 
 type StatusFilter = 'all' | 'new' | 'acknowledged' | 'closed';
 type SeverityFilter = 'all' | 'critical' | 'high' | 'medium' | 'low' | 'informational';
@@ -186,9 +187,17 @@ function timeRangeCutoff(range: TimeRangeFilter): number | null {
   }
 }
 
+// NAN-3884: the selector stays relative ("Last 7d"); its resolved window,
+// in the viewer's timezone, is the hover text.
+function timeRangeWindowTitle(range: TimeRangeFilter): string | undefined {
+  const cutoff = timeRangeCutoff(range);
+  return cutoff == null ? undefined : trailingWindowTitle(Date.now() - cutoff);
+}
+
 export function Alerts() {
   const navigate = useNavigate();
   const { hasPermission } = useAuth();
+  const alertPath = (id: string) => `/alerts/${id}`;
   const { capabilities } = useCapabilities();
   const { toast } = useToast();
 
@@ -574,7 +583,10 @@ export function Alerts() {
           </SelectContent>
         </Select>
         <Select value={timeRangeFilter} onValueChange={(v) => setTimeRangeFilter(v as TimeRangeFilter)}>
-          <SelectTrigger className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]">
+          <SelectTrigger
+            className="h-8 w-32 border-border bg-[var(--card-2)] text-[11.5px]"
+            title={timeRangeWindowTitle(timeRangeFilter)}
+          >
             <SelectValue placeholder="Time" />
           </SelectTrigger>
           <SelectContent>
@@ -639,7 +651,7 @@ export function Alerts() {
       {/* Loading / error / empty / table */}
       {isLoading && (
         <div className="flex h-64 items-center justify-center">
-          <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+          <LoadingIcon className="h-6 w-6 text-muted-foreground" />
         </div>
       )}
       {error && !isLoading && (
@@ -714,7 +726,7 @@ export function Alerts() {
                         'group h-9 cursor-pointer border-border transition-colors',
                         isSelected ? 'bg-primary/10 hover:bg-primary/12' : 'hover:bg-muted/50',
                       )}
-                      onClick={() => navigate(`/alerts/${alert.id}`)}
+                      onClick={() => navigate(alertPath(alert.id))}
                     >
                       {showSelection && (
                         <TableCell className="pl-3" onClick={(e) => e.stopPropagation()}>
@@ -756,7 +768,7 @@ export function Alerts() {
                       </TableCell>
                       <TableCell>
                         <Link
-                          to={`/alerts/${alert.id}`}
+                          to={alertPath(alert.id)}
                           onClick={(e) => e.stopPropagation()}
                           className="font-mono text-[11.5px] text-foreground hover:text-primary truncate inline-block max-w-[420px] align-middle"
                           title={ruleName}
@@ -830,7 +842,7 @@ export function Alerts() {
                           )}
                           <button
                             type="button"
-                            onClick={() => navigate(`/alerts/${alert.id}`)}
+                            onClick={() => navigate(alertPath(alert.id))}
                             title="Open"
                             className="inline-flex h-6 w-6 items-center justify-center rounded-sm border border-border bg-card text-muted-foreground hover:text-foreground"
                           >

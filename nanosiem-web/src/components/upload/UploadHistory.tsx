@@ -11,7 +11,6 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   Search,
   RefreshCw,
-  Loader2,
   CircleCheck,
   XCircle,
   Clock,
@@ -20,6 +19,7 @@ import {
   FileSpreadsheet,
   CircleAlert,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useUploadHistory } from '@/hooks/use-api';
 import type { UploadRecord, UploadHistoryFilter } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
@@ -155,7 +155,7 @@ export function UploadHistory({ filter: initialFilter, showFilters = true, limit
 
         {loading ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-8 h-8 animate-spin text-primary" />
+            <LoadingIcon className="w-8 h-8 text-primary" />
           </div>
         ) : !filteredUploads || filteredUploads.length === 0 ? (
           <div className="text-center py-12">

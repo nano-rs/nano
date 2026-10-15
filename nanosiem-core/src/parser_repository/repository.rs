@@ -6,6 +6,14 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
+
+// NAN-2361: repository_parsers is tenant-scoped (unique leads with tenant_id)
+// only under the enterprise overlay (9000321); the open edition keeps the
+// original (repository_id, file_path) key. Selected at compile time.
+#[cfg(feature = "enterprise")]
+const PARSER_CONFLICT_TARGET: &str = "ON CONFLICT (tenant_id, repository_id, file_path) DO UPDATE SET";
+#[cfg(not(feature = "enterprise"))]
+const PARSER_CONFLICT_TARGET: &str = "ON CONFLICT (repository_id, file_path) DO UPDATE SET";
 use super::models::{
     NewParserRepository, ParserImport, ParserRepository, RepositoryParser, RepositoryParserFilter,
     UpdateParserRepository,
@@ -35,7 +43,8 @@ impl ParserRepositoryRepository {
         repo: &NewParserRepository,
         created_by: Option<Uuid>,
     ) -> Result<ParserRepository, ParserRepositoryRepositoryError> {
-        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
+        let slug =
+            crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, ParserRepository>(
             r#"
@@ -51,9 +60,10 @@ impl ParserRepositoryRepository {
         .bind(&slug)
         .bind(&repo.description)
         .bind(&repo.url)
-        .bind(repo.branch.as_deref().unwrap_or("main"))
+        .bind(crate::schema::default_content_branch(&repo.url, repo.branch.as_deref()))
         .bind(repo.parsers_path.as_deref().unwrap_or("parsers/"))
-        .bind(repo.auto_sync_enabled.unwrap_or(false))
+        // NAN-3758: the first-party catalogs follow upstream unless the caller opts out.
+        .bind(repo.auto_sync_enabled.unwrap_or_else(|| crate::schema::is_first_party_content_url(&repo.url)))
         .bind(repo.sync_interval_hours.unwrap_or(24))
         .bind(created_by)
         .fetch_one(&self.pool)
@@ -190,7 +200,7 @@ impl RepositoryParsersRepository {
         target_table: Option<&str>,
         normalize_vrl: Option<&str>,
     ) -> Result<RepositoryParser, RepositoryParsersRepositoryError> {
-        let result = sqlx::query_as::<_, RepositoryParser>(
+        let result = sqlx::query_as::<_, RepositoryParser>(&format!(
             r#"
             INSERT INTO repository_parsers (
                 repository_id, file_path, file_sha, raw_content,
@@ -198,7 +208,7 @@ impl RepositoryParsersRepository {
                 kind, enrich_kind, enrich_source, target_table, normalize_vrl
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-            ON CONFLICT (repository_id, file_path) DO UPDATE SET
+            {PARSER_CONFLICT_TARGET}
                 file_sha = EXCLUDED.file_sha,
                 raw_content = EXCLUDED.raw_content,
                 name = EXCLUDED.name,
@@ -217,7 +227,7 @@ impl RepositoryParsersRepository {
                 updated_at = NOW()
             RETURNING *
             "#,
-        )
+        ))
         .bind(repository_id)
         .bind(file_path)
         .bind(file_sha)
@@ -341,8 +351,12 @@ impl RepositoryParsersRepository {
         repository_id: Uuid,
     ) -> Result<(), RepositoryParsersRepositoryError> {
         // Discard the affected-row count to preserve the historical `()` return.
-        crate::db::repo_store::delete_by_repository(&self.pool, "repository_parsers", repository_id)
-            .await?;
+        crate::db::repo_store::delete_by_repository(
+            &self.pool,
+            "repository_parsers",
+            repository_id,
+        )
+        .await?;
         Ok(())
     }
 

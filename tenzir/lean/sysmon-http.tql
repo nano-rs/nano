@@ -1,0 +1,100 @@
+// nano lean lake: Tenzir -> OCSF 1.9 -> nano (NAN-3807)
+//
+// Sysmon EventID 1 (process create) as NDJSON with flat EventData fields
+// (winlogbeat / NXLog style) -> OCSF 1.9.0 Process Activity: Launch (1007).
+// It POSTs to the open-core HTTP ingest endpoint, which runs through the
+// install's Vector into the lake.
+//
+// FALLBACK. Tenzir's main path is the bucket drop (sysmon-bucket.tql): files
+// straight into the install's object store, no Vector. Use this one only when
+// the sender cannot reach the object store. Proven 100/100 on CT 106 with
+// Tenzir v6.18.0.
+// Known limits of this path (tenzir/AGENTS.md has the details):
+//   * With no parser deployed for the source, Vector's generic lane wraps the
+//     event as OCSF class 0 (Base Event). The Tenzir mapping survives in
+//     `raw_data` and `message`, but `class_uid` and the promoted fields do not.
+//   * The `metadata` you send is replaced. `metadata.uid` is re-minted, so
+//     dedupe across sender retries is not guaranteed.
+//
+// Run it:
+//   docker run --rm -v "$PWD:/data" -e NANO_INGEST_TOKEN \
+//     -e NANO_INGEST_URL=http://<nano-host>/ingest \
+//     -v "$PWD/sysmon-http.tql:/p.tql:ro" tenzir/tenzir:v6.19.1@sha256:6e96f962bc0a957d94d5149f840f7603c47a7b11d995e0f1fc167c141db7c06f -f /p.tql
+//
+// NANO_INGEST_TOKEN is a per-sender ingest token (Ingestion -> Credentials, or
+// POST /api/ingest-tokens). Keep it in the environment; never commit it.
+
+// SOURCE: swap in your own (accept_http, load_tcp, from_kafka, ...).
+// `read_lines` keeps the original bytes so they can go in `raw_data` as-is.
+from_file "/data/sysmon.ndjson" {
+  read_lines
+}
+
+// MAPPING: Sysmon EID 1 -> OCSF 1.9.0 Process Activity: Launch.
+this = {raw: line, s: line.parse_json()}
+where s.EventID == 1
+let $vendor = "Microsoft"
+this = {
+  raw_data: raw,
+  s: s,
+  event: {
+    class_uid: 1007, class_name: "Process Activity",
+    category_uid: 1, category_name: "System Activity",
+    activity_id: 1, activity_name: "Launch",
+    type_uid: 100701, type_name: "Process Activity: Launch",
+    severity_id: 1, severity: "Informational",
+    time: int(s.UtcTime.time().since_epoch() / 1ms),
+    message: "Process launched: " + s.CommandLine,
+    metadata: {
+      version: "1.9.0",
+      uid: s.ProcessGuid.replace("{", "").replace("}", "").to_lower(),
+      original_event_uid: string(s.RecordID),
+      log_name: s.Channel,
+      product: {name: "Sysmon", vendor_name: $vendor},
+    },
+    device: {
+      hostname: s.Computer.to_lower(),
+      type_id: 0,
+    },
+    actor: {
+      process: {
+        uid: s.ParentProcessGuid.replace("{", "").replace("}", "").to_lower(),
+        pid: s.ParentProcessId,
+        cmd_line: s.ParentCommandLine,
+        file: {path: s.ParentImage, name: s.ParentImage.split("\\").last(), type_id: 1},
+      },
+      user: {name: s.User.split("\\").last(), domain: s.User.split("\\").first()},
+    },
+    process: {
+      uid: s.ProcessGuid.replace("{", "").replace("}", "").to_lower(),
+      pid: s.ProcessId,
+      cmd_line: s.CommandLine,
+      file: {
+        path: s.Image, name: s.Image.split("\\").last(), type_id: 1,
+        hashes: [{algorithm_id: 3, algorithm: "SHA-256", value: s.Hashes.split("=").last().to_lower()}],
+      },
+      user: {name: s.User.split("\\").last(), domain: s.User.split("\\").first()},
+    },
+  },
+}
+event.raw_data = raw_data
+this = event
+
+// SINK: open-core HTTP ingest (nginx /ingest -> Vector :8080).
+// * `every 2s` closes one request every 2 s. Without it, `to_http` sends the
+//   whole stream as one request, and on a long-running source that request
+//   never ends.
+// * `buffer_all=true` sends Content-Length and lets `to_http` retry a request
+//   whose body had already started.
+// * `X-Source-Type` sets the lowercase source label (`metadata.log_source`).
+every 2s {
+  to_http env("NANO_INGEST_URL").otherwise("http://localhost/ingest"),
+    buffer_all=true,
+    headers={
+      Authorization: "Bearer " + env("NANO_INGEST_TOKEN"),
+      "Content-Type": "application/x-ndjson",
+      "X-Source-Type": "tenzir_sysmon",
+    } {
+    write_ndjson
+  }
+}

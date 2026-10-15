@@ -251,7 +251,10 @@ mod tests {
             rows_read: 12,
             wall_seconds: 30,
         };
-        assert_eq!(reconcile_outcome(Some("completed"), &usage, &limits(), 3), "budget_exhausted");
+        assert_eq!(
+            reconcile_outcome(Some("completed"), &usage, &limits(), 3),
+            "budget_exhausted"
+        );
     }
 
     #[test]
@@ -264,23 +267,41 @@ mod tests {
             rows_read: 120,
             wall_seconds: 40,
         };
-        assert_eq!(reconcile_outcome(Some("completed"), &usage, &limits(), 0), "no_leads");
+        assert_eq!(
+            reconcile_outcome(Some("completed"), &usage, &limits(), 0),
+            "no_leads"
+        );
     }
 
     #[test]
     fn held_survives_reconciliation() {
         let usage = BudgetUsage::default();
-        assert_eq!(reconcile_outcome(Some("held"), &usage, &limits(), 0), "held");
+        assert_eq!(
+            reconcile_outcome(Some("held"), &usage, &limits(), 0),
+            "held"
+        );
     }
 
     #[test]
     fn every_budget_dimension_can_trigger_exhaustion() {
         let l = limits();
         let dims = [
-            BudgetUsage { turns: l.max_turns, ..Default::default() },
-            BudgetUsage { tool_calls: l.max_tool_calls, ..Default::default() },
-            BudgetUsage { rows_read: l.max_rows, ..Default::default() },
-            BudgetUsage { wall_seconds: l.max_wall_seconds, ..Default::default() },
+            BudgetUsage {
+                turns: l.max_turns,
+                ..Default::default()
+            },
+            BudgetUsage {
+                tool_calls: l.max_tool_calls,
+                ..Default::default()
+            },
+            BudgetUsage {
+                rows_read: l.max_rows,
+                ..Default::default()
+            },
+            BudgetUsage {
+                wall_seconds: l.max_wall_seconds,
+                ..Default::default()
+            },
         ];
         for usage in dims {
             assert!(usage.exhausted(&l), "{usage:?} should count as exhausted");

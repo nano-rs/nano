@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! OTLP (OpenTelemetry) signal generators — NAN-1533.
 //!
 //! Generates synthetic OTLP traces / metrics / logs in the OTLP/JSON encoding
@@ -8,24 +10,14 @@
 //! - a single metric **data point** (`gen_metrics` returns the per-service set),
 //! - a single **log record** (`gen_log`).
 //!
-//! The per-record JSON shape is the contract consumed by TWO downstream paths,
-//! and it is deliberately identical for both:
+//! `Transport::OtlpHttp` wraps each record in an OTLP export envelope
+//! (`resourceSpans`/`resourceMetrics`/`resourceLogs`) and POSTs it to the
+//! `opentelemetry` receiver's `/v1/{traces,metrics,logs}` endpoints.
 //!
-//! * **Vector** (`Transport::OtlpHttp`) wraps each record in an OTLP export
-//!   envelope (`resourceSpans`/`resourceMetrics`/`resourceLogs`) and POSTs it to
-//!   the `opentelemetry` receiver's `/v1/{traces,metrics,logs}` endpoints.
-//! * **Direct ClickHouse** (`Transport::OtlpClickHouse`) writes each record's
-//!   JSON verbatim into the single `event` column of `otel_spans_raw` /
-//!   `otel_metrics_raw` (the Null staging tables whose MVs derive the promoted
-//!   columns — clickhouse/138_otel_spans.sql, clickhouse/140_otel_metrics.sql).
-//!
-//! CRITICAL: the field names below are read VERBATIM by the derivation MVs via
-//! `JSONExtract*`. The span MV reads `traceId`, `spanId`, `parentSpanId`,
-//! `name`, `kind`, `startTimeUnixNano`, `endTimeUnixNano`, `status.code`,
-//! `status.message`, `attributes[].key`/`.value.{stringValue,intValue,...}`,
-//! and `resource.attributes[...]`. The metrics MV reads `name`, `unit`, `type`,
-//! `timeUnixNano`, `asInt`/`asDouble`, `count`, `sum`, `bucketCounts`,
-//! `explicitBounds`, plus `attributes`/`resource.attributes`. Do not rename.
+//! The field names follow the OTLP/JSON spec (`traceId`, `spanId`,
+//! `parentSpanId`, `startTimeUnixNano`, `attributes[].key`/`.value.*`,
+//! `resource.attributes[...]`, `timeUnixNano`, `asInt`/`asDouble`, ...) because
+//! the envelope is decoded to protobuf before it is sent. Do not rename.
 
 use chrono::Utc;
 use rand::Rng;

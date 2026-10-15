@@ -131,34 +131,34 @@ const MAPPING: &[(&str, &[&str])] = &[
         &["windows_sysmon", "linux_auditd"],
     ),
     // ---------------- File ----------------
-    (
-        "File: File Creation",
-        &["windows_sysmon", "linux_auditd"],
-    ),
+    ("File: File Creation", &["windows_sysmon", "linux_auditd"]),
     (
         "File: File Modification",
         &["windows_sysmon", "linux_auditd"],
     ),
-    (
-        "File: File Deletion",
-        &["windows_sysmon", "linux_auditd"],
-    ),
-    (
-        "File: File Access",
-        &["windows_sysmon", "linux_auditd"],
-    ),
-    (
-        "File: File Metadata",
-        &["windows_sysmon", "linux_auditd"],
-    ),
+    ("File: File Deletion", &["windows_sysmon", "linux_auditd"]),
+    ("File: File Access", &["windows_sysmon", "linux_auditd"]),
+    ("File: File Metadata", &["windows_sysmon", "linux_auditd"]),
     // ---------------- Module / Driver ----------------
     ("Module: Module Load", &["windows_sysmon"]),
     ("Driver: Driver Load", &["windows_sysmon"]),
     // ---------------- Windows Registry ----------------
-    ("Windows Registry: Windows Registry Key Creation", &["windows_sysmon"]),
-    ("Windows Registry: Windows Registry Key Modification", &["windows_sysmon"]),
-    ("Windows Registry: Windows Registry Key Deletion", &["windows_sysmon"]),
-    ("Windows Registry: Windows Registry Key Access", &["windows_sysmon"]),
+    (
+        "Windows Registry: Windows Registry Key Creation",
+        &["windows_sysmon"],
+    ),
+    (
+        "Windows Registry: Windows Registry Key Modification",
+        &["windows_sysmon"],
+    ),
+    (
+        "Windows Registry: Windows Registry Key Deletion",
+        &["windows_sysmon"],
+    ),
+    (
+        "Windows Registry: Windows Registry Key Access",
+        &["windows_sysmon"],
+    ),
     // ---------------- Logon / Auth ----------------
     (
         "Logon Session: Logon Session Creation",
@@ -174,20 +174,35 @@ const MAPPING: &[(&str, &[&str])] = &[
     ),
     (
         "User Account: User Account Creation",
-        &["windows_event_log", "okta", "azure_ad", "aws_cloudtrail", "linux_auditd"],
+        &[
+            "windows_event_log",
+            "okta",
+            "azure_ad",
+            "aws_cloudtrail",
+            "linux_auditd",
+        ],
     ),
     (
         "User Account: User Account Modification",
-        &["windows_event_log", "okta", "azure_ad", "aws_cloudtrail", "linux_auditd"],
+        &[
+            "windows_event_log",
+            "okta",
+            "azure_ad",
+            "aws_cloudtrail",
+            "linux_auditd",
+        ],
     ),
     (
         "User Account: User Account Deletion",
-        &["windows_event_log", "okta", "azure_ad", "aws_cloudtrail", "linux_auditd"],
+        &[
+            "windows_event_log",
+            "okta",
+            "azure_ad",
+            "aws_cloudtrail",
+            "linux_auditd",
+        ],
     ),
-    (
-        "User Account: User Account Metadata",
-        &["okta", "azure_ad"],
-    ),
+    ("User Account: User Account Metadata", &["okta", "azure_ad"]),
     // ---------------- Group ----------------
     (
         "Group: Group Modification",
@@ -215,18 +230,12 @@ const MAPPING: &[(&str, &[&str])] = &[
         &["windows_event_log", "azure_ad"],
     ),
     // ---------------- Network ----------------
-    (
-        "Network Traffic: Network Traffic Flow",
-        &["netflow"],
-    ),
+    ("Network Traffic: Network Traffic Flow", &["netflow"]),
     (
         "Network Traffic: Network Traffic Content",
         &["netflow", "squid_proxy", "conduit_mitm_proxy"],
     ),
-    (
-        "Network Traffic: Network Connection Creation",
-        &["netflow"],
-    ),
+    ("Network Traffic: Network Connection Creation", &["netflow"]),
     (
         "Network Share: Network Share Access",
         &["windows_sysmon", "windows_event_log"],
@@ -288,14 +297,8 @@ const MAPPING: &[(&str, &[&str])] = &[
         "Instance: Instance Deletion",
         &["aws_cloudtrail", "gcp_audit"],
     ),
-    (
-        "Instance: Instance Start",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
-    (
-        "Instance: Instance Stop",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
+    ("Instance: Instance Start", &["aws_cloudtrail", "gcp_audit"]),
+    ("Instance: Instance Stop", &["aws_cloudtrail", "gcp_audit"]),
     (
         "Instance: Instance Enumeration",
         &["aws_cloudtrail", "gcp_audit"],
@@ -312,19 +315,16 @@ const MAPPING: &[(&str, &[&str])] = &[
         "Snapshot: Snapshot Modification",
         &["aws_cloudtrail", "gcp_audit"],
     ),
-    ("Snapshot: Snapshot Deletion", &["aws_cloudtrail", "gcp_audit"]),
+    (
+        "Snapshot: Snapshot Deletion",
+        &["aws_cloudtrail", "gcp_audit"],
+    ),
     (
         "Volume: Volume Modification",
         &["aws_cloudtrail", "gcp_audit"],
     ),
-    (
-        "Volume: Volume Creation",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
-    (
-        "Volume: Volume Deletion",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
+    ("Volume: Volume Creation", &["aws_cloudtrail", "gcp_audit"]),
+    ("Volume: Volume Deletion", &["aws_cloudtrail", "gcp_audit"]),
     // ---------------- Web ----------------
     (
         "Web Credential: Web Credential Usage",
@@ -347,18 +347,9 @@ const MAPPING: &[(&str, &[&str])] = &[
         "Container: Container Enumeration",
         &["aws_cloudtrail", "gcp_audit"],
     ),
-    (
-        "Pod: Pod Creation",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
-    (
-        "Pod: Pod Modification",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
-    (
-        "Pod: Pod Enumeration",
-        &["aws_cloudtrail", "gcp_audit"],
-    ),
+    ("Pod: Pod Creation", &["aws_cloudtrail", "gcp_audit"]),
+    ("Pod: Pod Modification", &["aws_cloudtrail", "gcp_audit"]),
+    ("Pod: Pod Enumeration", &["aws_cloudtrail", "gcp_audit"]),
     // ---------------- Sensors ----------------
     (
         "Sensor Health: Host Status",

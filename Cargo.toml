@@ -5,13 +5,23 @@ members = [
     "nanosiem-api",
     "nanosiem-api-lib",
     "nanosiem-search",
+    "nanosiem-lake-worker",
+    "nanosiem-lake-cell",
     "tools/log-blaster",
     "tools/event-core",
     "tools/injector",
+    # NAN-3490 PoC: not a default member, so default builds are unaffected.
+    "nano-connector",
+]
+
+default-members = [
+    "nanosiem-core", "nanosiem-api", "nanosiem-api-lib",
+    "nanosiem-search", "nanosiem-lake-worker", "nanosiem-lake-cell",
+    "tools/log-blaster", "tools/event-core", "tools/injector",
 ]
 
 [workspace.package]
-version = "0.1.703"
+version = "1.0.2"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"
@@ -68,3 +78,16 @@ feed-rs = "2.3"
 # OpenAPI / Swagger documentation
 utoipa = { version = "5", features = ["chrono", "uuid", "axum_extras"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+[patch.crates-io]
+# NAN-2441: opt-in idle background polling for the UID ledger.
+slatedb = { path = "vendor/slatedb" }
+# NAN-2407: expose connect refusals before sqlx retries them.
+sqlx-core = { path = "vendor/sqlx-core" }
+# NAN-2446: cache capacity zero must use unnamed protocol statements.
+sqlx-postgres = { path = "vendor/sqlx-postgres" }
+
+# NAN-2441: instrument Iceberg FileIO at its provider HTTP boundary.
+iceberg-storage-opendal = { path = "vendor/iceberg-storage-opendal" }
+# NAN-3401: admit dotted field names under an explicit parent (OCSF `unmapped`).
+iceberg = { path = "vendor/iceberg" }

@@ -9,6 +9,37 @@ use crate::models::DetectionRule;
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
 
 impl DetectionRuleRepository {
+    /// Stop future scheduler claims before deleting a rule and report whether
+    /// the current claim has drained.
+    ///
+    /// A scheduler executes outside the claim transaction. Deleting its rule
+    /// row while that execution is still writing matches/statistics violates
+    /// foreign keys and turns an ordinary lifecycle operation into a failed
+    /// detection run. Pausing and clearing `next_run_at` closes the door to new
+    /// claims; callers may delete only after `claimed_by` is empty.
+    pub async fn quiesce_for_delete(
+        &self,
+        rule_id: Uuid,
+    ) -> Result<bool, DetectionRuleRepositoryError> {
+        let claimed_by: Option<Option<String>> = sqlx::query_scalar(
+            r#"
+            UPDATE detection_rules
+            SET mode = 'paused',
+                next_run_at = NULL
+            WHERE id = $1
+            RETURNING claimed_by
+            "#,
+        )
+        .bind(rule_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match claimed_by {
+            Some(owner) => Ok(owner.is_none()),
+            None => Err(DetectionRuleRepositoryError::NotFound(rule_id)),
+        }
+    }
+
     /// Atomically claim a batch of due detection rules using SKIP LOCKED.
     ///
     /// Returns rules that are now claimed by this node. Other nodes calling
@@ -20,16 +51,36 @@ impl DetectionRuleRepository {
         batch_size: i64,
         node_id: &str,
         stale_timeout_secs: i64,
+        include_realtime_microbatches: bool,
     ) -> Result<Vec<DetectionRule>, DetectionRuleRepositoryError> {
         let results = sqlx::query_as::<_, DetectionRule>(
             r#"
             WITH claimable AS (
                 SELECT id FROM detection_rules
                 WHERE archived = false
-                  AND detection_mode = 'scheduled' AND mode NOT IN ('staging', 'paused')
+                  AND (
+                      detection_mode = 'scheduled'
+                      OR ($4 AND detection_mode = 'real-time')
+                  )
+                  AND mode NOT IN ('staging', 'paused')
                   AND schedule_cron IS NOT NULL AND next_run_at IS NOT NULL
                   AND next_run_at <= NOW()
                   AND (claimed_by IS NULL OR claimed_at < NOW() - make_interval(secs => $3))
+                  -- A due late-arrival repair shares this rule's claim fence.
+                  -- Give it priority over the normal cron lane or a five-second
+                  -- real-time rule can win every synchronized poll forever and
+                  -- starve its repair job. Retry backoff does not block normal
+                  -- execution until the repair is actually due again.
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM detection_late_replay_jobs replay
+                      WHERE replay.rule_id = detection_rules.id
+                        AND (
+                            (replay.status = 'pending' AND replay.next_attempt_at <= NOW())
+                            OR
+                            (replay.status = 'running' AND replay.claim_expires_at < NOW())
+                        )
+                  )
                 ORDER BY next_run_at ASC
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
@@ -42,6 +93,7 @@ impl DetectionRuleRepository {
         .bind(batch_size)
         .bind(node_id)
         .bind(stale_timeout_secs as f64)
+        .bind(include_realtime_microbatches)
         .fetch_all(&self.pool)
         .await?;
 
@@ -75,7 +127,10 @@ impl DetectionRuleRepository {
             SET claimed_by = NULL,
                 claimed_at = NULL,
                 last_run_at = COALESCE($4, last_run_at),
-                next_run_at = $2
+                next_run_at = CASE
+                    WHEN archived OR mode IN ('staging', 'paused') THEN NULL
+                    ELSE $2
+                END
             WHERE id = $1 AND claimed_by = $3
             "#,
         )
@@ -112,6 +167,21 @@ impl DetectionRuleRepository {
         &self,
         node_id: &str,
     ) -> Result<u64, DetectionRuleRepositoryError> {
+        let mut transaction = self.pool.begin().await?;
+        // Late-arrival jobs share the rule claim to exclude a concurrent normal
+        // cron run. Put owned jobs back before clearing those claims so another
+        // node can safely resume them after this process shuts down.
+        sqlx::query(
+            r#"
+            UPDATE detection_late_replay_jobs
+            SET status = 'pending', claimed_by = NULL, claimed_at = NULL,
+                claim_expires_at = NULL, next_attempt_at = NOW()
+            WHERE status = 'running' AND claimed_by = $1
+            "#,
+        )
+        .bind(node_id)
+        .execute(&mut *transaction)
+        .await?;
         let result = sqlx::query(
             r#"
             UPDATE detection_rules
@@ -120,8 +190,9 @@ impl DetectionRuleRepository {
             "#,
         )
         .bind(node_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
 
         Ok(result.rows_affected())
     }
@@ -152,16 +223,22 @@ impl DetectionRuleRepository {
     /// List all eligible rules that are missing next_run_at (for startup backfill).
     pub async fn list_missing_next_run_at(
         &self,
+        include_realtime_microbatches: bool,
     ) -> Result<Vec<DetectionRule>, DetectionRuleRepositoryError> {
         let results = sqlx::query_as::<_, DetectionRule>(
             r#"
             SELECT * FROM detection_rules
             WHERE archived = false
-              AND detection_mode = 'scheduled' AND mode NOT IN ('staging', 'paused')
+              AND (
+                  detection_mode = 'scheduled'
+                  OR ($1 AND detection_mode = 'real-time')
+              )
+              AND mode NOT IN ('staging', 'paused')
               AND schedule_cron IS NOT NULL
               AND next_run_at IS NULL
             "#,
         )
+        .bind(include_realtime_microbatches)
         .fetch_all(&self.pool)
         .await?;
 

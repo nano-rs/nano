@@ -5,18 +5,24 @@
 //! Syncs user directories from identity providers (Entra ID, Google Workspace,
 //! Active Directory) into a unified user registry for enriching SIEM events.
 
+pub mod gate;
+pub mod lake;
+pub mod lean_directory;
+pub mod normalizers;
 pub mod repository;
 pub mod scheduler;
 pub mod service;
 pub mod sync;
 pub mod types;
 
+pub use lake::{LakeIdentityClient, LakeIdentityCounts, LakeIdentityError};
+pub use lean_directory::{LeanDirectoryError, LeanIdentityDirectoryClient};
 pub use repository::{IdentityRepository, IdentityRepositoryError};
 pub use scheduler::{IdentitySyncScheduler, IdentitySyncSchedulerConfig};
 pub use service::{IdentityServiceError, IdentitySyncService};
 pub use types::{
     ConnectionTestResult, CreateIdentityProvider, IdentityProvider, IdentityProviderSummary,
     IdentityProviderType, IdentityStats, IdentitySyncResult, ListUsersParams, ProviderStatsSummary,
-    UpdateIdentityProvider, UpdateIdentityProviderCredentials,
-    UserListResponse, UserRecord, UserRecordUpsert,
+    UpdateIdentityProvider, UpdateIdentityProviderCredentials, UserListResponse, UserRecord,
+    UserRecordUpsert,
 };

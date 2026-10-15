@@ -34,7 +34,9 @@ const EVERY_MINUTE: &str = "* * * * *";
 #[test]
 fn next_slot_is_strictly_after_the_anchor() {
     let anchor = utc(2026, 7, 30, 2, 0);
-    let next = next_slot_after(DAILY_2AM, Tz::UTC, anchor).unwrap().unwrap();
+    let next = next_slot_after(DAILY_2AM, Tz::UTC, anchor)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         next,
         utc(2026, 7, 31, 2, 0),
@@ -280,7 +282,11 @@ fn a_week_of_missed_daily_slots_collapses_to_one_sweep() {
 
     // Due slots in [23rd 02:00 .. 30th 09:15] are the 23rd..30th inclusive = 8.
     // ONE sweep is issued, for the LATEST.
-    assert_eq!(issue.slot, utc(2026, 7, 30, 2, 0), "issue the latest due slot");
+    assert_eq!(
+        issue.slot,
+        utc(2026, 7, 30, 2, 0),
+        "issue the latest due slot"
+    );
     assert_eq!(issue.trigger, SlotTrigger::Catchup);
     assert_eq!(
         issue.skipped, 7,
@@ -397,7 +403,10 @@ fn the_scan_cap_truncates_but_still_converges() {
         ticks += 1;
         assert!(ticks < 100, "catch-up must terminate");
     }
-    assert!(ticks > 1, "this case is supposed to need more than one pass");
+    assert!(
+        ticks > 1,
+        "this case is supposed to need more than one pass"
+    );
     assert_eq!(
         plan_slots(EVERY_MINUTE, Tz::UTC, watermark, now).unwrap(),
         SlotPlan::NotDue
@@ -589,5 +598,36 @@ async fn a_cancelled_scheduler_stops_without_touching_postgres() {
     tokio::time::timeout(std::time::Duration::from_secs(2), scheduler.start(shutdown))
         .await
         .expect("a cancelled scheduler must return immediately")
+        .expect("the task must not panic");
+}
+
+#[tokio::test(start_paused = true)]
+async fn absent_hunt_tables_park_the_scheduler_until_shutdown() {
+    use sqlx::postgres::PgPoolOptions;
+
+    // NAN-3376: open-core has no hunt tables. Returning here tripped the jobs
+    // binary's leader-scheduler supervisor (a clean return is fatal) and the
+    // process exited 70 every minute. The scheduler must instead stay pending
+    // until shutdown, without touching PostgreSQL (port 9 = discard).
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://postgres:postgres@127.0.0.1:9/nanosiem")
+        .unwrap();
+    let scheduler = HuntScheduler::with_config(pool, HuntSchedulerConfig::default());
+    let shutdown = ShutdownToken::new();
+    let task = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { scheduler.run_after_probe(&shutdown, Ok(false)).await })
+    };
+
+    tokio::time::sleep(crate::process_supervision::RETURN_SHUTDOWN_GRACE * 4).await;
+    assert!(
+        !task.is_finished(),
+        "a scheduler with no hunt tables must park, not return"
+    );
+
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .expect("a parked scheduler must stop on shutdown")
         .expect("the task must not panic");
 }

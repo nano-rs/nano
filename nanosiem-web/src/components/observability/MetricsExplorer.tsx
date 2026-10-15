@@ -24,11 +24,11 @@ import {
   LayoutDashboard,
   LineChart,
   ListOrdered,
-  Loader2,
   Plus,
   Sigma,
   X,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
@@ -54,6 +54,7 @@ import type {
 import { MetricViz, type MetricVizMode } from './MetricViz';
 import { MetricMonitorDialog } from './MetricMonitorDialog';
 import { AddMetricToDashboardDialog } from './AddMetricToDashboardDialog';
+import { seriesColor } from '@/lib/chart-colors';
 
 const AGG_OPTS: MetricAgg[] = [
   'avg',
@@ -322,7 +323,7 @@ export function MetricsExplorer({
           ))}
         </div>
 
-        {loading && <Loader2 className="w-3.5 h-3.5 animate-spin text-fg-4" />}
+        {loading && <LoadingIcon className="w-3.5 h-3.5 text-fg-4" />}
         <span className="flex-1" />
         <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={loading} />
       </div>
@@ -394,7 +395,7 @@ export function MetricsExplorer({
           </div>
         ) : loading && series.length === 0 ? (
           <div className="flex items-center justify-center h-[220px]">
-            <Loader2 className="w-5 h-5 animate-spin text-fg-4" />
+            <LoadingIcon className="w-5 h-5 text-fg-4" />
           </div>
         ) : (
           <MetricViz mode={viz} series={series} metricName={metric} height={240} />
@@ -408,18 +409,7 @@ export function MetricsExplorer({
             <span key={s.key || i} className="inline-flex items-center gap-1.5 text-[10.5px]">
               <span
                 className="w-2 h-2 rounded-sm"
-                style={{
-                  background: [
-                    '#3b82f6',
-                    '#22c55e',
-                    '#eab308',
-                    '#ef4444',
-                    '#a855f7',
-                    '#06b6d4',
-                    '#f97316',
-                    '#ec4899',
-                  ][i % 8],
-                }}
+                style={{ background: seriesColor(i) }}
               />
               <span className="font-mono text-fg-2 truncate max-w-[160px]">{s.key || '(empty)'}</span>
             </span>
@@ -609,7 +599,7 @@ function FiltersRow({
             <>
               <div className="px-2 py-1 text-[9.5px] uppercase tracking-[0.1em] text-fg-4 flex items-center gap-1">
                 {pendingKey}
-                {valuesLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                {valuesLoading && <LoadingIcon className="w-3 h-3" />}
               </div>
               {!valuesLoading && pendingValues.length === 0 && (
                 <div className="px-2 py-1.5 text-[11px] text-fg-4">No values.</div>

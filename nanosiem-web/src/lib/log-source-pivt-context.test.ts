@@ -34,7 +34,7 @@ test('NAN-2292: extracts bounded, unique raw messages with event fallback', () =
   assert.equal(samples[2].length, 16_000);
 });
 
-test('NAN-2292: prompt identifies the source and directs PIVT to generate without asking again', () => {
+test('NAN-2292: prompt identifies the source and directs pivt to generate without asking again', () => {
   const prompt = buildLogSourceParserPrompt({
     userMessage: 'Create an entire parser for this log source',
     sourceName: 'GitHub Public Events',

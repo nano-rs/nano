@@ -14,9 +14,10 @@
 
 mod common;
 
-use nanosiem_core::auth::repository::ApiKeyRepository;
+use nanosiem_core::auth::repository::{ApiKeyRepository, SessionRepository};
 use nanosiem_core::auth::{
-    ApiKeyService, ApiKeyServiceError, CreateApiKeyRequest, UserRepository, UserStatusResolver,
+    token::is_persisted_access_token_revoked, ApiKeyService, ApiKeyServiceError,
+    CreateApiKeyRequest, UserRepository, UserStatusResolver,
 };
 use nanosiem_core::db::repository::RateLimitRepository;
 use sqlx::PgPool;
@@ -109,6 +110,61 @@ async fn password_change_watermark_revokes_old_tokens_only() {
         !snap.token_predates_revocation(chrono::Utc::now().timestamp() + 3600),
         "a token issued after the password change must remain valid"
     );
+}
+
+/// Logout/password/session revocation must delete refresh sessions and advance
+/// the durable access-token watermark in the same transaction. The shared
+/// middleware reads this authority directly rather than trusting its cache.
+#[tokio::test]
+#[ignore = "db-backed; runs in pg-integration CI (cargo test -- --ignored)"]
+async fn bulk_session_revocation_is_atomic_and_durable() {
+    let pool = common::migrated_pool().await;
+    let sessions = SessionRepository::new(pool.clone());
+    let cached_status = UserStatusResolver::new(pool.clone());
+    let user = create_user(&pool, "active").await;
+    sessions
+        .create_session(
+            user,
+            &format!("revocation-refresh-{}", Uuid::now_v7()),
+            None,
+            None,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("create refresh session");
+    let access_jti = Uuid::now_v7();
+    let old_iat = chrono::Utc::now().timestamp() - 60;
+    let warm_snapshot = cached_status.resolve(user).await.expect("warm status cache");
+    assert!(warm_snapshot.is_active());
+    assert!(!warm_snapshot.token_predates_revocation(old_iat));
+    assert!(!is_persisted_access_token_revoked(&pool, access_jti, user, old_iat)
+        .await
+        .expect("read initial durable authority"));
+
+    assert_eq!(
+        sessions
+            .revoke_all_user_sessions(user)
+            .await
+            .expect("atomically revoke sessions"),
+        1,
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .expect("count remaining sessions");
+    assert_eq!(remaining, 0);
+    let still_warm = cached_status
+        .resolve(user)
+        .await
+        .expect("read deliberately warm status cache");
+    assert!(
+        still_warm.is_active() && !still_warm.token_predates_revocation(old_iat),
+        "the regression setup requires a stale warm cache so durable middleware authority is proven"
+    );
+    assert!(is_persisted_access_token_revoked(&pool, access_jti, user, old_iat)
+        .await
+        .expect("read durable post-logout authority"));
 }
 
 /// API keys: `validate_key` must reject a key whose OWNER is disabled, keep

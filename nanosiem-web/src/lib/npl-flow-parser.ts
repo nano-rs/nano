@@ -265,8 +265,8 @@ function generateLabel(command: string, rest: string, _category: StageCategory):
  * Generate source node label from the first segment.
  */
 function generateSourceLabel(segment: string): { label: string; description: string } {
-  // Look for source_type= or sourcetype=
-  const stMatch = segment.match(/source_?type\s*=\s*"?([^"\s|]+)"?/i);
+  // Recognize both the canonical OCSF source path and the isolated legacy lane.
+  const stMatch = segment.match(/(?:metadata\.log_source|source_?type)\s*=\s*"?([^"\s|]+)"?/i);
   if (stMatch) {
     return {
       label: stMatch[1].replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()),

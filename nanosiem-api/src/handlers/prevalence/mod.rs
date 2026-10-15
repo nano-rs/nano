@@ -26,6 +26,50 @@ pub use types::*;
 
 use nanosiem_core::prevalence::{ArtifactType, TimeWindow};
 
+async fn primary_lake_prevalence_client(
+    state: &crate::state::AppState,
+) -> Result<
+    Option<nanosiem_core::prevalence::LakePrevalenceClient>,
+    (axum::http::StatusCode, String),
+> {
+    if !nanosiem_core::schema::log_query_backend_is_lake() {
+        return Ok(None);
+    }
+    let client = nanosiem_core::prevalence::LakePrevalenceClient::from_env()
+        .map_err(|error| (axum::http::StatusCode::SERVICE_UNAVAILABLE, error))?
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "lake prevalence requires an immutable snapshot assignment".to_string(),
+            )
+        })?;
+    Ok(Some(client.with_rarity_setting(
+        settings_rarity_threshold(&nanosiem_core::prevalence::PrevalenceSettings::new(
+            state.pool.clone(),
+        ))
+        .await,
+    )))
+}
+
+/// NAN-3451: the Settings rarity threshold, read per request like the
+/// ClickHouse path reads its config, so every API replica honors a change at
+/// once. Unreadable or absent Settings leave it empty and the client keeps
+/// `NANO_LAKE_PREVALENCE_RARITY_THRESHOLD` as its fallback.
+async fn settings_rarity_threshold(
+    settings: &nanosiem_core::prevalence::PrevalenceSettings,
+) -> nanosiem_core::prevalence::RarityThresholdSetting {
+    match settings.stored_config().await {
+        Ok(Some(config)) => {
+            nanosiem_core::prevalence::RarityThresholdSetting::fixed(config.rarity_threshold)
+        }
+        Ok(None) => Default::default(),
+        Err(error) => {
+            tracing::warn!(%error, "prevalence settings unreadable; lake rarity threshold falls back to the deployment default");
+            Default::default()
+        }
+    }
+}
+
 /// One composition seam for every prevalence ARTIFACT read. `AuthContext` is
 /// populated identically by JWT and API-key middleware.
 ///
@@ -108,6 +152,7 @@ impl utoipa::OpenApi for PrevalenceApiDoc {
                 nanosiem_core::prevalence::ArtifactProcessEntry,
                 nanosiem_core::prevalence::ArtifactFileNameEntry,
                 nanosiem_core::prevalence::ArtifactThreatIntelEntry,
+                nanosiem_core::prevalence::ArtifactDetailCoverage,
                 nanosiem_core::prevalence::ArtifactInlineContext,
                 nanosiem_core::prevalence::ArtifactNetworkEntry,
                 nanosiem_core::prevalence::ArtifactGeoEntry,

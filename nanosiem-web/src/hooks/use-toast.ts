@@ -16,6 +16,8 @@ interface ToastOptions {
 }
 
 function toast({ title, description, variant, action, duration }: ToastOptions) {
+  // AuthContext owns the single session-expired prompt.
+  if (description === 'Session expired — sign in again') return;
   const opts: Record<string, unknown> = { description };
   if (action) {
     opts.action = { label: action.label, onClick: action.onClick };

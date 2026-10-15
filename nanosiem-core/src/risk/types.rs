@@ -65,7 +65,7 @@ impl RiskDecayConfig {
 pub const DEFAULT_RISK_NOTABLE_RULE_ID: uuid::Uuid =
     uuid::Uuid::from_u128(0xb8f3_d2a1_6c4e_4f7a_9d2b_3e5a_7c90_1f44);
 
-/// Optional per-entity-type threshold overrides for risk notables (NAN-1792).
+/// Optional per-entity-type threshold overrides for risk notables.
 ///
 /// `None` fields fall back to the global [`RiskNotableConfig`] thresholds, so
 /// an override can raise/lower just one window for one entity type (e.g. a
@@ -80,11 +80,11 @@ pub struct RiskNotableTypeThresholds {
     pub threshold_7d: Option<i32>,
 }
 
-/// Risk-notable generation settings (NAN-1792, repointed in NAN-1805).
+/// Risk-notable generation settings.
 ///
 /// A risk notable is an alert raised when an entity's ACCUMULATED decayed risk
 /// score crosses a threshold — many low-severity risk contributions collapse
-/// into one high-signal alert. Since NAN-1805 these settings are a thin editor
+/// into one high-signal alert. These settings are a thin editor
 /// over the seeded default `dataset=risk` detection rule
 /// ([`DEFAULT_RISK_NOTABLE_RULE_ID`]): thresholds/overrides regenerate its
 /// query ([`Self::default_rule_query`]), the cooldown maps to its
@@ -228,7 +228,6 @@ impl RiskNotableConfig {
         ));
         format!("* | where {} {}", branches.join(" or "), TABLE_TAIL)
     }
-
 }
 
 /// Entity risk score record
@@ -268,6 +267,19 @@ pub struct TimeWindowedRiskScore {
     pub last_finding_at: Option<DateTime<Utc>>,
     pub last_rule_name: Option<String>,
     pub last_severity: Option<String>,
+    /// Unweighted decayed 24h score when a watchlist weight applies;
+    /// `decayed_score_24h` is then the effective score. Only
+    /// for callers holding `risk:watchlists`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_decayed_score_24h: Option<i64>,
+    /// Unweighted decayed 7d score when a watchlist weight applies. Only for
+    /// callers holding `risk:watchlists`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_decayed_score_7d: Option<i64>,
+    /// Applied watchlist weight (max of the entity's enabled lists). Only
+    /// for callers holding `risk:watchlists`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_weight: Option<f64>,
 }
 
 /// Summary of entity risk for API responses
@@ -283,6 +295,17 @@ pub struct EntityRiskSummary {
     pub last_rule_name: Option<String>,
     pub last_severity: Option<String>,
     pub risk_level: RiskLevel,
+    /// Unweighted score when a watchlist weight applies:
+    /// `risk_score` is then the effective score `base x (1 + watch_weight)`.
+    /// Only for callers holding `risk:watchlists`; everyone else
+    /// gets the effective `risk_score` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_risk_score: Option<i32>,
+    /// Applied watchlist weight (max of the entity's enabled lists); absent
+    /// when the entity is not amplified or the caller lacks
+    /// `risk:watchlists`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_weight: Option<f64>,
 }
 
 /// Risk level classification
@@ -335,9 +358,44 @@ pub struct RiskAnalyticsOverview {
 pub struct RiskFilter {
     pub entity_type: Option<String>,
     pub min_score: Option<i32>,
+    pub max_score: Option<i32>,
     pub risk_level: Option<RiskLevel>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+impl RiskFilter {
+    /// The `entity_type` filter in the risk store's own vocabulary; see
+    /// [`canonical_risk_entity_type`].
+    pub fn canonical_entity_type(&self) -> Option<String> {
+        self.entity_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(canonical_risk_entity_type)
+    }
+}
+
+/// NAN-3073: map an API caller's entity type to the value the risk store
+/// classifies entities as (`ip`, `email`, `hostname`, `user`,
+/// `cloud_account`; lean `part_query::risk::entity_type` and the dedicated
+/// `risk_sql` share that classification).
+///
+/// The rest of the product (entity pages `/api/entities/host/…`, schema
+/// entity map, notebooks) names hosts `host`. Before this, `GET
+/// /api/risk/entities?entity_type=host` compared the literal `host` against
+/// stored `hostname` rows and returned nothing, although the host's risk was
+/// there. Unknown values pass through lowercased (an unknown type still
+/// matches nothing rather than widening the filter).
+pub fn canonical_risk_entity_type(raw: &str) -> String {
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "host" | "hostname" | "hosts" | "device" | "computer" | "endpoint" | "fqdn" => "hostname".to_string(),
+        "ip" | "ips" | "ip_address" | "ipaddress" | "address" => "ip".to_string(),
+        "user" | "users" | "username" | "user_name" | "account" => "user".to_string(),
+        "email" | "mail" | "email_address" => "email".to_string(),
+        _ => value,
+    }
 }
 
 /// Time window for risk queries
@@ -373,8 +431,8 @@ pub struct EntityActivityResponse {
     pub activity: std::collections::HashMap<String, Vec<EntityDailyCount>>,
 }
 
-/// Summary of a recent detection-rule firing for an entity, sourced from
-/// ClickHouse `logs WHERE source_type = 'findings'`.
+/// Summary of a recent detection-rule firing for an entity, sourced from the
+/// tenant's immutable findings ledger.
 ///
 /// Unlike alerts (which only exist for rules in `alerting` mode), every
 /// rule firing — regardless of mode — produces a finding row, so this
@@ -398,7 +456,7 @@ pub struct EntitySignalSummary {
 #[path = "types_tests.rs"]
 mod types_tests;
 
-/// Exact per-rule contribution to an entity's decayed risk score (NAN-1658).
+/// Exact per-rule contribution to an entity's decayed risk score.
 ///
 /// Computed with the SAME source, window, and decay curve as the entity's
 /// `decayed_score_24h/7d`, grouped by rule — so summing these per window
@@ -426,4 +484,12 @@ pub struct EntityRuleContribution {
     pub last_fire_at: DateTime<Utc>,
     /// The per-fire score of the most recent fire (undecayed).
     pub last_fire_score: i32,
+    /// MITRE ATT&CK tactics of the contributing rule, as the rule
+    /// stores them (IDs, slugs or labels). Empty for ad-hoc findings, deleted
+    /// rules and untagged rules. Additive: absent from older servers.
+    #[serde(default)]
+    pub mitre_tactics: Vec<String>,
+    /// MITRE ATT&CK technique IDs of the contributing rule.
+    #[serde(default)]
+    pub mitre_techniques: Vec<String>,
 }

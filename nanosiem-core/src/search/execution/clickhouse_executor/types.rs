@@ -72,7 +72,7 @@ pub struct ClickHouseLogReadRow {
     pub ingest_time: i64, // Microseconds since epoch for DateTime64(6)
     #[serde(rename = "enrich_time_micros")]
     pub enrich_time: i64, // 0 if not enriched, microseconds since epoch otherwise
-    pub ext: String,      // JSON string containing extended fields (non-explicit UDM fields)
+    pub ext: String, // JSON string containing extended fields (non-explicit UDM fields)
 }
 
 /// Columns to SELECT for ClickHouseLogReadRow struct.
@@ -127,10 +127,7 @@ pub(crate) fn with_query_options(
             .with_option("priority", &s.priority.to_string())
             .with_option("queue_max_wait_ms", &s.queue_max_wait_ms.to_string());
         if let Some(max_memory_usage_bytes) = s.max_memory_usage_bytes {
-            query = query.with_option(
-                "max_memory_usage",
-                &max_memory_usage_bytes.to_string(),
-            );
+            query = query.with_option("max_memory_usage", &max_memory_usage_bytes.to_string());
         }
     }
     query

@@ -9,13 +9,15 @@ import {
   AlertTriangle,
   Hash,
   Globe,
-  Loader2,
   Save,
   RotateCcw,
   Network,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { usePrevalenceSettings, useUpdatePrevalenceSettings } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
+import { PlatformManagedNotice } from '@/components/settings/PlatformManagedNotice';
+import { platformManaged } from '@/lib/platform-managed';
 
 const DEFAULTS = {
   rarity_threshold: 3,
@@ -119,7 +121,7 @@ export function PrevalenceSettings() {
   if (loadingSettings && !settings) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }
@@ -159,6 +161,10 @@ export function PrevalenceSettings() {
     ip: [enableIpTracking, setEnableIpTracking],
   };
 
+  // Hosted-shared tenant (NAN-2361): rarity thresholds are set by the platform
+  // for the shared lake; the values shown are its defaults, read-only.
+  const managed = platformManaged(settings);
+
   return (
     <div className="px-6 py-5 space-y-7">
       <div>
@@ -167,6 +173,8 @@ export function PrevalenceSettings() {
           Artifact prevalence, rarity policy, tracking scope
         </p>
       </div>
+
+      {managed && <PlatformManagedNotice verdict={managed} title="Rarity thresholds" />}
 
       <section>
         <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
@@ -309,11 +317,11 @@ export function PrevalenceSettings() {
         </Button>
         <Button
           onClick={handleSave}
-          disabled={saving || !hasChanges}
+          disabled={!!managed || saving || !hasChanges}
           size="sm"
           className="h-7 text-[11.5px] px-2.5"
         >
-          {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+          {saving ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
           Save changes
         </Button>
       </div>

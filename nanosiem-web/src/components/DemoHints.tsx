@@ -12,6 +12,8 @@ import { X, Search, Shield, Briefcase, BarChart3, ArrowRight, Play } from 'lucid
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
 
 // ============================================================================
 // Core DemoHint wrapper
@@ -80,13 +82,27 @@ function QueryChip({ query, label, onClick }: QueryChipProps) {
  * Search page hint: sample queries users can click to try
  */
 export function SearchDemoHint({ onRunQuery }: { onRunQuery: (query: string) => void }) {
-  const SAMPLE_QUERIES = [
-    { query: 'source_type=windows_event event_id=4625 | stats count by user | sort -count | head 20', label: 'Failed logins by user' },
-    { query: 'source_type=conduit_proxy | stats count by dest_host | sort -count | head 20', label: 'Top proxy destinations' },
-    { query: 'src_host="lt-eng-012.corp.local" | asset', label: 'Asset investigation' },
-    { query: '* | timechart span=1m count by source_type', label: 'Activity by source type' },
-    { query: 'source_type=aws_cloudtrail | cloud', label: 'Cloud activity' },
-  ];
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const SAMPLE_QUERIES = activeSchema?.schema === 'ocsf'
+    ? [
+        { query: 'metadata.log_source=windows_event class_uid=3002 status_id=2 | stats count by actor.user.name | sort -count | head 20', label: 'Failed logins by user' },
+        { query: 'metadata.log_source=conduit_proxy | stats count by dst_endpoint.hostname | sort -count | head 20', label: 'Top proxy destinations' },
+        { query: 'device.hostname="lt-eng-012.corp.local" | asset', label: 'Asset investigation' },
+        { query: '* | timechart span=1m count by metadata.log_source', label: 'Activity by log source' },
+        { query: 'metadata.log_source=aws_cloudtrail | cloud', label: 'Cloud activity' },
+      ]
+    : [
+        { query: 'source_type=windows_event event_id=4625 | stats count by user | sort -count | head 20', label: 'Failed logins by user' },
+        { query: 'source_type=conduit_proxy | stats count by dest_host | sort -count | head 20', label: 'Top proxy destinations' },
+        { query: 'src_host="lt-eng-012.corp.local" | asset', label: 'Asset investigation' },
+        { query: '* | timechart span=1m count by source_type', label: 'Activity by source type' },
+        { query: 'source_type=aws_cloudtrail | cloud', label: 'Cloud activity' },
+      ];
 
   return (
     <DemoHint id="search">

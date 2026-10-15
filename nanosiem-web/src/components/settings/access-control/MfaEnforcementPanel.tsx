@@ -18,9 +18,11 @@
  */
 
 import { useEffect, useState } from 'react';
-import { ShieldCheck, Loader2 } from 'lucide-react';
+import { ShieldCheck } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Switch } from '@/components/ui/switch';
 import { useAuth } from '@/contexts/AuthContext';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -29,6 +31,9 @@ export function MfaEnforcementPanel() {
   const { hasPermission } = useAuth();
   const { toast } = useToast();
   const canManage = hasPermission('settings:system');
+  // Hosted-shared tenants: MFA is always required by the platform (NAN-2361);
+  // the toggle is replaced by a static policy line.
+  const sharedTenant = useSharedTenant();
 
   const [required, setRequired] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
@@ -42,12 +47,17 @@ export function MfaEnforcementPanel() {
       setLoading(false);
       return;
     }
+    if (sharedTenant) {
+      setRequired(true);
+      setLoading(false);
+      return;
+    }
     api.auth
       .getMfaStatus()
       .then((s) => setRequired(s.mfa_required_globally))
       .catch(() => setRequired(null))
       .finally(() => setLoading(false));
-  }, [canManage]);
+  }, [canManage, sharedTenant]);
 
   if (!canManage) return null;
 
@@ -61,8 +71,8 @@ export function MfaEnforcementPanel() {
       toast({
         title: next ? 'MFA required for all users' : 'MFA enforcement disabled',
         description: next
-          ? 'Non-MFA users will be required to enrol on next login.'
-          : 'Users may sign in without MFA. Existing enrolments are unaffected.',
+          ? 'Non-MFA users will be required to enroll on next login.'
+          : 'Users may sign in without MFA. Existing enrollments are unaffected.',
       });
     } catch (err) {
       setRequired(prev);
@@ -101,27 +111,32 @@ export function MfaEnforcementPanel() {
             </span>
             {enabled && (
               <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-[var(--success)] bg-[color-mix(in_srgb,var(--success)_15%,transparent)] px-1.5 py-px rounded-sm">
-                org-wide
+                {sharedTenant ? 'platform policy' : 'org-wide'}
               </span>
             )}
           </div>
           <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-snug">
-            {enabled ? (
+            {sharedTenant ? (
               <>
-                Local-account users without MFA will be forced to enrol on next login. SSO
+                Every member of a hosted tenant enrolls MFA on activation; the platform does
+                not allow turning this off. SSO users follow their identity provider's policy.
+              </>
+            ) : enabled ? (
+              <>
+                Local-account users without MFA will be forced to enroll on next login. SSO
                 users follow their identity provider's policy.
               </>
             ) : (
               <>
                 Users may sign in with email + password alone. Toggle on to require TOTP
-                enrolment for every local account.
+                enrollment for every local account.
               </>
             )}
           </div>
         </div>
         {loading || required === null ? (
-          <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
-        ) : (
+          <LoadingIcon className="w-4 h-4 text-muted-foreground" />
+        ) : sharedTenant ? null : (
           <Switch
             checked={enabled}
             onCheckedChange={onToggle}

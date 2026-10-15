@@ -1,0 +1,107 @@
+# Map a raw Google Admin SDK Directory user object to the user_registry columns.
+now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+external_id = to_string(.id) ?? ""
+if external_id == "" {
+    log("nano_enrich google identity record missing id; dead-lettering", level: "warn")
+    abort
+}
+
+# version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+# otherwise stamp now. last_synced_at is the formatted-string form of version.
+version = to_int(.version) ?? 0
+if version <= 0 { version = now_ms }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+# username = local part of primaryEmail before "@".
+primary_email = to_string(.primaryEmail) ?? ""
+username = primary_email
+email_parts = split(primary_email, "@")
+if length(email_parts) > 1 {
+    username = email_parts[0]
+}
+
+# organizations[] -> department / title / company (Google "name" is company).
+org0 = {}
+if is_array(.organizations) && length(array!(.organizations)) > 0 {
+    org0 = array!(.organizations)[0]
+    if !is_object(org0) { org0 = {} }
+}
+department = to_string(org0.department) ?? ""
+title = to_string(org0.title) ?? ""
+company = to_string(org0.name) ?? ""
+
+# phones[] -> first value.
+ph0 = {}
+if is_array(.phones) && length(array!(.phones)) > 0 {
+    ph0 = array!(.phones)[0]
+    if !is_object(ph0) { ph0 = {} }
+}
+phone = to_string(ph0.value) ?? ""
+
+# relations[] -> .value of the first element with type == "manager".
+manager_upn = ""
+rels = .relations
+if is_array(rels) {
+    for_each(array!(rels)) -> |_i, r| {
+        if (to_string(r.type) ?? "") == "manager" && manager_upn == "" {
+            manager_upn = to_string(r.value) ?? ""
+        }
+    }
+}
+
+# externalIds[] -> .value of the first element with type == "organization".
+employee_id = ""
+ext_ids = .externalIds
+if is_array(ext_ids) {
+    for_each(array!(ext_ids)) -> |_i, e| {
+        if (to_string(e.type) ?? "") == "organization" && employee_id == "" {
+            employee_id = to_string(e.value) ?? ""
+        }
+    }
+}
+
+# mfa: Google 2-Step Verification enrollment.
+mfa_enabled = if (to_bool(.isEnrolledIn2Sv) ?? false) { 1 } else { 0 }
+
+# account state: enabled when NOT suspended AND NOT archived.
+suspended = to_bool(.suspended) ?? false
+archived = to_bool(.archived) ?? false
+account_enabled = if suspended || archived { 0 } else { 1 }
+
+# account_status: Google distinguishes suspended/archived. NAN-3483: the
+# directory enum is active/disabled/suspended/deleted/anonymized across the
+# lane, the coordinator and lean, so suspended stays suspended.
+account_status = if suspended { "suspended" } else if archived { "disabled" } else { "active" }
+if !includes(["active", "disabled", "suspended", "deleted", "anonymized"], account_status) {
+    account_status = "disabled"
+}
+
+. = {
+    "provider_id": to_string(.provider_id) ?? "",
+    "external_id": external_id,
+    "username": username,
+    "upn": primary_email,
+    "email": primary_email,
+    "display_name": to_string(.name.fullName) ?? "",
+    "first_name": to_string(.name.givenName) ?? "",
+    "last_name": to_string(.name.familyName) ?? "",
+    "department": department,
+    "title": title,
+    "manager_upn": manager_upn,
+    "manager_display_name": "",
+    "company": company,
+    "office_location": "",
+    "city": "",
+    "country": "",
+    "groups": [],
+    "account_enabled": account_enabled,
+    "account_status": account_status,
+    "mfa_enabled": mfa_enabled,
+    "phone": phone,
+    "employee_id": employee_id,
+    "employee_type": "employee",
+    "sync_hash": sha2(encode_json(.), variant: "SHA-256"),
+    "last_synced_at": last_synced_at,
+    "version": version
+}

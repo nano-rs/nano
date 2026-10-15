@@ -5,6 +5,7 @@
 //! Provides a library of example queries to help users learn the query language
 //! and discover useful patterns for security analysis.
 
+mod lake_builtins;
 pub mod repository;
 pub mod types;
 

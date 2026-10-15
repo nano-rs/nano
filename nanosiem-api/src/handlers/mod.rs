@@ -14,7 +14,7 @@ use nanosiem_core::auth::UserRepository;
 // only place that knows what an `AppState` is).
 pub use nanosiem_api_lib::AuditExt;
 
-// Agent enrichment handlers — lifted to nanosiem-enterprise in NAN-752
+// Agent enrichment handlers — lifted to the enterprise crate in NAN-752
 // (Phase 2 of the open-core split). Re-exported here so route registrations
 // (`handlers::agent_enrichment::list_providers`, etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
@@ -26,15 +26,19 @@ pub mod audit;
 #[cfg(feature = "enterprise")]
 pub mod airgap;
 pub mod auth;
+mod auth_challenge_audit;
 pub mod capabilities;
 // Cases + queues + queue-routing-rules + case-grouping settings handlers —
-// lifted to nanosiem-enterprise in NAN-752 (Phase 2 of the open-core split).
+// lifted to the enterprise crate in NAN-752 (Phase 2 of the open-core split).
 // Re-exported here so route registrations (`handlers::cases::list_cases`,
 // etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::cases;
+pub mod connector_feeds;
+pub mod ingest_tokens;
+pub mod landing_sources;
 pub mod credentials;
-// Custom enrichment handlers — lifted to nanosiem-enterprise in NAN-752 (Phase
+// Custom enrichment handlers — lifted to the enterprise crate in NAN-752 (Phase
 // 2 of the open-core split). Re-exported here so route registrations
 // (`handlers::custom_enrichment::list_custom_enrichments`, etc.) continue to
 // resolve.
@@ -46,7 +50,7 @@ pub mod demo;
 pub mod detection_code_targets;
 pub mod detections;
 pub mod enrichment;
-// Entity context handler — lifted to nanosiem-enterprise in NAN-752 (Phase
+// Entity context handler — lifted to the enterprise crate in NAN-752 (Phase
 // 2 of the open-core split). Re-exported here so route registrations
 // (`handlers::entity_context::get_entity_context`, etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
@@ -64,7 +68,7 @@ pub mod health;
 // NAN-2238 Active Hunter: hunt definitions, runners, sweeps, leads, triage.
 pub mod hunts;
 pub mod identity;
-// Incidents handlers — lifted to nanosiem-enterprise in NAN-752 (Phase 2 of
+// Incidents handlers — lifted to the enterprise crate in NAN-752 (Phase 2 of
 // the open-core split). Incidents group multiple cases for SOC investigations
 // and ship with cases.
 #[cfg(feature = "enterprise")]
@@ -81,7 +85,7 @@ pub mod license;
 pub mod log_sources;
 pub mod lookup;
 pub mod marketplace;
-// meloD AI handlers — lifted to nanosiem-enterprise in NAN-752 (Phase 2 of
+// meloD AI handlers — lifted to the enterprise crate in NAN-752 (Phase 2 of
 // the open-core split). Re-exported here so route registrations
 // (`handlers::melod_chat`, `handlers::melod::get_ai_failures`, etc.) continue
 // to resolve.
@@ -89,24 +93,29 @@ pub mod marketplace;
 pub use nanosiem_enterprise::handlers::melod;
 pub mod mfa;
 pub mod mitre;
-// Notebooks handlers — lifted to nanosiem-enterprise in NAN-752 (Phase 2 of
+// Notebooks handlers — lifted to the enterprise crate in NAN-752 (Phase 2 of
 // the open-core split). Re-exported here so route registrations
 // (`handlers::notebooks::list_notebooks`, etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::notebooks;
 pub mod notifications;
 pub mod observability_metric_monitors;
-// Observability ↔ Security convergence cross-link (NAN-1542) — ENTERPRISE only
-// (NAN-1544). Open builds omit the route + spec path entirely.
-#[cfg(feature = "enterprise")]
-pub mod observability_service_signals;
+// The Observability ↔ Security convergence cross-link (NAN-1542/NAN-1544)
+// moved to the search service in NAN-2361 (GET
+// /api/search/services/{service}/security-signals, OCSF/Iceberg lake).
 pub mod observability_slos;
 pub mod observability_synthetics;
-// OIDC handlers — lifted to nanosiem-enterprise in NAN-751 (Phase 2 of the
+// OIDC handlers — lifted to the enterprise crate in NAN-751 (Phase 2 of the
 // open-core split). Re-exported here so route registrations
 // (`handlers::oidc::list_providers`, etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::oidc;
+#[cfg(feature = "enterprise")]
+pub use nanosiem_enterprise::handlers::shared_activation;
+#[cfg(feature = "enterprise")]
+pub use nanosiem_enterprise::handlers::shared_membership_acceptance;
+#[cfg(feature = "enterprise")]
+pub use nanosiem_enterprise::handlers::shared_automation_keys;
 pub mod onboarding;
 pub mod parser_repositories;
 pub mod playbook_repositories;
@@ -118,11 +127,13 @@ pub mod reports;
 /// Composite target-resource capability policy shared by every
 /// content-repository import/sync/fixup/remove path (NAN-2029).
 pub mod repository_target_authz;
-// Risk analytics handlers — lifted to nanosiem-enterprise in NAN-752 (Phase
+// Risk analytics handlers — lifted to the enterprise crate in NAN-752 (Phase
 // 2 of the open-core split). Re-exported here so route registrations
 // (`handlers::risk::get_risky_entities`, etc.) continue to resolve.
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::risk;
+#[cfg(feature = "enterprise")]
+pub use nanosiem_enterprise::handlers::risk_watchlists;
 pub mod roles;
 pub mod rule_repositories;
 pub mod search;
@@ -160,7 +171,7 @@ pub use melod::*;
 #[cfg(feature = "enterprise")]
 pub use notebooks::*;
 pub use notifications::*;
-// `oidc` re-exported above as a module via `pub use nanosiem_enterprise::...`;
+// `oidc` re-exported above as a module via `pub use enterprise::...`;
 // nothing additional needed here.
 pub use prevalence::*;
 pub use query_library::*;
@@ -168,7 +179,7 @@ pub use recent_activity::*;
 // NOTE: `reports` is intentionally NOT glob-re-exported — its `list_reports` /
 // `get_report` would collide with `siem_health`'s same-named handlers. Route
 // bindings reference these as `handlers::reports::*` (NAN-1793).
-// `risk` re-exported above as a module via `pub use nanosiem_enterprise::...`;
+// `risk` re-exported above as a module via `pub use enterprise::...`;
 // route bindings reference items as `handlers::risk::*` so a wildcard
 // re-export here is unnecessary.
 pub use roles::*;
@@ -448,4 +459,152 @@ impl AuditExt for AppState {
             }
         });
     }
+
+    /// NAN-3790: hosted-shared auth events with a known tenant and verified
+    /// account go through one signed tenant + actor transaction; the shared
+    /// emitter behind `emit_audit` refuses every tenantless write. A failure
+    /// logs each full event at `error!` for recovery and bumps the failure
+    /// metric — never a silent drop. Other deployments keep `emit_audit`.
+    fn emit_tenant_auth_audit(
+        &self,
+        tenant: nanosiem_core::auth::TrustedTenantContext,
+        actor: uuid::Uuid,
+        events: Vec<AuditEvent>,
+    ) {
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            let runtime = self.tenant_ai_rls_runtime.clone();
+            tokio::spawn(async move {
+                let result = match runtime.as_ref() {
+                    Some(runtime) => runtime
+                        .tenant_auth_audit()
+                        .record_actor_events(&tenant, actor, &events)
+                        .await,
+                    None => Err(nanosiem_core::audit::AuditEmitError::TenantContextRequired),
+                };
+                if let Err(error) = result {
+                    tracing::error!(tenant_id = %tenant.tenant_id, %actor, %error,
+                        "hosted auth audit not written in a signed tenant transaction");
+                    for event in &events {
+                        record_audit_emit_failure(event, &error.to_string(), true, "shared_auth_unwritten");
+                    }
+                }
+            });
+            return;
+        }
+        let _ = (tenant, actor);
+        for event in events {
+            self.emit_audit(event);
+        }
+    }
 }
+
+impl AppState {
+    /// NAN-3790: a completed password reset. The reset token resolved to an
+    /// account; hosted shared audits it signed as that account in each tenant
+    /// it belongs to ([`UserRepository::audit_tenants_for_user`]: the home
+    /// tenant of a tenant-scoped identity, else every active membership of a
+    /// legacy global identity), one fresh event per tenant. An account with
+    /// no active tenant is logged (warn, `no_tenant_scope`); a lookup failure
+    /// is logged at error. Other deployments keep the historical actorless
+    /// event through `emit_audit`.
+    pub(crate) fn emit_password_reset_complete_audit(
+        &self,
+        user_id: uuid::Uuid,
+        client: nanosiem_core::audit::ClientContext,
+    ) {
+        use nanosiem_core::audit::{AuditSource, PASSWORD_RESET_COMPLETE};
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            let state = self.clone();
+            tokio::spawn(async move {
+                let event = || {
+                    AuditEvent::builder(AuditSource::Auth, PASSWORD_RESET_COMPLETE)
+                        .actor(Some(user_id), None)
+                        .resource("user", Some(user_id), None)
+                        .client_context(&client)
+                        .build()
+                };
+                match state.user_repo.audit_tenants_for_user(user_id).await {
+                    Ok(tenants) if tenants.is_empty() => record_audit_emit_failure(
+                        &event(),
+                        "password reset account has no active tenant",
+                        false,
+                        "no_tenant_scope",
+                    ),
+                    Ok(tenants) => {
+                        for tenant in tenants {
+                            state.emit_tenant_auth_audit(tenant, user_id, vec![event()]);
+                        }
+                    }
+                    Err(error) => {
+                        record_audit_emit_failure(&event(), &error.to_string(), true, "tenant_unresolved")
+                    }
+                }
+            });
+            return;
+        }
+        let _ = user_id;
+        self.emit_audit(
+            AuditEvent::builder(AuditSource::Auth, PASSWORD_RESET_COMPLETE)
+                .resource("user", None, None)
+                .client_context(&client)
+                .build(),
+        );
+    }
+
+    /// NAN-3790: audit an actorless pre-authentication auth event (login
+    /// failure, lockout, password-reset request/completion).
+    ///
+    /// Hosted shared: scoped to the tenant `tenant_slug` selects and written
+    /// through the closed `append_tenant_preauth_audit` definer. A request
+    /// with no slug, or a slug naming no tenant, has no tenant to scope the
+    /// row to; the full event is logged (warn) with a `no_tenant_scope`
+    /// failure metric instead. Runs in a spawned task, so a known-tenant
+    /// failure costs the caller no extra latency (no timing oracle). Other
+    /// deployments keep `emit_audit`.
+    pub(crate) fn emit_preauth_audit(&self, tenant_slug: Option<&str>, event: AuditEvent) {
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            let auth_service = self.auth_service.clone();
+            let runtime = self.tenant_ai_rls_runtime.clone();
+            let slug = tenant_slug.map(str::to_owned);
+            tokio::spawn(async move {
+                let tenant_id = match slug.as_deref() {
+                    Some(slug) => auth_service.enterprise_shared_tenant_id_for_slug(slug).await,
+                    None => Ok(None),
+                };
+                let tenant_id = match tenant_id {
+                    Ok(Some(tenant_id)) => tenant_id,
+                    Ok(None) => {
+                        record_audit_emit_failure(&event,
+                            "pre-authentication auth event names no tenant", false, "no_tenant_scope");
+                        return;
+                    }
+                    Err(error) => {
+                        record_audit_emit_failure(&event, &error.to_string(), true, "tenant_unresolved");
+                        return;
+                    }
+                };
+                let result = match runtime.as_ref() {
+                    Some(runtime) => runtime.tenant_auth_audit().record_preauth_failure(tenant_id, &event).await,
+                    None => Err(nanosiem_core::audit::AuditEmitError::TenantContextRequired),
+                };
+                if let Err(error) = result {
+                    tracing::error!(%tenant_id, %error, "hosted pre-authentication audit not written");
+                    record_audit_emit_failure(&event, &error.to_string(), true, "shared_preauth_unwritten");
+                }
+            });
+            return;
+        }
+        let _ = tenant_slug;
+        self.emit_audit(event);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod lock_contention_contract_tests;
+
+pub mod iceberg_export;
+
+pub mod source_onboarding;

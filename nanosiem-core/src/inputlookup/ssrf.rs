@@ -236,7 +236,7 @@ impl SsrfValidator {
 
         // Step 2: IP-literal hosts were already validated; reqwest dials them
         // directly, so no pinning override is required.
-        if host.parse::<IpAddr>().is_ok() {
+        if self.parse_ip_from_host(host).is_some() {
             return Ok((url, Vec::new()));
         }
 
@@ -562,10 +562,10 @@ impl SsrfValidator {
 
     /// Check if hostname matches a blocked domain pattern
     fn check_blocked_domain(&self, host: &str) -> Result<(), SsrfError> {
-        let host_lower = host.to_lowercase();
+        let host_lower = host.trim_end_matches('.').to_lowercase();
 
         for blocked in &self.config.blocked_domains {
-            let blocked_lower = blocked.to_lowercase();
+            let blocked_lower = blocked.trim_end_matches('.').to_lowercase();
             // Exact match or subdomain match
             if host_lower == blocked_lower || host_lower.ends_with(&format!(".{}", blocked_lower)) {
                 return Err(SsrfError::DomainBlocked(host.to_string()));
@@ -577,7 +577,7 @@ impl SsrfValidator {
 
     /// Check for cloud metadata endpoint hostnames
     fn check_metadata_endpoint(&self, host: &str) -> Result<(), SsrfError> {
-        let host_lower = host.to_lowercase();
+        let host_lower = host.trim_end_matches('.').to_lowercase();
 
         // AWS metadata endpoint
         if host_lower == "169.254.169.254" {
@@ -624,7 +624,9 @@ const AIRGAP_MODE_ENV: &str = "AIRGAP_MODE";
 
 fn env_flag_enabled(var: &str) -> bool {
     matches!(
-        std::env::var(var).map(|v| v.to_ascii_lowercase()).as_deref(),
+        std::env::var(var)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
         Ok("1" | "true" | "on" | "yes")
     )
 }
@@ -1185,6 +1187,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_and_resolve_allows_bracketed_public_ipv6_without_dns() {
+        let (url, addrs) = SsrfValidator::default_secure()
+            .validate_and_resolve("https://[2606:4700:4700::1111]/hook")
+            .await.expect("an IPv6 literal must not go through hostname resolution");
+        assert_eq!(url.host(), Some(url::Host::Ipv6("2606:4700:4700::1111".parse().unwrap())));
+        assert!(addrs.is_empty());
+    }
+
+    #[test]
+    fn absolute_dns_names_cannot_bypass_domain_guards() {
+        let v = SsrfValidator::new(SsrfConfig {
+            blocked_domains: vec!["localhost".into(), "svc".into(), "cluster.local".into()],
+            ..Default::default()
+        });
+        for host in ["localhost.", "api.tenant.svc.", "api.tenant.svc.cluster.local."] {
+            assert!(matches!(v.validate_url(&format!("https://{host}/")), Err(SsrfError::DomainBlocked(_))));
+        }
+        for host in ["metadata.google.internal.", "metadata.goog.", "instance-data."] {
+            assert!(matches!(v.validate_url(&format!("https://{host}/")), Err(SsrfError::MetadataEndpointBlocked(_))));
+        }
+    }
+
     // Network-dependent: confirms an allowed *hostname* returns non-empty,
     // pre-validated pinned addrs (the rebinding guard's positive path). Ignored
     // by default because it needs a working resolver + egress.
@@ -1304,7 +1329,10 @@ mod tests {
     fn pin_resolved_addrs_with_addrs_builds_pinned_client() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let url = Url::parse("https://example.com/").unwrap();
-        let addrs = [SocketAddr::new(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443)];
+        let addrs = [SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            443,
+        )];
         let builder = pin_resolved_addrs(reqwest::Client::builder(), &url, &addrs).unwrap();
         assert!(builder.build().is_ok());
     }

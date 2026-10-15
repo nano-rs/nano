@@ -12,7 +12,7 @@ use nanosiem_core::audit::{
 };
 use nanosiem_core::auth::permissions;
 
-use super::sanitize_config;
+use super::{sanitize_config, sanitize_download_url};
 use super::types::*;
 use super::AuditExt;
 use crate::middleware::{ensure_permission, AuthContext};
@@ -51,7 +51,7 @@ pub async fn list_enrichment_sources(
             name: s.name,
             source_type: s.source_type,
             description: s.description,
-            download_url: s.download_url,
+            download_url: sanitize_download_url(s.download_url),
             enabled: s.enabled,
             last_sync_at: s.last_sync_at.map(|t| t.to_rfc3339()),
             last_sync_status: s.last_sync_status,
@@ -150,9 +150,10 @@ pub async fn disable_enrichment_source(
     // UX, tombstone this source's CH payload rows so the dict drops them, then
     // reload the dict so the change takes effect immediately rather than after
     // its LIFETIME. Best-effort: a CH hiccup must not fail the config write.
+    let uses_mmdb = enrichment.uses_ipinfo_mmdb();
     if let Err(e) = enrichment.clear_ip_enrichments_for_source(&source_id).await {
         tracing::warn!(source_id = %source_id, error = %e, "Failed to tombstone CH IP enrichment rows on disable");
-    } else {
+    } else if !uses_mmdb {
         // Fan the reload out to every node when clustered: the dict loads
         // per-node, so a single-node reload would leave the other 5 nodes
         // serving the disabled source's data until their LIFETIME expires

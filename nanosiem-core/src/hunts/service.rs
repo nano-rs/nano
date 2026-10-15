@@ -55,7 +55,7 @@ use crate::hunts::repository::{CommitInputs, HuntRepository, PreparedLead, RuleI
 /// Checked in the service so an unknown type rejects ONE candidate with a
 /// countable reason, instead of the constraint rejecting the whole transaction
 /// and losing every good lead beside it.
-const ALLOWED_ENTITY_TYPES: &[&str] = &[
+pub const ALLOWED_ENTITY_TYPES: &[&str] = &[
     "ip", "user", "host", "domain", "hash", "process", "url", "email", "file",
 ];
 
@@ -73,7 +73,7 @@ pub const MAX_KNOWLEDGE_PER_REPORT: usize = 50;
 /// leads and 50 facts; resolving them serially can put otherwise healthy reports
 /// behind an edge request ceiling, while firing all of them at once would
 /// turn one model-authored report into a ClickHouse thundering herd.
-const REPORT_PREPARATION_CONCURRENCY: usize = 4;
+pub const REPORT_PREPARATION_CONCURRENCY: usize = 4;
 
 /// Prevalence and prior-history are optional scoring inputs, never provenance.
 /// A slow probe must therefore fail toward NO rarity/novelty bonus and let the
@@ -485,54 +485,9 @@ impl HuntService {
         candidate: &KnowledgeCandidate,
         scope: &ScopeSet,
     ) -> Result<Option<PreparedKnowledge>, HuntError> {
-        let Ok(category) = normalize_category(&candidate.category) else {
-            return Ok(None);
-        };
-        let Ok(subject) = normalize_subject(&candidate.subject) else {
-            return Ok(None);
-        };
-        let Ok(fact) = normalize_fact(&candidate.fact) else {
-            return Ok(None);
-        };
-        let Ok(confidence) = sanitize_confidence(candidate.confidence) else {
-            return Ok(None);
-        };
-        let evidence_event_ids = normalize_evidence_refs(&candidate.evidence_event_ids);
-        let ttl_days = clamp_ttl_days(candidate.ttl_days);
-        let resolved = self.resolver.resolve(&evidence_event_ids, scope).await?;
-        let provenance = resolved.provenance();
-        let stored_refs = resolved
-            .events
-            .iter()
-            .map(|event| event.canonical_event_id.clone())
-            .collect();
-
-        Ok(Some(PreparedKnowledge {
-            category,
-            subject,
-            fact,
-            confidence,
-            evidence_event_ids: stored_refs,
-            ttl_days,
-            provenance,
-        }))
+        prepare_knowledge_candidate(self.resolver.as_ref(), candidate, scope).await
     }
 
-    /// Resolve one candidate into something the repository can persist, or
-    /// `None` if the server declines to believe it.
-    ///
-    /// Three ways a candidate is refused, all of them silent-by-design failures
-    /// if they were not checked:
-    ///
-    /// 1. **Unknown entity type** — would violate `hunt_leads_entity_type_check`
-    ///    and abort the whole transaction, taking every good lead with it.
-    /// 2. **Uncorroborated entity** — the agent named something that appears in
-    ///    none of the evidence it attached. Either a hallucination or an attempt
-    ///    to aim a lead at a fingerprint of its choosing; both get the same
-    ///    answer.
-    /// 3. **Nothing readable behind it** — every cited event resolved to
-    ///    nothing the sweep principal could read. A lead with no evidence has a
-    ///    narrative and no way to check it.
     async fn prepare_candidate(
         &self,
         candidate: &LeadCandidate,
@@ -541,158 +496,7 @@ impl HuntService {
         window_end: chrono::DateTime<Utc>,
         scope: &ScopeSet,
     ) -> Result<Option<PreparedLead>, HuntError> {
-        let entity_type = candidate.entity_type.trim().to_lowercase();
-        if !ALLOWED_ENTITY_TYPES.contains(&entity_type.as_str()) {
-            return Ok(None);
-        }
-
-        let resolved: ResolvedEvidence = self
-            .resolver
-            .resolve(&candidate.evidence_event_ids, scope)
-            .await?;
-        if resolved.events.is_empty() {
-            return Ok(None);
-        }
-
-        // `resolve`, NOT `trusted`. `trusted` skips corroboration and exists for
-        // server-originated entities (recon, backfills); reaching for it here
-        // would let the agent choose its own fingerprint input, which is the
-        // whole attack the corroboration check closes.
-        let Some(entity) = CanonicalEntity::resolve(
-            &entity_type,
-            &candidate.entity_value,
-            &resolved.observed_entities,
-        ) else {
-            return Ok(None);
-        };
-
-        // Unrecognised signals are DROPPED, not rejected. Rejecting the
-        // candidate would let one junk signal remove a finding; dropping means a
-        // suppressed lead resubmitted with a nonce still hashes the same.
-        let signals: Vec<ValidatedSignal> = candidate
-            .signals
-            .iter()
-            .filter_map(|s| ValidatedSignal::validate(s, known_signals))
-            .collect();
-
-        // These probes affect SCORE only. Evidence resolution above is still
-        // mandatory and any failure there aborts the report: provenance may
-        // never be guessed. Prevalence/novelty have an explicitly safe unknown
-        // state, so run them together under a hard deadline and degrade toward
-        // an ordinary score when ClickHouse cannot answer promptly.
-        let prevalence_probe = tokio::time::timeout(
-            OPTIONAL_SCORING_PROBE_TIMEOUT,
-            self.resolver.asset_prevalence(
-                entity.entity_type(),
-                entity.value(),
-                window_start,
-                window_end,
-                scope,
-            ),
-        );
-        let history_probe = tokio::time::timeout(
-            OPTIONAL_SCORING_PROBE_TIMEOUT,
-            self.resolver.had_prior_history(
-                entity.entity_type(),
-                entity.value(),
-                window_start,
-                scope,
-            ),
-        );
-        let (prevalence_result, history_result) = tokio::join!(prevalence_probe, history_probe);
-        let prevalence = match prevalence_result {
-            Ok(Ok(value)) => value,
-            Ok(Err(_)) => {
-                tracing::warn!(
-                    entity_type = entity.entity_type(),
-                    "hunt report prevalence probe failed; scoring it as unmeasured"
-                );
-                None
-            }
-            Err(_) => {
-                tracing::warn!(
-                    entity_type = entity.entity_type(),
-                    "hunt report prevalence probe timed out; scoring it as unmeasured"
-                );
-                None
-            }
-        };
-        let first_seen_in_window = match history_result {
-            Ok(Ok(had_prior_history)) => !had_prior_history,
-            Ok(Err(_)) => {
-                tracing::warn!(
-                    entity_type = entity.entity_type(),
-                    "hunt report prior-history probe failed; withholding novelty bonus"
-                );
-                false
-            }
-            Err(_) => {
-                tracing::warn!(
-                    entity_type = entity.entity_type(),
-                    "hunt report prior-history probe timed out; withholding novelty bonus"
-                );
-                false
-            }
-        };
-
-        // Keep only the events that actually mention the corroborated entity.
-        //
-        // Corroboration proves the entity appears SOMEWHERE in the batch; it
-        // does not make every event in the batch evidence FOR it. Without this
-        // filter the agent picks the batch, and the batch drives
-        // `evidence_count`, `distinct_source_types` and the provenance manifest
-        // — so attaching twenty unrelated but readable events from three source
-        // types manufactures cross-source corroboration, which is the single
-        // heaviest term in the score. That is the same defeat as the fingerprint
-        // nonce: excluding the literal field is worthless while the agent still
-        // chooses the inputs.
-        //
-        // It also tightens provenance. Stamping the manifest from unrelated
-        // events marks a lead as derived from sources it never actually drew on,
-        // which over-restricts honest readers and muddies the audit trail.
-        // Completeness is read BEFORE the events are consumed: an unresolvable
-        // cited id already made the batch incomplete, and filtering to the
-        // corroborating subset must not launder that away.
-        let batch_complete = resolved.provenance().is_complete();
-        let corroborating: Vec<_> = resolved
-            .events
-            .into_iter()
-            .filter(|event| {
-                event.entities.iter().any(|(found_type, found_value)| {
-                    found_type.trim().eq_ignore_ascii_case(entity.entity_type())
-                        && CanonicalEntity::trusted(entity.entity_type(), found_value)
-                            .is_some_and(|c| c.value() == entity.value())
-                })
-            })
-            .collect();
-
-        // Every candidate reaches here with a corroborated entity, so an empty
-        // result means the extractor and the corroboration set disagree — fail
-        // the candidate rather than emit a lead with no evidence behind it.
-        if corroborating.is_empty() {
-            return Ok(None);
-        }
-
-        let provenance = crate::auth::SourceProvenance::from_parts(
-            corroborating.iter().map(|e| e.source_type.clone()),
-            batch_complete,
-        );
-
-        Ok(Some(PreparedLead {
-            provenance,
-            evidence: corroborating,
-            entity,
-            signals,
-            mitre_technique: candidate
-                .mitre_technique
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(str::to_string),
-            narrative: candidate.narrative.clone(),
-            prevalence,
-            first_seen_in_window,
-        }))
+        prepare_lead_candidate(self.resolver.as_ref(), candidate, known_signals, window_start, window_end, scope).await
     }
 
     // =========================================================================
@@ -951,6 +755,225 @@ impl HuntService {
         })
     }
 }
+
+// NAN-2361: the candidate preparation steps are free functions so the
+// enterprise-shared hunting port can run them over a tenant-pinned lake
+// resolver without constructing a PgPool-bound `HuntService`.
+pub async fn prepare_knowledge_candidate(
+    resolver: &dyn EvidenceResolver,
+    candidate: &KnowledgeCandidate,
+    scope: &ScopeSet,
+) -> Result<Option<PreparedKnowledge>, HuntError> {
+    let Ok(category) = normalize_category(&candidate.category) else {
+        return Ok(None);
+    };
+    let Ok(subject) = normalize_subject(&candidate.subject) else {
+        return Ok(None);
+    };
+    let Ok(fact) = normalize_fact(&candidate.fact) else {
+        return Ok(None);
+    };
+    let Ok(confidence) = sanitize_confidence(candidate.confidence) else {
+        return Ok(None);
+    };
+    let evidence_event_ids = normalize_evidence_refs(&candidate.evidence_event_ids);
+    let ttl_days = clamp_ttl_days(candidate.ttl_days);
+    let resolved = resolver.resolve(&evidence_event_ids, scope).await?;
+    let provenance = resolved.provenance();
+    let stored_refs = resolved
+        .events
+        .iter()
+        .map(|event| event.canonical_event_id.clone())
+        .collect();
+
+    Ok(Some(PreparedKnowledge {
+        category,
+        subject,
+        fact,
+        confidence,
+        evidence_event_ids: stored_refs,
+        ttl_days,
+        provenance,
+    }))
+}
+
+
+/// Resolve one candidate into something the repository can persist, or
+/// `None` if the server declines to believe it.
+///
+/// Three ways a candidate is refused, all of them silent-by-design failures
+/// if they were not checked:
+///
+/// 1. **Unknown entity type** — would violate `hunt_leads_entity_type_check`
+///    and abort the whole transaction, taking every good lead with it.
+/// 2. **Uncorroborated entity** — the agent named something that appears in
+///    none of the evidence it attached. Either a hallucination or an attempt
+///    to aim a lead at a fingerprint of its choosing; both get the same
+///    answer.
+/// 3. **Nothing readable behind it** — every cited event resolved to
+///    nothing the sweep principal could read. A lead with no evidence has a
+///    narrative and no way to check it.
+pub async fn prepare_lead_candidate(
+    resolver: &dyn EvidenceResolver,
+    candidate: &LeadCandidate,
+    known_signals: &BTreeSet<String>,
+    window_start: chrono::DateTime<Utc>,
+    window_end: chrono::DateTime<Utc>,
+    scope: &ScopeSet,
+) -> Result<Option<PreparedLead>, HuntError> {
+    let entity_type = candidate.entity_type.trim().to_lowercase();
+    if !ALLOWED_ENTITY_TYPES.contains(&entity_type.as_str()) {
+        return Ok(None);
+    }
+
+    let resolved: ResolvedEvidence = resolver
+        .resolve(&candidate.evidence_event_ids, scope)
+        .await?;
+    if resolved.events.is_empty() {
+        return Ok(None);
+    }
+
+    // `resolve`, NOT `trusted`. `trusted` skips corroboration and exists for
+    // server-originated entities (recon, backfills); reaching for it here
+    // would let the agent choose its own fingerprint input, which is the
+    // whole attack the corroboration check closes.
+    let Some(entity) = CanonicalEntity::resolve(
+        &entity_type,
+        &candidate.entity_value,
+        &resolved.observed_entities,
+    ) else {
+        return Ok(None);
+    };
+
+    // Unrecognised signals are DROPPED, not rejected. Rejecting the
+    // candidate would let one junk signal remove a finding; dropping means a
+    // suppressed lead resubmitted with a nonce still hashes the same.
+    let signals: Vec<ValidatedSignal> = candidate
+        .signals
+        .iter()
+        .filter_map(|s| ValidatedSignal::validate(s, known_signals))
+        .collect();
+
+    // These probes affect SCORE only. Evidence resolution above is still
+    // mandatory and any failure there aborts the report: provenance may
+    // never be guessed. Prevalence/novelty have an explicitly safe unknown
+    // state, so run them together under a hard deadline and degrade toward
+    // an ordinary score when ClickHouse cannot answer promptly.
+    let prevalence_probe = tokio::time::timeout(
+        OPTIONAL_SCORING_PROBE_TIMEOUT,
+        resolver.asset_prevalence(
+            entity.entity_type(),
+            entity.value(),
+            window_start,
+            window_end,
+            scope,
+        ),
+    );
+    let history_probe = tokio::time::timeout(
+        OPTIONAL_SCORING_PROBE_TIMEOUT,
+        resolver.had_prior_history(
+            entity.entity_type(),
+            entity.value(),
+            window_start,
+            scope,
+        ),
+    );
+    let (prevalence_result, history_result) = tokio::join!(prevalence_probe, history_probe);
+    let prevalence = match prevalence_result {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) => {
+            tracing::warn!(
+                entity_type = entity.entity_type(),
+                "hunt report prevalence probe failed; scoring it as unmeasured"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                entity_type = entity.entity_type(),
+                "hunt report prevalence probe timed out; scoring it as unmeasured"
+            );
+            None
+        }
+    };
+    let first_seen_in_window = match history_result {
+        Ok(Ok(had_prior_history)) => !had_prior_history,
+        Ok(Err(_)) => {
+            tracing::warn!(
+                entity_type = entity.entity_type(),
+                "hunt report prior-history probe failed; withholding novelty bonus"
+            );
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                entity_type = entity.entity_type(),
+                "hunt report prior-history probe timed out; withholding novelty bonus"
+            );
+            false
+        }
+    };
+
+    // Keep only the events that actually mention the corroborated entity.
+    //
+    // Corroboration proves the entity appears SOMEWHERE in the batch; it
+    // does not make every event in the batch evidence FOR it. Without this
+    // filter the agent picks the batch, and the batch drives
+    // `evidence_count`, `distinct_source_types` and the provenance manifest
+    // — so attaching twenty unrelated but readable events from three source
+    // types manufactures cross-source corroboration, which is the single
+    // heaviest term in the score. That is the same defeat as the fingerprint
+    // nonce: excluding the literal field is worthless while the agent still
+    // chooses the inputs.
+    //
+    // It also tightens provenance. Stamping the manifest from unrelated
+    // events marks a lead as derived from sources it never actually drew on,
+    // which over-restricts honest readers and muddies the audit trail.
+    // Completeness is read BEFORE the events are consumed: an unresolvable
+    // cited id already made the batch incomplete, and filtering to the
+    // corroborating subset must not launder that away.
+    let batch_complete = resolved.provenance().is_complete();
+    let corroborating: Vec<_> = resolved
+        .events
+        .into_iter()
+        .filter(|event| {
+            event.entities.iter().any(|(found_type, found_value)| {
+                found_type.trim().eq_ignore_ascii_case(entity.entity_type())
+                    && CanonicalEntity::trusted(entity.entity_type(), found_value)
+                        .is_some_and(|c| c.value() == entity.value())
+            })
+        })
+        .collect();
+
+    // Every candidate reaches here with a corroborated entity, so an empty
+    // result means the extractor and the corroboration set disagree — fail
+    // the candidate rather than emit a lead with no evidence behind it.
+    if corroborating.is_empty() {
+        return Ok(None);
+    }
+
+    let provenance = crate::auth::SourceProvenance::from_parts(
+        corroborating.iter().map(|e| e.source_type.clone()),
+        batch_complete,
+    );
+
+    Ok(Some(PreparedLead {
+        provenance,
+        evidence: corroborating,
+        entity,
+        signals,
+        mitre_technique: candidate
+            .mitre_technique
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        narrative: candidate.narrative.clone(),
+        prevalence,
+        first_seen_in_window,
+    }))
+}
+
 
 fn normalize_source_identity(raw: &str) -> Result<String, HuntError> {
     let normalized = raw.trim().to_ascii_lowercase();

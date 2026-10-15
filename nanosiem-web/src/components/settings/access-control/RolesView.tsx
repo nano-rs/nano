@@ -23,8 +23,8 @@ import {
   PencilLine,
   Check,
   AlertCircle,
-  Loader2,
-} from 'lucide-react';
+  } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
@@ -202,6 +202,8 @@ function RoleDetailView({
   onDelete,
 }: RoleDetailViewProps) {
   const { hasPermission } = useAuth();
+  // Hosted-shared tenants create their own custom roles since NAN-2361
+  // wave 5; the platform's system roles stay read-only (`is_system`).
   const canEdit = hasPermission('roles:edit');
   const canCreate = hasPermission('roles:create');
   const canDelete = hasPermission('roles:delete');
@@ -324,7 +326,7 @@ function RoleDetailView({
             <span className="text-[11px] text-muted-foreground">
               {locked ? 'read-only' : canEdit ? 'click to toggle' : 'view only'}
             </span>
-            {saving && <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />}
+            {saving && <LoadingIcon className="w-3 h-3 text-muted-foreground" />}
             <div className="flex-1" />
             <div className="flex items-center gap-3 text-[10.5px] text-muted-foreground">
               <span className="inline-flex items-center gap-1.5">
@@ -575,7 +577,7 @@ export function RolesView() {
           <div className="flex-1 overflow-y-auto scrollbar-thin">
             {loading ? (
               <div className="flex items-center justify-center py-12">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                <LoadingIcon className="w-4 h-4 text-muted-foreground" />
               </div>
             ) : filtered.length === 0 ? (
               <div className="px-4 py-8 text-center text-[11.5px] text-muted-foreground">

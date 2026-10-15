@@ -1,0 +1,65 @@
+# Frozen fixture for tests/preview_cli.rs. The shipped spec lives in the
+# content repo next to the Deno script it replaces (NAN-3490).
+# Port of nano-enrichments/enrichments/agent/virustotal (Deno). VRL: the
+# per-type endpoint (incl. the unpadded base64 URL id) and the risk mapping.
+version: 1
+name: virustotal
+kind: agent_enrichment
+allow:
+  - host: www.virustotal.com
+    path_prefixes: ["/api/v3"]
+auth: { type: api_key_header, header: x-apikey, credential: API_KEY }
+rate_limit: { max_retries_429: 2 }
+streams:
+  - id: lookup
+    program: |
+      status = to_int(.response.status) ?? 0
+      art = string!(.input.artifact)
+      typ = string!(.input.artifact_type)
+      if .response == null {
+        base = "https://www.virustotal.com/api/v3"
+        seg = encode_percent(art, "COMPONENT")
+        path = if typ == "hash" { "/files/" + seg } else if typ == "domain" { "/domains/" + seg } else if typ == "ip" { "/ip_addresses/" + seg } else if typ == "url" { "/urls/" + replace(encode_base64(art), r'=+$', "") } else { "/files/" + seg }
+        {"next_request": {"url": base + path}}
+      } else if status == 404 {
+        {"events": [{"key": art, "key_type": typ, "data": {"found": false}}]}
+      } else if status < 200 || status >= 300 {
+        {"error": "VirusTotal API error: " + to_string(status)}
+      } else {
+        attrs = object(.response.body.data.attributes) ?? {}
+        stats = object(attrs.last_analysis_stats) ?? {}
+        mal = to_int(stats.malicious) ?? 0
+        sus = to_int(stats.suspicious) ?? 0
+        total = mal + sus + (to_int(stats.undetected) ?? 0) + (to_int(stats.harmless) ?? 0)
+        tags = []
+        if mal > 0 { tags = push(tags, "malicious") }
+        if sus > 0 { tags = push(tags, "suspicious") }
+        if is_array(attrs.tags) { tags = append(tags, array!(attrs.tags)) }
+        label = attrs.popular_threat_classification.suggested_threat_label
+        if is_string(label) && label != "" { tags = push(tags, label) }
+        risk = 0
+        if total > 0 {
+          r = ((to_float(mal) + to_float(sus) * 0.5) / to_float(total) ?? 0.0) * 100.0
+          risk = to_int(round(r))
+          if risk > 100 { risk = 100 }
+        }
+        data = {
+          "malicious_count": mal, "suspicious_count": sus, "total_engines": total,
+          "reputation": attrs.reputation, "threat_label": label,
+          "categories": attrs.categories, "last_analysis_date": attrs.last_analysis_date
+        }
+        if typ == "hash" {
+          names = attrs.names
+          if is_array(names) && length!(names) > 5 { names = slice!(names, 0, 5) }
+          data = merge(data, {"file_type": attrs.type_description, "file_size": attrs.size, "names": names})
+        }
+        if typ == "domain" {
+          whois = attrs.whois
+          if is_string(whois) && strlen!(whois) > 500 { whois = slice!(whois, 0, 500) }
+          data = merge(data, {"registrar": attrs.registrar, "creation_date": attrs.creation_date, "whois": whois})
+        }
+        if typ == "ip" {
+          data = merge(data, {"country": attrs.country, "as_owner": attrs.as_owner, "network": attrs.network})
+        }
+        {"events": [{"key": art, "key_type": typ, "risk_score": risk, "tags": tags, "data": data}]}
+      }

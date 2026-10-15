@@ -7,14 +7,13 @@
 //! connection and releases the lock automatically, allowing another instance to
 //! take over.
 //!
-//! IMPORTANT: The connection MUST be opened outside the pool. Advisory locks are
-//! session-level — returning a pooled connection does not release the lock, so
-//! on the next retry the election would deadlock against itself.
+//! Ownership uses the bounded direct-session pool and closes its checkout on
+//! drop. It must never return a session still carrying a lock to an idle pool.
 //!
 //! Used by both the Jobs service (scheduler leadership) and the Search service
 //! (active/standby traffic gating).
 
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 use std::future::Future;
 use tokio::sync::watch;
 
@@ -58,7 +57,16 @@ impl LeaderElection {
         &self,
         shutdown: ShutdownToken,
     ) -> (watch::Receiver<bool>, tokio::task::JoinHandle<()>) {
-        let pool = self.pool.clone();
+        // In the staged/legacy direct deployment, leadership must not consume
+        // the application's only checkout (a max-1 app pool would deadlock).
+        // Pooled deployments share the explicit bounded session exception.
+        let pool = if self.pool.connect_options().get_port() == 6432 {
+            self.pool.clone()
+        } else {
+            crate::db::connection_budget::pool_options(2)
+                .acquire_timeout(self.pool.options().get_acquire_timeout())
+                .connect_lazy_with((*self.pool.connect_options()).clone())
+        };
         let lock_id = self.lock_id;
 
         let heartbeat_secs = parse_env("LEADER_HEARTBEAT_SECS", 15);
@@ -69,25 +77,20 @@ impl LeaderElection {
         let (tx, rx) = watch::channel(false);
 
         let handle = tokio::spawn(async move {
-            // Extract connect options from the pool so we can open dedicated
-            // connections outside pool management.
-            let connect_options = pool.connect_options().clone();
-
             loop {
-                // Open a dedicated connection OUTSIDE the pool. Advisory locks
-                // are session-level — a pooled connection returned to the pool
-                // still holds the lock, causing self-deadlock on retry. The
-                // attempt is cancellable on shutdown and hard-timeout bounded.
+                // Dedicated close-on-drop checkout from the bounded direct
+                // lane. Acquisition remains cancellable and timeout-bounded.
                 let mut conn = match shutdown
                     .run_until_cancelled(hard_timeout(
                         database_timeout,
-                        PgConnection::connect_with(&connect_options),
+                        crate::db::pooler::session_connection(&pool),
                     ))
                     .await
                 {
                     None => break,
                     Some(Ok(Ok(connection))) => connection,
                     Some(Ok(Err(error))) => {
+                        crate::db::connection_budget::warn_connect_refusal(&error, "leader-election");
                         tracing::warn!(
                             "Leader election: failed to open dedicated connection: {}",
                             error
@@ -126,7 +129,7 @@ impl LeaderElection {
                         database_timeout,
                         sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
                             .bind(lock_id)
-                            .fetch_one(&mut conn),
+                            .fetch_one(&mut *conn),
                     ))
                     .await
                 {
@@ -207,7 +210,7 @@ impl LeaderElection {
                     match shutdown
                         .run_until_cancelled(hard_timeout(
                             database_timeout,
-                            sqlx::query("SELECT 1").execute(&mut conn),
+                            sqlx::query("SELECT 1").execute(&mut *conn),
                         ))
                         .await
                     {

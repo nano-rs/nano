@@ -164,6 +164,12 @@ pub struct ArtifactExplorerQuery {
     pub limit: Option<i64>,
     /// Offset for pagination
     pub offset: Option<i64>,
+    /// Last-seen component of the stable lake continuation cursor.
+    pub cursor_last_seen: Option<String>,
+    /// Internal artifact-kind component of the stable continuation cursor.
+    pub cursor_kind: Option<String>,
+    /// Artifact-value component of the stable continuation cursor.
+    pub cursor_artifact: Option<String>,
 }
 
 /// Query parameters for artifact detail endpoint

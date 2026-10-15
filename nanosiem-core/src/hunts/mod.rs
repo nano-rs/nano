@@ -115,7 +115,8 @@ pub use capabilities::{
 };
 pub use error::HuntError;
 pub use evidence::{
-    ClickHouseEvidenceResolver, EvidenceResolver, ResolvedEvent, ResolvedEvidence,
+    ClickHouseEvidenceResolver, EvidenceResolver, LakeEvidenceResolver, ResolvedEvent,
+    ResolvedEvidence,
 };
 pub use fingerprint::{
     derive as derive_fingerprint, CanonicalEntity, FingerprintInput, ValidatedSignal,
@@ -124,12 +125,11 @@ pub use fingerprint::{
 // write shared with `HuntService` is the prepared-fact helper used by the sweep
 // report transaction; it cannot read knowledge or affect lead scoring.
 pub use knowledge::{
-    clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact,
-    normalize_subject, sanitize_confidence, HuntKnowledge, KnowledgeCandidate,
-    KnowledgeCategoryCount, KnowledgeRepository, ListKnowledgeQuery, RecordKnowledgeRequest,
-    RecordKnowledgeResponse, RecordOutcome, RevokeKnowledgeRequest, MAX_CATEGORY_CHARS,
-    MAX_CATEGORY_ROLLUP, MAX_EVIDENCE_REFS, MAX_FACT_CHARS, MAX_REVOKE_REASON_CHARS,
-    MAX_SUBJECT_CHARS, MAX_TTL_DAYS,
+    clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact, normalize_subject,
+    sanitize_confidence, HuntKnowledge, KnowledgeCandidate, KnowledgeCategoryCount,
+    KnowledgeRepository, ListKnowledgeQuery, RecordKnowledgeRequest, RecordKnowledgeResponse,
+    RecordOutcome, RevokeKnowledgeRequest, MAX_CATEGORY_CHARS, MAX_CATEGORY_ROLLUP,
+    MAX_EVIDENCE_REFS, MAX_FACT_CHARS, MAX_REVOKE_REASON_CHARS, MAX_SUBJECT_CHARS, MAX_TTL_DAYS,
 };
 pub use models::*;
 pub use recon::{
@@ -143,7 +143,6 @@ pub use recon::{
 pub use report::{
     reconcile_outcome, BudgetLimits, BudgetUsage, LeadCandidate, SweepReport, TrailStep,
 };
-pub use spec::HuntSpecDraft;
 pub use repository::{CommitInputs, HuntRepository, PreparedLead, RuleIdeaVerdict, SummaryCounts};
 pub use scheduler::{
     plan_slots, sweep_window, HuntScheduler, HuntSchedulerConfig, HuntSchedulerTick, SlotIssue,
@@ -151,3 +150,4 @@ pub use scheduler::{
 };
 pub use scoring::{score, Contribution, Score, ScoreInputs};
 pub use service::HuntService;
+pub use spec::HuntSpecDraft;

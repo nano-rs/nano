@@ -86,10 +86,7 @@ async fn restrict(pool: &PgPool, source_type: &str) {
 }
 
 /// Fire one detection alert at a single receiver and return the delivered body.
-async fn fire_and_capture(
-    pool: &PgPool,
-    matched: serde_json::Value,
-) -> serde_json::Value {
+async fn fire_and_capture(pool: &PgPool, matched: serde_json::Value) -> serde_json::Value {
     fire_and_capture_kind(pool, "detection", "siem_alert", matched).await
 }
 
@@ -145,7 +142,12 @@ async fn fire_and_capture_kind(
     serde_json::from_slice(&reqs[0].body).unwrap()
 }
 
-fn create_req(name: &str, url: String, event_types: Vec<&str>, secret: Option<&str>) -> CreateWebhookRequest {
+fn create_req(
+    name: &str,
+    url: String,
+    event_types: Vec<&str>,
+    secret: Option<&str>,
+) -> CreateWebhookRequest {
     CreateWebhookRequest {
         name: name.to_string(),
         url,
@@ -311,7 +313,11 @@ async fn detection_alert_delivers_complete_payload_with_valid_hmac() {
     )
     .await;
 
-    assert_eq!(wait_for(&server, 1, Duration::from_secs(5)).await, 1, "one delivery");
+    assert_eq!(
+        wait_for(&server, 1, Duration::from_secs(5)).await,
+        1,
+        "one delivery"
+    );
 
     let reqs = server.received_requests().await.unwrap();
     let req = &reqs[0];
@@ -324,8 +330,13 @@ async fn detection_alert_delivers_complete_payload_with_valid_hmac() {
     assert_eq!(v["severity"], "high");
     assert_eq!(v["rule_name"], "Impossible travel");
     assert_eq!(v["entity"], "10.0.0.5");
-    assert_eq!(v["link_url"], format!("https://nano.test/alerts/{}",
-        nanosiem_core::typeid::encode(nanosiem_core::typeid::alert::PREFIX, &alert_id)));
+    assert_eq!(
+        v["link_url"],
+        format!(
+            "https://nano.test/alerts/{}",
+            nanosiem_core::typeid::encode(nanosiem_core::typeid::alert::PREFIX, &alert_id)
+        )
+    );
     assert!(v["alert_id"].as_str().unwrap().starts_with("alert_"));
     assert!(v["rule_id"].as_str().unwrap().starts_with("rule_"));
 
@@ -566,24 +577,62 @@ async fn event_type_scoping_isolates_siem_and_observability() {
 
     // One receiver, two paths so we can tell the streams apart.
     let server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/siem"))
-        .respond_with(ResponseTemplate::new(200)).mount(&server).await;
-    Mock::given(method("POST")).and(path("/obs"))
-        .respond_with(ResponseTemplate::new(200)).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/siem"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/obs"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
 
     let repo = WebhookRepository::new(pool.clone());
-    repo.create(&create_req("siem-only", format!("{}/siem", server.uri()), vec!["siem_alert"], None)).await.unwrap();
-    repo.create(&create_req("obs-only", format!("{}/obs", server.uri()), vec!["obs_alert"], None)).await.unwrap();
+    repo.create(&create_req(
+        "siem-only",
+        format!("{}/siem", server.uri()),
+        vec!["siem_alert"],
+        None,
+    ))
+    .await
+    .unwrap();
+    repo.create(&create_req(
+        "obs-only",
+        format!("{}/obs", server.uri()),
+        vec!["obs_alert"],
+        None,
+    ))
+    .await
+    .unwrap();
 
     let svc = WebhookService::new(repo);
     let matched = serde_json::json!([{ "check": "api-health" }]);
 
     // A detection alert must reach ONLY the siem-only webhook.
-    svc.fire_alert(uuid::Uuid::now_v7(), "detection", Some(uuid::Uuid::now_v7()),
-        "rule", "medium", None, &matched, chrono::Utc::now()).await;
+    svc.fire_alert(
+        uuid::Uuid::now_v7(),
+        "detection",
+        Some(uuid::Uuid::now_v7()),
+        "rule",
+        "medium",
+        None,
+        &matched,
+        chrono::Utc::now(),
+    )
+    .await;
     // A synthetic (observability) alert must reach ONLY the obs-only webhook.
-    svc.fire_alert(uuid::Uuid::now_v7(), "synthetic", None,
-        "api-health", "high", Some("https://api".to_string()), &matched, chrono::Utc::now()).await;
+    svc.fire_alert(
+        uuid::Uuid::now_v7(),
+        "synthetic",
+        None,
+        "api-health",
+        "high",
+        Some("https://api".to_string()),
+        &matched,
+        chrono::Utc::now(),
+    )
+    .await;
 
     // Both deliveries land (2 total); give the fan-out time to settle.
     assert_eq!(wait_for(&server, 2, Duration::from_secs(5)).await, 2);
@@ -596,10 +645,12 @@ async fn event_type_scoping_isolates_siem_and_observability() {
     assert_eq!(obs_hits, 1, "synthetic -> obs only");
 
     // And the payloads carry the right kind.
-    let siem_body: serde_json::Value = serde_json::from_slice(
-        &reqs.iter().find(|r| r.url.path() == "/siem").unwrap().body).unwrap();
-    let obs_body: serde_json::Value = serde_json::from_slice(
-        &reqs.iter().find(|r| r.url.path() == "/obs").unwrap().body).unwrap();
+    let siem_body: serde_json::Value =
+        serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == "/siem").unwrap().body)
+            .unwrap();
+    let obs_body: serde_json::Value =
+        serde_json::from_slice(&reqs.iter().find(|r| r.url.path() == "/obs").unwrap().body)
+            .unwrap();
     assert_eq!(siem_body["kind"], "detection");
     assert_eq!(obs_body["kind"], "synthetic");
 }
@@ -613,24 +664,46 @@ async fn delivery_retries_on_5xx_then_gives_up() {
 
     // Persistent 500 → the service should attempt exactly MAX_DELIVERY_ATTEMPTS.
     let server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/hook"))
-        .respond_with(ResponseTemplate::new(500)).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
 
     let repo = WebhookRepository::new(pool.clone());
-    let webhook = repo.create(&create_req(
-        "flaky", format!("{}/hook", server.uri()), vec!["siem_alert"], None)).await.unwrap();
+    let webhook = repo
+        .create(&create_req(
+            "flaky",
+            format!("{}/hook", server.uri()),
+            vec!["siem_alert"],
+            None,
+        ))
+        .await
+        .unwrap();
 
     let svc = WebhookService::new(repo);
     // Held so attempts can be attributed to THIS delivery — a stale retry from an
     // earlier test can reach this socket via a reused ephemeral port (NAN-2210).
     let alert_uuid = uuid::Uuid::now_v7();
     let alert_id = nanosiem_core::typeid::encode(nanosiem_core::typeid::alert::PREFIX, &alert_uuid);
-    svc.fire_alert(alert_uuid, "detection", Some(uuid::Uuid::now_v7()),
-        "rule", "low", None, &serde_json::json!([{}]), chrono::Utc::now()).await;
+    svc.fire_alert(
+        alert_uuid,
+        "detection",
+        Some(uuid::Uuid::now_v7()),
+        "rule",
+        "low",
+        None,
+        &serde_json::json!([{}]),
+        chrono::Utc::now(),
+    )
+    .await;
 
     // 3 attempts with 0.5s + 1s backoff ≈ 1.5s; allow generous headroom.
     let n = wait_for_alert(&server, &alert_id, 3, Duration::from_secs(8)).await;
-    assert_eq!(n, 3, "exactly MAX_DELIVERY_ATTEMPTS attempts on persistent 5xx");
+    assert_eq!(
+        n, 3,
+        "exactly MAX_DELIVERY_ATTEMPTS attempts on persistent 5xx"
+    );
     // Proving a NEGATIVE, so this stays a fixed wait — there is no state to poll
     // toward. Counted per-alert so an unrelated delivery cannot fail it.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -646,6 +719,66 @@ async fn delivery_retries_on_5xx_then_gives_up() {
     assert_eq!(logs.len(), 1, "single log row per logical delivery");
     assert!(!logs[0].success);
     assert_eq!(logs[0].status_code, Some(500));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres; run with --test-threads=1"]
+async fn durable_alert_delivery_propagates_failure_with_stable_idempotency_key() {
+    set_env();
+    let pool = migrated_pool().await;
+    clean(&pool).await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let repo = WebhookRepository::new(pool.clone());
+    repo.create(&create_req(
+        "durable-flaky",
+        format!("{}/hook", server.uri()),
+        vec!["siem_alert"],
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let svc = WebhookService::new(repo);
+    let alert_id = uuid::Uuid::now_v7();
+    let error = svc
+        .fire_alert_durable(
+            alert_id,
+            "detection",
+            Some(uuid::Uuid::now_v7()),
+            "durable rule",
+            "high",
+            None,
+            &serde_json::json!([{}]),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect_err("persistent webhook failure must keep the outbox item retryable");
+    assert!(error.contains("failed"), "unexpected error: {error}");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the delivery still uses bounded HTTP retries"
+    );
+    let expected_key = format!("alert.created:{alert_id}");
+    for request in requests {
+        assert_eq!(
+            request
+                .headers
+                .get("X-NanoSIEM-Idempotency-Key")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_key.as_str()),
+            "every retry and future outbox replay must identify the same logical delivery"
+        );
+    }
 }
 
 /// F-39 regression: the FE no longer round-trips the (write-only) URL, so a
@@ -682,7 +815,10 @@ async fn update_without_url_preserves_stored_url() {
     let resp = WebhookResponse::from(&created);
     assert_eq!(resp.url_host.as_deref(), Some("hooks.slack.com"));
     let resp_json = serde_json::to_string(&resp).unwrap();
-    assert!(!resp_json.contains("XXXSECRET"), "response must not leak the URL secret");
+    assert!(
+        !resp_json.contains("XXXSECRET"),
+        "response must not leak the URL secret"
+    );
 
     // Update WITHOUT touching the URL (url: None = "keep").
     let update = UpdateWebhookRequest {
@@ -737,7 +873,10 @@ async fn legacy_plaintext_url_is_lazy_encrypted_on_read() {
     let repo = WebhookRepository::new(pool.clone());
     // get() is a delivery read path → hydrate + lazy-migrate.
     let loaded = repo.get(id).await.unwrap();
-    assert_eq!(loaded.url, legacy_url, "delivery url available from plaintext");
+    assert_eq!(
+        loaded.url, legacy_url,
+        "delivery url available from plaintext"
+    );
 
     // The row now has an encrypted column persisted.
     let enc: Option<Vec<u8>> =
@@ -757,5 +896,9 @@ async fn legacy_plaintext_url_is_lazy_encrypted_on_read() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(host.as_deref(), Some("hooks.slack.com"), "display host persisted");
+    assert_eq!(
+        host.as_deref(),
+        Some("hooks.slack.com"),
+        "display host persisted"
+    );
 }

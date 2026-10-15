@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Profile data loading — real telemetry data compiled into the binary
 //!
 //! Profile files are loaded via `include_str!` at compile time (~625K total).

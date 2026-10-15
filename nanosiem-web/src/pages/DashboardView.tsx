@@ -22,7 +22,6 @@ import {
   Clock,
   Download,
   LayoutDashboard,
-  Loader2,
   MoreHorizontal,
   Pencil,
   RefreshCw,
@@ -30,6 +29,7 @@ import {
   Share2,
   Shield,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
   Sheet,
   SheetContent,
@@ -722,7 +722,7 @@ export function DashboardView() {
   if (loading) {
     return (
       <div className="p-8 flex items-center justify-center min-h-[400px]">
-        <Loader2 className="w-6 h-6 animate-spin text-primary" />
+        <LoadingIcon className="w-6 h-6 text-primary" />
       </div>
     );
   }
@@ -1060,7 +1060,7 @@ export function DashboardView() {
               onClick={handleSaveSettings}
               disabled={updatingSettings || !settingsForm.name.trim()}
             >
-              {updatingSettings && <Loader2 className="w-[12px] h-[12px] animate-spin" />}
+              {updatingSettings && <LoadingIcon className="w-[12px] h-[12px]" />}
               Save
             </Button>
           </div>

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! World state — entities, process trees, and browsing sessions
 //!
 //! Extracted from the original log-blaster state.rs.
@@ -566,8 +568,9 @@ impl BrowsingSession {
         }
     }
 
-    pub fn next_request(&mut self) -> (String, String, String) {
-        let mut rng = rand::rng();
+    /// Draws from the caller's RNG so a seeded generator stays deterministic
+    /// (NAN-3294).
+    pub fn next_request(&mut self, rng: &mut impl Rng) -> (String, String, String) {
         let action: f64 = rng.random();
 
         if action < 0.10 && !self.history.is_empty() {
@@ -629,6 +632,8 @@ pub struct Entity {
     pub domain: String,
     process_tree: Mutex<ProcessTree>,
     browsing_session: Mutex<BrowsingSession>,
+    /// NAN-3294: Conduit referer / user-agent session (page tree state).
+    web_session: Mutex<crate::web_session::WebSession>,
     pub is_compromised: bool,
     last_dhcp_event: Mutex<Option<DateTime<Utc>>>,
     dhcp_event_interval: Duration,
@@ -659,6 +664,7 @@ impl Entity {
             domain: domain.to_string(),
             process_tree: Mutex::new(ProcessTree::new(user)),
             browsing_session: Mutex::new(BrowsingSession::new()),
+            web_session: Mutex::new(crate::web_session::WebSession::new()),
             is_compromised: false,
             last_dhcp_event: Mutex::new(None),
             dhcp_event_interval: Duration::hours(4),
@@ -709,8 +715,14 @@ impl Entity {
         (child, actual_parent)
     }
 
-    pub fn next_browse_request(&self) -> (String, String, String) {
-        self.browsing_session.lock().next_request()
+    pub fn next_browse_request(&self, rng: &mut impl Rng) -> (String, String, String) {
+        self.browsing_session.lock().next_request(rng)
+    }
+
+    /// NAN-3294: this client's web session (stable UA + open page state) for
+    /// the Conduit proxy generator.
+    pub fn web_session(&self) -> parking_lot::MutexGuard<'_, crate::web_session::WebSession> {
+        self.web_session.lock()
     }
 }
 
@@ -725,6 +737,8 @@ pub struct WorldState {
     pub server_count: usize,
     pub user_count: usize,
     pub domain: String,
+    /// NAN-3174: Zipf popularity for `random_entity`; `None` = uniform.
+    entity_skew: Option<crate::variance::SkewedIndex>,
 }
 
 /// A `nano_enrich` identity record (kind=identity, source=ad) for one fleet
@@ -761,6 +775,7 @@ impl WorldState {
             server_count: 0,
             user_count: 0,
             domain: domain.to_string(),
+            entity_skew: None,
         };
         state.init_population(asset_count);
         state
@@ -916,7 +931,23 @@ impl WorldState {
 
     pub fn random_entity(&self) -> &Entity {
         let mut rng = rand::rng();
-        self.entities.choose(&mut rng).unwrap()
+        match &self.entity_skew {
+            None => self.entities.choose(&mut rng).unwrap(),
+            Some(skew) => &self.entities[skew.sample(&mut rng)],
+        }
+    }
+
+    /// NAN-3174: make `random_entity` Zipf-skewed (`skew` > 0) over a seeded
+    /// popularity ranking of the fleet. The alias table is built once here.
+    /// `skew <= 0` keeps the historical uniform draw.
+    pub fn set_entity_skew(&mut self, skew: f64, seed: u64) {
+        self.entity_skew = (skew > 0.0 && !self.entities.is_empty())
+            .then(|| crate::variance::SkewedIndex::new(self.entities.len(), skew, seed));
+    }
+
+    /// True when `random_entity` is skewed.
+    pub fn entity_skew_active(&self) -> bool {
+        self.entity_skew.is_some()
     }
 
     pub fn get_entity(&self, hostname: &str) -> Option<&Entity> {

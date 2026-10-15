@@ -27,6 +27,7 @@ fn unrestricted_query_is_legacy_aggregate_sql_byte_for_byte() {
         &[],
         &hosts,
         &[],
+        None,
         &ScopeSet::unrestricted(),
     )
     .expect("host produces a query");
@@ -53,6 +54,7 @@ fn restricted_query_uses_raw_logs_with_real_identity_and_scope_predicates() {
         &[],
         &hosts,
         &[],
+        None,
         &scope,
     )
     .expect("host produces a query");
@@ -79,6 +81,7 @@ fn implicit_audit_deny_alone_routes_to_raw_logs() {
         &[],
         &[],
         &users,
+        None,
         &denied(&["audit"]),
     )
     .expect("user produces a query");
@@ -100,6 +103,7 @@ fn restricted_ocsf_host_uses_the_production_all_endpoint_predicate() {
         &[],
         &hosts,
         &[],
+        None,
         &denied(&["insider_threat"]),
     )
     .expect("host produces a query");
@@ -227,6 +231,7 @@ mod pg {
             &[],
             &hosts,
             &[],
+            None,
             &scope,
         )
         .expect("restricted query");
@@ -254,6 +259,7 @@ mod pg {
             &[],
             &hosts,
             &[],
+            None,
             &bypass_scope,
         )
         .expect("unrestricted query");

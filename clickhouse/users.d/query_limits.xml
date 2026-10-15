@@ -95,8 +95,8 @@
                  to ~14 prevalence/aggregation MV parts, so a sub-second flush is a
                  part storm that saturates the BackgroundSchedulePool and stalls
                  merge-selection (the failure mode behind the Saturn part-backlog
-                 incident; managed tenants run the same window via nano-main
-                 k8s-manifests/clickhouse.ts). Adaptive 2s–10s shrinks toward the
+                 incident; managed tenants run the same window via the platform
+                 ClickHouse manifest). Adaptive 2s–10s shrinks toward the
                  2s floor under sustained insert pressure (bounding the part rate)
                  and only grows toward 10s when ingest is light. The in-flight
                  buffer is still capped by async_insert_max_data_size above, so a
@@ -112,7 +112,7 @@
             <!-- Security -->
             <readonly>0</readonly>
             <!-- allow_ddl=1 matches the managed-SaaS nanosiem profile
-                 (nano-main k8s-manifests/clickhouse.ts). The `nanosiem` user is
+                 (platform ClickHouse manifest). The `nanosiem` user is
                  BOTH the analyst-query user and the app/sync user; system
                  operations like the IPinfo Lite sync's generational cleanup
                  (`ALTER TABLE ip_enrichments DELETE …`, a mutation = DDL) require

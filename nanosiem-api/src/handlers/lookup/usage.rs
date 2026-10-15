@@ -34,7 +34,7 @@ const MAX_SAMPLE_JOIN_LEN: usize = 200;
 ///
 /// `hits_24h` and `last_hit` are currently stubbed to `0` and `null`
 /// respectively. Wiring up per-rule signal counts from the ClickHouse
-/// `signals` table is deferred — see `TODO(NAN-511)` in
+/// `signals` table is deferred — see `TODO` in
 /// [`LookupUsage`](nanosiem_core::LookupUsage).
 #[utoipa::path(
     get,

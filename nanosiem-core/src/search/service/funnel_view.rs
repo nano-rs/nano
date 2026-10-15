@@ -29,9 +29,9 @@ impl SearchService {
         // shared field list — mirrors tree_view / asset_view signatures.
         _info: &FunnelCommandInfo,
     ) -> Vec<serde_json::Value> {
-        use crate::search::query_processing::FUNNEL_DROPPER_FIELDS;
-
         const TOP_K: usize = 5;
+        let dropper_fields =
+            crate::search::query_processing::funnel_dropper_fields(self.active_profile.as_ref());
 
         results
             .into_iter()
@@ -48,7 +48,7 @@ impl SearchService {
 
                 let mut top_attrs: Vec<serde_json::Value> = Vec::new();
 
-                for &field in FUNNEL_DROPPER_FIELDS {
+                for &field in dropper_fields {
                     let key = format!("_droppers_{}", field);
                     let Some(arr) = obj.remove(&key) else {
                         continue;

@@ -11,6 +11,6 @@ pub mod service;
 
 pub use migrations::run_demo_migrations;
 pub use service::{
-    DemoError, DemoResourceCounts, DemoResourceType, DemoService, DemoSession, DemoSessionStatus,
     get_other_demo_resource_ids_standalone, is_demo_session_active, track_demo_resource_standalone,
+    DemoError, DemoResourceCounts, DemoResourceType, DemoService, DemoSession, DemoSessionStatus,
 };

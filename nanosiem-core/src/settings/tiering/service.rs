@@ -749,10 +749,7 @@ impl TieringService {
             .await
             .map_err(|e| TieringError::ClickHouse(format!("Failed to set TTL rules: {}", e)))?;
 
-        tracing::info!(
-            retention_days = config.retention_days,
-            "TTL rules applied"
-        );
+        tracing::info!(retention_days = config.retention_days, "TTL rules applied");
 
         Ok(())
     }

@@ -6,7 +6,8 @@
  * Server-side pagination via "load more". Click a row to pivot to events.
  */
 
-import { ArrowUpRight, Box, User, Users, Info, Loader2 } from 'lucide-react';
+import { ArrowUpRight, Box, User, Users, Info } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import type { RetroAxis, RetroPivotRow } from '@/lib/api/types';
 import { RE_VERDICT, VerdictBadge, reFmtD, reAge } from './shared';
@@ -137,7 +138,7 @@ export function RetroPivot({
             disabled={loadingMore}
             className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-border bg-fg/[0.02] text-fg-2 hover:text-fg hover:border-border-2 font-mono text-[11px] transition-colors disabled:opacity-60"
           >
-            {loadingMore && <Loader2 className="w-[12px] h-[12px] animate-spin" />}
+            {loadingMore && <LoadingIcon className="w-[12px] h-[12px]" />}
             load more {isUser ? 'users' : 'assets'}
           </button>
         </div>

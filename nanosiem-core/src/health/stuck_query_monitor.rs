@@ -53,13 +53,20 @@ pub struct StuckQueryProbe {
 pub struct StuckQueryMonitor {
     ch_client: ClickHouseClient,
     threshold_secs: u64,
+    lake_mode: bool,
 }
 
 impl StuckQueryMonitor {
     pub fn new(ch_client: ClickHouseClient, threshold_secs: u64) -> Self {
+        let lake_mode = crate::schema::log_query_backend_is_lake();
+        Self::new_with_mode(ch_client, threshold_secs, lake_mode)
+    }
+
+    fn new_with_mode(ch_client: ClickHouseClient, threshold_secs: u64, lake_mode: bool) -> Self {
         Self {
             ch_client,
             threshold_secs,
+            lake_mode,
         }
     }
 
@@ -83,6 +90,17 @@ impl StuckQueryMonitor {
     /// `clusterAllReplicas` fan-out fails (e.g. restricted inter-node access)
     /// rather than losing the check entirely.
     pub async fn check_stuck_queries(&self) -> StuckQueryProbe {
+        if self.lake_mode {
+            // Native worker executor deadlines, recycling, and readiness are
+            // authoritative in canonical lake mode. The compatibility
+            // ClickHouse client is intentionally inert and must not create a
+            // false system-health failure.
+            return StuckQueryProbe {
+                statuses: Vec::new(),
+                authoritative: true,
+            };
+        }
+
         let cluster = clickhouse_cluster_name();
         match self
             .fetch(&Self::probe_sql(cluster.as_deref(), self.threshold_secs))
@@ -161,10 +179,7 @@ mod tests {
     #[test]
     fn clustered_probe_uses_the_definer_view() {
         let sql = StuckQueryMonitor::probe_sql(Some("nano"), 900);
-        assert!(
-            sql.contains("FROM cluster_processes"),
-            "got: {sql}"
-        );
+        assert!(sql.contains("FROM cluster_processes"), "got: {sql}");
         assert!(!sql.contains("clusterAllReplicas"), "got: {sql}");
         assert!(sql.contains("elapsed > 900"), "got: {sql}");
     }
@@ -180,6 +195,17 @@ mod tests {
         // runtime user never receives the raw query text through the view.
         let clustered = StuckQueryMonitor::probe_sql(Some("nano"), 600);
         assert!(clustered.contains("query_snippet"), "got: {clustered}");
-        assert!(!clustered.contains("normalizeQuery(query)"), "got: {clustered}");
+        assert!(
+            !clustered.contains("normalizeQuery(query)"),
+            "got: {clustered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_lake_mode_never_contacts_clickhouse() {
+        let monitor = StuckQueryMonitor::new_with_mode(ClickHouseClient::default(), 600, true);
+        let probe = monitor.check_stuck_queries().await;
+        assert!(probe.authoritative);
+        assert!(probe.statuses.is_empty());
     }
 }

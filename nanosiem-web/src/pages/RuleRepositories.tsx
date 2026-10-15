@@ -12,6 +12,14 @@ import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight, GitPullRequest } from 'lucide-react';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
+import {
+  PLATFORM_CATALOG_SETUP_POLL_MS,
+  platformCatalogSettingUp,
+  platformCatalogSetupBlocksPage,
+  repositorySyncPollInterval,
+} from '@/hooks/repository-sync-state';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
+import { PlatformCatalogSettingUp } from '@/components/repositories/PlatformCatalogSettingUp';
 import { useAuth } from '@/contexts/AuthContext';
 import { DetectionCodeTargetsDrawer } from '@/components/repositories/DetectionCodeTargetsDrawer';
 import { ImportBundleButton } from '@/components/airgap/ImportBundleButton';
@@ -28,6 +36,8 @@ import type {
 } from '@/lib/api/rule-repositories';
 import { RepoSidebar } from '@/components/repositories/RepoSidebar';
 import { RepoPreview } from '@/components/repositories/RepoPreview';
+import { RepositoryFilters } from '@/components/repositories/RepositoryFilters';
+import { filterRepositoryItems, ruleSourceTypes, sourceTypeCounts, type ImportStatusFilter } from '@/components/repositories/repository-filters';
 import {
   ReposHeader,
   ReposTable,
@@ -105,8 +115,18 @@ export function RuleRepositories() {
   const [activeRepoId, setActiveRepoId] = useState<string | null>(null);
   const [activeCat, setActiveCat] = useState<CategoryCount['id']>('all');
   const [query, setQuery] = useState('');
+  const [importStatus, setImportStatus] = useState<ImportStatusFilter>('all');
+  const [selectedSourceTypes, setSelectedSourceTypes] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectedRuleId, setSelectedRuleId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setActiveCat('all');
+    setQuery('');
+    setImportStatus('all');
+    setSelectedSourceTypes(new Set());
+    setSelected(new Set());
+  }, [activeRepoId]);
 
   const [historyOpen, setHistoryOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -118,12 +138,18 @@ export function RuleRepositories() {
   // Queries
   // ----------------------------------------------------------------
 
+  const [syncAcceptedAt, setSyncAcceptedAt] = useState<number | null>(null);
+  const sharedTenant = useSharedTenant();
+
   const { data: reposData, isLoading: reposLoading } = useQuery({
     queryKey: ['rule-repositories'],
     queryFn: () => api.ruleRepositories.listRepositories(),
     refetchInterval: (q) => {
       const repos = q.state.data?.repositories ?? [];
-      return repos.some((r) => r.last_sync_status === 'syncing') ? 1500 : false;
+      if (syncAcceptedAt && Date.now() - syncAcceptedAt < 65 * 60_000) return 1500;
+      // NAN-3436: keep checking while the platform catalog is being set up.
+      if (platformCatalogSettingUp(sharedTenant, repos, 'nano-rs/rules')) return PLATFORM_CATALOG_SETUP_POLL_MS;
+      return repositorySyncPollInterval(repos);
     },
   });
 
@@ -141,13 +167,14 @@ export function RuleRepositories() {
 
   const { data: rulesData = [], isLoading: rulesLoading, refetch: refetchRules } = useQuery({
     queryKey: ['rule-repository-rules', activeRepoId],
-    queryFn: () => (activeRepoId ? api.ruleRepositories.listRules(activeRepoId, { limit: 500 }) : Promise.resolve([])),
+    queryFn: () => (activeRepoId ? api.ruleRepositories.listRules(activeRepoId) : Promise.resolve([])),
     enabled: !!activeRepoId,
   });
 
   // When the active repo finishes syncing, refetch its rule list and surface a
   // toast so the user sees fresh data + completion confirmation without reload.
-  useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
+  const markSyncAccepted = useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
+    setSyncAcceptedAt(null);
     refetchRules();
     queryClient.invalidateQueries({ queryKey: ['rule-repository-upstream', repo.id] });
     if (repo.last_sync_status === 'failed') {
@@ -211,22 +238,20 @@ export function RuleRepositories() {
     return rulesData.map((r) => buildRuleView(r, upstreamByPath, fallbackCommit));
   }, [rulesData, upstreamByPath, activeRepo]);
 
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return ruleViews.filter((r) => {
-      if (activeCat === 'new' && r.status !== 'NEW') return false;
-      if (activeCat === 'updated' && r.status !== 'UPDATED') return false;
-      if (activeCat === 'imported' && r.status !== 'IMPORTED') return false;
-      if (activeCat === 'drift' && r.status !== 'DRIFT') return false;
-      if (activeCat === 'deleted' && r.status !== 'DELETED') return false;
-      if (!needle) return true;
-      const hay = [r.name, r.desc, r.source, ...r.mitre].join(' ').toLowerCase();
-      return hay.includes(needle);
-    });
-  }, [ruleViews, activeCat, query]);
+  const filtered = useMemo(() => filterRepositoryItems(ruleViews, {
+    query,
+    importStatus,
+    selectedSourceTypes,
+    sourceTypes: (rule) => ruleSourceTypes(rule.raw),
+    searchText: (rule) => [rule.name, rule.desc, rule.source, ...rule.mitre].join(' '),
+    inCategory: (rule) => activeCat === 'all' || rule.status.toLowerCase() === activeCat,
+  }), [ruleViews, activeCat, query, importStatus, selectedSourceTypes]);
+
+  const sourceCounts = useMemo(() => sourceTypeCounts(ruleViews, (rule) => ruleSourceTypes(rule.raw)), [ruleViews]);
+  const importedCount = ruleViews.filter((rule) => rule.raw.is_imported).length;
 
   const selectedRule = ruleViews.find((r) => r.id === selectedRuleId) ?? null;
-  const selectedRules = ruleViews.filter((r) => selected.has(r.id));
+  const selectedRules = filtered.filter((r) => selected.has(r.id));
   const categories = categoryCounts(ruleViews);
 
   const importIntent = (
@@ -300,11 +325,7 @@ export function RuleRepositories() {
       setActiveRepoId(repo.id);
       setAddOpen(false);
       toast({ title: `${repo.name} added — syncing…` });
-      // Kick off the first sync immediately so the rule list populates.
-      api.ruleRepositories
-        .syncRepository(repo.id)
-        .then(() => queryClient.invalidateQueries({ queryKey: ['rule-repositories'] }))
-        .catch(() => {});
+      syncMutation.mutate(repo.id);
     },
     onError: (err: Error) => {
       toast({
@@ -317,8 +338,23 @@ export function RuleRepositories() {
 
   const syncMutation = useMutation({
     mutationFn: (id: string) => api.ruleRepositories.syncRepository(id),
-    onSuccess: (result) => {
+    onSuccess: (result, repoId) => {
+      if (result.status === 'syncing') {
+        markSyncAccepted(repoId, result.sync_started_at ?? undefined);
+        setSyncAcceptedAt(Date.now());
+      }
       queryClient.invalidateQueries({ queryKey: ['rule-repositories'] });
+      if (result.status !== 'syncing') {
+        // Refresh immediately when a deployment returns a terminal result.
+        queryClient.invalidateQueries({ queryKey: ['rule-repository-rules', result.repository_id] });
+        queryClient.invalidateQueries({ queryKey: ['rule-repository-upstream', result.repository_id] });
+        toast({
+          title: result.status === 'success' ? 'Sync complete' : 'Sync failed',
+          description: result.message,
+          variant: result.status === 'success' ? 'default' : 'destructive',
+        });
+        return;
+      }
       toast({ title: 'Sync started', description: result.message });
     },
     onError: (err: Error) => {
@@ -515,11 +551,27 @@ export function RuleRepositories() {
     );
   }
 
+  // NAN-3436: a new hosted-shared workspace's rule catalog is still being
+  // copied in the background; not "no repositories" (and no connect button
+  // racing the platform).
+  if (platformCatalogSetupBlocksPage(sharedTenant, repositories, 'nano-rs/rules')) {
+    return (
+      <div className="-m-3 flex min-h-[calc(100%+1.5rem)] flex-col" data-testid="rule-repositories-page">
+        <div className="border-b border-border bg-card/30 px-5 py-3.5">
+          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">Rule repositories</div>
+        </div>
+        <div className="flex-1 flex items-center justify-center">
+          <PlatformCatalogSettingUp content="detection rules" catalog="nano-rs/rules" />
+        </div>
+      </div>
+    );
+  }
+
   // Empty state — first-run with no repos.
   if (!activeRepo) {
     return (
       <TooltipProvider>
-        <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
+        <div className="-m-3 flex min-h-[calc(100%+1.5rem)] flex-col" data-testid="rule-repositories-page">
         <div className="border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
           <div className="flex-1 min-w-0">
             <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">
@@ -574,7 +626,7 @@ export function RuleRepositories() {
               <>
                 <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
                   Connect a Git repository to sync detection rules. Start with the official{' '}
-                  <code className="font-mono text-foreground/80">nano-sh/rules</code> repo or bring your own.
+                  <code className="font-mono text-foreground/80">nano-rs/rules</code> repo or bring your own.
                 </div>
                 <div className="flex items-center justify-center gap-2">
                   <button
@@ -584,10 +636,10 @@ export function RuleRepositories() {
                         name: 'nano rules',
                         url: 'https://github.com/nano-rs/rules',
                         description: 'Official nano detection rules in native nPL format',
-                        branch: 'main',
+                        branch: 'ocsf-1.9',
                         rules_path: '',
                         rule_format: 'nanosiem',
-                        auto_sync_enabled: false,
+                        auto_sync_enabled: true,
                       })
                     }
                     disabled={createMutation.isPending}
@@ -637,12 +689,17 @@ export function RuleRepositories() {
 
   return (
     <TooltipProvider>
-      <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
+      {/* NAN-3250: the page flows in the app scroller instead of a fill-height
+          column. The master-detail grid (sidebar, rule list with a sticky
+          header, preview) keeps a bounded box, sized to the app scroller but
+          never below 36rem, so the rule list can't be squeezed to a sliver
+          under the header and filters (was 240px at a 720px window). */}
+      <div className="-m-3 flex min-h-[calc(100%+1.5rem)] flex-col" data-testid="rule-repositories-page">
         <ReposHeader
         repo={activeRepo}
         onSyncNow={() => syncMutation.mutate(activeRepo.id)}
         onOpenHistory={() => setHistoryOpen(true)}
-        syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
+        syncing={activeRepo.raw.last_sync_status === 'syncing' || (syncMutation.isPending && syncMutation.variables === activeRepo.id)}
         pushTargetsSlot={pushTargetsButton}
         airgapSlot={
           airGap ? (
@@ -656,7 +713,8 @@ export function RuleRepositories() {
       />
 
       <div
-        className="flex-1 min-h-0 grid"
+        className="grid h-[max(36rem,calc(100dvh-4rem))]"
+        data-testid="rule-repositories-grid"
         style={{
           gridTemplateColumns: showPreview ? '240px 1fr 420px' : '240px 1fr',
         }}
@@ -683,7 +741,7 @@ export function RuleRepositories() {
 
         <div className="flex flex-col min-h-0 min-w-0">
           <ReposToolbar
-            selectedCount={selected.size}
+            selectedCount={selectedRules.length}
             totalShown={filtered.length}
             query={query}
             onQueryChange={setQuery}
@@ -692,6 +750,16 @@ export function RuleRepositories() {
             bulkImportAccess={bulkImportAccess}
           />
           <FilterRow categories={categories} activeId={activeCat} onActivate={setActiveCat} />
+          <RepositoryFilters
+            importStatus={importStatus}
+            onImportStatusChange={setImportStatus}
+            importCounts={{ all: ruleViews.length, imported: importedCount, notImported: ruleViews.length - importedCount }}
+            sourceCounts={sourceCounts}
+            selectedSourceTypes={selectedSourceTypes}
+            onSourceTypesChange={setSelectedSourceTypes}
+            hasFilters={activeCat !== 'all' || importStatus !== 'all' || selectedSourceTypes.size > 0 || !!query}
+            onClear={() => { setActiveCat('all'); setImportStatus('all'); setSelectedSourceTypes(new Set()); setQuery(''); }}
+          />
           {(upstreamData?.total_count ?? 0) > 0 && activeCat !== 'updated' && (
             <button
               type="button"
@@ -716,7 +784,7 @@ export function RuleRepositories() {
           ) : (
             <ReposTable
               rules={filtered}
-              selected={selected}
+              selected={new Set(selectedRules.map((rule) => rule.id))}
               selectedRuleId={selectedRuleId}
               onToggleSelect={toggleSelect}
               onToggleSelectAll={toggleSelectAll}
@@ -756,7 +824,7 @@ export function RuleRepositories() {
         open={historyOpen}
         onClose={() => setHistoryOpen(false)}
         repo={activeRepo}
-        syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
+        syncing={activeRepo.raw.last_sync_status === 'syncing' || (syncMutation.isPending && syncMutation.variables === activeRepo.id)}
         onSyncNow={(id) => syncMutation.mutate(id)}
       />
 

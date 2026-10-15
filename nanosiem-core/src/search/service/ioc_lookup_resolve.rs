@@ -29,6 +29,30 @@ use crate::search::SearchError;
 /// bound rather than emitting an unusable query.
 pub(crate) const LOOKUP_IOC_MAX: usize = 50_000;
 
+/// Standalone lake searches expand feed-backed IOC terms through the immutable
+/// resident enrichment snapshot before SQL compilation. Keep the same bound as
+/// lookup-backed IOC terms: large enough for real feeds, but explicit rather
+/// than allowing an unbounded source to create a pathological SQL predicate.
+pub(crate) const FEED_IOC_MAX: usize = LOOKUP_IOC_MAX;
+
+/// Translate the user-facing IOC feed selector into immutable-snapshot filters.
+/// Provider forms retain their historical fuzzy-name + campaign-tag behavior.
+/// The generic `feed("source")` form is deliberately exact so one tenant source
+/// cannot accidentally select another source with a similar display name.
+pub(super) fn ioc_feed_snapshot_filters(
+    feed: &crate::query::IocFeed,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    if feed.name.eq_ignore_ascii_case("feed") {
+        (vec![feed.arg.clone()], Vec::new(), Vec::new())
+    } else {
+        (
+            Vec::new(),
+            vec![feed.name.clone(), feed.arg.clone()],
+            vec![feed.arg.clone()],
+        )
+    }
+}
+
 /// Resolve a single `IocLookup` source to a deduped list of indicator values.
 ///
 /// * validates the table exists via `get_table` — an unknown table surfaces a
@@ -230,6 +254,118 @@ pub(crate) async fn resolve_ioc_lookup_sources(
     Ok(())
 }
 
+/// Whether a parsed query contains any unresolved `ioc in feed(...)` term.
+pub(crate) fn query_has_ioc_feed(query: &Query) -> bool {
+    fn walk(expr: &SearchExpr) -> bool {
+        match expr {
+            SearchExpr::IocMatch { feed, .. } => feed.is_some(),
+            SearchExpr::And(left, right) | SearchExpr::Or(left, right) => walk(left) || walk(right),
+            SearchExpr::Not(inner) | SearchExpr::Group(inner) => walk(inner),
+            _ => false,
+        }
+    }
+    match query {
+        Query::Search(expr) => walk(expr),
+        Query::Piped { source, .. } => query_has_ioc_feed(source),
+    }
+}
+
+/// Resolve feed-backed IOC terms through the tenant-pinned immutable snapshot
+/// used by ingest decoration and retro hunts. This is the primary-lake
+/// equivalent of the legacy `custom_enrichment_results` subquery: storage
+/// coordinates and arbitrary SQL never cross the product/worker boundary.
+///
+/// `tenant_client` is the tenant-pinned reader of an enterprise-shared view
+/// (NAN-2922). When it is `Some`, it is the ONLY reader used; the process
+/// `NANO_LAKE_*` reader is consulted only for dedicated deployments (`None`).
+pub(crate) async fn resolve_ioc_feed_sources(
+    query: &mut Query,
+    tenant_client: Option<&crate::enrichment::ioc::LakeIocClient>,
+    warnings: &mut Vec<String>,
+) -> Result<(), SearchError> {
+    let process_client;
+    let client = match tenant_client {
+        Some(client) => client,
+        None => {
+            process_client = crate::enrichment::ioc::LakeIocClient::from_env()
+                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?
+                .ok_or_else(|| {
+                    SearchError::ServiceUnavailable(
+                        "immutable IOC snapshot is not configured for primary lake mode"
+                            .to_string(),
+                    )
+                })?;
+            &process_client
+        }
+    };
+
+    let mut nodes = Vec::new();
+    collect_ioc_feed_nodes(query, &mut nodes);
+    for node in nodes {
+        if let SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        } = node
+        {
+            let Some(source) = feed.take() else { continue };
+            let (feeds, name_terms, tag_terms) = ioc_feed_snapshot_filters(&source);
+            let (records, count) = client
+                .source_records(
+                    &feeds,
+                    &name_terms,
+                    &tag_terms,
+                    &[],
+                    None,
+                    FEED_IOC_MAX,
+                    false,
+                )
+                .await
+                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?;
+            if count > FEED_IOC_MAX {
+                return Err(SearchError::SqlValidationError(format!(
+                    "IOC feed {}(\"{}\") contains {count} distinct indicators, above the {}-indicator interactive expansion limit. Narrow the feed selection or run it as a scheduled retro hunt.",
+                    source.name, source.arg, FEED_IOC_MAX
+                )));
+            }
+            if records.is_empty() {
+                warnings.push(format!(
+                    "IOC feed {}(\"{}\") returned no current indicator values and matches nothing.",
+                    source.name, source.arg
+                ));
+            }
+            *values = records
+                .into_iter()
+                .map(|record| Value::String(record.value))
+                .collect();
+            *lookup = None;
+        }
+    }
+    Ok(())
+}
+
+fn collect_ioc_feed_nodes<'a>(query: &'a mut Query, out: &mut Vec<&'a mut SearchExpr>) {
+    match query {
+        Query::Search(expr) => collect_feed_in_expr(expr, out),
+        Query::Piped { source, .. } => collect_ioc_feed_nodes(source, out),
+    }
+}
+
+fn collect_feed_in_expr<'a>(expr: &'a mut SearchExpr, out: &mut Vec<&'a mut SearchExpr>) {
+    if matches!(expr, SearchExpr::IocMatch { feed: Some(_), .. }) {
+        out.push(expr);
+        return;
+    }
+    match expr {
+        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+            collect_feed_in_expr(left, out);
+            collect_feed_in_expr(right, out);
+        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => collect_feed_in_expr(inner, out),
+        _ => {}
+    }
+}
+
 /// Depth-first collect mutable references to every `IocMatch` node that has a
 /// lookup source.
 fn collect_ioc_lookup_nodes<'a>(query: &'a mut Query, out: &mut Vec<&'a mut SearchExpr>) {
@@ -264,11 +400,42 @@ fn collect_in_expr<'a>(expr: &'a mut SearchExpr, out: &mut Vec<&'a mut SearchExp
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::lookup::{LookupColumn, LookupService, LookupStore, LookupTable};
     use async_trait::async_trait;
     use std::collections::HashMap;
+
+    #[test]
+    fn detects_feed_sources_without_misclassifying_literal_iocs() {
+        let feed = crate::query::parse_query(r#"ioc in threatfox("apt29") | head 10"#)
+            .expect("feed query parses");
+        assert!(query_has_ioc_feed(&feed));
+        assert!(!query_has_ioc_lookup(&feed));
+
+        let literal =
+            crate::query::parse_query(r#"ioc="1.2.3.4""#).expect("literal IOC query parses");
+        assert!(!query_has_ioc_feed(&literal));
+    }
+
+    #[test]
+    fn generic_feed_uses_exact_snapshot_source_filter() {
+        let (feeds, names, tags) = ioc_feed_snapshot_filters(&crate::query::IocFeed {
+            name: "feed".to_string(),
+            arg: "Tenant Source".to_string(),
+        });
+        assert_eq!(feeds, vec!["Tenant Source"]);
+        assert!(names.is_empty());
+        assert!(tags.is_empty());
+
+        let (feeds, names, tags) = ioc_feed_snapshot_filters(&crate::query::IocFeed {
+            name: "threatfox".to_string(),
+            arg: "apt29".to_string(),
+        });
+        assert!(feeds.is_empty());
+        assert_eq!(names, vec!["threatfox", "apt29"]);
+        assert_eq!(tags, vec!["apt29"]);
+    }
 
     /// Minimal in-memory `LookupStore` for resolver unit tests. Only the methods
     /// the resolver touches (`get_table`, `list_tables`, `list_rows`) carry real
@@ -457,7 +624,10 @@ mod tests {
         }
     }
 
-    fn service_with(table: LookupTable, rows: Vec<HashMap<String, serde_json::Value>>) -> LookupService {
+    pub(crate) fn service_with(
+        table: LookupTable,
+        rows: Vec<HashMap<String, serde_json::Value>>,
+    ) -> LookupService {
         let mut tables = HashMap::new();
         let physical = table.table_name.clone();
         let name = table.name.clone();
@@ -508,7 +678,10 @@ mod tests {
             Some("id"),
         );
         let mut r1 = row("id", "1");
-        r1.insert("indicator".into(), serde_json::Value::String("bad.test".into()));
+        r1.insert(
+            "indicator".into(),
+            serde_json::Value::String("bad.test".into()),
+        );
         let svc = service_with(table, vec![r1]);
         let lookup = IocLookup {
             table: "threat_iocs".to_string(),

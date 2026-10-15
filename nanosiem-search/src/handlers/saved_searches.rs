@@ -4,20 +4,20 @@
 
 use axum::extract::Extension;
 use axum::{
-    Json,
     extract::{Path, State},
+    Json,
 };
 use nanosiem_core::{
-    NewNotification, NewSavedSearch, SavedSearch, SavedSearchWithContext, ShareSavedSearchRequest,
-    UpdateSavedSearch,
     audit::{AuditEvent, AuditSource, SAVED_SEARCH_SHARED},
-    auth::{TokenClaims, permissions},
+    auth::{permissions, TokenClaims},
     models::notification::NotificationType as ModelNotificationType,
     typeid::TypeIdParam,
+    NewNotification, NewSavedSearch, SavedSearch, SavedSearchWithContext, ShareSavedSearchRequest,
+    UpdateSavedSearch,
 };
 
 use crate::error::ErrorResponse;
-use crate::{SearchState, error::SearchError};
+use crate::{error::SearchError, SearchState};
 
 /// NAN-2033: feature-capability gate for the saved-search surface. These handlers
 /// extract `TokenClaims` (not `AuthContext`), so they gate on the claims directly.
@@ -98,8 +98,7 @@ pub async fn list_saved_searches(
         if exclude.is_empty() {
             searches
         } else {
-            let exclude_set: std::collections::HashSet<uuid::Uuid> =
-                exclude.into_iter().collect();
+            let exclude_set: std::collections::HashSet<uuid::Uuid> = exclude.into_iter().collect();
             searches
                 .into_iter()
                 .filter(|s| !exclude_set.contains(&s.id))
@@ -153,8 +152,7 @@ pub async fn list_shared_searches(
         if exclude.is_empty() {
             searches
         } else {
-            let exclude_set: std::collections::HashSet<uuid::Uuid> =
-                exclude.into_iter().collect();
+            let exclude_set: std::collections::HashSet<uuid::Uuid> = exclude.into_iter().collect();
             searches
                 .into_iter()
                 .filter(|s| !exclude_set.contains(&s.id))
@@ -287,7 +285,10 @@ pub async fn create_saved_search(
         let search_id = search.id;
         tokio::spawn(async move {
             nanosiem_core::demo::track_demo_resource_standalone(
-                &pool, user_id, "saved_search", search_id,
+                &pool,
+                user_id,
+                "saved_search",
+                search_id,
             )
             .await;
         });
@@ -548,13 +549,17 @@ mod tests {
         // Holds an unrelated saved-search capability (save) but not the one
         // required for reads (view) → still refused.
         assert!(matches!(
-            require_capability(&claims_with(&[permissions::SEARCH_SAVE]), permissions::SEARCH_VIEW),
+            require_capability(
+                &claims_with(&[permissions::SEARCH_SAVE]),
+                permissions::SEARCH_VIEW
+            ),
             Err(SearchError::Forbidden(_))
         ));
         // Exact capability → allowed.
-        assert!(
-            require_capability(&claims_with(&[permissions::SEARCH_VIEW]), permissions::SEARCH_VIEW)
-                .is_ok()
-        );
+        assert!(require_capability(
+            &claims_with(&[permissions::SEARCH_VIEW]),
+            permissions::SEARCH_VIEW
+        )
+        .is_ok());
     }
 }

@@ -64,10 +64,10 @@ pub struct SiemHealthReport {
     pub ingestion_score: i32,
     pub parsing_score: i32,
     pub detection_score: i32,
-    /// NAN-569: nullable for backward compat with reports generated before
+    /// nullable for backward compat with reports generated before
     /// enrichment scoring landed.
     pub enrichment_score: Option<i32>,
-    /// NAN-569: nullable for backward compat with reports generated before
+    /// nullable for backward compat with reports generated before
     /// alerting scoring landed.
     pub alerting_score: Option<i32>,
     pub summary: String,
@@ -343,6 +343,24 @@ pub struct IngestionMetrics {
     /// before this field existed still deserialize.
     #[serde(default)]
     pub insert_integrity: InsertIntegrityMetrics,
+    /// Publication-liveness evidence for the primary object-lake freshness
+    /// lane. `None` on the retiring ClickHouse backend and on reports written
+    /// before the lake health ledger existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lake_publication: Option<LakePublicationHealth>,
+}
+
+/// Metadata-only health for the signed staged-tail publisher. Event payloads
+/// remain exact-version Parquet objects in the tenant's object store.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LakePublicationHealth {
+    pub last_reconciled_age_seconds: Option<u64>,
+    pub unpublished_revisions: u64,
+    pub oldest_unpublished_age_seconds: Option<u64>,
+    pub visible_objects: u64,
+    pub visible_bytes: u64,
+    pub manifest_sha256: Option<String>,
+    pub newest_visible_event_time: Option<DateTime<Utc>>,
 }
 
 /// Insert-path integrity signals (NAN-1405) — the NAN-1404 silent-loss kill
@@ -573,6 +591,20 @@ pub struct DetectionMetrics {
     pub noisy_rules: Vec<NoisyRule>,
     /// Total alerts by severity in last 24h
     pub alerts_24h_by_severity: Vec<AlertsBySeverity>,
+    /// Durable repair-lane backlog for events that arrived behind a scheduled
+    /// rule's normal event-time watermark.
+    #[serde(default)]
+    pub late_replay: LateReplayHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LateReplayHealth {
+    pub unplanned_publications: u64,
+    pub oldest_unplanned_age_seconds: Option<u64>,
+    pub pending_jobs: u64,
+    pub running_jobs: u64,
+    pub dead_letter_jobs: u64,
+    pub oldest_outstanding_job_age_seconds: Option<u64>,
 }
 
 /// Rule count by mode

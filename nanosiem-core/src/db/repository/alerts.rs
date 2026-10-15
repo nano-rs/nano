@@ -126,7 +126,9 @@ pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> 
             // hidden from every restricted analyst. Only the engine's
             // `_nano_source_types` annotation below may carry it.
             if let Some(st) = event
-                .get("source_type")
+                .get("metadata.log_source")
+                .or_else(|| event.get("metadata")?.get("log_source"))
+                .or_else(|| event.get("source_type"))
                 .and_then(|v| v.as_str())
                 .filter(|st| !crate::auth::is_reserved_source_type(st))
             {
@@ -161,7 +163,11 @@ pub fn distinct_source_types(matched_events: &serde_json::Value) -> Vec<String> 
 /// stays visible; "we could not tell" is now a DIFFERENT, hidden-from-restricted
 /// value instead of being conflated with it. Unrestricted callers are unaffected
 /// — no clause is emitted at all, so the SQL is byte-identical.
-fn scope_clause(deny: &BTreeSet<String>, column: &str, param: usize) -> (String, Option<Vec<String>>) {
+fn scope_clause(
+    deny: &BTreeSet<String>,
+    column: &str,
+    param: usize,
+) -> (String, Option<Vec<String>>) {
     let denied = crate::auth::deny_bind_values(deny);
     if denied.is_empty() {
         (String::new(), None)
@@ -189,7 +195,7 @@ fn scope_clause(deny: &BTreeSet<String>, column: &str, param: usize) -> (String,
 /// - `source_id` carries the producer's identifier as text — the rule UUID for
 ///   detections, the monitor/check typeid for observability alerts, the
 ///   `<entity_type>:<entity>` pair for risk notables (NAN-1792).
-/// - `event_hash` drives dedup. `Some` uses `ON CONFLICT (rule_id, event_hash)
+/// - `event_hash` drives dedup. `Some` uses `ON CONFLICT ([tenant_id, ]rule_id, event_hash)
 ///   DO NOTHING`; `None` skips the dedup conflict path entirely.
 pub struct AlertInsert<'a> {
     pub kind: &'a str,
@@ -268,7 +274,7 @@ impl AlertRepository {
     /// and `source_id = rule_id`.
     ///
     /// When `event_hash` is `Some`, the insert is dedup-guarded via
-    /// `ON CONFLICT (rule_id, event_hash) DO NOTHING` (returns `DuplicateAlert`
+    /// `ON CONFLICT ([tenant_id, ]rule_id, event_hash) DO NOTHING` (returns `DuplicateAlert`
     /// on conflict). When `None`, a plain insert is issued (no dedup).
     pub async fn create_alert(
         &self,
@@ -276,7 +282,7 @@ impl AlertRepository {
     ) -> Result<Alert, AlertRepositoryError> {
         // A8 (NAN-1747): the dedup unique index is `(rule_id, event_hash)`.
         // Postgres treats NULLs as DISTINCT, so a row with `rule_id = NULL` can
-        // NEVER win the `ON CONFLICT (rule_id, event_hash)` race — the dedup is
+        // NEVER win the `ON CONFLICT ([tenant_id, ]rule_id, event_hash)` race — the dedup is
         // a silent no-op for any producer that leaves `rule_id` unset. Every
         // current observability producer passes `event_hash: None` (no dedup
         // expected), so nothing relies on it today. A future producer that
@@ -307,12 +313,12 @@ impl AlertRepository {
             Some(event_hash) => {
                 // Atomic insert with conflict detection - no race condition window
                 let result = sqlx::query_as::<_, Alert>(
-                    r#"
+                    concat!(r#"
                     INSERT INTO alerts (rule_id, severity, matched_events, event_hash, kind, source_id, matched_event_count, source_types)
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    ON CONFLICT (rule_id, event_hash) WHERE event_hash IS NOT NULL DO NOTHING
+                    ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id, event_hash) WHERE event_hash IS NOT NULL DO NOTHING
                     RETURNING *
-                    "#,
+                    "#),
                 )
                 .bind(insert.rule_id)
                 .bind(insert.severity)
@@ -897,7 +903,9 @@ impl AlertRepository {
                  AND (rule_id IS NULL OR NOT (rule_id = ANY($2))){scope_sql}
                GROUP BY status"#
         );
-        let mut query = sqlx::query_as(&sql).bind(kinds_filter).bind(exclude_rule_ids);
+        let mut query = sqlx::query_as(&sql)
+            .bind(kinds_filter)
+            .bind(exclude_rule_ids);
         if let Some(denied) = &scope_bind {
             query = query.bind(denied);
         }
@@ -1009,10 +1017,7 @@ mod tests {
         let events_a = serde_json::json!([{"src_ip": "10.1.3.212"}]);
         let events_b = serde_json::json!([{"src_ip": "10.1.3.213"}]);
 
-        assert_ne!(
-            compute_event_hash(&events_a),
-            compute_event_hash(&events_b),
-        );
+        assert_ne!(compute_event_hash(&events_a), compute_event_hash(&events_b),);
     }
 
     /// NAN-1711 / audit D16: an enriched AGGREGATE row (system-injected
@@ -1118,10 +1123,13 @@ mod tests {
     /// the requested parameter index with normalized bind values.
     #[test]
     fn scope_clause_restricted_deny_emits_overlap_filter() {
-        let deny: BTreeSet<String> =
-            [" Audit ".to_string(), "Insider_Threat".to_string(), "".to_string()]
-                .into_iter()
-                .collect();
+        let deny: BTreeSet<String> = [
+            " Audit ".to_string(),
+            "Insider_Threat".to_string(),
+            "".to_string(),
+        ]
+        .into_iter()
+        .collect();
         let (sql, bind) = scope_clause(&deny, "a.source_types", 7);
         assert_eq!(
             sql,

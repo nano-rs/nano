@@ -4,16 +4,42 @@
 import { api } from '@/lib/api';
 import { getAccessToken } from '@/lib/auth-token';
 import { PIPE_COMMANDS, EVAL_FUNCTIONS, COMMAND_PARAMS } from '@/lib/query-tokens';
+import { browserTenantRuntime, tenantModuleCacheKey } from '@/lib/tenant-runtime';
+import { requestCredentials } from '@/lib/request-credentials';
+import {
+  curatedFieldsFor,
+  rankFieldSuggestions,
+  type FieldSection,
+  type FieldUsage,
+  type RankableField,
+} from '@/lib/field-suggestion-ranking';
+
+export type { FieldSection, FieldUsage } from '@/lib/field-suggestion-ranking';
 
 export interface AutocompleteOption {
   value: string;
   description?: string;
   category?: string;
+  /** Field suggestions only: which group the field belongs to (NAN-3812). */
+  section?: FieldSection;
 }
 
 interface AutocompleteResult {
   options: AutocompleteOption[];
-  context: 'command' | 'field' | 'source_type' | 'function' | 'table_wildcard' | null;
+  /**
+   * - 'function': callable functions (eval / aggregation); the rule editor appends `()`.
+   * - 'parameter': command parameter names (span, window, ...); plain insertion.
+   * - 'argument_value': values for `param=` (span=1h, type=inner, ...); plain insertion.
+   */
+  context:
+    | 'command'
+    | 'field'
+    | 'source_type'
+    | 'function'
+    | 'parameter'
+    | 'argument_value'
+    | 'table_wildcard'
+    | null;
 }
 
 export interface UdmFieldInfo {
@@ -43,6 +69,10 @@ export interface AutocompleteDataSource {
   } | null>;
   /** `/api/udm/fields` — UDM only, but carries the human-readable descriptions. */
   getLegacyUdmFields(): Promise<UdmFieldInfo[]>;
+  /** Product-specific fields that should be offered before the schema fetch lands. */
+  commonQueryFields?: AutocompleteOption[];
+  /** `/api/me/field-usage` — the caller's recent + tenant-popular fields. Optional. */
+  getFieldUsage?(): Promise<FieldUsage | null>;
 }
 
 const defaultDataSource: AutocompleteDataSource = {
@@ -50,33 +80,70 @@ const defaultDataSource: AutocompleteDataSource = {
   getSchemaFields: () => api.getSchemaFields(),
   getLegacyUdmFields: () => {
     const token = getAccessToken();
+    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
     return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`, {
-      headers: {
-        Authorization: token ? `Bearer ${token}` : '',
-      },
+      headers,
+      credentials: requestCredentials('/api/udm/fields', headers),
     })
       .then((res) => res.json())
       .then((data) => (data.fields || []) as UdmFieldInfo[])
       .catch(() => [] as UdmFieldInfo[]);
   },
+  getFieldUsage: () => {
+    const token = getAccessToken();
+    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+    return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/me/field-usage`, {
+      headers,
+      credentials: requestCredentials('/api/me/field-usage', headers),
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => (data ? normalizeFieldUsage(data) : null))
+      .catch(() => null);
+  },
 };
+
+function normalizeFieldUsage(data: unknown): FieldUsage | null {
+  if (!data || typeof data !== 'object') return null;
+  const pick = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  const d = data as Record<string, unknown>;
+  return { recent: pick(d.recent), popular: pick(d.popular) };
+}
 
 let dataSource: AutocompleteDataSource = defaultDataSource;
 
 /** Swap the transport (see AutocompleteDataSource). Clears any cached results. */
 export function setAutocompleteDataSource(source: AutocompleteDataSource) {
   dataSource = source;
+  commonQueryFields = source.commonQueryFields ?? LEGACY_COMMON_QUERY_FIELDS;
+  curatedOverride = source.commonQueryFields;
+  resetAutocompleteCaches();
+}
+
+export function resetAutocompleteCaches(): void {
   sourceTypesCache = null;
   sourceTypesCacheKey = null;
   sourceTypesFetchPromise = null;
+  sourceTypesFetchPromiseKey = null;
   udmFieldsCache = null;
+  udmFieldsCacheKey = null;
   udmFieldsFetchPromise = null;
+  udmFieldsFetchPromiseKey = null;
+  invalidateFieldUsageCache();
+}
+
+/** Drop cached field usage so the next suggestion re-reads it (call after a
+ *  search lands in history, or history is cleared). */
+export function invalidateFieldUsageCache(): void {
+  fieldUsageCache = null;
+  fieldUsageCacheKey = null;
+  fieldUsageFetchPromise = null;
+  fieldUsageFetchPromiseKey = null;
 }
 
 const pipeCommands = PIPE_COMMANDS as readonly string[];
 
 // Common fields that should always be available for autocomplete (not always in UDM API)
-const commonQueryFields: AutocompleteOption[] = [
+const LEGACY_COMMON_QUERY_FIELDS: AutocompleteOption[] = [
   { value: 'sourcetype', description: 'Data source type', category: 'Source' },
   { value: 'source_type', description: 'Data source type (alias)', category: 'Source' },
   { value: 'source', description: 'Data source', category: 'Source' },
@@ -89,15 +156,58 @@ const commonQueryFields: AutocompleteOption[] = [
   { value: 'file_path', description: 'File path', category: 'File' },
   { value: 'event_type', description: 'Event type', category: 'Event' },
 ];
+let commonQueryFields = LEGACY_COMMON_QUERY_FIELDS;
+/** A data source's own curated list (desktop) replaces the OCSF default. */
+let curatedOverride: AutocompleteOption[] | undefined;
+
+// Field usage (recent + tenant-popular), refreshed at most once a minute.
+const FIELD_USAGE_TTL_MS = 60_000;
+let fieldUsageCache: { at: number; usage: FieldUsage | null } | null = null;
+let fieldUsageCacheKey: string | null = null;
+let fieldUsageFetchPromise: Promise<FieldUsage | null> | null = null;
+let fieldUsageFetchPromiseKey: string | null = null;
+
+async function fetchFieldUsage(): Promise<FieldUsage | null> {
+  if (!dataSource.getFieldUsage) return null;
+  const capturedRuntime = browserTenantRuntime.current();
+  const cacheKey = tenantModuleCacheKey(capturedRuntime, 'field-usage');
+  if (fieldUsageCache && fieldUsageCacheKey === cacheKey && Date.now() - fieldUsageCache.at < FIELD_USAGE_TTL_MS) {
+    return fieldUsageCache.usage;
+  }
+  if (fieldUsageFetchPromise && fieldUsageFetchPromiseKey === cacheKey) return fieldUsageFetchPromise;
+  fieldUsageFetchPromiseKey = cacheKey;
+  const promise = dataSource
+    .getFieldUsage()
+    .then((usage) => {
+      browserTenantRuntime.assertCurrent(capturedRuntime);
+      // A failed read is cached too (as null) so a broken endpoint is not
+      // hammered on every keystroke; suggestions fall back to the defaults.
+      fieldUsageCache = { at: Date.now(), usage };
+      fieldUsageCacheKey = cacheKey;
+      return usage;
+    })
+    .catch(() => null)
+    .finally(() => {
+      if (fieldUsageFetchPromise === promise) {
+        fieldUsageFetchPromise = null;
+        fieldUsageFetchPromiseKey = null;
+      }
+    });
+  fieldUsageFetchPromise = promise;
+  return promise;
+}
 
 // Cache for source types keyed by time range
 let sourceTypesCache: string[] | null = null;
 let sourceTypesCacheKey: string | null = null;
 let sourceTypesFetchPromise: Promise<string[]> | null = null;
+let sourceTypesFetchPromiseKey: string | null = null;
 
 // Cache for UDM fields to avoid repeated API calls
 let udmFieldsCache: UdmFieldInfo[] | null = null;
+let udmFieldsCacheKey: string | null = null;
 let udmFieldsFetchPromise: Promise<UdmFieldInfo[]> | null = null;
+let udmFieldsFetchPromiseKey: string | null = null;
 
 // Current time range for source type queries (set by caller)
 let _currentTimeRange: { start: string; end: string } | undefined;
@@ -108,20 +218,30 @@ export function setAutocompleteTimeRange(timeRange?: { start: string; end: strin
 }
 
 async function fetchSourceTypes(): Promise<string[]> {
-  const cacheKey = _currentTimeRange ? `${_currentTimeRange.start}_${_currentTimeRange.end}` : 'default';
+  const capturedRuntime = browserTenantRuntime.current();
+  const timeKey = _currentTimeRange ? `${_currentTimeRange.start}_${_currentTimeRange.end}` : 'default';
+  const cacheKey = tenantModuleCacheKey(capturedRuntime, `source-types:${timeKey}`);
   if (sourceTypesCache && sourceTypesCacheKey === cacheKey) return sourceTypesCache;
+  if (sourceTypesFetchPromise && sourceTypesFetchPromiseKey === cacheKey) {
+    return sourceTypesFetchPromise;
+  }
 
   sourceTypesCache = null;
   sourceTypesFetchPromise = null;
   sourceTypesCacheKey = cacheKey;
+  sourceTypesFetchPromiseKey = cacheKey;
 
   sourceTypesFetchPromise = dataSource.getSourceTypes(_currentTimeRange)
     .then(values => {
+      browserTenantRuntime.assertCurrent(capturedRuntime);
       sourceTypesCache = values.map(([value]) => value);
       return sourceTypesCache;
     })
     .catch(() => {
-      sourceTypesFetchPromise = null;
+      if (sourceTypesFetchPromiseKey === cacheKey) {
+        sourceTypesFetchPromise = null;
+        sourceTypesFetchPromiseKey = null;
+      }
       return [];
     });
 
@@ -150,8 +270,16 @@ async function fetchLegacyUdmFields(): Promise<UdmFieldInfo[]> {
  * - Schema endpoint unavailable / empty: fall back to `/api/udm/fields`.
  */
 async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
-  if (udmFieldsCache) return udmFieldsCache;
-  if (udmFieldsFetchPromise) return udmFieldsFetchPromise;
+  const capturedRuntime = browserTenantRuntime.current();
+  const cacheKey = tenantModuleCacheKey(capturedRuntime, 'schema-fields');
+  if (udmFieldsCache && udmFieldsCacheKey === cacheKey) return udmFieldsCache;
+  if (udmFieldsFetchPromise && udmFieldsFetchPromiseKey === cacheKey) {
+    return udmFieldsFetchPromise;
+  }
+  udmFieldsCache = null;
+  udmFieldsCacheKey = cacheKey;
+  udmFieldsFetchPromise = null;
+  udmFieldsFetchPromiseKey = cacheKey;
 
   udmFieldsFetchPromise = dataSource
     .getSchemaFields()
@@ -172,47 +300,59 @@ async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
     })
     .catch(() => fetchLegacyUdmFields())
     .then((fields) => {
+      browserTenantRuntime.assertCurrent(capturedRuntime);
       udmFieldsCache = fields;
       return fields;
     })
     .catch(() => {
-      udmFieldsFetchPromise = null;
+      if (udmFieldsFetchPromiseKey === cacheKey) {
+        udmFieldsFetchPromise = null;
+        udmFieldsFetchPromiseKey = null;
+      }
       return [] as UdmFieldInfo[];
     });
 
   return udmFieldsFetchPromise;
 }
 
-function groupByCategory(options: AutocompleteOption[]): Map<string, AutocompleteOption[]> {
-  const grouped = new Map<string, AutocompleteOption[]>();
-  
-  for (const option of options) {
-    const category = option.category || 'Other';
-    if (!grouped.has(category)) {
-      grouped.set(category, []);
-    }
-    grouped.get(category)!.push(option);
+/**
+ * Field suggestions for `partial`, grouped Recent → Popular → Common → rest
+ * (NAN-3812). The universe is the schema fields plus fields seen in the current
+ * results plus the legacy common list; usage comes from `/api/me/field-usage`.
+ */
+async function rankedFieldOptions(
+  partial: string,
+  availableFields: string[],
+  udmFields: UdmFieldInfo[],
+): Promise<AutocompleteOption[]> {
+  const universe = new Map<string, RankableField>();
+  for (const f of udmFields) {
+    universe.set(f.name, { value: f.name, description: f.description || undefined, category: f.category });
   }
-  
-  return grouped;
+  for (const name of availableFields) {
+    if (!universe.has(name)) universe.set(name, { value: name });
+  }
+  const schemaKnown = universe.size > 0;
+  // Legacy aliases only join the universe when there is no schema yet, or the
+  // schema is itself legacy; under OCSF they would bury the real columns.
+  if (!schemaKnown || !universe.has('metadata.log_source')) {
+    for (const f of commonQueryFields) if (!universe.has(f.value)) universe.set(f.value, f);
+  }
+  let usage: FieldUsage | null = null;
+  try {
+    usage = await fetchFieldUsage();
+  } catch {
+    usage = null;
+  }
+  const curated = curatedFieldsFor(schemaKnown ? universe : new Map(), commonQueryFields, curatedOverride);
+  return rankFieldSuggestions({ partial, universe, universeComplete: schemaKnown, usage, curated });
 }
 
-function flattenGroupedOptions(grouped: Map<string, AutocompleteOption[]>): AutocompleteOption[] {
-  const result: AutocompleteOption[] = [];
-  
-  // Sort categories alphabetically, but put "Other" last
-  const sortedCategories = Array.from(grouped.keys()).sort((a, b) => {
-    if (a === 'Other') return 1;
-    if (b === 'Other') return -1;
-    return a.localeCompare(b);
-  });
-  
-  for (const category of sortedCategories) {
-    const options = grouped.get(category)!;
-    result.push(...options);
-  }
-  
-  return result;
+/** Cursor sits where a new search term (field filter) may start, with nothing typed. */
+function isEmptyFilterPosition(textBeforeCursor: string): boolean {
+  if (/\|[^|]*$/.test(textBeforeCursor)) return false; // inside a pipe command
+  if ((textBeforeCursor.match(/"/g) ?? []).length % 2 === 1) return false; // inside a string
+  return /(?:^|\s|\()$/.test(textBeforeCursor);
 }
 
 /**
@@ -225,7 +365,8 @@ function flattenGroupedOptions(grouped: Map<string, AutocompleteOption[]>): Auto
 export async function getQueryAutocompleteSuggestions(
   query: string,
   cursorPos: number,
-  availableFields: string[] = []
+  availableFields: string[] = [],
+  opts: { explicit?: boolean } = {},
 ): Promise<AutocompleteResult> {
   const textBeforeCursor = query.substring(0, cursorPos);
   
@@ -308,7 +449,7 @@ export async function getQueryAutocompleteSuggestions(
     if (knownValues) {
       const matches = knownValues.filter(v => v.value.startsWith(partial));
       if (matches.length > 0) {
-        return { options: matches, context: 'function' };
+        return { options: matches, context: 'argument_value' };
       }
     }
   }
@@ -322,13 +463,13 @@ export async function getQueryAutocompleteSuggestions(
     if (matches.length > 0 && matches.length <= 15) {
       return {
         options: matches.map(m => ({ value: m, description: 'Parameter' })),
-        context: 'function',
+        context: 'parameter',
       };
     }
   }
 
-  // Check for source_type= context
-  const sourceTypeMatch = textBeforeCursor.match(/(?:source_type|sourcetype)\s*=\s*"?([^"\s]*)$/i);
+  // Source-value completion supports canonical OCSF and the isolated legacy lane.
+  const sourceTypeMatch = textBeforeCursor.match(/(?:metadata\.log_source|source_type|sourcetype)\s*=\s*"?([^"\s]*)$/i);
   if (sourceTypeMatch) {
     const partial = sourceTypeMatch[1].toLowerCase();
     try {
@@ -393,6 +534,16 @@ export async function getQueryAutocompleteSuggestions(
   }
   
   const isInFieldContext = fieldContextPatterns.some(pattern => pattern.test(textBeforeCursor));
+
+  // Empty field prompt (Ctrl+Space at the start of the query, or after a
+  // complete filter term): offer the grouped field list, metadata.log_source
+  // first on a cold start. Only on explicit request so it never pops on space.
+  if (opts.explicit && !isInFieldContext && isEmptyFilterPosition(textBeforeCursor)) {
+    const fieldOptions = await rankedFieldOptions('', availableFields, udmFields);
+    if (fieldOptions.length > 0) {
+      return { options: fieldOptions, context: 'field' };
+    }
+  }
   
   // Check for filter condition context - typing a field name for a new condition
   // Matches: start of query (after ---), start of line, after AND/OR, after quotes, after parentheses
@@ -402,58 +553,9 @@ export async function getQueryAutocompleteSuggestions(
   if (isTypingFieldName && !isInFieldContext) {
     const partial = filterConditionMatch[1].toLowerCase();
 
-    let fieldOptions: AutocompleteOption[] = [];
-    const existingValues = new Set<string>();
-
-    // Start with common query fields
-    const matchingCommonFields = commonQueryFields.filter(f =>
-      f.value.toLowerCase().startsWith(partial)
-    );
-    for (const field of matchingCommonFields) {
-      if (!existingValues.has(field.value)) {
-        fieldOptions.push(field);
-        existingValues.add(field.value);
-      }
-    }
-
-    // Add context-specific fields
-    if (availableFields.length > 0) {
-      const contextFields = availableFields
-        .filter(field => field.toLowerCase().startsWith(partial) && !existingValues.has(field))
-        .map(field => {
-          const udmField = udmFields.find(f => f.name === field || f.column_name === field);
-          return {
-            value: field,
-            description: udmField?.description,
-            category: udmField?.category,
-          };
-        });
-
-      for (const field of contextFields) {
-        fieldOptions.push(field);
-        existingValues.add(field.value);
-      }
-    }
-
-    // Add UDM fields from API
-    const allUdmFields = udmFields
-      .filter(f => f.name.toLowerCase().startsWith(partial) && !existingValues.has(f.name))
-      .map(f => ({
-        value: f.name,
-        description: f.description,
-        category: f.category,
-      }));
-
-    fieldOptions = [...fieldOptions, ...allUdmFields];
-
+    const fieldOptions = await rankedFieldOptions(partial, availableFields, udmFields);
     if (fieldOptions.length > 0) {
-      const grouped = groupByCategory(fieldOptions);
-      const flatOptions = flattenGroupedOptions(grouped);
-
-      return {
-        options: flatOptions,
-        context: 'field',
-      };
+      return { options: fieldOptions, context: 'field' };
     }
   }
   
@@ -466,58 +568,9 @@ export async function getQueryAutocompleteSuggestions(
       return { options: [], context: null };
     }
 
-    let fieldOptions: AutocompleteOption[] = [];
-    const existingValues = new Set<string>();
-
-    // Start with common query fields
-    const matchingCommonFields = commonQueryFields.filter(f =>
-      f.value.toLowerCase().startsWith(partial)
-    );
-    for (const field of matchingCommonFields) {
-      if (!existingValues.has(field.value)) {
-        fieldOptions.push(field);
-        existingValues.add(field.value);
-      }
-    }
-
-    // Add context-specific fields
-    if (availableFields.length > 0) {
-      const contextFields = availableFields
-        .filter(field => field.toLowerCase().startsWith(partial) && !existingValues.has(field))
-        .map(field => {
-          const udmField = udmFields.find(f => f.name === field || f.column_name === field);
-          return {
-            value: field,
-            description: udmField?.description,
-            category: udmField?.category,
-          };
-        });
-
-      for (const field of contextFields) {
-        fieldOptions.push(field);
-        existingValues.add(field.value);
-      }
-    }
-
-    // Add UDM fields from API
-    const allUdmFields = udmFields
-      .filter(f => f.name.toLowerCase().startsWith(partial) && !existingValues.has(f.name))
-      .map(f => ({
-        value: f.name,
-        description: f.description,
-        category: f.category,
-      }));
-
-    fieldOptions = [...fieldOptions, ...allUdmFields];
-
+    const fieldOptions = await rankedFieldOptions(partial, availableFields, udmFields);
     if (fieldOptions.length > 0) {
-      const grouped = groupByCategory(fieldOptions);
-      const flatOptions = flattenGroupedOptions(grouped);
-
-      return {
-        options: flatOptions,
-        context: 'field',
-      };
+      return { options: fieldOptions, context: 'field' };
     }
   }
   
@@ -541,4 +594,3 @@ export async function getQueryAutocompleteSuggestions(
     context: null,
   };
 }
-

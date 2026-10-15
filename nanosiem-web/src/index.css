@@ -1,7 +1,11 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
-@custom-variant dark (.dark &);
+/* `dark:` utilities must fire under EVERY dark-appearance theme, not just
+   `.dark`. Without `.matte` here, the ~395 `dark:` classes across the app would
+   silently fall back to their LIGHT styling on a black window — light text on
+   light backgrounds, invisible. Add any future dark-family theme to this list. */
+@custom-variant dark (:is(.dark, .matte, .mono, .dark-pink, .dark-violet, .dark-emerald, .dark-amber) &);
 
 @theme inline {
   /* Colors — all map to CSS vars in :root/.dark */
@@ -34,6 +38,11 @@
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
   --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-7: var(--chart-7);
+  --color-chart-8: var(--chart-8);
+  --color-chart-9: var(--chart-9);
+  --color-chart-10: var(--chart-10);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-primary: var(--sidebar-primary);
@@ -156,6 +165,25 @@
   100% { width: 10%; margin-left: 90%; }
 }
 
+/* LoadingIcon (src/components/icons/LoadingIcon.tsx, NAN-2585): eight dot
+   clusters fade 1 -> 0.2 over one 1s cycle; negative, staggered delays put
+   each cluster 1/8 of a cycle behind its clockwise neighbour so the bright
+   head chases around the ring from the first frame. */
+.nano-loading-icon path {
+  animation: nano-loading-fade 1s linear infinite;
+  animation-delay: calc(-1s * (8 - var(--nano-loading-step, 0)) / 8);
+}
+@keyframes nano-loading-fade {
+  from { opacity: 1; }
+  to { opacity: 0.2; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nano-loading-icon path {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
 /* =============================================================================
    CUSTOM OVERRIDES: Base Font and Rendering Settings
    Requirements: 4.3 - Preserve base font-family and rendering settings
@@ -172,8 +200,8 @@
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  /* PIVT (ambient AI assistant) accent tokens. Violet is deliberately off the
-     cyan brand so PIVT's voice reads as distinct. Hue 300° approximates the
+  /* pivt (ambient AI assistant) accent tokens. Violet is deliberately off the
+     cyan brand so pivt's voice reads as distinct. Hue 300° approximates the
      mockup's #A78BFA. */
   --pivt-accent: oklch(74% 0.16 300);
   --pivt-accent-dim: oklch(58% 0.12 300);
@@ -315,7 +343,7 @@ body {
     0 1px 3px rgba(2, 6, 23, 0.04);
 }
 
-.dark .search-workspace-panel {
+:is(.dark, .matte) .search-workspace-panel {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.02),
     0 2px 8px rgba(2, 6, 23, 0.12);
@@ -483,6 +511,13 @@ body {
     --chart-3: #CA8A04;
     --chart-4: #7C3AED;
     --chart-5: #2563EB;
+    /* 6-10 extend the ramp to the 10 series the chart components actually plot
+       (they previously carried private hex palettes for want of these). */
+    --chart-6: #E11D48;
+    --chart-7: #EA580C;
+    --chart-8: #DB2777;
+    --chart-9: #0E7490;
+    --chart-10: #6D28D9;
 
     --radius: 6px;
 
@@ -658,6 +693,11 @@ body {
     --chart-3: #F59E0B;
     --chart-4: #C084FC;
     --chart-5: #60A5FA;
+    --chart-6: #FB7185;
+    --chart-7: #FB923C;
+    --chart-8: #F472B6;
+    --chart-9: #22D3EE;
+    --chart-10: #A78BFA;
 
     --radius: 6px;
 
@@ -779,8 +819,1250 @@ body {
     --border-primary: #0F1B28;
     --border-secondary: #182029;
   }
+
+  /* ===========================================================================
+     Matte Black (NAN-XXXX) — a THIRD theme, tracking the Omarchy `matte-black`
+     palette (neutral near-black greys #090909→#1E1E1E, amber #E68E0D accent)
+     that the desktop app also ships. Not a variant of `.dark`: it is a peer
+     block, because `.dark` is blue-tinted (#0B0E12 has a visible slate cast)
+     and matte is deliberately hue-free.
+
+     Every token in `.dark` MUST have a value here. A token omitted does not
+     inherit from `.dark` — it falls through to the `:root` LIGHT value, which
+     is how you get a white card on a black window.
+
+     Three deliberate deviations from Omarchy's own colours, all for the same
+     reason (this is a SIEM; status must stay legible before it stays on-brand):
+       - Omarchy's `green` is the same amber as its yellow. A passing check must
+         not read as a warning, so `--success` keeps a desaturated green.
+       - The 5-colour chart palette cannot be monochrome — five indistinguishable
+         series is an unreadable chart — so it spans gold/green/yellow/red/grey.
+       - `--accent-*` chips keep their hue identity (purple/blue/cyan), damped
+         toward the theme rather than collapsed into grey.
+     =========================================================================== */
+  .matte {
+    /* Surfaces — Omarchy background ramp. */
+    --background: #121212;
+    --foreground: #EAEAEA;
+    --card: #161616;
+    --card-foreground: #EAEAEA;
+    --popover: #161616;
+    --popover-foreground: #EAEAEA;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") — Omarchy `accent`. */
+    --primary: #E68E0D;
+    --primary-foreground: #0D0D0D;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #1E1E1E;
+    --secondary-foreground: #EAEAEA;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 (Omarchy `light_foreground`) */
+    --muted: #161616;
+    --muted-foreground: #8A8A8D;
+    --fg-2: #BEBEBE;
+    --fg-4: #6E6E6E;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #1E1E1E;
+    --accent-foreground: #EAEAEA;
+
+    /* Destructive / warning — Omarchy `red` / `yellow`. */
+    --destructive: #D35F5F;
+    --destructive-foreground: #FFFFFF;
+    --warning: #FFC107;
+    --warning-foreground: #201800;
+    --warning-muted: rgba(255, 193, 7, 0.15);
+    --warning-border: rgba(255, 193, 7, 0.35);
+
+    /* Borders + input — Omarchy `selection` / `muted`. */
+    --border: #262626;
+    --input: #0D0D0D;
+    --input-border: #333333;
+    --ring: #E68E0D;
+
+    /* Chart palette — see the deviation note above: discriminability wins. */
+    --chart-1: #E68E0D;
+    --chart-2: #62A583;
+    --chart-3: #FFC107;
+    --chart-4: #D35F5F;
+    --chart-5: #BEBEBE;
+    /* Ten discriminable series on a near-black ground is the hardest ask in this
+       theme; 6-10 are damped hues rather than more greys, which would collide
+       with --chart-5 and with the text ramp. */
+    --chart-6: #8FA8C8;
+    --chart-7: #C97B3D;
+    --chart-8: #A98BC4;
+    --chart-9: #7FBFC4;
+    --chart-10: #8A8A8D;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #0D0D0D;
+    --sidebar-foreground: #EAEAEA;
+    --sidebar-primary: #E68E0D;
+    --sidebar-primary-foreground: #0D0D0D;
+    --sidebar-accent: #1E1E1E;
+    --sidebar-accent-foreground: #EAEAEA;
+    --sidebar-border: #262626;
+    --sidebar-ring: #E68E0D;
+
+    /* Design-kit specific tokens */
+    --outer: #090909;
+    --card-2: #1E1E1E;
+    --panel: #161616;
+    --inspector: #141414;
+    --border-2: #333333;
+    --rule: #1A1A1A;
+    --brand: #E68E0D;
+    --brand-2: #F59E0B;
+    --brand-ink: #0D0D0D;
+    --str: #BEBEBE;
+    --success: #62A583;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — same restraint as dark. */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — near-monochrome with amber carrying the emphasis;
+       pipe stays the loud structural token, as in dark. */
+    --syntax-comment: #555555;
+    --syntax-string: #BEBEBE;
+    --syntax-regex: #D35F5F;
+    --syntax-regex-delim: #C63D3D;
+    --syntax-regex-bg: rgba(211, 95, 95, 0.08);
+    --syntax-wildcard: #FFC107;
+    --syntax-wildcard-bg: rgba(255, 193, 7, 0.08);
+    --syntax-keyword: #F59E0B;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #FFC107;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #F59E0B;
+    --syntax-operator: #8A8A8D;
+    --syntax-pipe: #E68E0D;
+    --syntax-arithmetic: #8A8A8D;
+    --syntax-number: #FFC107;
+
+    /* AI/MeloD purple is a cross-theme brand identity ("preserved across
+       redesign"), NOT a palette colour — it stays purple here on purpose. */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #1E1E1E;
+
+    /* Brand alpha scale (matte) — Omarchy accent #E68E0D = rgb(230, 142, 13) */
+    --brand-50: rgba(230, 142, 13, 0.05);
+    --brand-100: rgba(230, 142, 13, 0.10);
+    --brand-200: rgba(230, 142, 13, 0.20);
+    --brand-300: rgba(230, 142, 13, 0.30);
+    --brand-400: rgba(230, 142, 13, 0.40);
+    --brand-500: rgba(230, 142, 13, 0.50);
+    --brand-600: rgba(230, 142, 13, 0.60);
+    --brand-700: rgba(230, 142, 13, 0.70);
+    --brand-800: rgba(230, 142, 13, 0.80);
+    --brand-900: rgba(230, 142, 13, 0.90);
+    --brand-1000: #E68E0D;
+
+    /* Accent colors (status chips, legends) — hue identity kept, damped. */
+    --accent-purple: #C084FC;
+    --accent-green: #62A583;
+    --accent-blue: #8FA8C8;
+    --accent-orange: #E68E0D;
+    --accent-cyan: #7FBFC4;
+    --accent-yellow: #FFC107;
+    --accent-light-blue: #A8BDD4;
+
+    /* Alpha white scale (matte — same as dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+  }
+
+  /* ===========================================================================
+     Matte Mono (NAN-2467)
+     =========================================================================== */
+  .mono {
+    /* Surfaces — Omarchy background ramp. */
+    --background: #121212;
+    --foreground: #EAEAEA;
+    --card: #161616;
+    --card-foreground: #EAEAEA;
+    --popover: #161616;
+    --popover-foreground: #EAEAEA;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") — Omarchy `accent`. */
+    --primary: #EAEAEA;
+    --primary-foreground: #0D0D0D;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #1E1E1E;
+    --secondary-foreground: #EAEAEA;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 (Omarchy `light_foreground`) */
+    --muted: #161616;
+    --muted-foreground: #8A8A8D;
+    --fg-2: #BEBEBE;
+    --fg-4: #6E6E6E;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #1E1E1E;
+    --accent-foreground: #EAEAEA;
+
+    /* Destructive / warning — Omarchy `red` / `yellow`. */
+    --destructive: #D35F5F;
+    --destructive-foreground: #FFFFFF;
+    --warning: #FFC107;
+    --warning-foreground: #201800;
+    --warning-muted: rgba(255, 193, 7, 0.15);
+    --warning-border: rgba(255, 193, 7, 0.35);
+
+    /* Borders + input — Omarchy `selection` / `muted`. */
+    --border: #262626;
+    --input: #0D0D0D;
+    --input-border: #333333;
+    --ring: #BEBEBE;
+
+    /* Chart palette — see the deviation note above: discriminability wins. */
+    --chart-1: #BEBEBE;
+    --chart-2: #62A583;
+    --chart-3: #8A8A8D;
+    --chart-4: #D35F5F;
+    --chart-5: #EAEAEA;
+    /* Ten discriminable series on a near-black ground is the hardest ask in this
+       theme; 6-10 are damped hues rather than more greys, which would collide
+       with --chart-5 and with the text ramp. */
+    --chart-6: #8FA8C8;
+    --chart-7: #A0A0A0;
+    --chart-8: #A98BC4;
+    --chart-9: #6E6E6E;
+    --chart-10: #8A8A8D;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #0D0D0D;
+    --sidebar-foreground: #EAEAEA;
+    --sidebar-primary: #BEBEBE;
+    --sidebar-primary-foreground: #0D0D0D;
+    --sidebar-accent: #1E1E1E;
+    --sidebar-accent-foreground: #EAEAEA;
+    --sidebar-border: #262626;
+    --sidebar-ring: #BEBEBE;
+
+    /* Design-kit specific tokens */
+    --outer: #090909;
+    --card-2: #1E1E1E;
+    --panel: #161616;
+    --inspector: #141414;
+    --border-2: #333333;
+    --rule: #1A1A1A;
+    --brand: #EAEAEA;
+    --brand-2: #BEBEBE;
+    --brand-ink: #0D0D0D;
+    --str: #BEBEBE;
+    --success: #62A583;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — same restraint as dark. */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — grayscale by design, so token classes are told
+       apart by LUMINANCE steps (plus the weights in codemirror-theme.ts), and
+       regex keeps the one red accent. NAN-3195: keyword, string, field and
+       number used to share #BEBEBE, which read as no highlighting at all. */
+    --syntax-comment: #5C5C5C;
+    --syntax-string: #9E9E9E;
+    --syntax-regex: #D35F5F;
+    --syntax-regex-delim: #C63D3D;
+    --syntax-regex-bg: rgba(211, 95, 95, 0.08);
+    --syntax-wildcard: #D4D4D4;
+    --syntax-wildcard-bg: rgba(190, 190, 190, 0.08);
+    --syntax-keyword: #FFFFFF;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #D4D4D4;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #C2C2C2;
+    --syntax-operator: #7A7A7D;
+    --syntax-pipe: #8A8A8D;
+    --syntax-arithmetic: #7A7A7D;
+    --syntax-number: #D9D9D9;
+
+    /* AI/MeloD purple is a cross-theme brand identity ("preserved across
+       redesign"), NOT a palette colour — it stays purple here on purpose. */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #1E1E1E;
+
+    /* Brand alpha scale (mono) — #EAEAEA = rgb(234, 234, 234) */
+    --brand-50: rgba(234, 234, 234, 0.05);
+    --brand-100: rgba(234, 234, 234, 0.10);
+    --brand-200: rgba(234, 234, 234, 0.20);
+    --brand-300: rgba(234, 234, 234, 0.30);
+    --brand-400: rgba(234, 234, 234, 0.40);
+    --brand-500: rgba(234, 234, 234, 0.50);
+    --brand-600: rgba(234, 234, 234, 0.60);
+    --brand-700: rgba(234, 234, 234, 0.70);
+    --brand-800: rgba(234, 234, 234, 0.80);
+    --brand-900: rgba(234, 234, 234, 0.90);
+    --brand-1000: #EAEAEA;
+
+    /* Accent colors (status chips, legends) — hue identity kept, damped. */
+    --accent-purple: #C084FC;
+    --accent-green: #62A583;
+    --accent-blue: #8FA8C8;
+    --accent-orange: #8A8A8D;
+    --accent-cyan: #BEBEBE;
+    --accent-yellow: #8A8A8D;
+    --accent-light-blue: #A8BDD4;
+
+    /* Alpha white scale (matte — same as dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+  }
+
+  /* ===========================================================================
+     Dark · Pink (NAN-2467)
+     =========================================================================== */
+  .dark-pink {
+    /* Surfaces */
+    --background: #0B0E12;
+    --foreground: #E5E7EB;
+    --card: #11151B;
+    --card-foreground: #E5E7EB;
+    --popover: #0E1319;
+    --popover-foreground: #E5E7EB;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #FF5CA8;
+    --primary-foreground: #08090C;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #161B23;
+    --secondary-foreground: #E5E7EB;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 */
+    --muted: #0F1319;
+    --muted-foreground: #A8ACB4;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #C3C7CF;
+    --fg-4: #6B7280;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #161B23;
+    --accent-foreground: #E5E7EB;
+
+    /* Destructive / warning */
+    --destructive: #F87171;
+    --destructive-foreground: #FFFFFF;
+    --warning: #F59E0B;
+    --warning-foreground: #422006;
+    --warning-muted: rgba(245, 158, 11, 0.15);
+    --warning-border: rgba(245, 158, 11, 0.35);
+
+    /* Borders + input */
+    --border: #1A1F27;
+    --input: #0E1319;
+    --input-border: #272C35;
+    --ring: #FF5CA8;
+
+    /* Chart palette — dark mode */
+    --chart-1: #FF5CA8;
+    --chart-2: #34D399;
+    --chart-3: #F59E0B;
+    --chart-4: #C084FC;
+    --chart-5: #60A5FA;
+    --chart-6: #FB7185;
+    --chart-7: #FB923C;
+    --chart-8: #F472B6;
+    --chart-9: #22D3EE;
+    --chart-10: #A78BFA;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #06080B;
+    --sidebar-foreground: #E5E7EB;
+    --sidebar-primary: #FF5CA8;
+    --sidebar-primary-foreground: #08090C;
+    --sidebar-accent: #161B23;
+    --sidebar-accent-foreground: #E5E7EB;
+    --sidebar-border: #1A1F27;
+    --sidebar-ring: #FF5CA8;
+
+    /* Design-kit specific tokens */
+    --outer: #06080B;
+    --card-2: #161B23;
+    --panel: #0F1319;
+    --inspector: #0E1218;
+    --border-2: #272C35;
+    --rule: #12161C;
+    --brand: #FF5CA8;
+    --brand-2: #FF5CA8;
+    --brand-ink: #08090C;
+    --str: #D8F7F9;
+    --success: #34D399;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — restrained; kit reserves shadows for modals/popovers */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — dark mode. Palette aligned with
+       `design-ref/shadcn/editor-code.jsx` (NAN-484): YAML keys + strings in
+       cyan, pipe as the loud structural token, logic operators + numbers in
+       amber, functions in brand cyan. UDM field names stay plain fg so the
+       query body has visual variety — otherwise everything reads cyan. */
+    --syntax-comment: #8b949e;
+    --syntax-string: #D8F7F9;
+    --syntax-regex: #f48fb1;
+    --syntax-regex-delim: #f06292;
+    --syntax-regex-bg: rgba(244, 143, 177, 0.08);
+    --syntax-wildcard: #ffb74d;
+    --syntax-wildcard-bg: rgba(255, 183, 77, 0.08);
+    --syntax-keyword: #ffb74d;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #64b5f6;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #9FF3F8;
+    --syntax-operator: #ffb74d;
+    --syntax-pipe: #9FF3F8;
+    --syntax-arithmetic: #ffb74d;
+    --syntax-number: #ffb74d;
+
+    /* AI/MeloD theme — dark mode (distinct purple preserved across redesign) */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #161B23;
+
+    /* Brand alpha scale (dark) — uses kit brand cyan #5EE7F0 = rgb(94, 231, 240) */
+    --brand-50: rgba(255, 92, 168, 0.05);
+    --brand-100: rgba(255, 92, 168, 0.10);
+    --brand-200: rgba(255, 92, 168, 0.20);
+    --brand-300: rgba(255, 92, 168, 0.30);
+    --brand-400: rgba(255, 92, 168, 0.40);
+    --brand-500: rgba(255, 92, 168, 0.50);
+    --brand-600: rgba(255, 92, 168, 0.60);
+    --brand-700: rgba(255, 92, 168, 0.70);
+    --brand-800: rgba(255, 92, 168, 0.80);
+    --brand-900: rgba(255, 92, 168, 0.90);
+    --brand-1000: #FF5CA8;
+
+    /* Accent colors (status chips, legends, etc.) — dark mode */
+    --accent-purple: #C084FC;
+    --accent-green: #4ADE80;
+    --accent-blue: #60A5FA;
+    --accent-orange: #FDBA74;
+    --accent-cyan: #22D3EE;
+    --accent-yellow: #FACC15;
+    --accent-light-blue: #93C5FD;
+
+    /* Alpha white scale (dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+
+    /* Legacy border tokens (used by pre-redesign components; kept for back-compat until routes are ported) */
+          }
+
+  /* ===========================================================================
+     Dark · Violet (NAN-2467)
+     =========================================================================== */
+  .dark-violet {
+    /* Surfaces */
+    --background: #0B0E12;
+    --foreground: #E5E7EB;
+    --card: #11151B;
+    --card-foreground: #E5E7EB;
+    --popover: #0E1319;
+    --popover-foreground: #E5E7EB;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #B58CFF;
+    --primary-foreground: #08090C;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #161B23;
+    --secondary-foreground: #E5E7EB;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 */
+    --muted: #0F1319;
+    --muted-foreground: #A8ACB4;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #C3C7CF;
+    --fg-4: #6B7280;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #161B23;
+    --accent-foreground: #E5E7EB;
+
+    /* Destructive / warning */
+    --destructive: #F87171;
+    --destructive-foreground: #FFFFFF;
+    --warning: #F59E0B;
+    --warning-foreground: #422006;
+    --warning-muted: rgba(245, 158, 11, 0.15);
+    --warning-border: rgba(245, 158, 11, 0.35);
+
+    /* Borders + input */
+    --border: #1A1F27;
+    --input: #0E1319;
+    --input-border: #272C35;
+    --ring: #B58CFF;
+
+    /* Chart palette — dark mode */
+    --chart-1: #B58CFF;
+    --chart-2: #34D399;
+    --chart-3: #F59E0B;
+    --chart-4: #C084FC;
+    --chart-5: #60A5FA;
+    --chart-6: #FB7185;
+    --chart-7: #FB923C;
+    --chart-8: #F472B6;
+    --chart-9: #22D3EE;
+    --chart-10: #A78BFA;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #06080B;
+    --sidebar-foreground: #E5E7EB;
+    --sidebar-primary: #B58CFF;
+    --sidebar-primary-foreground: #08090C;
+    --sidebar-accent: #161B23;
+    --sidebar-accent-foreground: #E5E7EB;
+    --sidebar-border: #1A1F27;
+    --sidebar-ring: #B58CFF;
+
+    /* Design-kit specific tokens */
+    --outer: #06080B;
+    --card-2: #161B23;
+    --panel: #0F1319;
+    --inspector: #0E1218;
+    --border-2: #272C35;
+    --rule: #12161C;
+    --brand: #B58CFF;
+    --brand-2: #B58CFF;
+    --brand-ink: #08090C;
+    --str: #D8F7F9;
+    --success: #34D399;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — restrained; kit reserves shadows for modals/popovers */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — dark mode. Palette aligned with
+       `design-ref/shadcn/editor-code.jsx` (NAN-484): YAML keys + strings in
+       cyan, pipe as the loud structural token, logic operators + numbers in
+       amber, functions in brand cyan. UDM field names stay plain fg so the
+       query body has visual variety — otherwise everything reads cyan. */
+    --syntax-comment: #8b949e;
+    --syntax-string: #D8F7F9;
+    --syntax-regex: #f48fb1;
+    --syntax-regex-delim: #f06292;
+    --syntax-regex-bg: rgba(244, 143, 177, 0.08);
+    --syntax-wildcard: #ffb74d;
+    --syntax-wildcard-bg: rgba(255, 183, 77, 0.08);
+    --syntax-keyword: #ffb74d;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #64b5f6;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #9FF3F8;
+    --syntax-operator: #ffb74d;
+    --syntax-pipe: #9FF3F8;
+    --syntax-arithmetic: #ffb74d;
+    --syntax-number: #ffb74d;
+
+    /* AI/MeloD theme — dark mode (distinct purple preserved across redesign) */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #161B23;
+
+    /* Brand alpha scale (dark) — uses kit brand cyan #5EE7F0 = rgb(94, 231, 240) */
+    --brand-50: rgba(181, 140, 255, 0.05);
+    --brand-100: rgba(181, 140, 255, 0.10);
+    --brand-200: rgba(181, 140, 255, 0.20);
+    --brand-300: rgba(181, 140, 255, 0.30);
+    --brand-400: rgba(181, 140, 255, 0.40);
+    --brand-500: rgba(181, 140, 255, 0.50);
+    --brand-600: rgba(181, 140, 255, 0.60);
+    --brand-700: rgba(181, 140, 255, 0.70);
+    --brand-800: rgba(181, 140, 255, 0.80);
+    --brand-900: rgba(181, 140, 255, 0.90);
+    --brand-1000: #B58CFF;
+
+    /* Accent colors (status chips, legends, etc.) — dark mode */
+    --accent-purple: #C084FC;
+    --accent-green: #4ADE80;
+    --accent-blue: #60A5FA;
+    --accent-orange: #FDBA74;
+    --accent-cyan: #22D3EE;
+    --accent-yellow: #FACC15;
+    --accent-light-blue: #93C5FD;
+
+    /* Alpha white scale (dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+
+    /* Legacy border tokens (used by pre-redesign components; kept for back-compat until routes are ported) */
+          }
+
+  /* ===========================================================================
+     Dark · Emerald (NAN-2467)
+     =========================================================================== */
+  .dark-emerald {
+    /* Surfaces */
+    --background: #0B0E12;
+    --foreground: #E5E7EB;
+    --card: #11151B;
+    --card-foreground: #E5E7EB;
+    --popover: #0E1319;
+    --popover-foreground: #E5E7EB;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #4FD6A0;
+    --primary-foreground: #08090C;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #161B23;
+    --secondary-foreground: #E5E7EB;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 */
+    --muted: #0F1319;
+    --muted-foreground: #A8ACB4;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #C3C7CF;
+    --fg-4: #6B7280;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #161B23;
+    --accent-foreground: #E5E7EB;
+
+    /* Destructive / warning */
+    --destructive: #F87171;
+    --destructive-foreground: #FFFFFF;
+    --warning: #F59E0B;
+    --warning-foreground: #422006;
+    --warning-muted: rgba(245, 158, 11, 0.15);
+    --warning-border: rgba(245, 158, 11, 0.35);
+
+    /* Borders + input */
+    --border: #1A1F27;
+    --input: #0E1319;
+    --input-border: #272C35;
+    --ring: #4FD6A0;
+
+    /* Chart palette — dark mode */
+    --chart-1: #4FD6A0;
+    --chart-2: #34D399;
+    --chart-3: #F59E0B;
+    --chart-4: #C084FC;
+    --chart-5: #60A5FA;
+    --chart-6: #FB7185;
+    --chart-7: #FB923C;
+    --chart-8: #F472B6;
+    --chart-9: #22D3EE;
+    --chart-10: #A78BFA;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #06080B;
+    --sidebar-foreground: #E5E7EB;
+    --sidebar-primary: #4FD6A0;
+    --sidebar-primary-foreground: #08090C;
+    --sidebar-accent: #161B23;
+    --sidebar-accent-foreground: #E5E7EB;
+    --sidebar-border: #1A1F27;
+    --sidebar-ring: #4FD6A0;
+
+    /* Design-kit specific tokens */
+    --outer: #06080B;
+    --card-2: #161B23;
+    --panel: #0F1319;
+    --inspector: #0E1218;
+    --border-2: #272C35;
+    --rule: #12161C;
+    --brand: #4FD6A0;
+    --brand-2: #4FD6A0;
+    --brand-ink: #08090C;
+    --str: #D8F7F9;
+    --success: #34D399;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — restrained; kit reserves shadows for modals/popovers */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — dark mode. Palette aligned with
+       `design-ref/shadcn/editor-code.jsx` (NAN-484): YAML keys + strings in
+       cyan, pipe as the loud structural token, logic operators + numbers in
+       amber, functions in brand cyan. UDM field names stay plain fg so the
+       query body has visual variety — otherwise everything reads cyan. */
+    --syntax-comment: #8b949e;
+    --syntax-string: #D8F7F9;
+    --syntax-regex: #f48fb1;
+    --syntax-regex-delim: #f06292;
+    --syntax-regex-bg: rgba(244, 143, 177, 0.08);
+    --syntax-wildcard: #ffb74d;
+    --syntax-wildcard-bg: rgba(255, 183, 77, 0.08);
+    --syntax-keyword: #ffb74d;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #64b5f6;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #9FF3F8;
+    --syntax-operator: #ffb74d;
+    --syntax-pipe: #9FF3F8;
+    --syntax-arithmetic: #ffb74d;
+    --syntax-number: #ffb74d;
+
+    /* AI/MeloD theme — dark mode (distinct purple preserved across redesign) */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #161B23;
+
+    /* Brand alpha scale (dark) — uses kit brand cyan #5EE7F0 = rgb(94, 231, 240) */
+    --brand-50: rgba(79, 214, 160, 0.05);
+    --brand-100: rgba(79, 214, 160, 0.10);
+    --brand-200: rgba(79, 214, 160, 0.20);
+    --brand-300: rgba(79, 214, 160, 0.30);
+    --brand-400: rgba(79, 214, 160, 0.40);
+    --brand-500: rgba(79, 214, 160, 0.50);
+    --brand-600: rgba(79, 214, 160, 0.60);
+    --brand-700: rgba(79, 214, 160, 0.70);
+    --brand-800: rgba(79, 214, 160, 0.80);
+    --brand-900: rgba(79, 214, 160, 0.90);
+    --brand-1000: #4FD6A0;
+
+    /* Accent colors (status chips, legends, etc.) — dark mode */
+    --accent-purple: #C084FC;
+    --accent-green: #4ADE80;
+    --accent-blue: #60A5FA;
+    --accent-orange: #FDBA74;
+    --accent-cyan: #22D3EE;
+    --accent-yellow: #FACC15;
+    --accent-light-blue: #93C5FD;
+
+    /* Alpha white scale (dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+
+    /* Legacy border tokens (used by pre-redesign components; kept for back-compat until routes are ported) */
+          }
+
+  /* ===========================================================================
+     Dark · Amber (NAN-2467)
+     =========================================================================== */
+  .dark-amber {
+    /* Surfaces */
+    --background: #0B0E12;
+    --foreground: #E5E7EB;
+    --card: #11151B;
+    --card-foreground: #E5E7EB;
+    --popover: #0E1319;
+    --popover-foreground: #E5E7EB;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #FFB454;
+    --primary-foreground: #08090C;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #161B23;
+    --secondary-foreground: #E5E7EB;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 */
+    --muted: #0F1319;
+    --muted-foreground: #A8ACB4;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #C3C7CF;
+    --fg-4: #6B7280;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #161B23;
+    --accent-foreground: #E5E7EB;
+
+    /* Destructive / warning */
+    --destructive: #F87171;
+    --destructive-foreground: #FFFFFF;
+    --warning: #F59E0B;
+    --warning-foreground: #422006;
+    --warning-muted: rgba(245, 158, 11, 0.15);
+    --warning-border: rgba(245, 158, 11, 0.35);
+
+    /* Borders + input */
+    --border: #1A1F27;
+    --input: #0E1319;
+    --input-border: #272C35;
+    --ring: #FFB454;
+
+    /* Chart palette — dark mode */
+    --chart-1: #FFB454;
+    --chart-2: #34D399;
+    --chart-3: #F59E0B;
+    --chart-4: #C084FC;
+    --chart-5: #60A5FA;
+    --chart-6: #FB7185;
+    --chart-7: #FB923C;
+    --chart-8: #F472B6;
+    --chart-9: #22D3EE;
+    --chart-10: #A78BFA;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #06080B;
+    --sidebar-foreground: #E5E7EB;
+    --sidebar-primary: #FFB454;
+    --sidebar-primary-foreground: #08090C;
+    --sidebar-accent: #161B23;
+    --sidebar-accent-foreground: #E5E7EB;
+    --sidebar-border: #1A1F27;
+    --sidebar-ring: #FFB454;
+
+    /* Design-kit specific tokens */
+    --outer: #06080B;
+    --card-2: #161B23;
+    --panel: #0F1319;
+    --inspector: #0E1218;
+    --border-2: #272C35;
+    --rule: #12161C;
+    --brand: #FFB454;
+    --brand-2: #FFB454;
+    --brand-ink: #08090C;
+    --str: #D8F7F9;
+    --success: #34D399;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — restrained; kit reserves shadows for modals/popovers */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — dark mode. Palette aligned with
+       `design-ref/shadcn/editor-code.jsx` (NAN-484): YAML keys + strings in
+       cyan, pipe as the loud structural token, logic operators + numbers in
+       amber, functions in brand cyan. UDM field names stay plain fg so the
+       query body has visual variety — otherwise everything reads cyan. */
+    --syntax-comment: #8b949e;
+    --syntax-string: #D8F7F9;
+    --syntax-regex: #f48fb1;
+    --syntax-regex-delim: #f06292;
+    --syntax-regex-bg: rgba(244, 143, 177, 0.08);
+    --syntax-wildcard: #ffb74d;
+    --syntax-wildcard-bg: rgba(255, 183, 77, 0.08);
+    --syntax-keyword: #ffb74d;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #64b5f6;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #9FF3F8;
+    --syntax-operator: #ffb74d;
+    --syntax-pipe: #9FF3F8;
+    --syntax-arithmetic: #ffb74d;
+    --syntax-number: #ffb74d;
+
+    /* AI/MeloD theme — dark mode (distinct purple preserved across redesign) */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #161B23;
+
+    /* Brand alpha scale (dark) — uses kit brand cyan #5EE7F0 = rgb(94, 231, 240) */
+    --brand-50: rgba(255, 180, 84, 0.05);
+    --brand-100: rgba(255, 180, 84, 0.10);
+    --brand-200: rgba(255, 180, 84, 0.20);
+    --brand-300: rgba(255, 180, 84, 0.30);
+    --brand-400: rgba(255, 180, 84, 0.40);
+    --brand-500: rgba(255, 180, 84, 0.50);
+    --brand-600: rgba(255, 180, 84, 0.60);
+    --brand-700: rgba(255, 180, 84, 0.70);
+    --brand-800: rgba(255, 180, 84, 0.80);
+    --brand-900: rgba(255, 180, 84, 0.90);
+    --brand-1000: #FFB454;
+
+    /* Accent colors (status chips, legends, etc.) — dark mode */
+    --accent-purple: #C084FC;
+    --accent-green: #4ADE80;
+    --accent-blue: #60A5FA;
+    --accent-orange: #FDBA74;
+    --accent-cyan: #22D3EE;
+    --accent-yellow: #FACC15;
+    --accent-light-blue: #93C5FD;
+
+    /* Alpha white scale (dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+
+    /* Legacy border tokens (used by pre-redesign components; kept for back-compat until routes are ported) */
+          }
   body {
     letter-spacing: var(--tracking-normal);
+  }
+
+  /* Matte White — monochrome light: paper surfaces, ink accent. */
+  .paper {
+    /* Surfaces */
+    --background: #FFFFFF;
+    --foreground: #111111;
+    --card: #FFFFFF;
+    --card-foreground: #111111;
+    --popover: #FFFFFF;
+    --popover-foreground: #111111;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #111111;
+    --primary-foreground: #FFFFFF;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #F5F5F5;
+    --secondary-foreground: #111111;
+
+    /* Muted = kit panel (softer bg), muted-fg = kit fg-3 */
+    --muted: #FAFAFA;
+    --muted-foreground: #64748B;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #334155;
+    --fg-4: #94A3B8;
+
+    /* Accent = kit card-2 (hover/selected states) */
+    --accent: #F5F5F5;
+    --accent-foreground: #111111;
+
+    /* Destructive / warning */
+    --destructive: #B91C1C;
+    --destructive-foreground: #FFFFFF;
+    --warning: #CA8A04;
+    --warning-foreground: #422006;
+    --warning-muted: #FEF9C3;
+    --warning-border: #FDE68A;
+
+    /* Borders + input */
+    --border: #E4E4E4;
+    --input: #FFFFFF;
+    --input-border: #CBD5E1;
+    --ring: #111111;
+
+    /* Chart palette — neutral placeholders; route PRs can refine */
+    --chart-1: #111111;
+    --chart-2: #059669;
+    --chart-3: #CA8A04;
+    --chart-4: #7C3AED;
+    --chart-5: #2563EB;
+    /* 6-10 extend the ramp to the 10 series the chart components actually plot
+       (they previously carried private hex palettes for want of these). */
+    --chart-6: #E11D48;
+    --chart-7: #EA580C;
+    --chart-8: #DB2777;
+    --chart-9: #333333;
+    --chart-10: #6D28D9;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #E4E4E4;
+    --sidebar-foreground: #111111;
+    --sidebar-primary: #111111;
+    --sidebar-primary-foreground: #FFFFFF;
+    --sidebar-accent: #F5F5F5;
+    --sidebar-accent-foreground: #111111;
+    --sidebar-border: #E4E4E4;
+    --sidebar-ring: #111111;
+
+    /* Design-kit specific tokens */
+    --outer: #E4E4E4;
+    --card-2: #F5F5F5;
+    --panel: #FAFAFA;
+    --inspector: #FAFAFA;
+    --border-2: #CBD5E1;
+    --rule: #EDF2F7;
+    --brand: #111111;
+    --brand-2: #333333;
+    --brand-ink: #FFFFFF;
+    --str: #333333;
+    --success: #059669;
+
+    /* Fonts */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — disabled by default; kit uses shadows only on modals/popovers */
+    --shadow-color: rgba(15, 23, 42, 0.10);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(15, 23, 42, 0.04);
+    --shadow-xs: 0 1px 2px 0 rgba(15, 23, 42, 0.06);
+    --shadow-sm: 0 1px 3px 0 rgba(15, 23, 42, 0.08);
+    --shadow: 0 2px 4px 0 rgba(15, 23, 42, 0.08);
+    --shadow-md: 0 4px 8px -2px rgba(15, 23, 42, 0.10);
+    --shadow-lg: 0 10px 20px -4px rgba(15, 23, 42, 0.12);
+    --shadow-xl: 0 20px 40px -8px rgba(15, 23, 42, 0.16);
+    --shadow-2xl: 0 28px 60px -12px rgba(15, 23, 42, 0.24);
+    --tracking-normal: 0em;
+
+    /* Syntax highlighting — light mode (preserved; CodeMirror-specific, not part of kit) */
+    --syntax-comment: #8a8a8a;
+    --syntax-string: #444444;
+    --syntax-regex: #444444;
+    --syntax-regex-delim: #9c1453;
+    --syntax-regex-bg: rgba(194, 24, 91, 0.07);
+    --syntax-wildcard: #111111;
+    --syntax-wildcard-bg: rgba(230, 81, 0, 0.07);
+    --syntax-keyword: #111111;
+    --syntax-function: #444444;
+    --syntax-eval-function: #0277bd;
+    --syntax-udm-field: #1565c0;
+    --syntax-field: #222222;
+    --syntax-operator: #8a8a8a;
+    --syntax-pipe: #8a8a8a;
+    --syntax-arithmetic: #111111;
+    --syntax-number: #111111;
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #E4E4E4;
+
+    /* Accent colors (status chips, legends, etc.) — light mode */
+    --accent-purple: #7c3aed;
+    --accent-green: #16a34a;
+    --accent-blue: #2563eb;
+    --accent-orange: #c2410c;
+    --accent-cyan: #0891b2;
+    --accent-yellow: #ca8a04;
+    --accent-light-blue: #3b82f6;
+
+    /* AI/MeloD theme — distinct purple for AI features, preserved across redesign */
+    --ai: #7c3aed;
+    --ai-foreground: #ffffff;
+    --ai-muted: #6d28d9;
+    --ai-border: rgba(124, 58, 237, 0.35);
+    --ai-bg: rgba(124, 58, 237, 0.10);
+    --ai-bg-subtle: rgba(124, 58, 237, 0.06);
+    --ai-shadow: rgba(124, 58, 237, 0.15);
+
+    /* Brand alpha scale (light) — uses kit brand cyan #111111 = rgb(8, 145, 178) */
+    --brand-50: rgba(17, 17, 17, 0.05);
+    --brand-100: rgba(17, 17, 17, 0.10);
+    --brand-200: rgba(17, 17, 17, 0.20);
+    --brand-300: rgba(17, 17, 17, 0.30);
+    --brand-400: rgba(17, 17, 17, 0.40);
+    --brand-500: rgba(17, 17, 17, 0.50);
+    --brand-600: rgba(17, 17, 17, 0.60);
+    --brand-700: rgba(17, 17, 17, 0.70);
+    --brand-800: rgba(17, 17, 17, 0.80);
+    --brand-900: rgba(17, 17, 17, 0.90);
+    --brand-1000: #111111;
+
+    /* Alpha white scale (light — uses near-black since "white overlay" is inverted) */
+    --alpha-white-50: rgba(15, 23, 42, 0.05);
+    --alpha-white-100: rgba(15, 23, 42, 0.10);
+    --alpha-white-200: rgba(15, 23, 42, 0.20);
+    --alpha-white-300: rgba(15, 23, 42, 0.30);
+    --alpha-white-400: rgba(15, 23, 42, 0.40);
+    --alpha-white-500: rgba(15, 23, 42, 0.50);
+    --alpha-white-600: rgba(15, 23, 42, 0.60);
+    --alpha-white-700: rgba(15, 23, 42, 0.70);
+    --alpha-white-800: rgba(15, 23, 42, 0.80);
+    --alpha-white-900: rgba(15, 23, 42, 0.90);
   }
 }
 
@@ -834,6 +2116,54 @@ body {
 }
 
 /* =============================================================================
+   TOASTS (sonner) — NAN-2788
+   Sonner only defines its --normal-* / --{success,info,warning,error}-* tokens
+   for `data-sonner-theme="light|dark"`. Every toast surface is re-pointed at the
+   app theme tokens here, so a toast is opaque and on-palette in EVERY theme
+   block (see theme-parity.test.ts). Deliberately UNLAYERED with a `:root`
+   prefix: sonner injects its stylesheet unlayered at runtime, which beats any
+   `@layer` rule (so Tailwind classNames on the toast never apply), and its
+   theme rules are (0,2,0) — (0,3,0) wins regardless of injection order.
+   The semantic tints mix an opaque accent into the opaque popover surface, so
+   the result stays opaque.
+   ============================================================================= */
+:root [data-sonner-toaster][data-sonner-theme] {
+  font-family: var(--font-sans);
+  --border-radius: var(--radius);
+  --normal-bg: var(--popover);
+  --normal-bg-hover: var(--accent);
+  --normal-border: var(--border);
+  --normal-border-hover: var(--border-2);
+  --normal-text: var(--popover-foreground);
+  --success-bg: color-mix(in srgb, var(--success) 12%, var(--popover));
+  --success-border: color-mix(in srgb, var(--success) 40%, var(--popover));
+  --success-text: var(--popover-foreground);
+  --info-bg: color-mix(in srgb, var(--primary) 12%, var(--popover));
+  --info-border: color-mix(in srgb, var(--primary) 40%, var(--popover));
+  --info-text: var(--popover-foreground);
+  --warning-bg: color-mix(in srgb, var(--warning) 12%, var(--popover));
+  --warning-border: color-mix(in srgb, var(--warning) 40%, var(--popover));
+  --warning-text: var(--popover-foreground);
+  --error-bg: color-mix(in srgb, var(--destructive) 12%, var(--popover));
+  --error-border: color-mix(in srgb, var(--destructive) 40%, var(--popover));
+  --error-text: var(--popover-foreground);
+}
+/* Sonner hard-codes #3f3f3f (light) / #e8e8e8 (dark) for descriptions. */
+:root [data-sonner-toaster] [data-sonner-toast][data-styled='true']:not([data-rich-colors='true']) [data-description] {
+  color: var(--muted-foreground);
+}
+:root [data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-close-button] {
+  background: var(--normal-bg);
+  border-color: var(--normal-border);
+  color: var(--normal-text);
+}
+/* Semantic icon tint — the only per-variant signal on a plain (non-rich) toast. */
+:root [data-sonner-toaster] [data-sonner-toast][data-type='success'] [data-icon] { color: var(--success); }
+:root [data-sonner-toaster] [data-sonner-toast][data-type='info'] [data-icon] { color: var(--primary); }
+:root [data-sonner-toaster] [data-sonner-toast][data-type='warning'] [data-icon] { color: var(--warning); }
+:root [data-sonner-toaster] [data-sonner-toast][data-type='error'] [data-icon] { color: var(--destructive); }
+
+/* =============================================================================
    UTILITY CLASSES: Field Labels
    Standardized styling for field labels in cards and detail views.
    Use .field-label for consistent mini-header style across the app.
@@ -842,7 +2172,7 @@ body {
   @apply text-xs font-medium uppercase tracking-wide mb-1;
   color: oklch(0.45 0 0); /* Gray-500 equivalent for light mode */
 }
-.dark .field-label {
+:is(.dark, .matte) .field-label {
   color: oklch(0.65 0 0); /* Gray-400 equivalent for dark mode */
 }
 
@@ -875,7 +2205,7 @@ body {
 .recharts-cartesian-axis-tick-value {
   fill: oklch(0.5 0 0) !important; /* Neutral gray that works in both modes */
 }
-.dark .recharts-cartesian-axis-tick-value {
+:is(.dark, .matte) .recharts-cartesian-axis-tick-value {
   fill: oklch(0.65 0 0) !important; /* Lighter for dark mode */
 }
 
@@ -884,8 +2214,8 @@ body {
 .recharts-cartesian-grid-vertical line {
   stroke: oklch(0.85 0 0) !important; /* Light gray for light mode */
 }
-.dark .recharts-cartesian-grid-horizontal line,
-.dark .recharts-cartesian-grid-vertical line {
+:is(.dark, .matte, .mono, .dark-pink, .dark-violet, .dark-emerald, .dark-amber) .recharts-cartesian-grid-horizontal line,
+:is(.dark, .matte, .mono, .dark-pink, .dark-violet, .dark-emerald, .dark-amber) .recharts-cartesian-grid-vertical line {
   stroke: oklch(0.25 0 0) !important; /* Dark gray for dark mode */
 }
 
@@ -1008,11 +2338,27 @@ body {
 }
 
 .cm-tooltip-autocomplete > ul > li {
-  padding: 6px 12px !important;
+  padding: 4px 10px !important;
+  line-height: 18px;
   display: flex;
   align-items: center;
   gap: 8px;
   color: var(--card-foreground);
+}
+
+/* Field-group labels (NAN-3812): tiny sans label above each group. */
+.cm-tooltip-autocomplete > ul > completion-section {
+  display: block;
+  padding: 6px 10px 2px !important;
+  font-family: var(--font-sans, "Geist", system-ui, sans-serif);
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted-foreground);
+  border-bottom: none !important;
+  opacity: 1 !important;
 }
 
 .cm-tooltip-autocomplete > ul > li[aria-selected="true"] {
@@ -1134,16 +2480,16 @@ body {
 }
 
 /* Dark mode adjustments for CodeMirror */
-.dark .cm-selectionBackground,
-.dark .cm-focused .cm-selectionBackground {
+:is(.dark, .matte) .cm-selectionBackground,
+:is(.dark, .matte) .cm-focused .cm-selectionBackground {
   background-color: rgba(59, 130, 246, 0.25) !important;
 }
 
-.dark .cm-activeLine {
+:is(.dark, .matte) .cm-activeLine {
   background-color: rgba(255, 255, 255, 0.03) !important;
 }
 
-.dark .cm-activeLineGutter {
+:is(.dark, .matte) .cm-activeLineGutter {
   background-color: rgba(255, 255, 255, 0.03) !important;
 }
 

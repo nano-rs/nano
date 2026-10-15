@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::AppState;
+use crate::handlers::AuditExt;
+use nanosiem_core::audit::actions::{
+    PARSER_REPO_CREATED, PARSER_REPO_SYNCED, PARSER_REPO_UPDATED, RULE_REPO_CREATED, RULE_REPO_SYNCED,
+    RULE_REPO_UPDATED,
+};
+use nanosiem_core::audit::{AuditEvent, AuditSource};
 
 #[cfg(feature = "enterprise")]
 use nanosiem_core::crypto::EncryptionService;
@@ -11,6 +17,7 @@ use nanosiem_core::mitre::{MitreRepository, MitreSync, MitreSyncOutcome};
 use nanosiem_core::models::detection_rule::DetectionMode;
 use nanosiem_core::parser_repository::ParserRepositoryService;
 use nanosiem_core::rule_repository::RuleRepositoryService;
+use nanosiem_core::search::SearchBackend;
 use nanosiem_core::tuning::versions::{PendingRuntimeSync, RuleVersionManager};
 use nanosiem_core::{DistributedDetectionScheduler, DistributedSchedulerConfig};
 #[cfg(feature = "enterprise")]
@@ -30,45 +37,165 @@ impl AppState {
         let mut handles = Vec::new();
 
         // --- Distributed detection scheduler ---
-        let config = DistributedSchedulerConfig::from_env();
-        tracing::info!(
-            node_id = %self.node_id,
-            poll_interval = config.poll_interval_secs,
-            batch_size = config.batch_size,
-            max_concurrent = config.max_concurrent_executions,
-            stale_timeout = config.stale_claim_timeout_secs,
-            "Starting distributed detection scheduler"
-        );
-
-        let scheduler = Arc::new(
-            DistributedDetectionScheduler::new(
-                self.detection_service.clone(),
-                self.pool.clone(),
-                config,
-                self.node_id.clone(),
-            )
-            .with_developer_settings(self.pool.clone()),
-        );
-
-        // Backfill next_run_at for any rules missing it
-        if let Err(e) = scheduler.backfill_next_run_at().await {
-            tracing::warn!("Failed to backfill next_run_at: {}", e);
+        // Shared mode has an independent, explicitly provisioned tenant loop.
+        // It must never fall through to the legacy singleton scheduler, whose
+        // process-global Search/runtime dependencies are valid only for
+        // dedicated/open deployments.
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            if let Some(runtime) = self.tenant_detection_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant detection operator loop started");
+                // NAN-3076: platform-hosted hunts runner (claims queued sweeps
+                // for shared tenants that have no runner of their own).
+                if let Some(hunts) = runtime.hosted_hunts() {
+                    handles.push(hunts.start_with_shutdown(self.shutdown_token()));
+                    tracing::info!("Enterprise-shared hosted hunts runner started");
+                }
+            } else {
+                tracing::error!(
+                    "Enterprise-shared tenant detection operator loop unavailable; legacy detection scheduler remains disabled"
+                );
+            }
+            // NAN-2361: tenant scheduled reports run through the private
+            // per-tenant runner (owner-signed transactions + tenant lake
+            // search), never the deployment-global ReportService below.
+            if let Some(runtime) = self.tenant_identity_sync_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant identity sync runtime started");
+            }
+            if let Some(runtime) = self.tenant_shadow_investigation_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared shadow investigation runtime started");
+            }
+            if let Some(runtime) = self.tenant_alert_triage_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared alert triage runtime started");
+            }
+            if let Some(runtime) = self.tenant_lookup_ingestion_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant lookup ingestion runner started");
+            }
+            if let Some(runtime) = self.tenant_export_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant export runner started");
+            }
+            if let Some(runtime) = self.tenant_custom_enrichment_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant custom enrichment runner started");
+            }
+            if let Some(runtime) = self.tenant_siem_health_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant SIEM-health runner started");
+            }
+            if let Some(runtime) = self.tenant_platform_readiness_attestor.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared platform readiness attestor started");
+            }
+            if let Some(runtime) = self.tenant_erasure_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared erasure runner started");
+            } else {
+                tracing::error!("Enterprise-shared erasure runner unavailable; data-subject erasure requests will not execute");
+            }
+            if let Some(runtime) = self.tenant_webhook_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant webhook delivery runner started");
+            } else {
+                tracing::error!("Enterprise-shared tenant webhook delivery runner unavailable; outbound deliveries stay queued");
+            }
+            if let Some(runtime) = self.tenant_report_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+                tracing::info!("Enterprise-shared tenant report runner started");
+            } else {
+                tracing::error!(
+                    "Enterprise-shared tenant report runner unavailable; tenant report definitions will not execute"
+                );
+            }
+            // Shared is a greenfield profile. No process-global inputlookup,
+            // report, or legacy detection scheduler is tenant authority, so the
+            // explicitly provisioned tenant loops above are the complete
+            // distributed-scheduler allowlist for this profile.
+            return handles;
         }
 
-        // Store reference for graceful shutdown
-        {
-            let mut guard = self.distributed_scheduler.write().await;
-            *guard = Some(scheduler.clone());
+        #[cfg(not(feature = "enterprise"))]
+        let shared_detection_runtime = false;
+        #[cfg(feature = "enterprise")]
+        let shared_detection_runtime = self.config.deployment_mode.is_enterprise_shared();
+
+        if !shared_detection_runtime {
+            let config = DistributedSchedulerConfig::from_env();
+            tracing::info!(
+                node_id = %self.node_id,
+                poll_interval = config.poll_interval_secs,
+                batch_size = config.batch_size,
+                max_concurrent = config.max_concurrent_executions,
+                stale_timeout = config.stale_claim_timeout_secs,
+                lake_event_time_delay_secs = config.lake_event_time_delay_secs,
+                late_publication_batch_size = config.late_replay_publication_batch_size,
+                late_replay_batch_size = config.late_replay_batch_size,
+                late_replay_max_concurrent = config.late_replay_max_concurrent,
+                alert_post_create_batch_size = config.alert_post_create_batch_size,
+                alert_post_create_max_concurrent = config.alert_post_create_max_concurrent,
+                "Starting distributed detection scheduler"
+            );
+
+            let lake_backend = self.search_service.backend() == SearchBackend::Lake;
+            let detection_service = match self.detection_service.open_cell_scheduler_view() {
+                Ok(service) => service,
+                Err(error) => {
+                    tracing::error!(%error, "Open cell detection route unavailable; scheduler disabled");
+                    return handles;
+                }
+            };
+            let scheduler = Arc::new(
+                DistributedDetectionScheduler::new(
+                    detection_service,
+                    self.pool.clone(),
+                    config,
+                    self.node_id.clone(),
+                )
+                .with_realtime_microbatches(lake_backend)
+                .with_late_arrival_reconciliation(lake_backend)
+                .with_developer_settings(self.pool.clone()),
+            );
+
+            // Backfill next_run_at for any rules missing it
+            if let Err(e) = scheduler.backfill_next_run_at().await {
+                tracing::warn!("Failed to backfill next_run_at: {}", e);
+            }
+
+            // Store reference for graceful shutdown
+            {
+                let mut guard = self.distributed_scheduler.write().await;
+                *guard = Some(scheduler.clone());
+            }
+
+            handles.push(scheduler.clone().start_with_shutdown(self.shutdown_token()));
+            if lake_backend {
+                handles.push(
+                    scheduler
+                        .clone()
+                        .start_late_arrival_with_shutdown(self.shutdown_token()),
+                );
+                handles
+                    .push(scheduler.start_alert_post_create_with_shutdown(self.shutdown_token()));
+            }
+            tracing::info!("Distributed detection scheduler started");
+
+            // Query changes and rollbacks commit a durable reconciliation job with
+            // PostgreSQL state. Every API node competes for these jobs so a crash
+            // between commit and ClickHouse DDL is recoverable.
+            if self.search_service.backend() == SearchBackend::ClickHouse {
+                handles.push(self.start_rule_runtime_sync_reconciler());
+                tracing::info!("Distributed rule runtime reconciliation started");
+            } else {
+                tracing::info!(
+                    "ClickHouse materialized-view reconciliation disabled; lake real-time rules use durable micro-batches"
+                );
+            }
         }
-
-        handles.push(scheduler.start_with_shutdown(self.shutdown_token()));
-        tracing::info!("Distributed detection scheduler started");
-
-        // Query changes and rollbacks commit a durable reconciliation job with
-        // PostgreSQL state. Every API node competes for these jobs so a crash
-        // between commit and ClickHouse DDL is recoverable.
-        handles.push(self.start_rule_runtime_sync_reconciler());
-        tracing::info!("Distributed rule runtime reconciliation started");
 
         // --- Distributed scheduled jobs ---
         // These are inputlookup ingestion jobs that fetch remote feed URLs over
@@ -109,6 +236,11 @@ impl AppState {
                 self.pool.clone(),
                 self.search_service.clone(),
                 self.node_id.clone(),
+            )
+            .with_denied_source_audit(
+                nanosiem_core::search::denied_source_audit::EmitterDeniedSourceAuditSink::new(
+                    self.audit_emitter.clone(),
+                ),
             );
             let poll_interval: u64 = std::env::var("REPORT_SCHEDULER_POLL_INTERVAL_SECS")
                 .ok()
@@ -205,7 +337,10 @@ impl AppState {
                 }
             };
             let mut rendered_revision = rule.updated_at;
-            if rule.detection_mode == DetectionMode::RealTime {
+            // NAN-3816: DELETE archives the rule and keeps the row, so an
+            // archived real-time rule must have its view dropped, never
+            // recreated.
+            if rule.detection_mode == DetectionMode::RealTime && !rule.archived {
                 match tokio::time::timeout(
                     DDL_TIMEOUT,
                     self.materialized_view_generator.recreate_view(&rule),
@@ -382,9 +517,10 @@ impl AppState {
     ///
     /// NOT egress-gated: every read and write is PostgreSQL-local, so hunts
     /// keep sweeping in an air-gapped install. `HUNT_SCHEDULER_ENABLED=false`
-    /// leaves hunts manual-only without disabling each one, and the loop exits
-    /// on its own in an open deployment where enterprise migration 9000054
-    /// never created the tables.
+    /// leaves hunts manual-only without disabling each one, and the loop parks
+    /// until shutdown in an open deployment where enterprise migration 9000054
+    /// never created the tables (returning would trip the leader-scheduler
+    /// supervisor and exit the jobs process, NAN-3376).
     pub fn start_hunt_scheduler(&self) -> tokio::task::JoinHandle<()> {
         nanosiem_core::hunts::HuntScheduler::from_env(self.pool.clone())
             .start(self.shutdown_token())
@@ -402,126 +538,244 @@ impl AppState {
     ///
     /// Initial delay: 30 minutes, then polls every 12 hours (configurable via MARKETPLACE_SYNC_INTERVAL_SECS).
     /// Syncs any repos that have auto_sync_enabled and are past their sync_interval_hours.
-    /// Runs last among repo schedulers (after parsers at 10m, rules at 20m).
+    /// Dedicated runs after parsers and rules. Shared polls platform repos immediately, then every minute.
     pub fn start_marketplace_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let pool = self.pool.clone();
+        #[cfg(feature = "enterprise")]
+        let platform = self.config.deployment_mode.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let platform = false;
         let poll_secs: u64 = std::env::var("MARKETPLACE_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(43200); // 12 hours
+            .unwrap_or(if platform { 60 } else { 43200 }).max(1);
+        let poll_secs = if platform { poll_secs.min(60) } else { poll_secs };
 
         tokio::spawn(async move {
             // Initial delay: 30 minutes — after parsers (10m) and rules (20m)
-            tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            if !platform {
+                tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+            }
 
             // Create sync service once so the syncing_repos guard persists across ticks
-            let sync_service = MarketplaceSyncService::new(pool.clone());
+            let sync_service = Arc::new(MarketplaceSyncService::new(pool.clone()));
 
             let interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
             tokio::pin!(interval);
 
+            let mut running = std::collections::HashMap::new();
             loop {
+                interval.tick().await;
+                running.retain(|_, task: &mut tokio::task::JoinHandle<()>| !task.is_finished());
+                let mut ids = std::collections::HashSet::new();
                 match sync_service.repository().list_repos_for_auto_sync().await {
-                    Ok(repos) if repos.is_empty() => {}
-                    Ok(repos) => {
-                        tracing::info!(count = repos.len(), "Auto-syncing marketplace repos");
-                        for r in &repos {
-                            if let Err(e) = sync_service.sync_repository(r.id).await {
-                                tracing::warn!(repo = %r.name, error = %e, "Failed to auto-sync marketplace repo");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to list marketplace repos for auto-sync");
+                    Ok(repos) => ids.extend(repos.into_iter().map(|repo| repo.id)),
+                    Err(error) => tracing::error!(%error, "Failed to list marketplace repos for auto-sync"),
+                }
+                if platform {
+                    match nanosiem_core::marketplace::platform_sync::pending_repositories(&pool).await {
+                        Ok(pending) => ids.extend(pending),
+                        Err(error) => tracing::error!(%error, "Failed to list platform sync requests"),
                     }
                 }
-                interval.tick().await;
+                for id in ids {
+                    if running.contains_key(&id) { continue; }
+                    let pool = pool.clone();
+                    let service = Arc::clone(&sync_service);
+                    running.insert(id, tokio::spawn(async move {
+                        let result = if platform {
+                            service.sync_platform_repository(&pool, id).await
+                        } else {
+                            service.sync_repository(id).await
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!(%id, %error, "Failed to sync marketplace repo");
+                        }
+                    }));
+                }
             }
         })
     }
 
     /// Start the parser repo auto-sync scheduler
     ///
-    /// Initial delay: 10 minutes, then polls every 12 hours (configurable via PARSER_REPO_SYNC_INTERVAL_SECS).
+    /// Open/dedicated: reconciles the first-party catalogs (NAN-3758), syncs at
+    /// once, then polls every 15 minutes (PARSER_REPO_SYNC_INTERVAL_SECS).
     /// Syncs any repos that have auto_sync_enabled and are past their sync_interval_hours.
     /// Runs first among repo schedulers so parsers are available for rule evaluation.
     pub fn start_parser_repo_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         use nanosiem_core::parser_repository::ParserRepositoryRepository;
 
-        let pool = self.pool.clone();
-        let poll_secs: u64 = std::env::var("PARSER_REPO_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(43200); // 12 hours
+        // NAN-2975: hosted-shared tenants follow the platform catalog mirror
+        // (nano-rs/parsers + nano-rs/rules): the leader refreshes the mirror
+        // (the only GitHub traffic) and fans it out to every tenant through
+        // signed tenant transactions, immediately and then every minute.
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            let state = self.clone();
+            return tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = nanosiem_enterprise::handlers::platform_catalog_follow::tick(state.clone()).await {
+                        tracing::warn!(%error, "Platform catalog follow tick failed");
+                    }
+                }
+            });
+        }
+
+        let state = self.clone();
+        let poll_secs =
+            repo_sync_interval_secs(std::env::var("PARSER_REPO_SYNC_INTERVAL_SECS").ok().as_deref());
 
         tokio::spawn(async move {
-            // Initial delay: 10 minutes — let the system stabilise, then sync promptly
-            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            // NAN-3758: register/reconcile the first-party catalogs, then sync
+            // at once so a fresh install has the full catalog at first login
+            // and an upgraded one starts following without a click.
+            let mut reconciled = reconcile_first_party_catalogs(&state).await;
 
+            let pool = state.pool.clone();
             let repo_repository = ParserRepositoryRepository::new(pool.clone());
             let service = ParserRepositoryService::new(pool.clone());
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                interval.tick().await;
+                if !reconciled {
+                    reconciled = reconcile_first_party_catalogs(&state).await;
+                }
                 match repo_repository.list_for_auto_sync().await {
                     Ok(repos) if repos.is_empty() => {}
                     Ok(repos) => {
                         tracing::info!(count = repos.len(), "Auto-syncing parser repos");
                         for r in &repos {
-                            if let Err(e) = service.sync_repository(r.id).await {
+                            let result = service.sync_repository(r.id).await;
+                            if let Err(e) = &result {
                                 tracing::warn!(repo = %r.name, error = %e, "Failed to auto-sync parser repo");
                             }
+                            state.emit_audit(scheduled_sync_audit(
+                                AuditSource::ParserRepo,
+                                PARSER_REPO_SYNCED,
+                                "parser_repository",
+                                r.id,
+                                &r.name,
+                                &r.branch,
+                                result.as_ref().map(|s| {
+                                    serde_json::json!({
+                                        "commit": s.commit, "added": s.parsers_added, "updated": s.parsers_updated,
+                                        "removed": s.parsers_removed, "total": s.parsers_total,
+                                    })
+                                }).map_err(|e| e.to_string()),
+                            ));
                         }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to list parser repos for auto-sync");
                     }
                 }
-                interval.tick().await;
             }
         })
     }
 
     /// Start the rule repo auto-sync scheduler
     ///
-    /// Initial delay: 20 minutes, then polls every 12 hours (configurable via RULE_REPO_SYNC_INTERVAL_SECS).
+    /// Shared tenants: immediate first tick, then every minute through signed tenant transactions.
+    /// Open/dedicated: reconciles the first-party catalogs (NAN-3758), first
+    /// pass after 30 s, then RULE_REPO_SYNC_INTERVAL_SECS (default 15 minutes).
     /// Syncs any repos that have auto_sync_enabled and are past their sync_interval_hours.
+    /// NAN-3211: enterprise-shared automatic detection tuning, leader-only.
+    /// The dedicated `TuningScheduler` stays off on shared (global pool,
+    /// tenant-pinned lake collector); this loop measures, baselines and
+    /// proposes per tenant inside signed tenant transactions and meters every
+    /// proposal through the tenant system AI principal. Internal work plus a
+    /// tenant-configured AI provider, so not egress-gated. `None` when the
+    /// tenant runtime is unavailable.
+    #[cfg(feature = "enterprise")]
+    pub fn start_shared_auto_tuning_scheduler(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let Some(rls) = self.tenant_ai_rls_runtime.clone() else {
+            tracing::warn!("Enterprise-shared auto-tuning unavailable: tenant runtime missing");
+            return None;
+        };
+        let runtime = std::sync::Arc::new(nanosiem_enterprise::auto_tuning_shared_runtime::TenantAutoTuningRuntime::new(
+            self.pool.clone(),
+            rls,
+            std::sync::Arc::clone(&self.agent_config_registry),
+        ));
+        tracing::info!("Enterprise-shared auto-tuning scheduler started (leader-only, signed tenant transactions)");
+        Some(runtime.start_with_shutdown(self.shutdown_token()))
+    }
+
     pub fn start_rule_repo_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         use nanosiem_core::rule_repository::RuleRepositoryRepository;
 
-        let pool = self.pool.clone();
-        let dual_pool = self.dual_pool.clone();
-        let poll_secs: u64 = std::env::var("RULE_REPO_SYNC_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(43200); // 12 hours
+        #[cfg(feature = "enterprise")]
+        if self.config.deployment_mode.is_enterprise_shared() {
+            let state = self.clone();
+            return tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = nanosiem_enterprise::handlers::repository_auto_sync::tick(state.clone()).await {
+                        tracing::warn!(%error, "Hosted repository scheduler tick failed");
+                    }
+                }
+            });
+        }
+
+        let state = self.clone();
+        let poll_secs =
+            repo_sync_interval_secs(std::env::var("RULE_REPO_SYNC_INTERVAL_SECS").ok().as_deref());
 
         tokio::spawn(async move {
-            // Initial delay: 20 minutes — after parsers, before marketplace
-            tokio::time::sleep(std::time::Duration::from_secs(1200)).await;
+            // NAN-3758: idempotent with the parser scheduler's reconcile; a
+            // short stagger keeps the two first GitHub pulls apart.
+            let mut reconciled = reconcile_first_party_catalogs(&state).await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-            let repo_repository = RuleRepositoryRepository::new(pool.clone());
-            let service = RuleRepositoryService::with_dual_pool(&dual_pool);
+            let repo_repository = RuleRepositoryRepository::new(state.pool.clone());
+            let service = RuleRepositoryService::with_dual_pool(&state.dual_pool);
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
+                interval.tick().await;
+                if !reconciled {
+                    reconciled = reconcile_first_party_catalogs(&state).await;
+                }
                 match repo_repository.list_for_auto_sync().await {
                     Ok(repos) if repos.is_empty() => {}
                     Ok(repos) => {
                         tracing::info!(count = repos.len(), "Auto-syncing rule repos");
                         for r in &repos {
-                            if let Err(e) = service.sync_repository(r.id).await {
+                            let result = service.sync_repository(r.id).await;
+                            if let Err(e) = &result {
                                 tracing::warn!(repo = %r.name, error = %e, "Failed to auto-sync rule repo");
                             }
+                            state.emit_audit(scheduled_sync_audit(
+                                AuditSource::RuleRepo,
+                                RULE_REPO_SYNCED,
+                                "rule_repository",
+                                r.id,
+                                &r.name,
+                                &r.branch,
+                                result.as_ref().map(|s| {
+                                    serde_json::json!({
+                                        "commit": s.commit, "added": s.rules_added, "updated": s.rules_updated,
+                                        "removed": s.rules_removed, "total": s.rules_total,
+                                    })
+                                }).map_err(|e| e.to_string()),
+                            ));
                         }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to list rule repos for auto-sync");
                     }
                 }
-                interval.tick().await;
             }
         })
     }
@@ -538,7 +792,15 @@ impl AppState {
             .and_then(|v| v.parse().ok())
             .unwrap_or(86400); // 24 hours
 
-        ModelCatalogScheduler::new(pool, interval_secs).start()
+        let on_synced = nanosiem_enterprise::melod::model_catalog_sync::reload_agent_registry(
+            self.agent_config_registry.clone(),
+        );
+        let scheduler = if self.config.deployment_mode.is_enterprise_shared() {
+            ModelCatalogScheduler::platform(pool, interval_secs)
+        } else {
+            ModelCatalogScheduler::new(pool, interval_secs)
+        };
+        scheduler.with_on_synced(on_synced).start()
     }
 
     /// Start the pinned MITRE ATT&CK catalog synchronizer.
@@ -556,6 +818,14 @@ impl AppState {
     /// locking fences manual sync and leader-failover overlap across nodes.
     pub fn start_mitre_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let pool = self.pool.clone();
+        // Hosted-shared: `self.pool` is the CONTROL login. The six `mitre_*`
+        // tables are platform data it may write (9000462), but the rule-mapping
+        // reconcile touches the RLS-registered `detection_rules` it holds
+        // nothing on, so the platform sync writes the catalog only.
+        #[cfg(feature = "enterprise")]
+        let platform_catalog_only = self.config.deployment_mode.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let platform_catalog_only = false;
         let interval_secs: u64 = std::env::var("MITRE_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -566,13 +836,17 @@ impl AppState {
             .unwrap_or(60);
 
         tokio::spawn(async move {
-            let sync = MitreSync::new(MitreRepository::new(pool));
+            let sync = if platform_catalog_only {
+                MitreSync::platform_catalog_only(MitreRepository::new(pool))
+            } else {
+                MitreSync::new(MitreRepository::new(pool))
+            };
+            let source_url = sync.source_url().to_string();
             let long_interval = std::time::Duration::from_secs(interval_secs.max(60));
             // Never let the boot cadence exceed the steady-state interval, and
             // keep a small floor so a misconfiguration can't hot-loop.
-            let boot_interval = std::time::Duration::from_secs(
-                boot_interval_secs.clamp(15, interval_secs.max(60)),
-            );
+            let boot_interval =
+                std::time::Duration::from_secs(boot_interval_secs.clamp(15, interval_secs.max(60)));
             let mut catalog_ready = false;
             let mut interval = tokio::time::interval(boot_interval);
             loop {
@@ -598,7 +872,16 @@ impl AppState {
                     Ok(MitreSyncOutcome::AlreadyRunning) => {
                         tracing::debug!("MITRE catalog sync is already running on another node")
                     }
-                    Err(error) => tracing::warn!(%error, "Scheduled MITRE catalog sync failed"),
+                    // An operator reading the pod log must see WHY the catalog
+                    // is empty (fetch blocked by egress, write refused by the
+                    // role, bundle rejected) — this was silent on the shared
+                    // deployment for eight days.
+                    Err(error) => tracing::error!(
+                        %error,
+                        source = %source_url,
+                        platform_catalog_only,
+                        "Scheduled MITRE catalog sync failed; the ATT&CK catalog stays empty until the next attempt"
+                    ),
                 }
 
                 // Once the catalog is confirmed current, drop to the long steady
@@ -644,7 +927,7 @@ impl AppState {
             TuningScheduler,
         };
         // Repository stays in core (data access only). The orchestrator
-        // moved to nanosiem-enterprise in Phase 3.5; only enterprise builds
+        // moved to the enterprise crate in Phase 3.5; only enterprise builds
         // import it. Keep both imports gated so the open build doesn't trip
         // the unused-import lint.
         #[cfg(feature = "enterprise")]
@@ -657,15 +940,22 @@ impl AppState {
         #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
         let dual_pool = self.dual_pool.clone();
 
-        // Create tuning services. Metrics collector reads findings from
-        // ClickHouse (`logs WHERE source_type='findings'`) — not the legacy
-        // PG `alerts` table — so it sees scheduled-mode detection output
-        // (NAN-866).
-        let metrics_collector = MetricsCollector::new(
-            self.pool.clone(),
-            self.dual_pool.clickhouse().clone(),
-            self.dual_pool.table_names(),
-        );
+        // Canonical lake findings are committed to the durable PostgreSQL
+        // outbox before asynchronous Iceberg publication. That ledger is the
+        // immediate, indexed tuning source. Legacy deployments retain the
+        // ClickHouse findings reader unchanged.
+        let metrics_collector = if self.dual_pool.clickhouse_required() {
+            MetricsCollector::new(
+                self.pool.clone(),
+                self.dual_pool.clickhouse().clone(),
+                self.dual_pool.table_names(),
+            )
+        } else {
+            MetricsCollector::new_lake(
+                self.pool.clone(),
+                std::env::var("NANO_LAKE_TENANT_ID").unwrap_or_default(),
+            )
+        };
         let baseline_monitor = BaselineMonitor::new(self.pool.clone());
         let threshold_detector =
             ThresholdDetector::new(self.pool.clone(), Arc::new(baseline_monitor.clone()));
@@ -684,7 +974,11 @@ impl AppState {
             threshold_detector,
             notification_service,
             tuning_cache,
-        );
+        )
+        // NAN-3219: each task reads the developer scheduler switch AND the
+        // tenant-wide AI tuning mode (`system_settings`) before it runs.
+        // Without the pool neither was ever consulted.
+        .with_pg_pool(self.pool.clone());
 
         // Enterprise always wires the orchestrator: durable PR recovery must
         // run after leader failover even when AI is unavailable and there are
@@ -707,14 +1001,14 @@ impl AppState {
                 }
                 Ok(_) => {
                     tracing::warn!(
-                            "AI is not configured - new tuning proposals are disabled; durable PR recovery remains enabled"
-                        );
+                        "AI is not configured - new tuning proposals are disabled; durable PR recovery remains enabled"
+                    );
                     None
                 }
                 Err(_) => {
                     tracing::warn!(
-                            "Could not read meloD service state - new tuning proposals are disabled; durable PR recovery remains enabled"
-                        );
+                        "Could not read meloD service state - new tuning proposals are disabled; durable PR recovery remains enabled"
+                    );
                     None
                 }
             };
@@ -737,7 +1031,7 @@ impl AppState {
                 test_engine,
                 Arc::new(dual_pool),
                 ai_client,
-                self.config.schema_profile(),
+                self.schema_profile(),
             );
 
             scheduler = scheduler.with_orchestrator(Arc::new(orchestrator));
@@ -761,6 +1055,7 @@ impl AppState {
             // NAN-1721 O1: route the `due_for` read to the `_distributed` wrapper
             // on a cluster so it sees every shard's results (INSERT stays local).
             self.dual_pool.table_names().is_clustered(),
+            self.dual_pool.clickhouse_required(),
         )
         // NAN-1546: forward synthetic-failure alerts to observability-subscribed
         // webhooks (same wiring pattern as the detection service).
@@ -807,6 +1102,7 @@ impl AppState {
             ch_client,
             is_clustered,
             ai_analyzer,
+            self.search_service.clone(),
         )
     }
 
@@ -1427,10 +1723,110 @@ fn slo_alert_within_rearm(
     elapsed < 0 || (elapsed as u64) < rearm_secs
 }
 
+/// NAN-3758: register the first-party catalogs on a first boot and reconcile
+/// them on an upgrade (see `nanosiem_core::content_catalog_defaults`). Only
+/// called from the egress schedulers, which air-gapped installs never start.
+/// Never fatal: on a database error it returns `false` and the caller retries
+/// on its next poll.
+async fn reconcile_first_party_catalogs(state: &AppState) -> bool {
+    use nanosiem_core::content_catalog_defaults::{ensure_first_party_catalogs, CatalogPlan, FirstPartyCatalog};
+    match ensure_first_party_catalogs(&state.pool).await {
+        Ok(outcomes) => {
+            for outcome in outcomes.iter().filter(|outcome| outcome.changed()) {
+                let created = matches!(outcome.plan, CatalogPlan::Create { .. });
+                let (source, action, resource) = match (outcome.catalog, created) {
+                    (FirstPartyCatalog::Parsers, true) => (AuditSource::ParserRepo, PARSER_REPO_CREATED, "parser_repository"),
+                    (FirstPartyCatalog::Parsers, false) => (AuditSource::ParserRepo, PARSER_REPO_UPDATED, "parser_repository"),
+                    (FirstPartyCatalog::Rules, true) => (AuditSource::RuleRepo, RULE_REPO_CREATED, "rule_repository"),
+                    (FirstPartyCatalog::Rules, false) => (AuditSource::RuleRepo, RULE_REPO_UPDATED, "rule_repository"),
+                };
+                tracing::info!(
+                    catalog = outcome.catalog.url(),
+                    repository_id = %outcome.repository_id,
+                    plan = ?outcome.plan,
+                    "First-party content catalog reconciled"
+                );
+                state.emit_audit(
+                    AuditEvent::builder(source, action)
+                        .resource(resource, Some(outcome.repository_id), Some(outcome.name.clone()))
+                        .details(outcome.audit_details())
+                        .build(),
+                );
+            }
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "First-party content catalog reconcile failed; retrying on the next poll");
+            false
+        }
+    }
+}
+
+/// Audit record for one scheduled (system-initiated) repository sync.
+fn scheduled_sync_audit(
+    source: AuditSource,
+    action: &str,
+    resource: &str,
+    id: uuid::Uuid,
+    name: &str,
+    branch: &str,
+    outcome: Result<serde_json::Value, String>,
+) -> AuditEvent {
+    let success = outcome.is_ok();
+    let mut details = serde_json::json!({"scheduled": true, "branch": branch});
+    match outcome {
+        Ok(summary) => details["summary"] = summary,
+        Err(error) => details["error"] = error.into(),
+    }
+    AuditEvent::builder(source, action)
+        .resource(resource, Some(id), Some(name.to_owned()))
+        .success(success)
+        .details(details)
+        .build()
+}
+
+/// Repo auto-sync poll interval from its env override (default 15 minutes).
+///
+/// NAN-3405: clamped to at least one second. `tokio::time::interval(0)`
+/// panics, and the jobs binary supervises leader schedulers as loops, so an
+/// operator setting `*_REPO_SYNC_INTERVAL_SECS=0` turned into an exit-70
+/// crash loop 10-20 minutes after every boot. Marketplace, hunt and MITRE
+/// already clamp the same way.
+///
+/// NAN-3758: the default poll is 15 minutes. A poll only selects repositories
+/// past their own `sync_interval_hours`, so it costs one PostgreSQL query; the
+/// old 12-hour poll capped every repository at twice a day whatever its
+/// interval said, so the hourly first-party catalogs could not stay current.
+fn repo_sync_interval_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(900)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::slo_alert_within_rearm;
+    use super::{repo_sync_interval_secs, slo_alert_within_rearm};
     use chrono::{Duration, Utc};
+
+    #[test]
+    fn repo_sync_interval_defaults_and_never_reaches_zero() {
+        assert_eq!(repo_sync_interval_secs(None), 900);
+        assert_eq!(repo_sync_interval_secs(Some("not-a-number")), 900);
+        assert_eq!(repo_sync_interval_secs(Some("900")), 900);
+        assert_eq!(repo_sync_interval_secs(Some(" 900 ")), 900);
+        // NAN-3405: zero would panic tokio::time::interval inside a
+        // supervised leader loop (exit 70).
+        assert_eq!(repo_sync_interval_secs(Some("0")), 1);
+    }
+
+    #[tokio::test]
+    async fn repo_sync_interval_is_always_a_valid_tokio_interval() {
+        for raw in [None, Some("0"), Some(""), Some("1")] {
+            let secs = repo_sync_interval_secs(raw);
+            // Panics on a zero period; must not for any accepted input.
+            let _ = tokio::time::interval(std::time::Duration::from_secs(secs));
+        }
+    }
 
     #[test]
     fn within_window_skips() {

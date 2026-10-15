@@ -17,6 +17,10 @@ pub struct PrevalenceData {
     pub artifact_type: ArtifactType,
     /// Number of unique hosts that have seen this artifact
     pub host_count: u64,
+    /// The exact host set exceeded the bounded snapshot representation. When
+    /// true, `host_count` is a lower bound and UIs must render it as `N+`.
+    #[serde(default)]
+    pub host_count_saturated: bool,
     /// Total number of occurrences across all hosts
     pub total_occurrences: u64,
     /// First time this artifact was observed
@@ -37,6 +41,7 @@ impl PrevalenceData {
             artifact,
             artifact_type,
             host_count: 0,
+            host_count_saturated: false,
             total_occurrences: 0,
             first_seen: now,
             last_seen: now,
@@ -64,6 +69,8 @@ pub enum ArtifactType {
     IpAddress,
     /// Private IP address (RFC1918)
     IpAddressPrivate,
+    /// A user or host name used for a detail pivot (not an explorer rollup kind).
+    Identity,
 }
 
 impl ArtifactType {
@@ -248,6 +255,7 @@ impl std::fmt::Display for ArtifactType {
             ArtifactType::Subdomain => write!(f, "subdomain"),
             ArtifactType::IpAddress => write!(f, "ip"),
             ArtifactType::IpAddressPrivate => write!(f, "ip_private"),
+            ArtifactType::Identity => write!(f, "identity"),
         }
     }
 }
@@ -424,6 +432,11 @@ pub struct ArtifactExplorerItem {
     pub artifact_type: ArtifactType,
     /// Number of unique hosts that have seen this artifact
     pub host_count: u64,
+    /// `host_count` is a lower bound because the snapshot's bounded host set
+    /// saturated. This is explicit so an authoritative-looking 65 is never
+    /// shown for an artifact observed on hundreds of hosts.
+    #[serde(default)]
+    pub host_count_saturated: bool,
     /// Total number of occurrences across all hosts
     pub total_occurrences: u64,
     /// First time this artifact was observed
@@ -444,6 +457,62 @@ pub struct ArtifactExplorerItem {
     /// when missing. Populated by `PrevalenceService::enrich_explorer_items`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ArtifactInlineContext>,
+}
+
+/// Stable continuation key for one immutable prevalence snapshot. All three
+/// fields are required because the explorer is ordered by newest observation,
+/// then artifact kind and value for deterministic tie-breaking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrevalenceExplorerCursor {
+    pub last_seen: String,
+    pub kind: String,
+    pub artifact: String,
+}
+
+impl PrevalenceExplorerCursor {
+    /// The cursor with `last_seen` normalized to RFC 3339 UTC (microseconds,
+    /// `Z`), or `None` when any field is invalid.
+    ///
+    /// NAN-3802: before this, the lake product-state explorer emitted
+    /// `YYYY-MM-DD HH:MM:SS.ffffff` (UTC) cursors that every consumer refused,
+    /// so page 2 always failed. That legacy form is still accepted here so a
+    /// browser tab holding an old cursor keeps paging across the roll.
+    pub fn validated(&self) -> Option<Self> {
+        if !matches!(self.kind.as_str(), "hash" | "domain" | "ip")
+            || self.artifact.is_empty()
+            || self.artifact.len() > 2_048
+            || self.artifact.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some(Self {
+            last_seen: explorer_cursor_timestamp(&self.last_seen)?,
+            kind: self.kind.clone(),
+            artifact: self.artifact.clone(),
+        })
+    }
+}
+
+/// An explorer cursor's `last_seen`, normalized to RFC 3339 UTC with
+/// microseconds. Accepts RFC 3339 (any offset) and the legacy UTC
+/// `YYYY-MM-DD HH:MM:SS[.f]` form (NAN-3802).
+pub fn explorer_cursor_timestamp(value: &str) -> Option<String> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+                .ok()
+                .map(|time| time.and_utc())
+        })?;
+    explorer_cursor_timestamp_from_micros(parsed.timestamp_micros())
+}
+
+/// The RFC 3339 cursor form of an event time in Unix microseconds.
+pub fn explorer_cursor_timestamp_from_micros(micros: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_micros(micros)
+        .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
 /// Inline subtitle data shown beneath each prevalence list row. Tuned per
@@ -492,6 +561,7 @@ impl ArtifactExplorerItem {
             artifact: data.artifact,
             artifact_type: data.artifact_type,
             host_count: data.host_count,
+            host_count_saturated: data.host_count_saturated,
             total_occurrences: data.total_occurrences,
             first_seen: data.first_seen,
             last_seen: data.last_seen,
@@ -517,6 +587,9 @@ pub struct ArtifactExplorerResponse {
     pub offset: i64,
     /// Whether more results are available
     pub has_more: bool,
+    /// Stable continuation for the next page of this immutable snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<PrevalenceExplorerCursor>,
     /// Current rarity threshold from configuration
     pub rarity_threshold: u64,
     /// Count of rare artifacts (below rarity threshold)
@@ -679,6 +752,41 @@ pub struct ArtifactDetailResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub threat_intel: Vec<ArtifactThreatIntelEntry>,
+    // NAN-3766.
+    /// Which part of the window the facet counts cover. Absent means the
+    /// whole window was counted (older backends, exact paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ArtifactDetailCoverage>,
+}
+
+// NAN-3766.
+/// The time range an artifact detail answer actually counted.
+/// A common artifact at volume is counted newest-first within a fixed
+/// budget; when the budget runs out the facets cover only the newest
+/// `[scanned_start, scanned_end]` of `[window_start, window_end]`, and every
+/// count is for that range, never the whole window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ArtifactDetailCoverage {
+    /// Every event in the window was counted.
+    pub complete: bool,
+    /// A facet had more distinct values than one slice keeps, so some
+    /// counts can be lower bounds.
+    #[serde(default)]
+    pub approximate: bool,
+    /// A wider answer is still being built; ask again shortly.
+    #[serde(default)]
+    pub refining: bool,
+    pub scanned_start: DateTime<Utc>,
+    pub scanned_end: DateTime<Utc>,
+    pub window_start: DateTime<Utc>,
+    pub window_end: DateTime<Utc>,
+}
+
+impl ArtifactDetailCoverage {
+    /// Whether the counts are anything other than the whole window, exactly.
+    pub fn is_partial(&self) -> bool {
+        !self.complete || self.approximate
+    }
 }
 
 #[cfg(test)]
@@ -1005,13 +1113,34 @@ mod tests {
             network: vec![],
             geo: vec![],
             threat_intel: vec![],
+            coverage: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(json.get("processes").is_none(), "empty vec should be skipped");
+        assert!(
+            json.get("processes").is_none(),
+            "empty vec should be skipped"
+        );
         assert!(
             json.get("top_file_names").is_none(),
             "empty top_file_names should be skipped"
         );
         assert!(json.get("threat_intel").is_none());
+        assert!(json.get("coverage").is_none(), "exact answers keep the old wire shape");
+    }
+
+    #[test]
+    fn test_artifact_detail_coverage_round_trips_a_partial_lake_answer() {
+        let resp: ArtifactDetailResponse = serde_json::from_value(serde_json::json!({
+            "artifact": "10.1.7.154", "artifact_type": "ip_address_private",
+            "top_hosts": [], "top_users": [], "source_types": [],
+            "coverage": {"complete": false, "approximate": false, "refining": true,
+                "scanned_start": "2026-10-13T09:00:00.000000Z", "scanned_end": "2026-10-13T15:00:00.000000Z",
+                "window_start": "2026-10-06T15:00:00.000000Z", "window_end": "2026-10-13T15:00:00.000000Z"}
+        })).unwrap();
+        let coverage = resp.coverage.as_ref().unwrap();
+        assert!(coverage.is_partial() && coverage.refining);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["coverage"]["complete"], false);
+        assert_eq!(json["coverage"]["scanned_start"], "2026-10-13T09:00:00Z");
     }
 }

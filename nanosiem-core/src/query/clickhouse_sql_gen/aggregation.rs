@@ -19,6 +19,7 @@ impl ClickHouseSqlGenerator {
         aggregations: &[Aggregation],
         group_by: Option<&[String]>,
         sparkline_span_secs: Option<u64>,
+        timestamp_available: bool,
     ) -> Result<String, SqlGenError> {
         // Pre-compute which aggregation aliases shadow their input field
         // e.g. `min(timestamp) AS timestamp` — ClickHouse inlines CTEs and expands
@@ -58,29 +59,39 @@ impl ClickHouseSqlGenerator {
 
                     let agg_expr = match agg.func {
                         AggFunc::Count => format!("countIf({})", cond_sql),
-                        AggFunc::Sum => {
-                            // For sum(eval(if(cond, field, 0))), extract field and condition
-                            // For now, just use sumIf with the condition
-                            if let Some(field) = &agg.field {
+                        // NAN-2361: `func(eval(<predicate>))` cannot name a
+                        // field — the parser yields `field: None` — so for
+                        // Sum/Avg the aggregated value is the constant 1 per
+                        // MATCHING row. `sum` therefore counts matches and
+                        // `avg` is 1.0 whenever anything matched.
+                        //
+                        // That is odd but it is the DOCUMENTED existing
+                        // behaviour (`npl_compat_tests::stats_conditional_sum_eval`
+                        // requires this to compile), so it must not start
+                        // erroring. What matters is that the Rust
+                        // post-processing path computes the SAME thing —
+                        // previously it returned 0 for sum and null for avg,
+                        // so the two backends disagreed silently. See
+                        // `compute_aggregation` (post_processing/stats.rs).
+                        AggFunc::Sum => match &agg.field {
+                            Some(field) => {
                                 let (field_expr, _) = field_to_sql_expr(field, self);
                                 format!("sumIf({}, {})", field_expr, cond_sql)
-                            } else {
-                                format!("sumIf(1, {})", cond_sql)
                             }
-                        }
-                        AggFunc::Avg => {
-                            if let Some(field) = &agg.field {
+                            None => format!("sumIf(1, {})", cond_sql),
+                        },
+                        AggFunc::Avg => match &agg.field {
+                            Some(field) => {
                                 let (field_expr, _) = field_to_sql_expr(field, self);
                                 format!("avgIf({}, {})", field_expr, cond_sql)
-                            } else {
-                                format!("avgIf(1, {})", cond_sql)
                             }
-                        }
+                            None => format!("avgIf(1, {})", cond_sql),
+                        },
                         _ => {
-                            // For other functions, fall back to regular aggregation
-                            return Err(SqlGenError::UnsupportedOperation(
-                                format!("Conditional aggregation not supported for {:?}", agg.func)
-                            ));
+                            return Err(SqlGenError::UnsupportedOperation(format!(
+                                "Conditional aggregation not supported for {:?}",
+                                agg.func
+                            )));
                         }
                     };
 
@@ -122,8 +133,20 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
-                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
+                    // Raw events have a physical event time, so first/last are
+                    // chronological. A transformed upstream row set (for
+                    // example `stats ... | append [...] | stats first(x)`) no
+                    // longer carries that column. In that grain, first/last
+                    // mean pipeline order and must not reference a dropped
+                    // physical timestamp.
+                    AggFunc::First if timestamp_available => {
+                        format!("argMin({}, {})", field_expr, self.time_column())
+                    }
+                    AggFunc::First => format!("any({})", field_expr),
+                    AggFunc::Last if timestamp_available => {
+                        format!("argMax({}, {})", field_expr, self.time_column())
+                    }
+                    AggFunc::Last => format!("anyLast({})", field_expr),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest => format!("min({})", field_expr),
                     AggFunc::Latest => format!("max({})", field_expr),
@@ -138,8 +161,11 @@ impl ClickHouseSqlGenerator {
                         // into time intervals and count per bucket.
                         // Uses sumMap to aggregate counts by time bucket in a single pass.
                         let span = sparkline_span_secs.unwrap_or(1800); // default 30min
+                        // NAN-3325: `tupleElement(…, 2)`, not `(…).2` — the hosted
+                        // stats-page rewrite re-parses this SQL with sqlparser,
+                        // which reads `).2` as a stray decimal literal.
                         format!(
-                            "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
+                            "tupleElement(sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]), 2)",
                             self.time_column(),
                             span
                         )
@@ -354,6 +380,7 @@ impl ClickHouseSqlGenerator {
         split_by: &[String],
         limit: Option<usize>,
         cont: bool,
+        timestamp_available: bool,
     ) -> Result<String, SqlGenError> {
         let time_bucket_expr = self.generate_time_bucket(span);
 
@@ -387,8 +414,14 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
-                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
+                    AggFunc::First if timestamp_available => {
+                        format!("argMin({}, {})", field_expr, self.time_column())
+                    }
+                    AggFunc::First => format!("any({})", field_expr),
+                    AggFunc::Last if timestamp_available => {
+                        format!("argMax({}, {})", field_expr, self.time_column())
+                    }
+                    AggFunc::Last => format!("anyLast({})", field_expr),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest => format!("min({})", field_expr),
                     AggFunc::Latest => format!("max({})", field_expr),
@@ -402,7 +435,7 @@ impl ClickHouseSqlGenerator {
                         // Sparkline in timechart: use a fraction of the timechart span
                         let sub_span = (span.as_secs() / 10).max(60);
                         format!(
-                            "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
+                            "tupleElement(sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]), 2)",
                             self.time_column(),
                             sub_span
                         )
@@ -557,8 +590,7 @@ impl ClickHouseSqlGenerator {
                         n
                     )
                     .unwrap();
-                    write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause)
-                        .unwrap();
+                    write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause).unwrap();
                 } else {
                     // Single-scan top-N (NAN-1430 / audit D1): the old form's rank
                     // subquery (`WHERE x IN (SELECT … FROM stage_0 … LIMIT n)`)

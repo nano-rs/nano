@@ -67,7 +67,10 @@ fn feed_stale_and_recovery_share_stable_health_lifecycle() {
 
     assert_eq!(event.dedup_key, recovery_key);
     assert_eq!(event.dedup_key, format!("log_source:{feed_id}:stale"));
-    assert_eq!(event.category, crate::system_health::HealthCategory::LogSource);
+    assert_eq!(
+        event.category,
+        crate::system_health::HealthCategory::LogSource
+    );
     assert_eq!(event.resource_type, "log_source");
     assert_eq!(event.resource_id, Some(feed_id.to_string()));
 }
@@ -86,7 +89,9 @@ fn stuck_query_notification_names_query_and_remedy() {
 
     let n = HealthScheduler::stuck_query_notification(&status);
     assert_eq!(n.title, "Unkillable ClickHouse query detected");
-    let msg = n.message.expect("stuck-query notification must carry a message");
+    let msg = n
+        .message
+        .expect("stuck-query notification must carry a message");
     assert!(
         msg.contains("b66b8ffa-755d-45b1-82f6-616f198903bf"),
         "message must name the query id, got: {msg}"
@@ -105,7 +110,10 @@ fn stuck_query_notification_names_query_and_remedy() {
     );
 
     let event = HealthScheduler::stuck_query_health_event(&status);
-    assert_eq!(event.dedup_key, "query:b66b8ffa-755d-45b1-82f6-616f198903bf:stuck");
+    assert_eq!(
+        event.dedup_key,
+        "query:b66b8ffa-755d-45b1-82f6-616f198903bf:stuck"
+    );
     assert_eq!(event.category, crate::system_health::HealthCategory::Query);
     assert_eq!(event.resource_type, "clickhouse_query");
 }

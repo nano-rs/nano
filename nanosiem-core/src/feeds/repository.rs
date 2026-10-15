@@ -1053,11 +1053,7 @@ impl FeedRepository {
 mod tests {
     use super::*;
 
-    fn feed(
-        name: &str,
-        match_pattern: Option<&str>,
-        match_values: Option<Vec<&str>>,
-    ) -> Feed {
+    fn feed(name: &str, match_pattern: Option<&str>, match_values: Option<Vec<&str>>) -> Feed {
         Feed {
             id: Uuid::nil(),
             name: name.to_string(),
@@ -1109,8 +1105,9 @@ mod tests {
             "(match(source_type, '.*')) AND (lower(source_type) != 'audit')"
         );
 
-        let deny: BTreeSet<String> =
-            ["audit".to_string(), "limacharlie_edr".to_string()].into_iter().collect();
+        let deny: BTreeSet<String> = ["audit".to_string(), "limacharlie_edr".to_string()]
+            .into_iter()
+            .collect();
         let f = feed("apache_access", None, None);
         assert_eq!(
             FeedRepository::build_feed_where_clause(&f, &deny),

@@ -15,7 +15,8 @@
 // auto-grouping, not on a manual attach).
 
 import { useCallback, useMemo, useState } from 'react';
-import { FolderPlus, Loader2, Search as SearchIcon } from 'lucide-react';
+import { FolderPlus, Search as SearchIcon } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api, type CaseSummary } from '@/lib/api';
 import { useCapabilities } from '@/hooks/use-capabilities';
@@ -138,7 +139,7 @@ export function AssociateCaseButton({ alertId, onAssociated }: AssociateCaseButt
           <div className="mt-2 max-h-[320px] overflow-y-auto rounded-md border border-border divide-y divide-border/60">
             {loading ? (
               <div className="py-8 flex items-center justify-center">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                <LoadingIcon className="w-4 h-4 text-muted-foreground" />
               </div>
             ) : filtered.length === 0 ? (
               <div className="py-8 text-center text-[11.5px] text-muted-foreground">
@@ -166,7 +167,7 @@ export function AssociateCaseButton({ alertId, onAssociated }: AssociateCaseButt
                     {c.severity}
                   </span>
                   {busyId === c.id && (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground shrink-0" />
+                    <LoadingIcon className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                   )}
                 </button>
               ))

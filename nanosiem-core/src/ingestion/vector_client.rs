@@ -9,8 +9,15 @@
 //!
 //! Wire contract (see `config/vector/00-base.toml`): POST NDJSON to the Vector
 //! HTTP ingest source (`:8080`) with `X-Source-Type: <type>` and
-//! `Authorization: Bearer <VECTOR_AUTH_TOKEN>`. The `auth_check` transform
-//! validates the bearer token before any router claims the event.
+//! `Authorization: Bearer <token>`. The source authenticates the token before
+//! any router claims the event.
+//!
+//! NAN-3806: ingest tokens decide the source, so a sender's `X-Source-Type`
+//! no longer routes. The platform's own pullers (collector integrations) post
+//! many types on one connection, so [`VectorIngestClient::from_env`] and
+//! [`VectorIngestClient::platform_token_from_env`] use the platform pull
+//! credential (`ingest_tokens::platform_pull_token`, derived from
+//! `VECTOR_AUTH_TOKEN`): the one credential whose declared type is kept.
 
 use serde::Serialize;
 use thiserror::Error;
@@ -71,9 +78,16 @@ impl VectorIngestClient {
     }
 
     /// Build from the environment: `VECTOR_INGEST_URL` (default
-    /// `http://vector:8080/`) and `VECTOR_AUTH_TOKEN`.
+    /// `http://vector:8080/`) and the platform pull credential derived from
+    /// `VECTOR_AUTH_TOKEN` ([`Self::platform_token_from_env`]).
     pub fn from_env() -> Self {
-        Self::new(Self::url_from_env(), std::env::var("VECTOR_AUTH_TOKEN").ok())
+        Self::new(Self::url_from_env(), Self::platform_token_from_env())
+    }
+
+    /// The bearer a platform puller sends: the platform pull credential
+    /// (NAN-3806), `None` without an install token.
+    pub fn platform_token_from_env() -> Option<String> {
+        crate::ingest_tokens::platform_pull_token_from_env()
     }
 
     pub fn url_from_env() -> String {

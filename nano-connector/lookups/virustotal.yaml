@@ -1,0 +1,100 @@
+# NAN-3763 official lookup spec. Matches the nano-enrichments `virustotal`
+# agent catalog entry (VirusTotal API v3). Free tier: 4 requests/min,
+# 500/day. The url type repeats the mapping in full: YAML merge keys
+# are not supported by the spec loader.
+version: 1
+name: virustotal
+display_name: VirusTotal
+description: File, domain, IP and URL reputation from 70+ antivirus engines and URL scanners.
+homepage: https://www.virustotal.com/gui/my-apikey
+allow:
+  - host: www.virustotal.com
+    path_prefixes: ["/api/v3"]
+auth: { type: api_key_header, header: x-apikey, credential: API_KEY }
+credentials:
+  - { name: API_KEY, label: API key }
+defaults: { cache_ttl_secs: 86400, per_minute: 4, per_day: 500 }
+types:
+  hash:
+    request: { url: "https://www.virustotal.com/api/v3/files/{{input.artifact}}" }
+    link: "https://www.virustotal.com/gui/file/{{input.artifact}}"
+    result: &vt
+      score:
+        ratio:
+          numerator:
+            - { path: data.attributes.last_analysis_stats.malicious }
+            - { path: data.attributes.last_analysis_stats.suspicious, weight: 0.5 }
+          denominator:
+            - data.attributes.last_analysis_stats.malicious
+            - data.attributes.last_analysis_stats.suspicious
+            - data.attributes.last_analysis_stats.undetected
+            - data.attributes.last_analysis_stats.harmless
+      rules:
+        - when: [{ path: data.attributes.last_analysis_stats.malicious, gte: 3 }]
+          verdict: malicious
+        - when: [{ path: data.attributes.last_analysis_stats.malicious, gte: 1 }]
+          verdict: suspicious
+        - when: [{ path: data.attributes.last_analysis_stats.suspicious, gte: 2 }]
+          verdict: suspicious
+      thresholds: { below: benign }
+      summary:
+        malicious: data.attributes.last_analysis_stats.malicious
+        suspicious: data.attributes.last_analysis_stats.suspicious
+        harmless: data.attributes.last_analysis_stats.harmless
+        undetected: data.attributes.last_analysis_stats.undetected
+        reputation: data.attributes.reputation
+        threat_label: data.attributes.popular_threat_classification.suggested_threat_label
+        file_type: data.attributes.type_description
+        names: data.attributes.names
+        country: data.attributes.country
+        as_owner: data.attributes.as_owner
+        registrar: data.attributes.registrar
+        categories: data.attributes.categories
+        last_analysis_date: data.attributes.last_analysis_date
+      tags:
+        - data.attributes.tags
+        - data.attributes.popular_threat_classification.suggested_threat_label
+  domain:
+    request: { url: "https://www.virustotal.com/api/v3/domains/{{input.artifact}}" }
+    link: "https://www.virustotal.com/gui/domain/{{input.artifact}}"
+    result: *vt
+  ip:
+    request: { url: "https://www.virustotal.com/api/v3/ip_addresses/{{input.artifact}}" }
+    link: "https://www.virustotal.com/gui/ip-address/{{input.artifact}}"
+    result: *vt
+  url:
+    request: { url: "https://www.virustotal.com/api/v3/urls/{{input.artifact_b64url}}" }
+    link: "https://www.virustotal.com/gui/url/{{item.url_id}}"
+    result:
+      score:
+        ratio:
+          numerator:
+            - { path: data.attributes.last_analysis_stats.malicious }
+            - { path: data.attributes.last_analysis_stats.suspicious, weight: 0.5 }
+          denominator:
+            - data.attributes.last_analysis_stats.malicious
+            - data.attributes.last_analysis_stats.suspicious
+            - data.attributes.last_analysis_stats.undetected
+            - data.attributes.last_analysis_stats.harmless
+      rules:
+        - when: [{ path: data.attributes.last_analysis_stats.malicious, gte: 3 }]
+          verdict: malicious
+        - when: [{ path: data.attributes.last_analysis_stats.malicious, gte: 1 }]
+          verdict: suspicious
+        - when: [{ path: data.attributes.last_analysis_stats.suspicious, gte: 2 }]
+          verdict: suspicious
+      thresholds: { below: benign }
+      tags:
+        - data.attributes.tags
+        - data.attributes.popular_threat_classification.suggested_threat_label
+      summary:
+        url_id: data.id
+        malicious: data.attributes.last_analysis_stats.malicious
+        suspicious: data.attributes.last_analysis_stats.suspicious
+        harmless: data.attributes.last_analysis_stats.harmless
+        undetected: data.attributes.last_analysis_stats.undetected
+        reputation: data.attributes.reputation
+        title: data.attributes.title
+        final_url: data.attributes.last_final_url
+        categories: data.attributes.categories
+        last_analysis_date: data.attributes.last_analysis_date

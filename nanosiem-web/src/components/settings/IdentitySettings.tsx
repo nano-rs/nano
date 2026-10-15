@@ -27,8 +27,8 @@ import {
   Users,
   CircleCheck,
   XCircle,
+  AlertTriangle,
   Clock,
-  Loader2,
   RefreshCw,
   Plug,
   Trash2,
@@ -41,6 +41,7 @@ import {
   Wand2,
   Download,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type {
   IdentityProviderSummary,
@@ -49,6 +50,8 @@ import type {
   IdentityStats,
 } from '@/lib/api/types';
 import { useToast } from '@/hooks/use-toast';
+import { useIngestGate } from '@/hooks/use-capabilities';
+import { TenzirOnlyNote, TENZIR_ONLY_NOTE } from '@/components/add-data/TenzirOnlyNote';
 import { formatUTCCompact } from '@/lib/date-utils';
 
 // =============================================================================
@@ -158,6 +161,10 @@ const PROVIDER_METADATA: Record<
 
 export function IdentitySettings() {
   const { toast } = useToast();
+  // NAN-3844: directory sync delivers through Vector's enrichment lane; an
+  // `install.sh --tenzir` install has none. Existing providers stay editable
+  // and deletable; adding one and syncing are off.
+  const { tenzirOnly, blocked } = useIngestGate();
   const [providers, setProviders] = useState<IdentityProviderSummary[]>([]);
   const [stats, setStats] = useState<IdentityStats | null>(null);
   const [loading, setLoading] = useState(true);
@@ -220,6 +227,13 @@ export function IdentitySettings() {
         </Badge>
       );
     }
+    if (provider.sync_status === 'partial') {
+      return (
+        <Badge className="bg-amber-500/10 text-amber-400 border-amber-500/20">
+          <AlertTriangle className="w-3 h-3 mr-1" /> Partial Sync
+        </Badge>
+      );
+    }
     if (provider.sync_status === 'failed') {
       return (
         <Badge className="bg-red-500/10 text-red-400 border-red-500/20">
@@ -230,7 +244,7 @@ export function IdentitySettings() {
     if (provider.sync_status === 'in_progress') {
       return (
         <Badge className="bg-blue-500/10 text-blue-400 border-blue-500/20">
-          <Loader2 className="w-3 h-3 mr-1 animate-spin" /> Syncing
+          <LoadingIcon className="w-3 h-3 mr-1" /> Syncing
         </Badge>
       );
     }
@@ -242,6 +256,7 @@ export function IdentitySettings() {
   };
 
   const handleOpenConfig = (type: IdentityProviderType, existing?: IdentityProviderSummary) => {
+    if (blocked && !existing) return;
     setConfigDialog(type);
     setEditingProvider(existing || null);
     setCredentials({});
@@ -332,7 +347,7 @@ export function IdentitySettings() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-6 h-6 text-muted-foreground" />
       </div>
     );
   }
@@ -387,6 +402,7 @@ export function IdentitySettings() {
       {/* Provider Cards */}
       <div>
         <h2 className="text-lg font-semibold mb-4">Identity Providers</h2>
+        {tenzirOnly && <TenzirOnlyNote className="mb-4" />}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {(Object.keys(PROVIDER_METADATA) as IdentityProviderType[]).map((type) => {
             const meta = PROVIDER_METADATA[type];
@@ -417,6 +433,23 @@ export function IdentitySettings() {
                       <span>Synced {formatUTCCompact(new Date(existing.last_sync_at))}</span>
                     )}
                   </div>
+                  {/* NAN-3483: dead-lettered records are visible, not hidden behind "Connected". */}
+                  {existing && (existing.last_sync_records_dead_lettered ?? 0) > 0 && (
+                    <div
+                      className="mt-2 text-[11px] text-amber-400"
+                      title={existing.last_sync_error ?? undefined}
+                      data-testid={`identity-dead-lettered-${type}`}
+                    >
+                      <span className="font-mono">
+                        {(existing.last_sync_records_dead_lettered ?? 0).toLocaleString()}
+                      </span>
+                      {' of '}
+                      <span className="font-mono">
+                        {(existing.last_sync_records_total ?? 0).toLocaleString()}
+                      </span>
+                      {' records dead-lettered'}
+                    </div>
+                  )}
                   {/* Action buttons */}
                   {existing?.has_credentials && (
                     <div className="flex gap-2 mt-3 pt-3 border-t border-border/50" onClick={e => e.stopPropagation()}>
@@ -429,7 +462,7 @@ export function IdentitySettings() {
                             onClick={() => handleTestConnection(existing.id)}
                             disabled={testing === existing.id}
                           >
-                            {testing === existing.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plug className="w-3 h-3" />}
+                            {testing === existing.id ? <LoadingIcon className="w-3 h-3" /> : <Plug className="w-3 h-3" />}
                             Test
                           </Button>
                           <Button
@@ -437,9 +470,10 @@ export function IdentitySettings() {
                             size="sm"
                             className="h-7 text-xs"
                             onClick={() => handleSync(existing.id)}
-                            disabled={syncing === existing.id}
+                            disabled={syncing === existing.id || blocked}
+                            title={tenzirOnly ? TENZIR_ONLY_NOTE : undefined}
                           >
-                            {syncing === existing.id ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                            {syncing === existing.id ? <LoadingIcon className="w-3 h-3" /> : <RefreshCw className="w-3 h-3" />}
                             Sync
                           </Button>
                         </>
@@ -508,7 +542,7 @@ export function IdentitySettings() {
               {usersLoading ? (
                 <TableRow>
                   <TableCell colSpan={6} className="text-center py-8">
-                    <Loader2 className="w-5 h-5 animate-spin inline-block mr-2" />Loading...
+                    <LoadingIcon className="w-5 h-5 inline-block mr-2" />Loading...
                   </TableCell>
                 </TableRow>
               ) : users.length === 0 ? (
@@ -647,7 +681,7 @@ export function IdentitySettings() {
           <SheetFooter className="mt-6">
             <Button variant="outline" onClick={() => setConfigDialog(null)}>Cancel</Button>
             <Button onClick={handleSave} disabled={saving}>
-              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              {saving ? <LoadingIcon className="w-4 h-4" /> : null}
               {editingProvider ? 'Update' : 'Save'}
             </Button>
           </SheetFooter>

@@ -61,7 +61,7 @@ pub struct LookupHistoryQuery {
 /// * Refresh entries currently come from `scheduled_jobs.last_run_*`, which
 ///   only stores the **most recent** run. Until a per-execution history table
 ///   is added, callers will get at most one `kind = "refresh"` entry. See
-///   `TODO(NAN-512)` below.
+///   `TODO` below.
 /// * Refresh `note` strings do not include row deltas
 ///   (`+N · −M · K total`) for the same reason — the schema does not persist
 ///   per-run row counts. The note is `"completed"` / `"failed: <error>"`.

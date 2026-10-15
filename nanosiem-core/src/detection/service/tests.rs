@@ -72,8 +72,14 @@ fn test_r1_query_derived_score_and_entity_are_per_event() {
     let rr = calc
         .calculate_from_query_result(&scored, 1.0)
         .expect("query-scored event must produce a RiskResult");
-    assert_eq!(rr.entity, "10.0.0.9", "entity must come from the event, not the rule");
-    assert_eq!(rr.weighted_score, 90, "score must come from the event, not the rule");
+    assert_eq!(
+        rr.entity, "10.0.0.9",
+        "entity must come from the event, not the rule"
+    );
+    assert_eq!(
+        rr.weighted_score, 90,
+        "score must come from the event, not the rule"
+    );
     assert_eq!(rr.entity_field.as_deref(), Some("src_ip"));
 
     // Plain event (no `| risk`): NOT query-scored → both paths fall back to

@@ -6,7 +6,7 @@
 //! Used by `tuning/scheduler.rs::start_threshold_detection_task`, which
 //! previously held an `Option<Arc<TuningOrchestrator>>` directly. The
 //! orchestrator + agent + hint_agent + safety checker live in the enterprise
-//! crate (`nanosiem-enterprise::tuning`); this trait lets the open-core
+//! crate (`enterprise::tuning`); this trait lets the open-core
 //! scheduler keep running base-rate threshold detection without depending on
 //! any of the AI machinery.
 //!

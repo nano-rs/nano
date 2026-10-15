@@ -1,0 +1,39 @@
+# NAN-3763 official lookup spec. Matches the nano-enrichments `abuseipdb`
+# agent catalog entry (APIv2 /check). Free tier: 1000 checks/day.
+version: 1
+name: abuseipdb
+display_name: AbuseIPDB
+description: Community-reported abuse confidence for IP addresses.
+homepage: https://www.abuseipdb.com/account/api
+allow:
+  - host: api.abuseipdb.com
+    path_prefixes: ["/api/v2"]
+auth: { type: api_key_header, header: Key, credential: API_KEY }
+credentials:
+  - { name: API_KEY, label: API key }
+defaults: { cache_ttl_secs: 43200, per_minute: 30, per_day: 1000 }
+types:
+  ip:
+    request:
+      url: "https://api.abuseipdb.com/api/v2/check"
+      query: { ipAddress: "{{input.artifact}}", maxAgeInDays: "90" }
+      headers: { Accept: application/json }
+    link: "https://www.abuseipdb.com/check/{{input.artifact}}"
+    result:
+      score: { path: data.abuseConfidenceScore }
+      rules:
+        - when: [{ path: data.isWhitelisted, equals: true }]
+          verdict: benign
+        - when: [{ path: data.totalReports, lt: 1 }]
+          verdict: unknown
+      thresholds: { malicious: 75, suspicious: 25, below: benign }
+      summary:
+        abuse_confidence: data.abuseConfidenceScore
+        total_reports: data.totalReports
+        distinct_reporters: data.numDistinctUsers
+        country: data.countryCode
+        isp: data.isp
+        usage_type: data.usageType
+        domain: data.domain
+        is_tor: data.isTor
+        last_reported_at: data.lastReportedAt

@@ -18,11 +18,14 @@ impl ClickHouseSqlGenerator {
         source: &str,
         cmd: &Command,
         available_columns: &mut Option<HashSet<String>>,
+        referenced_fields: Option<&HashSet<String>>,
         sparkline_span_secs: Option<u64>,
         has_prior_risk: bool,
         // True if an earlier aggregating command dropped the raw `timestamp` column.
         // tail/reverse use this to avoid `ORDER BY timestamp` (which would be Code 47).
         aggregated: bool,
+        sort_tie_fields: &[String],
+        sort_tie_enabled: bool,
         // True when the pipeline has exactly one resolve_identity — the stage
         // then also emits bare `identity_*` aliases (NAN-1346 #5).
         single_resolve_identity: bool,
@@ -53,6 +56,7 @@ impl ClickHouseSqlGenerator {
                 aggregations,
                 group_by.as_deref(),
                 sparkline_span_secs,
+                timestamp_available,
             ),
             Command::Chart {
                 aggregations,
@@ -64,6 +68,7 @@ impl ClickHouseSqlGenerator {
                     aggregations,
                     group_by.as_deref(),
                     sparkline_span_secs,
+                    timestamp_available,
                 )
             }
             Command::Where { condition } => {
@@ -74,7 +79,7 @@ impl ClickHouseSqlGenerator {
                 ))
             }
             Command::Sort { fields, limit } => {
-                let order_clauses: Vec<String> = fields
+                let mut order_clauses: Vec<String> = fields
                     .iter()
                     .map(|sf| {
                         let order = if sf.descending { "DESC" } else { "ASC" };
@@ -121,6 +126,19 @@ impl ClickHouseSqlGenerator {
                         format!("{} {}", field_expr, order)
                     })
                     .collect();
+                // Sort narrow, visible keys at numeric ties. Group keys
+                // uniquely identify stats rows; explicit projections have
+                // only the named output columns. A whole-row tuple here can
+                // turn a large top-N hunt into a full-width sort.
+                let tie_fields = if !sort_tie_enabled { Vec::new() }
+                else if aggregated {
+                    sort_tie_fields.to_vec()
+                } else if let Some(columns) = available_columns.as_ref().filter(|columns| columns.len() <= 8) {
+                    let mut fields = columns.iter().cloned().collect::<Vec<_>>();
+                    fields.sort();
+                    fields
+                } else { Vec::new() };
+                order_clauses.extend(tie_fields.iter().map(|field| format!("{} ASC", escape_identifier(field))));
                 let limit_clause = limit
                     .map(|n| format!("\n  LIMIT {}", n))
                     .unwrap_or_default();
@@ -155,11 +173,24 @@ impl ClickHouseSqlGenerator {
             }
             Command::Timechart {
                 span,
+                bins,
                 aggregations,
                 split_by,
                 limit,
                 cont,
-            } => self.generate_timechart_sql(source, span, aggregations, split_by, *limit, *cont),
+                useother: _,
+            } => self.generate_timechart_sql(
+                source,
+                &match bins {
+                    Some(n) => self.span_for_timechart_bins(*n)?,
+                    None => *span,
+                },
+                aggregations,
+                split_by,
+                *limit,
+                *cont,
+                timestamp_available,
+            ),
             Command::Table { fields } => {
                 // Check for wildcard: table *
                 if fields.len() == 1 && fields[0].name == "*" {
@@ -202,7 +233,7 @@ impl ClickHouseSqlGenerator {
                 let field_list = expanded_fields
                     .iter()
                     .map(|(name, alias)| {
-                        let (field_expr, needs_alias) = field_to_sql_expr(name.as_str(), self);
+                        let (field_expr, needs_alias, _) = self.table_field_projection(name);
 
                         match alias {
                             Some(a) => format!("{} AS {}", field_expr, escape_identifier(a)),
@@ -239,7 +270,24 @@ impl ClickHouseSqlGenerator {
                     .collect();
 
                 let renamed_fields = rename_exprs.join(", ");
-                Ok(format!("  SELECT *, {} FROM {}", renamed_fields, source))
+                // NAN-3336: a rename REPLACES its target. On OCSF every scalar
+                // leaf is already a column, so `SELECT *, a AS "user.name"`
+                // kept the source's `user.name` and the new value was lost.
+                // Non-strict `EXCEPT` drops the old target when it exists and
+                // is a no-op when it does not (e.g. after `stats`). A target
+                // that another mapping reads (`rename a as b, b as a`) keeps
+                // the previous shape: excluding it would hide that input.
+                let replaced: Vec<String> = mappings
+                    .iter()
+                    .filter(|m| !mappings.iter().any(|other| other.from == m.to))
+                    .map(|m| escape_identifier(&m.to).to_string())
+                    .collect();
+                let except = if replaced.is_empty() {
+                    String::new()
+                } else {
+                    format!(" EXCEPT ({})", replaced.join(", "))
+                };
+                Ok(format!("  SELECT *{except}, {renamed_fields} FROM {source}"))
             }
             Command::Lookup { .. } => {
                 // Lookup enrichment is handled entirely in Rust post-processing
@@ -253,7 +301,8 @@ impl ClickHouseSqlGenerator {
                 Ok(format!("  SELECT * FROM {}", source))
             }
             Command::Eval { assignments } => {
-                let mut select_parts = vec!["*".to_string()];
+                let mut replacements = Vec::new();
+                let mut additions = Vec::new();
 
                 for assignment in assignments {
                     let expr_sql = eval_expression_to_sql(self, &assignment.expression)?;
@@ -262,18 +311,42 @@ impl ClickHouseSqlGenerator {
                     // eval alias carrying arbitrary characters (`eval "a, b"=1`), so a raw
                     // interpolation here is a SQL-injection surface; byte-identical for
                     // ordinary aliases (NAN-1352).
-                    select_parts.push(format!(
+                    let projected = format!(
                         "{} AS {}",
                         expr_sql,
                         escape_identifier(&assignment.field)
-                    ));
+                    );
+                    // A bounded internal inputlookup projects its snapshot
+                    // under private aliases, then merges each matching value
+                    // into the public name. For a physical source column use
+                    // REPLACE so the original name cannot remain alongside a
+                    // duplicate alias. Other eval expressions keep their
+                    // existing additive behavior.
+                    let internal_merge = matches!(
+                        &assignment.expression,
+                        EvalExpression::FunctionCall { name, args }
+                            if name == "case" && matches!(args.first(),
+                                Some(EvalExpression::Field(field)) if field.starts_with("__nano_il_match_"))
+                    );
+                    if internal_merge
+                        && matches!(
+                            self.profile.resolve(&assignment.field),
+                            crate::schema::FieldResolution::ExplicitColumn(_)
+                        )
+                    {
+                        replacements.push(projected);
+                    } else {
+                        additions.push(projected);
+                    }
                 }
 
-                Ok(format!(
-                    "  SELECT {} FROM {}",
-                    select_parts.join(", "),
-                    source
-                ))
+                let replace = (!replacements.is_empty())
+                    .then(|| format!(" REPLACE({})", replacements.join(", ")))
+                    .unwrap_or_default();
+                let append = (!additions.is_empty())
+                    .then(|| format!(", {}", additions.join(", ")))
+                    .unwrap_or_default();
+                Ok(format!("  SELECT *{replace}{append} FROM {source}"))
             }
             Command::Dedup {
                 fields,
@@ -385,7 +458,18 @@ impl ClickHouseSqlGenerator {
                 alias,
                 window_type,
             } => {
+                // NAN-3312: `bins=N` resolves to a concrete time span here, the
+                // one place that knows both the binned column and the window.
+                let resolved_span;
+                let span = match span {
+                    BinSpan::Bins(n) => {
+                        resolved_span = BinSpan::Time(self.span_for_bins(field.as_deref(), *n)?);
+                        &resolved_span
+                    }
+                    other => other,
+                };
                 match span {
+                    BinSpan::Bins(_) => unreachable!("bins= resolved to a time span above"),
                     BinSpan::Time(duration) => {
                         // Generate ClickHouse SQL for time-based bin command.
                         // O7 (NAN-1721): resolve the binned field to the active
@@ -512,16 +596,15 @@ impl ClickHouseSqlGenerator {
                         let alias_name = alias.as_deref().unwrap_or(field_name);
 
                         // Use floor(field / bin_size) * bin_size to create bins
-                        let bucket_expr = format!(
-                            "floor({} / {}) * {}",
-                            escape_identifier(field_name),
-                            bin_size,
-                            bin_size
-                        );
+                        let (field_expr, _) = field_to_sql_expr(field_name, self);
+                        let bucket_expr =
+                            format!("floor({field_expr} / {bin_size}) * {bin_size}");
 
                         // If alias matches the field name (in-place modification), exclude the original
                         // field from SELECT * to avoid duplicate columns
-                        if alias_name == field_name {
+                        if alias_name == field_name
+                            && field_expr == escape_identifier(field_name)
+                        {
                             Ok(format!(
                                 "  SELECT * EXCEPT ({}), {} AS {} FROM {}",
                                 escape_identifier(field_name),
@@ -546,32 +629,41 @@ impl ClickHouseSqlGenerator {
                 mode,
             } => {
                 let source_field = field.as_deref().unwrap_or("message");
+                // OCSF columns are frequently Nullable. `field::String` is a
+                // CAST to non-Nullable String in ClickHouse/chDB, so one null
+                // row aborts the entire rex stage. Splunk-compatible rex treats
+                // a missing source value as an empty string instead.
+                let source_expr = format!(
+                    "ifNull(toString({}), '')",
+                    escape_identifier(source_field)
+                );
 
                 match mode {
                     RexMode::Extract => {
                         // Extract named capture groups from the pattern
-                        let named_groups = extract_named_groups(pattern);
+                        let named_groups = named_capture_groups(pattern);
 
                         if named_groups.is_empty() {
                             // No named groups, just return the matches array
                             Ok(format!(
-                                "  SELECT *, extractAll({}::String, '{}') AS rex_matches FROM {}",
-                                escape_identifier(source_field), escape_string(pattern), source
+                                "  SELECT *, extractAll({}, '{}') AS rex_matches FROM {}",
+                                source_expr, escape_string(pattern), source
                             ))
                         } else {
                             // Convert named groups to numbered groups for ClickHouse
                             let ch_pattern = convert_named_groups_to_numbered(pattern);
 
                             // Generate column extractions for each named group
+                            // NAN-3327: each name takes its index among ALL
+                            // capturing groups (unnamed ones count).
                             let extractions: Vec<String> = named_groups
                                 .iter()
-                                .enumerate()
-                                .map(|(idx, name)| {
+                                .map(|(name, index)| {
                                     format!(
-                                        "extractGroups({}::String, '{}')[{}] AS {}",
-                                        escape_identifier(source_field),
+                                        "extractGroups({}, '{}')[{}] AS {}",
+                                        source_expr,
                                         escape_string(&ch_pattern),
-                                        idx + 1,  // ClickHouse groups are 1-indexed
+                                        index,
                                         escape_identifier(name)
                                     )
                                 })
@@ -585,10 +677,29 @@ impl ClickHouseSqlGenerator {
                         }
                     }
                     RexMode::Sed { pattern: sed_pattern, replacement } => {
-                        Ok(format!(
-                            "  SELECT *, replaceRegexpAll({}::String, '{}', '{}') AS rex_result FROM {}",
-                            escape_identifier(source_field), escape_string(sed_pattern), escape_string(replacement), source
-                        ))
+                        // NAN-3327: sed rewrites the field IN PLACE (Splunk, and
+                        // the Rust post-processing path). It used to add a
+                        // `rex_result` column no later stage could name.
+                        let replaced = format!(
+                            "replaceRegexpAll({}, '{}', '{}') AS {}",
+                            source_expr,
+                            escape_string(sed_pattern),
+                            escape_string(replacement),
+                            escape_identifier(source_field)
+                        );
+                        // REPLACE needs a real column of that name in the
+                        // input block (see `fillnull`); a JSON-tail field is
+                        // added under its name instead.
+                        if self.profile.uses_strict_canonical_fields()
+                            || matches!(
+                                self.profile.resolve(source_field),
+                                crate::schema::FieldResolution::ExplicitColumn(_)
+                            )
+                        {
+                            Ok(format!("  SELECT * REPLACE({replaced}) FROM {source}"))
+                        } else {
+                            Ok(format!("  SELECT *, {replaced} FROM {source}"))
+                        }
                     }
                 }
             }
@@ -692,7 +803,7 @@ impl ClickHouseSqlGenerator {
                     // set only by detection query enrichment (gated on the raw
                     // `timestamp` still being in the stream — D3). Resolved via
                     // field_to_sql_expr so it matches the stats-path emission.
-                    let (ts_expr, _) = field_to_sql_expr("timestamp", self);
+                    let (ts_expr, _) = field_to_sql_expr(&self.time_column, self);
                     select_parts.push(format!("min({}) AS _first_seen", ts_expr));
                     select_parts.push(format!("max({}) AS _last_seen", ts_expr));
                 }
@@ -773,7 +884,7 @@ impl ClickHouseSqlGenerator {
                 }
                 if *inject_bounds && !top_rare_bounds_alias_collision(field, by_fields, self) {
                     // NAN-1711 / audit D15 — see the `top` arm.
-                    let (ts_expr, _) = field_to_sql_expr("timestamp", self);
+                    let (ts_expr, _) = field_to_sql_expr(&self.time_column, self);
                     select_parts.push(format!("min({}) AS _first_seen", ts_expr));
                     select_parts.push(format!("max({}) AS _last_seen", ts_expr));
                 }
@@ -847,6 +958,40 @@ impl ClickHouseSqlGenerator {
                     })
                     .collect();
 
+                // Splunk does not create a transaction for an event that does
+                // not carry every requested transaction key. Besides being the
+                // correct row semantics, applying that rule before the marker
+                // windows is essential for sparse OCSF classes: otherwise all
+                // events with a NULL `user.name`/`session.uid` become one giant
+                // partition and a selective startswith/endswith transaction can
+                // consume gigabytes while sorting rows that can never identify a
+                // useful transaction. JSON-backed string fields return an empty
+                // string when absent, so guard both NULL and empty string for
+                // string-like/cast keys; numeric zero remains a valid key.
+                let present_group_keys = fields
+                    .iter()
+                    .map(|field| {
+                        let (expression, needs_cast) = field_to_sql_expr(field, self);
+                        let string_like = needs_cast
+                            || matches!(
+                                self.profile.field_type(field),
+                                Some(
+                                    crate::schema::FieldType::String
+                                        | crate::schema::FieldType::IpAddress
+                                        | crate::schema::FieldType::Uuid
+                                )
+                            );
+                        if string_like {
+                            format!(
+                                "isNotNull({expression}) AND notEmpty(toString({expression}))"
+                            )
+                        } else {
+                            format!("isNotNull({expression})")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+
                 // O27 (NAN-1721): transaction aggregates on the dataset time column
                 // (`start_time` for spans) and captures the dataset's free-text
                 // column (`span_name` for spans) — not the logs-only
@@ -855,11 +1000,33 @@ impl ClickHouseSqlGenerator {
                 // on spans). Logs keep `timestamp`/`message`/`id` byte-identical.
                 let tc = self.time_column();
                 let kw = self.profile.keyword_search_column();
-                let order_tiebreak = match self.row_identity_column() {
-                    Some(id) => format!("{tc}, {id}"),
-                    None => tc.to_string(),
-                };
-
+                // A transaction changes row grain, but Splunk-compatible
+                // transaction rows still expose fields carried by their member
+                // events. Preserve only the base fields that the full pipeline
+                // actually references, choosing the newest value in each
+                // transaction. Without this, a valid shape such as
+                // `transaction session_id | table session_id, user` loses
+                // `user` at the transaction boundary and the table stage fails.
+                // Group keys, row identity/time, and the raw body capture are
+                // already represented explicitly and must not be duplicated.
+                let passthrough_specs: Vec<(String, String)> = referenced_fields
+                    .map(|required| {
+                        self.transaction_passthrough_fields(fields, required)
+                    })
+                    .unwrap_or_default();
+                let passthrough_fields: Vec<String> = passthrough_specs
+                    .iter()
+                    .map(|(expr, output)| {
+                        format!(
+                            "argMax({}, {}) AS {}",
+                            expr,
+                            tc,
+                            escape_identifier(output)
+                        )
+                    })
+                    .collect();
+                let mut transaction_fields = group_by_fields.clone();
+                transaction_fields.extend(passthrough_fields);
                 let having_clause = match (maxspan, maxevents) {
                     (Some(d), Some(n)) => {
                         let secs = d.as_secs();
@@ -881,14 +1048,29 @@ impl ClickHouseSqlGenerator {
                 // Cap groupArray to maxevents (or default 1000) to prevent OOM from unbounded array accumulation
                 let array_limit = maxevents.unwrap_or(1000);
 
-                // No start/end markers: one transaction per group key (legacy form).
+                // No start/end markers: one transaction per group key and
+                // `maxspan` window (legacy form). NAN-3059: `maxspan` used to
+                // be only a HAVING filter over ONE all-window group per key,
+                // so any key active for longer than `maxspan` anywhere in the
+                // search window vanished — a busy source over 1h returned no
+                // transactions at all. Split each key's events into
+                // `maxspan`-wide time windows instead, so every transaction
+                // spans at most `maxspan` and none is dropped for it.
                 if startswith.is_none() && endswith.is_none() {
+                    let mut group_by = group_by_refs.clone();
+                    if let Some(span) = maxspan {
+                        group_by.push(format!(
+                            "intDiv(toUnixTimestamp({tc}), {})",
+                            span.as_secs().max(1)
+                        ));
+                    }
                     return Ok(format!(
-                        "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min({tc}), max({tc})) AS duration,\n    min({tc}) AS transaction_start,\n    max({tc}) AS transaction_end,\n    groupArray({limit})({kw}) AS _raw_events\n  FROM {source}\n  GROUP BY {group_by}{having}\n  ORDER BY transaction_start DESC",
-                        fields = group_by_fields.join(", "),
+                        "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min({tc}), max({tc})) AS duration,\n    min({tc}) AS transaction_start,\n    max({tc}) AS transaction_end,\n    groupArray({limit})({kw}) AS _raw_events\n  FROM {source}\n  WHERE {present_group_keys}\n  GROUP BY {group_by}{having}\n  ORDER BY transaction_start DESC",
+                        fields = transaction_fields.join(", "),
                         limit = array_limit,
                         source = source,
-                        group_by = group_by_refs.join(", "),
+                        present_group_keys = present_group_keys,
+                        group_by = group_by.join(", "),
                         having = having_clause
                     ));
                 }
@@ -916,23 +1098,110 @@ impl ClickHouseSqlGenerator {
                     Some(expr) => format!("if({}, 1, 0)", self.generate_search_expr(expr)?),
                     None => "0".to_string(),
                 };
-                let partition = group_by_refs.join(", ");
+                // Marker transaction plans contain several dependent window
+                // sorts. The marker predicates may need wide free-text input,
+                // but once their two boolean flags have been calculated those
+                // body columns must not travel through every sort. Re-project
+                // the source into narrow internal columns before sessionizing.
+                // This is late materialization for the transaction operator:
+                // final output remains byte-for-byte compatible while sort
+                // memory scales with the transaction state, not the event row.
+                let mut scan_projection = Vec::new();
+                let mut marker_group_fields = Vec::new();
+                let mut marker_group_refs = Vec::new();
+                for (position, field) in fields.iter().enumerate() {
+                    let (expression, needs_cast) = field_to_sql_expr(field, self);
+                    let internal = format!("__nano_txn_group_{position}");
+                    scan_projection.push(format!(
+                        "{} AS {}",
+                        expression,
+                        escape_identifier(&internal)
+                    ));
+                    let reference = escape_identifier(&internal);
+                    let output = escape_identifier(by_field_output_name(field, self));
+                    if needs_cast {
+                        marker_group_fields.push(format!("toString({reference}) AS {output}"));
+                        marker_group_refs.push(format!("toString({reference})"));
+                    } else {
+                        marker_group_fields.push(format!("{reference} AS {output}"));
+                        marker_group_refs.push(reference);
+                    }
+                }
+                let marker_time = "__nano_txn_time";
+                let marker_body = "__nano_txn_body";
+                scan_projection.push(format!("{tc} AS {}", escape_identifier(marker_time)));
+                scan_projection.push(format!("{kw} AS {}", escape_identifier(marker_body)));
+                let marker_row_identity = self.row_identity_column().map(|identity| {
+                    let internal = "__nano_txn_row_identity";
+                    scan_projection.push(format!(
+                        "{} AS {}",
+                        escape_identifier(identity),
+                        escape_identifier(internal)
+                    ));
+                    internal
+                });
+                let mut marker_passthrough_fields = Vec::new();
+                for (position, (expression, output)) in passthrough_specs.iter().enumerate() {
+                    let internal = format!("__nano_txn_passthrough_{position}");
+                    scan_projection.push(format!(
+                        "{} AS {}",
+                        expression,
+                        escape_identifier(&internal)
+                    ));
+                    marker_passthrough_fields.push(format!(
+                        "argMax({}, {}) AS {}",
+                        escape_identifier(&internal),
+                        escape_identifier(marker_time),
+                        escape_identifier(output)
+                    ));
+                }
+                let mut marker_transaction_fields = marker_group_fields;
+                marker_transaction_fields.extend(marker_passthrough_fields);
+                let marker_partition = marker_group_refs.join(", ");
+                let marker_order_tiebreak = marker_row_identity.map_or_else(
+                    || escape_identifier(marker_time),
+                    |identity| {
+                        format!(
+                            "{}, {}",
+                            escape_identifier(marker_time),
+                            escape_identifier(identity)
+                        )
+                    },
+                );
+                let marker_having_clause = match (maxspan, maxevents) {
+                    (Some(duration), Some(events)) => format!(
+                        "\n  HAVING count() <= {} AND dateDiff('second', min({}), max({})) <= {}",
+                        events,
+                        escape_identifier(marker_time),
+                        escape_identifier(marker_time),
+                        duration.as_secs()
+                    ),
+                    (Some(duration), None) => format!(
+                        "\n  HAVING dateDiff('second', min({}), max({})) <= {}",
+                        escape_identifier(marker_time),
+                        escape_identifier(marker_time),
+                        duration.as_secs()
+                    ),
+                    (None, Some(events)) => format!("\n  HAVING count() <= {events}"),
+                    (None, None) => String::new(),
+                };
+                let partition = marker_partition;
                 let session_expr = if startswith.is_some() {
                     format!(
-                        "sum(_txn_is_start) OVER (PARTITION BY {partition} ORDER BY {order_tiebreak} ROWS UNBOUNDED PRECEDING)"
+                        "sum(_txn_is_start) OVER (PARTITION BY {partition} ORDER BY {marker_order_tiebreak} ROWS UNBOUNDED PRECEDING)"
                     )
                 } else {
                     // endswith only: a new transaction begins on the row AFTER an
                     // end marker, so count only strictly-preceding end markers.
                     format!(
-                        "1 + sum(_txn_is_end) OVER (PARTITION BY {partition} ORDER BY {order_tiebreak} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"
+                        "1 + sum(_txn_is_end) OVER (PARTITION BY {partition} ORDER BY {marker_order_tiebreak} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"
                     )
                 };
                 // Rows after a session's first end marker are evicted; when an
                 // end marker is required, sessions without one are too.
                 let end_filters = if endswith.is_some() {
                     format!(
-                        ",\n      sum(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session ORDER BY {order_tiebreak} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS _txn_ends_before,\n      max(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session) AS _txn_has_end"
+                        ",\n      sum(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session ORDER BY {marker_order_tiebreak} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS _txn_ends_before,\n      max(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session) AS _txn_has_end"
                     )
                 } else {
                     String::new()
@@ -944,37 +1213,74 @@ impl ClickHouseSqlGenerator {
                 };
 
                 Ok(format!(
-                    "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min({tc}), max({tc})) AS duration,\n    min({tc}) AS transaction_start,\n    max({tc}) AS transaction_end,\n    groupArray({limit})({kw}) AS _raw_events\n  FROM (\n    SELECT *{end_filters}\n    FROM (\n      SELECT *, {session_expr} AS _txn_session\n      FROM (\n        SELECT *, {start_flag} AS _txn_is_start, {end_flag} AS _txn_is_end\n        FROM {source}\n      )\n    )\n  )\n  WHERE {row_filter}\n  GROUP BY {group_by}, _txn_session{having}\n  ORDER BY transaction_start DESC",
-                    fields = group_by_fields.join(", "),
+                    "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min({marker_time}), max({marker_time})) AS duration,\n    min({marker_time}) AS transaction_start,\n    max({marker_time}) AS transaction_end,\n    groupArray({limit})({marker_body}) AS _raw_events\n  FROM (\n    SELECT *{end_filters}\n    FROM (\n      SELECT *, {session_expr} AS _txn_session\n      FROM (\n        SELECT {scan_projection}, {start_flag} AS _txn_is_start, {end_flag} AS _txn_is_end\n        FROM {source}\n        WHERE {present_group_keys}\n      )\n    )\n  )\n  WHERE {row_filter}\n  GROUP BY {group_by}, _txn_session{having}\n  ORDER BY transaction_start DESC",
+                    fields = marker_transaction_fields.join(", "),
                     limit = array_limit,
+                    marker_time = escape_identifier(marker_time),
+                    marker_body = escape_identifier(marker_body),
                     end_filters = end_filters,
                     session_expr = session_expr,
+                    scan_projection = scan_projection.join(", "),
                     start_flag = start_flag,
                     end_flag = end_flag,
                     source = source,
+                    present_group_keys = present_group_keys,
                     row_filter = row_filter,
-                    group_by = group_by_refs.join(", "),
-                    having = having_clause
+                    group_by = marker_group_refs.join(", "),
+                    having = marker_having_clause
                 ))
             }
             Command::Fillnull { value, fields } => match fields {
                 Some(field_list) => {
-                    let coalesce_exprs: Vec<String> = field_list
-                        .iter()
-                        .map(|f| {
-                            let (expr, _) = field_to_sql_expr(f, self);
-                            format!(
-                                "ifNull(toString({}), '{}') AS {}",
-                                expr,
-                                escape_string(value),
-                                escape_identifier(f)
+                    let mut replacements = Vec::new();
+                    let mut additions = Vec::new();
+                    for field in field_list {
+                        let (expr, _) = field_to_sql_expr(field, self);
+                        let coalesce = format!(
+                            "ifNull(toString({}), '{}') AS {}",
+                            expr,
+                            escape_string(value),
+                            escape_identifier(field)
+                        );
+                        // Canonical lake fields are projected as real typed
+                        // columns by the worker compatibility seam, including
+                        // `unmapped.*`. Legacy JSON/Map spill fields are only
+                        // expressions over their tail container, so they must
+                        // remain additive: REPLACE requires the alias to exist
+                        // in the input block and would regress UDM `ext.foo`.
+                        if self.profile.uses_strict_canonical_fields()
+                            || matches!(
+                                self.profile.resolve(field),
+                                crate::schema::FieldResolution::ExplicitColumn(_)
                             )
-                        })
-                        .collect();
-                    Ok(format!(
-                        "  SELECT *, {} FROM {}",
-                        coalesce_exprs.join(", "),
-                        source
+                        {
+                            replacements.push(coalesce);
+                        } else {
+                            additions.push(coalesce);
+                        }
+                    }
+                    // `SELECT *, expr AS existing_name` leaves two same-named
+                    // columns in the block. That becomes a hard type mismatch
+                    // as soon as a downstream stage reads the name (notably a
+                    // Nullable OCSF leaf filled with a non-null String). The
+                    // ClickHouse REPLACE modifier preserves the wide row while
+                    // replacing each requested physical column exactly once.
+                    let replace = (!replacements.is_empty())
+                        .then(|| format!(" REPLACE({})", replacements.join(", ")))
+                        .unwrap_or_default();
+                    let append = (!additions.is_empty())
+                        .then(|| format!(", {}", additions.join(", ")))
+                        .unwrap_or_default();
+                    Ok(format!("  SELECT *{replace}{append} FROM {source}"))
+                }
+                // NAN-3318: the lake has no Nano-side pass that could fill an
+                // open-ended column set, and SQL cannot rewrite `*` in place
+                // (APPLY renames every column). Emitting `SELECT *` silently
+                // returned the nulls unchanged; say so instead.
+                None if self.profile.uses_strict_canonical_fields() => {
+                    Err(SqlGenError::InvalidQuery(
+                        "fillnull needs a field list here: fillnull [value=<v>] <field1>, <field2>, ..."
+                            .into(),
                     ))
                 }
                 None => Ok(format!("  SELECT * FROM {}", source)),
@@ -987,9 +1293,13 @@ impl ClickHouseSqlGenerator {
                 let limit_clause = format!(" LIMIT {}", effective_limit);
 
                 Ok(format!(
-                    "  SELECT *, arrayJoin({}) AS {} FROM {}{}",
+                    // Splunk/nPL mvexpand changes the row grain while keeping
+                    // the field's name. A parallel `<field>_expanded` column
+                    // left downstream `stats by <field>` grouping the original
+                    // arrays and diverged from every documented pipeline.
+                    "  SELECT * REPLACE(arrayJoin({}) AS {}) FROM {}{}",
                     field_expr,
-                    escape_identifier(&format!("{}_expanded", field)),
+                    escape_identifier(field),
                     source,
                     limit_clause
                 ))
@@ -1014,6 +1324,115 @@ impl ClickHouseSqlGenerator {
                 let output_field = output.as_deref().unwrap_or("spath_result");
 
                 match path {
+                    Some(json_path) if json_path.ends_with("{}") => {
+                        let json_path = json_path.trim_end_matches("{}");
+                        let logical_field = if json_path.is_empty() {
+                            input
+                                .as_deref()
+                                .unwrap_or(self.profile.json_tail_column())
+                                .to_string()
+                        } else if input
+                            .as_deref()
+                            .is_none_or(|name| matches!(name, "ext" | "event" | "unmapped"))
+                        {
+                            format!("{}.{}", self.profile.json_tail_column(), json_path)
+                        } else {
+                            format!("{}.{}", input.as_deref().unwrap_or_default(), json_path)
+                        };
+
+                        // A strict lake snapshot exposes canonical repeated
+                        // leaves as typed Array columns. Read that projected
+                        // leaf directly: serializing the whole `unmapped`
+                        // struct and reparsing it both defeated column pruning
+                        // and failed once the worker's projection omitted the
+                        // parent struct. Unknown/computed JSON inputs retain the
+                        // generic JSONExtractArrayRaw behavior below.
+                        if self.profile.is_string_array_field(&logical_field) {
+                            let (array_expr, _) = field_to_sql_expr(&logical_field, self);
+                            return Ok(format!(
+                                "  SELECT *, {} AS {} FROM {}",
+                                array_expr,
+                                escape_identifier(output_field),
+                                source
+                            ));
+                        }
+                        let path_args = json_path
+                            .split('.')
+                            .filter(|part| !part.is_empty())
+                            .map(|part| format!("'{}'", escape_string(part)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let source_expr = if input
+                            .as_deref()
+                            .is_some_and(|name| self.is_upstream_computed_field(name))
+                        {
+                            escape_identifier(input.as_deref().unwrap_or_default())
+                        } else {
+                            escape_identifier(&input_field)
+                        };
+                        Ok(format!(
+                            "  SELECT *, JSONExtractArrayRaw(toString({}), {}) AS {} FROM {}",
+                            source_expr,
+                            path_args,
+                            escape_identifier(output_field),
+                            source
+                        ))
+                    }
+                    Some(json_path)
+                        if input
+                            .as_deref()
+                            .is_some_and(|name| self.is_upstream_computed_field(name)) =>
+                    {
+                        let path_args = json_path
+                            .split('.')
+                            .filter(|part| !part.is_empty())
+                            .map(|part| format!("'{}'", escape_string(part)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        Ok(format!(
+                            "  SELECT *, JSONExtractString({}, {}) AS {} FROM {}",
+                            escape_identifier(input.as_deref().unwrap_or_default()),
+                            path_args,
+                            escape_identifier(output_field),
+                            source
+                        ))
+                    }
+                    // NAN-3327: `input=raw_data` / `input=message` names a
+                    // scalar column holding JSON TEXT, not an object to path
+                    // into. It used to be concatenated with the path into
+                    // `ext.raw_dataeventName`. Parse the column's text.
+                    Some(json_path)
+                        if self.profile.id() == crate::schema::SchemaId::Ocsf
+                            && spath_reads_column_text(self.profile.as_ref(), input.as_deref(), json_path) =>
+                    {
+                        let column = input.as_deref().unwrap_or_default();
+                        let (column_expr, _) = field_to_sql_expr(column, self);
+                        Ok(format!(
+                            "  SELECT *, JSONExtractString(toString({}), {}) AS {} FROM {}",
+                            column_expr,
+                            spath_path_args(json_path),
+                            escape_identifier(output_field),
+                            source
+                        ))
+                    }
+                    Some(json_path)
+                        if self.profile.id() == crate::schema::SchemaId::Ocsf =>
+                    {
+                        let logical_field = if input
+                            .as_deref()
+                            .is_none_or(|name| matches!(name, "ext" | "event" | "unmapped"))
+                        {
+                            format!("{}.{}", self.profile.json_tail_column(), json_path)
+                        } else {
+                            format!("{}.{}", input.as_deref().unwrap_or_default(), json_path)
+                        };
+                        Ok(format!(
+                            "  SELECT *, toString({}) AS {} FROM {}",
+                            self.field_access_expr(&logical_field, "String"),
+                            escape_identifier(output_field),
+                            source
+                        ))
+                    }
                     Some(json_path) => Ok(format!(
                         "  SELECT *, JSONExtractString({}, '{}') AS {} FROM {}",
                         escape_identifier(&input_field),
@@ -1045,18 +1464,22 @@ impl ClickHouseSqlGenerator {
                 None => Ok(format!("  SELECT * FROM {}", source)),
             },
             Command::Return { count, fields } => {
-                let field_list = fields
-                    .iter()
-                    .map(|f| {
-                        let (expr, needs_alias) = field_to_sql_expr(f, self);
-                        if needs_alias {
-                            format!("{} AS {}", expr, escape_identifier(f))
-                        } else {
-                            expr
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let field_list = if fields.is_empty() {
+                    "*".to_string()
+                } else {
+                    fields
+                        .iter()
+                        .map(|f| {
+                            let (expr, needs_alias) = field_to_sql_expr(f, self);
+                            if needs_alias {
+                                format!("{} AS {}", expr, escape_identifier(f))
+                            } else {
+                                expr
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
 
                 Ok(format!(
                     "  SELECT DISTINCT {} FROM {} LIMIT {}",
@@ -1069,12 +1492,22 @@ impl ClickHouseSqlGenerator {
                 factor,
                 weight,
             } => {
-                // Generate ClickHouse SQL for risk command
+                // Generate ClickHouse SQL for risk command.
+                //
+                // Risk semantics (Splunk RBA; docs/user-guide/risk-scoring.md):
+                // `entity=` names the risk object; a pipe WITHOUT `entity=`
+                // inherits the previous pipe's entity (only a first pipe
+                // defaults to 'unknown'). `risk_score` accumulates across
+                // pipes and `raw_risk_score` carries the same accumulated,
+                // unweighted score, which the detection calculator scores the
+                // finding from. The Rust post-processing path
+                // (`post_processing::apply_risk_pipe`) implements the same.
                 let entity_expr = match entity_field {
                     Some(field) => {
                         let (expr, _) = field_to_sql_expr(field, self);
                         format!("coalesce(toString({}), 'unknown')", expr)
                     }
+                    None if has_prior_risk => "risk_entity".to_string(),
                     None => "'unknown'".to_string(),
                 };
 
@@ -1113,10 +1546,15 @@ impl ClickHouseSqlGenerator {
                         format!("least(100, greatest(0, risk_score + {}))", raw_score_expr);
                     let accumulated_factors =
                         format!("arrayConcat(risk_factors, [{}])", factor_expr);
+                    // `raw_risk_score` is projected one level up, from the
+                    // accumulated column: in the same SELECT, a reference to
+                    // `risk_score` resolves to the new alias or to the source
+                    // column depending on `prefer_column_name_to_alias`, so an
+                    // inline copy would double-count on one of the engines.
                     Ok(format!(
-                        "  SELECT * EXCEPT(raw_risk_score, risk_score, risk_entity, risk_factors{}),\n    {} AS raw_risk_score,\n    {} AS risk_score,\n    {} AS risk_entity,\n    {} AS risk_factors{}\n  FROM {}",
+                        "  SELECT *, risk_score AS raw_risk_score FROM (\n  SELECT * EXCEPT(raw_risk_score, risk_score, risk_entity, risk_factors{}),\n    {} AS risk_score,\n    {} AS risk_entity,\n    {} AS risk_factors{}\n  FROM {})",
                         if weight.is_some() { ", risk_weight" } else { "" },
-                        raw_score_expr, accumulated_score, entity_expr, accumulated_factors, weight_clause, source
+                        accumulated_score, entity_expr, accumulated_factors, weight_clause, source
                     ))
                 } else {
                     // First risk pipe: initialize score and factors
@@ -1137,10 +1575,22 @@ impl ClickHouseSqlGenerator {
                 // Prevalence command is handled as post-processing by the search service
                 Ok(format!("  SELECT * FROM {}", source))
             }
-            Command::Sample { limit } => Ok(format!(
-                "  SELECT * FROM {}\n  ORDER BY cityHash64(id, now())\n  LIMIT {}",
-                source, limit
-            )),
+            Command::Sample { limit } => {
+                // `id` is a UDM physical column. The canonical OCSF row identity
+                // is `metadata.uid`; spans use `span_id`, and metrics fall back
+                // to their dataset time column. Keeping this profile-aware is
+                // important because sample is often used before a second stats
+                // stage in exploratory pipelines.
+                let sample_key = self
+                    .row_identity_column()
+                    .unwrap_or_else(|| self.time_column());
+                Ok(format!(
+                    "  SELECT * FROM {}\n  ORDER BY cityHash64({}, now())\n  LIMIT {}",
+                    source,
+                    escape_identifier(sample_key),
+                    limit
+                ))
+            }
             Command::Reverse => {
                 if timestamp_available {
                     // Raw events: reverse the default newest-first order → oldest-first.
@@ -1187,6 +1637,7 @@ impl ClickHouseSqlGenerator {
                 *threshold,
                 method,
                 &stability,
+                aggregated,
             ),
             // InputLookup is handled in post-processing (Rust code), not SQL
             Command::InputLookup { .. } => Ok(format!("SELECT * FROM {}", source)),
@@ -1197,6 +1648,7 @@ impl ClickHouseSqlGenerator {
                 detail_field,
                 prevalence_field,
                 root_filter: _,
+                ..
             } => {
                 // The positional form `tree <field>` parses with an EMPTY
                 // parent_field when no `parent=` is given — emitting it would
@@ -1224,37 +1676,47 @@ impl ClickHouseSqlGenerator {
                 // byte-identical to the old raw-identifier form. Fields the
                 // profile can't resolve (custom ext fields like `ppid`) keep the
                 // raw identifier — stage_0's ext materialization aliases them.
-                let project_as = |f: &str| -> String {
+                // A field whose resolved expression IS its own escaped name is
+                // already carried by the upstream stage's `SELECT *` — naming
+                // it again next to `*` is a duplicate column, which ClickHouse
+                // tolerates but the lake's chDB engine rejects with
+                // ILLEGAL_COLUMN ("Cannot add column …", NAN-2361). Those
+                // return None (nothing to project); only expressions that need
+                // an alias back to the nPL name are emitted. Unresolvable
+                // fields (custom ext identifiers) keep the raw identifier —
+                // stage_0's ext materialization aliases them, and referencing
+                // a select-list alias is not a duplicate add.
+                let project_as = |f: &str| -> Option<String> {
                     let ident = escape_identifier(f).to_string();
                     if let Some(unified) = self.class_split_column(f) {
                         let unified = escape_identifier(&unified).to_string();
                         if unified == ident {
-                            ident
+                            None
                         } else {
-                            format!("{} AS {}", unified, ident)
+                            Some(format!("{} AS {}", unified, ident))
                         }
                     } else if self.resolves_to_column(f) {
                         let (expr, _) = field_to_sql_expr(f, self);
                         if expr == ident {
-                            ident
+                            None
                         } else {
-                            format!("{} AS {}", expr, ident)
+                            Some(format!("{} AS {}", expr, ident))
                         }
                     } else {
-                        ident
+                        Some(ident)
                     }
                 };
-                let mut required_fields = vec![
-                    project_as(parent_field),
-                    project_as(child_field),
-                    project_as(label_field),
-                ];
-                if let Some(detail) = detail_field {
-                    required_fields.push(project_as(detail));
-                }
-                if let Some(prevalence) = prevalence_field {
-                    required_fields.push(project_as(prevalence));
-                }
+                let mut required_fields: Vec<String> = [
+                    Some(parent_field.as_str()),
+                    Some(child_field.as_str()),
+                    Some(label_field.as_str()),
+                    detail_field.as_deref(),
+                    prevalence_field.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(project_as)
+                .collect();
                 // Prevalence columns used by the tree builder
                 // (prevalence_file_hash / process_hash / dest_domain / dest_ip /
                 // _min) are selected in the base CTE alongside other MATERIALIZED
@@ -1265,10 +1727,17 @@ impl ClickHouseSqlGenerator {
                 // Deduplicate
                 required_fields.sort();
                 required_fields.dedup();
+                if required_fields.is_empty() {
+                    // Every tree field is already inside `SELECT *` — a bare
+                    // pass-through avoids `SELECT *, ` (syntax error).
+                    return Ok(format!("  SELECT * FROM {}", source));
+                }
                 let fields_list = required_fields.join(", ");
                 Ok(format!("  SELECT *, {} FROM {}", fields_list, source))
             }
-            Command::ResolveIdentity { field, max_age } => {
+            Command::ResolveIdentity {
+                field, max_age, ..
+            } => {
                 // Generate ASOF JOIN with identity_observations table
                 self.generate_resolve_identity_sql(
                     source,

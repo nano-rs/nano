@@ -4,7 +4,7 @@
 //!
 //! PDF bytes and branding stay on the analyst's device. These endpoints record
 //! only bounded hashes and presentation metadata after a local action succeeds;
-//! they do not turn a report into a server-side artifact or grant PIVT a write
+//! they do not turn a report into a server-side artifact or grant pivt a write
 //! path into hunts or cases.
 
 use axum::{

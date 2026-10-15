@@ -1,0 +1,247 @@
+[
+  {
+    "name": "Filter by Status Code",
+    "original": "status>=400",
+    "query": "http_response.code>=400"
+  },
+  {
+    "name": "Combine Filters",
+    "original": "source_type=apache status>=400 method=\"POST\"",
+    "query": "source_type=apache http_response.code>=400 method=\"POST\""
+  },
+  {
+    "name": "Not Equal Filter",
+    "original": "status!=200",
+    "query": "http_response.code!=200"
+  },
+  {
+    "name": "Numeric Range",
+    "original": "bytes>1000000",
+    "query": "traffic.bytes_out>1000000"
+  },
+  {
+    "name": "IN Operator",
+    "original": "status IN (401, 403, 404)",
+    "query": "http_response.code IN (401, 403, 404)"
+  },
+  {
+    "name": "CIDR Network Filter",
+    "original": "src_ip IN CIDR \"10.0.0.0/8\"",
+    "query": "* | where cidr_match(src_ip, \"10.0.0.0/8\")"
+  },
+  {
+    "name": "Count by Status",
+    "original": "source_type=apache | stats count() by status",
+    "query": "source_type=apache | stats count() by http_response.code"
+  },
+  {
+    "name": "Average Response Size",
+    "original": "source_type=apache | stats avg(bytes) as avg_bytes",
+    "query": "source_type=apache | stats avg(traffic.bytes_out) as avg_bytes"
+  },
+  {
+    "name": "Sum of Bytes Transferred",
+    "original": "source_type=apache | stats sum(bytes) as total_bytes",
+    "query": "source_type=apache | stats sum(traffic.bytes_out) as total_bytes"
+  },
+  {
+    "name": "Min/Max Values",
+    "original": "* | stats min(bytes) as min_bytes, max(bytes) as max_bytes",
+    "query": "* | stats min(traffic.bytes_out) as min_bytes, max(traffic.bytes_out) as max_bytes"
+  },
+  {
+    "name": "Multiple Aggregations",
+    "original": "* | stats count() as events, dc(src_ip) as unique_ips, sum(bytes) as total_bytes by source_type",
+    "query": "* | stats count() as events, dc(src_ip) as unique_ips, sum(traffic.bytes_out) as total_bytes by source_type"
+  },
+  {
+    "name": "Percentiles",
+    "original": "source_type=apache | stats p50(response_time) as median, p95(response_time) as p95, p99(response_time) as p99",
+    "query": "source_type=apache | stats percentile(duration, 50) as median, percentile(duration, 95) as p95, percentile(duration, 99) as p99"
+  },
+  {
+    "name": "Errors Over Time",
+    "original": "status>=400 | bin span=1h | stats count() by _time",
+    "query": "http_response.code>=400 | bin span=1h | stats count() by _time"
+  },
+  {
+    "name": "High Risk Entities (24h)",
+    "original": "source_type=signals | bin span=24h | stats sum(risk_score) as total_risk by risk_entity | where total_risk > 80",
+    "query": "source_type=risk | mvexpand resources.name | rename resources.name as risk_entity | bin span=24h | stats sum(risk_score) as total_risk by risk_entity | where total_risk > 80"
+  },
+  {
+    "name": "High Risk Entities (7d)",
+    "original": "source_type=signals | bin span=7d | stats sum(risk_score) as total_risk by risk_entity | where total_risk > 90",
+    "query": "source_type=risk | mvexpand resources.name | rename resources.name as risk_entity | bin span=7d | stats sum(risk_score) as total_risk by risk_entity | where total_risk > 90"
+  },
+  {
+    "name": "Top Risky IPs",
+    "original": "source_type=signals | stats sum(risk_score) as total_risk, count() as signal_count by risk_entity | sort -total_risk | head 20",
+    "query": "source_type=risk | mvexpand resources.name | rename resources.name as risk_entity | stats sum(risk_score) as total_risk, count() as signal_count by risk_entity | sort -total_risk | head 20"
+  },
+  {
+    "name": "Signals by Rule",
+    "original": "source_type=signals | stats count() by rule_name | sort -count",
+    "query": "source_type=findings | stats count() by finding_info.analytic.name | sort -count"
+  },
+  {
+    "name": "Alert Timeline",
+    "original": "source_type=signals signal_type=alert | bin span=1h | stats count() by _time",
+    "query": "source_type=findings finding_info.types=alert | bin span=1h | stats count() by _time"
+  },
+  {
+    "name": "Risk Accumulation Rate",
+    "original": "source_type=signals | bin span=1h | stats sum(risk_score) as hourly_risk by risk_entity, _time | sort risk_entity, _time",
+    "query": "source_type=risk | mvexpand resources.name | rename resources.name as risk_entity | bin span=1h | stats sum(risk_score) as hourly_risk by risk_entity, _time | sort risk_entity, _time"
+  },
+  {
+    "name": "Top Destinations",
+    "original": "* | stats count() as connections by dst_ip | sort -connections | head 20",
+    "query": "* | stats count() as connections by dst_endpoint.ip | sort -connections | head 20"
+  },
+  {
+    "name": "Data Transfer by IP",
+    "original": "* | stats sum(bytes) as total_bytes by src_ip | sort -total_bytes | head 20",
+    "query": "* | stats sum(traffic.bytes_out) as total_bytes by src_ip | sort -total_bytes | head 20"
+  },
+  {
+    "name": "Internal vs External Traffic",
+    "original": "src_ip IN CIDR \"10.0.0.0/8\" OR src_ip IN CIDR \"192.168.0.0/16\" OR src_ip IN CIDR \"172.16.0.0/12\" | stats count() as internal_traffic",
+    "query": "* | where cidr_match(src_ip, \"10.0.0.0/8\") OR cidr_match(src_ip, \"192.168.0.0/16\") OR cidr_match(src_ip, \"172.16.0.0/12\") | stats count() as internal_traffic"
+  },
+  {
+    "name": "Port Scan Detection",
+    "original": "* | stats dc(dst_port) as unique_ports by src_ip | where unique_ports > 100 | sort -unique_ports",
+    "query": "* | stats dc(dst_endpoint.port) as unique_ports by src_ip | where unique_ports > 100 | sort -unique_ports"
+  },
+  {
+    "name": "Unusual Ports",
+    "original": "dst_port NOT IN (80, 443, 22, 21, 25, 53) | stats count() by dst_port | sort -count | head 20",
+    "query": "dst_endpoint.port NOT IN (80, 443, 22, 21, 25, 53) | stats count() by dst_endpoint.port | sort -count | head 20"
+  },
+  {
+    "name": "Failed Logins",
+    "original": "action=login status=failure",
+    "query": "class_uid=3002 activity_id=1 status_id=2"
+  },
+  {
+    "name": "Failed Logins by User",
+    "original": "action=login status=failure | stats count() as failures by user | sort -failures | head 20",
+    "query": "class_uid=3002 activity_id=1 status_id=2 | stats count() as failures by user | sort -failures | head 20"
+  },
+  {
+    "name": "Failed Logins by IP",
+    "original": "action=login status=failure | stats count() as failures by src_ip | sort -failures | head 20",
+    "query": "class_uid=3002 activity_id=1 status_id=2 | stats count() as failures by src_ip | sort -failures | head 20"
+  },
+  {
+    "name": "Brute Force Detection",
+    "original": "action=login status=failure | bin span=5m | stats count() as attempts by src_ip, _time | where attempts > 10",
+    "query": "class_uid=3002 activity_id=1 status_id=2 | bin span=5m | stats count() as attempts by src_ip, _time | where attempts > 10"
+  },
+  {
+    "name": "Successful Logins After Failures",
+    "original": "action=login | stats count(eval(status=\"failure\")) as failures, count(eval(status=\"success\")) as successes by user | where failures > 5 AND successes > 0",
+    "query": "class_uid=3002 activity_id=1 | stats count(eval(status_id=2)) as failures, count(eval(status_id=1)) as successes by user | where failures > 5 AND successes > 0"
+  },
+  {
+    "name": "Login Times",
+    "original": "action=login status=success | eval hour=strftime(\"%H\", timestamp) | stats count() by hour | sort hour",
+    "query": "class_uid=3002 activity_id=1 status_id=1 | eval hour=tonumber(strftime(timestamp, \"%H\")) | stats count() by hour | sort hour"
+  },
+  {
+    "name": "Off-Hours Logins",
+    "original": "action=login status=success | eval hour=strftime(\"%H\", timestamp) | where hour < 8 OR hour > 18",
+    "query": "class_uid=3002 activity_id=1 status_id=1 | eval hour=tonumber(strftime(timestamp, \"%H\")) | where hour < 8 OR hour > 18"
+  },
+  {
+    "name": "HTTP Error Rate",
+    "original": "source_type=apache | stats count() as total, count(eval(status>=400)) as errors | eval error_rate=round(errors/total*100, 2)",
+    "query": "source_type=apache | stats count() as total, count(eval(http_response.code>=400)) as errors | eval error_rate=round(errors/total*100, 2)"
+  },
+  {
+    "name": "404 Not Found",
+    "original": "source_type=apache status=404 | stats count() by uri | sort -count | head 20",
+    "query": "source_type=apache http_response.code=404 | stats count() by uri | sort -count | head 20"
+  },
+  {
+    "name": "500 Server Errors",
+    "original": "source_type=apache status>=500 | stats count() by uri, status | sort -count",
+    "query": "source_type=apache http_response.code>=500 | stats count() by uri, http_response.code | sort -count"
+  },
+  {
+    "name": "Slow Requests",
+    "original": "source_type=apache response_time>5000 | stats count() by uri | sort -count | head 20",
+    "query": "source_type=apache duration>5000 | stats count() by uri | sort -count | head 20"
+  },
+  {
+    "name": "Large Responses",
+    "original": "source_type=apache bytes>10000000 | stats count() by uri | sort -count",
+    "query": "source_type=apache traffic.bytes_out>10000000 | stats count() by uri | sort -count"
+  },
+  {
+    "name": "User Agents",
+    "original": "source_type=apache | stats count() by user_agent | sort -count | head 20",
+    "query": "source_type=apache | stats count() by http_request.user_agent | sort -count | head 20"
+  },
+  {
+    "name": "Bot Detection",
+    "original": "source_type=apache user_agent=\"*bot*\" OR user_agent=\"*crawler*\" OR user_agent=\"*spider*\" | stats count() by user_agent, src_ip",
+    "query": "source_type=apache http_request.user_agent=\"*bot*\" OR http_request.user_agent=\"*crawler*\" OR http_request.user_agent=\"*spider*\" | stats count() by http_request.user_agent, src_ip"
+  },
+  {
+    "name": "Suspicious User Agents",
+    "original": "user_agent=\"*sqlmap*\" OR user_agent=\"*nikto*\" OR user_agent=\"*nmap*\" OR user_agent=\"*masscan*\"",
+    "query": "http_request.user_agent=\"*sqlmap*\" OR http_request.user_agent=\"*nikto*\" OR http_request.user_agent=\"*nmap*\" OR http_request.user_agent=\"*masscan*\""
+  },
+  {
+    "name": "Rare User Agents",
+    "original": "source_type=apache | stats count() as requests by user_agent | where requests < 10 | sort requests",
+    "query": "source_type=apache | stats count() as requests by http_request.user_agent | where requests < 10 | sort requests"
+  },
+  {
+    "name": "Geographic Anomaly",
+    "original": "* | stats dc(src_ip) as unique_ips, count() as requests by country | sort -requests",
+    "query": "* | stats dc(src_ip) as unique_ips, count() as requests by src_endpoint.location.country | sort -requests"
+  },
+  {
+    "name": "Data Exfiltration",
+    "original": "bytes>50000000 | stats sum(bytes) as total_bytes by src_ip, dst_ip | sort -total_bytes | head 20",
+    "query": "traffic.bytes_out>50000000 | stats sum(traffic.bytes_out) as total_bytes by src_ip, dst_endpoint.ip | sort -total_bytes | head 20"
+  },
+  {
+    "name": "Beaconing Detection",
+    "original": "* | bin span=1m | stats count() as connections by src_ip, dst_ip, _time | stats stdev(connections) as stdev, avg(connections) as avg by src_ip, dst_ip | where stdev < 1 AND avg > 0",
+    "query": "* | bin span=1m | stats count() as connections by src_ip, dst_endpoint.ip, _time | stats stdev(connections) as stdev, avg(connections) as avg by src_ip, dst_endpoint.ip | where stdev < 1 AND avg > 0"
+  },
+  {
+    "name": "Error Summary",
+    "original": "status>=400 | stats count() by source_type, status | sort source_type, status",
+    "query": "http_response.code>=400 | stats count() by source_type, http_response.code | sort source_type, http_response.code"
+  },
+  {
+    "name": "Security Posture",
+    "original": "* | stats count() as total_events, count(eval(status>=400)) as errors, dc(src_ip) as unique_sources",
+    "query": "* | stats count() as total_events, count(eval(http_response.code>=400)) as errors, dc(src_ip) as unique_sources"
+  },
+  {
+    "name": "Traffic by Hour of Day",
+    "original": "* | eval hour=strftime(\"%H\", timestamp) | stats count() by hour | sort hour",
+    "query": "* | eval hour=tonumber(strftime(timestamp, \"%H\")) | stats count() by hour | sort hour"
+  },
+  {
+    "name": "After Hours Activity",
+    "original": "* | eval hour=strftime(\"%H\", timestamp) | where hour < 6 OR hour > 22 | stats count() by src_ip, hour",
+    "query": "* | eval hour=tonumber(strftime(timestamp, \"%H\")) | where hour < 6 OR hour > 22 | stats count() by src_ip, hour"
+  },
+  {
+    "name": "Hourly Heatmap Data",
+    "original": "* | eval hour=strftime(\"%H\", timestamp), day=strftime(\"%A\", timestamp) | stats count() by day, hour",
+    "query": "* | eval hour=tonumber(strftime(timestamp, \"%H\")), day=strftime(timestamp, \"%A\") | stats count() by day, hour"
+  },
+  {
+    "name": "Filter by Action",
+    "original": "action=\"login\"",
+    "query": "class_uid=3002 activity_id=1"
+  }
+]

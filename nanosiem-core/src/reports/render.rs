@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use crate::csv_safe::escape_field;
 
 /// Max rows rendered into an HTML table (cosmetic — CSV carries the full,
 /// byte-capped set). Keeps the HTML artifact small and the browser responsive.
@@ -92,45 +93,6 @@ pub fn resolve_columns(columns: &[String], rows: &[Value]) -> Vec<String> {
     seen
 }
 
-/// Neutralize a CSV field that a spreadsheet would evaluate as a FORMULA.
-///
-/// This is a SIEM: cell content is attacker-controlled log data. Excel / Sheets /
-/// LibreOffice execute any cell starting with `=`, `+`, `-`, `@` (or a leading
-/// tab/CR before one of those), so a crafted `user` or `command_line` value like
-/// `=cmd|'/c calc'!A0` becomes code execution on the analyst's workstation when
-/// they open the exported CSV (CSV injection / DDE).
-///
-/// Genuine negative numbers (`-5`, `-1.25`) must survive as numbers, so a
-/// leading-`-` field is only neutralized when it does NOT parse as a number —
-/// `-5` stays numeric, `-5+3` (a formula) does not. Neutralization prefixes a
-/// single quote, the conventional "treat as text" marker.
-fn csv_neutralize_formula(field: &str) -> std::borrow::Cow<'_, str> {
-    let trimmed = field.trim_start_matches(['\t', '\r', ' ']);
-    let first = match trimmed.chars().next() {
-        Some(c) => c,
-        None => return std::borrow::Cow::Borrowed(field),
-    };
-    if !matches!(first, '=' | '+' | '-' | '@') {
-        return std::borrow::Cow::Borrowed(field);
-    }
-    // A well-formed number is data, not a formula — keep it intact.
-    if field.trim().parse::<f64>().is_ok() {
-        return std::borrow::Cow::Borrowed(field);
-    }
-    std::borrow::Cow::Owned(format!("'{field}"))
-}
-
-/// Escape a CSV field per RFC 4180 (quote when it contains `,`, `"`, CR, or LF;
-/// double embedded quotes), after neutralizing spreadsheet formulas.
-fn csv_escape(field: &str) -> String {
-    let field = csv_neutralize_formula(field);
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.into_owned()
-    }
-}
-
 /// Render rows to CSV, bounded by `byte_cap`. Returns the bytes and whether the
 /// output was truncated (cap reached before all rows were written).
 pub fn render_csv(rows: &[Value], columns: &[String], byte_cap: usize) -> (Vec<u8>, bool) {
@@ -140,7 +102,7 @@ pub fn render_csv(rows: &[Value], columns: &[String], byte_cap: usize) -> (Vec<u
     // Header.
     let header = cols
         .iter()
-        .map(|c| csv_escape(c))
+        .map(|c| escape_field(c))
         .collect::<Vec<_>>()
         .join(",");
     out.push_str(&header);
@@ -152,8 +114,11 @@ pub fn render_csv(rows: &[Value], columns: &[String], byte_cap: usize) -> (Vec<u
         let line = cols
             .iter()
             .map(|c| {
-                let cell = obj.and_then(|o| o.get(c)).map(cell_to_string).unwrap_or_default();
-                csv_escape(&cell)
+                let cell = obj
+                    .and_then(|o| o.get(c))
+                    .map(cell_to_string)
+                    .unwrap_or_default();
+                escape_field(&cell)
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -201,12 +166,7 @@ svg{max-width:100%;height:auto;border:1px solid var(--border);border-radius:4px;
 /// Append an HTML `<table>` for `rows`, bounded by `byte_cap` (stops adding rows
 /// before the cap). Returns whether it truncated. Adds a "showing N of M" note
 /// when rows exceed the display cap.
-fn push_html_table(
-    out: &mut String,
-    rows: &[Value],
-    columns: &[String],
-    byte_cap: usize,
-) -> bool {
+fn push_html_table(out: &mut String, rows: &[Value], columns: &[String], byte_cap: usize) -> bool {
     let cols = resolve_columns(columns, rows);
     if cols.is_empty() {
         out.push_str("<p class=\"empty\">No columns.</p>");
@@ -228,7 +188,10 @@ fn push_html_table(
         let obj = row.as_object();
         let mut line = String::from("<tr>");
         for c in &cols {
-            let cell = obj.and_then(|o| o.get(c)).map(cell_to_string).unwrap_or_default();
+            let cell = obj
+                .and_then(|o| o.get(c))
+                .map(cell_to_string)
+                .unwrap_or_default();
             line.push_str("<td>");
             line.push_str(&html_escape(&cell));
             line.push_str("</td>");
@@ -513,14 +476,14 @@ pub fn render_dashboard_html(
         out.push_str(&format!("<h2>{}</h2>", html_escape(&panel.title)));
 
         if let Some(reason) = &panel.unsupported {
-            out.push_str(&format!(
-                "<p class=\"empty\">{}</p>",
-                html_escape(reason)
-            ));
+            out.push_str(&format!("<p class=\"empty\">{}</p>", html_escape(reason)));
             continue;
         }
         if let Some(err) = &panel.error {
-            out.push_str(&format!("<p class=\"err\">Panel failed: {}</p>", html_escape(err)));
+            out.push_str(&format!(
+                "<p class=\"err\">Panel failed: {}</p>",
+                html_escape(err)
+            ));
             continue;
         }
         if panel.rows.is_empty() {
@@ -537,12 +500,18 @@ pub fn render_dashboard_html(
                 .and_then(|o| o.values().next())
                 .map(cell_to_string)
                 .unwrap_or_default();
-            out.push_str(&format!("<div class=\"single\">{}</div>", html_escape(&value)));
+            out.push_str(&format!(
+                "<div class=\"single\">{}</div>",
+                html_escape(&value)
+            ));
             continue;
         }
 
         // Chartable line/area/bar shapes → inline SVG; else a table.
-        let charted = if matches!(panel.viz_type.as_str(), "line" | "area" | "bar" | "ranked_bar") {
+        let charted = if matches!(
+            panel.viz_type.as_str(),
+            "line" | "area" | "bar" | "ranked_bar"
+        ) {
             try_svg_chart(&panel.rows, &panel.columns, &panel.viz_type)
         } else {
             None

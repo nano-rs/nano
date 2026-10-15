@@ -18,7 +18,7 @@ pub mod stuck_query_monitor;
 pub mod types;
 
 pub use ai_monitor::{AiMonitor, AiProviderConnectivityChecker};
-pub use feed_monitor::FeedMonitor;
+pub use feed_monitor::{FeedMonitor, LakeFeedFreshness};
 pub use repository::{HealthRepository, HealthRepositoryError};
 pub use scheduler::HealthScheduler;
 pub use stuck_query_monitor::StuckQueryMonitor;

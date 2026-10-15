@@ -5,7 +5,7 @@
 pub mod alerts;
 pub mod artifacts;
 // Cases & incidents are an enterprise feature (NAN-744): the API routes that
-// expose them live in nanosiem-enterprise, no open-core code calls these repos,
+// expose them live in the enterprise crate, no open-core code calls these repos,
 // and the `ai_*` columns they SELECT only exist in the enterprise migration
 // overlay. Gate the repo layer out of the open edition entirely (NAN-1298),
 // matching the airgap/license precedent — so the open binary never compiles SQL
@@ -33,6 +33,8 @@ pub mod saved_searches;
 pub mod search_history;
 pub mod shared_searches;
 pub mod source_scope;
+#[cfg(feature = "enterprise")]
+pub mod tenant_case_notebooks;
 
 pub use alerts::{compute_event_hash, AlertInsert, AlertRepository, AlertRepositoryError};
 pub use artifacts::{ArtifactRepository, ArtifactRepositoryError};
@@ -49,7 +51,6 @@ pub use folder_settings::{FolderSetting, FolderSettingsError, FolderSettingsRepo
 pub use incidents::{IncidentRepository, IncidentRepositoryError};
 pub use notebooks::{NotebookRepository, NotebookRepositoryError};
 pub use notifications::{NotificationError, NotificationRepository};
-pub use retro_hunt::{RetroHuntRepository, RetroHuntRepositoryError};
 pub use query_explanations::{
     NewQueryExplanation, QueryExplanation, QueryExplanationError, QueryExplanationRepository,
     ReasoningStepRow,
@@ -58,6 +59,7 @@ pub use rate_limit::{RateLimitRepository, RateLimitRepositoryError};
 pub use recent_activity::{
     RecentActivityError, RecentActivityItem, RecentActivityRepository, RecentItemType,
 };
+pub use retro_hunt::{RetroHuntRepository, RetroHuntRepositoryError};
 pub use saved_searches::{SavedSearchRepository, SavedSearchRepositoryError};
 pub use search_history::{
     NewSearchHistoryEntry, SearchHistoryEntry, SearchHistoryError, SearchHistoryRepository,
@@ -65,4 +67,8 @@ pub use search_history::{
 pub use shared_searches::{SharedSearchRepository, SharedSearchRepositoryError};
 pub use source_scope::{
     RestrictedSourceType, SourceScopeError, SourceScopeRepository, SourceTypeGrant,
+};
+#[cfg(feature = "enterprise")]
+pub use tenant_case_notebooks::{
+    TenantCaseNotebookError, TenantCaseNotebookRepository, TenantCaseNotebookService,
 };

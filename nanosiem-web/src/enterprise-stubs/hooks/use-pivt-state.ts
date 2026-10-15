@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// Open-edition stub for usePivtState. PIVT (the AI assistant shell) is
+// Open-edition stub for usePivtState. pivt (the AI assistant shell) is
 // enterprise-only; in open builds AppLayout still mounts <PivtSummon> +
 // <PivtShellOverlay> until the AppLayout gating in Task #17 lands, so we
 // hand back a frozen no-op state object. The components themselves are

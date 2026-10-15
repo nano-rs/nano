@@ -9,9 +9,11 @@
 //! - Request ID propagation for distributed tracing
 //! - Rate limiting for auth endpoints
 
+pub mod api_cache_control;
 pub mod audit_authz;
 pub mod auth;
 pub mod demo_guard;
+pub mod denied_source_audit;
 pub mod ip_allowlist;
 #[cfg(feature = "enterprise")]
 pub mod license_guard;
@@ -20,7 +22,9 @@ pub mod rate_limit;
 pub mod request_id;
 pub mod sanitize_errors;
 pub mod tier_guard;
+pub mod vector_ingest_guard;
 
+pub use api_cache_control::api_default_cache_control;
 pub use audit_authz::audit_authz_failures;
 pub use auth::{
     auth_middleware, check_all_permissions, check_any_permission, check_permission,
@@ -41,3 +45,4 @@ pub use rate_limit::{
 pub use request_id::{request_id_middleware, RequestId, REQUEST_ID_HEADER};
 pub use sanitize_errors::sanitize_error_responses;
 pub use tier_guard::api_write_guard;
+pub use vector_ingest_guard::vector_ingest_guard;

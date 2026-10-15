@@ -6,13 +6,13 @@
 //! identity observation from the `identity_observations` ClickHouse table,
 //! enriched with user registry data via `dictGetOrDefault`.
 
-use axum::{Json, extract::State};
+use axum::{extract::State, Json};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::search::service::source_scope_sql_predicate;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorResponse;
-use crate::{SearchState, error::SearchError};
+use crate::{error::SearchError, SearchState};
 
 /// Query parameters for identity resolution
 #[derive(Debug, Deserialize, utoipa::IntoParams)]

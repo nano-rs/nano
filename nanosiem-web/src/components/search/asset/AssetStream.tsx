@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { ChevronRight, Filter, Layers, Star } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { fieldEntry } from '@/lib/ocsf-field-fallbacks';
+import { formatCellValue } from '@/lib/format-cell-value';
+import { flattenEventFields } from '../event-flatten';
 import { api } from '@/lib/api';
 import type {
   AssetEventsRequest,
   AssetEventsResponse,
   TimeRange,
 } from '@/lib/api/types';
+import { EventPayloadCache, eventPayloadKey } from './event-payload-cache';
+import { browserTenantRuntime } from '@/lib/tenant-runtime';
 import { parseAsUTC } from './helpers';
 import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
+import { DurableJobNotice, type DurableProductJobState } from '../DurableJobNotice';
+import { waitForDurableProductArtifact } from '../durable-product-job';
+import { fetchProgressive, progressLabel } from './progressive';
 
 const TYPE_COLORS: Record<string, { fg: string; bg: string }> = {
   NETWORK: { fg: 'oklch(72% 0.16 160)', bg: 'oklch(72% 0.16 160 / 0.12)' },
@@ -30,6 +38,10 @@ interface AssetStreamProps {
   identifierValue: string;
   identities: Record<string, unknown>[];
   timeRange: TimeRange | undefined;
+  initialSummary?: AssetEventsResponse | null;
+  /** Called once the first page has answered (painted or failed). */
+  onFirstPage?: () => void;
+  onOpenJobs?: () => void;
 }
 
 interface StreamEvent {
@@ -49,6 +61,9 @@ export function AssetStream({
   identifierValue,
   identities,
   timeRange,
+  initialSummary,
+  onFirstPage,
+  onOpenJobs,
 }: AssetStreamProps) {
   const [data, setData] = useState<AssetEventsResponse | null>(null);
   const [events, setEvents] = useState<StreamEvent[]>([]);
@@ -60,8 +75,32 @@ export function AssetStream({
   const [interestingOnly, setInterestingOnly] = useState(false);
   const [groupRepeats, setGroupRepeats] = useState(false);
   const [filter, setFilter] = useState('');
+  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
+  const [summaryError, setSummaryError] = useState<Error | null>(null);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const onFirstPageRef = useRef(onFirstPage);
+  onFirstPageRef.current = onFirstPage;
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const reqRef = useRef(0);
+  const pageAbort = useRef<AbortController | null>(null);
+  // Reset on every investigation/scope change; no payload survives a new authority.
+  const payloadScope = JSON.stringify([browserTenantRuntime.current().key, identifierField, identifierValue, identities, timeRange]);
+  const [payloadState, setPayloadState] = useState<{ scope: string; cache: EventPayloadCache } | null>(null);
+  const payloadCache = payloadState?.scope === payloadScope ? payloadState.cache : null;
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => {
+    const cache = new EventPayloadCache();
+    setPayloadState({ scope: payloadScope, cache });
+    setExpanded(new Set());
+    return () => { clearTimeout(hoverTimer.current); cache.dispose(); };
+  }, [payloadScope]);
+  const prefetch = (event: StreamEvent) => {
+    if (!payloadCache) return;
+    clearTimeout(hoverTimer.current);
+    hoverTimer.current = setTimeout(() => {
+      void loadEventPayload(payloadCache, event.id, event.timestamp, event.source_type, false).catch(() => undefined);
+    }, 200);
+  };
 
   // Initial fetch. Deps are intentionally granular: keying on the full
   // `timeRange` object would re-fire on every parent render that allocates a
@@ -71,8 +110,14 @@ export function AssetStream({
   // identifier switches — the reqRef guard discards stale responses.
   useEffect(() => {
     if (!timeRange) return;
+    pageAbort.current?.abort();
+    const controller = new AbortController();
+    pageAbort.current = controller;
+    const signal = controller.signal;
     const myReq = ++reqRef.current;
     setLoading(true);
+    setLoadingMore(false);
+    setPageError(null);
 
     const req: AssetEventsRequest = {
       identifier_field: identifierField,
@@ -81,25 +126,86 @@ export function AssetStream({
       time_range: timeRange,
       offset: 0,
       limit: PAGE_SIZE,
+      fetch: 'page',
     };
     api
-      .getAssetEvents(req)
+      .getAssetEvents(req, { signal })
       .then((resp) => {
         if (myReq !== reqRef.current) return;
         setData(resp);
         setEvents(resp.events.map(normalizeEvent));
+        // Exact counts and facets are useful context, but they must not hold
+        // the first paint behind analytics work. Fetch them only after the
+        // visible page has arrived and merge them into the same view state.
+        const mergeSummary = (summary: AssetEventsResponse) => {
+          if (myReq !== reqRef.current) return;
+          setData((current) => current ? {
+            ...current,
+            total_count: summary.total_count,
+            total_count_exact: summary.total_count_exact,
+            progress: summary.progress,
+            facets: summary.facets,
+            has_more: summary.total_count_exact
+              ? current.offset + current.events.length < summary.total_count
+              : current.has_more,
+          } : current);
+        };
+        const loadSummary = async () => {
+          setSummaryError(null);
+          if (initialSummary?.total_count_exact) {
+            mergeSummary(initialSummary);
+            return;
+          }
+          // NAN-3094: a lean summary is read from the page's shared snapshot
+          // and may answer before it is final; merge each answer and poll.
+          const summary = await fetchProgressive(
+            () => api.getAssetEvents({ ...req, fetch: 'summary', limit: 1 }, { signal }),
+            (partial) => { if (!partial.durable_job) mergeSummary(partial); },
+            () => myReq === reqRef.current && !signal.aborted,
+            false,
+            signal,
+          );
+          if (!summary.durable_job) {
+            mergeSummary(summary);
+            return;
+          }
+          setDurableJob({ jobId: summary.durable_job.job_id, status: 'queued' });
+          const artifact = await waitForDurableProductArtifact(
+            summary.durable_job.job_id,
+            'asset_v1',
+            (job) => { if (myReq === reqRef.current) setDurableJob(job); },
+            () => myReq === reqRef.current && !signal.aborted,
+            signal,
+          );
+          const durableSummary = artifact.row.response as AssetEventsResponse | undefined;
+          if (!durableSummary?.total_count_exact || !durableSummary.facets) {
+            throw new Error('Durable Asset summary returned an invalid response');
+          }
+          mergeSummary(durableSummary);
+          if (myReq === reqRef.current) setDurableJob(null);
+        };
+        void loadSummary().catch((error) => {
+          if (myReq !== reqRef.current || String(error).includes('superseded')) return;
+          setSummaryError(error instanceof Error ? error : new Error(String(error)));
+        });
       })
-      .catch(() => {
+      .catch((error) => {
         if (myReq !== reqRef.current) return;
+        setPageError(error instanceof Error ? error.message : String(error));
       })
       .finally(() => {
         if (myReq !== reqRef.current) return;
         setLoading(false);
+        onFirstPageRef.current?.();
       });
-  }, [identifierField, identifierValue, identities, timeRange?.start, timeRange?.end]);
+    return () => { controller.abort(); if (reqRef.current === myReq) ++reqRef.current; };
+  }, [identifierField, identifierValue, identities, timeRange?.start, timeRange?.end, initialSummary]);
 
   const loadMore = async () => {
     if (!data || !data.has_more || !timeRange || loadingMore) return;
+    const myReq = reqRef.current;
+    const signal = pageAbort.current?.signal;
+    if (!signal || signal.aborted) return;
     setLoadingMore(true);
     try {
       const req: AssetEventsRequest = {
@@ -108,13 +214,23 @@ export function AssetStream({
         identities,
         time_range: timeRange,
         offset: events.length,
+        cursor: data.next_cursor,
         limit: PAGE_SIZE,
+        fetch: 'page',
       };
-      const resp = await api.getAssetEvents(req);
+      const resp = await api.getAssetEvents(req, { signal });
+      if (myReq !== reqRef.current || signal.aborted) return;
       setEvents((prev) => [...prev, ...resp.events.map(normalizeEvent)]);
-      setData(resp);
+      setData((current) => current ? {
+        ...resp,
+        total_count: current.total_count_exact ? current.total_count : resp.total_count,
+        total_count_exact: current.total_count_exact,
+        facets: current.facets,
+      } : resp);
+    } catch (error) {
+      if (myReq === reqRef.current && !signal.aborted) setPageError(error instanceof Error ? error.message : String(error));
     } finally {
-      setLoadingMore(false);
+      if (myReq === reqRef.current) setLoadingMore(false);
     }
   };
 
@@ -158,6 +274,10 @@ export function AssetStream({
   };
 
   const totalAvailable = data?.total_count ?? events.length;
+  const summaryProgress = data?.progress;
+  const totalAvailableLabel = data?.total_count_exact
+    ? `${events.length.toLocaleString()} of ${totalAvailable.toLocaleString()} loaded`
+    : `${events.length} loaded${data?.has_more ? ', more available' : ''}`;
 
   return (
     <div className="bg-card border border-border rounded-lg overflow-hidden">
@@ -167,7 +287,7 @@ export function AssetStream({
           Asset stream
         </span>
         <span className="text-[10.5px] font-mono text-muted-foreground/70">
-          ({events.length} of {totalAvailable} loaded)
+          ({totalAvailableLabel})
         </span>
         <span className="flex-1" />
         <button
@@ -195,6 +315,29 @@ export function AssetStream({
           Group
         </button>
       </div>
+      {durableJob && <DurableJobNotice job={durableJob} onOpenJobs={onOpenJobs} />}
+      {summaryError && (
+        <div className="mx-4 mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive">
+          Exact Asset summary failed: {summaryError.message}
+        </div>
+      )}
+      {pageError && (
+        <div className="mx-4 mt-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive">
+          Event stream failed: {pageError}
+        </div>
+      )}
+      {progressLabel(summaryProgress, timeRange?.start) ? (
+        <div data-testid="asset-stream-counts" className="mx-4 mt-2 text-[10.5px] font-mono text-muted-foreground/70">
+          counts {progressLabel(summaryProgress, timeRange?.start)}
+        </div>
+      ) : data?.total_count_exact && summaryProgress?.complete ? (
+        // NAN-3291: exact full-window aggregates. The asset view matches the
+        // asset's identities across every source; leading search filters
+        // (e.g. a log source) do not narrow it.
+        <div data-testid="asset-stream-counts" className="mx-4 mt-2 text-[10.5px] font-mono text-muted-foreground/70">
+          counts exact · full window · all sources for this asset
+        </div>
+      ) : null}
 
       <div className="px-4 py-3 border-b border-border space-y-2">
         <ChipRow label="TYPE">
@@ -259,6 +402,10 @@ export function AssetStream({
             <li key={e.id} className="px-4 py-2">
               <button
                 onClick={() => toggleExpanded(e.id)}
+                onMouseEnter={() => prefetch(e)}
+                onFocus={() => prefetch(e)}
+                onMouseLeave={() => clearTimeout(hoverTimer.current)}
+                onBlur={() => clearTimeout(hoverTimer.current)}
                 className="flex items-start gap-2 w-full text-left hover:bg-foreground/3 rounded py-1 -mx-2 px-2"
               >
                 <ChevronRight
@@ -278,10 +425,12 @@ export function AssetStream({
                   {summarize(e)}
                 </span>
               </button>
-              {expanded.has(e.id) && (
+              {expanded.has(e.id) && payloadCache && (
                 <EventDetail
+                  cache={payloadCache}
                   id={e.id}
                   timestamp={e.timestamp}
+                  sourceType={e.source_type}
                   details={e.details}
                 />
               )}
@@ -396,77 +545,84 @@ function SimpleChip({
   );
 }
 
-function EventDetail({
-  id,
-  timestamp,
-  details,
-}: {
+async function loadEventPayload(cache: EventPayloadCache, id: string, timestamp: string, sourceType: string, allowFallback: boolean) {
+  const ts = parseAsUTC(timestamp);
+  const narrow = ts && !Number.isNaN(ts.getTime()) ? {
+    start: new Date(ts.getTime() - 1000).toISOString(),
+    end: new Date(ts.getTime() + 1000).toISOString(),
+  } : undefined;
+  // Speculative work never launches an unbounded lookup.
+  if (!narrow && !allowFallback) return Promise.resolve(null);
+  const key = eventPayloadKey(id, timestamp, sourceType);
+  const event = await cache.load(key, async (signal) => (await api.fetchLog(id, narrow, sourceType, signal)).event, !allowFallback);
+  // Expansion can join a speculative request, then deliberately retry its miss.
+  if (!event && narrow && allowFallback) {
+    return cache.load(key, async (signal) => (await api.fetchLog(id, undefined, sourceType, signal)).event);
+  }
+  return event;
+}
+
+function EventDetail({ cache, id, timestamp, sourceType, details }: {
+  cache: EventPayloadCache;
   id: string;
   timestamp: string;
+  sourceType: string;
   details: Record<string, unknown>;
 }) {
-  // Asset stream lists carry a slim ~45-column subset for payload reasons.
-  // On expand we fetch the full event (~130 cols incl. ext fields like
-  // threat_score, tls_intercepted, etc.) so analysts see everything that
-  // exists for that record. Fetch fires once per mount; collapsing then
-  // re-expanding triggers a fresh fetch (cheap, narrow time window).
-  const [fullLog, setFullLog] = useState<Record<string, unknown> | null>(null);
+  const key = eventPayloadKey(id, timestamp, sourceType);
+  const [fullLog, setFullLog] = useState<Record<string, unknown> | null>(() => cache.peek(key));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-
   useEffect(() => {
-    let cancelled = false;
+    let current = true;
+    setFullLog(cache.peek(key));
     setLoading(true);
     setError(null);
+    void loadEventPayload(cache, id, timestamp, sourceType, true).then((value) => {
+      if (current && value) setFullLog(value);
+    }).catch((error) => {
+      if (current) setError(error instanceof Error ? error.message : 'Failed to load full event');
+    }).finally(() => { if (current) setLoading(false); });
+    return () => { current = false; };
+  }, [cache, key, id, timestamp, sourceType]);
 
-    // 2-second window around the event timestamp keeps the lookup pinned
-    // to a single ClickHouse partition. Falls back to no-window on miss.
-    // NAN-1032: pass source_type so the (source_type, timestamp, ...) PK can do a
-    // tight range read — without it, S3-backed historical lookups take 12–60s.
-    const ts = parseAsUTC(timestamp);
-    const narrow = ts && !Number.isNaN(ts.getTime())
-      ? {
-          start: new Date(ts.getTime() - 1000).toISOString(),
-          end: new Date(ts.getTime() + 1000).toISOString(),
-        }
-      : undefined;
-    const sourceType = details?.source_type as string | undefined;
-
-    (async () => {
-      try {
-        let resp = await api.fetchLog(id, narrow, sourceType);
-        if (!resp.event && narrow) {
-          // Narrow window missed — retry without time bound.
-          resp = await api.fetchLog(id, undefined, sourceType);
-        }
-        if (cancelled) return;
-        if (resp.event) setFullLog(resp.event);
-      } catch (e) {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load full event');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [id, timestamp, details]);
+  const { data: schemaFields } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const isOcsf = schemaFields?.schema === 'ocsf';
+  const knownSchemaFields = useMemo(
+    () => new Set((schemaFields?.fields ?? []).map((f) => f.name)),
+    [schemaFields],
+  );
 
   const source = fullLog ?? details;
-  const entries = Object.entries(source).filter(([k, v]) => {
+  // NAN-2361: this used to iterate `Object.entries(source)` directly, so every
+  // OCSF top-level category (`actor`, `device`, `dst_endpoint`, `message`, ...)
+  // rendered as one raw JSON-stringified blob instead of individual inspectable
+  // fields -- regular Search results never had this problem because they route
+  // through `flattenEventFields`, which expands nested OCSF objects (and the raw
+  // `event` blob) into dotted leaf rows (`actor.process.name: ...`). Route the
+  // asset stream's expanded row through the same shared flattener so the two
+  // surfaces render identically.
+  const entries = flattenEventFields(source, isOcsf, '', knownSchemaFields).filter(([k, v]) => {
     if (v === '' || v === null || v === undefined || v === 0) return false;
     // Hide prevalence sentinel values (9999 = common, 65535 = N/A). Neither is
     // meaningful in the stream. See lib/prevalence-sentinels.
     if (isPrevalenceSentinelField(k, v)) return false;
     // Hide internal/marker fields the slim payload sometimes carries.
     if (k === 'event_kind' || k === 'summary') return false;
-    // NAN-1324: the OCSF full log (SELECT *) carries the entire raw source as a
-    // single `event` JSON blob plus the `time_dt` timestamp alias — both OCSF-only
-    // and redundant with the promoted columns already shown (the blob dwarfs the
-    // row). UDM carries neither, so this is OCSF-only (UDM detail unchanged).
-    if (k === 'event' || k === 'time_dt') return false;
+    // `time_dt` is a redundant timestamp alias `flattenEventFields` doesn't
+    // otherwise know to drop (UDM carries neither, so this is OCSF-only).
+    if (k === 'time_dt') return false;
+    // Keep the explicit `event` drop even though `flattenEventFields` expands
+    // that blob itself: it only does so when `isOcsf` is true, and that comes
+    // from an async schema-fields query. On a cold cache — or permanently, if
+    // that query errors — `isOcsf` is false and the whole raw OCSF event falls
+    // through here as one giant JSON string.
+    if (k === 'event') return false;
     return true;
   });
 
@@ -502,7 +658,7 @@ function EventDetail({
           <div key={k} className="text-[11px] font-mono flex gap-3">
             <span className="text-muted-foreground shrink-0 whitespace-nowrap min-w-[150px]">{k}:</span>
             <span className={`${valueClass} break-all min-w-0`}>
-              {typeof v === 'string' ? v : JSON.stringify(v)}
+              {formatCellValue(v)}
             </span>
           </div>
         );
@@ -627,7 +783,7 @@ function summarize(e: StreamEvent): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(s)) {
     if (v === '' || v === null || v === undefined) continue;
-    parts.push(`${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`);
+    parts.push(`${k}=${formatCellValue(v)}`);
     if (parts.length >= 4) break;
   }
   if (parts.length) return parts.join(' ');

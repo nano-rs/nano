@@ -37,6 +37,45 @@ max_body_size = 52428800  # 50MB to match batch size (was 10MB)
 # Keep-alive for better connection reuse from log shippers
 keepalive.max_connection_age_secs = 300  # 5 minutes
 
+# NAN-3770: named, revocable per-sender ingest tokens (Ingestion -> Credentials).
+# nano-api writes SHA-256 hashes of the active tokens to this file (0600, on
+# the shared nano-vector-dynamic volume); the nano-rs/vector fork re-reads it
+# at most every `reload_interval_secs`, so a revoke is refused within seconds
+# with no reload and no listener restart. A listed `Bearer <token>` is
+# authenticated by the source and stamps `%nano_credential_id` /
+# `%nano_credential_name`.
+#
+# NAN-3806: a token decides the source, 100% token based. Every listed token
+# is bound to one log source and its `name` in the file is that source's route
+# key, stamped as `%nano_credential_name`; `source_type_extract` routes on it
+# and ignores any X-Source-Type / body `source_type` the sender declares. An
+# unbound token (and the install token until an admin binds it) is not listed
+# and is refused with 401. nano-api writes `fallback_enabled = false` whenever
+# VECTOR_AUTH_TOKEN is set, so nothing falls through to the `auth` below; it
+# is reached only with no install token at all (the explicit
+# VECTOR_ALLOW_UNAUTHENTICATED_INGEST opt-in). A missing file = no tokens.
+# Requires ghcr.io/nano-rs/vector >= 0.59.0-nano.7.
+[sources.http_ingest.valid_tokens_file]
+path = "/etc/vector/dynamic/ingest-tokens/tokens.json"
+reload_interval_secs = 2
+
+# NAN-3379: authenticate at the source so a bad or missing token gets HTTP 401.
+# The `auth_check` remap below runs after the source has already answered 200,
+# and VRL cannot change the response, so a sender with a typo'd or rotated
+# token used to see success forever while every event was dropped.
+# NAN-3806: this static fallback never accepts a token. With VECTOR_AUTH_TOKEN
+# set, every accepted token (the install token included, once bound) is in
+# `valid_tokens_file` above, so an unlisted one is refused here too even if
+# the file is missing. A blank install token refuses everything unless
+# VECTOR_ALLOW_UNAUTHENTICATED_INGEST is explicitly "true" (NAN-1351).
+[sources.http_ingest.auth]
+strategy = "custom"
+source = '''
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
+expected_token == "" && allow_unauthenticated
+'''
+
 # Buffering / acks (NAN-1114): the `clickhouse_logs` sink (in
 # sources/parsers/_pipeline.toml) runs a non-blocking memory buffer
 # (when_full = "drop_newest") with sink-level acknowledgements OFF. So this HTTP
@@ -56,6 +95,86 @@ method = "newline_delimited"
 [sources.http_ingest.decoding]
 codec = "bytes"
 
+# Dedicated push-enrichment ingress. Identity/IP-context synchronization must
+# be allowed to use a durable blocking sink without ever backpressuring the log
+# front door. It shares the install token but has an independent Vector source
+# and topology branch.
+[sources.enrichment_ingest]
+type = "http_server"
+address = "0.0.0.0:8090"
+strict_path = false
+path = "/"
+headers = ["Authorization", "X-Source-Type", "Content-Type"]
+max_body_size = 52428800
+
+# NAN-3379: authenticate at the source so a bad or missing token gets HTTP 401.
+# The `enrichment_prepare` remap below runs after the source has already answered 200,
+# and VRL cannot change the response, so a sender with a typo'd or rotated
+# token used to see success forever while every event was dropped. Same rules
+# as `auth_check` (kept as defense in depth): `Bearer <VECTOR_AUTH_TOKEN>`, and
+# a blank token refuses everything unless VECTOR_ALLOW_UNAUTHENTICATED_INGEST
+# is explicitly "true" (NAN-1351). Header names are lowercase here.
+# `enrichment_prepare` still refuses a blank token outright, so the
+# unauthenticated opt-in never reaches the enrichment lane.
+[sources.enrichment_ingest.auth]
+strategy = "custom"
+source = '''
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
+auth_header = to_string(.headers.authorization) ?? ""
+if expected_token == "" {
+    allow_unauthenticated
+} else {
+    auth_header == "Bearer " + expected_token
+}
+'''
+
+[sources.enrichment_ingest.framing]
+method = "newline_delimited"
+
+# NAN-3767: end-to-end acknowledgements. A sender (the connector runner's
+# directory sync, provider sync) gets its 200 only once every record was
+# delivered: the lake identity sink keeps a memory buffer, so that is the
+# coordinator's answer. A refused record answers the sender with an error
+# instead of a silent drop.
+[sources.enrichment_ingest.acknowledgements]
+enabled = true
+
+[sources.enrichment_ingest.decoding]
+codec = "bytes"
+
+[transforms.enrichment_prepare]
+type = "remap"
+inputs = ["enrichment_ingest"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+auth_header = to_string(.Authorization) ?? to_string(.authorization) ?? ""
+if expected_token == "" || auth_header != "Bearer " + expected_token {
+    log("Auth failed on dedicated enrichment ingress", level: "warn")
+    abort
+}
+source_type = downcase(to_string(."X-Source-Type") ?? to_string(."x-source-type") ?? "")
+if source_type != "nano_enrich" {
+    log("Dedicated enrichment ingress requires X-Source-Type: nano_enrich", level: "warn")
+    abort
+}
+raw = to_string(.message) ?? ""
+parsed = parse_json!(raw)
+if !is_object(parsed) {
+    abort
+}
+. = parsed
+.source_type = "nano_enrich"
+'''
+
+[sinks.enrichment_ingest_dead_letter]
+type = "blackhole"
+inputs = ["enrichment_prepare.dropped"]
+print_interval_secs = 0
+
 # =============================================================================
 # Authentication Transform
 # =============================================================================
@@ -72,8 +191,14 @@ if exists(.Authorization) {
 
 expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
 allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
+# NAN-3770: the source already matched a named ingest token from
+# `valid_tokens_file` and stamped its credential id (event metadata cannot be
+# set by a sender).
+credential_id = to_string(%nano_credential_id) ?? ""
 
-if expected_token == "" {
+if credential_id != "" {
+    .auth_status = "authenticated"
+} else if expected_token == "" {
     # NAN-1351 (F1): fail closed when no ingest token is configured. Previously
     # a blank VECTOR_AUTH_TOKEN silently accepted every event, allowing
     # unauthenticated log injection + nano_enrich enrichment-lane poisoning by
@@ -86,20 +211,15 @@ if expected_token == "" {
         abort
     }
 } else {
+    # NAN-3806: with an install token configured, every accepted token is a
+    # listed, source-bound credential. An event without the stamp got in some
+    # other way: refuse it rather than route it by what it declares.
     if auth_header == "" {
         log("Auth failed: No Authorization header", level: "warn")
-        abort
+    } else {
+        log("Auth refused: the token is not bound to a source. Bind it in Ingestion -> Credentials.", level: "warn")
     }
-    if !starts_with(auth_header, "Bearer ") {
-        log("Auth failed: Invalid format", level: "warn")
-        abort
-    }
-    token = slice!(auth_header, 7)
-    if token != expected_token {
-        log("Auth failed: Invalid token", level: "warn")
-        abort
-    }
-    .auth_status = "authenticated"
+    abort
 }
 
 # Extract source_type from header, defaulting to "unknown"
@@ -144,17 +264,33 @@ if client_ip == null {
 
 [transforms.rate_limit]
 type = "throttle"
-inputs = ["rate_limit_prep"]
-threshold = 5000      # 5000 events/sec per client IP (was 1000)
+inputs = ["rate_limit_route.identified"]
+threshold = ${VECTOR_RATE_LIMIT_PER_CLIENT_EPS:-500000}
 window_secs = 1
 key_field = "client_ip"
+
+[transforms.rate_limit_route]
+type = "route"
+inputs = ["rate_limit_prep"]
+reroute_unmatched = false
+route.identified = '.client_ip != "unknown"'
+route.unidentified = '.client_ip == "unknown"'
+
+# Preserve a separate, configurable aggregate fence for legacy or
+# unidentified senders. This avoids both the retired 5k-EPS shared choke point
+# and an unbounded bypass when forwarding identity is unavailable.
+[transforms.rate_limit_unidentified]
+type = "throttle"
+inputs = ["rate_limit_route.unidentified"]
+threshold = ${VECTOR_RATE_LIMIT_UNIDENTIFIED_EPS:-500000}
+window_secs = 1
 
 # =============================================================================
 # Content-Type Detection & Parsing
 # =============================================================================
 [transforms.parse_content]
 type = "remap"
-inputs = ["rate_limit"]
+inputs = ["rate_limit", "rate_limit_unidentified"]
 source = '''
 content_type = to_string(."Content-Type") ?? to_string(."content-type") ?? ""
 content_type = downcase(content_type)
@@ -313,6 +449,27 @@ if source_type == "unknown" {
 # Source type aliasing is handled dynamically by the router via match_values
 # on each parser — no hardcoded aliases needed here.
 
+# NAN-3806: the token decides the source, 100% token based. A listed token's
+# `%nano_credential_name` is its bound source's route key (event metadata: a
+# sender cannot set it). Whatever the sender declared above (X-Source-Type,
+# a body `source_type`, `metadata.source_type`) never routes; a different
+# claim is kept only as the raw `claimed_source_type` field. A listed token
+# without a route is refused. The platform pull credential (nano-api's own
+# collector integrations, each stream typed by its manifest) is the one
+# credential whose declared type is kept.
+nano_credential_id = to_string(%nano_credential_id) ?? ""
+if nano_credential_id != "" && nano_credential_id != "6e616e6f-0000-4000-8000-000000000002" {
+    bound_source_type = to_string(%nano_credential_name) ?? ""
+    if bound_source_type == "" || bound_source_type == "*" {
+        log("Refusing an event: its ingest token is not bound to a source", level: "warn")
+        abort
+    }
+    if source_type != "unknown" && source_type != bound_source_type {
+        .claimed_source_type = source_type
+    }
+    source_type = bound_source_type
+}
+
 .source_type = source_type
 .routing_timestamp = now()
 
@@ -321,4 +478,10 @@ if source_type == "unknown" {
 # (which wipes `.source_type`). `%` metadata persists across `.` replacement on
 # Vector 0.54. `ocsf_prepare` reads `%source_type` back onto the ocsf_logs row.
 %source_type = downcase(source_type)
+# NAN-2361 wave 8: the ingress lane, stashed the same way. The lake sink
+# stamps it as `metadata.ingress_transport` so the tenant's per-source
+# ingest counters can attribute rows the edge did not bind to a named source
+# (the conventional `ingest-token` path) to the tenant's default source with
+# the protocol they arrived on. Vocabulary: nano_https | hec | otlp | vector.
+%ingress_transport = "nano_https"
 '''

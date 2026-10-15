@@ -30,7 +30,6 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
-  Loader2,
   Play,
   Search,
   Clock,
@@ -39,6 +38,7 @@ import {
   Database,
   ChartColumn,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { subHours, subDays } from 'date-fns';
 import { api } from '@/lib/api';
 import type { VisualizationType, VisualizationConfig } from '@/lib/api';
@@ -199,7 +199,7 @@ export function QueryTestModal({
             onClick={handleRunTest}
             disabled={testing || !query.trim()}
           >
-            {testing ? <Loader2 className="w-[12px] h-[12px] animate-spin" /> : <Play className="w-[12px] h-[12px]" />}
+            {testing ? <LoadingIcon className="w-[12px] h-[12px]" /> : <Play className="w-[12px] h-[12px]" />}
             Run preview
           </Button>
 
@@ -230,7 +230,7 @@ export function QueryTestModal({
           {testing && (
             <div className="h-full flex items-center justify-center">
               <div className="flex flex-col items-center gap-2 text-muted-foreground">
-                <Loader2 className="w-6 h-6 animate-spin text-primary" />
+                <LoadingIcon className="w-6 h-6 text-primary" />
                 <p className="text-[12px]">Running query…</p>
               </div>
             </div>

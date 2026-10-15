@@ -528,7 +528,11 @@ mod ext_flatten_tests {
 
         assert_eq!(o["category"], json!("web_proxy"), "column was clobbered");
         assert_eq!(o["ext.category"], json!("social_media"), "ext value lost");
-        assert_eq!(o["ext.cache_status"], json!("hit"), "non-colliding ext key dropped");
+        assert_eq!(
+            o["ext.cache_status"],
+            json!("hit"),
+            "non-colliding ext key dropped"
+        );
         assert!(!o.contains_key("ext"), "raw ext key should be removed");
     }
 
@@ -540,7 +544,11 @@ mod ext_flatten_tests {
     fn ext_always_namespaces_not_fills_blank_column() {
         let mut o = obj(json!({ "user": "", "ext": { "user": "jdoe", "host": "ws1" } }));
         flatten_ext_field_in_place(&mut o);
-        assert_eq!(o["ext.user"], json!("jdoe"), "ext value should land at ext.<key>");
+        assert_eq!(
+            o["ext.user"],
+            json!("jdoe"),
+            "ext value should land at ext.<key>"
+        );
         assert_eq!(o["user"], json!(""), "blank column should stay untouched");
         assert_eq!(o["ext.host"], json!("ws1"));
     }
@@ -555,7 +563,12 @@ mod ext_flatten_tests {
 
     #[test]
     fn ext_empty_or_missing_is_noop() {
-        for v in [json!({}), json!({ "ext": "{}" }), json!({ "ext": "null" }), json!({ "ext": "" })] {
+        for v in [
+            json!({}),
+            json!({ "ext": "{}" }),
+            json!({ "ext": "null" }),
+            json!({ "ext": "" }),
+        ] {
             let mut o = obj(v);
             flatten_ext_field_in_place(&mut o);
             assert!(!o.contains_key("ext"));

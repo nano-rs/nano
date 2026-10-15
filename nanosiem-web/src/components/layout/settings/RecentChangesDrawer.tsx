@@ -10,7 +10,7 @@ import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Clock, X, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useAuditLog } from '@/hooks/use-api';
+import { useRecentAuditChanges } from '@/hooks/use-api';
 import type { AuditLogEntry } from '@/lib/api/types';
 
 interface RecentChangesDrawerProps {
@@ -77,7 +77,7 @@ function relativeAge(ts: string): string {
 export function RecentChangesDrawer({ open, onClose }: RecentChangesDrawerProps) {
   const navigate = useNavigate();
   const query = useMemo(() => ({ limit: 50 }), []);
-  const { data, loading, error } = useAuditLog(query);
+  const { data, loading, error } = useRecentAuditChanges(query);
   const entries = data?.logs ?? [];
 
   if (!open) return null;

@@ -10,8 +10,9 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use clickhouse::Client as ClickhouseClient;
-use nanosiem_core::auth::permissions;
+use nanosiem_core::auth::{permissions, ScopeSet};
 use nanosiem_core::models::detection_rule::RuleMode;
+use nanosiem_core::{SearchBackend, SearchRequest, TimeRangeInput};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tokio::time::{timeout, Duration as TokioDuration};
@@ -244,6 +245,15 @@ async fn get_event_count(
     end: DateTime<Utc>,
     deny: &std::collections::BTreeSet<String>,
 ) -> Result<i64, ApiError> {
+    if state.search_service.backend() == SearchBackend::Lake {
+        let rows =
+            lake_system_search(state, "* | stats count() as events", start, end, deny, 1).await?;
+        return Ok(rows
+            .first()
+            .and_then(|row| json_i64(row, "events"))
+            .unwrap_or(0));
+    }
+
     if !deny.is_empty() {
         return timeout(
             TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
@@ -437,6 +447,28 @@ async fn get_activity_timeline(
     end: DateTime<Utc>,
     deny: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<ActivityPoint>, ApiError> {
+    if state.search_service.backend() == SearchBackend::Lake {
+        let points = lake_system_search(
+            state,
+            "* | timechart span=1h count() as events",
+            start,
+            end,
+            deny,
+            10_000,
+        )
+        .await?;
+        return Ok(points
+            .into_iter()
+            .filter_map(|point| {
+                Some(ActivityPoint {
+                    time: point.get("time_bucket")?.as_str()?.to_string(),
+                    event_count: json_i64(&point, "events").unwrap_or(0),
+                    alert_count: 0,
+                })
+            })
+            .collect());
+    }
+
     // Read from the per-source 5-minute rollup (NAN-736). Replaces an
     // un-scoped `count(*) * 10 SAMPLE 0.1 FROM logs` per page load with a
     // fixed-cost rollup read. The dashboard timeline is always a recent window
@@ -451,9 +483,7 @@ async fn get_activity_timeline(
         ),
     )
     .await
-    .map_err(|_| {
-        ApiError::Timeout("Dashboard activity timeline query timed out".to_string())
-    })?
+    .map_err(|_| ApiError::Timeout("Dashboard activity timeline query timed out".to_string()))?
     .map_err(|e| ApiError::InternalError(e.to_string()))?;
 
     Ok(points
@@ -464,6 +494,48 @@ async fn get_activity_timeline(
             alert_count: 0,
         })
         .collect())
+}
+
+async fn lake_system_search(
+    state: &AppState,
+    query: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    deny: &std::collections::BTreeSet<String>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let request = SearchRequest {
+        query: query.to_string(),
+        time_range: TimeRangeInput::new(start, end),
+        limit: Some(limit),
+        offset: None,
+        include_sql: Some(false),
+        skip_histogram: true,
+        skip_field_stats: true,
+        use_cache: true,
+        table_view: false,
+        request_id: None,
+        async_mode: false,
+        priority: Some("analytics".to_string()),
+        dataset: Some("logs".to_string()),
+    };
+    let scope = ScopeSet::from_denied(deny.iter().cloned().collect());
+    timeout(
+        TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
+        state.search_service.search(request, &scope),
+    )
+    .await
+    .map_err(|_| ApiError::Timeout("Dashboard lake query timed out".to_string()))?
+    .map(|response| response.results)
+    .map_err(|error| ApiError::InternalError(error.to_string()))
+}
+
+fn json_i64(row: &serde_json::Value, key: &str) -> Option<i64> {
+    let value = row.get(key)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 /// OpenAPI documentation for system endpoints
@@ -497,31 +569,37 @@ pub async fn get_system_config(
 ) -> Result<Json<SystemConfig>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
-    let is_managed = state.config.deployment_mode.is_managed();
+    let deployment_mode = state.config.deployment_mode;
+    #[cfg(feature = "enterprise")]
+    let shared_profile = deployment_mode.is_enterprise_shared();
+    #[cfg(not(feature = "enterprise"))]
+    let shared_profile = false;
+    let settings_are_platform_managed = deployment_mode.is_managed() || shared_profile;
 
     // Derive api_keys_editable from tier limits, not deployment mode. As of
     // NAN-1472 all tiers grant Full API access, so this is effectively always
     // true for enforced tiers; kept tier-driven in case gating ever returns.
     // Fall back to true if tier lookup fails (fail open).
-    let api_keys_editable = match nanosiem_core::TierSettings::new(state.pool.clone())
-        .get_tier_limits()
-        .await
-    {
-        Ok(limits) if limits.is_enforced() => {
-            limits.api_access == nanosiem_core::ApiAccessLevel::Full
+    let api_keys_editable = if shared_profile {
+        // Tenant automation keys (NAN-2361) are managed on the tenant surface.
+        true
+    } else {
+        match nanosiem_core::TierSettings::new(state.pool.clone())
+            .get_tier_limits()
+            .await
+        {
+            Ok(limits) if limits.is_enforced() => {
+                limits.api_access == nanosiem_core::ApiAccessLevel::Full
+            }
+            _ => true,
         }
-        _ => true,
     };
 
     Ok(Json(SystemConfig {
-        deployment_mode: if is_managed {
-            "managed".to_string()
-        } else {
-            "self-hosted".to_string()
-        },
-        settings_editable: !is_managed,
+        deployment_mode: deployment_mode.system_api_value().to_string(),
+        settings_editable: !settings_are_platform_managed,
         api_keys_editable,
-        ai_providers_editable: !is_managed,
+        ai_providers_editable: !settings_are_platform_managed,
         air_gap: state.config.airgap,
     }))
 }

@@ -80,7 +80,7 @@ export type StreamProvisionReport = {
  * Whether a provisioning outcome is worth putting in front of an operator.
  *
  * The TypeScript half of `StreamProvisionReport::needs_attention()` in
- * `nanosiem-enterprise/src/integrations/provisioning.rs` — keep the two in step.
+ * `enterprise/src/integrations/provisioning.rs` — keep the two in step.
  *
  * NAN-2202: `linked` alone is NOT success. A linked-but-undeployed stream looks
  * healthy on every surface and collects into nothing, so it has to count here;
@@ -100,7 +100,8 @@ export interface IntegrationInstance {
   has_credentials: boolean;
   enabled_streams: string[];
   schedule?: string;
-  backfill_from?: string;
+  /** Legacy (NAN-3697): always null for new instances; collectors start at now. */
+  backfill_from?: string | null;
   last_run_at?: string;
   last_run_status?: 'success' | 'partial' | 'failed' | 'running' | 'cancelled';
   last_run_duration_ms?: number;
@@ -121,7 +122,6 @@ export interface CreateInstanceRequest {
   /** Omit to take the manifest's `default: true` streams. */
   enabled_streams?: string[];
   schedule?: string;
-  backfill_from?: string;
   enabled?: boolean;
 }
 
@@ -134,7 +134,6 @@ export interface UpdateInstanceRequest {
   enabled_streams?: string[];
   /** `null` clears the override and falls back to the manifest schedule. */
   schedule?: string | null;
-  backfill_from?: string | null;
 }
 
 export interface ListInstancesResponse {

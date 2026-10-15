@@ -9,13 +9,34 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::schema::{active_profile_from_env, EntityType, SchemaProfile, UdmProfile};
+use crate::schema::{active_profile_from_env, EntityType, SchemaId, SchemaProfile};
 
 /// An extracted entity from alert events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExtractedEntity {
     pub entity_type: String,
     pub value: String,
+}
+
+/// NAN-3226: re-type `domain` entities under an internal suffix (built-in or
+/// the tenant's) as `host`: internal names are hosts, never external domains.
+/// Order is kept; a re-typed entity that duplicates an existing host is
+/// dropped.
+pub fn retype_internal_domains(
+    entities: Vec<ExtractedEntity>,
+    internal: &crate::internal_domains::InternalDomains,
+) -> Vec<ExtractedEntity> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(entities.len());
+    for mut entity in entities {
+        if entity.entity_type == "domain" && internal.is_internal(&entity.value) {
+            entity.entity_type = "host".to_string();
+        }
+        if seen.insert(entity.clone()) {
+            out.push(entity);
+        }
+    }
+    out
 }
 
 /// Entity extractor for parsing entities from JSON events
@@ -57,24 +78,48 @@ impl EntityExtractor {
 
     /// Extract all entities from matched events JSON
     pub fn extract_from_events(&self, events: &serde_json::Value) -> Vec<ExtractedEntity> {
-        let mut entities = HashSet::new();
-
         // NAN-1296: classify host/user/ip fields via the ACTIVE schema profile's
         // entity_type (not a hardcoded name list), so any promoted entity field —
         // OCSF device.hostname / src_endpoint.ip, UDM dvc / dvc_ip / user_name,
         // and any future field — is recognized automatically.
-        let profile = active_profile_from_env()
-            .unwrap_or_else(|_| std::sync::Arc::new(UdmProfile::new()));
+        //
+        // NAN-2361: this used to fall back to UdmProfile on error. Against the
+        // canonical OCSF lake that is not graceful degradation — UDM names match
+        // nothing in a nested OCSF event, so every host/user/ip entity silently
+        // vanished from case enrichment and grouping with no log anywhere. Fail
+        // closed and loudly instead: no entities is visibly wrong, entities
+        // classified against the wrong schema are plausibly wrong.
+        let profile = match active_profile_from_env() {
+            Ok(profile) => profile,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "entity extraction skipped: cannot resolve the active schema profile; \
+                     refusing to classify event fields against a different schema"
+                );
+                return Vec::new();
+            }
+        };
+        self.extract_from_events_with_profile(events, profile.as_ref())
+    }
+
+    /// [`Self::extract_from_events`] under an explicit schema profile.
+    pub fn extract_from_events_with_profile(
+        &self,
+        events: &serde_json::Value,
+        profile: &dyn SchemaProfile,
+    ) -> Vec<ExtractedEntity> {
+        let mut entities = HashSet::new();
 
         // Process the events array or single event
         match events {
             serde_json::Value::Array(arr) => {
                 for event in arr {
-                    self.extract_from_value(event, &mut entities, profile.as_ref());
+                    self.extract_from_value(event, "", &mut entities, profile);
                 }
             }
             serde_json::Value::Object(_) => {
-                self.extract_from_value(events, &mut entities, profile.as_ref());
+                self.extract_from_value(events, "", &mut entities, profile);
             }
             _ => {}
         }
@@ -86,21 +131,36 @@ impl EntityExtractor {
     fn extract_from_value(
         &self,
         value: &serde_json::Value,
+        path: &str,
         entities: &mut HashSet<ExtractedEntity>,
         profile: &dyn SchemaProfile,
     ) {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map {
-                    // Check for known entity field names
-                    self.extract_by_field_name(&key.to_lowercase(), val, entities, profile);
-                    // Recursively process nested values
-                    self.extract_from_value(val, entities, profile);
+                    let key = key.to_lowercase();
+                    let full_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    // Canonical OCSF events are nested JSON. Preserve the full
+                    // semantic path while descending so `device.hostname`,
+                    // `actor.user.name`, and repeated `file.hashes.value`
+                    // remain distinguishable from unrelated leaf names.
+                    self.extract_by_field_name(&full_path, val, entities, profile);
+                    // Legacy UDM rows are flat; calling with the leaf as well
+                    // only matters for nested compatibility payloads and does
+                    // not create a lake query/storage alias.
+                    if !path.is_empty() {
+                        self.extract_by_field_name(&key, val, entities, profile);
+                    }
+                    self.extract_from_value(val, &full_path, entities, profile);
                 }
             }
             serde_json::Value::Array(arr) => {
                 for item in arr {
-                    self.extract_from_value(item, entities, profile);
+                    self.extract_from_value(item, path, entities, profile);
                 }
             }
             serde_json::Value::String(s) => {
@@ -165,8 +225,12 @@ impl EntityExtractor {
         // Domain fields — UDM columns that contain actual domain values
         if matches!(
             field_name,
-            "url_domain" | "sender_domain" | "recipient_domain"
-                | "http_request.url.hostname" | "url.hostname" | "query.hostname"
+            "url_domain"
+                | "sender_domain"
+                | "recipient_domain"
+                | "http_request.url.hostname"
+                | "url.hostname"
+                | "query.hostname"
         ) {
             if !self.looks_like_ip(&string_val) && self.looks_like_domain(&string_val) {
                 entities.insert(ExtractedEntity {
@@ -179,8 +243,14 @@ impl EntityExtractor {
         // Hash fields — UDM column names + OCSF promoted SHA-256 columns (NAN-1291).
         if matches!(
             field_name,
-            "file_hash" | "process_hash"
-                | "file.hashes.sha256" | "process.file.hashes.sha256" | "actor.process.file.hashes.sha256"
+            "file_hash"
+                | "process_hash"
+                | "file.hashes.sha256"
+                | "process.file.hashes.sha256"
+                | "actor.process.file.hashes.sha256"
+                | "file.hashes.value"
+                | "process.file.hashes.value"
+                | "actor.process.file.hashes.value"
         ) {
             if self.looks_like_hash(&string_val) {
                 entities.insert(ExtractedEntity {
@@ -191,7 +261,10 @@ impl EntityExtractor {
         }
 
         // URL fields — UDM column name + OCSF promoted URL strings (NAN-1291).
-        if matches!(field_name, "url" | "url.url_string" | "http_request.url.url_string") {
+        if matches!(
+            field_name,
+            "url" | "url.url_string" | "http_request.url.url_string"
+        ) {
             if string_val.starts_with("http://") || string_val.starts_with("https://") {
                 entities.insert(ExtractedEntity {
                     entity_type: "url".to_string(),
@@ -205,8 +278,14 @@ impl EntityExtractor {
         // parent_process / parent_process_name = parent exe name
         if matches!(
             field_name,
-            "command_line" | "process_name" | "parent_command_line" | "parent_process_name"
-                | "process.name" | "actor.process.name" | "process.cmd_line" | "actor.process.cmd_line"
+            "command_line"
+                | "process_name"
+                | "parent_command_line"
+                | "parent_process_name"
+                | "process.name"
+                | "actor.process.name"
+                | "process.cmd_line"
+                | "actor.process.cmd_line"
         ) {
             if self.looks_like_process(&string_val) {
                 entities.insert(ExtractedEntity {
@@ -219,8 +298,14 @@ impl EntityExtractor {
         // File fields — UDM column names
         if matches!(
             field_name,
-            "file_path" | "file_name" | "process_path" | "parent_process_path"
-                | "file.path" | "file.name" | "process.file.path" | "actor.process.file.path"
+            "file_path"
+                | "file_name"
+                | "process_path"
+                | "parent_process_path"
+                | "file.path"
+                | "file.name"
+                | "process.file.path"
+                | "actor.process.file.path"
         ) {
             if !string_val.is_empty() && string_val.len() > 1 {
                 entities.insert(ExtractedEntity {
@@ -500,7 +585,9 @@ impl EntityExtractor {
         }
     }
 
-    /// Build a case title suffix from matched events using UDM fields
+    /// Build a case title suffix from matched events using the active event
+    /// contract. Canonical OCSF paths are read directly when that profile is
+    /// active; legacy UDM fields remain isolated to the UDM profile.
     ///
     /// Priority order for context:
     /// 1. user@host (e.g., "admin@WS-001")
@@ -511,8 +598,28 @@ impl EntityExtractor {
     /// 6. Just host (e.g., "WS-001")
     /// 7. Just IP (e.g., "192.168.1.50")
     pub fn build_title_suffix(&self, events: &serde_json::Value) -> Option<String> {
-        // Get all UDM field values from events
-        let fields = self.extract_udm_fields(events);
+        // NAN-2361: same fail-closed rule as `extract_from_events`. The OCSF
+        // branch is selected by the profile id, so a UdmProfile substitution
+        // silently read legacy flat names out of nested OCSF events and produced
+        // an empty title suffix anyway — with no error to explain it.
+        let schema = match active_profile_from_env() {
+            Ok(profile) => profile.id(),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "case title context skipped: cannot resolve the active schema profile"
+                );
+                return None;
+            }
+        };
+        self.build_title_suffix_for(events, schema)
+    }
+
+    /// [`Self::build_title_suffix`] for an explicit schema.
+    pub fn build_title_suffix_for(&self, events: &serde_json::Value, schema: SchemaId) -> Option<String> {
+        // Internal semantic slots used only to construct the title. They are
+        // not exposed as lake query or storage aliases.
+        let fields = self.extract_udm_fields(events, schema);
 
         let user = fields.get("user").or_else(|| fields.get("src_user"));
         let src_host = fields.get("src_host");
@@ -564,6 +671,7 @@ impl EntityExtractor {
     fn extract_udm_fields(
         &self,
         events: &serde_json::Value,
+        schema: SchemaId,
     ) -> std::collections::HashMap<String, String> {
         let mut fields = std::collections::HashMap::new();
 
@@ -588,6 +696,44 @@ impl EntityExtractor {
         // Extract from first event that has each field
         for event in events_to_check {
             if let serde_json::Value::Object(map) = event {
+                if schema == SchemaId::Ocsf {
+                    // Aggregated detection rows (`stats … by device.hostname`)
+                    // carry the group-by field as a literal dotted key; raw
+                    // events carry it nested. Read both, literal first — the
+                    // same rule `case_grouping::event_field_string` uses
+                    // (NAN-3036).
+                    let nested = |path: &str| {
+                        map.get(path)
+                            .or_else(|| {
+                                path.split('.')
+                                    .try_fold(event, |value, part| value.get(part))
+                            })
+                            .and_then(|value| self.value_to_string(value))
+                            .filter(|value| {
+                                !value.is_empty()
+                                    && value != "-"
+                                    && !value.eq_ignore_ascii_case("null")
+                            })
+                    };
+                    for (slot, paths) in [
+                        ("user", &["actor.user.name", "user.name"][..]),
+                        (
+                            "src_host",
+                            &["src_endpoint.hostname", "device.hostname"][..],
+                        ),
+                        ("dest_host", &["dst_endpoint.hostname"][..]),
+                        ("src_ip", &["src_endpoint.ip"][..]),
+                        ("dest_ip", &["dst_endpoint.ip"][..]),
+                    ] {
+                        if fields.contains_key(slot) {
+                            continue;
+                        }
+                        if let Some(value) = paths.iter().find_map(|path| nested(path)) {
+                            fields.insert(slot.to_string(), value);
+                        }
+                    }
+                    continue;
+                }
                 for field in &udm_fields {
                     if fields.contains_key(*field) {
                         continue;
@@ -621,13 +767,99 @@ mod tests {
     use super::*;
 
     #[test]
+    fn internal_domains_are_hosts_not_domains() {
+        use crate::internal_domains::InternalDomains;
+        let entity = |t: &str, v: &str| ExtractedEntity { entity_type: t.into(), value: v.into() };
+        let entities = vec![
+            entity("domain", "db1.prod"),
+            entity("domain", "login.example.com"),
+            entity("host", "db1.prod"),
+            entity("domain", "fs.corp.local"),
+            entity("domain", "myprod.com"),
+        ];
+        let out = retype_internal_domains(entities.clone(), &InternalDomains::with_tenant(["prod"]));
+        assert_eq!(
+            out,
+            vec![
+                entity("host", "db1.prod"),
+                entity("domain", "login.example.com"),
+                entity("host", "fs.corp.local"),
+                entity("domain", "myprod.com"),
+            ]
+        );
+        // Another tenant's list leaves db1.prod a domain.
+        let other = retype_internal_domains(entities, &InternalDomains::with_tenant(["cloud"]));
+        assert!(other.contains(&entity("domain", "db1.prod")));
+    }
+
+    #[test]
+    fn extracts_entities_from_nested_ocsf_19_paths() {
+        let extractor = EntityExtractor::new();
+        let events = serde_json::json!({
+            "device": {"hostname": "lt-legal-001.corp.local"},
+            "src_endpoint": {"ip": "198.51.100.25"},
+            "actor": {"user": {"name": "bsmith"}},
+            "process": {
+                "name": "powershell.exe",
+                "file": {"hashes": [{"algorithm_id": 3, "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}
+            }
+        });
+        let mut entities = HashSet::new();
+        extractor.extract_from_value(
+            &events,
+            "",
+            &mut entities,
+            &crate::schema::OcsfProfile::new(),
+        );
+        for (entity_type, value) in [
+            ("host", "lt-legal-001.corp.local"),
+            ("ip", "198.51.100.25"),
+            ("user", "bsmith"),
+            ("process", "powershell.exe"),
+            (
+                "hash",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            assert!(
+                entities.contains(&ExtractedEntity {
+                    entity_type: entity_type.to_string(),
+                    value: value.to_string(),
+                }),
+                "missing {entity_type}={value}"
+            );
+        }
+    }
+
+    /// NAN-3036: aggregated lean rows carry `device.hostname` as a literal
+    /// dotted key; the OCSF title context must read it like nested paths.
+    #[test]
+    fn ocsf_title_suffix_reads_literal_dotted_keys() {
+        let extractor = EntityExtractor::new();
+        let aggregated = serde_json::json!([{
+            "_nano_source_types": ["windows_sysmon"],
+            "device.hostname": "e2e-b98b021b-ps.corp.local",
+            "hits": 1,
+        }]);
+        assert_eq!(
+            extractor.build_title_suffix_for(&aggregated, SchemaId::Ocsf).as_deref(),
+            Some("e2e-b98b021b-ps.corp.local")
+        );
+        let nested = serde_json::json!({
+            "device": {"hostname": "ws-1"},
+            "actor": {"user": {"name": "bob"}},
+        });
+        assert_eq!(extractor.build_title_suffix_for(&nested, SchemaId::Ocsf).as_deref(), Some("bob@ws-1"));
+    }
+
+    #[test]
     fn test_extract_ip() {
         let extractor = EntityExtractor::new();
         let events = serde_json::json!({
             "src_ip": "203.0.113.1",
             "dest_ip": "8.8.8.8"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         assert!(entities
             .iter()
             .any(|e| e.entity_type == "ip" && e.value == "203.0.113.1"));
@@ -643,7 +875,7 @@ mod tests {
             "user": "john.doe",
             "src_user": "admin"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         assert!(entities
             .iter()
             .any(|e| e.entity_type == "user" && e.value == "john.doe"));
@@ -658,7 +890,7 @@ mod tests {
         let events = serde_json::json!({
             "file_hash": "d41d8cd98f00b204e9800998ecf8427e"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         assert!(entities.iter().any(|e| e.entity_type == "hash"));
     }
 
@@ -668,7 +900,7 @@ mod tests {
         let events = serde_json::json!({
             "message": "Connection from 192.168.1.1 to 8.8.4.4"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         // Should extract 8.8.4.4 but not 192.168.1.1
         assert!(entities
             .iter()
@@ -686,7 +918,7 @@ mod tests {
             "src_host": "1",
             "dest_host": "WS-001"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         // Should NOT extract numeric-only values as hosts
         assert!(!entities
             .iter()
@@ -704,7 +936,7 @@ mod tests {
             "user": "admin",
             "src_user": "john.doe"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         assert!(entities
             .iter()
             .any(|e| e.entity_type == "user" && e.value == "admin"));
@@ -721,7 +953,7 @@ mod tests {
             "user": "system",
             "dest_host": "none"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         // Should NOT extract placeholder values
         assert!(!entities
             .iter()
@@ -745,7 +977,7 @@ mod tests {
             "http_user_agent": "Mozilla/5.0",
             "user_name": "jsmith@corp.local"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
         // Should extract actual usernames
         assert!(entities
             .iter()
@@ -796,7 +1028,7 @@ mod tests {
             "parent_process_id": "9999",
             "parent_process_path": "C:\\Windows\\explorer.exe"
         });
-        let entities = extractor.extract_from_events(&events);
+        let entities = extractor.extract_from_events_with_profile(&events, &crate::schema::UdmProfile::new());
 
         // Should extract actual process names from UDM fields
         assert!(
@@ -877,7 +1109,7 @@ mod tests {
             "user": "admin",
             "src_host": "WS-001"
         });
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("admin@WS-001".to_string()));
     }
 
@@ -888,7 +1120,7 @@ mod tests {
             "user": "john.doe",
             "src_ip": "192.168.1.50"
         });
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("john.doe@192.168.1.50".to_string()));
     }
 
@@ -899,7 +1131,7 @@ mod tests {
             "src_host": "WORKSTATION-1",
             "dest_host": "DC-01"
         });
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("WORKSTATION-1 → DC-01".to_string()));
     }
 
@@ -910,7 +1142,7 @@ mod tests {
             "src_ip": "192.168.1.50",
             "dest_ip": "10.0.0.5"
         });
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("192.168.1.50 → 10.0.0.5".to_string()));
     }
 
@@ -920,7 +1152,7 @@ mod tests {
         let events = serde_json::json!({
             "user": "svc_backup"
         });
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("svc_backup".to_string()));
     }
 
@@ -930,7 +1162,7 @@ mod tests {
         let events = serde_json::json!({
             "src_host": "SERVER-01"
         });
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("SERVER-01".to_string()));
     }
 
@@ -938,7 +1170,7 @@ mod tests {
     fn test_title_suffix_empty_events() {
         let extractor = EntityExtractor::new();
         let events = serde_json::json!({});
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, None);
     }
 
@@ -950,7 +1182,7 @@ mod tests {
             { "user": "admin", "src_host": "WS-002" }
         ]);
         // Should use first event's values
-        let suffix = extractor.build_title_suffix(&events);
+        let suffix = extractor.build_title_suffix_for(&events, SchemaId::Udm);
         assert_eq!(suffix, Some("admin@WS-001".to_string()));
     }
 }

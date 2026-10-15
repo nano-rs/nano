@@ -1,0 +1,60 @@
+[package]
+name = "nanosiem-lake-cell"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lean-lake cell supervisor: per-tenant ingest/query processes in a shared cell pod (NAN-2871)"
+
+[[bin]]
+name = "nanosiem-lake-cell"
+path = "src/main.rs"
+
+[[bin]]
+name = "nanosiem-lake-cell-stub"
+path = "src/bin/stub_tenant.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+bytes = "1"
+chrono.workspace = true
+ed25519-dalek = "2"
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+landlock = "0.4"
+libc = "0.2"
+nix = { version = "0.31", features = ["socket", "uio", "process", "signal", "user", "fs", "resource", "mman", "ptrace"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+seccompiler = "0.5"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+subtle = "2.6"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize = "1"
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+# Requires a privileged/delegated mount and cgroup sandbox; never a bare OSS test.
+sandbox-integration = []
+
+[[test]]
+name = "isolation"
+path = "tests/isolation.rs"
+required-features = ["sandbox-integration"]
+
+[[test]]
+name = "zero_downtime_roll"
+path = "tests/zero_downtime_roll.rs"
+required-features = ["sandbox-integration"]

@@ -323,6 +323,7 @@ async fn raw_sql_dashboard_requires_current_capability_and_stamps_artifact_scope
             false,
             false,
             &[RenderedArtifact {
+                platform_read_fence: None,
                 kind: "html".to_string(),
                 filename: "sql-report.html".to_string(),
                 content_type: "text/html".to_string(),

@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowRight, Check, ListFilter, Search, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { absTime, extractAction, extractEventTime, eventEntityLabel, entityNoun, relTime, topActions, meanTimeToDetect, type MatchView } from './helpers';
+import { absTime, extractAction, extractEventTime, extractLogSource, eventEntityLabel, entityNoun, relTime, topActions, meanTimeToDetect, type MatchView } from './helpers';
 import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip';
 import { LatencyPill } from './LatencyPill';
 import { EventViewer } from './EventViewer';
@@ -40,10 +40,14 @@ function entitySearchQuery(entity: MatchEntity, schema: string | undefined): str
     case 'role':
     case 'service':
       // ARN-style identifiers (CloudTrail) round-trip through user_identity.arn.
-      if (raw.startsWith('arn:')) return `user_identity.arn="${escaped}"`;
+      if (raw.startsWith('arn:')) {
+        return isOcsf
+          ? `(actor.user.uid="${escaped}" OR actor.user.name="${escaped}")`
+          : `user_identity.arn="${escaped}"`;
+      }
       // OCSF Sysmon users live under actor.user.name / user.name; UDM uses `user`.
       return isOcsf
-        ? `user.name="${escaped}" OR actor.user.name="${escaped}"`
+        ? `(actor.user.name="${escaped}" OR actor.user.uid="${escaped}" OR user.name="${escaped}" OR user.uid="${escaped}")`
         : `user="${escaped}"`;
     case 'host':
       return isOcsf
@@ -130,7 +134,7 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
     const start = new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
     api
       .search({
-        query: `${queryStr} | sort -timestamp | head 10`,
+        query: `${queryStr} | sort -${schema === 'ocsf' ? 'time' : 'timestamp'} | head 10`,
         time_range: { start: start.toISOString(), end: end.toISOString() },
         limit: 10,
         skip_field_stats: true,
@@ -152,7 +156,7 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
     return () => {
       cancelled = true;
     };
-  }, [queryStr]);
+  }, [queryStr, schema]);
   return { events, loading };
 }
 
@@ -197,7 +201,7 @@ function RecentActivityCard({ view }: { view: MatchView }) {
         <ul className="p-1 flex flex-col">
           {events.map((e, i) => {
             const t = extractEventTime(e);
-            const action = extractAction(e) || (typeof e['source_type'] === 'string' ? (e['source_type'] as string) : 'event');
+            const action = extractAction(e) || extractLogSource(e) || 'event';
             const sev = typeof e['severity'] === 'string' ? (e['severity'] as string) : undefined;
             const id = typeof e['id'] === 'string' ? (e['id'] as string) : `re_${i}`;
             return (

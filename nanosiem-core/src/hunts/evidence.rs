@@ -216,6 +216,376 @@ const SUMMARY_MAX_CHARS: usize = 512;
 /// this is a malformed query rather than a large result.
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Lake-native evidence resolver for the canonical OCSF product lane.
+///
+/// Event reads and bounded history/source probes go through the same
+/// tenant-pinned [`crate::search::SearchService`] boundary as interactive
+/// search. No object URL, credential, arbitrary SQL, or storage alias crosses
+/// this interface. Unknown prevalence stays unmeasured instead of awarding a
+/// false rarity bonus.
+#[derive(Clone)]
+pub struct LakeEvidenceResolver {
+    search: crate::search::SearchService,
+}
+
+impl LakeEvidenceResolver {
+    pub fn new(search: crate::search::SearchService) -> Self {
+        Self { search }
+    }
+
+    fn safe_event_id(value: &str) -> Option<String> {
+        let value = value.trim();
+        (!value.is_empty() && value.len() <= 1_024 && !value.chars().any(char::is_control))
+            .then(|| value.to_string())
+    }
+
+    fn entity_predicate(entity_type: &str, entity_value: &str) -> Option<String> {
+        let fields: &[&str] = match entity_type {
+            "ip" => &["src_endpoint.ip", "dst_endpoint.ip"],
+            "host" => &[
+                "device.hostname",
+                "src_endpoint.hostname",
+                "dst_endpoint.hostname",
+            ],
+            "user" => &[
+                "actor.user.name",
+                "user.name",
+                "src_endpoint.user.name",
+                "dst_endpoint.user.name",
+            ],
+            "domain" => &["http_request.url.hostname", "query.hostname"],
+            "hash" => &[
+                "file.hashes.value",
+                "process.file.hashes.value",
+                "actor.process.file.hashes.value",
+            ],
+            "process" => &["process.name", "actor.process.name"],
+            "file" => &["file.path", "file.name", "process.file.path"],
+            "url" => &["http_request.url.url_string"],
+            _ => return None,
+        };
+        let value = entity_value.trim();
+        if value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control) {
+            return None;
+        }
+        let normalized = if matches!(entity_type, "ip" | "host" | "domain" | "hash" | "user") {
+            value.to_ascii_lowercase()
+        } else {
+            value.to_string()
+        };
+        let literal = crate::query::npl_quoted_literal(&normalized);
+        Some(
+            fields
+                .iter()
+                .map(|field| format!("{field}={literal}"))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+
+    fn ocsf_string(row: &serde_json::Value, path: &str) -> Option<String> {
+        path.split('.')
+            .try_fold(row, |value, part| value.get(part))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }
+}
+
+#[async_trait::async_trait]
+impl EvidenceResolver for LakeEvidenceResolver {
+    async fn resolve(
+        &self,
+        event_ids: &[String],
+        scope: &ScopeSet,
+    ) -> Result<ResolvedEvidence, HuntError> {
+        let mut wanted = BTreeSet::<String>::new();
+        let mut unresolved = Vec::<String>::new();
+        for raw in event_ids.iter().take(MAX_EVIDENCE_IDS_PER_CANDIDATE) {
+            match Self::safe_event_id(raw) {
+                Some(id) => {
+                    wanted.insert(id);
+                }
+                None => unresolved.push(raw.clone()),
+            }
+        }
+        unresolved.extend(
+            event_ids
+                .iter()
+                .skip(MAX_EVIDENCE_IDS_PER_CANDIDATE)
+                .cloned(),
+        );
+
+        let extractor = EntityExtractor::new();
+        let mut events = Vec::new();
+        let mut observed_entities = BTreeSet::new();
+        for id in wanted {
+            let row = self
+                .search
+                .fetch_log_by_id(&id, None, None, scope)
+                .await
+                .map_err(|error| HuntError::LogStore(error.to_string()))?;
+            let Some(row) = row else {
+                unresolved.push(id);
+                continue;
+            };
+            let returned_id = Self::ocsf_string(&row, "metadata.uid");
+            if returned_id.as_deref() != Some(id.as_str()) {
+                unresolved.push(id);
+                continue;
+            }
+            let timestamp = Self::ocsf_string(&row, "time")
+                .as_deref()
+                .and_then(parse_ch_timestamp)
+                .unwrap_or_else(Utc::now);
+            let source_type = Self::ocsf_string(&row, "metadata.log_source")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let mut summary = Self::ocsf_string(&row, "message").unwrap_or_default();
+            if summary.chars().count() > SUMMARY_MAX_CHARS {
+                summary = summary.chars().take(SUMMARY_MAX_CHARS).collect();
+            }
+            let entities = extractor
+                .extract_from_events(&row)
+                .into_iter()
+                .map(|entity| (entity.entity_type, entity.value))
+                .collect::<BTreeSet<_>>();
+            observed_entities.extend(entities.iter().cloned());
+            events.push(ResolvedEvent {
+                canonical_event_id: id,
+                timestamp,
+                source_type,
+                summary,
+                row,
+                entities,
+            });
+        }
+
+        Ok(ResolvedEvidence {
+            events,
+            observed_entities,
+            unresolved,
+        })
+    }
+
+    async fn had_prior_history(
+        &self,
+        entity_type: &str,
+        entity_value: &str,
+        window_start: DateTime<Utc>,
+        scope: &ScopeSet,
+    ) -> Result<bool, HuntError> {
+        let Some(predicate) = Self::entity_predicate(entity_type, entity_value) else {
+            // Unknown entity shapes fail toward unremarkable; they never earn
+            // the first-seen bonus merely because the product cannot measure.
+            return Ok(true);
+        };
+        let range = crate::query::TimeRange::new(
+            window_start - chrono::Duration::days(PRIOR_HISTORY_LOOKBACK_DAYS),
+            window_start,
+        );
+        let response = self
+            .search
+            .execute_lake_view_query(
+                format!("({predicate}) | head 1"),
+                &range,
+                scope,
+                "hunt-history",
+                1,
+            )
+            .await
+            .map_err(|error| HuntError::LogStore(error.to_string()))?;
+        Ok(!response.results.is_empty())
+    }
+
+    async fn asset_prevalence(
+        &self,
+        entity_type: &str,
+        entity_value: &str,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+        scope: &ScopeSet,
+    ) -> Result<Option<f64>, HuntError> {
+        if window_end <= window_start
+            || (window_end - window_start) > chrono::Duration::days(MAX_PREVALENCE_WINDOW_DAYS)
+        {
+            return Ok(None);
+        }
+        let (Some(artifact), Some(window)) = (
+            lake_prevalence_artifact(entity_type, entity_value),
+            lake_prevalence_window(window_end - window_start),
+        ) else {
+            return Ok(None);
+        };
+        let Some(lookup) = self.search.prevalence_lookup() else {
+            return Ok(None);
+        };
+        // The denominator counts observers the way the serving backend counts
+        // hosts, over the same window length the snapshot covers, ending at
+        // the hunt window's end.
+        let observers = lake_observer_count_query(self.search.serves_lake_cell(), &artifact);
+        let range = crate::query::TimeRange::new(window_end - chrono::Duration::hours(window.hours()), window_end);
+        measure_lake_prevalence(lookup.as_ref(), &artifact, window, scope, || async {
+            let response = self
+                .search
+                .execute_lake_view_query(observers, &range, scope, "hunt-prevalence", 1)
+                .await
+                .map_err(|error| HuntError::LogStore(error.to_string()))?;
+            Ok(response
+                .results
+                .first()
+                .and_then(|row| row.get("total"))
+                .and_then(json_u64))
+        })
+        .await
+    }
+
+    async fn silent_source_types(
+        &self,
+        candidates: &[String],
+        since: DateTime<Utc>,
+    ) -> Result<Vec<String>, HuntError> {
+        let wanted = candidates
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect::<BTreeSet<_>>();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = Utc::now();
+        if since >= now {
+            return Ok(wanted.into_iter().collect());
+        }
+        let range = crate::query::TimeRange::new(since, now);
+        let response = self
+            .search
+            .execute_lake_view_query(
+                "metadata.log_source!=\"\" | stats count() as events by metadata.log_source"
+                    .to_string(),
+                &range,
+                &ScopeSet::unrestricted(),
+                "hunt-sources",
+                10_000,
+            )
+            .await
+            .map_err(|error| HuntError::LogStore(error.to_string()))?;
+        let alive = response
+            .results
+            .iter()
+            .filter_map(|row| {
+                row.get("metadata.log_source")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .or_else(|| Self::ocsf_string(row, "metadata.log_source"))
+            })
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        Ok(wanted.difference(&alive).cloned().collect())
+    }
+}
+
+/// NAN-3451: the artifact a lake prevalence lookup can measure for a hunt
+/// entity, normalized as the builder indexes it. Only hashes, domains and
+/// public IPs have prevalence; every other entity stays unmeasured.
+pub(crate) fn lake_prevalence_artifact(entity_type: &str, entity_value: &str) -> Option<String> {
+    use crate::prevalence::ArtifactType;
+    let value = entity_value.trim().to_ascii_lowercase();
+    if value.is_empty() || value.len() > 2_048 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let detected = ArtifactType::detect(&value);
+    let measurable = match entity_type {
+        "hash" => matches!(detected, ArtifactType::HashMd5 | ArtifactType::HashSha256)
+            || (value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())),
+        "ip" => detected == ArtifactType::IpAddress,
+        "domain" => matches!(detected, ArtifactType::Domain | ArtifactType::Subdomain),
+        _ => false,
+    };
+    measurable.then_some(value)
+}
+
+/// The shortest served prevalence window that covers the hunt window. A
+/// longer baseline only over-counts hosts, which can never award rarity.
+pub(crate) fn lake_prevalence_window(
+    span: chrono::Duration,
+) -> Option<crate::prevalence::TimeWindow> {
+    use crate::prevalence::TimeWindow;
+    [TimeWindow::OneHour, TimeWindow::TwentyFourHours, TimeWindow::SevenDays]
+        .into_iter()
+        .find(|window| span <= chrono::Duration::hours(window.hours()))
+}
+
+/// nPL counting the distinct observer hosts the prevalence backend counts an
+/// artifact's hosts by, so numerator and denominator are the same unit.
+///
+/// * gen1 / open core (`prevalence_build.rs`): `device.hostname`, then
+///   `src_endpoint.hostname` (IPs also `dst_endpoint.hostname`), else
+///   `unknown`.
+/// * lean cells (`PREVALENCE_OBSERVER_PATHS`): `device.hostname`, then
+///   `src_endpoint.hostname`, then `src_endpoint.ip`, else `unknown`.
+pub(crate) fn lake_observer_count_query(lake_cell: bool, artifact: &str) -> String {
+    let is_ip = artifact.parse::<std::net::IpAddr>().is_ok();
+    let paths: &[&str] = match (lake_cell, is_ip) {
+        (true, _) => &["device.hostname", "src_endpoint.hostname", "src_endpoint.ip"],
+        (false, true) => &["device.hostname", "src_endpoint.hostname", "dst_endpoint.hostname"],
+        (false, false) => &["device.hostname", "src_endpoint.hostname"],
+    };
+    let observer = paths
+        .iter()
+        .map(|path| format!("nullif({path}, \"\")"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "* | eval nano_observer=lower(trim(coalesce({observer}, \"unknown\"))) | stats dc(nano_observer) as total"
+    )
+}
+
+/// The fraction of observers that saw `artifact`: its host count from the
+/// lake prevalence lookup over the observer count `denominator` returns.
+///
+/// Unmeasured (`None`) whenever the answer is not exact enough to award
+/// rarity: no lookup hit, no observers, or a saturated host set (its count
+/// is only a lower bound) whose bound does not already read as common.
+pub(crate) async fn measure_lake_prevalence<F, Fut>(
+    lookup: &dyn crate::prevalence::PrevalenceLookup,
+    artifact: &str,
+    window: crate::prevalence::TimeWindow,
+    scope: &ScopeSet,
+    denominator: F,
+) -> Result<Option<f64>, HuntError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<u64>, HuntError>>,
+{
+    let found = lookup
+        .lookup(
+            &[artifact.to_string()],
+            window,
+            &crate::auth::ArtifactScope::from_scope(scope),
+        )
+        .await
+        .map_err(|error| HuntError::LogStore(error.to_string()))?;
+    let Some(item) = found
+        .into_iter()
+        .find(|item| item.artifact.trim().eq_ignore_ascii_case(artifact))
+    else {
+        return Ok(None);
+    };
+    if item.host_count == 0 {
+        return Ok(None);
+    }
+    let Some(total) = denominator().await?.filter(|total| *total > 0) else {
+        return Ok(None);
+    };
+    let fraction = (item.host_count as f64 / total as f64).clamp(0.0, 1.0);
+    if item.host_count_saturated && fraction <= 0.10 {
+        return Ok(None);
+    }
+    Ok(Some(fraction))
+}
+
 /// A UTC instant as a ClickHouse `DateTime64(6, 'UTC')` literal.
 ///
 /// Explicitly `toDateTime64(…, 6, 'UTC')` rather than a bare string: a bare
@@ -503,10 +873,7 @@ impl EvidenceResolver for ClickHouseEvidenceResolver {
         );
 
         let rows = self
-            .fetch_json(
-                &sql,
-                &[Bound::TextList(wanted.values().cloned().collect())],
-            )
+            .fetch_json(&sql, &[Bound::TextList(wanted.values().cloned().collect())])
             .await?;
         let extractor = EntityExtractor::new();
         let observed_entities: BTreeSet<(String, String)> = extractor
@@ -727,10 +1094,7 @@ impl EvidenceResolver for ClickHouseEvidenceResolver {
             .map(|s| s.to_string())
             .collect();
 
-        let mut silent: Vec<String> = wanted
-            .into_iter()
-            .filter(|c| !alive.contains(c))
-            .collect();
+        let mut silent: Vec<String> = wanted.into_iter().filter(|c| !alive.contains(c)).collect();
         silent.sort();
         silent.dedup();
         Ok(silent)

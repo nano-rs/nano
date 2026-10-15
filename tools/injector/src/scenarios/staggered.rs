@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Staggered low-and-slow APT scenario — C2 beacons spread over time.
 //!
 //! Sysmon scripted steps go through `process_create_step` (NAN-1058) so the

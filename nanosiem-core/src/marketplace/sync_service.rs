@@ -20,6 +20,41 @@ const MAX_DIR_DEPTH: usize = 10;
 /// Maximum manifest file size (1MB)
 const MAX_MANIFEST_SIZE: u64 = 1_048_576;
 
+/// Version of the manifest parse/record logic in [`run_sync`] (NAN-3514).
+///
+/// A successful sync stores it next to `last_sync_commit`
+/// (`enrichment_marketplace_repos.last_sync_schema_version`). Sync skips a
+/// repository only when both the HEAD commit AND this version match what was
+/// stored, so a repo whose content has not moved still re-parses once after
+/// the code learns something new.
+///
+/// **Bump this whenever the parse or record logic gains or changes a recorded
+/// field** (a new manifest key copied into the catalog row, a changed
+/// derivation such as `execution_backend` or `config`, etc.).
+///
+/// History:
+/// - 0: rows synced before the version was recorded (column default).
+/// - 1: NAN-3490 `runtime` / `connector_spec` / `connector_spec_sha256` in
+///   `config` (NAN-3514 introduced the version).
+/// - 2: NAN-3490 item 5 `hosted_connector_spec` /
+///   `hosted_connector_spec_sha256` in `config`.
+/// - 3: NAN-3503 `categories` / `components` (identity component spec text
+///   and SHA-256) in `config`.
+pub const SYNC_SCHEMA_VERSION: i32 = 3;
+
+/// Whether `repo` is already synced at `commit` by the running sync code.
+///
+/// True only for a successful prior sync at the same commit by this
+/// [`SYNC_SCHEMA_VERSION`] or a newer one; anything else needs a full parse
+/// and apply.
+pub(super) fn is_up_to_date(repo: &EnrichmentMarketplaceRepo, commit: &str) -> bool {
+    repo.last_sync_commit.as_deref() == Some(commit)
+        && repo.last_sync_status.as_deref() == Some("success")
+        // A version from newer code counts as current: during a roll, old
+        // and new pods must not re-sync the same commit back and forth.
+        && repo.last_sync_schema_version >= SYNC_SCHEMA_VERSION
+}
+
 use super::error::MarketplaceError;
 use super::repository::MarketplaceRepository;
 use super::types::*;
@@ -168,6 +203,11 @@ impl MarketplaceSyncService {
         result
     }
 
+    /// Platform tables use the control pool, never a signed tenant transaction.
+    pub async fn sync_platform_repository(&self, pool: &PgPool, id: Uuid) -> Result<RepoSyncResult, MarketplaceError> {
+        super::platform_sync::sync(pool, &self.repository, &self.data_dir, id).await
+    }
+
     /// Auto-sync all repos that are due
     pub async fn auto_sync_all(&self) -> Result<Vec<Uuid>, MarketplaceError> {
         let repos = self.repository.list_repos_for_auto_sync().await?;
@@ -280,7 +320,7 @@ fn verify_path_containment(base: &PathBuf, target: &PathBuf) -> Result<(), Marke
 }
 
 /// Internal sync implementation
-async fn run_sync(
+pub(super) async fn run_sync(
     repo: &EnrichmentMarketplaceRepo,
     repository: &MarketplaceRepository,
     data_dir: &PathBuf,
@@ -307,8 +347,9 @@ async fn run_sync(
         git_clone(&repo.url, &repo_dir, &repo.branch).await?
     };
 
-    // Check if commit changed (skip if same)
-    if repo.last_sync_commit.as_deref() == Some(&commit) {
+    // Skip only when neither the content (commit) nor the sync code
+    // (SYNC_SCHEMA_VERSION) changed since the last successful sync.
+    if is_up_to_date(repo, &commit) {
         info!(repo_id = %repo.id, "No changes since last sync (commit {})", &commit[..8.min(commit.len())]);
         return Ok(RepoSyncResult {
             repository_id: repo.id,
@@ -321,6 +362,18 @@ async fn run_sync(
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
         });
+    }
+
+    if repo.last_sync_commit.as_deref() == Some(commit.as_str())
+        && repo.last_sync_schema_version < SYNC_SCHEMA_VERSION
+    {
+        info!(
+            repo_id = %repo.id,
+            stored_version = repo.last_sync_schema_version,
+            current_version = SYNC_SCHEMA_VERSION,
+            "Sync schema version changed; re-parsing at unchanged commit {}",
+            &commit[..8.min(commit.len())]
+        );
     }
 
     // Walk enrichments directory and find manifests
@@ -352,6 +405,22 @@ async fn run_sync(
     let mut seen_slugs = Vec::new();
 
     for (manifest_path, manifest) in &manifests {
+        // NAN-3490 item 5: `_mock` slugs are reserved for operator
+        // live-validation rows; a repository may not ship or overwrite one.
+        if super::repository::is_validation_mock_slug(&manifest.slug) {
+            warn!(path = %manifest_path.display(), slug = %manifest.slug, "Skipping manifest: `_mock` slugs are reserved for live-validation entries");
+            continue;
+        }
+        // NAN-3490: a manifest that names a connector spec carries it into the
+        // catalog row; one that asks for the connector runtime without a
+        // readable spec is skipped rather than synced half-formed.
+        let config = match catalog_config(manifest_path, manifest) {
+            Ok(config) => config,
+            Err(reason) => {
+                warn!(path = %manifest_path.display(), slug = %manifest.slug, %reason, "Skipping manifest");
+                continue;
+            }
+        };
         seen_slugs.push(manifest.slug.clone());
 
         // Read adjacent code file
@@ -377,7 +446,11 @@ async fn run_sync(
             .unwrap_or_default();
 
         // Check if entry already exists
-        let existing = repository.get_catalog_entry(&manifest.slug).await.ok();
+        let existing = match repository.get_catalog_entry(&manifest.slug).await {
+            Ok(entry) => Some(entry),
+            Err(MarketplaceError::CatalogEntryNotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
         let is_update = existing.is_some();
 
         // Build catalog entry
@@ -412,13 +485,13 @@ async fn run_sync(
             has_credentials: false, // computed field, set by hydrate()
             code,
             allowed_domains: manifest.allowed_domains.clone(),
-            config: sqlx::types::Json(effective_config(manifest)),
+            config: sqlx::types::Json(config),
             enabled: existing.as_ref().map(|e| e.enabled).unwrap_or(false),
             last_sync_at: existing.as_ref().and_then(|e| e.last_sync_at),
             last_sync_status: existing.as_ref().and_then(|e| e.last_sync_status.clone()),
             last_error: existing.as_ref().and_then(|e| e.last_error.clone()),
             record_count: existing.as_ref().map(|e| e.record_count).unwrap_or(0),
-            is_syncing: false, // derived per-query in repository; not stored
+            is_syncing: false,       // derived per-query in repository; not stored
             requires_network: false, // derived in repository hydrate; not stored
             changelog: manifest.changelog.clone(),
             created_at: existing
@@ -428,29 +501,14 @@ async fn run_sync(
             updated_at: chrono::Utc::now(),
         };
 
-        match repository.upsert_catalog_entry(&entry).await {
-            Ok(_) => {
-                if is_update {
-                    updated += 1;
-                } else {
-                    added += 1;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    slug = %manifest.slug,
-                    error = %e,
-                    "Failed to upsert catalog entry"
-                );
-            }
-        }
+        repository.upsert_catalog_entry(&entry).await?;
+        if is_update { updated += 1; } else { added += 1; }
     }
 
     // Remove stale entries (only non-installed ones)
     let removed = repository
         .remove_stale_repo_entries(repo.id, &seen_slugs)
-        .await
-        .unwrap_or(0);
+        .await?;
 
     Ok(RepoSyncResult {
         repository_id: repo.id,
@@ -475,6 +533,7 @@ async fn git_clone(url: &str, target: &PathBuf, branch: &str) -> Result<String, 
     }
 
     let output = tokio::process::Command::new("git")
+        .kill_on_drop(true)
         .args([
             "clone",
             "--depth=1",
@@ -503,6 +562,7 @@ async fn git_clone(url: &str, target: &PathBuf, branch: &str) -> Result<String, 
 async fn git_pull(repo_dir: &PathBuf, branch: &str) -> Result<String, MarketplaceError> {
     // Fetch
     let output = tokio::process::Command::new("git")
+        .kill_on_drop(true)
         .args(["fetch", "--depth=1", "origin", branch])
         .current_dir(repo_dir)
         .output()
@@ -519,6 +579,7 @@ async fn git_pull(repo_dir: &PathBuf, branch: &str) -> Result<String, Marketplac
 
     // Reset to fetched
     let output = tokio::process::Command::new("git")
+        .kill_on_drop(true)
         .args(["reset", "--hard", &format!("origin/{}", branch)])
         .current_dir(repo_dir)
         .output()
@@ -539,6 +600,7 @@ async fn git_pull(repo_dir: &PathBuf, branch: &str) -> Result<String, Marketplac
 /// Get HEAD commit hash
 async fn get_head_commit(repo_dir: &PathBuf) -> Result<String, MarketplaceError> {
     let output = tokio::process::Command::new("git")
+        .kill_on_drop(true)
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_dir)
         .output()
@@ -555,11 +617,11 @@ async fn get_head_commit(repo_dir: &PathBuf) -> Result<String, MarketplaceError>
 /// string comes from user-authored YAML in an external repo, so a typo there
 /// would otherwise route a collector through the enrichment executor, which
 /// would run it once and throw its output away.
-fn is_collector_manifest(manifest: &MarketplaceManifest) -> bool {
+pub fn is_collector_manifest(manifest: &MarketplaceManifest) -> bool {
     !manifest.streams.is_empty()
 }
 
-fn execution_backend_for(manifest: &MarketplaceManifest) -> &'static str {
+pub fn execution_backend_for(manifest: &MarketplaceManifest) -> &'static str {
     if is_collector_manifest(manifest) {
         "collector"
     } else {
@@ -575,7 +637,7 @@ fn execution_backend_for(manifest: &MarketplaceManifest) -> &'static str {
 /// queries these fields relationally, they are read as a unit when a run
 /// starts. Enrichment manifests are untouched, so their stored config stays
 /// byte-identical to what pre-NAN-2189 sync wrote.
-fn effective_config(manifest: &MarketplaceManifest) -> serde_json::Value {
+pub fn effective_config(manifest: &MarketplaceManifest) -> serde_json::Value {
     if !is_collector_manifest(manifest) {
         return manifest.config.clone();
     }
@@ -614,6 +676,221 @@ fn effective_config(manifest: &MarketplaceManifest) -> serde_json::Value {
     }
 
     serde_json::Value::Object(config)
+}
+
+/// Everything sync records in a catalog row's `config`: the manifest config
+/// and collector fields, the connector runtime and specs (NAN-3490) and the
+/// marketplace layout (NAN-3503). `Err` names why the manifest is skipped.
+pub fn catalog_config(manifest_path: &std::path::Path, manifest: &MarketplaceManifest) -> Result<serde_json::Value, String> {
+    let spec = read_connector_spec(manifest_path, manifest)?;
+    let config = apply_connector_runtime(effective_config(manifest), manifest, spec.as_deref())?;
+    let hosted = read_hosted_connector_spec(manifest_path, manifest)?;
+    let config = apply_hosted_connector_spec(config, hosted.as_deref());
+    apply_components(config, manifest_path, manifest)
+}
+
+/// NAN-3503: record the marketplace layout in `config`:
+///
+/// - `categories`: the sections the card lists under (`logs`, `identity`)
+/// - `components`: one object per component with `id`, `label`, `kind`,
+///   `description`, `streams`, `config_fields`, `default` and `setup`; an
+///   identity component also carries its spec as `connector_spec` (text) +
+///   `connector_spec_sha256`, and its hosted twin as
+///   `hosted_connector_spec` + `hosted_connector_spec_sha256`, the same keys
+///   the entry itself uses.
+///
+/// A manifest with neither key keeps its config unchanged. A malformed
+/// layout skips the manifest, like an unreadable spec: half a card would
+/// install the wrong things.
+pub fn apply_components(
+    config: serde_json::Value,
+    manifest_path: &std::path::Path,
+    manifest: &MarketplaceManifest,
+) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    use serde_json::{json, Value};
+    if manifest.categories.is_empty() && manifest.components.is_empty() {
+        return Ok(config);
+    }
+    let mut map = match config {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    for category in &manifest.categories {
+        if category != COMPONENT_KIND_LOGS && category != COMPONENT_KIND_IDENTITY {
+            return Err(format!("categories: unknown category '{category}'"));
+        }
+    }
+    let stream_ids: std::collections::BTreeMap<&str, &StreamDef> = manifest.streams.iter().map(|s| (s.id.as_str(), s)).collect();
+    let field_names: std::collections::BTreeSet<&str> = manifest.config_fields.iter().map(|f| f.name.as_str()).collect();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut claimed = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(manifest.components.len());
+    for c in &manifest.components {
+        let at = format!("components.{}", c.id);
+        let valid_id = !c.id.is_empty()
+            && c.id.len() <= 64
+            && c.id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+        if !valid_id {
+            return Err(format!("components: id '{}' must be [a-z0-9_], at most 64 characters", c.id));
+        }
+        if !ids.insert(c.id.as_str()) {
+            return Err(format!("{at}: duplicate id"));
+        }
+        if c.label.trim().is_empty() {
+            return Err(format!("{at}: label is empty"));
+        }
+        for field in &c.config_fields {
+            if !field_names.contains(field.as_str()) {
+                return Err(format!("{at}: config field '{field}' is not in config_fields"));
+            }
+        }
+        let mut entry = json!({
+            "id": c.id,
+            "label": c.label,
+            "kind": c.kind,
+            "description": c.description,
+            "streams": c.streams,
+            "config_fields": c.config_fields,
+            "default": c.default,
+            "setup": c.setup,
+        });
+        match c.kind.as_str() {
+            COMPONENT_KIND_LOGS => {
+                if c.streams.is_empty() {
+                    return Err(format!("{at}: a logs component needs streams"));
+                }
+                if c.connector_spec.is_some() || c.hosted_connector_spec.is_some() {
+                    return Err(format!("{at}: a logs component runs the entry's own spec"));
+                }
+                for stream in &c.streams {
+                    match stream_ids.get(stream.as_str()) {
+                        None => return Err(format!("{at}: unknown stream '{stream}'")),
+                        Some(s) if s.source_type == IDENTITY_SOURCE_TYPE => {
+                            return Err(format!("{at}: stream '{stream}' is an identity stream"))
+                        }
+                        Some(_) => {}
+                    }
+                    if !claimed.insert(stream.as_str()) {
+                        return Err(format!("{at}: stream '{stream}' belongs to another component"));
+                    }
+                }
+            }
+            COMPONENT_KIND_IDENTITY => {
+                if !c.streams.is_empty() {
+                    return Err(format!("{at}: an identity component names no streams"));
+                }
+                let spec = read_spec_file(manifest_path, &format!("{at}.connector_spec"), c.connector_spec.as_deref())?
+                    .ok_or_else(|| format!("{at}: an identity component needs connector_spec"))?;
+                let hosted = read_spec_file(manifest_path, &format!("{at}.hosted_connector_spec"), c.hosted_connector_spec.as_deref())?;
+                let digest = |text: &str| hex::encode(Sha256::digest(text.as_bytes()));
+                entry["connector_spec_sha256"] = Value::String(digest(&spec));
+                entry["connector_spec"] = Value::String(spec);
+                if let Some(hosted) = hosted {
+                    entry["hosted_connector_spec_sha256"] = Value::String(digest(&hosted));
+                    entry["hosted_connector_spec"] = Value::String(hosted);
+                }
+            }
+            other => return Err(format!("{at}: kind must be 'logs' or 'identity', got '{other}'")),
+        }
+        out.push(entry);
+    }
+    if !manifest.categories.is_empty() {
+        map.insert("categories".to_string(), json!(manifest.categories));
+    }
+    if !out.is_empty() {
+        map.insert("components".to_string(), Value::Array(out));
+    }
+    Ok(Value::Object(map))
+}
+
+/// NAN-3490: read the nano-connector spec a manifest names. It must be a plain
+/// file name next to the manifest (no path, no symlink) and no larger than a
+/// manifest. `Ok(None)` when the manifest names no spec.
+fn read_connector_spec(manifest_path: &std::path::Path, manifest: &MarketplaceManifest) -> Result<Option<String>, String> {
+    read_spec_file(manifest_path, "connector_spec", manifest.connector_spec.as_deref())
+}
+
+/// NAN-3490 item 5: the hosted-only spec (`hosted_connector_spec`), read
+/// under exactly the same rules as `connector_spec`.
+fn read_hosted_connector_spec(manifest_path: &std::path::Path, manifest: &MarketplaceManifest) -> Result<Option<String>, String> {
+    read_spec_file(manifest_path, "hosted_connector_spec", manifest.hosted_connector_spec.as_deref())
+}
+
+fn read_spec_file(manifest_path: &std::path::Path, field: &str, name: Option<&str>) -> Result<Option<String>, String> {
+    let Some(name) = name else { return Ok(None) };
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.starts_with('.') {
+        return Err(format!("{field} '{name}' must be a file name next to the manifest"));
+    }
+    let path = manifest_path.with_file_name(name);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("{field} '{name}': {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{field} '{name}' is not a regular file"));
+    }
+    if meta.len() > MAX_MANIFEST_SIZE {
+        return Err(format!("{field} '{name}' is larger than {MAX_MANIFEST_SIZE} bytes"));
+    }
+    std::fs::read_to_string(&path).map(Some).map_err(|e| format!("{field} '{name}': {e}"))
+}
+
+/// NAN-3490 item 5: record the hosted-only spec as
+/// `config.hosted_connector_spec` + `config.hosted_connector_spec_sha256`.
+/// Without one the config is unchanged.
+pub fn apply_hosted_connector_spec(config: serde_json::Value, spec: Option<&str>) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let Some(text) = spec else { return config };
+    let mut map = match config {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    map.insert("hosted_connector_spec".to_string(), serde_json::Value::String(text.to_string()));
+    map.insert(
+        "hosted_connector_spec_sha256".to_string(),
+        serde_json::Value::String(hex::encode(Sha256::digest(text.as_bytes()))),
+    );
+    serde_json::Value::Object(map)
+}
+
+/// NAN-3490: record which runtime runs this entry, and the connector spec, in
+/// the catalog row's `config`:
+///
+/// - `runtime`: `deno` or `connector`
+/// - `connector_spec`: the spec text
+/// - `connector_spec_sha256`: its hex SHA-256, so a feed can pin the spec it
+///   was configured against
+///
+/// A manifest with neither field keeps its config byte-identical. The
+/// `execution_backend` column is left alone: `collector` vs `deno` still says
+/// whether the entry streams events or returns enrichment results.
+pub fn apply_connector_runtime(
+    config: serde_json::Value,
+    manifest: &MarketplaceManifest,
+    spec: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    let runtime = manifest.runtime.as_deref().unwrap_or("deno");
+    if runtime != "deno" && runtime != CONNECTOR_RUNTIME {
+        return Err(format!("runtime must be 'deno' or '{CONNECTOR_RUNTIME}', got '{runtime}'"));
+    }
+    if runtime == CONNECTOR_RUNTIME && spec.is_none() {
+        return Err("runtime 'connector' needs connector_spec".to_string());
+    }
+    if manifest.runtime.is_none() && spec.is_none() {
+        return Ok(config);
+    }
+    let mut map = match config {
+        serde_json::Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    map.insert("runtime".to_string(), serde_json::Value::String(runtime.to_string()));
+    if let Some(text) = spec {
+        map.insert("connector_spec".to_string(), serde_json::Value::String(text.to_string()));
+        map.insert(
+            "connector_spec_sha256".to_string(),
+            serde_json::Value::String(hex::encode(Sha256::digest(text.as_bytes()))),
+        );
+    }
+    Ok(serde_json::Value::Object(map))
 }
 
 /// Find all manifest.yaml files in a directory tree
@@ -726,3 +1003,6 @@ fn browse_directory(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

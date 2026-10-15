@@ -12,25 +12,23 @@ mod lifecycle;
 #[cfg(feature = "enterprise")]
 mod melod;
 mod schedulers;
+mod schema_profile;
 mod vector_config;
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::source_scope_resolver::SourceScopeResolver;
 use nanosiem_core::auth::{
-    ApiKeyRepository, ApiKeyService, AuthConfig, AuthService, GroupRepository,
-    OidcRepository, OidcService, PermissionService, RoleRepository, SessionConfig,
-    SessionRepository, SessionService, TokenConfig, TokenService, UserRepository,
+    ApiKeyRepository, ApiKeyService, AuthConfig, AuthService, GroupRepository, OidcRepository,
+    OidcService, PermissionService, RoleRepository, SessionConfig, SessionRepository,
+    SessionService, TokenConfig, TokenService, UserRepository,
 };
+#[cfg(feature = "enterprise")]
+use nanosiem_core::db::repository::TenantCaseNotebookService;
 use nanosiem_core::db::repository::{RateLimitRepository, SourceScopeRepository};
 use nanosiem_core::db::DualPool;
 use nanosiem_core::detection::{MaterializedViewGenerator, SignalProcessor};
 use nanosiem_core::enrichment::EnrichmentService;
 use nanosiem_core::identity::IdentitySyncService;
-#[cfg(feature = "enterprise")]
-use nanosiem_enterprise::melod::{
-    AgentConfigRegistry, MelodJobRepository, MelodService, MelodSessionRepository,
-    WizardSessionRepository,
-};
 use nanosiem_core::onboarding::OnboardingRepository;
 use nanosiem_core::settings::local_auth::LocalAuthSettings;
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
@@ -38,6 +36,14 @@ use nanosiem_core::{
     DetectionService, DiskPressureService, DistributedDetectionScheduler, FeedService,
     IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
     QueryLibraryRepository, SearchService, SourceConfigService,
+};
+#[cfg(feature = "enterprise")]
+use nanosiem_enterprise::detection_shared_runtime::TenantDetectionRuntimeLoop;
+#[cfg(feature = "enterprise")]
+use nanosiem_enterprise::melod::{
+    AgentConfigRegistry, MelodJobRepository, MelodService, MelodSessionRepository,
+    TenantAiExecutionRepository, TenantAiRlsRuntime, TenantSearchRuntimeResolver,
+    WizardSessionRepository,
 };
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::risk::RiskAnalyticsService;
@@ -48,8 +54,11 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::config::ApiConfig;
+pub use schema_profile::{
+    run_schema_refresh_loop, SchemaDriftStatus, SharedSchemaProfile, SCHEMA_REFRESH_INTERVAL,
+};
 
-// `CaseChangeEvent` was lifted to `nanosiem_enterprise::cases::CaseChangeEvent`
+// `CaseChangeEvent` was lifted to `enterprise::cases::CaseChangeEvent`
 // in NAN-752 alongside the cases handler module. Re-exported here so the
 // existing pg_notify consumer in `state/lifecycle.rs` keeps resolving the
 // type through `super::CaseChangeEvent`.
@@ -61,19 +70,64 @@ fn get_vector_config_dir() -> String {
     std::env::var("VECTOR_CONFIG_DIR").unwrap_or_else(|_| "config/vector".to_string())
 }
 
-#[derive(Clone, Default)]
+/// NAN-3080: every registered task is supervised. Release panics unwind, so
+/// without this a panicking (or returning) background loop would just stop
+/// while the pod stays Ready. A supervised death exits the process
+/// (`process_supervision`); the exit fn is injectable for tests.
+#[derive(Clone)]
 struct TaskRegistry {
     handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
     shutdown: nanosiem_core::shutdown::ShutdownToken,
+    exit: nanosiem_core::process_supervision::ExitFn,
+}
+
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self {
+            handles: Arc::default(),
+            shutdown: nanosiem_core::shutdown::ShutdownToken::default(),
+            exit: nanosiem_core::process_supervision::process_exit(),
+        }
+    }
 }
 
 impl TaskRegistry {
+    fn supervise(
+        &self,
+        name: &'static str,
+        handle: tokio::task::JoinHandle<()>,
+        policy: nanosiem_core::process_supervision::TaskPolicy,
+    ) -> tokio::task::JoinHandle<()> {
+        nanosiem_core::process_supervision::supervise(
+            name,
+            handle,
+            policy,
+            self.shutdown.clone(),
+            self.exit.clone(),
+        )
+    }
+
     async fn add_handle(&self, handle: tokio::task::JoinHandle<()>) -> bool {
+        self.add_supervised(
+            "background_loop",
+            handle,
+            nanosiem_core::process_supervision::TaskPolicy::Loop,
+        )
+        .await
+    }
+
+    async fn add_supervised(
+        &self,
+        name: &'static str,
+        handle: tokio::task::JoinHandle<()>,
+        policy: nanosiem_core::process_supervision::TaskPolicy,
+    ) -> bool {
         let mut pending = Some(handle);
         {
             let mut handles = self.handles.write().await;
             if !self.shutdown.is_cancelled() {
-                handles.push(pending.take().expect("task handle must be present"));
+                let handle = pending.take().expect("task handle must be present");
+                handles.push(self.supervise(name, handle, policy));
             }
         }
 
@@ -99,7 +153,12 @@ impl TaskRegistry {
             return false;
         }
 
-        handles.push(tokio::spawn(future));
+        // One-shot work (a feed sync): completing is fine, a panic is not.
+        handles.push(self.supervise(
+            "tracked_task",
+            tokio::spawn(future),
+            nanosiem_core::process_supervision::TaskPolicy::MayComplete,
+        ));
         true
     }
 
@@ -116,14 +175,14 @@ impl TaskRegistry {
 
 /// Shared application state
 ///
-/// Dual-database architecture: ClickHouse for logs, PostgreSQL for metadata.
-/// Both pools are required — boot fails fast if ClickHouse is unreachable
-/// (the PG-only "degraded" fallback was removed in NAN-800).
+/// PostgreSQL always owns control-plane state. Legacy mode also requires
+/// ClickHouse; canonical lake mode routes event reads to the lake worker and
+/// carries no ClickHouse runtime connection.
 #[derive(Clone)]
 pub struct AppState {
     /// PostgreSQL connection pool
     pub pool: PgPool,
-    /// DualPool for ClickHouse + PostgreSQL
+    /// PostgreSQL plus the active event-backend compatibility handles
     pub dual_pool: DualPool,
     /// Search service
     pub search_service: SearchService,
@@ -160,7 +219,7 @@ pub struct AppState {
     #[cfg(feature = "enterprise")]
     pub melod_service: Arc<RwLock<Option<Arc<MelodService>>>>,
     /// Risk analytics service (enterprise — RiskAnalyticsService is lifted to
-    /// `nanosiem-enterprise::risk` in Phase 3.4 of NAN-744; open-core surfaces
+    /// `enterprise::risk` in Phase 3.4 of NAN-744; open-core surfaces
     /// risk via `extensions::CloudRiskProvider` and the `Noop` impl)
     #[cfg(feature = "enterprise")]
     pub risk_service: RiskAnalyticsService,
@@ -170,6 +229,10 @@ pub struct AppState {
     pub materialized_view_generator: Arc<MaterializedViewGenerator>,
     /// API configuration
     pub config: Arc<ApiConfig>,
+    /// Active schema profile, resolved ONCE at boot (NAN-2361). Read through
+    /// [`AppState::schema_profile`]; never rebuild it per request — under the
+    /// canonical lake backend building it parses the tenant source manifest.
+    pub schema_profile: SharedSchemaProfile,
     // Authentication and RBAC services
     /// Authentication service
     pub auth_service: Arc<AuthService>,
@@ -221,6 +284,71 @@ pub struct AppState {
     /// PostgreSQL-backed repository for meloD AI session persistence
     #[cfg(feature = "enterprise")]
     pub melod_session_repo: MelodSessionRepository,
+    /// Startup-immutable tenant Search worker/job-store resolver for shared
+    /// pivt. `None` fails the shared surface closed; dedicated handlers never
+    /// consult this field and retain their historical singleton service.
+    #[cfg(feature = "enterprise")]
+    pub tenant_search_runtime_resolver: Option<Arc<TenantSearchRuntimeResolver>>,
+    /// Exact-role, signed-transaction runtime for shared tenant AI ledgers.
+    /// It is never backed by the API control pool.
+    #[cfg(feature = "enterprise")]
+    pub tenant_ai_rls_runtime: Option<Arc<TenantAiRlsRuntime>>,
+    /// Bounded tenant-signed Cases/Notebooks data plane. This is derived only
+    /// from the startup-attested shared RLS runtime and remains absent in every
+    /// dedicated/open-core profile. The shared router fails closed when it is
+    /// absent; it never falls back to the legacy global repositories.
+    #[cfg(feature = "enterprise")]
+    pub tenant_case_notebook_service: Option<TenantCaseNotebookService>,
+    /// Private service-owned shared detection operator runtime. It is present
+    /// only when the exact worker registry, Redis namespace factory, runtime
+    /// database role, and signing authority all pass startup validation.
+    #[cfg(feature = "enterprise")]
+    pub tenant_detection_runtime: Option<Arc<TenantDetectionRuntimeLoop>>,
+    /// Private tenant scheduled-report runner (NAN-2361). Derived from the
+    /// same worker registry / job-store factory / signed RLS runtime as the
+    /// detection loop; absent in every dedicated profile and whenever any of
+    /// those startup inputs is missing (the shared report routes then fail
+    /// closed on `run`, while CRUD/read surfaces stay available).
+    #[cfg(feature = "enterprise")]
+    pub tenant_report_runtime: Option<Arc<nanosiem_enterprise::reports_shared_runtime::TenantReportRuntime>>,
+    /// NAN-2361 wave 3: per-tenant outbound webhook delivery runner (transactional
+    /// outbox claimed inside signed tenant transactions). `None` when the RLS
+    /// runtime or the worker identity is missing; deliveries then stay queued.
+    #[cfg(feature = "enterprise")]
+    pub tenant_webhook_runtime: Option<Arc<nanosiem_enterprise::webhooks_shared_runtime::TenantWebhookRuntime>>,
+    /// NAN-2361 wave 4: per-tenant identity directory sync (lake-observed identities).
+    #[cfg(feature = "enterprise")]
+    pub tenant_identity_sync_runtime: Option<Arc<nanosiem_enterprise::identity_shared_runtime::TenantIdentitySyncRuntime>>,
+    /// NAN-2361 wave 4: platform erasure runner (execute-only runner login; lake rewrite + snapshot).
+    #[cfg(feature = "enterprise")]
+    pub tenant_erasure_runtime: Option<Arc<nanosiem_enterprise::erasure_shared_runtime::TenantErasureRuntime>>,
+    /// NAN-2361 wave 5: shadow investigation runner for alert-derived tenant cases.
+    #[cfg(feature = "enterprise")]
+    pub tenant_shadow_investigation_runtime: Option<Arc<nanosiem_enterprise::shadow_investigation_shared_runtime::TenantShadowInvestigationRuntime>>,
+    /// NAN-2361 wave 7: background AI triage of new tenant alerts (jobs binary).
+    #[cfg(feature = "enterprise")]
+    pub tenant_alert_triage_runtime: Option<Arc<nanosiem_enterprise::alert_triage_shared_runtime::TenantAlertTriageRuntime>>,
+    /// NAN-2361 wave 8: scheduled tenant SIEM-health reports.
+    #[cfg(feature = "enterprise")]
+    pub tenant_siem_health_runtime: Option<Arc<nanosiem_enterprise::siem_health_shared_runtime::TenantSiemHealthRuntime>>,
+    /// NAN-3196: shared feed-staleness monitor (started leader-only).
+    #[cfg(feature = "enterprise")]
+    pub tenant_feed_staleness_runtime: Option<Arc<nanosiem_enterprise::feed_staleness_shared_runtime::TenantFeedStalenessRuntime>>,
+    /// NAN-2361 wave 8: platform readiness attestor (activation receipt sets).
+    #[cfg(feature = "enterprise")]
+    pub tenant_platform_readiness_attestor: Option<Arc<nanosiem_enterprise::platform_readiness_shared_runtime::TenantPlatformReadinessAttestor>>,
+    /// NAN-2361 wave 5: tenant lookup ingestion runner (scheduled + triggered feeds).
+    #[cfg(feature = "enterprise")]
+    pub tenant_lookup_ingestion_runtime: Option<Arc<nanosiem_enterprise::lookup_ingestion_shared_runtime::TenantLookupIngestionRuntime>>,
+    /// NAN-2361 wave 5: queued prevalence/audit exports (tenant job ledger).
+    #[cfg(feature = "enterprise")]
+    pub tenant_export_runtime: Option<Arc<nanosiem_enterprise::exports_shared_runtime::TenantExportRuntime>>,
+    /// NAN-2361 wave 5: per-tenant custom-enrichment sandbox executor.
+    #[cfg(feature = "enterprise")]
+    pub tenant_custom_enrichment_executor: Option<Arc<nanosiem_enterprise::custom_enrichment::TenantCustomEnrichmentExecutor>>,
+    /// NAN-2361 wave 6: scheduled custom-enrichment runs.
+    #[cfg(feature = "enterprise")]
+    pub tenant_custom_enrichment_runtime: Option<Arc<nanosiem_enterprise::custom_enrichment_shared_runtime::TenantCustomEnrichmentRuntime>>,
     /// Unified audit emitter for ClickHouse
     pub audit_emitter: Arc<AuditEmitter>,
     /// Audit query service for reading audit events from ClickHouse
@@ -238,6 +366,8 @@ pub struct AppState {
     pub identity_service: Arc<IdentitySyncService>,
     /// IP allowlist service for access control
     pub ip_allowlist_service: Arc<IpAllowlistService>,
+    /// Named per-sender ingest tokens + Vector tokens file (NAN-3770)
+    pub ingest_token_service: Arc<nanosiem_core::ingest_tokens::IngestTokenService>,
     /// Onboarding wizard progress repository
     pub onboarding_repo: OnboardingRepository,
     /// Demo service (only initialized when DEPLOYMENT_MODE=demo)
@@ -279,15 +409,14 @@ pub struct AppState {
     /// per-request `CaseService` built in handlers can pick it up via
     /// `CasesAppState::shadow_investigation_hook`, which is what makes the
     /// add-alert re-triage path (NAN-1059) fire.
-    pub shadow_investigation_hook:
-        Arc<dyn nanosiem_core::extensions::ShadowInvestigationHook>,
+    pub shadow_investigation_hook: Arc<dyn nanosiem_core::extensions::ShadowInvestigationHook>,
 }
 
 impl AppState {
     /// Initialize authentication services
     fn init_auth_services(
         pool: PgPool,
-        _config: &ApiConfig,
+        config: &ApiConfig,
     ) -> (
         Arc<AuthService>,
         Arc<TokenService>,
@@ -303,6 +432,11 @@ impl AppState {
         let auth_enabled = std::env::var("AUTH_ENABLED")
             .map(|v| v.to_lowercase() != "false" && v != "0")
             .unwrap_or(true);
+
+        #[cfg(feature = "enterprise")]
+        if config.deployment_mode.is_enterprise_shared() && !auth_enabled {
+            panic!("CRITICAL SECURITY ERROR: AUTH_ENABLED cannot be disabled in enterprise_shared");
+        }
 
         // Get JWT secret from environment - REQUIRED for security
         let jwt_secret = if !auth_enabled {
@@ -343,26 +477,9 @@ impl AppState {
         let token_service = Arc::new(TokenService::new(token_config));
         let shared_denylist = token_service.revoked_jtis_handle();
 
-        // H8: Load persisted revoked JTIs from PostgreSQL on startup.
-        // Spawn a dedicated thread with its own runtime since we're in a sync
-        // constructor that may be called from within the main tokio runtime.
-        {
-            let pool_clone = pool.clone();
-            let denylist_clone = shared_denylist.clone();
-            let _ = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new().unwrap().block_on(async {
-                    match nanosiem_core::auth::token::load_revoked_tokens(&pool_clone, &denylist_clone).await {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(count, "Loaded persisted token revocations from database");
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to load persisted token revocations (table may not exist yet)");
-                        }
-                        _ => {}
-                    }
-                })
-            }).join();
-        }
+        // The async constructor loads persisted revocations on the pool's
+        // existing runtime before returning AppState. Never borrow this pool
+        // from a temporary runtime or block an executor thread with join().
 
         // Second token service for AuthService shares the same denylist
         let token_config_for_auth = TokenConfig::new(jwt_secret);
@@ -371,14 +488,23 @@ impl AppState {
 
         // Create auth service
         let auth_config = AuthConfig::default();
-        let auth_service = Arc::new(AuthService::new(
+        let auth_service = AuthService::new(
             user_repo.clone(),
             session_repo.clone(),
             group_repo.clone(),
             token_service_for_auth,
             auth_config,
             LocalAuthSettings::new(pool.clone()),
-        ));
+        );
+        #[cfg(feature = "enterprise")]
+        let auth_service = if config.deployment_mode.is_enterprise_shared() {
+            auth_service.with_enterprise_shared_tenants(
+                nanosiem_core::auth::TenantMembershipResolver::new(pool.clone()),
+            )
+        } else {
+            auth_service
+        };
+        let auth_service = Arc::new(auth_service);
 
         // Create API key service
         let api_key_service = Arc::new(ApiKeyService::new(
@@ -509,8 +635,43 @@ impl AppState {
     }
 
     /// Register an already-spawned task, stopping it if shutdown already won.
+    /// Register a LONG-RUNNING background loop. It is supervised: if it
+    /// panics, or returns while the process is not shutting down, the process
+    /// exits non-zero so the orchestrator restarts it (NAN-3080).
     pub async fn add_task_handle(&self, handle: tokio::task::JoinHandle<()>) -> bool {
         self.task_registry.add_handle(handle).await
+    }
+
+    /// Register a supervised task with an explicit name and policy
+    /// (`MayComplete` for a task that may legitimately finish; only a panic
+    /// is then fatal).
+    pub async fn add_supervised_task(
+        &self,
+        name: &'static str,
+        handle: tokio::task::JoinHandle<()>,
+        policy: nanosiem_core::process_supervision::TaskPolicy,
+    ) -> bool {
+        self.task_registry.add_supervised(name, handle, policy).await
+    }
+
+    /// Supervise tasks this state does NOT register (the leader-scoped
+    /// schedulers, whose handles the leader loop aborts on leadership loss;
+    /// aborting a supervisor aborts its task and never exits).
+    pub fn supervise_tasks(
+        &self,
+        name: &'static str,
+        handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        handles
+            .into_iter()
+            .map(|handle| {
+                self.task_registry.supervise(
+                    name,
+                    handle,
+                    nanosiem_core::process_supervision::TaskPolicy::Loop,
+                )
+            })
+            .collect()
     }
 
     /// Atomically check shutdown state, spawn, and register a task.
@@ -524,6 +685,37 @@ impl AppState {
     /// Shared cancellation token for background tasks owned by this process.
     pub fn shutdown_token(&self) -> nanosiem_core::shutdown::ShutdownToken {
         self.task_registry.shutdown_token()
+    }
+
+    /// The active schema profile. One atomic load and an `Arc` clone — this is
+    /// the only form request handlers may use (NAN-2361; the old
+    /// `config.schema_profile()` re-parsed the lake source manifest per call).
+    pub fn schema_profile(&self) -> Arc<dyn nanosiem_core::schema::SchemaProfile> {
+        self.schema_profile.load()
+    }
+
+    /// The schema profile for one tenant's request (NAN-2718). In
+    /// hosted shared mode this is that tenant's own lake inventory from
+    /// the tenant-keyed cache (or the canonical empty-inventory profile) and
+    /// NEVER the process profile; dedicated deployments have one tenant and
+    /// keep [`schema_profile`](Self::schema_profile).
+    pub fn schema_profile_for_tenant(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> Arc<dyn nanosiem_core::schema::SchemaProfile> {
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let _ = tenant_id;
+            self.schema_profile()
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            if self.config.deployment_mode.is_enterprise_shared() {
+                nanosiem_core::schema::tenant_lake_schema::profile_for_tenant(tenant_id)
+            } else {
+                self.schema_profile()
+            }
+        }
     }
 }
 
@@ -572,6 +764,80 @@ mod task_registry_tests {
         assert!(registry.handles.read().await.is_empty());
     }
 
+    fn recording_registry() -> (TaskRegistry, Arc<std::sync::atomic::AtomicI32>) {
+        let code = Arc::new(std::sync::atomic::AtomicI32::new(-1));
+        let seen = Arc::clone(&code);
+        let registry = TaskRegistry {
+            exit: Arc::new(move |c| seen.store(c, Ordering::SeqCst)),
+            ..TaskRegistry::default()
+        };
+        (registry, code)
+    }
+
+    async fn wait_for_exit(code: &std::sync::atomic::AtomicI32) -> i32 {
+        for _ in 0..200 {
+            let value = code.load(Ordering::SeqCst);
+            if value != -1 {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        code.load(Ordering::SeqCst)
+    }
+
+    /// NAN-3080: a registered loop that panics takes the process-exit path.
+    #[tokio::test]
+    async fn a_registered_loop_that_panics_exits_the_process() {
+        let (registry, code) = recording_registry();
+        let handle = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            if std::hint::black_box(true) {
+                panic!("detection scheduler loop panicked");
+            }
+        });
+        assert!(registry.add_handle(handle).await);
+        assert_eq!(
+            wait_for_exit(&code).await,
+            nanosiem_core::process_supervision::BACKGROUND_TASK_EXIT_CODE
+        );
+    }
+
+    /// A tracked one-shot may complete; a panicking one is still fatal.
+    #[tokio::test]
+    async fn tracked_one_shots_may_complete_but_not_panic() {
+        let (registry, code) = recording_registry();
+        assert!(registry.spawn_tracked(async {}).await);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(code.load(Ordering::SeqCst), -1, "completion is fine");
+        assert!(
+            registry
+                .spawn_tracked(async {
+                    if std::hint::black_box(true) {
+                        panic!("feed sync panicked");
+                    }
+                })
+                .await
+        );
+        assert_eq!(
+            wait_for_exit(&code).await,
+            nanosiem_core::process_supervision::BACKGROUND_TASK_EXIT_CODE
+        );
+    }
+
+    /// Loops that stop because shutdown began never trigger the exit.
+    #[tokio::test]
+    async fn loops_stopping_for_shutdown_do_not_exit() {
+        let (registry, code) = recording_registry();
+        let token = registry.shutdown_token();
+        let handle = tokio::spawn(async move { token.cancelled().await });
+        assert!(registry.add_handle(handle).await);
+        let handles = registry.begin_shutdown().await;
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(code.load(Ordering::SeqCst), -1);
+    }
+
     #[tokio::test]
     async fn pre_cancelled_spawn_is_never_polled() {
         let registry = TaskRegistry::default();
@@ -597,7 +863,7 @@ mod task_registry_tests {
 // Enterprise handler trait bridges (NAN-751 Phase 2)
 // ----------------------------------------------------------------------------
 // The OIDC handler module was lifted from `nanosiem-api/src/handlers/oidc/`
-// into `nanosiem-enterprise/src/handlers/oidc/`. Those handlers are generic
+// into `enterprise/src/handlers/oidc/`. Those handlers are generic
 // over the `OidcAppState` trait so the enterprise crate doesn't have to
 // import `AppState` directly (which would create a circular dependency).
 // We implement the trait here on the concrete `AppState` so that
@@ -642,6 +908,235 @@ impl nanosiem_enterprise::handlers::oidc::OidcAppState for AppState {
     fn local_auth_settings(&self) -> &LocalAuthSettings {
         &self.local_auth_settings
     }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::oidc::SharedOidcAppState for AppState {
+    fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    fn user_repo(&self) -> &UserRepository {
+        &self.user_repo
+    }
+
+    fn token_service(&self) -> &Arc<TokenService> {
+        &self.token_service
+    }
+
+    fn deployment_is_enterprise_shared(&self) -> bool {
+        self.config.deployment_mode.is_enterprise_shared()
+    }
+
+    fn tenant_oidc_allowed_origin(&self) -> Option<String> {
+        std::env::var("NANOSIEM_BASE_URL").ok().or_else(|| {
+            std::env::var("NANOSIEM_HOSTNAME")
+                .ok()
+                .map(|hostname| format!("https://{hostname}"))
+        })
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::oidc::SharedOidcAdminAppState for AppState {
+    fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    fn deployment_is_enterprise_shared(&self) -> bool {
+        self.config.deployment_mode.is_enterprise_shared()
+    }
+
+    fn shared_oidc_admin_origin(&self) -> Option<String> {
+        std::env::var("NANOSIEM_BASE_URL").ok().or_else(|| {
+            std::env::var("NANOSIEM_HOSTNAME")
+                .ok()
+                .map(|hostname| format!("https://{hostname}"))
+        })
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::shared_activation::SharedActivationAppState for AppState {
+    fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    fn token_service(&self) -> &Arc<TokenService> {
+        &self.token_service
+    }
+
+    fn deployment_is_enterprise_shared(&self) -> bool {
+        self.config.deployment_mode.is_enterprise_shared()
+    }
+
+    fn follow_platform_catalogs(
+        &self,
+        tenant_id: uuid::Uuid,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            match nanosiem_enterprise::handlers::platform_catalog_follow::subscribe(self, tenant_id).await {
+                Ok(Some(outcome)) => tracing::info!(%tenant_id, current = outcome.current(), "Platform catalogs followed after activation (background)"),
+                Ok(None) => tracing::info!(%tenant_id, "No member may follow a platform catalog yet; the follow pass will"),
+                Err(error) => tracing::warn!(%tenant_id, %error, "Platform catalog follow after activation failed; the follow pass retries"),
+            }
+        })
+    }
+
+    fn record_activation_audit(
+        &self,
+        tenant: nanosiem_core::auth::TrustedTenantContext,
+        actor_id: uuid::Uuid,
+        event: nanosiem_core::audit::AuditEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let runtime = self.tenant_ai_rls_runtime.as_ref().ok_or("no signed tenant runtime")?;
+            runtime.tenant_pre_session_audit().record(&tenant, actor_id, &event).await.map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::shared_membership_acceptance::SharedMembershipAcceptanceAppState
+    for AppState
+{
+    fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    fn deployment_is_enterprise_shared(&self) -> bool {
+        self.config.deployment_mode.is_enterprise_shared()
+    }
+
+    fn shared_browser_origin(&self) -> Option<String> {
+        std::env::var("NANOSIEM_BASE_URL").ok().or_else(|| {
+            std::env::var("NANOSIEM_HOSTNAME")
+                .ok()
+                .map(|hostname| format!("https://{hostname}"))
+        })
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::shared_automation_keys::SharedAutomationKeysAppState
+    for AppState
+{
+    fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    fn deployment_is_enterprise_shared(&self) -> bool {
+        self.config.deployment_mode.is_enterprise_shared()
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_cases_notebooks::EnterpriseSharedCasesNotebooksAppState
+    for AppState
+{
+    fn deployment_mode(&self) -> &str {
+        self.config.deployment_mode.system_api_value()
+    }
+
+    fn tenant_case_notebook_service(&self) -> Option<&TenantCaseNotebookService> {
+        self.tenant_case_notebook_service.as_ref()
+    }
+
+    fn tenant_membership_resolver(&self) -> nanosiem_core::auth::TenantMembershipResolver {
+        nanosiem_core::auth::TenantMembershipResolver::new(self.pool.clone())
+    }
+
+    fn tenant_entitlement_resolver(
+        &self,
+    ) -> nanosiem_core::tenant_entitlements::TenantEntitlementResolver {
+        nanosiem_core::tenant_entitlements::TenantEntitlementResolver::new(self.pool.clone())
+    }
+
+    fn tenant_control_pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_detections::EnterpriseSharedDetectionsAppState for AppState {
+    fn deployment_mode(&self) -> &str { self.config.deployment_mode.system_api_value() }
+    fn detection_runtime(&self) -> Option<&TenantAiRlsRuntime> { self.tenant_ai_rls_runtime.as_deref() }
+    fn detection_control_pool(&self) -> &PgPool { &self.pool }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_reports::EnterpriseSharedReportsAppState for AppState {
+    fn report_runtime(&self) -> Option<&Arc<nanosiem_enterprise::reports_shared_runtime::TenantReportRuntime>> {
+        self.tenant_report_runtime.as_ref()
+    }
+}
+
+// NAN-2361 Rules dashboard port: the editor's interactive lake rule test and
+// the rule-repository sync need a little more than the base detections state.
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_detection_editor::EnterpriseSharedDetectionEditorAppState for AppState {
+    fn tenant_search_runtime_resolver(&self) -> Option<Arc<TenantSearchRuntimeResolver>> { self.tenant_search_runtime_resolver.clone() }
+    fn base_detection_service(&self) -> &DetectionService { &self.detection_service }
+    fn rule_test_admission(&self) -> &nanosiem_core::RuleTestAdmission { &self.rule_test_admission }
+    fn tenant_schema_profile(&self, tenant_id: uuid::Uuid) -> Arc<dyn nanosiem_core::schema::SchemaProfile> { AppState::schema_profile_for_tenant(self, tenant_id) }
+}
+// NAN-2771: shared dashboard panels run on the same attested tenant Search
+// resolver as the rule editor's interactive test.
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_dashboard_panels::EnterpriseSharedDashboardPanelsAppState for AppState {
+    fn panel_search_runtime_resolver(&self) -> Option<Arc<TenantSearchRuntimeResolver>> { self.tenant_search_runtime_resolver.clone() }
+}
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_rule_repositories::EnterpriseSharedRuleRepositoriesAppState for AppState {
+    fn rule_repository_egress_enabled(&self) -> bool { self.config.egress_jobs_enabled() }
+    fn rule_repository_search_resolver(&self) -> Option<Arc<TenantSearchRuntimeResolver>> { self.tenant_search_runtime_resolver.clone() }
+}
+
+// NAN-2361 wave 2: the remaining product areas on the tenant substrate.
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_sources::EnterpriseSharedSourcesAppState for AppState {
+    fn tenant_ingest_domain(&self) -> String { "ingest.nano.rs".to_string() }
+    fn credential_cipher(&self) -> Option<Arc<nanosiem_core::crypto::EncryptionService>> { Some(self.encryption_service.clone()) }
+    /// NAN-2592: nano-main's content-free fulfilment wake-up, e.g.
+    /// `https://app.nano.rs/api/shared-lake/ingest-credential-requests/wake`.
+    /// Unset = no wake-up; nano-main's 5 s poll still fulfils every request.
+    fn ingest_credential_wake_url(&self) -> Option<String> {
+        static WAKE_URL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        WAKE_URL
+            .get_or_init(|| std::env::var("NANO_MAIN_INGEST_CREDENTIAL_WAKE_URL").ok().filter(|v| !v.trim().is_empty()))
+            .clone()
+    }
+}
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_enrichment::EnterpriseSharedEnrichmentAppState for AppState {
+    fn tenant_search_runtime_resolver(&self) -> Option<Arc<TenantSearchRuntimeResolver>> { self.tenant_search_runtime_resolver.clone() }
+    fn platform_ip_enrichment(&self) -> Option<Arc<RwLock<nanosiem_core::enrichment::EnrichmentService>>> { Some(self.enrichment.clone()) }
+    fn tenant_ip_context_enrichment(&self) -> Option<Arc<RwLock<nanosiem_core::enrichment::EnrichmentService>>> { Some(self.enrichment.clone()) }
+    fn enrichment_cipher(&self) -> Option<Arc<nanosiem_core::crypto::EncryptionService>> { Some(self.encryption_service.clone()) }
+    fn tenant_custom_enrichment_executor(&self) -> Option<Arc<nanosiem_enterprise::custom_enrichment::TenantCustomEnrichmentExecutor>> { self.tenant_custom_enrichment_executor.clone() }
+}
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_melod::EnterpriseSharedMelodAppState for AppState {
+    fn melod_rls_runtime(&self) -> Option<Arc<TenantAiRlsRuntime>> { self.tenant_ai_rls_runtime.clone() }
+    fn melod_agent_registry(&self) -> &Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> { &self.agent_config_registry }
+}
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_cases_extras::EnterpriseSharedCasesExtrasAppState for AppState {
+    fn presence_tracker(&self) -> Option<&Arc<nanosiem_enterprise::PresenceTracker>> { Some(&self.presence_tracker) }
+    fn tenant_audit_query_service(&self) -> Option<nanosiem_core::audit::TenantAuditQueryService> {
+        self.tenant_ai_rls_runtime.as_ref().map(|r| r.tenant_audit_query_service())
+    }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_playbooks::EnterpriseSharedPlaybooksAppState for AppState {
+    fn playbook_repository_egress_enabled(&self) -> bool { self.config.egress_jobs_enabled() }
+    fn playbook_execution_search_resolver(&self) -> Option<Arc<TenantSearchRuntimeResolver>> { self.tenant_search_runtime_resolver.clone() }
+}
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::enterprise_shared_marketplace::EnterpriseSharedMarketplaceAppState for AppState {
+    fn encryption_service(&self) -> Option<Arc<nanosiem_core::crypto::EncryptionService>> { Some(self.encryption_service.clone()) }
+    fn detection_code_target_egress_enabled(&self) -> bool { self.config.egress_jobs_enabled() }
 }
 
 // --------------------------------------------------------------------------
@@ -716,6 +1211,21 @@ impl nanosiem_enterprise::handlers::melod::MelodAppState for AppState {
     }
     fn agent_config_registry(&self) -> &Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> {
         &self.agent_config_registry
+    }
+    fn deployment_is_enterprise_shared(&self) -> bool {
+        self.config.deployment_mode.is_enterprise_shared()
+    }
+    fn tenant_search_runtime_resolver(
+        &self,
+    ) -> Option<Arc<dyn nanosiem_enterprise::melod::TenantQuerySearchRuntime>> {
+        self.tenant_search_runtime_resolver
+            .as_ref()
+            .map(|resolver| resolver.clone() as Arc<_>)
+    }
+    fn tenant_ai_execution_repository(&self) -> Option<TenantAiExecutionRepository> {
+        self.tenant_ai_rls_runtime.as_ref().map(|runtime| {
+            TenantAiExecutionRepository::new_shared(self.pool.clone(), Arc::clone(runtime))
+        })
     }
     async fn get_melod_service(&self) -> Option<Arc<MelodService>> {
         AppState::get_melod_service(self).await

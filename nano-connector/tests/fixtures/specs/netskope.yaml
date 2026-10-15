@@ -1,0 +1,84 @@
+# Frozen fixture for nano-connector's own tests (point_forward.rs). The shipped spec lives in
+# nano-rs/nano-integrations integrations/netskope/connector.yaml (NAN-3697 branch).
+# nano-connector spec that replaces code.ts in this directory (NAN-3490).
+# Netskope keeps the read position server-side and advances it when a page is
+# SERVED, so the state records what the last page is in, not where we are:
+#   op: open    last page fetched and acknowledged; walk on with `next`
+#   op: resend  a page may have been served but not acknowledged; re-serve it
+#               with `resend`, which does not advance the index
+#   opened      Netskope holds a position for this index. `resend` is legal
+#               only then: a crash during the very first (epoch) fetch leaves
+#               `op: resend` without `opened`, and the next run re-opens at
+#               the pinned `start` epoch instead of resending on an iterator
+#               that never opened.
+#   start       epoch seconds the iterator is opened at (the initial cursor,
+#               NAN-3697), pinned before the first request so a re-open after
+#               a crash cannot skip ahead.
+# The engine commits `op: resend` ahead of every fetch (write_ahead_state), and
+# a 5xx or dropped connection on `next` is retried as `resend`
+# (retry_rewrite), since the failed request may already have moved the index.
+# Migrating a Deno cursor: "open" -> {op: open, opened: true}; "resend" ->
+# {op: resend, opened: true} (the Deno collector writes "resend" only after a
+# page was served).
+version: 1
+name: netskope
+kind: collector
+allow:
+  - host: "{{config.TENANT_HOST}}"
+    host_suffixes: [".goskope.com"]
+    path_prefixes: ["/api/v2/events/dataexport/events/"]
+auth: { type: api_key_header, header: Netskope-Api-Token, credential: API_TOKEN }
+schedule: "*/5 * * * *"
+limits: { max_run_secs: 900 }
+rate_limit: { min_interval_ms: 300, max_retries_429: 5, max_wait_ms: 60000, backoff_ms: 5000 }
+streams:
+  - id: dataexport
+    source_type: "netskope_{{item}}"
+    fanout:
+      discover: { from: config, key: STREAMS }
+      concurrency: 4
+    write_ahead_state: { op: resend }
+    retry_rewrite: { param: operation, from: next, to: resend }
+    ingest_id: { fields: [_id] }
+    program: |
+      status = to_int(.response.status) ?? 0
+      base = "https://" + string!(.config.TENANT_HOST) + "/api/v2/events/dataexport/events/" + string!(.item)
+      idx = (string(.config.INDEX_NAME) ?? "nano")
+      if idx == "" { idx = "nano" }
+      idx = idx + "_" + string!(.item)
+      if .response == null {
+        if .state.op == "open" {
+          {"next_request": {"url": base, "query": {"index": idx, "operation": "next"}}}
+        } else if .state.op == "resend" && .state.opened == true {
+          {"next_request": {"url": base, "query": {"index": idx, "operation": "resend"}}}
+        } else {
+          start = string(.state.start) ?? ""
+          if start == "" {
+            # Point-forward (NAN-3697): open at the engine's initial cursor;
+            # `.backfill_from` is its deprecated alias on older engines; with
+            # neither, now - 300 s. Never epoch 0 (full retention replay).
+            ic = string(.initial_cursor) ?? string(.backfill_from) ?? ""
+            t = parse_timestamp(ic, "%+") ?? from_unix_timestamp(to_unix_timestamp(now(), unit: "seconds") - 300) ?? now()
+            start = to_string(to_unix_timestamp(t, unit: "seconds"))
+          }
+          {"state": {"start": start},
+           "next_request": {"url": base, "query": {"index": idx, "operation": start}}}
+        }
+      } else if status == 409 {
+        {"error": "Netskope returned 409: iterator " + idx + " is being consumed concurrently. Change the iterator name if another tool shares this tenant."}
+      } else if status == 403 {
+        {"error": "Netskope returned 403: the API token lacks read access to /api/v2/events/dataexport/events/" + string!(.item) + ", or has expired."}
+      } else if status < 200 || status >= 300 {
+        {"error": "Netskope returned " + to_string(status)}
+      } else if .response.body.ok != null && .response.body.ok != 1 {
+        {"error": "Netskope reported failure: " + (string(.response.body.message) ?? "no message")}
+      } else {
+        evs = if is_array(.response.body.result) { array!(.response.body.result) } else { [] }
+        if length(evs) == 0 {
+          {"events": [], "state": {"op": "open", "opened": true}}
+        } else {
+          w = (to_int(.response.body.wait_time) ?? 0) * 1000
+          {"events": evs, "state": {"op": "open", "opened": true}, "wait_ms": w,
+           "next_request": {"url": base, "query": {"index": idx, "operation": "next"}}}
+        }
+      }

@@ -44,6 +44,17 @@ impl SchedulerRepository {
         Self { pool }
     }
 
+    /// Seal an auto-detected choice after the first successful fetch. A user
+    /// edit that supplied an explicit choice always wins.
+    pub async fn persist_detected_header(&self, id: Uuid, has_header: bool) -> Result<(), SchedulerRepositoryError> {
+        sqlx::query("UPDATE scheduled_jobs SET parser_config = jsonb_set(parser_config, '{has_header}', to_jsonb($2::boolean)) WHERE id = $1 AND parser_config->>'has_header' IS NULL")
+            .bind(id)
+            .bind(has_header)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Create a new scheduled job
     #[instrument(skip(self, job))]
     pub async fn create_job(

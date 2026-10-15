@@ -24,8 +24,17 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
+import {
+  PLATFORM_CATALOG_SETUP_POLL_MS,
+  platformCatalogSettingUp,
+  platformCatalogSetupBlocksPage,
+  repositorySyncPollInterval,
+} from '@/hooks/repository-sync-state';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
+import { PlatformCatalogSettingUp } from '@/components/repositories/PlatformCatalogSettingUp';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, ArrowUpRight, ChevronDown, Eye, Loader2, Rocket } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, ChevronDown, Eye, Rocket } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { ImportBundleButton } from '@/components/airgap/ImportBundleButton';
@@ -44,6 +53,8 @@ import type { SourceConfiguration } from '@/lib/api/types';
 import { ParserUpstreamDiffModal } from '@/components/repositories/ParserUpstreamDiffModal';
 import { BatchImportParsersModal } from '@/components/parser-repositories/BatchImportParsersModal';
 import { ParserRepoSidebar } from '@/components/parser-repositories/ParserRepoSidebar';
+import { RepositoryFilters } from '@/components/repositories/RepositoryFilters';
+import { filterRepositoryItems, sourceTypeCounts, type ImportStatusFilter } from '@/components/repositories/repository-filters';
 import {
   FilterRow,
   ReposHeader,
@@ -79,7 +90,7 @@ import {
 const SOURCE_TYPE_MAP: Record<string, { sourceType: string; label: string }> = {
   http: { sourceType: 'routed', label: 'HTTP (Routed)' },
   vector: { sourceType: 'vector', label: 'Vector' },
-  splunk_hec: { sourceType: 'splunk_hec', label: 'Splunk HEC' },
+  splunk_hec: { sourceType: 'splunk_hec', label: 'HEC' },
   kafka: { sourceType: 'kafka', label: 'Kafka' },
   aws_s3: { sourceType: 'aws_s3', label: 'AWS S3' },
   gcp_pubsub: { sourceType: 'gcp_pubsub', label: 'GCP Pub/Sub' },
@@ -116,8 +127,18 @@ export function ParserRepositories() {
   const [activeRepoId, setActiveRepoId] = useState<string | null>(null);
   const [activeCat, setActiveCat] = useState<CategoryCount['id']>('all');
   const [query, setQuery] = useState('');
+  const [importStatus, setImportStatus] = useState<ImportStatusFilter>('all');
+  const [selectedSourceTypes, setSelectedSourceTypes] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectedParserId, setSelectedParserId] = useState<string | null>(null);
+
+  useEffect(() => {
+    setActiveCat('all');
+    setQuery('');
+    setImportStatus('all');
+    setSelectedSourceTypes(new Set());
+    setSelected(new Set());
+  }, [activeRepoId]);
 
   const [historyOpen, setHistoryOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -137,12 +158,18 @@ export function ParserRepositories() {
   // Queries
   // ----------------------------------------------------------------
 
+  const [syncAcceptedAt, setSyncAcceptedAt] = useState<number | null>(null);
+  const sharedTenant = useSharedTenant();
+
   const { data: reposData, isLoading: reposLoading } = useQuery({
     queryKey: ['parser-repositories'],
     queryFn: () => api.parserRepositories.listRepositories(),
     refetchInterval: (q) => {
       const repos = q.state.data?.repositories ?? [];
-      return repos.some((r) => r.last_sync_status === 'syncing') ? 1500 : false;
+      if (syncAcceptedAt && Date.now() - syncAcceptedAt < 65 * 60_000) return 1500;
+      // NAN-3436: keep checking while the platform catalog is being set up.
+      if (platformCatalogSettingUp(sharedTenant, repos, 'nano-rs/parsers')) return PLATFORM_CATALOG_SETUP_POLL_MS;
+      return repositorySyncPollInterval(repos);
     },
   });
 
@@ -201,7 +228,8 @@ export function ParserRepositories() {
 
   // When the active repo finishes syncing, refresh parser list + upstream
   // updates and show a result toast (count of pending upstream changes if any).
-  useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
+  const markSyncAccepted = useSyncCompleteEffect(repositories, activeRepoId, (repo) => {
+    setSyncAcceptedAt(null);
     refetchParsers();
     refetchUpstream().then((result) => {
       const count = result.data?.updates?.length ?? 0;
@@ -249,33 +277,22 @@ export function ParserRepositories() {
     return parsersData.map((p) => buildParserView(p, upstreamByPath, fallbackCommit));
   }, [parsersData, upstreamByPath, activeRepo]);
 
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return parserViews.filter((p) => {
-      if (activeCat === 'updated' && p.status !== 'UPDATED') return false;
-      if (activeCat === 'available' && p.status !== 'AVAILABLE') return false;
-      if (activeCat === 'imported' && p.status !== 'IMPORTED') return false;
-      if (activeCat === 'drift' && p.status !== 'DRIFT') return false;
-      if (activeCat === 'deleted' && p.status !== 'DELETED') return false;
-      if (!needle) return true;
-      const hay = [
-        p.name,
-        p.desc,
-        p.sourceType,
-        p.vendor ?? '',
-        p.product ?? '',
-        p.category ?? '',
-      ]
-        .join(' ')
-        .toLowerCase();
-      return hay.includes(needle);
-    });
-  }, [parserViews, activeCat, query]);
+  const filtered = useMemo(() => filterRepositoryItems(parserViews, {
+    query,
+    importStatus,
+    selectedSourceTypes,
+    sourceTypes: (parser) => [parser.sourceType],
+    searchText: (parser) => [parser.name, parser.desc, parser.sourceType, parser.vendor ?? '', parser.product ?? '', parser.category ?? ''].join(' '),
+    inCategory: (parser) => activeCat === 'all' || parser.status.toLowerCase() === activeCat,
+  }), [parserViews, activeCat, query, importStatus, selectedSourceTypes]);
+
+  const sourceCounts = useMemo(() => sourceTypeCounts(parserViews, (parser) => [parser.sourceType]), [parserViews]);
+  const importedCount = parserViews.filter((parser) => parser.raw.is_imported).length;
 
   const selectedParser = parserViews.find((p) => p.id === selectedParserId) ?? null;
   const selectedRawParsers = useMemo(
-    () => parsersData.filter((p) => selected.has(p.id)),
-    [parsersData, selected],
+    () => filtered.filter((p) => selected.has(p.id)).map((p) => p.raw),
+    [filtered, selected],
   );
   const categories = categoryCounts(parserViews);
 
@@ -409,11 +426,7 @@ export function ParserRepositories() {
       queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });
       setActiveRepoId(repo.id);
       toast({ title: `${repo.name} added — syncing…` });
-      // Kick off the first sync immediately so the parser list populates.
-      api.parserRepositories
-        .syncRepository(repo.id)
-        .then(() => queryClient.invalidateQueries({ queryKey: ['parser-repositories'] }))
-        .catch(() => {});
+      syncMutation.mutate(repo.id);
     },
     onError: (err: Error) => {
       toast({
@@ -426,8 +439,23 @@ export function ParserRepositories() {
 
   const syncMutation = useMutation({
     mutationFn: (id: string) => api.parserRepositories.syncRepository(id),
-    onSuccess: (result) => {
+    onSuccess: (result, repoId) => {
+      if (result.status === 'syncing') {
+        markSyncAccepted(repoId, result.sync_started_at ?? undefined);
+        setSyncAcceptedAt(Date.now());
+      }
       queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });
+      if (result.status !== 'syncing') {
+        // Refresh immediately when a deployment returns a terminal result.
+        queryClient.invalidateQueries({ queryKey: ['parser-repository-parsers', result.repository_id] });
+        queryClient.invalidateQueries({ queryKey: ['parser-upstream-updates', result.repository_id] });
+        toast({
+          title: result.status === 'success' ? 'Sync complete' : 'Sync failed',
+          description: result.message,
+          variant: result.status === 'success' ? 'default' : 'destructive',
+        });
+        return;
+      }
       toast({ title: 'Sync started', description: result.message });
     },
     onError: (err: Error) => {
@@ -656,6 +684,21 @@ export function ParserRepositories() {
     );
   }
 
+  // NAN-3436: a new hosted-shared workspace's parser catalog is still being
+  // copied in the background; not "no repositories".
+  if (platformCatalogSetupBlocksPage(sharedTenant, repositories, 'nano-rs/parsers')) {
+    return (
+      <div className="-m-3 flex h-[calc(100%+1.5rem)] min-h-0 flex-col overflow-hidden">
+        <div className="border-b border-border bg-card/30 px-5 py-3.5">
+          <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">Parser repositories</div>
+        </div>
+        <div className="flex-1 flex items-center justify-center">
+          <PlatformCatalogSettingUp content="parsers" catalog="nano-rs/parsers" />
+        </div>
+      </div>
+    );
+  }
+
   // Empty state — first-run with no repos.
   if (!activeRepo) {
     return (
@@ -704,7 +747,7 @@ export function ParserRepositories() {
                 <>
                   <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
                     Sync the official{' '}
-                    <code className="font-mono text-foreground/80">nano-sh/parsers</code> library to
+                    <code className="font-mono text-foreground/80">nano-rs/parsers</code> library to
                     pull in pre-built parsers for common log sources.
                   </div>
                   <button
@@ -714,9 +757,9 @@ export function ParserRepositories() {
                         name: 'nano parsers',
                         url: 'https://github.com/nano-rs/parsers',
                         description: 'Official nano parsers for common log sources',
-                        branch: 'main',
+                        branch: 'ocsf-1.9',
                         parsers_path: 'parsers/',
-                        auto_sync_enabled: false,
+                        auto_sync_enabled: true,
                       })
                     }
                     disabled={createMutation.isPending}
@@ -780,7 +823,7 @@ export function ParserRepositories() {
 
           <div className="flex flex-col min-h-0 min-w-0">
             <ReposToolbar
-              selectedCount={selected.size}
+              selectedCount={selectedRawParsers.length}
               totalShown={filtered.length}
               query={query}
               onQueryChange={setQuery}
@@ -789,6 +832,16 @@ export function ParserRepositories() {
               bulkImportAccess={bulkImportAccess}
             />
             <FilterRow categories={categories} activeId={activeCat} onActivate={setActiveCat} />
+            <RepositoryFilters
+              importStatus={importStatus}
+              onImportStatusChange={setImportStatus}
+              importCounts={{ all: parserViews.length, imported: importedCount, notImported: parserViews.length - importedCount }}
+              sourceCounts={sourceCounts}
+              selectedSourceTypes={selectedSourceTypes}
+              onSourceTypesChange={setSelectedSourceTypes}
+              hasFilters={activeCat !== 'all' || importStatus !== 'all' || selectedSourceTypes.size > 0 || !!query}
+              onClear={() => { setActiveCat('all'); setImportStatus('all'); setSelectedSourceTypes(new Set()); setQuery(''); }}
+            />
             {upstreamCount > 0 && activeCat !== 'updated' && (
               <UpstreamBanner
                 count={upstreamCount}
@@ -815,7 +868,7 @@ export function ParserRepositories() {
             ) : (
               <ReposTable
                 parsers={filtered}
-                selected={selected}
+                selected={new Set(selectedRawParsers.map((parser) => parser.id))}
                 selectedParserId={selectedParserId}
                 onToggleSelect={toggleSelect}
                 onToggleSelectAll={toggleSelectAll}
@@ -861,7 +914,7 @@ export function ParserRepositories() {
 
         <BatchImportParsersModal
           repositoryId={activeRepoId ?? ''}
-          parsers={selectedRawParsers.length > 0 ? selectedRawParsers : parsersData.filter((p) => !p.is_imported)}
+          parsers={selectedRawParsers}
           open={bulkOpen}
           onOpenChange={setBulkOpen}
           onSuccess={() => {
@@ -964,7 +1017,7 @@ function UpstreamBanner({
         >
           {running ? (
             <>
-              <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
+              <LoadingIcon className="w-[11px] h-[11px]" strokeWidth={1.5} />
               {progress ?? 'Working…'}
             </>
           ) : (

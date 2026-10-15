@@ -13,6 +13,34 @@ use chrono::{TimeZone, Utc};
 
 use super::*;
 
+#[test]
+fn lake_evidence_accepts_opaque_ocsf_ids_but_rejects_control_text() {
+    assert_eq!(
+        LakeEvidenceResolver::safe_event_id(" ocsf19mixed03-0000000000004009 "),
+        Some("ocsf19mixed03-0000000000004009".to_string())
+    );
+    assert_eq!(LakeEvidenceResolver::safe_event_id("bad\nid"), None);
+    assert_eq!(LakeEvidenceResolver::safe_event_id(""), None);
+}
+
+#[test]
+fn lake_evidence_entity_predicates_are_exact_ocsf_only() {
+    let host = LakeEvidenceResolver::entity_predicate("host", "LT-LEGAL-001.CORP.LOCAL")
+        .expect("host predicate");
+    assert!(host.contains("device.hostname=\"lt-legal-001.corp.local\""));
+    assert!(host.contains("src_endpoint.hostname="));
+    assert!(!host.contains("src_host"));
+
+    let hash = LakeEvidenceResolver::entity_predicate(
+        "hash",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
+    .expect("hash predicate");
+    assert!(hash.contains("file.hashes.value="));
+    assert!(hash.contains("process.file.hashes.value="));
+    assert!(!hash.contains("file_hash"));
+}
+
 fn resolved(sources: &[&str], unresolved: &[&str]) -> ResolvedEvidence {
     ResolvedEvidence {
         events: sources
@@ -45,7 +73,10 @@ fn an_unresolved_id_makes_the_whole_manifest_incomplete() {
         &["sysmon".to_string(), "windows_security".to_string()]
     );
 
-    let partial = resolved(&["windows_security"], &["0190aaaa-0000-7000-8000-000000000000"]);
+    let partial = resolved(
+        &["windows_security"],
+        &["0190aaaa-0000-7000-8000-000000000000"],
+    );
     assert!(
         !partial.provenance().is_complete(),
         "a partially resolved evidence list claimed a complete manifest"
@@ -133,7 +164,10 @@ fn case_folding_follows_the_fingerprints_rules() {
         "file paths compare verbatim: {:?}",
         probe_binds(&path)
     );
-    assert!(!path.sql.contains("lower("), "file paths must not be folded");
+    assert!(
+        !path.sql.contains("lower("),
+        "file paths must not be folded"
+    );
 }
 
 #[test]
@@ -157,9 +191,7 @@ fn an_entity_value_never_becomes_query_text() {
     // mangled on the way to a bind is a probe that answers a question about a
     // different entity.
     assert!(
-        probe_binds(&evil)
-            .iter()
-            .all(|v| v == "/tmp/a' OR 1=1 --"),
+        probe_binds(&evil).iter().all(|v| v == "/tmp/a' OR 1=1 --"),
         "the bound value was rewritten: {:?}",
         probe_binds(&evil)
     );
@@ -244,9 +276,10 @@ fn the_scope_clause_cannot_smuggle_a_placeholder_into_the_template() {
     // operator-configured, but a `?` in one would be read as a placeholder and
     // error every evidence lookup — the same failure a `?` in a URL used to
     // cause.
-    let scoped = ClickHouseEvidenceResolver::scope_clause(&ScopeSet::from_denied(BTreeSet::from([
-        "weird?source".to_string(),
-    ])));
+    let scoped =
+        ClickHouseEvidenceResolver::scope_clause(&ScopeSet::from_denied(BTreeSet::from([
+            "weird?source".to_string(),
+        ])));
     assert!(
         scoped.contains("weird??source"),
         "a bare `?` survived into the template: {scoped}"
@@ -315,6 +348,121 @@ fn a_question_mark_in_an_entity_value_stays_in_the_value() {
         "the bound value was doubled or escaped"
     );
 }
+
+// NAN-3451 — lake hunt prevalence is measured through the lake prevalence
+// lookup instead of always reporting unmeasured.
+
+struct FixedPrevalence(Vec<crate::prevalence::PrevalenceData>);
+
+#[async_trait::async_trait]
+impl crate::prevalence::PrevalenceLookup for FixedPrevalence {
+    async fn rarity_threshold(&self) -> u64 {
+        3
+    }
+
+    async fn lookup(
+        &self,
+        artifacts: &[String],
+        _time_window: crate::prevalence::TimeWindow,
+        _scope: &crate::auth::ArtifactScope,
+    ) -> Result<Vec<crate::prevalence::PrevalenceData>, crate::prevalence::PrevalenceError> {
+        Ok(self
+            .0
+            .iter()
+            .filter(|item| artifacts.contains(&item.artifact))
+            .cloned()
+            .collect())
+    }
+}
+
+fn seen(artifact: &str, hosts: u64, saturated: bool) -> crate::prevalence::PrevalenceData {
+    let mut item = crate::prevalence::PrevalenceData::empty(
+        artifact.to_string(),
+        crate::prevalence::ArtifactType::detect(artifact),
+    );
+    item.host_count = hosts;
+    item.host_count_saturated = saturated;
+    item
+}
+
+async fn measured(lookup: &FixedPrevalence, artifact: &str, observers: Option<u64>) -> Option<f64> {
+    measure_lake_prevalence(
+        lookup,
+        artifact,
+        crate::prevalence::TimeWindow::TwentyFourHours,
+        &ScopeSet::unrestricted(),
+        || async move { Ok(observers) },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn lake_hunt_prevalence_is_host_count_over_observers() {
+    let rare = "a".repeat(64);
+    let lookup = FixedPrevalence(vec![
+        seen(&rare, 2, false),
+        seen("8.8.8.8", 65, true),
+        seen("big.example", 1000, true),
+    ]);
+    assert_eq!(measured(&lookup, &rare, Some(400)).await, Some(0.005));
+    // A miss, no observers, or an unknown denominator is unmeasured, never 0.
+    assert_eq!(measured(&lookup, &"b".repeat(64), Some(400)).await, None);
+    assert_eq!(measured(&lookup, &rare, Some(0)).await, None);
+    assert_eq!(measured(&lookup, &rare, None).await, None);
+    // A saturated count is a lower bound: it may read as common, never rare.
+    assert_eq!(measured(&lookup, "8.8.8.8", Some(10_000)).await, None);
+    assert_eq!(measured(&lookup, "big.example", Some(2_000)).await, Some(0.5));
+}
+
+#[test]
+fn lake_hunt_prevalence_measures_only_hashes_domains_and_public_ips() {
+    let hash = "A".repeat(64);
+    assert_eq!(lake_prevalence_artifact("hash", &format!(" {hash} ")), Some("a".repeat(64)));
+    assert_eq!(lake_prevalence_artifact("ip", "8.8.8.8"), Some("8.8.8.8".to_string()));
+    assert_eq!(lake_prevalence_artifact("domain", "Evil.Example"), Some("evil.example".to_string()));
+    assert_eq!(lake_prevalence_artifact("ip", "10.0.0.5"), None);
+    assert_eq!(lake_prevalence_artifact("hash", "not-a-hash"), None);
+    assert_eq!(lake_prevalence_artifact("host", "ws-01.corp.local"), None);
+    assert_eq!(lake_prevalence_artifact("user", "alice"), None);
+
+    use crate::prevalence::TimeWindow;
+    let window = |hours| lake_prevalence_window(chrono::Duration::hours(hours));
+    assert_eq!(window(1), Some(TimeWindow::OneHour));
+    assert_eq!(window(2), Some(TimeWindow::TwentyFourHours));
+    assert_eq!(window(24 * 7), Some(TimeWindow::SevenDays));
+    assert_eq!(window(24 * 8), None);
+}
+
+/// The denominator counts hosts by the serving backend's observer identity
+/// and compiles on the lake profile.
+#[test]
+fn lake_observer_count_query_matches_the_backend_and_compiles() {
+    use crate::query::{ClickHouseSqlGenerator, QueryOptions};
+    let gen1_hash = lake_observer_count_query(false, &"a".repeat(64));
+    assert!(gen1_hash.contains("nullif(device.hostname, \"\"), nullif(src_endpoint.hostname, \"\"), \"unknown\""));
+    assert!(!gen1_hash.contains("src_endpoint.ip") && !gen1_hash.contains("dst_endpoint"));
+    assert!(lake_observer_count_query(false, "8.8.8.8").contains("dst_endpoint.hostname"));
+    assert!(lake_observer_count_query(true, "evil.example").contains("src_endpoint.ip"));
+
+    let profile = std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9());
+    let generator = ClickHouseSqlGenerator::new().with_profile(profile.clone());
+    let range = crate::query::TimeRange::new(
+        Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+        Utc.with_ymd_and_hms(2026, 10, 2, 0, 0, 0).unwrap(),
+    );
+    for (cell, artifact) in [(false, "a".repeat(64)), (false, "8.8.8.8".into()), (true, "evil.example".into())] {
+        let npl = lake_observer_count_query(cell, &artifact);
+        let query = crate::parse_query(&npl).unwrap_or_else(|error| panic!("{npl}: {error}"));
+        let errors = crate::query::validate_query_fields_with_profile(&query, Some(profile.as_ref()));
+        assert!(errors.is_empty(), "{npl}: {errors:?}");
+        let sql = generator
+            .generate_with_options(&query, &range, &QueryOptions::default())
+            .unwrap_or_else(|error| panic!("{npl}: {error}"));
+        assert!(sql.contains("uniq"), "{sql}");
+    }
+}
+
 
 /// Statements that EXECUTE against a local ClickHouse.
 ///
@@ -405,7 +553,12 @@ mod live {
             .with_timezone(&Utc);
 
         let history = resolver()
-            .had_prior_history("url", url, seen_at + chrono::Duration::hours(1), &ScopeSet::unrestricted())
+            .had_prior_history(
+                "url",
+                url,
+                seen_at + chrono::Duration::hours(1),
+                &ScopeSet::unrestricted(),
+            )
             .await
             .expect("a `?` in a bound value must not error the probe");
         assert!(history, "the URL with a query string was not found");
@@ -413,7 +566,12 @@ mod live {
         // …and the same value one window later has no history, so the probe is
         // answering about the value rather than matching everything.
         let before = resolver()
-            .had_prior_history("url", url, seen_at - chrono::Duration::days(1), &ScopeSet::unrestricted())
+            .had_prior_history(
+                "url",
+                url,
+                seen_at - chrono::Duration::days(1),
+                &ScopeSet::unrestricted(),
+            )
             .await
             .expect("executed");
         assert!(!before, "the probe matched outside its window");

@@ -5,9 +5,8 @@
 
   Loaded by docker-compose.yml (dev) and docker-compose.opensource.yml
   (single-host open-core distribution). Platform K8s tenants get equivalent
-  settings via extraConfig.merge_tree in
-  nano-main/apps/api/src/services/k8s-manifests/clickhouse.ts — keep both
-  in sync, or document the divergence explicitly.
+  settings via extraConfig.merge_tree in the platform's ClickHouse manifest
+  generator — keep both in sync, or document the divergence explicitly.
 -->
 <clickhouse>
     <merge_tree>
@@ -19,8 +18,7 @@
         <!-- Vertical merge — activate for ALL part sizes on the 75+ column
              nanosiem.logs table. Horizontal merges on a table this wide use
              1+ GB RAM even on tiny parts, so the thresholds need to be 0/1.
-             Matches the platform manifest generator (nano-main
-             apps/api/src/services/k8s-manifests/clickhouse.ts:242-243) so
+             Matches the platform ClickHouse manifest generator so
              docker-compose dev and the open-core distribution behave like
              platform-provisioned tenants. -->
         <enable_vertical_merge_algorithm>1</enable_vertical_merge_algorithm>

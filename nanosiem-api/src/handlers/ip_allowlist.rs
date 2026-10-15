@@ -29,7 +29,6 @@ use crate::error::ApiError;
 use crate::handlers::AuditExt;
 use crate::middleware::{check_permission, AuthContext};
 use crate::state::AppState;
-use crate::utils::extract_client_ip;
 use nanosiem_core::typeid::TypeIdParam;
 
 /// Query parameters for listing IP allowlist entries
@@ -116,6 +115,7 @@ pub async fn get_ip_allowlist_status(
 pub async fn create_ip_allowlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    peer: nanosiem_api_lib::PeerAddr,
     headers: axum::http::HeaderMap,
     Json(body): Json<CreateIpAllowlistEntry>,
 ) -> Result<(axum::http::StatusCode, Json<IpAllowlistEntry>), ApiError> {
@@ -144,7 +144,7 @@ pub async fn create_ip_allowlist(
         })?;
 
     // Self-lockout check: after creating the rule, verify the admin's IP is still allowed
-    let admin_ip = extract_client_ip(&headers, None);
+    let admin_ip = nanosiem_api_lib::peer_client_ip(&headers, &peer);
     if let Some(ref ip) = admin_ip {
         if let Err(e) = state
             .ip_allowlist_service
@@ -189,6 +189,7 @@ pub async fn create_ip_allowlist(
 pub async fn update_ip_allowlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    peer: nanosiem_api_lib::PeerAddr,
     headers: axum::http::HeaderMap,
     Path(id): Path<TypeIdParam>,
     Json(body): Json<UpdateIpAllowlistEntry>,
@@ -218,7 +219,7 @@ pub async fn update_ip_allowlist(
         })?;
 
     // Self-lockout check
-    let admin_ip = extract_client_ip(&headers, None);
+    let admin_ip = nanosiem_api_lib::peer_client_ip(&headers, &peer);
     if let Some(ref ip) = admin_ip {
         if let Err(_) = state
             .ip_allowlist_service
@@ -261,6 +262,7 @@ pub async fn update_ip_allowlist(
 pub async fn delete_ip_allowlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    peer: nanosiem_api_lib::PeerAddr,
     headers: axum::http::HeaderMap,
     Path(id): Path<TypeIdParam>,
 ) -> Result<axum::http::StatusCode, ApiError> {
@@ -287,7 +289,7 @@ pub async fn delete_ip_allowlist(
 
     // Audit log
     let client = ClientContext::new(
-        extract_client_ip(&headers, None),
+        nanosiem_api_lib::peer_client_ip(&headers, &peer),
         crate::utils::extract_user_agent(&headers),
     );
     state.emit_audit(

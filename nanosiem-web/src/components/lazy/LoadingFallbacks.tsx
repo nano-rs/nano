@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 /**
  * Generic page loading spinner
@@ -8,7 +8,7 @@ import { Loader2 } from 'lucide-react';
 export function PageLoadingFallback() {
   return (
     <div className="min-h-[400px] flex items-center justify-center">
-      <Loader2 className="w-8 h-8 text-muted-foreground animate-spin" />
+      <LoadingIcon className="w-8 h-8 text-muted-foreground" />
     </div>
   );
 }
@@ -34,7 +34,7 @@ export function EditorLoadingFallback() {
       <div className="flex-1 flex">
         <div className="flex-1 p-4">
           <div className="h-full bg-muted/30 rounded-lg border border-border flex items-center justify-center">
-            <Loader2 className="w-6 h-6 text-muted-foreground animate-spin" />
+            <LoadingIcon className="w-6 h-6 text-muted-foreground" />
           </div>
         </div>
         {/* Side panel skeleton */}
@@ -71,7 +71,7 @@ export function ChartPageLoadingFallback() {
       </div>
       {/* Chart area */}
       <div className="h-80 bg-muted/30 rounded-lg border border-border flex items-center justify-center">
-        <Loader2 className="w-6 h-6 text-muted-foreground animate-spin" />
+        <LoadingIcon className="w-6 h-6 text-muted-foreground" />
       </div>
       {/* Table skeleton */}
       <div className="space-y-2">

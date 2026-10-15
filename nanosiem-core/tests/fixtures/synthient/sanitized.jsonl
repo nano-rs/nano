@@ -1,0 +1,6 @@
+{"schema":"nano-synthient-fixture/1","rows":5,"complete":true}
+{"network":"192.0.2.0/24","vpn":true,"proxy":null,"residential_proxy":false,"bot":false,"confidence":80,"unsupported_provider_name":"discard-me"}
+{"network":"192.0.2.1/32","vpn":false,"proxy":true,"residential_proxy":true,"bot":null,"confidence":95}
+{"network":"198.51.100.1/32","vpn":false,"proxy":false,"residential_proxy":false,"bot":false,"confidence":100}
+{"network":"203.0.113.1/32","vpn":null,"proxy":null,"residential_proxy":null,"bot":null,"confidence":null}
+{"network":"2001:db8::/32","vpn":null,"proxy":false,"residential_proxy":null,"bot":true,"confidence":70}

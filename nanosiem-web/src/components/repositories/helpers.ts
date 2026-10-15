@@ -59,7 +59,8 @@ export interface RepoView {
   };
   lastCommit: { sha: string };
   lastSync: { ts: string | null; relative: string; result: 'ok' | 'warn' | 'failed' | 'pending' };
-  nextSync: { in: string; cadence: string };
+  /** `overdue`: auto-sync is past due (NAN-3199) — never rendered as "next in 0m". */
+  nextSync: { in: string; cadence: string; overdue: boolean };
   autoSync: 'off' | 'hourly' | '4h' | 'daily';
   raw: RuleRepository;
 }
@@ -109,11 +110,12 @@ function cadenceFromHours(hours: number | null | undefined): RepoView['autoSync'
 }
 
 function nextSyncIn(repo: RuleRepository, nowMs = Date.now()): string {
-  if (!repo.auto_sync_enabled || !repo.last_synced_at) return '—';
-  const last = Date.parse(repo.last_synced_at);
-  if (Number.isNaN(last)) return '—';
-  const next = last + (repo.sync_interval_hours || 1) * 3600 * 1000;
-  const diff = Math.max(0, next - nowMs);
+  if (!repo.auto_sync_enabled) return '—';
+  const last = Date.parse(repo.last_synced_at ?? '');
+  const next = repo.next_sync_at ? Date.parse(repo.next_sync_at) : last + (repo.sync_interval_hours || 1) * 3600 * 1000;
+  if (Number.isNaN(next)) return '—';
+  const diff = next - nowMs;
+  if (diff <= 0) return 'overdue';
   const min = Math.floor(diff / 60000);
   if (min < 60) return `${min}m`;
   const hr = Math.floor(min / 60);
@@ -165,6 +167,7 @@ export function buildRepoView(
     },
     nextSync: {
       in: nextSyncIn(repo, nowMs),
+      overdue: nextSyncIn(repo, nowMs) === 'overdue',
       cadence: cadenceFromHours(repo.sync_interval_hours),
     },
     autoSync: cadenceFromHours(repo.sync_interval_hours),
@@ -185,7 +188,11 @@ export function buildRuleView(
     : rule.is_imported
       ? 'IMPORTED'
       : 'AVAILABLE';
-  const source = rule.requires_source_types?.[0] || '—';
+  // NAN-2361: an OCSF rule scopes itself by class_uid and sets no
+  // requires_source_types, which left this column as a bare "—" for most of the
+  // catalog. Fall back to the sources the API derived from that class.
+  const source =
+    rule.requires_source_types?.[0] || rule.suggested_source_types?.[0] || '—';
   const mitre: string[] = [
     ...(rule.mitre_techniques || []),
     ...(rule.mitre_tactics || []),

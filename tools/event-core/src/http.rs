@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! HTTP send functions for the ingestion transports log-blaster supports.
 //!
 //! Three wire formats:
@@ -42,6 +44,212 @@ fn retry_backoff(attempt: u32) -> TokioDuration {
     TokioDuration::from_millis(millis)
 }
 
+// ---------------------------------------------------------------------------
+// NAN-2988: forwarder-style delivery (retry until accepted, honour Retry-After)
+// ---------------------------------------------------------------------------
+
+/// Largest Retry-After honoured; a longer hint is clamped so one bad header
+/// cannot park a sender for hours.
+pub const MAX_RETRY_AFTER: TokioDuration = TokioDuration::from_secs(120);
+/// Ceiling of the exponential backoff used when no Retry-After was given.
+pub const MAX_FORWARDER_BACKOFF: TokioDuration = TokioDuration::from_secs(30);
+/// Floor between attempts, so `Retry-After: 0` cannot become a hot loop.
+const MIN_RETRY_DELAY: TokioDuration = TokioDuration::from_millis(100);
+
+/// How one refused or failed request is retried. A real forwarder (Splunk
+/// UF, Cribl, Vector) keeps retrying a retryable failure until the receiver
+/// accepts it; only a permanent refusal (a 4xx other than 408/429) is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Retries after the first attempt; `None` retries until accepted.
+    pub max_retries: Option<u32>,
+    /// Stop retrying once the next attempt would start later than this after
+    /// the first one. `None` never gives up on a retryable failure.
+    pub deadline: Option<TokioDuration>,
+}
+
+impl RetryPolicy {
+    /// The historical bounded loop: `max_retries` retries, no deadline.
+    pub fn bounded(max_retries: u32) -> Self {
+        Self {
+            max_retries: Some(max_retries),
+            deadline: None,
+        }
+    }
+
+    /// Retry every retryable failure until accepted, optionally bounded in time.
+    pub fn until_accepted(deadline: Option<TokioDuration>) -> Self {
+        Self {
+            max_retries: None,
+            deadline,
+        }
+    }
+}
+
+/// What delivering one request took.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryReport {
+    /// HTTP attempts, including the first.
+    pub attempts: u32,
+    /// Attempts the receiver shed with 429 or 503.
+    pub shed: u32,
+    /// Attempts answered with another retryable status (408, other 5xx).
+    pub server_errors: u32,
+    /// Attempts with no HTTP response (connect/TLS failure, timeout, reset).
+    pub network_errors: u32,
+}
+
+impl DeliveryReport {
+    /// True when the request needed at least one retry.
+    pub fn retried(&self) -> bool {
+        self.attempts > 1
+    }
+}
+
+/// A request that was not accepted.
+#[derive(Debug)]
+pub struct DeliveryFailure {
+    pub report: DeliveryReport,
+    /// True for a refusal no retry can fix (4xx other than 408/429).
+    pub permanent: bool,
+    /// The last HTTP status, if the last attempt got one.
+    pub status: Option<reqwest::StatusCode>,
+    pub error: anyhow::Error,
+}
+
+impl DeliveryFailure {
+    fn permanent(error: anyhow::Error) -> Self {
+        Self {
+            report: DeliveryReport::default(),
+            permanent: true,
+            status: None,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for DeliveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} after {} attempt(s)",
+            self.error, self.report.attempts
+        )
+    }
+}
+
+impl std::error::Error for DeliveryFailure {}
+
+/// 408, 429 and 5xx (except 501/505, which never change on retry) are
+/// transient; every other 4xx is a permanent refusal of this exact request.
+pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    match status.as_u16() {
+        408 | 429 => true,
+        501 | 505 => false,
+        code => (500..600).contains(&code),
+    }
+}
+
+/// `Retry-After` as delay-seconds (RFC 9110 §10.2.3), clamped to
+/// [`MAX_RETRY_AFTER`]. An HTTP-date or a malformed value is ignored and the
+/// caller falls back to its backoff.
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<TokioDuration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if value.is_empty() || value.len() > 9 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(TokioDuration::from_secs(value.parse::<u64>().ok()?).min(MAX_RETRY_AFTER))
+}
+
+/// Backoff between attempts when the receiver named no delay: 500 ms
+/// doubling, capped at [`MAX_FORWARDER_BACKOFF`].
+pub fn forwarder_backoff(retry: u32) -> TokioDuration {
+    retry_backoff(retry).min(MAX_FORWARDER_BACKOFF)
+}
+
+/// Run `attempt` until the receiver accepts (2xx), the failure is permanent,
+/// or `policy` gives up. Every attempt is reported to `observe` (its status,
+/// or `None` for a network error) before it is classified. The caller builds
+/// the identical request each time (same body, same idempotency key).
+pub async fn deliver_with_policy<F, Fut>(
+    policy: RetryPolicy,
+    label: &str,
+    mut attempt: F,
+    observe: impl Fn(Option<reqwest::StatusCode>) + Send + Sync,
+) -> std::result::Result<DeliveryReport, DeliveryFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut report = DeliveryReport::default();
+    let mut hinted: Option<TokioDuration> = None;
+    loop {
+        if report.attempts > 0 {
+            let delay = hinted
+                .take()
+                .unwrap_or_else(|| forwarder_backoff(report.attempts))
+                .max(MIN_RETRY_DELAY);
+            tokio::time::sleep(delay).await;
+        }
+        report.attempts += 1;
+        let response = attempt().await;
+        observe(response.as_ref().ok().map(|r| r.status()));
+        let (status, error) = match response {
+            Ok(response) if response.status().is_success() => return Ok(report),
+            Ok(response) => {
+                let status = response.status();
+                hinted = retry_after(response.headers());
+                let error = anyhow::Error::from(response.error_for_status().unwrap_err());
+                if !is_retryable_status(status) {
+                    return Err(DeliveryFailure {
+                        report,
+                        permanent: true,
+                        status: Some(status),
+                        error,
+                    });
+                }
+                if status.as_u16() == 429 || status.as_u16() == 503 {
+                    report.shed += 1;
+                } else {
+                    report.server_errors += 1;
+                }
+                (Some(status), error)
+            }
+            Err(error) => {
+                report.network_errors += 1;
+                (None, error)
+            }
+        };
+        let exhausted = policy.max_retries.is_some_and(|max| report.attempts > max);
+        let next = hinted
+            .unwrap_or_else(|| forwarder_backoff(report.attempts))
+            .max(MIN_RETRY_DELAY);
+        let late = policy
+            .deadline
+            .is_some_and(|deadline| started.elapsed() + next > deadline);
+        if exhausted || late {
+            return Err(DeliveryFailure {
+                report,
+                permanent: false,
+                status,
+                error,
+            });
+        }
+        tracing::debug!(
+            "[{}] attempt {} failed ({}); retrying in {:?}",
+            label,
+            report.attempts,
+            status.map_or_else(|| "network error".to_string(), |s| s.to_string()),
+            next
+        );
+    }
+}
+
 /// Where to send events. Built once at startup; passed by reference through
 /// the send call chain so the wire format never gets re-derived per call.
 #[derive(Debug, Clone)]
@@ -51,6 +259,11 @@ pub enum Transport {
     Vector {
         url: String,
         token: Option<String>,
+        /// Optional stable-key namespace for hosted durable-ingest requests.
+        /// Each logical HTTP request gets one UUID-suffixed key and retries
+        /// reuse it. Customer-owned/open-core Vector endpoints leave this
+        /// unset and preserve their existing wire contract.
+        idempotency_key_prefix: Option<String>,
     },
     /// Splunk HEC. `url` includes the `/services/collector/event` suffix —
     /// callers (log-blaster's CLI parsing) are responsible for appending
@@ -87,23 +300,10 @@ pub enum Transport {
         base_url: String,
         token: Option<String>,
     },
-    /// Vector-INDEPENDENT direct OTLP path (NAN-1533) — mirrors Tenzir/Cribl
-    /// direct producers. Each per-record OTLP/JSON is INSERTed as one
-    /// `{event, timestamp, source_type}` row into the Null staging table
-    /// (`otel_spans_raw` / `otel_metrics_raw` / the UDM `logs` lane) via the
-    /// ClickHouse HTTP interface (`INSERT ... FORMAT JSONEachRow`, basic auth).
-    /// Deterministically exercises the derivation MVs regardless of Vector's
-    /// experimental OTLP decode. Default `http://localhost:8123` with the
-    /// docker-compose dev creds.
-    OtlpClickHouse {
-        url: String,
-        user: String,
-        password: String,
-    },
 }
 
 /// The three OTLP signal kinds log-blaster can emit. Selects the receiver path
-/// (`/v1/<signal>`), the export-envelope key, and the ClickHouse target table.
+/// (`/v1/<signal>`) and the export-envelope key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtlpSignal {
     Traces,
@@ -118,16 +318,6 @@ impl OtlpSignal {
             OtlpSignal::Traces => "/v1/traces",
             OtlpSignal::Metrics => "/v1/metrics",
             OtlpSignal::Logs => "/v1/logs",
-        }
-    }
-
-    /// The `source_type` stamped on the raw-table row (matches the Vector
-    /// `*_prep` transforms in `config/vector/03-otlp-source.toml`).
-    fn source_type(&self) -> &'static str {
-        match self {
-            OtlpSignal::Traces => "otlp_trace",
-            OtlpSignal::Metrics => "otlp_metric",
-            OtlpSignal::Logs => "otlp_log",
         }
     }
 }
@@ -153,7 +343,6 @@ impl Transport {
             Transport::Hec { url, .. } => url,
             Transport::Tenzir { url } => url,
             Transport::OtlpHttp { base_url, .. } => base_url,
-            Transport::OtlpClickHouse { url, .. } => url,
         }
     }
 
@@ -162,9 +351,21 @@ impl Transport {
             Transport::Vector { token, .. } => token.as_deref(),
             Transport::Hec { token, .. } => token.as_deref(),
             Transport::Tenzir { .. } => None,
-            // OTLP receiver auth terminates at the LB; ClickHouse uses basic auth.
             Transport::OtlpHttp { token, .. } => token.as_deref(),
-            Transport::OtlpClickHouse { .. } => None,
+        }
+    }
+
+    fn fresh_vector_idempotency_key(&self) -> Option<String> {
+        match self {
+            Transport::Vector {
+                idempotency_key_prefix: Some(prefix),
+                ..
+            } => Some(format!(
+                "{}-{}",
+                prefix,
+                uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext))
+            )),
+            _ => None,
         }
     }
 
@@ -175,35 +376,17 @@ impl Transport {
             Transport::Hec { .. } => "hec",
             Transport::Tenzir { .. } => "tenzir",
             Transport::OtlpHttp { .. } => "otlp-http",
-            Transport::OtlpClickHouse { .. } => "otlp-clickhouse",
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// OTLP transports (NAN-1533)
+// OTLP transport (NAN-1533)
 // ---------------------------------------------------------------------------
 //
-// Both OTLP transports ship the SAME per-record OTLP/JSON shape produced by
-// `event_core::otlp` (one span / data point / log record per Value). They
-// differ only in framing:
-//   * OtlpHttp        — wrap N records in the OTLP export envelope and POST to
-//                       the receiver's /v1/<signal> endpoint (Vector decodes).
-//   * OtlpClickHouse  — INSERT one {event, timestamp, source_type} row per
-//                       record into the Null staging table (MV derives columns).
-
-/// ClickHouse target table for a direct-OTLP signal. Traces and metrics ride
-/// their own raw lanes; logs ride the UDM `logs` lane. Database-qualified.
-fn otlp_ch_target(signal: OtlpSignal) -> &'static str {
-    match signal {
-        OtlpSignal::Traces => "nanosiem.otel_spans_raw",
-        OtlpSignal::Metrics => "nanosiem.otel_metrics_raw",
-        // OTLP LogRecords are logs — they ride the existing UDM logs lane
-        // (clickhouse/141_logs_otel_correlation.sql). We map the record into a
-        // minimal logs row in `ch_logs_row` rather than the raw `event` blob.
-        OtlpSignal::Logs => "nanosiem.logs",
-    }
-}
+// OtlpHttp ships the per-record OTLP/JSON produced by `event_core::otlp` (one
+// span / data point / log record per Value): N records are wrapped in the OTLP
+// export envelope and POSTed to the receiver's /v1/<signal> endpoint.
 
 /// Build the OTLP/HTTP export envelope for a batch of per-record JSON values.
 /// Wraps records in the single-resource/single-scope envelope the OTLP spec
@@ -340,9 +523,6 @@ pub async fn send_otlp_with_retry(
             Transport::OtlpHttp { .. } => {
                 send_otlp_http(client, transport, signal, records).await
             }
-            Transport::OtlpClickHouse { .. } => {
-                send_otlp_clickhouse(client, transport, signal, records).await
-            }
             other => {
                 return Err(anyhow::anyhow!(
                     "send_otlp_with_retry called on non-OTLP transport: {}",
@@ -470,236 +650,6 @@ async fn send_otlp_http(
     Ok(())
 }
 
-/// Render the JSONEachRow body for the direct-OTLP ClickHouse path.
-///
-/// Traces/metrics write the per-record OTLP JSON verbatim into the single
-/// `event` column (the MV derives the rest). Logs write a minimal UDM `logs`
-/// row instead — the logs lane is a wide UDM table, not a raw `event` blob, so
-/// we promote body -> message, severity, and trace_id/span_id (lowercased to
-/// match the `lower(col)` correlation convention) directly.
-fn otlp_ch_body(signal: OtlpSignal, records: &[serde_json::Value]) -> String {
-    let now = chrono::Utc::now();
-    match signal {
-        OtlpSignal::Traces | OtlpSignal::Metrics => records
-            .iter()
-            .map(|rec| {
-                // One {event, source_type} row. `event` is the OTLP JSON as a
-                // STRING (the MV's JSONExtract* reads it); timestamp is left to
-                // the raw table's DEFAULT (derived from start/timeUnixNano).
-                serde_json::json!({
-                    "event": serde_json::to_string(rec).unwrap(),
-                    "source_type": signal.source_type(),
-                })
-                .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        OtlpSignal::Logs => records
-            .iter()
-            .map(|rec| ch_logs_row(rec, now).to_string())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-/// Map one OTLP LogRecord JSON into a minimal UDM `logs` row (JSONEachRow).
-fn ch_logs_row(rec: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
-    // OTLP body is `{stringValue: "..."}`; fall back to the whole record.
-    let message = rec["body"]["stringValue"]
-        .as_str()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| rec.to_string());
-    let sev_text = rec["severityText"].as_str().unwrap_or("INFO").to_lowercase();
-    let trace_id = rec["traceId"].as_str().unwrap_or("").to_lowercase();
-    let span_id = rec["spanId"].as_str().unwrap_or("").to_lowercase();
-
-    // Pull the entity-overlay semconv attrs the same way the UDM parse would.
-    let attr = |key: &str| -> String {
-        rec["attributes"]
-            .as_array()
-            .and_then(|arr| arr.iter().find(|kv| kv["key"] == key))
-            .and_then(|kv| kv["value"]["stringValue"].as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-
-    serde_json::json!({
-        "timestamp": now.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-        "message": message,
-        "source_type": "otlp_log",
-        "source": "otlp",
-        "severity": sev_text,
-        "trace_id": trace_id,
-        "span_id": span_id,
-        "src_ip": attr("client.address").to_lowercase(),
-        "user": attr("enduser.id"),
-        "src_host": attr("host.name"),
-        "url": attr("url.path"),
-    })
-}
-
-/// Direct INSERT into the ClickHouse Null staging table (or logs lane) via the
-/// HTTP interface, JSONEachRow body + basic auth.
-async fn send_otlp_clickhouse(
-    client: &Client,
-    transport: &Transport,
-    signal: OtlpSignal,
-    records: &[serde_json::Value],
-) -> Result<()> {
-    let (url, user, password) = match transport {
-        Transport::OtlpClickHouse {
-            url,
-            user,
-            password,
-        } => (url, user, password),
-        other => {
-            return Err(anyhow::anyhow!(
-                "send_otlp_clickhouse called on {} transport",
-                other.kind()
-            ))
-        }
-    };
-
-    let table = otlp_ch_target(signal);
-    let body = otlp_ch_body(signal, records);
-    // The column list mirrors the JSONEachRow keys we emit. For traces/metrics
-    // that is (event, source_type); for logs it is the promoted UDM subset.
-    // The query rides as a URL `?query=` param (ClickHouse HTTP interface); the
-    // JSONEachRow rows are the POST body.
-    // The query is a fixed-shape statement (`INSERT INTO <table> FORMAT
-    // JSONEachRow`) — only spaces need escaping for the URL `?query=` param;
-    // table names are ASCII identifiers with dots. Avoids pulling in a urlencode
-    // crate for a single space-replace.
-    let query = format!("INSERT INTO {table} FORMAT JSONEachRow");
-    let endpoint = format!(
-        "{}/?query={}",
-        url.trim_end_matches('/'),
-        query.replace(' ', "%20")
-    );
-
-    client
-        .post(endpoint)
-        .basic_auth(user, Some(password))
-        .header("Content-Type", "application/x-ndjson")
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
-/// One correlated security-signal UDM log row for the combo-join lane
-/// (NAN-1566). Shaped as an auth FAILURE so the spans<->logs correlation is a
-/// meaningful security pivot: `auth_result=failure` + a `user` + an `src_ip`,
-/// optionally carrying the `trace_id` of a just-emitted span.
-///
-/// `trace_id` is lowercased to match the `lower(col)` correlation convention and
-/// the lowercase-hex span ids the otel_spans MV writes; an empty `trace_id`
-/// yields a normal (uncorrelated) row.
-#[derive(Debug, Clone)]
-pub struct ComboLogRow {
-    pub trace_id: String,
-    pub user: String,
-    pub src_ip: String,
-    pub failure: bool,
-}
-
-/// INSERT a batch of combo-join security-signal log rows DIRECTLY into
-/// `nanosiem.logs` via the ClickHouse HTTP interface (JSONEachRow + basic auth).
-///
-/// combo-join uses the direct-CH path (mirroring `send_otlp_clickhouse`) on
-/// PURPOSE: `logs.trace_id` is a first-class UDM column, but the demo
-/// source-type parsers don't carry `trace_id` through the Vector pipeline, so a
-/// pipeline send would silently drop it. Writing the row straight to `logs`
-/// makes the spans<->logs trace_id overlap deterministic for validation. CH
-/// fills every other column from its DEFAULTs.
-pub async fn insert_combo_log_rows(
-    client: &Client,
-    transport: &Transport,
-    rows: &[ComboLogRow],
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let (url, user_cred, password) = match transport {
-        Transport::OtlpClickHouse {
-            url,
-            user,
-            password,
-        } => (url, user, password),
-        other => {
-            return Err(anyhow::anyhow!(
-                "insert_combo_log_rows requires the OtlpClickHouse transport, got {}",
-                other.kind()
-            ))
-        }
-    };
-
-    let now = chrono::Utc::now();
-    let ts = now.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-    let body: String = rows
-        .iter()
-        .map(|r| {
-            let (action, auth_result, status, severity, msg) = if r.failure {
-                (
-                    "auth_failure",
-                    "failure",
-                    "failure",
-                    "high",
-                    format!(
-                        "authentication failure for user {} from {}",
-                        r.user, r.src_ip
-                    ),
-                )
-            } else {
-                (
-                    "auth_success",
-                    "success",
-                    "success",
-                    "info",
-                    format!("authentication success for user {} from {}", r.user, r.src_ip),
-                )
-            };
-            serde_json::json!({
-                "timestamp": ts,
-                "message": msg,
-                "source_type": "combo_join_auth",
-                "source": "combo-join",
-                "trace_id": r.trace_id.to_lowercase(),
-                // Lowercase src_ip to match the ingest-lowercased raw-column
-                // convention for IP equality (CLAUDE.md ClickHouse notes).
-                "src_ip": r.src_ip.to_lowercase(),
-                "user": r.user,
-                "auth_type": "password",
-                "auth_result": auth_result,
-                "action": action,
-                "result": auth_result,
-                "status": status,
-                "severity": severity,
-                "category": "authentication",
-            })
-            .to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let query = "INSERT INTO nanosiem.logs FORMAT JSONEachRow";
-    let endpoint = format!(
-        "{}/?query={}",
-        url.trim_end_matches('/'),
-        query.replace(' ', "%20")
-    );
-    client
-        .post(endpoint)
-        .basic_auth(user_cred, Some(password))
-        .header("Content-Type", "application/x-ndjson")
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(())
-}
-
 /// Send a batch of pre-shaped JSON records as NDJSON under a fixed
 /// `X-Source-Type` (e.g. `nano_enrich` for enrichment-lane records, NAN-1154).
 /// Unlike `send_event`, the records aren't `Event`s — they're arbitrary
@@ -723,6 +673,9 @@ pub async fn send_json_records<T: serde::Serialize>(
         .header("Content-Type", "application/x-ndjson")
         .header("X-Source-Type", source_type)
         .body(body);
+    if let Some(key) = transport.fresh_vector_idempotency_key() {
+        req = req.header("Idempotency-Key", key);
+    }
     if let Some(t) = transport.token() {
         req = req.bearer_auth(t);
     }
@@ -736,9 +689,9 @@ pub async fn send_event(client: &Client, transport: &Transport, event: &Event) -
         Transport::Vector { .. } => send_event_vector(client, transport, event).await,
         Transport::Hec { .. } => send_event_hec(client, transport, event).await,
         Transport::Tenzir { .. } => send_tenzir_batch(client, transport, &[event]).await,
-        // OTLP transports carry OTLP/JSON records, not raw `Event`s — callers
+        // The OTLP transport carries OTLP/JSON records, not raw `Event`s — callers
         // use `send_otlp_with_retry`. Reaching here is a wiring bug.
-        Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => Err(anyhow::anyhow!(
+        Transport::OtlpHttp { .. } => Err(anyhow::anyhow!(
             "send_event called on OTLP transport ({}); use send_otlp_with_retry",
             transport.kind()
         )),
@@ -763,7 +716,7 @@ pub async fn send_batch_with_retry(
         Transport::Tenzir { .. } => {
             send_batch_tenzir_with_retry(client, transport, events, max_retries).await
         }
-        Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => Err(anyhow::anyhow!(
+        Transport::OtlpHttp { .. } => Err(anyhow::anyhow!(
             "send_batch_with_retry called on OTLP transport ({}); use send_otlp_with_retry",
             transport.kind()
         )),
@@ -780,6 +733,9 @@ async fn send_event_vector(client: &Client, transport: &Transport, event: &Event
         .header("Content-Type", "application/json")
         .header("X-Source-Type", &event.source_type)
         .json(event);
+    if let Some(key) = transport.fresh_vector_idempotency_key() {
+        req = req.header("Idempotency-Key", key);
+    }
     if let Some(t) = transport.token() {
         req = req.bearer_auth(t);
     }
@@ -792,7 +748,8 @@ async fn send_ndjson_group(
     transport: &Transport,
     source_type: &str,
     events: &[&Event],
-) -> Result<()> {
+    idempotency_key: Option<&str>,
+) -> Result<reqwest::Response> {
     let body: String = events
         .iter()
         .map(|e| serde_json::to_string(e).unwrap())
@@ -805,11 +762,13 @@ async fn send_ndjson_group(
         .header("X-Source-Type", source_type)
         .body(body);
 
+    if let Some(key) = idempotency_key {
+        req = req.header("Idempotency-Key", key);
+    }
     if let Some(t) = transport.token() {
         req = req.bearer_auth(t);
     }
-    req.send().await?.error_for_status()?;
-    Ok(())
+    Ok(req.send().await?)
 }
 
 async fn send_ndjson_group_with_retry(
@@ -819,24 +778,52 @@ async fn send_ndjson_group_with_retry(
     events: &[&Event],
     max_retries: u32,
 ) -> Result<()> {
-    let mut last_err = None;
-    for attempt in 0..=max_retries {
-        if attempt > 0 {
-            let backoff = retry_backoff(attempt);
-            warn!(
-                "[{}] Retry {}/{} after {:?}",
-                source_type, attempt, max_retries, backoff
-            );
-            tokio::time::sleep(backoff).await;
-        }
-        match send_ndjson_group(client, transport, source_type, events).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
+    send_vector_group_observed(
+        client,
+        transport,
+        source_type,
+        events,
+        RetryPolicy::bounded(max_retries),
+        |_| {},
+    )
+    .await
+    .map(|_| ())
+    .map_err(|failure| failure.error)
+}
+
+/// Send one Vector source group, reporting every HTTP status (or network error).
+/// Retries retain the same idempotency key. The observer runs before status validation.
+pub async fn send_vector_group_observed(
+    client: &Client,
+    transport: &Transport,
+    source_type: &str,
+    events: &[&Event],
+    policy: RetryPolicy,
+    observe: impl Fn(Option<reqwest::StatusCode>) + Send + Sync,
+) -> std::result::Result<DeliveryReport, DeliveryFailure> {
+    if !matches!(transport, Transport::Vector { .. }) {
+        return Err(DeliveryFailure::permanent(anyhow::anyhow!(
+            "expected Vector transport"
+        )));
     }
-    Err(last_err.unwrap())
+    // This is deliberately outside the retry loop: an ambiguous response
+    // must retry the exact same durable request, never create a second one.
+    let idempotency_key = transport.fresh_vector_idempotency_key();
+    deliver_with_policy(
+        policy,
+        source_type,
+        || {
+            send_ndjson_group(
+                client,
+                transport,
+                source_type,
+                events,
+                idempotency_key.as_deref(),
+            )
+        },
+        observe,
+    )
+    .await
 }
 
 async fn send_batch_vector_with_retry(
@@ -851,9 +838,16 @@ async fn send_batch_vector_with_retry(
         grouped.entry(&event.source_type).or_default().push(event);
     }
 
-    for (source_type, group) in &grouped {
-        send_ndjson_group_with_retry(client, transport, source_type, group, max_retries).await?;
-    }
+    // Vector's end-to-end acknowledgements wait for the durable sink. Waiting
+    // for each source partition serially multiplies that latency by the number
+    // of source types in a mixed batch and makes a 50 EPS generator behave like
+    // a single-digit one. The groups are independent HTTP requests, so await
+    // their durable acknowledgements together while keeping retry state scoped
+    // to each source type.
+    futures::future::try_join_all(grouped.iter().map(|(source_type, group)| {
+        send_ndjson_group_with_retry(client, transport, source_type, group, max_retries)
+    }))
+    .await?;
     Ok(())
 }
 
@@ -871,6 +865,8 @@ struct HecEnvelope<'a> {
     /// we always emit seconds-as-float to match Splunk's own forwarders.
     time: f64,
     sourcetype: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'a str>,
     /// The raw log payload. We pass the message as a string — hec_normalize
     /// handles the `is_string(.event)` branch and lifts it into `.message`.
     event: &'a str,
@@ -881,6 +877,7 @@ impl<'a> HecEnvelope<'a> {
         Self {
             time: event_epoch_seconds(event),
             sourcetype: &event.source_type,
+            source: None,
             event: &event.message,
         }
     }
@@ -916,7 +913,7 @@ fn hec_channel(transport: &Transport) -> &str {
         Transport::Hec { channel, .. } => channel,
         Transport::Vector { .. } => unreachable!("hec_channel called on Vector transport"),
         Transport::Tenzir { .. } => unreachable!("hec_channel called on Tenzir transport"),
-        Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => {
+        Transport::OtlpHttp { .. } => {
             unreachable!("hec_channel called on OTLP transport")
         }
     }
@@ -952,6 +949,56 @@ async fn send_hec_batch(
     }
     req.send().await?.error_for_status()?;
     Ok(())
+}
+
+/// Send a homogeneous HEC source batch with observable retries. Each batch gets
+/// a UUID channel. An explicit prefix enables a stable idempotency key across retries.
+/// Without a prefix, retries may duplicate events.
+/// The raw message uses the same envelope as the legacy HEC sender.
+pub async fn send_hec_group_observed(
+    client: &Client,
+    transport: &Transport,
+    events: &[&Event],
+    policy: RetryPolicy,
+    idempotency_key_prefix: Option<&str>,
+    observe: impl Fn(Option<reqwest::StatusCode>) + Send + Sync,
+) -> std::result::Result<DeliveryReport, DeliveryFailure> {
+    if !matches!(transport, Transport::Hec { .. }) {
+        return Err(DeliveryFailure::permanent(anyhow::anyhow!(
+            "expected HEC transport"
+        )));
+    }
+    let channel = uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).to_string();
+    let key = idempotency_key_prefix.map(|prefix| format!("{prefix}-{channel}"));
+    let body = events
+        .iter()
+        .map(|event| {
+            let mut envelope = HecEnvelope::from_event(event);
+            envelope.source = Some(&event.source_type);
+            serde_json::to_string(&envelope).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    deliver_with_policy(
+        policy,
+        "hec",
+        || {
+            let mut req = client
+                .post(transport.url())
+                .header("Content-Type", "application/json")
+                .header("X-Splunk-Request-Channel", &channel)
+                .body(body.clone());
+            if let Some(key) = &key {
+                req = req.header("Idempotency-Key", key);
+            }
+            if let Some(token) = transport.token() {
+                req = req.header("Authorization", format!("Splunk {token}"));
+            }
+            async move { Ok::<_, anyhow::Error>(req.send().await?) }
+        },
+        observe,
+    )
+    .await
 }
 
 async fn send_batch_hec_with_retry(
@@ -1103,6 +1150,7 @@ mod tests {
         let v = Transport::Vector {
             url: "http://x".into(),
             token: None,
+            idempotency_key_prefix: None,
         };
         let h = Transport::Hec {
             url: "http://x:8088/services/collector/event".into(),
@@ -1168,6 +1216,49 @@ mod tests {
     // pub(crate) so any future caller in this file inherits the cap.
     // ----------------------------------------------------------------------
 
+    // NAN-2988: forwarder-style retry classification.
+    #[test]
+    fn retryable_statuses_are_408_429_and_transient_5xx() {
+        use reqwest::StatusCode;
+        for code in [408u16, 429, 500, 502, 503, 504, 507, 520] {
+            assert!(
+                is_retryable_status(StatusCode::from_u16(code).unwrap()),
+                "{code}"
+            );
+        }
+        for code in [400u16, 401, 403, 404, 405, 409, 413, 415, 501, 505] {
+            assert!(
+                !is_retryable_status(StatusCode::from_u16(code).unwrap()),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_reads_delay_seconds_and_clamps() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            retry_after(&headers)
+        };
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+        assert_eq!(with("1"), Some(TokioDuration::from_secs(1)));
+        assert_eq!(with(" 5 "), Some(TokioDuration::from_secs(5)));
+        assert_eq!(with("0"), Some(TokioDuration::ZERO));
+        assert_eq!(with("86400"), Some(MAX_RETRY_AFTER));
+        assert_eq!(with("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(with("-1"), None);
+        assert_eq!(with("1.5"), None);
+    }
+
+    #[test]
+    fn forwarder_backoff_caps_at_30s() {
+        assert_eq!(forwarder_backoff(1), TokioDuration::from_millis(500));
+        assert_eq!(forwarder_backoff(4), TokioDuration::from_secs(4));
+        assert_eq!(forwarder_backoff(20), MAX_FORWARDER_BACKOFF);
+    }
+
     #[test]
     fn retry_backoff_first_attempt_is_500ms() {
         // attempt=1 → 500 × 2^0 = 500ms (unchanged from pre-NAN-953).
@@ -1216,6 +1307,7 @@ mod tests {
         let v = Transport::Vector {
             url: "http://x".into(),
             token: None,
+            idempotency_key_prefix: None,
         };
         let _ = hec_channel(&v);
     }

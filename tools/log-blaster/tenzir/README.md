@@ -1,7 +1,6 @@
 # log-blaster `--tenzir`: raw logs → Tenzir → OCSF → ClickHouse
 
-A permanent rig for the raw-log leg of direct OCSF ingestion (NAN-1402,
-follow-up to the NAN-1400 validation): log-blaster ships its generators'
+A permanent rig for the raw-log leg of direct OCSF ingestion: log-blaster ships its generators'
 **raw, pre-parse payloads** to a Tenzir HTTP listener; the TQL pipeline in
 this directory parses them, maps each feed to OCSF 1.8.0 (same
 class/activity/promoted-field coverage as the native Vector OCSF parsers),
@@ -62,7 +61,7 @@ Environment knobs on the pipeline: `NANO_CH_INGEST_USER` (default
 `NANO_CH_HOST` (default `clickhouse`), `NANO_CH_NATIVE_PORT` (default `9000`),
 `NANO_TENZIR_LISTEN` (default `0.0.0.0:9095`).
 
-### Sink: native `to_clickhouse` (NAN-1788)
+### Sink: native `to_clickhouse`
 
 The rig streams to ClickHouse via the native `to_clickhouse` operator over the
 native protocol (port 9000) directly into `nanosiem.ocsf_logs_raw`. **Requires
@@ -71,7 +70,7 @@ Tenzir ≥ 6.6.0** — the first release whose `to_clickhouse` accepts
 'UTC')` columns and omits the server-derived `timestamp`/`id` so their ClickHouse
 DEFAULTs fire. The rig runs the unpinned `tenzir/tenzir` image, which tracks the
 same v6.6.0+ floor as the bundled pipeline. The legacy `to_http`-JSONEachRow
-shooter was removed (NAN-1603); native is the only path.
+shooter was removed; native is the only path.
 
 On Tenzir 6.4.0–6.5.x, target the legacy `nanosiem.ocsf_logs_native_raw`
 entrypoint instead — a thin `ENGINE = Null` shim exposing only `event JSON` +
@@ -96,7 +95,7 @@ DEFAULT (only ABSENT columns default). Full rationale:
 - **Native sink, no batching wrapper**: `to_clickhouse` streams continuously
   over the native protocol and manages its own inserts, so the pipeline drops
   the old `every 1s { to_http … }` micro-batching wrapper the HTTP shooter
-  needed (NAN-1603).
+  needed.
 - **Mapping ground truth** is the OCSF parser set in the parsers repo
   (`parsers-ocsf/*/parser.yaml`). Known benign divergence: for Sysmon /
   Windows Event, the TQL emits `metadata.uid` = the Windows `record_id` (as

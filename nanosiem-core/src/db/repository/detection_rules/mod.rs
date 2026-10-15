@@ -15,10 +15,15 @@
 mod auto_tuning;
 mod case_permissions;
 mod crud;
+mod late_replay;
 mod lifecycle;
 mod listing;
 mod scheduling;
 mod stats;
 mod types;
 
+pub use late_replay::{
+    LateReplayClaim, LateReplayPlan, LateReplayReleaseOutcome,
+    LAKE_DETECTION_EVENT_PUBLICATION_UPSERT_SQL, PUBLICATION_VISIBILITY_SETTLE_SECONDS,
+};
 pub use types::{DailyStat, DetectionRuleRepository, DetectionRuleRepositoryError};

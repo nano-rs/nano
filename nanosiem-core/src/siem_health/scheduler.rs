@@ -15,9 +15,10 @@ use super::analyzer::SuppressedFinding;
 use super::collector;
 use super::repository::SiemHealthRepository;
 use super::suppressions_repository::SuppressionRepository;
-use super::types::HealthStatus;
+use super::types::{CollectedMetrics, HealthStatus};
 use crate::auth::ScopeSet;
 use crate::extensions::SiemHealthAiAnalyzer;
+use crate::search::{SearchBackend, SearchService};
 
 /// Default interval: 12 hours
 const DEFAULT_INTERVAL_SECS: u64 = 12 * 60 * 60;
@@ -30,6 +31,7 @@ pub fn start(
     ch_client: ClickHouseClient,
     is_clustered: bool,
     ai_analyzer: Arc<dyn SiemHealthAiAnalyzer>,
+    search_service: SearchService,
 ) -> tokio::task::JoinHandle<()> {
     let interval_secs: u64 = std::env::var("SIEM_HEALTH_CHECK_INTERVAL_SECS")
         .ok()
@@ -47,7 +49,21 @@ pub fn start(
         let repo = SiemHealthRepository::new(pool.clone());
 
         loop {
-            run_health_check(&pool, &ch_client, is_clustered, ai_analyzer.as_ref(), &repo).await;
+            if search_service.backend() == SearchBackend::Lake {
+                let system_scope = ScopeSet::unrestricted();
+                run_health_check_with_search_trigger(
+                    &pool,
+                    &search_service,
+                    ai_analyzer.as_ref(),
+                    &repo,
+                    &system_scope,
+                    None,
+                )
+                .await;
+            } else {
+                run_health_check(&pool, &ch_client, is_clustered, ai_analyzer.as_ref(), &repo)
+                    .await;
+            }
             time::sleep(Duration::from_secs(interval_secs)).await;
         }
     })
@@ -100,8 +116,74 @@ pub async fn run_health_check_with_trigger(
 
     // Step 1: Collect metrics
     let metrics = collector::collect_metrics(pool, ch_client, is_clustered, scope).await;
+    finish_health_check(
+        pool,
+        ai_analyzer,
+        repo,
+        metrics,
+        "clickhouse",
+        triggered_by,
+        start,
+    )
+    .await
+}
+
+/// Lake-backend counterpart of [`run_health_check_with_trigger`].
+///
+/// All event-derived metrics traverse the same strict OCSF, tenant-pinned
+/// [`SearchService`] boundary as product searches. This prevents a primary-lake
+/// deployment from publishing a plausible-looking report over a stale local
+/// ClickHouse table.
+pub async fn run_health_check_with_search_trigger(
+    pool: &PgPool,
+    search_service: &SearchService,
+    ai_analyzer: &dyn SiemHealthAiAnalyzer,
+    repo: &SiemHealthRepository,
+    scope: &ScopeSet,
+    triggered_by: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    let start = std::time::Instant::now();
+    info!("Starting lake SIEM health check...");
+    let metrics = collector::collect_metrics_from_search(pool, search_service, scope).await;
+    finish_health_check(
+        pool,
+        ai_analyzer,
+        repo,
+        metrics,
+        "lake",
+        triggered_by,
+        start,
+    )
+    .await
+}
+
+async fn finish_health_check(
+    pool: &PgPool,
+    ai_analyzer: &dyn SiemHealthAiAnalyzer,
+    repo: &SiemHealthRepository,
+    metrics: CollectedMetrics,
+    collector_backend: &str,
+    triggered_by: Option<uuid::Uuid>,
+    start: std::time::Instant,
+) -> Option<uuid::Uuid> {
     let provenance = metrics.source_provenance();
-    let metrics_json = serde_json::to_value(&metrics).unwrap_or_default();
+    let mut metrics_json = serde_json::to_value(&metrics).unwrap_or_default();
+    if let Some(object) = metrics_json.as_object_mut() {
+        object.insert(
+            "collector_backend".to_string(),
+            serde_json::Value::String(collector_backend.to_string()),
+        );
+        if collector_backend == "lake" {
+            object.insert(
+                "unavailable_metrics".to_string(),
+                serde_json::json!([
+                    "object_writer_integrity",
+                    "independent_ioc_hit_rate",
+                    "unmapped_field_usage"
+                ]),
+            );
+        }
+    }
 
     // Step 1b: Load active suppressions so the AI can omit classes the tenant
     // has already marked as not-an-issue (NAN-615).

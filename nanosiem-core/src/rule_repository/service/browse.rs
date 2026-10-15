@@ -124,7 +124,10 @@ impl RuleRepositoryService {
             if analyzer.is_inventory_empty() {
                 drop(analyzer); // Release read lock before acquiring write lock
                 let mut analyzer = self.coverage_analyzer.write().await;
-                if let Err(e) = analyzer.refresh_available_fields().await {
+                if let Err(e) = analyzer
+                    .refresh_available_fields(self.search_service.as_deref())
+                    .await
+                {
                     warn!("Failed to refresh coverage data: {}", e);
                 }
             }

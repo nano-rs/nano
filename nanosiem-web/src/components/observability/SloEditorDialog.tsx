@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import {
   Sheet,
@@ -257,7 +257,7 @@ export function SloEditorDialog({ open, onOpenChange, slo, onSubmit }: SloEditor
             onClick={handleSubmit}
             disabled={!valid || submitting}
           >
-            {submitting && <Loader2 className="h-[11px] w-[11px] animate-spin" />}
+            {submitting && <LoadingIcon className="h-[11px] w-[11px]" />}
             {editing ? 'Save changes' : 'Create SLO'}
           </Button>
         </div>

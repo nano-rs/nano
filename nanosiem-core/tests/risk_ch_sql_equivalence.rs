@@ -57,7 +57,7 @@ fn ch_insert_client() -> Client {
 
 // ---------------------------------------------------------------------------
 // Golden copies of the PRE-refactor inline statements + bind chains
-// (from nanosiem-enterprise/src/risk/repository.rs before NAN-1803; UDM
+// (from enterprise/src/risk/repository.rs before NAN-1803; UDM
 // sentinels substituted: risk_entity/risk_score/rule_name/rule_id/severity,
 // single-node table `logs`)
 // ---------------------------------------------------------------------------

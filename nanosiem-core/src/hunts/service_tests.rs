@@ -139,7 +139,12 @@ fn service(resolver: FakeResolver) -> HuntService {
     HuntService::new(HuntRepository::new(pool), Arc::new(resolver))
 }
 
-fn candidate(entity_type: &str, entity_value: &str, ids: &[&str], signals: &[&str]) -> LeadCandidate {
+fn candidate(
+    entity_type: &str,
+    entity_value: &str,
+    ids: &[&str],
+    signals: &[&str],
+) -> LeadCandidate {
     LeadCandidate {
         entity_type: entity_type.to_string(),
         entity_value: entity_value.to_string(),
@@ -180,7 +185,12 @@ async fn an_entity_that_appears_in_no_evidence_is_refused() {
     let svc = service(FakeResolver::new().with_event("e1", "sysmon", &[("host", "srv-web06")]));
     let signals = known(&["t1021"]);
 
-    let good = prepare(&svc, &candidate("host", "srv-web06", &["e1"], &["T1021"]), &signals).await;
+    let good = prepare(
+        &svc,
+        &candidate("host", "srv-web06", &["e1"], &["T1021"]),
+        &signals,
+    )
+    .await;
     assert!(good.is_some(), "a corroborated entity was refused");
 
     let fabricated = prepare(
@@ -354,7 +364,10 @@ async fn knowledge_is_normalized_and_provenance_is_server_derived() {
     assert_eq!(prepared.fact, "runs nightly at 03:00");
     assert_eq!(prepared.evidence_event_ids, vec!["evt-1"]);
     assert_eq!(prepared.ttl_days, crate::hunts::MAX_TTL_DAYS);
-    assert_eq!(prepared.provenance.source_types(), &["windows_security".to_string()]);
+    assert_eq!(
+        prepared.provenance.source_types(),
+        &["windows_security".to_string()]
+    );
     assert!(
         !prepared.provenance.is_complete(),
         "one unresolved event must make the fact fail closed for scoped readers"

@@ -7,7 +7,8 @@
 //
 // Data is REAL: api.observability.getServiceSecuritySignals(service, { start,
 // end }) → { host_count, signal_total, signal_count, signals: [{ ts, rule_name,
-// src_host, src_ip, severity }] }. signal_total is the true range count;
+// severity, matched_entity, matched_entity_type }] } (NAN-2361 — OCSF
+// Detection Findings from the lake). signal_total is the true range count;
 // signal_count is the bounded sample size (signals.length). The strip is
 // best-effort decoration — it never blocks
 // or errors the parent detail, and the common case is zero (rendered as a clean
@@ -49,15 +50,21 @@ function sevTone(sev: string | null): SevTone {
   return (sev != null && SEV_TONE[sev.toLowerCase()]) || SEV_FALLBACK;
 }
 
-/** Build a SIEM search query scoped to the signal's matched entity. */
+/** Build a SIEM search query scoped to the signal's matched entity.
+ *
+ * OCSF paths ONLY (NAN-2361): the lake validates every field name and an
+ * unknown field invalidates the ENTIRE query (all-or-nothing), so retired UDM
+ * names (src_ip/dest_ip/src_host/dest_host/hostname) would 400 every
+ * drill-down — OR'd OCSF halves never rescue it.
+ */
 function searchHref(s: ServiceSecuritySignal): string {
   let q: string | null = null;
-  if (s.src_ip) {
-    const ip = nplQuotedBody(s.src_ip);
-    q = `src_ip="${ip}" OR dest_ip="${ip}" OR src_endpoint.ip="${ip}" OR dst_endpoint.ip="${ip}"`;
-  } else if (s.src_host) {
-    const h = nplQuotedBody(s.src_host);
-    q = `src_host="${h}" OR dest_host="${h}" OR hostname="${h}" OR device.hostname="${h}"`;
+  if (s.matched_entity && s.matched_entity_type === 'ip') {
+    const ip = nplQuotedBody(s.matched_entity);
+    q = `src_endpoint.ip="${ip}" OR dst_endpoint.ip="${ip}"`;
+  } else if (s.matched_entity) {
+    const h = nplQuotedBody(s.matched_entity);
+    q = `device.hostname="${h}"`;
   }
   return q ? `/search?q=${encodeURIComponent(q)}` : '/alerts';
 }
@@ -156,9 +163,9 @@ export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecurit
           <span className="font-mono text-[11.5px] text-fg truncate flex-1" title={s.rule_name}>
             {s.rule_name}
           </span>
-          {(s.src_host || s.src_ip) && (
+          {s.matched_entity && (
             <span className="font-mono text-[10.5px] text-fg-3 truncate max-w-[160px] shrink-0">
-              {s.src_host || s.src_ip}
+              {s.matched_entity}
             </span>
           )}
           {s.severity && (

@@ -14,6 +14,8 @@ mod tests;
 
 use super::ast::*;
 
+pub(crate) use helpers::npl_quoted_literal;
+
 /// Trait for pretty-printing AST nodes to query string
 pub trait PrettyPrint {
     /// Convert the AST node to a query string

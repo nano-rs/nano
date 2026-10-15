@@ -13,7 +13,8 @@
  */
 
 import { useEffect, useState } from 'react';
-import { KeyRound, Loader2 } from 'lucide-react';
+import { KeyRound } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
 import {
   api,
@@ -145,7 +146,7 @@ export function EditApiKeyDialog({ open, apiKey, permissions, onClose, onSaved }
             Cancel
           </Button>
           <Button size="sm" onClick={handleSubmit} disabled={!canSubmit} className="h-7 text-[11.5px]">
-            {saving && <Loader2 className="w-3 h-3 animate-spin" />}
+            {saving && <LoadingIcon className="w-3 h-3" />}
             Save changes
           </Button>
         </SheetFooter>

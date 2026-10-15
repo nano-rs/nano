@@ -100,10 +100,7 @@ impl ClickHouseSqlGenerator {
     /// nPL-text deny gate (`enforce_source_scope`) does not cover. The empty
     /// set (the default on every existing construction site) renders nothing,
     /// keeping every emitted statement byte-identical.
-    pub fn with_source_scope_deny(
-        mut self,
-        deny: std::collections::BTreeSet<String>,
-    ) -> Self {
+    pub fn with_source_scope_deny(mut self, deny: std::collections::BTreeSet<String>) -> Self {
         self.source_scope_deny = deny;
         self
     }
@@ -256,7 +253,9 @@ impl ClickHouseSqlGenerator {
         // identical `main."user"`); OCSF resolves to `"user.name"` so the IP-lookup
         // user key does not reference a nonexistent `user` column → 500.
         let main_user_col = match self.profile.resolve("user") {
-            crate::schema::FieldResolution::ExplicitColumn(c) => crate::query::escape_identifier(&c),
+            crate::schema::FieldResolution::ExplicitColumn(c) => {
+                crate::query::escape_identifier(&c)
+            }
             _ => "\"user\"".to_string(),
         };
         // `field_access_expr` returns a plain (possibly quoted) column for
@@ -289,7 +288,10 @@ impl ClickHouseSqlGenerator {
         // actually being present; otherwise fall through to the dictGetOrDefault path,
         // which resolves the same values via the registry dict.
         let read_physical_identity = is_forward_user
-            && has_col(&format!("{}_{}", entity_prefix, IDENTITY_COLUMN_FIELDS[0].0));
+            && has_col(&format!(
+                "{}_{}",
+                entity_prefix, IDENTITY_COLUMN_FIELDS[0].0
+            ));
 
         if read_physical_identity {
             // Read dedicated columns directly from the row (already populated at ingestion)
@@ -598,8 +600,8 @@ mod source_scope_tests {
             start: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
         };
-        let query = parse_query("src_ip=10.0.0.5 | resolve_identity field=src_ip")
-            .expect("query parses");
+        let query =
+            parse_query("src_ip=10.0.0.5 | resolve_identity field=src_ip").expect("query parses");
 
         let scoped_sql = ClickHouseSqlGenerator::new()
             .with_source_scope_deny(deny(&["insider"]))

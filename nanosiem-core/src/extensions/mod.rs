@@ -3,7 +3,7 @@
 //! Extension hooks for plugging enterprise features into the open core.
 //!
 //! Each hook trait has a `Noop*` default implementation that the open-core
-//! build wires in. The enterprise crate (`nanosiem-enterprise`) provides real
+//! build wires in. The enterprise crate (the enterprise crate) provides real
 //! implementations that get injected at AppState construction time when the
 //! `enterprise` Cargo feature is enabled.
 //!
@@ -22,7 +22,10 @@ pub mod shadow_investigation;
 pub mod siem_health_analyzer;
 pub mod tuning_proposal_generator;
 
-pub use ai_client::{AiAgentId, AiClient, AiMessage, AiRole, AiStream, NoopAiClient};
+pub use ai_client::{
+    skipped_rows, AiAgentId, AiClient, AiClientFactory, AiMessage, AiRole, AiStream,
+    DeferredAiClient, NoopAiClient,
+};
 pub use case_grouping::{
     AlertCasePermissions, AlertGrouped, CaseGroupingHook, NoopCaseGroupingHook,
 };

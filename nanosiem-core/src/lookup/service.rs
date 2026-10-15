@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use super::clickhouse_repository::ClickHouseLookupRepository;
 use super::postgres_repository::PostgresLookupRepository;
-use super::repository::{LookupRepositoryError, LookupStorageBackend, LookupStore, RuleReferenceRow};
+use super::repository::{
+    LookupRepositoryError, LookupStorageBackend, LookupStore, RuleReferenceRow,
+};
 use super::types::*;
 use crate::upload::ColumnType;
 
@@ -42,12 +44,17 @@ pub enum LookupError {
     PrimaryKeyNotFound(String),
     #[error("Row not found: {0}")]
     RowNotFound(i64),
+    #[error("Lookup table is referenced by detection rules: {0}")]
+    TableInUse(String),
+    #[error("Lookup table is still referenced by related records")]
+    ReferenceConflict,
 }
 
 impl From<LookupRepositoryError> for LookupError {
     fn from(err: LookupRepositoryError) -> Self {
         match err {
             LookupRepositoryError::TableNotFound(n) => LookupError::TableNotFound(n),
+            LookupRepositoryError::ReferenceConflict => LookupError::ReferenceConflict,
             LookupRepositoryError::TableAlreadyExists(n) => LookupError::TableAlreadyExists(n),
             LookupRepositoryError::InvalidTableName(n) => LookupError::InvalidTableName(n),
             LookupRepositoryError::InvalidColumnName(n) => LookupError::InvalidColumn(n),
@@ -69,12 +76,10 @@ impl From<LookupRepositoryError> for LookupError {
             // SQLSTATE classifier: a CH exception caused by the uploaded
             // data/types (TYPE_MISMATCH / CANNOT_PARSE_*) is a 4xx user error;
             // anything else is treated as a 500-class infra failure.
-            LookupRepositoryError::ClickHouseError(msg) => {
-                match ch_input_error_message(&msg) {
-                    Some(m) => LookupError::InvalidData(m.to_string()),
-                    None => LookupError::RepositoryError(msg),
-                }
-            }
+            LookupRepositoryError::ClickHouseError(msg) => match ch_input_error_message(&msg) {
+                Some(m) => LookupError::InvalidData(m.to_string()),
+                None => LookupError::RepositoryError(msg),
+            },
         }
     }
 }
@@ -96,9 +101,7 @@ fn input_error_message(sqlstate: &str) -> Option<&'static str> {
     }
     match sqlstate.get(..2) {
         Some("22") => Some("a value in the upload is not valid for its column type"),
-        Some("23") => {
-            Some("the upload violates a table constraint (e.g. a duplicate primary key)")
-        }
+        Some("23") => Some("the upload violates a table constraint (e.g. a duplicate primary key)"),
         Some("54") => Some("the upload exceeds a database limit (e.g. too many columns)"),
         _ => None,
     }
@@ -174,9 +177,7 @@ impl LookupService {
     ) -> Self {
         let store: Arc<dyn LookupStore> = match backend {
             LookupStorageBackend::Postgres => Arc::new(PostgresLookupRepository::new(pg)),
-            LookupStorageBackend::ClickHouse => {
-                Arc::new(ClickHouseLookupRepository::new(pg, ch))
-            }
+            LookupStorageBackend::ClickHouse => Arc::new(ClickHouseLookupRepository::new(pg, ch)),
         };
         Self { repository: store }
     }
@@ -312,9 +313,19 @@ impl LookupService {
             .create_dynamic_table(&staging, &new_table.columns, pk)
             .await?;
 
+        // The ClickHouse staging name is not yet in the registry. Its encoder
+        // falls back to the first supplied column for key_raw, so put the
+        // requested key first for this insert without changing stored schema.
+        let mut insert_columns = new_table.columns.clone();
+        if let Some(pk) = pk {
+            if let Some(index) = insert_columns.iter().position(|column| column.name == pk) {
+                insert_columns.swap(0, index);
+            }
+        }
+
         let inserted = match self
             .repository
-            .insert_records(&staging, &new_table.columns, &records)
+            .insert_records(&staging, &insert_columns, &records)
             .await
         {
             Ok(n) => n,
@@ -351,14 +362,13 @@ impl LookupService {
     pub async fn drop_table(&self, name: &str) -> Result<(), LookupError> {
         // Get the table to find the actual table name
         let table = self.repository.get_table(name).await?;
-
-        // Drop the dynamic table
-        self.repository
-            .drop_dynamic_table(&table.table_name)
-            .await?;
-
-        // Remove from registry
-        self.repository.unregister_table(name).await?;
+        let rules = self.repository.find_rules_referencing(name).await?;
+        if !rules.is_empty() {
+            return Err(LookupError::TableInUse(
+                rules.iter().map(|rule| rule.name.as_str()).collect::<Vec<_>>().join(", "),
+            ));
+        }
+        self.repository.delete_table(&table).await?;
 
         Ok(())
     }
@@ -415,11 +425,7 @@ impl LookupService {
         let table = self.repository.get_table(table_name).await?;
         let (current_count, missing) = self
             .repository
-            .idempotent_record_counts(
-                &table.table_name,
-                idempotency_key,
-                records.len(),
-            )
+            .idempotent_record_counts(&table.table_name, idempotency_key, records.len())
             .await?;
         if current_count + missing as i64 > MAX_LOOKUP_TABLE_ROWS {
             return Err(LookupError::RowLimitExceeded(MAX_LOOKUP_TABLE_ROWS));
@@ -427,12 +433,7 @@ impl LookupService {
 
         let inserted = self
             .repository
-            .insert_records_idempotent(
-                &table.table_name,
-                &table.columns,
-                &records,
-                idempotency_key,
-            )
+            .insert_records_idempotent(&table.table_name, &table.columns, &records, idempotency_key)
             .await?;
 
         let new_count = self
@@ -991,7 +992,7 @@ mod tests {
         assert!(input_error_message("23502").is_some()); // not_null_violation
         assert!(input_error_message("54011").is_some()); // too_many_columns
         assert!(input_error_message("42804").is_some()); // datatype_mismatch (NAN-1361 F-4)
-        // ...but the rest of class 42 stays a 500 (real bug, not bad input).
+                                                         // ...but the rest of class 42 stays a 500 (real bug, not bad input).
         assert!(input_error_message("42601").is_none()); // syntax_error
         assert!(input_error_message("42P01").is_none()); // undefined_table
     }
@@ -999,18 +1000,15 @@ mod tests {
     #[test]
     fn ch_input_error_message_maps_type_mismatch_to_4xx() {
         // Data-caused CH exceptions -> a user-facing message (=> 4xx).
-        assert!(ch_input_error_message(
-            "Code: 53. DB::Exception: Type mismatch ... TYPE_MISMATCH"
-        )
-        .is_some());
+        assert!(
+            ch_input_error_message("Code: 53. DB::Exception: Type mismatch ... TYPE_MISMATCH")
+                .is_some()
+        );
         assert!(ch_input_error_message(
             "Code: 6. DB::Exception: Cannot parse ... CANNOT_PARSE_NUMBER"
         )
         .is_some());
-        assert!(ch_input_error_message(
-            "VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE"
-        )
-        .is_some());
+        assert!(ch_input_error_message("VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE").is_some());
         assert!(ch_input_error_message("ILLEGAL_TYPE_OF_ARGUMENT").is_some());
     }
 

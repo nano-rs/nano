@@ -12,7 +12,6 @@ import {
 } from '@/components/ui/dropdown-menu';
 import {
   Shield as LucideShield,
-  Rss,
   ChevronDown,
   Bot,
   Book,
@@ -28,18 +27,13 @@ import {
   Activity,
   ExternalLink,
   Code,
-  KeyRound,
   Briefcase,
   Inbox,
   Target,
-  Network,
-  PlusCircle,
   Webhook,
   Gauge,
   ShieldCheck,
   Menu,
-  Moon,
-  Sun,
 } from 'lucide-react';
 import {
   NavHome,
@@ -61,6 +55,7 @@ import {
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { cn } from '@/lib/utils';
 import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
+import { swaggerUiPath } from '@/lib/tenant-auth-shell';
 import { useAuth } from '@/contexts/AuthContext';
 import { useOnboardingProgress, useSiemHealthLatest, useIngestionHistory } from '@/hooks/use-api';
 import { VersionBadge } from '@/components/VersionBadge';
@@ -68,6 +63,7 @@ import { ScrollContainerProvider } from '@/contexts/ScrollContainerContext';
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext';
 import { DemoBanner } from '@/components/DemoBanner';
 import { LicenseBanner } from '@/components/LicenseBanner';
+import { AiAllowanceBanner } from '@/components/AiAllowanceBanner';
 import { AppBreadcrumbs, useCurrentPageTitle } from '@/components/layout/AppBreadcrumbs';
 import { useNotebookOptional } from '@/enterprise/contexts/NotebookContext';
 import { useLayoutOptional } from '@/contexts/LayoutContext';
@@ -76,11 +72,14 @@ import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { PivtShellOverlay } from '@/enterprise/components/pivt/PivtShellOverlay';
 import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
 import { NotificationBell } from '@/components/NotificationBell';
-import { useTheme } from 'next-themes';
+
 import { SettingsLayout } from '@/components/layout/settings/SettingsLayout';
 const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').then(m => ({ default: m.CommandPalette })));
 import { Button } from '@/components/ui/button';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
+import { ingestionNavigation, visibleOnEdition } from './ingestion-navigation';
 import { Logo } from '@/components/ui/logo';
+import { ThemeSwatches } from '@/components/ui/theme-swatches';
 import {
   Sheet,
   SheetContent,
@@ -188,7 +187,7 @@ function CollapsedSectionFlyout({
  * Navigation item with optional permission requirements
  * Requirements: 5.3 - Hide menu items user cannot access
  */
-interface NavItem {
+export interface NavItem {
   name: string;
   href: string;
   icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
@@ -208,6 +207,13 @@ interface NavItem {
    * URL. (NAN-437)
    */
   activePrefixes?: string[];
+  /**
+   * Hide on hosted-shared tenants (NAN-2593): the surface is platform-managed
+   * there (e.g. Source Configs: transports and routing belong to the platform).
+   */
+  hideOnShared?: boolean;
+  /** Hosted shared-lake pipeline management has a tenant runtime contract. */
+  sharedOnly?: boolean;
 }
 
 /**
@@ -218,7 +224,7 @@ interface NavItem {
 const navigation: NavItem[] = [
   { name: 'Home', href: '/', icon: NavHome }, // Always visible
   { name: 'Getting Started', href: '/getting-started', icon: NavPlusCross }, // Onboarding wizard
-  { name: 'Search', href: '/search', icon: NavSearch, permissions: 'search:view' },
+  { name: 'Search', href: '/search', icon: NavSearch, permissions: 'search:view', capability: 'search' },
   { name: 'Dashboards', href: '/dashboards', icon: NavGrid, permissions: 'dashboards:view' },
   // NAN-1793: scheduled reports — cron a saved search / dashboard into
   // downloadable CSV/HTML artifacts. Gated on search:view (same as Search).
@@ -266,21 +272,13 @@ const detectionNavigation: NavItem[] = [
   { name: 'Rule Editor', href: '/rules/editor', icon: PenTool, permissions: 'detections:create' },
   { name: 'Repositories', href: '/rules/repositories', icon: FolderInput, permissions: 'detections:view' },
   { name: 'Lookup Tables', href: '/rules/lookup-tables', icon: Table, permissions: 'lookup:view' },
+  // NAN-3467: `/api/ioc-lists` exists only on hosted-shared tenants.
+  { name: 'IOC Lists', href: '/rules/ioc-lists', icon: LucideShield, permissions: 'enrichments:view', capability: 'iocLists' },
   { name: 'MITRE Coverage', href: '/rules/coverage', icon: Target, permissions: 'detections:view' },
   { name: 'AI Tuning', href: '/rules/tuning', icon: PivtIcon, permissions: 'detections:view', capability: 'aiTuning' },
 ];
 
 
-/**
- * Ingestion section - data sources and parsing configuration
- */
-const ingestionNavigation: NavItem[] = [
-  { name: 'Add New Feed', href: '/ingestion/log-sources/wizard', icon: PlusCircle, permissions: 'log_sources:create' },
-  { name: 'Log Sources', href: '/ingestion/log-sources', icon: Rss, permissions: 'log_sources:view' },
-  { name: 'Repositories', href: '/ingestion/log-sources/repositories', icon: FolderInput, permissions: 'parsers:view' },
-  { name: 'Source Configs', href: '/ingestion/source-configurations', icon: Network, permissions: 'source_configs:view' },
-  { name: 'Credentials', href: '/ingestion/credentials', icon: KeyRound, permissions: 'credentials:view' },
-];
 
 /**
  * Settings section navigation items with permission requirements
@@ -364,10 +362,10 @@ function TopBar({
 
       <div className="flex-1 min-w-0" />
 
-      {/* Right actions — PIVT is the new home for notebook interaction;
+      {/* Right actions — pivt is the new home for notebook interaction;
           the legacy `Start a new notebook` icon (which opened the
-          deprecated NotebookSidebar via toggleSidebar) is gone. PIVT's
-          @-commands cover notebook creation; the floating PIVT panel
+          deprecated NotebookSidebar via toggleSidebar) is gone. pivt's
+          @-commands cover notebook creation; the floating pivt panel
           owns the read surface. */}
       <div className="flex items-center gap-1 shrink-0">
         {melodEnabled && <PivtSummon state={pivt} />}
@@ -538,8 +536,6 @@ function UserMenuContent({
   onLogout: () => void | Promise<void>;
   onUserSettings: () => void;
 }) {
-  const { resolvedTheme, setTheme } = useTheme();
-  const isDark = resolvedTheme === 'dark';
   const itemCls = 'text-[11.5px] py-1.5 gap-2';
   // Pops up from the avatar trigger with a small lift, then shifts right
   // via `alignOffset` so the menu straddles the sidebar / content edge —
@@ -558,14 +554,22 @@ function UserMenuContent({
         <User className="w-3.5 h-3.5" />
         User Settings
       </DropdownMenuItem>
-      {/* NAN-917 F-25: theme toggle is now reachable from every route via the
-          user menu (previously only on /settings/*). */}
+      {/* NAN-917 F-25: theme control is reachable from every route via the user
+          menu (previously only on /settings/*). It was a light/dark toggle,
+          which could not express a third theme — now a swatch row, so Matte
+          Black is reachable here too. `onSelect`+preventDefault keeps the menu
+          OPEN while you try themes: picking one repaints the menu itself, and
+          closing on each click would make comparing them a chore.
+          `system` is deliberately not here — it has no colour to preview; it
+          stays in Settings → User Settings. */}
       <DropdownMenuItem
-        onClick={() => setTheme(isDark ? 'light' : 'dark')}
-        className={itemCls}
+        onSelect={(event) => event.preventDefault()}
+        className={cn(itemCls, 'flex-col items-start gap-1.5 focus:bg-transparent')}
       >
-        {isDark ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-        {isDark ? 'Switch to light theme' : 'Switch to dark theme'}
+        <span className="text-[10.5px] uppercase tracking-wide text-muted-foreground">
+          Theme
+        </span>
+        <ThemeSwatches />
       </DropdownMenuItem>
       <DropdownMenuSeparator />
       <DropdownMenuItem asChild className={itemCls}>
@@ -576,7 +580,7 @@ function UserMenuContent({
         </a>
       </DropdownMenuItem>
       <DropdownMenuItem asChild className={itemCls}>
-        <a href="/swagger-ui/" target="_blank" rel="noopener noreferrer">
+        <a href={swaggerUiPath(window.location.pathname)} target="_blank" rel="noopener noreferrer">
           <Code className="w-3.5 h-3.5" />
           API
           <ExternalLink className="w-3 h-3 ml-auto opacity-50" />
@@ -605,7 +609,7 @@ function MainAppShell({ children }: AppLayoutProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const pivt = usePivtState();
 
-  // ── PIVT keyboard shortcuts ─────────────────────────────────────────────
+  // ── pivt keyboard shortcuts ─────────────────────────────────────────────
   // ⌘. / ctrl+.            → toggle open/close
   // ⌘⇧. / ctrl+shift+.     → switch dock ↔ float (and open if closed)
   // Escape hatch: don't fire while the user is typing into an input /
@@ -640,10 +644,12 @@ function MainAppShell({ children }: AppLayoutProps) {
    * Requirements: 5.3 - Hide menu items user cannot access
    */
   const { capabilities } = useCapabilities();
+  const sharedTenant = useSharedTenant();
   const filterNavItems = useCallback((items: NavItem[]): NavItem[] => {
     return items.filter(item => {
       // Build-time capability gate — open-core builds drop enterprise items.
       if (item.capability && !capabilities[item.capability]) return false;
+      if (!visibleOnEdition(item, sharedTenant)) return false;
 
       // No permission required - always show
       if (!item.permissions) return true;
@@ -654,7 +660,7 @@ function MainAppShell({ children }: AppLayoutProps) {
       }
       return hasPermission(item.permissions);
     });
-  }, [hasPermission, hasAnyPermission, capabilities]);
+  }, [hasPermission, hasAnyPermission, capabilities, sharedTenant]);
 
   // Filtered navigation arrays based on user permissions
   const filteredNavigation = useMemo(() => {
@@ -771,8 +777,14 @@ function MainAppShell({ children }: AppLayoutProps) {
 
   // Handle logout
   const handleLogout = useCallback(async () => {
-    await logout();
-    navigate('/login', { replace: true });
+    try {
+      await logout();
+    } catch {
+      // AuthContext already cleared local credentials and surfaced the durable
+      // revocation failure. Do not leak an unhandled event-handler rejection.
+    } finally {
+      navigate('/login', { replace: true });
+    }
   }, [logout, navigate]);
 
   // Get user initials for avatar
@@ -912,8 +924,11 @@ function MainAppShell({ children }: AppLayoutProps) {
                 <div className="mt-1 ml-6 space-y-0.5 border-l border-border/40 pl-2">
                   {filteredCasesNavigation.map((item) => {
                     const Icon = item.icon;
+                    // Investigate owns /inbox and case detail pages, but not the
+                    // sibling Case search route (which is its own nav item).
                     const isActive = item.href === '/inbox'
-                      ? location.pathname === '/inbox' || location.pathname.startsWith('/cases')
+                      ? location.pathname === '/inbox'
+                        || (location.pathname.startsWith('/cases') && !location.pathname.startsWith('/cases/search'))
                       : location.pathname.startsWith(item.href);
                     return (
                       <Link
@@ -1207,10 +1222,10 @@ function MainAppShell({ children }: AppLayoutProps) {
             pivt={pivt}
           />
 
-          {/* Main area + notebook sidebar + PIVT dock share this 1fr row.
+          {/* Main area + notebook sidebar + pivt dock share this 1fr row.
               PivtShellOverlay renders the docked panel as a flex sibling
               after NotebookSidebar (so they can coexist until NAN-405
-              consolidates NotebookChat into PIVT). Float + rail are absolute
+              consolidates NotebookChat into pivt). Float + rail are absolute
               positioned and don't affect this layout.
               Open-core builds skip the overlay entirely; the main content is
               rendered as a flex child directly. */}
@@ -1219,6 +1234,7 @@ function MainAppShell({ children }: AppLayoutProps) {
               const mainContent = (
                 <main className="flex-1 flex flex-col min-w-0 overflow-x-hidden md:[overflow-x:clip]">
                   <LicenseBanner />
+                  <AiAllowanceBanner />
                   <DemoBanner />
                   <div
                     ref={scrollContainerRef}

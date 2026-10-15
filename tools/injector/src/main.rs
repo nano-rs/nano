@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Injector - Attack scenario injection tool for SIEM testing
 //!
 //! Injects realistic attack chains into a running nano SIEM instance
@@ -12,21 +14,32 @@
 //!   injector --vector http://localhost:8080 --exfil
 //!   injector --vector http://localhost:8080 --persistence
 //!   injector --vector http://localhost:8080 --drive-by --target WS-FIN-042 --user CORP\\alice
+//!
+//! Ingest-edge targets (NAN-2705): send to a tenant's HEC / HTTPS edge instead of raw Vector.
+//! Ingest credentials are per source, so the token file maps each source:
+//!   injector --hec-url https://t1.ingest.example/services/collector/event \
+//!            --token-file tokens.txt --marker nanoe2eabc123 --host-name E2E-ABC-Q --quick
+//!   injector --https-url https://t1.ingest.example/ingest --token-file tokens.txt --persistence
+//!   injector --quick --plan          # print the generated steps as JSON, send nothing
 
+mod edge;
 mod scenarios;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use reqwest::Client;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::Duration as TokioDuration;
 use tracing::info;
 
 use event_core::entity::{Entity, WorldState};
-use event_core::http::{send_batch_with_retry, Transport};
+use event_core::http::send_batch_with_retry;
 use event_core::profiles;
 
-use scenarios::{drive_by, exfil, lateral, persistence, quick, staggered, AttackScenario};
+use edge::{SinkKind, SinkRouter};
+use scenarios::{drive_by, exfil, lateral, persistence, quick, staggered, AttackScenario, AttackStep};
 
 #[derive(Parser, Debug)]
 #[command(name = "injector")]
@@ -39,6 +52,32 @@ struct Args {
     /// Vector auth token (Bearer)
     #[arg(long)]
     token: Option<String>,
+
+    /// HEC endpoint (…/services/collector/event). Needs --token-file.
+    #[arg(long, conflicts_with = "https_url")]
+    hec_url: Option<String>,
+
+    /// HTTPS JSON endpoint (…/ingest): NDJSON, Bearer, Idempotency-Key. Needs --token-file.
+    #[arg(long)]
+    https_url: Option<String>,
+
+    /// Ingest token file: one bare token, and/or `source_type=token` lines
+    /// (ingest credentials are per source). Tokens are never printed.
+    #[arg(long, conflicts_with = "token")]
+    token_file: Option<PathBuf>,
+
+    /// Run marker stamped on every event (`nano_e2e_marker`), 8-64 letters/digits
+    #[arg(long, value_parser = edge::parse_marker)]
+    marker: Option<String>,
+
+    /// Replace the target (and the lateral pivots, as <name>-p1/-p2) with
+    /// synthetic hosts, so detections and risk are attributable to this run
+    #[arg(long, value_parser = edge::parse_host_name)]
+    host_name: Option<String>,
+
+    /// Print the generated steps as JSON and exit without sending anything
+    #[arg(long)]
+    plan: bool,
 
     /// Target hostname for the attack (random if not specified)
     #[arg(long)]
@@ -119,6 +158,9 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("injector=info".parse()?),
         )
+        // Logs go to stderr: stdout carries only the step lines, the
+        // `--plan` JSON and the final `INJECTOR_RESULT` line.
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();
@@ -155,8 +197,34 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     };
 
+    // Resolve the sink before generating anything: a missing or malformed
+    // token file must fail before a single event is sent.
+    let (sink, url) = match (&args.hec_url, &args.https_url) {
+        (Some(url), None) => (SinkKind::Hec, url.clone()),
+        (None, Some(url)) => (SinkKind::Https, url.clone()),
+        _ => (SinkKind::Vector, args.vector.clone()),
+    };
+    let tokens = match &args.token_file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read --token-file {}", path.display()))?;
+            Some(edge::parse_token_file(&text).map_err(anyhow::Error::msg)?)
+        }
+        None => args.token.clone().map(|token| edge::TokenMap {
+            default: Some(token),
+            ..Default::default()
+        }),
+    };
+    if sink != SinkKind::Vector && tokens.is_none() && !args.plan {
+        anyhow::bail!("--hec-url/--https-url need --token-file");
+    }
+    let run_tag = args.marker.clone().unwrap_or_else(|| {
+        uuid::Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext)).simple().to_string()
+    });
+    let router = SinkRouter::build(sink, &url, tokens.as_ref(), &format!("injector-{run_tag}"));
+
     // Generate attack steps
-    let steps = {
+    let (mut steps, target_host, hosts) = {
         let w = world.read();
         let requested_hostname = args.target.as_deref();
         let existing_target = requested_hostname
@@ -174,7 +242,41 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         });
 
-        let custom_target = if args.drive_by && args.user.is_some() {
+        // --host-name: a private three-host world (target + two pivots) built
+        // from the base target's addressing, so no event names a host that
+        // background traffic also uses.
+        let synthetic: Option<Vec<Entity>> = args.host_name.as_deref().map(|name| {
+            let user = args.user.as_deref().unwrap_or(&base_target.user);
+            // Two pivots, always: the neighbors first, then any other host.
+            let neighbors: Vec<&Entity> = base_target
+                .neighbor_indices
+                .iter()
+                .filter_map(|&idx| w.entities().get(idx))
+                .chain(w.entities().iter())
+                .filter(|e| e.hostname != base_target.hostname)
+                .take(2)
+                .collect();
+            let mut hosts = vec![Entity::new(
+                name,
+                user,
+                &base_target.ip,
+                &base_target.mac,
+                &base_target.domain,
+            )];
+            for (i, pivot) in neighbors.iter().enumerate() {
+                hosts.push(Entity::new(
+                    &format!("{name}-p{}", i + 1),
+                    &pivot.user,
+                    &pivot.ip,
+                    &pivot.mac,
+                    &pivot.domain,
+                ));
+            }
+            hosts[0].neighbor_indices = (1..hosts.len()).collect();
+            hosts
+        });
+
+        let custom_target = if synthetic.is_none() && args.drive_by && args.user.is_some() {
             Some(Entity::new(
                 &base_target.hostname,
                 args.user.as_deref().unwrap_or(&base_target.user),
@@ -185,7 +287,10 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-        let target = custom_target.as_ref().unwrap_or(base_target);
+        let (target, all_entities): (&Entity, &[Entity]) = match &synthetic {
+            Some(hosts) => (&hosts[0], hosts.as_slice()),
+            None => (custom_target.as_ref().unwrap_or(base_target), w.entities()),
+        };
 
         info!(
             "Scenario: {} | Target: {} | User: {}",
@@ -194,24 +299,54 @@ async fn main() -> Result<()> {
             target.user
         );
 
-        scenario.generate(target, w.entities())
+        let named: Vec<&Entity> = synthetic
+            .as_ref()
+            .map(|hosts| hosts.iter().collect())
+            .unwrap_or_else(|| vec![target]);
+        let hosts: Vec<HostIdentity> = named
+            .iter()
+            .map(|h| HostIdentity { fqdn: h.fqdn(), ip: h.ip.clone(), user: h.user.clone() })
+            .collect();
+        (scenario.generate(target, all_entities), target.fqdn(), hosts)
     };
+
+    if let Some(marker) = &args.marker {
+        for event in steps.iter_mut().flat_map(|s| s.events.iter_mut()) {
+            edge::tag_event(event, marker);
+        }
+    }
 
     info!("{} attack steps generated", steps.len());
 
-    // Execute steps with timing. Injector currently only targets Vector
-    // HTTP; if HEC injection is needed, add a `--hec` flag and build the
-    // matching Transport variant (mirrors log-blaster's NAN-909 wiring).
+    let sources: Vec<&str> = steps
+        .iter()
+        .flat_map(|s| s.events.iter().map(|e| e.source_type.as_str()))
+        .collect();
+    if args.plan {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&plan_json(scenario.name(), &target_host, &hosts, &steps, sink, &args.marker))?
+        );
+        return Ok(());
+    }
+    let missing = router.missing(sources.iter().copied());
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "no ingest token for source(s) {} in --token-file (ingest credentials are per source)",
+            missing.join(", ")
+        );
+    }
+
     let client = Client::builder()
         .connect_timeout(TokioDuration::from_secs(10))
         .timeout(TokioDuration::from_secs(30))
         .build()?;
-    let transport = Transport::Vector {
-        url: args.vector.clone(),
-        token: args.token.clone(),
-    };
 
     let start = std::time::Instant::now();
+    let started_at = chrono::Utc::now();
+    let mut sent: BTreeMap<String, usize> = BTreeMap::new();
+    let mut failed: BTreeMap<String, usize> = BTreeMap::new();
+    let mut last_error: Option<String> = None;
 
     for step in &steps {
         // Wait until the step's delay
@@ -231,8 +366,21 @@ async fn main() -> Result<()> {
             );
         }
 
-        if let Err(e) = send_batch_with_retry(&client, &transport, &step.events, 3).await {
-            tracing::warn!("Failed to send step '{}': {}", step.description, e);
+        // Ingest credentials are per source, so a mixed step is one request
+        // per source (the Vector transport groups the same way internally).
+        for (source_type, events) in edge::group_by_source(&step.events) {
+            let transport = router
+                .for_source(&source_type)
+                .expect("every source was checked for a token before sending");
+            match send_batch_with_retry(&client, transport, &events, 3).await {
+                Ok(()) => *sent.entry(source_type).or_default() += events.len(),
+                Err(e) => {
+                    // reqwest errors carry the URL and status, never the auth header.
+                    tracing::warn!("Failed to send step '{}' ({source_type}): {}", step.description, e);
+                    last_error = Some(format!("{source_type}: {e}"));
+                    *failed.entry(source_type).or_default() += events.len();
+                }
+            }
         }
     }
 
@@ -245,7 +393,68 @@ async fn main() -> Result<()> {
         start.elapsed().as_secs_f64()
     );
 
+    // One machine-readable line for drivers (scripts/e2e-detections-live.mjs).
+    println!(
+        "INJECTOR_RESULT {}",
+        serde_json::json!({
+            "scenario": scenario.name(),
+            "sink": sink.label(),
+            "marker": args.marker,
+            "target_host": target_host,
+            "hosts": hosts,
+            "steps": steps.len(),
+            "events": total_events,
+            "sent": sent,
+            "failed": failed,
+            "last_error": last_error,
+            "started_at": started_at.to_rfc3339(),
+            "finished_at": chrono::Utc::now().to_rfc3339(),
+        })
+    );
+
+    // An edge run is a test: a dropped step must not pass silently.
+    if sink != SinkKind::Vector && !failed.is_empty() {
+        std::process::exit(3);
+    }
     Ok(())
+}
+
+/// A host a run's events name: detections group by hostname, IP or user.
+#[derive(serde::Serialize)]
+struct HostIdentity {
+    fqdn: String,
+    ip: String,
+    user: String,
+}
+
+/// `--plan` output: what would be sent, without tokens or sending.
+fn plan_json(
+    scenario: &str,
+    target_host: &str,
+    hosts: &[HostIdentity],
+    steps: &[AttackStep],
+    sink: SinkKind,
+    marker: &Option<String>,
+) -> serde_json::Value {
+    let mut per_source: BTreeMap<&str, usize> = BTreeMap::new();
+    for event in steps.iter().flat_map(|s| s.events.iter()) {
+        *per_source.entry(event.source_type.as_str()).or_default() += 1;
+    }
+    serde_json::json!({
+        "scenario": scenario,
+        "sink": sink.label(),
+        "marker": marker,
+        "target_host": target_host,
+        "hosts": hosts,
+        "duration_s": steps.last().map(|s| s.delay.as_secs()).unwrap_or(0),
+        "events_per_source": per_source,
+        "steps": steps.iter().map(|s| serde_json::json!({
+            "delay_s": s.delay.as_secs(),
+            "stage": s.stage,
+            "description": s.description,
+            "sources": s.events.iter().map(|e| e.source_type.as_str()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[cfg(test)]

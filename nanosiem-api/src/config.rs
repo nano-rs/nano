@@ -4,11 +4,19 @@
 
 use std::env;
 
-/// Deployment mode — managed (platform-hosted) vs self-hosted (BYOC) vs demo
+/// Deployment mode for this API process.
+///
+/// `EnterpriseShared` is intentionally distinct from `Managed`: existing
+/// managed deployments are dedicated/customer-owned enterprise installations,
+/// while shared multi-tenancy must be enabled explicitly and audited one call
+/// site at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeploymentMode {
-    /// Platform-managed: AI pre-configured, settings locked
+    /// Dedicated/customer-owned enterprise: AI pre-configured, settings locked.
     Managed,
+    /// Nano-operated shared enterprise control and data plane.
+    #[cfg(feature = "enterprise")]
+    EnterpriseShared,
     /// Self-hosted / BYOC: user manages everything
     SelfHosted,
     /// Demo: shared instance with session-scoped ephemeral users
@@ -20,8 +28,94 @@ impl DeploymentMode {
         matches!(self, DeploymentMode::Managed)
     }
 
+    #[cfg(feature = "enterprise")]
+    pub fn is_enterprise_shared(&self) -> bool {
+        matches!(self, DeploymentMode::EnterpriseShared)
+    }
+
     pub fn is_demo(&self) -> bool {
         matches!(self, DeploymentMode::Demo)
+    }
+
+    /// Parse the explicit deployment profile without silently changing an
+    /// unknown non-empty value into self-hosted mode.
+    ///
+    /// Empty/unset remains the open-core default. `selfhosted` is retained for
+    /// compatibility with `scripts/start-microservices-dev.sh`, while
+    /// `self-hosted` matches the existing system API spelling.
+    fn from_env_value(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("") | Some("selfhosted") | Some("self-hosted") => Ok(Self::SelfHosted),
+            Some("managed") => Ok(Self::Managed),
+            #[cfg(feature = "enterprise")]
+            Some("enterprise_shared") => Ok(Self::EnterpriseShared),
+            #[cfg(not(feature = "enterprise"))]
+            Some("enterprise_shared") => Err(
+                "DEPLOYMENT_MODE=enterprise_shared is the hosted profile and needs the enterprise build"
+                    .to_string(),
+            ),
+            Some("demo") => Ok(Self::Demo),
+            Some(value) => Err(format!(
+                "invalid DEPLOYMENT_MODE {value:?}; expected managed, enterprise_shared, selfhosted, self-hosted, demo, or an empty/unset value"
+            )),
+        }
+    }
+
+    /// Stable value exposed by `/api/system/config`.
+    ///
+    /// Demo historically reported as `self-hosted`; preserve that external
+    /// behavior during this boundary-only phase. Shared enterprise must be
+    /// distinguishable so later tenant work can opt in explicitly.
+    pub fn system_api_value(&self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            #[cfg(feature = "enterprise")]
+            Self::EnterpriseShared => "enterprise_shared",
+            Self::SelfHosted | Self::Demo => "self-hosted",
+        }
+    }
+}
+
+/// How logs reach this install (NAN-3844).
+///
+/// `install.sh --tenzir` (NAN-3807) records `NANO_VECTOR_PROFILE=none` and
+/// starts open core with no Vector and no connector runner: data arrives only
+/// through the Tenzir RustFS bucket drop. Every surface that renders into, or
+/// delivers through, Vector (HTTP/HEC/OTLP push, pull connectors, directory
+/// sync, parser deploys, synthetic checks) cannot work there, so the API
+/// reports the mode on `/api/capabilities` and refuses those mutations with a
+/// clear error instead of letting them fail downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IngestMode {
+    /// Vector is installed (default, and every unknown value — the installer
+    /// falls back to Vector the same way).
+    #[default]
+    Vector,
+    /// Tenzir-direct: bucket drop only, no Vector.
+    TenzirOnly,
+}
+
+impl IngestMode {
+    /// Resolve from `NANO_VECTOR_PROFILE`. Only the exact installer value
+    /// `none` selects Tenzir-only, matching `resolve_vector_profile` in
+    /// install.sh, which treats anything else as the default Vector profile.
+    pub fn from_vector_profile(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("none") => Self::TenzirOnly,
+            _ => Self::Vector,
+        }
+    }
+
+    pub fn is_tenzir_only(&self) -> bool {
+        matches!(self, Self::TenzirOnly)
+    }
+
+    /// Stable wire value for `/api/capabilities` (`ingestMode`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::TenzirOnly => "tenzir_only",
+        }
     }
 }
 
@@ -52,7 +146,7 @@ pub struct ApiConfig {
     /// Bearer token for license API authentication
     /// Reads LICENSE_TOKEN (preferred) or HEARTBEAT_TOKEN (legacy) env var.
     pub license_token: Option<String>,
-    /// Unique deployment identifier assigned by nano-main
+    /// Unique deployment identifier assigned by the platform
     pub deployment_id: Option<String>,
     /// Air-gapped install: no outbound internet. Orthogonal to `deployment_mode`
     /// (an air-gap install is still self-hosted), so it's a separate flag rather
@@ -62,22 +156,34 @@ pub struct ApiConfig {
     /// come in via the air-gap import surface instead.
     pub airgap: bool,
     /// Active schema profile selected for this deployment (scoping §2.4).
-    /// Resolved from `NANO_SCHEMA_PROFILE` at boot (`udm` default | `ocsf`).
-    /// Boot fails fast on an unrecognized value (DualPool philosophy, NAN-800).
+    /// Resolved from `NANO_SCHEMA_PROFILE` at boot (unset | `ocsf`; NAN-3491).
+    /// Boot fails fast on any other value, including the removed `udm`.
     /// The resolved `Arc<dyn SchemaProfile>` is threaded into the search path
     /// from `AppState`; this field records the choice for reporting.
     pub schema_id: nanosiem_core::schema::SchemaId,
+    /// Whether this process serves the canonical OCSF 1.9 object-lake lane.
+    ///
+    /// `schema_id` alone cannot express the distinction between the legacy
+    /// ClickHouse OCSF compatibility layout and the strict Iceberg/lake layout.
+    /// Capture the backend choice once at boot so API-owned search services,
+    /// scheduled detections, field validation, and the search microservice all
+    /// resolve the same physical schema.
+    pub canonical_lake_ocsf: bool,
+    /// Ingest mode from `NANO_VECTOR_PROFILE` (NAN-3844). Shared tenants
+    /// always report `Vector`; only an open-core `install.sh --tenzir` sets it.
+    pub ingest_mode: IngestMode,
 }
 
 impl ApiConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
-        // Resolve the active schema profile early; an unrecognized
-        // NANO_SCHEMA_PROFILE is a hard boot failure (fail-fast, NAN-800) rather
-        // than a silent UDM fallback against a possibly-OCSF table.
-        let schema_raw = env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
-        let schema_id = nanosiem_core::schema::SchemaId::from_env_str(&schema_raw)
-            .unwrap_or_else(|e| panic!("{e}"));
+        // NAN-3491: one central resolution of backend + schema. Unset selects
+        // canonical OCSF on the lake; a legacy value (`clickhouse`, `shadow`,
+        // `udm`) is a hard boot failure, never a silent conversion.
+        let runtime =
+            nanosiem_core::schema::runtime_profile_from_env().unwrap_or_else(|e| panic!("{e}"));
+        let schema_id = runtime.schema;
+        let canonical_lake_ocsf = Self::is_canonical_lake_ocsf(runtime);
 
         let cors_origins = env::var("CORS_ORIGINS")
             .unwrap_or_else(|_| "*".to_string())
@@ -85,7 +191,7 @@ impl ApiConfig {
             .map(|s| s.trim().to_string())
             .collect();
 
-        Self {
+        let mut config = Self {
             host: env::var("API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
             port: env::var("API_PORT")
                 .ok()
@@ -98,11 +204,10 @@ impl ApiConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             api_key: env::var("API_KEY").ok(),
-            deployment_mode: match env::var("DEPLOYMENT_MODE").as_deref() {
-                Ok("managed") => DeploymentMode::Managed,
-                Ok("demo") => DeploymentMode::Demo,
-                _ => DeploymentMode::SelfHosted,
-            },
+            deployment_mode: DeploymentMode::from_env_value(
+                env::var("DEPLOYMENT_MODE").ok().as_deref(),
+            )
+            .unwrap_or_else(|error| panic!("{error}")),
             demo_session_ttl_hours: env::var("DEMO_SESSION_TTL_HOURS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -122,6 +227,90 @@ impl ApiConfig {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             schema_id,
+            canonical_lake_ocsf,
+            ingest_mode: IngestMode::from_vector_profile(
+                env::var("NANO_VECTOR_PROFILE").ok().as_deref(),
+            ),
+        };
+        // The hosted-shared substrate has no per-install Vector profile; a
+        // stray NANO_VECTOR_PROFILE there must not switch tenant surfaces off.
+        #[cfg(feature = "enterprise")]
+        if config.deployment_mode.is_enterprise_shared() {
+            config.ingest_mode = IngestMode::Vector;
+        }
+        config
+            .validate_runtime_security()
+            .unwrap_or_else(|error| panic!("{error}"));
+        config
+    }
+
+    /// Whether a resolved runtime profile is the canonical OCSF 1.9 lake lane.
+    /// Since NAN-3491 every profile `runtime_profile_from_env` accepts is.
+    fn is_canonical_lake_ocsf(runtime: nanosiem_core::schema::RuntimeProfile) -> bool {
+        runtime.schema == nanosiem_core::schema::SchemaId::Ocsf
+            && runtime.backend == nanosiem_core::schema::LogQueryBackend::Lake
+    }
+
+    /// Refuse deployment settings that would weaken the shared browser
+    /// boundary. Dedicated/open-core development keeps its existing localhost
+    /// behavior; the hosted profile has no insecure-cookie or wildcard-CORS
+    /// escape hatch.
+    fn validate_runtime_security(&self) -> Result<(), String> {
+        let dev_mode =
+            env::var("NANOSIEM_DEV_MODE").is_ok_and(|value| value.eq_ignore_ascii_case("true"));
+        self.validate_runtime_security_values(dev_mode)
+    }
+
+    fn validate_runtime_security_values(&self, dev_mode: bool) -> Result<(), String> {
+        // Open builds have no shared profile, so there is nothing to refuse.
+        #[cfg(not(feature = "enterprise"))]
+        {
+            let _ = dev_mode;
+            Ok(())
+        }
+        #[cfg(feature = "enterprise")]
+        {
+            if !self.deployment_mode.is_enterprise_shared() {
+                return Ok(());
+            }
+            if dev_mode {
+                return Err(
+                    "CRITICAL SECURITY ERROR: NANOSIEM_DEV_MODE cannot be enabled in enterprise_shared; shared session cookies must always be Secure"
+                        .to_string(),
+                );
+            }
+            if self.cors_origins.is_empty()
+                || self
+                    .cors_origins
+                    .iter()
+                    .any(|origin| origin.is_empty() || origin == "*")
+            {
+                return Err(
+                    "CRITICAL SECURITY ERROR: enterprise_shared requires an explicit HTTPS CORS_ORIGINS allowlist"
+                        .to_string(),
+                );
+            }
+            for origin in &self.cors_origins {
+                let parsed = url::Url::parse(origin).map_err(|_| {
+                    format!(
+                        "CRITICAL SECURITY ERROR: enterprise_shared CORS origin {origin:?} is invalid"
+                    )
+                })?;
+                if parsed.scheme() != "https"
+                    || parsed.host_str().is_none()
+                    || parsed.host_str().is_some_and(|host| host.contains('*'))
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.path() != "/"
+                    || parsed.query().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(format!(
+                        "CRITICAL SECURITY ERROR: enterprise_shared CORS origin {origin:?} must be an exact HTTPS origin without credentials, path, query, or fragment"
+                    ));
+                }
+            }
+            Ok(())
         }
     }
 
@@ -129,8 +318,24 @@ impl ApiConfig {
     /// [`schema_id`](ApiConfig::schema_id) (already validated at
     /// [`from_env`](ApiConfig::from_env)) so AppState can inject it into the
     /// search path without re-reading the environment.
-    pub fn schema_profile(&self) -> std::sync::Arc<dyn nanosiem_core::schema::SchemaProfile> {
-        nanosiem_core::schema::profile_for_id(self.schema_id)
+    ///
+    /// **Boot only.** Under the canonical lake backend this reads the lake
+    /// worker config and parses the signed source manifest it points at (tens
+    /// of MB of JSON), so it must be called exactly once and the resulting
+    /// `Arc` shared — request handlers go through
+    /// `AppState::schema_profile()`. It returns `Result` rather than panicking
+    /// so the single boot caller can refuse to serve: an unresolvable or
+    /// untrusted manifest is fail-closed by design (NAN-2361), never a
+    /// silently empty field inventory.
+    pub fn try_schema_profile(
+        &self,
+    ) -> Result<std::sync::Arc<dyn nanosiem_core::schema::SchemaProfile>, String> {
+        if self.canonical_lake_ocsf {
+            nanosiem_core::schema::lake_ocsf_profile_from_snapshot_env()
+                .map_err(|error| format!("invalid lake schema manifest: {error}"))
+        } else {
+            Ok(nanosiem_core::schema::profile_for_id(self.schema_id))
+        }
     }
 
     /// Get the bind address
@@ -161,6 +366,104 @@ impl ApiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nanosiem_core::schema::SchemaProfile;
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn deployment_mode_requires_explicit_enterprise_shared_profile() {
+        assert_eq!(
+            DeploymentMode::from_env_value(Some("enterprise_shared")),
+            Ok(DeploymentMode::EnterpriseShared)
+        );
+        assert!(DeploymentMode::EnterpriseShared.is_enterprise_shared());
+        assert!(!DeploymentMode::EnterpriseShared.is_managed());
+        assert!(!DeploymentMode::Managed.is_enterprise_shared());
+    }
+
+    #[test]
+    fn deployment_mode_preserves_existing_profiles() {
+        for value in [None, Some(""), Some("selfhosted"), Some("self-hosted")] {
+            assert_eq!(
+                DeploymentMode::from_env_value(value),
+                Ok(DeploymentMode::SelfHosted)
+            );
+        }
+        assert_eq!(
+            DeploymentMode::from_env_value(Some("managed")),
+            Ok(DeploymentMode::Managed)
+        );
+        assert_eq!(
+            DeploymentMode::from_env_value(Some("demo")),
+            Ok(DeploymentMode::Demo)
+        );
+    }
+
+    #[test]
+    fn deployment_mode_rejects_unknown_non_empty_values() {
+        let error = DeploymentMode::from_env_value(Some("enterprise-shared"))
+            .expect_err("an inexact shared profile must fail closed");
+        assert!(error.contains("invalid DEPLOYMENT_MODE"), "{error}");
+
+        assert!(DeploymentMode::from_env_value(Some("Managed")).is_err());
+        assert!(DeploymentMode::from_env_value(Some(" ")).is_err());
+    }
+
+    #[test]
+    fn deployment_mode_system_api_values_are_stable() {
+        assert_eq!(DeploymentMode::Managed.system_api_value(), "managed");
+        #[cfg(feature = "enterprise")]
+        assert_eq!(
+            DeploymentMode::EnterpriseShared.system_api_value(),
+            "enterprise_shared"
+        );
+        assert_eq!(DeploymentMode::SelfHosted.system_api_value(), "self-hosted");
+        assert_eq!(DeploymentMode::Demo.system_api_value(), "self-hosted");
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn enterprise_shared_requires_secure_cookies_and_exact_https_cors_origins() {
+        let shared = ApiConfig {
+            deployment_mode: DeploymentMode::EnterpriseShared,
+            cors_origins: vec!["https://tenant.nano.rs".to_string()],
+            ..ApiConfig::default()
+        };
+        assert!(shared.validate_runtime_security_values(false).is_ok());
+        assert!(shared.validate_runtime_security_values(true).is_err());
+
+        for origins in [
+            vec![],
+            vec!["*".to_string()],
+            vec!["".to_string()],
+            vec!["http://tenant.nano.rs".to_string()],
+            vec!["https://tenant.nano.rs/path".to_string()],
+            vec!["https://user@tenant.nano.rs".to_string()],
+            vec!["https://*.nano.rs".to_string()],
+        ] {
+            let config = ApiConfig {
+                deployment_mode: DeploymentMode::EnterpriseShared,
+                cors_origins: origins,
+                ..ApiConfig::default()
+            };
+            assert!(config.validate_runtime_security_values(false).is_err());
+        }
+    }
+
+    #[test]
+    fn dedicated_profiles_preserve_the_existing_development_cookie_and_cors_policy() {
+        for deployment_mode in [
+            DeploymentMode::Managed,
+            DeploymentMode::SelfHosted,
+            DeploymentMode::Demo,
+        ] {
+            let config = ApiConfig {
+                deployment_mode,
+                cors_origins: vec!["*".to_string()],
+                ..ApiConfig::default()
+            };
+            assert!(config.validate_runtime_security_values(true).is_ok());
+        }
+    }
 
     #[test]
     fn egress_jobs_enabled_by_default() {
@@ -178,6 +481,123 @@ mod tests {
             ..ApiConfig::default()
         };
         assert!(!config.egress_jobs_enabled());
+    }
+
+    #[test]
+    fn canonical_lake_ocsf_profile_is_strict_1_9() {
+        let profile = nanosiem_core::schema::OcsfProfile::try_lake_1_9_with_snapshot_field_types(
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(profile.timestamp_expr(), "time");
+        assert!(profile.is_known_field("src_endpoint.ip"));
+        // NAN-2447 (d4b291b09): product UDM names are query aliases on the
+        // lake profile, so they are "known" — but they must resolve to the
+        // strict OCSF 1.9 column, never to a compatibility column.
+        use nanosiem_core::schema::FieldResolution;
+        assert_eq!(
+            profile.resolve("src_ip"),
+            FieldResolution::ExplicitColumn("src_endpoint.ip".into())
+        );
+        assert_eq!(
+            profile.resolve("timestamp"),
+            FieldResolution::ExplicitColumn("time".into())
+        );
+        assert!(!profile.is_known_field("not_an_ocsf_field"));
+    }
+
+    /// NAN-3491: unset and the hosted `ocsf`+`lake` pair both select the
+    /// canonical lake lane (hosted takes exactly the branch it took before);
+    /// every legacy value is refused at boot.
+    #[test]
+    fn runtime_profile_resolution_selects_the_canonical_lake_lane() {
+        use nanosiem_core::schema::runtime_profile::resolve_runtime_profile;
+        for (schema, backend) in [
+            (None, None),
+            (Some(""), Some("")),
+            (Some("ocsf"), Some("lake")),
+        ] {
+            let runtime = resolve_runtime_profile(schema, backend).unwrap();
+            assert!(ApiConfig::is_canonical_lake_ocsf(runtime));
+            assert_eq!(runtime.schema, nanosiem_core::schema::SchemaId::Ocsf);
+        }
+        for (schema, backend) in [
+            (Some("udm"), None),
+            (None, Some("clickhouse")),
+            (Some("ocsf"), Some("shadow")),
+            (Some("udm"), Some("clickhouse")),
+        ] {
+            assert!(resolve_runtime_profile(schema, backend).is_err());
+        }
+    }
+
+    #[test]
+    fn clickhouse_ocsf_config_preserves_the_compatibility_profile() {
+        let config = ApiConfig {
+            schema_id: nanosiem_core::schema::SchemaId::Ocsf,
+            canonical_lake_ocsf: false,
+            ..ApiConfig::default()
+        };
+
+        let profile = config.try_schema_profile().unwrap();
+        assert_eq!(profile.timestamp_expr(), "timestamp");
+        assert_eq!(profile.table_name(), "nanosiem.ocsf_logs");
+    }
+
+    /// NAN-2361: boot must refuse to serve when the lake manifest cannot be
+    /// resolved. Previously this panicked from inside request handlers; the
+    /// error now travels to the boot caller, but it must still be an error and
+    /// never a profile with an empty field inventory.
+    #[test]
+    fn canonical_lake_boot_fails_closed_on_unreadable_manifest() {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let manifest = std::env::var(nanosiem_core::schema::LAKE_SCHEMA_MANIFEST_ENV).ok();
+        let worker = std::env::var(nanosiem_core::schema::LAKE_WORKER_CONFIG_ENV).ok();
+        std::env::set_var(
+            nanosiem_core::schema::LAKE_SCHEMA_MANIFEST_ENV,
+            "/nonexistent/nan2361/source_manifest.json",
+        );
+        std::env::remove_var(nanosiem_core::schema::LAKE_WORKER_CONFIG_ENV);
+
+        let config = ApiConfig {
+            schema_id: nanosiem_core::schema::SchemaId::Ocsf,
+            canonical_lake_ocsf: true,
+            ..ApiConfig::default()
+        };
+        let error = match config.try_schema_profile() {
+            Err(error) => error,
+            Ok(_) => panic!("unreadable manifest must not yield a usable profile"),
+        };
+        assert!(error.contains("invalid lake schema manifest"), "{error}");
+
+        match manifest {
+            Some(value) => {
+                std::env::set_var(nanosiem_core::schema::LAKE_SCHEMA_MANIFEST_ENV, value)
+            }
+            None => std::env::remove_var(nanosiem_core::schema::LAKE_SCHEMA_MANIFEST_ENV),
+        }
+        if let Some(value) = worker {
+            std::env::set_var(nanosiem_core::schema::LAKE_WORKER_CONFIG_ENV, value);
+        }
+    }
+
+    #[test]
+    fn ingest_mode_is_tenzir_only_only_for_the_installer_none_value() {
+        assert_eq!(IngestMode::from_vector_profile(Some("none")), IngestMode::TenzirOnly);
+        assert_eq!(IngestMode::from_vector_profile(Some(" none\n")), IngestMode::TenzirOnly);
+        for value in [None, Some(""), Some("lean"), Some("NONE"), Some("bogus")] {
+            assert_eq!(IngestMode::from_vector_profile(value), IngestMode::Vector, "{value:?}");
+        }
+        assert_eq!(IngestMode::TenzirOnly.as_str(), "tenzir_only");
+        assert_eq!(IngestMode::Vector.as_str(), "vector");
+        assert_eq!(ApiConfig::default().ingest_mode, IngestMode::Vector);
+    }
+
+    /// Manifest env vars are process-global; serialize the tests that mutate
+    /// them so a parallel run cannot observe another test's window.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
     }
 }
 
@@ -198,6 +618,8 @@ impl Default for ApiConfig {
             deployment_id: None,
             airgap: false,
             schema_id: nanosiem_core::schema::SchemaId::Udm,
+            canonical_lake_ocsf: false,
+            ingest_mode: IngestMode::Vector,
         }
     }
 }

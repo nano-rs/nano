@@ -57,7 +57,7 @@ async fn concurrent_rotation_mints_exactly_one_winner() {
         let old_hash = old_hash.clone();
         let new_hash = format!("new-{i}-{}", Uuid::now_v7());
         handles.push(tokio::spawn(async move {
-            repo.rotate_refresh_token(session.id, &old_hash, &new_hash, new_expires)
+            repo.rotate_refresh_token(session.id, &old_hash, &new_hash, new_expires, None, None)
                 .await
         }));
     }
@@ -101,7 +101,7 @@ async fn replay_of_rotated_token_is_rejected() {
     let new_expires = Utc::now() + Duration::hours(2);
 
     // First rotation succeeds.
-    repo.rotate_refresh_token(session.id, &old_hash, &new_hash, new_expires)
+    repo.rotate_refresh_token(session.id, &old_hash, &new_hash, new_expires, None, None)
         .await
         .expect("first rotation wins");
 
@@ -109,7 +109,7 @@ async fn replay_of_rotated_token_is_rejected() {
     // longer holds it.
     let replay_hash = format!("replay-{}", Uuid::now_v7());
     let err = repo
-        .rotate_refresh_token(session.id, &old_hash, &replay_hash, new_expires)
+        .rotate_refresh_token(session.id, &old_hash, &replay_hash, new_expires, None, None)
         .await
         .expect_err("replay of rotated token must fail");
     assert!(matches!(err, SessionRepositoryError::NotFoundByToken));

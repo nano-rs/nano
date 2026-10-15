@@ -162,6 +162,11 @@ fn report_service(state: &AppState) -> ReportService {
         state.search_service.clone(),
         state.node_id.clone(),
     )
+    .with_denied_source_audit(
+        nanosiem_core::search::denied_source_audit::EmitterDeniedSourceAuditSink::new(
+            state.audit_emitter.clone(),
+        ),
+    )
 }
 
 fn is_admin(auth: &AuthContext) -> bool {

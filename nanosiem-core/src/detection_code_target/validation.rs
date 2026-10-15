@@ -170,19 +170,24 @@ pub fn validate_path_template(template: &str) -> Result<(), TargetValidationErro
         return Err(reject("path template must be relative (no leading '/')"));
     }
     if template.ends_with('/') {
-        return Err(reject("path template must be a file path (no trailing '/')"));
+        return Err(reject(
+            "path template must be a file path (no trailing '/')",
+        ));
     }
     // Filename-safe charset plus `{}` for the `{rule_name}`/`{rule_id}` placeholders.
-    if let Some(bad) = template.chars().find(|c| {
-        !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | '{' | '}'))
-    }) {
+    if let Some(bad) = template
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | '{' | '}')))
+    {
         return Err(reject(format!(
             "path template contains an unsafe character: {bad:?}"
         )));
     }
     for seg in template.split('/') {
         if seg.is_empty() {
-            return Err(reject("path template must not contain an empty path segment"));
+            return Err(reject(
+                "path template must not contain an empty path segment",
+            ));
         }
         if seg == ".." {
             return Err(reject("path template must not contain a '..' segment"));

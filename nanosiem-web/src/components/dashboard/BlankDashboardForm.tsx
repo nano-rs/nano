@@ -16,7 +16,8 @@
  * state here would make both of those impossible without a remount hack.
  */
 
-import { Globe, Info, Loader2, Lock, Plus } from 'lucide-react';
+import { Globe, Info, Lock, Plus } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -142,7 +143,7 @@ export function BlankDashboardForm({
           disabled={submitting || !draft.name.trim()}
         >
           {submitting ? (
-            <Loader2 className="w-[12px] h-[12px] animate-spin" />
+            <LoadingIcon className="w-[12px] h-[12px]" />
           ) : (
             // NAN-2362: a sparkle means "generated with AI". This button makes
             // an EMPTY dashboard, and in open builds there is no AI at all —

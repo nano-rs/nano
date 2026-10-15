@@ -11,6 +11,7 @@ fn extensions() -> Vec<String> {
 
 fn repo_with_kinds(kinds: &[&str]) -> PlaybookRepository {
     PlaybookRepository {
+        sync_started_at: None, sync_lease_expires_at: None,
         id: Uuid::nil(),
         name: "stock".to_string(),
         slug: "nano-rs/playbooks".to_string(),
@@ -39,19 +40,13 @@ fn hunt_readme_is_not_synced_as_a_hunt() {
     // contract itself. A naive *.md walk hands documentation to the hunt
     // parser. The existing category folders have no READMEs, so this case
     // never arose before hunts landed.
-    assert!(!is_syncable_playbook_file(
-        "hunts/README.md",
-        &extensions()
-    ));
+    assert!(!is_syncable_playbook_file("hunts/README.md", &extensions()));
     assert!(!is_syncable_playbook_file("README.md", &extensions()));
     assert!(!is_syncable_playbook_file(
         "identity/readme.MD",
         &extensions()
     ));
-    assert!(!is_syncable_playbook_file(
-        "CONTRIBUTING.md",
-        &extensions()
-    ));
+    assert!(!is_syncable_playbook_file("CONTRIBUTING.md", &extensions()));
 }
 
 #[test]
@@ -142,11 +137,7 @@ fn a_hunts_only_repository_refuses_response_playbooks_and_vice_versa() {
 
 #[test]
 fn an_unknown_category_is_nulled_and_the_row_records_why() {
-    let (category, status, error) = resolve_category(
-        Some("soc-ops".to_string()),
-        "success",
-        None,
-    );
+    let (category, status, error) = resolve_category(Some("soc-ops".to_string()), "success", None);
 
     // Nulled so the INSERT satisfies the CHECK and the row actually lands:
     // browsable and visibly broken beats absent with no diagnostic.
@@ -156,9 +147,18 @@ fn an_unknown_category_is_nulled_and_the_row_records_why() {
     // The message has to name the offending value AND the accepted set — the
     // author is looking at their own file wondering why it did not appear.
     let error = error.expect("an unknown category must record a parse error");
-    assert!(error.contains("soc-ops"), "must name the bad value: {error}");
-    assert!(error.contains("identity"), "must list the accepted set: {error}");
-    assert!(error.contains("email"), "must list the accepted set: {error}");
+    assert!(
+        error.contains("soc-ops"),
+        "must name the bad value: {error}"
+    );
+    assert!(
+        error.contains("identity"),
+        "must list the accepted set: {error}"
+    );
+    assert!(
+        error.contains("email"),
+        "must list the accepted set: {error}"
+    );
 }
 
 #[test]
@@ -166,8 +166,7 @@ fn every_documented_category_passes_through_untouched() {
     // The six values the catalog CHECK accepts. If this list and the CHECK
     // ever diverge, valid playbooks start getting marked failed.
     for valid in ["identity", "endpoint", "cloud", "data", "network", "email"] {
-        let (category, status, error) =
-            resolve_category(Some(valid.to_string()), "success", None);
+        let (category, status, error) = resolve_category(Some(valid.to_string()), "success", None);
         assert_eq!(category, Some(valid.to_string()), "{valid} must survive");
         assert_eq!(status, "success", "{valid} must not be marked failed");
         assert!(error.is_none(), "{valid} must not record an error");

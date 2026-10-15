@@ -15,9 +15,7 @@ use crate::playbooks::{
 use crate::rule_repository::GitHubClient;
 
 use super::super::error::PlaybookRepositoryError;
-use super::super::models::{
-    PlaybookRepository, PlaybookSyncResult, PlaybookSyncStatus,
-};
+use super::super::models::{PlaybookRepository, PlaybookSyncResult, PlaybookSyncStatus};
 use super::super::repository::{
     PlaybookImportsRepository, PlaybookRepoRepository, RepositoryPlaybooksRepository,
 };
@@ -226,7 +224,10 @@ impl PlaybookRepositoryService {
             .map_err(|e| PlaybookRepositoryError::GitHubApi(e.to_string()))?;
 
         if repo.last_sync_commit.as_ref() == Some(&commit) {
-            info!("Playbook repo {} is up to date at commit {}", repo.name, commit);
+            info!(
+                "Playbook repo {} is up to date at commit {}",
+                repo.name, commit
+            );
             return Ok(PlaybookSyncResult {
                 repository_id: id,
                 status: PlaybookSyncStatus::Success,
@@ -277,7 +278,10 @@ impl PlaybookRepositoryService {
             synced_paths.push(entry.path.clone());
 
             // Skip unchanged files
-            let existing = playbooks_repository.find_by_path(id, &entry.path).await.ok();
+            let existing = playbooks_repository
+                .find_by_path(id, &entry.path)
+                .await
+                .ok();
             if let Some(ref e) = existing {
                 if e.file_sha.as_deref() == Some(entry.sha.as_str()) {
                     // Re-apply the kind gate to unchanged rows too, using the
@@ -307,17 +311,16 @@ impl PlaybookRepositoryService {
             };
 
             // Split frontmatter + parse body
-            let (fm, body, parse_status, parse_error, step_count) = match split_frontmatter(&content)
-            {
-                Ok((fm, body)) => {
-                    let tree = parse_playbook(body);
-                    let steps: i32 = (tree.phases.iter().map(|p| p.steps.len()).sum::<usize>()
-                        + tree.steps.len())
-                        as i32;
-                    (fm, body.to_string(), "success", None, Some(steps))
-                }
-                Err(e) => (None, content.clone(), "failed", Some(e.to_string()), None),
-            };
+            let (fm, body, parse_status, parse_error, step_count) =
+                match split_frontmatter(&content) {
+                    Ok((fm, body)) => {
+                        let tree = parse_playbook(body);
+                        let steps: i32 = (tree.phases.iter().map(|p| p.steps.len()).sum::<usize>()
+                            + tree.steps.len()) as i32;
+                        (fm, body.to_string(), "success", None, Some(steps))
+                    }
+                    Err(e) => (None, content.clone(), "failed", Some(e.to_string()), None),
+                };
 
             // The kind comes from the file's own frontmatter — NEVER from the
             // directory it was found in. `playbooks_path` is operator-
@@ -553,11 +556,7 @@ pub(crate) fn resolve_category<'a>(
         // the constraint, which is precisely the silent failure this function
         // exists to prevent.
         Some(ref value) => match PlaybookCategory::parse(value) {
-            Some(known) => (
-                Some(known.as_str().to_string()),
-                parse_status,
-                parse_error,
-            ),
+            Some(known) => (Some(known.as_str().to_string()), parse_status, parse_error),
             None => (
                 None,
                 "failed",

@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import type { MarketplaceCatalogEntry } from '@/lib/api/marketplace';
 import { isIpInfoEntry, CC_BY_SA_4_URL } from '@/lib/api/marketplace';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
+import { humanizeEnum } from '@/lib/marketplace-labels';
 
 export type IntegrationState =
   | 'not'         // not installed
@@ -122,7 +123,7 @@ export function IntegrationCard({ entry, onOpen, onInstall, airGap = false, onIm
         <div className="flex-1 min-w-0">
           <div className="text-[13.5px] font-semibold text-foreground leading-tight truncate">{entry.name}</div>
           <div className="flex items-center gap-1.5 mt-1 text-[10.5px] font-mono text-muted-foreground uppercase tracking-[0.08em]">
-            <span style={{ color: tone }}>{CATEGORY_LABEL[entry.category] || entry.category}</span>
+            <span style={{ color: tone }}>{CATEGORY_LABEL[entry.category] || humanizeEnum(entry.category)}</span>
           </div>
         </div>
         {/* Air-gap mode: every card carries a connectivity signal instead of

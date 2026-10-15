@@ -66,6 +66,8 @@ pub async fn audit_authz_failures(
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let auth = request.extensions().get::<AuthContext>().cloned();
+    #[cfg(feature = "enterprise")]
+    let tenant = request.extensions().get::<nanosiem_core::auth::TrustedTenantContext>().cloned();
     let client = request
         .extensions()
         .get::<ClientContext>()
@@ -84,12 +86,13 @@ pub async fn audit_authz_failures(
         return response;
     };
 
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
     let body_bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to read 403 body for audit emission");
-            return Response::from_parts(parts, Body::empty());
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            Bytes::new()
         }
     };
 
@@ -103,13 +106,35 @@ pub async fn audit_authz_failures(
         return Response::from_parts(parts, Body::from(body_bytes));
     }
 
-    state.emit_audit(build_auth_denied_event(
+    let event = build_auth_denied_event(
         &auth,
         method.as_str(),
         &path,
         &client,
         reason.as_deref(),
-    ));
+        parts.status.as_u16(),
+    );
+    #[cfg(feature = "enterprise")]
+    if state.config.deployment_mode.is_enterprise_shared() {
+        let mut event = event;
+        // Shared API-key claims identify the verified owning user; keep that
+        // actor separate from the delegated key already carried by the event.
+        event.actor_id = Some(auth.user_id());
+        let result = match (state.tenant_ai_rls_runtime.as_ref(), tenant.as_ref()) {
+            (Some(runtime), Some(tenant)) => runtime.tenant_authorization_audit()
+                .record_denial(tenant, auth.user_id(), &event).await,
+            _ => Err(nanosiem_core::audit::AuditEmitError::TenantContextRequired),
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, "tenant authorization denial audit could not commit");
+            return Response::builder().status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"audit_unavailable","message":"Request authorization is temporarily unavailable"}"#))
+                .expect("static audit-unavailable response");
+        }
+        return Response::from_parts(parts, Body::from(body_bytes));
+    }
+    state.emit_audit(event);
 
     Response::from_parts(parts, Body::from(body_bytes))
 }
@@ -120,6 +145,7 @@ fn build_auth_denied_event(
     path: &str,
     client: &ClientContext,
     reason: Option<&str>,
+    status: u16,
 ) -> AuditEvent {
     let actor_id = if auth.is_api_key {
         None
@@ -131,8 +157,11 @@ fn build_auth_denied_event(
         .actor(actor_id, None)
         .api_key(auth.api_key_id, auth.api_key_name.clone())
         .resource("endpoint", None, Some(format!("{} {}", method, path)))
-        .client(client.ip_address.clone(), client.user_agent.clone())
+        .client_context(client)
         .success(false)
+        // The status this middleware is passing back to the caller — known,
+        // not assumed (NAN-3227).
+        .status_code(status)
         .details(json!({
             "method": method,
             "path": path,
@@ -285,7 +314,8 @@ mod tests {
         let client = ClientContext::new(
             Some("203.0.113.7".to_string()),
             Some("Caido/1.0".to_string()),
-        );
+        )
+        .with_request_id(Some("req-0193".to_string()));
 
         let event = build_auth_denied_event(
             &auth,
@@ -293,7 +323,15 @@ mod tests {
             "/api/rules",
             &client,
             Some("Missing required permission: detections:create"),
+            403,
         );
+        // NAN-3227: the per-request id and the status actually returned are
+        // carried to OCSF `api.request.uid` / `status_code`.
+        assert_eq!(event.request_uid.as_deref(), Some("req-0193"));
+        assert_eq!(event.status_code.as_deref(), Some("403"));
+        let ocsf = event.to_ocsf_event(chrono::Utc::now());
+        assert_eq!(ocsf["api"]["request"]["uid"], "req-0193");
+        assert_eq!(ocsf["status_code"], "403");
 
         assert_eq!(event.action, AUTH_DENIED);
         assert!(matches!(event.source, AuditSource::Auth));
@@ -338,6 +376,7 @@ mod tests {
             "/api/users/abc",
             &ClientContext::default(),
             None,
+            403,
         );
 
         // Session callers populate actor_id from the JWT subject.

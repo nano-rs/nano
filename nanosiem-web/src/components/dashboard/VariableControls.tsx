@@ -19,7 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api, type DashboardVariable, type TimeRange } from '@/lib/api';
 import { substituteVariables } from './variable-substitution';
 
@@ -251,7 +251,7 @@ export function VariableControls({
             <>
               {queryCache[variable.name]?.loading ? (
                 <div className="h-[26px] w-[150px] flex items-center justify-center bg-foreground/[0.03] border border-border rounded-md">
-                  <Loader2 className="w-[12px] h-[12px] animate-spin text-muted-foreground" />
+                  <LoadingIcon className="w-[12px] h-[12px] text-muted-foreground" />
                 </div>
               ) : queryCache[variable.name]?.error ? (
                 // NAN-775: surface the full diagnostic inline next to the pill

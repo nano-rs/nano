@@ -1,0 +1,57 @@
+# Map a raw Microsoft Graph user object (Entra ID) to the user_registry columns.
+now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+external_id = to_string(.id) ?? ""
+if external_id == "" {
+    log("entra identity record missing id; dead-lettering", level: "warn")
+    abort
+}
+
+# sync_hash over the raw record (change-detector).
+sync_hash = sha2(encode_json(.), variant: "SHA-256")
+
+# version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+# otherwise stamp now. last_synced_at is the formatted-string form of version.
+version = to_int(.version) ?? 0
+if version <= 0 { version = now_ms }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+# upn + username (local part of UPN before @).
+upn = to_string(.userPrincipalName) ?? ""
+username = upn
+parts = split(upn, "@")
+if length(parts) > 1 { username = parts[0] }
+
+# account_enabled: MS Graph .accountEnabled bool (default true) -> 0/1;
+# account_status derived from it.
+account_enabled = if (to_bool(.accountEnabled) ?? true) { 1 } else { 0 }
+account_status = if account_enabled == 0 { "disabled" } else { "active" }
+
+. = {
+    "provider_id": to_string(.provider_id) ?? "",
+    "external_id": external_id,
+    "username": username,
+    "upn": upn,
+    "email": to_string(.mail) ?? "",
+    "display_name": to_string(.displayName) ?? "",
+    "first_name": to_string(.givenName) ?? "",
+    "last_name": to_string(.surname) ?? "",
+    "department": to_string(.department) ?? "",
+    "title": to_string(.jobTitle) ?? "",
+    "manager_upn": "",
+    "manager_display_name": "",
+    "company": to_string(.companyName) ?? "",
+    "office_location": to_string(.officeLocation) ?? "",
+    "city": to_string(.city) ?? "",
+    "country": to_string(.country) ?? "",
+    "groups": [],
+    "account_enabled": account_enabled,
+    "account_status": account_status,
+    "mfa_enabled": 0,
+    "phone": to_string(.mobilePhone) ?? "",
+    "employee_id": to_string(.employeeId) ?? "",
+    "employee_type": to_string(.employeeType) ?? "employee",
+    "sync_hash": sync_hash,
+    "last_synced_at": last_synced_at,
+    "version": version
+}

@@ -24,11 +24,11 @@ import {
   Folder,
   FolderTree,
   GitCommit,
-  Loader2,
   RefreshCw,
   X,
   XCircle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import type { RuleRepository } from '@/lib/api/rule-repositories';
@@ -86,7 +86,8 @@ export function SideDrawer({
             <X className="w-[13px] h-[13px]" strokeWidth={1.5} />
           </button>
         </div>
-        <div className="flex-1 overflow-auto">{children}</div>
+        {/* min-h-0: without it `flex-1` sizes to content and never scrolls (NAN-2361). */}
+        <div className="flex-1 min-h-0 overflow-auto">{children}</div>
         {footer && (
           <div className="border-t border-border px-4 py-3 shrink-0 bg-card">{footer}</div>
         )}
@@ -125,7 +126,11 @@ export function SyncHistoryDrawer({
       footer={
         <div className="flex items-center gap-2">
           <div className="flex-1 text-[10.5px] text-muted-foreground font-mono">
-            {repo.autoSync !== 'off' ? (
+            {repo.autoSync !== 'off' && repo.nextSync.overdue ? (
+              <span className={repo.lastSync.result === 'failed' ? 'text-destructive' : 'text-warning'}>
+                auto-sync overdue · {repo.nextSync.cadence}
+              </span>
+            ) : repo.autoSync !== 'off' ? (
               <>
                 next auto-sync in{' '}
                 <span className="text-foreground/70">{repo.nextSync.in}</span> ·{' '}
@@ -716,7 +721,8 @@ interface AddRepoProps {
   onSubmit: (req: {
     name: string;
     url: string;
-    branch: string;
+    // Omitted when blank so the server applies its default content branch.
+    branch?: string;
     rules_path: string;
     rule_format: RuleFormat;
     auto_sync_enabled: boolean;
@@ -728,7 +734,7 @@ interface AddRepoProps {
 export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoProps) {
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
-  const [branch, setBranch] = useState('main');
+  const [branch, setBranch] = useState('');
   const [rulesPath, setRulesPath] = useState('');
   const [format, setFormat] = useState<RuleFormat>('nanosiem');
   const [cadence, setCadence] = useState<'off' | 'hourly' | '4h' | 'daily'>('hourly');
@@ -737,7 +743,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
     if (open) {
       setName('');
       setUrl('');
-      setBranch('main');
+      setBranch('');
       setRulesPath('');
       setFormat('nanosiem');
       setCadence('hourly');
@@ -753,7 +759,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
     onSubmit({
       name: name.trim(),
       url: url.trim(),
-      branch: branch.trim() || 'main',
+      branch: branch.trim() || undefined,
       rules_path: rulesPath.trim(),
       rule_format: format,
       auto_sync_enabled: cadence !== 'off',
@@ -809,6 +815,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
           <Field label="Branch">
             <input
               value={branch}
+              placeholder="Automatic"
               onChange={(e) => setBranch(e.target.value)}
               className="w-full h-[30px] px-2.5 rounded-md border border-border bg-card text-[12px] font-mono focus:outline-none focus:border-primary"
             />
@@ -1029,7 +1036,7 @@ export function FolderSelectionDrawer({
             className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
           >
             {isPending && selected.size > 0 ? (
-              <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
+              <LoadingIcon className="w-[11px] h-[11px]" strokeWidth={1.5} />
             ) : (
               <RefreshCw className="w-[11px] h-[11px]" strokeWidth={1.5} />
             )}
@@ -1042,7 +1049,7 @@ export function FolderSelectionDrawer({
             className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium disabled:opacity-60 flex items-center gap-1.5"
           >
             {isPending && selected.size === 0 ? (
-              <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
+              <LoadingIcon className="w-[11px] h-[11px]" strokeWidth={1.5} />
             ) : (
               <FolderTree className="w-[11px] h-[11px]" strokeWidth={1.5} />
             )}
@@ -1101,7 +1108,7 @@ export function FolderSelectionDrawer({
 
         {isLoading ? (
           <div className="flex items-center justify-center py-8 text-muted-foreground">
-            <Loader2 className="w-5 h-5 animate-spin" strokeWidth={1.5} />
+            <LoadingIcon className="w-5 h-5" strokeWidth={1.5} />
           </div>
         ) : folders.length === 0 ? (
           <div className="text-center py-8">

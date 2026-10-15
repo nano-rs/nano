@@ -299,7 +299,7 @@ pub struct Case {
     pub ai_confidence: Option<f64>,
     #[serde(default)]
     pub ai_recommended_action: Option<String>,
-    /// AI-recommended severity (NAN-1297). Drives symmetric re-triage:
+    /// AI-recommended severity. Drives symmetric re-triage:
     /// escalate severity + priority on actionable verdicts.
     #[serde(default)]
     pub ai_recommended_severity: Option<String>,
@@ -458,11 +458,11 @@ pub struct CaseWithDetails {
     /// `None` when the case has no active pending state.
     #[serde(default)]
     pub pending_state: Option<CasePendingState>,
-    /// Latest open peer-to-peer handoff on this case (NAN-420). `None` when
+    /// Latest open peer-to-peer handoff on this case. `None` when
     /// no pending/offered handoff is currently in flight.
     #[serde(default)]
     pub active_handoff: Option<ActiveHandoffSummary>,
-    /// Live-collaboration presence summary (NAN-420). Currently just a
+    /// Live-collaboration presence summary. Currently just a
     /// viewer count; expanded later to carry avatars.
     #[serde(default)]
     pub collab_presence: CollabPresenceSummary,
@@ -585,8 +585,8 @@ pub struct NewCase {
 /// path (`POST /api/cases/{id}/status` → `change_status`), which enforces the
 /// `CASES_CLOSE` permission and runs the full close pipeline (timestamps, wall
 /// entry, workflow event, close note, webhook, audit). Routing status through
-/// this generic `update` (gated only on `CASES_EDIT`) bypassed all of that
-/// (NAN-1742).
+/// this generic `update` (gated only on `CASES_EDIT`) bypassed all of that.
+///
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCase {
     pub title: Option<String>,
@@ -867,7 +867,7 @@ pub struct RelatedCaseSummary {
     pub shared_entity_count: i64,
     /// Actor who linked this relation. `None` for auto-detected (entity
     /// intersection) relations; `Some(user_id)` for manual links added via
-    /// `POST /api/cases/{id}/related` (NAN-431). The UI surfaces this to
+    /// `POST /api/cases/{id}/related`. The UI surfaces this to
     /// distinguish analyst-confirmed links from the algorithmic ones.
     #[serde(default, with = "typeid::user::opt")]
     #[schema(value_type = Option<String>)]
@@ -878,7 +878,7 @@ pub struct RelatedCaseSummary {
     pub reason: Option<String>,
 }
 
-/// Duplicate-candidate result (NAN-421).
+/// Duplicate-candidate result.
 ///
 /// Surfaced by the dedup detector (`GET /api/cases/:id/duplicates`). Each
 /// candidate represents another case that shares enough signal with the
@@ -1592,7 +1592,7 @@ pub struct CasePendingState {
 
 /// Summary of the latest open handoff on a case, surfaced on the list
 /// response so the Cases page can render a "handoff to X" pill on rows
-/// without fetching the full case detail (NAN-420).
+/// without fetching the full case detail.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ActiveHandoffSummary {
     /// Handoff row id. Kept as a plain UUID schema — the list indicator
@@ -1617,7 +1617,7 @@ pub struct ActiveHandoffSummary {
 }
 
 /// Collaboration presence summary for a case on the list response
-/// (NAN-420). Currently surfaces only a viewer count; expanded to carry
+/// Currently surfaces only a viewer count; expanded to carry
 /// avatars + presence dots in a follow-up.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CollabPresenceSummary {

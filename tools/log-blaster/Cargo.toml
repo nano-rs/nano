@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "High-performance SIEM log generator using real telemetry profiles"
+default-run = "log-blaster"
 
 [dependencies]
 event-core = { path = "../event-core" }

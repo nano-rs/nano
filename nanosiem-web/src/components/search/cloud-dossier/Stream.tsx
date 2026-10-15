@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { List, Search, Filter as FilterIcon, Copy, Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { formatCellValue } from '@/lib/format-cell-value';
 import type { CloudDossierStreamEvent } from '@/lib/api/types';
 
 interface StreamProps {
@@ -93,7 +94,9 @@ function serviceAccent(service: string): string {
 }
 
 function truncateVal(v: unknown): string {
-  const s = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+  // NAN-2361 (audit bug 4): comma-join scalar arrays instead of leaking
+  // `["value"]` JSON into the stream; nested shapes still fall through to JSON.
+  const s = formatCellValue(v);
   if (s.length > 52) return s.slice(0, 48) + '…';
   return s;
 }
@@ -401,8 +404,8 @@ function EventRow({
         <div className="flex-1 min-w-0 flex items-center gap-x-3 overflow-hidden whitespace-nowrap">
           {summaryEntries.slice(0, 4).map(([k, v]) => {
             const udmField = STREAM_FIELD_MAP[k];
-            const rawValue =
-              typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+            // NAN-2361 (audit bug 4): scalar arrays comma-join, not JSON
+            const rawValue = formatCellValue(v);
             const clickable = !!onPivotField && !!udmField && rawValue.length > 0;
             return (
               <span key={k} className="inline-flex items-baseline gap-1 whitespace-nowrap">
@@ -472,7 +475,8 @@ function EventRow({
           <div className="pl-[100px] pr-4 grid grid-cols-[150px_1fr] gap-y-[3px] gap-x-4 font-mono text-[11.5px]">
             {Object.entries(ev.detail ?? {}).map(([k, v]) => {
               const isAccent = CLOUD_ACCENT_KEYS.has(k);
-              const display = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+              // NAN-2361 (audit bug 4): scalar arrays comma-join, not JSON
+              const display = formatCellValue(v);
               const udmField = STREAM_FIELD_MAP[k];
               const clickable = !!onPivotField && !!udmField && display.length > 0;
               return (

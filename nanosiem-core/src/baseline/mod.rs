@@ -51,7 +51,7 @@ pub const NEW_TO_ENTITY_ROW_CAP: usize = 100;
 pub const MAX_PEERS_SHOWN: usize = 12;
 
 /// New-to-entity values kept per dimension.
-const MAX_NEW_SHOWN: usize = 15;
+pub const MAX_NEW_SHOWN: usize = 15;
 
 /// Env-configurable positive day count within `[1, 365]`, or the default.
 fn env_days(var: &str, default: i64) -> i64 {
@@ -64,7 +64,10 @@ fn env_days(var: &str, default: i64) -> i64 {
 
 /// Days of activity history for rhythm/volume (agg-served, cheap).
 pub fn activity_days() -> i64 {
-    env_days("NANOSIEM_SHADOW_BASELINE_ACTIVITY_DAYS", DEFAULT_ACTIVITY_DAYS)
+    env_days(
+        "NANOSIEM_SHADOW_BASELINE_ACTIVITY_DAYS",
+        DEFAULT_ACTIVITY_DAYS,
+    )
 }
 
 /// Days the new-to-entity check looks back (raw-log scan, deliberately short).
@@ -119,7 +122,9 @@ impl BaselineSpans {
     /// Length of the current window in minutes — used to normalise its event count
     /// to a per-hour rate for the volume comparison.
     pub fn incident_minutes(&self) -> i64 {
-        (self.incident_end - self.incident_start).num_minutes().max(1)
+        (self.incident_end - self.incident_start)
+            .num_minutes()
+            .max(1)
     }
 
     /// Exclusive upper bound for agg buckets — the start of the incident's clock
@@ -357,7 +362,10 @@ impl ActivitySummary {
 /// because coverage's job is whether "absent from the new window" is trustworthy.
 /// The activity window is upper-bounded at [`BaselineSpans::coverage_end`] to drop
 /// the straddling incident-hour bucket.
-pub fn summarize_activity(buckets: &[(DateTime<Utc>, u64)], spans: &BaselineSpans) -> ActivitySummary {
+pub fn summarize_activity(
+    buckets: &[(DateTime<Utc>, u64)],
+    spans: &BaselineSpans,
+) -> ActivitySummary {
     use std::collections::BTreeSet;
 
     let mut hour_hist: HashMap<u32, u64> = HashMap::new();

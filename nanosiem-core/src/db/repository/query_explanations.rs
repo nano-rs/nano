@@ -62,6 +62,39 @@ pub struct NewQueryExplanation {
     pub suggested_time_range: Option<String>,
 }
 
+/// NAN-2049: fingerprint the caller's effective source-scope deny-set for the
+/// query-explanation cache key. The deny-set is a sorted `BTreeSet`, so the
+/// encoding is stable across requests: callers with the same effective
+/// visibility share cache entries (shared-URL explanations keep working), while
+/// a differently-scoped caller gets a distinct key and its own scope-correct
+/// entry. The empty (unrestricted) deny-set yields `""`.
+///
+/// NAN-2219: BOTH halves of the effective scope are encoded. The cached
+/// `generated_sql` is scope-specific, and the artifact half selects a
+/// different prevalence shape, so two callers sharing only the row-filter half
+/// must not share an entry. The halves are separated by a length-prefixed
+/// marker so the concatenation stays injective across the boundary.
+///
+/// Shared by the dedicated handler (`nanosiem-api/src/handlers/search.rs`) and
+/// the tenant port (`shared_search_extras`) so both profiles key
+/// the cache identically (NAN-2361).
+pub fn explanation_scope_fingerprint(scope: &crate::auth::ScopeSet) -> String {
+    let row = encode_scope_fingerprint(scope.deny_set().iter().map(String::as_str));
+    let artifact = encode_scope_fingerprint(scope.artifact_deny_set().iter().map(String::as_str));
+    format!("{}:{}{}", row.len(), row, artifact)
+}
+
+/// Canonical, injective encoding of a set of source-type names (NAN-2049).
+///
+/// Each element is length-prefixed (`<byte-len>:<value>`) so the concatenation
+/// is unambiguous even when a value contains the delimiter — source names are
+/// only trimmed/lowercased on the way in and PostgreSQL accepts embedded
+/// newlines, so a naive `join` would let `{"a","b"}` and `{"a\nb"}` collide.
+/// Input order must be stable (the caller passes a sorted `BTreeSet`).
+pub fn encode_scope_fingerprint<'a>(sources: impl Iterator<Item = &'a str>) -> String {
+    sources.map(|s| format!("{}:{}", s.len(), s)).collect()
+}
+
 /// Repository for query explanation operations
 pub struct QueryExplanationRepository {
     pool: PgPool,
@@ -100,6 +133,10 @@ impl QueryExplanationRepository {
     /// Store a query explanation (upsert - updates if exists), bound to the
     /// caller's effective source-scope fingerprint (NAN-2049 — see
     /// [`compute_query_hash`](Self::compute_query_hash)).
+    ///
+    /// NAN-2361 (9001060): `query_explanations` is tenant-scoped with PRIMARY
+    /// KEY `(tenant_id, query_hash)`; this dedicated insert takes the
+    /// compatibility-tenant DEFAULT, so the conflict target leads with it.
     pub async fn upsert(
         &self,
         data: &NewQueryExplanation,
@@ -118,13 +155,13 @@ impl QueryExplanationRepository {
             .map(|fields| serde_json::to_value(fields).unwrap_or(serde_json::Value::Null));
 
         let row = sqlx::query_as::<_, QueryExplanation>(
-            r#"
+            concat!(r#"
             INSERT INTO query_explanations (
                 query_hash, query, query_mode, natural_language_prompt,
                 explanation, reasoning_steps, fields_used, generated_sql,
                 complexity, suggested_time_range
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT (query_hash) DO UPDATE SET
+            ON CONFLICT ("#, crate::tenant_key!(), r#"query_hash) DO UPDATE SET
                 explanation = COALESCE(EXCLUDED.explanation, query_explanations.explanation),
                 reasoning_steps = COALESCE(EXCLUDED.reasoning_steps, query_explanations.reasoning_steps),
                 fields_used = COALESCE(EXCLUDED.fields_used, query_explanations.fields_used),
@@ -134,7 +171,7 @@ impl QueryExplanationRepository {
                 natural_language_prompt = COALESCE(EXCLUDED.natural_language_prompt, query_explanations.natural_language_prompt),
                 updated_at = NOW()
             RETURNING *
-            "#,
+            "#),
         )
         .bind(&query_hash)
         .bind(&data.query)

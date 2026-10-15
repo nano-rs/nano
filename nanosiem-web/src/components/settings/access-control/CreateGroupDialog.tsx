@@ -15,7 +15,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { Layers, Search as SearchIcon, X, Check, Loader2 } from 'lucide-react';
+import { Layers, Search as SearchIcon, X, Check } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import {
@@ -322,7 +323,7 @@ export function CreateGroupDialog({
             Cancel
           </Button>
           <Button size="sm" onClick={handleSubmit} disabled={!canSubmit} className="h-7 text-[11.5px]">
-            {saving && <Loader2 className="w-3 h-3 animate-spin" />}
+            {saving && <LoadingIcon className="w-3 h-3" />}
             {isEditing ? 'Save changes' : 'Create group'}
           </Button>
         </SheetFooter>

@@ -16,4 +16,4 @@ pub use groups::{GroupRepository, GroupRepositoryError};
 pub use oidc::{OidcAuthTransaction, OidcRepository, OidcRepositoryError};
 pub use roles::{RoleRepository, RoleRepositoryError};
 pub use sessions::{SessionRepository, SessionRepositoryError};
-pub use users::{UserRepository, UserRepositoryError};
+pub use users::{BackupCodeRotation, SharedMfaSetupAuthority, UserRepository, UserRepositoryError};

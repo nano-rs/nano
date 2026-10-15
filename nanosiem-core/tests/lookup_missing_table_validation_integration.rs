@@ -16,8 +16,11 @@ use nanosiem_core::{ColumnType, LookupColumn, LookupRepository, LookupService, N
 fn lookup_cmd(table: &str) -> LookupCommandInfo {
     LookupCommandInfo {
         table_name: table.to_string(),
+        event_field: "src_ip".to_string(),
         key_field: "src_ip".to_string(),
         output_fields: None,
+        output_renames: Vec::new(),
+        output_new: false,
         case_insensitive: false,
     }
 }

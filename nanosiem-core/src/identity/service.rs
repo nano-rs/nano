@@ -5,16 +5,18 @@
 //! Orchestrates sync operations: load config → decrypt creds → attempt delta sync
 //! → fall back to full sync → bulk upsert → soft-delete absent → update status.
 
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
-use crate::enrichment::EnrichmentLaneClient;
+use super::gate::{verdict, IdentityRecordGate, NormalizerOrigin, SyncTally, SyncVerdict};
 use super::repository::{IdentityRepository, IdentityRepositoryError};
 use super::sync::{
     entra::EntraIdSync, google::GoogleWorkspaceSync, okta::OktaSync, workday::WorkdaySync,
     SyncError, SyncProvider,
 };
 use super::types::*;
+use crate::enrichment::EnrichmentLaneClient;
 
 // =============================================================================
 // Error
@@ -32,6 +34,12 @@ pub enum IdentityServiceError {
     InvalidProviderType(String),
     #[error("Sync already in progress for provider: {0}")]
     SyncInProgress(String),
+    /// NAN-3483: no usable normalizer for the provider's lane source.
+    #[error("No identity normalizer: {0}")]
+    NoNormalizer(String),
+    /// NAN-3483: the normalizer rejected every record the provider returned.
+    #[error("Sync dead-lettered every record: {0}")]
+    AllRecordsDeadLettered(String),
 }
 
 // =============================================================================
@@ -177,9 +185,28 @@ impl IdentitySyncService {
                     duration_ms: start.elapsed().as_millis() as u64,
                     error: None,
                     is_delta: false,
+                    records_total: 0,
+                    records_dead_lettered: 0,
                 });
             }
         };
+
+        // NAN-3483: resolve the normalizer the lane runs for this source and
+        // run every record through it as it is emitted, so the status can say
+        // how many the lane dead-letters instead of `completed`. Records are
+        // not filtered here; Vector stays the one ingest path.
+        let gate = match self.identity_gate(&provider.provider_type).await {
+            Ok(gate) => Arc::new(gate),
+            Err(e) => {
+                let err_msg = e.to_string();
+                error!(provider_id, error = %err_msg, "Sync refused: no usable identity normalizer");
+                self.repo
+                    .finish_sync(provider_id, "failed", Some(&err_msg), None, None, None)
+                    .await?;
+                return Err(e);
+            }
+        };
+        let tally = Arc::new(Mutex::new(SyncTally::default()));
 
         // Attempt delta sync first, fall back to full
         let result = self
@@ -189,44 +216,91 @@ impl IdentitySyncService {
                 &credentials,
                 &config,
                 sync_impl.as_ref(),
+                &gate,
+                &tally,
             )
             .await;
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        match &result {
-            Ok(_sync_result) => {
+        let counts = tally.lock().map(|t| t.clone()).unwrap_or_default();
+        match result {
+            Ok(mut sync_result) => {
+                let outcome = verdict(&counts, &gate);
+                sync_result.error = outcome.error().map(str::to_string);
+                if outcome != SyncVerdict::Completed {
+                    warn!(
+                        provider_id,
+                        records_total = counts.total,
+                        records_dead_lettered = counts.dead_lettered,
+                        status = outcome.status(),
+                        "Identity sync dead-lettered records"
+                    );
+                }
                 let user_count = self.repo.get_user_count(provider_id).await.unwrap_or(0) as i32;
                 self.repo
-                    .update_sync_status(
+                    .finish_sync(
                         provider_id,
-                        "completed",
-                        None,
+                        outcome.status(),
+                        outcome.error(),
                         Some(user_count),
                         Some(duration_ms as i64),
-                        None,
+                        Some(&counts),
                     )
                     .await?;
-                // sync_result is already populated with duration_ms from below
+                match outcome {
+                    SyncVerdict::Failed(message) => {
+                        Err(IdentityServiceError::AllRecordsDeadLettered(message))
+                    }
+                    _ => Ok(sync_result),
+                }
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 error!(provider_id, error = %err_msg, "Sync failed");
                 self.repo
-                    .update_sync_status(
+                    .finish_sync(
                         provider_id,
                         "failed",
                         Some(&err_msg),
                         None,
                         Some(duration_ms as i64),
-                        None,
+                        Some(&counts),
                     )
                     .await?;
+                Err(e)
             }
         }
-
-        result
     }
 
+    /// NAN-3483: the gate for a provider type's lane source: the imported,
+    /// enabled enrichment parser for the source when there is one (what the
+    /// generated lane deploys), else the built-in normalizer. A provider type
+    /// with neither fails loudly — never silently into another source's VRL.
+    async fn identity_gate(
+        &self,
+        provider_type: &str,
+    ) -> Result<IdentityRecordGate, IdentityServiceError> {
+        let source = Self::provider_source(provider_type).ok_or_else(|| {
+            IdentityServiceError::NoNormalizer(format!(
+                "provider type '{provider_type}' has no enrichment-lane source"
+            ))
+        })?;
+        let (origin, vrl) = match self.repo.deployed_identity_normalizer(source).await? {
+            Some((name, vrl)) => (NormalizerOrigin::Imported(name), vrl),
+            None => {
+                let builtin = super::normalizers::builtin_identity_normalizer(source)
+                    .ok_or_else(|| {
+                        IdentityServiceError::NoNormalizer(format!(
+                            "source '{source}' has no built-in normalizer and no enabled enrichment parser"
+                        ))
+                    })?;
+                (NormalizerOrigin::Builtin, builtin.normalize_vrl.to_string())
+            }
+        };
+        IdentityRecordGate::new(source, origin, &vrl).map_err(IdentityServiceError::NoNormalizer)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn do_sync(
         &self,
         provider_id: &str,
@@ -234,6 +308,8 @@ impl IdentitySyncService {
         credentials: &serde_json::Value,
         config: &serde_json::Value,
         sync_impl: &dyn SyncProvider,
+        gate: &Arc<IdentityRecordGate>,
+        tally: &Arc<Mutex<SyncTally>>,
     ) -> Result<IdentitySyncResult, IdentityServiceError> {
         let start = std::time::Instant::now();
         // NAN-1151: providers now fetch RAW user objects and we emit them onto
@@ -242,7 +318,12 @@ impl IdentitySyncService {
         // fire-and-forget, so deprovisioning is the staleness reconciler's job
         // (scheduler) — NOT a synchronous mark-absent here, which would race the
         // async writes and false-delete the just-emitted users.
-        let source = Self::provider_source(&provider.provider_type);
+        // NAN-3483: every record is still emitted (Vector normalizes and
+        // dead-letters); `tally` counts the ones its normalizer will reject so
+        // the status can say so.
+        let source = Self::provider_source(&provider.provider_type).ok_or_else(|| {
+            IdentityServiceError::InvalidProviderType(provider.provider_type.clone())
+        })?;
 
         // Try delta sync first — delta results are bounded (only changed users).
         if let Some(delta_link) = &provider.delta_link {
@@ -263,12 +344,12 @@ impl IdentitySyncService {
                         .await?;
                 }
 
-                let users_synced = delta_result.users.len() as u64;
                 let records: Vec<serde_json::Value> = delta_result
                     .users
                     .into_iter()
                     .map(|u| Self::tag_enrich_value(u, source, provider_id))
                     .collect();
+                let users_synced = Self::tally(gate, tally, &records);
                 self.lane_client.push_records(&records).await.map_err(|e| {
                     IdentityServiceError::Sync(SyncError::StorageError(e.to_string()))
                 })?;
@@ -280,16 +361,13 @@ impl IdentitySyncService {
                     "Delta sync emitted to enrichment lane"
                 );
 
-                return Ok(IdentitySyncResult {
-                    provider_id: provider_id.to_string(),
+                return Ok(Self::sync_result(
+                    provider_id,
                     users_synced,
-                    users_created: 0,
-                    users_updated: 0,
-                    users_disabled: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    error: None,
-                    is_delta: true,
-                });
+                    start,
+                    true,
+                    tally,
+                ));
             }
             info!(
                 provider_id,
@@ -297,26 +375,28 @@ impl IdentitySyncService {
             );
         }
 
-        // Full sync — paged to keep memory bounded; each page is tagged and
-        // emitted to the lane, then dropped.
+        // Full sync — paged to keep memory bounded; each page is tagged,
+        // tallied and emitted to the lane, then dropped.
         let lane = self.lane_client.clone();
         let pid = provider_id.to_string();
         let src = source.to_string();
 
         let users_synced = sync_impl
             .full_sync_paged(credentials, config, &|page: Vec<serde_json::Value>| {
-                let count = page.len() as u64;
                 let lane = lane.clone();
                 let pid = pid.clone();
                 let src = src.clone();
+                let gate = Arc::clone(gate);
+                let tally = Arc::clone(tally);
                 Box::pin(async move {
                     let records: Vec<serde_json::Value> = page
                         .into_iter()
                         .map(|u| IdentitySyncService::tag_enrich_value(u, &src, &pid))
                         .collect();
-                    lane.push_records(&records).await.map_err(|e| {
-                        SyncError::StorageError(format!("Lane push failed: {}", e))
-                    })?;
+                    let count = IdentitySyncService::tally(&gate, &tally, &records);
+                    lane.push_records(&records)
+                        .await
+                        .map_err(|e| SyncError::StorageError(format!("Lane push failed: {}", e)))?;
                     Ok(count)
                 })
             })
@@ -327,7 +407,44 @@ impl IdentitySyncService {
             users_synced, "Full sync emitted to enrichment lane"
         );
 
-        Ok(IdentitySyncResult {
+        Ok(Self::sync_result(
+            provider_id,
+            users_synced,
+            start,
+            false,
+            tally,
+        ))
+    }
+
+    /// Count, in `tally`, the records the lane will dead-letter (they are
+    /// still all emitted: Vector is the ingest path). Returns how many the
+    /// normalizer will map.
+    fn tally(
+        gate: &IdentityRecordGate,
+        tally: &Mutex<SyncTally>,
+        records: &[serde_json::Value],
+    ) -> u64 {
+        let mut page = SyncTally::default();
+        gate.tally(records, &mut page);
+        if let Ok(mut tally) = tally.lock() {
+            tally.total += page.total;
+            tally.dead_lettered += page.dead_lettered;
+            if tally.first_reason.is_none() {
+                tally.first_reason = page.first_reason.clone();
+            }
+        }
+        page.synced()
+    }
+
+    fn sync_result(
+        provider_id: &str,
+        users_synced: u64,
+        start: std::time::Instant,
+        is_delta: bool,
+        tally: &Mutex<SyncTally>,
+    ) -> IdentitySyncResult {
+        let counts = tally.lock().map(|t| t.clone()).unwrap_or_default();
+        IdentitySyncResult {
             provider_id: provider_id.to_string(),
             users_synced,
             users_created: 0,
@@ -335,20 +452,24 @@ impl IdentitySyncService {
             users_disabled: 0, // deprovisioning handled by the staleness reconciler
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
-            is_delta: false,
-        })
+            is_delta,
+            records_total: counts.total,
+            records_dead_lettered: counts.dead_lettered,
+        }
     }
 
     /// Map an identity provider_type to its enrichment-lane `source`
     /// discriminator (must match the parsers-repo `enrich_source`). NAN-1151.
-    fn provider_source(provider_type: &str) -> &'static str {
+    /// NAN-3483: `None` for a type with no pull source, so the caller fails
+    /// loudly rather than tagging records `unknown`.
+    fn provider_source(provider_type: &str) -> Option<&'static str> {
         match provider_type {
-            "entra_id" => "entra",
-            "google_workspace" => "google",
-            "okta" => "okta",
-            "workday" => "workday",
+            "entra_id" => Some("entra"),
+            "google_workspace" => Some("google"),
+            "okta" => Some("okta"),
+            "workday" => Some("workday"),
             // active_directory flows via /push (source=ad), not this pull path.
-            _ => "unknown",
+            _ => None,
         }
     }
 
@@ -490,4 +611,3 @@ impl IdentitySyncService {
         Ok(self.repo.get_stats().await?)
     }
 }
-

@@ -201,7 +201,10 @@ fn trailing_backslash_value_is_literal() {
     fn first_str(q: &Query) -> Option<String> {
         fn walk(e: &SearchExpr) -> Option<String> {
             match e {
-                SearchExpr::FieldFilter { value: Value::String(s), .. } => Some(s.clone()),
+                SearchExpr::FieldFilter {
+                    value: Value::String(s),
+                    ..
+                } => Some(s.clone()),
                 SearchExpr::And(a, b) | SearchExpr::Or(a, b) => walk(a).or_else(|| walk(b)),
                 SearchExpr::Not(x) | SearchExpr::Group(x) => walk(x),
                 _ => None,
@@ -333,4 +336,54 @@ fn arithmetic_where_uses_eval_predicate_only_for_the_computed_leaf() {
         panic!("pretty-printed query did not reparse: {printed}: {error:?}")
     });
     assert_eq!(reparsed, parsed, "pretty-print round trip changed the AST");
+}
+
+/// NAN-3384: the right side of a comparison is an operand, not a boolean.
+/// `time >= now() - INTERVAL 2 HOUR AND time < now() - INTERVAL 1 HOUR` parsed
+/// its first RHS with the full eval grammar, which swallowed `AND time < …`
+/// into `time >= (A AND time < B)` → ClickHouse `Illegal type (DateTime) of
+/// argument of function and`. Both comparisons must be siblings under AND, in
+/// `where` and in the search grammar, for function, field-reference and
+/// parenthesized right sides alike.
+#[test]
+fn comparison_rhs_does_not_swallow_a_following_and_nan3384() {
+    use crate::query::{Command, Query, SearchExpr};
+
+    fn assert_two_comparisons(condition: &SearchExpr, query: &str) {
+        match condition {
+            SearchExpr::And(left, right) => {
+                for side in [left, right] {
+                    assert!(
+                        matches!(side.as_ref(), SearchExpr::FieldFunctionFilter { .. }),
+                        "{query}: each side must be its own comparison: {condition:?}"
+                    );
+                }
+            }
+            other => panic!("{query}: expected AND of two comparisons, got {other:?}"),
+        }
+    }
+
+    for query in [
+        "* | where time >= now() - INTERVAL 2 HOUR AND time < now() - INTERVAL 1 HOUR",
+        "* | where time >= now() - INTERVAL 2 HOUR && time < now() - INTERVAL 1 HOUR",
+        "* | where last_seen > first_seen AND last_seen < now()",
+        "* | where bytes_out > (bytes_in * 2) AND bytes_out < (bytes_in * 10)",
+    ] {
+        match parse_query(query).unwrap() {
+            Query::Piped {
+                command: Command::Where { condition },
+                ..
+            } => assert_two_comparisons(&condition, query),
+            other => panic!("expected piped where query, got {other:?}"),
+        }
+    }
+
+    // OR keeps OR at the top (lower precedence than AND).
+    match parse_query("* | where time < now() - INTERVAL 2 HOUR OR time > now() - INTERVAL 1 HOUR").unwrap() {
+        Query::Piped {
+            command: Command::Where { condition },
+            ..
+        } => assert!(matches!(condition, SearchExpr::Or(..)), "{condition:?}"),
+        other => panic!("expected piped where query, got {other:?}"),
+    }
 }

@@ -8,7 +8,8 @@
  */
 
 import { useState, useMemo } from 'react';
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { useQuery } from '@tanstack/react-query';
+import { DetailSheet, useDetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
@@ -16,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { CircleAlert, CircleCheck, Copy, ArrowRight, FileCode, AlertTriangle } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { api } from '@/lib/api';
 import YAML from 'yaml';
 
 interface SigmaConverterProps {
@@ -120,6 +122,62 @@ const FIELD_MAPPINGS: Record<string, string> = {
   'ComputerName': 'host',
 };
 
+type QuerySchema = 'udm' | 'ocsf';
+
+// Exact OCSF 1.9 query paths. Concepts without a standard OCSF home are kept
+// under `unmapped`, matching the producer contract instead of inventing Nano
+// aliases in the lake schema.
+const OCSF_FIELD_MAPPINGS: Record<string, string> = {
+  Image: 'process.file.path',
+  OriginalFileName: 'process.name',
+  CommandLine: 'process.cmd_line',
+  ParentImage: 'actor.process.file.path',
+  ParentCommandLine: 'actor.process.cmd_line',
+  User: 'user.name',
+  ProcessId: 'process.pid',
+  ParentProcessId: 'actor.process.pid',
+  IntegrityLevel: 'unmapped.integrity_level',
+  Hashes: 'process.file.hashes.value',
+  md5: 'file.hashes.value',
+  sha1: 'file.hashes.value',
+  sha256: 'file.hashes.value',
+  imphash: 'file.hashes.value',
+  DestinationIp: 'dst_endpoint.ip',
+  DestinationPort: 'dst_endpoint.port',
+  DestinationHostname: 'dst_endpoint.hostname',
+  SourceIp: 'src_endpoint.ip',
+  SourcePort: 'src_endpoint.port',
+  SourceHostname: 'src_endpoint.hostname',
+  Protocol: 'connection_info.protocol_num',
+  TargetFilename: 'file.path',
+  FileName: 'file.name',
+  FilePath: 'file.path',
+  TargetObject: 'reg_key.path',
+  Details: 'reg_value.data',
+  EventType: 'activity_name',
+  LogonType: 'auth_protocol',
+  TargetUserName: 'user.name',
+  TargetDomainName: 'user.domain',
+  SubjectUserName: 'actor.user.name',
+  SubjectDomainName: 'actor.user.domain',
+  IpAddress: 'src_endpoint.ip',
+  WorkstationName: 'device.hostname',
+  Status: 'status',
+  QueryName: 'query.hostname',
+  QueryResults: 'answers.rdata',
+  query: 'query.hostname',
+  'cs-uri-query': 'http_request.url.url_string',
+  'c-uri': 'http_request.url.url_string',
+  'cs-method': 'http_request.http_method',
+  'cs-host': 'http_request.url.hostname',
+  'cs-User-Agent': 'http_request.user_agent',
+  EventID: 'unmapped.event_id',
+  Channel: 'metadata.log_source',
+  Provider_Name: 'metadata.log_provider',
+  Computer: 'device.hostname',
+  ComputerName: 'device.hostname',
+};
+
 // Logsource to source_type mappings
 const LOGSOURCE_MAPPINGS: Record<string, string> = {
   // Windows
@@ -169,17 +227,18 @@ function toSnakeCase(str: string): string {
     .replace(/_+/g, '_');
 }
 
-function mapField(field: string, unmappedFields?: Set<string>): string {
-  const mapped = FIELD_MAPPINGS[field];
+function mapField(field: string, schema: QuerySchema, unmappedFields?: Set<string>): string {
+  const mapped = schema === 'ocsf' ? OCSF_FIELD_MAPPINGS[field] : FIELD_MAPPINGS[field];
   if (mapped) {
     return mapped;
   }
   // Field not in our mapping - track it and convert to snake_case
   const converted = field.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
+  const target = schema === 'ocsf' ? `unmapped.${converted}` : converted;
   if (unmappedFields) {
-    unmappedFields.add(`${field} → ${converted}`);
+    unmappedFields.add(`${field} → ${target}`);
   }
-  return converted;
+  return target;
 }
 
 /**
@@ -207,9 +266,10 @@ function convertValueWithModifiers(
   value: string | number | boolean,
   modifiers: string[],
   warnings: string[],
+  schema: QuerySchema,
   unmappedFields?: Set<string>
 ): string {
-  const mappedField = mapField(field, unmappedFields);
+  const mappedField = mapField(field, schema, unmappedFields);
   let strValue = String(value);
 
   // Handle wildcards in value
@@ -274,6 +334,7 @@ function convertSelection(
   name: string,
   selection: unknown,
   warnings: string[],
+  schema: QuerySchema,
   unmappedFields?: Set<string>
 ): { condition: string; isKeyword: boolean } {
   if (typeof selection === 'string') {
@@ -302,7 +363,7 @@ function convertSelection(
     if (Array.isArray(rawValue)) {
       // Multiple values
       const valueConditions = rawValue.map(v =>
-        convertValueWithModifiers(baseName, v, modifiers, warnings, unmappedFields)
+        convertValueWithModifiers(baseName, v, modifiers, warnings, schema, unmappedFields)
       );
 
       if (hasAll) {
@@ -317,7 +378,7 @@ function convertSelection(
         }
       }
     } else if (rawValue !== null && rawValue !== undefined) {
-      conditions.push(convertValueWithModifiers(baseName, rawValue as string | number | boolean, modifiers, warnings, unmappedFields));
+      conditions.push(convertValueWithModifiers(baseName, rawValue as string | number | boolean, modifiers, warnings, schema, unmappedFields));
     }
   }
 
@@ -395,7 +456,7 @@ function parseCondition(
   return result;
 }
 
-function convertSigmaRule(sigmaYaml: string, currentUser?: string): ConversionResult {
+function convertSigmaRule(sigmaYaml: string, currentUser?: string, schema: QuerySchema = 'udm'): ConversionResult {
   const warnings: string[] = [];
   const errors: string[] = [];
 
@@ -523,14 +584,16 @@ function convertSigmaRule(sigmaYaml: string, currentUser?: string): ConversionRe
     }
 
     if (sourceType) {
-      queryParts.push(`source_type="${sourceType}"`);
+      const sourceField = schema === 'ocsf' ? 'metadata.log_source' : 'source_type';
+      queryParts.push(`${sourceField}="${sourceType}"`);
     } else {
       // Generate a source_type from logsource components
       const parts = [product, service, category].filter(Boolean);
       if (parts.length > 0) {
         const generatedType = parts.join('_').toLowerCase().replace(/[^a-z0-9_]/g, '_');
-        queryParts.push(`source_type="${generatedType}"`);
-        warnings.push(`Generated source_type "${generatedType}" from logsource - verify this matches your data`);
+        const sourceField = schema === 'ocsf' ? 'metadata.log_source' : 'source_type';
+        queryParts.push(`${sourceField}="${generatedType}"`);
+        warnings.push(`Generated ${sourceField} "${generatedType}" from logsource - verify this matches your data`);
       }
     }
   }
@@ -551,13 +614,13 @@ function convertSigmaRule(sigmaYaml: string, currentUser?: string): ConversionRe
   for (const [key, value] of Object.entries(detection)) {
     if (key === 'condition' || key === 'timeframe') continue;
 
-    const converted = convertSelection(key, value, warnings, unmappedFields);
+    const converted = convertSelection(key, value, warnings, schema, unmappedFields);
     selections.set(key, converted);
   }
 
   // Warn about unmapped fields that need manual review
   if (unmappedFields.size > 0) {
-    warnings.push(`Unmapped fields (verify these match your UDM): ${Array.from(unmappedFields).join(', ')}`);
+    warnings.push(`Unmapped fields (verify these ${schema === 'ocsf' ? 'belong under OCSF unmapped' : 'match your UDM'}): ${Array.from(unmappedFields).join(', ')}`);
   }
 
   // Parse and convert the condition
@@ -615,6 +678,13 @@ ${authorComment}${query}`;
 export function SigmaConverter({ open, onOpenChange, onApply }: SigmaConverterProps) {
   const { toast } = useToast();
   const { user } = useAuth();
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const querySchema: QuerySchema = activeSchema?.schema === 'ocsf' ? 'ocsf' : 'udm';
   const [sigmaInput, setSigmaInput] = useState('');
   const [activeTab, setActiveTab] = useState<'input' | 'output'>('input');
 
@@ -622,8 +692,8 @@ export function SigmaConverter({ open, onOpenChange, onApply }: SigmaConverterPr
     if (!sigmaInput.trim()) {
       return null;
     }
-    return convertSigmaRule(sigmaInput, user?.name);
-  }, [sigmaInput, user?.name]);
+    return convertSigmaRule(sigmaInput, user?.name, querySchema);
+  }, [sigmaInput, user?.name, querySchema]);
 
   const handleConvert = () => {
     if (conversionResult?.success) {
@@ -654,164 +724,174 @@ export function SigmaConverter({ open, onOpenChange, onApply }: SigmaConverterPr
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="bg-card border-border text-foreground rounded-2xl max-w-4xl h-[85vh] flex flex-col p-0">
-        <DialogHeader className="px-6 pt-6 pb-4 border-b border-border flex-shrink-0">
-          <DialogTitle className="flex items-center gap-2">
-            <FileCode className="w-5 h-5 text-blue-400" />
-            Sigma Rule Converter
-          </DialogTitle>
-          <DialogDescription className="text-muted-foreground">
-            Paste a Sigma rule to convert it to nano detection format.
-          </DialogDescription>
-        </DialogHeader>
-
-        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'input' | 'output')} className="flex-1 flex flex-col overflow-hidden">
-          <TabsList className="mx-6 mt-4 mb-2 w-fit">
-            <TabsTrigger value="input" className="gap-2">
-              <FileCode className="w-4 h-4" />
-              Sigma Input
-            </TabsTrigger>
-            <TabsTrigger value="output" className="gap-2" disabled={!conversionResult?.success}>
-              <ArrowRight className="w-4 h-4" />
-              Converted Output
-              {conversionResult?.success && (
-                <Badge variant="outline" className="ml-1 text-xs border-green-500/30 text-green-400">Ready</Badge>
-              )}
-            </TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="input" className="flex-1 overflow-hidden px-6 pb-4 mt-0">
-            <div className="h-full flex flex-col gap-4">
-              <Textarea
-                value={sigmaInput}
-                onChange={(e) => setSigmaInput(e.target.value)}
-                placeholder={`Paste your Sigma rule here...
-
-Example:
-title: Suspicious PowerShell Encoded Command
-logsource:
-  category: process_creation
-  product: windows
-detection:
-  selection:
-    CommandLine|contains:
-      - ' -enc '
-      - ' -encodedcommand '
-  condition: selection
-level: medium`}
-                className="flex-1 font-mono text-sm border-border rounded-xl resize-none"
-              />
-
-              {/* Conversion status */}
-              {sigmaInput.trim() && (
-                <div className="space-y-2">
-                  {conversionResult?.success ? (
-                    <div className="flex items-center gap-2 text-green-400">
-                      <CircleCheck className="w-4 h-4" />
-                      <span className="text-sm">Rule parsed successfully</span>
-                    </div>
-                  ) : conversionResult?.errors.length ? (
-                    <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
-                      <div className="flex items-center gap-2 text-red-400 mb-2">
-                        <CircleAlert className="w-4 h-4" />
-                        <span className="text-sm font-medium">Conversion Errors</span>
-                      </div>
-                      <ul className="text-sm text-red-300 list-disc list-inside space-y-1">
-                        {conversionResult.errors.map((err, i) => (
-                          <li key={i}>{err}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-
-                  {conversionResult?.warnings.length ? (
-                    <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
-                      <div className="flex items-center gap-2 text-yellow-400 mb-2">
-                        <AlertTriangle className="w-4 h-4" />
-                        <span className="text-sm font-medium">Warnings ({conversionResult.warnings.length})</span>
-                      </div>
-                      <ul className="text-sm text-yellow-700 dark:text-yellow-300 list-disc list-inside space-y-1">
-                        {conversionResult.warnings.map((warn, i) => (
-                          <li key={i}>{warn}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                </div>
-              )}
-            </div>
-          </TabsContent>
-
-          <TabsContent value="output" className="flex-1 overflow-hidden px-6 pb-4 mt-0">
-            <div className="h-full flex flex-col gap-4">
-              <div className="flex-1 relative">
-                <Textarea
-                  value={conversionResult?.output || ''}
-                  readOnly
-                  className="h-full font-mono text-sm border-border rounded-xl resize-none text-green-400 bg-muted/30"
-                />
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleCopy}
-                  className="absolute top-2 right-2"
-                >
-                  <Copy className="w-4 h-4" />
-                </Button>
-              </div>
-
-              {conversionResult?.warnings.length ? (
-                <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
-                  <div className="flex items-center gap-2 text-yellow-400 mb-2">
-                    <AlertTriangle className="w-4 h-4" />
-                    <span className="text-sm font-medium">Review These Items</span>
-                  </div>
-                  <ul className="text-sm text-yellow-700 dark:text-yellow-300 list-disc list-inside space-y-1">
-                    {conversionResult.warnings.map((warn, i) => (
-                      <li key={i}>{warn}</li>
-                    ))}
-                  </ul>
-                </div>
-              ) : null}
-            </div>
-          </TabsContent>
-        </Tabs>
-
-        <div className="flex items-center justify-between px-6 py-4 border-t border-border flex-shrink-0">
-          <Button variant="outline" onClick={handleClose} className="rounded-xl">
-            Cancel
-          </Button>
-          <div className="flex items-center gap-2">
+    <DetailSheet
+      open={open}
+      onOpenChange={handleClose}
+      size="lg"
+      breadcrumb={['Detection', 'Sigma']}
+      icon={<FileCode className="w-4 h-4" strokeWidth={1.5} />}
+      title="Sigma Rule Converter"
+      description="Paste a Sigma rule to convert it to nano detection format."
+      guardDirty={sigmaInput.trim().length > 0}
+      discardTitle="Discard Sigma input?"
+      discardDescription="Closing the converter will lose the pasted Sigma rule."
+      bodyClassName="flex flex-col px-0 py-0"
+      footer={
+        <>
+          <SheetCancelButton />
+          <div className="ml-auto flex items-center gap-2">
             {activeTab === 'input' ? (
               <Button
+                size="sm"
                 onClick={handleConvert}
                 disabled={!conversionResult?.success}
-                className="bg-blue-600 hover:bg-blue-700 rounded-xl"
+                className="h-7 text-[11.5px]"
               >
-                <ArrowRight className="w-4 h-4" />
+                <ArrowRight className="w-3.5 h-3.5" />
                 View Converted Rule
               </Button>
             ) : (
               <>
-                <Button variant="outline" onClick={handleCopy} className="rounded-xl">
-                  <Copy className="w-4 h-4" />
+                <Button variant="outline" size="sm" onClick={handleCopy} className="h-7 text-[11.5px]">
+                  <Copy className="w-3.5 h-3.5" />
                   Copy
                 </Button>
                 {onApply && (
-                  <Button onClick={handleApply} className="bg-blue-600 hover:bg-blue-700 rounded-xl">
-                    <ArrowRight className="w-4 h-4" />
+                  <Button size="sm" onClick={handleApply} className="h-7 text-[11.5px]">
+                    <ArrowRight className="w-3.5 h-3.5" />
                     Apply to Editor
                   </Button>
                 )}
               </>
             )}
           </div>
-        </div>
-      </DialogContent>
-    </Dialog>
+        </>
+      }
+    >
+      <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'input' | 'output')} className="flex-1 flex flex-col min-h-0">
+        <TabsList className="mx-4 mt-3 mb-2 w-fit">
+          <TabsTrigger value="input" className="gap-2">
+            <FileCode className="w-4 h-4" />
+            Sigma Input
+          </TabsTrigger>
+          <TabsTrigger value="output" className="gap-2" disabled={!conversionResult?.success}>
+            <ArrowRight className="w-4 h-4" />
+            Converted Output
+            {conversionResult?.success && (
+              <Badge variant="outline" className="ml-1 text-xs border-green-500/30 text-green-400">Ready</Badge>
+            )}
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="input" className="flex-1 min-h-0 px-4 pb-3 mt-0">
+          <div className="h-full flex flex-col gap-4">
+            <Textarea
+              value={sigmaInput}
+              onChange={(e) => setSigmaInput(e.target.value)}
+              placeholder={`Paste your Sigma rule here...
+
+Example:
+title: Suspicious PowerShell Encoded Command
+logsource:
+category: process_creation
+product: windows
+detection:
+selection:
+  CommandLine|contains:
+    - ' -enc '
+    - ' -encodedcommand '
+condition: selection
+level: medium`}
+              className="flex-1 min-h-[240px] font-mono text-[12px] border-border rounded-md resize-none"
+            />
+
+            {/* Conversion status */}
+            {sigmaInput.trim() && (
+              <div className="space-y-2">
+                {conversionResult?.success ? (
+                  <div className="flex items-center gap-2 text-green-400">
+                    <CircleCheck className="w-4 h-4" />
+                    <span className="text-sm">Rule parsed successfully</span>
+                  </div>
+                ) : conversionResult?.errors.length ? (
+                  <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg">
+                    <div className="flex items-center gap-2 text-red-400 mb-2">
+                      <CircleAlert className="w-4 h-4" />
+                      <span className="text-sm font-medium">Conversion Errors</span>
+                    </div>
+                    <ul className="text-sm text-red-300 list-disc list-inside space-y-1">
+                      {conversionResult.errors.map((err, i) => (
+                        <li key={i}>{err}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {conversionResult?.warnings.length ? (
+                  <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
+                    <div className="flex items-center gap-2 text-yellow-400 mb-2">
+                      <AlertTriangle className="w-4 h-4" />
+                      <span className="text-sm font-medium">Warnings ({conversionResult.warnings.length})</span>
+                    </div>
+                    <ul className="text-sm text-yellow-700 dark:text-yellow-300 list-disc list-inside space-y-1">
+                      {conversionResult.warnings.map((warn, i) => (
+                        <li key={i}>{warn}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </div>
+        </TabsContent>
+
+        <TabsContent value="output" className="flex-1 min-h-0 px-4 pb-3 mt-0">
+          <div className="h-full flex flex-col gap-4">
+            <div className="flex-1 min-h-[240px] relative">
+              <Textarea
+                value={conversionResult?.output || ''}
+                readOnly
+                className="h-full font-mono text-[12px] border-border rounded-md resize-none text-green-400 bg-muted/30"
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleCopy}
+                className="absolute top-2 right-2"
+              >
+                <Copy className="w-4 h-4" />
+              </Button>
+            </div>
+
+            {conversionResult?.warnings.length ? (
+              <div className="p-3 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
+                <div className="flex items-center gap-2 text-yellow-400 mb-2">
+                  <AlertTriangle className="w-4 h-4" />
+                  <span className="text-sm font-medium">Review These Items</span>
+                </div>
+                <ul className="text-sm text-yellow-700 dark:text-yellow-300 list-disc list-inside space-y-1">
+                  {conversionResult.warnings.map((warn, i) => (
+                    <li key={i}>{warn}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        </TabsContent>
+      </Tabs>
+    </DetailSheet>
   );
 }
 
 // Export the conversion function for use elsewhere
 export { convertSigmaRule };
+
+/** Footer Cancel that routes through the sheet's dirty guard. */
+function SheetCancelButton() {
+  const { requestClose } = useDetailSheet();
+  return (
+    <Button variant="outline" size="sm" onClick={requestClose} className="h-7 text-[11.5px]">
+      Cancel
+    </Button>
+  );
+}

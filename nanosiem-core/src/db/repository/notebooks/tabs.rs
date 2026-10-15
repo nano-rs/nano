@@ -127,7 +127,7 @@ impl NotebookRepository {
             r#"
             INSERT INTO notebook_tabs (user_id, notebook_id, is_active, tab_order, last_accessed_at)
             VALUES ($1, $2, true, $3, NOW())
-            ON CONFLICT (user_id, notebook_id)
+            ON CONFLICT (tenant_id, user_id, notebook_id)
             DO UPDATE SET
                 is_active = true,
                 last_accessed_at = NOW()

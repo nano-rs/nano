@@ -54,8 +54,7 @@ const STAGING_COMPLETE_MARKER: &str = ".staging-complete";
 /// differ per deployment and some of these do not exist everywhere; staging
 /// creates all of them regardless, because a `--config-dir` pointing at a
 /// missing path is itself a Vector startup error.
-pub(super) const STAGED_CONFIG_SUBDIRS: &[&str] =
-    &["sources/parsers", "sources/configs", "sinks"];
+pub(super) const STAGED_CONFIG_SUBDIRS: &[&str] = &["sources/parsers", "sources/configs", "sinks"];
 
 /// The subset of [`STAGED_CONFIG_SUBDIRS`] copied verbatim out of the active
 /// tree. `sources/parsers` is deliberately absent: staging GENERATES it from the
@@ -247,11 +246,7 @@ impl VectorConfigManager {
         // completed. `promote_staged` refuses to touch the active tree without
         // it — an interrupted or corrupt stage now fails loudly instead of
         // promoting nothing and reporting success.
-        fs::write(
-            self.staging_dir.join(STAGING_COMPLETE_MARKER),
-            "staged\n",
-        )
-        .await?;
+        fs::write(self.staging_dir.join(STAGING_COMPLETE_MARKER), "staged\n").await?;
 
         let enabled_count = log_parsers.iter().filter(|p| p.enabled).count();
         tracing::info!(
@@ -336,7 +331,11 @@ impl VectorConfigManager {
                 continue;
             }
             let copied = Self::copy_toml_files(&source, &self.staging_dir.join(subdir)).await?;
-            tracing::debug!("Copied {} config file(s) from {} to staging", copied, subdir);
+            tracing::debug!(
+                "Copied {} config file(s) from {} to staging",
+                copied,
+                subdir
+            );
         }
 
         Ok(())
@@ -363,7 +362,11 @@ impl VectorConfigManager {
             if path.extension().map(|ext| ext == "toml") != Some(true) {
                 continue;
             }
-            if !fs::metadata(&path).await.map(|m| m.is_file()).unwrap_or(false) {
+            if !fs::metadata(&path)
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false)
+            {
                 continue;
             }
             let filename = entry.file_name();
@@ -495,7 +498,7 @@ impl VectorConfigManager {
             enrichment_parsers.iter().filter(|p| p.enabled).collect();
         config.push_str(&super::router::enrichment_router_block(
             &enabled_enrichment,
-            &inputs_formatted,
+            "\"enrichment_prepare\"",
         ));
 
         // Add placeholder transforms for built-in types without parsers
@@ -584,7 +587,8 @@ impl VectorConfigManager {
         // reverted dynamic enrichment parsers to the committed static lane).
         // NAN-2305: the split now happens once in `stage_parsers`, so this lane
         // and the logs lane can never disagree about which parsers are which.
-        let content = Self::enrichment_lane_config(enrichment_parsers);
+        let content =
+            Self::enrichment_lane_config_for_backend(enrichment_parsers, Self::lake_mode());
         // NAN-1150: same deploy-time guardrails as the active writer, so a
         // malformed enrichment parser is rejected at the stage→validate→promote
         // path too — never promoted to the active lane.
@@ -793,12 +797,13 @@ impl VectorConfigManager {
         fs::create_dir_all(&batch).await?;
 
         for (path, file_name) in strays {
-            // Suffixed so the copy is no longer a `.toml`. The S3 config sync
-            // (`deploy/src/s3.js::syncDirectory`) walks the whole config root
-            // and uploads every `.toml` it finds, skipping only `backup` and
-            // `staging` by name — a quarantined parser keeping its extension
-            // would be replicated to every Vector pod's config bundle, which is
-            // the opposite of quarantining it.
+            // Suffixed so the copy is no longer a `.toml`. An S3 config sync
+            // that walks the whole config root and uploads every `.toml` it
+            // finds, skipping only `backup` and `staging` by name (the old
+            // `deploy/src/s3.js::syncDirectory`, removed in NAN-3491; see tag
+            // `nan3491-pre-benchmarks-delete`), would replicate a quarantined
+            // parser that kept its extension to every Vector pod's config
+            // bundle, which is the opposite of quarantining it.
             let dest = batch.join(format!("{}{}", file_name, QUARANTINE_SUFFIX));
             // `rename` is atomic but only within a filesystem, and in K8s the
             // config root and the dynamic parsers dir can be different volumes.

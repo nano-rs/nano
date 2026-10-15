@@ -1,0 +1,28 @@
+rule_files:
+  - ../rules/nanosiem_alerts.yml
+evaluation_interval: 1h
+tests:
+  - interval: 1h
+    input_series:
+      - series: 'lake_part_gc_blocked_seconds{cell="c1",tenant="t",reason="sanctioned_path_unavailable",detail="lake_part_gc_not_delivered_or_unreadable"}'
+        values: '0 3600 7200 0'
+      - series: 'lake_part_gc_blocked_seconds{cell="c2",tenant="t",reason="sanctioned_path_unavailable",detail="lake_part_gc_not_delivered_or_unreadable"}'
+        values: '0 3600 7200 0'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: LakePartGcBlocked
+        exp_alerts: []
+      - eval_time: 2h
+        alertname: LakePartGcBlocked
+        exp_alerts:
+          - exp_labels:
+              tenant: t
+              reason: sanctioned_path_unavailable
+              detail: lake_part_gc_not_delivered_or_unreadable
+              severity: warning
+            exp_annotations:
+              summary: "Lake part GC blocked for tenant t"
+              description: "Superseded parts have been kept for at least two hours: sanctioned_path_unavailable (lake_part_gc_not_delivered_or_unreadable). Check the credential exchange lake_part_gc route and delete grant."
+      - eval_time: 3h
+        alertname: LakePartGcBlocked
+        exp_alerts: []

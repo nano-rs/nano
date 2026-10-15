@@ -54,7 +54,10 @@ pub use types::*;
 use std::sync::Arc;
 
 use nanosiem_core::auth::ArtifactScope;
-use nanosiem_core::hunts::{ClickHouseEvidenceResolver, HuntRepository, HuntService};
+use nanosiem_core::hunts::{
+    ClickHouseEvidenceResolver, EvidenceResolver, HuntRepository, HuntService,
+    LakeEvidenceResolver,
+};
 
 use crate::middleware::AuthContext;
 use crate::state::AppState;
@@ -67,8 +70,16 @@ use crate::state::AppState;
 pub(crate) fn service(state: &AppState) -> HuntService {
     HuntService::new(
         HuntRepository::new(state.pool.clone()),
-        Arc::new(ClickHouseEvidenceResolver::new(state.dual_pool())),
+        evidence_resolver(state),
     )
+}
+
+pub(crate) fn evidence_resolver(state: &AppState) -> Arc<dyn EvidenceResolver> {
+    if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        Arc::new(LakeEvidenceResolver::new(state.search_service.clone()))
+    } else {
+        Arc::new(ClickHouseEvidenceResolver::new(state.dual_pool()))
+    }
 }
 
 /// The caller's DERIVED-ARTIFACT scope (NAN-2219).

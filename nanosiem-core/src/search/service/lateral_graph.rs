@@ -192,8 +192,10 @@ pub(crate) async fn build_lateral_graph_payload(
     for ev in raw {
         // Resolve the host endpoints (host wins over IP — match existing
         // `service/lateral.rs` dedup convention).
-        let (src_host_id, src_host_kind, src_label, src_sub) = endpoint_node(&ev.src_host, &ev.src_ip);
-        let (dest_host_id, dest_host_kind, dest_label, dest_sub) = endpoint_node(&ev.dest_host, &ev.dest_ip);
+        let (src_host_id, src_host_kind, src_label, src_sub) =
+            endpoint_node(&ev.src_host, &ev.src_ip);
+        let (dest_host_id, dest_host_kind, dest_label, dest_sub) =
+            endpoint_node(&ev.dest_host, &ev.dest_ip);
         if src_host_id.is_empty() || dest_host_id.is_empty() {
             continue;
         }
@@ -237,11 +239,32 @@ pub(crate) async fn build_lateral_graph_payload(
             .or_default()
             .insert(dest_host_id.clone());
 
+        // NAN-3059: a USER seed is the origin of the trace, so it must reach
+        // every host it acted from. The satellite edge below points host →
+        // user; with only that, the BFS from a user seed reached nothing and
+        // every user-seeded graph collapsed to the lone seed node.
+        if seed_kind == "user"
+            && !is_placeholder_value(&ev.user)
+            && normalize_id(&ev.user) == seed_id
+        {
+            accumulate_edge(
+                &mut edge_acc,
+                &seed_id,
+                &src_host_id,
+                "auth-kerberos",
+                &format!("identity observed · {}", ev.user),
+                &ts_short,
+            );
+            adjacency
+                .entry(seed_id.clone())
+                .or_default()
+                .insert(src_host_id.clone());
+            push_evidence(&mut evidence, &seed_id, ev, "user", &dest_label);
+        } else if !is_placeholder_value(&ev.user) {
         // User node: when the user is non-empty, attach as a satellite of the
         // src host (the user is "discovered" at the src). This matches the
         // mockup which shows users (anna.kowalski, hrsvc$) hanging off the
         // host they authenticated at.
-        if !ev.user.is_empty() {
             let user_id = normalize_id(&ev.user);
             ensure_node(
                 &mut node_meta,
@@ -273,7 +296,7 @@ pub(crate) async fn build_lateral_graph_payload(
         }
 
         // Process node: only for process-class edges, attach to dest host.
-        if ev.method == "process" && !ev.process_name.is_empty() {
+        if ev.method == "process" && !is_placeholder_value(&ev.process_name) {
             let proc_id = normalize_id(&ev.process_name);
             ensure_node(
                 &mut node_meta,
@@ -301,11 +324,11 @@ pub(crate) async fn build_lateral_graph_payload(
         // ─── Evidence collection ────────────────────────────────────────────
         push_evidence(&mut evidence, &src_host_id, ev, "src", &dest_label);
         push_evidence(&mut evidence, &dest_host_id, ev, "dest", &src_label);
-        if !ev.user.is_empty() {
+        if !is_placeholder_value(&ev.user) && !(seed_kind == "user" && normalize_id(&ev.user) == seed_id) {
             let user_id = normalize_id(&ev.user);
             push_evidence(&mut evidence, &user_id, ev, "user", &dest_label);
         }
-        if ev.method == "process" && !ev.process_name.is_empty() {
+        if ev.method == "process" && !is_placeholder_value(&ev.process_name) {
             let proc_id = normalize_id(&ev.process_name);
             push_evidence(&mut evidence, &proc_id, ev, "process", &dest_label);
         }
@@ -366,8 +389,10 @@ pub(crate) async fn build_lateral_graph_payload(
         .collect();
 
     // ─── Stage 5: assemble edges with band ──────────────────────────────────
-    let node_band: HashMap<String, &'static str> =
-        nodes.iter().map(|n| (normalize_id(&n.id), n.band)).collect();
+    let node_band: HashMap<String, &'static str> = nodes
+        .iter()
+        .map(|n| (normalize_id(&n.id), n.band))
+        .collect();
     let mut edges: Vec<Edge> = edge_acc
         .into_iter()
         .filter_map(|(key, acc)| {
@@ -504,16 +529,28 @@ fn empty_summary(seed_field: &str, seed_value: &str) -> serde_json::Value {
     })
 }
 
+/// OCSF fields the parser had nothing to fill commonly carry the literal
+/// placeholder `"-"` (or `"--"`) rather than being null/absent. Treat those as
+/// absent so they never become graph nodes / pivot targets. Mirrors the
+/// client-side `isPlaceholderValue()` helper and the `value != "-"` filters in
+/// `baseline.rs` / `asset_dossier.rs`.
+pub(crate) fn is_placeholder_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == "-" || trimmed == "--"
+}
+
 fn endpoint_node(host: &str, ip: &str) -> (String, &'static str, String, String) {
+    let host = if is_placeholder_value(host) { "" } else { host };
+    let ip = if is_placeholder_value(ip) { "" } else { ip };
     if !host.is_empty() {
-        (
-            normalize_id(host),
-            "host",
-            host.to_string(),
-            host_sub(host),
-        )
+        (normalize_id(host), "host", host.to_string(), host_sub(host))
     } else if !ip.is_empty() {
-        (normalize_id(ip), "ip", ip.to_string(), "internal address".to_string())
+        (
+            normalize_id(ip),
+            "ip",
+            ip.to_string(),
+            "internal address".to_string(),
+        )
     } else {
         (String::new(), "host", String::new(), String::new())
     }
@@ -675,7 +712,9 @@ fn compute_hops(seed: &str, adjacency: &HashMap<String, BTreeSet<String>>) -> Ha
     hops
 }
 
-fn compute_degrees(edges: &HashMap<EdgeKey, EdgeAcc>) -> (HashMap<String, u32>, HashMap<String, u32>) {
+fn compute_degrees(
+    edges: &HashMap<EdgeKey, EdgeAcc>,
+) -> (HashMap<String, u32>, HashMap<String, u32>) {
     let mut in_deg: HashMap<String, u32> = HashMap::new();
     let mut out_deg: HashMap<String, u32> = HashMap::new();
     for key in edges.keys() {
@@ -706,8 +745,10 @@ fn compute_critical_path(
         .iter()
         .map(|n| (normalize_id(&n.id), n.role))
         .collect();
-    let display_of: HashMap<String, String> =
-        nodes.iter().map(|n| (normalize_id(&n.id), n.id.clone())).collect();
+    let display_of: HashMap<String, String> = nodes
+        .iter()
+        .map(|n| (normalize_id(&n.id), n.id.clone()))
+        .collect();
 
     // Adjacency keyed by from id (normalized).
     let mut adj: HashMap<String, Vec<&Edge>> = HashMap::new();
@@ -759,7 +800,10 @@ fn compute_critical_path(
         path_edges.push([chosen.from.clone(), chosen.to.clone()]);
         visited.insert(to_norm.clone());
         // Stop once we've reached a crown / crown-jewel — that's the climax.
-        if matches!(*role_of.get(&to_norm).unwrap_or(&"edge"), "crown" | "crown-jewel") {
+        if matches!(
+            *role_of.get(&to_norm).unwrap_or(&"edge"),
+            "crown" | "crown-jewel"
+        ) {
             break;
         }
         current = to_norm;
@@ -773,10 +817,7 @@ fn compute_critical_path(
     let reaches_something_critical = path.iter().skip(1).any(|id| {
         let n = normalize_id(id);
         matches!(*band_of.get(&n).unwrap_or(&"low"), "critical")
-            || matches!(
-                *role_of.get(&n).unwrap_or(&"edge"),
-                "crown" | "crown-jewel"
-            )
+            || matches!(*role_of.get(&n).unwrap_or(&"edge"), "crown" | "crown-jewel")
     });
     if !reaches_something_critical {
         return (Vec::new(), Vec::new());
@@ -785,10 +826,7 @@ fn compute_critical_path(
     (path, path_edges)
 }
 
-async fn fetch_risk_for_nodes<'a, I>(
-    risk: &LateralRiskContext<'_>,
-    ids: I,
-) -> HashMap<String, i32>
+async fn fetch_risk_for_nodes<'a, I>(risk: &LateralRiskContext<'_>, ids: I) -> HashMap<String, i32>
 where
     I: IntoIterator<Item = &'a String>,
 {
@@ -887,9 +925,7 @@ fn derive_role(
         return "crown-jewel";
     }
     // Crown: domain controllers
-    if (lid.starts_with("dc0") || lid.starts_with("dc-") || lid == "dc")
-        && kind == "host"
-    {
+    if (lid.starts_with("dc0") || lid.starts_with("dc-") || lid == "dc") && kind == "host" {
         return "crown";
     }
     match kind {
@@ -1241,6 +1277,52 @@ mod tests {
             first_seen: "00:00".to_string(),
             band: "low",
         }
+    }
+
+    fn auth_event(user: &str, src: &str, dest: &str) -> RawEvent {
+        RawEvent {
+            timestamp: "2026-09-30 00:10:00.000000".to_string(),
+            user: user.to_string(),
+            src_host: src.to_string(),
+            dest_host: dest.to_string(),
+            src_ip: String::new(),
+            dest_ip: String::new(),
+            dest_port: String::new(),
+            method: "auth".to_string(),
+            method_detail: "ntlm".to_string(),
+            process_name: String::new(),
+            auth_type: "NTLM".to_string(),
+            auth_result: "Success".to_string(),
+        }
+    }
+
+    /// NAN-3059: a user-seeded trace reaches the hosts the user acted from
+    /// and their onward hops. It used to collapse to the lone seed node: the
+    /// only user edge pointed host → user, so the BFS from the seed was empty.
+    #[tokio::test]
+    async fn user_seed_reaches_the_hosts_it_acted_from() {
+        let raw = vec![
+            auth_event("slopez", "ws-fin-059", "ws-hr-059"),
+            auth_event("slopez", "ws-hr-059", "srv-web02"),
+            auth_event("alopez", "srv-web02", "srv-db01"),
+        ];
+        let risk = LateralRiskContext {
+            ch_client: None,
+            findings_source: RiskFindingsSource::resolve(false),
+            config: RiskQueryConfig::default(),
+        };
+        let graph = build_lateral_graph_payload(&raw, "user", "slopez", &risk).await;
+        let ids = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["id"].as_str().unwrap().to_string())
+            .collect::<HashSet<_>>();
+        for host in ["slopez", "ws-fin-059", "ws-hr-059", "srv-web02", "srv-db01"] {
+            assert!(ids.contains(host), "{host} missing from {ids:?}");
+        }
+        assert!(graph["edges"].as_array().unwrap().len() >= 4, "{graph}");
+        assert_eq!(graph["summary"]["seed"]["kind"], "user");
     }
 
     #[test]

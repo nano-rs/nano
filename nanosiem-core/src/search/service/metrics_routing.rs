@@ -36,10 +36,7 @@ const MIN_WINDOW_FOR_HOUR_ROLLUP: i64 = 7 * 86400; // 7 days
 
 /// Pick a rollup grain for an eligible metrics aggregate query over a wide window,
 /// or `None` to read raw `otel_metrics`.
-pub(super) fn metrics_rollup_grain(
-    query: &Query,
-    time_range: &TimeRange,
-) -> Option<MetricRollup> {
+pub(super) fn metrics_rollup_grain(query: &Query, time_range: &TimeRange) -> Option<MetricRollup> {
     // Exactly one bare-search source + one aggregating command (no multi-stage
     // pipes — a `where`/`eval`/`rex` stage could reference per-point columns the
     // rollup lacks).
@@ -54,12 +51,20 @@ pub(super) fn metrics_rollup_grain(
     }
 
     let (aggs, group_by, span_secs): (&[Aggregation], &[String], Option<u64>) = match command {
-        Command::Stats { aggregations, group_by } | Command::Chart { aggregations, group_by } => {
-            (aggregations, group_by.as_deref().unwrap_or(&[]), None)
+        Command::Stats {
+            aggregations,
+            group_by,
         }
-        Command::Timechart { aggregations, split_by, span, .. } => {
-            (aggregations, split_by.as_slice(), Some(span.as_secs()))
-        }
+        | Command::Chart {
+            aggregations,
+            group_by,
+        } => (aggregations, group_by.as_deref().unwrap_or(&[]), None),
+        Command::Timechart {
+            aggregations,
+            split_by,
+            span,
+            ..
+        } => (aggregations, split_by.as_slice(), Some(span.as_secs())),
         _ => return None,
     };
 
@@ -164,7 +169,9 @@ mod tests {
     fn win(days: i64) -> TimeRange {
         TimeRange {
             start: "2026-06-01T00:00:00Z".parse().unwrap(),
-            end: ("2026-06-01T00:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap()
+            end: ("2026-06-01T00:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
                 + chrono::Duration::days(days)),
         }
     }
@@ -177,7 +184,10 @@ mod tests {
     fn eligible_aggregate_over_wide_window_routes_to_rollup() {
         // Stats avg(value) by service over a 30-day window → hourly rollup.
         assert_eq!(
-            grain(r#"metric_name="cpu" | stats avg(value) by service_name"#, 30),
+            grain(
+                r#"metric_name="cpu" | stats avg(value) by service_name"#,
+                30
+            ),
             Some(MetricRollup::Hour)
         );
         // 1-day window → minute rollup.
@@ -193,7 +203,11 @@ mod tests {
         // Rollup-equivalent funcs: avg/min/max/median/p95.
         for f in ["min(value)", "max(value)", "median(value)", "p95(value)"] {
             assert!(
-                grain(&format!(r#"metric_name="cpu" | stats {f} by service_name"#), 30).is_some(),
+                grain(
+                    &format!(r#"metric_name="cpu" | stats {f} by service_name"#),
+                    30
+                )
+                .is_some(),
                 "{f} should be rollup-eligible"
             );
         }
@@ -204,16 +218,34 @@ mod tests {
         // NAN-1555 adversarial review: sum/count are additive (would over-count the
         // window-edge bucket) and rate must stay reset-aware on raw points — none
         // of these are rollup-equivalent, so they are NOT routed (→ raw, exact).
-        assert_eq!(grain(r#"metric_name="cpu" | stats sum(value) by service_name"#, 30), None);
-        assert_eq!(grain(r#"metric_name="cpu" | stats count by service_name"#, 30), None);
-        assert_eq!(grain(r#"metric_name="cpu" | stats rate(value) by service_name"#, 30), None);
+        assert_eq!(
+            grain(
+                r#"metric_name="cpu" | stats sum(value) by service_name"#,
+                30
+            ),
+            None
+        );
+        assert_eq!(
+            grain(r#"metric_name="cpu" | stats count by service_name"#, 30),
+            None
+        );
+        assert_eq!(
+            grain(
+                r#"metric_name="cpu" | stats rate(value) by service_name"#,
+                30
+            ),
+            None
+        );
         assert_eq!(
             grain(r#"metric_name="cpu" | timechart span=1h rate(value)"#, 30),
             None
         );
         // A mixed agg list with any non-rollup func disqualifies the whole query.
         assert_eq!(
-            grain(r#"metric_name="cpu" | stats avg(value), sum(value) by service_name"#, 30),
+            grain(
+                r#"metric_name="cpu" | stats avg(value), sum(value) by service_name"#,
+                30
+            ),
             None
         );
     }
@@ -241,18 +273,45 @@ mod tests {
     #[test]
     fn ineligible_shapes_stay_on_raw() {
         // Tag filter (rollup carries no tag maps).
-        assert_eq!(grain(r#"metric_name="cpu" http.route="/api" | stats avg(value)"#, 30), None);
+        assert_eq!(
+            grain(
+                r#"metric_name="cpu" http.route="/api" | stats avg(value)"#,
+                30
+            ),
+            None
+        );
         // Tag group-by.
-        assert_eq!(grain(r#"metric_name="cpu" | stats avg(value) by http.route"#, 30), None);
+        assert_eq!(
+            grain(r#"metric_name="cpu" | stats avg(value) by http.route"#, 30),
+            None
+        );
         // Aggregation over a non-value field.
-        assert_eq!(grain(r#"metric_name="cpu" | stats avg(count) by service_name"#, 30), None);
+        assert_eq!(
+            grain(
+                r#"metric_name="cpu" | stats avg(count) by service_name"#,
+                30
+            ),
+            None
+        );
         // Unsupported function (stdev has no rollup state).
-        assert_eq!(grain(r#"metric_name="cpu" | stats stdev(value) by service_name"#, 30), None);
+        assert_eq!(
+            grain(
+                r#"metric_name="cpu" | stats stdev(value) by service_name"#,
+                30
+            ),
+            None
+        );
         // Distinct-count has no rollup state.
-        assert_eq!(grain(r#"metric_name="cpu" | stats dc(value) by service_name"#, 30), None);
+        assert_eq!(
+            grain(r#"metric_name="cpu" | stats dc(value) by service_name"#, 30),
+            None
+        );
         // Multi-stage pipe (a where stage references per-point value).
         assert_eq!(
-            grain(r#"metric_name="cpu" | where value > 0.5 | stats avg(value) by service_name"#, 30),
+            grain(
+                r#"metric_name="cpu" | where value > 0.5 | stats avg(value) by service_name"#,
+                30
+            ),
             None
         );
         // Free-text keyword predicate.

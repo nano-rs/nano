@@ -10,12 +10,14 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { formatUTCShort } from '@/lib/date-utils';
 import { isClickHouseDefault } from '@/lib/utils';
 import { api } from '@/lib/api';
+import { resolveLogTraceId } from '@/lib/otel-correlation';
 import {
   flattenEventFields,
   buildFieldCategories,
   isFieldHidden,
   splitFieldKey,
 } from './event-flatten';
+import { resolveRawView } from './event-raw-text';
 
 // ============================================================================
 // Types
@@ -162,12 +164,15 @@ export function EventInspectorPanel({
   const keyChipSpecs: Array<{ label: string; field: string; accent?: boolean }> =
     schemaFields?.schema === 'ocsf'
       ? [
-          { label: 'sourcetype', field: 'source_type' },
+          { label: 'log source', field: 'metadata.log_source' },
+          { label: 'host', field: 'device.hostname' },
           { label: 'src_ip', field: 'src_endpoint.ip' },
+          { label: 'src_host', field: 'src_endpoint.hostname' },
           { label: 'dest_ip', field: 'dst_endpoint.ip' },
+          { label: 'dest_host', field: 'dst_endpoint.hostname' },
           { label: 'user', field: 'user.name' },
           { label: 'status', field: 'status' },
-          { label: 'activity', field: 'activity', accent: true },
+          { label: 'activity', field: 'activity_name', accent: true },
         ]
       : [
           { label: 'sourcetype', field: 'source_type' },
@@ -203,13 +208,13 @@ export function EventInspectorPanel({
     ? { ...event.fields, ...fullLogData }
     : event.fields;
 
-  // NAN-1528: OTLP log↔trace correlation. When a log row carries a non-empty
-  // trace_id (the column added to logs/ocsf_logs), surface a "View trace" pivot
-  // that opens the distributed-trace waterfall.
-  const rawTraceId = displayFields?.['trace_id'];
+  // OTLP log↔trace correlation follows the canonical OCSF model first:
+  // Trace Profile classes expose trace.uid; generic Base Events retain the id
+  // as unmapped.trace_id. Keep the old top-level column as a migration fallback.
+  const resolvedTraceId = resolveLogTraceId(displayFields);
   const traceId =
-    typeof rawTraceId === 'string' && rawTraceId.trim() && !isClickHouseDefault(rawTraceId, 'trace_id')
-      ? rawTraceId.trim()
+    resolvedTraceId && !isClickHouseDefault(resolvedTraceId, 'trace_id')
+      ? resolvedTraceId
       : null;
 
   const isOcsf = schemaFields?.schema === 'ocsf';
@@ -291,24 +296,12 @@ export function EventInspectorPanel({
     });
   }, []);
 
-  // Raw message
-  const rawMessage = displayFields?.message as string | undefined;
-
-  // OTLP/structured records (spans/metrics) have no raw-text `message`. The
-  // structured record IS the raw, so build it from the row's REAL ingested
-  // fields (internal `_*`/id/timestamp excluded) and show that in the Raw tab
-  // instead of "No raw message available" (NAN-1568). Frontend-only.
-  const syntheticRaw = !rawMessage
-    ? (() => {
-        const obj: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(displayFields ?? {})) {
-          if (k.startsWith('_') || k === 'id' || k === 'timestamp') continue;
-          if (v == null || v === '') continue;
-          obj[k] = v;
-        }
-        return Object.keys(obj).length ? JSON.stringify(obj, null, 2) : null;
-      })()
-    : null;
+  // Raw tab text: the original log line (OCSF `raw_data`, UDM `message`,
+  // `_raw`), else the synthetic structured record for OTLP rows (NAN-1568,
+  // NAN-3245). See resolveRawView.
+  const rawView = resolveRawView(displayFields);
+  const rawMessage = rawView && !rawView.synthetic ? rawView.text : undefined;
+  const syntheticRaw = rawView?.synthetic ? rawView.text : null;
 
   // Full JSON
   const fullJson = JSON.stringify(displayFields, null, 2);
@@ -595,7 +588,7 @@ export function EventInspectorPanel({
                 variant="ghost"
                 size="sm"
                 className="h-6 px-2 gap-1 text-xs"
-                onClick={() => copyToClipboard(rawMessage || '', '_raw')}
+                onClick={() => copyToClipboard(rawMessage || syntheticRaw || '', '_raw')}
               >
                 {copiedField === '_raw' ? (
                   <><Check className="w-3 h-3" /> Copied</>

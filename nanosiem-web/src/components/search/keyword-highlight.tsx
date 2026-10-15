@@ -135,7 +135,7 @@ export function highlightText(text: string, keywords: string[]): ReactNode {
   return parts.map((part, i) => {
     const isMatch = keywords.some(k => k.toLowerCase() === part.toLowerCase());
     return isMatch ? (
-      <mark key={i} className="bg-amber-200/80 text-amber-950 ring-1 ring-amber-500/40 dark:bg-amber-400/25 dark:text-amber-200 dark:ring-amber-400/30 rounded-[2px] px-0.5 py-px -my-px">
+      <mark key={i} className="bg-amber-200/80 text-amber-950 ring-1 ring-amber-500/40 dark:bg-amber-400/15 dark:text-inherit dark:ring-0 rounded-[2px] px-0.5 py-px -my-px">
         {part}
       </mark>
     ) : (

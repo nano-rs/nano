@@ -44,7 +44,7 @@
 /// reach a decision.
 ///
 /// Each HTTP service has its own `AuthContext` type (`nanosiem-api-lib` for
-/// `nanosiem-api` / `nanosiem-enterprise`, and a separate one in
+/// `nanosiem-api` / the enterprise crate, and a separate one in
 /// `nanosiem-search`). Implementing this trait on each lets the decision logic
 /// in [`RoutePolicy::evaluate`] be written once and shared across all three,
 /// instead of re-deriving it per service (the divergence class NAN-2043 was
@@ -152,19 +152,28 @@ impl RoutePolicy {
     /// No authentication and no capability required. The only variant that
     /// admits an unauthenticated caller.
     pub const fn public() -> Self {
-        Self { auth_mode: AuthMode::Public, capability: CapabilityRequirement::None }
+        Self {
+            auth_mode: AuthMode::Public,
+            capability: CapabilityRequirement::None,
+        }
     }
 
     /// Any authenticated principal (session or API key); no permission beyond
     /// authentication.
     pub const fn authenticated() -> Self {
-        Self { auth_mode: AuthMode::Authenticated, capability: CapabilityRequirement::None }
+        Self {
+            auth_mode: AuthMode::Authenticated,
+            capability: CapabilityRequirement::None,
+        }
     }
 
     /// An authenticated interactive session (API keys denied); no permission
     /// beyond the session requirement.
     pub const fn interactive_session() -> Self {
-        Self { auth_mode: AuthMode::InteractiveSession, capability: CapabilityRequirement::None }
+        Self {
+            auth_mode: AuthMode::InteractiveSession,
+            capability: CapabilityRequirement::None,
+        }
     }
 
     /// Any authenticated principal that holds **all** of `perms`.
@@ -322,10 +331,16 @@ mod tests {
 
     impl TestPrincipal {
         fn session(perms: &[&'static str]) -> Self {
-            Self { api_key: false, perms: perms.to_vec() }
+            Self {
+                api_key: false,
+                perms: perms.to_vec(),
+            }
         }
         fn api_key(perms: &[&'static str]) -> Self {
-            Self { api_key: true, perms: perms.to_vec() }
+            Self {
+                api_key: true,
+                perms: perms.to_vec(),
+            }
         }
     }
 
@@ -345,8 +360,12 @@ mod tests {
     fn public_allows_everyone_including_anonymous() {
         let policy = RoutePolicy::public();
         assert!(policy.evaluate(ANON).is_allow());
-        assert!(policy.evaluate(Some(&TestPrincipal::session(&[]))).is_allow());
-        assert!(policy.evaluate(Some(&TestPrincipal::api_key(&[]))).is_allow());
+        assert!(policy
+            .evaluate(Some(&TestPrincipal::session(&[])))
+            .is_allow());
+        assert!(policy
+            .evaluate(Some(&TestPrincipal::api_key(&[])))
+            .is_allow());
         assert!(policy.is_public());
         assert!(!policy.requires_interactive_session());
     }
@@ -355,9 +374,13 @@ mod tests {
     fn authenticated_only_denies_anon_allows_any_principal() {
         let policy = RoutePolicy::authenticated();
         assert_eq!(policy.evaluate(ANON), PolicyDecision::Deny);
-        assert!(policy.evaluate(Some(&TestPrincipal::session(&[]))).is_allow());
+        assert!(policy
+            .evaluate(Some(&TestPrincipal::session(&[])))
+            .is_allow());
         // An API key is still an authenticated principal here.
-        assert!(policy.evaluate(Some(&TestPrincipal::api_key(&[]))).is_allow());
+        assert!(policy
+            .evaluate(Some(&TestPrincipal::api_key(&[])))
+            .is_allow());
         assert!(!policy.is_public());
     }
 
@@ -369,7 +392,9 @@ mod tests {
             policy.evaluate(Some(&TestPrincipal::api_key(&[]))),
             PolicyDecision::Deny
         );
-        assert!(policy.evaluate(Some(&TestPrincipal::session(&[]))).is_allow());
+        assert!(policy
+            .evaluate(Some(&TestPrincipal::session(&[])))
+            .is_allow());
         assert!(policy.requires_interactive_session());
     }
 
@@ -377,7 +402,10 @@ mod tests {
     fn all_of_requires_every_permission() {
         let policy = RoutePolicy::all_of(&["search:execute", "search:sql"]);
         assert!(policy
-            .evaluate(Some(&TestPrincipal::session(&["search:execute", "search:sql"])))
+            .evaluate(Some(&TestPrincipal::session(&[
+                "search:execute",
+                "search:sql"
+            ])))
             .is_allow());
         assert_eq!(
             policy.evaluate(Some(&TestPrincipal::session(&["search:execute"]))),
@@ -462,7 +490,10 @@ mod tests {
     fn constructors_never_produce_public_with_capability() {
         // The public construction surface (constructors) cannot express the
         // malformed state: the only Public constructor pairs it with None.
-        assert_eq!(RoutePolicy::public().capability(), &CapabilityRequirement::None);
+        assert_eq!(
+            RoutePolicy::public().capability(),
+            &CapabilityRequirement::None
+        );
         assert!(RoutePolicy::public().is_public());
     }
 

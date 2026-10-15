@@ -1,5 +1,0 @@
-*.json
-*.log
-!.gitignore
-# soc_ir_corpus.json is a committed benchmark input (consumed by search_realistic.js), not a run output
-!soc_ir_corpus.json

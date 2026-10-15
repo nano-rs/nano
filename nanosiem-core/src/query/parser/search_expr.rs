@@ -14,15 +14,19 @@ use nom::{
     sequence::{delimited, pair, preceded, terminated},
     Parser,
 };
-use regex;
 
-use super::eval_expr::{eval_expression, eval_predicate_expression};
+use super::eval_expr::{eval_expression, eval_operand_expression, eval_predicate_expression};
 use super::values::{comparator, field_name, filter_value, quoted_string};
 use super::ParseResult;
 use crate::query::ast::*;
 
-/// Parse a search expression (handles AND/OR precedence)
+/// Search command precedence: NOT, OR, then explicit or implicit AND.
 pub(super) fn search_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    search_and_expr(input)
+}
+
+/// Eval/where precedence: NOT, AND, then OR.
+pub(super) fn where_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     or_expr(input)
 }
 
@@ -80,7 +84,7 @@ pub(super) fn parse_paren_search_expr(input: &str) -> ParseResult<'_, SearchExpr
     }
     let content = &input[..i];
     let remaining = &input[i + 1..]; // skip closing paren
-    let (leftover, expr) = search_expr(content)?;
+    let (leftover, expr) = where_expr(content)?;
     if !leftover.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             leftover,
@@ -90,7 +94,7 @@ pub(super) fn parse_paren_search_expr(input: &str) -> ParseResult<'_, SearchExpr
     Ok((remaining, expr))
 }
 
-/// Parse OR expressions (lowest precedence)
+/// Parse OR expressions in a where clause (lowest precedence).
 /// Supports both OR keyword and || operator
 fn or_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     let (input, first) = and_expr(input)?;
@@ -114,7 +118,7 @@ fn or_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     Ok((input, expr))
 }
 
-/// Parse AND expressions (higher precedence than OR)
+/// Parse AND expressions in a where clause (higher precedence than OR).
 /// Supports both AND keyword and && operator
 fn and_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     let (input, first) = not_expr(input)?;
@@ -139,6 +143,59 @@ fn and_expr(input: &str) -> ParseResult<'_, SearchExpr> {
         .fold(first, |acc, e| SearchExpr::And(Box::new(acc), Box::new(e)));
 
     Ok((input, expr))
+}
+
+/// Search's AND is the lowest precedence operator, including whitespace AND.
+fn search_and_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    let (input, first) = search_or_expr(input)?;
+    let (input, rest) = many0(preceded(
+        alt((
+            delimited(multispace1, tag_no_case("AND"), multispace1),
+            delimited(multispace0, tag("&&"), multispace0),
+            implicit_and_separator,
+        )),
+        search_or_expr,
+    ))
+    .parse(input)?;
+    super::check_chain_len(input, rest.len())?;
+    Ok((
+        input,
+        rest.into_iter()
+            .fold(first, |acc, e| SearchExpr::And(Box::new(acc), Box::new(e))),
+    ))
+}
+
+/// Search's OR binds more tightly than either form of AND.
+fn search_or_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    let (input, first) = search_not_expr(input)?;
+    let (input, rest) = many0(preceded(
+        alt((
+            delimited(multispace1, tag_no_case("OR"), multispace1),
+            delimited(multispace0, tag("||"), multispace0),
+        )),
+        search_not_expr,
+    ))
+    .parse(input)?;
+    super::check_chain_len(input, rest.len())?;
+    Ok((
+        input,
+        rest.into_iter()
+            .fold(first, |acc, e| SearchExpr::Or(Box::new(acc), Box::new(e))),
+    ))
+}
+
+fn search_not_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    alt((
+        map(
+            preceded(
+                terminated(tag_no_case("NOT"), multispace1),
+                search_primary_expr,
+            ),
+            |e| SearchExpr::Not(Box::new(e)),
+        ),
+        search_primary_expr,
+    ))
+    .parse(input)
 }
 
 /// Match whitespace as implicit AND, but fail if followed by | or OR
@@ -174,11 +231,58 @@ fn not_expr(input: &str) -> ParseResult<'_, SearchExpr> {
 
 /// Parse primary expressions (field filters, keywords, groups, function calls)
 fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    alt((
+        arithmetic_predicate_expr,
+        grouped_where_expr,
+        unparenthesized_arithmetic_or_leaf,
+    ))
+    .parse(input)
+}
+
+/// NAN-3324: `where a > 10 * b` / `where last_seen - first_seen >= 300`.
+///
+/// Without parentheses the leaf grammar stopped at the first operand
+/// (`a > 10`) and implicit-AND turned the rest (`*`, `b`) into keyword
+/// searches — wrong rows, no error. Parse the comparison with the eval
+/// grammar as well and keep it only when it contains arithmetic AND reaches
+/// further than the ordinary leaf parse. Every filter the leaf grammar
+/// already consumes whole (`host=web-01`, `day=2024-01-01`, `x>5`) keeps its
+/// index-aware variant; only the previously mis-split predicates change.
+fn unparenthesized_arithmetic_or_leaf(input: &str) -> ParseResult<'_, SearchExpr> {
+    let leaf = primary_leaf_expr(input);
+    let arithmetic = eval_predicate_expression(input).ok().filter(|(_, e)| {
+        eval_contains_arithmetic(e) && eval_is_boolean(e)
+    });
+    // The leaf must have stopped AT an arithmetic operator; a `-term` after a
+    // filter stays what it was (a separate term), never a subtraction.
+    let stopped_at_operator = |rest: &str| {
+        let next = rest.trim_start();
+        let mut chars = next.chars();
+        match chars.next() {
+            Some('+' | '*' | '/' | '%') => true,
+            Some('-') => chars.next().is_some_and(char::is_whitespace),
+            _ => false,
+        }
+    };
+    match (leaf, arithmetic) {
+        (Ok((leaf_rest, _)), Some((rest, expression)))
+            if rest.len() < leaf_rest.len() && stopped_at_operator(leaf_rest) =>
+        {
+            Ok((rest, SearchExpr::EvalPredicate(expression)))
+        }
+        (Err(_), Some((rest, expression))) => Ok((rest, SearchExpr::EvalPredicate(expression))),
+        (leaf, _) => leaf,
+    }
+}
+
+fn search_primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    alt((arithmetic_predicate_expr, grouped_expr, primary_leaf_expr)).parse(input)
+}
+
+fn primary_leaf_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     // function_call_expr (func(args) op value) must come before boolean_function_expr (func(args))
     // since the former is more specific; boolean_function_expr catches the standalone case
     alt((
-        arithmetic_predicate_expr,
-        grouped_expr,
         // `ioc=` / `ioc in [...]` / `ioc in feed("arg")` are special-cased ahead
         // of the generic field/in-list filters so the `ioc` pseudo-field expands
         // to an observable-anywhere match (NAN-1580).
@@ -285,8 +389,15 @@ fn quoted_string_comparison(input: &str) -> ParseResult<'_, SearchExpr> {
     ))
 }
 
-/// Parse wildcard keyword: *keyword* (converts to regex search on message)
-/// This allows AI-generated queries like *users* to work as expected
+/// Parse wildcard keyword: `*keyword*` — a substring keyword search.
+///
+/// NAN-3034: this used to become `message=/(?i)keyword/`, so it searched ONLY
+/// `message`. OCSF events whose body lives in `raw_data` (sysmon, any direct
+/// producer) have no `message`, and `*svchost*` returned 0 on them while bare
+/// `svchost` matched. It is now a wildcard [`SearchExpr::Keyword`], which the
+/// SQL generator OR-folds across every body column (`keyword_search_columns()`)
+/// as `lower(col) iLike '%keyword%'` — the same column set as a plain keyword.
+/// Single-body profiles (UDM `message`) emit the same SQL as before.
 fn wildcard_keyword(input: &str) -> ParseResult<'_, SearchExpr> {
     let (input, _) = char('*').parse(input)?;
     // Parse the keyword content (alphanumeric, _, -, .)
@@ -295,16 +406,7 @@ fn wildcard_keyword(input: &str) -> ParseResult<'_, SearchExpr> {
             .parse(input)?;
     let (input, _) = char('*').parse(input)?;
 
-    // Convert *keyword* to a regex search on message
-    // The pattern will match the keyword anywhere in the content
-    Ok((
-        input,
-        SearchExpr::FieldFilter {
-            field: "message".to_string(),
-            op: Comparator::Regex,
-            value: Value::Regex(format!("(?i){}", regex::escape(keyword))),
-        },
-    ))
+    Ok((input, SearchExpr::Keyword(format!("*{keyword}*"))))
 }
 
 /// Parse function call expression in search context: func(args) op value
@@ -352,6 +454,28 @@ fn boolean_function_expr(input: &str) -> ParseResult<'_, SearchExpr> {
 
     // Only accept known boolean function names to avoid greedily consuming field names
     let lower = name.to_lowercase();
+    // NAN-3041: `in(field, v1, v2, …)` is the function spelling of `field IN
+    // (…)`. Its arguments are full eval expressions (numbers stay numbers, a
+    // quoted value stays a literal), so parse them with the eval grammar
+    // rather than the field-or-value heuristic below.
+    if lower == "in" {
+        let (input, _) = char('(').parse(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, args) = separated_list1(
+            delimited(multispace0, char(','), multispace0),
+            eval_expression,
+        )
+        .parse(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = char(')').parse(input)?;
+        return Ok((
+            input,
+            SearchExpr::BooleanFunction(EvalExpression::FunctionCall {
+                name: "in".to_string(),
+                args,
+            }),
+        ));
+    }
     let is_boolean_func = matches!(
         lower.as_str(),
         "isnull"
@@ -417,6 +541,19 @@ fn grouped_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     .parse(input)
 }
 
+fn grouped_where_expr(input: &str) -> ParseResult<'_, SearchExpr> {
+    let _guard = super::enter_nesting(input)?;
+    map(
+        delimited(
+            pair(char('('), multispace0),
+            where_expr,
+            pair(multispace0, char(')')),
+        ),
+        |e| SearchExpr::Group(Box::new(e)),
+    )
+    .parse(input)
+}
+
 /// Parse the `=~` / `!~` regex-match operators: `field =~ "pattern"` / `field !~ "pattern"`.
 ///
 /// NAN-1993: these are aliases for the `field=/pattern/` regex-match filter — they build the
@@ -444,6 +581,7 @@ fn regex_match_operator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             op,
             value: Value::Regex(pattern),
+            rhs: RhsSyntax::Literal,
         },
     ))
 }
@@ -615,6 +753,7 @@ fn regex_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             op,
             value: Value::Regex(pattern),
+            rhs: RhsSyntax::Literal,
         },
     ))
 }
@@ -709,11 +848,11 @@ fn in_list_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 
     Ok((
         input,
-        SearchExpr::InList {
+        crate::query::source_alias::expand_source_alias(SearchExpr::InList {
             field,
             values,
             negated,
-        },
+        }),
     ))
 }
 
@@ -721,7 +860,9 @@ fn in_list_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 ///   - `ioc = <value>`             -> IocMatch { values: [value] }
 ///   - `ioc in [v1, v2, ...]`      -> IocMatch { values } (also `( )`)
 ///   - `ioc in <feed>("arg")`      -> IocMatch { feed: Some(..) }
-///     where feed in {threatfox, misp, otx, feodo, abuse}.
+///     where feed in {feed, threatfox, misp, otx, feodo, abuse}. The generic
+///     `feed("source")` form addresses a tenant-defined enrichment source by
+///     its exact source ID or display name.
 ///   - `ioc in lookup("name")`     -> IocMatch { lookup: Some(..) }
 ///   - `ioc in lookup("name","col")` -> IocMatch { lookup: Some(.. column) }
 ///   - `ioc in [inputlookup name]` -> IocMatch { lookup: Some(..) } (alias)
@@ -752,12 +893,7 @@ fn ioc_list_value(input: &str) -> ParseResult<'_, Value> {
         map(quoted_string, Value::String),
         map(
             take_while1(|c: char| {
-                !c.is_whitespace()
-                    && c != ','
-                    && c != ']'
-                    && c != ')'
-                    && c != '['
-                    && c != '('
+                !c.is_whitespace() && c != ',' && c != ']' && c != ')' && c != '[' && c != '('
             }),
             |s: &str| Value::String(s.to_string()),
         ),
@@ -849,8 +985,7 @@ fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     }
 
     // Form 4: ioc in lookup("name") / ioc in lookup("name", "column")
-    if let Ok((rest, _)) =
-        tag_no_case::<&str, &str, nom::error::Error<&str>>("lookup").parse(input)
+    if let Ok((rest, _)) = tag_no_case::<&str, &str, nom::error::Error<&str>>("lookup").parse(input)
     {
         // Guard against a feed/identifier that merely starts with "lookup".
         if !rest
@@ -883,12 +1018,11 @@ fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     }
 
     // Form 3: ioc in <feed>("arg")
-    let (input, feed_name) =
-        take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)?;
+    let (input, feed_name) = take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)?;
     let lower = feed_name.to_lowercase();
     if !matches!(
         lower.as_str(),
-        "threatfox" | "misp" | "otx" | "feodo" | "abuse"
+        "feed" | "threatfox" | "misp" | "otx" | "feodo" | "abuse"
     ) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -906,10 +1040,7 @@ fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
         input,
         SearchExpr::IocMatch {
             values: vec![],
-            feed: Some(IocFeed {
-                name: lower,
-                arg,
-            }),
+            feed: Some(IocFeed { name: lower, arg }),
             lookup: None,
         },
     ))
@@ -976,6 +1107,7 @@ fn word_comparator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             op,
             value: val,
+            rhs: RhsSyntax::Literal,
         },
     ))
 }
@@ -984,7 +1116,8 @@ fn word_comparator_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 ///
 /// For simple values (strings, numbers, IPs, etc.), we use filter_value which treats
 /// unquoted identifiers as string literals (e.g., source_type=squid_proxy).
-/// For function calls and expressions (e.g., field > now() - INTERVAL 1 DAY), we use eval_expression.
+/// For function calls and expressions (e.g., field > now() - INTERVAL 1 DAY), we use the
+/// eval operand grammar, which stops before a following AND/OR (NAN-3384).
 /// Supports quoted field names for fields with spaces.
 fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     let (input, field) = alt((quoted_string, field_name)).parse(input)?;
@@ -1020,7 +1153,7 @@ fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
 
     if looks_like_function {
         // Parse as a full eval expression (handles function calls with operators like now() - INTERVAL 1 DAY)
-        let (input, expr) = eval_expression(input)?;
+        let (input, expr) = eval_operand_expression(input)?;
         return Ok((
             input,
             SearchExpr::FieldFunctionFilter {
@@ -1045,7 +1178,7 @@ fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     let looks_like_paren_expr = is_comparison_op && first_char == Some('(');
 
     if looks_like_paren_expr {
-        let (input, expr) = eval_expression(input)?;
+        let (input, expr) = eval_operand_expression(input)?;
         return Ok((
             input,
             SearchExpr::FieldFunctionFilter {
@@ -1094,7 +1227,7 @@ fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     if looks_like_field_ref {
         // Parse as a field reference using eval expression
         // This handles cases like: where first_seen > time_threshold
-        let (input, expr) = eval_expression(input)?;
+        let (input, expr) = eval_operand_expression(input)?;
         return Ok((
             input,
             SearchExpr::FieldFunctionFilter {
@@ -1105,16 +1238,54 @@ fn field_filter(input: &str) -> ParseResult<'_, SearchExpr> {
         ));
     }
 
+    // NAN-2380: an EXPLICIT column reference, written in backticks —
+    // `| where src_ip != `dest_ip``. Backticks have no other meaning in nPL
+    // (and are ClickHouse's own identifier quoting), so this is the one RHS
+    // form that says "column, not value" with no ambiguity at all. It lowers to
+    // the same `FieldFunctionFilter` node `first_seen > time_threshold`
+    // already produces, on every operator and every schema profile.
+    if let Some(rest) = trimmed.strip_prefix('`') {
+        let (rest, referenced) = field_name(rest)?;
+        let (rest, _) = char('`').parse(rest)?;
+        return Ok((
+            rest,
+            SearchExpr::FieldFunctionFilter {
+                field: field_str,
+                op,
+                function: EvalExpression::Field(referenced),
+            },
+        ));
+    }
+
+    // Was the RHS written with quotes? The tokenizer throws that away
+    // (`= x` and `= "x"` both yield `Value::String("x")`), which is precisely
+    // why `| where src_ip != dest_ip` could compile to `src_ip != 'dest_ip'`
+    // — true for every row — with nothing downstream able to notice. Record it
+    // (NAN-2380) so the SQL generator, which also knows the active schema, can
+    // tell a field reference from a literal that happens to spell a column name.
+    let rhs_written_bare = !matches!(first_char, Some('"') | Some('\''));
+
     // Otherwise, parse as a simple filter value (number, IP, bool, interval, quoted string)
     let (input, value) = filter_value(input)?;
 
+    let rhs = match &value {
+        Value::String(text) if rhs_written_bare && is_bareword_identifier(text) => {
+            RhsSyntax::Bareword
+        }
+        _ => RhsSyntax::Literal,
+    };
+
+    // NAN-3224: `metadata.log_source=risk` is a query-time alias of the
+    // findings that added risk; expand it here so every consumer (SQL, hints,
+    // rollups, source-visibility gates) only ever sees `findings`.
     Ok((
         input,
-        SearchExpr::FieldFilter {
+        crate::query::source_alias::expand_source_alias(SearchExpr::FieldFilter {
             field: field_str,
             op,
             value,
-        },
+            rhs,
+        }),
     ))
 }
 

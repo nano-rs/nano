@@ -78,7 +78,7 @@ export function detectBulkArtifacts(text: string): DetectedArtifact[] {
 
 /**
  * Short human-facing label for the type chip. Matches the analyst lexicon
- * (`SHA256`, `MD5`, `IP`, `IP (private)`, `Domain`, `Subdomain`).
+ * (`SHA256`, `MD5`, `IP`, `IP (private)`, `Domain`, `Subdomain`, `Identity`).
  */
 export function artifactKindLabel(kind: PrevalenceArtifactType): string {
   switch (kind) {
@@ -96,6 +96,8 @@ export function artifactKindLabel(kind: PrevalenceArtifactType): string {
       return 'Domain';
     case 'subdomain':
       return 'Subdomain';
+    case 'identity':
+      return 'Identity';
   }
 }
 

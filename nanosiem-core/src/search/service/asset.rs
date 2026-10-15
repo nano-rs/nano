@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::*;
 use super::lateral::source_scope_sql_predicate;
+use super::*;
 use crate::auth::ScopeSet;
 use crate::search::parse_clickhouse_error;
 
@@ -318,7 +318,8 @@ impl SearchService {
                     );
                     tracing::info!(
                         "Asset view empty for requested window; re-anchoring to last activity [{} .. {}]",
-                        anchored.start, anchored.end
+                        anchored.start,
+                        anchored.end
                     );
                     identities = self
                         .resolve_asset_identities(
@@ -482,14 +483,15 @@ impl SearchService {
         // the profile first, then fall back to the UDM-canonical names so BOTH
         // spaces bucket correctly under either schema.
         use crate::schema::EntityType;
-        let entity_type = profile
-            .entity_type(identifier_field)
-            .or_else(|| match identifier_field {
-                "src_ip" | "dest_ip" => Some(EntityType::Ip),
-                "src_host" | "dest_host" => Some(EntityType::Host),
-                "user" => Some(EntityType::User),
-                _ => None,
-            });
+        let entity_type =
+            profile
+                .entity_type(identifier_field)
+                .or_else(|| match identifier_field {
+                    "src_ip" | "dest_ip" => Some(EntityType::Ip),
+                    "src_host" | "dest_host" => Some(EntityType::Host),
+                    "user" => Some(EntityType::User),
+                    _ => None,
+                });
         match entity_type {
             Some(EntityType::Ip) => {
                 if !ips.contains(&identifier_value.to_string()) {
@@ -544,10 +546,14 @@ impl SearchService {
         // `src_endpoint.hostname` (network events) and misses everything else
         // (NAN-1318; same device.hostname family as NAN-1295/1302).
         let host_cols: Vec<String> = if profile.id() == crate::schema::SchemaId::Ocsf {
-            ["src_endpoint.hostname", "device.hostname", "dst_endpoint.hostname"]
-                .iter()
-                .map(|c| crate::query::escape_identifier(c))
-                .collect()
+            [
+                "src_endpoint.hostname",
+                "device.hostname",
+                "dst_endpoint.hostname",
+            ]
+            .iter()
+            .map(|c| crate::query::escape_identifier(c))
+            .collect()
         } else {
             profile.udm_column_sql("src_host").into_iter().collect()
         };
@@ -626,6 +632,27 @@ impl SearchService {
         filters: Option<&AssetEventFilters>,
         scope: &ScopeSet,
     ) -> Result<(Vec<serde_json::Value>, u64, AssetFacets), SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((Vec::new(), 0, AssetFacets::default()));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_asset_events_paginated(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    time_range,
+                    offset,
+                    limit,
+                    filters,
+                    scope,
+                )
+                .await;
+        }
         // NAN-2022: match build_asset_view — clamp an over-wide window end-anchored to
         // the cap instead of rejecting, so the timeline "load more" stays consistent
         // with the (already clamped) primary asset view rather than 400-ing on offset 0.
@@ -702,8 +729,7 @@ impl SearchService {
             if let Some(ref users) = f.users {
                 if !users.is_empty() {
                     let placeholders: Vec<&str> = users.iter().map(|_| "?").collect();
-                    filter_conditions
-                        .push(format!("{user_col} IN ({})", placeholders.join(",")));
+                    filter_conditions.push(format!("{user_col} IN ({})", placeholders.join(",")));
                     for s in users {
                         filter_binds.push(s.clone());
                     }
@@ -729,8 +755,7 @@ impl SearchService {
         // pre-scoping form.
         let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set());
 
-        let where_clause =
-            build_asset_events_where(&filter_conditions, scope_predicate.as_deref());
+        let where_clause = build_asset_events_where(&filter_conditions, scope_predicate.as_deref());
 
         // Combine identity + filter bind values for queries that use both
         let events_binds: Vec<String> = bind_values
@@ -767,7 +792,8 @@ impl SearchService {
             ORDER BY timestamp DESC
             LIMIT {limit} OFFSET {offset}"#,
             cols = timeline_columns,
-            event_kind = crate::search::classification::event_kind_sql(self.active_profile.as_ref()),
+            event_kind =
+                crate::search::classification::event_kind_sql(self.active_profile.as_ref()),
             start = start_str,
             end = end_str,
             ident = identity_clause,
@@ -979,6 +1005,108 @@ impl SearchService {
 
             Ok((events, total_count, facets))
         }
+    }
+
+    /// Fetch only the paintable Asset timeline page. In canonical lake mode
+    /// this deliberately avoids exact count/facet companions so the first rows
+    /// are not held behind analytics work. Legacy ClickHouse deployments keep
+    /// their established all-in-one implementation.
+    pub async fn query_asset_events_page(
+        &self,
+        identifier_field: &str,
+        identifier_value: &str,
+        identities: &[serde_json::Value],
+        time_range: &TimeRange,
+        offset: usize,
+        limit: usize,
+        cursor: Option<&ProductViewCursor>,
+        filters: Option<&AssetEventFilters>,
+        scope: &ScopeSet,
+    ) -> Result<(Vec<serde_json::Value>, bool, Option<ProductViewCursor>), SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((Vec::new(), false, None));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_asset_events_page(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    time_range,
+                    offset,
+                    limit,
+                    cursor,
+                    filters,
+                    scope,
+                )
+                .await;
+        }
+        let (events, total_count, _) = self
+            .query_asset_events_paginated(
+                identifier_field,
+                identifier_value,
+                identities,
+                time_range,
+                offset,
+                limit,
+                filters,
+                scope,
+            )
+            .await?;
+        let has_more = offset.saturating_add(events.len()) < total_count as usize;
+        Ok((events, has_more, None))
+    }
+
+    /// Fetch the exact Asset total and facets without materializing an event
+    /// page. This is the async companion to [`Self::query_asset_events_page`].
+    pub async fn query_asset_events_summary(
+        &self,
+        identifier_field: &str,
+        identifier_value: &str,
+        identities: &[serde_json::Value],
+        time_range: &TimeRange,
+        filters: Option<&AssetEventFilters>,
+        scope: &ScopeSet,
+    ) -> Result<(u64, AssetFacets, Option<super::asset_dossier::ProductViewProgress>), SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((0, AssetFacets::default(), None));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            // NAN-3094: an unfiltered lean summary reads the page's shared
+            // snapshot and may answer before it is final (`progress`).
+            return self
+                .query_lake_asset_events_summary(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    time_range,
+                    filters,
+                    scope,
+                    true,
+                )
+                .await;
+        }
+        let (_, total_count, facets) = self
+            .query_asset_events_paginated(
+                identifier_field,
+                identifier_value,
+                identities,
+                time_range,
+                0,
+                1,
+                filters,
+                scope,
+            )
+            .await?;
+        Ok((total_count, facets, None))
     }
 
     /// Detect the asset identifier from search results
@@ -1219,6 +1347,20 @@ impl SearchService {
         identities: &[serde_json::Value],
         scope: &ScopeSet,
     ) -> Result<(Option<String>, Option<String>), SearchError> {
+        let retention_cutoff = self.retention_cutoff_at(chrono::Utc::now())?;
+        let retention_time_range =
+            retention_cutoff.map(|cutoff| TimeRange::new(cutoff, chrono::Utc::now()));
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_asset_true_time_range(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    retention_time_range.as_ref(),
+                    scope,
+                )
+                .await;
+        }
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct AssetTimeRange {
             first_seen: String,
@@ -1230,8 +1372,12 @@ impl SearchService {
             None => return Ok((None, None)),
         };
 
-        let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
+        let (ips, hostnames, users) = Self::collect_asset_identifiers(
+            identities,
+            identifier_field,
+            identifier_value,
+            self.active_profile.as_ref(),
+        );
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
@@ -1243,6 +1389,7 @@ impl SearchService {
             &ips,
             &hostnames,
             &users,
+            retention_time_range.as_ref(),
             scope,
         ) {
             Some(query) => query,
@@ -1291,6 +1438,24 @@ impl SearchService {
         time_range: &TimeRange,
         scope: &ScopeSet,
     ) -> Result<serde_json::Value, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(serde_json::json!({ "hashes": [], "domains": [] }));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_asset_artifact_summary(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    time_range,
+                    scope,
+                )
+                .await;
+        }
         use serde_json::json;
 
         let clickhouse = match &self.ch_client {
@@ -1299,8 +1464,12 @@ impl SearchService {
         };
 
         let profile = self.active_profile.as_ref();
-        let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
+        let (ips, hostnames, users) = Self::collect_asset_identifiers(
+            identities,
+            identifier_field,
+            identifier_value,
+            self.active_profile.as_ref(),
+        );
         let (identity_clause, identity_binds) =
             match Self::build_log_identity_clause_for(profile, &ips, &hostnames, &users) {
                 Some(pair) => pair,
@@ -1318,9 +1487,7 @@ impl SearchService {
         // column is unmapped is skipped entirely so no unknown-column reference is
         // emitted. `prevalence_*` are operational columns present in both schemas; if
         // a profile somehow doesn't map one we fall back to the literal `0` host_count.
-        let logs_table = self
-            .table_names
-            .read(Self::logs_table_key(profile));
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
         let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
 
         // NAN-1801: caller's source-scope gate, ANDed into every branch's WHERE.
@@ -1393,34 +1560,42 @@ impl SearchService {
         let hash_binds = repeat_binds(hash_branches.len());
         let domain_binds = repeat_binds(domain_branches.len());
 
-        let hash_sql = if hash_branches.is_empty() {
-            String::new()
-        } else {
+        // Wrap the per-class UNION ALL branches into the final summary query.
+        //
+        // - `total_groups` (`count() OVER ()`, same trick as the executor's
+        //   `_total_count` in sql_helpers.rs): the TRUE artifact group count,
+        //   evaluated before the LIMIT, so the handler can report truncation
+        //   instead of presenting a silently capped 50 as the total.
+        // - `env_first_seen`: the artifact's REAL environment-wide first-seen
+        //   from the prevalence dict (SimpleAggregateFunction(min) over all
+        //   time), NOT the in-window `first_ts` -- the in-window minimum must
+        //   never drive "new to env" novelty. Epoch default = dict miss,
+        //   emitted as '' so the handler maps it to absent.
+        let summary_sql = |branches: &[String], dict: &str| -> String {
+            if branches.is_empty() {
+                return String::new();
+            }
             format!(
-                "SELECT artifact, \
-                    formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
-                    formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
-                    sum(cnt) as cnt, \
-                    max(host_count) as host_count \
-                 FROM ( {} ) GROUP BY artifact ORDER BY last_ts DESC LIMIT 50 \
+                "SELECT artifact, first_ts, last_ts, cnt, host_count, \
+                    if(env_fs_raw > toDateTime64('1970-01-01 00:00:00', 6), \
+                       formatDateTime(env_fs_raw, '%Y-%m-%dT%H:%i:%sZ'), '') as env_first_seen, \
+                    count() OVER () as total_groups \
+                 FROM ( \
+                    SELECT artifact, \
+                        formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
+                        formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
+                        sum(cnt) as cnt, \
+                        max(host_count) as host_count, \
+                        dictGetOrDefault('{dict}', 'first_seen', artifact, \
+                            toDateTime64('1970-01-01 00:00:00', 6)) as env_fs_raw \
+                    FROM ( {} ) GROUP BY artifact \
+                 ) ORDER BY last_ts DESC LIMIT 50 \
                   SETTINGS max_execution_time=30",
-                hash_branches.join(" UNION ALL ")
+                branches.join(" UNION ALL ")
             )
         };
-        let domain_sql = if domain_branches.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "SELECT artifact, \
-                    formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
-                    formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
-                    sum(cnt) as cnt, \
-                    max(host_count) as host_count \
-                 FROM ( {} ) GROUP BY artifact ORDER BY last_ts DESC LIMIT 50 \
-                  SETTINGS max_execution_time=30",
-                domain_branches.join(" UNION ALL ")
-            )
-        };
+        let hash_sql = summary_sql(&hash_branches, "nanosiem.hash_prevalence_dict");
+        let domain_sql = summary_sql(&domain_branches, "nanosiem.domain_prevalence_dict");
 
         // Run both queries in parallel (skip when a profile maps no source columns).
         let hash_future = async {
@@ -1432,7 +1607,7 @@ impl SearchService {
                 hash_query = hash_query.bind(val);
             }
             hash_query
-                .fetch_all::<(String, String, String, u64, u16)>()
+                .fetch_all::<(String, String, String, u64, u16, String, u64)>()
                 .await
         };
 
@@ -1445,33 +1620,57 @@ impl SearchService {
                 domain_query = domain_query.bind(val);
             }
             domain_query
-                .fetch_all::<(String, String, String, u64, u16)>()
+                .fetch_all::<(String, String, String, u64, u16, String, u64)>()
                 .await
         };
 
         let (hash_result, domain_result) = tokio::join!(hash_future, domain_future);
 
-        let hashes: Vec<serde_json::Value> = match hash_result {
-            Ok(rows) => rows.into_iter().map(|(artifact, first_ts, last_ts, count, host_count)| {
-                json!({ "artifact": artifact, "first_ts": first_ts, "last_ts": last_ts, "count": count, "host_count": host_count })
-            }).collect(),
+        // Every returned row carries the same pre-LIMIT group count; an empty
+        // result set means zero groups.
+        type SummaryRow = (String, String, String, u64, u16, String, u64);
+        let emit = |rows: Vec<SummaryRow>| -> (Vec<serde_json::Value>, u64) {
+            let total = rows.first().map(|row| row.6).unwrap_or(0);
+            let rows = rows
+                .into_iter()
+                .map(|(artifact, first_ts, last_ts, count, host_count, env_first_seen, _)| {
+                    json!({
+                        "artifact": artifact,
+                        "first_ts": first_ts,
+                        "last_ts": last_ts,
+                        "count": count,
+                        "host_count": host_count,
+                        // '' = prevalence dict miss = no environment-wide
+                        // first-seen known; the handler maps it to absent.
+                        "env_first_seen": if env_first_seen.is_empty() { serde_json::Value::Null } else { json!(env_first_seen) },
+                    })
+                })
+                .collect();
+            (rows, total)
+        };
+
+        let (hashes, hash_total) = match hash_result {
+            Ok(rows) => emit(rows),
             Err(e) => {
                 tracing::warn!("Failed to query asset artifact hashes: {}", e);
                 return Err(parse_clickhouse_error(&e.to_string()));
             }
         };
 
-        let domains: Vec<serde_json::Value> = match domain_result {
-            Ok(rows) => rows.into_iter().map(|(artifact, first_ts, last_ts, count, host_count)| {
-                json!({ "artifact": artifact, "first_ts": first_ts, "last_ts": last_ts, "count": count, "host_count": host_count })
-            }).collect(),
+        let (domains, domain_total) = match domain_result {
+            Ok(rows) => emit(rows),
             Err(e) => {
                 tracing::warn!("Failed to query asset artifact domains: {}", e);
                 return Err(parse_clickhouse_error(&e.to_string()));
             }
         };
 
-        Ok(json!({ "hashes": hashes, "domains": domains }))
+        Ok(json!({
+            "hashes": hashes,
+            "domains": domains,
+            "hash_total": hash_total,
+            "domain_total": domain_total,
+        }))
     }
 
     /// Query per-event artifact occurrences across the full search time range.
@@ -1492,6 +1691,26 @@ impl SearchService {
         domain_filter: Option<&[String]>,
         scope: &ScopeSet,
     ) -> Result<serde_json::Value, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(serde_json::json!({ "hashes": [], "domains": [] }));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_asset_artifact_occurrences(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    time_range,
+                    hash_filter,
+                    domain_filter,
+                    scope,
+                )
+                .await;
+        }
         use serde_json::json;
 
         let clickhouse = match &self.ch_client {
@@ -1500,8 +1719,12 @@ impl SearchService {
         };
 
         let profile = self.active_profile.as_ref();
-        let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
+        let (ips, hostnames, users) = Self::collect_asset_identifiers(
+            identities,
+            identifier_field,
+            identifier_value,
+            self.active_profile.as_ref(),
+        );
         let (identity_clause, identity_binds) =
             match Self::build_log_identity_clause_for(profile, &ips, &hostnames, &users) {
                 Some(pair) => pair,
@@ -1510,9 +1733,7 @@ impl SearchService {
 
         let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
         let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
-        let logs_table = self
-            .table_names
-            .read(Self::logs_table_key(profile));
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
         let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
 
         // NAN-1801: caller's source-scope gate, ANDed into every branch's WHERE.
@@ -1555,9 +1776,13 @@ impl SearchService {
                 }
                 None => {
                     if is_hash {
-                        format!("{col} != '' AND length({col}) >= 32 AND match({col}, '^[a-fA-F0-9]+$')")
+                        format!(
+                            "{col} != '' AND length({col}) >= 32 AND match({col}, '^[a-fA-F0-9]+$')"
+                        )
                     } else {
-                        format!("{col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0")
+                        format!(
+                            "{col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0"
+                        )
                     }
                 }
             };
@@ -1714,6 +1939,14 @@ impl SearchService {
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<EntityActivityBucket>, SearchError> {
+        let Some(retention_range) =
+            self.retention_bound_query_range(&TimeRange::new(start, end), chrono::Utc::now())?
+        else {
+            return Ok(Vec::new());
+        };
+        let start = retention_range.start;
+        let end = retention_range.end;
+
         let agg_entity_type = match entity_type {
             "host" => "src_host",
             "ip" => "src_ip",
@@ -1844,6 +2077,14 @@ impl SearchService {
         end: chrono::DateTime<chrono::Utc>,
         per_dim_limit: usize,
     ) -> Result<Vec<DimensionFirst>, SearchError> {
+        let Some(retention_range) =
+            self.retention_bound_query_range(&TimeRange::new(start, end), chrono::Utc::now())?
+        else {
+            return Ok(Vec::new());
+        };
+        let start = retention_range.start;
+        let end = retention_range.end;
+
         // Entity value is matched case-insensitively (`lower(col) = ?` on the
         // raw path, stored-lowercase equality on the agg path), so bind the
         // lowercased value.
@@ -1949,9 +2190,7 @@ impl SearchService {
             return Ok(Vec::new());
         }
 
-        let logs_table = self
-            .table_names
-            .read(Self::logs_table_key(profile));
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
 
         let scope_pred = source_scope_sql_predicate("source_type", scope.deny_set())
             .map(|p| format!(" AND {p}"))
@@ -2113,8 +2352,15 @@ impl SearchService {
                 covered_days: u64,
             }
 
-            match clickhouse.query(&marker_sql).fetch_all::<CoverageRow>().await {
-                Ok(rows) if rows.first().is_some_and(|r| r.covered_days >= needed as u64) => {}
+            match clickhouse
+                .query(&marker_sql)
+                .fetch_all::<CoverageRow>()
+                .await
+            {
+                Ok(rows)
+                    if rows
+                        .first()
+                        .is_some_and(|r| r.covered_days >= needed as u64) => {}
                 Ok(_) => {
                     tracing::debug!(
                         entity_type,
@@ -2244,10 +2490,9 @@ impl SearchService {
                      FROM {meta_table} WHERE k = 'active_since'"
                 );
                 match clickhouse.query(&sql).fetch_all::<MetaRow>().await {
-                    Ok(rows) => Ok(rows
-                        .first()
-                        .filter(|r| r.n > 0)
-                        .and_then(|r| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(r.active_us))),
+                    Ok(rows) => Ok(rows.first().filter(|r| r.n > 0).and_then(|r| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_micros(r.active_us)
+                    })),
                     Err(e) => {
                         tracing::warn!(
                             "baseline_agg_meta read failed; agg fast path off this call: {}",
@@ -2282,6 +2527,14 @@ impl SearchService {
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<EntityActivityBucket>, SearchError> {
+        let Some(retention_range) =
+            self.retention_bound_query_range(&TimeRange::new(start, end), chrono::Utc::now())?
+        else {
+            return Ok(Vec::new());
+        };
+        let start = retention_range.start;
+        let end = retention_range.end;
+
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(Vec::new()),
@@ -2296,9 +2549,7 @@ impl SearchService {
                 Some(p) => p,
                 None => return Ok(Vec::new()),
             };
-        let logs_table = self
-            .table_names
-            .read(Self::logs_table_key(profile));
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
         let scope_pred = source_scope_sql_predicate("source_type", scope.deny_set())
             .map(|p| format!(" AND {p}"))
             .unwrap_or_default();
@@ -2338,7 +2589,11 @@ impl SearchService {
                 })
                 .collect()),
             Err(e) => {
-                tracing::warn!(entity_type, "entity_hourly_activity_scoped scan failed: {}", e);
+                tracing::warn!(
+                    entity_type,
+                    "entity_hourly_activity_scoped scan failed: {}",
+                    e
+                );
                 Err(parse_clickhouse_error(&e.to_string()))
             }
         }
@@ -2361,9 +2616,10 @@ fn build_asset_true_time_range_query(
     ips: &[String],
     hostnames: &[String],
     users: &[String],
+    retention_range: Option<&TimeRange>,
     scope: &ScopeSet,
 ) -> Option<(String, Vec<String>)> {
-    if !scope.is_restricted() {
+    if !scope.is_restricted() && retention_range.is_none() {
         let (identity_clause, identity_binds) =
             SearchService::build_entity_identity_clause(ips, hostnames, users)?;
         let sql = format!(
@@ -2379,14 +2635,25 @@ fn build_asset_true_time_range_query(
 
     let (identity_clause, identity_binds) =
         SearchService::build_log_identity_clause_for(profile, ips, hostnames, users)?;
-    let scope_predicate = source_scope_sql_predicate("source_type", scope.deny_set())?;
+    let mut predicates = vec![format!("({identity_clause})")];
+    if let Some(range) = retention_range {
+        let start = crate::sql_hygiene::format_ch_bound_micros(&range.start);
+        let end = crate::sql_hygiene::format_ch_bound_micros(&range.end);
+        predicates.push(format!(
+            "timestamp >= toDateTime64('{start}', 6) AND timestamp <= toDateTime64('{end}', 6)"
+        ));
+    }
+    if let Some(scope_predicate) = source_scope_sql_predicate("source_type", scope.deny_set()) {
+        predicates.push(scope_predicate);
+    }
     let sql = format!(
         "SELECT \
             formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') as first_seen, \
             formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') as last_seen \
          FROM {} \
-         WHERE ({}) AND {}",
-        logs_table, identity_clause, scope_predicate
+         WHERE {}",
+        logs_table,
+        predicates.join(" AND ")
     );
     Some((sql, identity_binds))
 }
@@ -2579,10 +2846,7 @@ pub struct DimensionFirst {
 /// - filters only         → `"\n            WHERE (f1 AND f2)"` (byte-identical)
 /// - scope only           → `"\n            WHERE <pred>"`
 /// - both                 → `"\n            WHERE (f1 AND f2) AND <pred>"`
-fn build_asset_events_where(
-    filter_conditions: &[String],
-    scope_predicate: Option<&str>,
-) -> String {
+fn build_asset_events_where(filter_conditions: &[String], scope_predicate: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !filter_conditions.is_empty() {
         parts.push(format!("({})", filter_conditions.join(" AND ")));
@@ -2682,11 +2946,8 @@ mod source_scope_tests {
     /// events.
     #[test]
     fn nonempty_deny_set_gates_every_asset_scan() {
-        let pred = source_scope_sql_predicate(
-            "source_type",
-            &deny(&["audit", "insider_threat"]),
-        )
-        .expect("nonempty deny set must render");
+        let pred = source_scope_sql_predicate("source_type", &deny(&["audit", "insider_threat"]))
+            .expect("nonempty deny set must render");
         assert_eq!(
             pred,
             "lower(source_type) NOT IN ('audit', 'insider_threat')"
@@ -2705,13 +2966,15 @@ mod source_scope_tests {
 
         // The GROUP BY source_type facet — the gate must be ANDed into the
         // scan's PREWHERE conjunction, before the GROUP BY.
-        let facet = build_asset_combined_facet_sql("ET", "logs", "S", "E", "src_ip = ?", Some(&pred));
+        let facet =
+            build_asset_combined_facet_sql("ET", "logs", "S", "E", "src_ip = ?", Some(&pred));
         assert!(
             facet.contains(&format!("AND (src_ip = ?) AND {pred} GROUP BY source_type")),
             "source_type facet scan missing scope gate: {facet}"
         );
 
-        let user_facet = build_asset_user_facet_sql("user", "logs", "S", "E", "src_ip = ?", Some(&pred));
+        let user_facet =
+            build_asset_user_facet_sql("user", "logs", "S", "E", "src_ip = ?", Some(&pred));
         assert!(
             user_facet.contains(&format!("WHERE user != '' AND {pred}")),
             "user facet scan missing scope gate: {user_facet}"
@@ -3003,10 +3266,7 @@ pub(crate) fn detect_event_kind(event: &serde_json::Value) -> String {
     // DNS events
     let src_port = event.get("src_port").and_then(|v| v.as_u64()).unwrap_or(0);
     let dest_port = event.get("dest_port").and_then(|v| v.as_u64()).unwrap_or(0);
-    if (source_type.contains("dns")
-        || has_non_empty("query")
-        || src_port == 53
-        || dest_port == 53)
+    if (source_type.contains("dns") || has_non_empty("query") || src_port == 53 || dest_port == 53)
         && !source_type.contains("dhcp")
     {
         return "DNS".to_string();
@@ -3165,14 +3425,20 @@ mod nan2230_asset_reader_tests {
     #[test]
     fn event_lane_summary_falls_back_to_event_type() {
         let event = json!({ "event_type": "process_access", "source_type": "windows_sysmon" });
-        assert_eq!(build_event_summary(&udm(), &event, "EVENT"), "process_access");
+        assert_eq!(
+            build_event_summary(&udm(), &event, "EVENT"),
+            "process_access"
+        );
     }
 
     /// `message` still wins when present — the fallback is second, not first.
     #[test]
     fn event_lane_summary_prefers_message() {
         let event = json!({ "message": "a real message", "event_type": "process_access" });
-        assert_eq!(build_event_summary(&udm(), &event, "EVENT"), "a real message");
+        assert_eq!(
+            build_event_summary(&udm(), &event, "EVENT"),
+            "a real message"
+        );
     }
 
     /// With neither, the literal placeholder is still correct.

@@ -1,0 +1,174 @@
+# Hosted variant of connector.yaml (NAN-3503): identical collection, KEYLESS
+# auth. The customer's Okta API Services app uses private_key_jwt client
+# authentication against the public JWK nano's pull broker publishes for the
+# tenant (https://pull-broker.nano.rs/v1/okta/jwks/<nano tenant id>); the
+# broker signs the client assertion, so no API token or private key is ever
+# held by nano or the customer. Everything below auth is byte-for-byte
+# connector.yaml; the shadow contract test enforces it.
+version: 1
+name: okta_users
+kind: identity
+allow:
+  - host: "{{config.OKTA_DOMAIN}}"
+    host_suffixes: [".okta.com", ".oktapreview.com", ".okta-emea.com", ".okta-gov.com", ".okta.mil"]
+    path_prefixes: ["/api/v1/users", "/api/v1/groups", "/api/v1/iam/assignees/users", "/oauth2/v1/token"]
+auth:
+  type: okta_broker_jwt
+  okta_domain: "{{config.OKTA_DOMAIN}}"
+  client_id: "{{config.CLIENT_ID}}"
+  scope: "okta.users.read okta.groups.read okta.roles.read"
+schedule: "0 * * * *"
+limits: { max_run_secs: 3600, max_pages: 5000, max_requests: 20000 }
+rate_limit: { reset_header: X-Rate-Limit-Reset, remaining_header: X-Rate-Limit-Remaining, remaining_floor: 2 }
+identity:
+  full_every_secs: 86400
+streams:
+  - id: users
+    identity: { role: users, mode: delta }
+    # No `request`: the program picks the first request from .identity.mode
+    # (list for full, search for delta) and then follows rel="next".
+    program: |
+      mode = string(.identity.mode) ?? "full"
+      domain = string(.config.OKTA_DOMAIN) ?? ""
+      st = object(.state) ?? {}
+      if .response == null {
+        since = string(st.last_updated) ?? ""
+        if mode == "delta" && since != "" {
+          ts = parse_timestamp(since, "%+") ?? now()
+          since = format_timestamp!(from_unix_timestamp!(to_unix_timestamp(ts) - 300), "%Y-%m-%dT%H:%M:%S.000Z")
+          {"state": st, "next_request": {"url": "https://" + domain + "/api/v1/users", "query": {"limit": "200", "search": "lastUpdated gt \"" + since + "\""}}}
+        } else if mode == "delta" {
+          {"restart_full": true}
+        } else {
+          every = "status eq \"STAGED\" or status eq \"PROVISIONED\" or status eq \"ACTIVE\" or status eq \"RECOVERY\" or status eq \"PASSWORD_EXPIRED\" or status eq \"LOCKED_OUT\" or status eq \"SUSPENDED\" or status eq \"DEPROVISIONED\""
+          {"state": {"last_updated": "", "seen_max": ""}, "next_request": {"url": "https://" + domain + "/api/v1/users", "query": {"limit": "200", "search": every}}}
+        }
+      } else {
+        status = to_int(.response.status) ?? 0
+        if status < 200 || status >= 300 {
+          {"error": "Okta returned " + to_string(status) + ": " + (string(.response.body.errorSummary) ?? "no summary")}
+        } else {
+          users = array(.response.body) ?? []
+          seen = string(st.seen_max) ?? ""
+          evs = map_values(users) -> |u| {
+            lu = string(u.lastUpdated) ?? ""
+            if lu > seen { seen = lu }
+            p = u.profile
+            s = upcase(string(u.status) ?? "")
+            acct = "unknown"
+            if s == "ACTIVE" || s == "RECOVERY" || s == "PASSWORD_EXPIRED" { acct = "active" }
+            if s == "SUSPENDED" { acct = "suspended" }
+            if s == "DEPROVISIONED" { acct = "deprovisioned" }
+            if s == "LOCKED_OUT" { acct = "locked" }
+            if s == "STAGED" || s == "PROVISIONED" { acct = "staged" }
+            mid = string(p.managerId) ?? ""
+            mgr_upn = if contains(mid, "@") { mid } else { "" }
+            display = string(p.displayName) ?? ""
+            if display == "" { display = strip_whitespace((string(p.firstName) ?? "") + " " + (string(p.lastName) ?? "")) }
+            phone = string(p.mobilePhone) ?? ""
+            if phone == "" { phone = string(p.primaryPhone) ?? "" }
+            compact({
+              "external_id": u.id,
+              "username": p.login,
+              "upn": p.login,
+              "email": p.email,
+              "display_name": display,
+              "first_name": p.firstName,
+              "last_name": p.lastName,
+              "department": p.department,
+              "title": p.title,
+              "manager_upn": mgr_upn,
+              "manager_display_name": p.manager,
+              "company": p.organization,
+              "city": p.city,
+              "country": p.countryCode,
+              "phone": phone,
+              "employee_id": p.employeeNumber,
+              "employee_type": p.userType,
+              "account_enabled": acct == "active",
+              "account_status": acct,
+              "last_sign_in_at": u.lastLogin,
+              "created_in_directory_at": u.created
+            })
+          }
+          next = string(.response.links.next) ?? ""
+          if next == "" {
+            prev = string(st.last_updated) ?? ""
+            done = if seen > prev { seen } else { prev }
+            {"events": evs, "state": {"last_updated": done, "seen_max": ""}}
+          } else {
+            {"events": evs, "state": {"last_updated": st.last_updated, "seen_max": seen}, "next_request": {"url": next}}
+          }
+        }
+      }
+  - id: groups
+    identity: { role: memberships }
+    fanout:
+      discover:
+        from: request
+        request:
+          url: "https://{{config.OKTA_DOMAIN}}/api/v1/groups"
+          query: { limit: "200" }
+          headers: { Accept: application/json }
+        pagination: { type: link_header }
+      item_key: id
+      concurrency: 2
+      max_items: 10000
+    request:
+      url: "https://{{config.OKTA_DOMAIN}}/api/v1/groups/{{item.id}}/users"
+      query: { limit: "200" }
+      headers: { Accept: application/json }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Okta group members returned " + to_string(status) + ": " + (string(.response.body.errorSummary) ?? "no summary")}
+      } else {
+        group = string(.item.profile.name) ?? (string(.item.id) ?? "")
+        privs = []
+        for_each(split(downcase(string(.config.PRIVILEGED_GROUPS) ?? ""), ",")) -> |_i, p| {
+          p = strip_whitespace(p)
+          if p != "" { privs = push(privs, p) }
+        }
+        privileged = includes(privs, downcase(group))
+        evs = map_values(array(.response.body) ?? []) -> |u| { {"member": u.id, "group": group, "privileged": privileged} }
+        next = string(.response.links.next) ?? ""
+        if next == "" {
+          {"events": evs}
+        } else {
+          {"events": evs, "next_request": {"url": next}}
+        }
+      }
+  - id: roles
+    identity: { role: memberships }
+    fanout:
+      discover:
+        from: request
+        request:
+          url: "https://{{config.OKTA_DOMAIN}}/api/v1/iam/assignees/users"
+          query: { limit: "100" }
+          headers: { Accept: application/json }
+        response: { events_path: value }
+        # NAN-3503 lane A: the IAM APIs page with an absolute URL in the body
+        # (_links.next.href), not a Link header. Same `next_url` stepper as
+        # Graph's @odata.nextLink.
+        pagination: { type: next_url, pointer: "/_links/next/href" }
+      item_key: id
+      concurrency: 2
+      max_items: 10000
+    request:
+      url: "https://{{config.OKTA_DOMAIN}}/api/v1/users/{{item.id}}/roles"
+      headers: { Accept: application/json }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Okta role assignments returned " + to_string(status) + ": " + (string(.response.body.errorSummary) ?? "no summary")}
+      } else {
+        member = string(.item.id) ?? ""
+        roles = filter(array(.response.body) ?? []) -> |_i, r| { r.status != "INACTIVE" }
+        evs = map_values(roles) -> |r| {
+          t = string(r.type) ?? ""
+          if t == "" { t = string(r.label) ?? "unknown" }
+          {"member": member, "group": "role:" + t, "privileged": true}
+        }
+        {"events": evs}
+      }

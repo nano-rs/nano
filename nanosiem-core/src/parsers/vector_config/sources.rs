@@ -30,7 +30,11 @@ impl VectorConfigManager {
                 let router_input = format!("source_router.{}", safe_name);
                 (String::new(), router_input)
             }
-            st if matches!(super::router::transport_of(st), super::router::Transport::Fetch) => {
+            st if matches!(
+                super::router::transport_of(st),
+                super::router::Transport::Fetch
+            ) =>
+            {
                 // NAN-928: fetch-source parser bound to a deployed source
                 // configuration via the "DISPATCH FROM" picker. Mirror the
                 // HEC shape — `filter` on the source-config's routing
@@ -59,7 +63,11 @@ impl VectorConfigManager {
                 );
                 (config, filter_name)
             }
-            st if matches!(super::router::transport_of(st), super::router::Transport::SplunkHec) => {
+            st if matches!(
+                super::router::transport_of(st),
+                super::router::Transport::SplunkHec
+            ) =>
+            {
                 // NAN-921: HEC events arrive on the OOTB splunk_hec_ingest
                 // source (`:8088`) declared in `config/vector/02-hec-source.toml`.
                 // Per-parser HEC source declarations collided on the port and
@@ -73,7 +81,11 @@ impl VectorConfigManager {
                     self.generate_splunk_hec_filter(&filter_name, match_values, &parser.name);
                 (config, filter_name)
             }
-            st if matches!(super::router::transport_of(st), super::router::Transport::Otlp) => {
+            st if matches!(
+                super::router::transport_of(st),
+                super::router::Transport::Otlp
+            ) =>
+            {
                 // NAN-1528: OTLP events arrive on the OOTB `otlp_ingest` source
                 // (gRPC :4317 / HTTP :4318) declared in
                 // `config/vector/03-otlp-source.toml`. Like Splunk HEC (:8088),

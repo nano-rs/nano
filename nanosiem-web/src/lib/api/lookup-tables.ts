@@ -18,6 +18,7 @@ import type {
   JobExecution,
 } from './types';
 import { getServiceUrl } from './utils';
+import { requestCredentials } from '@/lib/request-credentials';
 
 export class LookupTablesApi {
   constructor(
@@ -56,6 +57,7 @@ export class LookupTablesApi {
     const response = await fetch(url, {
       method: 'POST',
       headers,
+      credentials: requestCredentials(endpoint, headers),
       body: formData,
     });
 

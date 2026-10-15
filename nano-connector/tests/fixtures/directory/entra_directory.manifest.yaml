@@ -1,0 +1,119 @@
+name: Microsoft Entra ID
+slug: entra_directory
+category: collector
+description: "Sync Entra ID users, group memberships and admin roles into nano's identity registry"
+icon: users
+author: nano
+version: 1
+changelog: >-
+  v1: initial release (NAN-3503), on the nano-connector runtime. Users,
+  managers, group memberships and activated directory roles from Microsoft
+  Graph v1.0. A full snapshot daily, Graph delta queries hourly in between.
+  Hosted feeds are keyless: your app registration trusts nano through a
+  federated identity credential, so no client secret is created or stored.
+
+# Self-hosted installs (connector.yaml) authenticate with the app
+# registration's client secret. Hosted installs (connector.hosted.yaml) read
+# no credential at all and never ask for this field.
+requires_credential: required
+credential_fields:
+  - name: CLIENT_SECRET
+    label: Client secret (self-hosted only)
+    field_type: secret
+    required: true
+    help: >-
+      Self-hosted only. App registration → Certificates & secrets → New client
+      secret; paste the secret's Value (not its ID). Hosted nano never asks for
+      it: hosted feeds use a federated identity credential instead.
+
+config_fields:
+  - name: DIRECTORY_ID
+    label: Directory (tenant) ID
+    field_type: string
+    required: true
+    placeholder: "00000000-0000-0000-0000-000000000000"
+    help: >-
+      Entra admin center → Identity → Overview → Tenant ID. A GUID, not a
+      domain name.
+  - name: CLIENT_ID
+    label: Application (client) ID
+    field_type: string
+    required: true
+    placeholder: "00000000-0000-0000-0000-000000000000"
+    help: >-
+      The Application (client) ID of the app registration you created for
+      nano (App registrations → your app → Overview).
+  - name: PRIVILEGED_GROUPS
+    label: Privileged groups
+    field_type: string
+    required: false
+    placeholder: "Domain Admins, Break Glass"
+    help: >-
+      Optional. Comma-separated group display names or object IDs whose
+      members nano treats as administrators, in addition to every user who
+      holds an active Entra directory role.
+
+# Fixed hosts. login.microsoftonline.com is the self-hosted token endpoint;
+# hosted feeds receive their Graph token from nano's pull broker.
+allowed_domains:
+  - graph.microsoft.com
+  - login.microsoftonline.com
+
+# Identity streams: their rows go to nano's identity snapshot, not to ingest,
+# so `nano_identity` marks them (no parser, no log source).
+streams:
+  - id: users
+    label: Users
+    source_type: nano_identity
+    default: true
+    description: "Every user with profile, manager, status and employee type"
+  - id: groups
+    label: Group memberships
+    source_type: nano_identity
+    default: true
+    description: "Which groups each user belongs to, nested groups included"
+  - id: roles
+    label: Directory roles
+    source_type: nano_identity
+    default: true
+    description: "Users holding an active Entra directory role, marked as admins"
+
+config:
+  poll_schedule: "0 * * * *"
+  max_run_secs: 3600
+  max_events_per_emit: 1000
+
+tags:
+  - identity
+  - microsoft
+  - entra
+
+categories:
+  - identity
+
+components:
+  - id: directory
+    label: Directory
+    kind: identity
+    description: "Users, managers, group memberships and admin roles from Microsoft Graph"
+    connector_spec: connector.yaml
+    hosted_connector_spec: connector.hosted.yaml
+    config_fields: [DIRECTORY_ID, CLIENT_ID, PRIVILEGED_GROUPS]
+    default: true
+    setup:
+      permissions:
+        - "Microsoft Graph application permission User.Read.All"
+        - "Microsoft Graph application permission GroupMember.Read.All"
+        - "Microsoft Graph application permission RoleManagement.Read.Directory"
+      steps:
+        - "In the Entra admin center, open **App registrations → New registration**. Name it `nano directory sync`, keep **Accounts in this organizational directory only**, and register it. Copy the **Application (client) ID** and the **Directory (tenant) ID** into the fields above."
+        - "Open **Certificates & secrets → Federated credentials → Add credential**, scenario **Other issuer**. Issuer: `https://pull-broker.nano.rs`. Subject identifier: `nano-connector:entra:<your nano tenant id>` (nano shows the exact value on this page). Audience: `api://AzureADTokenExchange`. Name it `nano`."
+        - "Open **API permissions → Add a permission → Microsoft Graph → Application permissions** and add `User.Read.All`, `GroupMember.Read.All` and `RoleManagement.Read.Directory`."
+        - "Click **Grant admin consent for <your directory>**. Until consent is granted every Graph call answers 403."
+        - "Self-hosted nano only: instead of the federated credential, create a client secret under **Certificates & secrets** and paste its value into Client secret."
+
+# NAN-3503: this integration exists only as nano-connector specs.
+runtime: connector
+connector_spec: connector.yaml
+# Hosted runner only: keyless federated credential via nano's pull broker.
+hosted_connector_spec: connector.hosted.yaml

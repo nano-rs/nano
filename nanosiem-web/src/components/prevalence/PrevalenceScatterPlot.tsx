@@ -5,9 +5,36 @@ import { Hash, Globe, SlidersHorizontal } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { Slider } from '@/components/ui/slider';
 
+/**
+ * Where a dot's host count came from.
+ *
+ * NAN-2361: the immutable prevalence snapshot rebuilds per generation and lags
+ * ingest by 30-90 minutes, so an artifact from a minutes-old alert simply is
+ * not in it. That miss used to arrive as `host_count: 0`, which the plot
+ * rendered as a receded dot — visually identical to "boring", at the moment an
+ * analyst most needs the opposite.
+ *
+ * - `baseline`  the snapshot answered. This is ENVIRONMENT truth over the
+ *               selected window and stays the number we show, because "is this
+ *               rare here?" is a question about history, not about whatever
+ *               window the analyst happens to have open.
+ * - `in-window` the snapshot missed; the count is distinct hosts observed in
+ *               the searched window only. A strict LOWER BOUND on environment
+ *               prevalence — an asset that touched this artifact yesterday is
+ *               outside the window and not counted — so it is drawn hollow and
+ *               labelled, never passed off as the environment number.
+ * - `none`      neither source has anything. Rendered as an explicit "no data"
+ *               marker rather than a plottable-looking dot.
+ */
+// NAN-2361: `global` is an environment-wide count measured by an unscoped
+// discovery query (asset mode). It is MEASURED — as authoritative as
+// `baseline` — so it must never be drawn or described as unmeasured.
+export type PrevalenceSource = 'baseline' | 'global' | 'in-window' | 'none';
+
 export interface PrevalenceScatterPoint {
   artifact: string;
   artifactType: 'hash' | 'domain';
+  /** Display count: baseline when present, else in-window, else 0. */
   hostCount: number;
   firstSeen: Date;
   lastSeen: Date;
@@ -18,6 +45,21 @@ export interface PrevalenceScatterPoint {
   // NAN-1700: prevalence not yet loaded for this artifact — plotted at its event
   // time on the baseline while the (slow) rarity lookup runs, then enriched.
   pending?: boolean;
+  /** NAN-2361: provenance of `hostCount`. Absent = legacy caller, treat as baseline. */
+  prevalenceSource?: PrevalenceSource;
+  /** Distinct hosts in the searched window (layer 1). Present regardless of source. */
+  inWindowHosts?: number;
+  /** Events in the searched window. Diagnostic; shown in the tooltip. */
+  inWindowEvents?: number;
+  /** Snapshot count when the baseline answered. Kept alongside for comparison. */
+  baselineHostCount?: number;
+  /**
+   * The ingest stamp flagged this artifact as new. NOT "first ever seen": the
+   * stamp is computed against the same lagging snapshot, so EVERY occurrence
+   * during the catch-up window carries it. Deduped to the earliest occurrence
+   * before it drives the novelty ring.
+   */
+  isNewAtIngest?: boolean;
 }
 
 export interface PrevalenceScatterData {
@@ -48,6 +90,11 @@ interface RarityDot {
   isRare: boolean;
   envFirstSeen?: Date;
   pending?: boolean;
+  prevalenceSource: PrevalenceSource;
+  inWindowHosts?: number;
+  inWindowEvents?: number;
+  baselineHostCount?: number;
+  isNewAtIngest?: boolean;
 }
 
 interface TipState {
@@ -137,6 +184,34 @@ export function PrevalenceScatterPlot({
         existing.events += p.totalOccurrences || 1;
         if (p.firstSeen < existing.firstSeen) existing.firstSeen = p.firstSeen;
         if (!p.pending) existing.pending = false;
+        // NAN-2361: one artifact contributes many occurrence points. Provenance
+        // is a property of the ARTIFACT, so let the best source any occurrence
+        // carries win rather than whichever happened to be ingested last.
+        if (
+          (p.prevalenceSource === 'baseline' || p.prevalenceSource === 'global') &&
+          existing.prevalenceSource !== 'baseline' &&
+          existing.prevalenceSource !== 'global'
+        ) {
+          // Carry the winning point's OWN source. Hardcoding 'baseline' here
+          // relabelled every multi-occurrence 'global' artifact as baseline —
+          // so the provenance an analyst saw depended on the ingest order of
+          // occurrence points, and the "environment-wide (measured)" tooltip
+          // branch was effectively unreachable.
+          existing.prevalenceSource = p.prevalenceSource;
+          existing.hostCount = p.hostCount;
+          existing.isRare = p.isRare;
+          existing.baselineHostCount = p.baselineHostCount ?? p.hostCount;
+        } else if (p.prevalenceSource === 'in-window' && existing.prevalenceSource === 'none') {
+          existing.prevalenceSource = 'in-window';
+          existing.hostCount = p.hostCount;
+          existing.isRare = p.isRare;
+        }
+        if (p.inWindowHosts != null) {
+          existing.inWindowHosts = Math.max(existing.inWindowHosts ?? 0, p.inWindowHosts);
+        }
+        if (p.inWindowEvents != null) {
+          existing.inWindowEvents = (existing.inWindowEvents ?? 0) + p.inWindowEvents;
+        }
       } else {
         map.set(key, {
           artifact: p.artifact,
@@ -147,6 +222,14 @@ export function PrevalenceScatterPlot({
           isRare: p.isRare,
           envFirstSeen: p.envFirstSeen,
           pending: p.pending,
+          // Absent provenance = a caller predating NAN-2361 (the ClickHouse/UDM
+          // path still sends plain snapshot points), so treat a real count as
+          // baseline and a zero as genuinely absent.
+          prevalenceSource: p.prevalenceSource ?? (p.hostCount > 0 ? 'baseline' : 'none'),
+          inWindowHosts: p.inWindowHosts,
+          inWindowEvents: p.inWindowEvents,
+          baselineHostCount: p.baselineHostCount,
+          isNewAtIngest: p.isNewAtIngest,
         });
       }
     };
@@ -456,18 +539,33 @@ export function PrevalenceScatterPlot({
           // and an unbaselined (host_count 0 / no prevalence) dot recedes too — we
           // have no signal, so don't draw the eye to it (NAN-1699). Common are
           // kept very faint so they're visible-but-quiet when the slider is widened.
-          const recede = d.hostCount >= COMMON_HOST_THRESHOLD || d.hostCount === 0;
-          const fillOpacity = d.isRare ? 1 : recede ? 0.15 : 0.6;
-          const strokeOpacity = d.isRare ? 0.9 : recede ? 0.1 : 0.4;
+          // NAN-2361: provenance drives fill, rarity drives colour. A dot with no
+          // baseline is drawn HOLLOW rather than receded — the old treatment made
+          // "we have no data" look identical to "boring", which is the failure
+          // that started this work. Hollow reads as "outline only: unmeasured",
+          // and stays legible instead of fading out.
+          const unmeasured =
+            d.prevalenceSource !== 'baseline' && d.prevalenceSource !== 'global';
+          const recede = d.hostCount >= COMMON_HOST_THRESHOLD;
+          const fillOpacity = unmeasured ? 0 : d.isRare ? 1 : recede ? 0.15 : 0.6;
+          const strokeOpacity = unmeasured ? 0.85 : d.isRare ? 0.9 : recede ? 0.1 : 0.4;
+          // `none` has no count to stand on, so it is pinned to the baseline row
+          // and dashed. `in-window` sits at its real (lower-bound) count.
+          const strokeDasharray = d.prevalenceSource === 'none' ? '2 2' : undefined;
           // Novelty ring: first seen in the env within the window. Gated to rare +
           // uncommon only — "new to env" is the actionable cue where spread is low;
           // on common (20+ hosts) it's just noise, so we keep those dots quiet.
+          // NAN-2361: novelty now has two sources. The baseline's `envFirstSeen`
+          // is the strong one. For an artifact the baseline has never heard of,
+          // the ingest stamp's `is_new` is the only newness signal that exists —
+          // and it is exactly the fresh-alert case the analyst cares about, so
+          // suppressing it would re-create the original blind spot.
           const isNovel =
             !d.pending &&
             d.hostCount > 0 &&
             d.hostCount < COMMON_HOST_THRESHOLD &&
-            d.envFirstSeen != null &&
-            nowMs - d.envFirstSeen.getTime() < NOVEL_WINDOW_MS;
+            ((d.envFirstSeen != null && nowMs - d.envFirstSeen.getTime() < NOVEL_WINDOW_MS) ||
+              (d.prevalenceSource === 'in-window' && d.isNewAtIngest === true));
           // NAN-1700 progressive render: while prevalence is loading, the dot is
           // plotted at its event time on the baseline (host_count 0) in a muted,
           // pulsing "scoring…" state. When the lookup lands it animates up to its
@@ -503,6 +601,9 @@ export function PrevalenceScatterPlot({
                 cy={cy}
                 r={r}
                 strokeWidth="1"
+                strokeDasharray={d.pending ? undefined : strokeDasharray}
+                data-prevalence-source={d.prevalenceSource}
+                data-artifact={d.artifact}
                 style={{
                   fill: dotFill,
                   fillOpacity: d.pending ? 0.4 : fillOpacity,
@@ -576,23 +677,61 @@ export function PrevalenceScatterPlot({
           {/* Rarity verdict — the headline. Rarity is measured by how many
               distinct ASSETS (hosts) the artifact is on, not by age. */}
           <div className={cn('text-[10.5px] font-semibold', tip.d.isRare ? 'text-primary' : 'text-muted-foreground')}>
-            {tip.d.isRare
+            {tip.d.prevalenceSource === 'none'
+              ? 'no prevalence data'
+              : tip.d.isRare
               ? `RARE · on ${tip.d.hostCount.toLocaleString()} host${tip.d.hostCount === 1 ? '' : 's'}`
               : tip.d.hostCount >= 9999
               ? 'common · 1000+ hosts'
               : tip.d.hostCount >= COMMON_HOST_THRESHOLD
               ? `common · on ${tip.d.hostCount.toLocaleString()} hosts`
-              : tip.d.hostCount === 0
-              ? 'not baselined yet'
               : `uncommon · on ${tip.d.hostCount.toLocaleString()} hosts`}
             {/* Novelty only when we have a REAL env-first-seen (NAN-1699) — never
-                inferred from the event time, and not for common/unbaselined. */}
+                inferred from the event time, and not for common/unbaselined —
+                or, for an artifact the baseline has never seen, the ingest stamp
+                (NAN-2361), which is the only newness signal that exists there. */}
             {tip.d.hostCount > 0 &&
               tip.d.hostCount < COMMON_HOST_THRESHOLD &&
-              tip.d.envFirstSeen != null &&
-              nowMs - tip.d.envFirstSeen.getTime() < NOVEL_WINDOW_MS && (
-                <span className="ml-1.5 text-primary font-medium">· new to env</span>
+              ((tip.d.envFirstSeen != null &&
+                nowMs - tip.d.envFirstSeen.getTime() < NOVEL_WINDOW_MS) ||
+                (tip.d.prevalenceSource === 'in-window' && tip.d.isNewAtIngest === true)) && (
+                <span className="ml-1.5 text-primary font-medium">
+                  {tip.d.prevalenceSource === 'in-window' ? '· new at ingest' : '· new to env'}
+                </span>
               )}
+          </div>
+          {/* NAN-2361 provenance line. The count above means different things
+              depending on where it came from, and an analyst reading "1 host"
+              as environment truth when it is a window-scoped lower bound is the
+              exact misread this line exists to prevent. */}
+          <div className="text-[10px] font-mono text-muted-foreground/90">
+            {tip.d.prevalenceSource === 'baseline' ? (
+              <>
+                environment baseline
+                {tip.d.inWindowHosts != null && (
+                  <> · {tip.d.inWindowHosts.toLocaleString()} in window</>
+                )}
+              </>
+            ) : tip.d.prevalenceSource === 'global' ? (
+              /* NAN-2361: a measured, environment-wide count from the unscoped
+                 discovery query. It fell through to the final branch and read
+                 "not observed in window" — the opposite of what it means. */
+              <>
+                environment-wide (measured)
+                {tip.d.inWindowHosts != null && (
+                  <> · {tip.d.inWindowHosts.toLocaleString()} in window</>
+                )}
+              </>
+            ) : tip.d.prevalenceSource === 'in-window' ? (
+              <>
+                in this window only · not yet in baseline
+                {tip.d.inWindowEvents != null && (
+                  <> · {tip.d.inWindowEvents.toLocaleString()} events</>
+                )}
+              </>
+            ) : (
+              <>not in baseline, not observed in window</>
+            )}
           </div>
           <div className="text-[10px] text-muted-foreground/90">
             fired{' '}

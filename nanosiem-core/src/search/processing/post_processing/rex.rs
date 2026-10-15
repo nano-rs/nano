@@ -8,6 +8,7 @@
 
 use regex::Regex;
 
+use super::helpers::get_nested_map_value;
 use crate::query::RexMode;
 use crate::search::SearchError;
 
@@ -95,7 +96,9 @@ pub(super) fn apply_rex_post_processing(
                 .map(|mut row| {
                     if let serde_json::Value::Object(ref mut obj) = row {
                         // Get the source field value
-                        if let Some(source_value) = obj.get(source_field).and_then(|v| v.as_str()) {
+                        if let Some(source_value) =
+                            get_nested_map_value(&obj, source_field).and_then(|v| v.as_str())
+                        {
                             // Apply regex replacement
                             let replaced = re.replace_all(source_value, replacement.as_str());
                             obj.insert(

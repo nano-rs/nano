@@ -200,8 +200,7 @@ fn analyze_search_expr(
         // above). Numeric-only needles (IPs) get a field-filter nudge instead,
         // since that is both faster and unambiguous.
         SearchExpr::Keyword(kw) if !kw.contains('*') && !kw.contains('?') => {
-            let is_ip_like =
-                kw.contains('.') && kw.chars().all(|c| c.is_ascii_digit() || c == '.');
+            let is_ip_like = kw.contains('.') && kw.chars().all(|c| c.is_ascii_digit() || c == '.');
             let suggestion = if is_ip_like {
                 format!(
                     "For a field match use src_ip=\"{kw}\" / dest_ip=\"{kw}\"; for a partial text match use a wildcard: *{kw}*"
@@ -351,21 +350,27 @@ fn analyze_command(
 
         Command::Stats { aggregations, .. } | Command::Chart { aggregations, .. } => {
             context.seen_aggregation = true;
-            // Warn when values()/list() aggregation is used without prior limit,
-            // since these generate groupArray() calls that accumulate in memory
-            if !context.seen_limit {
-                let has_array_agg = aggregations
-                    .iter()
-                    .any(|a| matches!(a.func, AggFunc::Values | AggFunc::List));
-                if has_array_agg {
-                    analysis.warnings.push(QueryWarning {
-                        severity: WarningSeverity::Info,
-                        code: "STATS_VALUES_LIST_UNBOUNDED".to_string(),
-                        message: "values()/list() results are capped at 100 unique elements per group".to_string(),
-                        suggestion: Some("Use dc() for distinct counts, or add '| head N' before stats to limit input".to_string()),
-                        impact: None,
-                    });
-                }
+            // values()/list() always compile to a 100-element group-array
+            // envelope. An upstream head larger than 100 does not make that
+            // output exact, so the cap advisory must be unconditional whenever
+            // either aggregation appears.
+            let has_array_agg = aggregations
+                .iter()
+                .any(|aggregation| matches!(aggregation.func, AggFunc::Values | AggFunc::List));
+            if has_array_agg {
+                analysis.warnings.push(QueryWarning {
+                    severity: WarningSeverity::Info,
+                    code: "STATS_VALUES_LIST_CAPPED".to_string(),
+                    message: "values()/list() results are capped at 100 elements per group"
+                        .to_string(),
+                    suggestion: Some(
+                        "Use dc() for an exact distinct count; narrow the input when the complete value set is required"
+                            .to_string(),
+                    ),
+                    impact: Some(
+                        "Additional values are omitted from the returned array".to_string(),
+                    ),
+                });
             }
         }
 
@@ -578,7 +583,9 @@ fn analyze_command(
                     severity: WarningSeverity::Info,
                     code: "UNBOUNDED_MVEXPAND".to_string(),
                     message: "mvexpand without explicit limit will use server default".to_string(),
-                    suggestion: Some("Add limit=N to explicitly cap the number of expanded rows".to_string()),
+                    suggestion: Some(
+                        "Add limit=N to explicitly cap the number of expanded rows".to_string(),
+                    ),
                     impact: None,
                 });
             }
@@ -747,14 +754,20 @@ mod tests {
         for kw in ["error", "cmd.exe", "comsvcs"] {
             let analysis = analyze_query_cost(&parse_query(kw).unwrap());
             assert!(
-                analysis.warnings.iter().any(|w| w.code == "KEYWORD_TOKEN_SEARCH"),
+                analysis
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "KEYWORD_TOKEN_SEARCH"),
                 "bare keyword {kw:?} should surface the token-search advisory"
             );
         }
         // Explicit wildcard = substring intent → no advisory, no WILDCARD_SEARCH.
         let analysis = analyze_query_cost(&parse_query("*cmd*").unwrap());
         assert!(
-            !analysis.warnings.iter().any(|w| w.code == "KEYWORD_TOKEN_SEARCH"),
+            !analysis
+                .warnings
+                .iter()
+                .any(|w| w.code == "KEYWORD_TOKEN_SEARCH"),
             "explicit *cmd* wildcard must not surface the token-search advisory"
         );
     }
@@ -765,6 +778,24 @@ mod tests {
         let analysis = analyze_query_cost(&query);
 
         assert!(analysis.has_aggregation);
+    }
+
+    #[test]
+    fn values_and_list_caps_are_disclosed_even_after_an_early_limit() {
+        for query in [
+            "source_type=squid_proxy | head 1000 | stats values(user) as users",
+            "source_type=squid_proxy | head 1000 | stats list(user) as users",
+        ] {
+            let analysis = analyze_query_cost(&parse_query(query).unwrap());
+            let warning = analysis
+                .warnings
+                .iter()
+                .find(|warning| warning.code == "STATS_VALUES_LIST_CAPPED")
+                .unwrap_or_else(|| panic!("missing values/list cap warning for {query}"));
+            assert_eq!(warning.severity, WarningSeverity::Info);
+            assert!(warning.message.contains("100"));
+            assert!(warning.impact.is_some());
+        }
     }
 
     #[test]
@@ -870,8 +901,7 @@ mod tests {
         assert!(analysis
             .warnings
             .iter()
-            .any(|w| w.code == "CROSS_DATASET_CORRELATION"
-                && w.severity == WarningSeverity::Info));
+            .any(|w| w.code == "CROSS_DATASET_CORRELATION" && w.severity == WarningSeverity::Info));
     }
 
     // Logs-only forms (no dataset token) must NOT emit the cross-dataset advisory.

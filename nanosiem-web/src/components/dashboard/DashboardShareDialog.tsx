@@ -11,7 +11,13 @@
  */
 
 import { useState, useEffect } from 'react';
-import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from '@/components/ui/sheet';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -19,12 +25,12 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import {
   Shield,
-  Loader2,
   Users,
   Globe,
   Lock,
   CircleAlert,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api, GroupDetail, SharedGroup, DashboardVisibility, DashboardShareResult } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -118,7 +124,7 @@ export function DashboardShareDialog({
         group_ids: visibility === 'group' ? selectedGroups : undefined,
       });
 
-      // DSH41: if this share revoked access for some users, keep the sheet open
+      // DSH41: if this share revoked access for some users, keep the dialog open
       // so the amber "users lost access" banner is actually visible — closing
       // synchronously unmounts before it can render. Hold the result and notify
       // the parent only when the user dismisses (Done). With no affected users,
@@ -143,70 +149,57 @@ export function DashboardShareDialog({
       JSON.stringify(selectedGroups.sort()) !==
         JSON.stringify(currentSharedGroups.map(g => g.id).sort()));
 
-  // Header (shared across owner/non-owner) — redesign-density chrome
+  // Centered share dialog (NAN-3209): a ≤3-field share form stays a Dialog,
+  // matching Case / Notebook share. Header + footer strips are shared by the
+  // owner and view-only variants.
   const headerNode = (
-    <div className="px-4 py-3 pr-12 border-b border-border flex items-center gap-2 shrink-0">
-      <Shield className="w-[13px] h-[13px] text-primary" />
-      <div className="flex-1 min-w-0">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground font-semibold">
-          Dashboard Permissions
-        </div>
-        <div className="text-[11px] text-muted-foreground mt-0.5 truncate">
-          {dashboardName ? `Visibility for "${dashboardName}"` : 'Visibility settings'}
-        </div>
-      </div>
-    </div>
+    <DialogHeader className="space-y-0.5 border-b border-border px-4 py-3 pr-10 text-left">
+      <DialogTitle className="flex items-center gap-2 text-[13px] leading-5">
+        <Shield className="h-[13px] w-[13px] shrink-0 text-primary" />
+        Dashboard Permissions
+      </DialogTitle>
+      <DialogDescription className="truncate text-[11px]">
+        {dashboardName ? `Visibility for "${dashboardName}"` : 'Visibility settings'}
+      </DialogDescription>
+    </DialogHeader>
   );
 
-  // a11y-only SheetTitle/Description (visually hidden) so radix doesn't warn
-  const a11yHeader = (
-    <SheetHeader className="hidden">
-      <SheetTitle>Dashboard Permissions</SheetTitle>
-      <SheetDescription>Change visibility for {dashboardName}</SheetDescription>
-    </SheetHeader>
-  );
+  const contentCls = 'flex max-h-[85vh] flex-col gap-0 border-border bg-card p-0 text-foreground sm:max-w-[480px]';
+  const footerCls = 'flex shrink-0 items-center justify-end gap-2 border-t border-border px-4 py-2.5';
 
   // DSH42: owners edit their own dashboards; admins may re-share any dashboard.
   // Everyone else sees the view-only block.
   if (!isOwner && !isAdmin) {
     return (
-      <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent
-          side="right"
-          className="w-[480px] max-w-[min(480px,calc(100vw-24px))] bg-card border-border p-0 overflow-hidden flex flex-col gap-0"
-        >
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className={contentCls}>
           {headerNode}
-          {a11yHeader}
-          <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col items-center justify-center gap-2 text-center">
-            <Lock className="w-8 h-8 text-muted-foreground/50" />
-            <div className="text-[12.5px] text-foreground font-medium">View only</div>
+          <div className="flex flex-col items-center justify-center gap-2 px-4 py-6 text-center">
+            <Lock className="h-6 w-6 text-muted-foreground/50" />
+            <div className="text-[12.5px] font-medium text-foreground">View only</div>
             <div className="text-[11.5px] text-muted-foreground">
               Only the dashboard owner can change permissions.
             </div>
           </div>
-          <div className="px-4 py-3 border-t border-border flex items-center justify-end gap-2 shrink-0">
-            <Button variant="ghost" size="sm" className="h-[28px]" onClick={() => onOpenChange(false)}>
+          <div className={footerCls}>
+            <Button variant="ghost" size="sm" className="h-7 text-[11.5px]" onClick={() => onOpenChange(false)}>
               Close
             </Button>
           </div>
-        </SheetContent>
-      </Sheet>
+        </DialogContent>
+      </Dialog>
     );
   }
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        side="right"
-        className="w-[480px] max-w-[min(480px,calc(100vw-24px))] bg-card border-border p-0 overflow-hidden flex flex-col gap-0"
-      >
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className={contentCls}>
         {headerNode}
-        {a11yHeader}
 
-        <div className="flex-1 min-h-0 overflow-y-auto p-4 flex flex-col gap-4">
+        <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-3">
           {isLoading ? (
             <div className="flex items-center justify-center py-8">
-              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-5 h-5 text-muted-foreground" />
             </div>
           ) : (
             <>
@@ -333,13 +326,13 @@ export function DashboardShareDialog({
           )}
         </div>
 
-        <div className="px-4 py-3 border-t border-border flex items-center justify-end gap-2 shrink-0">
+        <div className={footerCls}>
           {pendingResult ? (
             // DSH41: the share succeeded and revoked access — the banner above is
             // visible; dismiss explicitly, handing the result to the parent now.
             <Button
               size="sm"
-              className="h-[28px]"
+              className="h-7 text-[11.5px]"
               onClick={() => {
                 if (pendingResult) onShare(pendingResult);
                 onOpenChange(false);
@@ -349,18 +342,18 @@ export function DashboardShareDialog({
             </Button>
           ) : (
             <>
-              <Button variant="ghost" size="sm" className="h-[28px]" onClick={() => onOpenChange(false)}>
+              <Button variant="ghost" size="sm" className="h-7 text-[11.5px]" onClick={() => onOpenChange(false)}>
                 Cancel
               </Button>
               <Button
                 size="sm"
-                className="h-[28px] gap-1.5"
+                className="h-7 gap-1.5 text-[11.5px]"
                 onClick={handleSave}
                 disabled={isSaving || !hasChanges || isLoading}
               >
                 {isSaving ? (
                   <>
-                    <Loader2 className="w-[12px] h-[12px] animate-spin" />
+                    <LoadingIcon className="w-[12px] h-[12px]" />
                     Saving…
                   </>
                 ) : (
@@ -373,8 +366,8 @@ export function DashboardShareDialog({
             </>
           )}
         </div>
-      </SheetContent>
-    </Sheet>
+      </DialogContent>
+    </Dialog>
   );
 }
 

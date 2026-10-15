@@ -30,7 +30,12 @@ use crate::sql_hygiene::escape_sql_string;
 /// reduced to its top-level segment — the same key form the results-driven field list
 /// registers. `max_execution_time` keeps this best-effort, fire-and-forget query from
 /// ever hanging.
-fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_predicate: &str) -> String {
+fn build_ext_field_names_sql(
+    table: &str,
+    json_col: &str,
+    nested: bool,
+    where_predicate: &str,
+) -> String {
     // NAN-1241: the dynamic-JSON column is `ext` under UDM, `event` under OCSF.
     //
     // UDM `ext` is effectively flat — keys are bare identifiers (`foo`) the
@@ -590,6 +595,7 @@ impl ClickHouseExecutor {
                 count: total_count,
                 top_values,
                 cardinality: Some(cardinality),
+                sampled_rows: None,
             });
         }
 
@@ -866,8 +872,12 @@ mod tests {
     #[test]
     fn ext_field_names_sql_is_bounded_and_native() {
         // UDM `ext` is flat → nested=false. Recent-window predicate (highlighter).
-        let sql =
-            build_ext_field_names_sql("nanosiem.logs", "ext", false, "timestamp >= now() - INTERVAL 3 HOUR");
+        let sql = build_ext_field_names_sql(
+            "nanosiem.logs",
+            "ext",
+            false,
+            "timestamp >= now() - INTERVAL 3 HOUR",
+        );
 
         // Targets the resolved table.
         assert!(sql.contains("FROM nanosiem.logs"), "sql: {sql}");
@@ -878,7 +888,10 @@ mod tests {
         // exploded a row per path and timed out at scale (NAN-1177).
         assert!(sql.contains("distinctJSONPaths(ext)"), "sql: {sql}");
         // The caller's predicate is injected verbatim.
-        assert!(sql.contains("WHERE timestamp >= now() - INTERVAL 3 HOUR"), "sql: {sql}");
+        assert!(
+            sql.contains("WHERE timestamp >= now() - INTERVAL 3 HOUR"),
+            "sql: {sql}"
+        );
 
         // NAN-1241/1443: under OCSF the dynamic-JSON tail column is the
         // `unmapped` spill (was `event`, now EPHEMERAL), still nested → nested=true
@@ -889,8 +902,14 @@ mod tests {
             true,
             "timestamp >= now() - INTERVAL 3 HOUR",
         );
-        assert!(ocsf_sql.contains("distinctJSONPaths(unmapped)"), "sql: {ocsf_sql}");
-        assert!(ocsf_sql.contains("FROM nanosiem.ocsf_logs"), "sql: {ocsf_sql}");
+        assert!(
+            ocsf_sql.contains("distinctJSONPaths(unmapped)"),
+            "sql: {ocsf_sql}"
+        );
+        assert!(
+            ocsf_sql.contains("FROM nanosiem.ocsf_logs"),
+            "sql: {ocsf_sql}"
+        );
         assert!(!sql.contains("toString(ext)"), "sql: {sql}");
         assert!(!sql.contains("JSONExtractKeys"), "sql: {sql}");
         assert!(!sql.contains("JSONAllPaths"), "sql: {sql}");
@@ -904,7 +923,10 @@ mod tests {
             false,
             "timestamp BETWEEN '2026-05-30 02:00:00.000000' AND '2026-05-30 03:00:00.000000' AND (source_type = 'sysmon')",
         );
-        assert!(scoped.contains("timestamp BETWEEN '2026-05-30 02:00:00"), "sql: {scoped}");
+        assert!(
+            scoped.contains("timestamp BETWEEN '2026-05-30 02:00:00"),
+            "sql: {scoped}"
+        );
         assert!(scoped.contains("source_type = 'sysmon'"), "sql: {scoped}");
         assert!(!scoped.contains("INTERVAL 3 HOUR"), "sql: {scoped}");
         assert!(scoped.contains("distinctJSONPaths(ext)"), "sql: {scoped}");
@@ -916,7 +938,10 @@ mod tests {
         // OCSF (nested=true) keeps the FULL dotted leaf path
         // (`actor.process.file.path`), so it must NOT collapse via splitByChar.
         assert!(!ocsf_sql.contains("splitByChar"), "sql: {ocsf_sql}");
-        assert!(ocsf_sql.contains("SELECT DISTINCT path AS name"), "sql: {ocsf_sql}");
+        assert!(
+            ocsf_sql.contains("SELECT DISTINCT path AS name"),
+            "sql: {ocsf_sql}"
+        );
 
         // The predicate the caller passed is what bounds the READ (NAN-2174);
         // the clauses below bound the aggregate, the result, and the runtime.
@@ -1008,10 +1033,19 @@ mod tests {
 
         // Outer aggregates unchanged; data source is now a LIMITed subquery that
         // explicitly projects the stat columns.
-        assert!(sql.contains("topK(100)(toString(user)) as user_top"), "sql: {sql}");
-        assert!(sql.contains("FROM (\nSELECT user, src_ip\n"), "projection missing: {sql}");
+        assert!(
+            sql.contains("topK(100)(toString(user)) as user_top"),
+            "sql: {sql}"
+        );
+        assert!(
+            sql.contains("FROM (\nSELECT user, src_ip\n"),
+            "projection missing: {sql}"
+        );
         assert!(sql.contains("LIMIT 100000\n)"), "row cap missing: {sql}");
-        assert!(!sql.contains("SELECT *\nFROM nanosiem.logs"), "must not stat over `*`: {sql}");
+        assert!(
+            !sql.contains("SELECT *\nFROM nanosiem.logs"),
+            "must not stat over `*`: {sql}"
+        );
     }
 
     /// NAN-1506: a multi-CTE base is bounded by wrapping the CTE result in
@@ -1022,7 +1056,10 @@ mod tests {
         let base = "WITH s0 AS (SELECT id FROM nanosiem.logs WHERE (1)) SELECT * FROM s0";
         let cols = vec!["id".to_string()];
         let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, Some(100_000));
-        assert!(sql.contains("SELECT * FROM (\nWITH s0 AS"), "should wrap CTE: {sql}");
+        assert!(
+            sql.contains("SELECT * FROM (\nWITH s0 AS"),
+            "should wrap CTE: {sql}"
+        );
         assert!(sql.contains("LIMIT 100000\n)"), "row cap missing: {sql}");
         let opens = sql.matches('(').count();
         let closes = sql.matches(')').count();
@@ -1043,12 +1080,21 @@ mod tests {
         let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, None);
 
         // Wraps the whole query as a subquery and drops trailing SETTINGS.
-        assert!(sql.contains("FROM (\nWITH stage_0 AS"), "should wrap the CTE query: {sql}");
-        assert!(!sql.contains("SETTINGS max_threads"), "trailing SETTINGS must be stripped: {sql}");
+        assert!(
+            sql.contains("FROM (\nWITH stage_0 AS"),
+            "should wrap the CTE query: {sql}"
+        );
+        assert!(
+            !sql.contains("SETTINGS max_threads"),
+            "trailing SETTINGS must be stripped: {sql}"
+        );
         // Balanced parentheses (the original bug was unmatched parens, Code 62).
         let opens = sql.matches('(').count();
         let closes = sql.matches(')').count();
-        assert_eq!(opens, closes, "unbalanced parentheses in field-stats SQL: {sql}");
+        assert_eq!(
+            opens, closes,
+            "unbalanced parentheses in field-stats SQL: {sql}"
+        );
     }
 
     /// OCSF dotted columns must be double-quoted as a single identifier inside
@@ -1125,7 +1171,9 @@ mod tests {
             "DEFAULT",
             readd
         ));
-        assert!(ClickHouseExecutor::is_companion_safe_column("message", "", readd));
+        assert!(ClickHouseExecutor::is_companion_safe_column(
+            "message", "", readd
+        ));
     }
 
     /// The OCSF profile's bookkeeping columns must never reach the field-stats

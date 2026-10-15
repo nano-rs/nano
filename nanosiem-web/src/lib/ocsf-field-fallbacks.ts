@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 /**
  * OCSF native-column fallbacks for UDM-semantic concepts (NAN-1322/NAN-1324).
  *

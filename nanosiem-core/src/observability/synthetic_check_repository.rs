@@ -5,13 +5,15 @@
 //! CRUD over `observability_synthetic_checks` (migration 210). Storage is a
 //! UUID primary key; over the wire the id serializes as a typeid
 //! (`synth_<base32>`). These are the *definitions* — what to probe and how
-//! often. The probe *results* live in ClickHouse
-//! (`synthetic_check_results`, migration 142), written by the nanosiem-jobs
-//! runner and summarized for the response by the search layer
-//! ([`crate::search::SearchService::observability_synthetics_summary`] +
-//! [`crate::query::synthetic_summary_sql`] / [`crate::query::synthetic_history_sql`]).
+//! often. The probe *results* live in the selected observability store (native
+//! OTLP metrics in Iceberg for the lake profile; ClickHouse for the retiring
+//! legacy profile) and are summarized for the response by the search layer.
+//! PostgreSQL additionally owns the small `next_run_at` scheduling watermark:
+//! it is control-plane metadata, not a probe-result store, and lets multiple
+//! jobs replicas claim due checks atomically without depending on asynchronous
+//! lake visibility.
 //! The live `uptime_pct` / `p50_latency_ms` / `history` are NOT stored here —
-//! the api handler computes them from ClickHouse and merges them onto each
+//! the API handler computes them from the active observability store and merges them onto each
 //! definition for the response, mirroring the SLO subsystem.
 
 use chrono::{DateTime, Utc};
@@ -40,7 +42,7 @@ pub enum SyntheticCheckRepositoryError {
 
 /// A stored synthetic-check definition. The live summary fields
 /// (`uptime_pct`, `p50_latency_ms`, `history`) are computed separately by the
-/// api layer from ClickHouse and are NOT part of this row.
+/// API layer from telemetry and are NOT part of this row.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct SyntheticCheck {
     #[serde(with = "crate::typeid::synth")]
@@ -90,18 +92,41 @@ impl SyntheticCheckRepository {
         Ok(rows.iter().map(Self::row_to_check).collect())
     }
 
-    /// Only the enabled checks — the set the runner schedules (NAN-1538).
-    /// Ordered oldest-first by `id` for a stable iteration order across ticks.
-    pub async fn list_enabled(&self) -> Result<Vec<SyntheticCheck>, SyntheticCheckRepositoryError> {
+    /// Atomically claim enabled checks whose configured interval has elapsed.
+    ///
+    /// The claim advances `next_run_at` in the same PostgreSQL statement that
+    /// returns each definition. `FOR UPDATE SKIP LOCKED` makes this safe across
+    /// jobs replicas and leader failover. Probe payloads/results do not live in
+    /// PostgreSQL; this is only the durable scheduler watermark. Advancing from
+    /// `NOW()` intentionally avoids a rapid catch-up storm after an outage.
+    pub async fn claim_due_enabled(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<SyntheticCheck>, SyntheticCheckRepositoryError> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query(
             r#"
-            SELECT id, name, check_type, target_url, interval_secs, expected_status,
-                   timeout_secs, enabled, created_by, created_at, updated_at
-            FROM observability_synthetic_checks
-            WHERE enabled = TRUE
-            ORDER BY id ASC
+            WITH due AS (
+                SELECT id
+                FROM observability_synthetic_checks
+                WHERE enabled = TRUE
+                  AND next_run_at <= NOW()
+                ORDER BY next_run_at ASC, id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE observability_synthetic_checks AS checks
+            SET next_run_at = NOW() + make_interval(secs => checks.interval_secs)
+            FROM due
+            WHERE checks.id = due.id
+            RETURNING checks.id, checks.name, checks.check_type, checks.target_url,
+                      checks.interval_secs, checks.expected_status, checks.timeout_secs,
+                      checks.enabled, checks.created_by, checks.created_at, checks.updated_at
             "#,
         )
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
 
@@ -192,6 +217,10 @@ impl SyntheticCheckRepository {
                 expected_status = $6,
                 timeout_secs = $7,
                 enabled = $8,
+                next_run_at = CASE
+                    WHEN enabled = FALSE AND $8 = TRUE THEN NOW()
+                    ELSE next_run_at
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, check_type, target_url, interval_secs, expected_status,

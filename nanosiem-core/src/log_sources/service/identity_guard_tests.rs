@@ -31,7 +31,11 @@ fn a_differently_punctuated_name_is_rejected_with_the_holder_named() {
 
 #[test]
 fn case_and_spacing_variants_collide_too() {
-    for candidate in ["zz validation probe", "ZZ_VALIDATION_PROBE", "zz.validation.probe"] {
+    for candidate in [
+        "zz validation probe",
+        "ZZ_VALIDATION_PROBE",
+        "zz.validation.probe",
+    ] {
         assert!(
             generated_identity_conflict("log source", candidate, &rows(), None).is_some(),
             "{candidate} generates zz_validation_probe and must be rejected"

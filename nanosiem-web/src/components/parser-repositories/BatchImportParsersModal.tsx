@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState, useMemo, useCallback, useEffect } from 'react';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { DetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Progress } from '@/components/ui/progress';
@@ -20,12 +13,12 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {
-  Loader2,
   Download,
   CircleCheck,
   XCircle,
   CircleAlert,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { RepositoryParser, BatchImportParserItem } from '@/lib/api/parser-repositories';
 import { useToast } from '@/hooks/use-toast';
@@ -188,205 +181,212 @@ export function BatchImportParsersModal({
     : 0;
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { if (!importing) onOpenChange(o); }}>
-      <DialogContent className="flex max-h-[85vh] max-w-4xl flex-col">
-        <DialogHeader className="border-b border-border/50 pb-4">
-          <DialogTitle className="search-console-section-header"><Download />Batch Import Parsers</DialogTitle>
-          <DialogDescription>
-            Import multiple parsers at once. {parsers.length} parser{parsers.length !== 1 ? 's' : ''} available for import.
-          </DialogDescription>
-        </DialogHeader>
-
-        {/* Bulk controls */}
-        {!importing && (
-          <div className="flex items-center gap-3 border-b border-border/50 px-1 py-2">
-            <Button variant="ghost" className="h-7 text-[11.5px]" onClick={() => toggleAll(true)}>
-              Select All
+    <DetailSheet
+      open={open}
+      // An import in flight cannot be cancelled; only Done closes once it starts.
+      onOpenChange={(o) => { if (!importing) onOpenChange(o); }}
+      size="lg"
+      breadcrumb={['Repositories', 'Parsers']}
+      icon={<Download className="h-3.5 w-3.5" />}
+      title="Batch Import Parsers"
+      description="Import multiple parsers at once."
+      meta={
+        <>
+          <span>{parsers.length} available</span>
+          <span>{selectedCount} selected</span>
+        </>
+      }
+      bodyClassName="flex flex-col overflow-hidden p-0"
+      footer={
+        importDone ? (
+          <Button size="sm" className="h-7 text-[11.5px]" onClick={() => { onOpenChange(false); onSuccess(); }}>
+            Done
+          </Button>
+        ) : (
+          <>
+            <Button variant="outline" size="sm" className="h-7 text-[11.5px]" onClick={() => onOpenChange(false)} disabled={importing}>
+              Cancel
             </Button>
-            <Button variant="ghost" className="h-7 text-[11.5px]" onClick={() => toggleAll(false)}>
-              Deselect All
-            </Button>
-            <div className="h-4 w-px bg-border" />
-            <span className="search-console-section-meta">Set selected to:</span>
-            <Select onValueChange={(v) => setBulkImportType(v as 'linked' | 'forked')}>
-              <SelectTrigger className="w-28">
-                <SelectValue placeholder="Import type..." />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="linked">Linked</SelectItem>
-                <SelectItem value="forked">Forked</SelectItem>
-              </SelectContent>
-            </Select>
-            <Select onValueChange={setBulkIngestionMethod}>
-              <SelectTrigger className="w-32">
-                <SelectValue placeholder="Ingestion..." />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="routed">HTTP (Routed)</SelectItem>
-                <SelectItem value="vector">Vector</SelectItem>
-                <SelectItem value="splunk_hec">Splunk HEC</SelectItem>
-                <SelectItem value="kafka">Kafka</SelectItem>
-                <SelectItem value="aws_s3">AWS S3</SelectItem>
-                <SelectItem value="gcp_pubsub">GCP Pub/Sub</SelectItem>
-              </SelectContent>
-            </Select>
+            <PermissionAction access={importAccess}>
+              <Button
+                size="sm"
+                className="h-7 text-[11.5px] gap-1.5"
+                onClick={handleImport}
+                disabled={importing || selectedCount === 0 || !importAccess.allowed}
+              >
+                {importing ? (
+                  <LoadingIcon className="h-[11px] w-[11px]" />
+                ) : (
+                  <Download className="h-[11px] w-[11px]" />
+                )}
+                Import {selectedCount} Parser{selectedCount !== 1 ? 's' : ''}
+              </Button>
+            </PermissionAction>
+          </>
+        )
+      }
+    >
+      {/* Bulk controls */}
+      {!importing && (
+        <div className="flex shrink-0 flex-wrap items-center gap-3 border-b border-border px-4 py-2">
+          <Button variant="ghost" className="h-7 text-[11.5px]" onClick={() => toggleAll(true)}>
+            Select All
+          </Button>
+          <Button variant="ghost" className="h-7 text-[11.5px]" onClick={() => toggleAll(false)}>
+            Deselect All
+          </Button>
+          <div className="h-4 w-px bg-border" />
+          <span className="search-console-section-meta">Set selected to:</span>
+          <Select onValueChange={(v) => setBulkImportType(v as 'linked' | 'forked')}>
+            <SelectTrigger className="w-28">
+              <SelectValue placeholder="Import type..." />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="linked">Linked</SelectItem>
+              <SelectItem value="forked">Forked</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select onValueChange={setBulkIngestionMethod}>
+            <SelectTrigger className="w-32">
+              <SelectValue placeholder="Ingestion..." />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="routed">HTTP (Routed)</SelectItem>
+              <SelectItem value="vector">Vector</SelectItem>
+              <SelectItem value="splunk_hec">HEC</SelectItem>
+              <SelectItem value="kafka">Kafka</SelectItem>
+              <SelectItem value="aws_s3">AWS S3</SelectItem>
+              <SelectItem value="gcp_pubsub">GCP Pub/Sub</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      {/* Progress bar during import */}
+      {importing && (
+        <div className="space-y-3 px-4 py-4">
+          <Progress value={progressPercent} className="h-2" />
+          <div className="flex items-center gap-4 text-[11px]">
+            <span className="flex items-center gap-1 text-green-600">
+              <CircleCheck className="w-3.5 h-3.5" /> {importProgress.imported} imported
+            </span>
+            <span className="flex items-center gap-1 text-muted-foreground">
+              <CircleAlert className="w-3.5 h-3.5" /> {importProgress.skipped} skipped
+            </span>
+            {importProgress.failed > 0 && (
+              <span className="flex items-center gap-1 text-red-500">
+                <XCircle className="w-3.5 h-3.5" /> {importProgress.failed} failed
+              </span>
+            )}
+            <span className="ml-auto font-mono text-muted-foreground">
+              {importProgress.imported + importProgress.skipped + importProgress.failed} / {importProgress.total}
+            </span>
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Progress bar during import */}
-        {importing && (
-          <div className="space-y-3 py-4">
-            <Progress value={progressPercent} className="h-2" />
-            <div className="flex items-center gap-4 text-[11px]">
-              <span className="flex items-center gap-1 text-green-600">
-                <CircleCheck className="w-3.5 h-3.5" /> {importProgress.imported} imported
-              </span>
-              <span className="flex items-center gap-1 text-muted-foreground">
-                <CircleAlert className="w-3.5 h-3.5" /> {importProgress.skipped} skipped
-              </span>
-              {importProgress.failed > 0 && (
-                <span className="flex items-center gap-1 text-red-500">
-                  <XCircle className="w-3.5 h-3.5" /> {importProgress.failed} failed
-                </span>
-              )}
-              <span className="text-muted-foreground ml-auto">
-                {importProgress.imported + importProgress.skipped + importProgress.failed} / {importProgress.total}
-              </span>
-            </div>
-          </div>
-        )}
+      {/* Parsers table */}
+      {!importing && (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <table className="w-full text-[12px]">
+            <thead className="sticky top-0 z-10 bg-muted">
+              <tr className="border-b border-border/50">
+                <th className="w-10 py-1.5 pl-4 pr-2 text-left">
+                  <Checkbox
+                    checked={selectedCount === parsers.length && parsers.length > 0}
+                    onCheckedChange={(checked) => toggleAll(!!checked)}
+                  />
+                </th>
+                <th className="search-console-section-meta p-2 text-left">Parser</th>
+                <th className="search-console-section-meta w-36 p-2 text-left">Folder</th>
+                <th className="search-console-section-meta w-28 p-2 text-left">Import Type</th>
+                <th className="search-console-section-meta w-36 p-2 text-left">Ingestion</th>
+              </tr>
+            </thead>
+            <tbody>
+              {parsers.map((parser) => {
+                const config = configs[parser.id];
+                if (!config) return null;
+                const folder = getFolder(parser.file_path);
 
-        {/* Parsers table */}
-        {!importing && (
-          <div className="min-h-0 flex-1 overflow-auto rounded-md border border-border">
-            <table className="w-full text-[12px]">
-              <thead className="sticky top-0 z-10 bg-muted/60 backdrop-blur-sm">
-                <tr className="border-b border-border/50">
-                  <th className="w-10 p-2 text-left">
-                    <Checkbox
-                      checked={selectedCount === parsers.length && parsers.length > 0}
-                      onCheckedChange={(checked) => toggleAll(!!checked)}
-                    />
-                  </th>
-                  <th className="search-console-section-meta p-2 text-left">Parser</th>
-                  <th className="search-console-section-meta w-36 p-2 text-left">Folder</th>
-                  <th className="search-console-section-meta w-28 p-2 text-left">Import Type</th>
-                  <th className="search-console-section-meta w-36 p-2 text-left">Ingestion</th>
-                </tr>
-              </thead>
-              <tbody>
-                {parsers.map((parser) => {
-                  const config = configs[parser.id];
-                  if (!config) return null;
-                  const folder = getFolder(parser.file_path);
-
-                  return (
-                    <tr
-                      key={parser.id}
-                      className={`border-b hover:bg-accent/30 transition-colors ${
-                        config.selected ? '' : 'opacity-50'
-                      }`}
-                    >
-                      <td className="p-2">
-                        <Checkbox
-                          checked={config.selected}
-                          onCheckedChange={(checked) =>
-                            updateConfig(parser.id, { selected: !!checked })
-                          }
-                        />
-                      </td>
-                      <td className="p-2">
-                        <div className="font-medium text-[12.5px] leading-snug truncate max-w-[300px]" title={parser.display_name || parser.file_path}>
-                          {parser.display_name || parser.name || parser.file_path.split('/').pop()}
+                return (
+                  <tr
+                    key={parser.id}
+                    className={`border-b hover:bg-accent/30 transition-colors ${
+                      config.selected ? '' : 'opacity-50'
+                    }`}
+                  >
+                    <td className="py-1.5 pl-4 pr-2">
+                      <Checkbox
+                        checked={config.selected}
+                        onCheckedChange={(checked) =>
+                          updateConfig(parser.id, { selected: !!checked })
+                        }
+                      />
+                    </td>
+                    <td className="p-2">
+                      <div className="font-medium text-[12.5px] leading-snug truncate max-w-[300px]" title={parser.display_name || parser.file_path}>
+                        {parser.display_name || parser.name || parser.file_path.split('/').pop()}
+                      </div>
+                      {parser.description && (
+                        <div className="text-[11px] text-muted-foreground truncate max-w-[300px]">
+                          {parser.description}
                         </div>
-                        {parser.description && (
-                          <div className="text-[11px] text-muted-foreground truncate max-w-[300px]">
-                            {parser.description}
-                          </div>
-                        )}
-                      </td>
-                      <td className="p-2">
-                        <span className="font-mono text-[11px] text-muted-foreground truncate block max-w-[140px]" title={folder}>
-                          {folder}
-                        </span>
-                      </td>
-                      <td className="p-2">
-                        <Select
-                          value={config.importType}
-                          onValueChange={(v) => updateConfig(parser.id, { importType: v as 'linked' | 'forked' })}
-                          disabled={!config.selected}
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="linked">Linked</SelectItem>
-                            <SelectItem value="forked">Forked</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </td>
-                      <td className="p-2">
-                        <Select
-                          value={config.ingestionMethod}
-                          onValueChange={(v) => updateConfig(parser.id, { ingestionMethod: v })}
-                          disabled={!config.selected}
-                        >
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="routed">HTTP (Routed)</SelectItem>
-                            <SelectItem value="vector">Vector</SelectItem>
-                            <SelectItem value="splunk_hec">Splunk HEC</SelectItem>
-                            <SelectItem value="kafka">Kafka</SelectItem>
-                            <SelectItem value="aws_s3">AWS S3</SelectItem>
-                            <SelectItem value="gcp_pubsub">GCP Pub/Sub</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </td>
-                    </tr>
-                  );
-                })}
-                {parsers.length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="text-center py-8 text-muted-foreground">
-                      All parsers have already been imported.
+                      )}
+                    </td>
+                    <td className="p-2">
+                      <span className="font-mono text-[11px] text-muted-foreground truncate block max-w-[140px]" title={folder}>
+                        {folder}
+                      </span>
+                    </td>
+                    <td className="p-2">
+                      <Select
+                        value={config.importType}
+                        onValueChange={(v) => updateConfig(parser.id, { importType: v as 'linked' | 'forked' })}
+                        disabled={!config.selected}
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="linked">Linked</SelectItem>
+                          <SelectItem value="forked">Forked</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </td>
+                    <td className="p-2">
+                      <Select
+                        value={config.ingestionMethod}
+                        onValueChange={(v) => updateConfig(parser.id, { ingestionMethod: v })}
+                        disabled={!config.selected}
+                      >
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="routed">HTTP (Routed)</SelectItem>
+                          <SelectItem value="vector">Vector</SelectItem>
+                          <SelectItem value="splunk_hec">HEC</SelectItem>
+                          <SelectItem value="kafka">Kafka</SelectItem>
+                          <SelectItem value="aws_s3">AWS S3</SelectItem>
+                          <SelectItem value="gcp_pubsub">GCP Pub/Sub</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </td>
                   </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        <DialogFooter>
-          {importDone ? (
-            <Button className="h-8 text-[11.5px]" onClick={() => { onOpenChange(false); onSuccess(); }}>
-              Done
-            </Button>
-          ) : (
-            <>
-              <Button variant="outline" className="h-8 text-[11.5px]" onClick={() => onOpenChange(false)} disabled={importing}>
-                Cancel
-              </Button>
-              <PermissionAction access={importAccess}>
-                <Button
-                  className="h-8 text-[11.5px] gap-1.5"
-                  onClick={handleImport}
-                  disabled={importing || selectedCount === 0 || !importAccess.allowed}
-                >
-                  {importing ? (
-                    <Loader2 className="h-[11px] w-[11px] animate-spin" />
-                  ) : (
-                    <Download className="h-[11px] w-[11px]" />
-                  )}
-                  Import {selectedCount} Parser{selectedCount !== 1 ? 's' : ''}
-                </Button>
-              </PermissionAction>
-            </>
-          )}
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+                );
+              })}
+              {parsers.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="text-center py-8 text-muted-foreground">
+                    All parsers have already been imported.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </DetailSheet>
   );
 }

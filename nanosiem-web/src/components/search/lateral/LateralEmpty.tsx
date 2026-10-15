@@ -28,7 +28,7 @@ export function LateralEmpty({ reason }: LateralEmptyProps) {
           </div>
           <div className="font-mono text-[10.5px] text-muted-foreground/80 max-w-md leading-relaxed">
             Add a host, user, or IP before the pipe — e.g.{' '}
-            <span className="text-foreground">src_host=WIN-HR11 | lateral</span>, or supply{' '}
+            <span className="text-foreground">device.hostname=WIN-HR11 | lateral</span>, or supply{' '}
             <span className="text-foreground">| lateral seed=user entity=user</span>.
           </div>
         </>

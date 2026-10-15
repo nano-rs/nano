@@ -16,6 +16,7 @@ use super::{MAX_BULK_ARTIFACTS, effective_artifact_scope, parse_time_window};
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
+use nanosiem_core::prevalence::PrevalenceLookup;
 
 /// GET /api/prevalence/hash/{hash}
 ///
@@ -50,18 +51,34 @@ pub async fn get_hash_prevalence(
         )
     })?;
 
-    let dual_pool = state.dual_pool();
+    let time_window = parse_time_window(params.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
-    // Create service with database config for hot-reload support (Requirement 8.5)
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        let artifact_type = nanosiem_core::prevalence::ArtifactType::detect(&hash);
+        return match client.lookup(std::slice::from_ref(&hash), time_window, &scope).await {
+            Ok(mut data) => Ok(Json(PrevalenceResponse {
+                data: data.pop().unwrap_or_else(|| {
+                    nanosiem_core::prevalence::PrevalenceData::empty(
+                        hash,
+                        artifact_type,
+                    )
+                }),
+            })),
+            Err(error) => {
+                error!("Lake hash prevalence lookup failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
     .await;
-
-    let time_window = parse_time_window(params.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_hash_prevalence(&hash, time_window, &scope)
@@ -108,18 +125,36 @@ pub async fn get_domain_prevalence(
         )
     })?;
 
-    let dual_pool = state.dual_pool();
+    let time_window = parse_time_window(params.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
-    // Create service with database config for hot-reload support (Requirement 8.5)
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        return match client
+            .lookup(std::slice::from_ref(&domain), time_window, &scope)
+            .await
+        {
+            Ok(mut data) => Ok(Json(PrevalenceResponse {
+                data: data.pop().unwrap_or_else(|| {
+                    nanosiem_core::prevalence::PrevalenceData::empty(
+                        domain.clone(),
+                        nanosiem_core::prevalence::ArtifactType::detect(&domain),
+                    )
+                }),
+            })),
+            Err(error) => {
+                error!("Lake domain prevalence lookup failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
         dual_pool.table_names(),
         &state.pool,
     )
     .await;
-
-    let time_window = parse_time_window(params.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_domain_prevalence(&domain, time_window, &scope)
@@ -176,8 +211,23 @@ pub async fn get_bulk_prevalence(
         ));
     }
 
-    let dual_pool = state.dual_pool();
+    let time_window = parse_time_window(request.window.as_deref());
+    let scope = effective_artifact_scope(&auth);
 
+    if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
+        return match client.lookup(&request.artifacts, time_window, &scope).await {
+            Ok(data) => {
+                let total = data.len();
+                Ok(Json(BulkPrevalenceResponse { data, total }))
+            }
+            Err(error) => {
+                error!("Lake bulk prevalence lookup failed: {}", error);
+                Err((StatusCode::BAD_GATEWAY, error.to_string()))
+            }
+        };
+    }
+
+    let dual_pool = state.dual_pool();
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
@@ -185,9 +235,6 @@ pub async fn get_bulk_prevalence(
         &state.pool,
     )
     .await;
-
-    let time_window = parse_time_window(request.window.as_deref());
-    let scope = effective_artifact_scope(&auth);
 
     match prevalence_service
         .get_bulk_prevalence(&request.artifacts, time_window, &scope)

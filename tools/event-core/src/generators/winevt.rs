@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Windows Event generator for Security log events
 //!
 //! Produces Windows Security event JSON matching what the Vector agent collects.
@@ -8,7 +10,7 @@ use rand::Rng;
 use uuid::Uuid;
 
 use crate::entity::Entity;
-use crate::event::Event;
+use crate::event::{Event, next_windows_record_id};
 
 pub struct WindowsEventGenerator;
 
@@ -180,9 +182,12 @@ impl WindowsEventGenerator {
     fn process_create_4688(&self, ts: DateTime<Utc>, entity: &Entity, rng: &mut impl Rng) -> Event {
         let profiles = crate::profiles::profiles();
         let chain = profiles.sample_process_chain(rng);
+        let cmdline = if chain.command_line.is_empty() { format!("\"{}\"", chain.process_path) } else { chain.command_line.clone() };
+        // NAN-3174: opt-in command-line variance (no-op when off).
+        let cmdline = crate::variance::varied_cmdline(&cmdline).unwrap_or(cmdline);
 
         let event_data = serde_json::json!({
-            "CommandLine": if chain.command_line.is_empty() { format!("\"{}\"", chain.process_path) } else { chain.command_line.clone() },
+            "CommandLine": cmdline,
             "MandatoryLabel": "S-1-16-8192",
             "NewProcessId": format!("0x{:X}", rng.random_range(1000u32..30000)),
             "NewProcessName": chain.process_path,
@@ -280,7 +285,7 @@ impl WindowsEventGenerator {
             "process_id": rng.random_range(500u32..5000),
             "provider_guid": "{54849625-5478-4994-a5ba-3e3b0328c30d}",
             "provider_name": "Microsoft-Windows-Security-Auditing",
-            "record_id": rng.random_range(10000u32..999999),
+            "record_id": next_windows_record_id(),
             "task": 12544,
             "task_name": task_name,
             "thread_id": rng.random_range(1000u32..10000),

@@ -8,7 +8,10 @@
 //! - Scheduled daily syncs
 //! - IP enrichment lookups for ingestion
 
+use arc_swap::ArcSwapOption;
 use async_compression::tokio::bufread::GzipDecoder;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -16,6 +19,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::RwLock;
 use tracing::{info, instrument, warn};
 
+use super::ipinfo_mmdb::{
+    derive_mmdb_download_url, redacted_download_url, sha256_bytes, IpinfoMmdbError,
+    IpinfoMmdbSnapshot,
+};
+use super::lake_ip_context::{
+    LakeIpContextClient, LakeIpContextError, LakeIpContextInput, LakeIpContextResolver,
+};
 use super::repository::{EnrichmentRepository, EnrichmentRepositoryError};
 use super::types::*;
 use crate::db::dual_pool::{on_cluster_clause, TableNames};
@@ -37,6 +47,12 @@ pub enum EnrichmentError {
     ClickHouseError(#[from] clickhouse::error::Error),
     #[error("ClickHouse client not configured")]
     ClickHouseNotConfigured,
+    #[error("IPinfo MMDB error: {0}")]
+    IpinfoMmdb(#[from] IpinfoMmdbError),
+    #[error("IPinfo MMDB serving snapshot is not configured")]
+    IpinfoMmdbNotConfigured,
+    #[error("Lake IP context error: {0}")]
+    LakeIpContext(#[from] LakeIpContextError),
 }
 
 /// Result of an enrichment sync operation
@@ -154,6 +170,20 @@ pub struct EnrichmentService {
     /// contexts without a CH pool, but the sync writer / lookups error if it's
     /// absent rather than silently no-op'ing.
     clickhouse_client: Option<clickhouse::Client>,
+    /// The primary object-lake lane serves IPinfo from one immutable MMDB
+    /// generation. ArcSwap makes publication atomic and keeps the last reader
+    /// alive until in-flight lookups release it.
+    ipinfo_mmdb: Option<IpinfoMmdbState>,
+    /// Tenant-provided CIDR context lives in the lake enrichment coordinator.
+    /// Bronze uses the same immutable snapshot locally; this client preserves
+    /// product lookup/disable semantics without a ClickHouse dictionary.
+    lake_ip_context: Option<LakeIpContextClient>,
+    request_ip_context: Option<LakeIpContextResolver>,
+}
+
+struct IpinfoMmdbState {
+    publish_path: PathBuf,
+    snapshot: ArcSwapOption<IpinfoMmdbSnapshot>,
 }
 
 /// Simple in-memory cache for IP enrichments
@@ -212,6 +242,9 @@ impl EnrichmentService {
             config,
             cache: Arc::new(RwLock::new(IpEnrichmentCache::default())),
             clickhouse_client: None,
+            ipinfo_mmdb: None,
+            lake_ip_context: None,
+            request_ip_context: None,
         }
     }
 
@@ -228,6 +261,96 @@ impl EnrichmentService {
     pub fn with_clickhouse(mut self, client: clickhouse::Client) -> Self {
         self.clickhouse_client = Some(client);
         self
+    }
+
+    /// Select immutable MMDB serving for the object-lake lane.
+    ///
+    /// `active=false` preserves an operator-disabled source across restarts
+    /// while retaining the publication destination for the next explicit sync.
+    pub fn with_ipinfo_mmdb(
+        mut self,
+        path: PathBuf,
+        expected_sha256: Option<&str>,
+        active: bool,
+    ) -> Result<Self, EnrichmentError> {
+        let snapshot = if active {
+            match IpinfoMmdbSnapshot::open(&path, expected_sha256) {
+                Ok(snapshot) => Some(Arc::new(snapshot)),
+                Err(IpinfoMmdbError::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && expected_sha256.is_none() =>
+                {
+                    // A fresh lake install can boot before its first online or
+                    // signed air-gap publication. Lookups remain empty until
+                    // `activate_ipinfo_mmdb_bytes` atomically publishes and
+                    // swaps the first validated generation.
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        self.ipinfo_mmdb = Some(IpinfoMmdbState {
+            publish_path: path,
+            snapshot: ArcSwapOption::from(snapshot),
+        });
+        Ok(self)
+    }
+
+    pub fn uses_ipinfo_mmdb(&self) -> bool {
+        self.ipinfo_mmdb.is_some()
+    }
+
+    pub fn with_lake_ip_context(mut self, client: LakeIpContextClient) -> Self {
+        self.lake_ip_context = Some(client);
+        self
+    }
+
+    /// Shared mode never installs an ambient tenant client. Only an authenticated
+    /// request may resolve a mutation/statistics client; lookup stays unchanged.
+    pub fn with_request_ip_context(mut self, resolver: LakeIpContextResolver) -> Self {
+        self.lake_ip_context = None;
+        self.request_ip_context = Some(resolver);
+        self
+    }
+
+    async fn request_ip_context_client(
+        &self,
+        tenant: &crate::auth::TrustedTenantContext,
+    ) -> Result<LakeIpContextClient, EnrichmentError> {
+        let resolver = self.request_ip_context.as_ref().ok_or_else(|| {
+            LakeIpContextError::Configuration("request IP context resolver is not configured".into())
+        })?;
+        let resolver = resolver.clone();
+        let tenant = tenant.clone();
+        // Fresh reads and alias validation for every operation, off Tokio workers.
+        Ok(tokio::task::spawn_blocking(move || resolver.resolve(&tenant))
+            .await
+            .map_err(|_| LakeIpContextError::Configuration("request IP context resolution failed".into()))??)
+    }
+
+    pub async fn upload_ip_context_batch(
+        &self,
+        tenant: &crate::auth::TrustedTenantContext,
+        records: &[LakeIpContextInput],
+    ) -> Result<usize, EnrichmentError> {
+        Ok(self.request_ip_context_client(tenant).await?.upload_batch(records).await?)
+    }
+
+    pub async fn delete_ip_context_source(
+        &self,
+        tenant: &crate::auth::TrustedTenantContext,
+        source_id: &str,
+    ) -> Result<(), EnrichmentError> {
+        Ok(self.request_ip_context_client(tenant).await?.delete_source(source_id).await?)
+    }
+
+    pub async fn ip_context_stats(
+        &self,
+        tenant: &crate::auth::TrustedTenantContext,
+    ) -> Result<super::lake_ip_context::LakeIpContextCounts, EnrichmentError> {
+        Ok(self.request_ip_context_client(tenant).await?.stats().await?)
     }
 
     /// Get the ClickHouse client or a typed error if it was never configured.
@@ -284,7 +407,7 @@ impl EnrichmentService {
         let download_config = DownloadConfig::from_source_config(&source.config);
 
         info!(
-            url = %url,
+            url = %redacted_download_url(&url),
             keepalive_secs = download_config.tcp_keepalive_secs,
             "Starting IPinfo Lite streaming sync"
         );
@@ -294,18 +417,25 @@ impl EnrichmentService {
             .update_sync_status(source_id, SyncStatus::InProgress, None, None, None)
             .await?;
 
-        match self
-            .stream_and_insert_ipinfo(&url, &download_config, source_id)
-            .await
-        {
-            Ok(record_count) => {
+        let load_result = if self.ipinfo_mmdb.is_some() {
+            self.download_and_activate_ipinfo_mmdb(&url, &download_config)
+                .await
+                .map(|(records, digest)| (records, Some(digest)))
+        } else {
+            self.stream_and_insert_ipinfo(&url, &download_config, source_id)
+                .await
+                .map(|records| (records, None))
+        };
+
+        match load_result {
+            Ok((record_count, file_hash)) => {
                 self.repository
                     .update_sync_status(
                         source_id,
                         SyncStatus::Success,
                         None,
                         Some(record_count as i64),
-                        None,
+                        file_hash.as_deref(),
                     )
                     .await?;
 
@@ -416,8 +546,7 @@ impl EnrichmentService {
         let mut redirects_followed = 0usize;
 
         loop {
-            let (parsed_url, pinned_addrs) =
-                validate_and_resolve_ipinfo_url(&current_url).await?;
+            let (parsed_url, pinned_addrs) = validate_and_resolve_ipinfo_url(&current_url).await?;
             let pin_host = parsed_url
                 .host_str()
                 .ok_or_else(|| EnrichmentError::DownloadError("URL missing host".to_string()))?
@@ -425,11 +554,10 @@ impl EnrichmentService {
 
             let client = Self::build_http_client(config, &pin_host, &pinned_addrs)?;
 
-            let response = client
-                .get(parsed_url.as_str())
-                .send()
-                .await
-                .map_err(|e| EnrichmentError::DownloadError(format!("Request failed: {}", e)))?;
+            let response =
+                client.get(parsed_url.as_str()).send().await.map_err(|e| {
+                    EnrichmentError::DownloadError(format!("Request failed: {}", e))
+                })?;
 
             let status = response.status();
 
@@ -518,6 +646,87 @@ impl EnrichmentService {
         }
     }
 
+    /// Download, validate, and atomically publish the MMDB generation used by
+    /// the object-lake lane. The configured CSV URL is deliberately retained
+    /// as the operator contract; only its official IPinfo format suffix changes.
+    async fn download_and_activate_ipinfo_mmdb(
+        &self,
+        configured_url: &str,
+        config: &DownloadConfig,
+    ) -> Result<(u64, String), EnrichmentError> {
+        let mmdb_url = derive_mmdb_download_url(configured_url)?;
+        let response = self
+            .fetch_with_validated_redirects(&mmdb_url, config)
+            .await?;
+        let content_length = response.content_length();
+        let bytes = response.bytes().await.map_err(|error| {
+            EnrichmentError::DownloadError(format!("reading MMDB response body: {error}"))
+        })?;
+
+        info!(
+            url = %redacted_download_url(&mmdb_url),
+            content_length = ?content_length,
+            downloaded_bytes = bytes.len(),
+            "Downloaded IPinfo Lite MMDB; validating immutable generation"
+        );
+
+        self.activate_ipinfo_mmdb_bytes(bytes.to_vec()).await
+    }
+
+    /// Validate and atomically activate one complete IPinfo Lite MMDB payload.
+    ///
+    /// This is shared by online synchronization and signed air-gap imports.
+    /// Existing readers retain the old inode through their mmap while new API
+    /// lookups and the Bronze publisher observe the newly renamed generation.
+    pub async fn activate_ipinfo_mmdb_bytes(
+        &self,
+        bytes: Vec<u8>,
+    ) -> Result<(u64, String), EnrichmentError> {
+        let state = self
+            .ipinfo_mmdb
+            .as_ref()
+            .ok_or(EnrichmentError::IpinfoMmdbNotConfigured)?;
+        let publish_path = state.publish_path.clone();
+        let digest = sha256_bytes(&bytes);
+        let expected_digest = digest.clone();
+
+        let (snapshot, record_count) = tokio::task::spawn_blocking(move || {
+            let parent = publish_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+            temporary.write_all(&bytes)?;
+            temporary.as_file_mut().sync_all()?;
+
+            // Validate the entire candidate and count its published networks
+            // before it can replace the serving generation.
+            let candidate = IpinfoMmdbSnapshot::open(temporary.path(), Some(&expected_digest))?;
+            let record_count = candidate.record_count()?;
+            drop(candidate);
+
+            temporary
+                .into_temp_path()
+                .persist(&publish_path)
+                .map_err(|error| error.error)?;
+            let snapshot = IpinfoMmdbSnapshot::open(&publish_path, Some(&expected_digest))?;
+            Ok::<_, IpinfoMmdbError>((Arc::new(snapshot), record_count))
+        })
+        .await
+        .map_err(|error| {
+            EnrichmentError::DownloadError(format!("MMDB publication task failed: {error}"))
+        })??;
+
+        state.snapshot.store(Some(snapshot));
+        info!(
+            record_count,
+            sha256 = %digest,
+            path = %state.publish_path.display(),
+            "Activated IPinfo Lite MMDB generation"
+        );
+        Ok((record_count, digest))
+    }
+
     /// Download the IPinfo Lite gzip fully, then bulk-load it into ClickHouse.
     ///
     /// NAN-1286: the previous version streamed download → gzip → CSV →
@@ -562,9 +771,10 @@ impl EnrichmentService {
 
         // Drain the whole compressed payload first so the download connection is
         // held open only for the (seconds-long) ~24 MB transfer, not the load.
-        let compressed = response.bytes().await.map_err(|e| {
-            EnrichmentError::DownloadError(format!("reading response body: {}", e))
-        })?;
+        let compressed = response
+            .bytes()
+            .await
+            .map_err(|e| EnrichmentError::DownloadError(format!("reading response body: {}", e)))?;
         info!(
             content_length = ?content_length,
             compressed_bytes = compressed.len(),
@@ -719,7 +929,10 @@ impl EnrichmentService {
                 .await
             {
                 Ok(()) => {
-                    info!(source_id, "Stale IP enrichment CIDRs removed (lightweight delete)")
+                    info!(
+                        source_id,
+                        "Stale IP enrichment CIDRs removed (lightweight delete)"
+                    )
                 }
                 Err(e) => warn!(
                     source_id,
@@ -752,6 +965,29 @@ impl EnrichmentService {
         &self,
         source_id: &str,
     ) -> Result<(), EnrichmentError> {
+        if let Some(state) = &self.ipinfo_mmdb {
+            if source_id == "ipinfo_lite" {
+                state.snapshot.store(None);
+                match std::fs::remove_file(&state.publish_path) {
+                    Ok(()) => {
+                        if let Some(parent) = state.publish_path.parent() {
+                            std::fs::File::open(parent)?.sync_all()?;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                info!(source_id, "Deactivated IPinfo MMDB serving snapshot");
+            } else if let Some(client) = &self.lake_ip_context {
+                client.delete_source(source_id).await?;
+                info!(
+                    source_id,
+                    "Removed custom IP context source from immutable lake snapshot"
+                );
+            }
+            return Ok(());
+        }
+
         let ch = self.ch()?;
         let run_ms = chrono::Utc::now().timestamp_millis() as u64;
         // NAN-1728: ip_enrichments is a per-shard table with an additive
@@ -778,7 +1014,10 @@ impl EnrichmentService {
         .bind(source_id)
         .execute()
         .await?;
-        info!(source_id, "Tombstoned IP enrichment rows for disabled source");
+        info!(
+            source_id,
+            "Tombstoned IP enrichment rows for disabled source"
+        );
         Ok(())
     }
 
@@ -831,6 +1070,31 @@ impl EnrichmentService {
             return Ok(results);
         }
 
+        if let Some(state) = &self.ipinfo_mmdb {
+            // Custom tenant context wins. The public IPinfo baseline fills
+            // only addresses that had no custom longest-prefix match.
+            if let Some(client) = &self.lake_ip_context {
+                for batch in unique_ips.chunks(1_000) {
+                    results.extend(client.lookup_bulk(batch).await?);
+                }
+            }
+            if let Some(snapshot) = state.snapshot.load_full() {
+                for ip in unique_ips {
+                    if results.contains_key(&ip) {
+                        continue;
+                    }
+                    match snapshot.lookup(&ip) {
+                        Ok(Some(enrichment)) => {
+                            results.insert(ip, enrichment);
+                        }
+                        Ok(None) | Err(IpinfoMmdbError::InvalidIp(_)) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            return Ok(results);
+        }
+
         let ch = self.ch()?;
 
         // Build a SELECT over an injected array of IPs. The IP value is bound
@@ -869,11 +1133,7 @@ impl EnrichmentService {
             String,
             String,
             String,
-        )> = ch
-            .query(&sql)
-            .bind(&unique_ips)
-            .fetch_all()
-            .await?;
+        )> = ch.query(&sql).bind(&unique_ips).fetch_all().await?;
 
         for (ip, country, country_code, continent, continent_code, asn, as_name, as_domain) in rows
         {
@@ -918,28 +1178,38 @@ impl EnrichmentService {
     pub async fn get_stats(&self) -> Result<super::repository::EnrichmentStats, EnrichmentError> {
         let enabled_sources = self.repository.count_enabled_sources().await?;
 
-        let total_ip_records = match self.ch() {
-            Ok(ch) => {
-                // NAN-1728: ip_enrichments is per-shard with an additive
-                // `_distributed` wrapper. Route the read through the wrapper so
-                // the count spans all shards, not just the connected one;
-                // `.read()` returns the local name on single-node → byte-identical.
-                // `count(DISTINCT network)` collapses cross-shard duplicates of a
-                // CIDR intrinsically, so no version-collapse is needed for this
-                // display-only stat.
-                let table =
-                    TableNames::new(!on_cluster_clause().is_empty()).read("ip_enrichments");
-                let count: u64 = ch
-                    .query(&format!(
-                        "SELECT count(DISTINCT network) FROM {table} WHERE deleted = 0"
-                    ))
-                    .fetch_one::<u64>()
-                    .await?;
-                count as i64
+        let total_ip_records = if self.ipinfo_mmdb.is_some() {
+            let public = self.repository.count_enabled_ip_records().await?;
+            let custom = match &self.lake_ip_context {
+                Some(client) => i64::try_from(client.stats().await?.total_networks)
+                    .map_err(|_| LakeIpContextError::ResponseContract)?,
+                None => 0,
+            };
+            public.saturating_add(custom)
+        } else {
+            match self.ch() {
+                Ok(ch) => {
+                    // NAN-1728: ip_enrichments is per-shard with an additive
+                    // `_distributed` wrapper. Route the read through the wrapper so
+                    // the count spans all shards, not just the connected one;
+                    // `.read()` returns the local name on single-node → byte-identical.
+                    // `count(DISTINCT network)` collapses cross-shard duplicates of a
+                    // CIDR intrinsically, so no version-collapse is needed for this
+                    // display-only stat.
+                    let table =
+                        TableNames::new(!on_cluster_clause().is_empty()).read("ip_enrichments");
+                    let count: u64 = ch
+                        .query(&format!(
+                            "SELECT count(DISTINCT network) FROM {table} WHERE deleted = 0"
+                        ))
+                        .fetch_one::<u64>()
+                        .await?;
+                    count as i64
+                }
+                // No CH client (constructed without a pool): report 0 rather than
+                // failing the whole stats endpoint.
+                Err(_) => 0,
             }
-            // No CH client (constructed without a pool): report 0 rather than
-            // failing the whole stats endpoint.
-            Err(_) => 0,
         };
 
         Ok(super::repository::EnrichmentStats {
@@ -989,17 +1259,15 @@ mod ssrf_tests {
 
     #[tokio::test]
     async fn rejects_aws_metadata_endpoint() {
-        let res =
-            validate_and_resolve_ipinfo_url("http://169.254.169.254/latest/meta-data/").await;
+        let res = validate_and_resolve_ipinfo_url("http://169.254.169.254/latest/meta-data/").await;
         assert!(matches!(res, Err(EnrichmentError::DownloadError(_))));
     }
 
     #[tokio::test]
     async fn rejects_metadata_hostname() {
-        let res = validate_and_resolve_ipinfo_url(
-            "http://metadata.google.internal/computeMetadata/v1/",
-        )
-        .await;
+        let res =
+            validate_and_resolve_ipinfo_url("http://metadata.google.internal/computeMetadata/v1/")
+                .await;
         assert!(matches!(res, Err(EnrichmentError::DownloadError(_))));
     }
 
@@ -1089,5 +1357,62 @@ mod ipinfo_row_shape_tests {
                  table DEFAULT re-opens the NAN-1441 dedup self-wipe"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ipinfo_mmdb_publication_tests {
+    use super::*;
+
+    /// Uses the same real Lite database fixture as `ipinfo_mmdb`'s conditional
+    /// lookup test. CI without the fixture skips cleanly; the product gate sets
+    /// the path and proves both activation and failed-candidate rollback.
+    #[tokio::test]
+    async fn atomic_activation_keeps_the_last_valid_mmdb() {
+        let Ok(fixture) = std::env::var("NANO_TEST_IPINFO_MMDB_PATH") else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let published = root.path().join("ipinfo_lite.mmdb");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nano:nano@127.0.0.1:1/nano")
+            .unwrap();
+        let service = EnrichmentService::with_defaults(EnrichmentRepository::new(pool))
+            .with_ipinfo_mmdb(published.clone(), None, false)
+            .unwrap();
+        let bytes = std::fs::read(fixture).unwrap();
+        let (records, digest) = service
+            .activate_ipinfo_mmdb_bytes(bytes)
+            .await
+            .expect("activate valid fixture");
+        assert!(records > 0);
+        assert_eq!(sha256_bytes(&std::fs::read(&published).unwrap()), digest);
+
+        let before = std::fs::read(&published).unwrap();
+        assert!(service
+            .activate_ipinfo_mmdb_bytes(b"not an mmdb".to_vec())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&published).unwrap(), before);
+
+        service
+            .clear_ip_enrichments_for_source("ipinfo_lite")
+            .await
+            .expect("disable the immutable serving generation");
+        assert!(!published.exists());
+        assert!(service.lookup_ip("1.1.1.1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_fresh_install_waits_for_first_valid_mmdb() {
+        let root = tempfile::tempdir().unwrap();
+        let published = root.path().join("ipinfo_lite.mmdb");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nano:nano@127.0.0.1:1/nano")
+            .unwrap();
+        let service = EnrichmentService::with_defaults(EnrichmentRepository::new(pool))
+            .with_ipinfo_mmdb(published, None, true)
+            .expect("a missing first generation is a valid fresh-install state");
+        assert!(service.lookup_ip("1.1.1.1").await.unwrap().is_none());
     }
 }

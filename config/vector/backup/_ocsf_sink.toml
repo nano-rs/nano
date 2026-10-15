@@ -1,38 +1,144 @@
-# Auto-generated OCSF ingestion sink (NAN-1246)
+# Auto-generated canonical OCSF object-lake sink (NAN-2361)
 # DO NOT EDIT - regenerated on every parser deploy.
-# Each parser's generated `_ocsf_prepare` fork feeds nanosiem.ocsf_logs.
-# Emitted only under NANO_SCHEMA_PROFILE=ocsf; mirrors clickhouse_logs.
-# Durability ACK (NAN-1406): the server-side profile sets
-# wait_for_async_insert=1, so HTTP 200 means the flush succeeded —
-# a flush failure (NAN-1404 class) is a visible, retryable sink
-# error instead of a silently discarded pre-ACKed batch.
-[sinks.clickhouse_ocsf_logs]
-type = "clickhouse"
-inputs = ["apache_http_server__ocsf__ocsf_prepare", "aws_cloudtrail__ocsf__ocsf_prepare", "conduit_mitm_proxy__ocsf__ocsf_prepare", "microsoft_sysmon__json__ocsf__ocsf_prepare", "windows_event_log__ocsf__ocsf_prepare", "generic_ocsf_prepare"]
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_OCSF_LOGS_TABLE:-ocsf_logs_raw}"
-auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
-compression = "gzip"
-date_time_best_effort = true
-skip_unknown_fields = true
+# Vector performs real source parsing, then durably writes Parquet
+# bronze objects. The coordinator compacts and commits them to the
+# tenant's Iceberg table; no ClickHouse event copy is written.
+[transforms.ocsf_lake_storage_prepare]
+type = "remap"
+inputs = ["apache_http_server__ocsf__ocsf_prepare", "aws_cloudtrail__ocsf__ocsf_prepare", "conduit_mitm_proxy__ocsf__ocsf_prepare", "microsoft_sysmon__ocsf__ocsf_prepare", "opentelemetry_logs__ocsf__ocsf_prepare", "windows_event_log__ocsf__ocsf_prepare", "generic_ocsf_prepare"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+source_type = downcase(to_string(.source_type) ?? to_string(%source_type) ?? "unknown")
+if source_type == "" { source_type = "unknown" }
+tenant_id = downcase(to_string(%tenant_id) ?? "")
+if tenant_id == "" { tenant_id = downcase(get_env_var("NANO_TENANT_ID") ?? "") }
+if tenant_id == "" { abort }
+event = .event
+if is_object(event) { . = event }
+del(._nano_parser_id)
+del(._nano_parser_failure)
+# Preserve the verbatim source payload in canonical OCSF 1.9.
+# The imported parsers currently carry it in `message`; future
+# parsers can provide `raw_data` directly and retain precedence.
+raw_data = to_string(.raw_data) ?? ""
+if raw_data == "" { raw_data = to_string(.message) ?? "" }
+if raw_data != "" {
+.raw_data = raw_data
+.raw_data_size = length(raw_data)
+}
+time_ms = to_int(.time) ?? 0
+event_time = now()
+if time_ms > 0 { event_time = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+metadata = .metadata
+if !is_object(metadata) { metadata = {} }
+metadata.version = "1.9.0"
+metadata.log_source = source_type
+# NAN-2361 wave 8: the ingress lane the row arrived on (nano extension like
+# log_source): nano_https | hec | otlp | vector. Absent on rows from a lane
+# that does not stash `%ingress_transport`; the Bronze publisher's
+# per-source counters then assume the conventional HEC path.
+ingress_transport = downcase(to_string(%ingress_transport) ?? "")
+if ingress_transport != "" { metadata.ingress_transport = ingress_transport }
+metadata.tenant_uid = tenant_id
+# NAN-3770: the named ingest token (Ingestion -> Credentials) the sender
+# authenticated with, stamped by the nano-rs/vector `valid_tokens_file` check.
+# Only the canonical credential id is stored, never the token. A value a
+# parser copied from the payload is dropped so attribution cannot be forged.
+nano_sender_credential = downcase(to_string(%nano_credential_id) ?? "")
+if match(nano_sender_credential, r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') {
+metadata.nano_credential_id = nano_sender_credential
+} else {
+metadata = remove!(metadata, ["nano_credential_id"])
+}
+processed_time = to_unix_timestamp(now(), unit: "milliseconds")
+metadata.processed_time = processed_time
+metadata.logged_time = processed_time
+# NAN-2992: a deterministic event uid ONLY from the edge Worker's signed
+# per-event key (`%nano_event_key` = receipt digest + ordinal, verified by
+# hec_normalize), so a redelivered batch carries the same uids and the
+# ingest uid ledger drops it. A uid the event supplied (or a parser derived
+# from it) is kept: anything that is not a UUIDv4, or a UUIDv4 that appears
+# verbatim in the raw payload. Without a key nothing is derived from content:
+# the parser's random uid stays (identical real events are never collapsed).
+# The derived uid is UUID-shaped with version 8, so this stage is idempotent.
+uid = to_string(metadata.uid) ?? ""
+event_key = to_string(%nano_event_key) ?? ""
+uid_minted = uid == "" || (match(uid, r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$') && !contains(raw_data, uid, case_sensitive: false))
+if event_key != "" && uid_minted {
+uid_digest = sha2("nano-uid-v1:key:" + tenant_id + ":" + event_key, variant: "SHA-256")
+metadata.uid = slice!(uid_digest, 0, 8) + "-" + slice!(uid_digest, 8, 12) + "-8" + slice!(uid_digest, 13, 16) + "-a" + slice!(uid_digest, 17, 20) + "-" + slice!(uid_digest, 20, 32)
+} else if uid == "" {
+metadata.uid = uuid_v4()
+}
+bronze_shards = ${NANO_LAKE_BRONZE_SHARDS:-1}
+if bronze_shards < 1 || bronze_shards > 128 { abort }
+._nano_bronze_partition = if bronze_shards > 1 {
+bronze_digest = sha2!(to_string!(metadata.uid), variant: "SHA-256")
+bronze_hash_prefix = slice!(bronze_digest, 0, 8)
+bronze_hash_value = parse_int!(bronze_hash_prefix, base: 16)
+bronze_shard = mod!(bronze_hash_value, bronze_shards)
+"shard=" + to_string!(bronze_shard) + "/"
+} else {
+""
+}
+.metadata = metadata
+.time = event_time
+%tenant_id = tenant_id
+%source_type = source_type
+%class_uid = to_int(.class_uid) ?? 0
+%event_day = format_timestamp!(event_time, "%Y%m%d")
+# Bronze is the durable handoff, not the serving partition layout.
+# Each selected Bronze partition remains lexically append-only;
+# Vector's timestamped filenames preserve arrival order and the Rust publisher writes
+# canonical event-hour Iceberg partitions.
+'''
 
-[sinks.clickhouse_ocsf_logs.buffer]
+[sinks.ocsf_parquet_bronze]
+type = "aws_s3"
+inputs = ["ocsf_lake_storage_prepare"]
+bucket = "${NANO_LAKE_BRONZE_BUCKET}"
+region = "${AWS_REGION:-us-east-1}"
+endpoint = "${NANO_LAKE_OBJECT_ENDPOINT:-https://s3.amazonaws.com}"
+force_path_style = ${NANO_LAKE_FORCE_PATH_STYLE:-false}
+auth.access_key_id = "${NANO_LAKE_ACCESS_KEY_ID}"
+auth.secret_access_key = "${NANO_LAKE_SECRET_ACCESS_KEY}"
+key_prefix = "bronze-v2/{{ _nano_bronze_partition }}tenant_id={{ %tenant_id }}/"
+filename_extension = "parquet"
+filename_append_uuid = true
+acknowledgements.enabled = true
+
+[sinks.ocsf_parquet_bronze.encoding]
+codec = "json"
+except_fields = ["_nano_bronze_partition"]
+
+[sinks.ocsf_parquet_bronze.batch]
+max_bytes = ${VECTOR_LAKE_BATCH_MAX_BYTES:-33554432}
+max_events = ${VECTOR_LAKE_BATCH_MAX_EVENTS:-10000}
+# The byte/event thresholds still produce sized objects under load. The
+# short timeout bounds low-rate source visibility; it is not a tenant EPS cap.
+timeout_secs = ${VECTOR_LAKE_BATCH_TIMEOUT_SECS:-1}
+
+[sinks.ocsf_parquet_bronze.batch_encoding]
+codec = "parquet"
+schema_mode = "auto_infer"
+
+[sinks.ocsf_parquet_bronze.batch_encoding.compression]
+algorithm = "zstd"
+level = 9
+
+[sinks.ocsf_parquet_bronze.buffer]
+# NAN-3523: bounded by in-memory BYTES, not events: an event may be up to
+# 4 MiB, so 20000 events could hold ~80 GiB. 64 MiB is four of the hosted
+# Worker's 16 MiB batches, a small slice of the smallest Container. Memory
+# (never disk) keeps the source ACK behind the completed PUT; when full it
+# blocks, pushing back on the source and the durable raw handoff upstream.
 type = "memory"
-max_events = 100000
-when_full = "drop_newest"
+max_size = ${VECTOR_LAKE_BUFFER_MAX_BYTES:-67108864}
+when_full = "block"
 
-[sinks.clickhouse_ocsf_logs.acknowledgements]
-enabled = false
-
-[sinks.clickhouse_ocsf_logs.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
-
-[sinks.clickhouse_ocsf_logs.request]
+[sinks.ocsf_parquet_bronze.request]
 concurrency = "adaptive"
 timeout_secs = 120
 retry_initial_backoff_secs = 1

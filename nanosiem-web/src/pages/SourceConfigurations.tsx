@@ -10,7 +10,6 @@ import {
   Database,
   Eye,
   Globe,
-  Loader2,
   MoreHorizontal,
   Pencil,
   Plug,
@@ -23,6 +22,7 @@ import {
   Trash2,
   Zap,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
@@ -57,6 +57,8 @@ import {
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
+import { useIngestGate } from '@/hooks/use-capabilities';
+import { TenzirOnlyNote, TENZIR_ONLY_NOTE } from '@/components/add-data/TenzirOnlyNote';
 import { api } from '@/lib/api';
 import type {
   NewSourceConfiguration,
@@ -91,8 +93,9 @@ const TRANSPORTS: TransportSpec[] = [
   { value: 'aws_s3', label: 'AWS S3', icon: Cloud, description: 'Ingest objects from S3 via SQS notifications.', popular: true },
   { value: 'aws_sqs', label: 'AWS SQS', icon: Cloud, description: 'Consume an SQS queue directly, where the message body is the log.', popular: false },
   { value: 'gcp_pubsub', label: 'GCP Pub/Sub', icon: Cloud, description: 'Subscribe to a Google Cloud Pub/Sub topic.' },
+  { value: 'azure_event_hubs', label: 'Azure Event Hubs', icon: Cloud, description: 'Consume an Event Hub with a consumer group, checkpointed in Blob Storage.' },
   { value: 'kafka', label: 'Kafka', icon: Database, description: 'Consume events from one or more Kafka topics.' },
-  { value: 'splunk_hec', label: 'Splunk HEC', icon: Zap, description: 'Splunk HTTP Event Collector compatibility endpoint.' },
+  { value: 'splunk_hec', label: 'HEC', icon: Zap, description: 'HTTP Event Collector (HEC) compatible endpoint.' },
 ];
 
 const TRANSPORT_BY_VALUE = new Map(TRANSPORTS.map((t) => [t.value, t]));
@@ -132,10 +135,14 @@ export default function SourceConfigurations() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
 
-  const canCreate = hasPermission('source_configs:create');
+  // NAN-3844: source configurations are Vector listeners (HTTP / HEC / OTLP);
+  // an `install.sh --tenzir` install has no Vector. Existing rows stay
+  // visible for undeploy / delete.
+  const { tenzirOnly, blocked } = useIngestGate();
+  const canCreate = hasPermission('source_configs:create') && !blocked;
   const canEdit = hasPermission('source_configs:edit');
   const canDelete = hasPermission('source_configs:delete');
-  const canDeploy = hasPermission('source_configs:deploy');
+  const canDeploy = hasPermission('source_configs:deploy') && !blocked;
 
   const [searchQuery, setSearchQuery] = useState('');
   const [filter, setFilter] = useState<FilterId>('all');
@@ -264,6 +271,7 @@ export default function SourceConfigurations() {
     <TooltipProvider delayDuration={200}>
       <div className="-m-3 flex h-[calc(100%+1.5rem)] min-h-0 flex-col overflow-hidden [contain:layout]">
         <HeroStrip stats={stats} />
+        {tenzirOnly && <TenzirOnlyNote className="mx-4 mt-3" />}
 
         <Toolbar
           query={searchQuery}
@@ -279,7 +287,7 @@ export default function SourceConfigurations() {
         <div className="flex-1 min-h-0 overflow-auto">
           {isLoading ? (
             <div className="flex items-center justify-center py-16">
-              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-6 h-6 text-muted-foreground" />
             </div>
           ) : filtered.length === 0 ? (
             <EmptyState
@@ -293,6 +301,7 @@ export default function SourceConfigurations() {
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
+              enableBlocked={blocked}
               onRowClick={(config) =>
                 navigate(`/ingestion/source-configurations/${config.id}`)
               }
@@ -525,6 +534,7 @@ function SourceConfigTable({
   canEdit,
   canDeploy,
   canDelete,
+  enableBlocked,
   onRowClick,
   onToggle,
   onDeploy,
@@ -535,6 +545,8 @@ function SourceConfigTable({
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
+  /** NAN-3844: no Vector (Tenzir-only, or not known yet): turning a listener on is off. */
+  enableBlocked: boolean;
   onRowClick: (config: SourceConfiguration) => void;
   onToggle: (config: SourceConfiguration) => void;
   onDeploy: (config: SourceConfiguration) => void;
@@ -572,6 +584,7 @@ function SourceConfigTable({
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
+              enableBlocked={enableBlocked}
               onRowClick={() => onRowClick(config)}
               onToggle={() => onToggle(config)}
               onDeploy={() => onDeploy(config)}
@@ -590,6 +603,7 @@ function SourceConfigRow({
   canEdit,
   canDeploy,
   canDelete,
+  enableBlocked,
   onRowClick,
   onToggle,
   onDeploy,
@@ -600,6 +614,7 @@ function SourceConfigRow({
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
+  enableBlocked: boolean;
   onRowClick: () => void;
   onToggle: () => void;
   onDeploy: () => void;
@@ -676,9 +691,11 @@ function SourceConfigRow({
 
       <td className="py-3 align-top">
         <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+          {/* Turning a listener off stays open for cleanup; on needs Vector. */}
           <EnabledToggle
             checked={config.enabled}
-            disabled={!canEdit}
+            disabled={!canEdit || (enableBlocked && !config.enabled)}
+            title={enableBlocked && !config.enabled ? TENZIR_ONLY_NOTE : undefined}
             onClick={onToggle}
           />
           <span
@@ -772,10 +789,12 @@ function StatusBadge({ status }: { status: DerivedStatus }) {
 function EnabledToggle({
   checked,
   disabled,
+  title,
   onClick,
 }: {
   checked: boolean;
   disabled?: boolean;
+  title?: string;
   onClick: () => void;
 }) {
   return (
@@ -783,6 +802,7 @@ function EnabledToggle({
       type="button"
       onClick={onClick}
       disabled={disabled}
+      title={title}
       aria-pressed={checked}
       className={cn(
         'w-[30px] h-[17px] rounded-full flex items-center transition-colors relative shrink-0',
@@ -952,7 +972,7 @@ function AddSourceSheet({
               disabled={submitting || !name.trim()}
               onClick={submit}
             >
-              {submitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {submitting && <LoadingIcon className="h-3.5 w-3.5" />}
               Create &amp; configure
             </Button>
           )}
@@ -979,7 +999,7 @@ function PickTransport({
     SINGLE_INSTANCE_TYPES.includes(t.value) && existingTypes.has(t.value);
   const disabledReason = (t: TransportSpec): string | null =>
     t.value === 'splunk_hec' && existingTypes.has('splunk_hec')
-      ? 'Only one Splunk HEC routing config is supported. Edit the existing one to add routing rules.'
+      ? 'Only one HEC routing config is supported. Edit the existing one to add routing rules.'
       : null;
 
   const renderCard = (t: TransportSpec) => (

@@ -3,14 +3,7 @@
 import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import * as Diff from 'diff';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { DetailSheet, useDetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -20,7 +13,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip';
 import {
-  Loader2,
   Check,
   X,
   CircleCheck,
@@ -28,6 +20,7 @@ import {
   RotateCcw,
   ArrowRight,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import {
   repositoryQueryEnabled,
@@ -181,7 +174,7 @@ function HunkView({
   const hasNew = hunk.newLines.length > 0;
 
   return (
-    <div className={`border rounded-lg overflow-hidden ${
+    <div className={`border rounded-md overflow-hidden ${
       hunk.accepted === true
         ? 'border-green-500/50 bg-green-500/5'
         : hunk.accepted === false
@@ -189,8 +182,8 @@ function HunkView({
         : 'border-border'
     }`}>
       {/* Hunk header */}
-      <div className="flex items-center justify-between px-3 py-2 bg-muted/50 border-b">
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <div className="flex items-center justify-between px-3 py-1 bg-muted/50 border-b">
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
           {hasOld && hasNew ? (
             <span>Lines modified</span>
           ) : hasNew ? (
@@ -213,10 +206,10 @@ function HunkView({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className={`h-7 px-2 ${hunk.accepted === false ? 'bg-amber-500/20' : ''}`}
+                  className={`h-6 px-2 text-[11px] ${hunk.accepted === false ? 'bg-amber-500/20' : ''}`}
                   onClick={onReject}
                 >
-                  <XCircle className="w-4 h-4 text-amber-600" />
+                  <XCircle className="w-3.5 h-3.5 text-amber-600" />
                   Keep Mine
                 </Button>
               </TooltipTrigger>
@@ -227,10 +220,10 @@ function HunkView({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className={`h-7 px-2 ${hunk.accepted === true ? 'bg-green-500/20' : ''}`}
+                  className={`h-6 px-2 text-[11px] ${hunk.accepted === true ? 'bg-green-500/20' : ''}`}
                   onClick={onAccept}
                 >
-                  <CircleCheck className="w-4 h-4 text-green-600" />
+                  <CircleCheck className="w-3.5 h-3.5 text-green-600" />
                   Accept
                 </Button>
               </TooltipTrigger>
@@ -242,7 +235,8 @@ function HunkView({
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-7 px-2"
+                    className="h-6 px-2"
+                    aria-label="Reset decision"
                     onClick={onReset}
                   >
                     <RotateCcw className="w-3 h-3" />
@@ -256,7 +250,7 @@ function HunkView({
       </div>
 
       {/* Hunk content */}
-      <div className="font-mono text-sm">
+      <div className="font-mono text-[11.5px]">
         {/* Old lines (current/yours) - shown with strikethrough if accepting upstream */}
         {hunk.oldLines.map((line, idx) => (
           <div
@@ -301,6 +295,15 @@ function HunkView({
         ))}
       </div>
     </div>
+  );
+}
+
+function MergeCancelButton() {
+  const { requestClose } = useDetailSheet();
+  return (
+    <Button size="sm" variant="outline" className="h-7 text-[11.5px]" onClick={requestClose}>
+      Cancel
+    </Button>
   );
 }
 
@@ -371,110 +374,109 @@ export function UpstreamMergeModal({
   const queriesMatch = diff?.upstream_query === diff?.current_query;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
-        <DialogHeader>
-          <DialogTitle>Merge Upstream Changes</DialogTitle>
-          <DialogDescription>
-            Review each change and decide whether to accept the upstream version or keep yours.
-            {diff?.file_path && (
-              <span className="block font-mono text-xs mt-1">{diff.file_path}</span>
-            )}
-          </DialogDescription>
-        </DialogHeader>
-
-        {!diffAccess.allowed ? (
-          <div className="text-center py-8 text-muted-foreground">
-            {diffAccess.reason}
-          </div>
-        ) : isLoading ? (
-          <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-          </div>
-        ) : queriesMatch ? (
-          <div className="flex-1 flex items-center justify-center py-12">
-            <div className="text-center">
-              <Check className="w-12 h-12 mx-auto mb-4 text-green-500" />
-              <p className="text-lg font-medium">Queries are identical</p>
-              <p className="text-muted-foreground">No changes to merge.</p>
-            </div>
-          </div>
-        ) : diff && hunks.length > 0 ? (
-          <div className="space-y-4">
-            {/* Bulk actions */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-4 text-sm">
-                <span className="text-muted-foreground">
-                  {stats.total} change{stats.total !== 1 ? 's' : ''}
-                </span>
-                {stats.accepted > 0 && (
-                  <Badge variant="outline" className="text-green-600 border-green-600">
-                    <Check className="w-3 h-3 mr-1" />
-                    {stats.accepted} accepting
-                  </Badge>
-                )}
-                {stats.rejected > 0 && (
-                  <Badge variant="outline" className="text-amber-600 border-amber-600">
-                    <X className="w-3 h-3 mr-1" />
-                    {stats.rejected} keeping mine
-                  </Badge>
-                )}
-                {stats.undecided > 0 && (
-                  <Badge variant="outline" className="text-muted-foreground">
-                    {stats.undecided} undecided
-                  </Badge>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <Button variant="outline" size="sm" onClick={acceptAll}>
-                  <CircleCheck className="w-4 h-4 text-green-600" />
-                  Accept All
-                </Button>
-                <Button variant="outline" size="sm" onClick={rejectAll}>
-                  <XCircle className="w-4 h-4 text-amber-600" />
-                  Keep All Mine
-                </Button>
-                <Button variant="ghost" size="sm" onClick={resetAll}>
-                  <RotateCcw className="w-4 h-4" />
-                  Reset
-                </Button>
-              </div>
-            </div>
-
-            {/* Hunks */}
-            <div className="overflow-y-auto pr-1" style={{ maxHeight: 'calc(90vh - 260px)' }}>
-              <div className="space-y-4 pr-3">
-                {hunks.map((hunk) => (
-                  <HunkView
-                    key={hunk.id}
-                    hunk={hunk}
-                    onAccept={() => updateHunk(hunk.id, true)}
-                    onReject={() => updateHunk(hunk.id, false)}
-                    onReset={() => updateHunk(hunk.id, null)}
-                  />
-                ))}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div className="text-center py-8 text-muted-foreground">
-            Failed to load diff
-          </div>
-        )}
-
-        <DialogFooter className="flex-shrink-0">
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
+    <DetailSheet
+      open={open}
+      onOpenChange={onOpenChange}
+      size="xl"
+      breadcrumb={['Detections', 'Upstream']}
+      title="Merge Upstream Changes"
+      description="Review each change and decide whether to accept the upstream version or keep yours."
+      meta={diff?.file_path ? <span className="truncate">{diff.file_path}</span> : undefined}
+      // Hunk decisions are work the user would lose on an accidental close.
+      guardDirty={stats.accepted + stats.rejected > 0}
+      discardTitle="Discard merge decisions?"
+      discardDescription="Closing this panel will lose the accept / keep choices you made."
+      footer={
+        <>
+          <MergeCancelButton />
           <Button
+            size="sm"
+            className="h-7 text-[11.5px]"
             onClick={handleApply}
             disabled={!diff || queriesMatch}
           >
-            <Check className="w-4 h-4" />
+            <Check className="h-3.5 w-3.5" />
             Apply Merged Changes
           </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </>
+      }
+    >
+      {!diffAccess.allowed ? (
+        <div className="py-8 text-center text-muted-foreground">
+          {diffAccess.reason}
+        </div>
+      ) : isLoading ? (
+        <div className="flex items-center justify-center py-12">
+          <LoadingIcon className="h-6 w-6 text-muted-foreground" />
+        </div>
+      ) : queriesMatch ? (
+        <div className="flex items-center justify-center py-12">
+          <div className="text-center">
+            <Check className="mx-auto mb-3 h-8 w-8 text-green-500" />
+            <p className="text-[13px] font-medium">Queries are identical</p>
+            <p className="text-muted-foreground">No changes to merge.</p>
+          </div>
+        </div>
+      ) : diff && hunks.length > 0 ? (
+        <div className="space-y-3">
+          {/* Bulk actions */}
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-3 text-[12px]">
+              <span className="font-mono text-[11px] text-muted-foreground">
+                {stats.total} change{stats.total !== 1 ? 's' : ''}
+              </span>
+              {stats.accepted > 0 && (
+                <Badge variant="outline" className="border-green-600 font-mono text-green-600">
+                  <Check className="mr-1 h-3 w-3" />
+                  {stats.accepted} accepting
+                </Badge>
+              )}
+              {stats.rejected > 0 && (
+                <Badge variant="outline" className="border-amber-600 font-mono text-amber-600">
+                  <X className="mr-1 h-3 w-3" />
+                  {stats.rejected} keeping mine
+                </Badge>
+              )}
+              {stats.undecided > 0 && (
+                <Badge variant="outline" className="font-mono text-muted-foreground">
+                  {stats.undecided} undecided
+                </Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="sm" className="h-7 text-[11.5px]" onClick={acceptAll}>
+                <CircleCheck className="h-3.5 w-3.5 text-green-600" />
+                Accept All
+              </Button>
+              <Button variant="outline" size="sm" className="h-7 text-[11.5px]" onClick={rejectAll}>
+                <XCircle className="h-3.5 w-3.5 text-amber-600" />
+                Keep All Mine
+              </Button>
+              <Button variant="ghost" size="sm" className="h-7 text-[11.5px]" onClick={resetAll}>
+                <RotateCcw className="h-3.5 w-3.5" />
+                Reset
+              </Button>
+            </div>
+          </div>
+
+          {/* Hunks */}
+          <div className="space-y-3">
+            {hunks.map((hunk) => (
+              <HunkView
+                key={hunk.id}
+                hunk={hunk}
+                onAccept={() => updateHunk(hunk.id, true)}
+                onReject={() => updateHunk(hunk.id, false)}
+                onReset={() => updateHunk(hunk.id, null)}
+              />
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="py-8 text-center text-muted-foreground">
+          Failed to load diff
+        </div>
+      )}
+    </DetailSheet>
   );
 }

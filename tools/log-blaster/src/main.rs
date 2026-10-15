@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Log Blaster - Profile-driven SIEM log generator
 //!
 //! Generates realistic Sysmon, Windows Event, and proxy logs using real
@@ -16,11 +18,9 @@
 //!   log-blaster --hec --vector http://hec.example:8088 --blast --eps 50000    # HEC at custom URL
 //!   log-blaster --tenzir --rate 30                                             # Tenzir raw-log lane (default :9095)
 //!   log-blaster --tenzir http://tenzir.example:9095 --blast --eps 5000        # Tenzir at custom URL
-//!   log-blaster --otlp --otlp-direct --blast --eps 5000 --threads 8 --otlp-batch 50  # OTLP firehose → ClickHouse (10k+ spans/s)
 //!   log-blaster --otlp --blast --eps 2000 --threads 4 --otlp-batch 20         # OTLP firehose → Vector :4318
-//!   log-blaster --combo-join --combo-join-fraction 0.3 --rate 600 --duration 1 \
-//!     --clickhouse-url http://localhost:8123                                   # Spans→otel_spans + correlated auth-failure logs→nanosiem.logs (validate spans↔logs join)
 
+mod source_tokens;
 mod spike;
 
 use anyhow::Result;
@@ -32,7 +32,7 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::{interval, Duration as TokioDuration};
+use tokio::time::{interval, sleep_until, Duration as TokioDuration, Instant as TokioInstant};
 use tracing::{error, info, warn};
 
 use event_core::entity::WorldState;
@@ -42,13 +42,29 @@ use event_core::generators::{
     WindowsEventGenerator,
 };
 use event_core::http::{
-    send_batch_with_retry, send_event, send_otlp_with_retry, OtlpSignal, Transport,
+    send_batch_with_retry, send_event, send_otlp_with_retry, OtlpSignal, RetryPolicy, Transport,
 };
 use event_core::profiles;
+
+/// Retries for blast paths that predate forwarder-style delivery.
+const LEGACY_SEND_RETRIES: u32 = 3;
+
+/// NAN-2988: the source-credential blast retries like a forwarder unless
+/// --send-retries bounds it; the deadline applies either way (0 = none).
+fn source_retry_policy(send_retries: Option<u32>, deadline_secs: u64) -> RetryPolicy {
+    let deadline = (deadline_secs > 0).then(|| TokioDuration::from_secs(deadline_secs));
+    RetryPolicy {
+        max_retries: send_retries,
+        deadline,
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "log-blaster")]
 #[command(about = "Profile-driven SIEM log generator using real telemetry data")]
+#[command(
+    after_help = "Hosted source mode example:\n  log-blaster --vector https://tenant1.ingest.nano.rs --blast --eps 2000 --duration 5 \\\n    --source-token windows_sysmon=$SYSMON_TOKEN --source-token windows_event=$WINDOWS_TOKEN \\\n    --source-token conduit_proxy=$PROXY_TOKEN --source-token aws_cloudtrail=$CLOUDTRAIL_TOKEN \\\n    --source-token apache_http_server=$APACHE_TOKEN\nSee tools/log-blaster/README.md for accounting and credential precedence."
+)]
 struct Args {
     /// Vector HTTP endpoint (or HEC base URL when `--hec` is set).
     /// HEC default: `http://localhost:8088`. Path suffix is auto-appended:
@@ -60,6 +76,23 @@ struct Args {
     /// Falls back to `VECTOR_AUTH_TOKEN` env var, then a dev default.
     #[arg(long)]
     token: Option<String>,
+
+    /// Per-source Vector or HEC blast credential (repeatable). Also reads SOURCE_TOKENS
+    /// as source_type=token,source_type=token; CLI entries override matching env entries.
+    /// Implies source-homogeneous batches; missing credentials use --token or
+    /// VECTOR_AUTH_TOKEN, otherwise that source is skipped (no dev default).
+    #[arg(long, value_name = "SOURCE_TYPE=TOKEN", requires = "blast")]
+    source_token: Vec<String>,
+
+    /// Restrict the Vector or HEC blast mix to these comma-separated source types.
+    #[arg(long, value_delimiter = ',', requires = "blast")]
+    sources: Vec<String>,
+
+    /// Stable-key namespace for durable Vector/HEC source requests. Every
+    /// logical request gets a unique UUID suffix; retries retain the same key.
+    /// Unset by default for both transports; retries without a key may duplicate events.
+    #[arg(long)]
+    idempotency_key_prefix: Option<String>,
 
     /// Send events via Splunk HEC instead of Vector HTTP. Targets the OOTB
     /// `splunk_hec_ingest` listener on :8088 with line-delimited JSON
@@ -112,6 +145,49 @@ struct Args {
     #[arg(long, default_value = "1000")]
     batch_size: usize,
 
+    /// Maximum time to accumulate a paced blast batch before sending it.
+    #[arg(long, default_value = "2000", value_parser = clap::value_parser!(u64).range(1..))]
+    max_batch_latency_ms: u64,
+
+    /// Keep each Vector blast request source-homogeneous while preserving the
+    /// default aggregate source mix. Vector carries `X-Source-Type` at the
+    /// request level, so a mixed batch is otherwise split into five smaller
+    /// requests by the transport. Hosted durable-ingest capacity gates use
+    /// this to model customer Vector aggregators without changing the default
+    /// open-core load-generator behavior.
+    #[arg(long, requires = "blast")]
+    vector_source_homogeneous_batches: bool,
+
+    /// Maximum acknowledged HTTP batches in flight per sender thread.
+    ///
+    /// Vector object-sink acknowledgements can take tens of seconds. Keep this
+    /// bounded, but make it explicit so a durable-ACK capacity run can size the
+    /// window from measured request latency instead of silently rate-limiting
+    /// the generator.
+    #[arg(long, default_value = "16")]
+    inflight_per_thread: usize,
+
+    /// Send exactly this many blast batches per sender thread, then drain all
+    /// acknowledged sends and exit. Intended for short, repeatable throughput
+    /// sweeps where a wall-clock duration would hide the in-flight tail.
+    #[arg(long)]
+    blast_batches_per_thread: Option<usize>,
+
+    /// Retries for each raw-event HTTP group in blast mode. With source
+    /// credentials (--source-token/SOURCE_TOKENS/--sources) the default is to
+    /// retry like a real forwarder: every 429/503/5xx/timeout is retried with
+    /// the identical body (and key when explicitly configured), honouring
+    /// Retry-After, until accepted or --send-deadline-secs runs out (NAN-2988).
+    /// Setting this bounds the retries instead. Other blast paths default to 3.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..))]
+    send_retries: Option<u32>,
+
+    /// How long one source-credential batch keeps retrying a retryable failure
+    /// before it is counted lost (0 = never give up). Only a permanent 4xx
+    /// refusal is dropped earlier.
+    #[arg(long, default_value = "900")]
+    send_deadline_secs: u64,
+
     /// Run duration in minutes (0 = unlimited)
     #[arg(long, default_value = "0")]
     duration: u64,
@@ -149,8 +225,7 @@ struct Args {
     // --- OTLP (OpenTelemetry) mode — NAN-1533 -------------------------------
     /// Generate and ship OTLP signals (traces / metrics / logs) instead of the
     /// raw-log generators. Targets Vector's `opentelemetry` receiver by default
-    /// (OTLP/HTTP JSON to :4318); add `--otlp-direct` for the Vector-independent
-    /// direct-to-ClickHouse path. Honors --epm/--rate, --blast, --duration.
+    /// (OTLP/HTTP protobuf to :4318). Honors --epm/--rate, --blast, --duration.
     #[arg(long, conflicts_with_all = ["hec", "tenzir", "spike", "seed_identities"])]
     otlp: bool,
 
@@ -166,52 +241,191 @@ struct Args {
     )]
     otlp_signals: Vec<String>,
 
-    /// Use the direct OTLP->ClickHouse path (mirrors Tenzir/Cribl direct
-    /// producers) instead of OTLP/HTTP to Vector. Writes raw rows straight into
-    /// the otel_spans_raw / otel_metrics_raw Null tables (and the UDM logs lane
-    /// for logs) so the derivation MVs run regardless of Vector's OTLP decode.
-    #[arg(long)]
-    otlp_direct: bool,
-
-    /// ClickHouse HTTP endpoint for `--otlp-direct` (default dev docker-compose).
-    #[arg(long, default_value = "http://localhost:8123")]
-    clickhouse_url: String,
-
-    /// ClickHouse user for `--otlp-direct`.
-    #[arg(long, default_value = "nanosiem")]
-    clickhouse_user: String,
-
-    /// ClickHouse password for `--otlp-direct`.
-    #[arg(long, default_value = "nanosiem")]
-    clickhouse_password: String,
-
-    // --- Combo-join (spans <-> logs correlation) — NAN-1566 -----------------
-    /// Emit OTEL spans AND correlated UDM security-signal logs in ONE run so
-    /// the cross-dataset spans<->logs correlation can be validated. Spans land
-    /// in `otel_spans` (existing OTLP path); a `--combo-join-fraction` slice of
-    /// the UDM logs carry a REAL `trace_id` minted by the span side and are
-    /// shaped as an auth FAILURE (auth_result=failure + user + src_ip). The
-    /// correlated log rows are written DIRECTLY into `nanosiem.logs` via the
-    /// ClickHouse HTTP interface (the demo parsers don't carry trace_id through
-    /// Vector, so direct-CH is the deterministic delivery path). Implies the
-    /// direct-to-ClickHouse path; honors --rate/--blast/--eps/--threads/--duration.
-    #[arg(long, conflicts_with_all = ["hec", "tenzir", "spike", "seed_identities"])]
-    combo_join: bool,
-
-    /// Fraction (0.0..=1.0) of combo-join UDM logs that carry a real span
-    /// `trace_id` (the rest are normal, uncorrelated logs). Default 0.3.
-    #[arg(long, default_value = "0.3")]
-    combo_join_fraction: f64,
-
     /// OTLP records generated per tick (NAN-1545 firehose). Each tick sources
     /// ONE fleet entity and generates K full signal sets (K traces, K metric
     /// scrapes, K correlated logs, …), then ships each signal lane as a SINGLE
-    /// bulk OTLP POST / ClickHouse insert — the cheapest throughput multiplier
+    /// bulk OTLP POST — the cheapest throughput multiplier
     /// (amortizes one request over K records). Default 1 preserves the original
     /// one-entity-per-tick behavior. Combine with `--blast --eps --threads` to
     /// scale: spans/s ≈ eps × threads × otlp-batch × spans-per-trace.
     #[arg(long, default_value = "1")]
     otlp_batch: usize,
+
+    // --- Realistic variance (NAN-3174) — all opt-in --------------------------
+    /// Variance preset. `realistic` turns on every knob below with sensible
+    /// values (--entity-skew 1.0, --hash-pool 50000, --cmdline-variance,
+    /// --time-jitter, --diurnal 0.5, --burst 0.05,3,15); any knob passed
+    /// explicitly with a non-default value wins over the preset. `off`
+    /// (default) leaves output identical to previous releases.
+    #[arg(long, value_enum, default_value = "off")]
+    variance: VariancePreset,
+
+    /// Zipf skew for host/user popularity (`random_entity`). 0 = uniform
+    /// (default). ~1.0 gives a realistic long tail: a few busy servers and
+    /// workstations, many quiet ones.
+    #[arg(long, default_value = "0")]
+    entity_skew: f64,
+
+    /// Synthesize this many extra deterministic SHA-256 file hashes (seeded by
+    /// --variance-seed) as a long tail behind the profile hashes. 0 = off.
+    #[arg(long, default_value = "0")]
+    hash_pool: usize,
+
+    /// Zipf skew over [profile hashes ∪ synthetic pool]; higher = rarer tail.
+    #[arg(long, default_value = "1.1")]
+    hash_skew: f64,
+
+    /// Append random arguments/paths to profile command lines.
+    #[arg(long)]
+    cmdline_variance: bool,
+
+    /// Blast mode: give each event its own timestamp spread over the batch
+    /// period (sorted, mildly reordered) instead of one shared `now`.
+    #[arg(long)]
+    time_jitter: bool,
+
+    /// Blast mode: 24 h sine amplitude on the target EPS (0..1, peak ~14:00
+    /// UTC). The daily average stays ~--eps. 0 = flat (default).
+    #[arg(long, default_value = "0")]
+    diurnal: f64,
+
+    /// Blast mode: `prob,mult,secs` — each minute, with probability `prob`, run
+    /// at `mult`× EPS for the first `secs` seconds. Normalized so the long-run
+    /// average stays ~--eps.
+    #[arg(long)]
+    burst: Option<event_core::variance::BurstSpec>,
+
+    /// Seed for the variance structure (popular-host ranking, synthetic hash
+    /// set, burst schedule). Default: random.
+    #[arg(long)]
+    variance_seed: Option<u64>,
+}
+
+/// NAN-3174: `--variance` presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum VariancePreset {
+    /// No variance (historical uniform behavior).
+    Off,
+    /// Skewed entities, long-tail hashes, varied command lines, per-event
+    /// timestamps, diurnal rate and occasional bursts.
+    Realistic,
+}
+
+/// Values `--variance realistic` fills in for knobs left at their defaults.
+const REALISTIC_ENTITY_SKEW: f64 = 1.0;
+const REALISTIC_HASH_POOL: usize = 50_000;
+const REALISTIC_DIURNAL: f64 = 0.5;
+const REALISTIC_BURST: event_core::variance::BurstSpec = event_core::variance::BurstSpec {
+    prob: 0.05,
+    mult: 3.0,
+    secs: 15,
+};
+
+/// NAN-3174: resolved variance settings. `None` from [`VarianceSettings::from_args`]
+/// means every flag is at its default and no variance code runs.
+#[derive(Debug, Clone, Copy)]
+struct VarianceSettings {
+    seed: u64,
+    entity_skew: f64,
+    hash_pool: usize,
+    hash_skew: f64,
+    cmdline_variance: bool,
+    time_jitter: bool,
+    rate: event_core::variance::RateShape,
+}
+
+impl VarianceSettings {
+    fn from_args(args: &Args) -> Result<Option<Self>> {
+        anyhow::ensure!(
+            args.entity_skew >= 0.0 && args.entity_skew.is_finite(),
+            "--entity-skew must be >= 0"
+        );
+        anyhow::ensure!(
+            args.hash_skew >= 0.0 && args.hash_skew.is_finite(),
+            "--hash-skew must be >= 0"
+        );
+        anyhow::ensure!(
+            (0.0..1.0).contains(&args.diurnal),
+            "--diurnal must be in [0, 1)"
+        );
+        let realistic = args.variance == VariancePreset::Realistic;
+        // Explicit non-default knobs win; defaults take the preset value.
+        let entity_skew = if realistic && args.entity_skew == 0.0 {
+            REALISTIC_ENTITY_SKEW
+        } else {
+            args.entity_skew
+        };
+        let hash_pool = if realistic && args.hash_pool == 0 {
+            REALISTIC_HASH_POOL
+        } else {
+            args.hash_pool
+        };
+        let diurnal = if realistic && args.diurnal == 0.0 {
+            REALISTIC_DIURNAL
+        } else {
+            args.diurnal
+        };
+        let burst = args.burst.or(realistic.then_some(REALISTIC_BURST));
+        let cmdline_variance = args.cmdline_variance || realistic;
+        let time_jitter = args.time_jitter || realistic;
+
+        let active = entity_skew > 0.0
+            || hash_pool > 0
+            || cmdline_variance
+            || time_jitter
+            || diurnal > 0.0
+            || burst.is_some();
+        if !active {
+            return Ok(None);
+        }
+        let seed = args.variance_seed.unwrap_or_else(rand::random);
+        Ok(Some(Self {
+            seed,
+            entity_skew,
+            hash_pool,
+            hash_skew: args.hash_skew,
+            cmdline_variance,
+            time_jitter,
+            rate: event_core::variance::RateShape {
+                diurnal,
+                burst,
+                seed,
+            },
+        }))
+    }
+
+    /// Install generator hooks and skew the world. Called once at startup.
+    fn apply(&self, world: &mut WorldState) {
+        use event_core::variance;
+        world.set_entity_skew(self.entity_skew, self.seed);
+        let hash_pool = (self.hash_pool > 0).then(|| {
+            variance::HashPool::new(
+                profiles::profiles().file_hashes.len(),
+                self.hash_pool,
+                self.hash_skew,
+                self.seed,
+            )
+        });
+        variance::install(variance::GeneratorVariance {
+            hash_pool,
+            cmdline_variance: self.cmdline_variance,
+        });
+        info!(
+            "VARIANCE: seed={} entity_skew={} hash_pool={} hash_skew={} \
+             cmdline_variance={} time_jitter={} diurnal={} burst={}",
+            self.seed,
+            self.entity_skew,
+            self.hash_pool,
+            self.hash_skew,
+            self.cmdline_variance,
+            self.time_jitter,
+            self.rate.diurnal,
+            self.rate
+                .burst
+                .map(|b| format!("{}x for {}s @ p={}/min", b.mult, b.secs, b.prob))
+                .unwrap_or_else(|| "off".into()),
+        );
+    }
 }
 
 #[tokio::main]
@@ -224,6 +438,19 @@ async fn main() -> Result<()> {
         .init();
 
     let mut args = Args::parse();
+    let source_env = std::env::var("SOURCE_TOKENS")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let fallback = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("VECTOR_AUTH_TOKEN").ok());
+    let source_config =
+        if !args.source_token.is_empty() || !args.sources.is_empty() || source_env.is_some() {
+            source_tokens::SourceConfig::resolve(&mut args, source_env.as_deref(), fallback)?
+        } else {
+            source_tokens::SourceConfig::default()
+        };
 
     // HEC and Vector use different default ports / path suffixes. When
     // `--hec` is set and `--vector` was left at its default, switch the
@@ -236,19 +463,11 @@ async fn main() -> Result<()> {
     }
 
     // OTLP mode is wholly separate from the raw-log transports: it builds its
-    // own transport (OtlpHttp -> Vector :4318, or OtlpClickHouse -> :8123) and
+    // own transport (OtlpHttp -> Vector :4318) and
     // runs `run_otlp_mode`. Short-circuit the Vector/HEC/Tenzir path-suffix and
     // token resolution below and dispatch directly.
     if args.otlp {
         return run_otlp_entry(args).await;
-    }
-
-    // Combo-join (NAN-1566): emit OTEL spans AND correlated UDM security logs in
-    // one run, sharing a bounded trace_id pool, so spans<->logs correlation is
-    // validatable. Like --otlp it builds its own ClickHouse transport and
-    // bypasses the Vector/HEC/Tenzir path-suffix + token plumbing below.
-    if args.combo_join {
-        return run_combo_join_entry(args).await;
     }
 
     // Resolve the wire-format-specific path suffix. Idempotent — bails if
@@ -290,7 +509,7 @@ async fn main() -> Result<()> {
     // The token field is shared across the Vector and HEC transports — the
     // OOTB HEC listener also reads `VECTOR_AUTH_TOKEN` (one token to
     // rotate). The Tenzir listener has no auth, so skip resolution there.
-    if args.token.is_none() && args.tenzir.is_none() {
+    if args.token.is_none() && args.tenzir.is_none() && !source_config.configured {
         let resolved = std::env::var("VECTOR_AUTH_TOKEN")
             .unwrap_or_else(|_| "nanosiem-default-token".to_string());
         info!(
@@ -299,6 +518,21 @@ async fn main() -> Result<()> {
             tail4(&resolved)
         );
         args.token = Some(resolved);
+    }
+
+    if let Some(prefix) = args.idempotency_key_prefix.as_deref() {
+        let valid = (1..=90).contains(&prefix.len())
+            && prefix.is_ascii()
+            && prefix.bytes().enumerate().all(|(index, byte)| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => true,
+                b'.' | b'_' | b':' | b'~' | b'-' => index > 0,
+                _ => false,
+            });
+        if !valid {
+            anyhow::bail!(
+                "--idempotency-key-prefix must be 1-90 ASCII characters and match [A-Za-z0-9][A-Za-z0-9._:~-]*"
+            );
+        }
     }
 
     // Force profile loading at startup so errors surface early
@@ -326,11 +560,18 @@ async fn main() -> Result<()> {
         Transport::Vector {
             url: args.vector.clone(),
             token: args.token.clone(),
+            idempotency_key_prefix: args.idempotency_key_prefix.clone(),
         }
     };
 
     info!("Initializing World State ({} assets)...", args.assets);
-    let world = Arc::new(parking_lot::RwLock::new(WorldState::new(args.assets)));
+    let variance = VarianceSettings::from_args(&args)?;
+    let mut initial_world = WorldState::new(args.assets);
+    match &variance {
+        Some(v) => v.apply(&mut initial_world),
+        None => info!("Variance: off (uniform entities, profile hashes, flat rate)"),
+    }
+    let world = Arc::new(parking_lot::RwLock::new(initial_world));
 
     {
         let w = world.read();
@@ -343,9 +584,7 @@ async fn main() -> Result<()> {
         println!("  Servers:      {}", w.server_count);
         println!("  Users:        {}", w.user_count);
         println!("  IP range:     10.1.x.x (endpoints), 10.2.x.x (servers)");
-        println!(
-            "  Source types:  windows_sysmon, windows_event, conduit_proxy, aws_cloudtrail"
-        );
+        println!("  Source types:  windows_sysmon, windows_event, conduit_proxy, aws_cloudtrail");
         println!("--------------------------------------\n");
     }
 
@@ -378,7 +617,10 @@ async fn main() -> Result<()> {
     // across both normal and blast modes — it fires a full chain (3 events
     // per hop × N hops) every `chain_interval_secs` so the `| lateral`
     // aggregate always has something to render.
-    let chain_handle = if args.chain_interval_secs > 0 {
+    if source_config.configured && args.chain_interval_secs > 0 {
+        warn!("Lateral chain emitter disabled for a restricted source mix; blast accounting covers the selected sources");
+    }
+    let chain_handle = if args.chain_interval_secs > 0 && !source_config.configured {
         let chain_world = world.clone();
         let chain_transport = transport.clone();
         let interval_secs = args.chain_interval_secs;
@@ -393,7 +635,7 @@ async fn main() -> Result<()> {
     let result = if args.spike {
         run_spike_mode(args, transport, world).await
     } else if args.blast {
-        run_blast_mode(args, transport, world).await
+        run_blast_mode(args, transport, world, source_config, variance).await
     } else {
         run_normal_mode(args, transport, world).await
     };
@@ -479,7 +721,11 @@ async fn run_chain_emitter(
                 );
             }
             Err(e) => {
-                warn!("chain emitter: failed to send batch ({} events): {}", batch.len(), e);
+                warn!(
+                    "chain emitter: failed to send batch ({} events): {}",
+                    batch.len(),
+                    e
+                );
             }
         }
 
@@ -521,6 +767,139 @@ fn generate_event(
         return apache_gen.generate(timestamp, entity, rng);
     }
     cloudtrail_gen.generate(timestamp, entity, rng)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HomogeneousBlastSource {
+    Sysmon,
+    WindowsEvent,
+    Proxy,
+    Apache,
+    CloudTrail,
+}
+
+/// A smooth 50-request schedule with the exact historical source mix:
+/// 60% Sysmon, 10% Windows Event, 12% proxy, 10% Apache, 8% CloudTrail.
+/// Keeping this deterministic makes fixed-batch capacity gates repeatable.
+const HOMOGENEOUS_BLAST_SOURCE_CYCLE: [HomogeneousBlastSource; 50] = [
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Proxy,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::WindowsEvent,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Proxy,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Apache,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::WindowsEvent,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::CloudTrail,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Proxy,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Apache,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::WindowsEvent,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::CloudTrail,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Proxy,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Apache,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::WindowsEvent,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::CloudTrail,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Proxy,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Apache,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::WindowsEvent,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::CloudTrail,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Proxy,
+    HomogeneousBlastSource::Sysmon,
+    HomogeneousBlastSource::Apache,
+    HomogeneousBlastSource::Sysmon,
+];
+
+/// NAN-3174: batch period at a rate multiplier. Clamped so a deep diurnal
+/// trough never sleeps a sender for more than 10 s per batch.
+fn shaped_eps(base: f64, multiplier: f64) -> f64 {
+    base * multiplier.max(0.01)
+}
+
+fn homogeneous_blast_mix(batch_index: usize) -> spike::SourceMix {
+    match HOMOGENEOUS_BLAST_SOURCE_CYCLE[batch_index % HOMOGENEOUS_BLAST_SOURCE_CYCLE.len()] {
+        HomogeneousBlastSource::Sysmon => spike::SourceMix {
+            sysmon: 1.0,
+            ..Default::default()
+        },
+        HomogeneousBlastSource::WindowsEvent => spike::SourceMix {
+            winevt: 1.0,
+            ..Default::default()
+        },
+        HomogeneousBlastSource::Proxy => spike::SourceMix {
+            proxy: 1.0,
+            ..Default::default()
+        },
+        HomogeneousBlastSource::Apache => spike::SourceMix {
+            apache: 1.0,
+            ..Default::default()
+        },
+        HomogeneousBlastSource::CloudTrail => spike::SourceMix {
+            cloudtrail: 1.0,
+            ..Default::default()
+        },
+    }
+}
+
+#[cfg(test)]
+mod homogeneous_blast_tests {
+    use super::{homogeneous_blast_mix, HomogeneousBlastSource, HOMOGENEOUS_BLAST_SOURCE_CYCLE};
+
+    #[test]
+    fn source_cycle_preserves_the_default_mix_exactly() {
+        let count = |source| {
+            HOMOGENEOUS_BLAST_SOURCE_CYCLE
+                .iter()
+                .filter(|candidate| **candidate == source)
+                .count()
+        };
+
+        assert_eq!(count(HomogeneousBlastSource::Sysmon), 30);
+        assert_eq!(count(HomogeneousBlastSource::WindowsEvent), 5);
+        assert_eq!(count(HomogeneousBlastSource::Proxy), 6);
+        assert_eq!(count(HomogeneousBlastSource::Apache), 5);
+        assert_eq!(count(HomogeneousBlastSource::CloudTrail), 4);
+    }
+
+    #[test]
+    fn every_scheduled_mix_is_source_homogeneous() {
+        for batch_index in 0..HOMOGENEOUS_BLAST_SOURCE_CYCLE.len() * 2 {
+            let mix = homogeneous_blast_mix(batch_index);
+            let weights = [
+                mix.sysmon,
+                mix.winevt,
+                mix.proxy,
+                mix.apache,
+                mix.cloudtrail,
+            ];
+            assert_eq!(weights.iter().filter(|weight| **weight == 1.0).count(), 1);
+            assert_eq!(weights.iter().filter(|weight| **weight == 0.0).count(), 4);
+        }
+    }
 }
 
 async fn run_normal_mode(
@@ -661,38 +1040,77 @@ async fn run_normal_mode(
     Ok(())
 }
 
+/// Number of paced events that fit before the maximum batch age.
+fn paced_batch_size(requested: usize, eps: f64, latency: TokioDuration) -> usize {
+    if eps == 0.0 {
+        return requested;
+    }
+    requested.min((eps * latency.as_secs_f64()).floor().max(1.0) as usize)
+}
+
 async fn run_blast_mode(
     args: Args,
     transport: Transport,
     world: Arc<parking_lot::RwLock<WorldState>>,
+    source_config: source_tokens::SourceConfig,
+    variance: Option<VarianceSettings>,
 ) -> Result<()> {
-    let eps_per_thread_raw = args.eps / args.threads as u32;
-    let max_sleep_ms: u64 = 1000;
-    let effective_batch_size = if eps_per_thread_raw > 0 {
-        let ideal = args.batch_size;
-        let max_batch_for_sleep = (eps_per_thread_raw as u64 * max_sleep_ms / 1000) as usize;
-        ideal.min(max_batch_for_sleep).max(1)
-    } else {
-        args.batch_size
-    };
-
-    info!(
-        "BLAST MODE: Target {} EPS with {} threads, batch size {} (requested {})",
-        args.eps, args.threads, effective_batch_size, args.batch_size
+    if !(1..=64).contains(&args.inflight_per_thread) {
+        anyhow::bail!("--inflight-per-thread must be between 1 and 64");
+    }
+    if args.vector_source_homogeneous_batches && !matches!(transport, Transport::Vector { .. }) {
+        anyhow::bail!("--vector-source-homogeneous-batches requires the Vector transport");
+    }
+    anyhow::ensure!(
+        args.threads > 0 && args.batch_size > 0,
+        "--threads and --batch-size must be positive"
+    );
+    let eps_per_thread_raw = args.eps as f64 / args.threads as f64;
+    let effective_batch_size = paced_batch_size(
+        args.batch_size,
+        eps_per_thread_raw,
+        TokioDuration::from_millis(args.max_batch_latency_ms),
     );
 
+    info!(
+        "BLAST MODE: Target {} EPS with {} threads, batch size {} (requested {}), Vector source-homogeneous batches: {}",
+        args.eps,
+        args.threads,
+        effective_batch_size,
+        args.batch_size,
+        args.vector_source_homogeneous_batches
+    );
+
+    let accounting = source_tokens::Accounting::default();
     let events_sent = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
 
-    let inflight_per_thread: usize = 4;
+    // Durable Vector acknowledgements include the object sink's flush window.
+    // The caller sizes this bounded window from observed ACK latency and actual
+    // events per request; the default preserves the established behavior.
+    let inflight_per_thread = args.inflight_per_thread;
+    let batches_per_thread = args.blast_batches_per_thread;
+    let vector_source_homogeneous_batches = args.vector_source_homogeneous_batches;
+    let thread_count = args.threads;
+    let max_batch_latency = TokioDuration::from_millis(args.max_batch_latency_ms);
     let mut handles = Vec::new();
     for thread_id in 0..args.threads {
         let transport = transport.clone();
+        let source_config = source_config.clone();
+        let accounting = accounting.clone();
         let events_sent = events_sent.clone();
         let running = running.clone();
         let worker_world = world.clone();
-        let batch_size = effective_batch_size;
+        let requested_batch_size = args.batch_size;
         let max_inflight = inflight_per_thread;
+        let send_retries = args.send_retries.unwrap_or(LEGACY_SEND_RETRIES);
+        let source_policy = source_retry_policy(args.send_retries, args.send_deadline_secs);
+        let batch_limit = batches_per_thread;
+        let source_homogeneous = vector_source_homogeneous_batches
+            || (matches!(transport, Transport::Hec { .. }) && source_config.configured);
+        // NAN-3174: per-event jitter + shaped rate; both None/false by default.
+        let time_jitter = variance.is_some_and(|v| v.time_jitter);
+        let rate_shape = variance.map(|v| v.rate).filter(|r| !r.is_flat());
 
         let handle = tokio::spawn(async move {
             let client = Client::builder()
@@ -710,21 +1128,76 @@ async fn run_blast_mode(
             let mut rng = rand::rngs::StdRng::from_os_rng();
 
             let sem = Arc::new(tokio::sync::Semaphore::new(max_inflight));
+            let mut send_tasks = tokio::task::JoinSet::new();
+            let mut scheduled_batches = 0usize;
+            let mut next_batch_at = TokioInstant::now();
 
             while running.load(Ordering::Relaxed) {
+                while let Some(result) = send_tasks.try_join_next() {
+                    result.expect("blast send task panicked");
+                }
+                if batch_limit.is_some_and(|limit| scheduled_batches >= limit) {
+                    break;
+                }
+                let eps = rate_shape.map_or(eps_per_thread_raw, |shape| {
+                    shaped_eps(eps_per_thread_raw, shape.multiplier(Utc::now()))
+                });
+                let batch_size = paced_batch_size(requested_batch_size, eps, max_batch_latency);
+                let this_period =
+                    (eps > 0.0).then(|| TokioDuration::from_secs_f64(batch_size as f64 / eps));
                 let permit = match sem.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => break,
                 };
+                if !running.load(Ordering::Relaxed) && batch_limit.is_none() {
+                    break;
+                }
 
                 let sim_time = Utc::now();
                 let mut batch = Vec::with_capacity(batch_size);
+                let mut flush_at = None;
+                let batch_mix = if source_homogeneous {
+                    homogeneous_blast_mix(if source_config.configured {
+                        source_config.cycle[(scheduled_batches * thread_count + thread_id)
+                            % source_config.cycle.len()]
+                    } else {
+                        scheduled_batches * thread_count + thread_id
+                    })
+                } else if source_config.configured {
+                    source_config.mix()
+                } else {
+                    spike::DEFAULT_MIX
+                };
+                let timestamps = time_jitter.then(|| {
+                    event_core::variance::batch_timestamps(
+                        sim_time,
+                        batch_size,
+                        this_period.unwrap_or(TokioDuration::from_secs(1)),
+                        true,
+                        &mut rng,
+                    )
+                });
                 {
-                    let w = worker_world.read();
-                    for _ in 0..batch_size {
+                    // Accumulate events at the exact fractional per-worker rate. Sleeping
+                    // between events keeps batches bounded by latency without an initial burst.
+                    for i in 0..batch_size {
+                        if let Some(period) = this_period {
+                            let wake_at = flush_at
+                                .map_or(next_batch_at, |deadline| next_batch_at.min(deadline));
+                            sleep_until(wake_at).await;
+                            if flush_at.is_some_and(|deadline| TokioInstant::now() >= deadline) {
+                                break;
+                            }
+                            next_batch_at += period.div_f64(batch_size as f64);
+                        }
+                        flush_at.get_or_insert_with(|| TokioInstant::now() + max_batch_latency);
+                        if !running.load(Ordering::Relaxed) && batch_limit.is_none() {
+                            break;
+                        }
+                        let w = worker_world.read();
                         let entity = w.random_entity();
                         let event = generate_event(
-                            sim_time,
+                            timestamps.as_ref().map_or(sim_time, |ts| ts[i]),
                             entity,
                             w.entities(),
                             &sysmon_gen,
@@ -732,36 +1205,58 @@ async fn run_blast_mode(
                             &proxy_gen,
                             &apache_gen,
                             &cloudtrail_gen,
-                            &spike::DEFAULT_MIX,
+                            &batch_mix,
                             &mut rng,
                         );
                         batch.push(event);
                     }
                 }
 
+                if batch.is_empty() {
+                    break;
+                }
                 let batch_len = batch.len() as u64;
                 let client = client.clone();
                 let transport = transport.clone();
                 let events_sent = events_sent.clone();
-                tokio::spawn(async move {
-                    match send_batch_with_retry(&client, &transport, &batch, 3).await {
-                        Ok(()) => {
-                            events_sent.fetch_add(batch_len, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            error!(
-                                "Thread {}: Error sending batch after retries: {}",
-                                thread_id, e
-                            );
+                let source_config = source_config.clone();
+                let accounting = accounting.clone();
+                send_tasks.spawn(async move {
+                    if matches!(transport, Transport::Vector { .. })
+                        || source_config.configured
+                        || (matches!(transport, Transport::Hec { .. })
+                            && source_config.has_idempotency_prefix())
+                    {
+                        let accepted = source_tokens::send_batch(
+                            &client,
+                            &transport,
+                            batch,
+                            source_policy,
+                            &source_config,
+                            &accounting,
+                        )
+                        .await;
+                        events_sent.fetch_add(accepted, Ordering::Relaxed);
+                    } else {
+                        match send_batch_with_retry(&client, &transport, &batch, send_retries).await
+                        {
+                            Ok(()) => {
+                                events_sent.fetch_add(batch_len, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Thread {}: Error sending batch after retries: {}",
+                                    thread_id, e
+                                );
+                            }
                         }
                     }
                     drop(permit);
                 });
-
-                if eps_per_thread_raw > 0 {
-                    let sleep_ms = (batch_size as f64 / eps_per_thread_raw as f64) * 1000.0;
-                    tokio::time::sleep(TokioDuration::from_millis(sleep_ms as u64)).await;
-                }
+                scheduled_batches += 1;
+            }
+            while let Some(result) = send_tasks.join_next().await {
+                result.expect("blast send task panicked");
             }
         });
         handles.push(handle);
@@ -770,6 +1265,7 @@ async fn run_blast_mode(
     // Stats reporter
     let stats_events = events_sent.clone();
     let stats_running = running.clone();
+    let stats_accounting = accounting.clone();
     let stats_handle = tokio::spawn(async move {
         let mut interval = interval(TokioDuration::from_secs(1));
         let mut last_count = 0u64;
@@ -783,14 +1279,21 @@ async fn run_blast_mode(
             let avg_eps = current as f64 / elapsed;
 
             info!(
-                "EPS: {} (avg: {:.0}) | Total: {} | Elapsed: {:.1}s",
-                delta, avg_eps, current, elapsed
+                "EPS: {} (avg: {:.0}) | Total: {} | Elapsed: {:.1}s | {}",
+                delta,
+                avg_eps,
+                current,
+                elapsed,
+                source_tokens::summary(&stats_accounting)
             );
             last_count = current;
         }
     });
 
-    if args.duration > 0 {
+    if batches_per_thread.is_some() {
+        // Sender tasks self-terminate at the exact batch bound and drain their
+        // acknowledged request tasks before their handles resolve.
+    } else if args.duration > 0 {
         tokio::time::sleep(TokioDuration::from_secs(args.duration * 60)).await;
         running.store(false, Ordering::Relaxed);
     } else {
@@ -802,10 +1305,15 @@ async fn run_blast_mode(
     for handle in handles {
         handle.await?;
     }
+    running.store(false, Ordering::Relaxed);
     stats_handle.abort();
 
     let total = events_sent.load(Ordering::Relaxed);
-    info!("Total events sent: {}", total);
+    info!(
+        "Total events accepted: {} | {}",
+        total,
+        source_tokens::summary(&accounting)
+    );
 
     Ok(())
 }
@@ -867,17 +1375,9 @@ async fn run_otlp_entry(args: Args) -> Result<()> {
         args.vector.clone()
     };
 
-    let transport = if args.otlp_direct {
-        Transport::OtlpClickHouse {
-            url: args.clickhouse_url.clone(),
-            user: args.clickhouse_user.clone(),
-            password: args.clickhouse_password.clone(),
-        }
-    } else {
-        Transport::OtlpHttp {
-            base_url: otlp_http_base,
-            token: args.token.clone(),
-        }
+    let transport = Transport::OtlpHttp {
+        base_url: otlp_http_base,
+        token: args.token.clone(),
     };
 
     info!(
@@ -1021,7 +1521,6 @@ async fn ship_otlp_lanes(
 fn transport_target(t: &Transport) -> String {
     match t {
         Transport::OtlpHttp { base_url, .. } => base_url.clone(),
-        Transport::OtlpClickHouse { url, .. } => url.clone(),
         _ => "?".to_string(),
     }
 }
@@ -1061,8 +1560,13 @@ async fn run_otlp_mode(
     loop {
         // Generate one tick of signals for `batch` entities (lock held only for
         // generation), then ship each lane as a single bulk request.
-        let (spans, metrics, logs) =
-            generate_otlp_tick(&world, wants, batch, ticks.wrapping_mul(batch as u64), &mut rng);
+        let (spans, metrics, logs) = generate_otlp_tick(
+            &world,
+            wants,
+            batch,
+            ticks.wrapping_mul(batch as u64),
+            &mut rng,
+        );
 
         match ship_otlp_lanes(&client, &transport, &spans, &metrics, &logs).await {
             Ok(()) => {
@@ -1114,7 +1618,7 @@ async fn run_otlp_mode(
 /// worker model for the OTLP lanes: spawns `--threads` worker tasks, each
 /// running its own generate→ship loop with a semaphore-bounded inflight window
 /// so requests overlap. Each tick a worker generates `--otlp-batch` signal sets
-/// and ships each lane as ONE bulk OTLP POST / ClickHouse insert. Throughput
+/// and ships each lane as ONE bulk OTLP POST. Throughput
 /// scales as `threads × otlp-batch × spans-per-set` per tick, paced so each
 /// worker targets `eps / threads` ticks/sec.
 ///
@@ -1139,13 +1643,11 @@ async fn run_otlp_blast_mode(
         threads, batch, args.eps, ticks_per_sec_per_thread,
     );
 
-    // GLOBAL inflight cap across ALL workers. ClickHouse limits concurrent
-    // inserts (max_concurrent_insert_queries, ~20 → Code 202
-    // TOO_MANY_SIMULTANEOUS_QUERIES); per-thread semaphores let threads×inflight
-    // blow past it. One shared semaphore keeps total in-flight inserts under the
-    // cap regardless of --threads, so the firehose self-throttles instead of
-    // tripping the limit. ship_otlp_lanes sends each lane sequentially, so one
-    // permit ≈ one concurrent insert.
+    // GLOBAL inflight cap across ALL workers: per-thread semaphores let
+    // threads×inflight grow without bound. One shared semaphore keeps total
+    // in-flight requests bounded regardless of --threads, so the firehose
+    // self-throttles instead of overrunning the receiver. ship_otlp_lanes sends
+    // each lane sequentially, so one permit ≈ one concurrent request.
     const GLOBAL_MAX_INFLIGHT_INSERTS: usize = 16;
     let global_inflight = Arc::new(tokio::sync::Semaphore::new(GLOBAL_MAX_INFLIGHT_INSERTS));
 
@@ -1173,7 +1675,10 @@ async fn run_otlp_blast_mode(
             {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("OTLP worker {}: failed to build HTTP client: {}", thread_id, e);
+                    error!(
+                        "OTLP worker {}: failed to build HTTP client: {}",
+                        thread_id, e
+                    );
                     return;
                 }
             };
@@ -1200,7 +1705,8 @@ async fn run_otlp_blast_mode(
                     &worker_world,
                     wants,
                     batch,
-                    tick.wrapping_mul(threads as u64).wrapping_add(thread_id as u64),
+                    tick.wrapping_mul(threads as u64)
+                        .wrapping_add(thread_id as u64),
                     &mut rng,
                 );
                 tick = tick.wrapping_add(1);
@@ -1280,301 +1786,6 @@ async fn run_otlp_blast_mode(
         "OTLP firehose complete: {} spans, {} total records shipped.",
         spans_sent.load(Ordering::Relaxed),
         records_sent.load(Ordering::Relaxed),
-    );
-    Ok(())
-}
-
-// =============================================================================
-// Combo-join (spans <-> logs correlation) — NAN-1566
-// =============================================================================
-
-use event_core::http::{insert_combo_log_rows, ComboLogRow};
-use std::collections::VecDeque;
-
-/// Cap on the shared trace_id pool. Bounded so a long run doesn't grow the
-/// VecDeque unboundedly — the log side pulls recent ids, the span side pushes,
-/// and the oldest ids age out. ~5000 keeps a healthy window of correlatable
-/// traces without retaining the whole run.
-const COMBO_POOL_CAP: usize = 5000;
-
-/// Shared bounded pool of recently-minted span trace_ids. The span generator
-/// pushes the trace_ids it emits; the UDM-log generator pops a real one for the
-/// `combo-join-fraction` of logs that should correlate. parking_lot::Mutex (no
-/// awaits held across the lock) keeps contention cheap.
-type TraceIdPool = Arc<parking_lot::Mutex<VecDeque<String>>>;
-
-/// Push a trace_id into the bounded pool, evicting the oldest if at capacity.
-fn pool_push(pool: &TraceIdPool, trace_id: String) {
-    let mut p = pool.lock();
-    if p.len() >= COMBO_POOL_CAP {
-        p.pop_front();
-    }
-    p.push_back(trace_id);
-}
-
-/// Pop a recent trace_id from the pool (back = most recently minted, so the log
-/// correlates to a fresh span). `None` if the pool hasn't been primed yet.
-fn pool_pop_recent(pool: &TraceIdPool) -> Option<String> {
-    pool.lock().pop_back()
-}
-
-/// Build the combo-join ClickHouse transport and run the span + log lanes
-/// together. combo-join ALWAYS uses the direct-to-ClickHouse path: spans ride
-/// the OTLP-direct lane into `otel_spans`, and the correlated security logs are
-/// inserted directly into `nanosiem.logs` (the demo source-type parsers don't
-/// carry trace_id through Vector, so direct-CH is the only deterministic
-/// delivery for a validatable spans<->logs overlap).
-async fn run_combo_join_entry(args: Args) -> Result<()> {
-    let fraction = args.combo_join_fraction.clamp(0.0, 1.0);
-    let transport = Transport::OtlpClickHouse {
-        url: args.clickhouse_url.clone(),
-        user: args.clickhouse_user.clone(),
-        password: args.clickhouse_password.clone(),
-    };
-
-    info!(
-        "COMBO-JOIN MODE → {} (spans→otel_spans, {:.0}% of logs carry a span trace_id → nanosiem.logs)",
-        args.clickhouse_url,
-        fraction * 100.0,
-    );
-    info!("Initializing World State ({} assets)...", args.assets);
-    let world = Arc::new(parking_lot::RwLock::new(WorldState::new(args.assets)));
-
-    let pool: TraceIdPool = Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(
-        COMBO_POOL_CAP,
-    )));
-
-    run_combo_join_mode(args, transport, world, pool, fraction).await
-}
-
-/// Run the span side and the UDM-log side concurrently, sharing the trace_id
-/// pool. Two tasks: the span task generates OTLP traces (shipping each tick's
-/// spans to `otel_spans` via the OTLP-direct lane) and pushes the trace_ids it
-/// minted into the pool; the log task generates UDM security logs where
-/// `fraction` of them pop a real trace_id from the pool. `--rate` paces the log
-/// lane (epm); the span lane runs at the same tick cadence. `--duration`
-/// (minutes) bounds the run (0 = until ctrl-c).
-async fn run_combo_join_mode(
-    args: Args,
-    transport: Transport,
-    world: Arc<parking_lot::RwLock<WorldState>>,
-    pool: TraceIdPool,
-    fraction: f64,
-) -> Result<()> {
-    let sleep_ms: u64 = (60_000.0 / (args.rate.max(1) as f64)) as u64;
-    let batch = args.otlp_batch.max(1);
-    // In --blast scale the per-tick batch up so the firehose isn't paced by the
-    // epm sleep alone; otherwise honor --otlp-batch.
-    let log_batch = if args.blast { args.batch_size.max(1) } else { batch };
-    let duration = args.duration;
-    let quiet = args.quiet;
-
-    let spans_sent = Arc::new(AtomicU64::new(0));
-    let logs_sent = Arc::new(AtomicU64::new(0));
-    let correlated_sent = Arc::new(AtomicU64::new(0));
-    let running = Arc::new(AtomicBool::new(true));
-
-    // --- Span lane: generate traces, ship to otel_spans, push trace_ids -------
-    let span_task = {
-        let transport = transport.clone();
-        let world = world.clone();
-        let pool = pool.clone();
-        let running = running.clone();
-        let spans_sent = spans_sent.clone();
-        let span_batch = batch;
-        tokio::spawn(async move {
-            let client = match Client::builder()
-                .pool_max_idle_per_host(4)
-                .connect_timeout(TokioDuration::from_secs(10))
-                .timeout(TokioDuration::from_secs(30))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("combo-join span lane: failed to build HTTP client: {}", e);
-                    return;
-                }
-            };
-            let mut rng = rand::rngs::StdRng::from_os_rng();
-            let mut consecutive_errors = 0u32;
-
-            while running.load(Ordering::Relaxed) {
-                // Generate `span_batch` traces (lock held only for generation).
-                let spans: Vec<Value> = {
-                    let w = world.read();
-                    let mut acc = Vec::new();
-                    for _ in 0..span_batch {
-                        let entity = w.random_entity();
-                        acc.extend(event_core::otlp::gen_trace(entity, &mut rng));
-                    }
-                    acc
-                };
-
-                // Mint the pool entries: one trace_id per ROOT span (the first of
-                // each trace). gen_trace returns spans in DAG order (root first),
-                // and every span in a trace shares the trace_id, so de-dup.
-                let mut seen = std::collections::HashSet::new();
-                for s in &spans {
-                    if let Some(tid) = s["traceId"].as_str() {
-                        if seen.insert(tid.to_string()) {
-                            pool_push(&pool, tid.to_string());
-                        }
-                    }
-                }
-
-                match send_otlp_with_retry(&client, &transport, OtlpSignal::Traces, &spans, 3).await
-                {
-                    Ok(()) => {
-                        consecutive_errors = 0;
-                        spans_sent.fetch_add(spans.len() as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        warn!(
-                            "combo-join span lane: ship error: {} (consecutive: {})",
-                            e, consecutive_errors
-                        );
-                        if consecutive_errors >= 10 {
-                            error!("combo-join span lane: 10 consecutive failures, backing off 10s");
-                            tokio::time::sleep(TokioDuration::from_secs(10)).await;
-                            consecutive_errors = 0;
-                        }
-                    }
-                }
-
-                if sleep_ms > 0 {
-                    tokio::time::sleep(TokioDuration::from_millis(sleep_ms)).await;
-                }
-            }
-        })
-    };
-
-    // --- Log lane: generate UDM security logs, pull pool trace_ids ------------
-    let log_task = {
-        let transport = transport.clone();
-        let world = world.clone();
-        let pool = pool.clone();
-        let running = running.clone();
-        let logs_sent = logs_sent.clone();
-        let correlated_sent = correlated_sent.clone();
-        tokio::spawn(async move {
-            let client = match Client::builder()
-                .pool_max_idle_per_host(4)
-                .connect_timeout(TokioDuration::from_secs(10))
-                .timeout(TokioDuration::from_secs(30))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("combo-join log lane: failed to build HTTP client: {}", e);
-                    return;
-                }
-            };
-            let mut rng = rand::rngs::StdRng::from_os_rng();
-            let mut consecutive_errors = 0u32;
-            // Small head-start so the span lane primes the pool before the log
-            // lane starts pulling correlated ids.
-            tokio::time::sleep(TokioDuration::from_millis(250)).await;
-
-            while running.load(Ordering::Relaxed) {
-                let rows: Vec<ComboLogRow> = {
-                    let w = world.read();
-                    let mut acc = Vec::with_capacity(log_batch);
-                    for _ in 0..log_batch {
-                        let entity = w.random_entity();
-                        // `fraction` of rows correlate: pull a real span trace_id
-                        // from the pool. If the pool is empty (not yet primed) or
-                        // this row isn't selected, emit a normal uncorrelated log.
-                        let want_corr = rng.random_bool(fraction);
-                        let trace_id = if want_corr {
-                            pool_pop_recent(&pool).unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        acc.push(ComboLogRow {
-                            trace_id,
-                            user: entity.user.clone(),
-                            src_ip: entity.ip.clone(),
-                            // Correlated rows are auth FAILURES (the meaningful
-                            // security pivot); uncorrelated rows mix success too.
-                            failure: want_corr || rng.random_bool(0.4),
-                        });
-                    }
-                    acc
-                };
-
-                let n_corr = rows.iter().filter(|r| !r.trace_id.is_empty()).count() as u64;
-
-                match insert_combo_log_rows(&client, &transport, &rows).await {
-                    Ok(()) => {
-                        consecutive_errors = 0;
-                        logs_sent.fetch_add(rows.len() as u64, Ordering::Relaxed);
-                        correlated_sent.fetch_add(n_corr, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        warn!(
-                            "combo-join log lane: insert error: {} (consecutive: {})",
-                            e, consecutive_errors
-                        );
-                        if consecutive_errors >= 10 {
-                            error!("combo-join log lane: 10 consecutive failures, backing off 10s");
-                            tokio::time::sleep(TokioDuration::from_secs(10)).await;
-                            consecutive_errors = 0;
-                        }
-                    }
-                }
-
-                if sleep_ms > 0 {
-                    tokio::time::sleep(TokioDuration::from_millis(sleep_ms)).await;
-                }
-            }
-        })
-    };
-
-    // --- Stats reporter -------------------------------------------------------
-    let stats_handle = {
-        let spans_sent = spans_sent.clone();
-        let logs_sent = logs_sent.clone();
-        let correlated_sent = correlated_sent.clone();
-        let running = running.clone();
-        tokio::spawn(async move {
-            let mut tick = interval(TokioDuration::from_secs(1));
-            let start = Instant::now();
-            while running.load(Ordering::Relaxed) {
-                tick.tick().await;
-                if quiet {
-                    continue;
-                }
-                info!(
-                    "[COMBO] spans: {} | logs: {} ({} correlated) | elapsed: {:.1}s",
-                    spans_sent.load(Ordering::Relaxed),
-                    logs_sent.load(Ordering::Relaxed),
-                    correlated_sent.load(Ordering::Relaxed),
-                    start.elapsed().as_secs_f64(),
-                );
-            }
-        })
-    };
-
-    if duration > 0 {
-        tokio::time::sleep(TokioDuration::from_secs(duration * 60)).await;
-        running.store(false, Ordering::Relaxed);
-    } else {
-        tokio::signal::ctrl_c().await?;
-        info!("Shutting down...");
-        running.store(false, Ordering::Relaxed);
-    }
-
-    let _ = span_task.await;
-    let _ = log_task.await;
-    stats_handle.abort();
-
-    info!(
-        "Combo-join complete: {} spans, {} logs ({} correlated to a span trace_id).",
-        spans_sent.load(Ordering::Relaxed),
-        logs_sent.load(Ordering::Relaxed),
-        correlated_sent.load(Ordering::Relaxed),
     );
     Ok(())
 }
@@ -1812,4 +2023,226 @@ async fn run_spike_mode(
     info!("Total events sent: {}", total);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod variance_tests {
+    use super::{shaped_eps, Args, VarianceSettings};
+    use clap::Parser;
+    use event_core::entity::WorldState;
+
+    #[test]
+    fn defaults_run_no_variance_code() {
+        let args = Args::parse_from(["log-blaster", "--blast", "--eps", "300"]);
+        assert!(VarianceSettings::from_args(&args).unwrap().is_none());
+        // Nothing in this test binary installs generator variance, and a fresh
+        // world keeps the historical uniform `choose` draw.
+        assert!(!event_core::variance::installed());
+        assert!(!WorldState::new(50).entity_skew_active());
+    }
+
+    #[test]
+    fn flags_resolve_with_seed() {
+        let args = Args::parse_from([
+            "log-blaster",
+            "--blast",
+            "--entity-skew",
+            "1.0",
+            "--hash-pool",
+            "50000",
+            "--hash-skew",
+            "1.2",
+            "--cmdline-variance",
+            "--time-jitter",
+            "--diurnal",
+            "0.5",
+            "--burst",
+            "0.1,4,15",
+            "--variance-seed",
+            "42",
+        ]);
+        let v = VarianceSettings::from_args(&args).unwrap().unwrap();
+        assert_eq!(v.seed, 42);
+        assert_eq!(v.rate.seed, 42);
+        assert_eq!(v.hash_pool, 50_000);
+        assert!(v.time_jitter && v.cmdline_variance);
+        let b = v.rate.burst.unwrap();
+        assert_eq!((b.prob, b.mult, b.secs), (0.1, 4.0, 15));
+
+        let mut world = WorldState::new(100);
+        world.set_entity_skew(v.entity_skew, v.seed);
+        assert!(world.entity_skew_active());
+    }
+
+    #[test]
+    fn realistic_preset_fills_defaults_and_explicit_flags_win() {
+        let args = Args::parse_from([
+            "log-blaster",
+            "--blast",
+            "--variance",
+            "realistic",
+            "--variance-seed",
+            "7",
+        ]);
+        let v = VarianceSettings::from_args(&args).unwrap().unwrap();
+        assert_eq!(v.seed, 7);
+        assert_eq!(v.entity_skew, super::REALISTIC_ENTITY_SKEW);
+        assert_eq!(v.hash_pool, super::REALISTIC_HASH_POOL);
+        assert!(v.cmdline_variance && v.time_jitter);
+        assert_eq!(v.rate.diurnal, super::REALISTIC_DIURNAL);
+        assert_eq!(v.rate.burst, Some(super::REALISTIC_BURST));
+        assert!(!v.rate.is_flat());
+
+        let args = Args::parse_from([
+            "log-blaster",
+            "--variance",
+            "realistic",
+            "--entity-skew",
+            "1.5",
+            "--burst",
+            "0.5,2,30",
+        ]);
+        let v = VarianceSettings::from_args(&args).unwrap().unwrap();
+        assert_eq!(v.entity_skew, 1.5);
+        assert_eq!(v.rate.burst.unwrap().secs, 30);
+
+        let args = Args::parse_from(["log-blaster", "--variance", "off"]);
+        assert!(VarianceSettings::from_args(&args).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_variance_flags_are_rejected() {
+        for bad in [
+            &["log-blaster", "--diurnal", "1.0"][..],
+            &["log-blaster", "--entity-skew=-1"][..],
+        ] {
+            let args = Args::parse_from(bad);
+            assert!(VarianceSettings::from_args(&args).is_err(), "{bad:?}");
+        }
+        assert!(Args::try_parse_from(["log-blaster", "--burst", "0.1,0.5,15"]).is_err());
+    }
+
+    #[test]
+    fn entity_skew_concentrates_popularity() {
+        let mut world = WorldState::new(200);
+        let n = world.entities().len();
+        let top_share = |w: &WorldState| {
+            let mut counts = std::collections::HashMap::<String, u32>::new();
+            for _ in 0..40_000 {
+                *counts
+                    .entry(w.random_entity().hostname.clone())
+                    .or_default() += 1;
+            }
+            let mut c: Vec<u32> = counts.into_values().collect();
+            c.sort_unstable_by(|a, b| b.cmp(a));
+            c.iter().take(n / 10).sum::<u32>() as f64 / 40_000.0
+        };
+        let uniform = top_share(&world);
+        world.set_entity_skew(1.0, 42);
+        let skewed = top_share(&world);
+        // Uniform: top 10% of hosts ≈ 10-13% of events. Zipf(1): > 50%.
+        assert!(uniform < 0.2, "uniform top-10% share {uniform}");
+        assert!(skewed > 0.5, "skewed top-10% share {skewed}");
+        world.set_entity_skew(0.0, 42);
+        assert!(!world.entity_skew_active());
+    }
+
+    #[test]
+    fn shaped_eps_scales_and_clamps() {
+        assert_eq!(shaped_eps(100.0, 1.0), 100.0);
+        assert_eq!(shaped_eps(100.0, 2.0), 200.0);
+        assert_eq!(shaped_eps(100.0, 0.001), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod paced_batch_tests {
+    use super::*;
+
+    #[test]
+    fn size_and_latency_bounds_preserve_fractional_eps() {
+        let latency = TokioDuration::from_secs(2);
+        assert_eq!(paced_batch_size(500, 300.0 / 2.0, latency), 300);
+        assert_eq!(paced_batch_size(100, 300.0 / 8.0, latency), 75);
+        assert_eq!(paced_batch_size(500, 1000.0, latency), 500);
+        for threads in [2, 8, 400] {
+            let eps = 300.0 / threads as f64;
+            let size = paced_batch_size(500, eps, latency);
+            let period = size as f64 / eps;
+            assert!((size as f64 / period * threads as f64 - 300.0).abs() < 1e-9);
+            assert!((size - 1) as f64 / eps <= latency.as_secs_f64());
+        }
+    }
+}
+
+#[cfg(test)]
+mod blast_accumulation_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[tokio::test]
+    async fn accumulates_to_size_or_latency_with_exact_eps_and_one_source() {
+        for (requested, expected) in [(3, 3), (100, 5)] {
+            let (url, receiver) =
+                source_tokens::tests::scripted_receiver(vec![("200 OK", None); 4]).await;
+            // 105 / 2 = 52.5 EPS, not the old truncated 52 EPS.
+            let mut args = Args::parse_from([
+                "log-blaster",
+                "--blast",
+                "--hec",
+                "--eps",
+                "105",
+                "--threads",
+                "2",
+                "--batch-size",
+                &requested.to_string(),
+                "--max-batch-latency-ms",
+                "100",
+                "--blast-batches-per-thread",
+                "2",
+                "--sources",
+                "windows_sysmon,windows_event",
+                "--chain-interval-secs",
+                "0",
+            ]);
+            let config =
+                source_tokens::SourceConfig::resolve(&mut args, None, Some("test-token".into()))
+                    .unwrap();
+            let started = TokioInstant::now();
+            tokio::time::timeout(
+                TokioDuration::from_secs(5),
+                run_blast_mode(
+                    args,
+                    Transport::new_hec(url, None),
+                    Arc::new(parking_lot::RwLock::new(WorldState::new(10))),
+                    config,
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut seen = receiver.await.unwrap();
+            seen.sort_by_key(|(arrival, _)| *arrival);
+            for (_, request) in &seen {
+                assert!(!request.contains("idempotency-key:"));
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let events: Vec<serde_json::Value> = body
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(events.len(), expected);
+                assert!(events
+                    .iter()
+                    .all(|event| event["sourcetype"] == events[0]["sourcetype"]));
+            }
+            // First dispatch waits for accumulation, and subsequent requests
+            // retain the exact per-worker period rather than burst immediately.
+            let first_age = seen[0].0.duration_since(started).as_secs_f64();
+            assert!(first_age >= (expected - 1) as f64 / 52.5 - 0.01);
+            assert!(first_age < 0.25);
+            let spacing = seen[2].0.duration_since(seen[0].0).as_secs_f64();
+            assert!((spacing - expected as f64 / 52.5).abs() < 0.025);
+        }
+    }
 }

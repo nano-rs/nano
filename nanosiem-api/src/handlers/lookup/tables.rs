@@ -117,9 +117,7 @@ pub async fn create_lookup_table(
         }
     }
 
-    if let Some(has_headers) = config.csv_has_headers {
-        parser_config.csv_has_headers = has_headers;
-    }
+    parser_config.has_header = config.has_header.or(config.csv_has_headers);
 
     // Parse the file
     let parser = FileParser::new();
@@ -477,6 +475,7 @@ pub async fn get_lookup_table_sample(
         (status = 200, description = "Lookup table deleted successfully", body = LookupDeleteResponse),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Lookup table is referenced by detection rules", body = crate::error::ErrorResponse),
     ),
     security(("api_key" = []))
 )]
@@ -493,7 +492,12 @@ pub async fn delete_lookup_table(
     lookup_service
         .drop_table(&name)
         .await
-        .map_err(lookup_error_to_api)?;
+        .map_err(|error| match error {
+            nanosiem_core::LookupError::TableInUse(_) if !auth.has_permission(permissions::DETECTIONS_VIEW) => {
+                ApiError::Conflict("Lookup table is used by detection rules. Remove those references before deleting it.".to_string())
+            }
+            other => lookup_error_to_api(other),
+        })?;
 
     info!(table_name = %name, "Lookup table deleted");
 

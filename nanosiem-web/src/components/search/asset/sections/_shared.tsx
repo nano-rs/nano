@@ -61,6 +61,22 @@ export function EmptyCell({ children }: { children: React.ReactNode }) {
   );
 }
 
+/**
+ * NAN-3291: a dossier section still being read. Never the "no events in
+ * range" text: that would claim an absence the dossier has not proven yet.
+ */
+export function PendingCell() {
+  return (
+    <div
+      data-testid="asset-card-pending"
+      className="flex items-center justify-center gap-1.5 text-[11.5px] font-mono text-muted-foreground/70 py-4"
+    >
+      <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-pulse" />
+      Reading events…
+    </div>
+  );
+}
+
 export type StatCellTone = 'default' | 'warn' | 'critical';
 
 interface StatCellProps {

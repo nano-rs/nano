@@ -10,8 +10,32 @@ use anyhow::Result;
 use nanosiem_api::{create_router, ApiConfig, AppMetrics, AppState};
 use std::net::SocketAddr;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if nanosiem_core::app_features::print_if_requested(nanosiem_api::APP_FEATURES) {
+        return Ok(());
+    }
+    // Pure stdio mode must run before tracing, configuration, databases, or
+    // the normal multi-thread runtime. Its environment is cleared by the
+    // authorized parent's process-isolation wrapper.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--pipe-preview-worker")
+    {
+        if std::env::args_os().count() != 2 {
+            anyhow::bail!("Invalid preview worker invocation");
+        }
+        #[cfg(feature = "enterprise")]
+        return nanosiem_core::enterprise_shared_pipe::sandbox::worker_main().map_err(Into::into);
+        #[cfg(not(feature = "enterprise"))]
+        anyhow::bail!("Preview worker is unavailable in this edition");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(server_main())
+}
+
+async fn server_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-api");
 
     tracing::info!("Starting NanoSIEM API server");
@@ -23,6 +47,33 @@ async fn main() -> Result<()> {
         config.host,
         config.port
     );
+
+    // A hosted/shared application cannot read a tenant query worker's local
+    // generation volume. Install the worker-served field inventory before
+    // AppState performs its fail-closed schema-profile construction, then keep
+    // that installed profile current below. Dedicated deployments without the
+    // remote pair retain their local worker-config/manifest path.
+    // NAN-2718: shared mode refuses a process-global schema URL outright
+    // (`install_from_env` errors on it) and loads each tenant's schema from its
+    // own registry-assigned worker, cached by tenant UUID.
+    #[cfg(feature = "enterprise")]
+    if config.deployment_mode.is_enterprise_shared() {
+        nanosiem_core::schema::worker_schema::refuse_global_schema_in_shared_mode(&|name: &str| {
+            std::env::var(name).ok()
+        })
+        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
+    }
+    let worker_schema_source = if config.canonical_lake_ocsf {
+        nanosiem_core::schema::worker_schema::WorkerSchemaSource::install_from_env()
+            .await
+            .map_err(|error| anyhow::anyhow!("lake schema source unavailable: {error}"))?
+    } else {
+        None
+    };
+    #[cfg(feature = "enterprise")]
+    if config.canonical_lake_ocsf && config.deployment_mode.is_enterprise_shared() {
+        nanosiem_core::schema::tenant_lake_schema::start_for_shared_process().await;
+    }
 
     // Initialize with DualPool (ClickHouse + PostgreSQL). Both are required;
     // the historical PG-only fallback was removed in NAN-800. SchemaBehind
@@ -40,6 +91,52 @@ async fn main() -> Result<()> {
         }
     };
 
+    // NAN-3492: a trusted-local install's lake tenant must exist in
+    // `tenants` before any finding is stamped with it.
+    if let Some(tenant) = nanosiem_core::search::lake_cell::ensure_trusted_local_tenant(&state.pool)
+        .await
+        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?
+    {
+        tracing::info!(%tenant, "trusted-local tenant registered");
+    }
+
+    // The shared API control pool owns catalog verification. Do this before
+    // starting any task or constructing the Axum service: a missing role
+    // setting, audit-function ACL failure, or a single catalog violation is a
+    // hard boot failure, never a degraded tenant boundary.
+    #[cfg(feature = "enterprise")]
+    if config.deployment_mode.is_enterprise_shared() {
+        nanosiem_api::metrics::require_metrics_auth_token_for_enterprise_shared(true)?;
+        let runtime_role = std::env::var("NANOSIEM_SHARED_RLS_RUNTIME_ROLE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NANOSIEM_SHARED_RLS_RUNTIME_ROLE is required in enterprise_shared mode"
+                )
+            })?;
+        let owner_role = std::env::var("NANOSIEM_SHARED_RLS_OWNER_ROLE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NANOSIEM_SHARED_RLS_OWNER_ROLE is required in enterprise_shared mode"
+                )
+            })?;
+        nanosiem_core::tenant_db::require_tenant_rls_catalog(
+            &state.pool,
+            &runtime_role,
+            &owner_role,
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "enterprise-shared RLS catalog verification failed; refusing to serve: {error}"
+            )
+        })?;
+        tracing::info!("Enterprise-shared RLS catalog verification is green");
+    }
+
     // Initialize demo service if DEPLOYMENT_MODE=demo
     if let Err(e) = state.init_demo_if_enabled().await {
         tracing::warn!(
@@ -48,7 +145,13 @@ async fn main() -> Result<()> {
         );
     }
 
-    tracing::info!("Running in dual-mode (ClickHouse + PostgreSQL)");
+    if config.canonical_lake_ocsf {
+        tracing::info!(
+            "Running with canonical OCSF lake event storage and PostgreSQL control-plane state; no ClickHouse runtime connection"
+        );
+    } else {
+        tracing::info!("Running in legacy dual-mode (ClickHouse + PostgreSQL)");
+    }
 
     // === One-time PG→ClickHouse lookup row-data backfill (NAN-1581 Phase 2/3) ===
     // Only when LOOKUP_STORAGE_BACKEND=clickhouse: migrate every existing
@@ -57,10 +160,16 @@ async fn main() -> Result<()> {
     // data has no upstream re-sync). Multi-pod-safe via a transactional claim in
     // `lookup_backfill_state`; per-table done-markers make it resumable; re-runs
     // are dedup-safe. The default (postgres) path skips this entirely.
-    if matches!(
-        nanosiem_core::lookup::LookupStorageBackend::from_env(),
-        nanosiem_core::lookup::LookupStorageBackend::ClickHouse
-    ) {
+    #[cfg(feature = "enterprise")]
+    let shared_profile = config.deployment_mode.is_enterprise_shared();
+    #[cfg(not(feature = "enterprise"))]
+    let shared_profile = false;
+    if !shared_profile
+        && matches!(
+            nanosiem_core::lookup::LookupStorageBackend::from_env(),
+            nanosiem_core::lookup::LookupStorageBackend::ClickHouse
+        )
+    {
         tracing::info!("LOOKUP_STORAGE_BACKEND=clickhouse — running lookup backfill check...");
         match nanosiem_core::lookup::backfill_pg_to_clickhouse(
             state.pool.clone(),
@@ -131,73 +240,98 @@ async fn main() -> Result<()> {
     // the enterprise crate; open-core builds simply skip AI initialization.
     #[cfg(feature = "enterprise")]
     {
-    tracing::info!("Checking meloD configuration...");
-    match state.reload_melod_service().await {
-        Ok(true) => {
-            tracing::info!("meloD AI service initialized");
+        tracing::info!("Checking meloD configuration...");
+        match state.reload_melod_service().await {
+            Ok(true) => {
+                tracing::info!("meloD AI service initialized");
+            }
+            Ok(false) => {
+                tracing::info!("meloD AI service not configured (disabled or no credentials)");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to initialize meloD AI service: {}. AI features disabled.",
+                    e
+                );
+            }
         }
-        Ok(false) => {
-            tracing::info!("meloD AI service not configured (disabled or no credentials)");
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Failed to initialize meloD AI service: {}. AI features disabled.",
+    }
+
+    #[cfg(feature = "enterprise")]
+    let shared_profile = state.config.deployment_mode.is_enterprise_shared();
+    #[cfg(not(feature = "enterprise"))]
+    let shared_profile = false;
+    if shared_profile {
+        // Shared parser/source publication is owned by the tenant ingest-cell
+        // control plane. The legacy services below read deployment-global rows
+        // and use a system credential grant, so running them in a shared API
+        // pod could project one tenant's parser or source state into every cell.
+        tracing::info!(
+            "Enterprise-shared legacy/global Vector parser and source publication remains disabled"
+        );
+    } else {
+        // Deploy Vector pipeline configs (parsers, router, combiner, pipeline, sink).
+        // In Docker Compose these exist on disk from the repo. In k8s, the dirs are empty
+        // emptyDirs so we must generate them on startup before source configs can deploy.
+        tracing::info!("Deploying Vector pipeline configs...");
+        match state.parser_service.deploy_to_vector().await {
+            Ok(()) => tracing::info!("Vector pipeline configs deployed"),
+            Err(e) => tracing::warn!(
+                "Failed to deploy Vector pipeline configs: {}. Ingestion pipeline may be incomplete.",
                 e
-            );
+            ),
         }
-    }
-    }
 
-    // Deploy Vector pipeline configs (parsers, router, combiner, pipeline, sink).
-    // In Docker Compose these exist on disk from the repo. In k8s, the dirs are empty
-    // emptyDirs so we must generate them on startup before source configs can deploy.
-    tracing::info!("Deploying Vector pipeline configs...");
-    match state.parser_service.deploy_to_vector().await {
-        Ok(()) => tracing::info!("Vector pipeline configs deployed"),
-        Err(e) => tracing::warn!(
-            "Failed to deploy Vector pipeline configs: {}. Ingestion pipeline may be incomplete.",
-            e
-        ),
-    }
-
-    // Deploy all enabled source configurations to sync DB state with Vector config files.
-    // This ensures HTTP ingestion is live on first boot (migration seeds it as deployed=true
-    // but Vector config files need to be written).
-    tracing::info!("Syncing source configuration deployments...");
-    // Startup reconciliation is an explicit trusted system workflow. User
-    // requests receive a principal-derived grant in the source-config handler.
-    match state
-        .source_config_service
-        .deploy_all(nanosiem_core::auth::CredentialUseGrant::system())
-        .await
-    {
-        Ok(results) => {
-            let ok = results.iter().filter(|r| r.success).count();
-            let fail = results.iter().filter(|r| !r.success).count();
-            tracing::info!(
-                "Source config sync complete: {} deployed, {} failed",
-                ok,
-                fail
-            );
+        // Deploy all enabled source configurations to sync DB state with Vector config files.
+        // This ensures HTTP ingestion is live on first boot (migration seeds it as deployed=true
+        // but Vector config files need to be written).
+        tracing::info!("Syncing source configuration deployments...");
+        // Startup reconciliation is an explicit trusted system workflow. User
+        // requests receive a principal-derived grant in the source-config handler.
+        match state
+            .source_config_service
+            .deploy_all(nanosiem_core::auth::CredentialUseGrant::system())
+            .await
+        {
+            Ok(results) => {
+                let ok = results.iter().filter(|r| r.success).count();
+                let fail = results.iter().filter(|r| !r.success).count();
+                tracing::info!(
+                    "Source config sync complete: {} deployed, {} failed",
+                    ok,
+                    fail
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to sync source config deployments: {}. Ingestion may not work until manually deployed.", e);
+            }
         }
-        Err(e) => {
-            tracing::warn!("Failed to sync source config deployments: {}. Ingestion may not work until manually deployed.", e);
-        }
-    }
 
-    // Publish only a complete DB-derived generation. The same reconciler runs
-    // on every API replica so a new emptyDir can recover the committed
-    // generation; the PostgreSQL CAS prevents stale replicas from advancing it.
-    match state.reconcile_vector_config_publication().await {
-        Ok(outcome) => tracing::info!(?outcome, "Vector config publication reconciled"),
-        Err(error) => tracing::warn!(
-            %error,
-            "Initial Vector config publication failed; the background reconciler will retry"
-        ),
+        // Publish only a complete DB-derived generation. The same reconciler runs
+        // on every API replica so a new emptyDir can recover the committed
+        // generation; the PostgreSQL CAS prevents stale replicas from advancing it.
+        match state.reconcile_vector_config_publication().await {
+            Ok(outcome) => tracing::info!(?outcome, "Vector config publication reconciled"),
+            Err(error) => tracing::warn!(
+                %error,
+                "Initial Vector config publication failed; the background reconciler will retry"
+            ),
+        }
+        let vector_config_handle = state.start_vector_config_publication_reconciler();
+        state.add_task_handle(vector_config_handle).await;
+        tracing::info!("Vector config publication reconciler started");
+
+        // NAN-3770: keep Vector's hashed ingest tokens file in step with the
+        // database (it lives on the same dynamic volume this API publishes
+        // to) and sample per-token "last used". Every replica may run it:
+        // publication is idempotent and "last used" never moves backwards.
+        let ingest_tokens_handle = state.ingest_token_service.clone().spawn_reconcile();
+        state.add_task_handle(ingest_tokens_handle).await;
+        tracing::info!(
+            tokens_file = %state.ingest_token_service.tokens_file().display(),
+            "Ingest token reconcile started"
+        );
     }
-    let vector_config_handle = state.start_vector_config_publication_reconciler();
-    state.add_task_handle(vector_config_handle).await;
-    tracing::info!("Vector config publication reconciler started");
 
     // === License status poller (reads cached status from PG, written by nanosiem-jobs) ===
     // Enterprise-only: the open edition ships no license / phone-home machinery
@@ -263,7 +397,11 @@ async fn main() -> Result<()> {
         } else {
             tracing::info!(
                 tier = decided.tier.as_deref().unwrap_or("unknown"),
-                expires_at = decided.expires_at.map(|e| e.to_rfc3339()).as_deref().unwrap_or(""),
+                expires_at = decided
+                    .expires_at
+                    .map(|e| e.to_rfc3339())
+                    .as_deref()
+                    .unwrap_or(""),
                 "Air-gapped deployment unlocked by imported offline license"
             );
         }
@@ -275,9 +413,7 @@ async fn main() -> Result<()> {
             run_airgap_license_refresh(refresh_state).await;
         });
         state.add_task_handle(refresh_handle).await;
-        tracing::info!(
-            "Air-gap license refresh started (PostgreSQL NOTIFY + 30s fallback poll)"
-        );
+        tracing::info!("Air-gap license refresh started (30s database poll)");
     } else {
         tracing::info!(
             "License enforcement not configured (LICENSE_URL not set) — running unrestricted"
@@ -285,6 +421,46 @@ async fn main() -> Result<()> {
     }
 
     // === Per-instance tasks (API-specific) ===
+
+    // Lake schema profile refresher (NAN-2361). Per-instance, not leader-gated:
+    // every replica answers requests from its OWN pinned profile, so every
+    // replica has to notice its worker's generation promotion. Boot stays
+    // fail-closed (state construction refuses an unresolvable manifest); a failed
+    // REFRESH is logged and the previous good profile retained.
+    {
+        if let Some(source) = worker_schema_source {
+            // NAN-3492: republish each new worker-served field set into the
+            // state's profile; installing it alone changes nothing state reads.
+            let adopt = state.schema_profile.clone();
+            let worker_schema_handle = tokio::spawn(source.run_refresh_loop_with(move || {
+                if adopt.adopt_installed_lake_profile() {
+                    tracing::info!("lake schema profile republished from the worker-served schema");
+                }
+            }));
+            state.add_task_handle(worker_schema_handle).await;
+            tracing::info!("Worker-served lake schema refresher started");
+        }
+        let refresh_config = state.config.clone();
+        let refresh_shared = state.schema_profile.clone();
+        let schema_refresh_handle = tokio::spawn(async move {
+            nanosiem_api::state::run_schema_refresh_loop(refresh_shared, move || {
+                refresh_config.try_schema_profile()
+            })
+            .await;
+        });
+        // Returns by design when no worker config is configured (Disabled).
+        state
+            .add_supervised_task(
+                "lake_schema_refresh",
+                schema_refresh_handle,
+                nanosiem_core::process_supervision::TaskPolicy::MayComplete,
+            )
+            .await;
+        tracing::info!(
+            interval_secs = nanosiem_api::state::SCHEMA_REFRESH_INTERVAL.as_secs(),
+            "Lake schema profile refresher started"
+        );
+    }
 
     // meloD config poller (per-instance AI config, needed for API requests on
     // any pod). Enterprise only — the poller lives on the meloD service.
@@ -299,23 +475,17 @@ async fn main() -> Result<()> {
     // AI usage recorder (NAN-1519) — per-instance writer for the ai_usage_events
     // ledger. Every node makes AI calls and persists its own rows, so this is
     // initialized on all nodes (not leader-only). Enterprise-only: the AI gateway
-    // that feeds it lives in nanosiem-enterprise.
+    // that feeds it lives in the enterprise crate.
     #[cfg(feature = "enterprise")]
     {
-        nanosiem_enterprise::melod::usage_recorder::init(state.pool.clone());
+        nanosiem_enterprise::melod::usage_recorder::init(
+            state.pool.clone(),
+            state.tenant_ai_rls_runtime.clone(),
+        );
         tracing::info!("AI usage recorder started");
     }
 
-    // Case change listener (per-instance SSE broadcast via pg_notify).
-    // Phase 3.2 (NAN-744): cases moved to enterprise; the SSE listener
-    // only spins up when the enterprise feature is enabled.
-    #[cfg(feature = "enterprise")]
-    {
-        tracing::info!("Starting case change listener...");
-        let case_listener_handle = state.start_case_change_listener();
-        state.add_task_handle(case_listener_handle).await;
-        tracing::info!("Case change listener started");
-    }
+    // Case SSE clients periodically refetch through authorized endpoints.
 
     // Initialize metrics
     tracing::info!("Initializing Prometheus metrics...");
@@ -325,7 +495,8 @@ async fn main() -> Result<()> {
     // Create router with metrics layer
     let app = create_router(state.clone())
         .layer(prometheus_layer)
-        .merge(app_metrics.metrics_router());
+        .merge(app_metrics.metrics_router())
+        .merge(nanosiem_api::hosted_config_router());
 
     let wait_for_shutdown = async {
         match nanosiem_core::shutdown::wait_for_shutdown_signal().await {
@@ -380,37 +551,10 @@ async fn refresh_airgap_license_status(state: &AppState) {
 
 #[cfg(feature = "enterprise")]
 async fn run_airgap_license_refresh(state: AppState) {
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-    const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
-        let mut listener = match sqlx::postgres::PgListener::connect_with(&state.pool).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                tracing::warn!(%error, "Failed to connect air-gap license listener");
-                refresh_airgap_license_status(&state).await;
-                tokio::time::sleep(RECONNECT_DELAY).await;
-                continue;
-            }
-        };
-        if let Err(error) = listener.listen("license_status_changed").await {
-            tracing::warn!(%error, "Failed to subscribe air-gap license listener");
-            refresh_airgap_license_status(&state).await;
-            tokio::time::sleep(RECONNECT_DELAY).await;
-            continue;
-        }
-
-        // Close the load-before-LISTEN race on startup/reconnect.
+        interval.tick().await;
         refresh_airgap_license_status(&state).await;
-        loop {
-            match tokio::time::timeout(POLL_INTERVAL, listener.recv()).await {
-                Ok(Ok(_)) | Err(_) => refresh_airgap_license_status(&state).await,
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "Air-gap license listener disconnected");
-                    break;
-                }
-            }
-        }
     }
 }
 

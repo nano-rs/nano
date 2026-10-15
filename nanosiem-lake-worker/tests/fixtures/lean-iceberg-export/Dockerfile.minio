@@ -1,0 +1,4 @@
+# Local test only: minio binary is built from pinned upstream source by run-local.py.
+FROM debian:bookworm-slim
+COPY minio /usr/local/bin/minio
+ENTRYPOINT ["/usr/local/bin/minio"]

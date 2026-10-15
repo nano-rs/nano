@@ -166,11 +166,11 @@ pub struct TierLimits {
     pub ai_credits_per_month: Option<u32>,
     /// AI model tier — controls which models are available
     pub ai_model_tier: AiModelTier,
-    /// Maximum number of Observability metric monitors (None = unlimited). (NAN-1544)
+    /// Maximum number of Observability metric monitors (None = unlimited).
     pub max_metric_monitors: Option<u32>,
-    /// Maximum number of Observability synthetic checks (None = unlimited). (NAN-1544)
+    /// Maximum number of Observability synthetic checks (None = unlimited).
     pub max_synthetic_checks: Option<u32>,
-    /// Maximum number of Observability SLOs (None = unlimited). (NAN-1544)
+    /// Maximum number of Observability SLOs (None = unlimited).
     pub max_slos: Option<u32>,
 }
 
@@ -185,7 +185,11 @@ pub const AI_CREDITS_CEILING_ENV: &str = "NANO_AI_CREDITS_PER_MONTH";
 /// compares and stores the counter as PostgreSQL INTEGER — a value past
 /// `i32::MAX` would wrap negative there and reject the very first request.
 fn parse_ai_credits_ceiling(raw: &str) -> Option<u32> {
-    raw.trim().parse::<i32>().ok().filter(|v| *v > 0).map(|v| v as u32)
+    raw.trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|v| *v > 0)
+        .map(|v| v as u32)
 }
 
 /// Contractual AI credit ceiling for the otherwise-unlimited tiers.
@@ -331,7 +335,9 @@ impl TierLimits {
                 max_eps: Some(30),
                 // NAN-1472: API access is available on all tiers (not plan-gated).
                 api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
+                // SSO is included on every hosted/enterprise plan. The open
+                // build still omits the enterprise SSO implementation.
+                sso_enabled: true,
                 ha_enabled: false,
                 ai_credits_per_month: Some(3_000),
                 ai_model_tier: AiModelTier::Economy,
@@ -349,7 +355,7 @@ impl TierLimits {
                 max_eps: Some(75),
                 // NAN-1472: API access is available on all tiers (not plan-gated).
                 api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
+                sso_enabled: true,
                 ha_enabled: false,
                 ai_credits_per_month: Some(10_000),
                 ai_model_tier: AiModelTier::Standard,
@@ -365,7 +371,7 @@ impl TierLimits {
                 max_daily_gb: Some(10.0),
                 max_eps: Some(155),
                 api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
+                sso_enabled: true,
                 ha_enabled: false,
                 ai_credits_per_month: Some(25_000),
                 ai_model_tier: AiModelTier::Full,
@@ -382,7 +388,7 @@ impl TierLimits {
                 max_daily_gb: Some(25.0),
                 max_eps: Some(385),
                 api_access: ApiAccessLevel::Full,
-                sso_enabled: false,
+                sso_enabled: true,
                 ha_enabled: true,
                 ai_credits_per_month: Some(50_000),
                 ai_model_tier: AiModelTier::Full,
@@ -777,9 +783,10 @@ impl TierSettings {
 
         if let Some(max) = limit {
             if count > max as i32 {
-                return Err(TierError::AiRateLimitExceeded(format!(
-                    "AI credit limit reached ({}/month). Upgrade your plan for more.",
-                    max
+                // NAN-3512: a soft cap. AI pauses until the next UTC month
+                // or a raised allowance; nothing else consults this counter.
+                return Err(TierError::AiRateLimitExceeded(ai_allowance_paused_message(
+                    chrono::Utc::now(),
                 )));
             }
         }
@@ -1011,7 +1018,7 @@ pub struct AiUsage {
     pub model_tier: AiModelTier,
 }
 
-/// Per-agent AI usage rollup over a time range (NAN-1519).
+/// Per-agent AI usage rollup over a time range.
 ///
 /// Token counts are real provider-reported totals; `credits` is the summed
 /// per-call credit-equivalent (relative attribution, not a billing figure —
@@ -1030,7 +1037,7 @@ pub struct AgentUsage {
     pub credits: i64,
 }
 
-/// One day's AI usage rollup (NAN-1519), keyed by UTC date.
+/// One day's AI usage rollup, keyed by UTC date.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DailyAiUsage {
     pub date: chrono::NaiveDate,
@@ -1041,7 +1048,7 @@ pub struct DailyAiUsage {
     pub credits: i64,
 }
 
-/// One recorded AI call from the `ai_usage_events` ledger (NAN-1519).
+/// One recorded AI call from the `ai_usage_events` ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AiUsageEvent {
     pub occurred_at: chrono::DateTime<chrono::Utc>,
@@ -1053,6 +1060,38 @@ pub struct AiUsageEvent {
     pub cached_tokens: i64,
     pub cache_creation_tokens: i64,
     pub credits: i32,
+}
+
+/// Stable machine code for the monthly AI allowance pause (NAN-3512).
+pub const AI_ALLOWANCE_PAUSED_CODE: &str = "ai_allowance_exhausted";
+
+/// First instant of the next UTC month: when a spent monthly AI allowance
+/// resets (`tenant_ai_credit_usage` / `ai_request_counts` are keyed by UTC
+/// month).
+pub fn next_ai_allowance_reset(
+    now: chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{Datelike, TimeZone};
+    let (year, month) = if now.month() == 12 {
+        (now.year() + 1, 1)
+    } else {
+        (now.year(), now.month() + 1)
+    };
+    chrono::Utc
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()
+        .unwrap_or(now + chrono::Duration::days(31))
+}
+
+/// The soft-cap pause message every AI surface shows once the monthly AI
+/// allowance is spent (NAN-3512). AI pauses; search, detection and alerting
+/// never consult the allowance and keep running. No overage is charged.
+pub fn ai_allowance_paused_message(now: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "You've used this month's AI allowance. AI features are paused until {} or until you raise your AI allowance. \
+         Search, detection and alerting keep running.",
+        next_ai_allowance_reset(now).format("%B %-d, %Y")
+    )
 }
 
 /// Cost of an AI request using a lite/economy model (0.2 requests)
@@ -1102,6 +1141,12 @@ pub fn credits_for_cost_tier(cost_tier: Option<&str>, model_id: &str) -> i32 {
 /// back to the name heuristic when the model is absent/has no tier or on any DB
 /// error — usage billing must never fail the AI call.
 pub async fn resolve_ai_request_cost(pool: &PgPool, model_id: &str) -> i32 {
+    // `available_models` is synced by the enterprise model catalog and exists
+    // only in the enterprise overlay. Open goes straight to the heuristic
+    // rather than logging a Postgres error on every AI call (NAN-3463).
+    if !cfg!(feature = "enterprise") {
+        return credits_for_cost_tier(None, model_id);
+    }
     let row: Result<Option<Option<String>>, sqlx::Error> =
         sqlx::query_scalar("SELECT cost_tier FROM available_models WHERE model_id = $1")
             .bind(model_id)
@@ -1241,7 +1286,7 @@ pub fn check_api_write_access(limits: &TierLimits) -> Result<(), TierError> {
 pub fn check_sso_access(limits: &TierLimits) -> Result<(), TierError> {
     if !limits.sso_enabled {
         return Err(TierError::FeatureNotAvailable(
-            "SSO/SAML is not available on your plan. Upgrade to Starter or higher.".into(),
+            "SSO/SAML is not enabled for this organization.".into(),
         ));
     }
     Ok(())
@@ -1284,6 +1329,27 @@ pub fn check_model_access(model: &str, model_tier: &AiModelTier) -> Result<(), T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NAN-3512: the soft-cap pause wording and its reset date.
+    #[test]
+    fn ai_allowance_pause_message_names_the_next_utc_month() {
+        use chrono::TimeZone;
+        let at = |y, m, d, h| chrono::Utc.with_ymd_and_hms(y, m, d, h, 0, 0).unwrap();
+        assert_eq!(
+            next_ai_allowance_reset(at(2026, 10, 10, 14)),
+            at(2026, 11, 1, 0)
+        );
+        assert_eq!(
+            next_ai_allowance_reset(at(2026, 12, 31, 23)),
+            at(2027, 1, 1, 0)
+        );
+        assert_eq!(
+            ai_allowance_paused_message(at(2026, 10, 10, 14)),
+            "You've used this month's AI allowance. AI features are paused until November 1, 2026 \
+             or until you raise your AI allowance. Search, detection and alerting keep running."
+        );
+        assert!(!ai_allowance_paused_message(at(2026, 2, 3, 0)).contains("Upgrade"));
+    }
 
     // NAN-2347: the contractual AI credit ceiling for unlimited tiers.
 
@@ -1344,7 +1410,10 @@ mod tests {
         assert_eq!(parse_max_detection_rules("fifty"), None);
         assert_eq!(parse_max_detection_rules("5e1"), None);
         // tier_max_detection_rules is a PostgreSQL INTEGER.
-        assert_eq!(parse_max_detection_rules("2147483647"), Some(Some(2_147_483_647)));
+        assert_eq!(
+            parse_max_detection_rules("2147483647"),
+            Some(Some(2_147_483_647))
+        );
         assert_eq!(parse_max_detection_rules("2147483648"), None);
     }
 
@@ -1390,8 +1459,22 @@ mod tests {
         // unlimited — so flipping enforcement on caps rules and nothing else.
         assert_eq!(capped.max_data_sources, None);
         assert_eq!(capped.max_eps, None);
-        assert!(check_limit("data sources", 9_999, capped.max_data_sources, capped.tier, "").is_ok());
-        assert!(check_limit("detection rules", 50, capped.max_detection_rules, capped.tier, "").is_err());
+        assert!(check_limit(
+            "data sources",
+            9_999,
+            capped.max_data_sources,
+            capped.tier,
+            ""
+        )
+        .is_ok());
+        assert!(check_limit(
+            "detection rules",
+            50,
+            capped.max_detection_rules,
+            capped.tier,
+            ""
+        )
+        .is_err());
 
         let unlimited = TierLimits::for_tier_unoverridden(OrganizationTier::Unrestricted)
             .with_rule_override(Some(None));
@@ -1446,7 +1529,7 @@ mod tests {
         assert_eq!(limits.max_daily_gb, Some(2.0));
         assert_eq!(limits.max_eps, Some(30));
         assert_eq!(limits.api_access, ApiAccessLevel::Full); // NAN-1472: API access on all tiers
-        assert!(!limits.sso_enabled);
+        assert!(limits.sso_enabled);
         assert!(!limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(3_000));
         assert_eq!(limits.ai_model_tier, AiModelTier::Economy);
@@ -1466,7 +1549,7 @@ mod tests {
         assert_eq!(limits.max_daily_gb, Some(5.0));
         assert_eq!(limits.max_eps, Some(75));
         assert_eq!(limits.api_access, ApiAccessLevel::Full); // NAN-1472: API access on all tiers
-        assert!(!limits.sso_enabled);
+        assert!(limits.sso_enabled);
         assert!(!limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(10_000));
         assert_eq!(limits.ai_model_tier, AiModelTier::Standard);
@@ -1481,7 +1564,7 @@ mod tests {
         assert_eq!(limits.max_daily_gb, Some(10.0));
         assert_eq!(limits.max_eps, Some(155));
         assert_eq!(limits.api_access, ApiAccessLevel::Full);
-        assert!(!limits.sso_enabled);
+        assert!(limits.sso_enabled);
         assert!(!limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(25_000));
         assert_eq!(limits.ai_model_tier, AiModelTier::Full);
@@ -1494,7 +1577,7 @@ mod tests {
         assert_eq!(limits.max_daily_gb, Some(25.0));
         assert_eq!(limits.max_eps, Some(385));
         assert_eq!(limits.api_access, ApiAccessLevel::Full);
-        assert!(!limits.sso_enabled);
+        assert!(limits.sso_enabled);
         assert!(limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(50_000));
         assert_eq!(limits.ai_model_tier, AiModelTier::Full);
@@ -1573,10 +1656,18 @@ mod tests {
 
     #[test]
     fn test_sso_access() {
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Hobby)).is_err());
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Growth)).is_err());
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Starter)).is_ok());
-        assert!(check_sso_access(&TierLimits::for_tier_unoverridden(OrganizationTier::Pro)).is_ok());
+        for tier in [
+            OrganizationTier::Hobby,
+            OrganizationTier::Startup,
+            OrganizationTier::Growth,
+            OrganizationTier::Team,
+            OrganizationTier::Starter,
+            OrganizationTier::Pro,
+            OrganizationTier::Enterprise,
+            OrganizationTier::Unrestricted,
+        ] {
+            assert!(check_sso_access(&TierLimits::for_tier_unoverridden(tier)).is_ok());
+        }
     }
 
     #[test]

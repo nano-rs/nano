@@ -19,7 +19,7 @@
  */
 
 import * as React from 'react';
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -135,7 +135,7 @@ export function ConfirmDialog({
           >
             {loading ? (
               <>
-                <Loader2 className="h-[11px] w-[11px] animate-spin" />
+                <LoadingIcon className="h-[11px] w-[11px]" />
                 {loadingLabel ?? confirmLabel}
               </>
             ) : (

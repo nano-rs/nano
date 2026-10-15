@@ -20,12 +20,12 @@ import {
   EyeOff,
   ExternalLink,
   GitPullRequest,
-  Loader2,
   Pencil,
   Plus,
   RefreshCw,
   Trash2,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import type {
@@ -207,7 +207,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
                 className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5 disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 {saveMutation.isPending ? (
-                  <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
+                  <LoadingIcon className="w-[11px] h-[11px]" strokeWidth={1.5} />
                 ) : editingId ? (
                   <Pencil className="w-[11px] h-[11px]" strokeWidth={1.5} />
                 ) : (
@@ -238,7 +238,7 @@ export function DetectionCodeTargetsDrawer({ open, onClose, canManage }: Props) 
             </div>
             {isLoading ? (
               <div className="flex items-center justify-center py-6 text-muted-foreground">
-                <Loader2 className="w-4 h-4 animate-spin" strokeWidth={1.5} />
+                <LoadingIcon className="w-4 h-4" strokeWidth={1.5} />
               </div>
             ) : targets.length === 0 ? (
               <div className="rounded-md border border-dashed border-border px-3 py-4 text-center text-[11px] text-muted-foreground">
@@ -507,7 +507,7 @@ function TargetCard({
             className="h-[24px] px-2 rounded-md border border-border bg-card hover:bg-muted text-[10.5px] text-foreground/80 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {testing ? (
-              <Loader2 className="w-[11px] h-[11px] animate-spin" strokeWidth={1.5} />
+              <LoadingIcon className="w-[11px] h-[11px]" strokeWidth={1.5} />
             ) : (
               <RefreshCw className="w-[11px] h-[11px]" strokeWidth={1.5} />
             )}

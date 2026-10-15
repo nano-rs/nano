@@ -123,7 +123,12 @@ fn feed_name_format_rejects_hostile_characters() {
         );
     }
     // Ordinary feed names pass.
-    for ok in ["ThreatFox", "URLhaus", "abuse.ch Feodo", "my-custom_feed.v2"] {
+    for ok in [
+        "ThreatFox",
+        "URLhaus",
+        "abuse.ch Feodo",
+        "my-custom_feed.v2",
+    ] {
         assert!(
             validate_feed_name_format(ok).is_ok(),
             "expected {ok:?} to be accepted"

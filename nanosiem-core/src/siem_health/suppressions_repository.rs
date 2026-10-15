@@ -66,17 +66,17 @@ impl SuppressionRepository {
         created_by: Uuid,
     ) -> Result<FindingSuppression, SuppressionRepositoryError> {
         let row = sqlx::query(
-            r#"
+            concat!(r#"
             INSERT INTO siem_health_finding_suppressions
                 (finding_signature, title, reason, created_by)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (finding_signature) WHERE deactivated_at IS NULL DO UPDATE
+            ON CONFLICT ("#, crate::tenant_key!(), r#"finding_signature) WHERE deactivated_at IS NULL DO UPDATE
                 SET reason = EXCLUDED.reason,
                     title = EXCLUDED.title,
                     created_by = EXCLUDED.created_by
             RETURNING id, finding_signature, title, reason, created_by, created_at,
                       deactivated_at, deactivated_by
-            "#,
+            "#),
         )
         .bind(finding_signature)
         .bind(title)

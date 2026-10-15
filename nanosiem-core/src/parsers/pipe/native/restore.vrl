@@ -1,0 +1,24 @@
+# Renderer-owned: reduce keeps finalizers/secrets, but loses '%' value metadata.
+# A marker without data must never become a delivered event.
+if !exists(._nano_pipe_metadata) { . = [] } else {
+  nano_metadata = object!(._nano_pipe_metadata[0])
+  %tenant_id = nano_metadata.tenant_id
+  %source_type = nano_metadata.source_type
+  %ingress_transport = nano_metadata.ingress_transport
+  # The aggregate is a new event, not the retained member. Bronze must mint
+  # its UID from the aggregate key (or randomly when membership is unkeyed).
+  del(.context[0].metadata.uid)
+  nano_keys = array!(._nano_pipe_keys)
+  # Ordered membership preserves duplicate occurrences and matches order-sensitive
+  # retain/concat merges. Never reuse just the first or last member's identity.
+  if length(nano_keys) > 0 && !includes(nano_keys, "") {
+    %nano_event_key = "nano-pipe-combine-v1:" + sha2(encode_json([
+      .group_hash, nano_keys
+    ]), variant: "SHA-256")
+  } else {
+    # No content-derived identity when any member lacks a verified ingress key.
+    del(%nano_event_key)
+  }
+  del(._nano_pipe_metadata)
+  del(._nano_pipe_keys)
+}

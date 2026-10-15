@@ -18,7 +18,6 @@ import {
   ChevronRight,
   Download,
   Globe,
-  Loader2,
   Pencil,
   Play,
   Plus,
@@ -26,6 +25,7 @@ import {
   Trash2,
   User as UserIcon,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -44,7 +44,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
-import type { ReportArtifactMeta, ReportDefinition, ReportRun } from '@/lib/api';
+import type { ReportArtifactMeta, ReportDefinition, ReportRun, ReportRunAiSummary } from '@/lib/api';
 
 type FilterTab = 'mine' | 'all';
 
@@ -88,6 +88,45 @@ function formatBytes(n: number): string {
 
 function formatSchedule(cron: string): string {
   return cron;
+}
+
+/**
+ * NAN-2361 wave 7: the hosted-shared narrative block. A skipped/failed lane
+ * states its reason instead of hiding; completed shows the narrative and
+ * the concrete findings.
+ */
+function RunAiSummary({ summary }: { summary: ReportRunAiSummary }) {
+  if (summary.state !== 'completed') {
+    return (
+      <div className="basis-full text-[10.5px] font-mono text-muted-foreground/80">
+        ai summary {summary.state}
+        {summary.reason ? `: ${summary.reason}` : ''}
+      </div>
+    );
+  }
+  return (
+    <div className="basis-full border border-border rounded px-2.5 py-2 mb-1">
+      <div className="flex items-center gap-2 mb-1">
+        <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+          ai summary
+        </span>
+        {summary.model_id && (
+          <span className="font-mono text-[9.5px] text-muted-foreground/70">{summary.model_id}</span>
+        )}
+      </div>
+      <p className="text-[11.5px] text-foreground leading-snug">{summary.narrative}</p>
+      {summary.key_findings.length > 0 && (
+        <ul className="mt-1.5 space-y-0.5">
+          {summary.key_findings.map((finding, index) => (
+            <li key={index} className="text-[11px] text-muted-foreground leading-snug">
+              <span className="font-mono text-[10px] text-muted-foreground/60 mr-1.5">{index + 1}.</span>
+              {finding}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 /** Per-run row: expands to load artifacts (the runs list returns none). */
@@ -188,13 +227,14 @@ function RunRow({ run }: { run: ReportRun }) {
           <td colSpan={6} className="px-3 py-2">
             {loading ? (
               <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <LoadingIcon className="w-3.5 h-3.5" />
                 Loading artifacts…
               </div>
             ) : run.error ? (
               <div className="text-[11px] text-red-400 font-mono">{run.error}</div>
             ) : artifacts && artifacts.length > 0 ? (
               <div className="flex flex-wrap items-center gap-2">
+                {run.ai_summary && <RunAiSummary summary={run.ai_summary} />}
                 {artifacts.map((a) => (
                   <button
                     key={a.id}
@@ -208,7 +248,7 @@ function RunRow({ run }: { run: ReportRun }) {
                     title={a.filename}
                   >
                     {downloadingId === a.id ? (
-                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <LoadingIcon className="w-3 h-3" />
                     ) : (
                       <Download className="w-3 h-3 text-muted-foreground" />
                     )}
@@ -266,7 +306,7 @@ function ReportRunHistory({ reportId }: { reportId: string }) {
   if (loading) {
     return (
       <div className="flex items-center gap-2 px-4 py-4 text-[11px] text-muted-foreground">
-        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        <LoadingIcon className="w-3.5 h-3.5" />
         Loading run history…
       </div>
     );
@@ -459,7 +499,7 @@ export function Reports() {
       {/* Body */}
       {loading ? (
         <div className="flex items-center justify-center py-16">
-          <Loader2 className="w-6 h-6 animate-spin text-primary" />
+          <LoadingIcon className="w-6 h-6 text-primary" />
         </div>
       ) : error ? (
         <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-[12px] text-destructive">
@@ -561,7 +601,7 @@ export function Reports() {
                             aria-label="Run now"
                           >
                             {busyId === r.id ? (
-                              <Loader2 className="w-[13px] h-[13px] animate-spin" />
+                              <LoadingIcon className="w-[13px] h-[13px]" />
                             ) : (
                               <Play className="w-[13px] h-[13px]" />
                             )}

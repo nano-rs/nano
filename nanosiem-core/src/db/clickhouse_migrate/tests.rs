@@ -118,7 +118,7 @@ mod tests {
             spec("id", "UUID", "", ""),
             spec("command_line", "String", "", ""),
             spec("process", "String", "ALIAS", "command_line"), // missing, ALIAS
-            spec("tags", "Array(String)", "DEFAULT", "[]"),      // missing, DEFAULT
+            spec("tags", "Array(String)", "DEFAULT", "[]"),     // missing, DEFAULT
         ];
         let add = columns_to_add(&wrapper, &source);
         let names: Vec<&str> = add.iter().map(|(n, ..)| n.as_str()).collect();
@@ -130,7 +130,10 @@ mod tests {
     #[test]
     fn build_add_column_clause_covers_every_kind() {
         use crate::db::clickhouse_migrate::distributed::build_add_column_clause;
-        assert_eq!(build_add_column_clause("span_id", "String", "", ""), "span_id String");
+        assert_eq!(
+            build_add_column_clause("span_id", "String", "", ""),
+            "span_id String"
+        );
         assert_eq!(
             build_add_column_clause("tags", "Array(String)", "DEFAULT", "[]"),
             "tags Array(String) DEFAULT []"
@@ -176,11 +179,13 @@ mod tests {
         // SQL co-resident in the dir.
         let temp_dir = TempDir::new().unwrap();
 
-        let mut valid = std::fs::File::create(temp_dir.path().join("109_real_migration.sql")).unwrap();
+        let mut valid =
+            std::fs::File::create(temp_dir.path().join("109_real_migration.sql")).unwrap();
         writeln!(valid, "CREATE TABLE foo (id Int32);").unwrap();
 
         // Sub-migration form (e.g. 075a_*.sql) must still load.
-        let mut sub = std::fs::File::create(temp_dir.path().join("075a_sub_migration.sql")).unwrap();
+        let mut sub =
+            std::fs::File::create(temp_dir.path().join("075a_sub_migration.sql")).unwrap();
         writeln!(sub, "ALTER TABLE foo ADD COLUMN bar String;").unwrap();
 
         // Files that must be skipped:
@@ -282,7 +287,8 @@ mod tests {
     #[test]
     fn test_cluster_create_database() {
         let sql = "CREATE DATABASE IF NOT EXISTS nanosiem";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER: {}",
@@ -294,7 +300,8 @@ mod tests {
     #[test]
     fn test_cluster_create_table_mergetree() {
         let sql = "CREATE TABLE IF NOT EXISTS nanosiem.logs (id UUID) ENGINE = MergeTree PARTITION BY toYYYYMMDD(timestamp) ORDER BY (timestamp) SETTINGS index_granularity = 8192";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER: {}",
@@ -325,7 +332,8 @@ mod tests {
     #[test]
     fn test_cluster_create_table_aggregating() {
         let sql = "CREATE TABLE IF NOT EXISTS nanosiem.domain_prevalence_agg (domain String) ENGINE = AggregatingMergeTree() ORDER BY (domain)";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ReplicatedAggregatingMergeTree("),
             "Should convert to ReplicatedAggregatingMergeTree: {}",
@@ -336,7 +344,8 @@ mod tests {
     #[test]
     fn test_cluster_create_table_replacing() {
         let sql = "CREATE TABLE IF NOT EXISTS nanosiem.custom_enrichment_results (key String) ENGINE = ReplacingMergeTree(version) ORDER BY (key)";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ReplicatedReplacingMergeTree("),
             "Should convert to ReplicatedReplacingMergeTree: {}",
@@ -532,7 +541,10 @@ mod tests {
         // should be returned unchanged (same behavior as the cluster==db case).
         let sql = "CREATE DATABASE IF NOT EXISTS nanosiem";
         let result = ClickHouseMigrator::transform_for_cluster(sql, "default", "nanosiem", true);
-        assert_eq!(result, sql, "CH Cloud should return CREATE DATABASE unchanged");
+        assert_eq!(
+            result, sql,
+            "CH Cloud should return CREATE DATABASE unchanged"
+        );
     }
 
     #[test]
@@ -541,12 +553,18 @@ mod tests {
         // `storage_policy = 'tiered'` with UNKNOWN_POLICY (Code 478). The
         // transform must NOT re-inject the storage_policy after
         // sanitize_for_cloud has stripped it. NAN-1096.
-        for table in ["logs", "signals", "ingestion_errors", "custom_enrichment_results"] {
+        for table in [
+            "logs",
+            "signals",
+            "ingestion_errors",
+            "custom_enrichment_results",
+        ] {
             let sql = format!(
                 "CREATE TABLE IF NOT EXISTS nanosiem.{} (id UUID) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 8192",
                 table
             );
-            let result = ClickHouseMigrator::transform_for_cluster(&sql, "default", "nanosiem", true);
+            let result =
+                ClickHouseMigrator::transform_for_cluster(&sql, "default", "nanosiem", true);
             assert!(
                 !result.to_lowercase().contains("storage_policy"),
                 "CH Cloud must NOT inject storage_policy for {}: {}",
@@ -561,7 +579,8 @@ mod tests {
         // Regression guard: operator-managed in-cluster deploys must still get
         // `storage_policy = 'tiered'` injected on the main data tables.
         let sql = "CREATE TABLE IF NOT EXISTS nanosiem.logs (id UUID) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 8192";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("storage_policy = 'tiered'"),
             "In-cluster mode must still inject storage_policy for logs: {}",
@@ -575,7 +594,8 @@ mod tests {
         // must still produce the legacy explicit-zoo-path form for in-cluster
         // CH deployments. NAN-1092 only changes behavior when is_cloud=true.
         let sql = "CREATE TABLE IF NOT EXISTS nanosiem.logs (id UUID) ENGINE = MergeTree PARTITION BY toYYYYMMDD(timestamp) ORDER BY (timestamp) SETTINGS index_granularity = 8192";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Explicit cluster mode must keep ON CLUSTER: {}",
@@ -597,7 +617,8 @@ mod tests {
     fn test_cluster_no_duplicate_storage_policy() {
         // Migration 085 already has storage_policy in SETTINGS — don't duplicate it
         let sql = "CREATE TABLE nanosiem.logs (id UUID) ENGINE = MergeTree PARTITION BY toYYYYMMDD(timestamp) ORDER BY (timestamp) SETTINGS index_granularity = 8192, storage_policy = 'tiered', allow_experimental_full_text_index = 1";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         let count = result.matches("storage_policy").count();
         assert_eq!(
             count, 1,
@@ -614,7 +635,8 @@ mod tests {
     #[test]
     fn test_cluster_create_table_summing() {
         let sql = "CREATE TABLE IF NOT EXISTS nanosiem.nat_candidates (src_ip String, count UInt64) ENGINE = SummingMergeTree() ORDER BY (src_ip)";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ReplicatedSummingMergeTree("),
             "Should convert to ReplicatedSummingMergeTree: {}",
@@ -630,7 +652,8 @@ mod tests {
     #[test]
     fn test_cluster_create_table_unqualified() {
         let sql = "CREATE TABLE IF NOT EXISTS identity_observations (ip String) ENGINE = MergeTree() ORDER BY (ip) SETTINGS index_granularity = 8192";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER for unqualified table: {}",
@@ -646,7 +669,8 @@ mod tests {
     #[test]
     fn test_cluster_alter_table() {
         let sql = "ALTER TABLE nanosiem.logs ADD COLUMN IF NOT EXISTS foo String DEFAULT ''";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to ALTER: {}",
@@ -657,7 +681,8 @@ mod tests {
     #[test]
     fn test_cluster_alter_table_unqualified() {
         let sql = "ALTER TABLE logs DROP INDEX IF EXISTS idx_command_line";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to unqualified ALTER: {}",
@@ -668,7 +693,8 @@ mod tests {
     #[test]
     fn test_cluster_materialized_view() {
         let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_mv TO nanosiem.domain_prevalence_agg AS SELECT 1";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to MV: {}",
@@ -679,7 +705,8 @@ mod tests {
     #[test]
     fn test_cluster_dictionary() {
         let sql = "CREATE DICTIONARY IF NOT EXISTS nanosiem.hash_prevalence_dict (file_hash String) PRIMARY KEY file_hash SOURCE(CLICKHOUSE(HOST 'localhost' PORT 9000 USER 'nanosiem' DB 'nanosiem')) LIFETIME(MIN 300 MAX 600) LAYOUT(SPARSE_HASHED())";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to DICTIONARY: {}",
@@ -700,7 +727,8 @@ mod tests {
     #[test]
     fn test_cluster_create_or_replace_dictionary() {
         let sql = "CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict (file_hash String) PRIMARY KEY file_hash SOURCE(CLICKHOUSE(HOST 'localhost' PORT 9000 USER 'nanosiem' DB 'nanosiem')) LIFETIME(MIN 300 MAX 600) LAYOUT(SPARSE_HASHED())";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to CREATE OR REPLACE DICTIONARY: {}",
@@ -711,7 +739,8 @@ mod tests {
     #[test]
     fn test_cluster_truncate_table() {
         let sql = "TRUNCATE TABLE nanosiem.logs";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to TRUNCATE: {}",
@@ -723,7 +752,8 @@ mod tests {
     fn test_cluster_skip_non_replicated_dedup() {
         let sql =
             "ALTER TABLE nanosiem.logs MODIFY SETTING non_replicated_deduplication_window = 1000";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.trim().is_empty(),
             "Should skip non_replicated_deduplication_window: '{}'",
@@ -734,14 +764,16 @@ mod tests {
     #[test]
     fn test_cluster_skips_set_statements() {
         let sql = "SET allow_experimental_full_text_index = 1";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert_eq!(result, sql, "SET statements should pass through unchanged");
     }
 
     #[test]
     fn test_cluster_preserves_existing_on_cluster() {
         let sql = "CREATE TABLE nanosiem.test ON CLUSTER 'my_cluster' (id Int32) ENGINE = ReplicatedMergeTree('/path', '{replica}') ORDER BY id";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert_eq!(
             result, sql,
             "Should not modify SQL that already has ON CLUSTER"
@@ -751,7 +783,8 @@ mod tests {
     #[test]
     fn test_cluster_drop_table() {
         let sql = "DROP TABLE IF EXISTS nanosiem.old_table";
-        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
             result.contains("ON CLUSTER 'nanosiem_cluster'"),
             "Should add ON CLUSTER to DROP: {}",
@@ -810,11 +843,7 @@ mod tests {
 
         assert!(result.contains("HOST 'ch-shard-0.svc'"), "host: {}", result);
         assert!(result.contains("PORT 9001"), "port: {}", result);
-        assert!(
-            result.contains("USER 'rotated_admin'"),
-            "user: {}",
-            result
-        );
+        assert!(result.contains("USER 'rotated_admin'"), "user: {}", result);
         assert!(
             result.contains("PASSWORD 'rotated_pw_xyz'"),
             "password: {}",
@@ -862,7 +891,9 @@ mod tests {
         // Block-comment marker survives the line-comment strip that runs
         // before statement splitting in apply_migration.
         let stripped = ClickHouseMigrator::strip_sql_line_comments(stmt);
-        assert!(ClickHouseMigrator::has_skip_if_unknown_table_marker(&stripped));
+        assert!(ClickHouseMigrator::has_skip_if_unknown_table_marker(
+            &stripped
+        ));
         // Unmarked statements are never skip-eligible.
         assert!(!ClickHouseMigrator::has_skip_if_unknown_table_marker(
             "ALTER TABLE nanosiem.ocsf_logs MODIFY TTL timestamp + toIntervalDay(365)"
@@ -911,7 +942,11 @@ mod tests {
         // Production order: strip → substitute.
         let stripped = ClickHouseMigrator::strip_sql_line_comments(sql);
         let result = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
-            &stripped, "localhost", "9000", "default", password,
+            &stripped,
+            "localhost",
+            "9000",
+            "default",
+            password,
         );
 
         assert!(
@@ -950,7 +985,11 @@ mod tests {
 
         // The buggy order: substitute → strip.
         let substituted = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
-            sql, "localhost", "9000", "default", password,
+            sql,
+            "localhost",
+            "9000",
+            "default",
+            password,
         );
         let result = ClickHouseMigrator::strip_sql_line_comments(&substituted);
 
@@ -1073,11 +1112,8 @@ mod tests {
     #[test]
     fn nan_788_postgres_password_with_special_chars_is_escaped() {
         let sql = "SOURCE(POSTGRESQL(host 'postgres' port 5432 user 'nanosiem' password 'nanosiem' db 'nanosiem'))";
-        let result = ClickHouseMigrator::substitute_postgres_vars_with(
-            sql,
-            "pg.svc",
-            "pw'with\\stuff",
-        );
+        let result =
+            ClickHouseMigrator::substitute_postgres_vars_with(sql, "pg.svc", "pw'with\\stuff");
 
         assert!(
             result.contains("password 'pw''with\\\\stuff'"),
@@ -1093,14 +1129,32 @@ mod tests {
     #[test]
     fn parse_create_table_name_variants() {
         let cases = [
-            ("CREATE TABLE IF NOT EXISTS nanosiem.logs (\n  id UUID\n)", Some("nanosiem.logs")),
+            (
+                "CREATE TABLE IF NOT EXISTS nanosiem.logs (\n  id UUID\n)",
+                Some("nanosiem.logs"),
+            ),
             ("CREATE TABLE nanosiem.logs(id UUID)", Some("nanosiem.logs")),
-            ("create table if not exists nanosiem.foo (x Int8)", Some("nanosiem.foo")),
-            ("CREATE TABLE IF NOT EXISTS `nanosiem`.`logs` (id UUID)", Some("nanosiem.logs")),
-            ("CREATE TABLE IF NOT EXISTS nanosiem.logs ON CLUSTER default (id UUID)", Some("nanosiem.logs")),
+            (
+                "create table if not exists nanosiem.foo (x Int8)",
+                Some("nanosiem.foo"),
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS `nanosiem`.`logs` (id UUID)",
+                Some("nanosiem.logs"),
+            ),
+            (
+                "CREATE TABLE IF NOT EXISTS nanosiem.logs ON CLUSTER default (id UUID)",
+                Some("nanosiem.logs"),
+            ),
             ("CREATE TABLE bare_table (id UUID)", Some("bare_table")),
-            ("CREATE DICTIONARY nanosiem.ioc_enrichment_dict (k String)", None),
-            ("CREATE MATERIALIZED VIEW nanosiem.mv TO nanosiem.logs AS SELECT 1", None),
+            (
+                "CREATE DICTIONARY nanosiem.ioc_enrichment_dict (k String)",
+                None,
+            ),
+            (
+                "CREATE MATERIALIZED VIEW nanosiem.mv TO nanosiem.logs AS SELECT 1",
+                None,
+            ),
             ("ALTER TABLE nanosiem.logs ADD COLUMN x Int8", None),
         ];
         for (sql, want) in cases {
@@ -1127,7 +1181,8 @@ mod tests {
 
     #[test]
     fn create_settings_profile_gets_on_cluster() {
-        let sql = "CREATE SETTINGS PROFILE IF NOT EXISTS 'nanosiem_realtime' SETTINGS max_threads = 4";
+        let sql =
+            "CREATE SETTINGS PROFILE IF NOT EXISTS 'nanosiem_realtime' SETTINGS max_threads = 4";
         let result =
             ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(
@@ -1143,7 +1198,10 @@ mod tests {
         let result =
             ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
-        assert!(!result.contains("Replicated"), "TO-form MV must not gain an engine: {result}");
+        assert!(
+            !result.contains("Replicated"),
+            "TO-form MV must not gain an engine: {result}"
+        );
     }
 
     #[test]
@@ -1172,7 +1230,10 @@ mod tests {
         let result =
             ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
-        assert!(result.trim_end().ends_with("SYNC"), "DROP TABLE must end with SYNC: {result}");
+        assert!(
+            result.trim_end().ends_with("SYNC"),
+            "DROP TABLE must end with SYNC: {result}"
+        );
     }
 
     #[test]
@@ -1181,7 +1242,10 @@ mod tests {
         let sql = "DROP TABLE IF EXISTS nanosiem.logs";
         let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem", "nanosiem", false);
         assert!(!result.contains("ON CLUSTER"), "{result}");
-        assert!(!result.trim_end().ends_with("SYNC"), "no SYNC without ON CLUSTER: {result}");
+        assert!(
+            !result.trim_end().ends_with("SYNC"),
+            "no SYNC without ON CLUSTER: {result}"
+        );
     }
 
     #[test]
@@ -1191,7 +1255,10 @@ mod tests {
         let result =
             ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
-        assert!(!result.trim_end().ends_with("SYNC"), "DROP DICTIONARY must not get SYNC: {result}");
+        assert!(
+            !result.trim_end().ends_with("SYNC"),
+            "DROP DICTIONARY must not get SYNC: {result}"
+        );
     }
 
     // ── NAN-1728: {dist_suffix} read target resolves per topology ──
@@ -1211,8 +1278,14 @@ mod tests {
             single.contains("FROM nanosiem.hash_prevalence_summary GROUP BY"),
             "single-node must read the plain local table: {single}"
         );
-        assert!(!single.contains("_distributed"), "no wrapper on single-node: {single}");
-        assert!(!single.contains("{dist_suffix}"), "placeholder must be substituted: {single}");
+        assert!(
+            !single.contains("_distributed"),
+            "no wrapper on single-node: {single}"
+        );
+        assert!(
+            !single.contains("{dist_suffix}"),
+            "placeholder must be substituted: {single}"
+        );
 
         // Cluster → the _distributed wrapper.
         let clustered = ClickHouseMigrator::substitute_dist_suffix(query, true);
@@ -1220,7 +1293,10 @@ mod tests {
             clustered.contains("FROM nanosiem.hash_prevalence_summary_distributed GROUP BY"),
             "cluster must read the _distributed wrapper: {clustered}"
         );
-        assert!(!clustered.contains("{dist_suffix}"), "placeholder must be substituted: {clustered}");
+        assert!(
+            !clustered.contains("{dist_suffix}"),
+            "placeholder must be substituted: {clustered}"
+        );
 
         // General: works after a reference-table name too.
         let refq = "SELECT * FROM nanosiem.ip_enrichments{dist_suffix}";
@@ -1242,10 +1318,7 @@ mod tests {
             "SELECT * FROM system.processes"
         );
         assert_eq!(
-            ClickHouseMigrator::substitute_system_processes_source(
-                sql,
-                Some("nanosiem_cluster")
-            ),
+            ClickHouseMigrator::substitute_system_processes_source(sql, Some("nanosiem_cluster")),
             "SELECT * FROM clusterAllReplicas('nanosiem_cluster', system.processes)"
         );
         assert_eq!(
@@ -1276,14 +1349,38 @@ mod tests {
             "GRANT SELECT ON system.processes TO nanosiem"
         );
         assert_eq!(
-            ClickHouseMigrator::substitute_grant_on_cluster(
-                sql,
-                Some("default"),
-                "nanosiem",
-                true,
-            ),
+            ClickHouseMigrator::substitute_grant_on_cluster(sql, Some("default"), "nanosiem", true,),
             "GRANT SELECT ON system.processes TO nanosiem"
         );
+    }
+
+    #[test]
+    fn lookup_rows_delete_grant_resolves_for_runtime_user_and_topology() {
+        let migration =
+            include_str!("../../../../clickhouse/174_lookup_rows_alter_delete_grant.sql");
+        assert!(migration.contains("GRANT{grant_on_cluster} ALTER DELETE ON nanosiem.lookup_rows TO {clickhouse_runtime_user};"));
+
+        for (cluster, is_cloud, expected_cluster) in [
+            (
+                Some("nanosiem_cluster"),
+                false,
+                " ON CLUSTER 'nanosiem_cluster'",
+            ),
+            (Some("nanosiem"), false, ""),
+            (Some("default"), true, ""),
+            (None, false, ""),
+        ] {
+            let sql = ClickHouseMigrator::substitute_grant_on_cluster(
+                migration, cluster, "nanosiem", is_cloud,
+            );
+            let sql =
+                ClickHouseMigrator::substitute_clickhouse_users_with(&sql, "admin", "runtime-user");
+            assert!(sql.contains(&format!(
+                "GRANT{expected_cluster} ALTER DELETE ON nanosiem.lookup_rows TO `runtime-user`;"
+            )));
+            assert!(!sql.contains("{grant_on_cluster}"));
+            assert!(!sql.contains("{clickhouse_runtime_user}"));
+        }
     }
 
     #[test]
@@ -1333,14 +1430,10 @@ mod tests {
     #[test]
     fn historical_grants_are_not_globally_rewritten() {
         let sql = "GRANT SELECT ON nanosiem.cluster_processes TO nanosiem";
-        let result = ClickHouseMigrator::transform_for_cluster(
-            sql,
-            "nanosiem_cluster",
-            "nanosiem",
-            false,
-        );
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
         assert_eq!(result, sql);
-        }
+    }
 
     // ── NAN-2346: box-sized prevalence CACHE dict SIZE_IN_CELLS ──
 
@@ -1352,7 +1445,8 @@ mod tests {
     fn prevalence_cache_cells_default_to_the_historical_literals() {
         let ddl = "LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells_ip}));\n\
                    LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS {prevalence_cache_cells}));";
-        let out = ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "5000000", "1000000");
+        let out =
+            ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "5000000", "1000000");
         assert_eq!(
             out,
             "LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));\n\
@@ -1367,9 +1461,13 @@ mod tests {
     #[test]
     fn prevalence_cache_cells_ip_placeholder_is_not_clipped() {
         let ddl = "SIZE_IN_CELLS {prevalence_cache_cells_ip}";
-        let out = ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "262144", "262144");
+        let out =
+            ClickHouseMigrator::substitute_prevalence_cache_cells_with(ddl, "262144", "262144");
         assert_eq!(out, "SIZE_IN_CELLS 262144");
-        assert!(!out.contains("_ip"), "the _ip suffix must be consumed: {out}");
+        assert!(
+            !out.contains("_ip"),
+            "the _ip suffix must be consumed: {out}"
+        );
     }
 
     /// Both dict classes are independently sizable — the ip trie is the expensive
@@ -1449,7 +1547,11 @@ mod tests {
 
         // No reference to the base → None.
         assert_eq!(
-            repoint_from_table("SELECT 1 FROM nanosiem.other_table", "nanosiem", "ip_enrichments"),
+            repoint_from_table(
+                "SELECT 1 FROM nanosiem.other_table",
+                "nanosiem",
+                "ip_enrichments"
+            ),
             None
         );
     }
@@ -1464,7 +1566,10 @@ mod tests {
         assert_eq!(sharding_key_for("signals"), "cityHash64(id)");
         assert_eq!(sharding_key_for("ingestion_errors"), "cityHash64(id)");
         assert_eq!(sharding_key_for("otel_spans"), "cityHash64(trace_id)");
-        assert_eq!(sharding_key_for("otel_spans_trace_id_ts"), "cityHash64(trace_id)");
+        assert_eq!(
+            sharding_key_for("otel_spans_trace_id_ts"),
+            "cityHash64(trace_id)"
+        );
         // MV-fed aggregate wrappers keep rand() (never inserted through the wrapper).
         assert_eq!(sharding_key_for("hash_prevalence_summary"), "rand()");
         assert_eq!(sharding_key_for("entity_time_range_agg"), "rand()");
@@ -1480,9 +1585,15 @@ mod tests {
         let hashed_wrapper =
             "CREATE TABLE nanosiem.logs_distributed (id UUID) ENGINE = Distributed('c', 'nanosiem', 'logs', cityHash64(id))";
         // Old rand() wrapper vs intended content hash → drift (no match).
-        assert!(!wrapper_sharding_key_matches(rand_wrapper, "cityHash64(id)"));
+        assert!(!wrapper_sharding_key_matches(
+            rand_wrapper,
+            "cityHash64(id)"
+        ));
         // Correct content-hash wrapper → match.
-        assert!(wrapper_sharding_key_matches(hashed_wrapper, "cityHash64(id)"));
+        assert!(wrapper_sharding_key_matches(
+            hashed_wrapper,
+            "cityHash64(id)"
+        ));
         // rand() wrapper with intended rand() → match (whitespace-insensitive).
         assert!(wrapper_sharding_key_matches(rand_wrapper, "rand()"));
         assert!(wrapper_sharding_key_matches(
@@ -1490,7 +1601,10 @@ mod tests {
             "cityHash64(id)"
         ));
         // Non-Distributed / unparseable → treated as drift (safe: recreate).
-        assert!(!wrapper_sharding_key_matches("CREATE TABLE x (id UUID) ENGINE = MergeTree", "rand()"));
+        assert!(!wrapper_sharding_key_matches(
+            "CREATE TABLE x (id UUID) ENGINE = MergeTree",
+            "rand()"
+        ));
     }
 
     #[test]

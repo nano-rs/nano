@@ -34,6 +34,51 @@ pub struct AssetDossier {
     pub auth: AssetAuthSummary,
     pub files: AssetFilesSummary,
     pub dns: AssetDnsSummary,
+    /// Present when the exact dossier exceeded the interactive resource
+    /// envelope and was admitted to the isolated durable query lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<crate::search::AsyncSearchResponse>,
+    /// present while a lean dossier is still being built. The
+    /// sections cover `covered_start..covered_end` so far; the client renders
+    /// them and asks again after `retry_after_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ProductViewProgress>,
+}
+
+/// how far a progressively built lean product view has got.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, Default, PartialEq, Eq)]
+pub struct ProductViewProgress {
+    /// True once every section is final; the client stops polling.
+    pub complete: bool,
+    /// Oldest event time the sections cover so far (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_start: Option<String>,
+    /// Newest event time the sections cover (the window end, RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_end: Option<String>,
+    /// Ask again after this long while `complete` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// Why the finished view covers less than the requested window, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// NAN-3271: the note prefix of a finished view whose rarity baseline lookup
+/// failed (prevalence still warming, or the lookup errored).
+pub const RARITY_UNAVAILABLE: &str = "rarity unavailable:";
+
+impl ProductViewProgress {
+    /// A finished view that may be cached: one finished without its rarity
+    /// baseline is served, but not cached, so the next request picks the
+    /// rarity up once prevalence answers.
+    pub fn cacheable(&self) -> bool {
+        self.complete
+            && !self
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains(RARITY_UNAVAILABLE))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, Default)]
@@ -237,24 +282,47 @@ impl SearchService {
         identities: &[serde_json::Value],
         time_range: &TimeRange,
         scope: &ScopeSet,
+        fresh: bool,
     ) -> Result<AssetDossier, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(AssetDossier::default());
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_asset_dossier(
+                    identifier_field,
+                    identifier_value,
+                    identities,
+                    time_range,
+                    scope,
+                    fresh,
+                )
+                .await;
+        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(AssetDossier::default()),
         };
 
-        let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
-        let (identity_clause, bind_values) =
-            match Self::build_log_identity_clause_for(
-                self.active_profile.as_ref(),
-                &ips,
-                &hostnames,
-                &users,
-            ) {
-                Some(pair) => pair,
-                None => return Ok(AssetDossier::default()),
-            };
+        let (ips, hostnames, users) = Self::collect_asset_identifiers(
+            identities,
+            identifier_field,
+            identifier_value,
+            self.active_profile.as_ref(),
+        );
+        let (identity_clause, bind_values) = match Self::build_log_identity_clause_for(
+            self.active_profile.as_ref(),
+            &ips,
+            &hostnames,
+            &users,
+        ) {
+            Some(pair) => pair,
+            None => return Ok(AssetDossier::default()),
+        };
 
         // NAN-1801: render the caller's deny-set ONCE and fold it into the
         // identity clause — every per-section query below (identity,
@@ -276,9 +344,7 @@ impl SearchService {
         let unix_start = time_range.start.timestamp() as u64;
 
         let profile = self.active_profile.as_ref();
-        let logs_table = self
-            .table_names
-            .read(Self::logs_table_key(profile));
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
 
         // Kick off all 7 queries in parallel
         let identity_fut = query_identity(
@@ -402,19 +468,17 @@ impl SearchService {
             auth,
             files,
             dns,
+            durable_job: None,
+            progress: None,
         })
     }
-
 }
 
 // ============================================================================
 // Per-section queries
 // ============================================================================
 
-fn apply_binds(
-    query: clickhouse::query::Query,
-    binds: &[String],
-) -> clickhouse::query::Query {
+fn apply_binds(query: clickhouse::query::Query, binds: &[String]) -> clickhouse::query::Query {
     let mut q = query;
     for val in binds {
         q = q.bind(val);
@@ -609,7 +673,10 @@ async fn query_timeline(
     for row in &rows {
         let lane = row.get("lane").and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
         let c = row.get("c").and_then(|v| v.as_u64()).unwrap_or(0);
-        per_lane_max.entry(lane).and_modify(|m| *m = (*m).max(c)).or_insert(c);
+        per_lane_max
+            .entry(lane)
+            .and_modify(|m| *m = (*m).max(c))
+            .or_insert(c);
     }
 
     let points: Vec<[u32; 3]> = rows
@@ -696,7 +763,10 @@ async fn query_fleet_size(
         Ok(n) if n > 0 => n as f32,
         Ok(_) => ASSUMED_FLEET_SIZE,
         Err(e) => {
-            tracing::warn!("Fleet-size query failed ({}); using fallback denominator", e);
+            tracing::warn!(
+                "Fleet-size query failed ({}); using fallback denominator",
+                e
+            );
             ASSUMED_FLEET_SIZE
         }
     }
@@ -807,7 +877,10 @@ async fn query_processes(
     };
 
     let (scalars, tops, rares) = tokio::join!(
-        fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "processes_scalar"),
+        fetch_rows(
+            apply_binds(ch.query(&scalar_sql), binds),
+            "processes_scalar"
+        ),
         fetch_rows(apply_binds(ch.query(&top_sql), binds), "processes_top"),
         fetch_rows(apply_binds(ch.query(&rare_sql), binds), "processes_rare"),
     );
@@ -906,9 +979,7 @@ async fn query_network(
         .map(|c| format!("sum({c})"))
         .unwrap_or_else(|| "toUInt64(0)".to_string());
     let new_domains_expr = match &prev_domain {
-        Some(p) => format!(
-            "uniqExactIf({dest_host}, {dest_host_present} AND {p} < 5)"
-        ),
+        Some(p) => format!("uniqExactIf({dest_host}, {dest_host_present} AND {p} < 5)"),
         None => "toUInt64(0)".to_string(),
     };
     let scalar_sql = format!(
@@ -929,8 +1000,7 @@ async fn query_network(
         .as_ref()
         .map(|c| format!("any({c})"))
         .unwrap_or_else(|| "''".to_string());
-    let top_bytes_expr =
-        format!("({bytes_in_sum}) + ({bytes_out_sum})");
+    let top_bytes_expr = format!("({bytes_in_sum}) + ({bytes_out_sum})");
     let top_prev_expr = prev_domain
         .as_ref()
         .map(|p| format!("min({p})"))
@@ -973,7 +1043,10 @@ async fn query_network(
     let (scalars, tops, countries) = tokio::join!(
         fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "network_scalar"),
         fetch_rows(apply_binds(ch.query(&top_sql), binds), "network_top"),
-        fetch_rows(apply_binds(ch.query(&country_sql), binds), "network_countries"),
+        fetch_rows(
+            apply_binds(ch.query(&country_sql), binds),
+            "network_countries"
+        ),
     );
     let (scalars, tops, countries) = (scalars?, tops?, countries?);
 

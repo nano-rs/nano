@@ -71,7 +71,13 @@ fn create_is_rejected_when_the_generated_identifier_is_taken() {
 fn every_lossy_axis_is_treated_as_taken() {
     let existing = [parser(1, "My Source")];
 
-    for candidate in ["my source", "MY SOURCE", "my_source", "My/Source", "my.source"] {
+    for candidate in [
+        "my source",
+        "MY SOURCE",
+        "my_source",
+        "My/Source",
+        "my.source",
+    ] {
         assert!(
             identity_conflict(candidate, &existing, None).is_some(),
             "expected '{candidate}' to collide with 'My Source'"
@@ -84,7 +90,11 @@ fn every_lossy_axis_is_treated_as_taken() {
 fn distinct_names_are_accepted() {
     let existing = [parser(1, "My Source"), parser(2, "Apache HTTP Server")];
 
-    for candidate in ["Okta System Log", "my-source-2", "Apache HTTP Server (OCSF)"] {
+    for candidate in [
+        "Okta System Log",
+        "my-source-2",
+        "Apache HTTP Server (OCSF)",
+    ] {
         assert!(
             identity_conflict(candidate, &existing, None).is_none(),
             "expected '{candidate}' to be accepted"

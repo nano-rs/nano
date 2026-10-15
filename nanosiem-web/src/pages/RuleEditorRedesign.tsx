@@ -18,8 +18,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, Suspense } from 'react';
 import { useNavigate, useParams, useSearchParams, useLocation } from 'react-router-dom';
-import { Loader2, ShieldPlus } from 'lucide-react';
+import { ShieldPlus } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { getAccessToken } from '@/lib/auth-token';
+import { requestCredentials } from '@/lib/request-credentials';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
@@ -90,11 +92,17 @@ import {
   type ViewMode,
 } from '@/components/rule-editor';
 import { NewRuleAiPanel } from '@/enterprise/components/rule-editor/NewRuleAiPanel';
+import { AiTuningPanel } from '@/enterprise/components/detection/AiTuningPanel';
+import { useTuningWizardListener, TUNING_WIZARD_EVENT } from '@/hooks/use-tuning-wizard-listener';
+import { useAiTuningMode, AI_TUNING_OFF_EXPLANATION } from '@/hooks/use-ai-tuning-mode';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { UpstreamMergeModal } from '@/components/repositories/UpstreamMergeModal';
 import { ruleDiffAccess } from '@/components/repositories/repository-action-policy';
 import type { AiTriageHints, CaseVisibility, GeneratedDetection, TestDetectionResult } from '@/lib/api/types';
 import type { PlaybookSelectorMode } from '@/enterprise/components/detection/editor/RulePlaybookSelector';
+
+/** Cron for a scheduled rule saved without one: every minute (NAN-3468). */
+const DEFAULT_SCHEDULE_CRON = '* * * * *';
 
 export function RuleEditorRedesign() {
   const navigate = useNavigate();
@@ -121,7 +129,8 @@ export function RuleEditorRedesign() {
   const initialTechniques = searchParams.get('mitre_techniques')?.split(',').filter(Boolean) || [];
   const initialTags = searchParams.get('tags') || '';
 
-  const { data: apiRules, loading: rulesLoading, refetch: refetchRules } = useDetections();
+  // The rail's Archived tab lists deleted (archived) rules (NAN-3816).
+  const { data: apiRules, loading: rulesLoading, refetch: refetchRules } = useDetections({ includeArchived: true });
   const { data: apiRule, loading: ruleLoading, refetch: refetchRule } = useDetection(id);
   const { data: duplicateRule } = useDetection(duplicateId || undefined);
   const { mutate: updateDetection, loading: updating } = useUpdateDetection();
@@ -176,7 +185,33 @@ export function RuleEditorRedesign() {
   // It used to default OPEN for a new rule, so an open-core operator started the
   // create flow with an invisible panel held open and no way to close it.
   const { capabilities } = useCapabilities();
+  // NAN-2361: the hosted-shared lake has no materialized-view real-time path;
+  // shared authoring accepts scheduled rules only. Default to scheduled and
+  // never offer the real-time flip there.
+  const sharedLake = user?.deployment_mode === 'enterprise_shared';
+  const defaultDetectionMode: 'realtime' | 'scheduled' = sharedLake ? 'scheduled' : 'realtime';
   const [aiPanelOpen, setAiPanelOpen] = useState(isNewMode && capabilities.melod);
+  // NAN-3208: the AI tuning wizard. The Tune action and pivt `@tune` dispatch
+  // `pivt:open-tuning-wizard`; this editor is the listener for the focused
+  // saved rule (nothing listened after NAN-484, so the wizard never opened).
+  const aiTuningAvailable = capabilities.melod && capabilities.aiTuning;
+  const tuningWizard = useTuningWizardListener(
+    !isNewMode ? id : undefined,
+    aiTuningAvailable && canEdit,
+  );
+  // NAN-3219: a tenant that turned AI tuning off gets an explanation instead
+  // of the wizard, from the Tune action and from pivt `@tune` alike (the
+  // backend refuses the tune job too).
+  const { mode: aiTuningMode } = useAiTuningMode(aiTuningAvailable);
+  const tuningOffTenantWide = aiTuningMode === 'off';
+  const tuningWizardSeq = tuningWizard.request?.seq;
+  const closeTuningWizard = tuningWizard.close;
+  useEffect(() => {
+    if (tuningWizardSeq === undefined || !tuningOffTenantWide) return;
+    toast.error('AI tuning is off', { description: AI_TUNING_OFF_EXPLANATION });
+    closeTuningWizard();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tuningWizardSeq, tuningOffTenantWide]);
   // `?merge=upstream` entry point — Rule Repositories page sends analysts
   // here when they click "Merge upstream" on a forked rule. Open the modal
   // once; after they apply or close, we leave the URL param alone (clearing
@@ -205,8 +240,13 @@ export function RuleEditorRedesign() {
       try {
         const token = getAccessToken();
         const base = import.meta.env.VITE_API_URL ?? '';
+        const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+        // NAN-2361: a same-origin fetch sends the access-token cookie by
+        // default; with the bearer as well the shared-tenant API rejects the
+        // request as carrying two credentials (401). Match the ApiClient.
         const resp = await fetch(`${base}/api/rules/${id}/versions`, {
-          headers: token ? { Authorization: `Bearer ${token}` } : {},
+          headers,
+          credentials: requestCredentials(`/api/rules/${id}/versions`, headers),
         });
         if (!resp.ok || cancelled) return;
         type ApiVersion = {
@@ -262,7 +302,7 @@ export function RuleEditorRedesign() {
           author: user?.name || '',
           severity: initialSeverity,
           mode: 'staging',
-          detection_mode: 'realtime',
+          detection_mode: defaultDetectionMode,
           tags: initialTags,
           narrative: initialNarrative,
           mitre_tactics: initialTactics.join(', '),
@@ -455,7 +495,7 @@ export function RuleEditorRedesign() {
   }, [canEdit, metadata, actualQuery]);
 
   const realtimeNudgeAvailable =
-    canEdit && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
+    canEdit && !sharedLake && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
 
   // Browser close / refresh guard — mirrors the legacy editor.
   useEffect(() => {
@@ -522,8 +562,13 @@ export function RuleEditorRedesign() {
   const buildPayload = useCallback(() => {
     const severity = (metadata.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low';
     const mode = (metadata.mode || 'staging') as 'staging' | 'live' | 'alerting';
-    const detectionMode = metadata.detection_mode === 'scheduled' ? 'scheduled' : 'real-time';
-    const schedule = metadata.schedule || (detectionMode === 'real-time' ? '*/30 * * * * *' : '');
+    const detectionMode = sharedLake || metadata.detection_mode === 'scheduled' ? 'scheduled' : 'real-time';
+    // NAN-3468: a scheduled rule with no schedule used to be saved without a
+    // cron and then never ran. Blank now means the documented default, every
+    // minute (the server applies the same default).
+    const schedule =
+      metadata.schedule?.trim() ||
+      (detectionMode === 'real-time' ? '*/30 * * * * *' : DEFAULT_SCHEDULE_CRON);
     const lookbackMinutes = metadata.lookback ? parseLookbackToMinutes(metadata.lookback) : undefined;
     const tags = metadata.tags ? metadata.tags.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
     const mitreTactics = metadata.mitre_tactics
@@ -547,6 +592,10 @@ export function RuleEditorRedesign() {
       // made it impossible to flip a spans/metrics/risk rule back to logs.
       // Rules whose YAML has no dataset key keep omitting it (unchanged).
       dataset: metadata.dataset || undefined,
+      // Lean audit #2: hosted-shared rules run against one bound ingest
+      // source. Send the picked one; omitted, the server binds the query's
+      // unambiguous source when the rule goes live.
+      ...(sharedLake && metadata.source?.trim() ? { source_slug: metadata.source.trim() } : {}),
       // NAN-1825: mirror the backend feedback-loop guard (NAN-1805). A
       // dataset=risk rule's findings feed the risk dataset itself, so it must
       // not contribute risk: the server requires risk_score EXPLICITLY 0
@@ -581,6 +630,7 @@ export function RuleEditorRedesign() {
   }, [
     metadata,
     actualQuery,
+    sharedLake,
     playbookMode,
     playbookPickId,
     triageHints,
@@ -768,8 +818,8 @@ export function RuleEditorRedesign() {
       toast.success(`Promoted to ${updated.mode}`);
       refetchRules();
       refetchRule();
-    } catch {
-      toast.error('Failed to promote rule');
+    } catch (e: unknown) {
+      toast.error('Failed to promote rule', { description: e instanceof Error ? e.message : undefined });
     }
   }, [id, apiRule, promoteDetection, refetchRules, refetchRule]);
 
@@ -780,20 +830,22 @@ export function RuleEditorRedesign() {
       toast.success(`Demoted to ${updated.mode}`);
       refetchRules();
       refetchRule();
-    } catch {
-      toast.error('Failed to demote rule');
+    } catch (e: unknown) {
+      toast.error('Failed to demote rule', { description: e instanceof Error ? e.message : undefined });
     }
   }, [id, apiRule, demoteDetection, refetchRules, refetchRule]);
 
   const handleOpenTune = useCallback(() => {
-    // Route through the PIVT ambient assistant (NAN-407). The PIVT panel
-    // listens globally for `pivt:open-tuning-wizard` and drives the
-    // meloD tuning flow independently of any editor mount.
-    window.dispatchEvent(new CustomEvent('pivt:open-tuning-wizard', { detail: { ruleId: id } }));
-    toast.message('AI tuning opened in PIVT', {
-      description: 'Press ⌘. to focus the PIVT panel if it collapsed.',
-    });
-  }, [id]);
+    if (!aiTuningAvailable) {
+      toast.error('AI tuning is not available', {
+        description: 'This workspace has no AI provider or AI tuning entitlement.',
+      });
+      return;
+    }
+    // Same event pivt `@tune` fires; `useTuningWizardListener` opens the
+    // wizard for this rule (NAN-3208).
+    window.dispatchEvent(new CustomEvent(TUNING_WIZARD_EVENT, { detail: { ruleId: id } }));
+  }, [id, aiTuningAvailable]);
 
   // Rail row actions — act on any rule in the list, not just the focused one.
   // Each short-circuits into the same mutation hooks the topbar uses.
@@ -826,8 +878,8 @@ export function RuleEditorRedesign() {
           toast.success(`Promoted to ${updated.mode}`);
           refetchRules();
           if (ruleId === id) refetchRule();
-        } catch {
-          toast.error('Failed to promote rule');
+        } catch (e: unknown) {
+          toast.error('Failed to promote rule', { description: e instanceof Error ? e.message : undefined });
         }
       },
       onDemote: async (ruleId: string) => {
@@ -836,8 +888,8 @@ export function RuleEditorRedesign() {
           toast.success(`Demoted to ${updated.mode}`);
           refetchRules();
           if (ruleId === id) refetchRule();
-        } catch {
-          toast.error('Failed to demote rule');
+        } catch (e: unknown) {
+          toast.error('Failed to demote rule', { description: e instanceof Error ? e.message : undefined });
         }
       },
       onArchive: async (ruleId: string) => {
@@ -863,7 +915,7 @@ export function RuleEditorRedesign() {
       onDelete: async (ruleId: string) => {
         const rule = findRule(ruleId);
         const name = rule?.name || 'this rule';
-        if (!window.confirm(`Delete ${name}? This can't be undone.`)) return;
+        if (!window.confirm(`Delete ${name}? It stops running and moves to Archived; its matches and alerts are kept.`)) return;
         try {
           await deleteDetection(ruleId);
           toast.success('Rule deleted');
@@ -967,7 +1019,7 @@ export function RuleEditorRedesign() {
   if (ruleLoading && !isNewMode && id) {
     return (
       <div className="h-full flex items-center justify-center">
-        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-8 h-8 text-muted-foreground" />
       </div>
     );
   }
@@ -1073,7 +1125,7 @@ export function RuleEditorRedesign() {
           onDemote={!isNewMode && id && canEdit ? handleDemote : undefined}
           onArchive={!isNewMode && id && canEdit ? () => setShowArchiveConfirm(true) : undefined}
           onUnarchive={!isNewMode && id && canEdit && apiRule?.archived ? handleUnarchive : undefined}
-          onDelete={!isNewMode && id && canEdit ? () => setShowDeleteConfirm(true) : undefined}
+          onDelete={!isNewMode && id && canEdit && !apiRule?.archived ? () => setShowDeleteConfirm(true) : undefined}
           onOpenTune={!isNewMode && id && canEdit ? handleOpenTune : undefined}
           enabledLenses={new Set<ViewMode>(['code', 'flow', 'form'])}
           availableFolders={availableFolders}
@@ -1183,6 +1235,28 @@ export function RuleEditorRedesign() {
         onPendingVersionConsumed={() => setPendingVersionFocusId(null)}
       />
 
+      {/* Mounted only while open: the panel fetches the rule's alerts and
+          matches on mount, which an idle editor must not pay for. */}
+      {!isNewMode && id && aiTuningAvailable && !tuningOffTenantWide && tuningWizard.request !== null && (
+        <AiTuningPanel
+          key={tuningWizard.request.seq}
+          open
+          onOpenChange={(next) => {
+            if (!next) tuningWizard.close();
+          }}
+          ruleId={id}
+          ruleName={apiRule?.name ?? metadata.title ?? ''}
+          initialFeedback={tuningWizard.request?.prompt}
+          onApplySuggestion={(modifiedQuery) => {
+            // Lands in the editor as an unsaved edit: the analyst reviews and
+            // saves, which writes the rule version + audit like any edit.
+            setEditorContent((prev) =>
+              serializeDetectionMetadata(parseDetectionMetadata(prev).metadata, modifiedQuery),
+            );
+          }}
+        />
+      )}
+
       {isNewMode && aiPanelOpen && capabilities.melod && (
         <NewRuleAiPanel
           initialNarrative={initialNarrative}
@@ -1196,7 +1270,7 @@ export function RuleEditorRedesign() {
                 author: user?.name || '',
                 severity: (det.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low',
                 mode: 'staging',
-                detection_mode: 'realtime',
+                detection_mode: defaultDetectionMode,
                 tags: det.tags?.join(', '),
                 mitre_tactics: det.mitre_tactics?.join(', '),
                 mitre_techniques: det.mitre_techniques?.join(', '),
@@ -1216,7 +1290,7 @@ export function RuleEditorRedesign() {
                   query: det.query,
                   severity: (det.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low',
                   mode: 'staging',
-                  detection_mode: 'real-time',
+                  detection_mode: sharedLake ? 'scheduled' : 'real-time',
                   author: user?.name,
                   tags: det.tags,
                   mitre_tactics: det.mitre_tactics,

@@ -15,14 +15,12 @@
 use chrono::{DateTime, Duration, Utc};
 use clickhouse::Client as ClickHouseClient;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row as SqlxRow};
 use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{
-    derive_finding_source_manifest, AlertPattern, FindingProvenance, RuleMetrics,
-};
+use super::{derive_finding_source_manifest, AlertPattern, FindingProvenance, RuleMetrics};
 use crate::auth::{Provenanced, SourceProvenance, UNRESOLVED_SOURCE_SENTINEL};
 use crate::db::TableNames;
 
@@ -126,14 +124,27 @@ struct FindingAggregateRow {
     unattributed_count: u64,
 }
 
+#[derive(Clone)]
+enum FindingStore {
+    ClickHouse {
+        client: ClickHouseClient,
+        table_names: TableNames,
+    },
+    /// Canonical lake findings are durably inserted here before asynchronous
+    /// Iceberg/risk publication. Reading this bounded eight-day handoff gives
+    /// seven-day tuning an immediate, indexed and replay-safe source without
+    /// scanning object storage. Fully acknowledged rows are then reaped.
+    LakeOutbox { tenant_id: String },
+}
+
 /// Metrics collector service.
 ///
-/// Uses PostgreSQL for the rule registry / metrics-storage tables and
-/// ClickHouse for the finding count / sample queries.
+/// PostgreSQL owns the rule registry and metric snapshots. Legacy deployments
+/// read finding inputs from ClickHouse; canonical lake deployments read the
+/// durable, tenant-pinned finding outbox.
 pub struct MetricsCollector {
     pg_pool: PgPool,
-    ch_client: ClickHouseClient,
-    table_names: TableNames,
+    finding_store: FindingStore,
 }
 
 impl MetricsCollector {
@@ -146,8 +157,20 @@ impl MetricsCollector {
     pub fn new(pg_pool: PgPool, ch_client: ClickHouseClient, table_names: TableNames) -> Self {
         Self {
             pg_pool,
-            ch_client,
-            table_names,
+            finding_store: FindingStore::ClickHouse {
+                client: ch_client,
+                table_names,
+            },
+        }
+    }
+
+    /// Create a collector for the canonical lake finding ledger.
+    pub fn new_lake(pg_pool: PgPool, tenant_id: impl Into<String>) -> Self {
+        Self {
+            pg_pool,
+            finding_store: FindingStore::LakeOutbox {
+                tenant_id: tenant_id.into(),
+            },
         }
     }
 
@@ -227,10 +250,11 @@ impl MetricsCollector {
                     matched_events: &finding.matched_events,
                 })
                 .collect();
-            let (sample_sources, sample_complete) =
-                derive_finding_source_manifest(&sample_inputs);
-            provenance =
-                provenance.merge(&SourceProvenance::from_parts(sample_sources, sample_complete));
+            let (sample_sources, sample_complete) = derive_finding_source_manifest(&sample_inputs);
+            provenance = provenance.merge(&SourceProvenance::from_parts(
+                sample_sources,
+                sample_complete,
+            ));
         }
 
         Ok(Provenanced::new(metrics, provenance))
@@ -243,6 +267,10 @@ impl MetricsCollector {
         rule_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<FindingAggregateRow, MetricsCollectorError> {
+        if let FindingStore::LakeOutbox { tenant_id } = &self.finding_store {
+            return self.aggregate_lake_findings(tenant_id, rule_id, now).await;
+        }
+
         // SAFETY: the only value interpolated into `sql` via `format!` is the
         // table name returned by `TableNames::read`, which is a hard-coded
         // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
@@ -253,7 +281,14 @@ impl MetricsCollector {
         // the spill is now the stored `unmapped` column (the full `event` is
         // EPHEMERAL), so read it directly. UDM stays byte-identical (`rule_id`).
         let is_ocsf = active_profile_is_ocsf();
-        let table = self.table_names.read(crate::schema::active_logs_table());
+        let FindingStore::ClickHouse {
+            client,
+            table_names,
+        } = &self.finding_store
+        else {
+            unreachable!("lake finding store returned above")
+        };
+        let table = table_names.read(crate::schema::active_logs_table());
         let (metadata_expr, rule_id_col) = if is_ocsf {
             (
                 "toString(unmapped)",
@@ -283,7 +318,7 @@ impl MetricsCollector {
                AND timestamp <= fromUnixTimestamp64Micro(?)"
         );
 
-        self.ch_client
+        client
             .query(&sql)
             .bind(cutoff_1h.timestamp_micros())
             .bind(cutoff_24h.timestamp_micros())
@@ -293,6 +328,83 @@ impl MetricsCollector {
             .fetch_one()
             .await
             .map_err(Into::into)
+    }
+
+    async fn aggregate_lake_findings(
+        &self,
+        tenant_id: &str,
+        rule_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<FindingAggregateRow, MetricsCollectorError> {
+        let cutoff_1h = (now - Duration::hours(1)).timestamp_micros();
+        let cutoff_24h = (now - Duration::hours(24)).timestamp_micros();
+        let cutoff_7d = (now - Duration::days(7)).timestamp_micros();
+        let now_us = now.timestamp_micros();
+
+        // Counts and the complete source manifest come from one PostgreSQL
+        // statement, so the stored tuning snapshot cannot combine two finding
+        // populations. The writer owns compact_finding and guarantees the
+        // numeric timestamp/rule-id shape indexed by migration 299.
+        let row = sqlx::query(
+            r#"
+            WITH findings AS (
+                SELECT
+                    (compact_finding ->> 'timestamp_us')::bigint AS timestamp_us,
+                    CASE
+                        WHEN jsonb_typeof(compact_finding -> 'origin_source_types') = 'array'
+                        THEN compact_finding -> 'origin_source_types'
+                        ELSE '[]'::jsonb
+                    END AS origins
+                FROM detection_finding_lake_outbox
+                WHERE tenant_id = $1
+                  AND compact_finding ->> 'rule_id' = $2
+                  AND (compact_finding ->> 'timestamp_us')::bigint >= $3
+                  AND (compact_finding ->> 'timestamp_us')::bigint <= $4
+            )
+            SELECT
+                count(*) FILTER (WHERE timestamp_us >= $5)::bigint AS finding_count_1h,
+                count(*) FILTER (WHERE timestamp_us >= $6)::bigint AS finding_count_24h,
+                count(*)::bigint AS finding_count_7d,
+                COALESCE(
+                    ARRAY(
+                        SELECT DISTINCT lower(trim(origin.value))
+                        FROM findings AS source_finding
+                        CROSS JOIN LATERAL jsonb_array_elements_text(source_finding.origins)
+                            AS origin(value)
+                        WHERE trim(origin.value) <> ''
+                        ORDER BY 1
+                    ),
+                    ARRAY[]::text[]
+                ) AS origin_source_types,
+                count(*) FILTER (
+                    WHERE jsonb_array_length(origins) = 0
+                       OR EXISTS (
+                           SELECT 1
+                           FROM jsonb_array_elements_text(origins) AS origin(value)
+                           WHERE trim(origin.value) = ''
+                              OR lower(trim(origin.value)) = $7
+                       )
+                )::bigint AS unattributed_count
+            FROM findings
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(rule_id.to_string())
+        .bind(cutoff_7d)
+        .bind(now_us)
+        .bind(cutoff_1h)
+        .bind(cutoff_24h)
+        .bind(UNRESOLVED_SOURCE_SENTINEL)
+        .fetch_one(&self.pg_pool)
+        .await?;
+
+        Ok(FindingAggregateRow {
+            finding_count_1h: row.try_get::<i64, _>("finding_count_1h")?.max(0) as u64,
+            finding_count_24h: row.try_get::<i64, _>("finding_count_24h")?.max(0) as u64,
+            finding_count_7d: row.try_get::<i64, _>("finding_count_7d")?.max(0) as u64,
+            origin_source_types: row.try_get("origin_source_types")?,
+            unattributed_count: row.try_get::<i64, _>("unattributed_count")?.max(0) as u64,
+        })
     }
 
     /// Get recent findings for a detection rule from ClickHouse.
@@ -316,6 +428,12 @@ impl MetricsCollector {
         duration: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<Finding>, MetricsCollectorError> {
+        if let FindingStore::LakeOutbox { tenant_id } = &self.finding_store {
+            return self
+                .get_recent_lake_findings(tenant_id, rule_id, duration, now)
+                .await;
+        }
+
         let cutoff = now - duration;
         // SAFETY: the only value interpolated into `sql` via `format!` is the
         // table name returned by `TableNames::read`, which is a hard-coded
@@ -329,7 +447,14 @@ impl MetricsCollector {
         // JSON string, which the parsing below reads `.matched_events_sample`
         // from unchanged. `severity` is materialized. UDM stays byte-identical.
         let is_ocsf = active_profile_is_ocsf();
-        let table = self.table_names.read(crate::schema::active_logs_table());
+        let FindingStore::ClickHouse {
+            client,
+            table_names,
+        } = &self.finding_store
+        else {
+            unreachable!("lake finding store returned above")
+        };
+        let table = table_names.read(crate::schema::active_logs_table());
         let (meta_col, rule_id_col) = if is_ocsf {
             (
                 "toString(unmapped)",
@@ -349,8 +474,7 @@ impl MetricsCollector {
              LIMIT 1000"
         );
 
-        let rows: Vec<FindingRow> = self
-            .ch_client
+        let rows: Vec<FindingRow> = client
             .query(&sql)
             .bind(rule_id.to_string())
             .bind(cutoff.timestamp_micros())
@@ -416,6 +540,74 @@ impl MetricsCollector {
         Ok(findings)
     }
 
+    async fn get_recent_lake_findings(
+        &self,
+        tenant_id: &str,
+        rule_id: Uuid,
+        duration: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Finding>, MetricsCollectorError> {
+        let cutoff = (now - duration).timestamp_micros();
+        // NAN-3492: stream the rows. `fetch_all` held up to 1000 raw
+        // `ocsf_event` documents (each carrying its matched events) and their
+        // decoded trees at once, a ~100 MiB step in nano-jobs every tick
+        // for a noisy rule; each row is now decoded and dropped in turn.
+        let mut rows = sqlx::query(
+            r#"
+            SELECT compact_finding, ocsf_event
+            FROM detection_finding_lake_outbox
+            WHERE tenant_id = $1
+              AND compact_finding ->> 'rule_id' = $2
+              AND (compact_finding ->> 'timestamp_us')::bigint >= $3
+              AND (compact_finding ->> 'timestamp_us')::bigint <= $4
+            ORDER BY (compact_finding ->> 'timestamp_us')::bigint DESC
+            LIMIT 1000
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(rule_id.to_string())
+        .bind(cutoff)
+        .bind(now.timestamp_micros())
+        .fetch(&self.pg_pool);
+
+        let mut findings = Vec::new();
+        while let Some(row) = futures::TryStreamExt::try_next(&mut rows).await? {
+            findings.push({
+                let compact: serde_json::Value = row.try_get("compact_finding")?;
+                let event: serde_json::Value = row.try_get("ocsf_event")?;
+                let timestamp_us = compact
+                    .get("timestamp_us")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or_default();
+                let matched_events = lake_finding_matched_events(&event);
+                let origin_source_types = compact
+                    .get("origin_source_types")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|origins| {
+                        origins
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    });
+
+                Finding {
+                    rule_id,
+                    severity: compact
+                        .get("severity")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    matched_events: serde_json::Value::Array(matched_events),
+                    timestamp: DateTime::<Utc>::from_timestamp_micros(timestamp_us)
+                        .unwrap_or_default(),
+                    origin_source_types,
+                }
+            });
+        }
+        Ok(findings)
+    }
+
     /// Identify common patterns in finding field values.
     ///
     /// Analyzes matched events from recent findings to find frequently
@@ -425,7 +617,9 @@ impl MetricsCollector {
         rule_id: Uuid,
     ) -> Result<Vec<AlertPattern>, MetricsCollectorError> {
         // Get recent findings (last 24 hours)
-        let recent_findings = self.get_recent_findings(rule_id, Duration::hours(24)).await?;
+        let recent_findings = self
+            .get_recent_findings(rule_id, Duration::hours(24))
+            .await?;
 
         if recent_findings.is_empty() {
             return Ok(Vec::new());
@@ -470,10 +664,10 @@ impl MetricsCollector {
         Ok(patterns)
     }
 
-    /// Extract unique entity counts from findings.
+    /// Extract unique entity counts from canonical OCSF finding samples.
     ///
-    /// Reads UDM fields from the finding's `matched_events_sample` payload:
-    /// `src_user`, `dest_user`, `src_host`, `dest_host`, `src_ip`, `dest_ip`.
+    /// Legacy aliases remain readable for the security-maintenance branch, but
+    /// new tuning snapshots use OCSF paths exclusively.
     fn extract_unique_entities(&self, findings: &[Finding]) -> (i64, i64, i64) {
         let mut unique_users = std::collections::HashSet::new();
         let mut unique_hosts = std::collections::HashSet::new();
@@ -483,27 +677,43 @@ impl MetricsCollector {
             if let Some(events) = finding.matched_events.as_array() {
                 for event in events {
                     if let Some(obj) = event.as_object() {
-                        // Extract user information (UDM fields)
-                        for field in &["src_user", "dest_user"] {
-                            if let Some(user) = obj.get(*field).and_then(|v| v.as_str()) {
+                        for field in &[
+                            "actor.user.name",
+                            "actor.user.uid",
+                            "user.name",
+                            "user.uid",
+                            "src_user",
+                            "dest_user",
+                        ] {
+                            if let Some(user) = Self::nested_string(obj, field) {
                                 if !user.is_empty() {
                                     unique_users.insert(user.to_string());
                                 }
                             }
                         }
 
-                        // Extract host information (UDM fields)
-                        for field in &["src_host", "dest_host"] {
-                            if let Some(host) = obj.get(*field).and_then(|v| v.as_str()) {
+                        for field in &[
+                            "device.hostname",
+                            "src_endpoint.hostname",
+                            "dst_endpoint.hostname",
+                            "src_host",
+                            "dest_host",
+                        ] {
+                            if let Some(host) = Self::nested_string(obj, field) {
                                 if !host.is_empty() {
                                     unique_hosts.insert(host.to_string());
                                 }
                             }
                         }
 
-                        // Extract IP information (UDM fields)
-                        for field in &["src_ip", "dest_ip"] {
-                            if let Some(ip) = obj.get(*field).and_then(|v| v.as_str()) {
+                        for field in &[
+                            "src_endpoint.ip",
+                            "dst_endpoint.ip",
+                            "device.ip",
+                            "src_ip",
+                            "dest_ip",
+                        ] {
+                            if let Some(ip) = Self::nested_string(obj, field) {
                                 if !ip.is_empty() {
                                     unique_ips.insert(ip.to_string());
                                 }
@@ -542,37 +752,63 @@ impl MetricsCollector {
         severity_sum as f64 / findings.len() as f64
     }
 
-    /// Extract field patterns from an event object.
-    ///
-    /// Uses UDM field names from the finding's `matched_events_sample`:
-    /// `src_ip`, `dest_ip`, `src_host`, `dest_host`, `src_user`, `dest_user`,
-    /// `source_type`, `risk_entity`, plus metadata object keys.
+    fn nested_value<'a>(
+        obj: &'a serde_json::Map<String, serde_json::Value>,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        let mut parts = path.split('.');
+        let first = parts.next()?;
+        let mut current = obj.get(first)?;
+        for part in parts {
+            current = current.as_object()?.get(part)?;
+        }
+        Some(current)
+    }
+
+    fn nested_string<'a>(
+        obj: &'a serde_json::Map<String, serde_json::Value>,
+        path: &str,
+    ) -> Option<&'a str> {
+        Self::nested_value(obj, path)?.as_str()
+    }
+
+    /// Extract common canonical OCSF field patterns from an event sample.
     fn extract_field_patterns(
         &self,
         obj: &serde_json::Map<String, serde_json::Value>,
         field_value_counts: &mut HashMap<(String, String), i64>,
     ) {
-        // UDM fields present in matched_events_sample
+        // Canonical OCSF fields first. Legacy aliases at the end keep existing
+        // security-maintenance tenants readable without making them part of
+        // the forward storage contract.
         let tracked_fields = [
+            "metadata.log_source",
+            "actor.user.name",
+            "actor.user.uid",
+            "actor.process.name",
+            "actor.process.cmd_line",
+            "device.hostname",
+            "src_endpoint.ip",
+            "src_endpoint.hostname",
+            "src_endpoint.port",
+            "dst_endpoint.ip",
+            "dst_endpoint.hostname",
+            "dst_endpoint.port",
+            "connection_info.protocol_name",
+            "process.name",
+            "process.cmd_line",
+            "file.name",
+            "file.path",
             "src_ip",
             "dest_ip",
             "src_host",
             "dest_host",
             "src_user",
             "dest_user",
-            "source_type",
-            "risk_entity",
-            "src_port",
-            "dest_port",
-            "protocol",
-            "process_name",
-            "command_line",
-            "file_path",
-            "file_hash",
         ];
 
         for field in tracked_fields {
-            if let Some(value) = obj.get(field) {
+            if let Some(value) = Self::nested_value(obj, field) {
                 let value_str = match value {
                     serde_json::Value::String(s) => s.clone(),
                     serde_json::Value::Number(n) => n.to_string(),
@@ -582,24 +818,6 @@ impl MetricsCollector {
 
                 if !value_str.is_empty() {
                     let key = (field.to_string(), value_str);
-                    *field_value_counts.entry(key).or_insert(0) += 1;
-                }
-            }
-        }
-
-        // Also iterate over the metadata object for additional fields
-        if let Some(metadata) = obj.get("metadata").and_then(|v| v.as_object()) {
-            for (key, value) in metadata {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    _ => continue,
-                };
-
-                if !value_str.is_empty() {
-                    let field_name = format!("metadata.{}", key);
-                    let key = (field_name, value_str);
                     *field_value_counts.entry(key).or_insert(0) += 1;
                 }
             }
@@ -684,9 +902,67 @@ impl MetricsCollector {
     }
 }
 
+/// The matched events a lake finding's OCSF event carries (NAN-3224).
+///
+/// New findings keep each matched event as a JSON string in
+/// `evidences[].data`; rows with no OCSF evidence attribute (and every
+/// finding written before NAN-3224) keep `unmapped.matched_events_sample`,
+/// whose elements are JSON strings (or objects on the oldest rows). Both are
+/// read, evidence first, so a finding outbox holding both shapes during a
+/// roll serves tuning the same events either way.
+pub fn lake_finding_matched_events(event: &serde_json::Value) -> Vec<serde_json::Value> {
+    let decode = |sample: &serde_json::Value| match sample {
+        serde_json::Value::String(encoded) => serde_json::from_str(encoded).ok(),
+        value if value.is_object() => Some(value.clone()),
+        _ => None,
+    };
+    let evidence = event
+        .get("evidences")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|evidence| evidence.get("data"))
+        .filter_map(decode);
+    let legacy = event
+        .pointer("/unmapped/matched_events_sample")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(decode);
+    evidence.chain(legacy).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-3224: tuning reads matched events from new (`evidences[].data`)
+    /// and old (`unmapped.matched_events_sample`) lake findings alike.
+    #[test]
+    fn lake_finding_matched_events_reads_new_and_old_shapes() {
+        let event = serde_json::json!({"src_ip": "10.0.0.1", "metadata": {"uid": "e1"}});
+        let aggregate = serde_json::json!({"count": 3});
+        let new_shape = serde_json::json!({
+            "evidences": [{"src_endpoint": {"ip": "10.0.0.1"}, "data": event.to_string()},
+                          {"device": {"hostname": "h"}}],
+            "unmapped": {"matched_events_sample": [aggregate.to_string()]},
+        });
+        assert_eq!(lake_finding_matched_events(&new_shape), vec![event.clone(), aggregate]);
+        let old_strings = serde_json::json!({"unmapped": {"matched_events_sample": [event.to_string()]}});
+        assert_eq!(lake_finding_matched_events(&old_strings), vec![event.clone()]);
+        let old_objects = serde_json::json!({"unmapped": {"matched_events_sample": [event.clone(), 7]}});
+        assert_eq!(lake_finding_matched_events(&old_objects), vec![event]);
+        assert!(lake_finding_matched_events(&serde_json::json!({})).is_empty());
+    }
+
+    fn collector() -> MetricsCollector {
+        MetricsCollector::new_lake(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://localhost/nanosiem")
+                .expect("valid test URL"),
+            "tenant-test",
+        )
+    }
 
     fn make_finding(severity: &str, matched_events: serde_json::Value) -> Finding {
         Finding {
@@ -722,16 +998,16 @@ mod tests {
         assert_eq!(avg, 4.0); // (5 + 4 + 3) / 3 = 4.0
     }
 
-    #[test]
-    fn test_extract_unique_entities() {
+    #[tokio::test]
+    async fn test_extract_unique_entities() {
         let findings = vec![
             make_finding(
                 "high",
                 serde_json::json!([
                     {
-                        "src_user": "alice",
-                        "src_host": "server1",
-                        "src_ip": "192.168.1.1"
+                        "actor": {"user": {"name": "alice"}},
+                        "device": {"hostname": "server1"},
+                        "src_endpoint": {"ip": "192.168.1.1"}
                     }
                 ]),
             ),
@@ -739,9 +1015,9 @@ mod tests {
                 "high",
                 serde_json::json!([
                     {
-                        "src_user": "alice",
-                        "dest_host": "server2",
-                        "src_ip": "192.168.1.1"
+                        "actor": {"user": {"name": "alice"}},
+                        "dst_endpoint": {"hostname": "server2"},
+                        "src_endpoint": {"ip": "192.168.1.1"}
                     }
                 ]),
             ),
@@ -749,114 +1025,52 @@ mod tests {
                 "high",
                 serde_json::json!([
                     {
-                        "dest_user": "bob",
-                        "src_host": "server1",
-                        "dest_ip": "192.168.1.2"
+                        "user": {"name": "bob"},
+                        "src_endpoint": {"hostname": "server1"},
+                        "dst_endpoint": {"ip": "192.168.1.2"}
                     }
                 ]),
             ),
         ];
 
-        // Test entity extraction directly using UDM field names
-        let mut unique_users = std::collections::HashSet::new();
-        let mut unique_hosts = std::collections::HashSet::new();
-        let mut unique_ips = std::collections::HashSet::new();
-
-        for finding in &findings {
-            if let Some(events) = finding.matched_events.as_array() {
-                for event in events {
-                    if let Some(obj) = event.as_object() {
-                        for field in &["src_user", "dest_user"] {
-                            if let Some(user) = obj.get(*field).and_then(|v| v.as_str()) {
-                                if !user.is_empty() {
-                                    unique_users.insert(user.to_string());
-                                }
-                            }
-                        }
-                        for field in &["src_host", "dest_host"] {
-                            if let Some(host) = obj.get(*field).and_then(|v| v.as_str()) {
-                                if !host.is_empty() {
-                                    unique_hosts.insert(host.to_string());
-                                }
-                            }
-                        }
-                        for field in &["src_ip", "dest_ip"] {
-                            if let Some(ip) = obj.get(*field).and_then(|v| v.as_str()) {
-                                if !ip.is_empty() {
-                                    unique_ips.insert(ip.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        assert_eq!(unique_users.len(), 2); // alice, bob
-        assert_eq!(unique_hosts.len(), 2); // server1, server2
-        assert_eq!(unique_ips.len(), 2); // 192.168.1.1, 192.168.1.2
+        assert_eq!(collector().extract_unique_entities(&findings), (2, 2, 2));
     }
 
-    #[test]
-    fn test_extract_field_patterns() {
+    #[tokio::test]
+    async fn test_extract_field_patterns() {
         let mut field_value_counts = HashMap::new();
-        let mut obj = serde_json::Map::new();
-        obj.insert("process_name".to_string(), serde_json::json!("chrome.exe"));
-        obj.insert("src_user".to_string(), serde_json::json!("alice"));
-        obj.insert("src_host".to_string(), serde_json::json!("workstation1"));
-        obj.insert(
-            "metadata".to_string(),
-            serde_json::json!({"rule_name": "test_rule"}),
-        );
+        let event = serde_json::json!({
+            "metadata": {"log_source": "windows_sysmon"},
+            "actor": {
+                "user": {"name": "alice"},
+                "process": {"name": "powershell.exe", "cmd_line": "powershell -enc AAA"}
+            },
+            "device": {"hostname": "workstation1"}
+        });
+        collector()
+            .extract_field_patterns(event.as_object().expect("object"), &mut field_value_counts);
 
-        // Test pattern extraction directly using UDM field names
-        let tracked_fields = ["process_name", "src_user", "src_host"];
-
-        for field in tracked_fields {
-            if let Some(value) = obj.get(field) {
-                let value_str = match value {
-                    serde_json::Value::String(s) => s.clone(),
-                    serde_json::Value::Number(n) => n.to_string(),
-                    serde_json::Value::Bool(b) => b.to_string(),
-                    _ => continue,
-                };
-
-                if !value_str.is_empty() {
-                    let key = (field.to_string(), value_str);
-                    *field_value_counts.entry(key).or_insert(0) += 1;
-                }
-            }
-        }
-
-        // Also extract metadata fields
-        if let Some(metadata) = obj.get("metadata").and_then(|v| v.as_object()) {
-            for (key, value) in metadata {
-                if let Some(s) = value.as_str() {
-                    if !s.is_empty() {
-                        let field_name = format!("metadata.{}", key);
-                        *field_value_counts
-                            .entry((field_name, s.to_string()))
-                            .or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-
-        assert_eq!(field_value_counts.len(), 4); // 3 UDM fields + 1 metadata field
+        assert_eq!(field_value_counts.len(), 5);
         assert_eq!(
-            field_value_counts.get(&("process_name".to_string(), "chrome.exe".to_string())),
+            field_value_counts.get(&(
+                "actor.process.name".to_string(),
+                "powershell.exe".to_string()
+            )),
             Some(&1)
         );
         assert_eq!(
-            field_value_counts.get(&("src_user".to_string(), "alice".to_string())),
+            field_value_counts.get(&("actor.user.name".to_string(), "alice".to_string())),
             Some(&1)
         );
         assert_eq!(
-            field_value_counts.get(&("src_host".to_string(), "workstation1".to_string())),
+            field_value_counts.get(&("device.hostname".to_string(), "workstation1".to_string())),
             Some(&1)
         );
         assert_eq!(
-            field_value_counts.get(&("metadata.rule_name".to_string(), "test_rule".to_string())),
+            field_value_counts.get(&(
+                "metadata.log_source".to_string(),
+                "windows_sysmon".to_string()
+            )),
             Some(&1)
         );
     }

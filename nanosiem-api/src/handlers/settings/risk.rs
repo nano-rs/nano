@@ -7,7 +7,7 @@
 //!   (`nanosiem_core::detection::risk::ScoreCalculator`).
 //! - Risk **decay TTL** (`/api/settings/risk-decay`) is enterprise-only —
 //!   the decay factors are read by `RiskAnalyticsService` time-windowed
-//!   queries, which live in `nanosiem-enterprise::risk`.
+//!   queries, which live in `enterprise::risk`.
 //! - Risk **notables** (`/api/settings/risk-notables`, NAN-1792) are
 //!   enterprise-only. Since NAN-1805 the bespoke `RiskNotableScheduler` is
 //!   retired and notables run as the seeded DEFAULT DETECTION RULE over
@@ -303,7 +303,7 @@ pub async fn update_risk_decay_config(
 ///
 /// GET /api/settings/risk-notables
 ///
-/// Returns the risk-notable settings (NAN-1792/NAN-1805): the 24h/7d
+/// Returns the risk-notable settings: the 24h/7d
 /// decayed-score thresholds and per-entity-type overrides (stored on
 /// `system_settings`, from which the default rule's query is generated), plus
 /// the live state of the seeded default `dataset=risk` detection rule —
@@ -368,7 +368,7 @@ pub async fn get_risk_notable_config(
 /// PUT /api/settings/risk-notables
 ///
 /// Updates the risk-notable settings AND syncs the seeded default
-/// `dataset=risk` detection rule (NAN-1805): thresholds + per-type overrides
+/// `dataset=risk` detection rule: thresholds + per-type overrides
 /// regenerate the rule's query, `cooldown_minutes` writes its
 /// `alert_cooldown_minutes`, and `enabled` maps to Alerting (true) vs Live
 /// (false) mode — the same explicit operator action that previously flipped

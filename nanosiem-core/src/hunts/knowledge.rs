@@ -131,7 +131,7 @@ pub const MAX_TTL_DAYS: i64 = 90;
 ///
 /// `fact_digest` is GENERATED, so it is read and never written — the database
 /// owns fact identity. See the migration for why that matters to revocation.
-const KNOWLEDGE_SELECT: &str = "SELECT k.id, k.category, k.subject, k.fact, k.fact_digest, \
+pub const KNOWLEDGE_SELECT: &str = "SELECT k.id, k.category, k.subject, k.fact, k.fact_digest, \
      k.confidence::float8 AS confidence, k.learned_by_sweep_id, k.confirmed_by_sweep_id, \
      k.evidence_event_ids, k.observation_count, k.relearn_attempts, k.last_relearn_attempt_at, \
      k.learned_at, k.confirmed_at, k.expires_at, k.revoked_at, k.revoked_by, k.revoke_reason, \
@@ -348,10 +348,7 @@ pub fn normalize_category(raw: &str) -> Result<String, HuntError> {
     // than a rejection. Everything else outside the charset is REJECTED, not
     // stripped: silently deleting characters would map two distinct categories
     // onto one identity.
-    let normalized: String = lowered
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("_");
+    let normalized: String = lowered.split_whitespace().collect::<Vec<_>>().join("_");
     if normalized.chars().count() > MAX_CATEGORY_CHARS {
         return Err(HuntError::Validation(format!(
             "category is longer than {MAX_CATEGORY_CHARS} characters"
@@ -490,7 +487,9 @@ pub(crate) fn build_category_counts_sql(
     query: &ListKnowledgeQuery,
     scope: &ArtifactScope,
 ) -> (String, bool) {
-    let mut sql = String::from("SELECT k.category, COUNT(*)::bigint AS count FROM hunt_knowledge k WHERE 1 = 1");
+    let mut sql = String::from(
+        "SELECT k.category, COUNT(*)::bigint AS count FROM hunt_knowledge k WHERE 1 = 1",
+    );
     let mut param = 1usize;
     if !query.include_revoked {
         sql.push_str(" AND k.revoked_at IS NULL");
@@ -588,7 +587,7 @@ pub(crate) async fn record_prepared_in_tx(
               confirmed_by_sweep_id, evidence_event_ids, expires_at,
               source_types, source_types_complete)
            VALUES ($1, $2, $3, $4::float8::numeric, $5, $5, $6, $7, $8, $9)
-           ON CONFLICT (category, subject, fact_digest) DO UPDATE
+           ON CONFLICT (tenant_id, category, subject, fact_digest) DO UPDATE
               SET confirmed_at = NOW(),
                   expires_at = GREATEST(hunt_knowledge.expires_at, EXCLUDED.expires_at),
                   confidence = EXCLUDED.confidence,
@@ -827,7 +826,7 @@ impl KnowledgeRepository {
     }
 }
 
-fn knowledge_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntKnowledge, HuntError> {
+pub fn knowledge_from_row(row: &sqlx::postgres::PgRow) -> Result<HuntKnowledge, HuntError> {
     Ok(HuntKnowledge {
         id: row.try_get("id")?,
         category: row.try_get("category")?,

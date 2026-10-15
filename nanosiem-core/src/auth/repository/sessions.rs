@@ -62,6 +62,46 @@ impl SessionRepository {
         Ok(session)
     }
 
+    /// Create a tenant-bound enterprise-shared session.
+    ///
+    /// The composite database foreign key requires `(tenant_id, user_id)` to
+    /// exist in `tenant_members`; a caller cannot create a session for a tenant
+    /// selected only by a client-provided slug/header.
+    pub async fn create_tenant_session(
+        &self,
+        user_id: Uuid,
+        tenant_id: Uuid,
+        authenticated_at: DateTime<Utc>,
+        mfa_authenticated_at: Option<DateTime<Utc>>,
+        refresh_token_hash: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Session, SessionRepositoryError> {
+        let session = sqlx::query_as::<_, Session>(
+            r#"
+            INSERT INTO sessions (
+                user_id, tenant_id, authenticated_at, mfa_authenticated_at,
+                refresh_token_hash, ip_address, user_agent, expires_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING *
+            "#,
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .bind(authenticated_at)
+        .bind(mfa_authenticated_at)
+        .bind(refresh_token_hash)
+        .bind(ip_address)
+        .bind(user_agent)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(session)
+    }
+
     /// Get a session by its refresh token hash
     pub async fn get_session_by_token_hash(
         &self,
@@ -177,6 +217,101 @@ impl SessionRepository {
         Ok(result.rows_affected())
     }
 
+    /// Revoke every refresh session and every access token minted before this
+    /// operation in one database transaction.
+    ///
+    /// The users-row watermark is advanced first, establishing a shared lock
+    /// order with MFA/password mutations. Session deletion then removes every
+    /// refresh row before commit. Any refresh that won its row CAS earlier
+    /// still carries the older immutable authentication fence and is rejected.
+    pub async fn revoke_all_user_sessions(
+        &self,
+        user_id: Uuid,
+    ) -> Result<u64, SessionRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let stamped = sqlx::query(
+            "UPDATE users
+             SET tokens_valid_from = clock_timestamp(),
+                 totp_secret_encrypted = CASE WHEN mfa_enabled THEN totp_secret_encrypted ELSE NULL END,
+                 totp_secret_nonce = CASE WHEN mfa_enabled THEN totp_secret_nonce ELSE NULL END,
+                 mfa_setup_pending = CASE WHEN mfa_enabled THEN mfa_setup_pending ELSE FALSE END,
+                 mfa_setup_authority_tenant_id = NULL,
+                 mfa_setup_authority_jti = NULL,
+                 mfa_setup_authority_authenticated_at = NULL,
+                 mfa_setup_authority_expires_at = NULL,
+                 mfa_setup_authority_is_challenge = NULL,
+                 updated_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if stamped.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(SessionRepositoryError::NotFound(user_id));
+        }
+        let deleted = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// Revoke exactly one enterprise-shared tenant session namespace while
+    /// preserving the same user's sessions in every other tenant.
+    pub async fn revoke_tenant_user_sessions(
+        &self,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<u64, SessionRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        // Keep the shared auth mutation lock order user -> tenant/member. Clear
+        // only a pending setup owned by this tenant; active MFA and another
+        // tenant's setup are never touched.
+        sqlx::query(
+            "UPDATE users
+             SET totp_secret_encrypted = NULL,
+                 totp_secret_nonce = NULL,
+                 mfa_setup_pending = FALSE,
+                 mfa_setup_authority_tenant_id = NULL,
+                 mfa_setup_authority_jti = NULL,
+                 mfa_setup_authority_authenticated_at = NULL,
+                 mfa_setup_authority_expires_at = NULL,
+                 mfa_setup_authority_is_challenge = NULL,
+                 updated_at = clock_timestamp()
+             WHERE id = $1 AND mfa_enabled = FALSE
+               AND mfa_setup_authority_tenant_id = $2",
+        )
+        .bind(user_id)
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+        let stamped = sqlx::query(
+            "UPDATE tenant_members
+             SET tokens_valid_from = clock_timestamp(),
+                 updated_at = clock_timestamp()
+             WHERE tenant_id = $1 AND user_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        if stamped.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(SessionRepositoryError::NotFound(user_id));
+        }
+        let deleted = sqlx::query("DELETE FROM sessions WHERE tenant_id = $1 AND user_id = $2")
+            .bind(tenant_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     /// M6: Delete oldest sessions for a user, keeping the most recent ones
     pub async fn delete_oldest_user_sessions(
         &self,
@@ -220,13 +355,34 @@ impl SessionRepository {
     /// `NotFoundByToken`, which the handler surfaces as 401. Without the
     /// `refresh_token_hash` predicate every concurrent request would succeed,
     /// minting multiple valid token pairs from a single-use token (NAN-1391).
+    ///
+    /// `ip_address` / `user_agent` are the client of THIS refresh request.
+    /// They are not stored on the session (its network metadata belongs to
+    /// creation); they are handed to the enterprise session audit trigger
+    /// (migration 9012500) as transaction-local settings in the same
+    /// transaction as the UPDATE, so the `auth_session_refreshed` audit row
+    /// names the refreshing client (NAN-3460). Without the trigger the
+    /// settings are inert.
     pub async fn rotate_refresh_token(
         &self,
         id: Uuid,
         current_token_hash: &str,
         new_token_hash: &str,
         new_expires_at: DateTime<Utc>,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
     ) -> Result<Session, SessionRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        // is_local => TRUE: scoped to this transaction, never visible to the
+        // next request on the pooled connection. '' means unknown.
+        sqlx::query(
+            "SELECT set_config('nano_audit.session_client_ip', $1, TRUE), \
+                    set_config('nano_audit.session_client_user_agent', $2, TRUE)",
+        )
+        .bind(ip_address.unwrap_or(""))
+        .bind(user_agent.unwrap_or(""))
+        .execute(&mut *tx)
+        .await?;
         let session = sqlx::query_as::<_, Session>(
             r#"
             UPDATE sessions SET
@@ -241,9 +397,13 @@ impl SessionRepository {
         .bind(current_token_hash)
         .bind(new_token_hash)
         .bind(new_expires_at)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(SessionRepositoryError::NotFoundByToken)?;
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(session) = session else {
+            tx.rollback().await?;
+            return Err(SessionRepositoryError::NotFoundByToken);
+        };
+        tx.commit().await?;
 
         Ok(session)
     }

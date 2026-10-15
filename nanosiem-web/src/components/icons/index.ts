@@ -5,6 +5,8 @@
  */
 
 export { IPInfoIcon } from './IPInfoIcon';
+// App-wide loading indicator (NAN-2585) — replaces lucide Loader2.
+export { LoadingIcon } from './LoadingIcon';
 // PivtIcon came back to core in NAN-2356 — see the note in ./PivtIcon.tsx.
 export { PivtIcon } from './PivtIcon';
 

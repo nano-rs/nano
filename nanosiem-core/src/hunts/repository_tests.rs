@@ -159,7 +159,10 @@ fn the_count_carries_the_same_filters_and_the_same_scope_predicate_as_the_page()
         count.ends_with(shared),
         "the count's WHERE drifted from the page's:\n page: {shared}\ncount: {count}"
     );
-    assert!(!count.contains("LIMIT"), "a count took a page window: {count}");
+    assert!(
+        !count.contains("LIMIT"),
+        "a count took a page window: {count}"
+    );
 }
 
 #[test]
@@ -212,7 +215,12 @@ fn lead_with(contributions: serde_json::Value) -> HuntLead {
     }
 }
 
-fn stored(factor: &str, value: f64, detail: &str, basis: Option<ContributionBasis>) -> StoredContribution {
+fn stored(
+    factor: &str,
+    value: f64,
+    detail: &str,
+    basis: Option<ContributionBasis>,
+) -> StoredContribution {
     StoredContribution {
         contribution: Contribution {
             factor: factor.into(),
@@ -227,7 +235,13 @@ fn details(lead: &HuntLead) -> Vec<(String, f64, String)> {
     serde_json::from_value::<Vec<StoredContribution>>(lead.score_contributions.clone())
         .expect("the breakdown is still a contribution list")
         .into_iter()
-        .map(|s| (s.contribution.factor, s.contribution.value, s.contribution.detail))
+        .map(|s| {
+            (
+                s.contribution.factor,
+                s.contribution.value,
+                s.contribution.detail,
+            )
+        })
         .collect()
 }
 
@@ -269,7 +283,10 @@ fn a_referential_detail_is_withheld_rather_than_dropped_or_zeroed() {
     // And the manifest that justified withholding is not itself returned —
     // naming the source would leak what the sentence just refused to state.
     assert!(
-        !lead.score_contributions.to_string().contains("insider_threat"),
+        !lead
+            .score_contributions
+            .to_string()
+            .contains("insider_threat"),
         "the withheld basis was serialized back to the reader: {}",
         lead.score_contributions
     );
@@ -317,7 +334,10 @@ fn a_basis_the_reader_is_admitted_to_is_left_alone() {
             "recurrence",
             -0.10,
             "seen in 4 prior sweeps",
-            Some(ContributionBasis::from_artifacts(vec!["apache".into()], true)),
+            Some(ContributionBasis::from_artifacts(
+                vec!["apache".into()],
+                true,
+            )),
         )])
         .unwrap(),
     );
@@ -353,7 +373,10 @@ fn a_partially_admitted_basis_is_withheld_whole() {
             "recurrence",
             -0.05,
             "seen in 1 prior sweeps",
-            Some(ContributionBasis::from_artifacts(vec!["apache".into()], false)),
+            Some(ContributionBasis::from_artifacts(
+                vec!["apache".into()],
+                false,
+            )),
         )])
         .unwrap(),
     );
@@ -585,8 +608,7 @@ fn deciding_a_rule_idea_authorizes_under_the_lock_not_before_it() {
     ] {
         let body = function_body(REPOSITORY_SOURCE, internal);
         assert!(
-            body.contains("recompute_rule_idea_gate")
-                && body.contains("&ArtifactScope::system()"),
+            body.contains("recompute_rule_idea_gate") && body.contains("&ArtifactScope::system()"),
             "`{internal}` no longer states which scope its recount runs under"
         );
     }
@@ -636,10 +658,7 @@ fn function_body(source: &str, signature: &str) -> String {
     let start = source
         .find(signature)
         .unwrap_or_else(|| panic!("function `{signature}` not found"));
-    let open = source[start..]
-        .find('{')
-        .expect("function has a body")
-        + start;
+    let open = source[start..].find('{').expect("function has a body") + start;
     let mut depth = 0usize;
     for (offset, ch) in source[open..].char_indices() {
         match ch {
@@ -665,7 +684,9 @@ fn suppressions_are_written_from_exactly_two_paths_and_no_others() {
     //
     // A third insert appearing here means someone added a suppression path
     // without deciding which of the two sets of bounds it is under.
-    let occurrences = REPOSITORY_SOURCE.matches("INSERT INTO hunt_suppressions").count();
+    let occurrences = REPOSITORY_SOURCE
+        .matches("INSERT INTO hunt_suppressions")
+        .count();
     assert_eq!(
         occurrences, 2,
         "expected exactly two suppression inserts (analyst triage, agent sweep), found {occurrences}"
@@ -898,7 +919,10 @@ fn case_severity_comes_from_the_server_score_when_not_overridden() {
     assert_eq!(normalize_case_severity(Some("Medium"), 0.92), "medium");
     // An unrecognised override falls back to the derived value rather than
     // reaching `cases_severity_check` and 500ing.
-    assert_eq!(normalize_case_severity(Some("apocalyptic"), 0.92), "critical");
+    assert_eq!(
+        normalize_case_severity(Some("apocalyptic"), 0.92),
+        "critical"
+    );
 }
 
 #[test]
@@ -988,9 +1012,8 @@ mod live {
     /// ROLLBACK (or the connection closing on a panic) undoes all of it. The
     /// dev database's real leads are read, never mutated.
     async fn pool() -> sqlx::PgPool {
-        let url = std::env::var("NANO_TEST_DATABASE_URL").unwrap_or_else(|_| {
-            "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".to_string()
-        });
+        let url = std::env::var("NANO_TEST_DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".to_string());
         PgPoolOptions::new()
             .max_connections(1)
             .connect(&url)

@@ -6,7 +6,7 @@
 //! search service can render risk badges without depending on the analytics
 //! crate directly. Phase 2.5 introduced this trait; Phase 3.4 (NAN-744)
 //! relocated `RiskAnalyticsService` + `RiskRepository` to
-//! `nanosiem-enterprise::risk` with `RiskAnalyticsService` implementing
+//! `enterprise::risk` with `RiskAnalyticsService` implementing
 //! this trait on the enterprise side.
 //!
 //! Open core does not include the RBA framework or Risk page. The

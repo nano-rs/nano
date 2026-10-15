@@ -2,6 +2,7 @@
 
 import { Search as SearchIcon, User as UserIcon, Shield, AlertTriangle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { RiskSheetLauncher } from '@/enterprise/components/risk/RiskSheetLauncher';
 import type { CloudDossierIdentity, CloudDossierRisk } from '@/lib/api/types';
 import {
   CloudFact,
@@ -196,9 +197,19 @@ export function IdentityHeader({
           </div>
 
           <div className="flex flex-col items-end gap-3 shrink-0 w-[260px]">
-            <div
+            {/* NAN-3225: enterprise builds open the principal's RBA risk
+                sheet (rule contributions, tactics, timeline) from the score. */}
+            <RiskSheetLauncher entity={identity.id} entityType="user">
+              {(openRiskSheet) => (
+            <button
+              type="button"
+              data-testid="cloud-risk-score"
+              disabled={!openRiskSheet}
+              onClick={openRiskSheet ?? undefined}
+              title={openRiskSheet ? 'Why is this principal risky' : undefined}
               className={cn(
-                'w-full rounded-lg border px-3 py-2.5 flex items-center gap-3',
+                'w-full rounded-lg border px-3 py-2.5 flex items-center gap-3 text-left disabled:cursor-default',
+                openRiskSheet && 'hover:bg-foreground/5',
                 tone.border,
                 tone.bg
               )}
@@ -215,7 +226,9 @@ export function IdentityHeader({
                   <span className="text-[10px] text-muted-foreground/70">/ 100</span>
                 </div>
               </div>
-            </div>
+            </button>
+              )}
+            </RiskSheetLauncher>
             {onInvestigate && (
               <button
                 onClick={onInvestigate}

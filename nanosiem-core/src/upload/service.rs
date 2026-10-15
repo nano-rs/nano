@@ -118,8 +118,19 @@ impl UploadService {
             )
             .await?;
 
+        // Existing one-column jobs may predate header detection. Preserve their
+        // stored column name while reading every indicator as a data row.
+        let UploadDestination::LookupTable { table_name, .. } = &request.destination;
+        let lookup_service = LookupService::new(LookupRepository::new(self.pool.clone()));
+        let existing_table = lookup_service.get_table(table_name).await.ok();
+        let parse_config = match existing_table.as_ref() {
+            Some(table) if table.columns.len() == 1 => FileParser::config_for_existing_column(
+                &request.content, &request.config, &table.columns[0].name,
+            ),
+            _ => request.config.clone(),
+        };
         // Parse the file
-        let parse_result = match self.parser.parse(&request.content, &request.config) {
+        let parse_result = match self.parser.parse(&request.content, &parse_config) {
             Ok(result) => result,
             Err(e) => {
                 // Mark upload as failed
@@ -158,7 +169,15 @@ impl UploadService {
             .await
             .map_err(|e| UploadError::IngestionError(e.to_string()))?;
 
-        let records_ingested = match mode {
+        // Schema-created URL lookups start with a placeholder. Their first
+        // append is an initialization, then later runs append normally.
+        let effective_mode = if *mode == super::types::LookupMode::Append
+            && existing_table.as_ref().is_some_and(|table| table.columns.len() == 1 && table.columns[0].name == "_placeholder") {
+            super::types::LookupMode::Replace
+        } else {
+            *mode
+        };
+        let records_ingested = match effective_mode {
             super::types::LookupMode::Replace => {
                 // Upload service runs in system context (scheduled ingestion
                 // jobs etc.) — no user identity available, so auto-created
@@ -717,7 +736,11 @@ mod tests {
         let svc = preview_service();
         let content = csv_with_rows(MAX_PREVIEW_ROWS * 3);
         let result = svc
-            .preview(&content, &ParserConfig::default(), Some(MAX_PREVIEW_ROWS * 3))
+            .preview(
+                &content,
+                &ParserConfig::default(),
+                Some(MAX_PREVIEW_ROWS * 3),
+            )
             .await
             .expect("preview");
         assert_eq!(

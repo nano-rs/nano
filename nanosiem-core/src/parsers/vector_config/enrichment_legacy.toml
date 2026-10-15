@@ -1,0 +1,203 @@
+# =============================================================================
+# NAN-1149: Push enrichment lane (GENERATED from deployed enrichment parsers)
+# DO NOT EDIT - regenerated on every parser deploy.
+# =============================================================================
+
+[transforms.enrichment_normalize_ad]
+type = "remap"
+# NAN-1246 (local reload fix): router route is `identity` (see _router.toml),
+# not `ad`. The stale `ad`/`custom` inputs were aborting every config reload.
+inputs = ["enrichment_router.identity"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+# Map a pushed nano_enrich/kind=identity record to the user_registry columns.
+now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+external_id = to_string(.external_id) ?? ""
+if external_id == "" {
+    log("nano_enrich identity record missing external_id; dead-lettering", level: "warn")
+    abort
+}
+
+# version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+# otherwise stamp now. last_synced_at is the formatted-string form of version.
+version = to_int(.version) ?? 0
+if version <= 0 { version = now_ms }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+# account_enabled: bool -> 0/1 (absent defaults to enabled).
+account_enabled = to_int(.account_enabled) ?? 1
+
+# account_status: AD pushes carry account_enabled, not an explicit status, so
+# derive it from account_enabled when absent (mirrors the former Rust
+# into_upsert mapping that this VRL replaces — NAN-1151). Then enum-guard
+# (defense-in-depth; full validation in NAN-1133).
+account_status = downcase(to_string(.account_status) ?? "")
+if account_status == "" {
+    account_status = if account_enabled == 0 { "disabled" } else { "active" }
+}
+if !includes(["active", "disabled", "suspended", "deleted", "anonymized"], account_status) {
+    account_status = "active"
+}
+
+groups = .groups
+if !is_array(groups) { groups = [] }
+
+. = {
+    "provider_id": to_string(.provider_id) ?? "",
+    "external_id": external_id,
+    "username": to_string(.username) ?? "",
+    "upn": to_string(.upn) ?? "",
+    "email": to_string(.email) ?? "",
+    "display_name": to_string(.display_name) ?? "",
+    "first_name": to_string(.first_name) ?? "",
+    "last_name": to_string(.last_name) ?? "",
+    "department": to_string(.department) ?? "",
+    "title": to_string(.title) ?? "",
+    "manager_upn": to_string(.manager_upn) ?? "",
+    "manager_display_name": to_string(.manager_display_name) ?? "",
+    "company": to_string(.company) ?? "",
+    "office_location": to_string(.office_location) ?? "",
+    "city": to_string(.city) ?? "",
+    "country": to_string(.country) ?? "",
+    "groups": groups,
+    "account_enabled": account_enabled,
+    "account_status": account_status,
+    "mfa_enabled": to_int(.mfa_enabled) ?? 0,
+    "phone": to_string(.phone) ?? "",
+    "employee_id": to_string(.employee_id) ?? "",
+    "employee_type": to_string(.employee_type) ?? "employee",
+    "sync_hash": to_string(.sync_hash) ?? "",
+    "last_synced_at": last_synced_at,
+    "version": version
+}
+
+'''
+
+[transforms.enrichment_normalize_custom]
+type = "remap"
+# NAN-1246 (local reload fix): router route is `ip_context` (see _router.toml).
+inputs = ["enrichment_router.ip_context"]
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+# network is the IP_TRIE key — it MUST be a valid CIDR. Dead-letter on a
+# missing/malformed one rather than default to 0.0.0.0/0 (which would shadow
+# every lookup). NAN-1137.
+network = to_string(.network) ?? ""
+if !match(network, r'^[0-9a-fA-F:.]+/[0-9]+$') {
+    log("nano_enrich ip_context record missing/invalid network CIDR; dead-lettering", level: "warn")
+    abort
+}
+
+# source_id is the feed discriminator (coexists per network). Prefer the
+# explicit field, else the routing `source`, else a safe default.
+source_id = to_string(.source_id) ?? ""
+if source_id == "" { source_id = to_string(.source) ?? "custom" }
+
+# updated_at is BOTH the ReplacingMergeTree version AND the dict argMax key:
+# stamp it on one clock as a formatted DateTime64(3) string, NEVER far-future
+# (a 9999 value would permanently win and bury real updates). NAN-1137.
+updated_at = format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f")
+
+# deleted: 0/1 tombstone (a CIDR a newer feed dropped). Coerce to {0,1}.
+deleted = to_int(.deleted) ?? 0
+if deleted != 1 { deleted = 0 }
+
+. = {
+    "network": network,
+    "source_id": source_id,
+    "country": to_string(.country) ?? "",
+    "country_code": to_string(.country_code) ?? "",
+    "continent": to_string(.continent) ?? "",
+    "continent_code": to_string(.continent_code) ?? "",
+    "asn": to_string(.asn) ?? "",
+    "as_name": to_string(.as_name) ?? "",
+    "as_domain": to_string(.as_domain) ?? "",
+    "updated_at": updated_at,
+    "deleted": deleted
+}
+
+'''
+
+# NAN-1728: `ip_enrichments` is a CLUSTER-WIDE REPLICATED table (shared ZK path,
+# no {shard} macro), so a write landing on ANY node via the load-balanced
+# clickhouse-ingest Service replicates to every node and is globally visible —
+# each node's local `ip_enrichment_dict` refresh then reads a complete table.
+# Deliberately write the plain LOCAL name (NOT a `_distributed` wrapper): routing
+# reference-table writes through a Distributed wrapper is unnecessary and would
+# break the per-node dict source chain.
+[sinks.clickhouse_ip_enrichments]
+type = "clickhouse"
+inputs = ["enrichment_normalize_custom"]
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "ip_enrichments"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_ip_enrichments.buffer]
+type = "memory"
+max_events = 50000
+when_full = "drop_newest"
+
+[sinks.clickhouse_ip_enrichments.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_ip_enrichments.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.clickhouse_ip_enrichments.request]
+concurrency = "adaptive"
+timeout_secs = 60
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 60
+
+# NAN-1728: `user_registry` is a CLUSTER-WIDE REPLICATED table (shared ZK path,
+# no {shard} macro) — a single-node write replicates to all nodes and is globally
+# visible, so each node's `user_registry_dict` refresh reads a complete table.
+# Deliberately write the plain LOCAL name, NOT a `_distributed` wrapper (see the
+# ip_enrichments sink note above).
+[sinks.clickhouse_user_registry]
+type = "clickhouse"
+inputs = ["enrichment_normalize_ad"]
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "user_registry"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_user_registry.buffer]
+type = "memory"
+max_events = 50000
+when_full = "drop_newest"
+
+[sinks.clickhouse_user_registry.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_user_registry.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.clickhouse_user_registry.request]
+concurrency = "adaptive"
+timeout_secs = 60
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 60
+
+[sinks.enrichment_dead_letter]
+type = "blackhole"
+inputs = ["enrichment_normalize_ad.dropped", "enrichment_normalize_custom.dropped"]
+print_interval_secs = 0

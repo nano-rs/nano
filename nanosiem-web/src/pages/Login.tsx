@@ -32,13 +32,34 @@
 
 import { useState, useEffect, useRef, FormEvent, KeyboardEvent } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { Loader2, Terminal, RefreshCw, Check, ArrowUpRight } from 'lucide-react';
+import { RefreshCw, Check, ArrowUpRight } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { getSsoIcon } from '@/enterprise/components/icons/SsoIcons';
-import { Logo } from '@/components/ui/logo';
 import { useAuth, OidcProvider } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { cn } from '@/lib/utils';
+import { safeReturnPath } from '@/lib/tenant-auth-shell';
+import {
+  discoverEnterpriseSharedLoginMethods,
+  startEnterpriseSharedOidcLogin,
+  type SharedLoginMethods,
+  type SharedOidcBrowserDependencies,
+} from '@/lib/enterprise-shared-oidc';
+import { browserTenantRuntime } from '@/lib/tenant-runtime';
+import {
+  AuthTerminalFrame,
+  InspectorPanel,
+  InspectorSection,
+  KeyboardInspectorSection,
+  PromptCard,
+  PromptCardHeader,
+  TenantInspectorSection,
+  TermGroup,
+  TermLine,
+  WelcomeBanner,
+  type StatusLine,
+} from './auth-terminal-chrome';
 import {
   SSO_PANEL_CLASS,
   authMethodsLine,
@@ -52,6 +73,40 @@ import {
 } from './login-auth-methods';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
+
+function sharedOidcDependencies(): SharedOidcBrowserDependencies {
+  return {
+    fetch: ((input: string | URL | Request, init?: RequestInit) => {
+      const path = String(input);
+      if (!path.startsWith('/api/')) return Promise.reject(new Error('invalid API path'));
+      return window.fetch(`${API_BASE_URL}${path}`, init);
+    }) as typeof globalThis.fetch,
+    sessionStorage: window.sessionStorage,
+    runtime: browserTenantRuntime,
+    replaceUrl: (path) => window.history.replaceState(window.history.state, '', path),
+  };
+}
+
+/**
+ * One provider discovery per tenant per page visit. The login route remounts
+ * more than once while auth boots (and twice more under StrictMode), and the
+ * shared discovery answers a uniform 401 for a tenant without SSO — four
+ * identical 401s per visit on the live lake. A settled promise is reused;
+ * the "retry" affordance drops the entry first.
+ */
+const tenantProviderDiscovery = new Map<string, { at: number; pending: Promise<SharedLoginMethods> }>();
+const TENANT_PROVIDER_DISCOVERY_TTL_MS = 60_000;
+
+function discoverTenantLoginMethodsOnce(tenantSlug: string, fresh: boolean): Promise<SharedLoginMethods> {
+  const cached = tenantProviderDiscovery.get(tenantSlug);
+  if (!fresh && cached && Date.now() - cached.at < TENANT_PROVIDER_DISCOVERY_TTL_MS) {
+    return cached.pending;
+  }
+  const pending = discoverEnterpriseSharedLoginMethods(tenantSlug, sharedOidcDependencies());
+  tenantProviderDiscovery.set(tenantSlug, { at: Date.now(), pending });
+  pending.catch(() => tenantProviderDiscovery.delete(tenantSlug));
+  return pending;
+}
 
 type Step = 'email' | 'password' | 'mfa' | 'done';
 
@@ -74,26 +129,6 @@ const makeLine = (kind: LineKind, text: Line['text']): Line => ({
   kind,
   text,
 });
-
-// Inline terminal-line renderer. Tone follows the mockup:
-//   sys = muted, err = destructive, warn = warning, good = success,
-//   hint = italic muted, help = special card render
-function TermLine({ kind, children }: { kind: Exclude<LineKind, 'cmd' | 'help'>; children: React.ReactNode }) {
-  return (
-    <div
-      className={cn(
-        'font-mono text-[12.5px] leading-[1.6] min-w-0 break-words',
-        kind === 'sys' && 'text-foreground/85',
-        kind === 'err' && 'text-destructive',
-        kind === 'warn' && 'text-[var(--warning)]',
-        kind === 'good' && 'text-[var(--success)]',
-        kind === 'hint' && 'text-muted-foreground/60 italic',
-      )}
-    >
-      {children}
-    </div>
-  );
-}
 
 function CmdEcho({ prompt, cmd }: CmdPayload) {
   return (
@@ -138,340 +173,10 @@ function HelpCard({ ssoAvailable }: { ssoAvailable: boolean }) {
   );
 }
 
-function TermGroup({ children }: { children: React.ReactNode }) {
-  return <div style={{ paddingLeft: '9ch' }}>{children}</div>;
-}
-
-// ── Fake telemetry ──────────────────────────────────────────────────
-//
-// The mockup has a live-tenant feel — events/s + open-cases + MTTR + sensor
-// counts that drift every couple of seconds. Pre-auth we have no real
-// telemetry to wire, so this is theatre. Stable per-mount baselines + a
-// small jitter on the busy values, frozen on the labels.
-//
-// Things deliberately NOT surfaced (security):
-//   - Last-login user / timestamp / IP
-//   - Tenant identifier tied to the email being typed
-//   - Anything that would help an attacker fingerprint the install
-const STATIC_BUILD_HASH = '2a7c91f'; // matches the mockup; cosmetic only.
-const STATIC_SIG = 'sha256:2a7c…e91f';
-const STATIC_LATENCY_P50 = 34;
-
-interface FakeStats {
-  eps: number;
-  cases: number;
-  mttr: number;
-  sensorsUp: number;
-  sensorsTotal: number;
-}
-
-function useFakeStats(): FakeStats {
-  // Stable base on first render — mount-time random within a sensible
-  // SOC-ish range. eps drifts via a 1.8s ticker; everything else is fixed
-  // for this session. Don't reseed on re-render or the values will jiggle
-  // on every state change.
-  const baseRef = useRef<FakeStats | null>(null);
-  if (!baseRef.current) {
-    baseRef.current = {
-      eps: 12_700 + Math.floor(Math.random() * 800),
-      cases: 47,
-      mttr: 14,
-      sensorsUp: 312,
-      sensorsTotal: 314,
-    };
-  }
-  const [stats, setStats] = useState<FakeStats>(baseRef.current);
-  useEffect(() => {
-    const id = setInterval(() => {
-      setStats((prev) => ({ ...prev, eps: Math.max(8000, prev.eps + (Math.floor(Math.random() * 401) - 200)) }));
-    }, 1800);
-    return () => clearInterval(id);
-  }, []);
-  return stats;
-}
-
-function useClock(): Date {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(id);
-  }, []);
-  return now;
-}
-
-function fmtClock(d: Date): string {
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  const mm = String(d.getUTCMinutes()).padStart(2, '0');
-  const ss = String(d.getUTCSeconds()).padStart(2, '0');
-  return `${hh}:${mm}:${ss} UTC`;
-}
-
-function WelcomeBanner({ version, stats }: { version: string; stats: FakeStats }) {
+function Inspector({ ssoEnabled }: { ssoEnabled: boolean }) {
   return (
-    <div className="mb-4">
-      <Logo className="h-6 select-none" size="normal" />
-      <div className="mt-3 font-mono text-[11.5px] text-muted-foreground leading-[1.65]">
-        <div>
-          <span className="text-muted-foreground/60">release</span>{' '}
-          <span className="text-foreground/85">v{version}</span>{'   '}
-          <span className="text-muted-foreground/60">· build</span>{' '}
-          <span className="text-foreground/85">{STATIC_BUILD_HASH}</span>
-        </div>
-        <div>
-          <span className="text-muted-foreground/60">status</span>{'    '}
-          <span className="text-[var(--success)]">● operational</span>{'   '}
-          <span className="text-muted-foreground/60">· latency p50</span>{' '}
-          <span className="text-foreground/85">{STATIC_LATENCY_P50}ms</span>{'   '}
-          <span className="text-muted-foreground/60">· events/s</span>{' '}
-          <span className="text-foreground/85 tabular-nums">{stats.eps.toLocaleString()}</span>
-        </div>
-      </div>
-      <div
-        className="mt-3 font-mono text-[11px] text-muted-foreground/60 leading-[1.55] max-w-[78ch]"
-        style={{ textWrap: 'pretty' as React.CSSProperties['textWrap'] }}
-      >
-        Welcome to nano. Authenticated sessions are logged and tied to your identity for audit.
-        Type <span className="text-foreground/85">help</span> for commands ·{' '}
-        <span className="text-foreground/85">^C</span> to abort at any prompt.
-      </div>
-    </div>
-  );
-}
-
-function Rail() {
-  // Collapsed/locked rail per mockup — visual only, matches the rest of the
-  // app's left-rail width so the chrome reads as continuous post-login.
-  // Uses the real nano Logo so brand identity stays consistent post-login;
-  // the mockup's `n + dot` letter-mark was a placeholder.
-  return (
-    <div
-      className="hidden md:flex flex-col border-r border-border shrink-0 w-[44px]"
-      style={{ background: 'var(--background)' }}
-    >
-      <div className="h-[42px] flex items-center justify-center">
-        <Logo className="w-5 h-5" size="small" />
-      </div>
-      <div className="flex-1" />
-      <div className="py-2 flex justify-center border-t border-border">
-        <button
-          className="w-8 h-8 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/5"
-          title="Switch tenant"
-          type="button"
-          disabled
-        >
-          <RefreshCw className="w-[14px] h-[14px]" />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function Topbar({ step, version }: { step: Step; version: string }) {
-  const trail = [
-    { label: 'auth', mono: false },
-    {
-      label:
-        step === 'email'
-          ? 'identify'
-          : step === 'password'
-          ? 'verify'
-          : step === 'mfa'
-          ? 'mfa challenge'
-          : 'established',
-      mono: false,
-    },
-  ];
-  return (
-    <div
-      className="h-[42px] px-3 flex items-center gap-3 border-b border-border shrink-0"
-      style={{ background: 'var(--panel)' }}
-    >
-      <div className="flex items-center gap-1.5 text-[12px] min-w-0 shrink-0">
-        {trail.map((t, i) => (
-          <div key={i} className="flex items-center gap-1.5 shrink-0">
-            {i > 0 && <span className="text-muted-foreground/60 shrink-0">/</span>}
-            <span
-              className={cn(
-                'whitespace-nowrap shrink-0',
-                t.mono && 'font-mono',
-                i === trail.length - 1 ? 'text-foreground/85' : 'text-muted-foreground',
-              )}
-            >
-              {t.label}
-            </span>
-          </div>
-        ))}
-      </div>
-      <span className="flex-1" />
-      <div className="hidden sm:flex items-center gap-1.5 text-[11px] shrink-0">
-        <span className="h-[22px] inline-flex items-center gap-1.5 px-2 rounded-md border border-border text-muted-foreground font-mono whitespace-nowrap">
-          <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] animate-pulse" />
-          operational
-        </span>
-        <span className="h-[22px] inline-flex items-center gap-1.5 px-2 rounded-md border border-border text-muted-foreground font-mono whitespace-nowrap">
-          v{version}
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function StatusBar({
-  step,
-  version,
-  authError,
-  stats,
-  clock,
-}: {
-  step: Step;
-  version: string;
-  authError: string | null;
-  stats: FakeStats;
-  clock: Date;
-}) {
-  const stepLabel = {
-    email: 'awaiting identity',
-    password: 'awaiting password',
-    mfa: 'awaiting mfa · 6-digit code',
-    done: 'session established',
-  }[step];
-  return (
-    <div
-      className="h-[26px] px-3 flex items-center gap-3 border-t border-border font-mono text-[10.5px] text-muted-foreground tracking-[0.02em] shrink-0 whitespace-nowrap overflow-hidden"
-      style={{ background: 'var(--panel)' }}
-    >
-      <span
-        className={cn(
-          'flex items-center gap-1.5 shrink-0 whitespace-nowrap',
-          step === 'done' ? 'text-[var(--success)]' : 'text-primary',
-          authError && 'text-destructive',
-        )}
-      >
-        <span
-          className={cn(
-            'w-1.5 h-1.5 rounded-full',
-            step === 'done' ? 'bg-[var(--success)]' : 'bg-primary animate-pulse',
-            authError && 'bg-destructive',
-          )}
-        />
-        {authError ? 'auth failed · retry' : stepLabel}
-      </span>
-      <span className="text-muted-foreground/60 shrink-0">·</span>
-      <span className="shrink-0 whitespace-nowrap">TLS 1.3 · cert pinned</span>
-      <span className="text-muted-foreground/60 shrink-0 hidden xl:inline">·</span>
-      <span className="shrink-0 whitespace-nowrap hidden xl:inline">
-        sig <span className="text-foreground/85">{STATIC_SIG}</span>
-      </span>
-      <span className="flex-1" />
-      <span className="shrink-0 whitespace-nowrap">
-        <span className="text-muted-foreground/60">events/s</span>{' '}
-        <span className="text-foreground/85 tabular-nums">{stats.eps.toLocaleString()}</span>
-      </span>
-      <span className="text-muted-foreground/60 shrink-0">·</span>
-      <span className="shrink-0 whitespace-nowrap tabular-nums">{fmtClock(clock)}</span>
-      <span className="text-muted-foreground/60 shrink-0">·</span>
-      <span className="shrink-0 whitespace-nowrap">
-        <span className="text-muted-foreground/60">build</span>{' '}
-        <span className="text-foreground/85">v{version}</span>
-      </span>
-    </div>
-  );
-}
-
-function StatCell({ k, v, sub }: { k: string; v: string | number; sub: string }) {
-  return (
-    <div className="px-2.5 py-2">
-      <div className="text-[9.5px] font-mono text-muted-foreground uppercase tracking-[0.1em]">{k}</div>
-      <div className="text-[15px] font-semibold text-foreground tracking-[-0.01em] tabular-nums mt-0.5">{v}</div>
-      <div className="text-[9.5px] font-mono text-muted-foreground/60 mt-0.5">{sub}</div>
-    </div>
-  );
-}
-
-// Hoisted out of Inspector so its identity is stable across re-renders.
-// Defining it inside Inspector caused React to treat each tick of the
-// useClock / useFakeStats updates (1s / 1.8s) as a new component type
-// and remount every Section's subtree — visible as the nano Logo
-// flickering under TENANT every second, because Logo's own
-// mounted-gate useEffect ran from scratch on each remount.
-function InspectorSection({
-  title,
-  rightSlot,
-  children,
-}: {
-  title: string;
-  rightSlot?: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="border-b border-border">
-      <div className="px-3 py-2 flex items-center gap-2 whitespace-nowrap">
-        <span className="text-[10px] font-mono text-muted-foreground uppercase tracking-[0.14em] whitespace-nowrap">
-          {title}
-        </span>
-        <span className="flex-1" />
-        {rightSlot}
-      </div>
-      <div className="px-3 pb-3">{children}</div>
-    </div>
-  );
-}
-
-function Inspector({ stats, ssoEnabled }: { stats: FakeStats; ssoEnabled: boolean }) {
-  const Section = InspectorSection;
-
-  return (
-    <div
-      className="hidden lg:flex w-[300px] shrink-0 border-l border-border flex-col"
-      style={{ background: 'var(--panel)' }}
-    >
-      <Section title="tenant">
-        <div
-          className="rounded-md border border-border p-2.5 space-y-1.5"
-          style={{ background: 'var(--card)' }}
-        >
-          <div className="flex items-center gap-2">
-            <Logo className="w-7 h-7" size="small" />
-            <div className="min-w-0">
-              <div className="text-[12.5px] font-semibold text-foreground truncate">nano</div>
-              <div className="text-[10.5px] font-mono text-muted-foreground whitespace-nowrap">
-                control-plane
-              </div>
-            </div>
-          </div>
-          <div className="flex items-center justify-between pt-1 border-t border-border">
-            <span className="text-[10.5px] font-mono text-muted-foreground">environment</span>
-            <span className="text-[11px] font-mono text-foreground">production</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-[10.5px] font-mono text-muted-foreground">release channel</span>
-            <span className="text-[11px] font-mono text-foreground">stable</span>
-          </div>
-        </div>
-      </Section>
-
-      <Section
-        title="live · tenant metrics"
-        rightSlot={<span className="text-[9.5px] font-mono text-muted-foreground/60">tick 1.8s</span>}
-      >
-        <div
-          className="rounded-md border border-border overflow-hidden"
-          style={{ background: 'var(--card)' }}
-        >
-          <div className="grid grid-cols-2 divide-x divide-border">
-            <StatCell k="events/s" v={stats.eps.toLocaleString()} sub="rolling 5m" />
-            <StatCell k="open cases" v={stats.cases} sub="3 critical" />
-          </div>
-          <div className="grid grid-cols-2 divide-x divide-border border-t border-border">
-            <StatCell k="mttr p50" v={`${stats.mttr}m`} sub="24h" />
-            <StatCell
-              k="sensors"
-              v={`${stats.sensorsUp}/${stats.sensorsTotal}`}
-              sub={`${stats.sensorsTotal - stats.sensorsUp} degraded`}
-            />
-          </div>
-        </div>
-      </Section>
+    <InspectorPanel>
+      <TenantInspectorSection />
 
       {/*
         No SSO section here. Provider actions live in the primary column beside
@@ -479,25 +184,16 @@ function Inspector({ stats, ssoEnabled }: { stats: FakeStats; ssoEnabled: boolea
         only appears here is unreachable below the lg breakpoint.
       */}
 
-      <Section title="keyboard">
-        <div className="space-y-1 font-mono text-[10.5px]">
-          {[
-            ['enter', 'submit'],
-            ['^C', 'abort'],
-            ['^L', 'clear'],
-            ['?', 'help'],
-          ].map(([k, v]) => (
-            <div key={k} className="flex items-center justify-between gap-2 whitespace-nowrap">
-              <kbd className="px-1.5 py-px rounded bg-foreground/[0.06] text-foreground text-[10px] border border-border shrink-0">
-                {k}
-              </kbd>
-              <span className="text-muted-foreground shrink-0">{v}</span>
-            </div>
-          ))}
-        </div>
-      </Section>
+      <KeyboardInspectorSection
+        rows={[
+          ['enter', 'submit'],
+          ['^C', 'abort'],
+          ['^L', 'clear'],
+          ['?', 'help'],
+        ]}
+      />
 
-      <Section title="commands">
+      <InspectorSection title="commands">
         <div className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono text-[10.5px]">
           {[
             ['help', 'show help'],
@@ -511,31 +207,12 @@ function Inspector({ stats, ssoEnabled }: { stats: FakeStats; ssoEnabled: boolea
             </div>
           ))}
         </div>
-      </Section>
-
-      <div className="px-3 py-3 mt-auto">
-        <div className="text-[10px] font-mono text-muted-foreground/60 uppercase tracking-[0.14em] mb-1.5">
-          trust
-        </div>
-        <div className="flex flex-wrap gap-1">
-          {['SOC 2 · Type II', 'ISO 27001', 'HIPAA', 'FedRAMP Mod'].map((t) => (
-            <span
-              key={t}
-              className="px-1.5 py-0.5 rounded border border-border text-[10px] font-mono text-muted-foreground whitespace-nowrap"
-            >
-              {t}
-            </span>
-          ))}
-        </div>
-        <div className="mt-2.5 text-[10px] font-mono text-muted-foreground/60">
-          docs.nano.sh · status.nano.sh
-        </div>
-      </div>
-    </div>
+      </InspectorSection>
+    </InspectorPanel>
   );
 }
 
-export function Login() {
+export function Login({ tenantSlug }: { tenantSlug?: string } = {}) {
   const navigate = useNavigate();
   const location = useLocation();
   const {
@@ -550,6 +227,8 @@ export function Login() {
     challengeToken,
     verifyMfa,
     cancelMfa,
+    user,
+    pendingTenantSlug,
   } = useAuth();
 
   useDocumentTitle('Login');
@@ -558,11 +237,12 @@ export function Login() {
   // fetch, hide the inspector SSO panel, and drop the email-step "or use SSO"
   // hint — local credentials remain the only auth path.
   const { capabilities } = useCapabilities();
-  const ssoEnabled = capabilities.sso;
+  // A canonical shared tenant URL uses the server-owned tenant-local discovery
+  // contract. Dedicated/open-core keep the existing capability-gated global
+  // provider endpoint unchanged.
+  const ssoEnabled = tenantSlug !== undefined || capabilities.sso;
 
   const version = __APP_VERSION__;
-  const stats = useFakeStats();
-  const clock = useClock();
 
   const [step, setStep] = useState<Step>('email');
   const [email, setEmail] = useState('');
@@ -626,10 +306,12 @@ export function Login() {
   // ── Effects ────────────────────────────────────────────────────────
   useEffect(() => {
     if (isAuthenticated && !authLoading) {
-      const returnTo = (location.state as { from?: string })?.from || '/';
+      // A shared-lake tenant lands in the product like everyone else; the
+      // `/t/<slug>` shell is gone (see ProductRouteGate).
+      const returnTo = safeReturnPath((location.state as { from?: string })?.from);
       navigate(returnTo, { replace: true });
     }
-  }, [isAuthenticated, authLoading, navigate, location.state]);
+  }, [isAuthenticated, authLoading, navigate, location.state, user]);
 
   // Fetch OIDC providers once. Skipped in open-core builds (no SSO surface).
   useEffect(() => {
@@ -640,20 +322,31 @@ export function Login() {
     let cancelled = false;
     setLoadingProviders(true);
     setProvidersFailed(false);
-    fetch(`${API_BASE_URL}/api/auth/oidc/providers`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(`providers request failed: ${res.status}`);
-        return (await res.json()) as OidcProvider[];
-      })
-      .then((providers) => {
-        if (!cancelled) setOidcProviders(providers);
+    // A tenant URL learns both answers (providers + whether password sign-in
+    // is on) from the one uniform tenant-local discovery call (NAN-2361 wave
+    // 8); the dedicated page keeps its two endpoints.
+    const providersRequest = tenantSlug === undefined
+      ? fetch(`${API_BASE_URL}/api/auth/oidc/providers`).then(async (res) => {
+          if (!res.ok) throw new Error(`providers request failed: ${res.status}`);
+          return { providers: (await res.json()) as OidcProvider[], localPasswordEnabled: null };
+        })
+      : discoverTenantLoginMethodsOnce(tenantSlug, providersReload > 0);
+    providersRequest
+      .then(({ providers, localPasswordEnabled }) => {
+        if (cancelled) return;
+        setOidcProviders(providers);
+        if (localPasswordEnabled !== null) setLocalPasswordEnabled(localPasswordEnabled);
       })
       .catch(() => {
         // Never blocks sign-in: local credentials remain available, and the
         // panel says so rather than silently pretending SSO isn't configured.
+        // On a tenant URL this is also the NAN-2181 fallback: a failed
+        // discovery falls back to a password prompt, and the server still
+        // rejects the credentials if the tenant really is SSO-only.
         if (!cancelled) {
           setOidcProviders([]);
           setProvidersFailed(true);
+          if (tenantSlug !== undefined) setLocalPasswordEnabled(true);
         }
       })
       .finally(() => {
@@ -662,13 +355,16 @@ export function Login() {
     return () => {
       cancelled = true;
     };
-  }, [ssoEnabled, providersReload]);
+  }, [ssoEnabled, providersReload, tenantSlug]);
 
   // NAN-2181: which methods this deployment accepts. Public endpoint — the page
   // has to know before anyone authenticates. A failure falls back to enabled,
   // because the alternative is a login page offering nothing at all; the server
   // still rejects the credentials if the tenant really is SSO-only.
   useEffect(() => {
+    // A tenant URL is answered by the discovery effect above (stays null
+    // until it settles, so an SSO-only tenant never flashes the prompt).
+    if (tenantSlug !== undefined) return;
     let cancelled = false;
     fetch(`${API_BASE_URL}/api/auth/methods`)
       .then(async (res) => {
@@ -684,7 +380,7 @@ export function Login() {
     return () => {
       cancelled = true;
     };
-  }, [providersReload]);
+  }, [providersReload, tenantSlug]);
 
   // When the AuthContext flips MFA-pending, jump our wizard to the mfa step.
   useEffect(() => {
@@ -694,11 +390,19 @@ export function Login() {
   // MFA setup-required redirect (preserve legacy behavior).
   useEffect(() => {
     if (mfaSetupPending && challengeToken) {
-      navigate('/mfa-setup', {
-        state: { challengeToken, from: (location.state as { from?: string })?.from || '/' },
-      });
+      // Basename-relative: under `/t/<slug>` this is `/t/<slug>/mfa-setup`.
+      navigate(
+        '/mfa-setup',
+        {
+          state: {
+            challengeToken,
+            from: safeReturnPath((location.state as { from?: string })?.from),
+            tenantSlug: pendingTenantSlug ?? tenantSlug,
+          },
+        },
+      );
     }
-  }, [mfaSetupPending, challengeToken, navigate, location.state]);
+  }, [mfaSetupPending, challengeToken, navigate, location.state, pendingTenantSlug, tenantSlug]);
 
   // Echo a sessionExpired notice + auth errors into the terminal scroll.
   // Lives in an effect so the scroll order matches user-perceived time.
@@ -771,7 +475,7 @@ export function Login() {
     setBusy(true);
     clearError();
     try {
-      await login(email, val);
+      await login(email, val, tenantSlug);
       // login() resolves before MFA state flips on AuthContext when MFA is
       // required; the mfaPending effect above transitions us to the mfa
       // step. When no MFA is set up, we'll get redirected by the
@@ -839,7 +543,16 @@ export function Login() {
     clearError();
     pushLines(makeLine('sys', `→ launching SSO handoff · ${slug}`));
     try {
-      await loginWithOidc(slug, location.pathname);
+      if (tenantSlug === undefined) {
+        await loginWithOidc(slug, location.pathname);
+      } else {
+        const authorizeUrl = await startEnterpriseSharedOidcLogin(
+          tenantSlug,
+          slug,
+          sharedOidcDependencies(),
+        );
+        window.location.assign(authorizeUrl);
+      }
     } catch {
       setSsoLoading(null);
     }
@@ -992,6 +705,20 @@ export function Login() {
   const placeholder =
     step === 'email' ? 'you@company.co' : step === 'password' ? '' : step === 'mfa' ? '000000' : '';
   const isPassword = step === 'password';
+  // Per-prompt identity of the one wizard input, in the shape password
+  // managers key on (NAN-3146): a real `type="password"` field with
+  // `current-password`, a `username` field before it, and `one-time-code`
+  // for the MFA prompt. The email prompt stays `type="text"` (with an email
+  // keyboard) because it also accepts commands like `help` / `sso`, which
+  // native `type="email"` validation would block from submitting.
+  const inputField =
+    step === 'email'
+      ? { type: 'text', inputMode: 'email', name: 'username', id: 'username', autoComplete: 'username' } as const
+      : step === 'password'
+      ? { type: 'password', name: 'password', id: 'password', autoComplete: 'current-password' } as const
+      : step === 'mfa'
+      ? { type: 'text', inputMode: 'numeric', name: 'otp', id: 'otp', autoComplete: 'one-time-code' } as const
+      : null;
 
   // Step indicator chip values match design_handoff_login_terminal/README.md
   // (active config "anchored"). Email = [1/3] IDENTIFY, password = [2/3]
@@ -1004,6 +731,26 @@ export function Login() {
       : step === 'mfa'
       ? { num: '[3/3]', label: 'MFA CHALLENGE' }
       : null;
+
+  // Breadcrumb + status-bar copy for the shared pre-auth chrome. Same values
+  // the page rendered inline before the chrome was extracted.
+  const breadcrumbStep =
+    step === 'email'
+      ? 'identify'
+      : step === 'password'
+      ? 'verify'
+      : step === 'mfa'
+      ? 'mfa challenge'
+      : 'established';
+  const stepStatusLabel = {
+    email: 'awaiting identity',
+    password: 'awaiting password',
+    mfa: 'awaiting mfa · 6-digit code',
+    done: 'session established',
+  }[step];
+  const status: StatusLine = authError
+    ? { label: 'auth failed · retry', tone: 'error' }
+    : { label: stepStatusLabel, tone: step === 'done' ? 'done' : 'active' };
 
   // ── Authenticating-loader gate ────────────────────────────────────
   // Only show the full-page spinner during the *initial* auth probe (when
@@ -1018,435 +765,393 @@ export function Login() {
   if (authLoading && !terminalShownRef.current) {
     return (
       <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--background)' }}>
-        <Loader2 className="w-6 h-6 animate-spin text-primary" />
+        <LoadingIcon className="w-6 h-6 text-primary" />
       </div>
     );
   }
   terminalShownRef.current = true;
 
   return (
-    <div className="flex min-h-screen" style={{ background: 'var(--background)' }}>
-      <Rail />
-      <div className="flex-1 flex flex-col min-w-0">
-        <Topbar step={step} version={version} />
-        <div className="flex-1 flex min-h-0">
-          <div className="flex-1 flex flex-col min-w-0 p-3 md:p-5" style={{ background: 'var(--background)' }}>
-            <div
-              className="flex-1 flex flex-col min-h-0 rounded-[10px] border border-border overflow-hidden"
-              style={{ background: 'var(--card)' }}
+    <AuthTerminalFrame
+      version={version}
+      trail={[{ label: 'auth' }, { label: breadcrumbStep }]}
+      tab={{ label: 'auth login', sublabel: 'interactive' }}
+      status={status}
+      inspector={<Inspector ssoEnabled={ssoEnabled} />}
+      scrollRef={scrollRef}
+      onScrollClick={() => inputRef.current?.focus()}
+    >
+      <WelcomeBanner version={version}>
+        Welcome to nano. Authenticated sessions are logged and tied to your identity for audit.
+        Type <span className="text-foreground/85">help</span> for commands ·{' '}
+        <span className="text-foreground/85">^C</span> to abort at any prompt.
+      </WelcomeBanner>
+
+      {bootLines.current.map((l) => renderLine(l))}
+      {history.map((l) => renderLine(l))}
+
+      {step !== 'done' && passwordPromptVisible && (
+        <div className="pt-1">
+          {/*
+            Anchored prompt — design_handoff_login_terminal/README.md
+            "anchored" treatment. Bordered card + brand-tinted header
+            strip (status + path + step indicator) over the input row.
+          */}
+          <PromptCard>
+            <PromptCardHeader
+              caption="awaiting input"
+              prompt={prompt}
+              stepIndicator={stepIndicator}
+            />
+            <form
+              onSubmit={onSubmitDraft}
+              className="px-2.5 py-1.5 flex items-center gap-2 font-mono text-[12.5px] leading-none"
             >
-              {/* Tab strip */}
-              <div
-                className="h-[34px] px-1 flex items-end gap-0 border-b border-border shrink-0 whitespace-nowrap"
-                style={{ background: 'var(--card-2)' }}
-              >
-                <div
-                  className="h-full px-3 flex items-center gap-2 rounded-t-md border-t border-l border-r border-border text-[11.5px] -mb-px shrink-0 whitespace-nowrap"
-                  style={{ background: 'var(--card)' }}
+              <span className="text-primary select-none shrink-0 leading-none">&gt;</span>
+              {activePromptLabel && inputField && (
+                <label
+                  htmlFor={inputField.id}
+                  className="text-muted-foreground select-none shrink-0 whitespace-nowrap"
                 >
-                  <Terminal className="w-[12px] h-[12px] text-primary shrink-0" />
-                  <span className="font-mono text-foreground whitespace-nowrap">auth login</span>
-                  <span className="text-muted-foreground/60">·</span>
-                  <span className="font-mono text-muted-foreground text-[10.5px] whitespace-nowrap">interactive</span>
-                </div>
-                <div className="flex-1" />
-                <div className="h-full px-2 flex items-center gap-2 font-mono text-[10px] text-muted-foreground/60 shrink-0 whitespace-nowrap">
-                  <span>ansi · 256</span>
-                  <span>·</span>
-                  <span>utf-8</span>
-                </div>
+                  {activePromptLabel}
+                </label>
+              )}
+              {/*
+                NAN-3146 — password managers associate a saved password with
+                the username field of the SAME form. The email prompt is gone
+                by the time the password prompt renders, so the identity rides
+                along in a visually-hidden (not `hidden` / display:none, which
+                managers skip) read-only username field.
+              */}
+              {(step === 'password' || step === 'mfa') && (
+                <input
+                  type="text"
+                  name="username"
+                  autoComplete="username"
+                  value={email}
+                  readOnly
+                  tabIndex={-1}
+                  aria-hidden="true"
+                  className="sr-only"
+                />
+              )}
+              <div className="relative flex-1 min-w-0 flex items-center">
+                {inputField && (
+                  <input
+                    // A fresh element per prompt, so a manager never sees one
+                    // field flip from username to password to one-time code.
+                    key={step}
+                    ref={inputRef}
+                    {...inputField}
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={onKeyDown}
+                    maxLength={step === 'mfa' ? 12 : undefined}
+                    placeholder={placeholder}
+                    autoCapitalize="off"
+                    spellCheck={false}
+                    disabled={busy}
+                    className={cn(
+                      'w-full bg-transparent outline-none border-0 text-foreground font-mono text-[12.5px] caret-[var(--primary)]',
+                      // Native bullets, spaced like the echo line's `•` run.
+                      isPassword && 'tracking-[0.12em]',
+                      // Keep the terminal look when a manager fills the field:
+                      // no UA autofill background, same foreground colour.
+                      '[&:-webkit-autofill]:[-webkit-text-fill-color:var(--foreground)] [&:-webkit-autofill]:[transition:background-color_600000s_0s]',
+                    )}
+                  />
+                )}
+                {busy && (
+                  <LoadingIcon className="w-3.5 h-3.5 text-muted-foreground absolute right-1" />
+                )}
               </div>
-
-              {/* Terminal scroll */}
-              <div
-                ref={scrollRef}
-                className="flex-1 min-h-0 overflow-y-auto scrollbar-thin px-5 py-4 font-mono"
-                onClick={() => inputRef.current?.focus()}
+              {/*
+                NAN-3238 — a real submit button, not a bare <kbd>. Once the
+                NAN-3146 username field joins the form on the password / MFA
+                steps, the form has two text-like fields, and HTML implicit
+                submission (Enter) only fires when a submit button exists.
+                Always rendered (also tappable on mobile).
+              */}
+              <button
+                type="submit"
+                aria-label="Submit"
+                disabled={busy}
+                className="inline-flex items-center h-[16px] px-1 rounded-sm border border-border bg-foreground/[0.06] font-mono text-[9.5px] text-muted-foreground shrink-0 hover:text-foreground disabled:opacity-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
               >
-                <WelcomeBanner version={version} stats={stats} />
+                ↵
+              </button>
+            </form>
+          </PromptCard>
 
-                {bootLines.current.map((l) => renderLine(l))}
-                {history.map((l) => renderLine(l))}
-
-                {step !== 'done' && passwordPromptVisible && (
-                  <div className="pt-1">
-                    {/*
-                      Anchored prompt — design_handoff_login_terminal/README.md
-                      "anchored" treatment. Bordered card + brand-tinted header
-                      strip (status + path + step indicator) over the input row.
-                    */}
-                    <div
-                      className="max-w-[78ch] rounded-md overflow-hidden border bg-card"
-                      style={{
-                        borderColor:
-                          'color-mix(in srgb, var(--primary) 45%, var(--border))',
-                        backgroundColor:
-                          'color-mix(in srgb, var(--primary) 4%, var(--card))',
-                      }}
-                    >
-                      <div
-                        className="h-[22px] px-2.5 flex items-center gap-2 border-b border-border"
-                        style={{
-                          backgroundColor:
-                            'color-mix(in srgb, var(--primary) 7%, var(--card))',
-                        }}
-                      >
-                        <span className="w-1 h-1 rounded-full bg-primary animate-pulse shrink-0" />
-                        <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-muted-foreground">
-                          awaiting input
-                        </span>
-                        <span className="text-muted-foreground/50 text-[10px]">·</span>
-                        <span className="font-mono text-[9.5px] text-muted-foreground truncate">
-                          {prompt}
-                        </span>
-                        <div className="flex-1" />
-                        {stepIndicator && (
-                          <div className="h-[18px] px-1.5 rounded-sm border border-border inline-flex items-center gap-1 font-mono text-[10px] text-muted-foreground shrink-0">
-                            <span className="text-primary tabular-nums">
-                              {stepIndicator.num}
-                            </span>
-                            <span className="uppercase tracking-[0.12em]">
-                              {stepIndicator.label}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                      <form
-                        onSubmit={onSubmitDraft}
-                        className="px-2.5 py-1.5 flex items-center gap-2 font-mono text-[12.5px] leading-none"
-                      >
-                        <span className="text-primary select-none shrink-0 leading-none">&gt;</span>
-                        {activePromptLabel && (
-                          <span className="text-muted-foreground select-none shrink-0 whitespace-nowrap">
-                            {activePromptLabel}
-                          </span>
-                        )}
-                        <div className="relative flex-1 min-w-0 flex items-center">
-                          {isPassword ? (
-                            <>
-                              <span className="text-foreground">{'•'.repeat(draft.length)}</span>
-                              <span className="text-primary animate-pulse">▍</span>
-                              <input
-                                ref={inputRef}
-                                value={draft}
-                                onChange={(e) => setDraft(e.target.value)}
-                                onKeyDown={onKeyDown}
-                                type="text"
-                                autoComplete="current-password"
-                                autoCapitalize="off"
-                                spellCheck={false}
-                                disabled={busy}
-                                className="absolute inset-0 w-full h-full bg-transparent text-transparent caret-transparent outline-none"
-                              />
-                            </>
-                          ) : (
-                            <input
-                              ref={inputRef}
-                              value={draft}
-                              onChange={(e) => setDraft(e.target.value)}
-                              onKeyDown={onKeyDown}
-                              inputMode={step === 'mfa' ? 'numeric' : 'text'}
-                              maxLength={step === 'mfa' ? 12 : undefined}
-                              placeholder={placeholder}
-                              autoComplete={step === 'email' ? 'email' : 'off'}
-                              autoCapitalize="off"
-                              spellCheck={false}
-                              disabled={busy}
-                              className="w-full bg-transparent outline-none border-0 text-foreground font-mono text-[12.5px] caret-[var(--primary)]"
-                            />
-                          )}
-                          {busy && (
-                            <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground absolute right-1" />
-                          )}
-                        </div>
-                        <kbd className="hidden sm:inline-flex items-center h-[16px] px-1 rounded-sm border border-border bg-foreground/[0.06] font-mono text-[9.5px] text-muted-foreground shrink-0">
-                          ↵
-                        </kbd>
-                      </form>
-                    </div>
-
-                    {step === 'email' && (
-                      <TermGroup>
-                        <div className="text-muted-foreground/60 text-[10.5px] mt-0.5">
-                          your work email · type <span className="text-muted-foreground">help</span> for commands
-                        </div>
-                      </TermGroup>
-                    )}
-                    {step === 'password' && attempts > 0 && (
-                      <TermGroup>
-                        <div className="text-[10.5px] mt-0.5 flex items-center gap-1.5">
-                          <span
-                            className={cn(
-                              'inline-flex items-center gap-1 h-[16px] px-1.5 rounded-sm border font-mono tabular-nums',
-                              attempts >= 3
-                                ? 'border-destructive/40 text-destructive bg-destructive/[0.08]'
-                                : 'border-[var(--border-2)] text-[var(--warning)] bg-[color-mix(in_srgb,var(--warning)_10%,transparent)]',
-                            )}
-                          >
-                            attempt {attempts}/5
-                          </span>
-                          <span className="text-muted-foreground/60">
-                            re-enter your password to try again
-                          </span>
-                        </div>
-                      </TermGroup>
-                    )}
-                    {step === 'mfa' && (
-                      <TermGroup>
-                        <div className="text-muted-foreground/60 text-[10.5px] mt-0.5">
-                          open your authenticator · 6-digit TOTP or a backup code
-                        </div>
-                      </TermGroup>
-                    )}
-
-                    {/*
-                      Single sign-on, in the primary column directly under the
-                      prompt. Previously this lived only in the `hidden lg:flex`
-                      inspector, which made SSO both visually secondary and
-                      entirely unreachable below the lg breakpoint (NAN-2179).
-                    */}
-                    {showSsoPanel(step) && ssoSurface.kind !== 'hidden' && (
-                      <div className={SSO_PANEL_CLASS}>
-                        <div className="flex items-center gap-2 mb-1.5">
-                          <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-muted-foreground/70 shrink-0">
-                            or single sign-on
-                          </span>
-                          <span className="flex-1 h-px bg-border" />
-                        </div>
-
-                        {ssoSurface.kind === 'loading' && (
-                          <div className="flex items-center gap-2 h-9 px-2.5 rounded-md border border-border bg-card font-mono text-[11px] text-muted-foreground">
-                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            checking configured providers…
-                          </div>
-                        )}
-
-                        {ssoSurface.kind === 'error' && (
-                          <div
-                            className="flex items-center gap-2 h-9 px-2.5 rounded-md border font-mono text-[11px]"
-                            style={{
-                              borderColor: 'color-mix(in srgb, var(--warning) 40%, var(--border))',
-                              background: 'color-mix(in srgb, var(--warning) 8%, transparent)',
-                            }}
-                          >
-                            <span className="text-[var(--warning)] truncate">
-                              sso unavailable · email + password still works
-                            </span>
-                            <span className="flex-1" />
-                            <button
-                              type="button"
-                              onClick={() => setProvidersReload((n) => n + 1)}
-                              className="inline-flex items-center gap-1 h-[20px] px-1.5 rounded-sm border border-border text-muted-foreground hover:text-foreground hover:border-[var(--border-2)] text-[10px] shrink-0 transition-colors"
-                            >
-                              <RefreshCw className="w-3 h-3" />
-                              retry
-                            </button>
-                          </div>
-                        )}
-
-                        {ssoSurface.kind === 'providers' && (
-                          <>
-                            <div
-                              role="group"
-                              aria-label="Single sign-on providers"
-                              className="space-y-1.5"
-                            >
-                              {ssoSurface.providers.map((p, i) => {
-                                const Icon = getSsoIcon(p);
-                                const launching = ssoLoading === p.slug;
-                                return (
-                                  <button
-                                    // Keyed by slug, not id: the public
-                                    // providers endpoint returns only
-                                    // {slug, name}, so every `p.id` was
-                                    // undefined. Slug is unique per tenant.
-                                    key={p.slug}
-                                    type="button"
-                                    onClick={() => handleSsoClick(p.slug)}
-                                    disabled={ssoLoading !== null || busy}
-                                    aria-label={`Continue with ${p.name}`}
-                                    aria-busy={launching}
-                                    className="w-full h-9 rounded-md border border-border bg-card hover:border-[var(--border-2)] hover:bg-[var(--card-2)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] flex items-center gap-2 px-2.5 text-[11.5px] text-foreground/85 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                                  >
-                                    <span
-                                      aria-hidden="true"
-                                      className="font-mono text-[10px] text-muted-foreground/60 tabular-nums shrink-0"
-                                    >
-                                      [{i + 1}]
-                                    </span>
-                                    <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
-                                    <span className="truncate">Continue with {p.name}</span>
-                                    <span className="flex-1" />
-                                    {launching ? (
-                                      <Loader2 className="w-3 h-3 animate-spin text-muted-foreground shrink-0" />
-                                    ) : (
-                                      <ArrowUpRight className="w-3 h-3 text-muted-foreground/60 shrink-0" />
-                                    )}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                            <div className="text-muted-foreground/60 text-[10.5px] mt-1">
-                              or type{' '}
-                              <span className="text-muted-foreground">
-                                sso {ssoSurface.providers[0].slug}
-                              </span>{' '}
-                              at the prompt
-                            </div>
-                          </>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-
-                {/*
-                  NAN-2181 — SSO-only tenants. The password wizard is not
-                  rendered at all: soliciting credentials the server will refuse
-                  is worse than not offering them. Providers become the primary
-                  action, in the same primary column at every viewport width.
-                */}
-                {step !== 'done' && loginMode.kind === 'loading' && (
-                  <div className="pt-1 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    resolving sign-in methods…
-                  </div>
-                )}
-
-                {step !== 'done' && loginMode.kind === 'ssoOnlyLoading' && (
-                  <div className="pt-1 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    password sign-in is disabled · loading providers…
-                  </div>
-                )}
-
-                {step !== 'done' && loginMode.kind === 'ssoOnly' && (
-                  <div className="pt-1">
-                    <TermGroup>
-                      <div className="text-[11.5px] text-muted-foreground mb-2">
-                        this organization requires single sign-on · password
-                        sign-in is disabled
-                      </div>
-                    </TermGroup>
-                    <div className={SSO_PANEL_CLASS}>
-                      <div
-                        role="group"
-                        aria-label="Single sign-on providers"
-                        className="space-y-1.5"
-                      >
-                        {loginMode.providers.map((p, i) => {
-                          const Icon = getSsoIcon(p);
-                          const launching = ssoLoading === p.slug;
-                          return (
-                            <button
-                              key={p.slug}
-                              type="button"
-                              onClick={() => handleSsoClick(p.slug)}
-                              disabled={ssoLoading !== null}
-                              aria-label={`Continue with ${p.name}`}
-                              aria-busy={launching}
-                              className="w-full h-10 rounded-md border bg-card hover:bg-[var(--card-2)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] flex items-center gap-2 px-2.5 text-[12.5px] text-foreground disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                              style={{
-                                borderColor:
-                                  'color-mix(in srgb, var(--primary) 45%, var(--border))',
-                              }}
-                            >
-                              <span
-                                aria-hidden="true"
-                                className="font-mono text-[10px] text-muted-foreground/60 tabular-nums shrink-0"
-                              >
-                                [{i + 1}]
-                              </span>
-                              <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
-                              <span className="truncate">Continue with {p.name}</span>
-                              <span className="flex-1" />
-                              {launching ? (
-                                <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground shrink-0" />
-                              ) : (
-                                <ArrowUpRight className="w-3.5 h-3.5 text-muted-foreground/60 shrink-0" />
-                              )}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {step !== 'done' && loginMode.kind === 'ssoOnlyUnavailable' && (
-                  <div className="pt-1">
-                    <TermGroup>
-                      <div
-                        className="rounded-md border px-3.5 py-3 max-w-[72ch]"
-                        style={{
-                          borderColor: 'color-mix(in srgb, var(--destructive) 40%, transparent)',
-                          background: 'color-mix(in srgb, var(--destructive) 8%, transparent)',
-                        }}
-                      >
-                        <div className="text-[12.5px] text-foreground font-medium mb-1">
-                          No sign-in method is available
-                        </div>
-                        <div className="text-[11.5px] text-muted-foreground">
-                          {loginMode.reason === 'error'
-                            ? 'Password sign-in is disabled and the SSO providers could not be loaded.'
-                            : 'Password sign-in is disabled and no SSO provider is enabled.'}{' '}
-                          Contact an administrator.
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setProvidersReload((n) => n + 1)}
-                          className="mt-2 inline-flex items-center gap-1 h-[22px] px-2 rounded-sm border border-border text-muted-foreground hover:text-foreground hover:border-[var(--border-2)] text-[11px] transition-colors"
-                        >
-                          <RefreshCw className="w-3 h-3" />
-                          retry
-                        </button>
-                      </div>
-                    </TermGroup>
-                  </div>
-                )}
-
-                {step === 'done' && (
-                  <div className="mt-2">
-                    <TermGroup>
-                      <div
-                        className="rounded-md border px-3.5 py-3 max-w-[72ch]"
-                        style={{
-                          borderColor: 'color-mix(in srgb, var(--success) 40%, transparent)',
-                          background: 'color-mix(in srgb, var(--success) 9%, transparent)',
-                        }}
-                      >
-                        <div className="flex items-center gap-2 mb-1.5">
-                          <Check className="w-4 h-4 text-[var(--success)]" />
-                          <span className="font-sans text-[13px] font-semibold text-foreground">
-                            Session established
-                          </span>
-                        </div>
-                        <div className="font-mono text-[11px] text-foreground/85 space-y-0.5">
-                          <div>
-                            <span className="text-muted-foreground/60">identity</span>  {email}
-                          </div>
-                          <div>
-                            <span className="text-muted-foreground/60">issued</span>{'   '}
-                            {new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z'}
-                          </div>
-                        </div>
-                      </div>
-                    </TermGroup>
-                  </div>
-                )}
+          {step === 'email' && (
+            <TermGroup>
+              <div className="text-muted-foreground/60 text-[10.5px] mt-0.5">
+                your work email · type <span className="text-muted-foreground">help</span> for commands
               </div>
+            </TermGroup>
+          )}
+          {step === 'password' && attempts > 0 && (
+            <TermGroup>
+              <div className="text-[10.5px] mt-0.5 flex items-center gap-1.5">
+                <span
+                  className={cn(
+                    'inline-flex items-center gap-1 h-[16px] px-1.5 rounded-sm border font-mono tabular-nums',
+                    attempts >= 3
+                      ? 'border-destructive/40 text-destructive bg-destructive/[0.08]'
+                      : 'border-[var(--border-2)] text-[var(--warning)] bg-[color-mix(in_srgb,var(--warning)_10%,transparent)]',
+                  )}
+                >
+                  attempt {attempts}/5
+                </span>
+                <span className="text-muted-foreground/60">
+                  re-enter your password to try again
+                </span>
+              </div>
+            </TermGroup>
+          )}
+          {step === 'mfa' && (
+            <TermGroup>
+              <div className="text-muted-foreground/60 text-[10.5px] mt-0.5">
+                open your authenticator · 6-digit TOTP or a backup code
+              </div>
+            </TermGroup>
+          )}
+
+          {/*
+            Single sign-on, in the primary column directly under the
+            prompt. Previously this lived only in the `hidden lg:flex`
+            inspector, which made SSO both visually secondary and
+            entirely unreachable below the lg breakpoint (NAN-2179).
+          */}
+          {showSsoPanel(step) && ssoSurface.kind !== 'hidden' && (
+            <div className={SSO_PANEL_CLASS}>
+              <div className="flex items-center gap-2 mb-1.5">
+                <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-muted-foreground/70 shrink-0">
+                  or single sign-on
+                </span>
+                <span className="flex-1 h-px bg-border" />
+              </div>
+
+              {ssoSurface.kind === 'loading' && (
+                <div className="flex items-center gap-2 h-9 px-2.5 rounded-md border border-border bg-card font-mono text-[11px] text-muted-foreground">
+                  <LoadingIcon className="w-3.5 h-3.5" />
+                  checking configured providers…
+                </div>
+              )}
+
+              {ssoSurface.kind === 'error' && (
+                <div
+                  className="flex items-center gap-2 h-9 px-2.5 rounded-md border font-mono text-[11px]"
+                  style={{
+                    borderColor: 'color-mix(in srgb, var(--warning) 40%, var(--border))',
+                    background: 'color-mix(in srgb, var(--warning) 8%, transparent)',
+                  }}
+                >
+                  <span className="text-[var(--warning)] truncate">
+                    sso unavailable · email + password still works
+                  </span>
+                  <span className="flex-1" />
+                  <button
+                    type="button"
+                    onClick={() => setProvidersReload((n) => n + 1)}
+                    className="inline-flex items-center gap-1 h-[20px] px-1.5 rounded-sm border border-border text-muted-foreground hover:text-foreground hover:border-[var(--border-2)] text-[10px] shrink-0 transition-colors"
+                  >
+                    <RefreshCw className="w-3 h-3" />
+                    retry
+                  </button>
+                </div>
+              )}
+
+              {ssoSurface.kind === 'providers' && (
+                <>
+                  <div
+                    role="group"
+                    aria-label="Single sign-on providers"
+                    className="space-y-1.5"
+                  >
+                    {ssoSurface.providers.map((p, i) => {
+                      const Icon = getSsoIcon(p);
+                      const launching = ssoLoading === p.slug;
+                      return (
+                        <button
+                          // Keyed by slug, not id: the public
+                          // providers endpoint returns only
+                          // {slug, name}, so every `p.id` was
+                          // undefined. Slug is unique per tenant.
+                          key={p.slug}
+                          type="button"
+                          onClick={() => handleSsoClick(p.slug)}
+                          disabled={ssoLoading !== null || busy}
+                          aria-label={`Continue with ${p.name}`}
+                          aria-busy={launching}
+                          className="w-full h-9 rounded-md border border-border bg-card hover:border-[var(--border-2)] hover:bg-[var(--card-2)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] flex items-center gap-2 px-2.5 text-[11.5px] text-foreground/85 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          <span
+                            aria-hidden="true"
+                            className="font-mono text-[10px] text-muted-foreground/60 tabular-nums shrink-0"
+                          >
+                            [{i + 1}]
+                          </span>
+                          <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
+                          <span className="truncate">Continue with {p.name}</span>
+                          <span className="flex-1" />
+                          {launching ? (
+                            <LoadingIcon className="w-3 h-3 text-muted-foreground shrink-0" />
+                          ) : (
+                            <ArrowUpRight className="w-3 h-3 text-muted-foreground/60 shrink-0" />
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="text-muted-foreground/60 text-[10.5px] mt-1">
+                    or type{' '}
+                    <span className="text-muted-foreground">
+                      sso {ssoSurface.providers[0].slug}
+                    </span>{' '}
+                    at the prompt
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/*
+        NAN-2181 — SSO-only tenants. The password wizard is not
+        rendered at all: soliciting credentials the server will refuse
+        is worse than not offering them. Providers become the primary
+        action, in the same primary column at every viewport width.
+      */}
+      {step !== 'done' && loginMode.kind === 'loading' && (
+        <div className="pt-1 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
+          <LoadingIcon className="w-3.5 h-3.5" />
+          resolving sign-in methods…
+        </div>
+      )}
+
+      {step !== 'done' && loginMode.kind === 'ssoOnlyLoading' && (
+        <div className="pt-1 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
+          <LoadingIcon className="w-3.5 h-3.5" />
+          password sign-in is disabled · loading providers…
+        </div>
+      )}
+
+      {step !== 'done' && loginMode.kind === 'ssoOnly' && (
+        <div className="pt-1">
+          <TermGroup>
+            <div className="text-[11.5px] text-muted-foreground mb-2">
+              this organization requires single sign-on · password
+              sign-in is disabled
+            </div>
+          </TermGroup>
+          <div className={SSO_PANEL_CLASS}>
+            <div
+              role="group"
+              aria-label="Single sign-on providers"
+              className="space-y-1.5"
+            >
+              {loginMode.providers.map((p, i) => {
+                const Icon = getSsoIcon(p);
+                const launching = ssoLoading === p.slug;
+                return (
+                  <button
+                    key={p.slug}
+                    type="button"
+                    onClick={() => handleSsoClick(p.slug)}
+                    disabled={ssoLoading !== null}
+                    aria-label={`Continue with ${p.name}`}
+                    aria-busy={launching}
+                    className="w-full h-10 rounded-md border bg-card hover:bg-[var(--card-2)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--primary)] flex items-center gap-2 px-2.5 text-[12.5px] text-foreground disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    style={{
+                      borderColor:
+                        'color-mix(in srgb, var(--primary) 45%, var(--border))',
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className="font-mono text-[10px] text-muted-foreground/60 tabular-nums shrink-0"
+                    >
+                      [{i + 1}]
+                    </span>
+                    <Icon className="w-4 h-4 text-muted-foreground shrink-0" />
+                    <span className="truncate">Continue with {p.name}</span>
+                    <span className="flex-1" />
+                    {launching ? (
+                      <LoadingIcon className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                    ) : (
+                      <ArrowUpRight className="w-3.5 h-3.5 text-muted-foreground/60 shrink-0" />
+                    )}
+                  </button>
+                );
+              })}
             </div>
           </div>
-          <Inspector stats={stats} ssoEnabled={ssoEnabled} />
         </div>
-        <StatusBar
-          step={step}
-          version={version}
-          authError={authError ?? null}
-          stats={stats}
-          clock={clock}
-        />
-      </div>
-    </div>
+      )}
+
+      {step !== 'done' && loginMode.kind === 'ssoOnlyUnavailable' && (
+        <div className="pt-1">
+          <TermGroup>
+            <div
+              className="rounded-md border px-3.5 py-3 max-w-[72ch]"
+              style={{
+                borderColor: 'color-mix(in srgb, var(--destructive) 40%, transparent)',
+                background: 'color-mix(in srgb, var(--destructive) 8%, transparent)',
+              }}
+            >
+              <div className="text-[12.5px] text-foreground font-medium mb-1">
+                No sign-in method is available
+              </div>
+              <div className="text-[11.5px] text-muted-foreground">
+                {loginMode.reason === 'error'
+                  ? 'Password sign-in is disabled and the SSO providers could not be loaded.'
+                  : 'Password sign-in is disabled and no SSO provider is enabled.'}{' '}
+                Contact an administrator.
+              </div>
+              <button
+                type="button"
+                onClick={() => setProvidersReload((n) => n + 1)}
+                className="mt-2 inline-flex items-center gap-1 h-[22px] px-2 rounded-sm border border-border text-muted-foreground hover:text-foreground hover:border-[var(--border-2)] text-[11px] transition-colors"
+              >
+                <RefreshCw className="w-3 h-3" />
+                retry
+              </button>
+            </div>
+          </TermGroup>
+        </div>
+      )}
+
+      {step === 'done' && (
+        <div className="mt-2">
+          <TermGroup>
+            <div
+              className="rounded-md border px-3.5 py-3 max-w-[72ch]"
+              style={{
+                borderColor: 'color-mix(in srgb, var(--success) 40%, transparent)',
+                background: 'color-mix(in srgb, var(--success) 9%, transparent)',
+              }}
+            >
+              <div className="flex items-center gap-2 mb-1.5">
+                <Check className="w-4 h-4 text-[var(--success)]" />
+                <span className="font-sans text-[13px] font-semibold text-foreground">
+                  Session established
+                </span>
+              </div>
+              <div className="font-mono text-[11px] text-foreground/85 space-y-0.5">
+                <div>
+                  <span className="text-muted-foreground/60">identity</span>  {email}
+                </div>
+                <div>
+                  <span className="text-muted-foreground/60">issued</span>{'   '}
+                  {new Date().toISOString().replace('T', ' ').slice(0, 19) + 'Z'}
+                </div>
+              </div>
+            </div>
+          </TermGroup>
+        </div>
+      )}
+    </AuthTerminalFrame>
   );
 }

@@ -12,7 +12,8 @@
 // presents them. Each SLO's service links into the Service detail drill-in.
 
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, Pencil, Trash2, AlertTriangle, Loader2 } from 'lucide-react';
+import { Plus, Pencil, Trash2, AlertTriangle } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
 import type { Slo, SloInput, SloStatus } from '@/lib/api/observability';
@@ -140,7 +141,7 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
 
       {loading ? (
         <div className="flex items-center justify-center gap-2 py-12 text-[12px] text-fg-3">
-          <Loader2 className="h-[14px] w-[14px] animate-spin" />
+          <LoadingIcon className="h-[14px] w-[14px]" />
           Loading SLOs…
         </div>
       ) : sorted.length === 0 && error == null ? (

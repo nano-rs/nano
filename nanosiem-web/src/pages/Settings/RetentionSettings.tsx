@@ -2,24 +2,26 @@
 
 import { useEffect, useState, type ComponentType } from 'react';
 import { useSearchParams } from 'react-router-dom';
+import { PlatformManagedNotice } from '@/components/settings/PlatformManagedNotice';
+import { platformManaged } from '@/lib/platform-managed';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import {
   Database,
   Calendar,
-  Loader2,
   Zap,
   Archive,
   Gauge,
   Trash2,
   Activity,
 } from 'lucide-react';
-import { api, StorageOverview, ClickHouseStorageStats, DiskPressureStatus } from '@/lib/api';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import { api, StorageOverview, ClickHouseStorageStats, LakeStorageStats, DiskPressureStatus, TenantLakeStorageFacts } from '@/lib/api';
 import { formatUTC } from '@/lib/date-utils';
 import { useToast } from '@/hooks/use-toast';
 import { SettingsSubsectionShell, type SubsectionTab } from '@/components/settings/SettingsSubsectionShell';
 
-type StorageTabId = 'clickhouse' | 'postgres';
-const TAB_IDS: StorageTabId[] = ['clickhouse', 'postgres'];
+type StorageTabId = 'logs' | 'postgres';
+const TAB_IDS: StorageTabId[] = ['logs', 'postgres'];
 
 function isStorageTab(value: string | null): value is StorageTabId {
   return value !== null && (TAB_IDS as string[]).includes(value);
@@ -27,10 +29,10 @@ function isStorageTab(value: string | null): value is StorageTabId {
 
 const TABS: SubsectionTab<StorageTabId>[] = [
   {
-    id: 'clickhouse',
-    label: 'ClickHouse · Logs',
+    id: 'logs',
+    label: 'Event Lake · Logs',
     icon: Zap,
-    desc: 'Time-series log storage. Daily partitions; TTL retention managed via deployment config.',
+    desc: 'Canonical OCSF events in Iceberg/Parquet object storage.',
   },
   {
     id: 'postgres',
@@ -49,12 +51,12 @@ export function RetentionSettings() {
   const [loading, setLoading] = useState(true);
 
   const requested = searchParams.get('tab');
-  const activeTab: StorageTabId = isStorageTab(requested) ? requested : 'clickhouse';
+  const activeTab: StorageTabId = isStorageTab(requested) ? requested : 'logs';
 
   // Canonicalize URL on mount so the rail child highlights when arriving at bare /settings/storage
   useEffect(() => {
     if (!isStorageTab(searchParams.get('tab'))) {
-      setSearchParams({ tab: 'clickhouse' }, { replace: true });
+      setSearchParams({ tab: 'logs' }, { replace: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -89,15 +91,65 @@ export function RetentionSettings() {
     >
       {loading && !overview ? (
         <div className="flex items-center justify-center py-12">
-          <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+          <LoadingIcon className="w-5 h-5 text-muted-foreground" />
         </div>
       ) : (
         <div className="px-6 py-5 space-y-5">
-          {/* ClickHouse */}
-          <div style={{ display: activeTab === 'clickhouse' ? 'block' : 'none' }} className="space-y-5">
+          {/* Active event store */}
+          <div style={{ display: activeTab === 'logs' ? 'block' : 'none' }} className="space-y-5">
             {overview?.disk_pressure && <DiskPressurePanel status={overview.disk_pressure} />}
 
-            {overview?.clickhouse ? (
+            {platformManaged(overview) ? (
+              <>
+                {/* Hosted-shared tenant (NAN-2361): storage is the platform's shared lake;
+                    retention follows the plan; the lake reports what it has written. */}
+                <PlatformManagedNotice verdict={platformManaged(overview)!} title="Storage and retention" />
+                {overview?.retention && (
+                  <div className="rounded-md border border-border bg-card p-3 grid grid-cols-3 gap-4">
+                    <div>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">Retention</div>
+                      <div className="font-mono text-[13px] text-foreground tabular-nums">{overview.retention.retention_days} days</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">Retained from</div>
+                      <div className="font-mono text-[12px] text-foreground/80">{overview.retention.retained_from.replace('T', ' ').slice(0, 16)}Z</div>
+                    </div>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">Plan</div>
+                      <div className="font-mono text-[12px] text-foreground/80">{overview.retention.plan_code}</div>
+                    </div>
+                  </div>
+                )}
+                {overview?.tenant_lake ? (
+                  <>
+                    <TenantLakeStats facts={overview.tenant_lake} />
+                    <HelperNote
+                      icon={Archive}
+                      iconColor="text-cyan-400"
+                      title="Written to date"
+                      body="Objects and bytes are what the lake recorded for this tenant (writer completion receipts), summed since the tenant was created. Objects removed by plan retention are not subtracted; event counts are not tracked per object."
+                    />
+                  </>
+                ) : (
+                  <HelperNote
+                    icon={Database}
+                    iconColor="text-muted-foreground"
+                    title="Nothing recorded yet"
+                    body="The lake has not recorded any object for this tenant yet. Storage figures appear once a source starts sending data."
+                  />
+                )}
+              </>
+            ) : overview?.lake ? (
+              <>
+                <LakeStats stats={overview.lake} />
+                <HelperNote
+                  icon={Archive}
+                  iconColor="text-cyan-400"
+                  title="Iceberg retention"
+                  body="Canonical OCSF events are stored as immutable Parquet objects. Retention, compaction, snapshot expiry, and orphan cleanup are coordinated as object-lake maintenance jobs."
+                />
+              </>
+            ) : overview?.clickhouse ? (
               <>
                 <ClickHouseStats stats={overview.clickhouse} />
                 <HelperNote
@@ -118,8 +170,8 @@ export function RetentionSettings() {
               <HelperNote
                 icon={Database}
                 iconColor="text-muted-foreground"
-                title="ClickHouse not configured"
-                body="ClickHouse is not enabled for this deployment. Log storage is using PostgreSQL."
+                title="Event storage unavailable"
+                body="No active event-store snapshot is available for this deployment."
               />
             )}
           </div>
@@ -131,7 +183,7 @@ export function RetentionSettings() {
               icon={Database}
               iconColor="text-primary"
               title="Metadata storage"
-              body="PostgreSQL stores metadata: detection rules, alerts, dashboards, saved searches, parser configurations, and AI settings. Log telemetry lives in ClickHouse for query performance."
+              body="PostgreSQL stores metadata: detection rules, alerts, dashboards, saved searches, parser configurations, and AI settings. Event telemetry lives in the configured event store."
             />
           </div>
         </div>
@@ -209,6 +261,66 @@ function ClickHouseStats({ stats }: { stats: ClickHouseStorageStats }) {
       label: 'Date range',
       value: formatUTC(stats.oldest_log),
       sub: `to ${formatUTC(stats.newest_log)}`,
+    },
+  ];
+  return <StatGrid cells={cells} />;
+}
+
+function LakeStats({ stats }: { stats: LakeStorageStats }) {
+  const cells: StatCell[] = [
+    {
+      label: 'Event data',
+      value: stats.total_size_pretty,
+      sub: `${stats.table_format} · ${stats.file_format}`,
+    },
+    {
+      label: 'Total events',
+      value: stats.row_count.toLocaleString(),
+    },
+    {
+      label: 'Objects',
+      value: stats.object_count.toLocaleString(),
+      sub: 'immutable data files',
+    },
+    {
+      label: 'Entity index',
+      value: stats.index_size_pretty,
+      sub: `${stats.index_overhead_percent.toFixed(1)}% of event bytes`,
+    },
+  ];
+  return <StatGrid cells={cells} />;
+}
+
+function formatLakeBytes(bytes: number): string {
+  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+/** Hosted-shared tenant (NAN-2361): lake facts from writer completion receipts. */
+function TenantLakeStats({ facts }: { facts: TenantLakeStorageFacts }) {
+  const cells: StatCell[] = [
+    {
+      label: 'Event data',
+      value: formatLakeBytes(facts.ingest_bytes),
+      sub: 'hot tail + Iceberg data objects',
+    },
+    {
+      label: 'Data objects',
+      value: facts.ingest_objects.toLocaleString(),
+      sub: 'written to date',
+    },
+    {
+      label: 'All objects',
+      value: `${facts.objects.toLocaleString()} · ${formatLakeBytes(facts.bytes)}`,
+      sub: `${facts.writer_classes.length} writer class${facts.writer_classes.length === 1 ? '' : 'es'}`,
+    },
+    {
+      label: 'Last write',
+      value: facts.last_written_at ? formatUTC(facts.last_written_at) : '—',
+      sub: facts.first_written_at ? `first ${formatUTC(facts.first_written_at)}` : null,
     },
   ];
   return <StatGrid cells={cells} />;
@@ -345,4 +457,3 @@ function DiskPressurePanel({ status }: { status: DiskPressureStatus }) {
     </section>
   );
 }
-

@@ -22,9 +22,9 @@ import {
   Layers,
   Shield,
   X,
-  Loader2,
   AlertCircle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
@@ -183,7 +183,7 @@ function GroupDetailView({ group, members, membersLoading, onEdit, onDelete }: G
             </div>
             {membersLoading ? (
               <div className="px-4 py-6 text-center">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground inline" />
+                <LoadingIcon className="w-4 h-4 text-muted-foreground inline" />
               </div>
             ) : members.length === 0 ? (
               <div className="px-4 py-6 text-center text-[11.5px] text-muted-foreground">No members yet.</div>
@@ -353,7 +353,7 @@ export function GroupsView() {
           <div className="flex-1 overflow-y-auto scrollbar-thin">
             {loading ? (
               <div className="flex items-center justify-center py-12">
-                <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+                <LoadingIcon className="w-4 h-4 text-muted-foreground" />
               </div>
             ) : filtered.length === 0 ? (
               <div className="px-4 py-8 text-center text-[11.5px] text-muted-foreground">

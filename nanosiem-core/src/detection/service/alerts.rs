@@ -5,19 +5,112 @@
 //! Alert CRUD operations, grouped/per-event alert handling,
 //! signal logging, case grouping, and webhook notifications.
 
+use futures::stream::{self, StreamExt};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
 use crate::db::repository::alerts::AlertRepositoryError;
-use crate::extensions::AlertCasePermissions;
 use crate::db::repository::DailyStat;
+use crate::extensions::AlertCasePermissions;
 use crate::models::{
     AcknowledgeAlert, Alert, AlertStatus, CloseAlert, DetectionRule, Disposition, NewAlert,
     Severity,
 };
 
+use super::helpers::MatchedEventKind;
 use super::DetectionError;
 use super::DetectionService;
+
+/// Maximum number of independent per-event alert writes in flight at once.
+///
+/// Each alert writes its review row, durable alert, finding outbox entry, and
+/// optional case/webhook side effects. Serial execution made a 100-event drain
+/// batch take several minutes; unbounded fanout can exhaust the PostgreSQL pool
+/// and downstream hooks. Eight keeps pressure bounded while allowing the
+/// independent writes to overlap. Cooldown rules retain their ordered path
+/// below because same-batch entity suppression is stateful.
+const PER_EVENT_FANOUT_CONCURRENCY: usize = 8;
+
+const ALERT_POST_CREATE_CONTEXT_VERSION: u32 = 1;
+
+/// Immutable inputs for the durable work that follows creation of a per-event
+/// alert. The dispatcher must never rebuild finding, case, or webhook content
+/// from the current rule: users can edit or delete a rule while this row is
+/// waiting, and the deterministic finding ID deliberately rejects changed
+/// content for an existing alert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AlertPostCreateContext {
+    schema_version: u32,
+    rule: DetectionRule,
+    case_permissions: Option<AlertCasePermissions>,
+    global_risk_weight: f64,
+}
+
+impl AlertPostCreateContext {
+    fn new(
+        rule: &DetectionRule,
+        case_permissions: Option<AlertCasePermissions>,
+        global_risk_weight: f64,
+    ) -> Self {
+        Self {
+            schema_version: ALERT_POST_CREATE_CONTEXT_VERSION,
+            rule: rule.clone(),
+            case_permissions,
+            global_risk_weight,
+        }
+    }
+
+    fn validate_for_alert(&self, alert: &Alert) -> Result<(), DetectionError> {
+        if self.schema_version != ALERT_POST_CREATE_CONTEXT_VERSION {
+            return Err(DetectionError::QueryExecutionError(format!(
+                "unsupported alert post-create context version {} for alert {}",
+                self.schema_version, alert.id
+            )));
+        }
+        if alert.rule_id.is_some_and(|rule_id| rule_id != self.rule.id) {
+            return Err(DetectionError::QueryExecutionError(format!(
+                "alert post-create context rule {} does not match alert {} rule {:?}",
+                self.rule.id, alert.id, alert.rule_id
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn enforce_per_event_window_envelope(
+    result_count: usize,
+    alert_cap: usize,
+) -> Result<(), DetectionError> {
+    if alert_cap == 0 || result_count > alert_cap {
+        return Err(DetectionError::QueryExecutionError(format!(
+            "per-event detection window produced {result_count} alerts above its {alert_cap}-alert storm envelope; the window remains pending for durable fanout"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PerEventBatchPlan {
+    pub batch_len: usize,
+    pub remaining: usize,
+}
+
+pub(super) fn plan_per_event_batch(
+    result_count: usize,
+    alert_cap: usize,
+) -> Result<PerEventBatchPlan, DetectionError> {
+    if alert_cap == 0 {
+        return Err(DetectionError::QueryExecutionError(
+            "per-event detection alert batch size must be greater than zero".to_string(),
+        ));
+    }
+    let batch_len = result_count.min(alert_cap);
+    Ok(PerEventBatchPlan {
+        batch_len,
+        remaining: result_count.saturating_sub(batch_len),
+    })
+}
 
 /// A per-entity finding candidate with its stable cross-execution identity
 /// (NAN-1305). Built by `build_finding_candidates`, filtered to the new ones by
@@ -106,28 +199,15 @@ impl DetectionService {
         // In a genuinely mixed batch, an event whose `| risk` score is null
         // produces no per-event finding — the query authored it as no-risk
         // (`score=if(cond, X, null)`), so this is intentional, not a drop.
-        let has_query_scores = results
-            .iter()
-            .any(super::super::risk::ScoreCalculator::has_query_risk_score);
-
-        let groups = if has_query_scores {
-            results
-                .iter()
-                .filter_map(|event| {
-                    let rr = self
-                        .score_calculator
-                        .calculate_from_query_result(event, global_weight)?;
-                    let field = rr.entity_field.clone().unwrap_or_default();
-                    Some((rr.entity, field, vec![event.clone()]))
-                })
-                .collect()
-        } else {
-            self.group_events_by_entity(rule.risk_entity_field.as_deref(), results)
-                .into_iter()
-                .map(|((entity, field), events)| (entity, field, events))
-                .collect()
-        };
-        (has_query_scores, groups)
+        // Shared with the hosted-shared publish path (NAN-2713): one
+        // implementation, so both engines partition identically.
+        crate::detection::entity_risk::partition_entity_groups(
+            &self.score_calculator,
+            self.active_profile.as_ref(),
+            rule,
+            results,
+            global_weight,
+        )
     }
 
     /// Compute the risk result for one entity group, honoring query-derived
@@ -147,45 +227,17 @@ impl DetectionService {
         events: &[serde_json::Value],
         global_weight: f64,
     ) -> Option<super::super::risk::RiskResult> {
-        let result = if has_query_scores {
-            self.score_calculator
-                .calculate_from_query_result(&events[0], global_weight)
-        } else {
-            let r = self.score_calculator.calculate(
-                rule.risk_score,
-                rule.severity,
-                Some(field),
-                &rule.risk_modifiers,
-                events,
-                global_weight,
-            );
-            Some(super::super::risk::RiskResult::new(
-                r.raw_score,
-                r.weighted_score,
-                entity.to_string(),
-                Some(field.to_string()),
-                r.factors,
-            ))
-        };
-
-        // NAN-1805: execution-side feedback-loop guard. A dataset=risk rule's
-        // findings feed the risk dataset itself, so its score is FORCED to 0 at
-        // this single choke point (shared by the Live, grouped-Alerting, and
-        // per-event paths) — covering the rule-level score, severity defaults,
-        // modifiers, and any query-derived `| risk` score alike. The finding is
-        // still emitted (audit trail / signal visibility); it contributes 0.
-        if Self::is_risk_dataset_rule(rule) {
-            return result.map(|mut r| {
-                r.raw_score = 0;
-                r.weighted_score = 0;
-                r.factors = vec![
-                    "dataset=risk rule: score forced to 0 (feedback-loop guard, NAN-1805)"
-                        .to_string(),
-                ];
-                r
-            });
-        }
-        result
+        // NAN-2713: single implementation shared with the hosted-shared
+        // publish path (incl. the NAN-1805 dataset=risk zeroing).
+        crate::detection::entity_risk::risk_result_for_group(
+            &self.score_calculator,
+            rule,
+            has_query_scores,
+            entity,
+            field,
+            events,
+            global_weight,
+        )
     }
 
     /// Log risk signals for an alert's matched events, grouped by entity.
@@ -202,15 +254,16 @@ impl DetectionService {
         alert: &Alert,
         events: &[serde_json::Value],
         global_weight: f64,
-    ) {
+    ) -> Result<(), DetectionError> {
         let Some(ref logger) = self.finding_logger else {
-            return;
+            return Ok(());
         };
 
         // R1: honor the `| risk` command's per-event score/entity here too — the
         // per-event alert path must score identically to Live/grouped, not revert
         // to the rule-level score/entity.
         let (has_query_scores, groups) = self.partition_entity_groups(rule, events, global_weight);
+        let mut failures = Vec::new();
         for (entity, field_name, entity_events) in groups {
             let Some(risk_result) = self.risk_result_for_group(
                 rule,
@@ -228,9 +281,21 @@ impl DetectionService {
                 entity, field_name, risk_result.raw_score, risk_result.weighted_score
             );
 
-            if let Err(e) = logger.log_alert(rule, alert, false, risk_result).await {
+            let realtime =
+                rule.detection_mode == crate::models::detection_rule::DetectionMode::RealTime;
+            if let Err(e) = logger.log_alert(rule, alert, realtime, risk_result).await {
                 error!("Failed to log alert signal for entity {}: {}", entity, e);
+                failures.push(format!("{entity}: {e}"));
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DetectionError::QueryExecutionError(format!(
+                "failed to publish {} alert finding(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
         }
     }
 
@@ -241,16 +306,55 @@ impl DetectionService {
         alert: &Alert,
         case_permissions: Option<AlertCasePermissions>,
     ) {
+        if let Err(error) = self
+            .process_alert_post_create_with_mode(rule, alert, case_permissions, false)
+            .await
+        {
+            error!(
+                alert_id = %alert.id,
+                %error,
+                "Alert post-create side effect failed"
+            );
+        }
+    }
+
+    async fn process_alert_post_create_durable(
+        &self,
+        rule: &DetectionRule,
+        alert: &Alert,
+        case_permissions: Option<AlertCasePermissions>,
+    ) -> Result<(), DetectionError> {
+        self.process_alert_post_create_with_mode(rule, alert, case_permissions, true)
+            .await
+    }
+
+    async fn process_alert_post_create_with_mode(
+        &self,
+        rule: &DetectionRule,
+        alert: &Alert,
+        case_permissions: Option<AlertCasePermissions>,
+        durable: bool,
+    ) -> Result<(), DetectionError> {
         // Auto-group alert into a case via the CaseGroupingHook extension.
         // Open-core builds use a no-op hook that returns Ok(None) and skips
         // case grouping (and downstream shadow investigation) entirely.
-        let rule_name = Some(rule.name.as_str());
-        match self
-            .case_grouping
-            .group_alert(alert, rule_name, case_permissions)
-            .await
-        {
-            Ok(Some(grouped)) => {
+        let grouping = if alert.case_id.is_some() {
+            debug!(
+                alert_id = %alert.id,
+                case_id = ?alert.case_id,
+                "Alert is already grouped; skipping idempotent outbox replay"
+            );
+            None
+        } else {
+            Some(
+                self.case_grouping
+                    .group_alert(alert, Some(rule.name.as_str()), case_permissions)
+                    .await,
+            )
+        };
+        match grouping {
+            None => {}
+            Some(Ok(Some(grouped))) => {
                 info!(
                     alert_id = %alert.id,
                     case_id = %grouped.case_id,
@@ -274,18 +378,24 @@ impl DetectionService {
                     }
                 }
             }
-            Ok(None) => {
+            Some(Ok(None)) => {
                 debug!(
                     alert_id = %alert.id,
                     "Case grouping disabled (open-core build or hook returned None)"
                 );
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 error!(
                     alert_id = %alert.id,
                     error = %e,
                     "Failed to group alert into case"
                 );
+                if durable {
+                    return Err(DetectionError::QueryExecutionError(format!(
+                        "failed to group alert {} into a case: {e}",
+                        alert.id
+                    )));
+                }
             }
         }
 
@@ -308,19 +418,41 @@ impl DetectionService {
                         other => Some(other.to_string()),
                     })
             });
-            webhook_service
-                .fire_alert(
-                    alert.id,
-                    &alert.kind,
-                    Some(rule.id),
-                    &rule.name,
-                    &severity_str,
-                    entity,
-                    &alert.matched_events,
-                    alert.created_at,
-                )
-                .await;
+            if durable {
+                webhook_service
+                    .fire_alert_durable(
+                        alert.id,
+                        &alert.kind,
+                        Some(rule.id),
+                        &rule.name,
+                        &severity_str,
+                        entity,
+                        &alert.matched_events,
+                        alert.created_at,
+                    )
+                    .await
+                    .map_err(|error| {
+                        DetectionError::QueryExecutionError(format!(
+                            "durable webhook delivery failed for alert {}: {error}",
+                            alert.id
+                        ))
+                    })?;
+            } else {
+                webhook_service
+                    .fire_alert(
+                        alert.id,
+                        &alert.kind,
+                        Some(rule.id),
+                        &rule.name,
+                        &severity_str,
+                        entity,
+                        &alert.matched_events,
+                        alert.created_at,
+                    )
+                    .await;
+            }
         }
+        Ok(())
     }
 
     /// G2 (NAN-1749): reconcile alerting-mode alerts that were never grouped
@@ -396,7 +528,11 @@ impl DetectionService {
             // SYSTEM caller: the reconcile sweep repairs grouping for ALL
             // alerts regardless of any viewer's per-source scope (NAN-1800).
             let system_scope = crate::auth::ScopeSet::unrestricted();
-            let alert = match self.alert_repo.find_by_id(alert_id, system_scope.deny_set()).await {
+            let alert = match self
+                .alert_repo
+                .find_by_id(alert_id, system_scope.deny_set())
+                .await
+            {
                 Ok(a) => a,
                 Err(e) => {
                     debug!(alert_id = %alert_id, error = %e, "Reconcile: alert load failed; skipping");
@@ -467,7 +603,7 @@ impl DetectionService {
         // Live→Alerting promotion instead of reverting to rule-level grouping.
         let (has_query_scores, groups) = self.partition_entity_groups(rule, results, global_weight);
         let candidates = Self::build_finding_candidates("alert", rule.id, groups.into_iter());
-        let mut new_findings = self.retain_unemitted(rule.id, candidates).await;
+        let mut new_findings = self.retain_unemitted(rule.id, candidates).await?;
 
         // NAN-1805: per-(rule, entity) alert cooldown. Window-dedup above keys
         // on the entity's newest activity, so an entity producing NEW activity
@@ -645,7 +781,13 @@ impl DetectionService {
             );
 
             if let Err(e) = logger
-                .log_alert_at(rule, alert, false, risk_result, Some(nf.window_end))
+                .log_alert_at(
+                    rule,
+                    alert,
+                    rule.detection_mode == crate::models::detection_rule::DetectionMode::RealTime,
+                    risk_result,
+                    Some(nf.window_end),
+                )
                 .await
             {
                 error!("Failed to log alert signal for entity {}: {}", nf.entity, e);
@@ -673,7 +815,7 @@ impl DetectionService {
         let (has_query_scores, groups) = self.partition_entity_groups(rule, results, global_weight);
 
         let candidates = Self::build_finding_candidates("live", rule.id, groups);
-        let new_findings = self.retain_unemitted(rule.id, candidates).await;
+        let new_findings = self.retain_unemitted_bake_in(rule.id, candidates).await;
         if new_findings.is_empty() {
             return 0;
         }
@@ -701,7 +843,13 @@ impl DetectionService {
             );
 
             if let Err(e) = logger
-                .log_detection_match_at(rule, &nf.events, false, risk_result, Some(nf.window_end))
+                .log_detection_match_at(
+                    rule,
+                    &nf.events,
+                    rule.detection_mode == crate::models::detection_rule::DetectionMode::RealTime,
+                    risk_result,
+                    Some(nf.window_end),
+                )
                 .await
             {
                 error!(
@@ -717,6 +865,291 @@ impl DetectionService {
 
     /// Handle per-event alert mode: each matched event -> its own alert
     /// Used for vendor pass-through (e.g., CrowdStrike/SentinelOne detections)
+    async fn emit_one_per_event_alert(
+        &self,
+        rule: &DetectionRule,
+        event: &serde_json::Value,
+        global_weight: f64,
+        case_permissions: Option<AlertCasePermissions>,
+    ) -> Result<Option<Alert>, DetectionError> {
+        // Store each event as its own detection match (1:1 with alerts).
+        self.store_detection_match(rule, std::slice::from_ref(event))
+            .await?;
+        let new_alert = NewAlert {
+            rule_id: rule.id,
+            severity: rule.severity,
+            matched_events: serde_json::json!([event]),
+            event_hash: None, // Hash computed from single event -- dedup works per-event
+            // A13 (NAN-1752): per-event mode is exactly one event per alert.
+            match_count: Some(1),
+        };
+
+        // Call repo directly to catch DuplicateAlert before conversion to
+        // DetectionError. A duplicate is a completed event: its durable alert
+        // already exists, so the caller may safely checkpoint it.
+        let (alert, created) = match self.alert_repo.create(&new_alert).await {
+            Ok(alert) => (alert, true),
+            Err(AlertRepositoryError::DuplicateAlert(rule_id, hash)) => {
+                debug!(
+                    "Skipped duplicate per-event alert for rule {} with hash {}",
+                    rule_id, hash
+                );
+                let alert = sqlx::query_as::<_, Alert>(
+                    "SELECT * FROM alerts WHERE rule_id = $1 AND event_hash = $2",
+                )
+                .bind(rule_id)
+                .bind(&hash)
+                .fetch_one(&self.pg_pool)
+                .await?;
+                (alert, false)
+            }
+            Err(e) => return Err(DetectionError::from(e)),
+        };
+
+        if self.primary_lake_detection_backend() {
+            // Finding publication, case grouping, and webhook fanout are
+            // durable side effects, but they are not allowed to hold a lake
+            // rule window open. An idempotent outbox row makes a crash after
+            // alert creation safe: a retry finds the duplicate alert and
+            // re-enqueues the same alert id.
+            self.enqueue_alert_post_create(alert.id, rule, case_permissions.clone(), global_weight)
+                .await?;
+        } else if created {
+            // Preserve the legacy ClickHouse execution contract. Its jobs
+            // profile does not start the lake outbox dispatcher.
+            if let Err(error) = self
+                .log_alert_signals(rule, &alert, std::slice::from_ref(event), global_weight)
+                .await
+            {
+                error!(alert_id = %alert.id, %error, "Failed to log legacy alert signals");
+            }
+            self.process_alert_post_create(rule, &alert, case_permissions)
+                .await;
+        }
+
+        Ok(created.then_some(alert))
+    }
+
+    async fn enqueue_alert_post_create(
+        &self,
+        alert_id: Uuid,
+        rule: &DetectionRule,
+        case_permissions: Option<AlertCasePermissions>,
+        global_risk_weight: f64,
+    ) -> Result<(), DetectionError> {
+        let context = AlertPostCreateContext::new(rule, case_permissions, global_risk_weight);
+        sqlx::query(
+            concat!(r#"
+            INSERT INTO alert_post_create_outbox (alert_id, context)
+            VALUES ($1, $2)
+            ON CONFLICT ("#, crate::tenant_key!(), r#"alert_id) DO NOTHING
+            "#),
+        )
+        .bind(alert_id)
+        .bind(sqlx::types::Json(context))
+        .execute(&self.pg_pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Claim and execute a bounded batch of alert side effects. The claim is
+    /// fenced by node id and stale processing rows are recoverable after five
+    /// minutes. This lane is deliberately independent of rule execution.
+    pub async fn drain_alert_post_create_outbox(
+        &self,
+        node_id: &str,
+        limit: usize,
+        max_concurrent: usize,
+    ) -> Result<usize, DetectionError> {
+        let alert_ids = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            WITH candidates AS (
+                SELECT alert_id
+                FROM alert_post_create_outbox
+                WHERE attempts < 10
+                  AND available_at <= NOW()
+                  AND (
+                    status = 'pending'
+                    OR (status = 'processing' AND claimed_at < NOW() - INTERVAL '5 minutes')
+                  )
+                ORDER BY created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE alert_post_create_outbox AS outbox
+            SET status = 'processing',
+                attempts = outbox.attempts + 1,
+                claimed_by = $2,
+                claimed_at = NOW(),
+                last_error = NULL
+            FROM candidates
+            WHERE outbox.alert_id = candidates.alert_id
+            RETURNING outbox.alert_id
+            "#,
+        )
+        .bind(i64::try_from(limit.clamp(1, 100)).unwrap_or(100))
+        .bind(node_id)
+        .fetch_all(&self.pg_pool)
+        .await?;
+        let claimed = alert_ids.len();
+
+        stream::iter(alert_ids)
+            .for_each_concurrent(max_concurrent.clamp(1, 100), |alert_id| {
+                let service = self.clone();
+                let node_id = node_id.to_string();
+                async move {
+                    if let Err(error) = service
+                        .process_alert_post_create_outbox_item(alert_id)
+                        .await
+                    {
+                        error!(%alert_id, %error, "Alert post-create outbox item failed");
+                        if let Err(release_error) = service
+                            .release_alert_post_create_outbox(alert_id, &node_id, &error.to_string())
+                            .await
+                        {
+                            error!(%alert_id, %release_error, "Failed to release alert post-create outbox item");
+                        }
+                    } else if let Err(error) = service
+                        .complete_alert_post_create_outbox(alert_id, &node_id)
+                        .await
+                    {
+                        error!(%alert_id, %error, "Failed to complete alert post-create outbox item");
+                    }
+                }
+            })
+            .await;
+
+        Ok(claimed)
+    }
+
+    /// Graceful-shutdown cleanup for this dispatcher's fenced claims. A hard
+    /// crash still relies on the five-minute stale-claim recovery; a normal
+    /// pod drain makes the work immediately available to another replica.
+    pub async fn release_alert_post_create_claims(
+        &self,
+        node_id: &str,
+    ) -> Result<u64, DetectionError> {
+        let released = sqlx::query(
+            r#"
+            UPDATE alert_post_create_outbox
+            SET status = 'pending',
+                available_at = NOW(),
+                claimed_by = NULL,
+                claimed_at = NULL,
+                last_error = 'dispatcher stopped before completion'
+            WHERE status = 'processing' AND claimed_by = $1
+            "#,
+        )
+        .bind(node_id)
+        .execute(&self.pg_pool)
+        .await?
+        .rows_affected();
+        Ok(released)
+    }
+
+    async fn process_alert_post_create_outbox_item(
+        &self,
+        alert_id: Uuid,
+    ) -> Result<(), DetectionError> {
+        let alert = sqlx::query_as::<_, Alert>("SELECT * FROM alerts WHERE id = $1")
+            .bind(alert_id)
+            .fetch_one(&self.pg_pool)
+            .await?;
+        let context = sqlx::query_scalar::<_, Option<sqlx::types::Json<AlertPostCreateContext>>>(
+            "SELECT context FROM alert_post_create_outbox WHERE alert_id = $1",
+        )
+        .bind(alert_id)
+        .fetch_one(&self.pg_pool)
+        .await?;
+        let (rule, permissions, global_weight) = if let Some(sqlx::types::Json(context)) = context {
+            context.validate_for_alert(&alert)?;
+            (
+                context.rule,
+                context.case_permissions,
+                context.global_risk_weight,
+            )
+        } else {
+            // Upgrade compatibility for rows queued before migration 306. New
+            // rows always carry immutable context; a legacy row can only fall
+            // back to the still-existing current rule.
+            let rule_id = alert.rule_id.ok_or_else(|| {
+                DetectionError::QueryExecutionError(format!(
+                    "legacy detection alert {alert_id} has no rule id or immutable post-create context"
+                ))
+            })?;
+            let rule = self.rule_repo.find_by_id(rule_id).await?;
+            let permissions = self.get_case_permissions(&rule).await;
+            let global_weight = self.load_risk_weight().await;
+            (rule, permissions, global_weight)
+        };
+        let events = alert.matched_events.as_array().cloned().unwrap_or_default();
+        self.log_alert_signals(&rule, &alert, &events, global_weight)
+            .await?;
+        self.process_alert_post_create_durable(&rule, &alert, permissions)
+            .await
+    }
+
+    async fn complete_alert_post_create_outbox(
+        &self,
+        alert_id: Uuid,
+        node_id: &str,
+    ) -> Result<(), DetectionError> {
+        sqlx::query(
+            r#"
+            UPDATE alert_post_create_outbox
+            SET status = 'completed', completed_at = NOW(), claimed_by = NULL, claimed_at = NULL
+            WHERE alert_id = $1 AND status = 'processing' AND claimed_by = $2
+            "#,
+        )
+        .bind(alert_id)
+        .bind(node_id)
+        .execute(&self.pg_pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn release_alert_post_create_outbox(
+        &self,
+        alert_id: Uuid,
+        node_id: &str,
+        last_error: &str,
+    ) -> Result<(), DetectionError> {
+        sqlx::query(
+            r#"
+            UPDATE alert_post_create_outbox
+            SET status = CASE WHEN attempts >= 10 THEN 'failed' ELSE 'pending' END,
+                available_at = NOW() + INTERVAL '5 seconds',
+                claimed_by = NULL,
+                claimed_at = NULL,
+                last_error = LEFT($3, 2000)
+            WHERE alert_id = $1 AND status = 'processing' AND claimed_by = $2
+            "#,
+        )
+        .bind(alert_id)
+        .bind(node_id)
+        .bind(last_error)
+        .execute(&self.pg_pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Owned wrapper for the bounded fanout stream. Keeping every input inside
+    /// the future avoids borrowing a scheduler-owned rule/result slice across
+    /// `.await`, which in turn keeps the scheduler task `Send` for
+    /// `tokio::spawn`.
+    async fn emit_one_per_event_alert_owned(
+        self,
+        rule: DetectionRule,
+        event: serde_json::Value,
+        global_weight: f64,
+        case_permissions: Option<AlertCasePermissions>,
+    ) -> (serde_json::Value, Result<Option<Alert>, DetectionError>) {
+        let result = self
+            .emit_one_per_event_alert(&rule, &event, global_weight, case_permissions)
+            .await;
+        (event, result)
+    }
+
     pub(super) async fn handle_per_event_alerts(
         &self,
         rule: &DetectionRule,
@@ -724,26 +1157,18 @@ impl DetectionService {
         match_count: i64,
         today: chrono::NaiveDate,
         global_weight: f64,
+        matched_kind: MatchedEventKind,
     ) -> Result<Option<Alert>, DetectionError> {
         let case_permissions = self.get_case_permissions(rule).await;
         let mut first_alert: Option<Alert> = None;
         let mut alerts_created: i64 = 0;
 
-        // Audit D19: the detection query now returns ALL matches (so match_count
-        // is accurate), but per-event mode creates one alert per event. Cap the
-        // number of ALERTS created per window at max_events_per_alert so a broad
-        // or misconfigured per-event rule can't storm PG with up to 1M
-        // inserts/case-groupings/findings in a single cycle. The overflow is
-        // VISIBLE (warn + accurate match_count), not silently dropped at 100.
+        // `execute_rule` feeds this method exactly one bounded drain batch. Keep
+        // the envelope assertion here as a defense in depth for alternate call
+        // sites such as retro replay; an oversized direct call must fail before
+        // its first write, never silently drop a tail.
         let alert_cap = self.config.max_events_per_alert;
-        if results.len() > alert_cap {
-            tracing::warn!(
-                "Rule {} (per-event) matched {} events but is capping alert creation at {} this window — narrow the rule or use grouped mode",
-                rule.name,
-                results.len(),
-                alert_cap
-            );
-        }
+        enforce_per_event_window_envelope(results.len(), alert_cap)?;
 
         // NAN-1805: per-(rule, entity) alert cooldown for per-event mode. One
         // batched anchor read up front; an event is suppressed when EVERY
@@ -766,81 +1191,121 @@ impl DetectionService {
         } else {
             std::collections::HashSet::new()
         };
-        let mut fired_entities: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut fired_entities: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut cooldown_suppressed = 0usize;
 
-        for event in results.iter().take(alert_cap) {
-            // NAN-1805: cooldown gate before any per-event writes.
-            let event_entities: Vec<String> = if cooldown_minutes > 0 {
+        // Cooldown is intentionally ordered: an alert for an entity earlier in
+        // this batch suppresses later events for the same entity. Keep that
+        // stateful path serial and checkpoint every completed event. The common
+        // no-cooldown path below is independent and uses bounded concurrency.
+        if cooldown_minutes > 0 {
+            for event in results {
+                // NAN-1805: cooldown gate before any per-event writes.
                 let (_, ev_groups) =
                     self.partition_entity_groups(rule, std::slice::from_ref(event), global_weight);
-                ev_groups.into_iter().map(|(entity, _, _)| entity).collect()
-            } else {
-                Vec::new()
-            };
-            if cooldown_minutes > 0
-                && !event_entities.is_empty()
-                && event_entities
-                    .iter()
-                    .all(|e| cooled.contains(e) || fired_entities.contains(e))
-            {
-                cooldown_suppressed += 1;
-                continue;
-            }
-
-            // Store each event as its own detection match (1:1 with alerts)
-            self.store_detection_match(rule, std::slice::from_ref(event))
-                .await?;
-            let matched_events = serde_json::json!([event]);
-            let new_alert = NewAlert {
-                rule_id: rule.id,
-                severity: rule.severity,
-                matched_events,
-                event_hash: None, // Hash computed from single event -- dedup works per-event
-                // A13 (NAN-1752): per-event mode is exactly one event per alert.
-                match_count: Some(1),
-            };
-
-            // Call repo directly to catch DuplicateAlert before conversion to DetectionError
-            let alert = match self.alert_repo.create(&new_alert).await {
-                Ok(alert) => alert,
-                Err(AlertRepositoryError::DuplicateAlert(rule_id, hash)) => {
-                    debug!(
-                        "Skipped duplicate per-event alert for rule {} with hash {}",
-                        rule_id, hash
-                    );
+                let event_entities: Vec<String> =
+                    ev_groups.into_iter().map(|(entity, _, _)| entity).collect();
+                if crate::detection::entity_risk::event_suppressed_by_cooldown(
+                    &event_entities,
+                    &cooled,
+                    &fired_entities,
+                ) {
+                    cooldown_suppressed += 1;
+                    self.record_matched_events(rule.id, matched_kind, std::slice::from_ref(event))
+                        .await?;
                     continue;
                 }
-                Err(e) => return Err(DetectionError::from(e)),
-            };
 
-            alerts_created += 1;
-            fired_entities.extend(event_entities);
+                let alert = self
+                    .emit_one_per_event_alert(rule, event, global_weight, case_permissions.clone())
+                    .await?;
+                self.record_matched_events(rule.id, matched_kind, std::slice::from_ref(event))
+                    .await?;
 
-            // Log signals for this single event
-            self.log_alert_signals(rule, &alert, std::slice::from_ref(event), global_weight)
-                .await;
-
-            // Group into case and fire webhooks
-            self.process_alert_post_create(rule, &alert, case_permissions.clone())
-                .await;
-
-            if first_alert.is_none() {
-                first_alert = Some(alert);
+                if let Some(alert) = alert {
+                    alerts_created += 1;
+                    fired_entities.extend(event_entities);
+                    if first_alert.is_none() {
+                        first_alert = Some(alert);
+                    }
+                }
             }
-        }
+            // NAN-1805: anchor every entity that alerted in this batch.
+            if !fired_entities.is_empty() {
+                let entities: Vec<String> = fired_entities.into_iter().collect();
+                self.record_alert_cooldown_anchors(rule.id, &entities).await;
+            }
+            if cooldown_suppressed > 0 {
+                debug!(
+                    "Rule {} (ALERTING/per_event): {} events suppressed by the {}m alert cooldown",
+                    rule.name, cooldown_suppressed, cooldown_minutes
+                );
+            }
+        } else {
+            for wave in results.chunks(PER_EVENT_FANOUT_CONCURRENCY) {
+                // Materialize owned work before awaiting the stream. Retaining
+                // the slice iterator here would make the spawned scheduler
+                // future borrow `results` across the fanout await.
+                let work: Vec<_> = wave
+                    .iter()
+                    .enumerate()
+                    .map(|(index, event)| {
+                        (
+                            index,
+                            self.clone(),
+                            rule.clone(),
+                            event.clone(),
+                            case_permissions.clone(),
+                        )
+                    })
+                    .collect();
+                let mut outcomes = stream::iter(work.into_iter().map(
+                    |(index, service, rule, event, case_permissions)| async move {
+                        let (event, result) = service
+                            .emit_one_per_event_alert_owned(
+                                rule,
+                                event,
+                                global_weight,
+                                case_permissions,
+                            )
+                            .await;
+                        (index, event, result)
+                    },
+                ))
+                .buffer_unordered(PER_EVENT_FANOUT_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+                outcomes.sort_by_key(|(index, _, _)| *index);
 
-        // NAN-1805: anchor the cooldown for every entity that alerted in this
-        // batch (single durable upsert; best-effort).
-        if cooldown_minutes > 0 && !fired_entities.is_empty() {
-            let entities: Vec<String> = fired_entities.into_iter().collect();
-            self.record_alert_cooldown_anchors(rule.id, &entities).await;
-        }
-        if cooldown_suppressed > 0 {
-            debug!(
-                "Rule {} (ALERTING/per_event): {} events suppressed by the {}m alert cooldown",
-                rule.name, cooldown_suppressed, cooldown_minutes
-            );
+                // Checkpoint all successful (including duplicate) events before
+                // surfacing a sibling failure. A retry then resumes after this
+                // wave instead of replaying every alert already committed.
+                let completed: Vec<serde_json::Value> = outcomes
+                    .iter()
+                    .filter_map(|(_, event, result)| result.as_ref().ok().map(|_| event.clone()))
+                    .collect();
+                self.record_matched_events(rule.id, matched_kind, &completed)
+                    .await?;
+
+                let mut first_error = None;
+                for (_, _, outcome) in outcomes {
+                    match outcome {
+                        Ok(Some(alert)) => {
+                            alerts_created += 1;
+                            if first_alert.is_none() {
+                                first_alert = Some(alert);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) if first_error.is_none() => first_error = Some(error),
+                        Err(_) => {}
+                    }
+                }
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+            }
         }
 
         // Record daily stats with actual number of alerts created
@@ -1069,5 +1534,149 @@ impl DetectionService {
         }
 
         Ok(grouped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use crate::extensions::AlertCasePermissions;
+    use crate::models::detection_rule::{AlertMode, DetectionMode};
+    use crate::models::{Alert, AlertStatus, DetectionRule, RuleMode, Severity};
+
+    use super::{enforce_per_event_window_envelope, plan_per_event_batch, AlertPostCreateContext};
+
+    fn sample_rule() -> DetectionRule {
+        DetectionRule {
+            id: Uuid::now_v7(),
+            name: "Original rule".to_string(),
+            description: None,
+            query: "metadata.log_source=windows_sysmon".to_string(),
+            severity: Severity::High,
+            mitre_tactics: vec![],
+            mitre_techniques: vec![],
+            schedule_cron: None,
+            mode: RuleMode::Alerting,
+            narrative: None,
+            reference_url: None,
+            author: None,
+            tags: vec![],
+            ai_generated: false,
+            realtime_enabled: false,
+            detection_mode: DetectionMode::Scheduled,
+            materialized_view_name: None,
+            near_real_time_interval_seconds: None,
+            execution_mode: None,
+            risk_score: Some(72),
+            risk_entity_field: Some("device.hostname".to_string()),
+            risk_modifiers: sqlx::types::Json(vec![]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_run_at: None,
+            last_match_at: None,
+            match_count: 0,
+            live_match_count: 0,
+            archived: false,
+            folder: None,
+            ai_triage_hints: sqlx::types::Json(Default::default()),
+            lookback_minutes: None,
+            dataset: None,
+            auto_tuning_enabled: true,
+            auto_tuning_min_confidence: 0.8,
+            auto_tuning_critical: false,
+            auto_tuning_disabled_until: None,
+            case_visibility: "group".to_string(),
+            case_assigned_group: Some(Uuid::now_v7()),
+            alert_mode: AlertMode::PerEvent,
+            next_run_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            playbook_selector_mode: "none".to_string(),
+            playbook_id: None,
+            source_path: None,
+            source_repo_url: None,
+            kind: "standard".to_string(),
+            alert_cooldown_minutes: None,
+        }
+    }
+
+    fn sample_alert(rule_id: Option<Uuid>) -> Alert {
+        Alert {
+            id: Uuid::now_v7(),
+            rule_id,
+            rule_name: Some("Original rule".to_string()),
+            severity: Severity::High,
+            status: AlertStatus::New,
+            disposition: None,
+            matched_events: serde_json::json!([]),
+            matched_event_count: Some(1),
+            event_hash: None,
+            assigned_to: None,
+            acknowledged_by: None,
+            acknowledged_at: None,
+            closed_by: None,
+            closed_at: None,
+            created_at: Utc::now(),
+            triage_verdict: None,
+            triage_confidence: None,
+            triage_verdict_details: None,
+            case_id: None,
+            kind: "detection".to_string(),
+            source_id: None,
+            source_types: vec![],
+        }
+    }
+
+    #[test]
+    fn per_event_storm_guard_never_allows_a_partial_success() {
+        assert!(enforce_per_event_window_envelope(100, 100).is_ok());
+        assert!(enforce_per_event_window_envelope(101, 100).is_err());
+        assert!(enforce_per_event_window_envelope(0, 0).is_err());
+    }
+
+    #[test]
+    fn per_event_batch_plan_drains_without_dropping_the_tail() {
+        let exact = plan_per_event_batch(100, 100).unwrap();
+        assert_eq!(exact.batch_len, 100);
+        assert_eq!(exact.remaining, 0);
+
+        let overflow = plan_per_event_batch(251, 100).unwrap();
+        assert_eq!(overflow.batch_len, 100);
+        assert_eq!(overflow.remaining, 151);
+        assert!(plan_per_event_batch(1, 0).is_err());
+    }
+
+    #[test]
+    fn alert_post_create_context_survives_rule_edits_and_deletion() {
+        let mut live_rule = sample_rule();
+        let rule_id = live_rule.id;
+        let permissions = AlertCasePermissions {
+            visibility: "group".to_string(),
+            group_ids: Some(vec![Uuid::now_v7()]),
+            assigned_group: live_rule.case_assigned_group,
+            playbook_selector_mode: "none".to_string(),
+            playbook_id: None,
+        };
+        let frozen = AlertPostCreateContext::new(&live_rule, Some(permissions), 0.65);
+
+        live_rule.name = "Renamed after alert".to_string();
+        live_rule.query = "severity=Critical".to_string();
+        live_rule.risk_score = Some(5);
+
+        let frozen: AlertPostCreateContext =
+            serde_json::from_value(serde_json::to_value(frozen).unwrap()).unwrap();
+        assert_eq!(frozen.rule.name, "Original rule");
+        assert_eq!(frozen.rule.risk_score, Some(72));
+        assert_eq!(frozen.global_risk_weight, 0.65);
+        assert!(frozen
+            .validate_for_alert(&sample_alert(Some(rule_id)))
+            .is_ok());
+        // ON DELETE SET NULL must not strand already-queued side effects.
+        assert!(frozen.validate_for_alert(&sample_alert(None)).is_ok());
+        assert!(frozen
+            .validate_for_alert(&sample_alert(Some(Uuid::now_v7())))
+            .is_err());
     }
 }

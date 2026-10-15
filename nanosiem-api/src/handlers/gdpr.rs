@@ -58,6 +58,13 @@ pub struct SubmitAnonymizationRequest {
     pub identifier_value: String,
     /// Justification for the anonymization request
     pub justification: Option<String>,
+    /// Also rewrite free-text mentions (`message` / `ext`) of the subject.
+    /// Accepted for request-shape parity with the hosted-shared lake path
+    /// where it is honored per request; the dedicated
+    /// ClickHouse mutation always rewrites free text, so `false` is
+    /// recorded but not applied here.
+    #[serde(default)]
+    pub redact_free_text: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -298,9 +305,13 @@ pub async fn execute_anonymization(
 fn build_service(
     state: &AppState,
 ) -> Result<AnonymizationService, (StatusCode, Json<GdprApiError>)> {
+    // NAN-2361: pass the once-resolved profile from AppState. Resolving it here
+    // re-parsed the lake source manifest, and on failure silently substituted the
+    // UDM schema for an irreversible erasure.
     Ok(AnonymizationService::new(
         state.pool.clone(),
         state.dual_pool.clone(),
+        state.schema_profile(),
     ))
 }
 

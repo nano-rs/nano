@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! AWS CloudTrail generator for management-plane events
 //!
 //! Produces realistic CloudTrail JSON covering EC2, Lambda, S3, IAM, KMS, RDS,

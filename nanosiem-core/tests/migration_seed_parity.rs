@@ -49,7 +49,7 @@ const LEGACY_DB: &str = "nanosiem_parity_legacy";
 /// `playbooks:*` / `playbook_repositories:*` — seeded by `157_playbooks.sql`,
 /// which lives in the open series and therefore runs on the legacy path, but is
 /// NOT replayed by 177. On a fresh install they arrive only via the enterprise
-/// overlay (`postgres-enterprise/9000004_seed_playbook_permissions.sql`), so a
+/// overlay (`enterprise migrations/9000004_seed_playbook_permissions.sql`), so a
 /// fresh OPEN install legitimately lacks them. That is consistent with the
 /// runtime gate: the playbooks nav is double-gated on a build-time `playbooks`
 /// capability that open-core does not have, and the routes fail closed at 403.
@@ -68,7 +68,7 @@ const EXPECTED_OPEN_TIER_DIVERGENCE: &[&str] = &[
 ///
 /// The four queue groups are created by `154_queues.sql` (open series, so the
 /// legacy path runs it) and re-seeded on the enterprise path by
-/// `postgres-enterprise/9000008_seed_baseline_queues.sql`. Queues and cases are
+/// `enterprise migrations/9000008_seed_baseline_queues.sql`. Queues and cases are
 /// enterprise-only, so a fresh OPEN install correctly has neither.
 ///
 /// Note the reason 177 gives for carving 154/155 out is WRONG: it claims "Cases

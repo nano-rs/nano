@@ -33,11 +33,13 @@
 
 mod cost_analysis;
 mod derived_fields;
+mod field_candidates;
 mod field_validation;
 mod query_checks;
 
 pub use cost_analysis::{analyze_query_cost, QueryCostAnalysis, QueryWarning, WarningSeverity};
 pub use derived_fields::collect_derived_fields;
+pub use field_candidates::{extract_comparator_field_candidates, mask_query_literals};
 pub use field_validation::{
     suggest_similar_fields, validate_field_name, validate_field_name_format, validate_query_fields,
     validate_query_fields_with_profile, FieldValidationError,

@@ -50,7 +50,7 @@ pub async fn acquire_rule_runtime_lock(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_millis(20);
     loop {
-        let mut connection = pool.acquire().await?;
+        let mut connection = crate::db::pooler::session_connection(pool).await?;
         // Set this before the query: cancellation after PostgreSQL grants the
         // lock must close the session instead of returning it to the pool.
         connection.close_on_drop();
@@ -144,6 +144,19 @@ fn validate_ddl_field_name(
     )))
 }
 
+/// `*kw*` as the parser's `wildcard_keyword` produces it: a non-empty run of
+/// `[A-Za-z0-9_.-]` between one leading and one trailing `*`.
+fn is_double_sided_wildcard_keyword(kw: &str) -> bool {
+    kw.strip_prefix('*')
+        .and_then(|rest| rest.strip_suffix('*'))
+        .is_some_and(|inner| {
+            !inner.is_empty()
+                && inner
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        })
+}
+
 /// Reject search expressions that are valid for scheduled search but not eligible
 /// for a real-time materialized view.
 ///
@@ -154,6 +167,10 @@ fn validate_ddl_field_name(
 /// decision here rather than silently slipping into the real-time path.
 fn reject_unsupported_for_realtime(expr: &SearchExpr) -> Result<(), MaterializedViewError> {
     match expr {
+        // NAN-3034: `*kw*` used to parse to `message=/(?i)kw/` (eligible); it
+        // is now a wildcard Keyword that emits the same single-column UDM
+        // `lower(message) iLike '%kw%'`. Keep its historical eligibility.
+        SearchExpr::Keyword(kw) if is_double_sided_wildcard_keyword(kw) => Ok(()),
         SearchExpr::Keyword(_) => Err(MaterializedViewError::InvalidRule(
             "Real-time rules cannot use keyword search (requires full-text search)".to_string(),
         )),
@@ -857,6 +874,8 @@ mod tests {
             realtime_enabled: false,
             detection_mode: DetectionMode::RealTime,
             materialized_view_name: None,
+            near_real_time_interval_seconds: None,
+            execution_mode: None,
             risk_score: Some(75),
             risk_entity_field: Some("src_ip".to_string()),
             risk_modifiers: sqlx::types::Json(vec![]),
@@ -935,6 +954,10 @@ mod tests {
             "dest_port=445 AND process_name=\"cmd.exe\""
         ));
         assert!(is_realtime_eligible("NOT (user=\"admin\")"));
+        // NAN-3034: `*kw*` is now a wildcard Keyword but keeps the real-time
+        // eligibility it had as `message=/(?i)kw/`.
+        assert!(is_realtime_eligible("*mimikatz* dest_port=445"));
+        assert!(!is_realtime_eligible("mimi*"));
     }
 
     #[test]

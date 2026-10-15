@@ -7,15 +7,16 @@
 
 use axum::{
     extract::{ConnectInfo, Path, State},
-    http::{header::SET_COOKIE, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
+#[cfg(feature = "enterprise")]
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use uuid::Uuid;
 
-use crate::handlers::auth::{build_access_token_cookie, build_refresh_token_cookie};
 use crate::handlers::AuditExt;
 use crate::middleware::{require_session_auth, AuthContext};
 use crate::state::AppState;
@@ -24,15 +25,41 @@ use nanosiem_core::audit::{actions as audit_actions, AuditEvent, AuditSource, Cl
 use nanosiem_core::auth::{
     mfa, permissions, AuthError, MfaChallengeRequest, MfaDisableRequest,
     MfaRegenerateBackupCodesRequest, MfaSetupCompleteResponse, MfaSetupRequest, MfaSetupResponse,
-    MfaStatusResponse, MfaVerifySetupRequest,
+    MfaStatusResponse, MfaVerifySetupRequest, SharedMfaSetupAuthority,
 };
 use nanosiem_core::typeid::TypeIdParam;
+use nanosiem_api_lib::{
+    append_set_cookies, clear_mfa_challenge_cookie, clear_mfa_challenge_cookie_for,
+    extract_scoped_cookie, issued_session_set_cookies, shared_mfa_challenge_tenant,
+    SessionCookieScope, MFA_CHALLENGE_COOKIE,
+};
+#[cfg(feature = "enterprise")]
+use nanosiem_api_lib::{select_tenant_cookie, shared_access_token_tenant, ACCESS_TOKEN_COOKIE};
+
+// Hosted tenant-bound MFA setup actor resolution (NAN-3861).
+#[cfg(feature = "enterprise")]
+mod enterprise_shared_setup_actor;
+#[cfg(feature = "enterprise")]
+use enterprise_shared_setup_actor::resolve_setup_actor;
 
 /// Error response for MFA endpoints
 #[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MfaApiError {
     pub error: String,
     pub message: String,
+}
+
+fn shared_continuation_error(error: AuthError) -> (StatusCode, Json<MfaApiError>) {
+    let (status, code, message) = match error {
+        AuthError::TenantAccessDenied => (
+            StatusCode::FORBIDDEN, "tenant_access_denied", "Tenant access denied",
+        ),
+        AuthError::TenantUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE, "tenant_unavailable", "Tenant access is temporarily unavailable",
+        ),
+        _ => (StatusCode::UNAUTHORIZED, "unauthorized", "Invalid or expired authentication"),
+    };
+    (status, Json(MfaApiError { error: code.into(), message: message.into() }))
 }
 
 /// NAN-2080: adapt a `require_session_auth` rejection into this module's error
@@ -83,45 +110,65 @@ fn access_token_cookie(headers: &HeaderMap) -> Option<String> {
 struct SetupActor {
     user_id: Uuid,
     challenge_jti: Option<(Uuid, i64)>,
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
+    shared_authority: Option<SharedMfaSetupAuthority>,
+    /// NAN-3436: the verified tenant, so pre-session audit can be signed.
+    #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
+    shared_tenant: Option<nanosiem_core::auth::TrustedTenantContext>,
 }
 
-/// Resolve the user_id for a setup-flow request. Accepts either a Bearer
-/// session (voluntary enrolment from User Settings) or an `mfa_challenge`
-/// token in the body (forced enrolment, where the caller has no session
-/// yet — only the 5-minute challenge token from the prior login response).
-///
-/// Returns a single `unauthorized` error for both "no auth" and "invalid
-/// challenge" cases — distinguishing them client-side is a token-validity
-/// oracle for probers. The exact reason is logged server-side via tracing.
+#[cfg(not(feature = "enterprise"))]
+/// Open build: Bearer / `access_token` cookie session, else a body
+/// `challenge_token`; there is no tenant-bound credential to resolve.
 async fn resolve_setup_actor(
     state: &AppState,
     headers: &HeaderMap,
     challenge_token: Option<&str>,
+    tenant_slug: Option<&str>,
+    _ip_address: Option<&str>,
 ) -> Result<SetupActor, (StatusCode, Json<MfaApiError>)> {
+    let bearer = bearer_from_headers(headers);
+    let session_cookie = access_token_cookie(headers);
+
     // Prefer Bearer / cookie session — keeps the voluntary path identical.
-    if let Some(token) = bearer_from_headers(headers).or_else(|| access_token_cookie(headers)) {
-        if let Ok(claims) = state
-            .token_service
-            .validate_access_token_async(&token)
-            .await
-        {
-            return Ok(SetupActor {
-                user_id: claims.sub,
-                challenge_jti: None,
-            });
+    if let Some(token) = bearer.or(session_cookie) {
+        if tenant_slug.is_none() {
+            if let Ok(claims) = state
+                .token_service
+                .validate_access_token_async(&token)
+                .await
+            {
+                if claims.purpose == "access" {
+                    return Ok(SetupActor {
+                        user_id: claims.sub,
+                        challenge_jti: None,
+                        shared_authority: None,
+                        shared_tenant: None,
+                    });
+                }
+            }
         }
     }
     // Fall back to a challenge_token explicitly passed in the body.
     if let Some(token) = challenge_token.filter(|s| !s.is_empty()) {
-        match state.token_service.validate_mfa_challenge_token(token) {
-            Ok(claims) => {
-                return Ok(SetupActor {
-                    user_id: claims.sub,
-                    challenge_jti: Some((claims.jti, claims.exp)),
-                });
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "MFA setup: challenge_token rejected");
+        if tenant_slug.is_none() {
+            match state
+                .token_service
+                .validate_mfa_challenge_token_async(token)
+                .await
+            {
+                Ok(claims) if claims.purpose == "mfa_challenge" => {
+                    return Ok(SetupActor {
+                        user_id: claims.sub,
+                        challenge_jti: Some((claims.jti, claims.exp)),
+                        shared_authority: None,
+                        shared_tenant: None,
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "MFA setup: challenge_token rejected");
+                }
             }
         }
     }
@@ -148,6 +195,8 @@ async fn resolve_setup_actor(
         (status = 200, description = "MFA setup initiated", body = MfaSetupResponse),
         (status = 400, description = "MFA already enabled or OIDC user", body = MfaApiError),
         (status = 401, description = "Authentication required", body = MfaApiError),
+        (status = 403, description = "Tenant access denied", body = MfaApiError),
+        (status = 503, description = "Tenant access policy unavailable", body = MfaApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -157,23 +206,41 @@ pub async fn setup_mfa(
     headers: HeaderMap,
     body: Option<Json<MfaSetupRequest>>,
 ) -> Result<Json<MfaSetupResponse>, (StatusCode, Json<MfaApiError>)> {
-    // Body is optional — voluntary enrolment from User Settings POSTs an
-    // empty body and authenticates via Bearer; forced enrolment passes the
+    // Body is optional — voluntary enrollment from User Settings POSTs an
+    // empty body and authenticates via Bearer; forced enrollment passes the
     // mfa_challenge token in the body because there's no session yet.
     let challenge_token = body.as_ref().and_then(|b| b.0.challenge_token.as_deref());
-    let actor = resolve_setup_actor(&state, &headers, challenge_token).await?;
+    let tenant_slug = body.as_ref().and_then(|b| b.0.tenant_slug.as_deref());
     let ip_address = extract_client_ip(&headers, Some(&addr));
+    let actor = resolve_setup_actor(&state, &headers, challenge_token, tenant_slug, ip_address.as_deref()).await?;
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address, user_agent);
-    let user = state.user_repo.get_user_by_id(actor.user_id).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
+    let user = state
+        .user_repo
+        .get_user_by_id(actor.user_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MfaApiError {
+                    error: "internal_error".into(),
+                    message: "Failed to fetch user".into(),
+                }),
+            )
+        })?;
+
+    // The challenge proves a recent password check, not that the account is
+    // still active. Do not let a disabled/locked user mutate MFA state during
+    // the five-minute enrollment window.
+    if user.status != "active" {
+        return Err((
+            StatusCode::UNAUTHORIZED,
             Json(MfaApiError {
-                error: "internal_error".into(),
-                message: "Failed to fetch user".into(),
+                error: "unauthorized".into(),
+                message: "Authentication required".into(),
             }),
-        )
-    })?;
+        ));
+    }
 
     // Reject OIDC-only users
     if user.oidc_provider_id.is_some() && user.password_hash.is_none() {
@@ -248,27 +315,101 @@ pub async fn setup_mfa(
         )
     })?;
 
-    state
-        .user_repo
-        .store_pending_totp_secret(user.id, &ciphertext, &encrypted.nonce)
-        .await
-        .map_err(|e| {
+    #[cfg(feature = "enterprise")]
+    if state.config.deployment_mode.is_enterprise_shared() {
+        let authority = actor.shared_authority.ok_or_else(|| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::UNAUTHORIZED,
                 Json(MfaApiError {
-                    error: "db_error".into(),
-                    message: e.to_string(),
+                    error: "unauthorized".into(),
+                    message: "Authentication required".into(),
                 }),
             )
         })?;
+        let stored = state
+            .user_repo
+            .store_pending_totp_secret_for_shared_authority(
+                user.id,
+                authority,
+                &ciphertext,
+                &encrypted.nonce,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "shared MFA setup authority persistence failed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(MfaApiError {
+                        error: "mfa_setup_unavailable".into(),
+                        message: "MFA setup is temporarily unavailable".into(),
+                    }),
+                )
+            })?;
+        if !stored {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(MfaApiError {
+                    error: "credential_stale".into(),
+                    message: "Authentication must be repeated before MFA setup".into(),
+                }),
+            ));
+        }
+    } else {
+        state
+            .user_repo
+            .store_pending_totp_secret(user.id, &ciphertext, &encrypted.nonce)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(MfaApiError {
+                        error: "db_error".into(),
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+    }
+    #[cfg(not(feature = "enterprise"))]
+    {
+        state
+            .user_repo
+            .store_pending_totp_secret(user.id, &ciphertext, &encrypted.nonce)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(MfaApiError {
+                        error: "db_error".into(),
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+    }
 
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_SETUP_INITIATED)
-            .actor(Some(user.id), Some(user.email.clone()))
-            .resource("user", Some(user.id), Some(user.email))
-            .client_context(&client_ctx)
-            .build(),
-    );
+    let setup_event = AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_SETUP_INITIATED)
+        .actor(Some(user.id), Some(user.email.clone()))
+        .resource("user", Some(user.id), Some(user.email))
+        .client_context(&client_ctx)
+        .build();
+    // NAN-3436: hosted-shared enrollment runs before any session; write its
+    // audit row in a signed tenant + actor transaction (the shared emitter
+    // refuses tenantless writes and could only log it "for recovery").
+    #[cfg(feature = "enterprise")]
+    let setup_event = match (actor.shared_tenant.as_ref(), state.tenant_ai_rls_runtime.as_ref()) {
+        (Some(tenant), Some(runtime)) => match runtime.tenant_pre_session_audit().record(tenant, user.id, &setup_event).await {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::error!(tenant_id = %tenant.tenant_id, %error, "MFA setup audit not written in a signed tenant transaction; logged for recovery");
+                Some(setup_event)
+            }
+        },
+        _ => Some(setup_event),
+    };
+    #[cfg(not(feature = "enterprise"))]
+    let setup_event = Some(setup_event);
+    if let Some(event) = setup_event {
+        state.emit_audit(event);
+    }
 
     Ok(Json(MfaSetupResponse {
         secret: secret_base32,
@@ -288,6 +429,9 @@ pub async fn setup_mfa(
     responses(
         (status = 200, description = "MFA activated, backup codes returned", body = MfaSetupCompleteResponse),
         (status = 400, description = "Invalid code or no pending setup", body = MfaApiError),
+        (status = 401, description = "Authentication required", body = MfaApiError),
+        (status = 403, description = "Tenant access denied", body = MfaApiError),
+        (status = 503, description = "Tenant access policy unavailable", body = MfaApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -296,23 +440,43 @@ pub async fn verify_mfa_setup(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<MfaVerifySetupRequest>,
-) -> Result<Json<MfaSetupCompleteResponse>, (StatusCode, Json<MfaApiError>)> {
-    // Same dual-auth as `setup_mfa`: Bearer/cookie for voluntary enrolment;
-    // challenge_token in body for forced enrolment users without a session.
-    let actor =
-        resolve_setup_actor(&state, &headers, request.challenge_token.as_deref()).await?;
+) -> Result<Response, (StatusCode, Json<MfaApiError>)> {
+    // Same dual-auth as `setup_mfa`: Bearer/cookie for voluntary enrollment;
+    // challenge_token in body for forced enrollment users without a session.
     let ip_address = extract_client_ip(&headers, Some(&addr));
+    let actor = resolve_setup_actor(
+        &state,
+        &headers,
+        request.challenge_token.as_deref(),
+        request.tenant_slug.as_deref(),
+        ip_address.as_deref(),
+    )
+    .await?;
     let user_agent = extract_user_agent(&headers);
     let client_ctx = ClientContext::new(ip_address, user_agent);
-    let user = state.user_repo.get_user_by_id(actor.user_id).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
+    let user = state
+        .user_repo
+        .get_user_by_id(actor.user_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(MfaApiError {
+                    error: "internal_error".into(),
+                    message: "Failed to fetch user".into(),
+                }),
+            )
+        })?;
+
+    if user.status != "active" {
+        return Err((
+            StatusCode::UNAUTHORIZED,
             Json(MfaApiError {
-                error: "internal_error".into(),
-                message: "Failed to fetch user".into(),
+                error: "unauthorized".into(),
+                message: "Authentication required".into(),
             }),
-        )
-    })?;
+        ));
+    }
 
     if user.mfa_enabled {
         return Err((
@@ -328,7 +492,7 @@ pub async fn verify_mfa_setup(
     // being flipped atomically by `store_pending_totp_secret` (so it can
     // only flow from a fresh `/api/auth/mfa/setup` call), this prevents
     // a stolen challenge_token from advancing the wizard against a user
-    // who never started enrolment in this window.
+    // who never started enrollment in this window.
     if !user.mfa_setup_pending {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -419,44 +583,141 @@ pub async fn verify_mfa_setup(
         )
     })?;
 
-    // Activate MFA
-    state
-        .user_repo
-        .enable_mfa(
-            user.id,
-            totp_encrypted,
-            totp_nonce,
-            &backup_ciphertext,
-            &encrypted_backups.nonce,
-        )
-        .await
-        .map_err(|e| {
+    // Activate MFA. Shared mode atomically revalidates the exact tenant
+    // credential, the user watermark and the exact pending-secret snapshot;
+    // a reset/logout or competing setup cannot win between TOTP verification
+    // and this state transition.
+    #[cfg(feature = "enterprise")]
+    if state.config.deployment_mode.is_enterprise_shared() {
+        let authority = actor.shared_authority.ok_or_else(|| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::UNAUTHORIZED,
                 Json(MfaApiError {
-                    error: "db_error".into(),
-                    message: e.to_string(),
+                    error: "unauthorized".into(),
+                    message: "Authentication required".into(),
                 }),
             )
         })?;
+        let enabled = state
+            .user_repo
+            .enable_mfa_for_shared_authority(
+                user.id,
+                authority,
+                totp_encrypted,
+                totp_nonce,
+                &backup_ciphertext,
+                &encrypted_backups.nonce,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "shared MFA activation authority check failed");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(MfaApiError {
+                        error: "mfa_setup_unavailable".into(),
+                        message: "MFA setup is temporarily unavailable".into(),
+                    }),
+                )
+            })?;
+        if !enabled {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(MfaApiError {
+                    error: "credential_stale".into(),
+                    message: "Authentication must be repeated before MFA setup".into(),
+                }),
+            ));
+        }
+    } else {
+        state
+            .user_repo
+            .enable_mfa(
+                user.id,
+                totp_encrypted,
+                totp_nonce,
+                &backup_ciphertext,
+                &encrypted_backups.nonce,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(MfaApiError {
+                        error: "db_error".into(),
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+    }
+    #[cfg(not(feature = "enterprise"))]
+    {
+        state
+            .user_repo
+            .enable_mfa(
+                user.id,
+                totp_encrypted,
+                totp_nonce,
+                &backup_ciphertext,
+                &encrypted_backups.nonce,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(MfaApiError {
+                        error: "db_error".into(),
+                        message: e.to_string(),
+                    }),
+                )
+            })?;
+    }
 
     // Single-use challenge_token: revoke the JTI so a leaked token can't
     // re-run setup → verify and overwrite this user's TOTP secret. Only
-    // applies to the forced-enrolment path; Bearer-auth callers don't
+    // applies to the forced-enrollment path; Bearer-auth callers don't
     // carry a JTI here (their access tokens have their own lifecycle).
     if let Some((jti, exp)) = actor.challenge_jti {
         state.token_service.revoke_token(jti, exp).await;
     }
 
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_SETUP_COMPLETE)
-            .actor(Some(user.id), Some(user.email.clone()))
-            .resource("user", Some(user.id), Some(user.email))
-            .client_context(&client_ctx)
-            .build(),
-    );
+    let setup_complete = AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_SETUP_COMPLETE)
+        .actor(Some(user.id), Some(user.email.clone()))
+        .resource("user", Some(user.id), Some(user.email))
+        .client_context(&client_ctx)
+        .build();
+    // NAN-3790: hosted shared writes it in the verified tenant (the shared
+    // emitter refuses tenantless rows).
+    match actor.shared_tenant.clone() {
+        Some(tenant) => state.emit_tenant_auth_audit(tenant, user.id, vec![setup_complete]),
+        None => state.emit_audit(setup_complete),
+    }
 
-    Ok(Json(MfaSetupCompleteResponse { backup_codes }))
+    let clear_challenge = actor.challenge_jti.is_some();
+    let mut response = Json(MfaSetupCompleteResponse { backup_codes }).into_response();
+    if clear_challenge {
+        // NAN-3548: clear the tenant-suffixed challenge, and the legacy
+        // unsuffixed one only when it is bound to the same tenant.
+        let clears = match actor.shared_tenant.as_ref() {
+            Some(tenant) => {
+                let mut clears = vec![clear_mfa_challenge_cookie_for(SessionCookieScope::Tenant(
+                    tenant.tenant_id,
+                ))];
+                let legacy_tenant = extract_scoped_cookie(
+                    &headers,
+                    MFA_CHALLENGE_COOKIE,
+                    SessionCookieScope::Default,
+                )
+                .and_then(|token| shared_mfa_challenge_tenant(&state.token_service, &token));
+                if legacy_tenant == Some(tenant.tenant_id) {
+                    clears.push(clear_mfa_challenge_cookie());
+                }
+                clears
+            }
+            None => vec![clear_mfa_challenge_cookie()],
+        };
+        append_set_cookies(response.headers_mut(), clears);
+    }
+    Ok(response)
 }
 
 // === Login Challenge ===
@@ -472,6 +733,8 @@ pub async fn verify_mfa_setup(
     responses(
         (status = 200, description = "MFA verified, login complete", body = nanosiem_core::auth::AuthResponse),
         (status = 401, description = "Invalid code or challenge token", body = MfaApiError),
+        (status = 403, description = "Tenant access denied", body = MfaApiError),
+        (status = 503, description = "Authentication or durable audit unavailable", body = MfaApiError),
     ),
     security(())
 )]
@@ -490,6 +753,7 @@ pub async fn verify_mfa_challenge(
         .complete_mfa_login(
             &request.challenge_token,
             &request.code,
+            request.tenant_slug.as_deref(),
             &state.encryption_service,
             ip_address.as_deref(),
             user_agent.as_deref(),
@@ -498,6 +762,9 @@ pub async fn verify_mfa_challenge(
     {
         Ok(outcome) => outcome,
         Err(e) => {
+            if matches!(e, AuthError::TenantAccessDenied | AuthError::TenantUnavailable) {
+                return Err(shared_continuation_error(e));
+            }
             // Only an actually-wrong MFA code is a failed *challenge*.
             // `complete_mfa_login` returns `InvalidCredentials` for exactly that
             // case (bad TOTP and no/invalid backup code). Every other error here
@@ -508,20 +775,39 @@ pub async fn verify_mfa_challenge(
             if matches!(e, AuthError::InvalidCredentials) {
                 // The challenge token validated (we got past its check), so the
                 // actor resolves from it.
-                let actor_id = state
-                    .token_service
-                    .validate_mfa_challenge_token(&request.challenge_token)
-                    .ok()
-                    .map(|c| c.sub);
-                state.emit_audit(
-                    AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_FAILED)
-                        .actor(actor_id, None)
-                        .resource("user", actor_id, None)
-                        .client_context(&client_ctx)
-                        .success(false)
-                        .details(serde_json::json!({ "reason": "invalid_mfa_code" }))
-                        .build(),
-                );
+                #[cfg(feature = "enterprise")]
+                if state.config.deployment_mode.is_enterprise_shared() {
+                    super::auth_challenge_audit::record(
+                        &state, &request.challenge_token, request.tenant_slug.as_deref(), &client_ctx,
+                        audit_actions::MFA_CHALLENGE_FAILED, false,
+                        Some(serde_json::json!({"reason": "invalid_mfa_code"})),
+                    ).await.map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Json(MfaApiError {
+                        error: "audit_unavailable".into(),
+                        message: "Authentication auditing is temporarily unavailable".into(),
+                    })))?;
+                } else {
+                    let actor_id = state.token_service
+                        .validate_mfa_challenge_token_async(&request.challenge_token)
+                        .await.ok().map(|c| c.sub);
+                    state.emit_audit(
+                        AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_FAILED)
+                            .actor(actor_id, None).resource("user", actor_id, None)
+                            .client_context(&client_ctx).success(false)
+                            .details(serde_json::json!({"reason": "invalid_mfa_code"})).build(),
+                    );
+                }
+                #[cfg(not(feature = "enterprise"))]
+                {
+                    let actor_id = state.token_service
+                        .validate_mfa_challenge_token_async(&request.challenge_token)
+                        .await.ok().map(|c| c.sub);
+                    state.emit_audit(
+                        AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_FAILED)
+                            .actor(actor_id, None).resource("user", actor_id, None)
+                            .client_context(&client_ctx).success(false)
+                            .details(serde_json::json!({"reason": "invalid_mfa_code"})).build(),
+                    );
+                }
             }
             return Err((
                 StatusCode::UNAUTHORIZED,
@@ -537,11 +823,12 @@ pub async fn verify_mfa_challenge(
     let actor_id = response.user.id;
     let actor_email = response.user.email.clone();
 
+    let mut events = Vec::with_capacity(3);
     // A single-use backup code was consumed — defenders track these (a burst can
     // indicate the user lost their authenticator or an attacker is draining
     // codes).
     if outcome.used_backup_code {
-        state.emit_audit(
+        events.push(
             AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_BACKUP_CODE_USED)
                 .actor(Some(actor_id), Some(actor_email.clone()))
                 .resource("user", Some(actor_id), Some(actor_email.clone()))
@@ -552,7 +839,7 @@ pub async fn verify_mfa_challenge(
     // The MFA challenge was satisfied, and login completed. The non-MFA path
     // emits login_success from the login handler; the MFA-completion path must
     // emit its own (with mfa_verified) so MFA users' logins are audited too.
-    state.emit_audit(
+    events.push(
         AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_SUCCESS)
             .actor(Some(actor_id), Some(actor_email.clone()))
             .resource("user", Some(actor_id), Some(actor_email.clone()))
@@ -562,7 +849,7 @@ pub async fn verify_mfa_challenge(
             }))
             .build(),
     );
-    state.emit_audit(
+    events.push(
         AuditEvent::builder(AuditSource::Auth, audit_actions::LOGIN_SUCCESS)
             .actor(Some(actor_id), Some(actor_email.clone()))
             .resource("user", Some(actor_id), Some(actor_email))
@@ -570,23 +857,36 @@ pub async fn verify_mfa_challenge(
             .details(serde_json::json!({ "mfa_verified": true }))
             .build(),
     );
+    // NAN-3790: hosted shared writes the login in the tenant the challenge
+    // was revalidated against, in one signed tenant + actor transaction.
+    match outcome.tenant {
+        Some(tenant) => state.emit_tenant_auth_audit(tenant, actor_id, events),
+        None => events.into_iter().for_each(|event| state.emit_audit(event)),
+    }
 
-    // Set cookies (same as normal login success)
-    let access_cookie =
-        build_access_token_cookie(&response.tokens.access_token, response.tokens.expires_in);
-    let refresh_cookie = build_refresh_token_cookie(
+    // Set cookies (same as normal login success; per-tenant names in shared mode)
+    #[cfg(feature = "enterprise")]
+    let cookies = issued_session_set_cookies(
+        &headers,
+        &state.token_service,
+        state.config.deployment_mode.is_enterprise_shared(),
+        &response.tokens.access_token,
+        response.tokens.expires_in,
+        &response.tokens.refresh_token,
+        state.token_service.refresh_token_ttl(),
+    );
+    #[cfg(not(feature = "enterprise"))]
+    let cookies = issued_session_set_cookies(
+        &headers,
+        &state.token_service,
+        false,
+        &response.tokens.access_token,
+        response.tokens.expires_in,
         &response.tokens.refresh_token,
         state.token_service.refresh_token_ttl(),
     );
     let mut res = Json(&response).into_response();
-    res.headers_mut().append(
-        SET_COOKIE,
-        access_cookie.parse().expect("valid cookie header"),
-    );
-    res.headers_mut().append(
-        SET_COOKIE,
-        refresh_cookie.parse().expect("valid cookie header"),
-    );
+    append_set_cookies(res.headers_mut(), cookies);
     Ok(res)
 }
 
@@ -961,15 +1261,19 @@ pub async fn admin_reset_mfa(
         ));
     }
 
-    let target_user = state.user_repo.get_user_by_id(*user_id).await.map_err(|_| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(MfaApiError {
-                error: "not_found".into(),
-                message: "User not found".into(),
-            }),
-        )
-    })?;
+    let target_user = state
+        .user_repo
+        .get_user_by_id(*user_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(MfaApiError {
+                    error: "not_found".into(),
+                    message: "User not found".into(),
+                }),
+            )
+        })?;
 
     state.user_repo.disable_mfa(*user_id).await.map_err(|e| {
         (
@@ -1099,6 +1403,21 @@ pub struct MfaApiDoc;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tenant_ip_policy_continuation_errors_are_sanitized_and_distinct() {
+        use super::*;
+        for (error, expected_status, expected_code) in [
+            (AuthError::TenantAccessDenied, StatusCode::FORBIDDEN, "tenant_access_denied"),
+            (AuthError::TenantUnavailable, StatusCode::SERVICE_UNAVAILABLE, "tenant_unavailable"),
+            (AuthError::DatabaseError("private database detail".into()), StatusCode::UNAUTHORIZED, "unauthorized"),
+        ] {
+            let (status, Json(body)) = shared_continuation_error(error);
+            assert_eq!(status, expected_status);
+            assert_eq!(body.error, expected_code);
+            assert!(!body.message.contains("private"));
+        }
+    }
+
     use super::*;
     use nanosiem_core::typeid;
     use std::str::FromStr;

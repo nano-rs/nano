@@ -25,7 +25,10 @@ pub enum SourceConfigType {
     AwsSqs,
     /// GCP Pub/Sub subscription
     GcpPubSub,
-    /// Splunk HTTP Event Collector endpoint
+    /// Azure Event Hubs consumer group, checkpointed in Azure Blob Storage
+    /// (NAN-3764; Vector fork `azure_event_hubs` source)
+    AzureEventHubs,
+    /// HTTP Event Collector (HEC) endpoint
     SplunkHec,
     /// Vector-to-Vector native protocol (system-level)
     Vector,
@@ -41,6 +44,7 @@ impl SourceConfigType {
             Self::AwsS3 => "aws_s3",
             Self::AwsSqs => "aws_sqs",
             Self::GcpPubSub => "gcp_pubsub",
+            Self::AzureEventHubs => "azure_event_hubs",
             Self::SplunkHec => "splunk_hec",
             Self::Vector => "vector",
             Self::Otlp => "otlp",
@@ -54,6 +58,7 @@ impl SourceConfigType {
             "aws_s3" | "s3" => Some(Self::AwsS3),
             "aws_sqs" | "sqs" => Some(Self::AwsSqs),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
+            "azure_event_hubs" | "event_hubs" | "eventhubs" => Some(Self::AzureEventHubs),
             "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),
             "vector" => Some(Self::Vector),
             "otlp" | "opentelemetry" | "otel" => Some(Self::Otlp),
@@ -65,7 +70,7 @@ impl SourceConfigType {
     pub fn requires_credentials(&self) -> bool {
         matches!(
             self,
-            Self::AwsS3 | Self::AwsSqs | Self::GcpPubSub | Self::Kafka
+            Self::AwsS3 | Self::AwsSqs | Self::GcpPubSub | Self::AzureEventHubs | Self::Kafka
         )
     }
 
@@ -77,7 +82,8 @@ impl SourceConfigType {
             Self::AwsS3 => "AWS S3",
             Self::AwsSqs => "AWS SQS",
             Self::GcpPubSub => "GCP Pub/Sub",
-            Self::SplunkHec => "Splunk HEC",
+            Self::AzureEventHubs => "Azure Event Hubs",
+            Self::SplunkHec => "HEC",
             Self::Vector => "Vector",
             Self::Otlp => "OpenTelemetry (OTLP)",
         }
@@ -94,7 +100,11 @@ impl SourceConfigType {
                  itself rather than an S3 notification"
             }
             Self::GcpPubSub => "Subscribe to GCP Pub/Sub with attribute-based routing",
-            Self::SplunkHec => "Receive logs via Splunk HEC with sourcetype-based routing",
+            Self::AzureEventHubs => {
+                "Consume an Azure Event Hub (Azure Monitor, Entra ID, Defender exports) with a \
+                 consumer group, checkpointed in Azure Blob Storage; starts at the newest events"
+            }
+            Self::SplunkHec => "Receive logs via HTTP Event Collector (HEC) with sourcetype-based routing",
             Self::Vector => "Receive from on-prem Vector aggregator (system-level)",
             Self::Otlp => {
                 "Receive OpenTelemetry (OTLP) logs via gRPC (:4317) / HTTP (:4318) (system-level)"
@@ -110,6 +120,7 @@ impl SourceConfigType {
             Self::AwsS3,
             Self::AwsSqs,
             Self::GcpPubSub,
+            Self::AzureEventHubs,
             Self::SplunkHec,
             Self::Vector,
             Self::Otlp,
@@ -127,6 +138,9 @@ impl SourceConfigType {
             // between log types. Content sniffing is the only option here.
             Self::AwsSqs => "message",
             Self::GcpPubSub => "subscription",
+            // One hub routinely carries mixed categories, so the hub name
+            // rarely discriminates; the body is what does.
+            Self::AzureEventHubs => "message",
             Self::SplunkHec => "sourcetype",
             Self::Vector => "source_type",
             Self::Otlp => "source_type",
@@ -145,7 +159,12 @@ impl SourceConfigType {
     pub fn is_pull_source(&self) -> bool {
         matches!(
             self,
-            Self::Kafka | Self::AwsS3 | Self::AwsSqs | Self::GcpPubSub | Self::SplunkHec
+            Self::Kafka
+                | Self::AwsS3
+                | Self::AwsSqs
+                | Self::GcpPubSub
+                | Self::AzureEventHubs
+                | Self::SplunkHec
         )
     }
 
@@ -214,6 +233,32 @@ impl SourceConfigType {
                      producer cannot label events out-of-band the way Kafka headers allow."
                         .to_string(),
             }],
+            // Fields the fork's `azure_event_hubs` source emits on every event
+            // (`event_hub_name`, `partition_id`, `properties`, `message`, ...).
+            Self::AzureEventHubs => vec![
+                MatchFieldPreset {
+                    label: "Message body field (default)".to_string(),
+                    path: "message".to_string(),
+                    description:
+                        "Content sniffing — match on a field inside the message body. Azure \
+                         Monitor batches are split into one event per record after routing, so \
+                         a rule sees the whole batch."
+                            .to_string(),
+                },
+                MatchFieldPreset {
+                    label: "Application property".to_string(),
+                    path: "properties.source_type".to_string(),
+                    description:
+                        "Set by the producer as an Event Hubs application property. Cheapest \
+                         match — no payload decode. Absent properties never match."
+                            .to_string(),
+                },
+                MatchFieldPreset {
+                    label: "Event Hub name".to_string(),
+                    path: "event_hub_name".to_string(),
+                    description: "Match on the Event Hub the event was read from.".to_string(),
+                },
+            ],
             Self::Kafka => vec![
                 MatchFieldPreset {
                     label: "Header (recommended)".to_string(),
@@ -261,18 +306,18 @@ impl SourceConfigType {
                     label: "Sourcetype (default)".to_string(),
                     path: "sourcetype".to_string(),
                     description:
-                        "Splunk HEC `sourcetype` field — the canonical labelling for HEC events."
+                        "HEC `sourcetype` field — the canonical labelling for HEC events."
                             .to_string(),
                 },
                 MatchFieldPreset {
                     label: "Source".to_string(),
                     path: "source".to_string(),
-                    description: "Splunk HEC `source` field.".to_string(),
+                    description: "HEC `source` field.".to_string(),
                 },
                 MatchFieldPreset {
                     label: "Index".to_string(),
                     path: "index".to_string(),
-                    description: "Splunk HEC `index` field.".to_string(),
+                    description: "HEC `index` field.".to_string(),
                 },
             ],
         }
@@ -476,7 +521,7 @@ pub struct SourceConfiguration {
     pub deployed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// NAN-1919: fallback `source_type` for unmatched events on pull-transport
+    /// fallback `source_type` for unmatched events on pull-transport
     /// configs (Kafka / AWS S3 / GCP Pub/Sub). When no routing rule fires the
     /// generated routing transform stamps this value instead of `"unknown"`.
     /// Seeded from the onboarded feed's name when the first routing rule is
@@ -549,7 +594,7 @@ pub struct NewSourceConfiguration {
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
-    /// NAN-1919: optional fallback `source_type` for unmatched pull-source
+    /// optional fallback `source_type` for unmatched pull-source
     /// events. Usually left unset — it is auto-seeded from the first routing
     /// rule's target when a feed is onboarded.
     #[serde(default)]
@@ -569,7 +614,7 @@ pub struct UpdateSourceConfiguration {
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
     pub enabled: Option<bool>,
-    /// NAN-1919: fallback `source_type` for unmatched pull-source events.
+    /// fallback `source_type` for unmatched pull-source events.
     #[serde(default)]
     pub default_source_type: Option<String>,
     /// Optimistic-concurrency precondition: the caller's last-seen

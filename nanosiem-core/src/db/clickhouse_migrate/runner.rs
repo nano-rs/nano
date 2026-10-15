@@ -46,8 +46,8 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
         return sql.to_string();
     }
     let trimmed_upper = sql_upper.trim_start();
-    let is_target_ddl = trimmed_upper.starts_with("ALTER TABLE")
-        || trimmed_upper.starts_with("CREATE TABLE");
+    let is_target_ddl =
+        trimmed_upper.starts_with("ALTER TABLE") || trimmed_upper.starts_with("CREATE TABLE");
     if !is_target_ddl {
         return sql.to_string();
     }
@@ -91,10 +91,7 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
             b')' => depth -= 1,
             _ => {}
         }
-        if depth == 0
-            && i + 10 <= upper_bytes.len()
-            && &upper_bytes[i..i + 10] == b" SETTINGS "
-        {
+        if depth == 0 && i + 10 <= upper_bytes.len() && &upper_bytes[i..i + 10] == b" SETTINGS " {
             top_level_settings = Some(i);
         }
         i += 1;
@@ -151,8 +148,7 @@ impl ClickHouseMigrator {
         // NAN-2330: the admin-owned process view reads the local system table on
         // single-node, and fans out only inside its SQL SECURITY DEFINER body on
         // clusters. The runtime user therefore never needs REMOTE.
-        let migration_sql =
-            Self::substitute_system_processes_source(&migration_sql, cluster_name);
+        let migration_sql = Self::substitute_system_processes_source(&migration_sql, cluster_name);
 
         // NAN-2330: access-control DDL places ON CLUSTER immediately after
         // GRANT. Keep that special syntax explicit to this migration instead of
@@ -191,7 +187,8 @@ impl ClickHouseMigrator {
 
             // Apply cluster transformation if in cluster mode
             let sql = if let Some(cluster) = cluster_name {
-                let transformed = Self::transform_for_cluster(sql, cluster, &self.database, is_cloud);
+                let transformed =
+                    Self::transform_for_cluster(sql, cluster, &self.database, is_cloud);
                 if transformed.trim().is_empty() {
                     continue; // Statement was intentionally skipped (e.g., non_replicated_dedup)
                 }
@@ -389,8 +386,7 @@ impl ClickHouseMigrator {
             tracing::error!(
                 count = rows.len(),
                 "FAILED ClickHouse dictionaries detected — every INSERT into a table with a \
-                 dictGet()-backed MATERIALIZED column on these will be dropped until they load \
-                 (NAN-1116)"
+                 dictGet()-backed MATERIALIZED column on these will be dropped until they load"
             );
             for r in &rows {
                 tracing::error!("  FAILED dict: {}", r);
@@ -424,7 +420,7 @@ impl ClickHouseMigrator {
 
         // Check if the script has changed since last run by comparing SHA-256
         // hashes. The hash is stored in the _migrations table under version_key.
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let hash = hex::encode(Sha256::digest(init_sql.as_bytes()));
 
         self.ensure_migrations_table().await?;
@@ -483,7 +479,8 @@ impl ClickHouseMigrator {
 
             // Apply cluster transformation
             let sql_stmt = if let Some(ref cluster) = cluster_name {
-                let transformed = Self::transform_for_cluster(sql_stmt, cluster, &self.database, is_cloud);
+                let transformed =
+                    Self::transform_for_cluster(sql_stmt, cluster, &self.database, is_cloud);
                 if transformed.trim().is_empty() {
                     continue;
                 }
@@ -579,7 +576,7 @@ impl ClickHouseMigrator {
                         tracing::warn!(
                             "Init SQL CREATE TABLE failed but the table already exists — \
                              continuing (likely a FAILED dependent dictionary re-validated \
-                             at CREATE time; see NAN-1115): {} - {}",
+                             at CREATE time): {} - {}",
                             &sql_stmt[..sql_stmt.len().min(120)],
                             e
                         );
@@ -622,7 +619,11 @@ impl ClickHouseMigrator {
         // Best-effort: don't fail startup if hash storage fails
         let _ = self.client.query(&delete_sql).execute().await;
         if let Err(e) = self.client.query(&upsert_sql).execute().await {
-            tracing::warn!("Failed to store {} hash: {} — next startup will re-run it", label, e);
+            tracing::warn!(
+                "Failed to store {} hash: {} — next startup will re-run it",
+                label,
+                e
+            );
         }
 
         // Seed baseline migrations on fresh deployments so the runner
@@ -850,7 +851,8 @@ mod tests {
     fn cluster_ddl_without_settings_gets_timeout_appended() {
         // NAN-1028 repro: this exact statement timed out at 180s on Saturn
         // and Hetzner org while dropping a real idx_ext_text.
-        let sql = "ALTER TABLE nanosiem.logs ON CLUSTER 'default' DROP INDEX IF EXISTS idx_ext_text";
+        let sql =
+            "ALTER TABLE nanosiem.logs ON CLUSTER 'default' DROP INDEX IF EXISTS idx_ext_text";
         let out = ensure_distributed_ddl_timeout(sql);
         assert_eq!(
             out,
@@ -861,7 +863,8 @@ mod tests {
 
     #[test]
     fn cluster_ddl_with_existing_settings_gets_timeout_prepended() {
-        let sql = "ALTER TABLE x ON CLUSTER 'default' MODIFY COLUMN y Int32 SETTINGS mutations_sync = 2";
+        let sql =
+            "ALTER TABLE x ON CLUSTER 'default' MODIFY COLUMN y Int32 SETTINGS mutations_sync = 2";
         let out = ensure_distributed_ddl_timeout(sql);
         assert_eq!(
             out,

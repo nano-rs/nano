@@ -54,7 +54,7 @@ function savePinned(set: Set<string>) {
 }
 
 function extractSourcetype(query: string): string {
-  const m = query.match(/\b(?:sourcetype|source_type)\s*=\s*["']?([a-zA-Z0-9_.-]+)/i);
+  const m = query.match(/\b(?:metadata\.log_source|sourcetype|source_type)\s*=\s*["']?([a-zA-Z0-9_.-]+)/i);
   return m ? m[1] : 'other';
 }
 

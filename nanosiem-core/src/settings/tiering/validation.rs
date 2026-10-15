@@ -381,9 +381,11 @@ mod tests {
     #[tokio::test]
     async fn accepts_public_endpoint() {
         // Real public S3 endpoint — IP class checks pass.
-        assert!(validate_s3_endpoint_ssrf("https://s3.us-east-1.amazonaws.com")
-            .await
-            .is_ok());
+        assert!(
+            validate_s3_endpoint_ssrf("https://s3.us-east-1.amazonaws.com")
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
@@ -394,20 +396,18 @@ mod tests {
         assert!(
             validate_s3_endpoint("https://docs.example.com/host.docker.internal-guide").is_ok()
         );
-        assert!(validate_s3_endpoint(
-            "https://example.com/?ref=gateway.docker.internal-faq"
-        )
-        .is_ok());
+        assert!(
+            validate_s3_endpoint("https://example.com/?ref=gateway.docker.internal-faq").is_ok()
+        );
     }
 
     #[tokio::test]
     async fn validate_and_resolve_returns_addrs_for_hostname() {
         // Public hostname → returns at least one safe SocketAddr that the
         // caller can pin into reqwest::ClientBuilder::resolve.
-        let (url, addrs) =
-            validate_and_resolve_s3_endpoint("https://s3.us-east-1.amazonaws.com")
-                .await
-                .expect("public endpoint should resolve");
+        let (url, addrs) = validate_and_resolve_s3_endpoint("https://s3.us-east-1.amazonaws.com")
+            .await
+            .expect("public endpoint should resolve");
         assert_eq!(url.host_str(), Some("s3.us-east-1.amazonaws.com"));
         assert!(
             !addrs.is_empty(),

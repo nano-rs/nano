@@ -39,6 +39,26 @@ import type {
 // Shared shapes
 // ---------------------------------------------------------------------------
 
+/**
+ * GET /api/observability/telemetry (NAN-2361, shared-lake tenants only).
+ *
+ * Whether spans/metrics are ingested behind this console. A hosted-shared
+ * tenant has no per-tenant OTLP data path, so the API answers
+ * `{ available: false, reason: 'telemetry_not_ingested' }` and the console
+ * renders the data tabs as an honest empty state instead of calling the
+ * (fenced) search routes. Dedicated deployments do not mount the route; the
+ * console never asks there.
+ */
+export interface TelemetryAvailability {
+  available: boolean;
+  /** Stable machine reason, e.g. `telemetry_not_ingested`; null when available. */
+  reason: string | null;
+  /** Human explanation for the empty state. */
+  detail: string | null;
+  /** Datasets the verdict covers (`spans`, `metrics`, `services`, …). */
+  datasets: string[];
+}
+
 /** A single time-bucketed scalar point. `t` is RFC3339, `v` the bucket value. */
 export interface SeriesPoint {
   t: string;
@@ -164,6 +184,8 @@ export interface Slo {
 
 export interface SloListResponse {
   slos: Slo[];
+  /** Present on shared-lake tenants (NAN-2361): whether spans back the attainment. */
+  telemetry?: TelemetryAvailability;
 }
 
 /** Stored SLO definition returned by create/update (no live span query). */
@@ -279,16 +301,23 @@ export interface RumQuery {
 // Convergence cross-link (NAN-1542) — security detections on a service's hosts
 // ---------------------------------------------------------------------------
 
-/** One security detection touching a host/IP that the service runs on. */
+/** One security detection touching a host/IP that the service runs on.
+ *
+ * NAN-2361: rows are OCSF Detection Findings from the lake. The matched
+ * entity is the observed `observables[].value` (usually the FQDN) that the
+ * service's span hosts matched on — that is the drill-down target.
+ */
 export interface ServiceSecuritySignal {
-  /** RFC3339 timestamp of the detection. */
+  /** Detection timestamp. UTC; may be zone-less ("YYYY-MM-DD HH:MM:SS.ffffff")
+   * — parse with parseUTCTimestamp, not bare new Date(). */
   ts: string;
+  /** Rule identity (OCSF finding_info.title). */
   rule_name: string;
-  /** The matched entity, when it resolved to a hostname (else null). */
-  src_host: string | null;
-  /** The matched entity, when it parsed as an IP (else null). */
-  src_ip: string | null;
   severity: string | null;
+  /** The observed entity the signal matched on (else null). */
+  matched_entity: string | null;
+  /** Whether the matched entity is a hostname or an IP (else null). */
+  matched_entity_type: 'hostname' | 'ip' | null;
 }
 
 export interface ServiceSecuritySignalsResponse {
@@ -355,6 +384,8 @@ export interface SyntheticCheck {
 
 export interface SyntheticChecksResponse {
   checks: SyntheticCheck[];
+  /** Present on shared-lake tenants (NAN-2361): whether probe results exist at all. */
+  telemetry?: TelemetryAvailability;
 }
 
 /** Stored check definition returned by create/update (no live result query). */
@@ -414,6 +445,13 @@ export class ObservabilityApi {
       key?: string
     ) => Promise<MetricTagsResponse>
   ) {}
+
+  // --- Telemetry availability (NAN-2361, shared-lake tenants) ---
+
+  /** Whether spans/metrics back this console. Only mounted on shared-lake tenants. */
+  async getTelemetryAvailability(): Promise<TelemetryAvailability> {
+    return this.request('/api/observability/telemetry');
+  }
 
   // --- Services (RED) — search service ---
 
@@ -520,12 +558,14 @@ export class ObservabilityApi {
     return this.request(`/api/search/rum?${params.toString()}`, undefined, cacheOpts);
   }
 
-  // --- Convergence cross-link (NAN-1542) — main api service ---
+  // --- Convergence cross-link (NAN-1542/NAN-2361) — search service ---
 
   /**
-   * Security detections touching the hosts/IPs a service runs on, over the
+   * Security detections touching the hosts a service runs on, over the
    * window. Backs the "Related security signals" strip on Service detail.
-   * Reads `search:view`. Often returns zero — render an empty state cleanly.
+   * NAN-2361: served by the search service against the OCSF/Iceberg lake
+   * (was /api/observability/... on the main api). Requires `search:execute`.
+   * Often returns zero — render an empty state cleanly.
    */
   async getServiceSecuritySignals(
     service: string,
@@ -538,7 +578,7 @@ export class ObservabilityApi {
     if (query?.limit != null) params.set('limit', String(query.limit));
     const qs = params.toString();
     return this.request(
-      `/api/observability/services/${encodeURIComponent(service)}/security-signals${qs ? `?${qs}` : ''}`
+      `/api/search/services/${encodeURIComponent(service)}/security-signals${qs ? `?${qs}` : ''}`
     );
   }
 

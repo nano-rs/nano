@@ -21,8 +21,12 @@ use super::types::{
 };
 use crate::auth::CredentialUseGrant;
 use crate::log_telemetry::repository::is_safe_source_type;
+use crate::parsers::tenant_bundle::pull::{
+    PullEnvelope, AZURE_CHECKPOINT_INTERVAL_SECS, AZURE_START_POSITION,
+};
 use crate::parsers::{
-    base_router_inputs, hec_normalize_present, redact_config_snapshot, CredentialRepository,
+    apply_hec_route_fallback, base_router_inputs, hec_normalize_present, redact_config_snapshot,
+    CredentialRepository, HEC_ROUTE,
 };
 
 /// SQS poll interval emitted when a source config does not override it.
@@ -96,6 +100,66 @@ pub(crate) fn normalize_pubsub_subscription(raw: &str) -> &str {
         .map(|(_, name)| name)
         .unwrap_or(raw)
         .trim_matches('/')
+}
+
+/// NAN-3764: the consumer group an Event Hubs source reads with when none is
+/// given (the hosted default too).
+pub(crate) const AZURE_DEFAULT_CONSUMER_GROUP: &str = "$Default";
+
+/// DNS suffix of a public-cloud Event Hubs namespace.
+const AZURE_EVENT_HUBS_SUFFIX: &str = "servicebus.windows.net";
+
+/// Event Hub / consumer-group name grammar (the hosted validator's): letters,
+/// digits, `.`, `_`, `-`; alphanumeric first and last; at most `max` bytes.
+fn azure_entity_name(value: &str, max: usize) -> bool {
+    let b = value.as_bytes();
+    !b.is_empty()
+        && b.len() <= max
+        && b[0].is_ascii_alphanumeric()
+        && b[b.len() - 1].is_ascii_alphanumeric()
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+}
+
+/// Blob container name: 3-63 lowercase letters, digits or single hyphens,
+/// letter/digit first and last.
+fn azure_blob_container_name(container: &str) -> bool {
+    let b = container.as_bytes();
+    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    (3..=63).contains(&b.len())
+        && alnum(b[0])
+        && alnum(b[b.len() - 1])
+        && b.iter().all(|&c| alnum(c) || c == b'-')
+        && !container.contains("--")
+}
+
+/// The namespace host Vector connects to. A bare namespace name (`acme-logs`)
+/// becomes `acme-logs.servicebus.windows.net` like the hosted renderer derives
+/// it; a full host (sovereign clouds, private DNS) is kept. `sb://` and a
+/// trailing `/` are tolerated because the Azure portal shows them. `None` for
+/// anything that is not a DNS name.
+fn azure_namespace_host(raw: &str) -> Option<String> {
+    let host = raw
+        .trim()
+        .trim_start_matches("sb://")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    };
+    if host.is_empty() || host.len() > 253 || !host.split('.').all(label_ok) {
+        return None;
+    }
+    if host.contains('.') {
+        Some(host)
+    } else {
+        Some(format!("{host}.{AZURE_EVENT_HUBS_SUFFIX}"))
+    }
 }
 
 #[derive(Error, Debug)]
@@ -174,16 +238,11 @@ impl SourceConfigService {
     /// mutable Secret volume can lag the object-store completion marker and
     /// make Vector reload new TOML with an old credential. The normal live
     /// deployment constructor keeps its auto-detected backend.
-    pub fn with_publication_vector_config_dir(
-        pool: PgPool,
-        config_dir: impl AsRef<Path>,
-    ) -> Self {
+    pub fn with_publication_vector_config_dir(pool: PgPool, config_dir: impl AsRef<Path>) -> Self {
         let config_dir = config_dir.as_ref().to_path_buf();
         let runtime_path = Self::resolve_runtime_path();
-        let creds_backend = Self::publication_creds_backend(
-            config_dir.clone(),
-            runtime_path.clone(),
-        );
+        let creds_backend =
+            Self::publication_creds_backend(config_dir.clone(), runtime_path.clone());
         Self {
             repository: SourceConfigRepository::new(pool.clone()),
             credential_repo: CredentialRepository::new(pool),
@@ -400,10 +459,12 @@ impl SourceConfigService {
         let generated = Self::config_safe_stem(config_type, name);
         let holder = crate::vector_naming::find_identity_holder(
             &generated,
-            existing
-                .iter()
-                .filter(|c| Some(c.id) != exclude)
-                .map(|c| (Self::config_safe_stem(&c.config_type, &c.name), c.name.clone())),
+            existing.iter().filter(|c| Some(c.id) != exclude).map(|c| {
+                (
+                    Self::config_safe_stem(&c.config_type, &c.name),
+                    c.name.clone(),
+                )
+            }),
         )?;
         Some(SourceConfigServiceError::InvalidConfig(
             crate::vector_naming::describe_identity_conflict(
@@ -539,18 +600,18 @@ impl SourceConfigService {
         // stem is pinned, so old_path == new_path and this is a no-op.
         // For Kafka / S3 / GCP / HTTP / Vector configs the stem follows
         // safe_name(name) and the path changes on rename.
-        let pre_update_snapshot: Option<(String, String, PathBuf, bool)> =
-            if request.name.is_some() {
-                let old_path = self.get_config_file_path(&existing.config_type, &existing.name);
-                Some((
-                    existing.config_type,
-                    existing.name,
-                    old_path,
-                    existing.deployed,
-                ))
-            } else {
-                None
-            };
+        let pre_update_snapshot: Option<(String, String, PathBuf, bool)> = if request.name.is_some()
+        {
+            let old_path = self.get_config_file_path(&existing.config_type, &existing.name);
+            Some((
+                existing.config_type,
+                existing.name,
+                old_path,
+                existing.deployed,
+            ))
+        } else {
+            None
+        };
 
         let updated = match self
             .repository
@@ -664,6 +725,7 @@ impl SourceConfigService {
             "aws_s3" => Self::validate_aws_s3_conn(conn)?,
             "aws_sqs" => Self::validate_aws_sqs_conn(conn)?,
             "gcp_pubsub" => Self::validate_gcp_pubsub_conn(conn)?,
+            "azure_event_hubs" => Self::validate_azure_event_hubs_conn(conn)?,
             "splunk_hec" => Self::validate_splunk_hec_conn(conn)?,
             _ => {}
         }
@@ -728,7 +790,9 @@ impl SourceConfigService {
         if ok {
             return Ok(());
         }
-        Err(SourceConfigServiceError::InvalidConfig(format!("aws_s3 connection_config.{key} must be an integer between 1 and {max}")))
+        Err(SourceConfigServiceError::InvalidConfig(format!(
+            "aws_s3 connection_config.{key} must be an integer between 1 and {max}"
+        )))
     }
 
     fn validate_aws_sqs_conn(conn: &serde_json::Value) -> Result<(), SourceConfigServiceError> {
@@ -740,7 +804,11 @@ impl SourceConfigService {
         // Vector's visibility timeout must exceed the time it takes to process
         // a batch, or SQS redelivers messages that are still in flight and the
         // pipeline duplicates them. Bounded by SQS's own 12-hour maximum.
-        Self::expect_bounded_int_if_present(conn, "visibility_timeout_secs", MAX_SQS_VISIBILITY_SECS)?;
+        Self::expect_bounded_int_if_present(
+            conn,
+            "visibility_timeout_secs",
+            MAX_SQS_VISIBILITY_SECS,
+        )?;
         Ok(())
     }
 
@@ -753,6 +821,99 @@ impl SourceConfigService {
                     "gcp_pubsub connection_config.ack_deadline_secs must be a non-negative integer"
                         .to_string(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// NAN-3764: Event Hubs coordinates. Secrets (SAS / storage connection
+    /// strings, the Entra client secret) never live here: they are in the
+    /// sealed `azure_event_hubs` credential. Point-forward only, so a
+    /// `start_position` other than `latest` is refused rather than ignored —
+    /// there is deliberately no backfill option.
+    fn validate_azure_event_hubs_conn(
+        conn: &serde_json::Value,
+    ) -> Result<(), SourceConfigServiceError> {
+        let invalid = |msg: String| SourceConfigServiceError::InvalidConfig(msg);
+        for key in [
+            "namespace",
+            "event_hub_name",
+            "consumer_group",
+            "checkpoint_account",
+            "checkpoint_container",
+            "start_position",
+        ] {
+            Self::expect_string_if_present(conn, key)?;
+        }
+        let field = |key: &str| {
+            conn.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        };
+
+        let hub = field("event_hub_name").ok_or_else(|| {
+            invalid("azure_event_hubs connection_config.event_hub_name is required".into())
+        })?;
+        if !azure_entity_name(hub, 256) {
+            return Err(invalid(
+                "azure_event_hubs connection_config.event_hub_name must be 1-256 letters, digits, \
+                 '.', '_' or '-', starting and ending with a letter or digit"
+                    .into(),
+            ));
+        }
+        if let Some(group) = field("consumer_group") {
+            if group != AZURE_DEFAULT_CONSUMER_GROUP && !azure_entity_name(group, 50) {
+                return Err(invalid(
+                    "azure_event_hubs connection_config.consumer_group must be $Default or 1-50 \
+                     letters, digits, '.', '_' or '-'"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(namespace) = field("namespace") {
+            if azure_namespace_host(namespace).is_none() {
+                return Err(invalid(
+                    "azure_event_hubs connection_config.namespace must be a namespace name \
+                     (e.g. acme-logs) or its host (acme-logs.servicebus.windows.net)"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(account) = field("checkpoint_account") {
+            let ok = (3..=24).contains(&account.len())
+                && account
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+            if !ok {
+                return Err(invalid(
+                    "azure_event_hubs connection_config.checkpoint_account must be 3-24 \
+                     lowercase letters or digits"
+                        .into(),
+                ));
+            }
+        }
+        let container = field("checkpoint_container").ok_or_else(|| {
+            invalid(
+                "azure_event_hubs connection_config.checkpoint_container is required: \
+                 checkpoints are what let a restart resume without loss or duplicates"
+                    .into(),
+            )
+        })?;
+        if !azure_blob_container_name(container) {
+            return Err(invalid(
+                "azure_event_hubs connection_config.checkpoint_container must be 3-63 lowercase \
+                 letters, digits or single hyphens, starting and ending with a letter or digit"
+                    .into(),
+            ));
+        }
+        if let Some(start) = field("start_position") {
+            if start != AZURE_START_POSITION {
+                return Err(invalid(format!(
+                    "azure_event_hubs connection_config.start_position must be \
+                     \"{AZURE_START_POSITION}\": pull sources start at the newest events and \
+                     have no backfill option"
+                )));
             }
         }
         Ok(())
@@ -780,7 +941,9 @@ impl SourceConfigService {
         conn: &serde_json::Value,
         key: &str,
     ) -> Result<(), SourceConfigServiceError> {
-        let Some(v) = conn.get(key) else { return Ok(()) };
+        let Some(v) = conn.get(key) else {
+            return Ok(());
+        };
         let is_empty = match v {
             serde_json::Value::Null => true,
             serde_json::Value::String(s) => s.is_empty(),
@@ -860,7 +1023,11 @@ impl SourceConfigService {
         id: Uuid,
         enabled: bool,
     ) -> Result<SourceConfiguration, SourceConfigServiceError> {
-        Ok(self.repository.toggle_enabled(id, enabled).await?.redacted())
+        Ok(self
+            .repository
+            .toggle_enabled(id, enabled)
+            .await?
+            .redacted())
     }
 
     // ========================================================================
@@ -954,7 +1121,10 @@ impl SourceConfigService {
         // of those fields (otherwise the existing rule is already valid).
         if request.match_type.is_some() || request.match_field.is_some() {
             let existing = self.repository.get_rule(rule_id).await?;
-            let parent = self.repository.get(existing.source_configuration_id).await?;
+            let parent = self
+                .repository
+                .get(existing.source_configuration_id)
+                .await?;
             let effective_field = request
                 .match_field
                 .as_deref()
@@ -1038,9 +1208,7 @@ impl SourceConfigService {
     /// could break the generated VRL. `None` / whitespace-only is allowed
     /// (falls back to "unknown" as before); validation runs on the trimmed
     /// value to mirror what the generator emits.
-    fn validate_default_source_type(
-        value: Option<&str>,
-    ) -> Result<(), SourceConfigServiceError> {
+    fn validate_default_source_type(value: Option<&str>) -> Result<(), SourceConfigServiceError> {
         let Some(value) = value else {
             return Ok(());
         };
@@ -1354,10 +1522,8 @@ impl SourceConfigService {
         // intermediary (source_type_extract or hec_normalize).
         if let Some(intermediary_source) = Self::system_intermediary_source(&config.config_type) {
             let has_meaningful_rules = Self::has_meaningful_routing_rules(&config_with_rules);
-            let vector_config = Self::render_system_source_config(
-                &config_with_rules,
-                intermediary_source,
-            );
+            let vector_config =
+                Self::render_system_source_config(&config_with_rules, intermediary_source);
             if let Some(config_content) = &vector_config {
                 // NAN-689 acceptance criterion #3: validate before
                 // mark_deployed / router-update / file write. Failure path
@@ -1704,9 +1870,7 @@ impl SourceConfigService {
     /// and does not implicitly undeploy an already-running source.
     /// The publication reconciler uses a fresh directory, so deletion is
     /// represented by absence and snapshots never inherit another pod's files.
-    pub async fn render_deployed_to_vector_config(
-        &self,
-    ) -> Result<(), SourceConfigServiceError> {
+    pub async fn render_deployed_to_vector_config(&self) -> Result<(), SourceConfigServiceError> {
         Self::require_canonical_router(&self.vector_config_dir)?;
 
         let sources = self.repository.list_deployed().await?;
@@ -1722,13 +1886,12 @@ impl SourceConfigService {
                 routing_rules,
             };
             let config = &config_with_rules.config;
-            let rendered = if let Some(intermediary) =
-                Self::system_intermediary_source(&config.config_type)
-            {
-                Self::render_system_source_config(&config_with_rules, intermediary)
-            } else {
-                Some(self.generate_vector_config(&config_with_rules).await?)
-            };
+            let rendered =
+                if let Some(intermediary) = Self::system_intermediary_source(&config.config_type) {
+                    Self::render_system_source_config(&config_with_rules, intermediary)
+                } else {
+                    Some(self.generate_vector_config(&config_with_rules).await?)
+                };
 
             if let Some(rendered) = rendered {
                 Self::validate_generated_config(&rendered)?;
@@ -1827,12 +1990,8 @@ impl SourceConfigService {
         }
 
         let route_name = Self::config_route_name(&config.config.config_type, &config.config.name);
-        let routing_block = Self::generate_routing_transform(
-            config,
-            intermediary_source,
-            &route_name,
-            true,
-        );
+        let routing_block =
+            Self::generate_routing_transform(config, intermediary_source, &route_name, true);
         Some(format!(
             "# Auto-generated routing rules for system-level source: {}\n\
              # DO NOT EDIT - changes will be overwritten\n\
@@ -1937,6 +2096,9 @@ impl SourceConfigService {
             "gcp_pubsub" => {
                 Self::generate_gcp_pubsub_source(&source_name, conn, gcp_creds_path.as_deref())
             }
+            "azure_event_hubs" => {
+                Self::generate_azure_event_hubs_source(&source_name, conn, creds.as_ref())?
+            }
             _ => {
                 return Err(SourceConfigServiceError::InvalidConfig(format!(
                     "Unknown config type: {}",
@@ -1981,15 +2143,18 @@ impl SourceConfigService {
             .unwrap_or("localhost:9092");
         let topics: Vec<String> = conn["topics"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_else(|| vec!["logs".to_string()]);
         let auto_offset_reset = conn["auto_offset_reset"].as_str().unwrap_or("latest");
         let group_id_owned: String;
         let group_id: &str = match conn["group_id"].as_str() {
             Some(explicit) => explicit,
             None => {
-                group_id_owned =
-                    format!("nanosiem-{}", crate::typeid::encode_suffix(config_id));
+                group_id_owned = format!("nanosiem-{}", crate::typeid::encode_suffix(config_id));
                 &group_id_owned
             }
         };
@@ -2090,19 +2255,23 @@ impl SourceConfigService {
             }
         }
 
+        let mut sqs = toml::Table::new();
+        sqs.insert("queue_url".into(), sqs_queue_url.into());
         // NAN-2188: `client_concurrency` is the first knob worth touching on a
         // high-object-count feed, and it was previously unreachable. Omitted
         // entirely when unset so Vector's own default applies — emitting a
         // guess here would silently override it for every existing deployment.
-        if let Some(concurrency) = Self::positive_u32(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY) {
-            source.insert(
+        // NAN-3604: it belongs in the `sqs` table (Vector's aws_s3
+        // `sqs::Config`); the source's top level is `deny_unknown_fields`, so a
+        // top-level key fails `vector validate` with "unknown field".
+        if let Some(concurrency) =
+            Self::positive_u32(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY)
+        {
+            sqs.insert(
                 "client_concurrency".into(),
                 toml::Value::Integer(i64::from(concurrency)),
             );
         }
-
-        let mut sqs = toml::Table::new();
-        sqs.insert("queue_url".into(), sqs_queue_url.into());
         // Defaults to the previously hard-coded 15, so an existing config that
         // does not set it emits byte-identical TOML. `poll_secs` governs
         // empty-queue backoff, NOT throughput — with a backlog Vector keeps
@@ -2111,7 +2280,8 @@ impl SourceConfigService {
         sqs.insert(
             "poll_secs".into(),
             toml::Value::Integer(i64::from(
-                Self::positive_u32(conn, "poll_secs", MAX_POLL_SECS).unwrap_or(DEFAULT_SQS_POLL_SECS),
+                Self::positive_u32(conn, "poll_secs", MAX_POLL_SECS)
+                    .unwrap_or(DEFAULT_SQS_POLL_SECS),
             )),
         );
         sqs.insert("delete_message".into(), true.into());
@@ -2249,6 +2419,8 @@ impl SourceConfigService {
             )),
         );
 
+        // Top level is correct here, unlike aws_s3 (where it sits under `sqs`):
+        // Vector's `AwsSqsConfig` declares `client_concurrency` directly.
         if let Some(concurrency) =
             Self::positive_u32(conn, "client_concurrency", MAX_CLIENT_CONCURRENCY)
         {
@@ -2305,6 +2477,171 @@ impl SourceConfigService {
         Self::wrap_source_table(source_name, source)
     }
 
+    /// Build the `[sources.<name>]` block for an Azure Event Hubs source
+    /// (NAN-3764), on the Vector fork's `azure_event_hubs` source.
+    ///
+    /// Mirrors the hosted pull renderer (`parsers::tenant_bundle::pull`,
+    /// NAN-3604) so both editions behave the same: point-forward
+    /// (`start_position = "latest"`, which with a checkpoint store writes each
+    /// partition's current end as its first checkpoint at connect), the same
+    /// checkpoint interval, end-to-end acknowledgements (a position is
+    /// checkpointed only once its events are delivered), and the message body
+    /// as raw bytes. Only authentication differs: hosted federates through
+    /// nano's broker, while a dedicated deployment brings its own credential.
+    ///
+    /// Event Hub authentication, from the sealed credential:
+    ///
+    /// | credential                         | result                                   |
+    /// |------------------------------------|------------------------------------------|
+    /// | `connection_string`                | SAS connection string (`namespace` unused) |
+    /// | tenant + client id + client secret | Entra service principal on `namespace`   |
+    /// | none                               | managed identity on `namespace`          |
+    ///
+    /// The checkpoint store (Azure Blob Storage) uses the credential's
+    /// `checkpoint_connection_string` when set, else `checkpoint_account` with
+    /// the same Entra service principal or managed identity. A checkpoint store
+    /// is mandatory: without one every restart would start at the newest
+    /// events and drop whatever arrived while Vector was down.
+    fn generate_azure_event_hubs_source(
+        source_name: &str,
+        conn: &serde_json::Value,
+        creds: Option<&serde_json::Value>,
+    ) -> Result<String, SourceConfigServiceError> {
+        let invalid =
+            |msg: &str| SourceConfigServiceError::InvalidConfig(format!("azure_event_hubs: {msg}"));
+        let conn_field = |key: &str| {
+            conn.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        };
+        let cred_field = |key: &str| {
+            creds
+                .and_then(|c| c.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        };
+
+        let event_hub = conn_field("event_hub_name")
+            .ok_or_else(|| invalid("connection_config.event_hub_name is required"))?;
+        let container = conn_field("checkpoint_container")
+            .ok_or_else(|| invalid("connection_config.checkpoint_container is required"))?;
+        let consumer_group = conn_field("consumer_group").unwrap_or(AZURE_DEFAULT_CONSUMER_GROUP);
+
+        // Entra service principal when all three parts are present; a partial
+        // one is a misconfiguration, not a credential (same rule as AWS keys).
+        let entra = match (
+            cred_field("azure_tenant_id"),
+            cred_field("azure_client_id"),
+            cred_field("azure_client_secret"),
+        ) {
+            (Some(tenant), Some(client), Some(secret)) => {
+                let mut auth = toml::Table::new();
+                auth.insert(
+                    "azure_credential_kind".into(),
+                    "client_secret_credential".into(),
+                );
+                auth.insert("azure_tenant_id".into(), tenant.into());
+                auth.insert("azure_client_id".into(), client.into());
+                auth.insert("azure_client_secret".into(), secret.into());
+                auth
+            }
+            _ => {
+                let mut auth = toml::Table::new();
+                auth.insert("azure_credential_kind".into(), "managed_identity".into());
+                auth
+            }
+        };
+
+        let mut source = toml::Table::new();
+        source.insert("type".into(), "azure_event_hubs".into());
+        if let Some(connection_string) = cred_field("connection_string") {
+            source.insert("connection_string".into(), connection_string.into());
+        } else {
+            let namespace = conn_field("namespace")
+                .and_then(azure_namespace_host)
+                .ok_or_else(|| {
+                    invalid(
+                        "connection_config.namespace is required unless the credential \
+                         carries an Event Hubs connection string",
+                    )
+                })?;
+            source.insert("namespace".into(), namespace.into());
+            source.insert("auth".into(), toml::Value::Table(entra.clone()));
+        }
+        source.insert("event_hub_name".into(), event_hub.into());
+        source.insert("consumer_group".into(), consumer_group.into());
+        // Only for a partition with no checkpoint yet: point-forward.
+        source.insert("start_position".into(), AZURE_START_POSITION.into());
+        source.insert(
+            "checkpoint_interval_secs".into(),
+            toml::Value::Integer(i64::from(AZURE_CHECKPOINT_INTERVAL_SECS)),
+        );
+
+        let store = match cred_field("checkpoint_connection_string") {
+            Some(connection_string) => {
+                Self::azure_blob_checkpoint_store(container, connection_string, None)
+            }
+            None => {
+                let account = conn_field("checkpoint_account").ok_or_else(|| {
+                    invalid(
+                        "connection_config.checkpoint_account is required unless the credential \
+                         carries a storage connection string",
+                    )
+                })?;
+                Self::azure_blob_checkpoint_store(container, account, Some(entra))
+            }
+        };
+        source.insert("checkpoint_store".into(), toml::Value::Table(store));
+
+        let mut acknowledgements = toml::Table::new();
+        acknowledgements.insert("enabled".into(), true.into());
+        source.insert(
+            "acknowledgements".into(),
+            toml::Value::Table(acknowledgements),
+        );
+        let mut decoding = toml::Table::new();
+        decoding.insert("codec".into(), "bytes".into());
+        source.insert("decoding".into(), toml::Value::Table(decoding));
+        let mut framing = toml::Table::new();
+        framing.insert("method".into(), "bytes".into());
+        source.insert("framing".into(), toml::Value::Table(framing));
+
+        Ok(Self::wrap_source_table(source_name, source))
+    }
+
+    /// The `checkpoint_store` table of an `azure_event_hubs` source (NAN-3764):
+    /// Azure Blob Storage, addressed by a storage connection string (`auth`
+    /// `None`; the fork refuses a credential-bearing connection string next to
+    /// `auth`) or by an account name with Entra `auth`. Kept out of
+    /// [`Self::generate_azure_event_hubs_source`] because its `type` is a
+    /// checkpoint-store kind, not a Vector component type, and the fork's
+    /// component scanner reads every `type` inserted in a `generate_*_source`
+    /// body as a shipped source.
+    fn azure_blob_checkpoint_store(
+        container: &str,
+        connection_string_or_account: &str,
+        auth: Option<toml::Table>,
+    ) -> toml::Table {
+        let mut store = toml::Table::new();
+        store.insert("type".into(), "azure_blob".into());
+        match auth {
+            None => {
+                store.insert(
+                    "connection_string".into(),
+                    connection_string_or_account.into(),
+                );
+            }
+            Some(auth) => {
+                store.insert("account_name".into(), connection_string_or_account.into());
+                store.insert("auth".into(), toml::Value::Table(auth));
+            }
+        }
+        store.insert("container_name".into(), container.into());
+        store
+    }
+
     /// Pre-deploy validation gate (NAN-689 acceptance criterion #3).
     ///
     /// Runs entirely in-process — no Docker / `vector validate` subprocess
@@ -2356,9 +2693,8 @@ impl SourceConfigService {
                 Some(s) => s,
                 None => continue,
             };
-            if let Err(diagnostics) = vrl::compiler::compile(source, &fns) {
-                let formatted =
-                    vrl::diagnostic::Formatter::new(source, diagnostics).to_string();
+            if let Err(error) = crate::parsers::vrl_guard::compile(source, &fns) {
+                let formatted = error.render(source);
                 return Err(SourceConfigServiceError::InvalidConfig(format!(
                     "generated VRL for transform '{name}' failed to compile:\n{formatted}"
                 )));
@@ -2463,16 +2799,18 @@ impl SourceConfigService {
             // shipped (NAN-884 K-7). Coerce header values to string for
             // every comparison; `?? ""` keeps the rule falsy when the
             // header is missing instead of aborting the VRL program.
-            let field = Self::routing_field_expression(
-                &config.config.config_type,
-                &rule.match_field,
-            );
+            let field =
+                Self::routing_field_expression(&config.config.config_type, &rule.match_field);
             let raw_value = rule.match_value.as_deref().unwrap_or("");
 
             let condition = match rule.match_type.as_str() {
                 "exact" => format!("{} == \"{}\"", field, Self::vrl_escape(raw_value)),
                 "prefix" => {
-                    format!("starts_with({}, \"{}\")", field, Self::vrl_escape(raw_value))
+                    format!(
+                        "starts_with({}, \"{}\")",
+                        field,
+                        Self::vrl_escape(raw_value)
+                    )
                 }
                 "suffix" => {
                     format!("ends_with({}, \"{}\")", field, Self::vrl_escape(raw_value))
@@ -2481,7 +2819,11 @@ impl SourceConfigService {
                     format!("contains({}, \"{}\")", field, Self::vrl_escape(raw_value))
                 }
                 "regex" => {
-                    let pattern = if raw_value.is_empty() { ".*" } else { raw_value };
+                    let pattern = if raw_value.is_empty() {
+                        ".*"
+                    } else {
+                        raw_value
+                    };
                     if pattern.contains('\'') {
                         tracing::warn!(
                             rule_id = %rule.id,
@@ -2561,6 +2903,28 @@ impl SourceConfigService {
             vrl.push_str("# passthrough: keep existing .source_type\n");
         } else {
             vrl.push_str(&format!(".source_type = \"{}\"\n", default_source_type));
+        }
+
+        // NAN-3764: stash the routed source type in event metadata like the
+        // system ingress (`00-base.toml`) and the hosted pull stamp do. An
+        // OCSF parser replaces the event root (`. = {...}`), wiping
+        // `.source_type`; its `_ocsf_prepare` reads `%source_type` back, so
+        // without this every dispatch-bound pull source's OCSF rows were
+        // stored as `unknown`. System-level sources feed the router, which
+        // sets it itself.
+        if !system_level {
+            vrl.push_str("%source_type = .source_type\n");
+        }
+
+        // NAN-3764: an Event Hubs message is usually an Azure Monitor batch,
+        // `{"records": [...]}`. Split it into one event per record exactly as
+        // the hosted pull stamp does (same VRL), so the lane — and any parser
+        // shared between editions — sees one record in `.message`. Runs LAST:
+        // the rules above routed the whole message, and every record inherits
+        // that `.source_type`.
+        if !system_level && config.config.config_type == "azure_event_hubs" {
+            vrl.push('\n');
+            vrl.push_str(PullEnvelope::AzureRecords.vrl());
         }
 
         let mut transform = toml::Table::new();
@@ -2689,13 +3053,22 @@ impl SourceConfigService {
         // rewrite would put back raw route names that double-feed events into
         // both `source_router` and the per-parser filter.
         let claims = self.repository.load_route_claims().await?;
-        let claim_substitutions = Self::build_claim_substitutions(&claims);
 
         let router_inputs = Self::compute_router_inputs(
             &deployed_configs,
-            |cfg| self.get_config_file_path(&cfg.config_type, &cfg.name).exists(),
+            |cfg| {
+                self.get_config_file_path(&cfg.config_type, &cfg.name)
+                    .exists()
+            },
             hec_normalize_present(),
         );
+        // NAN-3765: same reference closure as the parser-side writer
+        // (`build_router_inputs_with_claim_dedupe`): HEC claims with no
+        // rendered HEC route get the passthrough route, and only claims on
+        // routes that actually feed source_router get an `_unclaimed` filter.
+        let (router_inputs, hec_fallback_block, claims) =
+            Self::close_router_references(router_inputs, claims);
+        let claim_substitutions = Self::build_claim_substitutions(&claims);
         // Apply claim substitution AFTER compute_router_inputs so the
         // pure function (and its 8 unit tests) stay focused on the base-input
         // logic; this layer adds dedupe-safety on top.
@@ -2745,49 +3118,94 @@ impl SourceConfigService {
         // Filter blocks are injected just above `[transforms.source_router]`
         // (placement is cosmetic — Vector resolves inputs file-wide).
         let current_content = Self::strip_existing_unclaimed_blocks(&raw_content);
-        let claim_blocks = Self::build_unclaimed_blocks(&claims);
+        let claim_blocks = format!(
+            "{}{}",
+            hec_fallback_block,
+            Self::build_unclaimed_blocks(&claims)
+        );
 
-        // Replace the inputs line in the [transforms.source_router] section.
-        // Match the first inputs = [...] line that appears after the source_router header.
-        // We can't rely on "source_type_extract" being present since system-level routes
-        // may have already removed it.
-        let mut updated = String::new();
-        let mut found = false;
-        let mut in_source_router = false;
-        let mut filter_block_emitted = false;
-        for line in current_content.lines() {
-            let trimmed = line.trim();
-            if trimmed == "[transforms.source_router]" {
-                // Emit unclaimed-filter blocks immediately before
-                // source_router so the file reads top-down.
-                if !filter_block_emitted && !claim_blocks.is_empty() {
-                    updated.push_str(&claim_blocks);
-                    filter_block_emitted = true;
-                }
-                in_source_router = true;
-                updated.push_str(line);
-                updated.push('\n');
-            } else if in_source_router && !found && trimmed.starts_with("inputs = [") {
-                // Replace this line with the new inputs
-                // Preserve leading whitespace
-                let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-                updated.push_str(&format!("{}{}\n", leading_ws, new_inputs_line));
-                found = true;
-                in_source_router = false;
-            } else {
-                updated.push_str(line);
-                updated.push('\n');
-            }
-        }
+        // Source-config reconciliation owns only the ordinary log transport
+        // fan-in. The enrichment router is fed by the dedicated, authenticated
+        // `enrichment_prepare` source on :8090 and must not be rewritten to the
+        // log inputs here.
+        let (updated, found, enrichment_preserved) =
+            Self::rewrite_router_inputs(&current_content, &new_inputs_line, &claim_blocks);
 
         if found {
             tokio::fs::write(&router_path, &updated).await?;
-            tracing::info!("Updated dynamic router inputs: {}", new_inputs_line);
+            tracing::info!(
+                enrichment_router_preserved = enrichment_preserved,
+                "Updated dynamic router inputs: {}",
+                new_inputs_line
+            );
         } else {
             tracing::warn!("Could not find source_router inputs line in _router.toml");
         }
 
         Ok(())
+    }
+
+    fn rewrite_router_inputs(
+        content: &str,
+        new_inputs_line: &str,
+        claim_blocks: &str,
+    ) -> (String, bool, bool) {
+        let mut updated = String::new();
+        let mut in_source_router = false;
+        let mut found_source = false;
+        let mut found_enrichment = false;
+        let mut filter_block_emitted = false;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[transforms.source_router]" {
+                if !filter_block_emitted && !claim_blocks.is_empty() {
+                    updated.push_str(claim_blocks);
+                    filter_block_emitted = true;
+                }
+                in_source_router = true;
+                updated.push_str(line);
+                updated.push('\n');
+            } else if trimmed == "[transforms.enrichment_router]" {
+                in_source_router = false;
+                found_enrichment = true;
+                updated.push_str(line);
+                updated.push('\n');
+            } else if in_source_router && trimmed.starts_with("inputs = [") {
+                let leading_ws: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+                updated.push_str(&format!("{}{}\n", leading_ws, new_inputs_line));
+                found_source = true;
+                in_source_router = false;
+            } else {
+                if trimmed.starts_with('[') {
+                    in_source_router = false;
+                }
+                updated.push_str(line);
+                updated.push('\n');
+            }
+        }
+
+        (updated, found_source, found_enrichment)
+    }
+
+    /// NAN-3765: make the router's references self-consistent with what this
+    /// render actually declares. Adds the passthrough `splunk_hec_route` when
+    /// HEC parsers claim it but no HEC source config route is rendered, and
+    /// drops claims on routes that do not feed `source_router` (disabled,
+    /// undeployed, or unrendered source configs) so no `<route>_unclaimed`
+    /// filter consumes a missing component.
+    fn close_router_references(
+        router_inputs: Vec<String>,
+        claims: Vec<RouteClaim>,
+    ) -> (Vec<String>, String, Vec<RouteClaim>) {
+        let hec_claimed = claims.iter().any(|claim| claim.route == HEC_ROUTE);
+        let (router_inputs, hec_fallback_block) =
+            apply_hec_route_fallback(router_inputs, hec_claimed);
+        let claims = claims
+            .into_iter()
+            .filter(|claim| router_inputs.iter().any(|input| *input == claim.route))
+            .collect();
+        (router_inputs, hec_fallback_block, claims)
     }
 
     /// NAN-930: build the route→substituted-route map. Any route that one or
@@ -2821,8 +3239,11 @@ impl SourceConfigService {
             let trimmed = line.trim_start();
             // Section-header start. Decide whether to enter or exit skip mode.
             if trimmed.starts_with('[') {
-                in_unclaimed = trimmed.starts_with("[transforms.")
-                    && trimmed.contains("_unclaimed]");
+                // NAN-3765: the passthrough HEC route is router-owned and
+                // re-derived on every rewrite, exactly like `_unclaimed`.
+                in_unclaimed = (trimmed.starts_with("[transforms.")
+                    && trimmed.contains("_unclaimed]"))
+                    || trimmed.trim_end() == format!("[transforms.{HEC_ROUTE}]");
                 if in_unclaimed {
                     continue;
                 }
@@ -2847,7 +3268,10 @@ impl SourceConfigService {
         // Group claimants by route so the union match_values list comes out stable.
         let mut by_route: BTreeMap<&str, Vec<&RouteClaim>> = BTreeMap::new();
         for claim in claims {
-            by_route.entry(claim.route.as_str()).or_default().push(claim);
+            by_route
+                .entry(claim.route.as_str())
+                .or_default()
+                .push(claim);
         }
 
         let mut out = String::new();
@@ -2905,7 +3329,12 @@ impl SourceConfigService {
     /// GCP `attributes.*` doesn't need coercion — `gcp_pubsub` decodes
     /// `.attributes` as `Object(String, String)` already.
     fn routing_field_expression(config_type: &str, match_field: &str) -> String {
-        if config_type == "kafka" && match_field.starts_with("headers.") {
+        // NAN-3764: Event Hubs application properties are producer-set and
+        // typed (string, number, bool, ...); an absent one must simply not
+        // match, and a non-string one must compare as its string form.
+        if (config_type == "kafka" && match_field.starts_with("headers."))
+            || (config_type == "azure_event_hubs" && match_field.starts_with("properties."))
+        {
             format!("(to_string(.{match_field}) ?? \"\")")
         } else {
             format!(".{match_field}")
@@ -2925,6 +3354,7 @@ impl SourceConfigService {
             "aws_s3" => Some("aws_s3"),
             "aws_sqs" => Some("aws_sqs"),
             "gcp_pubsub" => Some("gcp_pubsub"),
+            "azure_event_hubs" => Some("azure_event_hubs"),
             _ => None,
         }
     }

@@ -23,11 +23,25 @@ pub enum DetectionError {
     #[error("Query execution error: {0}")]
     QueryExecutionError(String),
 
+    /// A bounded detection batch was durably committed, but the same fixed
+    /// window still contains unprocessed matches. Schedulers must retry the
+    /// window without advancing its watermark or consuming a failure attempt.
+    #[error(
+        "detection window drain pending: committed {processed} events; at least {remaining_at_least} remain"
+    )]
+    WindowDrainPending {
+        processed: usize,
+        remaining_at_least: usize,
+    },
+
     #[error("Invalid cron expression: {0}")]
     InvalidCronExpression(String),
 
     #[error("Rule is paused: {0}")]
     RulePaused(Uuid),
+
+    #[error("Rule is still executing: {0}")]
+    RuleExecuting(Uuid),
 
     #[error("Alert not found: {0}")]
     AlertNotFound(Uuid),
@@ -55,6 +69,12 @@ pub enum DetectionError {
 
     #[error("Concurrent modification detected for rule {0} - refresh and try again")]
     ConcurrentModification(Uuid),
+}
+
+impl DetectionError {
+    pub fn is_window_drain_pending(&self) -> bool {
+        matches!(self, Self::WindowDrainPending { .. })
+    }
 }
 
 impl From<crate::db::repository::detection_rules::DetectionRuleRepositoryError> for DetectionError {

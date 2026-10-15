@@ -29,9 +29,76 @@ use super::helpers::get_nested_value;
 /// # Returns
 /// * `true` - If the condition is satisfied
 /// * `false` - If the condition is not satisfied
+
+/// Render a JSON scalar as a string for regex matching. Objects/arrays never
+/// match a scalar regex, which is the same choice the SQL path makes.
+fn json_to_haystack(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Compile a pattern, honouring the `(?i)` inline flag the SQL path emits.
+/// Compilation is cheap relative to a network round trip and these predicates
+/// run over a bounded post-processing page, so no cache is warranted yet.
+fn regex_cache(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(pattern).ok()
+}
+
+/// Compare an evaluated function result against the predicate's literal.
+/// Mirrors the numeric/string/bool semantics used elsewhere in this module.
+fn compare_json_to_value(result: &serde_json::Value, op: &Comparator, value: &Value) -> bool {
+    match (result, value) {
+        (serde_json::Value::Bool(b), Value::Bool(t)) => match op {
+            Comparator::Eq => b == t,
+            Comparator::Ne => b != t,
+            _ => false,
+        },
+        // `| where is_private_ip(x)` parses as a bare truthy predicate; the
+        // generator compares against boolean true.
+        (serde_json::Value::Bool(b), _) => *b,
+        (serde_json::Value::Number(n), Value::Number(t)) => {
+            let l = n.as_f64().unwrap_or(0.0);
+            match op {
+                Comparator::Eq => (l - t).abs() < f64::EPSILON,
+                Comparator::Ne => (l - t).abs() >= f64::EPSILON,
+                Comparator::Lt => l < *t,
+                Comparator::Lte => l <= *t,
+                Comparator::Gt => l > *t,
+                Comparator::Gte => l >= *t,
+                _ => false,
+            }
+        }
+        (serde_json::Value::String(s), Value::String(t)) => match op {
+            Comparator::Eq => s.eq_ignore_ascii_case(t),
+            Comparator::Ne => !s.eq_ignore_ascii_case(t),
+            Comparator::Contains => s.to_lowercase().contains(&t.to_lowercase()),
+            Comparator::NotContains => !s.to_lowercase().contains(&t.to_lowercase()),
+            _ => false,
+        },
+        (serde_json::Value::String(s), Value::Regex(p)) => match regex_cache(p) {
+            Some(re) => {
+                let hit = re.is_match(s);
+                if matches!(op, Comparator::NotRegex) {
+                    !hit
+                } else {
+                    hit
+                }
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Value) -> bool {
     match condition {
-        SearchExpr::FieldFilter { field, op, value } => {
+        SearchExpr::FieldFilter {
+            field, op, value, ..
+        } => {
             // Use get_nested_value to support dot-notation for nested fields like _prevalence.hash.artifact
             let row_value = get_nested_value(row, field);
 
@@ -41,6 +108,32 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
                     "evaluate_condition_on_json: field={}, row_value={:?}, target_value={:?}, op={:?}",
                     field, row_value, value, op
                 );
+            }
+
+            // NAN-2361: `Value::Regex` had NO arm here, so it fell through to
+            // `false` — every regex predicate evaluated Nano-side (i.e. after a
+            // `| prevalence` / `| risk` stage) silently matched nothing. A rule
+            // whose escalation is `| where dest_host=/(\d{3,})/ | risk score=95`
+            // simply never escalated. Verified live: `/^10\./` after
+            // `| prevalence` returned 0 rows; the same predicate without it
+            // returned 5, on data where every value starts `10.`.
+            if let Value::Regex(pattern) = value {
+                let Some(haystack) = row_value.as_ref().and_then(|v| json_to_haystack(v)) else {
+                    return matches!(op, Comparator::NotRegex);
+                };
+                return match regex_cache(pattern) {
+                    Some(re) => {
+                        let hit = re.is_match(&haystack);
+                        if matches!(op, Comparator::NotRegex) {
+                            !hit
+                        } else {
+                            hit
+                        }
+                    }
+                    // An uncompilable pattern must not silently match everything
+                    // or nothing in one direction only.
+                    None => false,
+                };
             }
 
             match (row_value, value) {
@@ -96,15 +189,39 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
             op,
             value,
         } => {
-            // For function filters, we need to evaluate the function on the JSON data
-            // This is a simplified implementation - in practice, we'd need a full expression evaluator
+            // Delegate to the post-processing eval evaluator, which implements the
+            // full nPL function set (38 functions), instead of the hand-rolled
+            // whitelist below.
+            //
+            // NAN-2361: that whitelist covered only min/max/now/dayofweek, and
+            // every other function fell through to `false`. Because these
+            // predicates are evaluated Nano-side AFTER a stage like
+            // `| prevalence`, the consequence was silent and inverted: a rule
+            // ending `| prevalence … | where NOT is_private_ip(src_endpoint.ip)`
+            // had its RFC1918 exclusion evaluate to NOT(false) = TRUE for every
+            // row, so the filter never applied. Measured on a live lake:
+            // `is_private_ip` after `| prevalence` returned 0 rows where the
+            // same predicate without it returned 5, on data that is entirely
+            // RFC1918.
+            if let EvalExpression::FunctionCall { name, .. } = function {
+                if !matches!(name.as_str(), "min" | "max" | "now" | "dayofweek") {
+                    if let Some(obj) = row.as_object() {
+                        if let Some(result) = super::eval::evaluate_eval_expression(function, obj) {
+                            return compare_json_to_value(&result, op, value);
+                        }
+                    }
+                    // The function is real but produced nothing for this row —
+                    // treat as non-matching rather than pretending it matched.
+                    return false;
+                }
+            }
             match function {
                 EvalExpression::FunctionCall { name, args } => {
                     match name.as_str() {
                         "dayofweek" => {
                             // Extract timestamp field from args and evaluate dayofweek
                             if let Some(EvalExpression::Field(field)) = args.first() {
-                                if let Some(timestamp_val) = row.get(field) {
+                                if let Some(timestamp_val) = get_nested_value(row, field) {
                                     if let Some(timestamp_str) = timestamp_val.as_str() {
                                         // Parse timestamp and get day of week (1=Sunday, 7=Saturday)
                                         if let Ok(dt) =
@@ -274,13 +391,30 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
         SearchExpr::Not(inner) => !evaluate_condition_on_json(inner, row),
         SearchExpr::Group(inner) => evaluate_condition_on_json(inner, row),
         SearchExpr::Keyword(kw) => {
+            // A wildcard keyword (`*svchost*`, `svch*`) mirrors the SQL
+            // `iLike` over the whole value (NAN-3034: `*kw*` is now a Keyword,
+            // not a message regex); a plain keyword is a substring test.
+            let wildcard = (kw.contains(['*', '?'])).then(|| {
+                let mut pattern = String::from("(?is)^");
+                for c in kw.chars() {
+                    match c {
+                        '*' => pattern.push_str(".*"),
+                        '?' => pattern.push('.'),
+                        other => pattern.push_str(&regex::escape(&other.to_string())),
+                    }
+                }
+                pattern.push('$');
+                regex_cache(&pattern)
+            });
+            let needle = kw.to_lowercase();
             // Check if keyword appears in any string field
             if let Some(obj) = row.as_object() {
                 obj.values().any(|v| {
-                    if let Some(s) = v.as_str() {
-                        s.to_lowercase().contains(&kw.to_lowercase())
-                    } else {
-                        false
+                    let Some(s) = v.as_str() else { return false };
+                    match &wildcard {
+                        Some(Some(re)) => re.is_match(s),
+                        Some(None) => false,
+                        None => s.to_lowercase().contains(&needle),
                     }
                 })
             } else {
@@ -308,13 +442,48 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
                 matches
             }
         }
-        SearchExpr::BooleanFunction(_) => {
-            // Standalone boolean function predicate (e.g., isnull(field))
-            // Would need full eval engine for post-processing evaluation
-            false
+        SearchExpr::BooleanFunction(function) => {
+            // NAN-2361: this used to be a hardcoded `false` — "would need full
+            // eval engine for post-processing evaluation" — but that engine is
+            // this module's sibling, `super::eval`, with the full 38-function
+            // set. Returning false made every standalone boolean predicate
+            // evaluated Nano-side (i.e. after `| prevalence` / `| risk`) fail
+            // shut, and its NEGATION fail OPEN: a rule ending
+            // `| prevalence … | where NOT is_private_ip(src_endpoint.ip)`
+            // evaluated NOT(false) = true for every row, so the RFC1918
+            // exclusion silently never applied. Measured live: `is_private_ip`
+            // after `| prevalence` matched 0 of 5 rows that are all RFC1918,
+            // while the same predicate without prevalence matched all 5.
+            //
+            // A function that genuinely yields nothing for a row stays false —
+            // an absent value is not a match — but that is now a real answer
+            // rather than a stub.
+            row.as_object()
+                .and_then(|obj| super::eval::evaluate_eval_expression(function, obj))
+                .map(|v| match v {
+                    serde_json::Value::Bool(b) => b,
+                    serde_json::Value::Null => false,
+                    serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
+                    serde_json::Value::String(ref s) => {
+                        !s.is_empty() && !s.eq_ignore_ascii_case("false")
+                    }
+                    _ => false,
+                })
+                .unwrap_or(false)
         }
+        // The timestamp-aware evaluator first (epoch arithmetic over stats
+        // aliases), then the full eval function set: a predicate such as
+        // `(is_private_ip(ip) AND port > 1024)` must not fail shut Nano-side.
         SearchExpr::EvalPredicate(expression) => evaluate_expression_on_json(expression, row)
-            .and_then(|value| value.as_bool())
+            .or_else(|| {
+                row.as_object()
+                    .and_then(|obj| super::eval::evaluate_eval_expression(expression, obj))
+            })
+            .map(|value| match value {
+                serde_json::Value::Bool(b) => b,
+                serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
+                _ => false,
+            })
             .unwrap_or(false),
         SearchExpr::LiteralComparison { left, op, right } => {
             // Compare two literal strings - used for parameter expansion checks
@@ -440,8 +609,15 @@ pub fn evaluate_expression_on_json(
                     if let Some(left_str) = left_val.as_str() {
                         if let Some(dt) = parse_datetime_flexible(left_str) {
                             if let Some(secs) = right_val.as_f64() {
-                                let new_dt = dt - chrono::Duration::seconds(secs as i64);
-                                return Some(serde_json::Value::String(new_dt.to_rfc3339()));
+                                // NAN-3080: checked. An out-of-range delta
+                                // (a huge INTERVAL) used to panic here and,
+                                // under a release panic=abort, kill the jobs
+                                // process. It evaluates to null instead.
+                                return Some(
+                                    shift_datetime(dt, -secs)
+                                        .map(|new_dt| serde_json::Value::String(new_dt.to_rfc3339()))
+                                        .unwrap_or(serde_json::Value::Null),
+                                );
                             }
                         }
                     }
@@ -456,8 +632,15 @@ pub fn evaluate_expression_on_json(
                     if let Some(left_str) = left_val.as_str() {
                         if let Some(dt) = parse_datetime_flexible(left_str) {
                             if let Some(secs) = right_val.as_f64() {
-                                let new_dt = dt + chrono::Duration::seconds(secs as i64);
-                                return Some(serde_json::Value::String(new_dt.to_rfc3339()));
+                                // NAN-3080: checked. An out-of-range delta
+                                // (a huge INTERVAL) used to panic here and,
+                                // under a release panic=abort, kill the jobs
+                                // process. It evaluates to null instead.
+                                return Some(
+                                    shift_datetime(dt, secs)
+                                        .map(|new_dt| serde_json::Value::String(new_dt.to_rfc3339()))
+                                        .unwrap_or(serde_json::Value::Null),
+                                );
                             }
                         }
                     }
@@ -564,5 +747,190 @@ mod nan2331_where_arithmetic_tests {
         });
 
         assert!(evaluate_condition_on_json(&condition, &row));
+    }
+
+    /// NAN-3080: the live crash. A `where ... > now() - INTERVAL <huge>` after
+    /// a Rust-side stage (prevalence) panicked with `DateTime - TimeDelta
+    /// overflowed` and took the jobs process down. It must evaluate cleanly.
+    #[test]
+    fn huge_interval_arithmetic_does_not_panic() {
+        let row = serde_json::json!({"host_count": 1, "prevalence_first_seen": "2026-09-29T10:00:00Z"});
+        for npl in [
+            "* | where host_count < 5 AND prevalence_first_seen > now() - INTERVAL 86400 HOURS",
+            "* | where prevalence_first_seen > now() - INTERVAL 311040000 HOURS",
+            "* | where prevalence_first_seen < now() + INTERVAL 9999999999 YEARS",
+            "* | where prevalence_first_seen > now() - INTERVAL 24 HOUR",
+        ] {
+            let condition = where_condition(npl);
+            let _ = evaluate_condition_on_json(&condition, &row);
+        }
+        assert!(evaluate_condition_on_json(
+            &where_condition("* | where prevalence_first_seen > now() - INTERVAL 100000 DAYS"),
+            &row
+        ));
+    }
+}
+
+#[cfg(test)]
+mod nan2361_post_stage_predicate_tests {
+    use super::*;
+    use crate::query::parse_query;
+
+    /// Pull the `| where` condition out of a parsed pipeline so these tests
+    /// exercise the real AST the product builds, not a hand-made one.
+    fn where_condition(npl: &str) -> SearchExpr {
+        fn find(q: &crate::query::Query) -> Option<SearchExpr> {
+            match q {
+                crate::query::Query::Piped { source, command } => {
+                    if let crate::query::Command::Where { condition } = command {
+                        return Some(condition.clone());
+                    }
+                    find(source)
+                }
+                _ => None,
+            }
+        }
+        find(&parse_query(npl).expect("parses")).expect("has a where stage")
+    }
+
+    fn row(json: serde_json::Value) -> serde_json::Value {
+        json
+    }
+
+    /// A `| where` after a Nano-side stage (prevalence/risk) is evaluated in
+    /// Rust, not SQL. `Value::Regex` had no arm here, so EVERY such regex
+    /// matched nothing — a risk escalation gated on a regex simply never fired,
+    /// silently.
+    #[test]
+    fn regex_predicate_is_evaluated_not_silently_false() {
+        let cond = where_condition(r#"* | where src_endpoint.ip=/^10\./"#);
+        assert!(
+            evaluate_condition_on_json(
+                &cond,
+                &row(serde_json::json!({"src_endpoint.ip": "10.1.5.1"}))
+            ),
+            "a regex that matches must match; before the fix this was always false"
+        );
+        assert!(
+            !evaluate_condition_on_json(
+                &cond,
+                &row(serde_json::json!({"src_endpoint.ip": "203.0.113.9"}))
+            ),
+            "a regex that does not match must not match"
+        );
+    }
+
+    #[test]
+    fn negated_regex_predicate_is_evaluated() {
+        let cond = where_condition(r#"* | where src_endpoint.ip!=/^10\./"#);
+        assert!(!evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"src_endpoint.ip": "10.1.5.1"}))
+        ));
+        assert!(evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"src_endpoint.ip": "203.0.113.9"}))
+        ));
+    }
+
+    /// The dangerous one: the evaluator knew only min/max/now/dayofweek, so
+    /// `is_private_ip(...)` was false for every row — and its NEGATION was
+    /// therefore true for every row. A rule ending
+    /// `| prevalence … | where NOT is_private_ip(x)` had no RFC1918 exclusion
+    /// at all, while looking perfectly healthy.
+    #[test]
+    fn function_predicate_uses_the_real_evaluator() {
+        let cond = where_condition("* | where is_private_ip(src_endpoint.ip)");
+        assert!(
+            evaluate_condition_on_json(
+                &cond,
+                &row(serde_json::json!({"src_endpoint.ip": "10.1.5.1"}))
+            ),
+            "10.1.5.1 is RFC1918; before the fix this was false"
+        );
+        assert!(
+            !evaluate_condition_on_json(
+                &cond,
+                &row(serde_json::json!({"src_endpoint.ip": "203.0.113.9"}))
+            ),
+            "203.0.113.9 is public"
+        );
+    }
+
+    /// The inversion that made it dangerous rather than merely broken.
+    #[test]
+    fn negated_function_predicate_does_not_pass_everything() {
+        let cond = where_condition("* | where NOT is_private_ip(src_endpoint.ip)");
+        assert!(
+            !evaluate_condition_on_json(
+                &cond,
+                &row(serde_json::json!({"src_endpoint.ip": "10.1.5.1"}))
+            ),
+            "an RFC1918 address must NOT survive a NOT is_private_ip filter — \
+             before the fix every row survived, so the exclusion never applied"
+        );
+        assert!(evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"src_endpoint.ip": "203.0.113.9"}))
+        ));
+    }
+
+    /// Guard the shapes that already worked, so the delegation does not regress
+    /// them: numeric thresholds on prevalence output columns are how every
+    /// rarity rule is written.
+    #[test]
+    fn numeric_thresholds_on_decoration_columns_still_work() {
+        let cond = where_condition("* | where host_count < 10");
+        assert!(evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"host_count": 2}))
+        ));
+        assert!(!evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"host_count": 40}))
+        ));
+    }
+
+    #[test]
+    fn string_equality_still_works() {
+        let cond = where_condition(r#"* | where severity = "Informational""#);
+        assert!(evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"severity": "Informational"}))
+        ));
+        assert!(!evaluate_condition_on_json(
+            &cond,
+            &row(serde_json::json!({"severity": "High"}))
+        ));
+    }
+}
+
+/// `dt + secs` seconds, or `None` when the delta or the result is outside
+/// chrono's range (never panics; NAN-3080).
+pub(crate) fn shift_datetime<Tz: chrono::TimeZone>(
+    dt: chrono::DateTime<Tz>,
+    secs: f64,
+) -> Option<chrono::DateTime<Tz>> {
+    if !secs.is_finite() || secs.abs() >= i64::MAX as f64 {
+        return None;
+    }
+    let delta = chrono::TimeDelta::try_seconds(secs as i64)?;
+    dt.checked_add_signed(delta)
+}
+
+#[cfg(test)]
+mod nan3080_datetime_overflow_tests {
+    use super::shift_datetime;
+
+    #[test]
+    fn huge_or_invalid_deltas_do_not_panic() {
+        let now = chrono::Utc::now();
+        // `INTERVAL 86400 HOURS` re-parsed: 311,040,000 hours in seconds.
+        assert!(shift_datetime(now, -(86_400.0 * 3_600.0 * 3_600.0)).is_some());
+        assert!(shift_datetime(now, -1.0e15).is_none(), "beyond chrono's range");
+        assert!(shift_datetime(now, 1.0e19).is_none(), "beyond i64");
+        assert!(shift_datetime(now, f64::NAN).is_none());
+        assert!(shift_datetime(now, f64::NEG_INFINITY).is_none());
+        assert_eq!(shift_datetime(now, -86_400.0), Some(now - chrono::Duration::days(1)));
     }
 }

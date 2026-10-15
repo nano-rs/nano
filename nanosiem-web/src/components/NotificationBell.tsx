@@ -8,7 +8,6 @@ import {
   Bell,
   BookOpen,
   CheckCheck,
-  Loader2,
   MessageSquare,
   UserPlus,
   AlertTriangle,
@@ -22,7 +21,9 @@ import {
   XCircle,
   RefreshCw,
   FileText,
+  ShieldAlert,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -43,6 +44,8 @@ const NOTIFICATION_ICONS: Record<NotificationType, typeof Bell> = {
   alert_assigned: AlertTriangle,
   ai_provider_down: ServerCrash,
   data_feed_stale: Database,
+  // NAN-3207: one segment (class / region / account …) of a source stopped.
+  data_feed_segment_drop: Database,
   search_access_removed: Info,
   case_access_removed: Info,
   system: Info,
@@ -57,6 +60,8 @@ const NOTIFICATION_ICONS: Record<NotificationType, typeof Bell> = {
   // NAN-1793: a scheduled report finished — link points at the /reports list.
   report_ready: FileText,
   model_deprecated: RefreshCw,
+  // NAN-3230: internal-domain suffixes changed (detection-blinding lever).
+  internal_domains_changed: ShieldAlert,
 };
 
 // Tone bucket per notification kind. Drives the icon-tile colour so the
@@ -67,6 +72,8 @@ const NOTIFICATION_TONE: Partial<Record<NotificationType, Tone>> = {
   alert_assigned: 'danger',
   ai_provider_down: 'danger',
   data_feed_stale: 'warn',
+  data_feed_segment_drop: 'warn',
+  internal_domains_changed: 'warn',
   tuning_validation_complete: 'good',
   tuning_promoted: 'good',
   tuning_reverted: 'warn',
@@ -190,7 +197,7 @@ export function NotificationBell() {
               disabled={markAllReadMutation.isPending}
             >
               {markAllReadMutation.isPending ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
+                <LoadingIcon className="w-3 h-3" />
               ) : (
                 <CheckCheck className="w-3 h-3" />
               )}
@@ -203,7 +210,7 @@ export function NotificationBell() {
         <ScrollArea className="h-[320px]">
           {isLoading ? (
             <div className="flex items-center justify-center py-12">
-              <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-4 h-4 text-muted-foreground" />
             </div>
           ) : notifications.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 gap-2">

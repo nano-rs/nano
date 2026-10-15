@@ -6,6 +6,7 @@ import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
+import { Switch } from '@/components/ui/switch';
 import {
   Select,
   SelectContent,
@@ -23,7 +24,6 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import {
-  Loader2,
   ChevronLeft,
   ChevronRight,
   Play,
@@ -32,9 +32,13 @@ import {
   Eye,
   AlertTriangle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
 import { useGdprRequests } from '@/hooks/use-api';
 import { api } from '@/lib/api';
+import { PlatformManagedNotice } from '@/components/settings/PlatformManagedNotice';
+import { platformManaged } from '@/lib/platform-managed';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import type {
   GdprIdentifierType,
   GdprAnonymizationStatus,
@@ -50,6 +54,7 @@ const IDENTIFIER_TYPES: { value: GdprIdentifierType; label: string }[] = [
 
 const STATUS_PILL: Record<GdprAnonymizationStatus, string> = {
   pending: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+  queued_for_platform: 'bg-sky-500/10 text-sky-400 border-sky-500/20',
   running: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
   completed: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
   failed: 'bg-red-500/10 text-red-400 border-red-500/20',
@@ -60,7 +65,7 @@ function StatusPill({ status }: { status: GdprAnonymizationStatus }) {
     <span
       className={`font-mono text-[10px] font-semibold uppercase tracking-[0.08em] px-1.5 py-0.5 rounded border w-fit ${STATUS_PILL[status]}`}
     >
-      {status}
+      {status === 'queued_for_platform' ? 'queued' : status}
     </span>
   );
 }
@@ -70,11 +75,18 @@ export function GdprAnonymizationPage() {
   useBreadcrumbTitle('GDPR & Compliance');
   const { toast } = useToast();
   const baseId = useId();
+  // Hosted-shared tenant (NAN-2361): requests are a tenant ledger; executing
+  // one queues it for the platform's erasure runner (the lake rewrite).
+  const shared = useSharedTenant();
 
   // Form state
   const [identifierType, setIdentifierType] = useState<GdprIdentifierType>('username');
   const [identifierValue, setIdentifierValue] = useState('');
   const [justification, setJustification] = useState('');
+  // Also rewrite free-text mentions (message / unmapped) of the subject.
+  // Default on; the dedicated path always does this, the shared lake honors
+  // the choice per request (NAN-2361 wave 6).
+  const [redactFreeText, setRedactFreeText] = useState(true);
   const [submitting, setSubmitting] = useState(false);
 
   // Preview dialog
@@ -114,6 +126,7 @@ export function GdprAnonymizationPage() {
         identifier_type: identifierType,
         identifier_value: identifierValue.trim(),
         justification: justification.trim() || undefined,
+        redact_free_text: redactFreeText,
       });
       setPreview(result);
       setPreviewOpen(true);
@@ -146,8 +159,10 @@ export function GdprAnonymizationPage() {
     try {
       await api.executeGdprRequest(executeId);
       toast({
-        title: 'Execution started',
-        description: 'Anonymization mutations have been submitted.',
+        title: shared ? 'Queued for the platform' : 'Execution started',
+        description: shared
+          ? 'The platform erasure runner will rewrite the matching lake data; the request reports its progress here.'
+          : 'Anonymization mutations have been submitted.',
       });
       refetch();
     } catch (err) {
@@ -172,6 +187,25 @@ export function GdprAnonymizationPage() {
   const placeholderFor = (t: GdprIdentifierType) =>
     t === 'ip' ? '192.168.1.100' : t === 'email' ? 'user@example.com' : 'jdoe';
 
+  // Hosted-shared tenant (NAN-2361): the shared lake is append-only, so
+  // in-place anonymization is the platform's data-subject process.
+  const managed = platformManaged(data);
+  if (managed) {
+    return (
+      <div className="px-6 py-5 space-y-7">
+        <div>
+          <h1 className="text-[18px] font-semibold tracking-tight text-foreground">
+            GDPR &amp; Compliance
+          </h1>
+          <p className="text-[11.5px] text-muted-foreground mt-0.5">
+            Submit and manage data-subject anonymization requests.
+          </p>
+        </div>
+        <PlatformManagedNotice verdict={managed} title="Data-subject erasure" />
+      </div>
+    );
+  }
+
   return (
     <div className="px-6 py-5 space-y-7">
       <div>
@@ -192,9 +226,9 @@ export function GdprAnonymizationPage() {
           </div>
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
-          Anonymize all PII matching an identifier across logs, identity observations, cloud
-          activity, and the user registry. The original value is hashed immediately and never
-          stored.
+          {shared
+            ? 'Record a data-subject erasure request for an identifier. Executing it hands the request to the platform, which rewrites and tombstones the matching lake data across your retention window and reports the affected rows here when it completes.'
+            : 'Anonymize all PII matching an identifier across logs, identity observations, cloud activity, and the user registry. The original value is hashed immediately and never stored.'}
         </p>
 
         <div className="flex flex-col">
@@ -264,6 +298,23 @@ export function GdprAnonymizationPage() {
             />
           </div>
 
+          <div className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
+            <div className="min-w-0 flex-1">
+              <label htmlFor={id('redact-free-text')} className="text-[12.5px] font-medium text-foreground cursor-pointer">
+                Redact free-text mentions
+              </label>
+              <div className="text-[11px] text-muted-foreground mt-0.5">
+                Also replace mentions of the subject inside <span className="font-mono">message</span> and unmapped fields with the request&apos;s identifier hash. Off keeps only the exact identity-field rewrite.
+              </div>
+            </div>
+            <Switch
+              id={id('redact-free-text')}
+              checked={redactFreeText}
+              onCheckedChange={setRedactFreeText}
+              className="h-4 w-7 shrink-0"
+            />
+          </div>
+
           <div className="flex justify-end pt-4">
             <Button
               onClick={handleSubmit}
@@ -272,7 +323,7 @@ export function GdprAnonymizationPage() {
               className="h-7 text-[11.5px] px-2.5"
             >
               {submitting ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
+                <LoadingIcon className="w-3 h-3" />
               ) : (
                 <Send className="w-3 h-3" />
               )}
@@ -297,7 +348,7 @@ export function GdprAnonymizationPage() {
 
         {loading && requests.length === 0 ? (
           <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            <LoadingIcon className="w-5 h-5 text-muted-foreground" />
           </div>
         ) : (
           <div className="border-y border-border">
@@ -347,6 +398,11 @@ export function GdprAnonymizationPage() {
                         <Play className="w-3 h-3" />
                         Execute
                       </Button>
+                    )}
+                    {r.status === 'queued_for_platform' && (
+                      <span className="font-mono text-[10.5px] text-muted-foreground truncate">
+                        platform runs the rewrite
+                      </span>
                     )}
                     {r.status === 'failed' && r.error_message && (
                       <span
@@ -484,8 +540,9 @@ export function GdprAnonymizationPage() {
               Execute anonymization
             </AlertDialogTitle>
             <p className="text-[11.5px] text-muted-foreground mt-1">
-              This will permanently anonymize all matching PII across logs, identity observations,
-              cloud activity, and the user registry. The original values cannot be recovered.
+              {shared
+                ? 'This queues the request for the platform erasure runner, which permanently rewrites the matching data in the shared lake. The original values cannot be recovered once it runs.'
+                : 'This will permanently anonymize all matching PII across logs, identity observations, cloud activity, and the user registry. The original values cannot be recovered.'}
             </p>
           </AlertDialogHeader>
           <AlertDialogFooter className="border-t border-border px-5 py-3">
@@ -500,7 +557,7 @@ export function GdprAnonymizationPage() {
               className="h-7 text-[11.5px] px-2.5 bg-red-600 hover:bg-red-700"
               disabled={executing}
             >
-              {executing && <Loader2 className="w-3 h-3 animate-spin" />}
+              {executing && <LoadingIcon className="w-3 h-3" />}
               Execute
             </AlertDialogAction>
           </AlertDialogFooter>

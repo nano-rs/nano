@@ -16,6 +16,8 @@ import {
   COMPUTED_FIELDS_SET,
   FIELD_ALIASES_SET,
   TREE_STEP_PATTERN,
+  DOTTED_FIELD_PATH_PATTERN,
+  isDottedFieldReference,
 } from '@/lib/query-tokens';
 
 // Combined UDM field names (includes enriched, IOC, computed, and aliases)
@@ -45,12 +47,18 @@ const YAML_AUTOCOMPLETE_FIELDS = new Set([
   'severity', 'mode', 'detection_mode', 'alert_mode', 'risk_score', 'risk_entity', 'mitre_tactics', 'mitre_techniques',
 ]);
 
-interface DetectionState {
+export interface DetectionState {
   inYaml: boolean;
   yamlStarted: boolean;
   yamlEnded: boolean;
   afterRegexOp: boolean;
   inBlockComment: boolean;
+  /** Previous significant token was a comparison operator (NAN-3383). */
+  afterComparison: boolean;
+  /** Next significant token starts a pipe segment (query start or after `|`). */
+  segmentStart: boolean;
+  /** Pipe command of the current segment (lowercase), null in the search segment. */
+  command: string | null;
 }
 
 function createInitialState(): DetectionState {
@@ -60,13 +68,16 @@ function createInitialState(): DetectionState {
     yamlEnded: false,
     afterRegexOp: false,
     inBlockComment: false,
+    afterComparison: false,
+    segmentStart: true,
+    command: null,
   };
 }
 
 /**
  * Stream-based tokenizer for detection rules
  */
-const detectionLanguageDefinition = {
+export const detectionLanguageDefinition = {
   name: 'detection',
 
   startState: createInitialState,
@@ -213,6 +224,13 @@ function tokenizeQuery(stream: StringStream, state: DetectionState): string | nu
     return 'lineComment';
   }
 
+  // Context for dotted-path classification (NAN-3383): consume the
+  // previous-token flags; the operator / pipe branches below re-arm them.
+  const afterComparison = state.afterComparison;
+  const atSegmentStart = state.segmentStart;
+  state.afterComparison = false;
+  state.segmentStart = false;
+
   // Regex patterns after =~ or ~ operators
   if (state.afterRegexOp && stream.peek() === '/') {
     if (stream.match(/^\/(?:[^/\\\n]|\\.)+\/[igmsuy]*/)) {
@@ -224,30 +242,36 @@ function tokenizeQuery(stream: StringStream, state: DetectionState): string | nu
   // Check for regex operators (=~ and ~)
   if (stream.match(/^=~|^~/)) {
     state.afterRegexOp = true;
+    state.afterComparison = true;
     return 'operator';
   }
 
   // Comparison operators - = can also precede regex like: sourcetype = /sys/
   if (stream.match(/^!=|^>=|^<=/)) {
     state.afterRegexOp = false;
+    state.afterComparison = true;
     return 'operator';
   }
 
   // Plain = can be followed by regex
   if (stream.match(/^=/)) {
     state.afterRegexOp = true;
+    state.afterComparison = true;
     return 'operator';
   }
 
   // Other comparison operators
   if (stream.match(/^>|^</)) {
     state.afterRegexOp = false;
+    state.afterComparison = true;
     return 'operator';
   }
 
   // Pipe operator (special highlighting)
   if (stream.match(/^\|/)) {
     state.afterRegexOp = false;
+    state.segmentStart = true;
+    state.command = null;
     return 'separator';
   }
 
@@ -259,6 +283,22 @@ function tokenizeQuery(stream: StringStream, state: DetectionState): string | nu
   // Strings
   if (stream.match(/^"[^"]*"/)) {
     return 'string';
+  }
+
+  // Dotted field paths (`metadata.log_source`, `actor.user.name`) are ONE
+  // token (NAN-3383). Checked before keywords / identifiers so the head
+  // segment isn't split off at the `.`. Dotted values (`dest_host=evil.com`,
+  // a bare `evil.com` term) are not fields; IPs start with a digit so never match.
+  const pathStart = stream.pos;
+  if (stream.match(DOTTED_FIELD_PATH_PATTERN)) {
+    const path = stream.string.slice(pathStart, stream.pos);
+    const isField = isDottedFieldReference(path, {
+      command: state.command,
+      afterComparison,
+      rest: stream.string.slice(stream.pos),
+      knownFields: UDM_FIELD_NAMES,
+    });
+    return isField ? 'special(propertyName)' : 'variableName';
   }
 
   // Keywords (AND, OR, NOT, IN, CONTAINS, LIKE, STARTSWITH, ENDSWITH, INTERVAL)
@@ -286,18 +326,18 @@ function tokenizeQuery(stream: StringStream, state: DetectionState): string | nu
     return 'special(propertyName)';
   }
 
-  // Identifiers (check against known sets). Dots are included so OCSF promoted
-  // columns (`src_endpoint.ip`, `actor.user.name`) tokenize as a single field
-  // and match the registered schema set (NAN-1241); bare UDM names are unaffected.
+  // Identifiers (check against known sets). Dotted OCSF paths
+  // (`src_endpoint.ip`, NAN-1241) are handled by the dotted-path branch above.
   // Save current position to get the matched string
   const startPos = stream.pos;
-  if (stream.match(/^[a-zA-Z_][a-zA-Z0-9_.]*/)) {
+  if (stream.match(/^[a-zA-Z_][a-zA-Z0-9_]*/)) {
     // Get the matched word by extracting from the string
     const word = stream.string.slice(startPos, stream.pos);
     const wordLower = word.toLowerCase();
 
     // Pipe commands
     if (PIPE_COMMANDS_SET.has(wordLower)) {
+      if (atSegmentStart) state.command = wordLower;
       return 'function(variableName)';
     }
 

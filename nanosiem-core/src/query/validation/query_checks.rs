@@ -139,9 +139,9 @@ fn risk_in_command(command: &Command) -> bool {
                 || endswith.as_ref().is_some_and(risk_in_search_expr)
         }
         Command::Sequence { conditions, .. } => conditions.iter().any(risk_in_search_expr),
-        Command::Funnel { steps, .. } => {
-            steps.iter().any(|(_, condition)| risk_in_search_expr(condition))
-        }
+        Command::Funnel { steps, .. } => steps
+            .iter()
+            .any(|(_, condition)| risk_in_search_expr(condition)),
         // Commands carrying no nested `Query`/`SearchExpr`. Listed explicitly
         // (no `_` arm) so the fail-closed property above holds.
         Command::Stats { .. }
@@ -363,8 +363,7 @@ mod tests {
         assert!(contains_risk_command(&with_risk));
 
         // Buried mid-pipeline still detected.
-        let buried =
-            parse_query("error | risk score=50 entity=src_ip | where status=500").unwrap();
+        let buried = parse_query("error | risk score=50 entity=src_ip | where status=500").unwrap();
         assert!(contains_risk_command(&buried));
 
         // The risk-notable rule shape carries no `| risk`.
@@ -385,13 +384,11 @@ mod tests {
         // every one of these, so the rule persisted and even executed.
 
         // Buried inside a `join` subsearch.
-        let joined =
-            parse_query("* | join entity [* | risk score=50 entity=entity]").unwrap();
+        let joined = parse_query("* | join entity [* | risk score=50 entity=entity]").unwrap();
         assert!(contains_risk_command(&joined));
 
         // Buried inside an `append` subsearch.
-        let appended =
-            parse_query("* | append [* | risk score=50 entity=src_ip]").unwrap();
+        let appended = parse_query("* | append [* | risk score=50 entity=src_ip]").unwrap();
         assert!(contains_risk_command(&appended));
 
         // Buried inside a `where … IN [subsearch]`.
@@ -401,14 +398,12 @@ mod tests {
 
         // Root, non-piped `field IN [subsearch]` — the `Query::Search` arm must
         // walk the expression, not short-circuit to false.
-        let root_in =
-            parse_query("src_ip IN [* | risk score=50 entity=src_ip]").unwrap();
+        let root_in = parse_query("src_ip IN [* | risk score=50 entity=src_ip]").unwrap();
         assert!(contains_risk_command(&root_in));
 
         // Two levels of subsearch nesting.
         let two_level =
-            parse_query("* | join entity [* | append [* | risk score=50 entity=src_ip]]")
-                .unwrap();
+            parse_query("* | join entity [* | append [* | risk score=50 entity=src_ip]]").unwrap();
         assert!(contains_risk_command(&two_level));
     }
 
@@ -418,13 +413,11 @@ mod tests {
 
         // A subsearch that merely references a field named `risk_score`.
         let nested_field_ref =
-            parse_query("* | where src_ip IN [* | where risk_score > 10 | return src_ip]")
-                .unwrap();
+            parse_query("* | where src_ip IN [* | where risk_score > 10 | return src_ip]").unwrap();
         assert!(!contains_risk_command(&nested_field_ref));
 
         // A join subsearch with no `| risk` anywhere.
-        let benign_join =
-            parse_query("* | join src_ip [* | stats count by src_ip]").unwrap();
+        let benign_join = parse_query("* | join src_ip [* | stats count by src_ip]").unwrap();
         assert!(!contains_risk_command(&benign_join));
 
         // A plain aggregation.

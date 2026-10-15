@@ -11,7 +11,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { User as UserIcon, Loader2, Shield, RefreshCw, Copy, Check, AlertCircle } from 'lucide-react';
+import { User as UserIcon, Shield, RefreshCw, Copy, Check, AlertCircle } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { api, type UserDetail, type GroupDetail, type UpdateUserRequest } from '@/lib/api';
@@ -283,7 +284,7 @@ export function EditUserDialog({ open, user, groups, onClose, onUpdated }: EditU
             Cancel
           </Button>
           <Button size="sm" onClick={handleSave} disabled={!canSubmit} className="h-7 text-[11.5px]">
-            {saving && <Loader2 className="w-3 h-3 animate-spin" />}
+            {saving && <LoadingIcon className="w-3 h-3" />}
             Save changes
           </Button>
         </SheetFooter>

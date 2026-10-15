@@ -31,6 +31,9 @@ pub struct TracingGuard {
 ///
 /// Returns a guard that must be held for the process lifetime to keep the root span active.
 pub fn init_tracing(service_name: &str) -> TracingGuard {
+    // NAN-3080: release panics unwind; log and count every panic through
+    // tracing (installed once, chains the default stderr hook).
+    crate::process_supervision::install_panic_hook();
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info,sqlx::query=warn".into());
 

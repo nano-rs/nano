@@ -23,24 +23,25 @@
 //!                                 FindingLogger (analytics)
 //! ```
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
 use serde::Deserialize;
 use tokio::sync::RwLock;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::db::DualPool;
 use crate::db::repository::detection_rules::DetectionRuleRepositoryError;
 use crate::db::repository::{AlertRepository, AlertRepositoryError, DetectionRuleRepository};
+use crate::db::DualPool;
 use crate::detection::findings::FindingLogger;
 use crate::detection::risk::{score_rule_match, RiskModifier, RiskResult, ScoreCalculator};
 use crate::detection::service::helpers::{
-    realtime_finding_candidate, record_finding_emissions_with_pool, retain_unemitted_with_pool,
+    realtime_finding_candidate, record_finding_emissions_with_pool, retain_unemitted_checked,
+    retain_unemitted_with_pool,
 };
 use crate::detection::service::ClaimedFinding;
 use crate::extensions::{
@@ -587,7 +588,17 @@ impl SignalProcessor {
         let score_calculator = match crate::schema::active_profile_from_env() {
             Ok(profile) => ScoreCalculator::new().with_profile(profile),
             Err(e) => {
-                warn!("SignalProcessor: invalid schema profile ({e}); using UDM default");
+                // NAN-2361: deliberately NOT propagated. `poll_and_process`'s caller
+                // dead-letters a batch after `max_skip_threshold` consecutive errors
+                // by advancing the persisted watermark, so failing here would drop
+                // real signals instead of scoring them. Scored with the UDM field
+                // set, real-time risk numbers can be wrong on the OCSF lake, which
+                // is why this is an error and names the consequence rather than a
+                // quiet warning.
+                error!(
+                    "SignalProcessor: cannot resolve the active schema profile ({e}); this batch \
+                     is scored with the UDM field set and its risk scores may be wrong"
+                );
                 ScoreCalculator::new()
             }
         };
@@ -703,16 +714,16 @@ impl SignalProcessor {
             // row is recreated instead of silently persisting nothing — which
             // would reprocess the whole signals table on every restart.
             sqlx::query(
-                r#"
+                concat!(r#"
                 INSERT INTO signal_processor_watermarks
                     (id, last_inserted_at, last_signal_id, processed_count, updated_at)
                 VALUES ('default', $1, $2, $3, NOW())
-                ON CONFLICT (id) DO UPDATE SET
+                ON CONFLICT ("#, crate::tenant_key!(), r#"id) DO UPDATE SET
                     last_inserted_at = EXCLUDED.last_inserted_at,
                     last_signal_id = EXCLUDED.last_signal_id,
                     processed_count = EXCLUDED.processed_count,
                     updated_at = NOW()
-                "#,
+                "#),
             )
             .bind(signal.inserted_at)
             .bind(Some(signal.id))
@@ -785,11 +796,11 @@ impl SignalProcessor {
                 // can't rewind (codex). `updated_at` always changes, so
                 // RETURNING yields the current row even when the position holds.
                 sqlx::query_as(
-                    r#"
+                    concat!(r#"
                     INSERT INTO signal_processor_watermarks
                         (id, last_inserted_at, last_signal_id, updated_at)
                     VALUES ('default', $1, $2, NOW())
-                    ON CONFLICT (id) DO UPDATE SET
+                    ON CONFLICT ("#, crate::tenant_key!(), r#"id) DO UPDATE SET
                         last_inserted_at = CASE
                             WHEN EXCLUDED.last_inserted_at > signal_processor_watermarks.last_inserted_at
                               OR (EXCLUDED.last_inserted_at = signal_processor_watermarks.last_inserted_at
@@ -808,7 +819,7 @@ impl SignalProcessor {
                         END,
                         updated_at = NOW()
                     RETURNING last_inserted_at, last_signal_id
-                    "#,
+                    "#),
                 )
                 .bind(ts)
                 .bind(id)
@@ -817,17 +828,17 @@ impl SignalProcessor {
             }
             None => {
                 sqlx::query_as(
-                    r#"
+                    concat!(r#"
                     INSERT INTO signal_processor_watermarks
                         (id, last_inserted_at, last_signal_id, updated_at)
                     VALUES ('default', $1, NULL, NOW())
-                    ON CONFLICT (id) DO UPDATE SET
+                    ON CONFLICT ("#, crate::tenant_key!(), r#"id) DO UPDATE SET
                         last_inserted_at =
                             signal_processor_watermarks.last_inserted_at + INTERVAL '1 second',
                         last_signal_id = NULL,
                         updated_at = NOW()
                     RETURNING last_inserted_at, last_signal_id
-                    "#,
+                    "#),
                 )
                 .bind(seed_ts)
                 .fetch_one(dual_pool.postgres())
@@ -916,10 +927,7 @@ impl SignalProcessor {
 
         // Create matched_events JSON array with detection timing metadata
         let mut events_vec = vec![matched_log];
-        crate::detection::service::helpers::inject_detected_at(
-            &mut events_vec,
-            chrono::Utc::now(),
-        );
+        crate::detection::service::helpers::inject_detected_at(&mut events_vec, chrono::Utc::now());
 
         // Score the match through the SAME engine the scheduled path uses (audit
         // R1 / NAN-1663): apply the rule's base score, its `risk_modifiers`, and
@@ -972,12 +980,9 @@ impl SignalProcessor {
             // window) — repeated signals for the same entity in the bucket would
             // otherwise inflate entity risk the scheduled Live path dedups.
             if let Some(candidate) = dedup_candidate {
-                let mut new_findings = retain_unemitted_with_pool(
-                    dual_pool.postgres(),
-                    rule.id,
-                    vec![candidate],
-                )
-                .await;
+                let mut new_findings =
+                    retain_unemitted_with_pool(dual_pool.postgres(), rule.id, vec![candidate])
+                        .await;
                 let Some(candidate) = new_findings.pop() else {
                     debug!(
                         rule_id = %rule.id,
@@ -1007,18 +1012,16 @@ impl SignalProcessor {
         }
 
         // Audit D13: Alerting + Grouped — claim the (rule, entity, window) slot
-        // BEFORE creating the alert. Read-only here (fail-open on store errors:
-        // `retain_unemitted_with_pool` treats every candidate as new); the
+        // BEFORE creating the alert. Fails CLOSED on store errors: an empty dedup
+        // set here would mean "alert on everything again", so a transient
+        // PostgreSQL failure propagates and the next signal retries instead. The
         // emission is recorded only after the alert durably exists, mirroring the
         // scheduled `handle_grouped_alert` ordering (audit D5/D20).
         let claimed_finding: Option<ClaimedFinding> = match dedup_candidate {
             Some(candidate) => {
-                let mut new_findings = retain_unemitted_with_pool(
-                    dual_pool.postgres(),
-                    rule.id,
-                    vec![candidate],
-                )
-                .await;
+                let mut new_findings =
+                    retain_unemitted_checked(dual_pool.postgres(), rule.id, vec![candidate])
+                        .await?;
                 match new_findings.pop() {
                     Some(candidate) => Some(candidate),
                     None => {
@@ -1030,9 +1033,7 @@ impl SignalProcessor {
                             warn!(rule_id = %rule.id, "Real-time window-dedup: update_execution_stats failed: {}", e);
                         }
                         let today = chrono::Utc::now().date_naive();
-                        if let Err(e) =
-                            rule_repo.record_daily_stats(rule.id, today, 1, 0).await
-                        {
+                        if let Err(e) = rule_repo.record_daily_stats(rule.id, today, 1, 0).await {
                             warn!(rule_id = %rule.id, "Real-time window-dedup: record_daily_stats failed: {}", e);
                         }
                         debug!(
@@ -1327,13 +1328,24 @@ impl SignalProcessor {
         modifiers: &[RiskModifier],
     ) -> Vec<(String, String)> {
         const BASE_PROJECTION: &[&str] = &[
-            "src_ip", "dest_ip", "src_host", "dest_host", "src_user", "dest_user",
-            "message", "source_type", "risk_entity", "id", "timestamp",
+            "src_ip",
+            "dest_ip",
+            "src_host",
+            "dest_host",
+            "src_user",
+            "dest_user",
+            "message",
+            "source_type",
+            "risk_entity",
+            "id",
+            "timestamp",
         ];
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut cols: Vec<(String, String)> = Vec::new();
         for m in modifiers {
-            let Some(field) = m.field_name() else { continue };
+            let Some(field) = m.field_name() else {
+                continue;
+            };
             if field.contains('.') || BASE_PROJECTION.contains(&field) {
                 continue;
             }
@@ -1489,12 +1501,10 @@ impl SignalProcessor {
         // Bound the scan to a tight window around the event time. The window is
         // guaranteed to contain the row (the MV copies the log's `timestamp`
         // into the signal), so this never causes a spurious miss.
-        let ts_lower = crate::sql_hygiene::format_ch_bound_micros(
-            &(event_ts - Self::MATCHED_LOG_WINDOW),
-        );
-        let ts_upper = crate::sql_hygiene::format_ch_bound_micros(
-            &(event_ts + Self::MATCHED_LOG_WINDOW),
-        );
+        let ts_lower =
+            crate::sql_hygiene::format_ch_bound_micros(&(event_ts - Self::MATCHED_LOG_WINDOW));
+        let ts_upper =
+            crate::sql_hygiene::format_ch_bound_micros(&(event_ts + Self::MATCHED_LOG_WINDOW));
         let query = Self::build_fetch_matched_log_query(
             profile.as_ref(),
             &logs_table,
@@ -1671,20 +1681,25 @@ mod tests {
     fn resolve_modifier_columns_gates_to_known_non_base_fields() {
         use crate::detection::risk::RiskModifier;
         let profile = crate::schema::UdmProfile::new();
-        let m = |c: &str| RiskModifier { condition: c.to_string(), score: 50 };
+        let m = |c: &str| RiskModifier {
+            condition: c.to_string(),
+            score: 50,
+        };
         let mods = vec![
-            m("auth_result = failure"),  // known UDM column, not in base → included
-            m("bytes_out > 1000000"),    // known UDM column → included
-            m("src_ip = 10.0.0.1"),      // in base projection → skipped
-            m("metadata.count > 5"),     // nested → skipped (metadata blob resolves it)
-            m("not_a_real_field = x"),   // unknown → skipped (no unknown-column 500)
-            m("auth_result = success"),  // duplicate field → deduped
+            m("auth_result = failure"), // known UDM column, not in base → included
+            m("bytes_out > 1000000"),   // known UDM column → included
+            m("src_ip = 10.0.0.1"),     // in base projection → skipped
+            m("metadata.count > 5"),    // nested → skipped (metadata blob resolves it)
+            m("not_a_real_field = x"),  // unknown → skipped (no unknown-column 500)
+            m("auth_result = success"), // duplicate field → deduped
         ];
         let cols = SignalProcessor::resolve_modifier_columns(&profile, &mods);
         let fields: Vec<&str> = cols.iter().map(|(f, _)| f.as_str()).collect();
         assert_eq!(fields, vec!["auth_result", "bytes_out"]);
         // UDM resolves the column SQL to the field itself.
-        assert!(cols.iter().any(|(f, sql)| f == "auth_result" && sql.contains("auth_result")));
+        assert!(cols
+            .iter()
+            .any(|(f, sql)| f == "auth_result" && sql.contains("auth_result")));
     }
 
     #[test]
@@ -1701,7 +1716,9 @@ mod tests {
             &cols,
         );
         assert!(
-            query.contains("toJSONString(map('auth_result', toString(auth_result))) AS modifier_fields"),
+            query.contains(
+                "toJSONString(map('auth_result', toString(auth_result))) AS modifier_fields"
+            ),
             "modifier map must select the resolved column: {query}"
         );
     }
@@ -1805,6 +1822,8 @@ mod tests {
             realtime_enabled: true,
             detection_mode: DetectionMode::RealTime,
             materialized_view_name: None,
+            near_real_time_interval_seconds: None,
+            execution_mode: None,
             risk_score: Some(75),
             risk_entity_field: Some("src_ip".to_string()),
             risk_modifiers: sqlx::types::Json(vec![]),

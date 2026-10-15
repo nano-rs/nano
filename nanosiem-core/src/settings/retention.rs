@@ -234,27 +234,48 @@ impl RetentionService {
             total_records: i64,
         }
 
-        let metadata = sqlx::query_as::<_, MetadataStats>(
-            r#"
+        // NAN-3463: there is no `detections` table (matches live in
+        // `detection_matches`, keyed by `detected_at`), so this read failed on
+        // every call and always fell back to zeros. `cases` exists only under
+        // the enterprise overlay, so the open edition leaves it out.
+        #[cfg(feature = "enterprise")]
+        const METADATA_STATS_SQL: &str = r#"
             SELECT
                 LEAST(
                     (SELECT MIN(created_at) FROM alerts),
-                    (SELECT MIN(created_at) FROM detections),
+                    (SELECT MIN(detected_at) FROM detection_matches),
                     (SELECT MIN(created_at) FROM cases)
                 ) as oldest,
                 GREATEST(
                     (SELECT MAX(created_at) FROM alerts),
-                    (SELECT MAX(created_at) FROM detections),
+                    (SELECT MAX(detected_at) FROM detection_matches),
                     (SELECT MAX(created_at) FROM cases)
                 ) as newest,
                 (
                     (SELECT COUNT(*) FROM alerts) +
-                    (SELECT COUNT(*) FROM detections) +
+                    (SELECT COUNT(*) FROM detection_matches) +
                     (SELECT COUNT(*) FROM cases) +
                     (SELECT COUNT(*) FROM dashboards)
                 )::bigint as total_records
-            "#,
-        )
+            "#;
+        #[cfg(not(feature = "enterprise"))]
+        const METADATA_STATS_SQL: &str = r#"
+            SELECT
+                LEAST(
+                    (SELECT MIN(created_at) FROM alerts),
+                    (SELECT MIN(detected_at) FROM detection_matches)
+                ) as oldest,
+                GREATEST(
+                    (SELECT MAX(created_at) FROM alerts),
+                    (SELECT MAX(detected_at) FROM detection_matches)
+                ) as newest,
+                (
+                    (SELECT COUNT(*) FROM alerts) +
+                    (SELECT COUNT(*) FROM detection_matches) +
+                    (SELECT COUNT(*) FROM dashboards)
+                )::bigint as total_records
+            "#;
+        let metadata = sqlx::query_as::<_, MetadataStats>(METADATA_STATS_SQL)
         .fetch_one(&self.pool)
         .await
         .unwrap_or(MetadataStats {
@@ -293,12 +314,20 @@ impl RetentionService {
             r#"
             WITH deleted_events AS (
                 DELETE FROM detection_matched_events
-                WHERE matched_at < NOW() - ($1 || ' days')::interval
+                -- Detection replay defaults to seven days and can finish near
+                -- that boundary. Dedup identities are compact metadata, so an
+                -- operator's shorter general-retention setting must not make
+                -- a replay emit the same alert again.
+                WHERE matched_at < NOW() - (GREATEST($1, 30) || ' days')::interval
                 RETURNING 1
             ),
             deleted_emissions AS (
                 DELETE FROM detection_finding_emissions
-                WHERE emitted_at < NOW() - ($1 || ' days')::interval
+                -- Same boundary race as the dedup identities above: the
+                -- finding-emission rows ARE the alert-level dedup set that
+                -- `retain_unemitted` reads, so they must outlive the replay
+                -- horizon or a late repair re-emits an alert already sent.
+                WHERE emitted_at < NOW() - (GREATEST($1, 30) || ' days')::interval
                 RETURNING 1
             ),
             deleted_history AS (

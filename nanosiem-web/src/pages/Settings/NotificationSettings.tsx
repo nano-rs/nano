@@ -31,7 +31,6 @@ import {
   Plus,
   Trash2,
   Send,
-  Loader2,
   CircleCheck,
   XCircle,
   List,
@@ -40,6 +39,7 @@ import {
   Link2,
   Pencil,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type {
@@ -439,7 +439,7 @@ function NotificationSettings() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }
@@ -496,7 +496,7 @@ function NotificationSettings() {
               className="h-7 text-[11.5px] font-mono flex-1"
             />
             <Button onClick={saveBaseUrl} disabled={savingBaseUrl} size="sm" className="h-7 text-[11px] px-2.5">
-              {savingBaseUrl && <Loader2 className="w-3 h-3 animate-spin" />}
+              {savingBaseUrl && <LoadingIcon className="w-3 h-3" />}
               Save
             </Button>
             <Button variant="ghost" size="sm" onClick={() => setEditingBaseUrl(false)} className="h-7 text-[11px] px-2.5">
@@ -610,7 +610,7 @@ function NotificationSettings() {
                         disabled={testingId === c.id}
                         title="Send test"
                       >
-                        {testingId === c.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+                        {testingId === c.id ? <LoadingIcon className="w-3.5 h-3.5" /> : <Send className="w-3.5 h-3.5" />}
                       </Button>
                       <Button
                         variant="ghost"
@@ -892,7 +892,7 @@ function NotificationSettings() {
           <SheetFooter className="border-t border-border px-5 py-3 flex sm:justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={() => setDialogOpen(false)} className="h-7 text-[11.5px] px-2.5">Cancel</Button>
             <Button onClick={handleSave} disabled={saving} size="sm" className="h-7 text-[11.5px] px-2.5">
-              {saving && <Loader2 className="w-3 h-3 animate-spin" />}
+              {saving && <LoadingIcon className="w-3 h-3" />}
               {editing ? 'Save changes' : 'Create channel'}
             </Button>
           </SheetFooter>
@@ -912,7 +912,7 @@ function NotificationSettings() {
           </SheetHeader>
           {loadingDeliveries ? (
             <div className="flex items-center justify-center py-12">
-              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-5 h-5 text-muted-foreground" />
             </div>
           ) : deliveries.length === 0 ? (
             <div className="px-5 py-12 text-center">

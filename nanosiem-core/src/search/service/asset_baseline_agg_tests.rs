@@ -27,7 +27,9 @@ fn agg_dimension_set_covers_every_production_scope_group() {
             crate::baseline::dimension_scope_groups(entity, true, true, true)
         {
             let supported = agg_dimension_set(entity, source_side_only).unwrap_or_else(|| {
-                panic!("agg_dimension_set must cover ({entity}, source_side_only={source_side_only})")
+                panic!(
+                    "agg_dimension_set must cover ({entity}, source_side_only={source_side_only})"
+                )
             });
             for d in dims {
                 assert!(
@@ -56,43 +58,87 @@ fn agg_dimension_set_rejects_unknown_combos() {
 /// would read as no-history and every peer would look new.
 #[test]
 fn private_ip_gate_mirrors_mv_regexes() {
-    for yes in ["10.0.0.1", "10.255.9.9", "192.168.1.5", "172.16.0.1", "172.31.255.1"] {
+    for yes in [
+        "10.0.0.1",
+        "10.255.9.9",
+        "192.168.1.5",
+        "172.16.0.1",
+        "172.31.255.1",
+    ] {
         assert!(agg_covers_private_ip(yes), "{yes} should be agg-covered");
     }
     for no in [
-        "8.8.8.8",        // public
-        "172.15.0.1",     // below the /12
-        "172.32.0.1",     // above the /12
-        "172.016.0.1",    // leading zero — the regex needs exactly two digits
-        "172.1.1.1",      // one digit
-        "172.160.1.1",    // three digits
-        "169.254.1.1",    // link-local: NOT aggregated, raw path
-        "127.0.0.1",      // loopback
-        "192.169.1.1",    // adjacent block
-        "fe80::1",        // IPv6: raw path
-        "",               // empty
-        "1092.168.1.1",   // must be a PREFIX match, not a substring match
+        "8.8.8.8",      // public
+        "172.15.0.1",   // below the /12
+        "172.32.0.1",   // above the /12
+        "172.016.0.1",  // leading zero — the regex needs exactly two digits
+        "172.1.1.1",    // one digit
+        "172.160.1.1",  // three digits
+        "169.254.1.1",  // link-local: NOT aggregated, raw path
+        "127.0.0.1",    // loopback
+        "192.169.1.1",  // adjacent block
+        "fe80::1",      // IPv6: raw path
+        "",             // empty
+        "1092.168.1.1", // must be a PREFIX match, not a substring match
     ] {
-        assert!(!agg_covers_private_ip(no), "{no} should route to the raw scan");
+        assert!(
+            !agg_covers_private_ip(no),
+            "{no} should route to the raw scan"
+        );
     }
 }
 
 #[test]
 fn can_serve_requires_subset_and_private_ip() {
     // Production groups are servable.
-    assert!(baseline_agg_can_serve("host", "ws-1", true, &["process_name", "dest_ip"]));
+    assert!(baseline_agg_can_serve(
+        "host",
+        "ws-1",
+        true,
+        &["process_name", "dest_ip"]
+    ));
     assert!(baseline_agg_can_serve("host", "ws-1", false, &["user"]));
-    assert!(baseline_agg_can_serve("user", "bob", true, &["src_host", "src_ip", "process_name"]));
+    assert!(baseline_agg_can_serve(
+        "user",
+        "bob",
+        true,
+        &["src_host", "src_ip", "process_name"]
+    ));
     // A SUBSET (profile skipped a field / analyst passed dims=) still serves.
-    assert!(baseline_agg_can_serve("host", "ws-1", true, &["process_name"]));
+    assert!(baseline_agg_can_serve(
+        "host",
+        "ws-1",
+        true,
+        &["process_name"]
+    ));
     // A dim outside the baked-in set for the anchoring must go raw.
-    assert!(!baseline_agg_can_serve("host", "ws-1", true, &["process_name", "user"]));
-    assert!(!baseline_agg_can_serve("host", "ws-1", false, &["process_name"]));
+    assert!(!baseline_agg_can_serve(
+        "host",
+        "ws-1",
+        true,
+        &["process_name", "user"]
+    ));
+    assert!(!baseline_agg_can_serve(
+        "host",
+        "ws-1",
+        false,
+        &["process_name"]
+    ));
     // Nothing mapped → nothing to serve.
     assert!(!baseline_agg_can_serve("host", "ws-1", true, &[]));
     // ip entities are only aggregated for RFC1918 values.
-    assert!(baseline_agg_can_serve("ip", "10.0.0.5", false, &["src_host", "dest_port", "user"]));
-    assert!(!baseline_agg_can_serve("ip", "8.8.8.8", false, &["src_host", "dest_port", "user"]));
+    assert!(baseline_agg_can_serve(
+        "ip",
+        "10.0.0.5",
+        false,
+        &["src_host", "dest_port", "user"]
+    ));
+    assert!(!baseline_agg_can_serve(
+        "ip",
+        "8.8.8.8",
+        false,
+        &["src_host", "dest_port", "user"]
+    ));
 }
 
 /// NAN-1895: the agg source-scope gate must admit a deny-set of ONLY sources the
@@ -104,8 +150,9 @@ fn can_serve_requires_subset_and_private_ip() {
 fn scope_gate_admits_audit_only_denyset() {
     use crate::auth::ScopeSet;
     use std::collections::BTreeSet;
-    let denied =
-        |xs: &[&str]| ScopeSet::from_denied(xs.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
+    let denied = |xs: &[&str]| {
+        ScopeSet::from_denied(xs.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>())
+    };
 
     assert!(scope_within_agg_exclusions(&ScopeSet::unrestricted())); // empty deny-set
     assert!(scope_within_agg_exclusions(&denied(&["audit"]))); // exactly the agg's exclusion
@@ -268,7 +315,11 @@ mod live {
         // Day alignment keeps the day-grain agg edges exactly congruent with
         // the raw scan's timestamp bounds; nothing here touches the (partial)
         // day the MVs went live on.
-        let today = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let today = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
         let incident_start = today - Duration::days(2);
         let incident_end = today - Duration::days(1);
         let new_start = incident_start - Duration::days(7);
@@ -309,7 +360,9 @@ mod live {
                     crate::baseline::NEW_TO_ENTITY_ROW_CAP,
                 )
                 .await
-                .expect("agg path must be covered — migration 166 applied + contiguous filler seeded?");
+                .expect(
+                    "agg path must be covered — migration 166 applied + contiguous filler seeded?",
+                );
             let raw = ss
                 .entity_dimension_firsts_raw(
                     &scope,
@@ -341,7 +394,11 @@ mod live {
                 v.sort();
                 v
             };
-            assert_eq!(new_of(&agg), new_of(&raw), "NEW set diverged for dims {dims:?}");
+            assert_eq!(
+                new_of(&agg),
+                new_of(&raw),
+                "NEW set diverged for dims {dims:?}"
+            );
             if source_side_only {
                 assert_eq!(
                     new_of(&agg),
@@ -394,9 +451,7 @@ mod live {
         // on day D-2 (a closed day). incident_start is mid-day D-2 too.
         let day = |d: i64| (Utc::now() - Duration::days(d)).date_naive();
         let d2 = day(2); // the incident day (closed)
-        let at = |nd: chrono::NaiveDate, h: u32, m: u32| {
-            nd.and_hms_opt(h, m, 0).unwrap().and_utc()
-        };
+        let at = |nd: chrono::NaiveDate, h: u32, m: u32| nd.and_hms_opt(h, m, 0).unwrap().and_utc();
         let new_start = day(3).and_hms_opt(0, 0, 0).unwrap().and_utc(); // day-aligned
         let incident_start = at(d2, 12, 0);
         let incident_end = at(d2, 14, 0);
@@ -425,14 +480,24 @@ mod live {
         let dims = ["process_name"];
         let agg = ss
             .entity_dimension_firsts_from_agg(
-                "host", host, &dims, new_start, incident_end,
+                "host",
+                host,
+                &dims,
+                new_start,
+                incident_end,
                 crate::baseline::NEW_TO_ENTITY_ROW_CAP,
             )
             .await
             .expect("agg covered");
         let raw = ss
             .entity_dimension_firsts_raw(
-                &ScopeSet::unrestricted(), "host", host, true, &dims, new_start, incident_end,
+                &ScopeSet::unrestricted(),
+                "host",
+                host,
+                true,
+                &dims,
+                new_start,
+                incident_end,
                 crate::baseline::NEW_TO_ENTITY_ROW_CAP,
             )
             .await
@@ -453,7 +518,11 @@ mod live {
             "P1-1: HAVING must drop the after-window value from the agg (got {:?})",
             vals(&agg)
         );
-        assert_eq!(vals(&agg), vals(&raw), "sub-day agg/raw value sets diverged");
+        assert_eq!(
+            vals(&agg),
+            vals(&raw),
+            "sub-day agg/raw value sets diverged"
+        );
 
         // The NEW set is exactly {inside.exe}; known.exe is history, after.exe gone.
         let new_of = |rows: &[DimensionFirst]| {
@@ -540,7 +609,7 @@ mod live {
         let cap = crate::baseline::NEW_TO_ENTITY_ROW_CAP;
         let has_phantom = |rows: &[DimensionFirst]| rows.iter().any(|r| r.value == "phantom.exe");
         let lane = "udm"; // UdmProfile in local()
-        // Inclusive marker range for a D-midnight start: start_day = active_day = D.
+                          // Inclusive marker range for a D-midnight start: start_day = active_day = D.
         let marker_from = d;
         let marker_to = d.succ_opt().unwrap(); // set/clear_markers seed [from, to)
 
@@ -550,7 +619,16 @@ mod live {
         set_active_since(&ch, active_noon).await;
         let (ssa, _ca) = local().await.expect("db up");
         let a = ssa
-            .entity_dimension_firsts(&scope, "host", host, true, &dims, midnight, incident_end, cap)
+            .entity_dimension_firsts(
+                &scope,
+                "host",
+                host,
+                true,
+                &dims,
+                midnight,
+                incident_end,
+                cap,
+            )
             .await
             .expect("routed runs (A)");
         assert!(
@@ -568,7 +646,16 @@ mod live {
         set_active_since(&ch, active_noon).await;
         let (ssb, _cb) = local().await.expect("db up");
         let b = ssb
-            .entity_dimension_firsts(&scope, "host", host, true, &dims, active_noon, incident_end, cap)
+            .entity_dimension_firsts(
+                &scope,
+                "host",
+                host,
+                true,
+                &dims,
+                active_noon,
+                incident_end,
+                cap,
+            )
             .await
             .expect("routed runs (B)");
         assert!(
@@ -582,7 +669,16 @@ mod live {
         set_active_since(&ch, active_noon).await;
         let (ssc, _cc) = local().await.expect("db up");
         let c = ssc
-            .entity_dimension_firsts(&scope, "host", host, true, &dims, midnight, incident_end, cap)
+            .entity_dimension_firsts(
+                &scope,
+                "host",
+                host,
+                true,
+                &dims,
+                midnight,
+                incident_end,
+                cap,
+            )
             .await
             .expect("routed runs (C)");
         assert!(
@@ -602,7 +698,16 @@ mod live {
         set_active_since(&ch, active_sub).await;
         let (ssd, _cd) = local().await.expect("db up");
         let dd = ssd
-            .entity_dimension_firsts(&scope, "host", host, true, &dims, start_sub, incident_end, cap)
+            .entity_dimension_firsts(
+                &scope,
+                "host",
+                host,
+                true,
+                &dims,
+                start_sub,
+                incident_end,
+                cap,
+            )
             .await
             .expect("routed runs (D)");
         assert!(
@@ -636,7 +741,12 @@ mod live {
         let early = at(9);
         let late = at(12);
         let start = at(10); // between the two watermarks
-        let incident_end = d.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let incident_end = d
+            .succ_opt()
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
         let peer_ts = at(10) + Duration::minutes(30);
         let ts = |t: DateTime<Utc>| t.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
@@ -700,7 +810,13 @@ mod live {
         let (ss2, _c2) = local().await.expect("db up");
         let rows = ss2
             .entity_dimension_firsts(
-                &scope, "host", host, true, &dims, start, incident_end,
+                &scope,
+                "host",
+                host,
+                true,
+                &dims,
+                start,
+                incident_end,
                 crate::baseline::NEW_TO_ENTITY_ROW_CAP,
             )
             .await
@@ -734,7 +850,11 @@ mod live {
         };
         let host = format!("nan1895-scope-{}", nonce());
         let host = host.as_str();
-        let today = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let today = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
         let incident_start = today - Duration::days(2);
         let incident_end = today - Duration::days(1);
         let new_start = incident_start - Duration::days(7);
@@ -763,13 +883,23 @@ mod live {
         let dims = ["process_name"];
         let has_phantom = |rows: &[DimensionFirst]| rows.iter().any(|r| r.value == "phantom.exe");
         let denied = |xs: &[&str]| {
-            ScopeSet::from_denied(xs.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>())
+            ScopeSet::from_denied(
+                xs.iter()
+                    .map(|s| s.to_string())
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
         };
 
         // {audit}-only deny-set (the audit-gate case): MUST use the agg — phantom present.
         let audit_only = ss
             .entity_dimension_firsts(
-                &denied(&["audit"]), "host", host, true, &dims, new_start, incident_end,
+                &denied(&["audit"]),
+                "host",
+                host,
+                true,
+                &dims,
+                new_start,
+                incident_end,
                 crate::baseline::NEW_TO_ENTITY_ROW_CAP,
             )
             .await
@@ -783,8 +913,14 @@ mod live {
         // Denying ANOTHER source (which the agg includes): MUST fall back to raw.
         let multi = ss
             .entity_dimension_firsts(
-                &denied(&["audit", "nan1895_other"]), "host", host, true, &dims, new_start,
-                incident_end, crate::baseline::NEW_TO_ENTITY_ROW_CAP,
+                &denied(&["audit", "nan1895_other"]),
+                "host",
+                host,
+                true,
+                &dims,
+                new_start,
+                incident_end,
+                crate::baseline::NEW_TO_ENTITY_ROW_CAP,
             )
             .await
             .expect("runs");

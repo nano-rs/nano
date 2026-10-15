@@ -3,11 +3,12 @@
 //! Synthetic-check runner (NAN-1538).
 //!
 //! A leader-only, panic-safe background arm that probes enabled synthetic
-//! checks on their configured interval. Each tick it loads the enabled
-//! definitions from PostgreSQL ([`SyntheticCheckRepository::list_enabled`]),
-//! and for every check whose `interval_secs` has elapsed since its last
-//! recorded result it executes one HTTP GET (reqwest, per-check timeout) and
-//! writes a row into `nanosiem.synthetic_check_results` (migration 142).
+//! checks on their configured interval. Each tick atomically claims due
+//! definitions in PostgreSQL
+//! ([`SyntheticCheckRepository::claim_due_enabled`]), executes one HTTP GET
+//! (reqwest, per-check timeout), and publishes the result to the selected
+//! observability store. PostgreSQL owns only the scheduling watermark; probe
+//! measurements remain in native OTLP/Iceberg or the retiring ClickHouse path.
 //!
 //! Concurrency (O47): due checks are probed concurrently with a bounded number
 //! of simultaneous probes, so one slow / black-holed target (up to
@@ -23,7 +24,7 @@
 //! runs forever.
 //!
 //! Alerting (O18/O19): the PG alert spine is written *independently of* the
-//! ClickHouse result row — the spine stays reachable even when ClickHouse is
+//! telemetry result — the spine stays reachable even when the data store is
 //! down, which is exactly the outage a synthetic check exists to catch. Failure
 //! alerts honor a durable re-arm window (one alert per window while a check
 //! stays down, not one per probe), and a one-shot recovery notification fires on
@@ -36,6 +37,8 @@ use std::time::Duration as StdDuration;
 
 use chrono::Utc;
 use clickhouse::Client as ClickHouseClient;
+use prost::Message;
+use reqwest::Url;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
@@ -65,11 +68,140 @@ const MAX_TIMEOUT_SECS: u64 = 120;
 /// timeout). Check cardinality is tier-capped, so this bound is generous.
 const MAX_CONCURRENT_PROBES: usize = 16;
 
+/// Bound one scheduler claim so a large newly enabled fleet is drained over
+/// successive ticks instead of allocating an unbounded task set at once.
+const MAX_DUE_CHECKS_PER_TICK: i64 = 1_000;
+
 /// Default re-arm window (seconds) for synthetic failure/recovery alerts (O19):
 /// while a check stays down, at most one failure alert per this window (not one
 /// per probe). Overridable via `SYNTHETIC_REARM_SECS`; defaults to 1h. Mirrors
 /// the SLO evaluator's durable cadence gate (NAN-1563).
 const DEFAULT_REARM_SECS: u64 = 3600;
+
+#[derive(Clone)]
+struct SyntheticLakeStore {
+    otlp_metrics_url: Url,
+    http: reqwest::Client,
+}
+
+impl SyntheticLakeStore {
+    fn from_env() -> Result<Self, String> {
+        let otlp_metrics_url = required_http_url("NANO_OTLP_INTERNAL_HTTP_URL")?;
+        if otlp_metrics_url.path() != "/v1/metrics" {
+            return Err(
+                "NANO_OTLP_INTERNAL_HTTP_URL must end in the standard /v1/metrics path".to_string(),
+            );
+        }
+        let http = reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(130))
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            otlp_metrics_url,
+            http,
+        })
+    }
+
+    async fn publish_result(
+        &self,
+        check: &SyntheticCheck,
+        timestamp: chrono::DateTime<Utc>,
+        success: bool,
+        latency_ms: f64,
+        status_code: u16,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let body = encode_synthetic_otlp_request(
+            check,
+            timestamp,
+            success,
+            latency_ms,
+            status_code,
+            error,
+        )?;
+        self.http
+            .post(self.otlp_metrics_url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+}
+
+fn required_http_url(name: &str) -> Result<Url, String> {
+    let raw = std::env::var(name).map_err(|_| format!("{name} is required in lake mode"))?;
+    let url = Url::parse(&raw).map_err(|error| format!("{name}: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.cannot_be_a_base()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!("{name} must be a credential-free http(s) URL"));
+    }
+    Ok(url)
+}
+
+fn encode_synthetic_otlp_request(
+    check: &SyntheticCheck,
+    timestamp: chrono::DateTime<Utc>,
+    success: bool,
+    latency_ms: f64,
+    status_code: u16,
+    error: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use opentelemetry_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest,
+        common::v1::InstrumentationScope,
+        metrics::v1::{Metric, ResourceMetrics, ScopeMetrics},
+        resource::v1::Resource,
+    };
+
+    let timestamp_nanos = timestamp
+        .timestamp_nanos_opt()
+        .ok_or_else(|| anyhow::anyhow!("synthetic result timestamp is out of range"))?;
+    let metric_json = serde_json::json!({
+        "name": "nano.synthetic.probe",
+        "unit": "ms",
+        "gauge": { "dataPoints": [{
+            "timeUnixNano": timestamp_nanos.to_string(),
+            "asDouble": latency_ms,
+            "attributes": [
+                {"key": "synthetic.check_id", "value": {"stringValue": check.id.to_string()}},
+                {"key": "synthetic.success", "value": {"stringValue": success.to_string()}},
+                {"key": "http.status_code", "value": {"stringValue": status_code.to_string()}},
+                {"key": "error.message", "value": {"stringValue": error}},
+                {"key": "synthetic.check_name", "value": {"stringValue": check.name}},
+            ]
+        }]}
+    });
+    let metric: Metric = serde_json::from_str(&serde_json::to_string(&metric_json)?)?;
+    let resource: Resource = serde_json::from_value(serde_json::json!({
+        "attributes": [
+            {"key": "service.name", "value": {"stringValue": "nano-synthetics"}}
+        ]
+    }))?;
+    Ok(ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(resource),
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(InstrumentationScope {
+                    name: "nano.synthetic.runner".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                }),
+                metrics: vec![metric],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+    .encode_to_vec())
+}
 
 /// The synthetic-check runner. Cheap to clone (wraps the connection-pooling
 /// `reqwest::Client` and the two DB handles).
@@ -77,12 +209,12 @@ const DEFAULT_REARM_SECS: u64 = 3600;
 pub struct SyntheticRunner {
     repo: SyntheticCheckRepository,
     ch_client: ClickHouseClient,
-    /// Whether the ClickHouse deployment is clustered (NAN-1721 O1). When true,
-    /// the `due_for` READ routes to `synthetic_check_results_distributed` so it
-    /// sees results from every shard; the result INSERT stays on the LOCAL table
-    /// (the Distributed engine does not accept inserts here). Detected once from
-    /// the pool's `TableNames` at wiring time.
-    is_clustered: bool,
+    /// Canonical lake mode publishes standard OTLP metrics through Vector's
+    /// existing durable batch path. Product reads query the committed Iceberg
+    /// rows separately through `SearchService`.
+    /// `Some(Err)` retains a fail-closed configuration error so every due tick
+    /// reports the missing contract instead of touching an inert CH client.
+    lake_store: Option<Result<SyntheticLakeStore, String>>,
     /// NAN-1541: the unified alert spine. A check that probes to a status other
     /// than its `expected_status` (or errors out) raises one alert per failing
     /// probe through here with `kind = synthetic`.
@@ -90,24 +222,28 @@ pub struct SyntheticRunner {
     /// NAN-1546: fires the raised synthetic alert to webhooks subscribed to the
     /// observability stream. `None` when no webhook service is wired (e.g. tests).
     webhook_service: Option<WebhookService>,
-    /// O47: check ids with a probe currently in flight. Because `due_for`
-    /// measures from the last *completed* result, a slow (black-holed) probe
-    /// would otherwise be re-scheduled on every tick while it's still running;
-    /// this guard drops the duplicate. Shared across the concurrent probe tasks.
+    /// O47: check ids with a probe currently in flight. The PostgreSQL claim
+    /// advances the normal cadence before execution; this guard additionally
+    /// protects an unusually slow probe whose runtime exceeds its interval.
     in_flight: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl SyntheticRunner {
     /// Build a runner from the PG pool (definitions) and the ClickHouse client
-    /// (results). The HTTP client carries no default timeout — each probe sets
-    /// its own per-request timeout from the check's `timeout_secs`. `is_clustered`
-    /// (from the pool's `TableNames`) routes the `due_for` READ to the
-    /// `_distributed` wrapper on a cluster (NAN-1721 O1); the INSERT stays local.
-    pub fn new(pool: PgPool, ch_client: ClickHouseClient, is_clustered: bool) -> Self {
+    /// (legacy-profile results). The HTTP client carries no default timeout;
+    /// each probe sets its own timeout from the check definition. The retained
+    /// cluster argument keeps the existing constructor contract while cadence
+    /// ownership moves to PostgreSQL for both profiles.
+    pub fn new(
+        pool: PgPool,
+        ch_client: ClickHouseClient,
+        _is_clustered: bool,
+        clickhouse_required: bool,
+    ) -> Self {
         Self {
             repo: SyntheticCheckRepository::new(pool.clone()),
             ch_client,
-            is_clustered,
+            lake_store: (!clickhouse_required).then(SyntheticLakeStore::from_env),
             alert_repo: AlertRepository::new(pool),
             webhook_service: None,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -142,10 +278,10 @@ impl SyntheticRunner {
     /// surfacing here as a `JoinError` we log, never aborting the tick or the
     /// scheduler (NAN-1102).
     async fn run_tick(&self) {
-        let checks = match self.repo.list_enabled().await {
+        let checks = match self.repo.claim_due_enabled(MAX_DUE_CHECKS_PER_TICK).await {
             Ok(c) => c,
             Err(e) => {
-                error!(error = %e, "Synthetic runner: failed to list enabled checks");
+                error!(error = %e, "Synthetic runner: failed to claim due checks");
                 return;
             }
         };
@@ -169,24 +305,9 @@ impl SyntheticRunner {
                     Err(_) => return,
                 };
 
-                // Per-check isolation (NAN-1102): due_for / probe_and_record
-                // return Result and are logged here, never `?`-propagated.
-                let due = match runner.due_for(&check).await {
-                    Ok(due) => due,
-                    Err(e) => {
-                        warn!(check = %check.id, error = %e, "Synthetic runner: due-check query failed; skipping");
-                        return;
-                    }
-                };
-                if !due {
-                    return;
-                }
-
                 // O47: skip if a probe for this check is still running from an
-                // earlier tick. `due_for` measures from the last *completed*
-                // result, so without this a slow probe would pile up concurrent
-                // duplicates every tick. The guard frees the slot on drop —
-                // including early return / panic.
+                // earlier tick. The guard frees the slot on drop, including an
+                // early return or isolated panic.
                 let _in_flight = match runner.try_claim(check.id) {
                     Some(guard) => guard,
                     None => {
@@ -226,49 +347,6 @@ impl SyntheticRunner {
         })
     }
 
-    /// Whether `check` is due: no prior result, or the newest result is older
-    /// than `interval_secs`. One bounded `max(timestamp)` read per check.
-    async fn due_for(&self, check: &SyntheticCheck) -> Result<bool, clickhouse::error::Error> {
-        let check_id = check.id.to_string();
-        // Read routes to the `_distributed` wrapper on a cluster so the last-run
-        // time reflects EVERY shard's results, not just the connected one
-        // (NAN-1721 O1); local otherwise. The result INSERT in `probe_and_record`
-        // must stay on the LOCAL table (the Distributed engine rejects inserts).
-        let table = if self.is_clustered {
-            "nanosiem.synthetic_check_results_distributed"
-        } else {
-            "nanosiem.synthetic_check_results"
-        };
-        // Parameterized via the official client's `?` binding — injection-safe.
-        // (`table` is not user input: a compile-time literal chosen by cluster
-        // state, so splicing it into the query text carries no injection risk.)
-        // `timestamp` is DateTime64(3, 'UTC') (clickhouse/142) and ClickHouse
-        // rejects arithmetic between a DateTime64 and an integer outright —
-        // Code 43 ILLEGAL_TYPE_OF_ARGUMENT. The original form scaled the max to
-        // milliseconds by multiplication and so failed on EVERY tick; because the
-        // caller logs-and-skips (NAN-1102), that silently meant no synthetic check
-        // ever ran (NAN-2381). `toUnixTimestamp64Milli` is the typed conversion;
-        // the empty set still yields 0 (the DateTime64 epoch) -> `last_ms == 0`
-        // -> due. Guarded by tests/synthetic_due_for_type_guard.rs.
-        let sql = format!(
-            "SELECT toUnixTimestamp64Milli(max(timestamp)) FROM {table} WHERE check_id = ?"
-        );
-        let last_ms: i64 = self
-            .ch_client
-            .query(&sql)
-            .bind(&check_id)
-            .fetch_optional::<i64>()
-            .await?
-            .unwrap_or(0);
-
-        if last_ms == 0 {
-            return Ok(true);
-        }
-        let now_ms = Utc::now().timestamp_millis();
-        let elapsed_secs = (now_ms - last_ms).max(0) / 1000;
-        Ok(elapsed_secs >= check.interval_secs as i64)
-    }
-
     /// Build a reqwest client whose connection is pinned to the validated,
     /// resolved IP(s) of `target_url` — the SSRF guard for synthetic probes
     /// (the runner fetches user-supplied URLs server-side on the leader).
@@ -296,7 +374,9 @@ impl SyntheticRunner {
         // already validated). DNS-name hosts: pin reqwest to the pre-validated
         // addrs so DNS can't be rebound to an internal IP after validation.
         if !addrs.is_empty() {
-            let host = url.host_str().ok_or_else(|| "URL missing host".to_string())?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "URL missing host".to_string())?;
             builder = builder.resolve_to_addrs(host, &addrs);
         }
 
@@ -308,12 +388,10 @@ impl SyntheticRunner {
     /// Execute one HTTP GET for `check` and write the result row. A failed
     /// request (DNS / connect / timeout / non-2xx) is NOT an error — it is
     /// recorded as a `success=0` row. The only `Err` returned here is a
-    /// ClickHouse write failure (so the tick can log it and move on).
-    async fn probe_and_record(
-        &self,
-        check: &SyntheticCheck,
-    ) -> Result<(), clickhouse::error::Error> {
-        let timeout = StdDuration::from_secs((check.timeout_secs.max(1) as u64).min(MAX_TIMEOUT_SECS));
+    /// telemetry publication failure (so the tick can log it and move on).
+    async fn probe_and_record(&self, check: &SyntheticCheck) -> anyhow::Result<()> {
+        let timeout =
+            StdDuration::from_secs((check.timeout_secs.max(1) as u64).min(MAX_TIMEOUT_SECS));
 
         // SSRF guard (defense-in-depth): validate + DNS-resolve the target and
         // pin the connection to the validated IP(s), so a check can never be
@@ -355,7 +433,8 @@ impl SyntheticRunner {
         } else {
             0u8
         };
-        let now_ms = Utc::now().timestamp_millis();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis();
 
         debug!(
             check = %check.id,
@@ -383,8 +462,8 @@ impl SyntheticRunner {
         }
 
         // O18: raise the failure/recovery notification through the PG alert spine
-        // FIRST, independent of the ClickHouse result write below. The spine (PG)
-        // stays reachable even when ClickHouse is down — the very outage a
+        // FIRST, independent of the telemetry result write below. The spine (PG)
+        // stays reachable even when the data store is down — the very outage a
         // synthetic check exists to catch — so the CH insert's success must not
         // gate whether the alert fires. O19: failure alerts honor a durable
         // re-arm window (one per window, not one per probe — NAN-1541's
@@ -392,15 +471,27 @@ impl SyntheticRunner {
         // notification fires on the failing→healthy edge. A PG raise failure is
         // logged inside these helpers, never propagated (NAN-1102).
         if success == 0 {
-            self.maybe_raise_failure_alert(check, status_code, &error).await;
+            self.maybe_raise_failure_alert(check, status_code, &error)
+                .await;
         } else {
             self.maybe_raise_recovery(check).await;
         }
 
-        // Record the probe result in ClickHouse. DateTime64(3) <- millis (the
-        // column's CODEC is Delta,ZSTD; the official client serializes the bound
-        // i64 into the 3-precision column). A write failure is returned so the
-        // tick logs it; the alert above already fired independently (O18).
+        if let Some(lake_store) = &self.lake_store {
+            let lake_store = lake_store
+                .as_ref()
+                .map_err(|error| anyhow::anyhow!(error.clone()))?;
+            // Publish through the existing internal OTLP receiver. Vector owns
+            // disk buffering and batches the point into the native metrics
+            // Iceberg table; no per-probe Iceberg micro-commit is created.
+            lake_store
+                .publish_result(check, now, success != 0, latency_ms, status_code, &error)
+                .await?;
+            return Ok(());
+        }
+
+        // Legacy profile: record the probe result in ClickHouse. DateTime64(3)
+        // <- millis. The alert above already fired independently (O18).
         self.ch_client
             .query(
                 "INSERT INTO nanosiem.synthetic_check_results \
@@ -426,7 +517,7 @@ impl SyntheticRunner {
     /// check stays down, instead of one per probe. Because the authority is the
     /// persisted table, the gate survives a jobs restart / leader failover. On a
     /// lookup error we skip raising this tick rather than risk an alert storm
-    /// without the guard; the ClickHouse result row still records the failure.
+    /// without the guard; the telemetry result still records the failure.
     async fn maybe_raise_failure_alert(
         &self,
         check: &SyntheticCheck,
@@ -681,4 +772,53 @@ fn rearm_window_secs() -> u64 {
 /// the real id for the FE either way (O19).
 fn recovery_source_id(check: &SyntheticCheck) -> String {
     format!("{}:recovered", check.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest, metrics::v1::metric,
+    };
+
+    #[test]
+    fn synthetic_result_is_a_standard_otlp_gauge_with_queryable_attributes() {
+        let check = SyntheticCheck {
+            id: Uuid::parse_str("e4081f94-003c-435f-b6c9-65181dd022bf").unwrap(),
+            name: "Checkout".to_string(),
+            check_type: "http".to_string(),
+            target_url: "https://example.com/health".to_string(),
+            interval_secs: 30,
+            expected_status: 200,
+            timeout_secs: 10,
+            enabled: true,
+            created_by: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-08-17T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let bytes = encode_synthetic_otlp_request(&check, timestamp, true, 12.5, 200, "").unwrap();
+        let request = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
+        let resource = &request.resource_metrics[0];
+        let metric = &resource.scope_metrics[0].metrics[0];
+        assert_eq!(metric.name, "nano.synthetic.probe");
+        let metric::Data::Gauge(gauge) = metric.data.as_ref().unwrap() else {
+            panic!("synthetic result was not encoded as an OTLP gauge");
+        };
+        let point = &gauge.data_points[0];
+        assert_eq!(
+            point.time_unix_nano,
+            timestamp.timestamp_nanos_opt().unwrap() as u64
+        );
+        let keys = point
+            .attributes
+            .iter()
+            .map(|attribute| attribute.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(keys.contains("synthetic.check_id"));
+        assert!(keys.contains("synthetic.success"));
+        assert!(keys.contains("http.status_code"));
+    }
 }

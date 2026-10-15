@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { parseUTCTimestamp } from '@/lib/date-utils';
+import { ocsfTraceLogPredicate } from '@/lib/otel-correlation';
 import type { OtelSpan } from '@/lib/api/types';
 
 // Padding added either side of the trace's own [start,end] when pivoting to the
@@ -41,7 +42,7 @@ const TRACE_LOGS_PAD_MS = 10 * 60 * 1000;
 // timestamps (traceStartMs === 0), matching the "don't fabricate a window" rule.
 function buildTraceLogsHref(traceId: string, traceStartMs: number, durMs: number): string {
   const params = new URLSearchParams();
-  params.set('q', `trace_id="${traceId}"`);
+  params.set('q', ocsfTraceLogPredicate(traceId));
   if (Number.isFinite(traceStartMs) && traceStartMs > 0) {
     const startMs = traceStartMs - TRACE_LOGS_PAD_MS;
     const endMs = traceStartMs + (Number.isFinite(durMs) ? Math.max(durMs, 0) : 0) + TRACE_LOGS_PAD_MS;

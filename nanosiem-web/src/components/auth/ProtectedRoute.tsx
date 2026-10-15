@@ -13,12 +13,15 @@
 
 import { ReactNode } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
-import { Loader2, ShieldX } from 'lucide-react';
+import { ShieldX } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '@/components/ui/button';
 
 interface ProtectedRouteProps {
   children: ReactNode;
+  /** Tenant-aware login route for exact shared product paths. */
+  loginPath?: string;
   /** Single permission required to access this route */
   permission?: string;
   /** Multiple permissions - user needs ANY of these */
@@ -31,6 +34,7 @@ interface ProtectedRouteProps {
 
 export function ProtectedRoute({
   children,
+  loginPath = '/login',
   permission,
   anyPermission,
   allPermissions,
@@ -43,14 +47,14 @@ export function ProtectedRoute({
   if (isLoading) {
     return (
       <div className="min-h-screen bg-background flex items-center justify-center">
-        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+        <LoadingIcon className="w-8 h-8 text-primary" />
       </div>
     );
   }
 
   // Redirect to login if not authenticated
   if (!isAuthenticated) {
-    return <Navigate to="/login" state={{ from: location.pathname }} replace />;
+    return <Navigate to={loginPath} state={{ from: location.pathname }} replace />;
   }
 
   // Check permissions

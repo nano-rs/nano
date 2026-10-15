@@ -1,0 +1,18 @@
+{
+  "warehouse-name": "nano",
+  "project-id": "00000000-0000-0000-0000-000000000000",
+  "storage-profile": {
+    "type": "s3",
+    "bucket": "nano-lake",
+    "key-prefix": "warehouse",
+    "region": "us-east-1",
+    "endpoint": "http://lake-object-store:9000",
+    "path-style-access": true,
+    "flavor": "s3-compat",
+    "sts-enabled": false,
+    "remote-signing-enabled": false
+  },
+  "delete-profile": {
+    "type": "hard"
+  }
+}

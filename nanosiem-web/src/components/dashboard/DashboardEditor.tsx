@@ -22,7 +22,6 @@ import {
   Pencil,
   LayoutDashboard,
   CircleAlert,
-  Loader2,
   Variable,
   LayoutGrid,
   Shield,
@@ -30,6 +29,7 @@ import {
   Users,
   Globe,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { toast } from 'sonner';
 import { GridLayout, compactLayout } from './GridLayout';
 import { Panel, type PanelDataState } from './Panel';
@@ -789,7 +789,7 @@ export function DashboardEditor({
               disabled={isSaving || !name.trim()}
             >
               {isSaving ? (
-                <Loader2 className="w-[12px] h-[12px] animate-spin" />
+                <LoadingIcon className="w-[12px] h-[12px]" />
               ) : (
                 <Save className="w-[12px] h-[12px]" />
               )}

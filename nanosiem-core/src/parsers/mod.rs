@@ -3,23 +3,35 @@
 //! Parser management module
 
 mod credential_repository;
+pub mod landing_ocsf;
+pub mod lake_bronze_row;
+pub mod pipe;
+mod ocsf_validation;
 mod repository;
 mod service;
+pub mod tenant_bundle;
 mod types;
 mod validator;
 mod vector_config;
+pub mod vrl_guard;
 
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
+pub use ocsf_validation::{
+    ocsf_attribute_leaf, validate_ocsf_event, OcsfAttributeLeaf, OcsfValidationDiagnostic,
+    OcsfValidationResult, OCSF_VALIDATION_VERSION,
+};
 pub use repository::{
     list_effective_deployed_parsers, resolve_parser_dispatch_routes, ParserRepository,
-    ParserRepositoryError,
+    ParserRepositoryError, WaitingParser,
 };
 pub use service::{ParserService, ParserServiceError};
 pub use types::*;
-pub use validator::{VrlValidator, VrlValidatorError};
-pub use vector_config::{
-    base_router_inputs, hec_normalize_present, redact_config_snapshot, PublicationOutcome,
-    SnapshotBundle, VectorConfigError, VectorConfigManager, VectorConfigPublicationError,
-    VectorConfigPublisher,
-};
+#[cfg(test)]
+pub(crate) use validator::validate_enrichment_encoding_contract;
+pub use validator::{CompiledNormalizer, VrlValidator, VrlValidatorError};
 pub use vector_config::delivery as vector_config_delivery;
+pub use vector_config::{
+    apply_hec_route_fallback, base_router_inputs, hec_normalize_present, redact_config_snapshot,
+    ParserConfigOptions, PublicationOutcome, SnapshotBundle, VectorConfigError,
+    VectorConfigManager, VectorConfigPublicationError, VectorConfigPublisher, HEC_ROUTE,
+};

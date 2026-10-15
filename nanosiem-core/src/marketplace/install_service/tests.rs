@@ -116,7 +116,9 @@ fn non_string_value_counts_as_real() {
 fn non_object_payload_does_not_skip() {
     // Defensive: a non-object body falls through to the existing
     // encrypt path rather than being silently swallowed.
-    assert!(!credentials_payload_is_masked_or_empty(&json!("string-body")));
+    assert!(!credentials_payload_is_masked_or_empty(&json!(
+        "string-body"
+    )));
     assert!(!credentials_payload_is_masked_or_empty(&json!([1, 2, 3])));
 }
 
@@ -330,6 +332,50 @@ fn does_not_impose_the_url_contract_on_other_backends() {
         assert!(
             validate_credential_values(&entry, &creds).is_ok(),
             "{backend} entries must not inherit the native URL contract"
+        );
+    }
+}
+
+/// NAN-3463: the open edition refuses backends whose tables and runtime exist
+/// only in the enterprise overlay, instead of failing the install with a 500.
+#[test]
+fn backend_availability_follows_the_edition() {
+    for backend in [ExecutionBackend::Native, ExecutionBackend::Identity] {
+        assert!(ensure_backend_available(backend, "feed").is_ok());
+    }
+    for backend in [ExecutionBackend::Deno, ExecutionBackend::Collector] {
+        let result = ensure_backend_available(backend, "feed");
+        if cfg!(feature = "enterprise") {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(MarketplaceError::BackendUnavailable(_))));
+        }
+    }
+}
+
+/// NAN-3490: a connector-runtime entry installs on every edition, whatever its
+/// `execution_backend`; a Deno-runtime entry keeps the edition gate.
+#[test]
+fn connector_runtime_entries_skip_the_edition_gate() {
+    for backend in [ExecutionBackend::Deno, ExecutionBackend::Collector] {
+        let connector = MarketplaceCatalogEntry {
+            execution_backend: backend.to_string(),
+            config: sqlx::types::Json(json!({ "runtime": "connector", "connector_spec": "version: 1" })),
+            ..native_entry()
+        };
+        assert!(connector.is_connector_runtime());
+        assert!(ensure_installable(&connector, backend, "feed").is_ok());
+
+        let deno = MarketplaceCatalogEntry {
+            execution_backend: backend.to_string(),
+            config: sqlx::types::Json(json!({ "runtime": "deno", "connector_spec": "version: 1" })),
+            ..native_entry()
+        };
+        assert!(!deno.is_connector_runtime());
+        assert_eq!(
+            ensure_installable(&deno, backend, "feed").is_ok(),
+            cfg!(feature = "enterprise"),
+            "a deno-runtime {backend} entry keeps the edition gate"
         );
     }
 }

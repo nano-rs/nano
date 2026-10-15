@@ -17,8 +17,8 @@ use super::error::PlaybookError;
 use super::models::{
     AttachToCaseRequest, CreatePlaybookRequest, FinishRunRequest, ForkPlaybookRequest,
     ListPlaybooksQuery, Playbook, PlaybookApproval, PlaybookListResponse, PlaybookPermission,
-    PlaybookRun, PlaybookSuggestion, PlaybookVersion, SetPermissionRequest,
-    SubmitForReviewRequest, UpdatePlaybookRequest,
+    PlaybookRun, PlaybookSuggestion, PlaybookVersion, SetPermissionRequest, SubmitForReviewRequest,
+    UpdatePlaybookRequest,
 };
 use super::parser::parse_playbook;
 use super::repository::PlaybookRepository;
@@ -217,9 +217,7 @@ impl PlaybookService {
         Ok(rows
             .into_iter()
             .map(|(pb, score, matched)| {
-                let matched_by_category = category
-                    .map(|c| pb.category == c)
-                    .unwrap_or(false);
+                let matched_by_category = category.map(|c| pb.category == c).unwrap_or(false);
                 PlaybookSuggestion {
                     playbook: pb,
                     score,
@@ -351,7 +349,6 @@ impl PlaybookService {
         self.repo.get_run(run_id, principal).await
     }
 
-
     /// NAN-462 — resolve a run's playbook doc against its frozen
     /// `run_context` snapshot. Fetches the run + its version's doc, parses
     /// the doc, and substitutes every `{{...}}` token in every step's label
@@ -451,7 +448,12 @@ impl PlaybookService {
         principal: &PlaybookPrincipal,
     ) -> Result<Playbook, PlaybookError> {
         self.repo
-            .promote(playbook_id, promoted_by_user_id, promoted_by_name, principal)
+            .promote(
+                playbook_id,
+                promoted_by_user_id,
+                promoted_by_name,
+                principal,
+            )
             .await
     }
 
@@ -616,7 +618,14 @@ impl PlaybookService {
 
         // Map rule.folder to a valid PlaybookCategory (fallback: identity).
         let category = match rule_folder.as_deref() {
-            Some(f) if matches!(f, "identity" | "endpoint" | "cloud" | "data" | "network" | "email") => f,
+            Some(f)
+                if matches!(
+                    f,
+                    "identity" | "endpoint" | "cloud" | "data" | "network" | "email"
+                ) =>
+            {
+                f
+            }
             _ => "identity",
         };
 

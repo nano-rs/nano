@@ -11,7 +11,6 @@ import {
   EyeOff,
   History,
   KeyRound,
-  Loader2,
   Lock,
   Plug,
   Plus,
@@ -22,9 +21,11 @@ import {
   Server,
   Undo2,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
+import { safeRandomUUID } from '@/lib/uuid';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
@@ -40,6 +41,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import type {
   AwsS3Credentials,
+  AzureEventHubsCredentials,
   CloudCredential,
   CloudCredentialVersion,
   CreateCloudCredentialRequest,
@@ -51,8 +53,9 @@ import type {
   UpdateCloudCredentialRequest,
 } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { Checkbox } from '@/components/ui/checkbox';
 
-type Provider = 'aws_s3' | 'gcp_pubsub' | 'kafka';
+type Provider = 'aws_s3' | 'gcp_pubsub' | 'kafka' | 'azure_event_hubs';
 /** How an AWS credential authenticates — see `AwsS3Credentials` (NAN-2186). */
 type AwsAuthMode = 'keys' | 'role';
 
@@ -92,7 +95,7 @@ function AwsAuthModeButton({
 }
 
 function newExternalId(): string {
-  return `nano-${crypto.randomUUID()}`;
+  return `nano-${safeRandomUUID()}`;
 }
 type ProviderFilter = 'all' | Provider;
 type EnvironmentFilter = 'all' | CredentialEnvironment;
@@ -262,7 +265,135 @@ const PROVIDERS: ProviderSpec[] = [
     iconClass: 'text-emerald-400',
     description: 'Bootstrap servers + SASL credentials for topic subscription.',
   },
+  {
+    value: 'azure_event_hubs',
+    label: 'Azure Event Hubs',
+    short: 'Azure',
+    icon: Cloud,
+    iconClass: 'text-blue-400',
+    description:
+      'Event Hubs + checkpoint storage connection strings, or an Entra service principal.',
+  },
 ];
+
+/**
+ * NAN-3764: the Event Hubs credential form state, shared by add and rotate.
+ * Two postures: SAS connection strings, or an Entra service principal that
+ * holds the Event Hubs Data Receiver role (and Storage Blob Data Contributor
+ * on the checkpoint container unless a storage connection string is given).
+ */
+type EventHubsAuthMode = 'connection_string' | 'service_principal';
+
+function useEventHubsCredential() {
+  const [mode, setMode] = useState<EventHubsAuthMode>('connection_string');
+  const [connectionString, setConnectionString] = useState('');
+  const [checkpointConnectionString, setCheckpointConnectionString] = useState('');
+  const [tenantId, setTenantId] = useState('');
+  const [clientId, setClientId] = useState('');
+  const [clientSecret, setClientSecret] = useState('');
+  const [reveal, setReveal] = useState(false);
+
+  const valid =
+    mode === 'connection_string'
+      ? connectionString.trim() !== ''
+      : tenantId.trim() !== '' && clientId.trim() !== '' && clientSecret.trim() !== '';
+
+  const payload = (): AzureEventHubsCredentials => ({
+    ...(mode === 'connection_string'
+      ? { connection_string: connectionString.trim() }
+      : {
+          azure_tenant_id: tenantId.trim(),
+          azure_client_id: clientId.trim(),
+          azure_client_secret: clientSecret.trim(),
+        }),
+    checkpoint_connection_string: checkpointConnectionString.trim() || undefined,
+  });
+
+  const fields = (
+    <div className="space-y-2.5">
+      <FieldRow label="Authentication">
+        <div className="grid grid-cols-2 gap-1.5">
+          {(
+            [
+              ['connection_string', 'Connection string'],
+              ['service_principal', 'Service principal'],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => setMode(value)}
+              className={cn(
+                'h-8 px-2.5 rounded-md border text-[12px] text-left transition-colors',
+                mode === value
+                  ? 'border-primary/60 bg-primary/8 text-foreground'
+                  : 'border-border bg-card hover:border-border/80 text-foreground/80',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </FieldRow>
+      {mode === 'connection_string' ? (
+        <FieldRow label="Event Hubs connection string" required secret>
+          <SecretInput
+            value={connectionString}
+            onChange={setConnectionString}
+            reveal={reveal}
+            onToggleReveal={() => setReveal((v) => !v)}
+            placeholder="Endpoint=sb://acme-logs.servicebus.windows.net/;SharedAccessKeyName=…"
+          />
+        </FieldRow>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-2.5">
+            <FieldRow label="Directory (tenant) ID" required>
+              <Input
+                value={tenantId}
+                onChange={(e) => setTenantId(e.target.value)}
+                placeholder="00000000-0000-…"
+                className="h-8 text-[12px] bg-card font-mono"
+              />
+            </FieldRow>
+            <FieldRow label="Application (client) ID" required>
+              <Input
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="00000000-0000-…"
+                className="h-8 text-[12px] bg-card font-mono"
+              />
+            </FieldRow>
+          </div>
+          <FieldRow label="Client secret" required secret>
+            <SecretInput
+              value={clientSecret}
+              onChange={setClientSecret}
+              reveal={reveal}
+              onToggleReveal={() => setReveal((v) => !v)}
+            />
+          </FieldRow>
+        </>
+      )}
+      <FieldRow label="Checkpoint storage connection string" secret>
+        <SecretInput
+          value={checkpointConnectionString}
+          onChange={setCheckpointConnectionString}
+          reveal={reveal}
+          onToggleReveal={() => setReveal((v) => !v)}
+          placeholder="DefaultEndpointsProtocol=https;AccountName=…;AccountKey=…"
+        />
+      </FieldRow>
+      <div className="text-[10.5px] text-muted-foreground leading-relaxed">
+        {mode === 'connection_string'
+          ? 'A listen-only shared access policy is enough. Without a storage connection string, checkpoints use the managed identity.'
+          : 'The principal needs Azure Event Hubs Data Receiver on the hub, and Storage Blob Data Contributor on the checkpoint container unless a storage connection string is given.'}
+      </div>
+    </div>
+  );
+
+  return { valid, payload, fields };
+}
 
 const PROVIDER_BY_VALUE = new Map(PROVIDERS.map((p) => [p.value, p]));
 
@@ -531,7 +662,7 @@ export function Credentials() {
       <div className="flex-1 min-h-0 overflow-auto">
         {isLoading ? (
           <div className="flex items-center justify-center py-16">
-            <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+            <LoadingIcon className="w-6 h-6 text-muted-foreground" />
           </div>
         ) : credentials.length === 0 ? (
           <EmptyState
@@ -1087,7 +1218,7 @@ function EmptyState({ canCreate, onPick }: { canCreate: boolean; onPick: (p: Pro
         </div>
 
         {canCreate && (
-          <div className="mt-6 grid grid-cols-3 gap-2.5">
+          <div className="mt-6 grid grid-cols-2 gap-2.5">
             {PROVIDERS.map((p) => {
               const Icon = p.icon;
               return (
@@ -1484,7 +1615,7 @@ function OverviewTab({
               onClick={save}
               disabled={!valid || updating}
             >
-              {updating && <Loader2 className="w-3 h-3 animate-spin" />}
+              {updating && <LoadingIcon className="w-3 h-3" />}
               Save changes
             </Button>
           </div>
@@ -1526,7 +1657,7 @@ function VersionsTab({
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-8">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }
@@ -1623,7 +1754,7 @@ function VersionRow({
           className="text-[10.5px] text-muted-foreground hover:text-primary transition-colors mt-1 inline-flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {rollingBack ? (
-            <Loader2 className="w-3 h-3 animate-spin" />
+            <LoadingIcon className="w-3 h-3" />
           ) : (
             <Undo2 className="w-3 h-3" />
           )}
@@ -1749,7 +1880,7 @@ function DangerTab({
           disabled={!canDelete || !matches || deleting}
           onClick={onDelete}
         >
-          {deleting && <Loader2 className="w-3 h-3 animate-spin" />}
+          {deleting && <LoadingIcon className="w-3 h-3" />}
           Delete permanently
         </Button>
       </div>
@@ -1806,6 +1937,7 @@ function AddCredentialForm({
   const [tlsCaCert, setTlsCaCert] = useState('');
   const [showKafkaPassword, setShowKafkaPassword] = useState(false);
   const [kafkaPreset, setKafkaPreset] = useState<KafkaPresetId | null>(null);
+  const eventHubs = useEventHubsCredential();
 
   const spec = providerSpec(provider);
 
@@ -1818,6 +1950,7 @@ function AddCredentialForm({
         : accessKeyId.trim() !== '' && secretAccessKey.trim() !== '';
     }
     if (provider === 'gcp_pubsub') return credentialsJson.trim() !== '';
+    if (provider === 'azure_event_hubs') return eventHubs.valid;
     if (provider === 'kafka') {
       if (saslMechanism && saslMechanism !== '_none') {
         return saslUsername.trim() !== '' && saslPassword.trim() !== '';
@@ -1828,8 +1961,15 @@ function AddCredentialForm({
   })();
 
   const buildPayload = (): CreateCloudCredentialRequest => {
-    let credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
+    let credentials:
+      | AwsS3Credentials
+      | GcpPubSubCredentials
+      | KafkaCredentials
+      | AzureEventHubsCredentials;
     switch (provider) {
+      case 'azure_event_hubs':
+        credentials = eventHubs.payload();
+        break;
       case 'aws_s3':
         credentials =
           awsAuthMode === 'role'
@@ -1899,7 +2039,7 @@ function AddCredentialForm({
           <Label className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground">
             Provider
           </Label>
-          <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+          <div className="mt-1.5 grid grid-cols-2 gap-1.5">
             {PROVIDERS.map((p) => {
               const Icon = p.icon;
               const active = provider === p.value;
@@ -2054,6 +2194,8 @@ function AddCredentialForm({
             </div>
           )}
 
+          {provider === 'azure_event_hubs' && eventHubs.fields}
+
           {provider === 'gcp_pubsub' && (
             <FieldRow label="Service account JSON" required secret>
               <Textarea
@@ -2135,14 +2277,13 @@ function AddCredentialForm({
                 </>
               )}
               <label className="flex items-center gap-2 text-[11.5px] text-foreground/80 cursor-pointer select-none">
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={tlsEnabled}
-                  onChange={(e) => {
-                    setTlsEnabled(e.target.checked);
+                  onCheckedChange={(checked) => {
+                    setTlsEnabled(checked === true);
                     setKafkaPreset(null);
                   }}
-                  className="rounded border-border"
+                  className="h-3.5 w-3.5"
                 />
                 Enable TLS/SSL
               </label>
@@ -2181,7 +2322,7 @@ function AddCredentialForm({
           disabled={!isValid || submitting}
           onClick={() => onSubmit(buildPayload())}
         >
-          {submitting && <Loader2 className="w-3 h-3 animate-spin" />}
+          {submitting && <LoadingIcon className="w-3 h-3" />}
           <KeyRound className="w-3 h-3" />
           Create credential
         </Button>
@@ -2224,8 +2365,10 @@ function RotateCredentialForm({
   const [tlsCaCert, setTlsCaCert] = useState('');
   const [showKafkaPassword, setShowKafkaPassword] = useState(false);
   const [note, setNote] = useState('');
+  const eventHubs = useEventHubsCredential();
 
   const isValid = (() => {
+    if (cred.provider === 'azure_event_hubs') return eventHubs.valid;
     if (cred.provider === 'aws_s3') {
       return awsAuthMode === 'role'
         ? assumeRoleArn.trim() !== ''
@@ -2242,8 +2385,15 @@ function RotateCredentialForm({
   })();
 
   const buildPayload = (): RotateCredentialRequest => {
-    let credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
+    let credentials:
+      | AwsS3Credentials
+      | GcpPubSubCredentials
+      | KafkaCredentials
+      | AzureEventHubsCredentials;
     switch (cred.provider) {
+      case 'azure_event_hubs':
+        credentials = eventHubs.payload();
+        break;
       case 'aws_s3':
         credentials =
           awsAuthMode === 'role'
@@ -2382,6 +2532,8 @@ function RotateCredentialForm({
             </div>
           )}
 
+          {cred.provider === 'azure_event_hubs' && eventHubs.fields}
+
           {cred.provider === 'gcp_pubsub' && (
             <FieldRow label="Service account JSON" required secret>
               <Textarea
@@ -2430,11 +2582,10 @@ function RotateCredentialForm({
                 </>
               )}
               <label className="flex items-center gap-2 text-[11.5px] text-foreground/80 cursor-pointer select-none">
-                <input
-                  type="checkbox"
+                <Checkbox
                   checked={tlsEnabled}
-                  onChange={(e) => setTlsEnabled(e.target.checked)}
-                  className="rounded border-border"
+                  onCheckedChange={(checked) => setTlsEnabled(checked === true)}
+                  className="h-3.5 w-3.5"
                 />
                 Enable TLS/SSL
               </label>
@@ -2482,7 +2633,7 @@ function RotateCredentialForm({
           disabled={!isValid || submitting}
           onClick={() => onSubmit(buildPayload())}
         >
-          {submitting && <Loader2 className="w-3 h-3 animate-spin" />}
+          {submitting && <LoadingIcon className="w-3 h-3" />}
           <RotateCcw className="w-3 h-3" />
           Rotate &amp; activate v{cred.active_version + 1}
         </Button>

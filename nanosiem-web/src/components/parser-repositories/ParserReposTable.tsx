@@ -96,7 +96,7 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
                 className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')}
                 strokeWidth={1.5}
               />
-              {syncing ? 'Syncing…' : 'Sync now'}
+              {syncing ? (repo.raw.sync_started_at ? `Syncing since ${new Date(repo.raw.sync_started_at).toLocaleTimeString()}` : 'Syncing…') : 'Sync now'}
             </button>
           </div>
         )

@@ -9,7 +9,8 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ArrowLeft, Save, Loader2, Play, FileCode, WandSparkles, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Import, Power } from 'lucide-react';
+import { ArrowLeft, Save, Play, FileCode, WandSparkles, Eye, Archive, ArchiveRestore, Trash2, MoreHorizontal, Undo2, Import, Power } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { Link } from 'react-router-dom';
 
@@ -124,7 +125,7 @@ export function DetectionEditorHeader({
           onClick={onValidate}
           disabled={validating || disableValidate}
         >
-          {validating ? <Loader2 className="w-4 h-4 md: animate-spin" /> : <Play className="w-4 h-4 md:" />}
+          {validating ? <LoadingIcon className="w-4 h-4 md:" /> : <Play className="w-4 h-4 md:" />}
           <span className="hidden md:inline">Validate</span>
         </Button>
 
@@ -137,7 +138,7 @@ export function DetectionEditorHeader({
           <DropdownMenuContent align="end" className="w-48">
             {onFormat && (
               <DropdownMenuItem onClick={onFormat} disabled={formatting || disableValidate}>
-                {formatting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <WandSparkles className="w-4 h-4 mr-2" />}
+                {formatting ? <LoadingIcon className="w-4 h-4 mr-2" /> : <WandSparkles className="w-4 h-4 mr-2" />}
                 Format Query
               </DropdownMenuItem>
             )}
@@ -186,7 +187,7 @@ export function DetectionEditorHeader({
           disabled={saving || disableSave || archived}
           className="bg-primary hover:bg-primary/90 text-foreground h-8"
         >
-          {saving ? <Loader2 className="w-4 h-4 md: animate-spin" /> : <Save className="w-4 h-4 md:" />}
+          {saving ? <LoadingIcon className="w-4 h-4 md:" /> : <Save className="w-4 h-4 md:" />}
           <span className="hidden md:inline">{saveLabel}</span>
         </Button>
       </div>

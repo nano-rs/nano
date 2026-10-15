@@ -7,7 +7,7 @@
 
 import { useMemo, type ReactNode } from 'react';
 import { AlertTriangle, ArrowRight } from 'lucide-react';
-import type { DetectionRule, FleetHealthSummary, AlertVelocityBucket } from '@/lib/api/types';
+import type { DetectionRule, FleetHealthSummary, AlertVelocityBucket, ScheduleLagSummary } from '@/lib/api/types';
 import { SEV_META, bandOf, type SeverityKey } from './helpers';
 
 interface RulesOverviewProps {
@@ -29,6 +29,8 @@ interface RulesOverviewProps {
    * a flat baseline. Empty array also renders the baseline.
    */
   velocity?: AlertVelocityBucket[] | null;
+  /** NAN-3064: scheduling lag; null/undefined while loading or on error. */
+  schedulingLag?: ScheduleLagSummary | null;
   onReviewSilent?: () => void;
 }
 
@@ -96,7 +98,7 @@ function VelocitySpark({ buckets, compact = false }: { buckets?: AlertVelocityBu
   );
 }
 
-export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velocity, onReviewSilent, compact = false }: RulesOverviewProps) {
+export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velocity, schedulingLag, onReviewSilent, compact = false }: RulesOverviewProps) {
   const byBand = useMemo(() => {
     const acc: Record<string, number> = { firing: 0, active: 0, silent: 0, staging: 0, disabled: 0 };
     rules.forEach((r) => { acc[bandOf(r)]++; });
@@ -123,6 +125,7 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velo
         silentCount={silentCount}
         alerts24h={alerts24h}
         fleetHealth={fleetHealth ?? null}
+        schedulingLag={schedulingLag ?? null}
         velocity={velocity}
         byBand={byBand}
         bySev={bySev}
@@ -240,7 +243,7 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velo
             Counts are over the schedulable fleet (Live/Alerting + scheduled +
             has cron). When `fleetHealth` is null/undefined or `total` is 0,
             we fall back to em-dashes — same shape as the original placeholder. */}
-        <FleetHealthCell fleetHealth={fleetHealth ?? null} />
+        <FleetHealthCell fleetHealth={fleetHealth ?? null} schedulingLag={schedulingLag ?? null} />
       </div>
     </div>
   );
@@ -258,6 +261,7 @@ function CompactRulesOverview({
   silentCount,
   alerts24h,
   fleetHealth,
+  schedulingLag,
   velocity,
   byBand,
   bySev,
@@ -268,6 +272,7 @@ function CompactRulesOverview({
   silentCount: number;
   alerts24h: number;
   fleetHealth: FleetHealthSummary | null;
+  schedulingLag: ScheduleLagSummary | null;
   velocity?: AlertVelocityBucket[] | null;
   byBand: Record<string, number>;
   bySev: Record<SeverityKey, number>;
@@ -383,6 +388,7 @@ function CompactRulesOverview({
               No scheduled runs yet
             </div>
           )}
+          <ScheduleLagLine lag={schedulingLag} />
         </div>
       </div>
     </div>
@@ -418,7 +424,7 @@ function HealthDatum({ label, value, color }: { label: string; value: number | s
 // Tri-segment progress bar (green / amber / red) sized proportionally so a
 // reviewer can read the mix at a glance. Empty (pending) rules in the fleet
 // — those without a `last_run_at` — show as the empty remainder of the bar.
-function FleetHealthCell({ fleetHealth }: { fleetHealth: FleetHealthSummary | null }) {
+function FleetHealthCell({ fleetHealth, schedulingLag }: { fleetHealth: FleetHealthSummary | null; schedulingLag: ScheduleLagSummary | null }) {
   const total = fleetHealth?.total ?? 0;
   const healthy = fleetHealth?.healthy ?? 0;
   const slow = fleetHealth?.slow ?? 0;
@@ -497,12 +503,56 @@ function FleetHealthCell({ fleetHealth }: { fleetHealth: FleetHealthSummary | nu
           </div>
         </div>
       </div>
+      <ScheduleLagLine lag={schedulingLag} />
       <div
         className="mt-2 text-[10.5px] text-muted-foreground/70 leading-[1.4]"
         title={hasData ? footer : undefined}
       >
         {footer}
       </div>
+    </div>
+  );
+}
+
+/** `1h 2m`, `8m 36s`, `42s`. */
+function formatLag(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, '0')}s`;
+  return `${Math.floor(secs / 3600)}h ${String(Math.floor((secs % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+/**
+ * NAN-3064 — scheduling lag in one dense mono line: rules behind schedule,
+ * max and p95 lag. Turns destructive when a rule lags more than twice its
+ * interval (the scheduler can't keep up); the title lists the worst rules.
+ */
+function ScheduleLagLine({ lag }: { lag: ScheduleLagSummary | null }) {
+  if (!lag || lag.total === 0) return null;
+  const tone = lag.degraded ? 'var(--destructive)' : lag.behind_schedule > 0 ? 'var(--warning)' : 'var(--success)';
+  const worst = lag.worst
+    .map((r) => `${r.rule_name}  ${formatLag(r.lag_secs)} late${r.interval_secs ? ` (every ${formatLag(r.interval_secs)})` : ''}`)
+    .join('\n');
+  return (
+    <div
+      className="mt-1.5 flex items-center gap-2 whitespace-nowrap font-mono text-[10.5px] text-muted-foreground"
+      title={worst || `All ${lag.total} scheduled rules on time`}
+      data-testid="schedule-lag"
+    >
+      <span className="size-[5px] shrink-0 rounded-full" style={{ background: tone }} />
+      <span>Lag</span>
+      <span className="text-foreground tabular-nums">{lag.behind_schedule}</span>
+      <span>behind</span>
+      <span className="text-muted-foreground/50">·</span>
+      <span>max</span>
+      <span className="tabular-nums" style={{ color: lag.degraded ? 'var(--destructive)' : 'var(--foreground)' }}>
+        {formatLag(lag.max_lag_secs)}
+      </span>
+      <span className="text-muted-foreground/50">·</span>
+      <span>p95</span>
+      <span className="text-foreground tabular-nums">{formatLag(lag.p95_lag_secs)}</span>
+      {lag.degraded && (
+        <span className="text-destructive">· {lag.over_2x_interval} &gt;2× interval</span>
+      )}
     </div>
   );
 }

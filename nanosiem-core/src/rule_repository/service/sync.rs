@@ -134,6 +134,22 @@ impl RuleRepositoryService {
         // Get rule files - use git sparse-checkout for selected paths (avoids API rate limits entirely)
         // NAN-1266: under NANO_SCHEMA_PROFILE=ocsf the sync walks the sibling
         // `rules-ocsf/` tree so imported rules target OCSF; UDM is unchanged.
+        // NAN-2361: same content-branch remap as the parser sync. Scoped to the
+        // first-party rules repo: sigmahq/sigma has no `ocsf-1.9` branch.
+        let resolved_branch = if owner == "nano-rs" {
+            crate::schema::active_content_branch(&repo.branch)
+        } else {
+            repo.branch.clone()
+        };
+        if resolved_branch != repo.branch {
+            info!(
+                repo_id = %id,
+                stored = %repo.branch,
+                resolved = %resolved_branch,
+                "Lake profile: syncing the OCSF 1.9 content branch"
+            );
+        }
+
         let stored_rules_path = repo.rules_path.as_deref().unwrap_or("rules/");
         let rules_path = crate::schema::active_repo_path(stored_rules_path);
         let rules_path = rules_path.as_str();
@@ -180,7 +196,7 @@ impl RuleRepositoryService {
                     .sparse_clone(
                         &owner,
                         &repo_name,
-                        &repo.branch,
+                        &resolved_branch,
                         &clone_paths,
                         temp_dir.path(),
                     )
@@ -221,7 +237,12 @@ impl RuleRepositoryService {
                 )?;
                 untranslated_paths = fallback_paths;
 
-                info!("Found {} rule files via sparse checkout (selected_paths={:?}, temp_dir={:?})", files.len(), selected, temp_dir.path());
+                info!(
+                    "Found {} rule files via sparse checkout (selected_paths={:?}, temp_dir={:?})",
+                    files.len(),
+                    selected,
+                    temp_dir.path()
+                );
                 for f in &files {
                     info!("  rule file: {}", f.path);
                 }
@@ -229,7 +250,7 @@ impl RuleRepositoryService {
             } else {
                 // Empty selected_paths means sync nothing
                 let commit = github_client
-                    .get_latest_commit(&owner, &repo_name, &repo.branch)
+                    .get_latest_commit(&owner, &repo_name, &resolved_branch)
                     .await
                     .map_err(|e| RuleRepositoryError::GitHubApi(e.to_string()))?;
                 (Vec::new(), None, commit)
@@ -237,7 +258,7 @@ impl RuleRepositoryService {
         } else {
             // No selected_paths - use API (Tree API for files, get_latest_commit for change detection)
             let commit = github_client
-                .get_latest_commit(&owner, &repo_name, &repo.branch)
+                .get_latest_commit(&owner, &repo_name, &resolved_branch)
                 .await
                 .map_err(|e| RuleRepositoryError::GitHubApi(e.to_string()))?;
 
@@ -263,11 +284,11 @@ impl RuleRepositoryService {
             }
 
             let tree = github_client
-                .get_tree(&owner, &repo_name, &repo.branch, Some(rules_path))
+                .get_tree(&owner, &repo_name, &resolved_branch, Some(rules_path))
                 .await
                 .map_err(|e| RuleRepositoryError::GitHubApi(e.to_string()))?;
 
-            let files: Vec<TreeEntry> = tree
+            let mut files: Vec<TreeEntry> = tree
                 .into_iter()
                 .filter(|e| {
                     e.entry_type == "blob"
@@ -277,6 +298,26 @@ impl RuleRepositoryService {
                             .any(|ext| e.path.ends_with(ext))
                 })
                 .collect();
+
+            // NAN-2361: ROOT-layout repositories (empty `rules_path`, tactic
+            // trees at the repo root — the nano-rs/rules layout) carry the
+            // `-ocsf` convention per top-level folder rather than on a base
+            // directory, so the whole root arrives here. Pick the OCSF sibling
+            // where one exists; keep the UDM file flagged where none does.
+            //
+            // Without this the fixed base remap would import BOTH trees and
+            // every rule would land twice, once against the wrong schema.
+            if stored_rules_path.trim_matches('/').is_empty()
+                && crate::schema::runtime_profile_from_env()
+                    .map(|p| p.schema == crate::schema::SchemaId::Ocsf)
+                    .unwrap_or(false)
+            {
+                let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+                let (kept, fallback) = crate::schema::select_ocsf_root_layout(&paths);
+                let kept: std::collections::HashSet<String> = kept.into_iter().collect();
+                files.retain(|f| kept.contains(&f.path));
+                untranslated_paths = fallback;
+            }
 
             (files, None, commit)
         };
@@ -311,7 +352,7 @@ impl RuleRepositoryService {
                 }
             } else {
                 match github_client
-                    .get_raw_file(&owner, &repo_name, &entry.path, &repo.branch)
+                    .get_raw_file(&owner, &repo_name, &entry.path, &resolved_branch)
                     .await
                 {
                     Ok(c) => c,
@@ -414,7 +455,17 @@ impl RuleRepositoryService {
                     Err(e) => {
                         warn!("Failed to parse Sigma rule {}: {}", entry.path, e);
                         // Store anyway with minimal metadata
-                        (None, None, None, None, None, None, None, None, Some("failed"))
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("failed"),
+                        )
                     }
                 }
             } else {
@@ -452,12 +503,26 @@ impl RuleRepositoryService {
                         // nPL rules are already native format — unless they
                         // were pulled from the UDM tree because no `-ocsf`
                         // sibling exists under the OCSF profile (NAN-1387)
-                        Some(if untranslated { "untranslated" } else { "success" }),
+                        Some(if untranslated {
+                            "untranslated"
+                        } else {
+                            "success"
+                        }),
                     ),
                     Err(e) => {
                         warn!("Failed to parse nPL rule {}: {}", entry.path, e);
                         // Store anyway with minimal metadata
-                        (None, None, None, None, None, None, None, None, Some("failed"))
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some("failed"),
+                        )
                     }
                 }
             };
@@ -723,7 +788,6 @@ impl RuleRepositoryService {
         Ok(())
     }
 }
-
 
 /// Resolve the rule files for a sparse-checkout (folder-picker) sync.
 ///

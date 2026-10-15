@@ -12,6 +12,7 @@ use nanosiem_core::settings::{
     ClickHouseStorageStats, DualSystemSettings, RetentionConfig, StorageStats, SystemSettings,
 };
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
@@ -89,6 +90,158 @@ pub struct ClickHouseStorageStatsResponse {
     pub ttl_days: Option<u32>,
 }
 
+/// Storage statistics for the tenant-pinned Iceberg event snapshot. These are
+/// read from the same immutable coordinator manifest used for schema and
+/// sidecar fencing, never inferred from the compatibility ClickHouse service.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LakeStorageStatsResponse {
+    pub total_size_bytes: u64,
+    pub total_size_pretty: String,
+    pub row_count: u64,
+    pub object_count: u64,
+    pub index_size_bytes: u64,
+    pub index_size_pretty: String,
+    pub index_overhead_percent: f64,
+    pub file_format: String,
+    pub table_format: String,
+    pub manifest_modified_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LakeStorageManifest {
+    #[serde(default)]
+    source_bytes: u64,
+    #[serde(default)]
+    event_rows: u64,
+    #[serde(default)]
+    index_bytes: u64,
+    #[serde(default)]
+    objects: Vec<serde_json::Value>,
+}
+
+const LAKE_WORKER_CONFIG_ENV: &str = "NANO_LAKE_WORKER_CONFIG";
+
+fn active_lake_storage_manifest(worker_config: &Path) -> Result<std::path::PathBuf, ApiError> {
+    let raw = std::fs::read_to_string(worker_config).map_err(|error| {
+        ApiError::InternalError(format!("failed to read active lake worker config: {error}"))
+    })?;
+    let config: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+        ApiError::InternalError(format!("invalid active lake worker config: {error}"))
+    })?;
+    let path = config
+        .pointer("/tenant/source_manifest/path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::InternalError(
+                "active lake worker config has no tenant source manifest".to_string(),
+            )
+        })?;
+    Ok(std::path::PathBuf::from(path))
+}
+
+fn pretty_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes / TIB)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+pub(super) fn lake_storage_stats_from_manifest(
+    path: &Path,
+) -> Result<LakeStorageStatsResponse, ApiError> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        ApiError::InternalError(format!("failed to read lake storage manifest: {error}"))
+    })?;
+    let manifest: LakeStorageManifest = serde_json::from_str(&raw).map_err(|error| {
+        ApiError::InternalError(format!("invalid lake storage manifest: {error}"))
+    })?;
+    let modified_at = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .map(|timestamp| timestamp.to_rfc3339());
+    let overhead = if manifest.source_bytes == 0 {
+        0.0
+    } else {
+        manifest.index_bytes as f64 * 100.0 / manifest.source_bytes as f64
+    };
+    Ok(LakeStorageStatsResponse {
+        total_size_bytes: manifest.source_bytes,
+        total_size_pretty: pretty_bytes(manifest.source_bytes),
+        row_count: manifest.event_rows,
+        object_count: manifest.objects.len() as u64,
+        index_size_bytes: manifest.index_bytes,
+        index_size_pretty: pretty_bytes(manifest.index_bytes),
+        index_overhead_percent: overhead,
+        file_format: "Parquet".to_string(),
+        table_format: "Iceberg v2".to_string(),
+        manifest_modified_at: modified_at,
+    })
+}
+
+fn non_blank_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+pub(super) fn lake_storage_stats_from_env() -> Result<LakeStorageStatsResponse, ApiError> {
+    lake_storage_stats_from_paths(
+        non_blank_env(LAKE_WORKER_CONFIG_ENV).as_deref(),
+        non_blank_env(nanosiem_core::schema::LAKE_SCHEMA_MANIFEST_ENV).as_deref(),
+    )
+}
+
+/// Stats from the gen1 lake manifest: the worker config's active manifest when
+/// a worker config is configured, else the explicit schema manifest.
+fn lake_storage_stats_from_paths(
+    worker_config: Option<&str>,
+    schema_manifest: Option<&str>,
+) -> Result<LakeStorageStatsResponse, ApiError> {
+    if let Some(worker_config) = worker_config {
+        let manifest = active_lake_storage_manifest(Path::new(worker_config))?;
+        return lake_storage_stats_from_manifest(&manifest);
+    }
+    let path = schema_manifest.ok_or_else(|| {
+        ApiError::InternalError(
+            "lake worker config and schema manifest are not configured".to_string(),
+        )
+    })?;
+    lake_storage_stats_from_manifest(Path::new(path))
+}
+
+/// NAN-3492: lake manifest stats are optional telemetry, not a precondition of
+/// the storage pages. A lean trusted-local install has no gen1 worker config or
+/// source manifest at all, so a missing/unreadable manifest degrades to `None`
+/// (logged) instead of failing the whole response with a 500.
+pub(super) fn lake_storage_stats_or_none(
+    stats: Result<LakeStorageStatsResponse, ApiError>,
+) -> Option<LakeStorageStatsResponse> {
+    match stats {
+        Ok(stats) => Some(stats),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "lake storage manifest stats unavailable; reporting no lake stats"
+            );
+            None
+        }
+    }
+}
+
 impl From<ClickHouseStorageStats> for ClickHouseStorageStatsResponse {
     fn from(stats: ClickHouseStorageStats) -> Self {
         Self {
@@ -138,12 +291,16 @@ pub struct DiskPressureStatusResponse {
 /// Combined storage overview response
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StorageOverviewResponse {
+    /// Active log storage backend (`clickhouse` or `iceberg`).
+    pub log_backend: String,
     /// Whether ClickHouse is enabled for log storage
     pub clickhouse_enabled: bool,
     /// PostgreSQL storage stats (metadata)
     pub postgres: Option<StorageStatsResponse>,
     /// ClickHouse storage stats (logs)
     pub clickhouse: Option<ClickHouseStorageStatsResponse>,
+    /// Iceberg/Parquet snapshot stats (only in primary-lake mode).
+    pub lake: Option<LakeStorageStatsResponse>,
     /// Disk pressure status (only when ClickHouse is enabled)
     pub disk_pressure: Option<DiskPressureStatusResponse>,
 }
@@ -179,6 +336,8 @@ pub async fn get_retention_config(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RetentionConfigResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let settings = SystemSettings::new(state.pool.clone());
     let config = settings.get_retention_config().await?;
@@ -207,6 +366,8 @@ pub async fn update_retention_config(
     Json(request): Json<UpdateRetentionRequest>,
 ) -> Result<Json<RetentionConfigResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let settings = SystemSettings::new(state.pool.clone());
 
@@ -249,6 +410,8 @@ pub async fn get_storage_stats(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<StorageStatsResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let settings = SystemSettings::new(state.pool.clone());
     let stats = settings.get_storage_stats().await?;
@@ -275,6 +438,8 @@ pub async fn run_retention_now(
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let settings = SystemSettings::new(state.pool.clone());
     let dropped = settings.run_retention_now().await?;
@@ -315,6 +480,24 @@ pub async fn get_storage_overview(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<StorageOverviewResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
+
+    if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        let postgres = SystemSettings::new(state.pool.clone())
+            .get_storage_stats()
+            .await
+            .ok()
+            .map(StorageStatsResponse::from);
+        return Ok(Json(StorageOverviewResponse {
+            log_backend: "iceberg".to_string(),
+            clickhouse_enabled: false,
+            postgres,
+            clickhouse: None,
+            lake: lake_storage_stats_or_none(lake_storage_stats_from_env()),
+            disk_pressure: None,
+        }));
+    }
 
     let dual_pool = state.dual_pool();
     let settings =
@@ -361,11 +544,35 @@ pub async fn get_storage_overview(
     };
 
     Ok(Json(StorageOverviewResponse {
+        log_backend: "clickhouse".to_string(),
         clickhouse_enabled: true,
         postgres: postgres_stats,
         clickhouse: clickhouse_stats,
+        lake: None,
         disk_pressure,
     }))
+}
+
+/// Message for ClickHouse storage endpoints on a lake (Iceberg) backend.
+pub(crate) const CLICKHOUSE_STORAGE_NOT_APPLICABLE: &str =
+    "ClickHouse storage settings are not applicable on the lake backend; use GET /api/settings/storage/overview";
+
+/// Refuse ClickHouse-specific storage endpoints when logs live in the lake.
+///
+/// On `NANO_LOG_QUERY_BACKEND=lake` the ClickHouse pool is an inert
+/// compatibility client: querying `system.parts` through it surfaces as a 500
+/// "storage error" (NAN-3378). The storage overview already reports
+/// `clickhouse_enabled: false` there, so these endpoints answer with a clean
+/// 404 instead of touching ClickHouse.
+fn ensure_clickhouse_storage_applicable(
+    backend: nanosiem_core::SearchBackend,
+) -> Result<(), ApiError> {
+    if backend == nanosiem_core::SearchBackend::Lake {
+        return Err(ApiError::NotFound(
+            CLICKHOUSE_STORAGE_NOT_APPLICABLE.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Get ClickHouse storage statistics
@@ -381,6 +588,7 @@ pub async fn get_storage_overview(
         (status = 200, description = "ClickHouse storage stats", body = ClickHouseStorageStatsResponse),
         (status = 400, description = "ClickHouse not enabled", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 404, description = "Not applicable: logs are stored in the lake backend", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -390,6 +598,9 @@ pub async fn get_clickhouse_storage_stats(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ClickHouseStorageStatsResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
+    ensure_clickhouse_storage_applicable(state.search_service.backend())?;
 
     let dual_pool = state.dual_pool();
     let settings =
@@ -413,6 +624,7 @@ pub async fn get_clickhouse_storage_stats(
         (status = 200, description = "Retention updated", body = serde_json::Value),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 404, description = "Not applicable: logs are stored in the lake backend", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -424,6 +636,9 @@ pub async fn update_clickhouse_retention(
     Json(request): Json<UpdateClickHouseRetentionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
+    ensure_clickhouse_storage_applicable(state.search_service.backend())?;
 
     let dual_pool = state.dual_pool();
 
@@ -474,6 +689,7 @@ pub async fn update_clickhouse_retention(
         (status = 200, description = "Retention job completed", body = serde_json::Value),
         (status = 400, description = "ClickHouse not enabled", body = ErrorResponse),
         (status = 403, description = "Missing permission", body = ErrorResponse),
+        (status = 404, description = "Not applicable: logs are stored in the lake backend", body = ErrorResponse),
         (status = 500, description = "Internal error", body = ErrorResponse)
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -484,6 +700,9 @@ pub async fn run_clickhouse_retention_now(
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
+    ensure_clickhouse_storage_applicable(state.search_service.backend())?;
 
     let dual_pool = state.dual_pool();
 
@@ -529,4 +748,125 @@ pub async fn run_clickhouse_retention_now(
         "success": true,
         "rows_deleted": deleted
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clickhouse_storage_endpoints_are_a_clean_404_on_lake() {
+        use axum::response::IntoResponse;
+
+        let err = ensure_clickhouse_storage_applicable(nanosiem_core::SearchBackend::Lake)
+            .expect_err("lake backend must refuse ClickHouse storage endpoints");
+        assert_eq!(err.code(), "NOT_FOUND");
+        assert!(err
+            .to_string()
+            .contains("not applicable on the lake backend"));
+        assert_eq!(
+            err.into_response().status(),
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn clickhouse_storage_endpoints_proceed_on_clickhouse() {
+        assert!(
+            ensure_clickhouse_storage_applicable(nanosiem_core::SearchBackend::ClickHouse).is_ok()
+        );
+    }
+
+    #[test]
+    fn active_worker_config_selects_the_promoted_storage_manifest() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let stale = directory.path().join("stale.json");
+        let active = directory.path().join("active.json");
+        let worker = directory.path().join("worker.json");
+        std::fs::write(
+            &stale,
+            r#"{"source_bytes":10,"event_rows":1,"index_bytes":2,"objects":[{}]}"#,
+        )
+        .expect("stale manifest");
+        std::fs::write(
+            &active,
+            r#"{"source_bytes":1000,"event_rows":2313337,"index_bytes":250,"objects":[{},{},{}]}"#,
+        )
+        .expect("active manifest");
+        std::fs::write(
+            &worker,
+            serde_json::json!({
+                "tenant": {
+                    "source_manifest": {
+                        "path": active,
+                        "sha256": "0".repeat(64),
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("worker config");
+
+        let selected = active_lake_storage_manifest(&worker).expect("active path");
+        let stats = lake_storage_stats_from_manifest(&selected).expect("active stats");
+        assert_eq!(stats.row_count, 2_313_337);
+        assert_eq!(stats.object_count, 3);
+        assert_eq!(stats.total_size_bytes, 1_000);
+        assert_eq!(stats.index_size_bytes, 250);
+    }
+
+    #[test]
+    fn malformed_worker_config_does_not_fall_back_to_stale_telemetry() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let worker = directory.path().join("worker.json");
+        std::fs::write(&worker, r#"{"tenant":{}}"#).expect("worker config");
+
+        let error = active_lake_storage_manifest(&worker).expect_err("missing manifest");
+        assert!(error
+            .to_string()
+            .contains("active lake worker config has no tenant source manifest"));
+    }
+
+    #[test]
+    fn missing_worker_config_degrades_the_overview_to_no_lake_stats() {
+        // NAN-3492: the lean compose used to point at a gen1 worker config that
+        // never exists there; the overview must render without lake stats.
+        let directory = tempfile::tempdir().expect("temp directory");
+        let missing = directory.path().join("worker.json");
+        let missing = missing.to_str().expect("utf-8 path");
+
+        let error = lake_storage_stats_from_paths(Some(missing), None)
+            .expect_err("missing worker config is an error at the source");
+        assert!(error
+            .to_string()
+            .contains("failed to read active lake worker config"));
+        assert!(lake_storage_stats_or_none(Err(error)).is_none());
+    }
+
+    #[test]
+    fn unconfigured_lake_manifest_degrades_the_overview_to_no_lake_stats() {
+        let result = lake_storage_stats_from_paths(None, None);
+        assert!(result.is_err());
+        assert!(lake_storage_stats_or_none(result).is_none());
+    }
+
+    #[test]
+    fn readable_schema_manifest_still_reports_lake_stats() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let manifest = directory.path().join("manifest.json");
+        std::fs::write(
+            &manifest,
+            r#"{"source_bytes":2048,"event_rows":7,"index_bytes":0,"objects":[{}]}"#,
+        )
+        .expect("manifest");
+
+        let stats = lake_storage_stats_or_none(lake_storage_stats_from_paths(
+            None,
+            Some(manifest.to_str().expect("utf-8 path")),
+        ))
+        .expect("stats");
+        assert_eq!(stats.total_size_bytes, 2048);
+        assert_eq!(stats.row_count, 7);
+        assert_eq!(stats.object_count, 1);
+    }
 }

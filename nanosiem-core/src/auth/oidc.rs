@@ -131,6 +131,9 @@ pub struct IdTokenClaims {
     pub sub: String,
     /// Audience (client ID)
     pub aud: serde_json::Value, // Can be string or array
+    /// Authorized party. OIDC requires this when multiple audiences are
+    /// present; shared mode validates it against the bound client ID.
+    pub azp: Option<String>,
     /// Expiration time
     pub exp: i64,
     /// Issued at
@@ -509,7 +512,12 @@ impl OidcService {
 
         // Validate ID token — using the *server-stored* nonce
         let claims = self
-            .validate_id_token(&id_token, &provider, &discovery.jwks_uri, &transaction.nonce)
+            .validate_id_token(
+                &id_token,
+                &provider,
+                &discovery.jwks_uri,
+                &transaction.nonce,
+            )
             .await?;
 
         // Extract user info
@@ -562,11 +570,7 @@ impl OidcService {
                 ))
             })?;
 
-        let response = client
-            .post(token_endpoint)
-            .form(&params)
-            .send()
-            .await?;
+        let response = client.post(token_endpoint).form(&params).send().await?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();

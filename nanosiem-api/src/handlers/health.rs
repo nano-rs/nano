@@ -3,14 +3,18 @@
 //! Health check handlers
 //!
 //! Provides health check endpoints for monitoring the API server and database connections.
-//! Supports dual database architecture with ClickHouse and PostgreSQL.
-//! Also checks downstream service health (Ingest Service, Search Service) when available.
+//! Reports PostgreSQL plus the active event backend: ClickHouse in legacy mode
+//! or the canonical lake worker in lake mode.
+//! Also checks downstream ingest and Search service health when available. The
+//! lake product's ingest boundary is Vector; the retired standalone ingest
+//! service remains relevant only to the legacy profile.
 //!
 //! Requirements: 4.4 (Main API reports its own status and downstream service status)
 //! Requirements: 7.3 (X-Request-ID header propagation)
 
 use axum::{extract::State, Extension, Json};
 use serde::Serialize;
+use nanosiem_core::request_timing::{timed, Phase};
 
 use crate::middleware::RequestId;
 use crate::state::AppState;
@@ -22,9 +26,7 @@ use crate::state::AppState;
 /// system.one)`; `Ok(())` means all shards answered. `CLICKHOUSE_CLUSTER` is set
 /// only on clustered ClickHouse — unset (single-node / open-core) returns
 /// `Ok(())` without issuing any query, so the health path is byte-identical.
-async fn cluster_all_shard_ch_probe(
-    dual_pool: &nanosiem_core::db::DualPool,
-) -> Result<(), String> {
+async fn cluster_all_shard_ch_probe(dual_pool: &nanosiem_core::db::DualPool) -> Result<(), String> {
     if !dual_pool.is_clustered() {
         return Ok(());
     }
@@ -65,10 +67,32 @@ pub struct PublicHealthResponse {
     pub status: String,
 }
 
+// Shared API control-plane availability must not depend on the separate Search
+// fleet. Retired gen1 assignments can time out even while lean tenant requests
+// and PostgreSQL work; Search owns its own dependency readiness.
+async fn api_dependencies_ready(
+    shared: bool,
+    postgres_probe: impl std::future::Future<Output = bool>,
+    lake_probe: impl std::future::Future<Output = bool>,
+) -> bool {
+    postgres_probe.await && (shared || lake_probe.await)
+}
+
 async fn control_plane_ready(state: &AppState) -> bool {
-    // The API intentionally degrades to PostgreSQL-only operation when ClickHouse
-    // is unavailable. Search has its own CH-dependent readiness endpoint.
-    state.dual_pool().health_check().await.postgres_healthy
+    #[cfg(feature = "enterprise")]
+    let shared_profile = state.config.deployment_mode.is_enterprise_shared();
+    #[cfg(not(feature = "enterprise"))]
+    let shared_profile = false;
+    api_dependencies_ready(
+        shared_profile,
+        async {
+            timed(Phase::Authority, state.dual_pool().health_check())
+                .await
+                .postgres_healthy
+        },
+        async { timed(Phase::Upstream, state.search_service.lake_worker_ready()).await },
+    )
+    .await
 }
 
 /// Health check response for PostgreSQL-only mode
@@ -97,6 +121,72 @@ pub struct DualHealthResponse {
     /// Downstream service health (Ingest and Search services)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<DownstreamServicesHealth>,
+    /// Pinned lake schema generation and whether it still matches the manifest
+    /// the assigned worker is serving. Absent outside lake deployments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaProfileHealth>,
+}
+
+/// Which lake schema generation this process resolves OCSF field names against.
+///
+/// the profile is pinned at boot and refreshed on a low-frequency tick,
+/// so between a promotion and the next tick the pinned generation can lag the
+/// worker's. That window is legitimate; a lag that never clears is a real defect,
+/// and it used to be invisible. Reported here (and warned about in the log) so
+/// operators can see the pinned identity rather than infer it.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SchemaProfileHealth {
+    /// Number of fields in the pinned field inventory — the universe query
+    /// validation is resolved against.
+    pub field_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_manifest_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_manifest_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_tenant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_generation_id: Option<String>,
+    /// Digest the worker config DECLARES for its active manifest. Reported for
+    /// comparison only — adoption re-hashes the bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_declared_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_tenant_id: Option<String>,
+    /// True when the on-disk active manifest is not the pinned one, or when
+    /// agreement could not be established at all.
+    pub drifted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Cheap: reads the small worker config, never hashes the multi-MB manifest, so
+/// a health poll cannot become expensive work on the request path.
+fn schema_profile_health(state: &AppState) -> Option<SchemaProfileHealth> {
+    let status = state.schema_profile.drift_status()?;
+    if status.drifted {
+        tracing::warn!(
+            pinned_generation = status.pinned_generation_id.as_deref().unwrap_or("unknown"),
+            active_generation = status.active_generation_id.as_deref().unwrap_or("unknown"),
+            error = status.error.as_deref().unwrap_or(""),
+            "pinned lake schema manifest differs from the worker's active manifest; \
+             OCSF field resolution may describe a generation that is no longer served"
+        );
+    }
+    Some(SchemaProfileHealth {
+        field_count: state.schema_profile().fields().len(),
+        pinned_generation_id: status.pinned_generation_id,
+        pinned_manifest_digest: status.pinned_digest,
+        pinned_manifest_path: status.pinned_manifest_path,
+        pinned_tenant_id: status.pinned_tenant_id,
+        active_generation_id: status.active_generation_id,
+        active_declared_digest: status.active_declared_digest,
+        active_tenant_id: status.active_tenant_id,
+        drifted: status.drifted,
+        error: status.error,
+    })
 }
 
 /// Health status for a single database
@@ -111,10 +201,22 @@ pub struct DatabaseHealth {
 /// Health status for downstream services
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct DownstreamServicesHealth {
-    /// Ingest Service health (port 3001)
+    /// Active ingest boundary health (Vector for lake, Ingest Service for legacy)
     pub ingest: ServiceHealth,
     /// Search Service health (port 3002)
     pub search: ServiceHealth,
+}
+
+fn ingest_health_url(
+    lake_backend: bool,
+    ingest_service_url: Option<String>,
+    vector_api_url: Option<String>,
+) -> String {
+    if lake_backend {
+        vector_api_url.unwrap_or_else(|| "http://vector:8686/health".to_string())
+    } else {
+        ingest_service_url.unwrap_or_else(|| "http://ingest:3001/health".to_string())
+    }
 }
 
 /// Health status for a single downstream service
@@ -205,14 +307,19 @@ async fn check_service_health(url: &str, request_id: Option<&str>) -> ServiceHea
     security(())
 )]
 pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthResponse> {
-    let mut is_healthy = state.dual_pool().health_check().await.is_healthy();
+    let lake_backend = state.search_service.backend() == nanosiem_core::SearchBackend::Lake;
+    let mut is_healthy = if lake_backend {
+        control_plane_ready(&state).await
+    } else {
+        timed(Phase::Authority, state.dual_pool().health_check()).await.is_healthy()
+    };
 
     // NAN-1728 (L-1): the DualPool `SELECT 1` only touches the LB-connected node,
     // so a cluster with a dead shard reports healthy while every distributed read
     // errors. When clustered, additionally require an all-shard probe to succeed.
     // Single-node skips the probe (`Ok(())`), so this is byte-identical there.
-    if is_healthy {
-        if let Err(e) = cluster_all_shard_ch_probe(state.dual_pool()).await {
+    if is_healthy && !lake_backend {
+        if let Err(e) = timed(Phase::Authority, cluster_all_shard_ch_probe(state.dual_pool())).await {
             tracing::warn!("ClickHouse all-shard health probe failed: {}", e);
             is_healthy = false;
         }
@@ -230,18 +337,24 @@ pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthRes
 #[utoipa::path(
     get, path = "/ready", tag = "health",
     responses(
-        (status = 200, description = "API is ready", body = PublicHealthResponse),
+        (status = 200, description = "API control plane is ready; shared Search readiness is checked separately", body = PublicHealthResponse),
         (status = 503, description = "API dependencies are unavailable", body = PublicHealthResponse),
     ),
     security(())
 )]
 pub async fn ready_check(State(state): State<AppState>) -> impl axum::response::IntoResponse {
     let ready = control_plane_ready(&state).await;
-    let status = if ready { axum::http::StatusCode::OK }
-        else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
-    (status, Json(PublicHealthResponse {
-        status: if ready { "ready" } else { "not_ready" }.to_string(),
-    }))
+    let status = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(PublicHealthResponse {
+            status: if ready { "ready" } else { "not_ready" }.to_string(),
+        }),
+    )
 }
 
 /// Shallow liveness/readiness probe (NAN-1786).
@@ -268,7 +381,9 @@ pub async fn livez() -> Json<PublicHealthResponse> {
 /// Detailed health check endpoint (authenticated)
 ///
 /// Returns health status for all configured databases and downstream services.
-/// In dual mode, checks both PostgreSQL and ClickHouse.
+/// In legacy dual mode, checks both PostgreSQL and ClickHouse. Primary-lake
+/// mode reports PostgreSQL plus the ingest/search services and does not make an
+/// unused compatibility ClickHouse instance part of readiness.
 /// Also checks Ingest Service (port 3001) and Search Service (port 3002) health.
 /// Propagates X-Request-ID header to downstream services for distributed tracing.
 ///
@@ -300,9 +415,16 @@ pub async fn health_check_detailed(
     // `settings:system` capability, not the broad read-only `settings:view`.
     crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
-    // Get service URLs from environment or use defaults
-    let ingest_url = std::env::var("INGEST_SERVICE_URL")
-        .unwrap_or_else(|_| "http://ingest:3001/health".to_string());
+    let lake_backend = state.search_service.backend() == nanosiem_core::SearchBackend::Lake;
+
+    // The standalone ingest service was removed. Canonical lake deployments
+    // health-check the Vector API that owns their active ingest pipeline;
+    // legacy deployments retain the old ingest-service contract.
+    let ingest_url = ingest_health_url(
+        lake_backend,
+        std::env::var("INGEST_SERVICE_URL").ok(),
+        std::env::var("VECTOR_API_URL").ok(),
+    );
     let search_url = std::env::var("SEARCH_SERVICE_URL")
         .unwrap_or_else(|_| "http://search:3002/health".to_string());
 
@@ -331,7 +453,7 @@ pub async fn health_check_detailed(
     // all-shard probe fails even though the LB-connected node answered `SELECT 1`
     // — a dead shard would otherwise report healthy. Single-node skips the probe
     // (`Ok(())`), so `clickhouse_healthy` is unchanged and this is byte-identical.
-    if clickhouse_healthy {
+    if clickhouse_healthy && !lake_backend {
         if let Err(e) = cluster_all_shard_ch_probe(state.dual_pool()).await {
             tracing::warn!("ClickHouse all-shard health probe failed: {}", e);
             clickhouse_healthy = false;
@@ -339,16 +461,32 @@ pub async fn health_check_detailed(
         }
     }
 
-    let is_healthy = postgres_healthy && clickhouse_healthy;
+    let lake_worker_healthy = state.search_service.lake_worker_ready().await;
+    let is_healthy = postgres_healthy
+        && if lake_backend {
+            lake_worker_healthy
+        } else {
+            clickhouse_healthy
+        };
 
     let postgres_health = DatabaseHealth {
-        status: if postgres_healthy { "connected" } else { "error" }.to_string(),
+        status: if postgres_healthy {
+            "connected"
+        } else {
+            "error"
+        }
+        .to_string(),
         latency_ms: health_status.postgres_latency_ms,
         error: health_status.postgres_error,
     };
 
     let clickhouse_health = DatabaseHealth {
-        status: if clickhouse_healthy { "connected" } else { "error" }.to_string(),
+        status: if clickhouse_healthy {
+            "connected"
+        } else {
+            "error"
+        }
+        .to_string(),
         latency_ms: health_status.clickhouse_latency_ms,
         error: clickhouse_error,
     };
@@ -371,7 +509,11 @@ pub async fn health_check_detailed(
         "unhealthy"
     };
 
-    let database_status = if is_healthy {
+    let database_status = if is_healthy && lake_backend {
+        "postgres connected; events served by lake query backend".to_string()
+    } else if lake_backend && postgres_healthy {
+        "postgres connected; lake query worker unavailable or mismatched".to_string()
+    } else if is_healthy {
         "all connected".to_string()
     } else if postgres_healthy {
         "clickhouse error".to_string()
@@ -386,9 +528,14 @@ pub async fn health_check_detailed(
         version: env!("CARGO_PKG_VERSION").to_string(),
         database: database_status,
         postgres: postgres_health,
-        clickhouse: Some(clickhouse_health),
-        dual_mode_enabled: true,
+        clickhouse: (!lake_backend).then_some(clickhouse_health),
+        dual_mode_enabled: !lake_backend,
         services: Some(services_health),
+        // Drift is reported, not folded into `status`: a promotion legitimately
+        // leaves this true for up to one refresh interval, and flipping the
+        // deployment to "degraded" every 15 minutes would train operators to
+        // ignore it.
+        schema: schema_profile_health(&state),
     }))
 }
 
@@ -401,7 +548,70 @@ pub async fn health_check_detailed(
         DualHealthResponse,
         DatabaseHealth,
         DownstreamServicesHealth,
-        ServiceHealth
+        ServiceHealth,
+        SchemaProfileHealth
     ))
 )]
 pub struct HealthApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::{api_dependencies_ready, ingest_health_url};
+
+    #[tokio::test]
+    async fn shared_api_stays_ready_when_search_never_answers() {
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            api_dependencies_ready(true, async { true }, std::future::pending()),
+        )
+        .await
+        .expect("shared API readiness must not wait for the search fleet");
+        assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn postgres_failure_keeps_all_api_modes_unready() {
+        for shared in [false, true] {
+            assert!(
+                !api_dependencies_ready(shared, async { false }, async {
+                    panic!("failed PostgreSQL must short-circuit downstream probes")
+                })
+                .await
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_shared_api_still_checks_its_lake_worker() {
+        assert!(!api_dependencies_ready(false, async { true }, async { false }).await);
+        assert!(api_dependencies_ready(false, async { true }, async { true }).await);
+    }
+
+    #[test]
+    fn lake_health_uses_vector_instead_of_the_retired_ingest_service() {
+        assert_eq!(
+            ingest_health_url(
+                true,
+                Some("http://legacy-ingest:3001/health".to_string()),
+                Some("http://vector:8686/health".to_string()),
+            ),
+            "http://vector:8686/health"
+        );
+        assert_eq!(
+            ingest_health_url(true, None, None),
+            "http://vector:8686/health"
+        );
+    }
+
+    #[test]
+    fn legacy_health_keeps_the_ingest_service_contract() {
+        assert_eq!(
+            ingest_health_url(
+                false,
+                Some("http://legacy-ingest:3001/health".to_string()),
+                Some("http://vector:8686/health".to_string()),
+            ),
+            "http://legacy-ingest:3001/health"
+        );
+    }
+}

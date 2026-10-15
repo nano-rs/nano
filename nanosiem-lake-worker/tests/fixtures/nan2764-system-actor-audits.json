@@ -1,0 +1,269 @@
+[
+  {
+    "api": {
+      "service": {
+        "name": "platform"
+      },
+      "operation": "ingest_credential_request_fulfilled"
+    },
+    "time": 1790167446891,
+    "actor": {
+      "user": {
+        "uid": "platform:fulfilment:ingest-credential-worker",
+        "name": "platform:fulfilment:ingest-credential-worker"
+      }
+    },
+    "status": "Success",
+    "message": "Nano-main fulfilled a tenant ingest credential request",
+    "metadata": {
+      "uid": "ab75cf03-a9d1-45f6-948e-3a9f44649e65",
+      "product": {
+        "name": "nano",
+        "vendor_name": "nano"
+      },
+      "version": "1.9.0",
+      "log_name": "audit",
+      "log_source": "audit",
+      "tenant_uid": "tenant-a"
+    },
+    "severity": "Informational",
+    "type_uid": 600301,
+    "unmapped": {
+      "action": "ingest_credential_request_fulfilled",
+      "source": "platform",
+      "details": {
+        "protocol": "hec",
+        "route_id": "dd53ad67-a159-446d-ab12-1e05e396fb7c",
+        "request_id": "fc7943b6-aa67-462a-b35d-0442a97b04df",
+        "source_slug": "apache_access",
+        "requested_by": "df308d92-1fe3-4f8b-a9ff-cd6770f70eff",
+        "sealed_expires_at": "2026-09-23T12:54:06.740774+00:00"
+      },
+      "success": true,
+      "actor_id": null,
+      "actor_name": "platform:fulfilment:ingest-credential-worker",
+      "resource_id": "8b8be64a-f435-4e31-a046-fd9efcd2239f",
+      "resource_name": "e2e-onboarding-89de34a753b2",
+      "resource_type": "ingest_credential"
+    },
+    "class_uid": 6003,
+    "resources": [
+      {
+        "uid": "8b8be64a-f435-4e31-a046-fd9efcd2239f",
+        "name": "e2e-onboarding-89de34a753b2",
+        "type": "ingest_credential"
+      }
+    ],
+    "status_id": 1,
+    "class_name": "API Activity",
+    "activity_id": 1,
+    "severity_id": 1,
+    "category_uid": 6,
+    "activity_name": "Create",
+    "category_name": "Application Activity"
+  },
+  {
+    "api": {
+      "service": {
+        "name": "tenant"
+      },
+      "operation": "ingest_credential_revoked"
+    },
+    "time": 1790167449827,
+    "actor": {
+      "user": {
+        "uid": "df308d92-1fe3-4f8b-a9ff-cd6770f70eff",
+        "name": "df308d92-1fe3-4f8b-a9ff-cd6770f70eff"
+      }
+    },
+    "status": "Success",
+    "message": "Tenant member revoked an ingest credential",
+    "metadata": {
+      "uid": "56879e91-9876-4299-8b02-2fc7e95439f5",
+      "product": {
+        "name": "nano",
+        "vendor_name": "nano"
+      },
+      "version": "1.9.0",
+      "log_name": "audit",
+      "log_source": "audit",
+      "tenant_uid": "tenant-a"
+    },
+    "severity": "Informational",
+    "type_uid": 600304,
+    "unmapped": {
+      "action": "ingest_credential_revoked",
+      "source": "tenant",
+      "details": {
+        "reason": "NAN-2588 live onboarding e2e cleanup (run 89de34a753b2)",
+        "protocol": "hec",
+        "self_service": true,
+        "source_slugs": [
+          "apache_access"
+        ]
+      },
+      "success": true,
+      "actor_id": "df308d92-1fe3-4f8b-a9ff-cd6770f70eff",
+      "actor_name": "df308d92-1fe3-4f8b-a9ff-cd6770f70eff",
+      "resource_id": "8b8be64a-f435-4e31-a046-fd9efcd2239f",
+      "resource_name": "e2e-onboarding-89de34a753b2",
+      "resource_type": "ingest_credential"
+    },
+    "class_uid": 6003,
+    "resources": [
+      {
+        "uid": "8b8be64a-f435-4e31-a046-fd9efcd2239f",
+        "name": "e2e-onboarding-89de34a753b2",
+        "type": "ingest_credential"
+      }
+    ],
+    "status_id": 1,
+    "class_name": "API Activity",
+    "activity_id": 4,
+    "severity_id": 1,
+    "category_uid": 6,
+    "activity_name": "Delete",
+    "category_name": "Application Activity"
+  },
+  {
+    "api": {
+      "service": {
+        "name": "operator"
+      },
+      "operation": "ingest_route_created"
+    },
+    "time": 1789747745658,
+    "actor": {
+      "user": {
+        "uid": "platform:user:user_01kn2v90gresm8fy9aytjwhs0e",
+        "name": "platform:user:user_01kn2v90gresm8fy9aytjwhs0e"
+      }
+    },
+    "status": "Success",
+    "message": "Nano-main routed a HEC source template to the tenant's validated parser cell.",
+    "metadata": {
+      "uid": "cdf057bb-b084-4daa-895d-16522ff64f9f",
+      "product": {
+        "name": "nano",
+        "vendor_name": "nano"
+      },
+      "version": "1.9.0",
+      "log_name": "audit",
+      "log_source": "audit",
+      "tenant_uid": "tenant-a"
+    },
+    "severity": "Informational",
+    "type_uid": 600301,
+    "unmapped": {
+      "action": "ingest_route_created",
+      "source": "operator",
+      "details": {
+        "issue": "NAN-2361",
+        "source": "apache_access",
+        "cell_id": "a5a0da7b-f5ff-4dd6-b602-4ba6f2a8f169",
+        "protocol": "hec",
+        "request_id": "d643fa7f-1b95-4f5b-aaa2-d5e07909bf3d",
+        "credential_id": "2b6eb010-3741-4643-9014-223dedaa91bc",
+        "route_template": true
+      },
+      "success": true,
+      "actor_id": null,
+      "actor_name": "platform:user:user_01kn2v90gresm8fy9aytjwhs0e",
+      "resource_id": "e48a2785-7f7a-4255-a335-24081a538f82",
+      "resource_name": "apache_access",
+      "resource_type": "ingest_route"
+    },
+    "class_uid": 6003,
+    "resources": [
+      {
+        "uid": "e48a2785-7f7a-4255-a335-24081a538f82",
+        "name": "apache_access",
+        "type": "ingest_route"
+      }
+    ],
+    "status_id": 1,
+    "class_name": "API Activity",
+    "activity_id": 1,
+    "severity_id": 1,
+    "category_uid": 6,
+    "activity_name": "Create",
+    "category_name": "Application Activity"
+  },
+  {
+    "api": {
+      "service": {
+        "name": "operator"
+      },
+      "operation": "runtime_assignments_renewed"
+    },
+    "time": 1790206452770,
+    "actor": {
+      "user": {
+        "uid": "platform:script:renew-detection-authority:operator",
+        "name": "platform:script:renew-detection-authority:operator"
+      }
+    },
+    "status": "Success",
+    "message": "Nano-main operator changed the tenant runtime assignments",
+    "metadata": {
+      "uid": "ca0568f3-d73d-4a5b-8e7a-e61e8dd3d1a0",
+      "product": {
+        "name": "nano",
+        "vendor_name": "nano"
+      },
+      "version": "1.9.0",
+      "log_name": "audit",
+      "log_source": "audit",
+      "tenant_uid": "tenant-a"
+    },
+    "severity": "Informational",
+    "type_uid": 600301,
+    "unmapped": {
+      "action": "runtime_assignments_renewed",
+      "source": "operator",
+      "details": {
+        "reason": "NAN-2740: renew the tenant's detection worker authority at the current grant head (keep path, no supersede)",
+        "search": {
+          "outcome": "present",
+          "worker_identity": "nano-query-tenant-a",
+          "worker_revision": 1,
+          "assignment_revision": 1,
+          "superseded_assignment_revision": null
+        },
+        "detection": {
+          "outcome": "superseded",
+          "worker_actor_id": "df308d92-1fe3-4f8b-a9ff-cd6770f70eff",
+          "worker_identity": "staging-detection-ab-v1",
+          "assignment_revision": 2,
+          "grant_authority_revision": 452,
+          "superseded_assignment_revision": 1,
+          "renewed_stale_grant_authority_revision": 425
+        },
+        "request_id": "62fcfcff-9fff-4729-9cba-5d6bd7d96884",
+        "system_worker_user_id": "e5c9dd40-48f7-4313-bb32-e53ec7d8a2ae",
+        "plan_assignment_revision": 1
+      },
+      "success": true,
+      "actor_id": null,
+      "actor_name": "platform:script:renew-detection-authority:operator",
+      "resource_id": "tenant-a",
+      "resource_name": "staging-detection-ab-v1",
+      "resource_type": "runtime_assignment"
+    },
+    "class_uid": 6003,
+    "resources": [
+      {
+        "uid": "tenant-a",
+        "name": "staging-detection-ab-v1",
+        "type": "runtime_assignment"
+      }
+    ],
+    "status_id": 1,
+    "class_name": "API Activity",
+    "activity_id": 1,
+    "severity_id": 1,
+    "category_uid": 6,
+    "activity_name": "Create",
+    "category_name": "Application Activity"
+  }
+]

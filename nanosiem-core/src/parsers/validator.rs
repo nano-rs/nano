@@ -68,12 +68,30 @@ const DANGEROUS_FUNCTION_PATTERNS: &[(&str, &str)] = &[
         "get_env_var!(",
         "Environment variable access leaks API process secrets",
     ),
-    ("http_request(", "Outbound HTTP from API process (SSRF risk)"),
-    ("http_request!(", "Outbound HTTP from API process (SSRF risk)"),
-    ("dns_lookup(", "DNS query from API process (exfiltration risk)"),
-    ("dns_lookup!(", "DNS query from API process (exfiltration risk)"),
-    ("reverse_dns(", "DNS query from API process (exfiltration risk)"),
-    ("reverse_dns!(", "DNS query from API process (exfiltration risk)"),
+    (
+        "http_request(",
+        "Outbound HTTP from API process (SSRF risk)",
+    ),
+    (
+        "http_request!(",
+        "Outbound HTTP from API process (SSRF risk)",
+    ),
+    (
+        "dns_lookup(",
+        "DNS query from API process (exfiltration risk)",
+    ),
+    (
+        "dns_lookup!(",
+        "DNS query from API process (exfiltration risk)",
+    ),
+    (
+        "reverse_dns(",
+        "DNS query from API process (exfiltration risk)",
+    ),
+    (
+        "reverse_dns!(",
+        "DNS query from API process (exfiltration risk)",
+    ),
     ("get_hostname(", "Host info disclosure from API process"),
     ("get_hostname!(", "Host info disclosure from API process"),
 ];
@@ -93,7 +111,7 @@ const SUSPICIOUS_PATTERNS: &[(&str, &str)] = &[
 /// - Host process info: `get_env_var` (secrets), `get_hostname` (recon).
 /// - Network egress: `http_request` (SSRF/exfil), `dns_lookup` /
 ///   `reverse_dns` (DNS-tunnel exfil).
-const BLOCKED_VRL_FUNCTIONS: &[&str] = &[
+pub(crate) const BLOCKED_VRL_FUNCTIONS: &[&str] = &[
     "get_env_var",
     "get_hostname",
     "http_request",
@@ -102,7 +120,7 @@ const BLOCKED_VRL_FUNCTIONS: &[&str] = &[
 ];
 
 /// Returns the VRL stdlib function set with security-blocked functions removed.
-fn safe_vrl_functions() -> Vec<Box<dyn vrl::compiler::Function>> {
+pub(crate) fn safe_vrl_functions() -> Vec<Box<dyn vrl::compiler::Function>> {
     vrl::stdlib::all()
         .into_iter()
         .filter(|f| !BLOCKED_VRL_FUNCTIONS.contains(&f.identifier()))
@@ -162,6 +180,24 @@ const MAX_VRL_SIZE: usize = 1024 * 1024;
 /// Maximum allowed nesting depth
 const MAX_NESTING_DEPTH: i32 = 20;
 
+/// A VRL program that passed every validation gate and compiled.
+///
+/// Produced once by `VrlValidator::validate_and_compile` and reused for every
+/// input a caller runs — the compile is the expensive part (NAN-2385).
+struct CompiledVrl {
+    program: vrl::compiler::Program,
+    /// Suspicious-pattern, helpful, and compiler warnings, in that order.
+    warnings: Vec<String>,
+}
+
+/// Why a VRL program was rejected: one entry per compiler diagnostic, or a
+/// single entry for a pre-compile gate (size, security pattern, brackets…).
+struct VrlCompileFailure {
+    errors: Vec<String>,
+    /// Warnings gathered before the failure — the public results keep them.
+    warnings: Vec<String>,
+}
+
 /// VRL Validator for syntax checking and security validation
 ///
 /// Uses native VRL compilation for validation - no Docker required.
@@ -215,98 +251,34 @@ impl VrlValidator {
     /// 2. Size and complexity limits
     /// 3. Basic syntax validation (balanced brackets, etc.)
     /// 4. Native VRL compilation check
+    ///
+    /// The compile runs on the blocking pool — see [`Self::validate_and_compile`].
     pub async fn validate_vrl(
         &self,
         vrl_code: &str,
     ) -> Result<VrlValidationResult, VrlValidatorError> {
-        let mut warnings = Vec::new();
-
-        // Step 1: Check for empty code
-        if vrl_code.trim().is_empty() {
-            return Ok(VrlValidationResult {
-                valid: false,
-                error: Some("VRL code cannot be empty".to_string()),
-                warnings,
-            });
-        }
-
-        // Step 2: Check size limits
-        if vrl_code.len() > MAX_VRL_SIZE {
-            return Ok(VrlValidationResult {
-                valid: false,
-                error: Some(format!(
-                    "VRL code exceeds maximum size of {} bytes (got {} bytes)",
-                    MAX_VRL_SIZE,
-                    vrl_code.len()
-                )),
-                warnings,
-            });
-        }
-
-        // Step 3: Security pattern checks
-        if let Err(e) = self.check_security_patterns(vrl_code) {
-            return Ok(VrlValidationResult {
-                valid: false,
-                error: Some(e.to_string()),
-                warnings,
-            });
-        }
-
-        // Step 4: Check for suspicious patterns (warnings only)
-        warnings.extend(self.check_suspicious_patterns(vrl_code));
-
-        // Step 5: Check nesting depth
-        if let Err(e) = self.check_nesting_depth(vrl_code) {
-            return Ok(VrlValidationResult {
-                valid: false,
-                error: Some(e.to_string()),
-                warnings,
-            });
-        }
-
-        // Step 6: Check balanced brackets
-        if let Err(e) = self.check_balanced_brackets(vrl_code) {
-            return Ok(VrlValidationResult {
-                valid: false,
-                error: Some(e.to_string()),
-                warnings,
-            });
-        }
-
-        // Step 7: Check for TOML injection attempts
-        if let Err(e) = self.check_toml_injection(vrl_code) {
-            return Ok(VrlValidationResult {
-                valid: false,
-                error: Some(e.to_string()),
-                warnings,
-            });
-        }
-
-        // Step 8: Add helpful warnings
-        warnings.extend(self.generate_helpful_warnings(vrl_code));
-
-        // Step 9: Native VRL compilation check
-        match self.compile_vrl(vrl_code) {
-            Ok(compile_warnings) => {
-                warnings.extend(compile_warnings);
+        if let Ok(Some(plan)) = crate::parsers::pipe::stored_plan(vrl_code) {
+            if plan.has_native() {
+                return self.validate_native_plan(&plan).await;
             }
-            Err(errors) => {
+        }
+        Ok(match self.validate_and_compile(vrl_code).await? {
+            Ok(compiled) => VrlValidationResult {
+                valid: true,
+                error: None,
+                warnings: compiled.warnings,
+            },
+            Err(failure) => {
                 // Preserve the existing public shape: `error: Option<String>`
                 // is a single string with all diagnostics joined. The Vec
                 // form is exposed via `validate_vrl_collect_errors` for
                 // callers that need to iterate.
-                return Ok(VrlValidationResult {
+                VrlValidationResult {
                     valid: false,
-                    error: Some(errors.join("\n")),
-                    warnings,
-                });
+                    error: Some(failure.errors.join("\n")),
+                    warnings: failure.warnings,
+                }
             }
-        }
-
-        Ok(VrlValidationResult {
-            valid: true,
-            error: None,
-            warnings,
         })
     }
 
@@ -327,112 +299,223 @@ impl VrlValidator {
         &self,
         vrl_code: &str,
     ) -> Result<(VrlValidationResult, Vec<String>), VrlValidatorError> {
+        if let Ok(Some(plan)) = crate::parsers::pipe::stored_plan(vrl_code) {
+            if plan.has_native() {
+                let result = self.validate_native_plan(&plan).await?;
+                let errors = result.error.clone().into_iter().collect();
+                return Ok((result, errors));
+            }
+        }
+        Ok(match self.validate_and_compile(vrl_code).await? {
+            Ok(compiled) => (
+                VrlValidationResult {
+                    valid: true,
+                    error: None,
+                    warnings: compiled.warnings,
+                },
+                Vec::new(),
+            ),
+            Err(failure) => (
+                VrlValidationResult {
+                    valid: false,
+                    error: Some(failure.errors.join("\n")),
+                    warnings: failure.warnings.clone(),
+                },
+                failure.errors,
+            ),
+        })
+    }
+
+    /// Validate each remap scope and native condition before graph publication.
+    async fn validate_native_plan(
+        &self,
+        plan: &crate::parsers::pipe::Plan,
+    ) -> Result<VrlValidationResult, VrlValidatorError> {
+        let mut segments = plan.segments();
+        let mut predicates = Vec::new();
+        for step in &plan.steps {
+            if !step.enabled || !crate::parsers::pipe::native::KINDS.contains(&step.kind.as_str()) {
+                continue;
+            }
+            if let Some(condition) = step
+                .condition
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                predicates.push(condition.clone());
+            }
+            if let crate::parsers::pipe::native::Native::Route { branches, .. } =
+                crate::parsers::pipe::native::parse(step)
+                    .map_err(VrlValidatorError::InvalidInput)?
+            {
+                predicates.extend(branches.into_iter().map(|branch| branch.predicate));
+            }
+        }
+        for (index, predicate) in predicates.into_iter().enumerate() {
+            segments.push(crate::parsers::pipe::Plan {
+                version: 2,
+                revision: 1,
+                steps: vec![crate::parsers::pipe::Step {
+                    id: format!("condition-{index}"),
+                    name: "Native condition".into(),
+                    kind: "vrl".into(),
+                    enabled: true,
+                    condition: None,
+                    config: serde_json::Map::from_iter([(
+                        "code".into(),
+                        serde_json::Value::String(format!("if {predicate} {{ . }}")),
+                    )]),
+                }],
+            });
+        }
+        let mut warnings=vec!["Native transform settings are validated. Publication additionally validates the complete config against the pinned Vector image.".into()];
+        for segment in segments {
+            let code = segment.stored().map_err(VrlValidatorError::InvalidInput)?;
+            match self.validate_and_compile(&code).await? {
+                Ok(compiled) => warnings.extend(compiled.warnings),
+                Err(failure) => {
+                    return Ok(VrlValidationResult {
+                        valid: false,
+                        error: Some(failure.errors.join("\n")),
+                        warnings,
+                    })
+                }
+            }
+        }
+        Ok(VrlValidationResult {
+            valid: true,
+            error: None,
+            warnings,
+        })
+    }
+
+    /// Run every validation gate and compile the program, off the async
+    /// runtime.
+    ///
+    /// NAN-2385: compiling a ~1k-line OCSF parser takes seconds (and the
+    /// native compiler is single-threaded), and this used to happen inline on
+    /// a tokio worker — `validate_vrl` compiled the program once to check it,
+    /// then every `test_vrl*` entrypoint compiled it AGAIN to run it, so one
+    /// sample test cost two compiles and pinned a runtime worker for the
+    /// duration. A deploy that validated a dozen bundled samples took over a
+    /// minute and the UI gave up on it. This is now the single place a VRL
+    /// program is compiled: the gates and the compile run once on the blocking
+    /// pool, and the callers reuse the returned program for every input.
+    async fn validate_and_compile(
+        &self,
+        vrl_code: &str,
+    ) -> Result<Result<CompiledVrl, VrlCompileFailure>, VrlValidatorError> {
+        let validator = self.clone();
+        let vrl_code = vrl_code.to_string();
+        tokio::task::spawn_blocking(move || validator.validate_and_compile_sync(&vrl_code))
+            .await
+            .map_err(|e| VrlValidatorError::ExecutionError(format!("VRL compile task failed: {e}")))
+    }
+
+    /// Synchronous body of [`Self::validate_and_compile`]: steps 1–8 are the
+    /// pre-compile source gates, step 9 is the native compiler.
+    fn validate_and_compile_sync(&self, vrl_code: &str) -> Result<CompiledVrl, VrlCompileFailure> {
         let mut warnings = Vec::new();
+        let gate = |message: String, warnings: &Vec<String>| VrlCompileFailure {
+            errors: vec![message],
+            warnings: warnings.clone(),
+        };
 
-        // Steps 1-8 mirror `validate_vrl` — pre-compile gates that produce
-        // a single error string each. We collect them as a 1-element Vec
-        // so the caller's contract stays uniform.
+        // A stored processing document is compiled at the same boundary as
+        // ordinary parser VRL. Its fixed marker is never executed as a no-op.
+        let processing_plan = vrl_code.starts_with(crate::parsers::pipe::HEADER);
+        let resolved = crate::parsers::pipe::runtime_program(vrl_code)
+            .map_err(|message| gate(message, &warnings))?;
+        let vrl_code = resolved.as_str();
+
+        // Step 1: Check for empty code
         if vrl_code.trim().is_empty() {
-            let msg = "VRL code cannot be empty".to_string();
-            return Ok(single_error_result(msg, warnings));
+            return Err(gate("VRL code cannot be empty".to_string(), &warnings));
         }
 
+        // Step 2: Check size limits
         if vrl_code.len() > MAX_VRL_SIZE {
-            let msg = format!(
-                "VRL code exceeds maximum size of {} bytes (got {} bytes)",
-                MAX_VRL_SIZE,
-                vrl_code.len()
-            );
-            return Ok(single_error_result(msg, warnings));
+            return Err(gate(
+                format!(
+                    "VRL code exceeds maximum size of {} bytes (got {} bytes)",
+                    MAX_VRL_SIZE,
+                    vrl_code.len()
+                ),
+                &warnings,
+            ));
         }
 
-        if let Err(e) = self.check_security_patterns(vrl_code) {
-            return Ok(single_error_result(e.to_string(), warnings));
+        // Step 3: Security pattern checks
+        // Processing sources use TOML basic strings. Retain function/null
+        // checks; the triple-literal delimiter check belongs to legacy VRL.
+        let security_text = processing_plan.then(|| vrl_code.replace("'''", "' ' '"));
+        if let Err(e) = self.check_security_patterns(security_text.as_deref().unwrap_or(vrl_code)) {
+            return Err(gate(e.to_string(), &warnings));
         }
 
+        // Step 4: Check for suspicious patterns (warnings only)
         warnings.extend(self.check_suspicious_patterns(vrl_code));
 
+        // Step 5: Check nesting depth
         if let Err(e) = self.check_nesting_depth(vrl_code) {
-            return Ok(single_error_result(e.to_string(), warnings));
+            return Err(gate(e.to_string(), &warnings));
         }
 
+        // Step 6: Check balanced brackets
         if let Err(e) = self.check_balanced_brackets(vrl_code) {
-            return Ok(single_error_result(e.to_string(), warnings));
+            return Err(gate(e.to_string(), &warnings));
         }
 
-        if let Err(e) = self.check_toml_injection(vrl_code) {
-            return Ok(single_error_result(e.to_string(), warnings));
+        // Step 7: Check for TOML injection attempts
+        if let Err(e) = if processing_plan {
+            Ok(())
+        } else {
+            self.check_toml_injection(vrl_code)
+        } {
+            return Err(gate(e.to_string(), &warnings));
         }
 
+        // Step 8: Add helpful warnings
         warnings.extend(self.generate_helpful_warnings(vrl_code));
 
-        // Step 9: real compiler — this is where multi-error splitting
-        // earns its keep.
-        match self.compile_vrl(vrl_code) {
-            Ok(compile_warnings) => {
+        // Step 9: Native VRL compilation — the only compile of this program.
+        match self.compile_program(vrl_code) {
+            Ok((program, compile_warnings)) => {
                 warnings.extend(compile_warnings);
-                Ok((
-                    VrlValidationResult {
-                        valid: true,
-                        error: None,
-                        warnings,
-                    },
-                    Vec::new(),
-                ))
+                Ok(CompiledVrl { program, warnings })
             }
-            Err(errors) => {
-                let joined = errors.join("\n");
-                Ok((
-                    VrlValidationResult {
-                        valid: false,
-                        error: Some(joined),
-                        warnings,
-                    },
-                    errors,
-                ))
-            }
+            Err(errors) => Err(VrlCompileFailure { errors, warnings }),
         }
     }
 
     /// Compile VRL code using the native VRL compiler
     ///
-    /// Returns `Ok(warnings)` on success, `Err(errors)` on failure where
-    /// `errors` is one formatted block per diagnostic. Callers that need a
-    /// single string can `.join("\n")`; callers that need to attach
+    /// Returns `Ok((program, warnings))` on success, `Err(errors)` on failure
+    /// where `errors` is one formatted block per diagnostic. Callers that
+    /// need a single string can `.join("\n")`; callers that need to attach
     /// per-error context (line snippets, etc.) can iterate. Splitting at
     /// the diagnostic boundary is the whole point of NAN-641 — the LLM
     /// retry loop renders each error's source snippet independently, and
     /// joining + re-splitting downstream is fragile because codespan
     /// output is multi-line per diagnostic.
-    fn compile_vrl(&self, vrl_code: &str) -> Result<Vec<String>, Vec<String>> {
-        use vrl::compiler::compile;
+    fn compile_program(
+        &self,
+        vrl_code: &str,
+    ) -> Result<(vrl::compiler::Program, Vec<String>), Vec<String>> {
         use vrl::diagnostic::Formatter;
 
         let fns = safe_vrl_functions();
 
-        match compile(vrl_code, &fns) {
-            Ok(result) => {
-                let mut warnings = Vec::new();
-                // Check for compilation warnings
-                for warning in result.warnings {
-                    let formatter = Formatter::new(vrl_code, warning.clone());
-                    warnings.push(format!("VRL warning: {}", formatter));
-                }
-                Ok(warnings)
-            }
-            Err(diagnostics) => {
-                // One formatted block per diagnostic — preserves the
-                // boundary so callers can render per-error context.
-                let errors: Vec<String> = diagnostics
-                    .into_iter()
-                    .map(|d| {
-                        let formatter = Formatter::new(vrl_code, d);
-                        formatter.to_string()
-                    })
-                    .collect();
-                Err(errors)
-            }
-        }
+        // NAN-3494: the size/nesting guard and large-stack compile. Errors
+        // stay one formatted block per diagnostic — preserves the boundary
+        // so callers can render per-error context.
+        let result = super::vrl_guard::compile_formatted(vrl_code, &fns)?;
+        let warnings = result
+            .warnings
+            .into_iter()
+            .map(|warning| format!("VRL warning: {}", Formatter::new(vrl_code, warning)))
+            .collect();
+        Ok((result.program, warnings))
     }
 
     /// Check for dangerous security patterns
@@ -636,83 +719,49 @@ impl VrlValidator {
         vrl_code: &str,
         sample_input: &str,
     ) -> Result<ParserTestResult, VrlValidatorError> {
-        let start = Instant::now();
-
-        // First validate the VRL code
-        let validation = self.validate_vrl(vrl_code).await?;
-        if !validation.valid {
-            return Ok(ParserTestResult {
-                success: false,
-                input: sample_input.to_string(),
-                output: None,
-                error: validation.error,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        // Validate that sample input is valid JSON
-        let input_json: serde_json::Value = match serde_json::from_str(sample_input) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(ParserTestResult {
-                    success: false,
-                    input: sample_input.to_string(),
-                    output: None,
-                    error: Some(format!("Invalid JSON input: {}", e)),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-        };
-
-        // Execute VRL natively
-        match self.execute_vrl(vrl_code, &input_json) {
-            Ok(output) => Ok(ParserTestResult {
-                success: true,
-                input: sample_input.to_string(),
-                output: Some(output),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            }),
-            Err(e) => Ok(ParserTestResult {
-                success: false,
-                input: sample_input.to_string(),
-                output: None,
-                error: Some(format!("Execution error: {}", e)),
-                duration_ms: start.elapsed().as_millis() as u64,
-            }),
-        }
+        let mut results = self
+            .test_vrl_batch(vrl_code, std::slice::from_ref(&sample_input.to_string()))
+            .await?;
+        results.pop().ok_or_else(|| {
+            VrlValidatorError::ExecutionError("VRL test produced no result".to_string())
+        })
     }
 
     /// Test one VRL program against multiple sample inputs.
     ///
     /// The live parser editor fetches several events at once. Compiling the
     /// same parser separately for every event made that request scale with
-    /// `events × parser versions`; this validates and compiles each distinct
-    /// parser once, then reuses the immutable program for every input.
+    /// `events × parser versions`; this validates and compiles the parser
+    /// once, then reuses the immutable program for every input.
     pub async fn test_vrl_batch(
         &self,
         vrl_code: &str,
         sample_inputs: &[String],
     ) -> Result<Vec<ParserTestResult>, VrlValidatorError> {
+        if let Some(plan) = crate::parsers::pipe::stored_plan(vrl_code)
+            .map_err(VrlValidatorError::InvalidInput)?
+            .filter(|plan| plan.has_native())
+        {
+            return self.test_native_pipe(plan, None, sample_inputs).await;
+        }
         let start = Instant::now();
 
-        let validation = self.validate_vrl(vrl_code).await?;
-        if !validation.valid {
-            return Ok(sample_inputs
-                .iter()
-                .map(|sample_input| ParserTestResult {
-                    success: false,
-                    input: sample_input.clone(),
-                    output: None,
-                    error: validation.error.clone(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                })
-                .collect());
-        }
-
-        let program = self
-            .compile_program(vrl_code)
-            .map_err(VrlValidatorError::ExecutionError)?;
+        let compiled = match self.validate_and_compile(vrl_code).await? {
+            Ok(compiled) => compiled,
+            Err(failure) => {
+                let error = failure.errors.join("\n");
+                return Ok(sample_inputs
+                    .iter()
+                    .map(|sample_input| ParserTestResult {
+                        success: false,
+                        input: sample_input.clone(),
+                        output: None,
+                        error: Some(error.clone()),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    })
+                    .collect());
+            }
+        };
 
         Ok(sample_inputs
             .iter()
@@ -730,7 +779,7 @@ impl VrlValidator {
                     }
                 };
 
-                match self.execute_program(vrl_code, &program, &input_json) {
+                match self.execute_program(vrl_code, &compiled.program, &input_json) {
                     Ok(output) => ParserTestResult {
                         success: true,
                         input: sample_input.clone(),
@@ -748,6 +797,85 @@ impl VrlValidator {
                 }
             })
             .collect())
+    }
+
+    /// Sample tests share the same bounded frozen-batch engine as Pipe preview.
+    /// Native state starts empty for each request; it never reads live state.
+    async fn test_native_pipe(
+        &self,
+        plan: crate::parsers::pipe::Plan,
+        extension: Option<&str>,
+        sample_inputs: &[String],
+    ) -> Result<Vec<ParserTestResult>, VrlValidatorError> {
+        let start = Instant::now();
+        if sample_inputs.len() > 100 || sample_inputs.iter().any(|input| input.len() > 64 * 1024) {
+            return Err(VrlValidatorError::InvalidInput(
+                "Batch tests accept at most 100 inputs of 64 KiB each".into(),
+            ));
+        }
+        let validation = self.validate_native_plan(&plan).await?;
+        if !validation.valid {
+            return Err(VrlValidatorError::InvalidInput(
+                validation.error.unwrap_or_default(),
+            ));
+        }
+        if let Some(extension) = extension {
+            // Existing extensions are separate remap scopes. Native transforms
+            // belong in the processing plan, where their graph is published.
+            crate::parsers::pipe::runtime_program(extension)
+                .map_err(VrlValidatorError::InvalidInput)?;
+            let validation = self.validate_vrl(extension).await?;
+            if !validation.valid {
+                return Err(VrlValidatorError::InvalidInput(
+                    validation.error.unwrap_or_default(),
+                ));
+            }
+        }
+        let mut indices = Vec::new();
+        let mut inputs = Vec::new();
+        let mut results: Vec<_> = sample_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let error = match serde_json::from_str::<serde_json::Value>(input) {
+                    Ok(value) => {
+                        indices.push(index);
+                        inputs.push(value);
+                        None
+                    }
+                    Err(error) => Some(format!("Invalid JSON input: {error}")),
+                };
+                ParserTestResult {
+                    success: false,
+                    input: input.clone(),
+                    output: None,
+                    error,
+                    duration_ms: 0,
+                }
+            })
+            .collect();
+        if !inputs.is_empty() {
+            let extension = extension.map(str::to_owned);
+            let rows = tokio::task::spawn_blocking(move || {
+                crate::parsers::pipe::batch::run(&plan, &inputs, extension.as_deref())
+            })
+            .await
+            .map_err(|error| VrlValidatorError::ExecutionError(error.to_string()))?
+            .map_err(VrlValidatorError::ExecutionError)?;
+            for (index, row) in indices.into_iter().zip(rows) {
+                results[index].success = row.error.is_none();
+                results[index].error = row.error;
+                results[index].output = Some(if row.outputs.len() == 1 {
+                    row.outputs.into_iter().next().unwrap()
+                } else {
+                    serde_json::Value::Array(row.outputs)
+                });
+            }
+        }
+        for result in &mut results {
+            result.duration_ms = start.elapsed().as_millis() as u64;
+        }
+        Ok(results)
     }
 
     /// Test a chain of VRL stages against sample input (NAN-874).
@@ -768,6 +896,50 @@ impl VrlValidator {
         vrl_stages: &[&str],
         sample_input: &str,
     ) -> Result<ParserTestResult, VrlValidatorError> {
+        let mut results = self
+            .test_vrl_chain_batch(vrl_stages, std::slice::from_ref(&sample_input.to_string()))
+            .await?;
+        results.pop().ok_or_else(|| {
+            VrlValidatorError::ExecutionError("VRL chain test produced no result".to_string())
+        })
+    }
+
+    /// Run one chain of VRL stages over many sample inputs (NAN-2385).
+    ///
+    /// Same semantics as [`Self::test_vrl_chain`], applied per input, with the
+    /// stages validated and compiled exactly once for the whole batch. This is
+    /// the primitive for anything that executes a parser over a set of
+    /// representative events (sample-backed deploy validation, the live
+    /// editor): looping `test_vrl_chain` per sample multiplies a multi-second
+    /// compile by the sample count.
+    ///
+    /// The result vector is index-aligned with `sample_inputs`. A stage that
+    /// fails validation fails every input with the same `stage {i}:` error.
+    pub async fn test_vrl_chain_batch(
+        &self,
+        vrl_stages: &[&str],
+        sample_inputs: &[String],
+    ) -> Result<Vec<ParserTestResult>, VrlValidatorError> {
+        let nonblank: Vec<_> = vrl_stages
+            .iter()
+            .copied()
+            .filter(|stage| !stage.trim().is_empty())
+            .collect();
+        if let Some(first) = nonblank.first() {
+            if let Some(plan) = crate::parsers::pipe::stored_plan(first)
+                .map_err(VrlValidatorError::InvalidInput)?
+                .filter(|plan| plan.has_native())
+            {
+                if nonblank.len() > 2 {
+                    return Err(VrlValidatorError::InvalidInput(
+                        "A processing plan accepts one separate source extension".into(),
+                    ));
+                }
+                return self
+                    .test_native_pipe(plan, nonblank.get(1).copied(), sample_inputs)
+                    .await;
+            }
+        }
         let start = Instant::now();
 
         // Filter out blank stages — they're no-ops in the chain.
@@ -779,94 +951,81 @@ impl VrlValidator {
             .collect();
 
         if stages.is_empty() {
-            // Nothing to run — return the input unchanged as a successful no-op.
-            let parsed = serde_json::from_str::<serde_json::Value>(sample_input)
-                .unwrap_or_else(|_| serde_json::Value::String(sample_input.to_string()));
-            return Ok(ParserTestResult {
-                success: true,
-                input: sample_input.to_string(),
-                output: Some(parsed),
-                error: None,
-                duration_ms: start.elapsed().as_millis() as u64,
-            });
-        }
-
-        // Validate every stage upfront — we don't want to leak partial state on a
-        // downstream syntax error.
-        for (idx, vrl) in &stages {
-            let validation = self.validate_vrl(vrl).await?;
-            if !validation.valid {
-                return Ok(ParserTestResult {
-                    success: false,
-                    input: sample_input.to_string(),
-                    output: None,
-                    error: Some(format!(
-                        "stage {}: {}",
-                        idx,
-                        validation.error.unwrap_or_else(|| "validation failed".into())
-                    )),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-        }
-
-        // Parse the sample as JSON; if it isn't JSON, fall through with the raw
-        // string as `.message` — same forgiving behavior the Vector pipeline has.
-        let mut current: serde_json::Value = match serde_json::from_str(sample_input) {
-            Ok(v) => v,
-            Err(_) => serde_json::json!({ "message": sample_input }),
-        };
-
-        for (idx, vrl) in &stages {
-            match self.execute_vrl(vrl, &current) {
-                Ok(output) => current = output,
-                Err(e) => {
-                    return Ok(ParserTestResult {
-                        success: false,
-                        input: sample_input.to_string(),
-                        output: None,
-                        error: Some(format!("stage {}: execution error: {}", idx, e)),
+            // Nothing to run — return each input unchanged as a successful no-op.
+            return Ok(sample_inputs
+                .iter()
+                .map(|sample_input| {
+                    let parsed = serde_json::from_str::<serde_json::Value>(sample_input)
+                        .unwrap_or_else(|_| serde_json::Value::String(sample_input.clone()));
+                    ParserTestResult {
+                        success: true,
+                        input: sample_input.clone(),
+                        output: Some(parsed),
+                        error: None,
                         duration_ms: start.elapsed().as_millis() as u64,
-                    });
+                    }
+                })
+                .collect());
+        }
+
+        // Validate and compile every stage upfront — once for the whole batch,
+        // and before running anything so a downstream syntax error never leaks
+        // partial state.
+        let mut programs = Vec::with_capacity(stages.len());
+        for (idx, vrl) in &stages {
+            match self.validate_and_compile(vrl).await? {
+                Ok(compiled) => programs.push((*idx, *vrl, compiled.program)),
+                Err(failure) => {
+                    let error = format!("stage {}: {}", idx, failure.errors.join("\n"));
+                    return Ok(sample_inputs
+                        .iter()
+                        .map(|sample_input| ParserTestResult {
+                            success: false,
+                            input: sample_input.clone(),
+                            output: None,
+                            error: Some(error.clone()),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                        })
+                        .collect());
                 }
             }
         }
 
-        Ok(ParserTestResult {
-            success: true,
-            input: sample_input.to_string(),
-            output: Some(current),
-            error: None,
-            duration_ms: start.elapsed().as_millis() as u64,
-        })
-    }
+        Ok(sample_inputs
+            .iter()
+            .map(|sample_input| {
+                // Parse the sample as JSON; if it isn't JSON, fall through with
+                // the raw string as `.message` — same forgiving behavior the
+                // Vector pipeline has.
+                let mut current: serde_json::Value = match serde_json::from_str(sample_input) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::json!({ "message": sample_input }),
+                };
 
-    /// Execute VRL code against input using the native VRL runtime
-    fn execute_vrl(
-        &self,
-        vrl_code: &str,
-        input: &serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let program = self.compile_program(vrl_code)?;
-        self.execute_program(vrl_code, &program, input)
-    }
+                for (idx, vrl, program) in &programs {
+                    match self.execute_program(vrl, program, &current) {
+                        Ok(output) => current = output,
+                        Err(e) => {
+                            return ParserTestResult {
+                                success: false,
+                                input: sample_input.clone(),
+                                output: None,
+                                error: Some(format!("stage {}: execution error: {}", idx, e)),
+                                duration_ms: start.elapsed().as_millis() as u64,
+                            };
+                        }
+                    }
+                }
 
-    /// Compile an executable VRL program. Kept separate from execution so batch
-    /// callers can reuse the same program across multiple independent events.
-    fn compile_program(&self, vrl_code: &str) -> Result<vrl::compiler::Program, String> {
-        use vrl::compiler::compile;
-        use vrl::diagnostic::Formatter;
-
-        let fns = safe_vrl_functions();
-        compile(vrl_code, &fns)
-            .map(|result| result.program)
-            .map_err(|diagnostics| {
-                diagnostics
-                    .into_iter()
-                    .map(|diagnostic| Formatter::new(vrl_code, diagnostic).to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                ParserTestResult {
+                    success: true,
+                    input: sample_input.clone(),
+                    output: Some(current),
+                    error: None,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                }
             })
+            .collect())
     }
 
     /// Execute a precompiled VRL program against one event.
@@ -929,10 +1088,10 @@ pub(crate) fn validate_enrichment_encoding_contract(
     }
 }
 
-/// `user_registry` (identity) contract (NAN-1123): `external_id` required
+/// `user_registry` (identity) contract: `external_id` required
 /// (record with none must abort, not emit an empty id), `version` a non-zero
 /// integer-ms, `last_synced_at` formatted `%Y-%m-%d %H:%M:%S%.3f`,
-/// `account_status ∈ {active,disabled,deleted,anonymized}`, `groups` an Array —
+/// `account_status ∈ {active,disabled,suspended,deleted,anonymized}`, `groups` an Array —
 /// verified on a valid AND a type-corrupt record (the VRL must sanitise).
 fn validate_identity_contract(normalize_vrl: &str) -> Result<(), String> {
     // A generic identity-shaped record carrying every common external_id source
@@ -964,11 +1123,16 @@ fn validate_identity_contract(normalize_vrl: &str) -> Result<(), String> {
     match run_normalize_for_contract(normalize_vrl, &missing) {
         Err(_) => Ok(()), // aborted — correct (record dead-letters)
         Ok(out) => {
-            let ext = out.get("external_id").and_then(|v| v.as_str()).unwrap_or("");
+            let ext = out
+                .get("external_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if ext.is_empty() {
-                Err("normalize VRL emitted a row with empty external_id instead of \
-                     aborting — external_id is required (NAN-1123)"
-                    .to_string())
+                Err(
+                    "normalize VRL emitted a row with empty external_id instead of \
+                     aborting — external_id is required"
+                        .to_string(),
+                )
             } else {
                 Err(format!(
                     "normalize VRL invented an external_id ({ext:?}) for a record that had none \
@@ -1005,7 +1169,10 @@ fn validate_ip_context_contract(normalize_vrl: &str) -> Result<(), String> {
 
     // Missing/invalid network: the parser MUST reject (abort), not emit a row
     // with an empty or garbage CIDR (a bad CIDR poisons the IP_TRIE dict).
-    for bad in [serde_json::json!({ "source_id": "x" }), serde_json::json!({ "network": "not-a-cidr", "source_id": "x" })] {
+    for bad in [
+        serde_json::json!({ "source_id": "x" }),
+        serde_json::json!({ "network": "not-a-cidr", "source_id": "x" }),
+    ] {
         match run_normalize_for_contract(normalize_vrl, &bad) {
             Err(_) => {} // aborted — correct
             Ok(out) => {
@@ -1013,7 +1180,7 @@ fn validate_ip_context_contract(normalize_vrl: &str) -> Result<(), String> {
                 if !is_cidr(net) {
                     return Err(format!(
                         "ip_context normalize emitted network {net:?} (not a valid CIDR) instead \
-                         of aborting — network must be a validated CIDR (NAN-1137)"
+                         of aborting — network must be a validated CIDR"
                     ));
                 }
             }
@@ -1032,7 +1199,9 @@ fn assert_ip_context_contract(out: &serde_json::Value, ctx: &str) -> Result<(), 
     }
     let source_id = obj.get("source_id").and_then(|v| v.as_str()).unwrap_or("");
     if source_id.is_empty() {
-        return Err(format!("{ctx}: source_id is missing or empty (the feed discriminator)"));
+        return Err(format!(
+            "{ctx}: source_id is missing or empty (the feed discriminator)"
+        ));
     }
     let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
     if !last_synced_at_well_formed(updated_at) {
@@ -1044,7 +1213,7 @@ fn assert_ip_context_contract(out: &serde_json::Value, ctx: &str) -> Result<(), 
     if updated_at.as_bytes().first() == Some(&b'9') {
         return Err(format!(
             "{ctx}: updated_at {updated_at:?} is far-future — it would permanently win the \
-             ReplacingMergeTree/dict argMax and bury real updates (NAN-1137)"
+             ReplacingMergeTree/dict argMax and bury real updates"
         ));
     }
     match obj.get("deleted") {
@@ -1084,7 +1253,10 @@ fn assert_user_registry_contract(out: &serde_json::Value, ctx: &str) -> Result<(
         .as_object()
         .ok_or_else(|| format!("{ctx}: normalize output is not a JSON object"))?;
 
-    let ext = obj.get("external_id").and_then(|v| v.as_str()).unwrap_or("");
+    let ext = obj
+        .get("external_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if ext.is_empty() {
         return Err(format!("{ctx}: external_id is missing or empty"));
     }
@@ -1096,23 +1268,33 @@ fn assert_user_registry_contract(out: &serde_json::Value, ctx: &str) -> Result<(
         .as_i64()
         .or_else(|| version.as_u64().map(|u| u as i64))
         .ok_or_else(|| {
-            format!("{ctx}: version must be an integer-ms timestamp, got {version} (NAN-1123)")
+            format!("{ctx}: version must be an integer-ms timestamp, got {version}")
         })?;
     if v <= 0 {
-        return Err(format!("{ctx}: version must be a non-zero integer-ms timestamp, got {v}"));
+        return Err(format!(
+            "{ctx}: version must be a non-zero integer-ms timestamp, got {v}"
+        ));
     }
     // last_synced_at: "YYYY-MM-DD HH:MM:SS.mmm"
-    let lsa = obj.get("last_synced_at").and_then(|v| v.as_str()).unwrap_or("");
+    let lsa = obj
+        .get("last_synced_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if !last_synced_at_well_formed(lsa) {
         return Err(format!(
             "{ctx}: last_synced_at must be formatted '%Y-%m-%d %H:%M:%S%.3f', got {lsa:?}"
         ));
     }
     // account_status enum.
-    let status = obj.get("account_status").and_then(|v| v.as_str()).unwrap_or("");
-    if !["active", "disabled", "deleted", "anonymized"].contains(&status) {
+    let status = obj
+        .get("account_status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // NAN-3483: `suspended` is part of the directory enum everywhere (lake
+    // coordinator, lean, the PG/CH readers that count it as disabled).
+    if !["active", "disabled", "suspended", "deleted", "anonymized"].contains(&status) {
         return Err(format!(
-            "{ctx}: account_status {status:?} not in {{active,disabled,deleted,anonymized}}"
+            "{ctx}: account_status {status:?} not in {{active,disabled,suspended,deleted,anonymized}}"
         ));
     }
     // groups must be an Array (the CH column is Array(String)).
@@ -1131,17 +1313,24 @@ fn last_synced_at_well_formed(s: &str) -> bool {
     let digit = |i: usize| b[i].is_ascii_digit();
     (0..4).all(digit)
         && b[4] == b'-'
-        && digit(5) && digit(6)
+        && digit(5)
+        && digit(6)
         && b[7] == b'-'
-        && digit(8) && digit(9)
+        && digit(8)
+        && digit(9)
         && b[10] == b' '
-        && digit(11) && digit(12)
+        && digit(11)
+        && digit(12)
         && b[13] == b':'
-        && digit(14) && digit(15)
+        && digit(14)
+        && digit(15)
         && b[16] == b':'
-        && digit(17) && digit(18)
+        && digit(17)
+        && digit(18)
         && b[19] == b'.'
-        && digit(20) && digit(21) && digit(22)
+        && digit(20)
+        && digit(21)
+        && digit(22)
 }
 
 /// Compile + run a normalize VRL against one JSON record, returning the
@@ -1150,18 +1339,12 @@ fn run_normalize_for_contract(
     vrl_code: &str,
     input: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    use vrl::compiler::{compile, TargetValue};
-    use vrl::diagnostic::Formatter;
+    use vrl::compiler::TargetValue;
     use vrl::value::{Secrets, Value};
 
     let fns = safe_vrl_functions();
-    let result = compile(vrl_code, &fns).map_err(|diagnostics| {
-        diagnostics
-            .into_iter()
-            .map(|d| Formatter::new(vrl_code, d).to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    })?;
+    let result =
+        super::vrl_guard::compile_formatted(vrl_code, &fns).map_err(|errors| errors.join("\n"))?;
 
     let mut target = TargetValue {
         value: json_to_vrl_value(input),
@@ -1179,32 +1362,133 @@ fn run_normalize_for_contract(
     // validation resolve only via a thread-local no-op subscriber; the real lane
     // keeps its WARNs. (`execute_vrl`, the parser-test path, is left untouched so
     // users testing a parser still see its log output.)
-    let resolved = tracing::subscriber::with_default(
-        tracing::subscriber::NoSubscriber::default(),
-        || runtime.resolve(&mut target, &result.program, &timezone),
-    );
+    let resolved =
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            runtime.resolve(&mut target, &result.program, &timezone)
+        });
     match resolved {
         Ok(_) => Ok(vrl_value_to_json(&target.value)),
         Err(e) => Err(format!("VRL runtime error/abort: {e}")),
     }
 }
 
-/// Build a `(VrlValidationResult, Vec<String>)` for the single-error
-/// pre-compile failure case. Used by [`VrlValidator::validate_vrl_collect_errors`]
-/// so each early-return branch is a one-liner.
-fn single_error_result(
-    error: String,
-    warnings: Vec<String>,
-) -> (VrlValidationResult, Vec<String>) {
-    let errors = vec![error.clone()];
-    (
-        VrlValidationResult {
-            valid: false,
-            error: Some(error),
-            warnings,
-        },
-        errors,
-    )
+/// NAN-3483: an enrichment normalize program compiled once and run in-process
+/// over every record an identity pull is about to emit. The sync uses it to
+/// count, before emission, the records the lane's `enrichment_normalize_<source>`
+/// transform would dead-letter, so a sync can no longer report `completed`
+/// while Vector silently drops every record.
+pub struct CompiledNormalizer {
+    program: vrl::compiler::Program,
+}
+
+impl std::fmt::Debug for CompiledNormalizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledNormalizer").finish_non_exhaustive()
+    }
+}
+
+impl CompiledNormalizer {
+    /// Compile with the same (security-filtered) function set the lane is
+    /// validated against.
+    pub fn compile(vrl_code: &str) -> Result<Self, String> {
+        let fns = safe_vrl_functions();
+        let result = super::vrl_guard::compile(vrl_code, &fns).map_err(|e| e.render(vrl_code))?;
+        Ok(Self {
+            program: result.program,
+        })
+    }
+
+    /// Whether the program maps `input` (no abort, no runtime error). The
+    /// cheap check; [`Self::run`] also explains a rejection.
+    pub fn accepts(&self, input: &serde_json::Value) -> bool {
+        self.resolve(input, tracing::subscriber::NoSubscriber::default())
+            .is_ok()
+    }
+
+    /// Run the program on one record. `Err` is the dead-letter reason: the
+    /// message the VRL logged before it aborted (e.g. "nano_enrich okta
+    /// identity record missing id; dead-lettering") when it logged one, else
+    /// the runtime error.
+    pub fn run(&self, input: &serde_json::Value) -> Result<serde_json::Value, String> {
+        // Fast path: no subscriber, so the lane's `log(... dead-lettering)`
+        // guard doesn't flood the api log once per bad record.
+        match self.resolve(input, tracing::subscriber::NoSubscriber::default()) {
+            Ok(out) => Ok(out),
+            Err(error) => {
+                // Slow path, failures only: re-run with a subscriber that keeps
+                // the first message the VRL logged, to name the reason.
+                use tracing_subscriber::layer::SubscriberExt;
+                let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+                let subscriber =
+                    tracing_subscriber::registry().with(FirstLoggedMessage(captured.clone()));
+                let _ = self.resolve(input, subscriber);
+                let message = captured.lock().ok().and_then(|mut slot| slot.take());
+                Err(match message {
+                    Some(message) => message,
+                    None => error,
+                })
+            }
+        }
+    }
+
+    fn resolve<S>(
+        &self,
+        input: &serde_json::Value,
+        subscriber: S,
+    ) -> Result<serde_json::Value, String>
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        use vrl::compiler::TargetValue;
+        use vrl::value::{Secrets, Value};
+        let mut target = TargetValue {
+            value: json_to_vrl_value(input),
+            metadata: Value::Object(BTreeMap::new()),
+            secrets: Secrets::default(),
+        };
+        let timezone = vrl::compiler::TimeZone::Local;
+        let mut runtime = vrl::compiler::runtime::Runtime::default();
+        let resolved = tracing::subscriber::with_default(subscriber, || {
+            runtime.resolve(&mut target, &self.program, &timezone)
+        });
+        match resolved {
+            Ok(_) => Ok(vrl_value_to_json(&target.value)),
+            Err(e) => Err(format!("VRL runtime error/abort: {e}")),
+        }
+    }
+}
+
+/// Keeps the `message` of the first event logged while it is the default
+/// subscriber (VRL's `log()` emits one tracing event per call).
+struct FirstLoggedMessage(std::sync::Arc<std::sync::Mutex<Option<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FirstLoggedMessage {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(Option<String>);
+        impl tracing::field::Visit for Message {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut visitor = Message(None);
+        event.record(&mut visitor);
+        if let (Some(message), Ok(mut slot)) = (visitor.0, self.0.lock()) {
+            if slot.is_none() {
+                *slot = Some(message);
+            }
+        }
+    }
 }
 
 /// Convert serde_json::Value to vrl::value::Value
@@ -1456,7 +1740,10 @@ if !is_array(groups) { groups = [] }
             validate_enrichment_encoding_contract("identity", LOGS_THEN_ABORTS)
         });
 
-        assert!(result.is_ok(), "contract should pass (abort is the expected outcome): {result:?}");
+        assert!(
+            result.is_ok(),
+            "contract should pass (abort is the expected outcome): {result:?}"
+        );
         assert_eq!(
             count.load(Ordering::SeqCst),
             0,
@@ -1529,16 +1816,52 @@ mod tests {
                 "groups": array(.groups) ?? [],
             }
         "#;
-        assert!(v.check_normalize_vrl_safety(legit).is_ok(), "legit normalize VRL must pass");
+        assert!(
+            v.check_normalize_vrl_safety(legit).is_ok(),
+            "legit normalize VRL must pass"
+        );
 
         // `'''` breakout and a TOML section header must be rejected.
         assert!(v.check_normalize_vrl_safety("x = \"a ''' b\"").is_err());
-        assert!(v.check_normalize_vrl_safety("[sinks.exfil]\n. = {}").is_err());
-        assert!(v.check_normalize_vrl_safety(". = get_env_var(\"SECRET\")").is_err());
+        assert!(v
+            .check_normalize_vrl_safety("[sinks.exfil]\n. = {}")
+            .is_err());
+        assert!(v
+            .check_normalize_vrl_safety(". = get_env_var(\"SECRET\")")
+            .is_err());
     }
 
     fn validator() -> VrlValidator {
         VrlValidator::new()
+    }
+
+    /// NAN-3367: the validator must track the VRL the tenant cell runs
+    /// (Vector 0.59 = VRL 0.36). VRL 0.36 types array-parameter elements, so
+    /// `join` over a known string array is infallible and `?? ""` on it is
+    /// error E651. Before the crate bump this passed validation and failed
+    /// first in the parser-bundle build Job.
+    #[tokio::test]
+    async fn test_vrl_036_rejects_coalesce_on_infallible_join() {
+        let v = validator();
+        for program in [
+            "x = [\"a\", \"b\"]\n.y = join(x, \"\\t\") ?? \"\"",
+            "x = split(string!(.message), \" \")\n.y = join(x, \"\\t\") ?? \"\"",
+        ] {
+            let result = v.validate_vrl(program).await.unwrap();
+            assert!(!result.valid, "VRL 0.36 must reject: {program}");
+            let error = result.error.unwrap_or_default();
+            assert!(error.contains("E651"), "expected E651, got: {error}");
+        }
+
+        // Still fine: `join!` on a typed array, and `??` where the array's
+        // element kinds are unknown (join stays fallible).
+        for program in [
+            "x = split(string!(.message), \" \")\n.y = join!(x, \"\\t\")",
+            ".y = join(.arr, \"\\t\") ?? \"\"",
+        ] {
+            let result = v.validate_vrl(program).await.unwrap();
+            assert!(result.valid, "must accept {program}: {:?}", result.error);
+        }
     }
 
     #[tokio::test]
@@ -1694,7 +2017,7 @@ mod tests {
     #[tokio::test]
     async fn test_blocked_function_names_as_field_values_allowed() {
         // String values like .action = "http_request" appear in legitimate
-        // parsers (see migrations/archive/029_seed_parser_library.sql). Field
+        // library parsers. Field
         // names matching blocked identifiers should also pass: the pattern
         // check requires a trailing `(`, and the function-set strip only
         // affects function calls.
@@ -2041,7 +2364,11 @@ mod tests {
             .test_vrl_chain(&["", ".team = \"soc\""], r#"{"raw": "x"}"#)
             .await
             .unwrap();
-        assert!(r.success, "should succeed with empty first stage: {:?}", r.error);
+        assert!(
+            r.success,
+            "should succeed with empty first stage: {:?}",
+            r.error
+        );
         assert_eq!(
             r.output.unwrap().get("team").and_then(|v| v.as_str()),
             Some("soc")
@@ -2083,5 +2410,92 @@ mod tests {
             err.contains("get_env_var") || err.contains("not allowed") || err.contains("blocked"),
             "error should mention the blocked function: {err}"
         );
+    }
+
+    // NAN-2385: the deploy-time sample validation and the live editor run one
+    // parser over many events. The chain batch compiles the stages once and
+    // keeps every per-input outcome, index-aligned with the inputs.
+    #[tokio::test]
+    async fn test_vrl_chain_batch_runs_every_input_through_all_stages() {
+        let v = validator();
+        let inputs = vec![
+            r#"{"n": 1}"#.to_string(),
+            "not json at all".to_string(),
+            r#"{"n": 3}"#.to_string(),
+        ];
+        let results = v
+            .test_vrl_chain_batch(&[".parsed = true", "", ".ext = .n"], &inputs)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.success), "{results:?}");
+        assert_eq!(results[0].output.as_ref().unwrap()["ext"], 1);
+        // A non-JSON sample is wrapped as `.message`, like the Vector pipeline.
+        assert_eq!(
+            results[1].output.as_ref().unwrap()["message"],
+            "not json at all"
+        );
+        assert_eq!(results[2].output.as_ref().unwrap()["ext"], 3);
+        assert_eq!(results[2].input, inputs[2]);
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_batch_keeps_per_input_runtime_failures() {
+        let v = validator();
+        let inputs = vec![r#"{"n": "1"}"#.to_string(), r#"{"n": 2}"#.to_string()];
+        let results = v
+            .test_vrl_chain_batch(&[".out = to_int!(.n)"], &inputs)
+            .await
+            .unwrap();
+        assert!(results[0].success, "{:?}", results[0]);
+        assert_eq!(results[0].output.as_ref().unwrap()["out"], 1);
+        assert!(results[1].success, "{:?}", results[1]);
+        assert_eq!(results[1].output.as_ref().unwrap()["out"], 2);
+
+        let inputs = vec![r#"{"n": "x"}"#.to_string(), r#"{"n": "4"}"#.to_string()];
+        let results = v
+            .test_vrl_chain_batch(&[".pre = 1", ".out = to_int!(.n)"], &inputs)
+            .await
+            .unwrap();
+        assert!(!results[0].success);
+        let err = results[0].error.as_deref().unwrap();
+        assert!(err.starts_with("stage 1: execution error:"), "{err}");
+        assert!(results[1].success, "{:?}", results[1]);
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_batch_invalid_stage_fails_every_input() {
+        let v = validator();
+        let inputs = vec![r#"{"a": 1}"#.to_string(), r#"{"a": 2}"#.to_string()];
+        let results = v
+            .test_vrl_chain_batch(&[".a = 1", ".b = ("], &inputs)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert!(!r.success);
+            assert!(r.error.as_deref().unwrap().starts_with("stage 1:"), "{r:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_batch_no_stages_is_passthrough() {
+        let v = validator();
+        let inputs = vec![r#"{"a": 1}"#.to_string(), "raw".to_string()];
+        let results = v.test_vrl_chain_batch(&["", "  "], &inputs).await.unwrap();
+        assert_eq!(results[0].output.as_ref().unwrap()["a"], 1);
+        assert_eq!(results[1].output.as_ref().unwrap(), "raw");
+    }
+
+    /// The single-input entrypoints are thin wrappers over the batch ones, so
+    /// a validation failure still comes back as a result (not an `Err`) with
+    /// the same joined diagnostics `validate_vrl` reports.
+    #[tokio::test]
+    async fn test_vrl_reports_validation_failure_as_result() {
+        let v = validator();
+        let r = v.test_vrl(".a = (", r#"{"a": 1}"#).await.unwrap();
+        assert!(!r.success);
+        let validation = v.validate_vrl(".a = (").await.unwrap();
+        assert_eq!(r.error, validation.error);
     }
 }

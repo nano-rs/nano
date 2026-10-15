@@ -5,7 +5,7 @@
 //! The correctness bar for the extraction was that the builder emits the SAME
 //! statements the enterprise `RiskRepository` inlined before it existed. The
 //! `ORIG_*` constants below are the pre-refactor templates copied VERBATIM
-//! from `nanosiem-enterprise/src/risk/repository.rs` (as of origin/main at
+//! from `enterprise/src/risk/repository.rs` (as of origin/main at
 //! extraction time), with ONE deliberate lockstep evolution: NAN-1806 (P4)
 //! added the stamped `risk_entity_type = 'cloud_account'` first branch to the
 //! entity-type inference (write-side stamp honored for the one type value
@@ -36,10 +36,10 @@ use std::collections::HashMap;
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
-    decayed_overview_query, entity_scores_query, entity_types_query, lateral_scores_query,
-    risk_dataset_base_query, risk_for_entities_query, risky_entities_query,
-    rule_contributions_query, ClearedBoundaries, EntityScoreSelection, RiskChQuery,
-    RiskFindingsSource, RiskSqlBind,
+    decayed_overview_query, entity_scores_query, entity_set_scores_query, entity_types_query,
+    lateral_scores_query, risk_dataset_base_query, risk_for_entities_query, risky_entities_query,
+    rule_contributions_query, rule_timeline_buckets_query, ClearedBoundaries, EntityScoreSelection,
+    RiskChQuery, RiskFindingsSource, RiskSqlBind,
 };
 use crate::auth::{ScopeSet, UNRESOLVED_SOURCE_SENTINEL};
 use crate::risk::types::{RiskDecayConfig, RiskTimeWindow};
@@ -49,7 +49,8 @@ use crate::risk::types::{RiskDecayConfig, RiskTimeWindow};
 // ---------------------------------------------------------------------------
 
 /// `get_time_windowed_risk_scores_clickhouse` raw template, pre-refactor,
-/// plus the NAN-1806 stamped-type first branch (see module docs).
+/// plus the NAN-1806 stamped-type first branch (see module docs) and the
+/// NAN-3228 watchlist weight (base / weight / effective decayed scores).
 const ORIG_TIME_WINDOWED: &str = r#"
             WITH signal_scores AS (
                 SELECT
@@ -95,8 +96,14 @@ const ORIG_TIME_WINDOWED: &str = r#"
                     -- Decayed scores (primary metric). round() (not truncating
                     -- toInt64) so the headline matches the per-rule contribution
                     -- breakdown, which also rounds (NAN-1658 / R3).
-                    toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as decayed_score_24h,
-                    toInt64(round(sum(risk_score * decay_factor))) as decayed_score_7d,
+                    toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
+                    toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
+                    -- Watchlist weight (NAN-3228): MAX enabled-list weight for
+                    -- the entity value, 0 when unwatched; the decayed scores
+                    -- below are the EFFECTIVE (weighted) scores.
+                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
+                    toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
                     countIf(ts_micros >= ?) as signal_count_24h,
                     count() as signal_count_7d,
                     max(ts_micros) as last_signal_at,
@@ -116,7 +123,10 @@ const ORIG_TIME_WINDOWED: &str = r#"
                 signal_count_7d,
                 last_signal_at,
                 last_rule_name,
-                last_severity
+                last_severity,
+                base_decayed_score_24h,
+                base_decayed_score_7d,
+                watch_weight
             FROM aggregated
             WHERE decayed_score_24h >= ? OR decayed_score_7d >= ?
             ORDER BY decayed_score_24h DESC, decayed_score_7d DESC
@@ -124,7 +134,8 @@ const ORIG_TIME_WINDOWED: &str = r#"
         "#;
 
 /// `get_decayed_overview_clickhouse` raw template, pre-refactor (the
-/// `{dscore}`/`{scount}` format! holes renamed to sentinels).
+/// `{dscore}`/`{scount}` format! holes renamed to sentinels), plus the
+/// NAN-3228 watchlist weight: bands count the effective scores.
 const ORIG_OVERVIEW: &str = r#"
             WITH signal_scores AS (
                 SELECT
@@ -148,8 +159,11 @@ const ORIG_OVERVIEW: &str = r#"
             aggregated AS (
                 SELECT
                     entity,
-                    toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as decayed_score_24h,
-                    toInt64(round(sum(risk_score * decay_factor))) as decayed_score_7d,
+                    toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_decayed_score_24h,
+                    toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d,
+                    arrayElement(?, indexOf(?, lower(entity))) as watch_weight,
+                    toInt64(round(base_decayed_score_24h * (1 + watch_weight))) as decayed_score_24h,
+                    toInt64(round(base_decayed_score_7d * (1 + watch_weight))) as decayed_score_7d,
                     countIf(ts_micros >= ?) as signal_count_24h,
                     count() as signal_count_7d
                 FROM signal_scores
@@ -305,6 +319,15 @@ fn fixed_cutoffs() -> (i64, i64, i64, i64) {
     )
 }
 
+/// The watchlist weight lookup binds for a tenant with no watchlists (the
+/// `('', 0.0)` typing sentinel only), in placeholder order.
+fn unwatched_binds() -> [RiskSqlBind; 2] {
+    [
+        RiskSqlBind::F64List(vec![0.0]),
+        RiskSqlBind::StrList(vec![String::new()]),
+    ]
+}
+
 fn expected_decay_binds() -> Vec<RiskSqlBind> {
     let (c24, c3d, c5d, c7d) = fixed_cutoffs();
     vec![
@@ -389,8 +412,7 @@ fn overview_sql_is_token_identical_to_pre_refactor_query() {
     ] {
         let source = RiskFindingsSource::new(false, "logs");
         let (cleared, _) = one_cleared_entity();
-        let query =
-            decayed_overview_query(&source, fixed_now(), &decay_config(), &cleared, window);
+        let query = decayed_overview_query(&source, fixed_now(), &decay_config(), &cleared, window);
         let expected = substitute_original(ORIG_OVERVIEW, false, "logs")
             .replace("__DSCORE__", dscore)
             .replace("__SCOUNT__", scount);
@@ -476,24 +498,13 @@ fn every_restricted_risk_builder_emits_one_origin_guard_and_matching_bind() {
             RiskTimeWindow::Last7Days,
             None,
             0,
+            None,
             100,
             0,
         ),
-        risk_for_entities_query(
-            &source,
-            fixed_now(),
-            &decay_config(),
-            &cleared,
-            &entities,
-        ),
+        risk_for_entities_query(&source, fixed_now(), &decay_config(), &cleared, &entities),
         entity_types_query(&source, fixed_now(), &decay_config(), &cleared),
-        lateral_scores_query(
-            &source,
-            fixed_now(),
-            &decay_config(),
-            &cleared,
-            &entities,
-        ),
+        lateral_scores_query(&source, fixed_now(), &decay_config(), &cleared, &entities),
         decayed_overview_query(
             &source,
             fixed_now(),
@@ -536,8 +547,7 @@ fn restricted_ocsf_scope_reads_persisted_unmapped_origin_extension() {
     let source = RiskFindingsSource::new(true, "ocsf_logs_distributed")
         .with_source_scope(&restricted_scope(&["windows_event"]));
     let query = risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared);
-    let origin =
-        "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')";
+    let origin = "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')";
 
     assert!(query.sql.contains(&format!("AND notEmpty({origin})")));
     assert!(query.sql.contains(&format!(
@@ -567,8 +577,7 @@ fn unrestricted_scope_emits_no_origin_sql_or_bind() {
         },
     );
     let explicitly_unrestricted = entity_scores_query(
-        &RiskFindingsSource::new(false, "logs")
-            .with_source_scope(&ScopeSet::unrestricted()),
+        &RiskFindingsSource::new(false, "logs").with_source_scope(&ScopeSet::unrestricted()),
         fixed_now(),
         &decay_config(),
         &cleared,
@@ -612,10 +621,15 @@ fn min_scores_and_leaderboard_share_the_cte_prefix() {
         RiskTimeWindow::Last7Days,
         None,
         0,
+        None,
         50,
         0,
     );
-    let min_prefix = min.sql.split("            WHERE decayed_score").next().unwrap();
+    let min_prefix = min
+        .sql
+        .split("            WHERE decayed_score")
+        .next()
+        .unwrap();
     let lb_prefix = leaderboard
         .sql
         .split("            WHERE decayed_score")
@@ -643,10 +657,15 @@ fn leaderboard_windows_selection_and_binds() {
         RiskTimeWindow::Last24Hours,
         None,
         5,
+        None,
         50,
         10,
     );
-    assert!(q24.sql.contains("WHERE decayed_score_24h >= ?"), "{}", q24.sql);
+    assert!(
+        q24.sql.contains("WHERE decayed_score_24h >= ?"),
+        "{}",
+        q24.sql
+    );
     assert!(
         q24.sql
             .contains("ORDER BY decayed_score_24h DESC, signal_count_24h DESC"),
@@ -662,6 +681,9 @@ fn leaderboard_windows_selection_and_binds() {
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
+    ]);
+    expected.extend(unwatched_binds());
+    expected.extend([
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(5),  // floor
         RiskSqlBind::I64(50), // LIMIT
@@ -680,6 +702,7 @@ fn leaderboard_windows_selection_and_binds() {
             window,
             None,
             0,
+            None,
             50,
             0,
         );
@@ -711,6 +734,7 @@ fn leaderboard_entity_type_filter_binds_after_floor() {
         RiskTimeWindow::Last7Days,
         Some("cloud_account"),
         0,
+        None,
         200,
         0,
     );
@@ -727,11 +751,58 @@ fn leaderboard_entity_type_filter_binds_after_floor() {
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
+    ]);
+    expected.extend(unwatched_binds());
+    expected.extend([
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(0),
         RiskSqlBind::Str("cloud_account".into()),
         RiskSqlBind::I64(200),
         RiskSqlBind::I64(0),
+    ]);
+    assert_eq!(q.binds, expected);
+    assert_placeholder_bind_parity(&q);
+}
+
+#[test]
+fn leaderboard_score_band_is_parameterized_before_type_and_pagination() {
+    let (c24, _c3d, _c5d, c7d) = fixed_cutoffs();
+    let (cleared, cleared_micros) = one_cleared_entity();
+    let q = risky_entities_query(
+        &RiskFindingsSource::new(false, "logs"),
+        fixed_now(),
+        &decay_config(),
+        &cleared,
+        RiskTimeWindow::Last24Hours,
+        Some("ip"),
+        51,
+        Some(70),
+        101,
+        200,
+    );
+    assert!(
+        q.sql.contains(
+            "WHERE decayed_score_24h >= ? AND decayed_score_24h <= ? AND signal_count_24h > 0 AND entity_type = ?"
+        ),
+        "{}",
+        q.sql
+    );
+    let mut expected = expected_decay_binds();
+    expected.extend([
+        RiskSqlBind::I64(c7d),
+        RiskSqlBind::I64List(vec![cleared_micros, 0]),
+        RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
+        RiskSqlBind::I64(c24),
+        RiskSqlBind::I64(c24),
+    ]);
+    expected.extend(unwatched_binds());
+    expected.extend([
+        RiskSqlBind::I64(c24),
+        RiskSqlBind::I64(51),
+        RiskSqlBind::I64(70),
+        RiskSqlBind::Str("ip".into()),
+        RiskSqlBind::I64(101),
+        RiskSqlBind::I64(200),
     ]);
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
@@ -745,7 +816,10 @@ fn entity_type_inference_honors_cloud_account_stamp_only() {
     let (cleared, _) = one_cleared_entity();
     for (ocsf, stamped_col) in [
         (false, "JSONExtractString(metadata, 'risk_entity_type')"),
-        (true, "JSONExtractString(toString(unmapped),'risk_entity_type')"),
+        (
+            true,
+            "JSONExtractString(toString(unmapped),'risk_entity_type')",
+        ),
     ] {
         let source = RiskFindingsSource::new(ocsf, "logs");
         let q = entity_scores_query(
@@ -781,7 +855,8 @@ fn dossier_query_restricts_to_entity_set_and_ranks_by_decayed_7d() {
     );
     assert!(q.sql.contains("AND risk_entity IN ?"), "{}", q.sql);
     assert!(
-        q.sql.contains("ORDER BY decayed_score_7d DESC\n            LIMIT 1"),
+        q.sql
+            .contains("ORDER BY decayed_score_7d DESC\n            LIMIT 1"),
         "{}",
         q.sql
     );
@@ -793,8 +868,9 @@ fn dossier_query_restricts_to_entity_set_and_ranks_by_decayed_7d() {
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
         RiskSqlBind::I64(c24),
         RiskSqlBind::I64(c24),
-        RiskSqlBind::I64(c24),
     ]);
+    expected.extend(unwatched_binds());
+    expected.extend([RiskSqlBind::I64(c24)]);
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
 
@@ -815,12 +891,14 @@ fn facet_query_counts_distinct_entities_per_type() {
     );
     assert!(q.sql.contains("GROUP BY entity, entity_type"), "{}", q.sql);
     assert!(
-        q.sql.contains("SELECT entity_type, count() as entity_count"),
+        q.sql
+            .contains("SELECT entity_type, count() as entity_count"),
         "{}",
         q.sql
     );
     assert!(
-        q.sql.contains("ORDER BY entity_count DESC, entity_type ASC"),
+        q.sql
+            .contains("ORDER BY entity_count DESC, entity_type ASC"),
         "{}",
         q.sql
     );
@@ -857,7 +935,7 @@ fn lateral_query_matches_lowered_and_fqdn_stripped_ids() {
     // 7d decayed sum per entity value, same rounding as the entity list.
     assert!(
         q.sql
-            .contains("toInt64(round(sum(risk_score * decay_factor))) as decayed_score_7d"),
+            .contains("toInt64(round(sum(risk_score * decay_factor))) as base_decayed_score_7d"),
         "{}",
         q.sql
     );
@@ -870,6 +948,7 @@ fn lateral_query_matches_lowered_and_fqdn_stripped_ids() {
         RiskSqlBind::StrList(ids.clone()),
         RiskSqlBind::StrList(ids.clone()),
     ]);
+    expected.extend(unwatched_binds());
     assert_eq!(q.binds, expected);
     assert_placeholder_bind_parity(&q);
 }
@@ -888,6 +967,7 @@ fn p4_variants_substitute_ocsf_sentinels() {
             RiskTimeWindow::Last7Days,
             Some("cloud_account"),
             0,
+            None,
             50,
             0,
         ),
@@ -942,11 +1022,14 @@ fn entity_list_bind_order_matches_pre_refactor_chain() {
 
     let mut expected = expected_decay_binds();
     expected.extend([
-        RiskSqlBind::I64(c7d), // main WHERE timestamp >= ?
+        RiskSqlBind::I64(c7d),                         // main WHERE timestamp >= ?
         RiskSqlBind::I64List(vec![cleared_micros, 0]), // arrayElement(?, …)
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]), // indexOf(?, …)
-        RiskSqlBind::I64(c24), // sumIf 24h raw
-        RiskSqlBind::I64(c24), // sumIf 24h decayed
+        RiskSqlBind::I64(c24),                         // sumIf 24h raw
+        RiskSqlBind::I64(c24),                         // sumIf 24h decayed
+    ]);
+    expected.extend(unwatched_binds()); // watchlist weight lookup (NAN-3228)
+    expected.extend([
         RiskSqlBind::I64(c24), // countIf 24h
         RiskSqlBind::I64(5),   // WHERE decayed_score_24h >= ?
         RiskSqlBind::I64(10),  // WHERE decayed_score_7d >= ?
@@ -973,6 +1056,9 @@ fn overview_bind_order_matches_pre_refactor_chain() {
         RiskSqlBind::I64List(vec![cleared_micros, 0]),
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
         RiskSqlBind::I64(c24), // sumIf 24h decayed
+    ]);
+    expected.extend(unwatched_binds()); // watchlist weight lookup (NAN-3228)
+    expected.extend([
         RiskSqlBind::I64(c24), // countIf 24h
     ]);
     assert_eq!(query.binds, expected);
@@ -1039,15 +1125,21 @@ fn dataset_base_shares_the_entity_scores_scan() {
 
     // Identical decayed-sum expressions under the dataset's public names.
     for expr in [
-        "toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as score_24h",
-        "toInt64(round(sum(risk_score * decay_factor))) as score_7d",
+        "toInt64(round(sumIf(risk_score * decay_factor, ts_micros >= ?))) as base_score_24h",
+        "toInt64(round(sum(risk_score * decay_factor))) as base_score_7d",
+        "toInt64(round(base_score_24h * (1 + watch_weight))) as score_24h",
+        "toInt64(round(base_score_7d * (1 + watch_weight))) as score_7d",
         "sumIf(risk_score, ts_micros >= ?) as raw_score_24h",
         "sum(risk_score) as raw_score_7d",
         "uniqIf(rule_id, ts_micros >= ?) as distinct_rules_24h",
         "uniqArrayIf(tactics, ts_micros >= ?) as distinct_tactics_24h",
         "GROUP BY entity, entity_type",
     ] {
-        assert!(dataset.sql.contains(expr), "missing {expr}\n{}", dataset.sql);
+        assert!(
+            dataset.sql.contains(expr),
+            "missing {expr}\n{}",
+            dataset.sql
+        );
     }
 
     // Same bind prefix (decay + findings WHERE) as the entity list; the tail
@@ -1060,7 +1152,9 @@ fn dataset_base_shares_the_entity_scores_scan() {
         RiskSqlBind::I64List(vec![cleared_micros, 0]),
         RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
     ]);
-    expected.extend(std::iter::repeat(RiskSqlBind::I64(c24)).take(5));
+    expected.push(RiskSqlBind::I64(c24));
+    expected.extend(unwatched_binds());
+    expected.extend(std::iter::repeat(RiskSqlBind::I64(c24)).take(4));
     let dataset = risk_dataset_base_query(
         &RiskFindingsSource::new(false, "logs"),
         fixed_now(),
@@ -1084,8 +1178,12 @@ fn dataset_base_ocsf_reads_unmapped_sentinels() {
         &decay_config(),
         &cleared,
     );
-    assert!(q.sql.contains("JSONExtractString(toString(unmapped),'risk_entity')"));
-    assert!(q.sql.contains("JSONExtract(toString(unmapped), 'mitre_tactics', 'Array(String)')"));
+    assert!(q
+        .sql
+        .contains("JSONExtractString(toString(unmapped),'risk_entity')"));
+    assert!(q
+        .sql
+        .contains("JSONExtract(toString(unmapped), 'mitre_tactics', 'Array(String)')"));
     assert!(q.sql.contains("FROM ocsf_logs_distributed"));
     assert!(!q.sql.contains("__MITRE_TACTICS__"));
     assert_placeholder_bind_parity(&q);
@@ -1122,7 +1220,9 @@ fn inline_rendering_matches_bind_semantics() {
         .unwrap()
         .timestamp_micros();
     assert!(
-        inline.contains(&format!("arrayElement([{boundary}, 0], indexOf(['o''brien\\\\host', ''],")),
+        inline.contains(&format!(
+            "arrayElement([{boundary}, 0], indexOf(['o''brien\\\\host', ''],"
+        )),
         "{inline}"
     );
     // Cutoffs inline as bare integers.
@@ -1150,7 +1250,11 @@ fn cleared_boundaries_empty_map_yields_only_sentinel() {
         "sentinel must keep the array non-empty"
     );
     assert_eq!(bounds.boundaries_micros().len(), 1);
-    assert_eq!(bounds.entities()[0], "", "sentinel entity is the empty string");
+    assert_eq!(
+        bounds.entities()[0],
+        "",
+        "sentinel entity is the empty string"
+    );
     assert_eq!(bounds.boundaries_micros()[0], 0, "sentinel boundary is 0");
 }
 
@@ -1182,4 +1286,294 @@ fn cleared_boundaries_preserves_value_and_micros() {
 
     // Sentinel still present and inert.
     assert!(bounds.entities().iter().any(|e| e.is_empty()));
+}
+
+// ---------------------------------------------------------------------------
+// NAN-3225: entity risk timeline buckets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn timeline_buckets_are_anchor_aligned_bounded_and_unscoped_by_default() {
+    let now = fixed_now();
+    let query = rule_timeline_buckets_query(
+        &RiskFindingsSource::new(false, "logs"),
+        now,
+        &["alice".to_string()],
+    );
+    let anchor_us = now.timestamp_micros();
+    let lookback_us = (now - chrono::Duration::hours(336)).timestamp_micros();
+    assert_eq!(
+        query.binds,
+        vec![
+            RiskSqlBind::I64(anchor_us), // hours_ago = intDiv(anchor - 1 - ts, 1h)
+            RiskSqlBind::StrList(vec!["alice".into()]),
+            RiskSqlBind::I64(lookback_us),
+            RiskSqlBind::I64(anchor_us), // ts < anchor
+        ]
+    );
+    assert_eq!(query.sql.matches('?').count(), query.binds.len());
+    assert!(query.sql.contains("intDiv(? - 1 - ts_micros, 3600000000)"));
+    assert!(query.sql.contains("ORDER BY hours_ago ASC, rule_id ASC"));
+    assert!(query.sql.contains("LIMIT 10000"));
+    assert!(query
+        .sql
+        .contains("JSONExtract(metadata, 'mitre_tactics', 'Array(String)')"));
+    assert!(!query.sql.contains("PREWHERE"), "single WHERE (NAN-1412)");
+    assert!(
+        !query.sql.contains("hasAny"),
+        "unrestricted callers emit no scope predicate"
+    );
+}
+
+/// Source visibility: a restricted viewer's buckets carry the same fail-closed
+/// origin predicate as every other risk read, bound last.
+#[test]
+fn restricted_timeline_buckets_hide_denied_and_unattributed_origins() {
+    let source = RiskFindingsSource::new(true, "ocsf_logs")
+        .with_source_scope(&restricted_scope(&["apache_access"]));
+    let query = rule_timeline_buckets_query(&source, fixed_now(), &["10.0.0.5".to_string()]);
+    assert!(query.sql.contains(
+        "AND notEmpty(JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)'))"
+    ));
+    assert!(query.sql.contains("AND NOT hasAny("));
+    assert_eq!(query.sql.matches('?').count(), query.binds.len());
+    match query.binds.last() {
+        Some(RiskSqlBind::StrList(deny)) => {
+            assert!(deny.contains(&"apache_access".to_string()));
+            assert!(deny.contains(&UNRESOLVED_SOURCE_SENTINEL.to_string()));
+        }
+        other => panic!("deny set must be the last bind, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NAN-3228: watchlist weights
+// ---------------------------------------------------------------------------
+
+fn watched(cleared: ClearedBoundaries) -> ClearedBoundaries {
+    use crate::risk::watchlist::RiskWatchWeights;
+    cleared.with_watch(RiskWatchWeights::from_rows([
+        ("alice".to_string(), 60),
+        ("alice".to_string(), 25),
+        ("web-01".to_string(), 100),
+    ]))
+}
+
+fn watched_binds() -> [RiskSqlBind; 2] {
+    [
+        RiskSqlBind::F64List(vec![0.6, 1.0, 0.0]),
+        RiskSqlBind::StrList(vec!["alice".into(), "web-01".into(), String::new()]),
+    ]
+}
+
+/// Every entity-grain builder binds the tenant's weight map (max weight per
+/// value, sorted, with the typing sentinel) exactly once, so leaderboard
+/// ordering, floors, overview bands, lateral scores and the `dataset=risk`
+/// notable thresholds all read the effective score.
+#[test]
+fn every_entity_grain_builder_binds_the_watch_weights_once() {
+    let (cleared, _) = one_cleared_entity();
+    let cleared = watched(cleared);
+    let source = RiskFindingsSource::new(false, "logs");
+    let queries = [
+        entity_scores_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            EntityScoreSelection::MinScores {
+                min_score_24h: 0,
+                min_score_7d: 0,
+                limit: 10,
+            },
+        ),
+        risky_entities_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            RiskTimeWindow::Last7Days,
+            None,
+            0,
+            None,
+            50,
+            0,
+        ),
+        risk_for_entities_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            &["alice".to_string()],
+        ),
+        decayed_overview_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            RiskTimeWindow::Last24Hours,
+        ),
+        lateral_scores_query(
+            &source,
+            fixed_now(),
+            &decay_config(),
+            &cleared,
+            &["alice".to_string()],
+        ),
+        risk_dataset_base_query(&source, fixed_now(), &decay_config(), &cleared),
+    ];
+    let [weights, entities] = watched_binds();
+    for q in &queries {
+        assert_placeholder_bind_parity(q);
+        assert!(
+            q.sql
+                .contains("arrayElement(?, indexOf(?, lower(entity))) as watch_weight"),
+            "{}",
+            q.sql
+        );
+        let at = q
+            .binds
+            .iter()
+            .position(|b| *b == weights)
+            .unwrap_or_else(|| panic!("weights not bound\n{}", q.sql));
+        assert_eq!(q.binds[at + 1], entities, "entities follow weights");
+        assert_eq!(q.binds.iter().filter(|b| **b == weights).count(), 1);
+    }
+}
+
+/// Notable threshold with a watched entity: the `dataset=risk` columns a
+/// risk-notable rule thresholds on (`score_24h` / `score_7d`) ARE the
+/// effective scores; the base stays alongside, internal to the CTE.
+#[test]
+fn dataset_notable_threshold_reads_the_effective_score() {
+    let (cleared, _) = one_cleared_entity();
+    let q = risk_dataset_base_query(
+        &RiskFindingsSource::new(false, "logs"),
+        fixed_now(),
+        &decay_config(),
+        &watched(cleared),
+    );
+    assert!(q
+        .sql
+        .contains("toInt64(round(base_score_24h * (1 + watch_weight))) as score_24h"));
+    assert!(q
+        .sql
+        .contains("toInt64(round(base_score_7d * (1 + watch_weight))) as score_7d"));
+    // Inline rendering (the SQL a scheduled rule wraps) carries the map.
+    let inline = q.to_inline_sql();
+    assert!(inline.contains("[0.6, 1.0, 0.0]"), "{inline}");
+    assert!(inline.contains("['alice', 'web-01', '']"), "{inline}");
+    // 60 base on a 0.6-weight list → 96 effective, over a `score_24h > 90` rule.
+    assert_eq!(crate::risk::watchlist::effective_score(60, 0.6), 96);
+}
+
+#[test]
+fn member_scores_query_matches_lowered_values_and_binds_in_order() {
+    let (c24, _c3d, _c5d, c7d) = fixed_cutoffs();
+    let (cleared, cleared_micros) = one_cleared_entity();
+    let values = vec!["alice".to_string(), "web-01".to_string()];
+    let q = entity_set_scores_query(
+        &RiskFindingsSource::new(false, "logs"),
+        fixed_now(),
+        &decay_config(),
+        &watched(cleared),
+        &values,
+        500,
+    );
+    assert!(q.sql.contains("AND lower(risk_entity) IN ?"), "{}", q.sql);
+    assert!(
+        q.sql.contains("ORDER BY decayed_score_7d DESC, entity ASC"),
+        "{}",
+        q.sql
+    );
+    let mut expected = expected_decay_binds();
+    expected.extend([
+        RiskSqlBind::StrList(values.clone()),
+        RiskSqlBind::I64(c7d),
+        RiskSqlBind::I64List(vec![cleared_micros, 0]),
+        RiskSqlBind::StrList(vec!["john.doe".into(), String::new()]),
+        RiskSqlBind::I64(c24),
+        RiskSqlBind::I64(c24),
+    ]);
+    expected.extend(watched_binds());
+    expected.extend([RiskSqlBind::I64(c24), RiskSqlBind::I64(500)]);
+    assert_eq!(q.binds, expected);
+    assert_placeholder_bind_parity(&q);
+}
+
+// ---------------------------------------------------------------------------
+// NAN-3249: watchlist entity suggestions
+// ---------------------------------------------------------------------------
+
+fn suggest_plan(values: &[&str]) -> crate::risk::watchlist_suggest::SuggestPlan {
+    use crate::risk::watchlist_suggest::{plan, SuggestInput};
+    plan(
+        &values
+            .iter()
+            .map(|value| SuggestInput { value: value.to_string(), entity_type: None })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+}
+
+/// Bounded (28d window, per-value LIMIT BY) and fully parameterized: typed
+/// values — including LIKE metacharacters and quotes — only ever travel as
+/// binds, and the SQL never uses LIKE.
+#[test]
+fn watchlist_suggest_query_is_bounded_parameterized_and_like_free() {
+    use super::watchlist_suggest_query;
+    use crate::risk::watchlist_suggest::{SUGGEST_LOOKBACK_DAYS, SUGGEST_ROWS_PER_VALUE};
+    let plan = suggest_plan(&["o'neil%_x", "web01.corp.local"]);
+    let q = watchlist_suggest_query(&RiskFindingsSource::new(false, "logs"), fixed_now(), &plan.patterns);
+    assert_placeholder_bind_parity(&q);
+    let upper = q.sql.to_uppercase();
+    assert!(!upper.contains("LIKE"), "{}", q.sql);
+    assert!(!q.sql.contains("o'neil") && !q.sql.contains("web01"), "values must be bound");
+    assert!(q.sql.contains("LIMIT ? BY value_index"), "{}", q.sql);
+    assert!(!q.sql.contains("PREWHERE"));
+    assert!(!q.sql.contains("__"), "every sentinel substituted: {}", q.sql);
+    assert!(!q.sql.contains("hasAny"), "unrestricted callers emit no scope predicate");
+    let texts: Vec<String> = plan.patterns.iter().map(|p| p.text.clone()).collect();
+    let ops: Vec<i64> = plan.patterns.iter().map(|p| i64::from(p.op.code())).collect();
+    let groups: Vec<i64> = plan.patterns.iter().map(|p| i64::from(p.group)).collect();
+    let expected = vec![
+        RiskSqlBind::I64((fixed_now() - chrono::Duration::days(SUGGEST_LOOKBACK_DAYS)).timestamp_micros()),
+        RiskSqlBind::I64(fixed_now().timestamp_micros()),
+        RiskSqlBind::StrList(texts.clone()),
+        RiskSqlBind::I64List(ops.clone()),
+        RiskSqlBind::StrList(texts),
+        RiskSqlBind::I64List(ops),
+        RiskSqlBind::I64List(groups),
+        RiskSqlBind::I64List((1..=plan.patterns.len() as i64).collect()),
+        RiskSqlBind::I64(SUGGEST_ROWS_PER_VALUE as i64),
+    ];
+    assert_eq!(q.binds, expected);
+    // The inlined rendering escapes the quote rather than breaking out.
+    assert!(q.to_inline_sql().contains("'o''neil%_x'"), "{}", q.to_inline_sql());
+}
+
+/// A restricted viewer's suggestions carry the same fail-closed origin
+/// predicate as every other risk read, bound right after the pruning arrays.
+#[test]
+fn watchlist_suggest_query_applies_the_source_scope_deny() {
+    use super::watchlist_suggest_query;
+    let plan = suggest_plan(&["jsmith"]);
+    for (ocsf, table, origin) in [
+        (false, "logs", "JSONExtract(metadata, 'origin_source_types', 'Array(String)')"),
+        (true, "ocsf_logs", "JSONExtract(toString(unmapped), 'origin_source_types', 'Array(String)')"),
+    ] {
+        let source = RiskFindingsSource::new(ocsf, table).with_source_scope(&restricted_scope(&[" Apache_Access "]));
+        let q = watchlist_suggest_query(&source, fixed_now(), &plan.patterns);
+        assert_placeholder_bind_parity(&q);
+        assert!(q.sql.contains(&format!("AND notEmpty({origin})")), "{}", q.sql);
+        assert!(q.sql.contains("AND NOT hasAny("), "{}", q.sql);
+        match &q.binds[4] {
+            RiskSqlBind::StrList(deny) => {
+                assert!(deny.contains(&"apache_access".to_string()), "{deny:?}");
+                assert!(deny.contains(&UNRESOLVED_SOURCE_SENTINEL.to_string()));
+            }
+            other => panic!("deny set must follow the pruning arrays, got {other:?}"),
+        }
+        assert!(q.sql.contains(&format!("FROM {table}")));
+    }
 }

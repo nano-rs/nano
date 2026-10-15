@@ -80,6 +80,13 @@ pub struct RepositoryRuleResponse {
     #[serde(with = "nanosiem_core::typeid::rule::opt")]
     #[schema(value_type = Option<String>)]
     pub linked_detection_rule_id: Option<Uuid>,
+    /// source types derived from the `class_uid` the rule scopes
+    /// itself to, resolved against live telemetry. The browser's SOURCE column
+    /// falls back to this when the rule sets no `requires_source_types`, which
+    /// an OCSF rule never does. Empty for a caller without the live-data
+    /// capability, and filtered by their per-source RBAC scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_source_types: Vec<String>,
 }
 
 // =============================================================================
@@ -214,7 +221,7 @@ pub struct BatchImportRequest {
     pub items: Vec<BatchImportItem>,
 }
 
-/// Response for batch import operation. NAN-673 added `updated` so the
+/// Response for batch import operation. This added `updated` so the
 /// caller can distinguish freshly-imported rules from existing ones that
 /// were re-imported against newer upstream content.
 #[derive(Debug, Serialize, ToSchema)]

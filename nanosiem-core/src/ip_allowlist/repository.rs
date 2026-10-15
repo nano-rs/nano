@@ -57,7 +57,6 @@ impl IpAllowlistRepository {
         Ok(rows.iter().map(row_to_entry).collect())
     }
 
-
     /// Get a single entry by ID
     pub async fn get(&self, id: Uuid) -> Result<IpAllowlistEntry, IpAllowlistRepositoryError> {
         let row = sqlx::query(

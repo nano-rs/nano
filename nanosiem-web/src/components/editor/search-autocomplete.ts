@@ -9,12 +9,35 @@ import {
   type CompletionContext,
   type CompletionResult,
   type Completion,
+  type CompletionSection,
 } from '@codemirror/autocomplete';
 import { type Extension } from '@codemirror/state';
 import {
   getQueryAutocompleteSuggestions,
   type AutocompleteOption,
 } from '@/lib/query-autocomplete';
+import {
+  FIELD_SECTION_LABELS,
+  FIELD_SECTION_RANK,
+  type FieldSection,
+} from '@/lib/field-suggestion-ranking';
+
+/** One CodeMirror section per field group, in fixed order (NAN-3812). */
+export const FIELD_COMPLETION_SECTIONS: Record<FieldSection, CompletionSection> = Object.fromEntries(
+  (Object.keys(FIELD_SECTION_LABELS) as FieldSection[]).map((key) => [
+    key,
+    { name: FIELD_SECTION_LABELS[key], rank: FIELD_SECTION_RANK[key] },
+  ]),
+) as Record<FieldSection, CompletionSection>;
+
+/**
+ * A completable token: field names include dotted OCSF paths
+ * (`dst_endpoint.ip`, `actor.process.name`), so '.' is part of the word.
+ * Without it the replaced range starts after the last '.', and accepting a
+ * full-path suggestion duplicates the prefix (NAN-3192).
+ */
+export const COMPLETION_TOKEN_BEFORE = /[\w.*]+$/;
+export const COMPLETION_VALID_FOR = /^[\w.*]*$/;
 
 /**
  * Convert query autocomplete options to CodeMirror completions
@@ -41,9 +64,19 @@ function toCompletions(
         if (opt.category) {
           completion.detail = opt.category;
         }
+        if (opt.section) {
+          completion.section = FIELD_COMPLETION_SECTIONS[opt.section];
+        }
         break;
       case 'function':
         completion.type = 'function';
+        break;
+      case 'parameter':
+        completion.type = 'property';
+        break;
+      case 'argument_value':
+        // Plain value (span=1h, type=inner): never append `()` (NAN-3193).
+        completion.type = 'constant';
         break;
       case 'source_type':
         completion.type = 'enum';
@@ -65,18 +98,18 @@ function toCompletions(
   return {
     from,
     options: completions,
-    validFor: /^[\w*]*$/,
+    validFor: COMPLETION_VALID_FOR,
   };
 }
 
 /**
  * Autocomplete source for nPL queries in the search bar
  */
-async function searchQueryAutocomplete(context: CompletionContext): Promise<CompletionResult | null> {
+export async function searchQueryAutocomplete(context: CompletionContext): Promise<CompletionResult | null> {
   const doc = context.state.doc.toString();
   const pos = context.pos;
 
-  const result = await getQueryAutocompleteSuggestions(doc, pos, []);
+  const result = await getQueryAutocompleteSuggestions(doc, pos, [], { explicit: context.explicit });
 
   if (result.options.length === 0) {
     return null;
@@ -85,7 +118,7 @@ async function searchQueryAutocomplete(context: CompletionContext): Promise<Comp
   // Find where the current word starts
   const textBefore = doc.substring(0, pos);
   let from = pos;
-  const wordMatch = textBefore.match(/[\w*]+$/);
+  const wordMatch = textBefore.match(COMPLETION_TOKEN_BEFORE);
   if (wordMatch) {
     from = pos - wordMatch[0].length;
   }

@@ -6,7 +6,27 @@ use crate::search::execution::clickhouse_executor::{
     raw_sql_needs_skip_index_guard, wrap_query_for_count, wrap_query_with_pagination,
     BoundedCountInput, ClickHouseExecutor,
 };
-use crate::search::query_processing::enforce_source_scope;
+use crate::search::query_processing::{enforce_source_scope, enforce_source_scope_with_field};
+
+fn enforce_explain_source_scope(
+    query: &str,
+    dataset: crate::query::Dataset,
+    lake_mode: LakeQueryMode,
+    scope: &ScopeSet,
+) -> Result<String, SearchError> {
+    if dataset != crate::query::Dataset::Logs {
+        // Native spans and metrics have no log-source dimension. Risk applies
+        // this deny-set while constructing its derived grain in the lake
+        // worker, so injecting a logs-only field here would be both invalid
+        // and different from the execution path.
+        return Ok(query.to_string());
+    }
+    if lake_mode == LakeQueryMode::Primary {
+        enforce_source_scope_with_field(query, scope.deny_set(), "metadata.log_source")
+    } else {
+        enforce_source_scope(query, scope.deny_set())
+    }
+}
 
 /// NAN-2001: which raw-SQL ClickHouse identity a caller runs as. This is the ONE
 /// security decision the raw-SQL handler makes — everything else (table
@@ -38,7 +58,7 @@ impl SearchService {
         };
         executor.ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
-                "raw-SQL ClickHouse feature identity not configured (NAN-2001)".into(),
+                "raw-SQL ClickHouse feature identity not configured".into(),
             ))
         })
     }
@@ -63,7 +83,18 @@ impl SearchService {
     ) -> Result<SearchResponse, SearchError> {
         let start_time = Instant::now();
 
+        self.require_dedicated_retention_surface("raw SQL")?;
+
+        if self.lake_query.mode == LakeQueryMode::Primary {
+            return Err(SearchError::SqlValidationError(
+                "raw SQL is not supported by the lake MVP; use nPL so Nano can enforce tenant and byte-scan policy"
+                    .to_string(),
+            ));
+        }
+
         if scope.is_restricted() {
+            // NAN-3222: audit the refusal; the error the caller sees is unchanged.
+            crate::search::denied_source_audit::observe_raw_sql_refused(&request.sql);
             return Err(SearchError::SqlValidationError(
                 "Raw SQL search is not available for accounts with per-source access \
                  restrictions. Use the piped query language instead."
@@ -114,9 +145,16 @@ impl SearchService {
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
         // Raw SQL queries don't get cost analysis or display type (we can't parse them)
+        // NAN-2550: raw SQL pages the same way. Page 1 ran the count companion;
+        // a later page reports `paged_total_estimate`, which is exact only when
+        // the page came back short (proving the end of the result set).
+        let total_count_exact = offset == 0 || results.len() < limit;
+
         Ok(SearchResponse {
+            server_wall_ms: None,
             results,
             total_count,
+            total_count_exact,
             execution_time_ms,
             fields,
             generated_sql: Some(sql.to_string()),
@@ -125,6 +163,7 @@ impl SearchService {
             cost_score: None,
             display_type: None, // Raw SQL - let frontend determine
             column_order: None, // Raw SQL - no parsed column order
+            completeness: None,
         })
     }
 
@@ -134,7 +173,7 @@ impl SearchService {
     /// the query text exactly as the executed path does, so "Inspect SQL"
     /// renders the SQL that would actually run for this caller (including the
     /// scope exclusion) and the two can never diverge.
-    #[instrument(skip(self, scope), fields(query = %query))]
+    #[instrument(skip(self, scope, query), fields(query = %crate::inputlookup::storage_policy::redact_url_credentials(query)))]
     pub async fn explain(
         &self,
         query: &str,
@@ -145,6 +184,64 @@ impl SearchService {
     ) -> Result<String, SearchError> {
         // Validate time range
         time_range.validate()?;
+        let Some(retention_time_range) =
+            self.retention_bound_input_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(
+                "-- requested time range is outside the current retention window".to_string(),
+            );
+        };
+        let time_range = &retention_time_range;
+
+        let query_dataset = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
+        if self.lake_query.mode == LakeQueryMode::Primary
+            && matches!(
+                query_dataset,
+                crate::query::Dataset::Logs | crate::query::Dataset::Risk
+            )
+        {
+            let (cleaned_query, earliest_offset, latest_offset) = extract_time_modifiers(query);
+            let cleaned_query = enforce_explain_source_scope(
+                &cleaned_query,
+                query_dataset,
+                self.lake_query.mode,
+                scope,
+            )?;
+            let mut adjusted_time_range = time_range.clone();
+            if let Some(offset_secs) = earliest_offset {
+                adjusted_time_range.start =
+                    chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
+            }
+            if let Some(offset_secs) = latest_offset {
+                adjusted_time_range.end =
+                    chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
+            }
+            adjusted_time_range.validate()?;
+            let request_id = format!("lake-explain-{}", uuid::Uuid::now_v7());
+            let request = SearchRequest {
+                query: cleaned_query,
+                time_range: adjusted_time_range,
+                limit: Some(1_000_000),
+                offset: Some(0),
+                include_sql: Some(true),
+                skip_histogram: true,
+                skip_field_stats: true,
+                use_cache: false,
+                table_view,
+                request_id: Some(request_id.clone()),
+                async_mode: false,
+                priority: None,
+                dataset: dataset.map(ToOwned::to_owned),
+            };
+            let client = self.lake_query.client.as_ref().ok_or_else(|| {
+                SearchError::ServiceUnavailable(
+                    "canonical lake query worker is not configured".to_string(),
+                )
+            })?;
+            return client
+                .explain(&request, &request_id, scope.deny_set())
+                .await;
+        }
 
         // NAN-1569: resolve the per-query dataset profile so explain matches the
         // executed path — without this, "Inspect SQL" validates against and
@@ -157,7 +254,12 @@ impl SearchService {
         // NAN-1799: same injection point as `search()` — before the parse, so
         // every explain branch below (prevalence pushdown included) renders
         // the gated query. Empty deny-set → text unchanged.
-        let cleaned_query = enforce_source_scope(&cleaned_query, scope.deny_set())?;
+        let cleaned_query = enforce_explain_source_scope(
+            &cleaned_query,
+            query_dataset,
+            self.lake_query.mode,
+            scope,
+        )?;
 
         // Parse the cleaned query
         let parsed = parse_query(&cleaned_query).map_err(|e| convert_parse_error(e))?;
@@ -169,8 +271,7 @@ impl SearchService {
         // NAN-806: keep `explain` honest — the executed query has implicit
         // top-N sorting injected after a trailing `stats … by …`, and the
         // explained SQL should reflect that.
-        let (parsed, auto_sort_decision) =
-            crate::search::query_processing::apply_auto_sort(parsed);
+        let (parsed, auto_sort_decision) = crate::search::query_processing::apply_auto_sort(parsed);
 
         // Extract post-prevalence commands to determine if we need to strip them
         let post_prevalence = extract_post_prevalence_commands(&parsed);
@@ -236,7 +337,7 @@ impl SearchService {
                 .is_some();
             if has_count_conditions || enrich_decorated_filter {
                 sql.push_str(
-                    "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n-- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary and, if rare,\n-- their _hp/_dp/_ip_host_count projection is transform()-rewritten to the fresh count so the\n-- filter and every decoration/`| where host_count` see the truth in-SQL (NAN-1705). The IP\n-- dimension is rescued only for the enrich+decorated-filter form; broad rules are bounded\n-- (miss-key cap) and rarest-capped with a WARN on overflow.",
+                    "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n-- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary and, if rare,\n-- their _hp/_dp/_ip_host_count projection is transform()-rewritten to the fresh count so the\n-- filter and every decoration/`| where host_count` see the truth in-SQL. The IP\n-- dimension is rescued only for the enrich+decorated-filter form; broad rules are bounded\n-- (miss-key cap) and rarest-capped with a WARN on overflow.",
                 );
             }
             return Ok(sql);
@@ -333,7 +434,7 @@ impl SearchService {
         match auto_sort_decision {
             crate::search::query_processing::AutoSortDecision::Applied { field } => {
                 sql.push_str(&format!(
-                    "\n\n-- Note: implicit `| sort -{}` injected so the outer LIMIT keeps top-N (NAN-806)",
+                    "\n\n-- Note: implicit `| sort -{}` injected so the outer LIMIT keeps top-N",
                     field
                 ));
             }
@@ -424,7 +525,9 @@ impl SearchService {
                 )
                 .await
         } else {
-            ch_executor.execute_sql(sql, limit, offset, preserve_columns).await
+            ch_executor
+                .execute_sql(sql, limit, offset, preserve_columns)
+                .await
         }
     }
 
@@ -464,5 +567,63 @@ impl SearchService {
     /// Validate that SQL is a SELECT statement only
     fn validate_sql(&self, sql: &str) -> Result<(), SearchError> {
         validate_sql_query(sql)
+    }
+}
+
+#[cfg(test)]
+mod explain_scope_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn restricted_scope() -> ScopeSet {
+        ScopeSet::from_denied(BTreeSet::from([
+            "audit".to_string(),
+            "restricted-edr".to_string(),
+        ]))
+    }
+
+    #[test]
+    fn primary_lake_log_explain_uses_canonical_ocsf_source_field() {
+        let out = enforce_explain_source_scope(
+            r#"metadata.log_source="windows_sysmon" | stats count()"#,
+            crate::query::Dataset::Logs,
+            LakeQueryMode::Primary,
+            &restricted_scope(),
+        )
+        .unwrap();
+
+        assert!(out.contains("metadata.log_source NOT IN"), "{out}");
+        assert!(!out.contains("source_type"), "{out}");
+    }
+
+    #[test]
+    fn legacy_log_explain_preserves_legacy_source_scope_field() {
+        let out = enforce_explain_source_scope(
+            "error | stats count()",
+            crate::query::Dataset::Logs,
+            LakeQueryMode::Disabled,
+            &restricted_scope(),
+        )
+        .unwrap();
+
+        assert!(out.contains("source_type NOT IN"), "{out}");
+    }
+
+    #[test]
+    fn non_log_explain_does_not_inject_a_log_source_field() {
+        for dataset in [
+            crate::query::Dataset::Spans,
+            crate::query::Dataset::Metrics,
+            crate::query::Dataset::Risk,
+        ] {
+            let out = enforce_explain_source_scope(
+                "service.name=auth",
+                dataset,
+                LakeQueryMode::Primary,
+                &restricted_scope(),
+            )
+            .unwrap();
+            assert_eq!(out, "service.name=auth");
+        }
     }
 }

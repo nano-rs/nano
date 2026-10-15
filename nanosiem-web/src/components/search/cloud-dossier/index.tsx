@@ -6,6 +6,8 @@ import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import type { CloudDossierResponse, TimeRange } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
+import { DurableJobNotice, type DurableProductJobState } from '../DurableJobNotice';
+import { waitForDurableProductArtifact } from '../durable-product-job';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { useIsLiveRun } from '@/components/search/live-run-context';
 import { CloudDossierTopStrip } from './CloudDossierTopStrip';
@@ -20,6 +22,7 @@ import { TopResources } from './TopResources';
 import { ErrorRate } from './ErrorRate';
 import { Stream } from './Stream';
 import { nplQuotedBody } from '@/lib/npl-quote';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 
 interface CloudPrincipalDossierProps {
   principal: string;
@@ -33,6 +36,8 @@ interface CloudPrincipalDossierProps {
   onAddToQuery?: (field: string, value: string, exclude: boolean) => void;
   /** Replace the full query and re-run (for command-level pivots) */
   onSetQuery?: (query: string) => void;
+  initialDossier?: CloudDossierResponse | null;
+  onOpenJobs?: () => void;
 }
 
 export function CloudPrincipalDossier({
@@ -45,7 +50,11 @@ export function CloudPrincipalDossier({
   onExpandFields,
   onAddToQuery,
   onSetQuery,
+  initialDossier,
+  onOpenJobs,
 }: CloudPrincipalDossierProps) {
+  const { schema } = useSchemaEntityMap();
+  const strictOcsf = schema === 'ocsf';
   // Facet filters live entirely client-side: clicking a chip toggles entries
   // in this state, and the dossier hook re-fetches with the new filter set so
   // every section (identity, facets, timeline, stream, …) narrows in lockstep.
@@ -78,20 +87,28 @@ export function CloudPrincipalDossier({
   // Primary dossier fetch (NAN-1595). Owned locally (rather than via the
   // useCloudDossier hook) so we can capture the server cache status via
   // `onMeta` and force a live re-fetch with `bypass` from the header notice.
-  const [dossier, setDossier] = useState<CloudDossierResponse | null>(null);
-  const [loading, setLoading] = useState(!!request);
+  const [dossier, setDossier] = useState<CloudDossierResponse | null>(initialDossier ?? null);
+  const [loading, setLoading] = useState(!!request && !initialDossier);
   const [error, setError] = useState<Error | null>(null);
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
+  const initialDossierRef = useRef(initialDossier ?? null);
 
   // NAN-1595: sequence guard so a slow older request can't overwrite newer
   // data / badge / loading state (or setState after unmount).
+  const requestAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => { requestAbort.current?.abort(); ++reqSeq.current; }, []);
   const reqSeq = useRef(0);
   const fetchDossier = useCallback(
     // NAN-1602: `bypass` controls the cache; `asRefresh` controls the UI — a
     // live initial load bypasses the cache but still shows loading.
     async (bypass: boolean, asRefresh: boolean = bypass) => {
       // Bump first so even a no-request call invalidates any older in-flight response.
+      requestAbort.current?.abort();
+      const controller = new AbortController();
+      requestAbort.current = controller;
+      const signal = controller.signal;
       const seq = ++reqSeq.current;
       if (!request) {
         setLoading(false);
@@ -102,15 +119,58 @@ export function CloudPrincipalDossier({
       if (asRefresh) setRefreshing(true);
       else {
         setLoading(true);
+        setDossier(null);
+        setDurableJob(null);
         setCacheMeta(null); // clear stale badge while a fresh load runs
       }
       setError(null);
       try {
-        const result = await api.getCloudDossier(request, {
+        if (!asRefresh) {
+          try {
+            const page = await api.getCloudDossier({ ...request, fetch: 'page' }, { bypass, signal });
+            if (seq !== reqSeq.current || signal.aborted) return;
+            setDossier(page);
+            // Non-lake backends can return the already complete dossier.
+            if (!page.bounded_preview && !page.durable_job) return;
+          } catch {
+            if (seq !== reqSeq.current || signal.aborted) return;
+            // Preview failure must not suppress the independent exact fetch.
+          }
+        }
+        const result = await api.getCloudDossier({ ...request, fetch: 'full' }, {
           onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); },
           bypass,
+          signal,
         });
-        if (seq === reqSeq.current) setDossier(result);
+        if (result.durable_job) {
+          const handle = result.durable_job;
+          if (seq === reqSeq.current) {
+            setDurableJob({ jobId: handle.job_id, status: 'queued' });
+          }
+          const artifact = await waitForDurableProductArtifact(
+            handle.job_id,
+            'cloud_dossier_v1',
+            (job) => { if (seq === reqSeq.current) setDurableJob(job); },
+            () => seq === reqSeq.current && !signal.aborted,
+            signal,
+          );
+          const response = artifact.row.response;
+          if (
+            artifact.row.operation !== 'cloud_dossier'
+            || !response
+            || typeof response !== 'object'
+            || !('identity' in response)
+          ) {
+            throw new Error('Durable Cloud dossier returned an invalid typed result artifact');
+          }
+          if (seq === reqSeq.current) {
+            setDossier(response as CloudDossierResponse);
+            setDurableJob(null);
+          }
+        } else if (seq === reqSeq.current) {
+          setDurableJob(null);
+          setDossier(result);
+        }
       } catch (err) {
         if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
       } finally {
@@ -130,9 +190,16 @@ export function CloudPrincipalDossier({
   // Re-run on a fresh (non-refresh) load whenever the request changes
   // (principal / account / provider / window / facet filters).
   useEffect(() => {
+    if (initialDossierRef.current) {
+      setDossier(initialDossierRef.current);
+      initialDossierRef.current = null;
+      setLoading(false);
+      return;
+    }
     const bypass = liveOnceRef.current;
     liveOnceRef.current = false;
-    fetchDossier(bypass, false);
+    void fetchDossier(bypass, false);
+    return () => { requestAbort.current?.abort(); ++reqSeq.current; };
   }, [fetchDossier]);
 
   const refresh = useCallback(() => {
@@ -149,7 +216,7 @@ export function CloudPrincipalDossier({
     loading,
     settled: dossier != null || error != null,
     error,
-    totalCount: dossier ? eventsTotal : undefined,
+    totalCount: dossier && !dossier.bounded_preview ? eventsTotal : undefined,
   });
 
   const handleFacetClick = (dim: string, value: string) => {
@@ -186,7 +253,7 @@ export function CloudPrincipalDossier({
       );
       onSetQuery(rewritten);
     } else {
-      onAddToQuery?.('user', id, false);
+      onAddToQuery?.(strictOcsf ? 'actor.user.name' : 'user', id, false);
     }
   };
 
@@ -199,14 +266,27 @@ export function CloudPrincipalDossier({
   // mode on a different entity.
   const handleAddFilter = (field: string, value: string) => {
     if (!field || !value) return;
+    const queryField = strictOcsf
+      ? ({
+          cloud_account_id: 'cloud.account.uid',
+          cloud_region: 'cloud.region',
+          cloud_service: 'api.service.name',
+          src_ip: 'src_endpoint.ip',
+          event_type: 'activity_name',
+          action: 'activity_name',
+          resource_id: 'resources.uid',
+          resource_name: 'resources.name',
+          user: 'actor.user.name',
+        } as Record<string, string>)[field] ?? field
+      : field;
     if (query && onSetQuery) {
       const withoutCloud = query.replace(/\s*\|\s*cloud\b[^|]*/i, '').trim();
       const escaped = nplQuotedBody(value);
-      const filter = `${field}="${escaped}"`;
+      const filter = `${queryField}="${escaped}"`;
       const rewritten = withoutCloud ? `${withoutCloud} ${filter}` : filter;
       onSetQuery(rewritten);
     } else {
-      onAddToQuery?.(field, value, false);
+      onAddToQuery?.(queryField, value, false);
     }
   };
 
@@ -243,6 +323,8 @@ export function CloudPrincipalDossier({
         lastEventLabel={dossier?.identity.last_seen?.slice(11, 19) ?? null}
       />
 
+      {durableJob && <DurableJobNotice job={durableJob} onOpenJobs={onOpenJobs} />}
+
       <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
         <div className="px-4 py-4 space-y-3 min-w-0">
           {error && (
@@ -261,14 +343,19 @@ export function CloudPrincipalDossier({
             <>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1">
-                  <IdentityHeader
+                  {dossier.bounded_preview ? (
+                    <div className="border border-border p-3 text-[12px] font-mono">
+                      <div>{principal}</div>
+                      <div className="text-muted-foreground text-[10.5px]">{dossier.identity.arn ?? dossier.identity.account ?? account ?? ''}</div>
+                    </div>
+                  ) : <IdentityHeader
                     identity={dossier.identity}
                     risk={dossier.risk}
                     eventsTotal={eventsTotal}
                     onPivotAccount={(id) => handleAddFilter('cloud_account_id', id)}
                     onPivotIp={(ip) => handleAddFilter('src_ip', ip)}
                     onPivotAssumedRole={handlePivotPrincipal}
-                  />
+                  />}
                 </div>
                 <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
               </div>
@@ -298,6 +385,12 @@ export function CloudPrincipalDossier({
                 </div>
               )}
 
+              {dossier.bounded_preview && (
+                <div role="status" className="text-[10.5px] font-mono text-muted-foreground">
+                  Newest 200-event sample in the requested window, with current filters applied. {loading ? 'Window summaries loading…' : 'Window summaries unavailable.'}
+                </div>
+              )}
+              {!dossier.bounded_preview && <>
               <FacetsBand
                 facets={dossier.facets}
                 eventsTotal={eventsTotal}
@@ -345,6 +438,8 @@ export function CloudPrincipalDossier({
                   handleAddFilter(arn.startsWith('arn:') ? 'resource_id' : 'resource_name', arn)
                 }
               />
+
+              </>}
 
               <Stream
                 events={dossier.stream}

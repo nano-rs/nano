@@ -32,4 +32,11 @@ export const PIVT_CHAT_MESSAGE_EVENT = 'pivt:chat-message' as const;
 export const PIVT_OPEN_DETECTION_WIZARD = 'pivt:open-detection-wizard' as const;
 export const PIVT_OPEN_TUNING_WIZARD = 'pivt:open-tuning-wizard' as const;
 export const PIVT_OPEN_DASHBOARD_WIZARD = 'pivt:open-dashboard-wizard' as const;
+export const PIVT_OPEN_PLAYBOOK_WIZARD = 'pivt:open-playbook-wizard' as const;
+export const PIVT_OPEN_PIPE_WIZARD = 'pivt:open-pipe-wizard' as const;
 export const PIVT_SUMMARIZE_EVENT = 'pivt:summarize' as const;
+
+/** Open builds never dispatch hosted assistant commands. */
+export function usePivtCommands(): { dispatch: (input: string) => PivtDispatchResult } {
+  return { dispatch: () => ({ handled: false, action: 'unavailable' }) };
+}

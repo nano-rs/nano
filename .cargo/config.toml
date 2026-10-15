@@ -4,12 +4,28 @@
 incremental = false
 
 [profile.release]
-# Optimize for size in release builds
-opt-level = "z"     # Optimize for size
-lto = true          # Link-time optimization
-codegen-units = 1   # Better optimization, slower compile
+# Optimize for speed. NAN-2793: this was `opt-level = "z"` (size) from
+# 2026-01-01, and every release binary -- the lake bronze publisher, tail
+# pack/compaction, generation builder, API and search -- shipped
+# size-optimized. Measured on real tenant1 bronze objects, admission cost
+# 2.3 ms CPU per event at "z" vs 0.28 ms at 3; one ed25519 verify_strict
+# was 1,351 us vs 23 us. Services are CPU-bound; binary size is not a
+# constraint. Guarded by nanosiem-lake-worker/tests/
+# nan2793_release_profile_static_contract.rs.
+opt-level = 3
+# NAN-3450: thin LTO + 16 codegen units. Fat LTO with codegen-units = 1
+# serialized every release link onto one core: the 2026-10-09 macy trial
+# built the api image cold in 17:36 with thin LTO vs >28 min with fat LTO.
+# Thin LTO keeps cross-crate inlining; opt-level 3 above is unchanged.
+lto = "thin"        # Parallel link-time optimization
+codegen-units = 16  # Parallel codegen; thin LTO recovers cross-unit inlining
 strip = true        # Strip symbols from binary
-panic = "abort"     # Smaller binary size
+# NAN-3080: unwind, never abort. With abort, one rule's panic (a
+# `DateTime - TimeDelta` overflow in post-processing, 2026-09-30) killed
+# the whole jobs process (exit 139) and every in-flight detection of every
+# tenant surfaced as worker_lease_expired; every catch_unwind / JoinError
+# isolation in the services was dead code. Binary size is not a constraint.
+panic = "unwind"
 
 [profile.dev]
 # Keep incremental for local dev
@@ -17,4 +33,29 @@ incremental = true
 
 # Speed up dev builds
 opt-level = 0
-debug = true
+# Line tables only (debug = 1): backtraces and panics still carry file:line,
+# but test/dev binaries shrink ~90% and link ~85% faster. Full DWARF (debug =
+# 2) had every integration-test executable at ~800 MB, and parallel agent
+# builds were writing >1 GB/s through btrfs+LUKS (52% iowait, 22 GB swap,
+# ~900 GB of target/ across worktrees on 2026-09-17).
+debug = 1
+# NAN-2905: keep the bulk of the DWARF (.debug_info/.debug_str) out of every
+# linked test/bin executable. rustc writes it once per object as `.dwo` files
+# under target/; .debug_line stays in the binary, so panic backtraces keep
+# file:line even for a binary copied out of target/ or deps restored from
+# sccache (verified with RUST_BACKTRACE=1). A `cargo test --no-run -p
+# nanosiem-lake-worker` target went 55 GB -> 21 GB. Release is unaffected
+# (strip = true, and the container images build --release).
+split-debuginfo = "unpacked"
+
+[profile.test]
+debug = 1
+split-debuginfo = "unpacked"
+
+[env]
+# NAN-3861: tests render, deploy and read back hosted tenant Workers against this
+# placeholder Cloudflare account (the Worker build-context fixture account id),
+# so no checked-in fixture carries the hosted account.
+# Applies only to processes cargo starts (tests, `cargo run`); deployed hosted
+# binaries do not see it and keep resolving the hosted pin.
+NANO_CLOUDFLARE_ACCOUNT_ID = "0123456789abcdef0123456789abcdef"

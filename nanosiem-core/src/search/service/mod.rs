@@ -18,10 +18,13 @@ use crate::db::dual_pool::TableNames;
 use crate::db::DualPool;
 use crate::extensions::{AiClient, CloudRiskProvider, NoopAiClient, NoopCloudRiskProvider};
 use crate::lookup::LookupService;
-use crate::prevalence::{PrevalenceData, PrevalenceService, TimeWindow as PrevalenceTimeWindow};
+use crate::prevalence::{
+    LakePrevalenceClient, PrevalenceData, PrevalenceLookup, PrevalenceService,
+    TimeWindow as PrevalenceTimeWindow,
+};
 use crate::query::{
     analyze_query_cost, parse_query, AggFunc, BinSpan, ClickHouseSqlGenerator, Command, ParseError,
-    PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
+    PrettyPrint, PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
     PrevalenceTimeWindow as AstTimeWindow, Query, TimeRange, WarningSeverity, WindowType,
 };
 use crate::udm::UdmField;
@@ -31,23 +34,25 @@ use super::evaluator::helpers::{escape_like_pattern, escape_sql_string};
 use super::execution::{
     escape_question_marks_in_strings, validate_sql_query, ClickHouseExecutor, SqlExecutor,
 };
+use super::lake::{LakeQueryMode, LakeQueryRuntime};
 use super::processing::{
     apply_inputlookup_enrichment, apply_lookup_enrichment, apply_post_prevalence_commands,
     apply_post_prevalence_commands_with_limit, validate_lookup_tables,
 };
 use super::query_processing::{
-    apply_auto_sort, detect_oom_risk, extract_ai_command, extract_asset_command,
-    extract_baseline_command, extract_asset_identifier_from_query, extract_base_query,
-    extract_cloud_command,
-    extract_inputlookup_commands, extract_lateral_command, extract_lookup_commands,
+    apply_auto_sort, contains_lake_post_processing_anywhere, contains_nested_lake_post_processing,
+    detect_oom_risk, extract_ai_command, extract_asset_command,
+    extract_asset_identifier_from_query, extract_base_query, extract_baseline_command,
+    extract_cloud_command, extract_funnel_command, extract_inputlookup_commands,
+    extract_lake_lateral_identifier_from_query, extract_lateral_command, extract_lookup_commands,
     extract_post_ai_commands, extract_post_inputlookup_commands, extract_post_lateral_commands,
-    extract_funnel_command, extract_post_prevalence_commands, extract_prevalence_commands,
-    extract_tree_command, has_aggregation_before_prevalence,
-    has_only_simple_post_prevalence_commands, query_has_aggregation, query_has_per_row_filters,
-    strip_ai_and_after, strip_inputlookup_and_after, strip_lateral_and_after,
-    strip_post_prevalence_commands,
-    strip_prevalence_and_after, AssetCommandInfo, CloudCommandInfo, FunnelCommandInfo,
-    InputLookupCommandInfo, LookupCommandInfo, PrevalenceCommandInfo, TreeCommandInfo,
+    extract_post_prevalence_commands, extract_prevalence_commands, extract_tree_command,
+    has_aggregation_before_prevalence, has_only_simple_post_prevalence_commands,
+    lake_post_processing_replaces_source, query_has_aggregation, query_has_per_row_filters,
+    split_lake_post_processing, strip_ai_and_after, strip_inputlookup_and_after,
+    strip_lateral_and_after, strip_post_prevalence_commands, strip_prevalence_and_after,
+    AssetCommandInfo, CloudCommandInfo, FunnelCommandInfo, InputLookupCommandInfo,
+    LookupCommandInfo, PrevalenceCommandInfo, TreeCommandInfo,
 };
 use super::types::*;
 use crate::inputlookup::InputLookupService;
@@ -59,16 +64,27 @@ pub(super) use super::admission;
 pub(super) use super::execution;
 pub(super) use super::jobs;
 
+mod ai_pipe_deadline;
 mod asset;
 pub use asset::{DimensionFirst, EntityActivityBucket};
-mod baseline;
 pub mod asset_dossier;
+mod baseline;
+pub use baseline::{run_lake_baseline, LakeBaselineOutcome, LakeBaselinePlan, LAKE_BASELINE_BUDGET_EXHAUSTED};
 mod cloud;
 pub mod cloud_dossier;
 pub mod cloud_overview;
 mod core_search;
+mod timechart;
 mod field_queries;
+pub use field_queries::{FieldStatsResult, FieldValuesResult};
 mod funnel_view;
+mod lake_asset;
+pub use lake_asset::{LakeAssetCardRead, LakeAssetCards};
+mod lake_cloud;
+pub use lake_cloud::CloudDossierAccumulator;
+mod lake_identity;
+mod lake_host_identity;
+mod lake_stats_merge;
 
 /// NAN-1506: row cap for the bulk field-stats scan (shared by the standalone
 /// `/api/search/field-stats` companion and the inline parallel companion in
@@ -85,19 +101,33 @@ pub(crate) const FIELD_STATS_ROW_CAP: usize = 100_000;
 /// former bounds high-cardinality grouped output, while the latter selects a
 /// page from within that bounded output.
 pub(super) const AGGREGATE_OUTPUT_CAP: usize = 1_000_000;
+/// Hosted tenant-pinned service views and their tenant-bound setters.
+#[cfg(feature = "enterprise")]
+mod enterprise_shared_views;
 mod histogram;
+pub use histogram::SearchHistogramResult;
 mod ioc_lookup_resolve;
-mod lateral;
-mod metrics_routing;
+mod lake_views;
+mod lake_view_cache;
+pub(crate) use lake_views::lake_product_cursor as lake_product_cursor_for_row;
+pub(crate) mod lateral;
 mod lateral_graph;
+/// NAN-3088: Prevalence export and the rare list as durable lean-cell jobs.
+pub mod lean_prevalence;
+mod metrics_routing;
 mod otel;
+mod output_column_guard;
 mod prevalence_join;
 mod prevalence_processing;
 mod retro;
 mod sql_execution;
 pub use sql_execution::RawSqlAuditAccess;
+/// NAN-2564: the shared detection runtime classifies scan-budget refusals.
+pub use core_search::is_lake_scan_budget_rejection;
+pub use core_search::{is_durable_lane_post_processing_refusal, DURABLE_LANE_POST_PROCESSING_REFUSAL};
 mod streaming;
 mod tree_view;
+pub(crate) use tree_view::{derived_parent_label_field, TREE_PREVALENCE_FIELDS};
 mod window_clamp;
 
 /// Crate-public re-export of the ONE source-scope SQL predicate builder
@@ -187,7 +217,46 @@ pub(crate) fn all_query_ids(query_id: &str) -> Vec<String> {
 /// lateral views ship their own visualizations; timechart / ranked_bar / flow
 /// render their own charts. For those, the histogram companion's full-window
 /// scan was computed and then discarded — so the backend skips it entirely.
-/// Events, Table (trailing `stats`), and Transaction DO render the timeline.
+/// Events and Transaction render the timeline; lake stats tables omit it.
+/// Lake stats pipelines omit the base-event timeline (NAN-3077). A second
+/// full-window scan competes with the aggregation for tenant CPU and reads
+/// the same files again. Inspect the AST so quoted pipes and downstream
+/// sorting/filtering cannot accidentally re-enable the companion.
+pub(super) fn lake_histogram_applies(query: &Query) -> bool {
+    fn contains_stats(query: &Query) -> bool {
+        match query {
+            Query::Search(_) => false,
+            Query::Piped { source, command } => {
+                matches!(command, Command::Stats { .. }) || contains_stats(source)
+            }
+        }
+    }
+    display_type_renders_timeline(determine_display_type(query)) && !contains_stats(query)
+}
+
+/// Whether the base-search histogram's sum is the result's row count: true
+/// only when every pipe stage keeps each base event as exactly one row.
+/// Row-reducing stages (`where`, `dedup`, `head`, `search`, …) keep the
+/// histogram for the timeline but not its sum as the total.
+pub(super) fn lake_histogram_counts_result_rows(query: &Query) -> bool {
+    match query {
+        Query::Search(_) => true,
+        Query::Piped { source, command } => {
+            matches!(
+                command,
+                Command::Table { .. }
+                    | Command::Fields { .. }
+                    | Command::Rename { .. }
+                    | Command::Fillnull { .. }
+                    | Command::Eval { .. }
+                    | Command::Rex { .. }
+                    | Command::Sort { limit: None, .. }
+                    | Command::Reverse
+            ) && lake_histogram_counts_result_rows(source)
+        }
+    }
+}
+
 fn display_type_renders_timeline(display_type: DisplayType) -> bool {
     matches!(
         display_type,
@@ -255,6 +324,10 @@ pub(crate) fn validate_query_field_names(
     // codegen paths (saved rules, dashboards).
     validate_time_spans(query)?;
 
+    // NAN-2373: a filter on a column that no upstream stage produces is a query
+    // error, not a legitimate empty result set.
+    output_column_guard::validate_declared_output_column_references(query)?;
+
     if let Some(err) =
         crate::query::validation::validate_query_fields_with_profile(query, Some(profile))
             .into_iter()
@@ -285,9 +358,14 @@ fn validate_time_spans(query: &Query) -> Result<(), SearchError> {
                 span, window_type, ..
             } => {
                 match span {
-                    BinSpan::Time(d) if d.is_zero() => return err("bin span must be greater than 0"),
+                    BinSpan::Time(d) if d.is_zero() => {
+                        return err("bin span must be greater than 0");
+                    }
                     BinSpan::Numeric(n) if *n <= 0.0 => {
-                        return err("bin span must be greater than 0")
+                        return err("bin span must be greater than 0");
+                    }
+                    BinSpan::Bins(0) => {
+                        return err("bin bins must be greater than 0");
                     }
                     _ => {}
                 }
@@ -378,8 +456,14 @@ fn collect_column_order_recursive(query: &Query, columns: &mut Vec<String>) {
                             .unwrap_or_else(|| normalize_column_name(&f.name).to_string())
                     }));
                 }
-                Command::Stats { aggregations, group_by }
-                | Command::Chart { aggregations, group_by } => {
+                Command::Stats {
+                    aggregations,
+                    group_by,
+                }
+                | Command::Chart {
+                    aggregations,
+                    group_by,
+                } => {
                     // Stats resets columns to: group_by fields + aggregation result names
                     columns.clear();
                     if let Some(gb) = group_by {
@@ -400,6 +484,32 @@ fn collect_column_order_recursive(query: &Query, columns: &mut Vec<String>) {
                             agg.func.as_str().to_string()
                         };
                         columns.push(name);
+                    }
+                }
+                Command::Top {
+                    field,
+                    by_fields,
+                    show_count,
+                    show_percent,
+                    ..
+                }
+                | Command::Rare {
+                    field,
+                    by_fields,
+                    show_count,
+                    show_percent,
+                    ..
+                } => {
+                    // top/rare replace the row shape (`stats … | top f`
+                    // listed the stats columns).
+                    columns.clear();
+                    columns.extend(by_fields.iter().cloned());
+                    columns.push(field.clone());
+                    if *show_count {
+                        columns.push("count".to_string());
+                    }
+                    if *show_percent {
+                        columns.push("percent".to_string());
                     }
                 }
                 Command::Eval { assignments } => {
@@ -520,15 +630,40 @@ static TIME_MODIFIER_PATTERN: once_cell::sync::Lazy<regex::Regex> =
 
 /// Extract and parse time modifiers (earliest/latest) from the query
 /// Returns the cleaned query and optional time offset in seconds
+///
+/// NAN-3377: comments are stripped FIRST, with the parser's own
+/// `strip_comments` (quote-aware, so `url="http://x"` survives). The tidy-up
+/// below flattens newlines, and a `//` comment ends at a newline: flattening
+/// first turned `base\n// note\n| where x=1` into one line whose comment
+/// swallowed the `| where`. Stripping first also means an `earliest=` written
+/// inside a comment no longer sets the search range — exactly what the parser
+/// sees, since it strips comments before anything else.
 fn extract_time_modifiers(query: &str) -> (String, Option<i64>, Option<i64>) {
-    tracing::debug!("extract_time_modifiers called with query: {}", query);
+    tracing::debug!(
+        "extract_time_modifiers called with query: {}",
+        crate::inputlookup::storage_policy::redact_url_credentials(query)
+    );
+
+    let without_comments = crate::query::strip_comments(query);
+    let query = without_comments.as_str();
 
     let time_pattern = &*TIME_MODIFIER_PATTERN;
 
     let mut earliest_offset: Option<i64> = None;
     let mut latest_offset: Option<i64> = None;
+    // NAN-3337: a modifier inside a `[...]` subsearch never sets the OUTER
+    // range. It stays in the query text, where `parse_query` rejects it.
+    let depths = crate::query::subsearch_depths(query);
+    // `x.latest=-1h` is a field filter, as in the parser's scan.
+    let top_level = |m: &regex::Match<'_>| {
+        depths.get(m.start()).copied().unwrap_or(0) == 0
+            && (m.start() == 0 || query.as_bytes()[m.start() - 1] != b'.')
+    };
 
     for cap in time_pattern.captures_iter(query) {
+        if !cap.get(0).is_some_and(|m| top_level(&m)) {
+            continue;
+        }
         let modifier = cap
             .get(1)
             .map(|m| m.as_str().to_lowercase())
@@ -577,13 +712,22 @@ fn extract_time_modifiers(query: &str) -> (String, Option<i64>, Option<i64>) {
     }
 
     // Remove the time modifiers from the query
-    let cleaned = time_pattern.replace_all(query, "").to_string();
+    let cleaned = time_pattern
+        .replace_all(query, |cap: &regex::Captures<'_>| {
+            let whole = cap.get(0).expect("match");
+            if top_level(&whole) {
+                String::new()
+            } else {
+                whole.as_str().to_string()
+            }
+        })
+        .to_string();
     // Clean up any double spaces
     let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
 
     tracing::debug!(
         "Cleaned query: {}, earliest: {:?}, latest: {:?}",
-        cleaned,
+        crate::inputlookup::storage_policy::redact_url_credentials(&cleaned),
         earliest_offset,
         latest_offset
     );
@@ -727,6 +871,9 @@ fn strip_internal_lookup_fields(results: &mut Vec<serde_json::Value>) {
 pub struct SearchService {
     /// ClickHouse client (for log queries)
     ch_client: Option<clickhouse::Client>,
+    /// PostgreSQL control-plane metadata used by storage-neutral lake surfaces
+    /// such as the retro-hunt feed catalog.
+    metadata_pool: Option<sqlx::PgPool>,
     /// Service configuration
     config: SearchConfig,
     /// ClickHouse SQL generator
@@ -735,10 +882,27 @@ pub struct SearchService {
     lookup_service: Option<LookupService>,
     /// Prevalence service for filtering and enrichment (uses ClickHouse)
     prevalence_service: Option<PrevalenceService>,
+    /// Storage-neutral point lookup used by search and scheduled rule
+    /// decoration. In primary lake mode this is a tenant/snapshot-pinned
+    /// worker client; it never falls back to ClickHouse prevalence state.
+    prevalence_lookup: Option<std::sync::Arc<dyn PrevalenceLookup>>,
+    /// NAN-2361 wave 6: the tenant-pinned IOC snapshot reader installed by
+    /// `shared_tenant_view` from the SAME assignment as the query
+    /// runtime (retro-hunt feed candidates on the shared lake). Always `None`
+    /// on the process singleton and on dedicated services, which keep the
+    /// `NANO_LAKE_*` process-pinned client.
+    shared_ioc_client: Option<crate::enrichment::ioc::LakeIocClient>,
     /// InputLookup service for URL-based enrichment
     inputlookup_service: Option<InputLookupService>,
     /// Backend to use for log queries
     backend: SearchBackend,
+    /// Optional tenant-pinned lake worker. Shadow mode retains ClickHouse as
+    /// the response source; primary mode routes log queries to this client.
+    lake_query: LakeQueryRuntime,
+    /// Native OTLP Iceberg reader for API-local unattended evaluators such as
+    /// metric monitors and SLOs. Interactive observability routes use the same
+    /// service through nanosiem-search.
+    otel_lake: Option<super::otel_lake::OtelLakeEvaluator>,
     /// ClickHouse executor (if configured)
     ch_executor: Option<ClickHouseExecutor>,
     /// NAN-2001: raw-SQL executors backed by the two dedicated ClickHouse
@@ -751,12 +915,26 @@ pub struct SearchService {
     ch_executor_rawsql_noaudit: Option<ClickHouseExecutor>,
     /// Query tracker for cancellation support (local instance monitoring)
     query_tracker: super::query_tracking::QueryTracker,
+    /// Live cell SSE cancellation survives per-request tenant-view cloning.
+    follow_cancellations: std::sync::Arc<dashmap::DashMap<String, tokio::sync::watch::Sender<bool>>>,
     /// Job store for async search support (pluggable: in-memory or Redis)
     job_store: std::sync::Arc<dyn super::jobs::SearchJobStore>,
+    durable_job_control: Option<std::sync::Arc<dyn super::job_control_store::DurableJobControlStore>>,
     /// Admission controller for search query concurrency limits
     admission_controller: Option<std::sync::Arc<super::admission::AdmissionController>>,
+    /// Server-owned identity namespace for admission counters. Dedicated and
+    /// open-core services retain their historical user-only keyspace. A shared
+    /// tenant view binds the immutable tenant UUID here before any query can
+    /// acquire from the process/cell controller.
+    admission_scope: super::tenant::SearchTenantScope,
     /// Per-query ClickHouse settings (set by admission-controlled path, consumed by execute)
     active_ch_settings: Option<super::admission::ClickHouseQuerySettings>,
+    /// NAN-3093: a request-local view that answers only the search's
+    /// timeline (`POST /api/search/histogram`). The primary lake runs the
+    /// same preparation as a full search (scope, IOC resolution, lookup
+    /// push-down) and then the histogram companion alone, so rows paint
+    /// without waiting for it. Set through [`SearchService::histogram_only`].
+    histogram_only: bool,
     /// Deployment-sized ceiling for per-query ClickHouse memory overrides.
     /// Priority tiers may ask for less, but never more than this value.
     query_memory_ceiling_bytes: Option<u64>,
@@ -768,6 +946,11 @@ pub struct SearchService {
     /// Open-core builds wire `NoopAiClient`; enterprise builds inject the
     /// `AiPipeAgent`-backed implementation via `set_ai_client`.
     ai_client: std::sync::Arc<dyn AiClient>,
+    /// NAN-2922: true only when `ai_client` was installed by
+    /// [`SearchService::set_tenant_ai_client`] on an enterprise-shared view,
+    /// i.e. it is bound to the tenant's billing authority. Every tenant-view
+    /// constructor resets it; the shared Search gate admits `| ai` only when set.
+    ai_pipe_tenant_bound: bool,
     /// Cloud risk analytics provider for cloud_overview / cloud_dossier risk
     /// fan-out. Open-core builds wire `NoopCloudRiskProvider`; enterprise
     /// builds inject the `RiskAnalyticsService`-backed implementation via
@@ -801,6 +984,64 @@ pub struct SearchService {
 }
 
 impl SearchService {
+    /// Test-only: point this service's lake backend, prevalence and IOC reads
+    /// at one lean-lake cell route (the open build's analogue of the hosted
+    /// tenant view, without changing the admission scope).
+    #[cfg(all(test, not(feature = "enterprise")))]
+    pub(crate) fn pinned_to_cell_route_for_test(
+        &self,
+        route: &crate::search::lake_cell::LakeCellRoute,
+        store: std::sync::Arc<dyn crate::search::jobs::SearchJobStore>,
+    ) -> Result<Self, SearchError> {
+        let timeout =
+            std::time::Duration::from_secs(crate::search::lake::DEFAULT_LAKE_CELL_TIMEOUT_SECS);
+        let mut service = self.clone();
+        service.lake_query = LakeQueryRuntime::from_lake_cell_route(route, timeout)
+            .map_err(SearchError::ServiceUnavailable)?;
+        service.prevalence_lookup = Some(std::sync::Arc::new(
+            LakePrevalenceClient::from_lake_cell_route(
+                route,
+                crate::search::lake_cell::LAKE_CELL_PREVALENCE_RARITY_THRESHOLD,
+                timeout,
+            )
+            .map_err(SearchError::ServiceUnavailable)?,
+        ));
+        service.shared_ioc_client = Some(
+            crate::enrichment::ioc::LakeIocClient::from_lake_cell_route(route)
+                .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?,
+        );
+        service.job_store = store;
+        Ok(service)
+    }
+}
+
+impl SearchService {
+    fn prevalence_lookup_for_runtime(
+        lake_query: &LakeQueryRuntime,
+        clickhouse_fallback: Option<&PrevalenceService>,
+    ) -> Option<std::sync::Arc<dyn PrevalenceLookup>> {
+        if lake_query.mode == LakeQueryMode::Primary {
+            // NAN-3451: the Settings rarity threshold drives the lake client
+            // (the hot-reloaded service's live value); the env threshold is
+            // only its fallback.
+            return LakePrevalenceClient::from_env()
+                .unwrap_or_else(|error| panic!("invalid lake prevalence configuration: {error}"))
+                .map(|client| match clickhouse_fallback {
+                    Some(service) => client.with_rarity_setting(service.rarity_setting()),
+                    None => client,
+                })
+                .map(|client| std::sync::Arc::new(client) as std::sync::Arc<dyn PrevalenceLookup>);
+        }
+        clickhouse_fallback.map(|service| {
+            std::sync::Arc::new(service.clone()) as std::sync::Arc<dyn PrevalenceLookup>
+        })
+    }
+
+    fn lake_runtime_for_profile(profile: &dyn crate::schema::SchemaProfile) -> LakeQueryRuntime {
+        LakeQueryRuntime::from_env(profile.id())
+            .unwrap_or_else(|error| panic!("invalid lake query configuration: {error}"))
+    }
+
     /// The tenant-aware `table_names` registry key for the active profile's logs
     /// table. UDM → `"logs"` (byte-identical to today); OCSF → `"ocsf_logs"`.
     ///
@@ -992,30 +1233,75 @@ impl SearchService {
         dual_pool: &DualPool,
         profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
     ) -> Self {
+        let lake_query = Self::lake_runtime_for_profile(profile.as_ref());
+        Self::with_dual_pool_profile_and_lake(dual_pool, profile, lake_query)
+    }
+
+    /// [`with_dual_pool_and_profile`](Self::with_dual_pool_and_profile) for a
+    /// base service that has no process-wide lake route: the lake lane is
+    /// selected but every request must go through a tenant view
+    /// (`shared_tenant_view` / the lake-cell view), which binds its
+    /// own tenant-pinned route — exactly the enterprise-shared base service.
+    /// Reads no lake-route environment (NAN-3491).
+    pub fn with_dual_pool_and_profile_unrouted(
+        dual_pool: &DualPool,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    ) -> Self {
+        let lake_query = LakeQueryRuntime {
+            mode: LakeQueryMode::Primary,
+            client: None,
+        };
+        Self::with_dual_pool_profile_and_lake(dual_pool, profile, lake_query)
+    }
+
+    fn with_dual_pool_profile_and_lake(
+        dual_pool: &DualPool,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+        lake_query: LakeQueryRuntime,
+    ) -> Self {
+        let otel_lake = super::otel_lake::OtelLakeEvaluator::from_env()
+            .unwrap_or_else(|error| panic!("invalid native OTLP lake configuration: {error}"));
+        // `backend` is the executor for surfaces that have not moved to the
+        // object lake (risk, telemetry, field helpers, and raw SQL). The lake
+        // runtime is deliberately a logs-only routing decision in `search()`.
+        let backend = SearchBackend::ClickHouse;
+        let prevalence_lookup = Self::prevalence_lookup_for_runtime(&lake_query, None);
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
         // NAN-2001: raw-SQL executors on the two dedicated feature identities.
-        let ch_executor_rawsql =
-            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql().clone()));
-        let ch_executor_rawsql_noaudit =
-            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql_noaudit().clone()));
+        let ch_executor_rawsql = Some(ClickHouseExecutor::new(
+            dual_pool.clickhouse_rawsql().clone(),
+        ));
+        let ch_executor_rawsql_noaudit = Some(ClickHouseExecutor::new(
+            dual_pool.clickhouse_rawsql_noaudit().clone(),
+        ));
         Self {
             ch_client: Some(dual_pool.clickhouse().clone()),
+            metadata_pool: Some(dual_pool.postgres().clone()),
             config: SearchConfig::default(),
             ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
             lookup_service: None,
             prevalence_service: None,
+            prevalence_lookup,
+            shared_ioc_client: None,
             inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
+            backend,
+            lake_query,
+            otel_lake,
             ch_executor,
             ch_executor_rawsql,
             ch_executor_rawsql_noaudit,
             query_tracker: super::query_tracking::QueryTracker::new(),
+            follow_cancellations: std::sync::Arc::new(dashmap::DashMap::new()),
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
+            durable_job_control: None,
             admission_controller: None,
+            admission_scope: super::tenant::SearchTenantScope::dedicated(),
             active_ch_settings: None,
+            histogram_only: false,
             query_memory_ceiling_bytes: super::admission::query_memory_ceiling_from_env(),
             active_execution_limits: None,
             ai_client: std::sync::Arc::new(NoopAiClient),
+            ai_pipe_tenant_bound: false,
             cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
             table_names: dual_pool.table_names(),
             query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -1059,30 +1345,50 @@ impl SearchService {
         prevalence_service: PrevalenceService,
         profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
     ) -> Self {
+        let lake_query = Self::lake_runtime_for_profile(profile.as_ref());
+        let otel_lake = super::otel_lake::OtelLakeEvaluator::from_env()
+            .unwrap_or_else(|error| panic!("invalid native OTLP lake configuration: {error}"));
+        // Keep ClickHouse available for non-log datasets while the OCSF logs
+        // lane is served by the tenant-pinned lake worker.
+        let backend = SearchBackend::ClickHouse;
+        let prevalence_lookup =
+            Self::prevalence_lookup_for_runtime(&lake_query, Some(&prevalence_service));
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
         // NAN-2001: raw-SQL executors on the two dedicated feature identities.
-        let ch_executor_rawsql =
-            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql().clone()));
-        let ch_executor_rawsql_noaudit =
-            Some(ClickHouseExecutor::new(dual_pool.clickhouse_rawsql_noaudit().clone()));
+        let ch_executor_rawsql = Some(ClickHouseExecutor::new(
+            dual_pool.clickhouse_rawsql().clone(),
+        ));
+        let ch_executor_rawsql_noaudit = Some(ClickHouseExecutor::new(
+            dual_pool.clickhouse_rawsql_noaudit().clone(),
+        ));
         Self {
             ch_client: Some(dual_pool.clickhouse().clone()),
+            metadata_pool: Some(dual_pool.postgres().clone()),
             config: SearchConfig::default(),
             ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
             lookup_service: Some(lookup_service),
             prevalence_service: Some(prevalence_service),
+            prevalence_lookup,
+            shared_ioc_client: None,
             inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
+            backend,
+            lake_query,
+            otel_lake,
             ch_executor,
             ch_executor_rawsql,
             ch_executor_rawsql_noaudit,
             query_tracker: super::query_tracking::QueryTracker::new(),
+            follow_cancellations: std::sync::Arc::new(dashmap::DashMap::new()),
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
+            durable_job_control: None,
             admission_controller: None,
+            admission_scope: super::tenant::SearchTenantScope::dedicated(),
             active_ch_settings: None,
+            histogram_only: false,
             query_memory_ceiling_bytes: super::admission::query_memory_ceiling_from_env(),
             active_execution_limits: None,
             ai_client: std::sync::Arc::new(NoopAiClient),
+            ai_pipe_tenant_bound: false,
             cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
             table_names: dual_pool.table_names(),
             query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -1102,9 +1408,157 @@ impl SearchService {
     pub fn active_profile(&self) -> &std::sync::Arc<dyn crate::schema::SchemaProfile> {
         &self.active_profile
     }
+
+    /// A copy of this service re-pinned to `profile`; every other dependency
+    /// is shared. NAN-3492: a dedicated Search follows the worker-served
+    /// schema this way after the field set changes.
+    pub fn with_active_profile(
+        &self,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    ) -> Self {
+        let mut service = self.clone();
+        service.set_active_profile(profile);
+        service
+    }
+
+    /// Re-pin this service (and its SQL generator) to a schema profile. Used by
+    /// the enterprise-shared tenant view to bind a tenant's own inventory.
+    pub(crate) fn set_active_profile(
+        &mut self,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    ) {
+        self.ch_sql_generator = self.ch_sql_generator.clone().with_profile(profile.clone());
+        self.active_profile = profile;
+    }
     /// Get the current backend type
     pub fn backend(&self) -> SearchBackend {
-        self.backend
+        if self.lake_query.mode == LakeQueryMode::Primary {
+            SearchBackend::Lake
+        } else {
+            self.backend
+        }
+    }
+
+    /// Server-assigned tenant carried by the active lake client. Dedicated and
+    /// legacy services remain tenantless. Shared resolvers use this as a final
+    /// structural assertion after replacing a process-global service's worker.
+    pub fn assigned_tenant_id(&self) -> Option<uuid::Uuid> {
+        self.lake_query
+            .assigned_tenant_id()
+            .and_then(|tenant| uuid::Uuid::parse_str(tenant).ok())
+    }
+
+    /// The serving generation of the tenant-pinned primary-lake worker, as a
+    /// result-cache identity (NAN-2361 wave 6). `None` off the primary lake
+    /// or when the worker cannot report one stable generation; a shared
+    /// tenant is then simply not served from cache.
+    pub async fn serving_generation_key(&self) -> Option<crate::search::ServingGenerationKey> {
+        if self.lake_query.mode != LakeQueryMode::Primary {
+            return None;
+        }
+        let client = self.lake_query.client.as_ref()?;
+        let pin = client.generation_pin().await.ok()?;
+        Some(crate::search::ServingGenerationKey {
+            generation_id: pin.generation_id,
+            snapshot_id: pin.snapshot_id,
+        })
+    }
+
+    /// Deep readiness for the tenant-pinned primary-lake worker. Legacy and
+    /// shadow modes do not make the worker a serving dependency.
+    pub async fn lake_worker_ready(&self) -> bool {
+        if self.lake_query.mode != LakeQueryMode::Primary {
+            return true;
+        }
+        let Some(client) = self.lake_query.client.as_ref() else {
+            return false;
+        };
+        client.health().await.is_ok()
+    }
+
+    /// Enqueue a complete Prevalence export on the same generation-pinned,
+    /// isolated job lane as heavy Search, Asset, and Cloud work. The handler
+    /// supplies only semantic filters; the archived worker config owns every
+    /// snapshot and object-store coordinate.
+    pub async fn enqueue_durable_prevalence_export(
+        &self,
+        window: PrevalenceTimeWindow,
+        artifact_type: Option<&str>,
+        max_prevalence: u64,
+        format: &str,
+        scope: &crate::auth::ScopeSet,
+        user_id: uuid::Uuid,
+        authority: Option<&crate::search::DurableSearchJobAuthority>,
+    ) -> Result<String, SearchError> {
+        self.require_dedicated_retention_surface("durable Prevalence exports")?;
+        if self.lake_query.mode != LakeQueryMode::Primary {
+            return Err(SearchError::ServiceUnavailable(
+                "durable Prevalence exports require the primary lake backend".to_string(),
+            ));
+        }
+        let client = self.lake_query.client.as_ref().ok_or_else(|| {
+            SearchError::ServiceUnavailable(
+                "lake query backend is enabled without a worker client".to_string(),
+            )
+        })?;
+        let generation_pin = client.generation_pin().await?;
+        let end = chrono::Utc::now();
+        let start = end - chrono::Duration::hours(window.hours());
+        let task = crate::search::DurableLakeTask::PrevalenceExportV1 {
+            window: window.to_string(),
+            artifact_type: artifact_type.map(str::to_string),
+            max_prevalence,
+            format: format.to_string(),
+        };
+        let request = SearchRequest {
+            query: format!("prevalence export window={window} format={format}"),
+            time_range: TimeRangeInput::new(start, end),
+            limit: Some(1),
+            offset: Some(0),
+            include_sql: Some(false),
+            skip_histogram: true,
+            skip_field_stats: true,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: true,
+            priority: Some("analytics".to_string()),
+            dataset: Some("logs".to_string()),
+        };
+        self.job_control()
+            .create_durable_queued(
+                request,
+                &task,
+                user_id,
+                crate::search::QueryPriority::Analytics,
+                scope,
+                &generation_pin,
+                authority,
+            )
+            .await
+            .map_err(|error| {
+                SearchError::ServiceUnavailable(format!(
+                    "durable Prevalence export admission failed: {error}"
+                ))
+            })
+    }
+
+    /// Return strict `unmapped.*` schema paths from the worker's pinned source
+    /// manifest. These are stable schema names, not values sampled from rows.
+    pub async fn lake_unmapped_field_names(&self) -> Result<Vec<String>, SearchError> {
+        if self.lake_query.mode != LakeQueryMode::Primary {
+            return Ok(Vec::new());
+        }
+        self.lake_query
+            .client
+            .as_ref()
+            .ok_or_else(|| {
+                SearchError::SqlValidationError(
+                    "lake query backend is enabled without a worker client".to_string(),
+                )
+            })?
+            .unmapped_field_names()
+            .await
     }
 
     /// Install hard ClickHouse output limits on a one-shot cloned service.
@@ -1117,7 +1571,28 @@ impl SearchService {
     }
     /// Set the prevalence service
     pub fn set_prevalence_service(&mut self, prevalence_service: PrevalenceService) {
+        if self.lake_query.mode != LakeQueryMode::Primary {
+            self.prevalence_lookup = Some(std::sync::Arc::new(prevalence_service.clone()));
+        }
         self.prevalence_service = Some(prevalence_service);
+    }
+
+    /// Override the point-serving backend without changing discovery/explorer
+    /// surfaces. Primarily used by tenant-pinned lake deployments and focused
+    /// contract tests.
+    pub fn set_prevalence_lookup(
+        &mut self,
+        prevalence_lookup: std::sync::Arc<dyn PrevalenceLookup>,
+    ) {
+        self.prevalence_lookup = Some(prevalence_lookup);
+    }
+
+    /// The point-serving prevalence backend this view answers from: the
+    /// tenant's lake client (gen1 snapshots or a lean cell's query[T]) on a
+    /// lake view, the ClickHouse service otherwise. NAN-3451: hunt evidence
+    /// measures lake prevalence through it.
+    pub fn prevalence_lookup(&self) -> Option<std::sync::Arc<dyn PrevalenceLookup>> {
+        self.prevalence_lookup.clone()
     }
 
     /// Set the inputlookup service
@@ -1126,11 +1601,98 @@ impl SearchService {
         self.inputlookup_service = Some(inputlookup_service);
     }
 
+    pub fn storage_lookup_tenant_bound(&self) -> bool {
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        shared_scope && self.assigned_tenant_id().is_some()
+            && self.inputlookup_service.as_ref().and_then(InputLookupService::shared_storage_tenant) == self.assigned_tenant_id()
+    }
+
     /// Set the AI client used by the `| ai` pipe operator. Enterprise builds
     /// inject an `AiPipeAgent`-backed implementation; open-core builds keep
     /// the default `NoopAiClient` which tags rows `ai_verdict = "SKIPPED"`.
     pub fn set_ai_client(&mut self, client: std::sync::Arc<dyn AiClient>) {
         self.ai_client = client;
+        self.ai_pipe_tenant_bound = false;
+    }
+
+    /// Install an `| ai` client bound to this enterprise-shared view's tenant
+    /// billing authority (NAN-2922, #4668). Refuses any view that is not a
+    /// tenant-pinned shared view, so the flag cannot be set on the process
+    /// singleton.
+    pub fn set_tenant_ai_client(
+        &mut self,
+        client: std::sync::Arc<dyn AiClient>,
+        tenant_id: uuid::Uuid,
+    ) -> Result<(), SearchError> {
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        if !shared_scope
+            || tenant_id.is_nil()
+            || self.assigned_tenant_id() != Some(tenant_id)
+        {
+            return Err(SearchError::ServiceUnavailable(
+                "tenant AI client does not match the tenant view".into(),
+            ));
+        }
+        self.ai_client = client;
+        self.ai_pipe_tenant_bound = true;
+        Ok(())
+    }
+
+    /// Whether `| ai` on this view is billed to its tenant (NAN-2922).
+    pub fn ai_pipe_tenant_bound(&self) -> bool {
+        self.ai_pipe_tenant_bound
+    }
+
+    /// Bind the `dataset=risk` decay / clear state of this enterprise-shared
+    /// lean-lake cell view to its tenant, read by the caller in that tenant's
+    /// signed transaction. Refuses the process singleton, a gen1 view, and a
+    /// view pinned to any other tenant, so a risk search can only ever send
+    /// the cell the requesting tenant's own clear boundaries.
+    #[cfg(feature = "enterprise")]
+    pub fn set_tenant_risk_config(
+        &mut self,
+        tenant_id: uuid::Uuid,
+        decay: crate::risk::RiskDecayConfig,
+        clear: &crate::enterprise_shared_risk::TenantRiskClearState,
+    ) -> Result<(), SearchError> {
+        if !self.admission_scope.is_enterprise_shared()
+            || tenant_id.is_nil()
+            || self.admission_scope.tenant_id() != Some(tenant_id)
+            || self.assigned_tenant_id() != Some(tenant_id)
+            || !self.serves_lake_cell()
+        {
+            return Err(SearchError::ServiceUnavailable(
+                "tenant risk configuration does not match the tenant cell view".into(),
+            ));
+        }
+        let provider = crate::risk::config_provider::RiskQueryConfigProvider::for_tenant(
+            tenant_id, decay, clear,
+        )
+        .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))?;
+        self.risk_query_config = std::sync::Arc::new(provider);
+        Ok(())
+    }
+
+    /// Whether this view may serve `dataset=risk` for an enterprise-shared
+    /// tenant: a lean-lake cell view whose risk state is bound to the same
+    /// tenant the cell route and admission scope are pinned to.
+    pub fn tenant_risk_dataset_bound(&self) -> bool {
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        let tenant = self.assigned_tenant_id();
+        shared_scope
+            && self.serves_lake_cell()
+            && tenant.is_some()
+            && self.admission_scope.tenant_id() == tenant
+            && self.risk_query_config.bound_tenant_id() == tenant
     }
 
     /// Set the cloud risk analytics provider used by the cloud overview /
@@ -1144,6 +1706,329 @@ impl SearchService {
     /// Set the job store (e.g., RedisJobStore for active/active deployments)
     pub fn set_job_store(&mut self, store: std::sync::Arc<dyn super::jobs::SearchJobStore>) {
         self.job_store = store;
+        self.durable_job_control = None;
+    }
+
+    /// The hosted job control attached to this tenant view, if any. Cached
+    /// views compare it by pointer with the process's current producer so a
+    /// dropped or re-attested producer is never served from a stale view
+    /// (NAN-3531 N2a).
+    pub fn durable_job_control(&self) -> Option<&std::sync::Arc<dyn super::job_control_store::DurableJobControlStore>> {
+        self.durable_job_control.as_ref()
+    }
+
+    pub fn job_control(&self)->super::job_control_store::JobControlView<'_> {
+        super::job_control_store::JobControlView {legacy:self.job_store.as_ref(),hosted:self.durable_job_control.as_deref()}
+    }
+
+    /// Attach only to an already tenant-pinned service view, never its process
+    /// singleton. Backend failure is not permission to consult the legacy store.
+    pub fn set_durable_job_control(&mut self,store:std::sync::Arc<dyn super::job_control_store::DurableJobControlStore>,
+        assignment:super::job_coordinator_client::HostedAssignment)->Result<(),SearchError> {
+        // Both gen1 and cell views must be structurally tenant-pinned before
+        // the hosted coordinator can admit work.
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        if !shared_scope || self.lake_query.mode!=LakeQueryMode::Primary
+            || !store.matches_binding(self.admission_scope,assignment) {
+            return Err(SearchError::ServiceUnavailable("hosted job control identity does not match the tenant view".into()));
+        }
+        self.durable_job_control=Some(store);Ok(())
+    }
+
+    /// The tenant query[T] prefix this view talks to, when it is a lean-lake
+    /// cell view. Cached views compare it with the current route so a moved
+    /// tenant is never served from its old cell.
+    pub fn lake_cell_query_base(&self) -> Option<&str> {
+        self.lake_query
+            .client
+            .as_ref()
+            .and_then(|client| client.lake_cell_query_base())
+    }
+
+    /// Scheduled detection RPCs have their own read-only cell process and
+    /// cgroup. The tenant scope and authenticated route remain pinned.
+    pub fn detection_lane_view(&self) -> Result<Self, SearchError> {
+        let mut view = self.clone();
+        view.lake_query = self.lake_query.detection_lane().map_err(SearchError::ServiceUnavailable)?;
+        if let Some((base, tenant, token)) = view.lake_query.detection_prevalence_parts() {
+            view.prevalence_lookup = Some(std::sync::Arc::new(LakePrevalenceClient::from_cell_detection_parts(
+                base, tenant, token, super::lake_cell::LAKE_CELL_PREVALENCE_RARITY_THRESHOLD,
+                detection_prevalence_timeout(),
+            ).map_err(SearchError::ServiceUnavailable)?));
+        }
+        Ok(view)
+    }
+
+    /// Whether this view's lake backend is a lean-lake cell (NAN-2891).
+    pub fn serves_lake_cell(&self) -> bool {
+        self.lake_query.mode == LakeQueryMode::Primary
+            && self
+                .lake_query
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_lake_cell())
+    }
+
+    /// query[T]'s detection gate for one rule window (NAN-2891). `Ok(None)`
+    /// off a lean-lake cell: gen1 detections run every window as before.
+    pub async fn lake_cell_detection_plan(
+        &self,
+        rule_id: &str,
+        window_start_us: i64,
+        window_end_us: i64,
+        grid_us: Option<i64>,
+    ) -> Result<Option<super::LakeDetectionPlan>, SearchError> {
+        if !self.serves_lake_cell() {
+            return Ok(None);
+        }
+        match self.lake_query.client.as_ref() {
+            Some(client) => {
+                client
+                    .detection_plan(rule_id, window_start_us, window_end_us, grid_us)
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// A detached handle that records completed rule windows with query[T]'s
+    /// detection gate (NAN-2891), so the caller can commit without holding
+    /// its executor slot. `None` off a lean-lake cell.
+    pub fn lake_cell_detection_committer(&self) -> Option<LakeCellDetectionCommitter> {
+        if !self.serves_lake_cell() {
+            return None;
+        }
+        self.lake_query
+            .client
+            .clone()
+            .map(|client| LakeCellDetectionCommitter { client })
+    }
+
+    /// Resolve the event-time retention frontier for this service identity.
+    ///
+    /// A tenant-only shared scope is historical decoding state, never query
+    /// authority. Keeping this check on `SearchService` gives every hand-built
+    /// lake/ClickHouse companion one fail-closed seam instead of relying on the
+    /// main nPL search path to have run first.
+    pub(crate) fn retention_cutoff_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, SearchError> {
+        match self.admission_scope {
+            super::tenant::SearchTenantScope::Dedicated => Ok(None),
+            super::tenant::SearchTenantScope::EnterpriseShared(_) => {
+                Err(SearchError::ServiceUnavailable(
+                    "enterprise-shared query has no current retention policy identity".to_string(),
+                ))
+            }
+            retained @ super::tenant::SearchTenantScope::EnterpriseSharedRetained { .. } => {
+                retained.event_time_cutoff(now).map(Some).ok_or_else(|| {
+                    SearchError::ServiceUnavailable(
+                        "enterprise-shared query retention policy is invalid".to_string(),
+                    )
+                })
+            }
+        }
+    }
+
+    /// Intersect a required search request range with the exact current
+    /// event-time retention frontier. `None` means the entire requested window
+    /// is expired and callers must return an empty result without touching a
+    /// data backend.
+    pub(crate) fn retention_bound_input_range(
+        &self,
+        range: &TimeRangeInput,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<TimeRangeInput>, SearchError> {
+        let Some(cutoff) = self.retention_cutoff_at(now)? else {
+            return Ok(Some(range.clone()));
+        };
+        if range.end < cutoff {
+            return Ok(None);
+        }
+        Ok(Some(TimeRangeInput::new(
+            range.start.max(cutoff),
+            range.end,
+        )))
+    }
+
+    /// Retention-bind an optional row-lookup range. Shared callers that omit a
+    /// range receive the exact `cutoff..now` window; dedicated callers preserve
+    /// the historical unbounded lookup. The boolean is true only when a
+    /// caller-supplied window is wholly expired.
+    pub(crate) fn retention_bound_optional_input_range(
+        &self,
+        range: Option<&TimeRangeInput>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(Option<TimeRangeInput>, bool), SearchError> {
+        let Some(cutoff) = self.retention_cutoff_at(now)? else {
+            return Ok((range.cloned(), false));
+        };
+        let Some(range) = range else {
+            return Ok((Some(TimeRangeInput::new(cutoff, now)), false));
+        };
+        match self.retention_bound_input_range(range, now)? {
+            Some(bound) => Ok((Some(bound), false)),
+            None => Ok((None, true)),
+        }
+    }
+
+    /// Intersect a hand-built query range with retention. This is the query
+    /// generator's `TimeRange`, distinct from the API `TimeRangeInput` above.
+    pub(crate) fn retention_bound_query_range(
+        &self,
+        range: &TimeRange,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<TimeRange>, SearchError> {
+        let Some(cutoff) = self.retention_cutoff_at(now)? else {
+            return Ok(Some(range.clone()));
+        };
+        if range.end <= cutoff {
+            return Ok(None);
+        }
+        Ok(Some(TimeRange::new(range.start.max(cutoff), range.end)))
+    }
+
+    /// Variant for aggregate companions whose return shape has no unambiguous
+    /// empty representation. A wholly expired range is rejected before backend
+    /// access; callers may translate it to their ordinary empty response.
+    pub(crate) fn retention_require_query_range(
+        &self,
+        range: &TimeRange,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TimeRange, SearchError> {
+        self.retention_bound_query_range(range, now)?
+            .ok_or(SearchError::InvalidTimeRange)
+    }
+
+    /// Release-close an event-bearing surface that does not yet carry a
+    /// moving-cutoff proof. This is intentionally stricter than merely binding
+    /// the retention revision: a cached aggregate or durable result can age
+    /// across the cutoff while the revision remains unchanged.
+    pub(crate) fn require_dedicated_retention_surface(
+        &self,
+        surface: &str,
+    ) -> Result<(), SearchError> {
+        match self.admission_scope {
+            super::tenant::SearchTenantScope::Dedicated => Ok(()),
+            super::tenant::SearchTenantScope::EnterpriseShared(_)
+            | super::tenant::SearchTenantScope::EnterpriseSharedRetained { .. } => {
+                Err(SearchError::ServiceUnavailable(format!(
+                    "enterprise-shared {surface} is release-closed until its result carries a moving retention-cutoff proof"
+                )))
+            }
+        }
+    }
+
+    /// Whether durable jobs for this cell tenant have a runner: the tenant's
+    /// hosted producer (`durable_job_control`). NAN-3492: the explicitly
+    /// trusted-local install (`NANO_TRUSTED_LOCAL`, never hosted) keeps its
+    /// own Redis job store, which `lake_job_runner --cell-only --trusted-local`
+    /// claims, so its dedicated cell needs no hosted producer.
+    pub(crate) fn has_cell_job_runner(&self) -> bool {
+        self.durable_job_control.is_some() || self.serves_trusted_local_cell()
+    }
+
+    /// NAN-3492: this service reads the explicitly trusted-local install's
+    /// dedicated cell (see [`super::lake_cell::trusted_local_from_env`]).
+    /// Never true under a shared scope or for a route without the flag.
+    pub(crate) fn serves_trusted_local_cell(&self) -> bool {
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        !shared_scope
+            && self.serves_lake_cell()
+            && self.lake_query.client.as_ref().is_some_and(|client| client.is_trusted_local())
+    }
+
+    /// NAN-3078: whether a typed product view that exceeds its interactive
+    /// budget can escalate to a durable job on this service: a lean cell with
+    /// its hosted job runner. The runner binds the job to the tenant's
+    /// retention cutoff and query[T] enforces it.
+    pub fn has_durable_view_lane(&self) -> bool {
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        self.serves_lake_cell()
+            && self.has_cell_job_runner()
+            && (!shared_scope
+                || self.admission_scope.require_retention_identity().is_ok())
+    }
+
+    /// NAN-3078: views whose durable assembler materializes the whole event
+    /// set (Cloud user timeline, Cloud entity pivot) have no
+    /// lean durable lane. Refuse with the interactive budget error so the
+    /// caller is told to narrow the window instead of seeing a 503.
+    pub(crate) fn require_materializing_view_lane(&self, surface: &str) -> Result<(), SearchError> {
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        if shared_scope || self.serves_lake_cell() {
+            return Err(SearchError::ResourceExhausted(format!(
+                "{surface} exceed the interactive event envelope and have no background-job lane on this tenant yet; narrow the time range or add filters"
+            )));
+        }
+        Ok(())
+    }
+
+    /// NAN-3078: admit a typed durable product view (Cloud, Asset, baseline).
+    /// Replaces the old shared-tenant release close: the durable result now
+    /// carries a moving retention-cutoff proof end to end.
+    ///
+    /// * the admitted range is bound to the tenant's retention cutoff here;
+    /// * the runner re-binds it at dispatch and signs a proof over it;
+    /// * query[T] clamps every read to the proof's current cutoff and refuses
+    ///   a compiled window outside the admitted range;
+    /// * every read of the result re-checks the proof against the moving
+    ///   cutoff and hides the result once the cutoff crosses its start.
+    ///
+    /// Returns the generation pin and the retention-bound range.
+    pub(crate) async fn durable_view_admission(
+        &self,
+        surface: &str,
+        range: &TimeRange,
+    ) -> Result<(super::jobs::DurableLakeGenerationPin, TimeRange), SearchError> {
+        if self.lake_query.mode != LakeQueryMode::Primary {
+            return Err(SearchError::ServiceUnavailable(format!(
+                "{surface} require the primary lake backend"
+            )));
+        }
+        let client = self.lake_query.client.as_ref().ok_or_else(|| {
+            SearchError::ServiceUnavailable(
+                "lake query backend is enabled without a worker client".to_string(),
+            )
+        })?;
+        #[cfg(feature = "enterprise")]
+        let shared_scope = self.admission_scope.is_enterprise_shared();
+        #[cfg(not(feature = "enterprise"))]
+        let shared_scope = !matches!(self.admission_scope, super::tenant::SearchTenantScope::Dedicated);
+        if shared_scope && !self.has_durable_view_lane() {
+            return Err(SearchError::ServiceUnavailable(format!(
+                "enterprise-shared {surface} need the tenant's lean cell job runner and its current retention identity"
+            )));
+        }
+        let bound = self
+            .retention_bound_input_range(
+                &TimeRangeInput::new(range.start, range.end),
+                chrono::Utc::now(),
+            )?
+            .ok_or_else(|| {
+                SearchError::SqlValidationError(format!(
+                    "{surface}: the requested window is entirely past the tenant's retention"
+                ))
+            })?;
+        let generation_pin = if client.is_lake_cell() {
+            client.admission_generation().await?.0
+        } else {
+            client.generation_pin().await?
+        };
+        Ok((generation_pin, TimeRange::new(bound.start, bound.end)))
     }
 
     /// Get a reference to the job store
@@ -1164,6 +2049,59 @@ impl SearchService {
         &self,
     ) -> Option<&std::sync::Arc<super::admission::AdmissionController>> {
         self.admission_controller.as_ref()
+    }
+
+    /// Resolve the controller for an admission-gated path. Dedicated/open-core
+    /// services preserve their historical direct fallback when no controller
+    /// is wired. Enterprise-shared views never do: losing this cell boundary
+    /// is a service outage, not permission to execute unbounded work.
+    pub(super) fn required_admission_controller(
+        &self,
+    ) -> Result<Option<std::sync::Arc<super::admission::AdmissionController>>, SearchError> {
+        match (&self.admission_controller, self.admission_scope) {
+            (Some(controller), _) => Ok(Some(std::sync::Arc::clone(controller))),
+            (None, super::tenant::SearchTenantScope::Dedicated) => Ok(None),
+            (
+                None,
+                super::tenant::SearchTenantScope::EnterpriseShared(_)
+                | super::tenant::SearchTenantScope::EnterpriseSharedRetained { .. },
+            ) => Err(SearchError::SearchAdmissionUnavailable(
+                "distributed search admission (Redis) is not configured for this deployment".to_string(),
+            )),
+        }
+    }
+
+    pub(super) async fn acquire_search_admission(
+        &self,
+        controller: &super::admission::AdmissionController,
+        job_id: &str,
+        user_id: uuid::Uuid,
+        priority: super::admission::QueryPriority,
+    ) -> Result<super::admission::AdmissionPermit, super::admission::AdmissionError> {
+        controller
+            .acquire_for_scope(job_id, self.admission_scope, user_id, priority)
+            .await
+    }
+
+    /// Admission for a companion of a rows search (histogram, field stats).
+    /// NAN-3299: companions are capped below the per-user limit and queue
+    /// behind rows searches, so one run's companions never starve its rows.
+    pub(super) async fn acquire_auxiliary_search_admission(
+        &self,
+        controller: &super::admission::AdmissionController,
+        job_id: &str,
+        user_id: uuid::Uuid,
+        priority: super::admission::QueryPriority,
+    ) -> Result<super::admission::AdmissionPermit, super::admission::AdmissionError> {
+        controller
+            .acquire_for_scope_in_lane(
+                job_id,
+                self.admission_scope,
+                user_id,
+                priority,
+                super::admission::AdmissionLane::Auxiliary,
+            )
+            .await
     }
 
     fn ch_settings_for_priority(
@@ -1187,7 +2125,9 @@ impl SearchService {
         if *limits != config {
             tracing::info!(
                 "Query safety limits updated: max_group_array_size={}, max_mvexpand_rows={}, block_on_cost_errors={}",
-                config.max_group_array_size, config.max_mvexpand_rows, config.block_on_cost_errors
+                config.max_group_array_size,
+                config.max_mvexpand_rows,
+                config.block_on_cost_errors
             );
             *limits = config;
         }
@@ -1203,6 +2143,57 @@ impl SearchService {
 mod tests {
     use super::*;
 
+    /// Audit #10: transforming pipelines on the lake skip the base-search
+    /// histogram, and only row-preserving pipelines take its sum as total.
+    #[test]
+    fn lake_histogram_gate_and_total_follow_the_pipeline_shape() {
+        let parsed = |q: &str| crate::query::parse_query(q).unwrap();
+        for query in [
+            "powershell",
+            "* | table time, user.name",
+            "* | where status=1",
+            "* | dedup user.name",
+            r#"message="literal | stats count""#,
+        ] {
+            assert!(lake_histogram_applies(&parsed(query)), "{query}");
+        }
+        for query in [
+            "* | rex field=url \"(?<tld>[a-z]+)$\" | stats count by tld",
+            "* | eval p=is_private_ip(src_endpoint.ip) | stats count by p",
+            "* | dedup user.name | stats count by user.name",
+            "* | where cidr_match(\"10.0.0.0/8\", src_endpoint.ip) | stats count",
+            "metadata.log_source=\"windows_sysmon\" | stats count by device.hostname",
+            "* | stats count by user.name | sort -count | head 10",
+            "* | stats count by user.name | where count > 1 | table user.name, count",
+            "* | top 10 http_request.url.hostname",
+            "* | rare user.name",
+            "* | timechart span=1h count",
+        ] {
+            assert!(!lake_histogram_applies(&parsed(query)), "{query}");
+        }
+        for query in [
+            "* | stats count by user.name",
+            "* | eval p=is_private_ip(src_endpoint.ip) | stats count by p",
+        ] {
+            // The histogram is not the aggregate's row count.
+            assert!(!lake_histogram_counts_result_rows(&parsed(query)), "{query}");
+        }
+        for (query, counts_rows) in [
+            ("powershell", true),
+            ("* | eval x=1 | table time, x | sort -time", true),
+            ("* | where status=1", false),
+            ("* | dedup user.name", false),
+            ("* | sort 10 -time", false),
+        ] {
+            assert_eq!(lake_histogram_counts_result_rows(&parsed(query)), counts_rows, "{query}");
+        }
+        assert_eq!(determine_display_type(&parsed("* | top 10 user.name")), DisplayType::RankedBar);
+        assert_eq!(
+            determine_display_type(&parsed("* | rex field=url \"(?<tld>[a-z]+)$\" | stats count by tld")),
+            DisplayType::Table
+        );
+    }
+
     /// NAN-2019: a zero timechart span / bin span / bin hop must be rejected at
     /// validation (a clean 400) rather than reaching ClickHouse as `INTERVAL 0`
     /// (a 500) or a divide-by-zero. Legit spans/hops still validate.
@@ -1216,7 +2207,10 @@ mod tests {
             "* | prevalence src_ip | timechart span=0s count",
         ] {
             let parsed = parse_query(q).unwrap_or_else(|e| panic!("{q} should parse: {e:?}"));
-            assert!(validate_time_spans(&parsed).is_err(), "{q} must be rejected");
+            assert!(
+                validate_time_spans(&parsed).is_err(),
+                "{q} must be rejected"
+            );
         }
         for q in [
             "* | timechart span=1h count",
@@ -1453,6 +2447,37 @@ mod tests {
     }
 
     #[test]
+    fn subsearch_time_modifiers_never_set_the_outer_range_nan3337() {
+        let query = "class_uid=3002 | stats count as main | append [search class_uid=3002 earliest=-3h latest=-2h | stats count as sub]";
+        let (cleaned, earliest, latest) = extract_time_modifiers(query);
+        assert_eq!((earliest, latest), (None, None), "outer range took the subsearch's modifiers");
+        assert!(cleaned.contains("earliest=-3h") && cleaned.contains("latest=-2h"), "{cleaned}");
+        let err = parse_query(&cleaned).expect_err("subsearch modifiers must be rejected");
+        assert!(err.message.contains("subsearch"), "{}", err.message);
+
+        // Outer modifiers still apply next to a plain subsearch.
+        let (cleaned, earliest, _) =
+            extract_time_modifiers("a earliest=-1h | append [search b | stats count]");
+        assert_eq!(earliest, Some(-3600));
+        assert!(parse_query(&cleaned).is_ok(), "{cleaned}");
+        // Word boundaries and escapes: neither of these is a modifier.
+        for query in [
+            "a | append [search b is_latest=true | stats count]",
+            "a | append [search b x.earliest=-1h | stats count]",
+        ] {
+            let (cleaned, earliest, latest) = extract_time_modifiers(query);
+            assert_eq!((earliest, latest), (None, None), "{query}");
+            assert!(parse_query(&cleaned).is_ok(), "{query} must parse");
+        }
+        let (_, earliest, _) = extract_time_modifiers(r"a \[ earliest=-1h");
+        assert_eq!(earliest, Some(-3600), "an escaped bracket opens no subsearch");
+        assert!(crate::query::subsearch_depths(r"a \[ b").iter().all(|d| *d == 0));
+        // A whole-query `[search …]` wrapper is not a subsearch.
+        let (_, earliest, _) = extract_time_modifiers("[search a earliest=-1h]");
+        assert_eq!(earliest, Some(-3600));
+    }
+
+    #[test]
     fn test_extract_time_modifiers() {
         // Test earliest with hours
         let (cleaned, earliest, latest) =
@@ -1498,6 +2523,53 @@ mod tests {
         assert_eq!(latest, Some(0));
     }
 
+    #[test]
+    fn own_line_comments_keep_the_rest_of_the_query_nan3377() {
+        // A `//` comment on its own line used to swallow every later line:
+        // the whitespace tidy flattened newlines before the parser's comment
+        // stripper (which ends `//` at a newline) ever saw the query.
+        let (cleaned, earliest, latest) = extract_time_modifiers("base\n// note\n| where x=1");
+        assert_eq!(cleaned, "base | where x=1");
+        assert_eq!((earliest, latest), (None, None));
+        assert_eq!(
+            parse_query(&cleaned).unwrap(),
+            parse_query("base | where x=1").unwrap()
+        );
+
+        // A leading comment line used to leave an empty query (400).
+        let (cleaned, _, _) = extract_time_modifiers("// c\nbase");
+        assert_eq!(cleaned, "base");
+        assert_eq!(parse_query(&cleaned).unwrap(), parse_query("base").unwrap());
+
+        // Time modifiers are still extracted around a comment line.
+        let (cleaned, earliest, latest) =
+            extract_time_modifiers("earliest=-2h base\n// c\n| head 5");
+        assert_eq!(cleaned, "base | head 5");
+        assert_eq!((earliest, latest), (Some(-2 * 3600), None));
+
+        // Block comments spanning lines, CRLF line endings and trailing
+        // comments all reduce to the same query.
+        for query in [
+            "base\r\n// note\r\n| where x=1",
+            "base /* one\ntwo */\n| where x=1",
+            "base // trailing\n| where x=1",
+        ] {
+            let (cleaned, _, _) = extract_time_modifiers(query);
+            assert_eq!(cleaned, "base | where x=1", "{query:?}");
+        }
+
+        // An `earliest=` written inside a comment is commentary, not the range
+        // (the parser never sees it either).
+        let (cleaned, earliest, _) =
+            extract_time_modifiers("base // earliest=-30d was too slow\n| head 5");
+        assert_eq!(cleaned, "base | head 5");
+        assert_eq!(earliest, None);
+
+        // `//` inside a quoted value is not a comment.
+        let (cleaned, _, _) = extract_time_modifiers("url=\"http://x/y\"\n// note\n| head 5");
+        assert_eq!(cleaned, "url=\"http://x/y\" | head 5");
+    }
+
     // NAN-1453: full-chain guard. A non-audit-view user's query is rewritten by
     // `enforce_non_audit_query` before it reaches `search()`, where
     // `extract_time_modifiers` reads the time window. If the rewrite drops
@@ -1506,9 +2578,10 @@ mod tests {
     // picker window. This pins the whole chain end-to-end.
     #[test]
     fn test_enforce_non_audit_preserves_time_window_end_to_end() {
-        let enforced =
-            crate::search::query_processing::enforce_non_audit_query("error earliest=-12h latest=now")
-                .unwrap();
+        let enforced = crate::search::query_processing::enforce_non_audit_query(
+            "error earliest=-12h latest=now",
+        )
+        .unwrap();
         let (_cleaned, earliest, latest) = extract_time_modifiers(&enforced);
         assert_eq!(
             earliest,
@@ -1538,7 +2611,9 @@ mod tests {
 
         // Formatting commands don't change the row shape — this is the reported
         // query, whose empty bucket must keep its key.
-        assert!(grouped("* | stats count by source_type | sort -count | head 25"));
+        assert!(grouped(
+            "* | stats count by source_type | sort -count | head 25"
+        ));
 
         // A grouping command with no `by` still returns one summary row; keeping
         // its columns costs nothing and stays consistent.
@@ -1565,5 +2640,141 @@ mod tests {
         assert!(!grouped("error"));
         assert!(!grouped("error | head 10"));
         assert!(!grouped("* | table src_ip, user"));
+    }
+}
+
+/// NAN-2961: the committed part-log head of one lean-lake tenant, read from
+/// its detect[T] leaf (`GET …/detect/v1/status`, which also catches the
+/// detect process up with the log). Tenant-pinned by the route: the status
+/// report must name exactly this tenant or the probe fails.
+#[derive(Clone)]
+pub struct LakeCellDetectHeadProbe {
+    client: super::lake::LakeQueryClient,
+    route_base: String,
+}
+
+impl LakeCellDetectHeadProbe {
+    /// Build a probe for `route`'s detect leaf.
+    pub fn for_route(route: &super::lake_cell::LakeCellRoute) -> Result<Self, String> {
+        let runtime = super::lake::LakeQueryRuntime::from_lake_cell_route(
+            route,
+            std::time::Duration::from_secs(5),
+        )?
+        .detection_lane()?;
+        let client = runtime
+            .client
+            .ok_or_else(|| "lean-lake detect probe has no client".to_string())?;
+        Ok(Self { client, route_base: route.query_base_url.clone() })
+    }
+
+    /// Whether this probe was built for `route` (a moved tenant rebuilds it).
+    pub fn serves(&self, route: &super::lake_cell::LakeCellRoute) -> bool {
+        self.route_base == route.query_base_url
+    }
+
+    /// `(seq, sha256)` of the tenant's committed head, `None` before genesis.
+    pub async fn head(&self) -> Result<Option<(u64, String)>, SearchError> {
+        self.client.lake_cell_part_log_head().await
+    }
+}
+
+/// Records completed rule windows with one lean-lake tenant's query[T]
+/// detection gate (NAN-2891). Bounded by its own short timeout.
+#[derive(Clone)]
+pub struct LakeCellDetectionCommitter {
+    client: super::lake::LakeQueryClient,
+}
+
+impl LakeCellDetectionCommitter {
+    pub async fn commit(
+        &self,
+        rule_id: &str,
+        log_seq: u64,
+        evaluated_through_us: i64,
+    ) -> Result<bool, SearchError> {
+        self.client
+            .detection_commit(rule_id, log_seq, evaluated_through_us)
+            .await
+    }
+}
+
+/// NAN-3080: per-request ceiling on a scheduled detection's prevalence lookup
+/// (`NANOSIEM_DETECTION_PREVALENCE_TIMEOUT_SECS`, default 30, clamped
+/// 5..=120). A rule that needs prevalence the tenant cannot serve fails with
+/// `prevalence_unavailable` in well under the detection search deadline
+/// (180 s) instead of spending the interactive 130 s per lookup; a healthy
+/// lookup (one statement per request since NAN-3068) takes about a second.
+pub(crate) fn detection_prevalence_timeout() -> std::time::Duration {
+    static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        std::time::Duration::from_secs(parse_detection_prevalence_timeout(
+            std::env::var("NANOSIEM_DETECTION_PREVALENCE_TIMEOUT_SECS").ok().as_deref(),
+        ))
+    })
+}
+
+fn parse_detection_prevalence_timeout(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok()).unwrap_or(30).clamp(5, 120)
+}
+
+#[cfg(test)]
+mod nan3080_detection_prevalence_timeout_tests {
+    #[test]
+    fn detection_prevalence_timeout_defaults_to_30s_and_is_clamped() {
+        use super::parse_detection_prevalence_timeout as parse;
+        assert_eq!(parse(None), 30);
+        assert_eq!(parse(Some("garbage")), 30);
+        assert_eq!(parse(Some("1")), 5);
+        assert_eq!(parse(Some("600")), 120);
+        assert_eq!(parse(Some(" 45 ")), 45);
+        assert!(super::detection_prevalence_timeout() < std::time::Duration::from_secs(180));
+    }
+}
+
+#[cfg(test)]
+mod signed_url_trace_tests {
+    use super::extract_time_modifiers;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn time_modifier_traces_do_not_disclose_signed_url_credentials() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let capture = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || capture.clone())
+            .finish();
+        let query = "| inputlookup url=\"https://storage.googleapis.com/bucket/x?sig=TEST_CREDENTIAL\" earliest=-1h";
+        tracing::subscriber::with_default(subscriber, || {
+            let (cleaned, earliest, _) = extract_time_modifiers(query);
+            assert!(
+                cleaned.contains("sig=TEST_CREDENTIAL"),
+                "execution retains credentials"
+            );
+            assert_eq!(earliest, Some(-3600));
+        });
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("Cleaned query"),
+            "capture must observe the real traces"
+        );
+        assert!(
+            !output.contains("TEST_CREDENTIAL"),
+            "signed URL leaked to debug traces"
+        );
     }
 }

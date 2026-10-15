@@ -48,6 +48,8 @@ fn risk_config() -> RiskQueryConfig {
     RiskQueryConfig {
         decay: RiskDecayConfig::default(),
         cleared: ClearedBoundaries::from_map(&cleared),
+        lake_cleared: None,
+        lake_minimum_clear_revision: None,
         now: fixed_now(),
     }
 }
@@ -142,9 +144,7 @@ fn risk_dataset_uses_generator_source_scope_for_finding_origins() {
     let sql = generate(&gen, "score_24h > 0");
 
     assert!(
-        sql.contains(
-            "notEmpty(JSONExtract(metadata, 'origin_source_types', 'Array(String)'))"
-        ),
+        sql.contains("notEmpty(JSONExtract(metadata, 'origin_source_types', 'Array(String)'))"),
         "restricted dataset=risk must fail closed on legacy-empty origins: {sql}"
     );
     assert!(
@@ -160,9 +160,8 @@ fn risk_dataset_uses_generator_source_scope_for_finding_origins() {
         "user IN [dataset=risk score_24h > 0 | return entity]",
     );
     assert!(
-        subsearch_sql.contains(
-            "notEmpty(JSONExtract(metadata, 'origin_source_types', 'Array(String)'))"
-        ),
+        subsearch_sql
+            .contains("notEmpty(JSONExtract(metadata, 'origin_source_types', 'Array(String)'))"),
         "a risk subsearch must inherit the outer request's scope: {subsearch_sql}"
     );
 }
@@ -195,7 +194,10 @@ fn risk_base_source_is_ocsf_and_cluster_aware() {
         "({})",
         risk_dataset_base_query(&source, cfg.now, &cfg.decay, &cfg.cleared).to_inline_sql()
     );
-    assert!(sql.contains(&base), "must embed the OCSF/clustered base source");
+    assert!(
+        sql.contains(&base),
+        "must embed the OCSF/clustered base source"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +246,10 @@ fn risk_pipeline_where_stats_sort_table_head_compose() {
     assert!(!sql.contains("ext."), "{sql}");
 
     let sql = generate(&gen, "* | table entity, entity_type, score_24h, score_7d");
-    assert!(sql.contains("SELECT entity, entity_type, score_24h, score_7d"), "{sql}");
+    assert!(
+        sql.contains("SELECT entity, entity_type, score_24h, score_7d"),
+        "{sql}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -263,8 +268,14 @@ fn logs_query_with_risk_in_subsearch_scopes_derived_source_to_the_bracket() {
     );
 
     assert!(sql.contains("FROM logs"), "{sql}");
-    assert!(sql.contains("timestamp BETWEEN"), "outer logs bound must remain: {sql}");
-    assert!(sql.contains(&expected_base_source()), "subsearch must read the derived source: {sql}");
+    assert!(
+        sql.contains("timestamp BETWEEN"),
+        "outer logs bound must remain: {sql}"
+    );
+    assert!(
+        sql.contains(&expected_base_source()),
+        "subsearch must read the derived source: {sql}"
+    );
     assert!(
         sql.contains("WHERE 1 = 1 AND (score_24h > 100)"),
         "subsearch bound must be neutral: {sql}"
@@ -282,7 +293,10 @@ fn logs_query_with_risk_join_scopes_derived_source_to_the_subsearch() {
         "error | join user [dataset=risk score_7d > 50 | rename entity as user]",
     );
 
-    assert!(sql.contains("timestamp BETWEEN"), "outer logs bound must remain: {sql}");
+    assert!(
+        sql.contains("timestamp BETWEEN"),
+        "outer logs bound must remain: {sql}"
+    );
     // The multi-stage subsearch generator re-indents nested SQL, so compare the
     // embedded derived source whitespace-normalized (token-identical).
     let normalize = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");

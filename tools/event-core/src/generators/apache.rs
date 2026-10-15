@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Apache HTTP Server access log generator
 //!
 //! Produces Apache Combined Log Format lines matching what the Vector

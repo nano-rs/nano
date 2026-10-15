@@ -36,6 +36,7 @@ pub(crate) const IOC_OBSERVABLE_LOWER_COLUMNS: &[&str] = &[
     "process_hash",
     "url",
     "url_domain",
+    "dest_host",
     "query",
     "user_id",
     "sender",
@@ -50,47 +51,95 @@ pub(crate) const IOC_OBSERVABLE_LOWER_COLUMNS: &[&str] = &[
     "dns_answers",
 ];
 
-/// A single resolved observable: the stable LOGICAL UDM field name (kept for UI
-/// attribution — see `RetroListRow.field` / summary `matched_fields` — so the
-/// analyst sees a consistent label regardless of profile), the active-profile
-/// physical column SQL it resolves to (already escaped/quoted — OCSF columns are
-/// dotted), and whether it compares RAW vs `lower()`.
+/// Canonical OCSF 1.9 observables searched by the schema-level `ioc` term.
+///
+/// These are event paths, not Nano serving aliases. Repeated hash/answer
+/// objects are represented by their canonical `value`/`rdata` leaves and use
+/// array membership semantics below. Keeping this list beside the legacy UDM
+/// list makes the storage boundary explicit: the selected schema contributes
+/// exactly one vocabulary.
+const OCSF_1_9_IOC_RAW_COLUMNS: &[&str] = &["src_endpoint.ip", "dst_endpoint.ip"];
+
+const OCSF_1_9_IOC_RAW_ARRAY_COLUMNS: &[&str] = &[
+    "file.hashes.value",
+    "process.file.hashes.value",
+    "actor.process.file.hashes.value",
+];
+
+const OCSF_1_9_IOC_LOWER_COLUMNS: &[&str] = &[
+    "http_request.url.url_string",
+    "url.url_string",
+    "http_request.url.hostname",
+    "url.hostname",
+    "query.hostname",
+    // NAN-2361: a domain indicator also surfaces as the DESTINATION of a
+    // connection (Sysmon EID 3 DestinationHostname, proxy/firewall egress
+    // logs), not only as a URL host or DNS question. Without this a hunt for a
+    // known-bad domain silently missed every network-connection sighting of
+    // it — confirmed live: an ingested EID 3 to a ThreatFox domain returned
+    // hits=0 while the same domain seen in a DNS query returned hits=1.
+    "dst_endpoint.hostname",
+    "user.uid",
+    "user.name",
+    "actor.user.uid",
+    "actor.user.name",
+    "email.from",
+    "email.to",
+    "vulnerabilities.cve.uid",
+];
+
+const OCSF_1_9_IOC_LOWER_ARRAY_COLUMNS: &[&str] = &["answers.rdata"];
+
+/// A single resolved observable in the active storage vocabulary.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedObservable {
-    /// Stable logical UDM observable name (e.g. `src_ip`) — the UI label.
+    /// Schema-native observable name used for UI attribution.
     pub logical: &'static str,
     /// Profile-resolved, properly-escaped physical column SQL (e.g.
     /// `` `src_endpoint.ip` `` under OCSF, `src_ip` under UDM).
     pub col_sql: String,
     /// `true` → compare RAW (`<col> = 'v'`); `false` → `lower(<col>) = 'v'`.
     pub raw: bool,
+    /// Whether the physical leaf is an `Array(String)` and therefore needs
+    /// membership rather than scalar comparison semantics.
+    pub array: bool,
 }
 
-/// Resolve the LOGICAL observable lists to the active profile's physical columns
-/// (NAN-1580 OCSF-awareness). Each logical UDM observable name is mapped to its
-/// physical column via [`crate::schema::SchemaProfile::udm_column_sql`] — the SAME
-/// resolver the query generator's `field_to_sql_expr` uses — so UDM tenants emit
-/// the UDM columns (the resolution is the identity) and OCSF tenants emit the
-/// promoted OCSF columns (`src_endpoint.ip`, `file.hashes.sha256`, the `*_unified`
-/// class-split columns). Observables the active profile has NO column for resolve
-/// to `None` and are SKIPPED — so an OCSF sweep never emits a non-existent column
-/// (which would 500 in ClickHouse) and simply doesn't scan that observable. The
-/// raw-vs-lower compare mode stays attached to the LOGICAL observable (IPs/host/mac
-/// → raw on both schemas; hashes/urls/text → lower).
+/// Strict OCSF uses canonical 1.9 paths directly. The temporary ClickHouse/UDM
+/// profile keeps its historical mapping isolated behind `udm_column_sql`; those
+/// aliases are never accepted by or emitted for the lake profile.
 pub(crate) fn resolve_ioc_observables(
     profile: &dyn crate::schema::SchemaProfile,
 ) -> Vec<ResolvedObservable> {
     let mut out = Vec::new();
-    for (raw, names) in [
-        (true, IOC_OBSERVABLE_RAW_COLUMNS),
-        (false, IOC_OBSERVABLE_LOWER_COLUMNS),
-    ] {
+    let groups: &[(bool, bool, &[&str])] = if profile.uses_strict_canonical_fields() {
+        &[
+            (true, false, OCSF_1_9_IOC_RAW_COLUMNS),
+            (true, true, OCSF_1_9_IOC_RAW_ARRAY_COLUMNS),
+            (false, false, OCSF_1_9_IOC_LOWER_COLUMNS),
+            (false, true, OCSF_1_9_IOC_LOWER_ARRAY_COLUMNS),
+        ]
+    } else {
+        &[
+            (true, false, IOC_OBSERVABLE_RAW_COLUMNS),
+            (false, false, IOC_OBSERVABLE_LOWER_COLUMNS),
+        ]
+    };
+    for &(raw, array, names) in groups {
         for &logical in names {
-            if let Some(col_sql) = profile.udm_column_sql(logical) {
+            let col_sql = if profile.uses_strict_canonical_fields() {
+                profile
+                    .is_known_field(logical)
+                    .then(|| crate::query::escape_identifier(logical))
+            } else {
+                profile.udm_column_sql(logical)
+            };
+            if let Some(col_sql) = col_sql {
                 out.push(ResolvedObservable {
                     logical,
                     col_sql,
                     raw,
+                    array,
                 });
             }
         }
@@ -100,7 +149,38 @@ pub(crate) fn resolve_ioc_observables(
 
 /// Classify an indicator value into a coarse type (ip/hash/url/cve/user/domain).
 /// Shared by the retro rollup and the general `ioc=` SQL gen (NAN-1589/1590).
-pub(crate) fn classify_indicator(value: &str) -> &'static str {
+/// Does `field = "<literal>"` expand to `exact OR FQDN-prefix`?
+///
+/// A dotless literal on a host-entity field is deliberately NOT an exact match:
+/// `device.hostname="ws-fin-011"` also matches `ws-fin-011.corp.local`, because
+/// sources disagree about whether they emit the short name or the FQDN.
+///
+/// NAN-2361: this is public and shared because a SECOND consumer has to agree
+/// with it. The lake compiler emits candidate hints used to prune objects
+/// before the SQL ever runs, and a hint must be a SUPERSET of the predicate it
+/// accompanies. It was emitting an exact-value entity hint here, which is
+/// strictly NARROWER than the expansion — so every object was pruned away and
+/// short-hostname lookups returned zero rows on promoted data, while the same
+/// query worked on the un-indexed hot tail. Any future consumer that has to
+/// reason about this expansion must call this rather than restate the rule.
+/// The field is CANONICALIZED first: `entity_type` is not alias-aware, so
+/// asking it about a UDM alias (`dest_hostname`) returns `None` while its
+/// canonical form (`dest_host`) returns `Host`. Without this, an alias and the
+/// column it resolves to compile to different predicates — the alias silently
+/// staying exact-match while the canonical name expands.
+pub fn hostname_equality_expands(
+    profile: &dyn crate::schema::SchemaProfile,
+    field: &str,
+    literal: &str,
+) -> bool {
+    if literal.contains('.') {
+        return false;
+    }
+    let canonical = profile.canonicalize(field);
+    profile.entity_type(canonical.as_ref()) == Some(crate::schema::EntityType::Host)
+}
+
+pub fn classify_indicator(value: &str) -> &'static str {
     let v = value.trim();
     if v.parse::<std::net::IpAddr>().is_ok() {
         return "ip";
@@ -136,13 +216,54 @@ pub(crate) fn classify_indicator(value: &str) -> &'static str {
 /// keep the full observable set" (the caller's safe fallback).
 pub(crate) fn observable_logicals_for_type(indicator_type: &str) -> &'static [&'static str] {
     match indicator_type {
-        "ip" => &["src_ip", "dest_ip", "dvc_ip"],
-        "hash" => &["file_hash", "process_hash"],
-        // a domain can surface as a URL host, an email party domain, or a DNS query
-        "domain" => &["url_domain", "sender_domain", "recipient_domain", "query"],
-        "url" => &["url"],
-        "cve" => &["cve"],
-        "user" => &["user_id", "sender", "recipient"],
+        "ip" => &[
+            "src_ip",
+            "dest_ip",
+            "dvc_ip",
+            "src_endpoint.ip",
+            "dst_endpoint.ip",
+        ],
+        "hash" => &[
+            "file_hash",
+            "process_hash",
+            "file.hashes.value",
+            "process.file.hashes.value",
+            "actor.process.file.hashes.value",
+        ],
+        // a domain can surface as a URL host, an email party domain, a DNS
+        // query, or the DESTINATION of a network connection (NAN-2361 — the
+        // egress case was missing, so proxy/firewall/Sysmon-EID-3 sightings of
+        // a known-bad domain were invisible to IOC hunting).
+        //
+        // NOTE: matching on `dst_endpoint.hostname` is correct here and must
+        // NOT be confused with using it as the sighting's ASSET identity —
+        // on a row matched this way the destination hostname IS the indicator.
+        // See `LAKE_RETRO_ASSET_FIELDS` (search/service/retro.rs), which
+        // deliberately excludes it for exactly that reason.
+        "domain" => &[
+            "url_domain",
+            "dest_host",
+            "sender_domain",
+            "recipient_domain",
+            "query",
+            "http_request.url.hostname",
+            "url.hostname",
+            "query.hostname",
+            "dst_endpoint.hostname",
+        ],
+        "url" => &["url", "http_request.url.url_string", "url.url_string"],
+        "cve" => &["cve", "vulnerabilities.cve.uid"],
+        "user" => &[
+            "user_id",
+            "sender",
+            "recipient",
+            "user.uid",
+            "user.name",
+            "actor.user.uid",
+            "actor.user.name",
+            "email.from",
+            "email.to",
+        ],
         _ => &[],
     }
 }
@@ -197,7 +318,8 @@ pub(crate) fn ioc_feed_indicator_subquery(feed: &IocFeed, is_clustered: bool) ->
     // set is complete across shards; on single-node `.read()` returns the local
     // `nanosiem.custom_enrichment_results` → byte-identical. Dupes are harmless in
     // an IN-subquery, so no version-collapse is needed here.
-    let table = crate::db::dual_pool::TableNames::new(is_clustered).read("custom_enrichment_results");
+    let table =
+        crate::db::dual_pool::TableNames::new(is_clustered).read("custom_enrichment_results");
     format!(
         "SELECT lower(key_value) FROM {table} \
          WHERE is_ioc = 1 AND expires_at > now() \
@@ -298,10 +420,7 @@ fn build_optimized_regex_sql(
                         if skip_tostring {
                             format!("lower({}) iLike '%{}%'", field_expr, pattern)
                         } else {
-                            format!(
-                                "lower(toString({})) iLike '%{}%'",
-                                field_expr, pattern
-                            )
+                            format!("lower(toString({})) iLike '%{}%'", field_expr, pattern)
                         }
                     })
                     .collect();
@@ -324,10 +443,7 @@ fn build_optimized_regex_sql(
                 let guard = if skip_tostring {
                     format!("lower({}) iLike '%{}%'", field_expr, pattern)
                 } else {
-                    format!(
-                        "lower(toString({})) iLike '%{}%'",
-                        field_expr, pattern
-                    )
+                    format!("lower(toString({})) iLike '%{}%'", field_expr, pattern)
                 };
                 // For negated: NOT (guard AND match) → can't short-circuit, just negate match.
                 if negated {
@@ -378,6 +494,9 @@ fn validate_cidr_literal(cidr: &str) -> Result<(), SqlGenError> {
 
     Ok(())
 }
+
+/// Prevalence scalar value meaning "no artifact on this row" (NAN-1689).
+const PREVALENCE_NA_SENTINEL: u16 = 65535;
 
 impl ClickHouseSqlGenerator {
     /// Whether `field` is an IP-valued security entity under the active schema.
@@ -457,6 +576,158 @@ impl ClickHouseSqlGenerator {
             || self.is_dataset_numeric_column(super::normalize_field_name(field))
     }
 
+    /// Resolved schema type of `field`: the logical type, else the type of the
+    /// physical column it resolves to.
+    fn resolved_field_type(&self, field: &str) -> Option<crate::schema::FieldType> {
+        self.profile
+            .field_type(field)
+            .or_else(|| match self.profile.resolve(field) {
+                crate::schema::FieldResolution::ExplicitColumn(column) => {
+                    self.profile.field_type(&column)
+                }
+                _ => None,
+            })
+    }
+
+    /// True when `field` is a typed non-string scalar (number, bool, time, UUID).
+    /// Comparing such a column with `''` makes ClickHouse parse `''` as the
+    /// column type, which fails (`Code: 32 ... while converting '' to UInt16`).
+    fn field_is_non_string_scalar(&self, field: &str) -> bool {
+        use crate::schema::FieldType;
+        self.field_is_numeric(field)
+            || matches!(
+                self.resolved_field_type(field),
+                Some(
+                    FieldType::Integer
+                        | FieldType::Long
+                        | FieldType::Float
+                        | FieldType::Boolean
+                        | FieldType::Timestamp
+                        | FieldType::Uuid
+                )
+            )
+    }
+
+    /// `prevalence_*` scalars encode "no artifact on this row" as 65535
+    /// (NAN-1689). Existence must treat that sentinel as absent.
+    fn is_prevalence_sentinel_field(&self, field: &str) -> bool {
+        super::normalize_field_name(field).starts_with("prevalence_")
+            && self.field_is_non_string_scalar(field)
+    }
+
+    /// NAN-2707: the `field=*` existence predicate, typed to the column.
+    ///
+    /// String columns keep the non-NULL and non-empty test unchanged. A typed
+    /// scalar compares its rendered form instead, because `numeric != ''` is a
+    /// ClickHouse type error. On the lake that error came back as a
+    /// 500 and was reported to the analyst as "search service unavailable".
+    /// Prevalence scalars also exclude their N/A sentinel, so
+    /// `prevalence_dest_ip=*` means "has a prevalence value".
+    fn scalar_presence_sql(&self, field: &str, field_expr: &str) -> String {
+        if self.is_prevalence_sentinel_field(field) {
+            return format!(
+                "({field_expr} IS NOT NULL AND {field_expr} != {PREVALENCE_NA_SENTINEL})"
+            );
+        }
+        if self.field_is_non_string_scalar(field) {
+            return format!("({field_expr} IS NOT NULL AND toString({field_expr}) != '')");
+        }
+        format!("({field_expr} IS NOT NULL AND {field_expr} != '')")
+    }
+
+    /// Whether the logical or resolved physical field is a real Boolean leaf.
+    /// Strict OCSF lake `unmapped.*` types come from the immutable manifest, so
+    /// quoted UI drilldown values such as `"true"` must not enter `lower(Bool)`.
+    fn field_is_boolean(&self, field: &str) -> bool {
+        if self.profile.field_type(field) == Some(crate::schema::FieldType::Boolean) {
+            return true;
+        }
+        match self.profile.resolve(field) {
+            crate::schema::FieldResolution::ExplicitColumn(column) => {
+                self.profile.field_type(&column) == Some(crate::schema::FieldType::Boolean)
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `field` resolves to an `Array(T)` leaf.
+    ///
+    /// Every path under an OCSF list-of-struct is one — `enrichments.name`,
+    /// `enrichments.data.host_count`, and 61 others in the live lake manifest,
+    /// which types them `array` already. The schema knew; the codegen did not
+    /// ask.
+    pub(super) fn field_is_array(&self, field: &str) -> bool {
+        if self.profile.field_type(field) == Some(crate::schema::FieldType::Array) {
+            return true;
+        }
+        match self.profile.resolve(field) {
+            crate::schema::FieldResolution::ExplicitColumn(column) => {
+                self.profile.field_type(&column) == Some(crate::schema::FieldType::Array)
+            }
+            _ => false,
+        }
+    }
+
+    /// Membership comparison for an `Array(T)` leaf.
+    ///
+    /// A scalar comparison against an array stringifies the WHOLE array, so
+    /// `lower(toString("enrichments.name")) = 'prevalence'` compares against
+    /// `"['prevalence','abuse.ch']"` and matches nothing — while returning
+    /// HTTP 200, which is indistinguishable from "no matches". Worse, the
+    /// substring form accidentally *works*, so `like "%ioc%"` would also match
+    /// an element named `not_ioc`.
+    ///
+    /// `Ne` is "no element matches" (`NOT arrayExists`), which keeps
+    /// `a != "x"` complementary to `a = "x"` over the same rows.
+    fn array_membership_sql(&self, field_expr: &str, sql_op: &str, value: &Value) -> String {
+        // Lowercased for case-insensitive membership; escaped in both arms. The
+        // non-string arm goes through `value_to_sql` first so Ip/Regex/Interval
+        // render canonically, then has its quoting stripped since the needle is
+        // re-quoted below.
+        let needle = match value {
+            Value::String(text) => escape_string(&text.to_ascii_lowercase()),
+            other => escape_string(&value_to_sql(other).trim_matches('\'').to_ascii_lowercase()),
+        };
+        let exists = format!("arrayExists(x -> lower(toString(x)) = '{needle}', {field_expr})");
+        if sql_op.trim() == "!=" {
+            format!("NOT {exists}")
+        } else {
+            exists
+        }
+    }
+
+    /// Range comparison against an `Array(T)` leaf: does ANY element satisfy it.
+    ///
+    /// `enrichments.data.host_count <= 25` must mean "some enrichment on this row
+    /// reports 25 hosts or fewer", not "the rendered array compares less than
+    /// '25'". Elements that are NULL (an enrichment of a different kind that has
+    /// no such field) simply fail the predicate rather than poisoning the row,
+    /// which is what makes a mixed `enrichments[]` array queryable at all.
+    fn array_range_sql(&self, field_expr: &str, sql_op: &str, value: &Value) -> String {
+        // Route through the shared converter rather than Display: it is the only
+        // thing that quotes/escapes every Value variant (Ip, Regex, Interval)
+        // correctly. An earlier version escaped the String arm and fell back to
+        // raw `to_string()` for the rest -- no live parser path reached it, but
+        // "unreachable today" is a property of the parser, not a guarantee.
+        let rhs = value_to_sql(value);
+        format!("arrayExists(x -> x IS NOT NULL AND x {sql_op} {rhs}, {field_expr})")
+    }
+
+    fn boolean_comparison_sql(&self, field_expr: &str, sql_op: &str, value: &Value) -> String {
+        match value {
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => format!("{field_expr} {sql_op} true"),
+                "false" | "0" => format!("{field_expr} {sql_op} false"),
+                other => format!(
+                    "lower(toString({field_expr})) {sql_op} '{}'",
+                    escape_string(other)
+                ),
+            },
+            Value::Bool(value) => format!("{field_expr} {sql_op} {value}"),
+            _ => format!("{field_expr} {sql_op} {}", value_to_sql(value)),
+        }
+    }
+
     /// True when `field` resolves to a plain String column — a UDM/OCSF promoted
     /// `ExplicitColumn` that is neither numeric nor UUID. For these, full-text
     /// substring search must use `lower(<col>)`, NOT `lower(toString(<col>))`:
@@ -469,6 +740,7 @@ impl ClickHouseSqlGenerator {
             self.profile.resolve(field),
             crate::schema::FieldResolution::ExplicitColumn(_)
         ) && !self.profile.is_numeric_field(field)
+            && !self.field_is_boolean(field)
             && !self.profile.is_uuid_field(field)
     }
 
@@ -546,6 +818,18 @@ impl ClickHouseSqlGenerator {
     /// analysis engage), `lower(col)` otherwise (the migration-119 text
     /// indexes are built on `lower(col)`). Shared by every filter arm so the
     /// form selection can't drift per-arm again (NAN-1634).
+    /// LHS of the dotless-hostname expansion legs: the shared
+    /// [`Self::string_filter_lhs`] on profiles whose storage has no
+    /// `lower(col)` index to serve them (the object lake, NAN-3154), and
+    /// `lower(col)` on ClickHouse, where that text index serves both legs.
+    fn host_prefix_lhs(&self, field: &str, column_expr: &str) -> String {
+        if self.profile.lowercased_host_prefix_compares_raw() {
+            self.string_filter_lhs(field, column_expr)
+        } else {
+            format!("lower({})", column_expr)
+        }
+    }
+
     fn string_filter_lhs(&self, field: &str, column_expr: &str) -> String {
         if self.is_resolved_lowercased_at_ingest(field) {
             column_expr.to_string()
@@ -597,6 +881,54 @@ impl ClickHouseSqlGenerator {
             && self.is_plain_string_physical_column(field)
     }
 
+    /// NAN-3041: the physical expression of a schema ALIAS referenced in a
+    /// `| where` stage, or `None` to keep the bare stage-column reference.
+    ///
+    /// The search term resolves `user` / `src_ip` / `process_name` on the lean
+    /// lake to their OCSF homes (`user` = `if("user.name" != '', "user.name",
+    /// "actor.user.name")`), and so does `eval`. The `| where` arm used the bare
+    /// name, so `… | where NOT user="x"` compiled to `lower(toString("user"))`
+    /// — a column that does not exist in an OCSF part — and silently matched
+    /// every row (NOT) or none. Resolve exactly like `eval` (`field_to_sql_expr`)
+    /// whenever the name is not a pipeline-computed column (stats by-field,
+    /// eval/rex output, …) and the schema maps it somewhere other than its own
+    /// name. UDM columns resolve to themselves, so gen1 is byte-identical.
+    fn where_scope_schema_alias_expr(&self, original: &str, field: &str) -> Option<String> {
+        if self.is_computed_field(field)
+            || self.is_computed_field(original)
+            || self.is_upstream_computed_field(original)
+            || self.agg_reference_alias(field).is_some()
+            || !self.resolves_to_column(field)
+        {
+            return None;
+        }
+        let (resolved, _) = field_to_sql_expr(field, self);
+        (resolved != escape_identifier(field)).then_some(resolved)
+    }
+
+    /// [`Self::field_is_array`] for a `| where` operand, which is only an
+    /// `Array(T)` leaf when it still names the schema field.
+    ///
+    /// NAN-3848: a pipeline-computed name shadows any same-named schema
+    /// alias, which is how `where_scope_schema_alias_expr` builds the column
+    /// reference. The array test has to agree with it. Without that, the
+    /// Cloud resources panel's `eval resource_id=mvindex(...) | where
+    /// resource_id!=""` saw the OCSF alias `resource_id -> resources.uid`
+    /// (Array) and emitted `NOT arrayExists(..., resource_id)` against the
+    /// scalar String eval output. chDB rejects that ("arrayExists arg 2 must
+    /// be Array, found String"), so `/api/search/cloud-events` returned 400 on
+    /// every lean tenant.
+    fn where_scope_field_is_array(&self, original: &str, field: &str) -> bool {
+        if self.is_computed_field(field)
+            || self.is_computed_field(original)
+            || self.is_upstream_computed_field(original)
+            || self.agg_reference_alias(field).is_some()
+        {
+            return false;
+        }
+        self.field_is_array(field)
+    }
+
     /// Generate SQL for a search expression (WHERE clause content)
     pub fn generate_search_expr(&self, expr: &SearchExpr) -> Result<String, SqlGenError> {
         match expr {
@@ -622,9 +954,12 @@ impl ClickHouseSqlGenerator {
                     &self.profile.keyword_search_columns(),
                 ))
             }
-            SearchExpr::FieldFilter { field, op, value } => {
-                self.generate_field_filter(field, op, value)
-            }
+            SearchExpr::FieldFilter {
+                field,
+                op,
+                value,
+                rhs,
+            } => self.generate_field_filter(field, op, value, *rhs),
             SearchExpr::FunctionFilter {
                 function,
                 op,
@@ -650,9 +985,7 @@ impl ClickHouseSqlGenerator {
                 // Standalone boolean function predicate: isnull(user), like(field, pattern), etc.
                 eval_expression_to_sql(self, function)
             }
-            SearchExpr::EvalPredicate(expression) => {
-                typed_eval_expression_to_sql(self, expression)
-            }
+            SearchExpr::EvalPredicate(expression) => typed_eval_expression_to_sql(self, expression),
             SearchExpr::FieldFunctionFilter {
                 field,
                 op,
@@ -697,10 +1030,9 @@ impl ClickHouseSqlGenerator {
                             self.string_filter_lhs(field, &field_expr),
                             func_sql
                         )),
-                        Comparator::Ne => Ok(format!(
-                            "lower({}) != lower({})",
-                            field_expr, func_sql
-                        )),
+                        Comparator::Ne => {
+                            Ok(format!("lower({}) != lower({})", field_expr, func_sql))
+                        }
                         _ => Ok(format!("{} {} {}", field_expr, sql_op, func_sql)),
                     };
                 }
@@ -724,14 +1056,21 @@ impl ClickHouseSqlGenerator {
                 let right_sql = self.generate_search_expr(right)?;
                 Ok(format!("({} AND {})", left_sql, right_sql))
             }
-            SearchExpr::Or(left, right) => {
-                let left_sql = self.generate_search_expr(left)?;
-                let right_sql = self.generate_search_expr(right)?;
-                Ok(format!("({} OR {})", left_sql, right_sql))
+            SearchExpr::Or(..) => {
+                // NAN-3276: one flat `(a OR b OR …)` per OR chain, never one
+                // parenthesised level per binary node. A generated predicate
+                // over thousands of values nested `((((a OR b) OR c) …)` past
+                // every SQL parser's depth limit (sqlparser's 50, ClickHouse's
+                // `max_parser_depth`); the flat chain parses at constant depth.
+                let legs = or_chain_legs(expr)
+                    .into_iter()
+                    .map(|leg| self.generate_search_expr(leg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(format!("({})", legs.join(" OR ")))
             }
             SearchExpr::Not(inner) => {
                 let inner_sql = self.generate_search_expr(inner)?;
-                Ok(format!("NOT ({})", inner_sql))
+                Ok(null_safe_not(&inner_sql))
             }
             SearchExpr::Group(inner) => {
                 let inner_sql = self.generate_search_expr(inner)?;
@@ -761,19 +1100,16 @@ impl ClickHouseSqlGenerator {
                 subsearch,
                 negated,
                 subsearch_dataset,
-            } => self.generate_in_subsearch_filter(
-                field,
-                subsearch,
-                *negated,
-                *subsearch_dataset,
-            ),
+            } => self.generate_in_subsearch_filter(field, subsearch, *negated, *subsearch_dataset),
             // NAN-1580: observable-anywhere IOC term. Expands literal indicator
             // values across the full UDM observable column set (per-column index-
             // prunable equality), and for feed-sourced terms resolves the
             // indicator set from `custom_enrichment_results` via an IN-subquery.
-            SearchExpr::IocMatch { values, feed, lookup } => {
-                self.generate_ioc_match_filter(values, feed.as_ref(), lookup.as_ref())
-            }
+            SearchExpr::IocMatch {
+                values,
+                feed,
+                lookup,
+            } => self.generate_ioc_match_filter(values, feed.as_ref(), lookup.as_ref()),
         }
     }
 
@@ -823,10 +1159,8 @@ impl ClickHouseSqlGenerator {
             };
         }
 
-        // NAN-1580 (OCSF-aware): resolve the LOGICAL observable names to the
-        // active profile's physical columns. UDM → src_ip…; OCSF →
-        // `src_endpoint.ip`/`file.hashes.sha256`/`*_unified`; observables with no
-        // column under the profile are skipped (no dead column → no CH 500).
+        // Resolve observables in exactly one vocabulary: canonical OCSF 1.9 for
+        // the lake, historical UDM only for the legacy ClickHouse profile.
         let observables = resolve_ioc_observables(self.profile.as_ref());
 
         // NAN-1590: type-scope to the columns the indicator types can actually
@@ -865,7 +1199,17 @@ impl ClickHouseSqlGenerator {
 
         let mut clauses = Vec::new();
         for obs in &observables {
-            if obs.raw {
+            if obs.array && obs.raw {
+                clauses.push(format!(
+                    "arrayExists(x -> ifNull(x, '') IN ({}), {})",
+                    in_list, obs.col_sql
+                ));
+            } else if obs.array {
+                clauses.push(format!(
+                    "arrayExists(x -> lower(ifNull(x, '')) IN ({}), {})",
+                    in_list, obs.col_sql
+                ));
+            } else if obs.raw {
                 clauses.push(format!("{} IN ({})", obs.col_sql, in_list));
             } else {
                 clauses.push(format!("lower({}) IN ({})", obs.col_sql, in_list));
@@ -891,7 +1235,17 @@ impl ClickHouseSqlGenerator {
         let observables = resolve_ioc_observables(self.profile.as_ref());
         let mut clauses = Vec::new();
         for obs in &observables {
-            if obs.raw {
+            if obs.array && obs.raw {
+                clauses.push(format!(
+                    "arrayExists(x -> ifNull(x, '') IN ({}), {})",
+                    subquery, obs.col_sql
+                ));
+            } else if obs.array {
+                clauses.push(format!(
+                    "arrayExists(x -> lower(ifNull(x, '')) IN ({}), {})",
+                    subquery, obs.col_sql
+                ));
+            } else if obs.raw {
                 clauses.push(format!("{} IN ({})", obs.col_sql, subquery));
             } else {
                 clauses.push(format!("lower({}) IN ({})", obs.col_sql, subquery));
@@ -911,6 +1265,42 @@ impl ClickHouseSqlGenerator {
         negated: bool,
     ) -> Result<String, SqlGenError> {
         let op = if negated { "NOT IN" } else { "IN" };
+
+        // Lake hashes and other repeated OCSF leaves are arrays, including
+        // class-spanning product aliases such as process_hash. IN is element
+        // membership; lower(array) is neither valid SQL nor scalar equality.
+        if self.profile.is_string_array_field(field) {
+            let column = self.filter_field_expr(field, "String");
+            // NAN-3276: ONE element test against the whole list (the same
+            // lowered needles `array_membership_sql` compares), not one
+            // `arrayExists` per value OR-ed together: a long list stays one
+            // flat expression.
+            let needles: Vec<_> = values
+                .iter()
+                .map(|value| match value {
+                    Value::String(text) => {
+                        format!("'{}'", escape_string(&text.to_ascii_lowercase()))
+                    }
+                    other => format!(
+                        "'{}'",
+                        escape_string(&value_to_sql(other).trim_matches('\'').to_ascii_lowercase())
+                    ),
+                })
+                .collect();
+            let matched = if needles.is_empty() {
+                "0".to_string()
+            } else {
+                format!(
+                    "arrayExists(x -> lower(toString(x)) IN ({}), {column})",
+                    needles.join(", ")
+                )
+            };
+            return Ok(if negated {
+                format!("NOT {matched}")
+            } else {
+                matched
+            });
+        }
 
         // Check if all values are strings (for case-insensitive handling)
         let all_strings = values.iter().all(|v| matches!(v, Value::String(_)));
@@ -964,7 +1354,12 @@ impl ClickHouseSqlGenerator {
                                 _ => Ok(value_to_sql(v)),
                             })
                             .collect();
-                        Ok(format!("{} {} ({})", field_expr, op, values_sql?.join(", ")))
+                        Ok(format!(
+                            "{} {} ({})",
+                            field_expr,
+                            op,
+                            values_sql?.join(", ")
+                        ))
                     }
                     crate::schema::EnumIntMapping::LabelColumn(sibling) => {
                         // Class-scoped enum: integer ids hit the int column, verbs
@@ -1058,7 +1453,49 @@ impl ClickHouseSqlGenerator {
                 } else {
                     format!("lower({})", field_expr)
                 };
-                Ok(format!("{} {} ({})", lhs, op, values_list))
+                let membership = format!("{} {} ({})", lhs, op, values_list);
+
+                // NAN-2361: `IN` must mean the same thing `=` does.
+                //
+                // A dotless literal on a host-entity field expands to
+                // `= v OR startsWith(col, 'v.')` in the Eq arm, so short names
+                // match FQDNs. The IN arm had no such expansion, which made
+                // `host = "ws-fin-011"` and `host IN ("ws-fin-011")` two
+                // different questions. The asset dossier builds its predicate
+                // as `IN (...)`, so it kept splitting one host into two assets
+                // long after the `=` path was fixed.
+                //
+                // Only the dotless literals get a prefix leg; FQDNs are already
+                // exact. Negation is De Morgan's: NOT IN AND none-of-the-prefixes.
+                let prefix_legs: Vec<String> = values
+                    .iter()
+                    .filter_map(|value| match value {
+                        Value::String(text)
+                            if hostname_equality_expands(self.profile.as_ref(), field, text) =>
+                        {
+                            // NAN-3154: positive legs follow the membership's
+                            // own LHS (raw on ingest-lowercased columns); a
+                            // negation keeps `lower()` like the NOT IN above.
+                            Some(format!(
+                                "{}startsWith({}, '{}.')",
+                                if negated { "NOT " } else { "" },
+                                if negated { format!("lower({})", field_expr) } else { self.host_prefix_lhs(field, &field_expr) },
+                                escape_string(&text.to_lowercase())
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if prefix_legs.is_empty() {
+                    return Ok(membership);
+                }
+                let joiner = if negated { " AND " } else { " OR " };
+                Ok(format!(
+                    "({}{}{})",
+                    membership,
+                    joiner,
+                    prefix_legs.join(joiner)
+                ))
             } else {
                 let values_sql: Vec<String> = values
                     .iter()
@@ -1091,11 +1528,65 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for a field filter
+    /// Resolve a `<field> = <other>` / `<field> != <other>` term into a
+    /// field-to-field comparison, or refuse it as ambiguous (NAN-2378 /
+    /// NAN-2380).
+    ///
+    /// The tokenizer used to throw away quotedness, so an unquoted RHS became a
+    /// string literal for `=` / `!=` (only `>` `<` `>=` `<=` peeked for a bare
+    /// field reference). `| where process.name != process.file.name` therefore
+    /// asked "is process.name different from the seventeen-character text
+    /// `process.file.name`" — true for every row ever ingested — and `=` asked
+    /// the mirror question, false for every row. That is not a missing feature:
+    /// it is the EXACT INVERSE of the intended predicate, returned with a
+    /// plausible row count and no error. It silently destroys the whole
+    /// "claims to be X but is actually Y" masquerading family (T1036.003).
+    ///
+    /// The reading is decided by [`classify_rhs`], which is also called by query
+    /// validation; this method is the codegen backstop that covers every
+    /// non-search lane (detection rules, materialized views, dashboards). It is
+    /// the one place holding both the term and the active `SchemaProfile`, and
+    /// it is shared by ClickHouse UDM, ClickHouse OCSF and the object lake.
+    ///
+    /// A resolved term is returned as the existing `FieldFunctionFilter` node —
+    /// the same shape `first_seen > time_threshold` already produces — so
+    /// column-to-column SQL is emitted by code that was already exercised.
+    pub(crate) fn field_to_field_term(
+        &self,
+        field: &str,
+        op: &Comparator,
+        value: &Value,
+        rhs_syntax: RhsSyntax,
+    ) -> Result<Option<SearchExpr>, SqlGenError> {
+        match classify_rhs(self.profile.as_ref(), field, op, value, rhs_syntax) {
+            RhsReading::Literal => Ok(None),
+            RhsReading::FieldReference => {
+                let Value::String(rhs) = value else {
+                    unreachable!("classify_rhs only resolves a Value::String")
+                };
+                Ok(Some(SearchExpr::FieldFunctionFilter {
+                    field: field.to_string(),
+                    op: *op,
+                    function: EvalExpression::Field(rhs.clone()),
+                }))
+            }
+            RhsReading::Ambiguous => {
+                let Value::String(rhs) = value else {
+                    unreachable!("classify_rhs only flags a Value::String")
+                };
+                Err(SqlGenError::InvalidQuery(ambiguous_comparison_message(
+                    field, op, rhs,
+                )))
+            }
+        }
+    }
+
     pub(super) fn generate_field_filter(
         &self,
         field: &str,
         op: &Comparator,
         value: &Value,
+        rhs_syntax: RhsSyntax,
     ) -> Result<String, SqlGenError> {
         // SECURITY: Validate field name format to prevent injection of function calls
         // (e.g., "version()" or "currentDatabase()") through field name positions.
@@ -1105,6 +1596,11 @@ impl ClickHouseSqlGenerator {
         // Validate regex patterns before generating SQL
         if let Value::Regex(pattern) = value {
             validate_regex_pattern(pattern).map_err(|e| SqlGenError::InvalidQuery(e))?;
+        }
+
+        // NAN-2378/NAN-2380: `a = b` where `b` is a column, not a literal.
+        if let Some(term) = self.field_to_field_term(field, op, value, rhs_syntax)? {
+            return self.generate_search_expr(&term);
         }
 
         // Normalize field name (apply aliases like sourcetype -> source_type).
@@ -1144,14 +1640,40 @@ impl ClickHouseSqlGenerator {
         // (per-element predicate over `x`, negate). Exact-equality short-circuits
         // to has() before this, since it's cheaper than arrayExists.
         let (elem, negate): (String, bool) = match (op, value) {
-            (Comparator::Eq, Value::String(s)) if s == "*" => return Ok("1".to_string()),
-            (Comparator::Ne, Value::String(s)) if s == "*" => return Ok("0".to_string()),
+            // NAN-2361: `field=*` is an EXISTENCE test, not "match all rows".
+            // It used to compile to the literal `1`, so `file.hashes.value=*`
+            // became `WHERE 1` and returned every row in the window — measured
+            // at 395 of 400 sampled rows carrying no hash at all. On an array
+            // column, presence is a non-empty array.
+            (Comparator::Eq, Value::String(s)) if s == "*" => {
+                return Ok(format!("notEmpty({col})"))
+            }
+            (Comparator::Ne, Value::String(s)) if s == "*" => return Ok(format!("empty({col})")),
             (Comparator::Eq | Comparator::Ne, Value::String(s)) => {
                 let negate = *op == Comparator::Ne;
+                // Canonical repeated OCSF objects use an empty array for an
+                // absent value. Treat `field=""` / `field!=""` as array
+                // absence/presence, not membership of an empty string. The
+                // latter incorrectly made `[] != ""` true.
+                if s.is_empty() {
+                    return Ok(if negate {
+                        format!("notEmpty({})", col)
+                    } else {
+                        format!("empty({})", col)
+                    });
+                }
                 if s.contains('*') || s.contains('?') {
                     let pattern = wildcard_to_like_pattern(&s.to_lowercase());
                     (format!("lower(x) iLike '{}'", pattern), negate)
                 } else {
+                    // Stored enrichment text preserves display case (country
+                    // names and continent codes). It
+                    // does not follow the lowercase-at-rest tag convention.
+                    if field.starts_with("enrichments.data.") {
+                        return Ok(self.array_membership_sql(
+                            &col, if negate { "!=" } else { "=" }, value,
+                        ));
+                    }
                     let lit = escape_string(&s.to_lowercase());
                     let has = format!("has({}, '{}')", col, lit);
                     return Ok(if negate { format!("NOT {}", has) } else { has });
@@ -1172,7 +1694,10 @@ impl ClickHouseSqlGenerator {
                 )
             }
             (Comparator::StartsWith | Comparator::NotStartsWith, Value::String(s)) => (
-                format!("startsWith(lower(x), '{}')", escape_string(&s.to_lowercase())),
+                format!(
+                    "startsWith(lower(x), '{}')",
+                    escape_string(&s.to_lowercase())
+                ),
                 *op == Comparator::NotStartsWith,
             ),
             (Comparator::EndsWith | Comparator::NotEndsWith, Value::String(s)) => (
@@ -1213,7 +1738,7 @@ impl ClickHouseSqlGenerator {
         // NAN-1464: Array(String) columns (`tags`, `*_tags`) use membership
         // semantics — a scalar `col = 'v'` is a ClickHouse type error that
         // silently matches nothing.
-        if super::is_array_column(field) {
+        if super::is_array_column(field) || self.profile.is_string_array_field(field) {
             return self.generate_array_field_filter(field, op, value);
         }
 
@@ -1228,13 +1753,16 @@ impl ClickHouseSqlGenerator {
         if let Value::String(s) = value {
             if (s.contains('*') || s.contains('?')) && matches!(op, Comparator::Eq | Comparator::Ne)
             {
-                // Special case: pure wildcard "*" means "match all" - just return true/false
-                // This avoids generating useless "field LIKE '%'" which adds overhead
+                // NAN-2361: `field=*` is an EXISTENCE test, not "match all".
+                // It used to compile to the literal `1`/`0`, which ignored the
+                // field entirely and silently returned rows where it is absent.
+                // A scalar exists when it is non-NULL and non-empty.
                 if s == "*" {
+                    let presence = self.scalar_presence_sql(field, &field_expr);
                     return Ok(if *op == Comparator::Eq {
-                        "1".to_string()
+                        presence
                     } else {
-                        "0".to_string()
+                        format!("NOT {presence}")
                     });
                 }
                 let pattern = wildcard_to_like_pattern(&s.to_lowercase());
@@ -1280,10 +1808,7 @@ impl ClickHouseSqlGenerator {
                         // no index to serve the guard.
                         if self.is_plain_string_search_column(field) {
                             if let Some(guard) = longest_guard_token(&token) {
-                                return Ok(format!(
-                                    "{} AND {} iLike '%{}%'",
-                                    full, lhs, guard
-                                ));
+                                return Ok(format!("{} AND {} iLike '%{}%'", full, lhs, guard));
                             }
                         }
                         return Ok(full);
@@ -1393,7 +1918,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'{}%'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat(lower({}), '%')", value_sql),
                 };
@@ -1409,7 +1937,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'{}%'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat(lower({}), '%')", value_sql),
                 };
@@ -1425,7 +1956,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'%{}'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat('%', lower({}))", value_sql),
                 };
@@ -1441,7 +1975,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'%{}'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat('%', lower({}))", value_sql),
                 };
@@ -1476,14 +2013,12 @@ impl ClickHouseSqlGenerator {
                                 // label String column. UDM has no enum-int columns → None
                                 // → byte-identical.
                                 match mapping {
-                                    crate::schema::EnumIntMapping::Values(labels) => {
-                                        Ok(format!(
-                                            "{} {} {}",
-                                            field_expr,
-                                            sql_op,
-                                            enum_values_literal_sql(field, labels, s)?
-                                        ))
-                                    }
+                                    crate::schema::EnumIntMapping::Values(labels) => Ok(format!(
+                                        "{} {} {}",
+                                        field_expr,
+                                        sql_op,
+                                        enum_values_literal_sql(field, labels, s)?
+                                    )),
                                     crate::schema::EnumIntMapping::LabelColumn(sibling) => {
                                         Ok(format!(
                                             "lower({}) {} '{}'",
@@ -1505,6 +2040,8 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => Ok(format!("{} {} {}", field_expr, sql_op, value_sql)),
                     }
+                } else if self.field_is_boolean(field) {
+                    Ok(self.boolean_comparison_sql(&field_expr, sql_op, value))
                 } else if self.profile.is_uuid_field(field) {
                     // UUID fields: compare via toString() — lower() doesn't work on UUID type
                     match value {
@@ -1528,15 +2065,24 @@ impl ClickHouseSqlGenerator {
                             // profile's entity classification so OCSF promoted host
                             // columns (e.g. `src_endpoint.hostname`) expand too — for
                             // UDM these are exactly the host-entity columns.
-                            let is_hostname_field =
-                                self.profile.entity_type(field) == Some(crate::schema::EntityType::Host);
+                            // Single source of truth, shared with the lake
+                            // compiler's candidate-hint gate (see the helper).
+                            let expands =
+                                hostname_equality_expands(self.profile.as_ref(), field, s);
+                            let is_hostname_field = self.profile.entity_type(field)
+                                == Some(crate::schema::EntityType::Host);
                             let has_no_dot = !s.contains('.');
 
-                            if is_hostname_field && has_no_dot && *op == Comparator::Eq {
+                            if expands && *op == Comparator::Eq {
                                 // Expand: exact match OR starts with "value."
+                                // NAN-3154: on the object lake an ingest-lowercased
+                                // column compares RAW in both legs (the form the
+                                // plain Eq arm below emits), so the equality leg
+                                // keeps its Parquet bloom / row-group pruning.
+                                let lhs = self.host_prefix_lhs(field, &field_expr);
                                 Ok(format!(
-                                    "(lower({}) = '{}' OR startsWith(lower({}), '{}.'))",
-                                    field_expr, escaped_lower, field_expr, escaped_lower
+                                    "({} = '{}' OR startsWith({}, '{}.'))",
+                                    lhs, escaped_lower, lhs, escaped_lower
                                 ))
                             } else if is_hostname_field && has_no_dot && *op == Comparator::Ne {
                                 // Negated: NOT exact AND NOT starts with "value."
@@ -1655,13 +2201,20 @@ impl ClickHouseSqlGenerator {
         if let Value::String(s) = value {
             if (s.contains('*') || s.contains('?')) && matches!(op, Comparator::Eq | Comparator::Ne)
             {
-                // Special case: pure wildcard "*" means "match all" - just return true/false
-                // This avoids generating useless "field LIKE '%'" which adds overhead
+                // NAN-2361: `field=*` is an EXISTENCE test, not "match all".
+                // It used to compile to the literal `1`/`0`, which ignored the
+                // field entirely and silently returned rows where it is absent.
+                // A scalar exists when it is non-NULL and non-empty.
                 if s == "*" {
-                    return Ok(if *op == Comparator::Eq {
-                        "1".to_string()
+                    let presence = if use_metadata {
+                        format!("({field_expr} IS NOT NULL AND {field_expr} != '')")
                     } else {
-                        "0".to_string()
+                        self.scalar_presence_sql(&field_path, &field_expr)
+                    };
+                    return Ok(if *op == Comparator::Eq {
+                        presence
+                    } else {
+                        format!("NOT {presence}")
                     });
                 }
                 let pattern = wildcard_to_like_pattern(&s.to_lowercase());
@@ -1721,11 +2274,7 @@ impl ClickHouseSqlGenerator {
                         true,
                     ));
                 }
-                Ok(format!(
-                    "match({}, {}) = 0",
-                    field_str,
-                    value_to_sql(value)
-                ))
+                Ok(format!("match({}, {}) = 0", field_str, value_to_sql(value)))
             }
             Comparator::Like => Ok(format!("{} iLike {}", pattern_expr, value_to_sql(value))),
             Comparator::NotLike => Ok(format!(
@@ -1769,7 +2318,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'{}%'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat(lower({}), '%')", value_to_sql(value)),
                 };
@@ -1780,7 +2332,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'{}%'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat(lower({}), '%')", value_to_sql(value)),
                 };
@@ -1791,7 +2346,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'%{}'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat('%', lower({}))", value_to_sql(value)),
                 };
@@ -1802,7 +2360,10 @@ impl ClickHouseSqlGenerator {
                     Value::String(s) => {
                         // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
                         // matched literally, not as an iLike wildcard (mirrors Contains:480).
-                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                        format!(
+                            "'%{}'",
+                            escape_like_pattern(&escape_string(&s.to_lowercase()))
+                        )
                     }
                     _ => format!("concat('%', lower({}))", value_to_sql(value)),
                 };
@@ -1850,6 +2411,15 @@ impl ClickHouseSqlGenerator {
                             }
                         };
                     }
+                }
+                if self.field_is_boolean(&field_path) {
+                    return Ok(self.boolean_comparison_sql(&field_expr, sql_op, value));
+                }
+                // NAN-2361: array leaves need membership, not scalar comparison.
+                // Checked AFTER boolean/enum so a scalar column keeps its exact
+                // existing form; only genuinely Array-typed fields divert here.
+                if self.field_is_array(&field_path) {
+                    return Ok(self.array_membership_sql(&field_expr, sql_op, value));
                 }
                 match value {
                     // NAN-1333: a class-split concept resolves to its INDEXED unified
@@ -1954,7 +2524,8 @@ impl ClickHouseSqlGenerator {
     /// preserved byte-for-byte.
     pub fn generate_json_extract(&self, field: &str, json_type: &str) -> String {
         // OCSF nested-path resolution (additive; never exercised by UDM).
-        if let crate::schema::FieldResolution::JsonPath { col, path } = self.profile.resolve(field) {
+        if let crate::schema::FieldResolution::JsonPath { col, path } = self.profile.resolve(field)
+        {
             return json_tail_access_sql(&col, &path, json_type);
         }
 
@@ -2052,7 +2623,19 @@ impl ClickHouseSqlGenerator {
                     &self.profile.keyword_search_columns(),
                 ))
             }
-            SearchExpr::FieldFilter { field, op, value } => {
+            SearchExpr::FieldFilter {
+                field,
+                op,
+                value,
+                rhs,
+            } => {
+                // NAN-2378/NAN-2380: `a = b` where `b` is a column, not a
+                // literal. Same resolution as the base-scope arm; see
+                // `field_to_field_term`.
+                if let Some(term) = self.field_to_field_term(field, op, value, *rhs)? {
+                    return self.generate_where_condition(&term);
+                }
+                let original_field = field.as_str();
                 // Normalize field name (apply aliases like command_line -> process).
                 // NAN-1555: profile-aware (spans keep `service_name`); logs identical.
                 let field = self.canonicalize_field(field);
@@ -2098,10 +2681,41 @@ impl ClickHouseSqlGenerator {
                         // attribute — `is_computed_field` excludes it so it stays a
                         // bare reference (the stats stage carries no `attributes`).
                         self.field_access_expr(field, "String")
+                    } else if let Some(resolved) =
+                        self.where_scope_schema_alias_expr(original_field, field)
+                    {
+                        resolved
                     } else {
                         escape_identifier(field)
                     }
                 };
+
+                // NAN-2361: `field=*` is an EXISTENCE test here too. The
+                // pipeline path had the inverse of the search-term bug: rather
+                // than collapsing to `1` (match all) it fell through to a plain
+                // equality and emitted `lower("user") = '*'`, matching only rows
+                // whose value is the literal asterisk — i.e. nothing. Both arms
+                // now agree that `=*` means present and `!=*` means absent.
+                if let Value::String(s) = value {
+                    if s == "*" && matches!(op, Comparator::Eq | Comparator::Ne) {
+                        // NAN-2707: a numeric prevalence column carries the
+                        // N/A sentinel, which is "absent", not a value.
+                        let presence = if self.is_prevalence_sentinel_field(field) {
+                            format!(
+                                "({column_ref} IS NOT NULL AND {column_ref} != {PREVALENCE_NA_SENTINEL})"
+                            )
+                        } else {
+                            format!(
+                                "(toString({column_ref}) IS NOT NULL AND toString({column_ref}) != '')"
+                            )
+                        };
+                        return Ok(if *op == Comparator::Eq {
+                            presence
+                        } else {
+                            format!("NOT {presence}")
+                        });
+                    }
+                }
 
                 // Always treat as direct column reference
                 let value_sql = match value {
@@ -2191,7 +2805,10 @@ impl ClickHouseSqlGenerator {
                             Value::String(s) => {
                                 // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
                                 // value is matched literally, not as an iLike wildcard.
-                                format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                                format!(
+                                    "'{}%'",
+                                    escape_like_pattern(&escape_string(&s.to_lowercase()))
+                                )
                             }
                             _ => format!("concat(lower({}), '%')", value_sql),
                         };
@@ -2202,7 +2819,10 @@ impl ClickHouseSqlGenerator {
                             Value::String(s) => {
                                 // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
                                 // value is matched literally, not as an iLike wildcard.
-                                format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                                format!(
+                                    "'{}%'",
+                                    escape_like_pattern(&escape_string(&s.to_lowercase()))
+                                )
                             }
                             _ => format!("concat(lower({}), '%')", value_sql),
                         };
@@ -2213,7 +2833,10 @@ impl ClickHouseSqlGenerator {
                             Value::String(s) => {
                                 // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
                                 // value is matched literally, not as an iLike wildcard.
-                                format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                                format!(
+                                    "'%{}'",
+                                    escape_like_pattern(&escape_string(&s.to_lowercase()))
+                                )
                             }
                             _ => format!("concat('%', lower({}))", value_sql),
                         };
@@ -2224,7 +2847,10 @@ impl ClickHouseSqlGenerator {
                             Value::String(s) => {
                                 // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
                                 // value is matched literally, not as an iLike wildcard.
-                                format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                                format!(
+                                    "'%{}'",
+                                    escape_like_pattern(&escape_string(&s.to_lowercase()))
+                                )
                             }
                             _ => format!("concat('%', lower({}))", value_sql),
                         };
@@ -2233,6 +2859,14 @@ impl ClickHouseSqlGenerator {
                     Comparator::Eq | Comparator::Ne => {
                         // Case-insensitive string comparison
                         let sql_op = comparator_to_sql(op);
+                        // NAN-2361: an array leaf needs membership. The pipeline
+                        // `| where` path builds its own comparison, so the search-term
+                        // arm's guard does not cover it — `| where file.hashes.value =
+                        // "<sha256>"` was compiling to a scalar compare against the
+                        // rendered whole array and silently matching nothing.
+                        if self.where_scope_field_is_array(original_field, field) {
+                            return Ok(self.array_membership_sql(&column_ref, sql_op, value));
+                        }
                         match value {
                             Value::String(s) => {
                                 // Boolean coercion: "true"/"false" → 1/0 for boolean fields (is_*, has_*, *_enabled, *_supported)
@@ -2278,6 +2912,14 @@ impl ClickHouseSqlGenerator {
                     _ => {
                         // Numeric comparisons
                         let sql_op = comparator_to_sql(op);
+                        // NAN-2361: a range against an array leaf needs ANY-element
+                        // semantics for the same reason equality does -- a scalar
+                        // compare runs against the rendered whole array and silently
+                        // matches nothing. This is the form the rarity slider needs
+                        // (`host_count <= N`).
+                        if self.where_scope_field_is_array(original_field, field) {
+                            return Ok(self.array_range_sql(&column_ref, sql_op, value));
+                        }
                         // O44 (NAN-1721): when `column_ref` is a spans/metrics
                         // attribute Map access (the same guard that produced it
                         // above), a numeric range against its String value is
@@ -2315,6 +2957,10 @@ impl ClickHouseSqlGenerator {
                     } else {
                         escape_identifier(field)
                     }
+                } else if let Some(resolved) =
+                    self.where_scope_schema_alias_expr(field, self.canonicalize_field(field))
+                {
+                    resolved
                 } else {
                     escape_identifier(field)
                 };
@@ -2389,9 +3035,7 @@ impl ClickHouseSqlGenerator {
                 }
             }
             SearchExpr::BooleanFunction(function) => eval_expression_to_sql(self, function),
-            SearchExpr::EvalPredicate(expression) => {
-                typed_eval_expression_to_sql(self, expression)
-            }
+            SearchExpr::EvalPredicate(expression) => typed_eval_expression_to_sql(self, expression),
             SearchExpr::FieldFunctionFilter {
                 field,
                 op,
@@ -2432,7 +3076,7 @@ impl ClickHouseSqlGenerator {
             }
             SearchExpr::Not(inner) => {
                 let inner_sql = self.generate_where_condition(inner)?;
-                Ok(format!("NOT ({})", inner_sql))
+                Ok(null_safe_not(&inner_sql))
             }
             SearchExpr::Group(inner) => {
                 let inner_sql = self.generate_where_condition(inner)?;
@@ -2460,16 +3104,13 @@ impl ClickHouseSqlGenerator {
                 subsearch,
                 negated,
                 subsearch_dataset,
-            } => self.generate_in_subsearch_filter(
-                field,
-                subsearch,
-                *negated,
-                *subsearch_dataset,
-            ),
+            } => self.generate_in_subsearch_filter(field, subsearch, *negated, *subsearch_dataset),
             // NAN-1580: same observable-anywhere expansion as the top-level arm.
-            SearchExpr::IocMatch { values, feed, lookup } => {
-                self.generate_ioc_match_filter(values, feed.as_ref(), lookup.as_ref())
-            }
+            SearchExpr::IocMatch {
+                values,
+                feed,
+                lookup,
+            } => self.generate_ioc_match_filter(values, feed.as_ref(), lookup.as_ref()),
         }
     }
 
@@ -2535,6 +3176,17 @@ impl ClickHouseSqlGenerator {
         // Walk the subsearch Query to extract the search expression and return fields
         let stages = self.collect_stages(subsearch);
 
+        // This form compiles the subsearch's search predicate and optional
+        // return field directly. Silently ignoring a stats/where/etc. stage
+        // would turn a detection correlation into a different query.
+        if stages.iter().any(|stage| matches!(stage,
+            super::QueryStage::Command(command) if !matches!(command, Command::Return { .. })
+        )) {
+            return Err(SqlGenError::UnsupportedOperation(
+                "IN subsearch supports only a search and optional return field".to_string(),
+            ));
+        }
+
         // Find the search expression (first stage)
         let search_expr = stages.iter().find_map(|s| match s {
             super::QueryStage::Search(expr) => Some(*expr),
@@ -2580,8 +3232,7 @@ impl ClickHouseSqlGenerator {
         // `start_time`); a `dataset=risk` subsearch neutralizes the bound
         // entirely (fixed trailing windows baked into its derived base source,
         // NAN-1798 P2).
-        let mut where_clause =
-            sub_gen.time_bound_predicate(sub_gen.time_column(), time_range);
+        let mut where_clause = sub_gen.time_bound_predicate(sub_gen.time_column(), time_range);
         if let Some(expr) = search_expr {
             let where_sql = sub_gen.generate_search_expr(expr)?;
             where_clause = format!("{} AND ({})", where_clause, where_sql);
@@ -2651,4 +3302,172 @@ impl ClickHouseSqlGenerator {
             ))
         }
     }
+}
+
+/// True when the RHS of a field filter compiles as a VALUE, never as a column
+/// reference or an ambiguity error: every quoted RHS, every typed literal, and
+/// every bareword that [`classify_rhs`] reads as a literal. For such a filter
+/// the generated SQL is identical to the quoted spelling (codegen consults the
+/// surface form only through `classify_rhs`), so a consumer outside this crate
+/// -- the lean compiler's candidate hints (NAN-3162) -- may treat
+/// `host=web1.corp.local` exactly like `host="web1.corp.local"`.
+pub fn rhs_compiles_as_value(
+    profile: &dyn crate::schema::SchemaProfile,
+    field: &str,
+    op: &Comparator,
+    value: &Value,
+    rhs_syntax: RhsSyntax,
+) -> bool {
+    classify_rhs(profile, field, op, value, rhs_syntax) == RhsReading::Literal
+}
+
+/// How the right-hand side of a `=` / `!=` field filter must be read
+/// (NAN-2378 / NAN-2380).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RhsReading {
+    /// An ordinary value. Every quoted RHS, every typed literal, and every bare
+    /// token that does not name a field of the active profile.
+    Literal,
+    /// A reference to another column: a bare token that names a field, in a
+    /// position where that cannot plausibly be a value.
+    FieldReference,
+    /// A bare token that names a field of the active profile on a profile where
+    /// flat column names are ALSO everyday log values. Neither reading can be
+    /// chosen without silently changing the meaning of a working query.
+    Ambiguous,
+}
+
+/// NAN-3276: the legs of the maximal OR chain rooted at `expr`, left to
+/// right, looking through grouping parentheses whose content is itself an OR
+/// (`(a OR b) OR c` and `a OR (b OR c)` are the same disjunction). Iterative,
+/// so a chain of any length costs no stack.
+fn or_chain_legs(expr: &SearchExpr) -> Vec<&SearchExpr> {
+    let mut legs = Vec::new();
+    let mut pending = vec![expr];
+    while let Some(next) = pending.pop() {
+        match next {
+            SearchExpr::Or(left, right) => {
+                pending.push(right);
+                pending.push(left);
+            }
+            SearchExpr::Group(inner) if matches!(**inner, SearchExpr::Or(..)) => {
+                pending.push(inner);
+            }
+            leg => legs.push(leg),
+        }
+    }
+    legs
+}
+
+/// Classify the RHS of a `=` / `!=` field filter. Single source of truth: query
+/// VALIDATION calls it to reject an ambiguous comparison before execution (which
+/// also covers the `| where` stages evaluated in Rust after a prevalence/risk
+/// stage, where no SQL is ever generated), and CODEGEN calls it as the backstop
+/// for every non-search path — detection rules, materialized views, dashboards.
+pub(crate) fn classify_rhs(
+    profile: &dyn crate::schema::SchemaProfile,
+    field: &str,
+    op: &Comparator,
+    value: &Value,
+    rhs_syntax: RhsSyntax,
+) -> RhsReading {
+    let ordering = matches!(
+        op,
+        Comparator::Gt | Comparator::Lt | Comparator::Gte | Comparator::Lte
+    );
+    if !ordering && !matches!(op, Comparator::Eq | Comparator::Ne) {
+        return RhsReading::Literal;
+    }
+    let Value::String(rhs) = value else {
+        return RhsReading::Literal;
+    };
+    // NAN-3329: `src_endpoint.port > dst_endpoint.port`. The parser resolves a
+    // FLAT bare identifier after an ordering operator as a field itself; a
+    // DOTTED one reached codegen as the string literal 'dst_endpoint.port'.
+    // Ordering a column against a dotted schema path's spelling is never what
+    // was meant, so a bare dotted path naming a known field is a reference.
+    if ordering {
+        let canonical_lhs =
+            crate::query::clickhouse_sql_gen::canonicalize_field_for_profile(profile, field);
+        return if matches!(rhs_syntax, RhsSyntax::Bareword)
+            && rhs != field
+            && is_dotted_schema_path(rhs)
+            && profile.is_known_field(rhs)
+            && profile.is_known_field(canonical_lhs)
+        {
+            RhsReading::FieldReference
+        } else {
+            RhsReading::Literal
+        };
+    }
+    // A QUOTED right-hand side is a value, full stop, on every profile.
+    // `process.name != "process.file.name"` and `status = "disposition"` mean
+    // the literal text, and saying so is possible only because the AST now
+    // carries the surface form (NAN-2380).
+    if !matches!(rhs_syntax, RhsSyntax::Bareword) {
+        return RhsReading::Literal;
+    }
+    if rhs == field {
+        return RhsReading::Literal;
+    }
+    // Both sides must name real columns of the ACTIVE profile, so an ordinary
+    // value (`status=Success`, `source_type=squid_proxy`) is never touched.
+    if !profile.is_known_field(rhs) {
+        return RhsReading::Literal;
+    }
+    let canonical_lhs =
+        crate::query::clickhouse_sql_gen::canonicalize_field_for_profile(profile, field);
+    if !profile.is_known_field(canonical_lhs) {
+        return RhsReading::Literal;
+    }
+    // A schema-native DOTTED path (`process.file.name`, `src_endpoint.ip`) is
+    // not a value that appears in logs, and on a strict-canonical profile a bare
+    // token that is not a known field is rejected outright — so in both cases a
+    // token that resolves is a field reference, not a literal.
+    if is_dotted_schema_path(rhs) || profile.uses_strict_canonical_fields() {
+        return RhsReading::FieldReference;
+    }
+    // A FLAT bare token on a permissive profile (UDM, OCSF 1.8 on ClickHouse).
+    // `target_type=user`, `object=message` and `status=action` are all ordinary
+    // log values that happen to spell column names.
+    RhsReading::Ambiguous
+}
+
+/// The error an [`RhsReading::Ambiguous`] comparison must produce. One message,
+/// shared by validation and codegen, naming BOTH readings and how to write each.
+pub(crate) fn ambiguous_comparison_message(field: &str, op: &Comparator, rhs: &str) -> String {
+    format!(
+        "Ambiguous comparison '{field} {op} {rhs}': '{rhs}' is both a field of this \
+         schema and a possible literal value, and an unquoted token does not say \
+         which you mean. To compare the two FIELDS write '{field} {op} `{rhs}`' \
+         (backticks quote a field reference) or \
+         '| eval same = ({field} = {rhs}) | where same = true'. To compare against \
+         the literal text write '{field} {op} \"{rhs}\"'.",
+        op = op.as_str()
+    )
+}
+
+/// True when `s` is shaped like a DOTTED schema path — the only literal shape
+/// [`ClickHouseSqlGenerator::field_to_field_term`] will consider resolving as a
+/// field reference (NAN-2378).
+///
+/// Requires at least one interior dot, ASCII identifier segments only, and no
+/// wildcard/regex metacharacters. Deliberately stricter than
+/// `validate_field_name_format`: this decides whether a token the user may have
+/// meant as a VALUE is treated as a COLUMN, so anything that could plausibly be
+/// a value (`10.0.0.1`, `cmd.exe*`, `a..b`, `.leading`) must fail here.
+pub(crate) fn is_dotted_schema_path(s: &str) -> bool {
+    let mut segments = 0;
+    for segment in s.split('.') {
+        segments += 1;
+        let mut chars = segment.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+    }
+    segments >= 2
 }

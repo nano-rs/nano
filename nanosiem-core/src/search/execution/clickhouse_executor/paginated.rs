@@ -165,7 +165,11 @@ impl ClickHouseExecutor {
             let count_sql = build_count_query(sql, bounded_count);
             let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
-                self.execute_dynamic_query_with_query_id(&paginated_sql, query_id, preserve_columns),
+                self.execute_dynamic_query_with_query_id(
+                    &paginated_sql,
+                    query_id,
+                    preserve_columns
+                ),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
             );
             let results = results?;
@@ -210,8 +214,13 @@ impl ClickHouseExecutor {
                 )
                 .await?
             } else {
-                self.execute_dynamic_query_with_settings(&combined_sql, query_id, settings, preserve_columns)
-                    .await?
+                self.execute_dynamic_query_with_settings(
+                    &combined_sql,
+                    query_id,
+                    settings,
+                    preserve_columns,
+                )
+                .await?
             };
 
             let total_count = match take_aggregation_total(&mut results) {
@@ -252,7 +261,12 @@ impl ClickHouseExecutor {
             // exact total was already delivered with page 1.
             if !is_first_page(offset) {
                 let results = self
-                    .execute_dynamic_query_with_settings(&paginated_sql, query_id, settings, preserve_columns)
+                    .execute_dynamic_query_with_settings(
+                        &paginated_sql,
+                        query_id,
+                        settings,
+                        preserve_columns,
+                    )
                     .await?;
                 let total_count = paged_total_estimate(offset, results.len(), limit);
                 return Ok((results, total_count));
@@ -264,7 +278,12 @@ impl ClickHouseExecutor {
             let count_sql = build_count_query(sql, bounded_count);
             let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
-                self.execute_dynamic_query_with_settings(&paginated_sql, query_id, settings, preserve_columns),
+                self.execute_dynamic_query_with_settings(
+                    &paginated_sql,
+                    query_id,
+                    settings,
+                    preserve_columns
+                ),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), Some(settings))
             );
             let results = results?;
@@ -317,10 +336,8 @@ impl ClickHouseExecutor {
                 .with_option("priority", &settings.priority.to_string())
                 .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
             if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-                query_builder = query_builder.with_option(
-                    "max_memory_usage",
-                    &max_memory_usage_bytes.to_string(),
-                );
+                query_builder = query_builder
+                    .with_option("max_memory_usage", &max_memory_usage_bytes.to_string());
             }
         }
 
@@ -377,7 +394,8 @@ impl ClickHouseExecutor {
                     while let Some(newline_pos) = line_buffer.find('\n') {
                         let line = &line_buffer[..newline_pos];
                         if !line.is_empty() {
-                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties) {
+                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties)
+                            {
                                 row_batch.push(row);
                             }
                         }
@@ -403,7 +421,8 @@ impl ClickHouseExecutor {
                     if !line_buffer.is_empty() {
                         let line = line_buffer.trim();
                         if !line.is_empty() {
-                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties) {
+                            if let Some(row) = Self::parse_and_postprocess_row(line, strip_empties)
+                            {
                                 row_batch.push(row);
                             }
                         }

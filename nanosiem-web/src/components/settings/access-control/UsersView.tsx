@@ -18,13 +18,15 @@ import {
   Download,
   ChevronRight,
   X,
-  Loader2,
-} from 'lucide-react';
+  } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import { csvCell } from '@/lib/csv-safe';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { useTierContext } from '@/hooks/use-tier';
-import { api, type UserDetail, type GroupDetail } from '@/lib/api';
+import { api, type UserDetail, type GroupDetail, type SharedTenantMember } from '@/lib/api';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
@@ -32,6 +34,7 @@ import { TierUsageBar } from '@/components/TierUsageBar';
 import { InviteUserDialog } from './InviteUserDialog';
 import { EditUserDialog } from './EditUserDialog';
 import { MfaEnforcementPanel } from './MfaEnforcementPanel';
+import { SharedInviteMemberDialog, SharedEditMemberDialog } from './SharedTenantMemberDialogs';
 
 // ---------- presentation helpers ----------
 
@@ -48,6 +51,37 @@ function StatusPill({ status }: { status: string }) {
   return (
     <span className={cn('inline-flex items-center h-5 px-1.5 rounded-sm border text-[10.5px] font-medium', def.cls)}>
       {def.label}
+    </span>
+  );
+}
+
+/**
+ * Hosted-shared tenant (NAN-2361): the API adds membership fields to each
+ * user; a dedicated deployment never sets them.
+ */
+function asSharedMember(user: UserDetail): SharedTenantMember | null {
+  return Array.isArray((user as SharedTenantMember).roles) ? (user as SharedTenantMember) : null;
+}
+
+/** Roles (shared tenant) or groups (dedicated) — the row's assignment chips. */
+function assignmentsFor(user: UserDetail): Array<{ id: string; name: string }> {
+  const shared = asSharedMember(user);
+  return shared ? shared.roles : user.groups;
+}
+
+function InvitationPill({ user }: { user: UserDetail }) {
+  const state = asSharedMember(user)?.invitation_state;
+  if (state !== 'pending' && state !== 'expired') return null;
+  const expired = state === 'expired';
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center h-5 px-1.5 rounded-sm border text-[10.5px] font-medium',
+        expired ? 'bg-red-500/12 text-red-500 border-red-500/30' : 'bg-sky-500/12 text-sky-500 border-sky-500/30',
+      )}
+      title={expired ? 'The activation link expired; revoke and invite again.' : 'Invited — waiting for activation'}
+    >
+      {expired ? 'Invite expired' : 'Invited'}
     </span>
   );
 }
@@ -98,15 +132,15 @@ function UserRow({ user, selected, onSelect }: UserRowProps) {
         )}
       </div>
       <div className="min-w-0 font-mono text-[11.5px] text-foreground/80 truncate">{user.email}</div>
-      <div><StatusPill status={user.status} /></div>
+      <div className="flex items-center gap-1"><StatusPill status={user.status} /><InvitationPill user={user} /></div>
       <div className="min-w-0 flex items-center gap-1 flex-wrap">
-        {user.groups.slice(0, 2).map(g => (
+        {assignmentsFor(user).slice(0, 2).map(g => (
           <span key={g.id} className="inline-flex items-center h-5 px-1.5 rounded-sm border border-border text-[10.5px] text-foreground/80 bg-card">
             {g.name}
           </span>
         ))}
-        {user.groups.length > 2 && (
-          <span className="text-[10.5px] text-muted-foreground">+{user.groups.length - 2}</span>
+        {assignmentsFor(user).length > 2 && (
+          <span className="text-[10.5px] text-muted-foreground">+{assignmentsFor(user).length - 2}</span>
         )}
       </div>
       <div className="min-w-0 font-mono text-[11px] text-muted-foreground tabular-nums truncate">
@@ -161,6 +195,7 @@ function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDe
           <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1.5">Status</div>
           <div className="flex items-center gap-2">
             <StatusPill status={user.status} />
+            <InvitationPill user={user} />
             {user.oidc_provider && (
               <span className="text-[10.5px] text-muted-foreground">SSO · {user.oidc_provider}</span>
             )}
@@ -168,12 +203,12 @@ function UserDrawer({ user, onClose, onEdit, onDisable, onEnable, onUnlock, onDe
         </div>
 
         <div>
-          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1.5">Groups</div>
-          {user.groups.length === 0 ? (
-            <div className="text-[11.5px] text-muted-foreground italic">No groups</div>
+          <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1.5">{asSharedMember(user) ? 'Roles' : 'Groups'}</div>
+          {assignmentsFor(user).length === 0 ? (
+            <div className="text-[11.5px] text-muted-foreground italic">{asSharedMember(user) ? 'No roles' : 'No groups'}</div>
           ) : (
             <div className="flex items-center gap-1 flex-wrap">
-              {user.groups.map(g => (
+              {assignmentsFor(user).map(g => (
                 <span key={g.id} className="inline-flex items-center h-5 px-1.5 rounded-sm border border-border text-[10.5px] text-foreground/80 bg-card">
                   {g.name}
                 </span>
@@ -258,6 +293,7 @@ export function UsersView() {
   const { toast } = useToast();
   const { hasPermission } = useAuth();
   const { status: tierStatus, isEnforced } = useTierContext();
+  const sharedTenant = useSharedTenant();
 
   const canCreate = hasPermission('users:create');
   const canEdit = hasPermission('users:edit');
@@ -279,6 +315,8 @@ export function UsersView() {
     try {
       const [res, groupsRes] = await Promise.all([
         api.listUsers(),
+        // GET /api/groups exists on every profile (tenant groups since
+        // NAN-2361 wave 5, 9000700); a failure just means no group chips.
         api.listGroups().catch(() => ({ groups: [] as GroupDetail[], total: 0 })),
       ]);
       setUsers(res.users);
@@ -313,7 +351,7 @@ export function UsersView() {
       return (
         u.name.toLowerCase().includes(q) ||
         u.email.toLowerCase().includes(q) ||
-        u.groups.some(g => g.name.toLowerCase().includes(q))
+        assignmentsFor(u).some(g => g.name.toLowerCase().includes(q))
       );
     });
   }, [query, statusFilter, users]);
@@ -357,17 +395,17 @@ export function UsersView() {
   };
 
   const exportCsv = () => {
-    const header = ['name', 'email', 'status', 'groups', 'last_login_at', 'created_at'];
+    const header = ['name', 'email', 'status', sharedTenant ? 'roles' : 'groups', 'last_login_at', 'created_at'];
     const rows = filtered.map(u => [
       u.name,
       u.email,
       u.status,
-      u.groups.map(g => g.name).join('|'),
+      assignmentsFor(u).map(g => g.name).join('|'),
       u.last_login_at || '',
       u.created_at,
     ]);
     const csv = [header, ...rows]
-      .map(r => r.map(c => /[",\n]/.test(String(c)) ? `"${String(c).replace(/"/g, '""')}"` : String(c)).join(','))
+      .map(r => r.map(csvCell).join(','))
       .join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
     const a = document.createElement('a');
@@ -393,7 +431,7 @@ export function UsersView() {
               <input
                 value={query}
                 onChange={e => setQuery(e.target.value)}
-                placeholder="Search users, email, group…"
+                placeholder={sharedTenant ? 'Search members, email, role…' : 'Search users, email, group…'}
                 className="flex-1 bg-transparent outline-none text-[12px] text-foreground placeholder:text-muted-foreground/70"
               />
             </div>
@@ -437,7 +475,7 @@ export function UsersView() {
                 onClick={() => setInviteOpen(true)}
               >
                 <Plus className="w-[12px] h-[12px]" />
-                Invite user
+                {sharedTenant ? 'Invite member' : 'Invite user'}
               </Button>
             )}
           </div>
@@ -448,7 +486,7 @@ export function UsersView() {
             <span>Name</span>
             <span>Email</span>
             <span>Status</span>
-            <span>Groups</span>
+            <span>{sharedTenant ? 'Roles' : 'Groups'}</span>
             <span>Last login</span>
             <span />
           </div>
@@ -457,7 +495,7 @@ export function UsersView() {
           <div className="flex-1 overflow-y-auto scrollbar-thin">
             {loading && (
               <div className="flex items-center justify-center py-12">
-                <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+                <LoadingIcon className="w-5 h-5 text-muted-foreground" />
               </div>
             )}
             {!loading && filtered.map(u => (
@@ -497,26 +535,49 @@ export function UsersView() {
         )}
       </div>
 
-      <InviteUserDialog
-        open={inviteOpen}
-        groups={groups}
-        onClose={() => setInviteOpen(false)}
-        onCreated={async () => {
-          setInviteOpen(false);
-          await fetchData();
-        }}
-      />
-
-      <EditUserDialog
-        open={!!editing}
-        user={editing}
-        groups={groups}
-        onClose={() => setEditing(null)}
-        onUpdated={async () => {
-          setEditing(null);
-          await fetchData();
-        }}
-      />
+      {sharedTenant ? (
+        <>
+          <SharedInviteMemberDialog
+            open={inviteOpen}
+            onClose={() => setInviteOpen(false)}
+            onCreated={async () => {
+              setInviteOpen(false);
+              await fetchData();
+            }}
+          />
+          <SharedEditMemberDialog
+            open={!!editing}
+            member={editing ? asSharedMember(editing) : null}
+            onClose={() => setEditing(null)}
+            onUpdated={async () => {
+              setEditing(null);
+              await fetchData();
+            }}
+          />
+        </>
+      ) : (
+        <>
+          <InviteUserDialog
+            open={inviteOpen}
+            groups={groups}
+            onClose={() => setInviteOpen(false)}
+            onCreated={async () => {
+              setInviteOpen(false);
+              await fetchData();
+            }}
+          />
+          <EditUserDialog
+            open={!!editing}
+            user={editing}
+            groups={groups}
+            onClose={() => setEditing(null)}
+            onUpdated={async () => {
+              setEditing(null);
+              await fetchData();
+            }}
+          />
+        </>
+      )}
 
       <ConfirmDialog
         open={!!pending}
@@ -530,7 +591,7 @@ export function UsersView() {
         }
         title={
           pending?.kind === 'delete'
-            ? 'Delete user'
+            ? (sharedTenant ? 'Remove member' : 'Delete user')
             : pending?.kind === 'disable'
               ? 'Disable user'
               : pending?.kind === 'enable'
@@ -539,7 +600,9 @@ export function UsersView() {
         }
         description={
           pending?.kind === 'delete' ? (
-            <>Permanently delete <span className="text-foreground font-medium">{pending?.user.name}</span>? This cannot be undone.</>
+            sharedTenant
+              ? <>Remove <span className="text-foreground font-medium">{pending?.user.name}</span> from this tenant? Their sessions end immediately; re-adding them later goes through the platform.</>
+              : <>Permanently delete <span className="text-foreground font-medium">{pending?.user.name}</span>? This cannot be undone.</>
           ) : pending?.kind === 'disable' ? (
             <>Disable <span className="text-foreground font-medium">{pending?.user.name}</span>? They won't be able to sign in until re-enabled.</>
           ) : pending?.kind === 'enable' ? (
@@ -550,7 +613,7 @@ export function UsersView() {
         }
         confirmLabel={
           pending?.kind === 'delete'
-            ? 'Delete'
+            ? (sharedTenant ? 'Remove' : 'Delete')
             : pending?.kind === 'disable'
               ? 'Disable'
               : pending?.kind === 'enable'

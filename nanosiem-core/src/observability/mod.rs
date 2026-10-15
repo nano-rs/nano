@@ -22,7 +22,7 @@ pub use metric_monitor_repository::{
 };
 pub use slo_repository::{SloDefinition, SloRepository, SloRepositoryError, SloSliKind};
 pub use synthetic_check_repository::{
-    SyntheticCheck, SyntheticCheckRepository, SyntheticCheckRepositoryError,
-    SYNTHETIC_CHECK_TYPES, SYNTHETIC_MAX_INTERVAL_SECS, SYNTHETIC_MIN_INTERVAL_SECS,
+    SyntheticCheck, SyntheticCheckRepository, SyntheticCheckRepositoryError, SYNTHETIC_CHECK_TYPES,
+    SYNTHETIC_MAX_INTERVAL_SECS, SYNTHETIC_MIN_INTERVAL_SECS,
 };
 pub use synthetic_runner::SyntheticRunner;

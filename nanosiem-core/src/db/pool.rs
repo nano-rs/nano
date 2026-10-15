@@ -38,7 +38,7 @@ impl Database {
             pool_options = pool_options.max_lifetime(Duration::from_secs(config.max_lifetime_secs));
         }
 
-        let pool = pool_options.connect(&config.url).await?;
+        let pool = pool_options.connect_with(super::pooler::options(&config.url)?).await?;
 
         Ok(Self { pool })
     }

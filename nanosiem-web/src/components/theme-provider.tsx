@@ -2,9 +2,11 @@
 
 import { ThemeProvider as NextThemesProvider } from "next-themes"
 
+import { THEMES, type Theme } from "@/lib/theme"
+
 interface ThemeProviderProps {
   children: React.ReactNode
-  defaultTheme?: "light" | "dark" | "system"
+  defaultTheme?: Theme | "system"
   storageKey?: string
   attribute?: "class" | "data-theme"
 }
@@ -19,6 +21,9 @@ export function ThemeProvider({
   return (
     <NextThemesProvider
       attribute={attribute}
+      // next-themes only writes classes for themes it knows about; without this
+      // `matte` would be selectable and never actually applied.
+      themes={[...THEMES]}
       defaultTheme={defaultTheme}
       storageKey={storageKey}
       enableSystem

@@ -290,7 +290,10 @@ impl SchemaProfile for SpansProfile {
     }
 
     fn is_numeric_field(&self, field: &str) -> bool {
-        matches!(self.field_type(field), Some(FieldType::Long | FieldType::Integer | FieldType::Float))
+        matches!(
+            self.field_type(field),
+            Some(FieldType::Long | FieldType::Integer | FieldType::Float)
+        )
     }
 
     fn is_uuid_field(&self, _field: &str) -> bool {
@@ -499,7 +502,11 @@ mod tests {
         assert_eq!(p.entity_type("src_ip"), Some(EntityType::Ip));
         assert_eq!(p.entity_type("user"), Some(EntityType::User));
         assert_eq!(p.entity_type("host"), Some(EntityType::Host));
-        let order: Vec<&str> = p.entity_extraction_order().iter().map(|(_, f)| *f).collect();
+        let order: Vec<&str> = p
+            .entity_extraction_order()
+            .iter()
+            .map(|(_, f)| *f)
+            .collect();
         assert_eq!(order.first(), Some(&"src_ip"));
     }
 }

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import React, { useCallback, useRef, useState, useEffect } from 'react';
-import { Globe, User, Server, Loader2, ArrowRight, ArrowLeft, ShieldAlert } from 'lucide-react';
+import { Globe, User, Server, ArrowRight, ArrowLeft, ShieldAlert } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import type { CloudEntityPivotResponse, EntityCrossReference } from '@/lib/api/types';
@@ -14,8 +15,12 @@ import {
   SheetTitle,
   SheetDescription,
 } from '@/components/ui/sheet';
-import { formatUTCShort, formatCompactNumber } from '@/lib/date-utils';
+import { formatUTCShort, formatCompactNumber, parseTimestampAsUTC } from '@/lib/date-utils';
+import { isPlaceholderValue } from '@/lib/is-placeholder-value';
+import { isAdmissionDenied, retryOnAdmissionDenied } from '@/lib/admission-retry';
 import { CopyableValue } from './CopyableValue';
+import { DurableJobNotice, type DurableProductJobState } from './DurableJobNotice';
+import { waitForDurableProductArtifact } from './durable-product-job';
 import { useIsMobile } from '@/hooks/use-mobile';
 
 // ============================================================================
@@ -61,12 +66,12 @@ interface TimelineEvent {
   event_type: string;
   status: string;
   http_status_code: number;
-  enriched_src_country_code: string;
-  enriched_src_asn: string;
-  enriched_src_as_name: string;
-  ioc_src_ip_threat_type: string;
-  ioc_src_ip_malware: string;
-  ioc_src_ip_confidence: number;
+  // NAN-2370: OCSF-shaped enrichment. The former UDM keys
+  // (enriched_src_* / ioc_src_ip_*) were never emitted by the lake DTO, so
+  // these badges rendered permanently blank — which reads as "clean IP"
+  // rather than "not evaluated". Both are now supplied by cloud_event_dto.
+  src_endpoint_geo?: { country: string; asn: number; as_name: string } | null;
+  src_endpoint_threat?: { threat_type: string; malware: string; confidence: number } | null;
   [key: string]: unknown;
 }
 
@@ -173,21 +178,32 @@ export function CloudEntityPivotSheet({
   const isMobile = useIsMobile();
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<CloudEntityPivotResponse | null>(null);
+  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
   // Server cache status of the displayed pivot context (NAN-1595).
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  // NAN-2361 (audit bug 3): a failed pivot load must render visibly — a
+  // swallowed error previously left the sheet blank, reading as "no data".
+  const [loadError, setLoadError] = useState<string | null>(null);
 
+  const requestAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => { requestAbort.current?.abort(); ++reqSeq.current; }, []);
   const reqSeq = useRef(0); // NAN-1595: drop stale out-of-order responses
   const load = useCallback(
     (bypass: boolean) => {
       if (!entity) return;
+      requestAbort.current?.abort();
+      const controller = new AbortController();
+      requestAbort.current = controller;
+      const signal = controller.signal;
       const seq = ++reqSeq.current;
+      setLoadError(null);
       if (bypass) setRefreshing(true);
       else {
         setLoading(true);
         setCacheMeta(null); // clear stale badge while a fresh load runs
       }
-      api
+      retryOnAdmissionDenied(() => api
         .getCloudEntityPivot(
           {
             query,
@@ -195,13 +211,53 @@ export function CloudEntityPivotSheet({
             entity_type: entity.type,
             entity_value: entity.value,
           },
-          { onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass }
-        )
-        .then((response) => {
-          if (seq === reqSeq.current) setData(response);
+          { signal, onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass }
+        ), signal)
+        .then(async (response) => {
+          if (!response.durable_job) {
+            if (seq === reqSeq.current) {
+              setDurableJob(null);
+              setData(response);
+            }
+            return;
+          }
+          const handle = response.durable_job;
+          if (seq === reqSeq.current) {
+            setData(null);
+            setDurableJob({ jobId: handle.job_id, status: 'queued' });
+          }
+          const artifact = await waitForDurableProductArtifact(
+            handle.job_id,
+            'cloud_entity_pivot_v1',
+            (job) => { if (seq === reqSeq.current) setDurableJob(job); },
+            () => seq === reqSeq.current && !signal.aborted,
+            signal,
+          );
+          const result = artifact.row.response;
+          if (
+            artifact.row.operation !== 'cloud_entity_pivot'
+            || !result
+            || typeof result !== 'object'
+            || !('events' in result)
+            || !('cross_references' in result)
+            || !('entity_summary' in result)
+          ) {
+            throw new Error('Durable Cloud entity pivot returned an invalid typed artifact');
+          }
+          if (seq === reqSeq.current) {
+            setData(result as CloudEntityPivotResponse);
+            setDurableJob(null);
+          }
         })
         .catch((err) => {
           console.error('Failed to load entity pivot:', err);
+          if (seq === reqSeq.current) {
+            setLoadError(
+              isAdmissionDenied(err)
+                ? 'The search service is at its concurrent-query limit — retry in a moment.'
+                : err instanceof Error ? err.message : String(err),
+            );
+          }
         })
         .finally(() => {
           if (seq === reqSeq.current) {
@@ -217,18 +273,23 @@ export function CloudEntityPivotSheet({
     if (!entity) {
       reqSeq.current++; // invalidate any in-flight load so it can't write after clear
       setData(null);
+      setDurableJob(null);
       setCacheMeta(null);
       setLoading(false);
       setRefreshing(false);
+      setLoadError(null);
       return;
     }
     load(false);
+    return () => { requestAbort.current?.abort(); ++reqSeq.current; };
   }, [entity, load]);
 
   const refresh = useCallback(() => load(true), [load]);
 
   const events = (data?.events || []) as unknown as TimelineEvent[];
-  const crossRefs = data?.cross_references || [];
+  // NAN-2361 (audit bug 2): drop "-" placeholder entities — a clickable "-"
+  // cross-ref card pivots into a query matching nothing meaningful.
+  const crossRefs = (data?.cross_references || []).filter((x) => !isPlaceholderValue(x.entity_value));
   const summary = data?.entity_summary || {};
 
   // Build IP enrichment map from events
@@ -237,12 +298,12 @@ export function CloudEntityPivotSheet({
     for (const evt of events) {
       if (evt.src_ip && !map.has(evt.src_ip)) {
         map.set(evt.src_ip, {
-          country: evt.enriched_src_country_code || '',
-          asn: evt.enriched_src_asn || '',
-          asName: evt.enriched_src_as_name || '',
-          iocThreat: evt.ioc_src_ip_threat_type || '',
-          iocMalware: evt.ioc_src_ip_malware || '',
-          iocConf: evt.ioc_src_ip_confidence || 0,
+          country: evt.src_endpoint_geo?.country || '',
+          asn: evt.src_endpoint_geo?.asn ? String(evt.src_endpoint_geo.asn) : '',
+          asName: evt.src_endpoint_geo?.as_name || '',
+          iocThreat: evt.src_endpoint_threat?.threat_type || '',
+          iocMalware: evt.src_endpoint_threat?.malware || '',
+          iocConf: evt.src_endpoint_threat?.confidence || 0,
         });
       }
     }
@@ -251,11 +312,11 @@ export function CloudEntityPivotSheet({
 
   // Pull enrichment from first event with data (for IP header context)
   const firstEnriched = entity?.type === 'ip'
-    ? events.find((e) => e.enriched_src_country_code)
+    ? events.find((e) => e.src_endpoint_geo?.country)
     : null;
 
   // Check if any event for this entity has an IOC hit
-  const iocEvent = events.find((e) => e.ioc_src_ip_threat_type);
+  const iocEvent = events.find((e) => e.src_endpoint_threat?.threat_type);
 
   const iocIps = React.useMemo(
     () => [...ipEnrichment.entries()].filter(([, v]) => v.iocThreat),
@@ -291,13 +352,13 @@ export function CloudEntityPivotSheet({
             </span>
             {firstEnriched && (
               <span className="text-xs text-muted-foreground">
-                {firstEnriched.enriched_src_country_code}
-                {firstEnriched.enriched_src_asn ? ` / ${firstEnriched.enriched_src_asn}` : ''}
-                {firstEnriched.enriched_src_as_name ? ` (${firstEnriched.enriched_src_as_name})` : ''}
+                {firstEnriched.src_endpoint_geo?.country}
+                {firstEnriched.src_endpoint_geo?.asn ? ` / ${firstEnriched.src_endpoint_geo.asn}` : ''}
+                {firstEnriched.src_endpoint_geo?.as_name ? ` (${firstEnriched.src_endpoint_geo.as_name})` : ''}
               </span>
             )}
             {iocEvent && (
-              <IocBadge threatType={iocEvent.ioc_src_ip_threat_type} malware={iocEvent.ioc_src_ip_malware} confidence={iocEvent.ioc_src_ip_confidence} />
+              <IocBadge threatType={iocEvent.src_endpoint_threat?.threat_type ?? ''} malware={iocEvent.src_endpoint_threat?.malware ?? ''} confidence={iocEvent.src_endpoint_threat?.confidence ?? 0} />
             )}
             {(summary as Record<string, unknown>).event_count != null && (
               <Badge variant="outline" className="text-[10px]">
@@ -313,10 +374,18 @@ export function CloudEntityPivotSheet({
         </SheetHeader>
 
         <div className="overflow-y-auto px-6 pt-4 pb-6" style={{ maxHeight: isMobile ? 'calc(72vh - 5rem)' : 'calc(100vh - 5rem)' }}>
+        {durableJob && <DurableJobNotice job={durableJob} />}
         {loading ? (
           <div className="flex items-center justify-center py-12 text-muted-foreground">
-            <Loader2 className="h-5 w-5 animate-spin mr-2" />
+            <LoadingIcon className="h-5 w-5 mr-2" />
             Loading pivot context...
+          </div>
+        ) : loadError && !data ? (
+          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[11px] text-destructive flex items-center gap-2">
+            <span className="flex-1">Failed to load pivot context: {loadError}</span>
+            <button className="underline hover:no-underline shrink-0" onClick={() => load(false)}>
+              Retry
+            </button>
           </div>
         ) : data ? (
           <>
@@ -339,7 +408,7 @@ export function CloudEntityPivotSheet({
                   <div className="text-xs text-muted-foreground">First Seen</div>
                   <div className="text-[10px] font-mono">
                     {(summary as Record<string, unknown>).event_count && (summary as Record<string, unknown>).first_seen
-                      ? formatUTCShort(new Date((summary as Record<string, unknown>).first_seen as string))
+                      ? formatUTCShort(parseTimestampAsUTC((summary as Record<string, unknown>).first_seen as string))
                       : '-'}
                   </div>
                 </div>
@@ -347,7 +416,7 @@ export function CloudEntityPivotSheet({
                   <div className="text-xs text-muted-foreground">Last Seen</div>
                   <div className="text-[10px] font-mono">
                     {(summary as Record<string, unknown>).event_count && (summary as Record<string, unknown>).last_seen
-                      ? formatUTCShort(new Date((summary as Record<string, unknown>).last_seen as string))
+                      ? formatUTCShort(parseTimestampAsUTC((summary as Record<string, unknown>).last_seen as string))
                       : '-'}
                   </div>
                 </div>
@@ -447,6 +516,12 @@ export function CloudEntityPivotSheet({
 
               {events.map((evt, i) => {
                 const dotColor = CHANGE_TYPE_DOT_COLORS[evt.change_type] || CHANGE_TYPE_DOT_COLORS.access;
+                // NAN-2361 (audit bug 2): don't render "-" placeholders as pivots
+                const resourceVal = !isPlaceholderValue(evt.resource_name)
+                  ? evt.resource_name
+                  : !isPlaceholderValue(evt.resource_id) ? evt.resource_id : null;
+                const userVal = !isPlaceholderValue(evt.user) ? evt.user : null;
+                const ipVal = !isPlaceholderValue(evt.src_ip) ? evt.src_ip : null;
 
                 return (
                   <div key={i} className="relative pb-4 last:pb-0">
@@ -455,49 +530,49 @@ export function CloudEntityPivotSheet({
                     <div className="rounded-md border p-2.5 hover:bg-accent/30 transition-colors">
                       <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                         <span className="text-[11px] font-mono text-muted-foreground">
-                          {formatUTCShort(new Date(evt.timestamp))}
+                          {formatUTCShort(parseTimestampAsUTC(evt.timestamp))}
                         </span>
                         <Badge variant="outline" className="text-[10px]">{evt.cloud_service}</Badge>
                         <Badge variant="outline" className="text-[10px]">
                           {evt.change_type || 'access'}
                         </Badge>
                         <StatusBadge code={evt.http_status_code} />
-                        <IocBadge threatType={evt.ioc_src_ip_threat_type} malware={evt.ioc_src_ip_malware} confidence={evt.ioc_src_ip_confidence} />
+                        <IocBadge threatType={evt.src_endpoint_threat?.threat_type ?? ''} malware={evt.src_endpoint_threat?.malware ?? ''} confidence={evt.src_endpoint_threat?.confidence ?? 0} />
                       </div>
                       <div className="text-xs">
                         <span className="font-medium">{evt.event_type || '-'}</span>
-                        {evt.resource_name || evt.resource_id ? (
+                        {resourceVal ? (
                           <span className="text-muted-foreground ml-1.5">
                             {' → '}
                             <CopyableValue
-                              value={evt.resource_name || evt.resource_id}
+                              value={resourceVal}
                               className="text-primary hover:underline"
-                              onClick={() => onEntityClick?.('resource', evt.resource_name || evt.resource_id)}
+                              onClick={() => onEntityClick?.('resource', resourceVal)}
                             />
                           </span>
                         ) : null}
                       </div>
                       <div className="flex items-center gap-3 mt-1 text-[10px] text-muted-foreground">
-                        {evt.user && entity?.type !== 'user' && (
+                        {userVal && entity?.type !== 'user' && (
                           <CopyableValue
-                            value={evt.user}
+                            value={userVal}
                             className="text-primary hover:underline"
-                            onClick={() => onUserClick?.(evt.user)}
+                            onClick={() => onUserClick?.(userVal)}
                           />
                         )}
-                        {evt.cloud_region && <span>{evt.cloud_region}</span>}
-                        {evt.src_ip && entity?.type !== 'ip' && (
+                        {!isPlaceholderValue(evt.cloud_region) && <span>{evt.cloud_region}</span>}
+                        {ipVal && entity?.type !== 'ip' && (
                           <span className="inline-flex items-center gap-1">
                             <CopyableValue
-                              value={evt.src_ip}
+                              value={ipVal}
                               className="font-mono text-primary hover:underline"
-                              onClick={() => onEntityClick?.('ip', evt.src_ip)}
+                              onClick={() => onEntityClick?.('ip', ipVal)}
                             />
-                            {evt.enriched_src_country_code && (
+                            {evt.src_endpoint_geo?.country && (
                               <span className="text-muted-foreground">
-                                {evt.enriched_src_country_code}
-                                {evt.enriched_src_asn ? ` ${evt.enriched_src_asn}` : ''}
-                                {evt.enriched_src_as_name ? ` (${evt.enriched_src_as_name})` : ''}
+                                {evt.src_endpoint_geo?.country}
+                                {evt.src_endpoint_geo?.asn ? ` ${evt.src_endpoint_geo.asn}` : ''}
+                                {evt.src_endpoint_geo?.as_name ? ` (${evt.src_endpoint_geo.as_name})` : ''}
                               </span>
                             )}
                           </span>

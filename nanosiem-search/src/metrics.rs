@@ -5,9 +5,9 @@
 //! Provides HTTP request metrics and search query latency tracking.
 
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Router, routing::get};
-use axum_prometheus::PrometheusMetricLayer;
+use axum::{routing::get, Router};
 use axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
+use axum_prometheus::PrometheusMetricLayer;
 use metrics::histogram;
 
 /// Application metrics handles

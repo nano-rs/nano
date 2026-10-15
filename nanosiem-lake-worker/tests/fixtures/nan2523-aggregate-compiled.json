@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "profile": "ocsf",
+  "dataset": "logs",
+  "source_placeholder": "__nano_lake_source__",
+  "query_sha256": "ae9cd734e2235c4d1b4f4eb2656e8db3b43b08151ef4020e0dae2fa03c5193c0",
+  "start": "2026-09-21T13:15:00Z",
+  "end": "2026-09-21T14:15:00Z",
+  "limit": 100,
+  "table_view": true,
+  "newest_first_event_rows": false,
+  "required_columns": [
+    {
+      "name": "actor.user.name",
+      "field_type": "string"
+    },
+    {
+      "name": "message",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.log_source",
+      "field_type": "string"
+    },
+    {
+      "name": "metadata.uid",
+      "field_type": "string"
+    },
+    {
+      "name": "time",
+      "field_type": "timestamp"
+    },
+    {
+      "name": "user.name",
+      "field_type": "string"
+    }
+  ],
+  "projected_scan_columns": [
+    "actor.user.name",
+    "time",
+    "user.name"
+  ],
+  "sql": "WITH stage_0 AS (\n  SELECT \"actor.user.name\", message, \"metadata.log_source\", \"metadata.uid\", time, \"user.name\" FROM __nano_lake_source__\n  WHERE time BETWEEN '2026-09-21 13:15:00.000000' AND '2026-09-21 14:15:00.000000'\n  AND (((lower(\"actor.user.name\") = 'jsmith' OR lower(\"user.name\") = 'jsmith')))\n),\nstage_1 AS (\n  SELECT toStartOfInterval(time, INTERVAL 2 MINUTE) AS time_bucket, count() AS count\n  FROM stage_0\n  GROUP BY time_bucket\n  ORDER BY time_bucket\n)\nSELECT * FROM stage_1 LIMIT 100 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=1, optimize_aggregation_in_order=1"
+}

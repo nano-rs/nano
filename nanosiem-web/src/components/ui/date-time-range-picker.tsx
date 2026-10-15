@@ -16,7 +16,7 @@ import { useViewPreference } from '@/hooks/use-view-preference';
 // Import straight from the source module rather than the hooks barrel: the
 // desktop app reuses this picker, and hooks/use-api pulls in the whole API
 // client (fetch + localStorage), which a Tauri webview must never load.
-import { toApiTimeRange, TIME_RANGE_PRESETS, type TimeRangeValue } from '@/lib/time-range';
+import { formatTimeWindowLabel, toApiTimeRange, TIME_RANGE_PRESETS, type TimeRangeValue } from '@/lib/time-range';
 
 interface DateTimeRangePickerProps {
   value: TimeRangeValue;
@@ -43,6 +43,12 @@ interface DateTimeRangePickerProps {
       so existing call sites (Search, Dashboards, etc.) are unaffected.
       Used by the rule-test drawer to mirror the backend's 14-day cap. */
   maxRangeDays?: number;
+  /** Trigger text that replaces the formatted `value` while the consumer is
+      moving the window itself (Search's live tail rolls it to now, NAN-3263).
+      The popover still edits `value`. */
+  displayOverride?: string;
+  /** Hover text for the trigger (e.g. the exact rolling start–end). */
+  displayTitle?: string;
 }
 
 // Presets organized by category — mirrors mockup `CalendarPopover` grouping
@@ -66,7 +72,7 @@ function presetDurationDays(presetValue: string): number {
   }
 }
 
-export function DateTimeRangePicker({ value, onChange, className, variant = 'default', aiMode = false, align, defaultMode, labelPrefix, popoverClassName, maxRangeDays }: DateTimeRangePickerProps) {
+export function DateTimeRangePicker({ value, onChange, className, variant = 'default', aiMode = false, align, defaultMode, labelPrefix, popoverClassName, maxRangeDays, displayOverride, displayTitle }: DateTimeRangePickerProps) {
   const [open, setOpen] = React.useState(false);
   const isMobile = useIsMobile();
   // Always show custom picker expanded by default (desktop), presets first on mobile
@@ -118,15 +124,22 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
       .filter((category) => category.presets.length > 0);
   }, [maxRangeDays]);
 
-  // Sync internal state when value prop changes externally (e.g., from chart selection)
+  // Sync internal state when value prop changes externally (e.g., from chart selection).
+  // NAN-2836: never while the popover is open. The staged dates/times ARE the
+  // analyst's in-progress edit, and a live-tail tick re-anchors the page's
+  // range every interval. Syncing here overwrote the edit with the tail's
+  // (old) window, so Apply sent the previous range back. The on-open effect
+  // below re-stages from `value` each time the popover opens, and closing
+  // re-runs this sync, so a cancelled edit still falls back to `value`.
   React.useEffect(() => {
+    if (open) return;
     if (value.type === 'custom' && value.start && value.end) {
       setStartDate(value.start);
       setEndDate(value.end);
       setStartTime(formatInTimeZone(value.start, 'UTC', 'HH:mm:ss'));
       setEndTime(formatInTimeZone(value.end, 'UTC', 'HH:mm:ss'));
     }
-  }, [value.type, value.start?.getTime(), value.end?.getTime()]);
+  }, [open, value.type, value.start?.getTime(), value.end?.getTime()]);
 
   // Desktop: open to custom view with presets on the left
   // Mobile: open to presets (simpler, most common use case)
@@ -164,6 +177,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
   }, [open]);
 
   const displayValue = React.useMemo(() => {
+    if (displayOverride) return displayOverride;
     if (value.type === 'preset' && value.preset) {
       return value.preset;
     }
@@ -171,7 +185,25 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
       return `${formatInTimeZone(value.start, 'UTC', 'MMM d, HH:mm')} - ${formatInTimeZone(value.end, 'UTC', 'MMM d, HH:mm')} UTC`;
     }
     return 'Select time range';
-  }, [value]);
+  }, [value, displayOverride]);
+
+  // NAN-3884: the trigger keeps a relative pick relative ("Last 7 days"); the
+  // window it resolves to right now lives in the hover text, in the viewer's
+  // timezone. Re-resolved on each hover so a long-open page never shows a
+  // stale window.
+  const [titleNow, setTitleNow] = React.useState(() => Date.now());
+  const resolvedTitle = React.useMemo(() => {
+    if (displayTitle) return displayTitle;
+    if (value.type === 'preset' && !value.preset) return undefined;
+    if (value.type === 'custom' && !(value.start && value.end)) return undefined;
+    try {
+      return formatTimeWindowLabel(value, toApiTimeRange(value), undefined, new Date(titleNow));
+    } catch {
+      return undefined;
+    }
+    // titleNow re-resolves a relative preset against the hover moment.
+  }, [value, displayTitle, titleNow]);
+  const refreshTitle = () => setTitleNow(Date.now());
 
   const handlePresetSelect = (preset: string) => {
     setMode('presets');
@@ -235,6 +267,9 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
       <PopoverTrigger asChild>
         <Button
           variant="outline"
+          title={resolvedTitle}
+          onPointerEnter={refreshTitle}
+          onFocus={refreshTitle}
           className={cn(
             variant === 'search'
               ? 'h-[34px] rounded-md border px-3 justify-center text-left font-mono text-[12px] transition-colors'

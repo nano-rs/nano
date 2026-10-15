@@ -129,23 +129,54 @@ pub fn parse_npl(content: &str) -> Result<NplRule, NplParseError> {
     })
 }
 
-/// Extract source_type values from an nPL query
-/// Matches patterns like:
-///   source_type=windows_sysmon
-///   source_type="windows_sysmon"
-///   source_type=windows_sysmon OR source_type=endpoint_edr
+/// Extract the log sources an nPL query restricts itself to.
+///
+/// Matches both spellings and both shapes:
+///   source_type=windows_sysmon                     (UDM)
+///   source_type="windows_sysmon" OR source_type=…  (UDM)
+///   metadata.log_source="windows_sysmon"           (OCSF)
+///   metadata.log_source IN ("windows_sysmon", …)   (OCSF)
+///
+/// NAN-2361: this recognised only the UDM `source_type=` spelling, so every
+/// OCSF rule reported no sources and the repository browser rendered "-" for
+/// all of them. Measured on the 144 rules synced from nano-rs/rules
+/// (`ocsf-1.9`): 63 use `metadata.log_source=`, 21 use `metadata.log_source
+/// IN (…)`, and NONE use `source_type=` — so the extractor matched nothing at
+/// all on that content.
+///
+/// A rule that genuinely constrains no log source still yields an empty list;
+/// "-" is the honest answer there (class_uid-only rules are the common case).
 pub fn extract_source_types(query: &str) -> Vec<String> {
     let mut source_types = Vec::new();
+    let mut push = |value: &str| {
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_lowercase();
+        if !value.is_empty() && !source_types.contains(&value) {
+            source_types.push(value);
+        }
+    };
 
-    // Match source_type=value or source_type="value" patterns.
-    // Also handles the no-underscore `sourcetype=` alias.
-    let re = Regex::new(r#"(?i)source_?type\s*=\s*"?([a-zA-Z0-9_-]+)"?"#).unwrap();
+    // `<field> = "value"` — the field is either UDM's `source_type`/`sourcetype`
+    // or OCSF's `log_source`, optionally under its `metadata.` prefix.
+    let equality =
+        Regex::new(r#"(?i)(?:metadata\.)?(?:log_source|source_?type)\s*=\s*"?([a-zA-Z0-9_.-]+)"?"#)
+            .unwrap();
+    for cap in equality.captures_iter(query) {
+        if let Some(value) = cap.get(1) {
+            push(value.as_str());
+        }
+    }
 
-    for cap in re.captures_iter(query) {
-        if let Some(st) = cap.get(1) {
-            let value = st.as_str().to_lowercase();
-            if !source_types.contains(&value) {
-                source_types.push(value);
+    // `<field> IN ("a", "b")` — one clause carrying several sources.
+    let in_list =
+        Regex::new(r#"(?i)(?:metadata\.)?(?:log_source|source_?type)\s+IN\s*\(([^)]*)\)"#).unwrap();
+    for cap in in_list.captures_iter(query) {
+        if let Some(list) = cap.get(1) {
+            for item in list.as_str().split(',') {
+                push(item);
             }
         }
     }
@@ -437,5 +468,62 @@ source_type=windows_sysmon OR source_type=endpoint_edr
         let validation = validate_source_types(&required, &available);
         assert!(!validation.is_valid);
         assert_eq!(validation.missing, vec!["okta"]);
+    }
+}
+
+#[cfg(test)]
+mod ocsf_source_extraction_tests {
+    use super::*;
+
+    /// NAN-2361: the real first line of an imported OCSF rule
+    /// (`execution-ocsf/renamed_windows_system_binary`). Only `source_type=`
+    /// was recognised, so every OCSF rule showed "-" as its source.
+    #[test]
+    fn ocsf_log_source_equality_is_extracted() {
+        let query = r#"metadata.log_source="windows_sysmon" OR metadata.log_source="endpoint_edr"
+| where class_uid=1007 AND activity_id=1"#;
+        let sources = extract_source_types(query);
+        assert_eq!(sources, vec!["windows_sysmon", "endpoint_edr"]);
+    }
+
+    /// 21 of the 144 synced rules use the IN-list form.
+    #[test]
+    fn ocsf_log_source_in_list_is_extracted() {
+        let query = r#"metadata.log_source IN ("aws_cloudtrail", "azure_activity") | where x=1"#;
+        let mut sources = extract_source_types(query);
+        sources.sort();
+        assert_eq!(sources, vec!["aws_cloudtrail", "azure_activity"]);
+    }
+
+    /// The UDM spelling must keep working — 1.8 repositories still use it.
+    #[test]
+    fn udm_source_type_still_extracted() {
+        assert_eq!(
+            extract_source_types(r#"source_type="windows_sysmon" | where a=1"#),
+            vec!["windows_sysmon"]
+        );
+        assert_eq!(
+            extract_source_types("sourcetype=linux_auth | where a=1"),
+            vec!["linux_auth"]
+        );
+        assert_eq!(
+            extract_source_types("source_type=a OR source_type=b"),
+            vec!["a", "b"]
+        );
+    }
+
+    /// A rule that constrains no log source still reports none — "-" is the
+    /// honest rendering there, and class_uid-only rules are common.
+    #[test]
+    fn a_rule_without_a_log_source_reports_none() {
+        assert!(extract_source_types("| where class_uid=1007 AND activity_id=1").is_empty());
+    }
+
+    #[test]
+    fn duplicates_collapse_and_values_normalise() {
+        let sources = extract_source_types(
+            r#"metadata.log_source="Windows_Sysmon" OR metadata.log_source="windows_sysmon""#,
+        );
+        assert_eq!(sources, vec!["windows_sysmon"], "case-folded and deduped");
     }
 }

@@ -22,11 +22,16 @@ import {
   Share2,
   X,
 } from 'lucide-react';
+import { atPath, firstStringAt, firstBoolAt } from '@/lib/row-path';
 import { cn } from '@/lib/utils';
+import { parseTimestampAsUTC } from '@/lib/date-utils';
 
 // ─────────────────────────── public types ───────────────────────────
 
 export interface TreeNode {
+  _children_count?: number;
+  _page_path?: number[];
+  _next_children_offset?: number | null;
   id: string;
   label: string;
   detail?: string;
@@ -50,6 +55,8 @@ export interface TreeConfig {
 }
 
 interface TreeVisualizationProps {
+  serverPaged?: boolean;
+  onLoadChildren?: (node: TreeNode, offset: number) => void;
   nodes: TreeNode[];
   config: TreeConfig;
   onFilter?: (field: string, value: string) => void;
@@ -128,9 +135,21 @@ function firstBool(row: Record<string, unknown> | undefined, keys: string[]): bo
   return undefined;
 }
 
+/**
+ * UTC-safe parse for backend timestamp strings: naive "YYYY-MM-DD HH:MM:SS"
+ * strings get a `Z` appended so they're parsed as UTC — otherwise
+ * `new Date(...)` parses them as LOCAL time while the `getUTC*()` accessors
+ * below print them claiming UTC, shifting the display by the local offset.
+ */
+function parseAsUTC(raw: unknown): Date {
+  if (raw instanceof Date) return raw;
+  if (typeof raw === 'number') return new Date(raw);
+  return parseTimestampAsUTC(String(raw));
+}
+
 function formatUtcTime(raw: unknown): string | undefined {
   if (raw == null) return undefined;
-  const d = raw instanceof Date ? raw : new Date(String(raw));
+  const d = parseAsUTC(raw);
   if (Number.isNaN(d.getTime())) return undefined;
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
@@ -138,7 +157,7 @@ function formatUtcTime(raw: unknown): string | undefined {
 
 function formatUtcDate(raw: unknown): string | undefined {
   if (raw == null) return undefined;
-  const d = raw instanceof Date ? raw : new Date(String(raw));
+  const d = parseAsUTC(raw);
   if (Number.isNaN(d.getTime())) return undefined;
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   return `${months[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
@@ -162,6 +181,8 @@ interface DisplayNode {
   isRare: boolean;
   signed?: boolean;
   signer?: string;
+  /** Whether the event carried ANY code-signing data — distinct from `signed`. */
+  signatureCollected: boolean;
   ts?: string;
   tsDate?: string;
   flags: string[];
@@ -172,26 +193,32 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
   const r = node._data;
   const name = typeof node.label === 'string' ? node.label : JSON.stringify(node.label ?? node.id);
 
-  // Lookup key lists union the UDM names with their OCSF promoted-column
-  // equivalents (NAN-1241). UDM rows never carry the dotted OCSF keys, so the
-  // extra entries are inert under UDM (firstString skips absent keys → output
-  // byte-identical); under OCSF they let user/cmd/hash/signer nodes populate.
+  // Lookup key lists union the UDM names with their OCSF equivalents
+  // (NAN-1241). NAN-2361: they resolve through `firstStringAt`, not a flat
+  // `row[k]`.
+  //
+  // The dotted OCSF entries were added on the assumption that they would
+  // "let user/cmd/hash nodes populate", but a full-event row is NESTED, so a
+  // flat lookup of `actor.user.name` found nothing and every one of them was
+  // dead. Verified against a live ProcessCreate row: user and cmd resolve only
+  // nested, and `hashes` is an ARRAY of {algorithm_id, value} so it needs the
+  // `.value` leaf. UDM rows are flat and keep resolving on the first branch.
   const pid = preset === 'process'
-    ? firstString(r, ['pid', 'process_id', 'ProcessId', 'actor.process.pid'])
+    ? firstStringAt(r, ['pid', 'process_id', 'ProcessId', 'process.pid', 'actor.process.pid'])
     : undefined;
 
-  const user = firstString(r, [
+  const user = firstStringAt(r, [
     'user', 'user_name', 'username', 'target_user', 'process_user',
     'actor.user.name', 'user.name',
   ]);
 
   const cmd = node.detail
-    ?? firstString(r, [
+    ?? firstStringAt(r, [
       'command_line', 'CommandLine', 'cmdline', 'url', 'http_url',
-      'actor.process.cmd_line', 'process.cmd_line', 'url.url_string',
+      'process.cmd_line', 'actor.process.cmd_line', 'url.url_string',
     ]);
 
-  const hashRaw = firstString(r, [
+  const hashRaw = firstStringAt(r, [
     'process_hash',
     'file_hash',
     'image_hash',
@@ -200,32 +227,59 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     'md5',
     'MD5',
     'sha1',
-    'actor.process.file.hashes',
-    'process.file.hashes',
-    'file.hashes',
+    // Own binary before the parent's, and the array leaf rather than the array.
+    'process.file.hashes.value',
+    'file.hashes.value',
+    'actor.process.file.hashes.value',
   ]);
 
   const prevHostCount = node.prevalence?.host_count;
   const isRare = !!(node.prevalence?.is_rare);
 
-  const signed = firstBool(r, [
-    'process_signed',
-    'file_signed',
-    'image_signed',
-    'signature_verified',
-    'signed',
-    'actor.process.file.signature.state',
-    'file.signature.state',
+  // OCSF puts code signing in a PLURAL `signatures[]` array hanging off the
+  // relevant file object, with the signer in `developer_uid` — not in a
+  // singular `signature` object with a `certificate.subject`. The old candidate
+  // lists matched neither the shape nor the leaf names, and were flat-only
+  // besides, so this row was structurally incapable of resolving under OCSF.
+  //
+  // `process.file` is the node's OWN binary; `actor.process.file` is its
+  // PARENT's; `module.file` is the loaded image on ImageLoad rows. Own-binary
+  // first — attributing the parent's signature to the child would be worse than
+  // showing nothing.
+  const SIGNATURE_OBJECTS = [
+    'process.file',
+    'file',
+    'module.file',
+    'actor.process.file',
+  ];
+  const signatureStatePaths = SIGNATURE_OBJECTS.flatMap((base) => [
+    `${base}.signatures.state`,
+    `${base}.signature.state`,
   ]);
-  const signer = firstString(r, [
-    'process_signer',
-    'file_signer',
-    'image_signer',
-    'signature_subject',
-    'signer',
-    'actor.process.file.signature.certificate.subject',
-    'file.signature.certificate.subject',
+  const signerPaths = SIGNATURE_OBJECTS.flatMap((base) => [
+    `${base}.signatures.developer_uid`,
+    `${base}.signatures.certificate.subject`,
+    `${base}.signature.developer_uid`,
+    `${base}.signature.certificate.subject`,
   ]);
+
+  const signed =
+    firstBool(r, ['process_signed', 'file_signed', 'image_signed', 'signature_verified', 'signed']) ??
+    // OCSF `state` is a verdict string ("Valid"/"Expired"/"Untrusted"/…).
+    // Unrecognised verdicts stay undefined ("collected but not a clean
+    // yes/no") rather than being reported as unsigned.
+    firstBoolAt(r, signatureStatePaths);
+  const signer =
+    firstString(r, ['process_signer', 'file_signer', 'image_signer', 'signature_subject', 'signer']) ??
+    firstStringAt(r, signerPaths);
+  // Distinguish "not signed" from "never collected". Sysmon emits signature
+  // fields only on ImageLoad by default, so ProcessCreate rows — the ones that
+  // become tree nodes — legitimately carry nothing. Rendering that as an empty
+  // dash alongside genuine unsigned binaries invites the wrong read.
+  const signatureCollected =
+    signed !== undefined ||
+    signer !== undefined ||
+    signatureStatePaths.some((p) => atPath(r, p) != null);
 
   const ts = formatUtcTime(r?.timestamp ?? r?.event_time ?? r?.utc_time);
   const tsDate = formatUtcDate(r?.timestamp ?? r?.event_time ?? r?.utc_time);
@@ -253,6 +307,7 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     isRare,
     signed,
     signer,
+    signatureCollected,
     ts,
     tsDate,
     flags,
@@ -642,8 +697,23 @@ function TreeDetail({
                 <AlertTriangle className="w-[11px] h-[11px]" />
                 Unsigned
               </span>
+            ) : display.signatureCollected ? (
+              // Signature data exists but its verdict is not a clean yes/no
+              // (Expired, Untrusted, Revoked, …). Show the verdict rather than
+              // rounding it to signed or unsigned.
+              <span className="inline-flex items-center gap-1.5 text-foreground">
+                <FileSignature className="w-[11px] h-[11px] text-muted-foreground" />
+                {display.signer ?? 'Present'}
+                <span className="text-muted-foreground/70">(unverified)</span>
+              </span>
             ) : (
-              <span className="text-muted-foreground/70">—</span>
+              // NOT the same as unsigned. Sysmon emits signature fields only on
+              // ImageLoad by default, so ProcessCreate rows — exactly the ones
+              // that become tree nodes — carry none. A bare dash next to real
+              // unsigned binaries reads as "we checked and it is fine".
+              <span className="text-muted-foreground/70" title="No code-signing data on this event">
+                not collected
+              </span>
             )}
           </DetailRow>
           {display.cmd && (
@@ -806,7 +876,8 @@ interface TreeNodeComponentProps {
   parentMap: Map<string, string | null>;
   flatById: Map<string, TreeNode>;
   expanded: Set<string>;
-  onToggle: (id: string) => void;
+  onToggle: (id: string, node?: TreeNode) => void;
+  onLoadChildren?: (node: TreeNode, offset: number) => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
   visibleSet: Set<string> | null;
@@ -826,7 +897,7 @@ function TreeNodeComponent(props: TreeNodeComponentProps) {
   } = props;
 
   const children = node.children ?? [];
-  const hasChildren = children.length > 0;
+  const hasChildren = children.length > 0 || (node._children_count ?? 0) > 0;
   const isExpanded = expanded.has(node.id);
   const isSelected = selectedId === node.id;
 
@@ -850,7 +921,7 @@ function TreeNodeComponent(props: TreeNodeComponentProps) {
         hasChildren={hasChildren}
         isExpanded={isExpanded}
         isSelected={isSelected}
-        onToggle={(e) => { e.stopPropagation(); onToggle(node.id); }}
+        onToggle={(e) => { e.stopPropagation(); onToggle(node.id, node); }}
         onSelect={() => onSelect(node.id)}
       />
       {isSelected && (
@@ -881,6 +952,7 @@ function TreeNodeComponent(props: TreeNodeComponentProps) {
           />
         );
       })}
+      {isExpanded && node._next_children_offset != null && props.onLoadChildren && <button className="ml-8 px-2 py-1 text-[10.5px] font-mono text-muted-foreground" onClick={() => props.onLoadChildren?.(node, node._next_children_offset!)}>Load more children</button>}
     </>
   );
 }
@@ -897,6 +969,8 @@ export function TreeVisualization({
   fieldsCollapsed,
   fieldsCount,
   onExpandFields,
+  serverPaged,
+  onLoadChildren,
 }: TreeVisualizationProps) {
   const preset = useMemo(() => derivePreset(config), [config]);
   const presetLabel =
@@ -947,7 +1021,7 @@ export function TreeVisualization({
   // Expansion state — default auto-expand LOLBin ancestry if process preset, otherwise first level.
   const allNodeIds = useMemo(() => collectIds(nodes), [nodes]);
   const [expanded, setExpanded] = useState<Set<string>>(() => {
-    if (nodes.length === 0) return new Set();
+    if (nodes.length === 0 || serverPaged) return new Set();
     // Small trees: fully expand. Large trees: expand roots + suspicious paths only.
     if (allNodeIds.size <= 60) return new Set(allNodeIds);
     const s = new Set<string>();
@@ -966,17 +1040,19 @@ export function TreeVisualization({
     return s;
   });
 
-  const toggleNode = useCallback((id: string) => {
+  const toggleNode = useCallback((id: string, selected?: TreeNode) => {
+    const node = selected ?? flatById.get(id);
+    if (!expanded.has(id) && node && !node.children.length && (node._children_count ?? 0) > 0) onLoadChildren?.(node, 0);
     setExpanded((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  }, []);
+  }, [expanded, flatById, onLoadChildren]);
 
-  const expandAll = useCallback(() => setExpanded(new Set(allNodeIds)), [allNodeIds]);
-  const collapseAll = useCallback(() => setExpanded(new Set(nodes.map((r) => r.id))), [nodes]);
+  const expandAll = useCallback(() => setExpanded(serverPaged ? new Set([...flatById.values()].filter(node => node.children.length > 0).map(node => node.id)) : new Set(allNodeIds)), [allNodeIds, serverPaged, flatById]);
+  const collapseAll = useCallback(() => setExpanded(serverPaged ? new Set() : new Set(nodes.map((r) => r.id))), [nodes, serverPaged]);
 
   // Selection + focus
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1105,7 +1181,7 @@ export function TreeVisualization({
         )}
         <span className="flex-1" aria-hidden />
         <span className="text-muted-foreground font-mono normal-case tracking-normal">
-          {stats.total} nodes
+          {stats.total} {serverPaged ? "loaded nodes" : "nodes"}
           {stats.unique > 0 && (
             <> · {stats.unique} unique hashes</>
           )}
@@ -1120,7 +1196,7 @@ export function TreeVisualization({
           <input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            placeholder="Filter in tree (name or cmdline)…"
+            placeholder={serverPaged ? "Filter loaded nodes (name or cmdline)…" : "Filter in tree (name or cmdline)…"}
             className="pl-7 pr-2 h-6 w-[280px] rounded-md border border-border bg-card text-[11px] text-foreground font-mono outline-none focus:border-primary/40 placeholder:text-muted-foreground"
           />
         </div>
@@ -1143,7 +1219,7 @@ export function TreeVisualization({
           onClick={expandAll}
           className="inline-flex items-center px-2 h-6 rounded-md text-[10.5px] text-muted-foreground hover:text-foreground font-mono cursor-pointer"
         >
-          Expand all
+          {serverPaged ? "Expand loaded" : "Expand all"}
         </button>
         <button
           type="button"
@@ -1236,6 +1312,7 @@ export function TreeVisualization({
                   flatById={flatById}
                   expanded={expanded}
                   onToggle={toggleNode}
+                  onLoadChildren={onLoadChildren}
                   selectedId={selectedId}
                   onSelect={(id) => setSelectedId((prev) => (prev === id ? null : id))}
                   visibleSet={visibleSet}

@@ -25,7 +25,7 @@ impl NotebookRepository {
             r#"
             INSERT INTO notebook_references (notebook_id, reference_type, reference_id, reference_name)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (notebook_id, reference_type, reference_id) DO NOTHING
+            ON CONFLICT (tenant_id, notebook_id, reference_type, reference_id) DO NOTHING
             RETURNING *
             "#,
         )

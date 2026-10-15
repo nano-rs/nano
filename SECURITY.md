@@ -21,7 +21,7 @@ mail and we'll respond with it.
 ## Scope
 
 This repository (`nano-rs/nano`) is the open-core engine —
-ingestion, ClickHouse / Postgres data layer, search, detection,
+ingestion, lake (Parquet/chDB) and Postgres data layer, search, detection,
 alerting, web UI shell.
 
 In-scope vulnerabilities for this repo:
@@ -53,14 +53,15 @@ profiles. Pick the right one:
 - **`docker-compose.opensource.yml`** — the supported deployment, what
   `install.sh` (`curl … | bash` from get.nano.rs) brings up. It publishes only
   the **nginx entrypoint** (`:80`, add TLS with `docker-compose.tls.yml`) and the
-  **Vector ingest ports**. Postgres, ClickHouse, Dragonfly, and the api / search /
-  jobs services have **no published host ports** — they are reachable only on the
-  internal Docker network. There is no Prometheus, Grafana, or exporter in this
+  **Vector ingest ports**. Postgres, Dragonfly, and the api / search / jobs
+  services have **no published host ports** — they are reachable only on the
+  internal Docker network (the lake object store, catalog and query worker
+  publish to `127.0.0.1` only). There is no Prometheus, Grafana, or exporter in this
   file. A default install does **not** expose a database or monitoring/control
   plane to the host.
 
 - **`docker-compose.yml`** — **local development only.** It binds internal
-  services (Postgres, ClickHouse HTTP/native, Prometheus with
+  services (Postgres, Prometheus with
   `--web.enable-admin-api`, Grafana with default credentials, the exporters) to
   `0.0.0.0`. **Do not run it on a public host** — on a machine with a public IP
   those services are reachable, unauthenticated, from the internet. This is by
@@ -89,7 +90,7 @@ Fluent source, it won't carry built-in auth either, so firewall it the same way.
 - Keep everything else off the public interface.
 - Put TLS in front (`docker-compose.tls.yml`) and set `BASE_URL` to your HTTPS URL.
 
-See `docs/getting-started/docker-deployment.md` → "Network exposure & firewall"
+See `docs/getting-started/open-core-operations.md` → "Network exposure & firewall"
 for concrete rules.
 
 ## Disclosure timeline

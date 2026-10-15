@@ -4,9 +4,13 @@
 
 pub mod clickhouse_migrate;
 pub mod config;
+pub mod contention;
+pub mod connection_budget;
 pub mod dual_pool;
+pub mod edition_sql;
 pub mod migrations;
 pub mod pool;
+pub mod pooler;
 pub mod repo_error;
 pub mod repo_store;
 pub mod repository;

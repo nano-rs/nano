@@ -153,9 +153,15 @@ fn hit_event_id_is_stable_and_specific() {
     assert!(a1.starts_with("retro_"));
 
     // Different indicator → different id.
-    assert_ne!(a1, hit_event_id(rule_id(), "5.6.7.8", "2026-01-02T00:00:00Z"));
+    assert_ne!(
+        a1,
+        hit_event_id(rule_id(), "5.6.7.8", "2026-01-02T00:00:00Z")
+    );
     // A later last-seen (new activity) → different id (so it re-alerts).
-    assert_ne!(a1, hit_event_id(rule_id(), "1.2.3.4", "2026-01-03T00:00:00Z"));
+    assert_ne!(
+        a1,
+        hit_event_id(rule_id(), "1.2.3.4", "2026-01-03T00:00:00Z")
+    );
     // Different rule → different id.
     let other = Uuid::parse_str("00000000-0000-0000-0000-0000000000dd").unwrap();
     assert_ne!(a1, hit_event_id(other, "1.2.3.4", "2026-01-02T00:00:00Z"));
@@ -190,7 +196,10 @@ fn build_hit_events_carries_entity_window_and_context() {
     assert_eq!(e["retro_hits"], 3);
     // Stable id present for matched-event dedup.
     let id = e["id"].as_str().unwrap();
-    assert_eq!(id, hit_event_id(rule_id(), "1.2.3.4", "2026-01-05T10:00:00Z"));
+    assert_eq!(
+        id,
+        hit_event_id(rule_id(), "1.2.3.4", "2026-01-05T10:00:00Z")
+    );
     // Human message mentions the indicator + feed.
     let msg = e["message"].as_str().unwrap();
     assert!(msg.contains("1.2.3.4") && msg.contains("threatfox"));

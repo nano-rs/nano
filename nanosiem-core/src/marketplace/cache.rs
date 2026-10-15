@@ -14,7 +14,7 @@
 //! source visibility for the next 6 hours, without exposing an unrestricted
 //! result to a restricted caller (NAN-2061).
 //!
-//! Mirrors the wiring pattern of `nanosiem_enterprise::cases::PresenceTracker`
+//! Mirrors the wiring pattern of `enterprise::cases::PresenceTracker`
 //! (lifted in Phase 3.2 of NAN-744): an `Option<Arc<Mutex<ConnectionManager>>>`
 //! so single-node dev (no Redis) short-circuits to a "cache miss every time"
 //! path without any branches at the call site.
@@ -123,16 +123,16 @@ impl MarketplaceCoverageCache {
     /// be established. Mirrors `PresenceTracker::try_with_redis_url` so the
     /// `nanosiem-api` startup code stays out of the redis crate's surface.
     pub async fn try_with_redis_url(redis_url: &str) -> Self {
-        match redis::Client::open(redis_url) {
+        match crate::redis_transport::client_from_url(redis_url) {
             Ok(client) => match ConnectionManager::new(client).await {
                 Ok(conn) => Self::with_redis(conn),
                 Err(err) => {
-                    warn!(redis_url, error = %err, "marketplace_coverage_cache: Redis ConnectionManager failed; cache disabled");
+                    warn!(error = %err, "marketplace_coverage_cache: Redis ConnectionManager failed; cache disabled");
                     Self::new()
                 }
             },
             Err(err) => {
-                warn!(redis_url, error = %err, "marketplace_coverage_cache: invalid Redis URL; cache disabled");
+                warn!(error = %err, "marketplace_coverage_cache: invalid Redis URL; cache disabled");
                 Self::new()
             }
         }

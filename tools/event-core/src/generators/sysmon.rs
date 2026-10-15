@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Sysmon event generator using real process chains and file hashes
 //!
 //! Produces Windows Event JSON matching the format the Vector Sysmon parser expects.
@@ -10,7 +12,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::entity::{Entity, Process};
-use crate::event::Event;
+use crate::event::{Event, next_windows_record_id};
 use crate::profiles::{self, ProcessChain, ProfileData};
 
 pub struct SysmonGenerator;
@@ -342,6 +344,8 @@ impl SysmonGenerator {
         let chain = profiles.sample_process_chain(rng);
         // Use file hash data for the loaded image
         let file = profiles.sample_file_hash(rng);
+        // NAN-3174: opt-in long-tail hash pool (None + no RNG draw when off).
+        let synth = crate::variance::sample_synthetic_file(rng);
 
         let event_data = serde_json::json!({
             "RuleName": "ImageLoad",
@@ -349,13 +353,13 @@ impl SysmonGenerator {
             "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
-            "ImageLoaded": if file.file_path.is_empty() { r"C:\Windows\System32\kernel32.dll".to_string() } else { file.file_path.clone() },
+            "ImageLoaded": if let Some(f) = synth { f.path.clone() } else if file.file_path.is_empty() { r"C:\Windows\System32\kernel32.dll".to_string() } else { file.file_path.clone() },
             "FileVersion": "10.0.22621.1 (WinBuild.160101.0800)",
             "Description": "-",
             "Product": "Microsoft Windows Operating System",
             "Company": "Microsoft Corporation",
-            "OriginalFileName": if file.file_name.is_empty() { "kernel32.dll".to_string() } else { file.file_name.clone() },
-            "Hashes": format!("SHA256={}", if file.file_hash.is_empty() { &chain.process_hash } else { &file.file_hash }),
+            "OriginalFileName": if let Some(f) = synth { f.name.clone() } else if file.file_name.is_empty() { "kernel32.dll".to_string() } else { file.file_name.clone() },
+            "Hashes": format!("SHA256={}", if let Some(f) = synth { &f.hash } else if file.file_hash.is_empty() { &chain.process_hash } else { &file.file_hash }),
             "Signed": "true",
             "Signature": "Microsoft Windows",
             "SignatureStatus": "Valid",
@@ -528,6 +532,8 @@ impl SysmonGenerator {
     ) -> Event {
         let file = profiles.sample_file_hash(rng);
         let chain = profiles.sample_process_chain(rng);
+        // NAN-3174: opt-in long-tail hash pool (None + no RNG draw when off).
+        let synth = crate::variance::sample_synthetic_file(rng);
 
         let event_data = serde_json::json!({
             "RuleName": "-",
@@ -535,8 +541,8 @@ impl SysmonGenerator {
             "ProcessGuid": format!("{{{}}}", Uuid::now_v7()),
             "ProcessId": rng.random_range(1000u32..30000).to_string(),
             "Image": chain.process_path,
-            "TargetFilename": if file.file_path.is_empty() { format!(r"C:\Users\{}\AppData\Local\Temp\tmp{:08x}.tmp", entity.user.split('\\').last().unwrap_or("user"), rng.random::<u32>()) } else { file.file_path.clone() },
-            "Hashes": if file.file_hash.is_empty() { format!("SHA256={}", chain.process_hash) } else { format!("SHA256={}", file.file_hash) },
+            "TargetFilename": if let Some(f) = synth { f.path.clone() } else if file.file_path.is_empty() { format!(r"C:\Users\{}\AppData\Local\Temp\tmp{:08x}.tmp", entity.user.split('\\').last().unwrap_or("user"), rng.random::<u32>()) } else { file.file_path.clone() },
+            "Hashes": if let Some(f) = synth { format!("SHA256={}", f.hash) } else if file.file_hash.is_empty() { format!("SHA256={}", chain.process_hash) } else { format!("SHA256={}", file.file_hash) },
             "IsExecutable": "false",
             "User": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
         });
@@ -562,6 +568,8 @@ impl SysmonGenerator {
         } else {
             chain.command_line.clone()
         };
+        // NAN-3174: opt-in command-line variance (no-op when off).
+        let cmdline = crate::variance::varied_cmdline(&cmdline).unwrap_or(cmdline);
 
         entity.spawn_process(&chain.process_name, &chain.process_path, &cmdline, None)
     }
@@ -589,7 +597,7 @@ impl SysmonGenerator {
             "process_id": rng.random_range(1000u32..10000),
             "provider_guid": "{5770385f-c22a-43e0-bf4c-06f5698ffbd9}",
             "provider_name": "Microsoft-Windows-Sysmon",
-            "record_id": rng.random_range(100000u32..999999),
+            "record_id": next_windows_record_id(),
             "task": event_id,
             "task_name": task_name,
             "thread_id": rng.random_range(1000u32..10000),

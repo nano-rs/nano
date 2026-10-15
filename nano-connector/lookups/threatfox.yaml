@@ -1,0 +1,48 @@
+# NAN-3763 official lookup spec. The nano-enrichments `threatfox` catalog
+# entry is a bulk data feed; this is its on-demand IOC search (abuse.ch
+# ThreatFox API v1, Auth-Key required).
+version: 1
+name: threatfox
+display_name: ThreatFox
+description: abuse.ch database of IOCs (C2 IPs, domains, URLs, payload hashes) attributed to malware families.
+homepage: https://auth.abuse.ch/
+allow:
+  - host: threatfox-api.abuse.ch
+    path_prefixes: ["/api/v1"]
+auth: { type: api_key_header, header: Auth-Key, credential: AUTH_KEY }
+credentials:
+  - { name: AUTH_KEY, label: abuse.ch Auth-Key }
+defaults: { cache_ttl_secs: 21600, per_minute: 60, per_day: 10000 }
+types:
+  ip: &tf
+    request:
+      method: POST
+      url: "https://threatfox-api.abuse.ch/api/v1/"
+      body: { json: { query: search_ioc, search_term: "{{input.artifact}}", exact_match: true } }
+    link: "https://threatfox.abuse.ch/browse.php?search=ioc%3A{{input.artifact_q}}"
+    result: &tfr
+      score: { path: data.0.confidence_level }
+      rules:
+        - when: [{ path: query_status, in: [no_result, no_results] }]
+          verdict: not_found
+        - when: [{ path: query_status, equals: ok }, { path: data.0.confidence_level, gte: 50 }]
+          verdict: malicious
+        - when: [{ path: query_status, equals: ok }]
+          verdict: suspicious
+      default_verdict: unknown
+      summary:
+        threat_type: data.0.threat_type
+        malware: data.0.malware_printable
+        confidence: data.0.confidence_level
+        first_seen: data.0.first_seen
+        reporter: data.0.reporter
+      tags: [data.0.tags, data.0.malware_printable]
+  domain: *tf
+  url: *tf
+  hash:
+    request:
+      method: POST
+      url: "https://threatfox-api.abuse.ch/api/v1/"
+      body: { json: { query: search_hash, hash: "{{input.artifact}}" } }
+    link: "https://threatfox.abuse.ch/browse.php?search=ioc%3A{{input.artifact_q}}"
+    result: *tfr

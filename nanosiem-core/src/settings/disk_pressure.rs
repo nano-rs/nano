@@ -325,7 +325,7 @@ impl DiskPressureService {
     /// 1. Postgres `system_settings.tiering_enabled` — set by the in-app tiering
     ///    workflow when a user configures S3/R2 from the UI.
     /// 2. ClickHouse `system.storage_policies` / `system.disks` — set when the
-    ///    platform layer (e.g. nano-main provisioning) bootstraps a multi-volume
+    ///    platform layer (e.g. The platform provisioning) bootstraps a multi-volume
     ///    policy without going through the app. The Postgres flag may never be
     ///    set in that case, but the storage layer is the authoritative truth.
     ///
@@ -550,7 +550,10 @@ impl DiskPressureService {
         // just the node the LB'd connection landed on.
         let on_cluster = on_cluster_clause();
         for table in DAILY_TABLES {
-            let stmt = format!("ALTER TABLE {}{} DROP PARTITION '{}'", table, on_cluster, date);
+            let stmt = format!(
+                "ALTER TABLE {}{} DROP PARTITION '{}'",
+                table, on_cluster, date
+            );
             self.ch_admin
                 .query(&stmt)
                 .execute()

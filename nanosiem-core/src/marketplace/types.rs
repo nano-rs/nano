@@ -170,6 +170,9 @@ impl std::str::FromStr for CredentialRequirement {
 /// An enrichment marketplace repository (external GitHub repo)
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
 pub struct EnrichmentMarketplaceRepo {
+    #[serde(default)]
+    #[sqlx(skip)]
+    pub managed_by_platform: bool,
     #[serde(with = "typeid::catalog")]
     #[schema(value_type = String)]
     pub id: Uuid,
@@ -183,6 +186,14 @@ pub struct EnrichmentMarketplaceRepo {
     pub sync_interval_hours: i32,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub last_sync_commit: Option<String>,
+    /// `SYNC_SCHEMA_VERSION` of the sync code that last succeeded (NAN-3514).
+    /// 0 for rows synced before the version was recorded, and for tables
+    /// that do not carry the column (`shared_marketplace_repos`),
+    /// hence `sqlx(default)`. Internal bookkeeping, not part of the API.
+    #[serde(skip)]
+    #[sqlx(default)]
+    #[schema(ignore)]
+    pub last_sync_schema_version: i32,
     pub last_sync_status: Option<String>,
     pub last_sync_error: Option<String>,
     pub enrichment_count: i32,
@@ -197,7 +208,7 @@ pub struct EnrichmentMarketplaceRepo {
 /// A unified marketplace catalog entry
 ///
 /// `Default` exists so tests can build an entry by naming only the couple of
-/// fields under test instead of all ~40 (NAN-2343). It is not a meaningful
+/// fields under test instead of all ~40. It is not a meaningful
 /// runtime value — every production entry comes from a `FromRow` decode.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
 pub struct MarketplaceCatalogEntry {
@@ -271,7 +282,7 @@ pub struct MarketplaceCatalogEntry {
     /// in `custom_enrichment_runs` with `status='running'` and a null
     /// `completed_at`). Lets the catalog card distinguish "actively fetching
     /// right now" from "configured and healthy" — both used to look the
-    /// same as a green "running" pill (NAN-1108). Derived per-query in
+    /// same as a green "running" pill. Derived per-query in
     /// `hydrate_with_run_state`, not stored on `marketplace_catalog`.
     #[serde(default)]
     #[sqlx(default)]
@@ -549,6 +560,109 @@ pub struct MarketplaceManifest {
     /// non-empty `streams` list is what makes a manifest a collector.
     #[serde(default)]
     pub streams: Vec<StreamDef>,
+
+    // -------------------------------------------------------------------------
+    // nano-connector runtime (NAN-3490)
+    // -------------------------------------------------------------------------
+    /// Which runtime executes this entry: `deno` (default, `code.ts`) or
+    /// `connector` (the declarative spec named by `connector_spec`). Sync
+    /// records it as `config.runtime`; the backend column is unchanged.
+    #[serde(default)]
+    pub runtime: Option<String>,
+
+    /// File name of the nano-connector spec next to the manifest
+    /// (`connector.yaml`). Sync stores its text as `config.connector_spec`
+    /// and its SHA-256 as `config.connector_spec_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_spec: Option<String>,
+
+    /// File name of the spec hosted (hosted-shared) installs run instead
+    /// of `connector_spec` (`connector.hosted.yaml`), e.g. keyless Google
+    /// Workspace through the platform pull broker. Sync stores its text as
+    /// `config.hosted_connector_spec` and its SHA-256 as
+    /// `config.hosted_connector_spec_sha256`. Dedicated installs, open core
+    /// and the shadow harness keep using `connector_spec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_connector_spec: Option<String>,
+
+    // -------------------------------------------------------------------------
+    // Marketplace layout (NAN-3503)
+    // -------------------------------------------------------------------------
+    /// Marketplace sections this card lists under (`logs`, `identity`). Sync
+    /// stores it as `config.categories`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+
+    /// Separately toggleable parts of one vendor card (e.g. Google Workspace
+    /// audit logs + directory). Sync stores them as `config.components`, each
+    /// identity component with its spec text and SHA-256.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<ComponentDef>,
+}
+
+/// `components[].kind` for rows that go to ingest through parsers.
+pub const COMPONENT_KIND_LOGS: &str = "logs";
+/// `components[].kind` for rows that go to the identity snapshot.
+pub const COMPONENT_KIND_IDENTITY: &str = "identity";
+/// `streams[].source_type` marking an identity stream (no parser, no log
+/// source).
+pub const IDENTITY_SOURCE_TYPE: &str = "nano_identity";
+
+/// One component of a vendor card (NAN-3503, nano-integrations SCHEMA.md
+/// "Components and categories").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentDef {
+    /// Stable id, `[a-z0-9_]`.
+    pub id: String,
+    pub label: String,
+    /// `logs` or `identity`.
+    pub kind: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `logs`: ids from the manifest's `streams`.
+    #[serde(default)]
+    pub streams: Vec<String>,
+    /// `identity`: spec file next to the manifest (`kind: identity`).
+    #[serde(default)]
+    pub connector_spec: Option<String>,
+    /// Hosted twin of `connector_spec`.
+    #[serde(default)]
+    pub hosted_connector_spec: Option<String>,
+    /// Names from the manifest's `config_fields` this component reads.
+    #[serde(default)]
+    pub config_fields: Vec<String>,
+    /// Pre-selected at install.
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub setup: ComponentSetup,
+}
+
+/// What the install drawer shows for one component.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ComponentSetup {
+    /// OAuth scopes the customer must grant.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// Vendor roles / API permissions, plain text.
+    #[serde(default)]
+    pub permissions: Vec<String>,
+    /// Markdown, one string per step, in order.
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+/// `config.runtime` value for an entry the nano-connector engine runs.
+pub const CONNECTOR_RUNTIME: &str = "connector";
+
+impl MarketplaceCatalogEntry {
+    /// NAN-3490: true when sync marked this entry `runtime: connector`. Such
+    /// an entry is run by the connector service from the spec in
+    /// `config.connector_spec`, never by the Deno sandbox, whatever its
+    /// `execution_backend` says.
+    pub fn is_connector_runtime(&self) -> bool {
+        self.config.0.get("runtime").and_then(|v| v.as_str()) == Some(CONNECTOR_RUNTIME)
+    }
 }
 
 /// The inverse of `sync_service::effective_config`: pulls a collector's
@@ -566,6 +680,11 @@ pub struct CollectorManifestFields {
     pub config_fields: Vec<ConfigFieldDef>,
     pub allowed_domain_suffixes: Vec<String>,
     pub streams: Vec<StreamDef>,
+    /// NAN-3490: `runtime` (`deno` | `connector`), when the manifest set one.
+    pub runtime: Option<String>,
+    /// NAN-3490: the connector spec TEXT sync copied into `config`. An export
+    /// writes it as `connector.yaml` and names that file in the manifest.
+    pub connector_spec: Option<String>,
     /// `config` with the lifted keys removed — what belongs under `config:` in
     /// the emitted manifest.
     pub remainder: serde_json::Value,
@@ -574,13 +693,26 @@ pub struct CollectorManifestFields {
 impl CollectorManifestFields {
     /// Keys sync writes into `config`. Kept in one place so lifting and
     /// stripping can never disagree about the set.
-    const LIFTED_KEYS: [&'static str; 5] = [
+    const LIFTED_KEYS: [&'static str; 12] = [
         "streams",
         "config_fields",
         "allowed_domain_suffixes",
         "auth_type",
         "auth",
+        "runtime",
+        "connector_spec",
+        "connector_spec_sha256",
+        // Platform-only (hosted installs); an export does not carry it.
+        "hosted_connector_spec",
+        "hosted_connector_spec_sha256",
+        // NAN-3503 marketplace layout (platform-only: component specs are
+        // stored as text, which an exported manifest cannot name).
+        "categories",
+        "components",
     ];
+
+    /// File name an exported manifest gives its connector spec.
+    pub const CONNECTOR_SPEC_FILE: &'static str = "connector.yaml";
 
     pub fn take_from(config: &serde_json::Value) -> Self {
         let Some(map) = config.as_object() else {
@@ -611,6 +743,8 @@ impl CollectorManifestFields {
             streams: get("streams")
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default(),
+            runtime: get("runtime").and_then(|v| v.as_str().map(str::to_string)),
+            connector_spec: get("connector_spec").and_then(|v| v.as_str().map(str::to_string)),
             remainder: serde_json::Value::Object(remainder),
         }
     }
@@ -689,7 +823,7 @@ pub struct StreamDef {
     pub source_type: String,
     /// Repository parser (by its YAML `name`) that parses this stream.
     ///
-    /// NAN-2248: when set, provisioning resolves the parser by name and the
+    /// When set, provisioning resolves the parser by name and the
     /// parser's `match_values` play no part in resolution. Before this field,
     /// the only way to find a stream's parser was a reverse lookup — index every
     /// repository parser's `match_values` and look up `source_type` — which

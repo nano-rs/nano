@@ -4,15 +4,14 @@
  *
  * Outputs:
  *   1. nanosiem-web/src/lib/udm-fields.ts   (frontend Set)
- *   2. docs/udm_fields_parsed.json           (full metadata JSON)
- *   3. nanosiem-enterprise/src/melod/sigma_converter/data/udm-fields.json  (sigma converter, enterprise crate; skipped if absent)
- *   4. <docs-site>/public/udm-fields.json    (docs site, if present)
+ *   2. enterprise/src/melod/sigma_converter/data/udm-fields.json  (sigma converter, enterprise crate; skipped if absent)
+ *   3. <docs-site>/public/udm-fields.json    (docs site, if present)
  *
  * Usage:  node scripts/generate-udm-fields.mjs
  * Called automatically by:  npm run generate:udm
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -22,14 +21,18 @@ const CSV_PATH = resolve(ROOT, 'nanosiem-core/docs/udmfields.csv');
 
 // Output paths
 const TS_OUTPUT = resolve(__dirname, '../src/lib/udm-fields.ts');
-const JSON_OUTPUTS = [
-  resolve(ROOT, 'docs/udm_fields_parsed.json'),
-  resolve(ROOT, 'nanosiem-enterprise/src/melod/sigma_converter/data/udm-fields.json'),
-];
-// Optional: docs-site in sibling directory
-const DOCS_SITE_JSON = resolve(ROOT, '../nano-main/docs-site/public/udm-fields.json');
-if (existsSync(resolve(ROOT, '../nano-main/docs-site/public'))) {
-  JSON_OUTPUTS.push(DOCS_SITE_JSON);
+// Every crate that vendors the Sigma converter's field table (present only in
+// editions that ship the converter).
+const JSON_OUTPUTS = readdirSync(ROOT)
+  .map((dir) => resolve(ROOT, dir, 'src/melod/sigma_converter/data'))
+  .filter((dir) => existsSync(dir))
+  .map((dir) => resolve(dir, 'udm-fields.json'));
+// Optional: a docs site checked out in a sibling directory.
+for (const sibling of readdirSync(resolve(ROOT, '..'))) {
+  const docsPublic = resolve(ROOT, '..', sibling, 'docs-site/public');
+  if (existsSync(docsPublic)) {
+    JSON_OUTPUTS.push(resolve(docsPublic, 'udm-fields.json'));
+  }
 }
 
 // Additional fields not in the CSV but used in the frontend
@@ -267,7 +270,7 @@ const jsonStr = JSON.stringify(jsonOutput, null, 2) + '\n';
 
 for (const dest of JSON_OUTPUTS) {
   // Skip when the parent dir is absent — the open-core repo split (NAN-744)
-  // means nanosiem-enterprise/ may not be present in every checkout.
+  // means enterprise/ may not be present in every checkout.
   if (!existsSync(dirname(dest))) {
     console.log(`  SKIP  ${dest} (parent dir missing)`);
     continue;

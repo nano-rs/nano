@@ -261,7 +261,7 @@ pub struct ApiKeyUsageResponse {
 /// audited actions performed *via* the key (mutations + authorization denials)
 /// rather than raw request volume — read-only GET traffic is not audited, and
 /// admin lifecycle actions taken *on* the key (create/enable/disable) are not
-/// counted here since the key is the target, not the actor. NAN-1622 moved this
+/// counted here since the key is the target, not the actor. This data moved
 /// off the retired PostgreSQL `audit_logs` table.
 ///
 /// GET /api/api-keys/{id}/usage

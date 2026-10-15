@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-export { SearchHistory } from './SearchHistory';
 export { TimelineVisualization } from './TimelineVisualization';
 export { FieldsPanel, FIELD_STATS_PINNED_COLUMNS, type FieldStat } from './FieldsPanel';
 export { SearchResults } from './SearchResults';

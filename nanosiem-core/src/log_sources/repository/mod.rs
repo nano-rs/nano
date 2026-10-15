@@ -9,7 +9,8 @@
 mod crud;
 mod deployments;
 mod health;
-mod helpers;
+pub use health::collector_error_hint;
+pub(crate) mod helpers;
 mod status;
 
 use clickhouse::Client as ClickHouseClient;

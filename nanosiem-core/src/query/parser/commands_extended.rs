@@ -10,14 +10,14 @@ use nom::{
     bytes::complete::{tag, tag_no_case},
     character::complete::{alpha1, char, digit1, multispace0, multispace1, one_of},
     combinator::{map, map_res, opt, peek, recognize, value},
-    multi::separated_list1,
+    multi::{many0, separated_list1},
     sequence::{delimited, pair, preceded, terminated},
     Parser,
 };
 use std::time::Duration;
 
 use super::commands_core::{duration, field_list};
-use super::search_expr::{parse_paren_search_expr, search_expr, unquoted_keyword};
+use super::search_expr::{parse_paren_search_expr, unquoted_keyword, where_expr};
 use super::values::{field_name, field_name_with_wildcard, quoted_string};
 use super::ParseResult;
 use crate::query::ast::*;
@@ -144,13 +144,18 @@ pub(super) fn bin_command(input: &str) -> ParseResult<'_, Command> {
     // Parse span=duration|number OR bins=N (one is required)
     let (input, span) = alt((
         bin_span_spec,
-        // bins=N — use a placeholder Numeric(1.0); execution layer computes actual span
+        // bins=N (NAN-3312): carried through to the SQL generator, which derives
+        // the span from the query time range. It used to become a placeholder
+        // `Numeric(1.0)` that nothing resolved — one bucket per unit.
         map(
             preceded(
                 tag_no_case("bins="),
-                map_res(digit1, |s: &str| s.parse::<f64>()),
+                nom::combinator::verify(
+                    map_res(digit1, |s: &str| s.parse::<u32>()),
+                    |n: &u32| *n > 0,
+                ),
             ),
-            |_n| BinSpan::Numeric(1.0),
+            BinSpan::Bins,
         ),
     ))
     .parse(input)?;
@@ -480,6 +485,7 @@ pub(super) fn regex_command(input: &str) -> ParseResult<'_, Command> {
         field,
         op,
         value: Value::Regex(pattern),
+        rhs: RhsSyntax::Literal,
     };
     Ok((input, Command::Where { condition }))
 }
@@ -826,7 +832,7 @@ pub(super) fn transaction_command(input: &str) -> ParseResult<'_, Command> {
                     continue;
                 }
                 // Bare search expression: startswith=action="login"
-                if let Ok((r, expr)) = search_expr(after_val) {
+                if let Ok((r, expr)) = where_expr(after_val) {
                     startswith = Some(expr);
                     remaining = r;
                     continue;
@@ -852,7 +858,7 @@ pub(super) fn transaction_command(input: &str) -> ParseResult<'_, Command> {
                     continue;
                 }
                 // Bare search expression
-                if let Ok((r, expr)) = search_expr(after_val) {
+                if let Ok((r, expr)) = where_expr(after_val) {
                     endswith = Some(expr);
                     remaining = r;
                     continue;
@@ -1119,54 +1125,59 @@ pub(super) fn append_command(input: &str) -> ParseResult<'_, Command> {
 ///   | join type=left user [search source_type=users | fields user, department]
 ///   | join type=inner src_ip, dest_ip [search source_type=firewall | table src_ip, dest_ip, action]
 ///   | join maxout=50000 user [search source_type=users | fields user, department]
+/// One `join` option token (NAN-3335).
+enum JoinOption {
+    Type(JoinType),
+    MaxOut(usize),
+    Max(usize),
+    Overwrite(bool),
+}
+
 pub(super) fn join_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("join").parse(input)?;
     let (input, _) = multispace1(input)?;
 
-    // Parse optional type=inner|left|outer
-    let (input, join_type) = opt(terminated(
-        preceded(
-            tag_no_case("type="),
-            alt((
-                map(tag_no_case("inner"), |_| JoinType::Inner),
-                map(tag_no_case("left"), |_| JoinType::Left),
-                map(tag_no_case("outer"), |_| JoinType::Outer),
-            )),
-        ),
-        multispace1,
-    ))
-    .parse(input)?;
-    let join_type = join_type.unwrap_or(JoinType::Inner);
-
-    // Parse optional maxout=N before fields (MUST come before max= to avoid prefix match)
-    let (input, maxout_before) = opt(terminated(
-        preceded(
-            tag_no_case("maxout="),
-            map_res(digit1, |s: &str| s.parse::<usize>()),
-        ),
-        multispace1,
-    ))
-    .parse(input)?;
-
-    // Parse optional max=N before fields
-    let (input, max_before) = opt(terminated(
-        preceded(
-            tag_no_case("max="),
-            map_res(digit1, |s: &str| s.parse::<usize>()),
-        ),
-        multispace1,
-    ))
-    .parse(input)?;
-
-    // Parse optional overwrite=true|false before fields
-    let (input, overwrite_opt) = opt(terminated(
-        preceded(
-            tag_no_case("overwrite="),
-            alt((
-                map(tag_no_case("true"), |_| true),
-                map(tag_no_case("false"), |_| false),
-            )),
-        ),
+    // NAN-3335: `type=`, `maxout=`, `max=` and `overwrite=` in ANY order
+    // before the fields, and `maxout=` / `max=` in any order after them.
+    // (`maxout=` is tried before `max=` so the shorter tag never eats it.)
+    let maxout_opt = || {
+        map(
+            preceded(tag_no_case("maxout="), map_res(digit1, |s: &str| s.parse::<usize>())),
+            JoinOption::MaxOut,
+        )
+    };
+    let max_opt = || {
+        map(
+            preceded(tag_no_case("max="), map_res(digit1, |s: &str| s.parse::<usize>())),
+            JoinOption::Max,
+        )
+    };
+    let (input, leading) = many0(terminated(
+        alt((
+            map(
+                preceded(
+                    tag_no_case("type="),
+                    alt((
+                        map(tag_no_case("inner"), |_| JoinType::Inner),
+                        map(tag_no_case("left"), |_| JoinType::Left),
+                        map(tag_no_case("outer"), |_| JoinType::Outer),
+                    )),
+                ),
+                JoinOption::Type,
+            ),
+            maxout_opt(),
+            max_opt(),
+            map(
+                preceded(
+                    tag_no_case("overwrite="),
+                    alt((
+                        map(tag_no_case("true"), |_| true),
+                        map(tag_no_case("false"), |_| false),
+                    )),
+                ),
+                JoinOption::Overwrite,
+            ),
+        )),
         multispace1,
     ))
     .parse(input)?;
@@ -1177,27 +1188,23 @@ pub(super) fn join_command(input: &str) -> ParseResult<'_, Command> {
 
     let (input, _) = multispace0(input)?;
 
-    // Parse optional maxout=N after fields (MUST come before max= to avoid prefix match)
-    let (input, maxout_after) = opt(preceded(
-        multispace0,
-        preceded(
-            tag_no_case("maxout="),
-            map_res(digit1, |s: &str| s.parse::<usize>()),
-        ),
-    ))
-    .parse(input)?;
-
-    // Parse optional max=N after fields
-    let (input, max_after) = opt(preceded(
-        multispace0,
-        preceded(
-            tag_no_case("max="),
-            map_res(digit1, |s: &str| s.parse::<usize>()),
-        ),
-    ))
-    .parse(input)?;
+    let (input, trailing) =
+        many0(preceded(multispace0, alt((maxout_opt(), max_opt())))).parse(input)?;
 
     let (input, _) = multispace0(input)?;
+
+    // Later options win; after-fields options therefore take precedence.
+    let mut join_type = JoinType::Inner;
+    let (mut max, mut maxout, mut overwrite) = (None, None, true);
+    for option in leading.into_iter().chain(trailing) {
+        match option {
+            JoinOption::Type(t) => join_type = t,
+            JoinOption::MaxOut(n) => maxout = Some(n),
+            JoinOption::Max(n) => max = Some(n),
+            JoinOption::Overwrite(b) => overwrite = b,
+        }
+    }
+    let max = max.unwrap_or(1);
 
     // Parse the subsearch in brackets
     let (input, _) = char('[').parse(input)?;
@@ -1213,11 +1220,6 @@ pub(super) fn join_command(input: &str) -> ParseResult<'_, Command> {
 
     let (input, _) = multispace0(input)?;
     let (input, _) = char(']').parse(input)?;
-
-    // Use max/maxout from either position, with after-fields taking precedence
-    let max = max_after.or(max_before).unwrap_or(1);
-    let overwrite = overwrite_opt.unwrap_or(true);
-    let maxout = maxout_after.or(maxout_before);
 
     Ok((
         input,

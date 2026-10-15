@@ -107,6 +107,14 @@ pub struct IdentityProvider {
     /// NAN-1124: users soft-deleted by mark-absent / the reconcile job for this provider.
     #[sqlx(default)]
     pub deprovisioned_count: Option<i64>,
+    /// NAN-3483: records the last sync fetched / emitted / dead-lettered.
+    /// `None` until a sync records them.
+    #[sqlx(default)]
+    pub last_sync_records_total: Option<i64>,
+    #[sqlx(default)]
+    pub last_sync_records_synced: Option<i64>,
+    #[sqlx(default)]
+    pub last_sync_records_dead_lettered: Option<i64>,
     #[serde(skip_serializing)]
     pub delta_link: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -138,12 +146,23 @@ pub struct IdentityProviderSummary {
     pub enabled: bool,
     pub has_credentials: bool,
     pub config: Option<serde_json::Value>,
+    /// idle | in_progress | completed | partial | failed. `partial`
+    /// means some fetched records were dead-lettered by the source's
+    /// normalizer; `failed` includes every record dead-lettered.
     pub sync_status: Option<String>,
     pub last_sync_at: Option<DateTime<Utc>>,
+    /// For `partial`/`failed`: the error, or the dead-letter counts and the
+    /// first reason.
     pub last_sync_error: Option<String>,
     pub last_sync_duration_ms: Option<i64>,
     pub user_count: Option<i32>,
     pub deprovisioned_count: Option<i64>,
+    /// records the last sync fetched from the provider.
+    pub last_sync_records_total: Option<i64>,
+    /// records of the last sync the lane maps into the directory.
+    pub last_sync_records_synced: Option<i64>,
+    /// records of the last sync the lane's normalizer dead-letters.
+    pub last_sync_records_dead_lettered: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -163,6 +182,9 @@ impl From<IdentityProvider> for IdentityProviderSummary {
             last_sync_duration_ms: p.last_sync_duration_ms,
             user_count: p.user_count,
             deprovisioned_count: p.deprovisioned_count,
+            last_sync_records_total: p.last_sync_records_total,
+            last_sync_records_synced: p.last_sync_records_synced,
+            last_sync_records_dead_lettered: p.last_sync_records_dead_lettered,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -204,7 +226,7 @@ pub struct UpdateIdentityProviderCredentials {
 
 /// A unified user record from any identity provider.
 ///
-/// NAN-1117: the `user_registry` payload moved from a PG OLTP table to a CH
+/// the `user_registry` payload moved from a PG OLTP table to a CH
 /// ReplacingMergeTree. CH has no BIGSERIAL, so the synthetic `id: i64` is
 /// replaced by a stable composite string key `"{provider_id}|{external_id}"`
 /// (see [`UserRecord::composite_id`]) — this is the value `GET
@@ -387,6 +409,13 @@ pub struct IdentitySyncResult {
     pub duration_ms: u64,
     pub error: Option<String>,
     pub is_delta: bool,
+    /// NAN-3483: records fetched from the provider and emitted to the lane.
+    #[serde(default)]
+    pub records_total: u64,
+    /// NAN-3483: records the lane's normalizer dead-letters (still emitted;
+    /// Vector drops them). `users_synced` counts the ones it maps.
+    #[serde(default)]
+    pub records_dead_lettered: u64,
 }
 
 /// Result from a delta sync operation.

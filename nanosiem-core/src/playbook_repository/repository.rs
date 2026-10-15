@@ -41,7 +41,8 @@ impl PlaybookRepoRepository {
         repo: &NewPlaybookRepository,
         created_by: Option<Uuid>,
     ) -> Result<PlaybookRepository, PlaybookRepoRepositoryError> {
-        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
+        let slug =
+            crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, PlaybookRepository>(
             r#"
@@ -121,7 +122,12 @@ impl PlaybookRepoRepository {
         .bind(update.name.as_ref().unwrap_or(&repo.name))
         .bind(update.description.as_ref().or(repo.description.as_ref()))
         .bind(update.branch.as_ref().unwrap_or(&repo.branch))
-        .bind(update.playbooks_path.as_ref().or(repo.playbooks_path.as_ref()))
+        .bind(
+            update
+                .playbooks_path
+                .as_ref()
+                .or(repo.playbooks_path.as_ref()),
+        )
         .bind(update.auto_sync_enabled.or(repo.auto_sync_enabled))
         .bind(update.sync_interval_hours.or(repo.sync_interval_hours))
         .bind(update.enabled.or(repo.enabled))
@@ -213,7 +219,7 @@ impl RepositoryPlaybooksRepository {
                 parse_status, parse_error, step_count
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-            ON CONFLICT (repository_id, file_path) DO UPDATE SET
+            ON CONFLICT ON CONSTRAINT repository_playbooks_repository_id_file_path_key DO UPDATE SET
                 file_sha = EXCLUDED.file_sha,
                 raw_content = EXCLUDED.raw_content,
                 kind = EXCLUDED.kind,
@@ -299,7 +305,8 @@ impl RepositoryPlaybooksRepository {
         }
         if let Some(ref s) = filter.search {
             let pattern = format!("%{}%", s);
-            qb.push(" AND (COALESCE(title, '') ILIKE ").push_bind(pattern.clone());
+            qb.push(" AND (COALESCE(title, '') ILIKE ")
+                .push_bind(pattern.clone());
             qb.push(" OR file_path ILIKE ").push_bind(pattern);
             qb.push(")");
         }

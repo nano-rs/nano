@@ -44,6 +44,30 @@ fn null_canonical_key_sql(key_exprs: &[String]) -> String {
     }
 }
 
+/// Row predicate keeping only rows whose every group key is present — not
+/// NULL and not the empty string (NAN-3258). Splunk/EQL semantics for
+/// `sequence by k` / `funnel by k` (and `transaction k`, which already guards
+/// the same way): an event that does not carry the key never joins a group.
+/// Without it, every key-less row collapses into ONE NULL/'' group, and on
+/// sparse OCSF classes that group chains unrelated hosts into a bogus match
+/// (`sequence by user.name` → a `user.name: null` row, sequence_count 361913).
+///
+/// `notEmpty(toString(..))` is safe for every key type: numeric zero renders
+/// as `'0'` (stays a valid key) and `toString(NULL)` is NULL (row dropped).
+/// Returns `None` when there are no keys.
+pub(super) fn group_keys_present_sql(key_exprs: &[String]) -> Option<String> {
+    if key_exprs.is_empty() {
+        return None;
+    }
+    Some(
+        key_exprs
+            .iter()
+            .map(|e| format!("(isNotNull({e}) AND notEmpty(toString({e})))"))
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
+}
+
 /// Scalar subquery producing a per-group aggregate Map: canonicalized key →
 /// aggregate value(s). Attached per row via `map[<key>]`, this replaces the
 /// whole-partition window shape (`agg(x) OVER (PARTITION BY k)`), which
@@ -60,7 +84,8 @@ pub(super) fn group_agg_map_sql(
     stats_source: &str,
 ) -> String {
     format!(
-        "(SELECT mapFromArrays(groupArray(__nano_k), groupArray(__nano_v)) FROM \
+        "(SELECT mapFromArrays(groupArrayIf(__nano_k, isNotNull(__nano_v)), \
+         groupArrayIf(__nano_v, isNotNull(__nano_v))) FROM \
          (SELECT {} AS __nano_k, {} AS __nano_v FROM {} GROUP BY __nano_k))",
         build_key_sql, value_sql, stats_source
     )
@@ -75,7 +100,7 @@ pub(super) fn group_agg_map_sql(
 /// sync with the format string above — guarded by
 /// `group_agg_map_marker_stays_in_sync`.
 pub(super) fn emits_group_agg_map(sql: &str) -> bool {
-    sql.contains("mapFromArrays(groupArray(__nano_k)")
+    sql.contains("mapFromArrays(groupArrayIf(__nano_k")
 }
 
 /// The snapshot id-closure source (NAN-2265): a deterministic stand-in for an
@@ -281,15 +306,29 @@ impl ClickHouseSqlGenerator {
         attach: &str,
         filter_anomalies: bool,
     ) -> String {
+        Self::zscore_outer_sql_with_alias(value_col, threshold, attach, filter_anomalies, None)
+    }
+
+    fn zscore_outer_sql_with_alias(
+        value_col: &str,
+        threshold: f64,
+        attach: &str,
+        filter_anomalies: bool,
+        aggregate_alias: Option<&str>,
+    ) -> String {
         let filter = if filter_anomalies {
             "\n  WHERE is_anomaly = 1"
         } else {
             ""
         };
+        let aggregate_projection = aggregate_alias
+            .map(|alias| format!(",\n    {value_col} AS {}", escape_identifier(alias)))
+            .unwrap_or_default();
         format!(
             "  SELECT *, avg_val, stddev_val,\n    \
              abs({v} - avg_val) / nullIf(stddev_val, 0) as anomaly_score,\n    \
-             if(abs({v} - avg_val) > {t} * stddev_val, 1, 0) as is_anomaly\n  \
+             if(abs({v} - avg_val) > {t} * stddev_val, 1, 0) as is_anomaly,\n    \
+             avg_val AS expected{aggregate_projection}\n  \
              FROM (\n    {attach}\n  ){filter}\n  \
              ORDER BY anomaly_score DESC",
             v = value_col,
@@ -306,15 +345,29 @@ impl ClickHouseSqlGenerator {
         attach: &str,
         filter_anomalies: bool,
     ) -> String {
+        Self::mad_outer_sql_with_alias(value_col, threshold, attach, filter_anomalies, None)
+    }
+
+    fn mad_outer_sql_with_alias(
+        value_col: &str,
+        threshold: f64,
+        attach: &str,
+        filter_anomalies: bool,
+        aggregate_alias: Option<&str>,
+    ) -> String {
         let filter = if filter_anomalies {
             "\n  WHERE is_anomaly = 1"
         } else {
             ""
         };
+        let aggregate_projection = aggregate_alias
+            .map(|alias| format!(",\n    {value_col} AS {}", escape_identifier(alias)))
+            .unwrap_or_default();
         format!(
             "  SELECT *, median_val, mad_val,\n    \
              abs({v} - median_val) / nullIf(mad_val * 1.4826, 0) as anomaly_score,\n    \
-             if(abs({v} - median_val) > {t} * mad_val * 1.4826, 1, 0) as is_anomaly\n  \
+             if(abs({v} - median_val) > {t} * mad_val * 1.4826, 1, 0) as is_anomaly,\n    \
+             median_val AS expected{aggregate_projection}\n  \
              FROM (\n    {attach}\n  ){filter}\n  \
              ORDER BY anomaly_score DESC",
             v = value_col,
@@ -339,9 +392,12 @@ impl ClickHouseSqlGenerator {
         } else {
             "1 PRECEDING"
         };
+        // NAN-3329: Splunk `window=N` is N events: the current one and N-1
+        // before it, or (current=false) the N before it. `window=0` means
+        // unbounded. `N PRECEDING AND CURRENT ROW` covered N+1.
         let frame_start = match window {
-            Some(n) => format!("{} PRECEDING", n),
-            None => "UNBOUNDED PRECEDING".to_string(),
+            Some(n) if *n > 0 => format!("{} PRECEDING", if current { n - 1 } else { *n }),
+            _ => "UNBOUNDED PRECEDING".to_string(),
         };
         let frame_spec = format!("ROWS BETWEEN {} AND {}", frame_start, frame_end);
 
@@ -372,6 +428,20 @@ impl ClickHouseSqlGenerator {
                 let (field_expr, _) = agg.field.as_ref()
                     .map(|f| field_to_sql_expr(f, self))
                     .unwrap_or_else(|| ("*".to_string(), false));
+                // NAN-3329: with current=false a group's first event has an
+                // EMPTY frame. A non-Nullable argument made value functions
+                // return their type default there (`last(time)` = 1970-01-01);
+                // Nullable makes it NULL, like Splunk's missing field.
+                let field_expr = if !current
+                    && field_expr != "*"
+                    && !matches!(
+                        agg.func,
+                        AggFunc::Count | AggFunc::Dc | AggFunc::EstDc | AggFunc::Values | AggFunc::List
+                    ) {
+                    format!("toNullable({field_expr})")
+                } else {
+                    field_expr
+                };
 
                 // Map aggregation functions to window functions
                 // For last() with current=false, use lagInFrame for "previous value"
@@ -572,7 +642,10 @@ impl ClickHouseSqlGenerator {
                     // ClickHouse has no DISTINCT window function, so the
                     // single-scan whole-set form uses uniqExact — also exact.
                     if grouped || over.is_some() {
-                        format!("toFloat64({})", windowed(format!("uniqExact({})", field_expr)))
+                        format!(
+                            "toFloat64({})",
+                            windowed(format!("uniqExact({})", field_expr))
+                        )
                     } else {
                         format!("toFloat64(count(DISTINCT {}))", field_expr)
                     }
@@ -590,15 +663,22 @@ impl ClickHouseSqlGenerator {
                 AggFunc::Min => windowed(format!("min({})", field_expr)),
                 AggFunc::Max => windowed(format!("max({})", field_expr)),
                 AggFunc::Stdev => {
-                    format!("toFloat64({})", windowed(format!("stddevPop({})", field_expr)))
+                    format!(
+                        "toFloat64({})",
+                        windowed(format!("stddevPop({})", field_expr))
+                    )
                 }
-                AggFunc::Var => format!("toFloat64({})", windowed(format!("varPop({})", field_expr))),
+                AggFunc::Var => {
+                    format!("toFloat64({})", windowed(format!("varPop({})", field_expr)))
+                }
                 AggFunc::Range => format!(
                     "toFloat64({} - {})",
                     windowed(format!("max({})", field_expr)),
                     windowed(format!("min({})", field_expr))
                 ),
-                AggFunc::Median => format!("toFloat64({})", windowed(format!("median({})", field_expr))),
+                AggFunc::Median => {
+                    format!("toFloat64({})", windowed(format!("median({})", field_expr)))
+                }
                 AggFunc::Perc95 => format!(
                     "toFloat64({})",
                     windowed(format!("quantile(0.95)({})", field_expr))
@@ -741,7 +821,11 @@ impl ClickHouseSqlGenerator {
                 .iter()
                 .enumerate()
                 .map(|(i, alias)| {
-                    format!("{} AS {}", element(i, "__nano_es"), escape_identifier(alias))
+                    format!(
+                        "{} AS {}",
+                        element(i, "__nano_es"),
+                        escape_identifier(alias)
+                    )
                 })
                 .collect();
             (scalar, attaches)
@@ -777,6 +861,8 @@ impl ClickHouseSqlGenerator {
             .collect();
         let condition_sqls = condition_sqls?;
         let n_conds = condition_sqls.len();
+        let time_column = escape_identifier(&self.time_column);
+        let event_id_column = escape_identifier(self.row_identity_column().unwrap_or("id"));
 
         // Extract field names from each condition for auto-capture
         let condition_fields: Vec<Vec<String>> = conditions
@@ -785,9 +871,10 @@ impl ClickHouseSqlGenerator {
             .collect();
 
         // Group by fields
-        let group_fields: Vec<String> = group_by
+        let group_fields: Vec<String> = group_by.iter().map(|f| by_field_sql(f, self)).collect();
+        let group_aliases: Vec<String> = group_by
             .iter()
-            .map(|f| by_field_sql(f, self))
+            .map(|f| escape_identifier(normalize_field_name(f)))
             .collect();
 
         // Build the sequence function for HAVING clause. HAVING filters *groups*
@@ -797,22 +884,27 @@ impl ClickHouseSqlGenerator {
             let seconds = span.as_secs();
             (
                 format!(
-                    "windowFunnel({})(toUInt32(timestamp), {}) = {}",
+                    "windowFunnel({})(toUInt32({}), {}) = {}",
                     seconds,
+                    time_column,
                     condition_sqls.join(", "),
                     n_conds
                 ),
                 Some(seconds),
             )
         } else {
+            // `.*` between steps: plain `(?1)(?2)` needs the steps adjacent
+            // among condition-matching events, which drops a group whose run
+            // has another step's event in between (NAN-3338).
             let pattern = (1..=n_conds)
                 .map(|i| format!("(?{})", i))
                 .collect::<Vec<_>>()
-                .join("");
+                .join(".*");
             (
                 format!(
-                    "sequenceMatch('{}')(toUInt32(timestamp), {})",
+                    "sequenceMatch('{}')(toUInt32({}), {})",
                     pattern,
+                    time_column,
                     condition_sqls.join(", ")
                 ),
                 None,
@@ -840,10 +932,7 @@ impl ClickHouseSqlGenerator {
                 push_unique(&mut step_list, f);
             }
             for f in &step_list {
-                if !all_fields_ordered
-                    .iter()
-                    .any(|x| x.eq_ignore_ascii_case(f))
-                {
+                if !all_fields_ordered.iter().any(|x| x.eq_ignore_ascii_case(f)) {
                     all_fields_ordered.push(f.clone());
                 }
             }
@@ -867,8 +956,10 @@ impl ClickHouseSqlGenerator {
 
         // Build the tuple construction for groupArrayIf
         let mut tuple_parts: Vec<String> = Vec::with_capacity(2 + k + n_conds);
-        tuple_parts.push("toUInt32(timestamp)".to_string());
-        tuple_parts.push("id".to_string());
+        // Epoch MILLISECONDS (NAN-3338): events in the same second keep their
+        // order and step times keep their precision.
+        tuple_parts.push(format!("toUnixTimestamp64Milli(toDateTime64({time_column}, 3, 'UTC'))"));
+        tuple_parts.push(event_id_column.clone());
         for f in &all_fields_ordered {
             // Resolve the capture value through the active profile (NAN-1346): a step
             // condition field like `action` is a UDM name with no OCSF column, so the
@@ -891,28 +982,38 @@ impl ClickHouseSqlGenerator {
         // Step 1 still uses argMinIf/minIf directly: step 1 has no prior step to
         // anchor to, and its "earliest matching event" is the correct semantics.
         let mut layer0_cols: Vec<String> = Vec::new();
-        for f in &group_fields {
-            layer0_cols.push(f.clone());
+        for (field, alias) in group_fields.iter().zip(&group_aliases) {
+            layer0_cols.push(if field == alias {
+                field.clone()
+            } else {
+                format!("{field} AS {alias}")
+            });
         }
         let cond1 = &condition_sqls[0];
-        layer0_cols.push(format!("minIf(timestamp, {}) AS step1_time", cond1));
-        layer0_cols.push(format!(
-            "argMinIf(id, timestamp, {}) AS step1_event_id",
-            cond1
-        ));
-        for f in &per_step_captures[0] {
-            // Alias suffix must be a bare identifier — OCSF dotted fields
-            // (`process.name`) would produce an invalid `step1_process.name`
-            // alias, so sanitize dots to underscores (NAN-1294). The value
-            // expression resolves through the active profile (NAN-1346) so a UDM
-            // condition field (`action`) maps to its OCSF column instead of a raw
-            // reference that 500s.
+        // With two or more steps every step (step 1 included) comes from the
+        // reported run in `_evts` (NAN-3338); a one-step sequence keeps the
+        // direct aggregates.
+        if n_conds == 1 {
+            layer0_cols.push(format!("minIf({time_column}, {}) AS step1_time", cond1));
             layer0_cols.push(format!(
-                "argMinIf({}, timestamp, {}) AS step1_{}",
-                by_field_sql(f, self),
+                "argMinIf({event_id_column}, {time_column}, {}) AS step1_event_id",
                 cond1,
-                f.replace('.', "_")
             ));
+            for f in &per_step_captures[0] {
+                // Alias suffix must be a bare identifier — OCSF dotted fields
+                // (`process.name`) would produce an invalid `step1_process.name`
+                // alias, so sanitize dots to underscores (NAN-1294). The value
+                // expression resolves through the active profile (NAN-1346) so a UDM
+                // condition field (`action`) maps to its OCSF column instead of a raw
+                // reference that 500s.
+                layer0_cols.push(format!(
+                    "argMinIf({}, {time_column}, {}) AS step1_{}",
+                    by_field_sql(f, self),
+                    cond1,
+                    f.replace('.', "_")
+                ));
+            }
+            layer0_cols.push("count() AS sequence_count".to_string());
         }
         // Sorted event tuple array — only if there's at least one step beyond 1.
         let needs_evts = n_conds > 1;
@@ -923,7 +1024,6 @@ impl ClickHouseSqlGenerator {
                 any_cond
             ));
         }
-        layer0_cols.push("count() AS sequence_count".to_string());
 
         let maxspan_column = if let Some(secs) = maxspan_seconds {
             format!(", {} AS maxspan_seconds", secs)
@@ -931,61 +1031,150 @@ impl ClickHouseSqlGenerator {
             String::new()
         };
 
+        // NAN-3258: rows without the group key never join a sequence.
+        let key_filter = group_keys_present_sql(&group_fields)
+            .map(|p| format!("\n    WHERE {p}"))
+            .unwrap_or_default();
         let inner = format!(
-            "SELECT {}{}\n    FROM {}\n    GROUP BY {}\n    HAVING {}",
+            "SELECT {}{}\n    FROM {}{}\n    GROUP BY {}\n    HAVING {}",
             layer0_cols.join(", "),
             maxspan_column,
             source,
+            key_filter,
             group_fields.join(", "),
             sequence_func
         );
 
-        // -------- Layers 1..N-1: compute _step_{k+1} = first cond_{k+1} event
-        //          in _evts with timestamp strictly after the previous step. --------
-        // After layer `k` runs, `_step_{k+1}` is in scope as a tuple. For step 2
-        // the anchor is `step1_time`; for step 3+ it's `_step_k.1`.
+        // -------- Steps 2..N (NAN-3338) --------
+        // The reported run must be ONE run that satisfies `maxspan`, and
+        // `sequence_count` must count completed sequences. The old walk anchored
+        // at the group's earliest step-1 event and took the first later event of
+        // each step from there, so a group whose only in-span run started later
+        // reported a run of any length (maxspan=5m, duration 972 s), and
+        // `count()` counted every event of the key.
+        //
+        // Every array below is O(events) per group (no anchor x event product),
+        // and every lambda is element-wise over equal-length arrays. A lambda
+        // that reads an outer array column (`_evts[p]` inside `arrayFilter`)
+        // makes ClickHouse replicate that array once per element: O(events²)
+        // per group, which ran a busy user (8k events/h) out of query memory on
+        // the lean cell. Lookups at a computed position therefore happen only
+        // outside lambdas, on the one reported run.
+        //   _seq_end{k}[j]  = (end ms, end position) of the greedy run of steps
+        //                     k..N whose step-k event is the first one at or
+        //                     after j ((0, 0) = none). It is built from the
+        //                     last step backwards: the step-k event at j is
+        //                     followed by _seq_end{k+1}[j + 1], a one-element
+        //                     left shift.
+        //   _seq_run_end[i] = end of the greedy run anchored at the step-1
+        //                     event at i ((0, 0) when i is not step 1).
+        //   _seq_nxt{k}[j]  = position of the first step-k event at or after j;
+        //                     walks the reported run from its anchor.
+        // The greedy walk (earliest next event after the previous step) ends as
+        // early as any run from that anchor can, so an anchor has an in-span run
+        // iff its greedy run is in span. The reported run is the earliest such
+        // anchor; `sequence_count` is the number of distinct events that
+        // complete an in-span run.
         let mut current_query = inner;
-        for k_idx in 1..n_conds {
-            let prev_ts_expr = if k_idx == 1 {
-                "step1_time".to_string()
-            } else {
-                format!("_step_{}.1", k_idx)
-            };
-            let wrapper = format!(
-                "SELECT *, arrayFirst(e -> e.{flag} = 1 AND e.1 > toUInt32({prev}), _evts) AS _step_{next}\n    FROM (\n    {inner}\n    )",
-                flag = flag_pos(k_idx),
-                prev = prev_ts_expr,
-                next = k_idx + 1,
-                inner = current_query
+        if n_conds > 1 {
+            let wrap = |cols: &str, q: &str| format!("SELECT *, {cols}\n    FROM (\n    {q}\n    )");
+            let none = "tuple(toInt64(0), toUInt32(0))";
+            let shift = |arr: &str| format!("arrayPushBack(arrayPopFront({arr}), {none})");
+            current_query = wrap(
+                "arrayEnumerate(_evts) AS _seq_pos, arrayMap(e -> tupleElement(e, 1), _evts) AS _seq_ts",
+                &current_query,
             );
-            current_query = wrapper;
+            let nxt = (2..=n_conds)
+                .map(|step| {
+                    format!(
+                        "arrayReverseFill(x -> x > 0, arrayMap((e, i) -> if(tupleElement(e, {flag}) = 1, i, 0), _evts, _seq_pos)) AS _seq_nxt{step}",
+                        flag = flag_pos(step - 1),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            current_query = wrap(&nxt, &current_query);
+            current_query = wrap(
+                &format!(
+                    "arrayReverseFill(x -> tupleElement(x, 2) > 0, arrayMap((e, i) -> if(tupleElement(e, {flag}) = 1, tuple(tupleElement(e, 1), i), {none}), _evts, _seq_pos)) AS _seq_end{n_conds}",
+                    flag = flag_pos(n_conds - 1),
+                ),
+                &current_query,
+            );
+            for step in (2..n_conds).rev() {
+                current_query = wrap(
+                    &format!(
+                        "arrayReverseFill(x -> tupleElement(x, 2) > 0, arrayMap((e, r) -> if(tupleElement(e, {flag}) = 1, r, {none}), _evts, {next})) AS _seq_end{step}",
+                        flag = flag_pos(step - 1),
+                        next = shift(&format!("_seq_end{}", step + 1)),
+                    ),
+                    &current_query,
+                );
+            }
+            current_query = wrap(
+                &format!(
+                    "arrayMap((e, r) -> if(tupleElement(e, {flag}) = 1, r, {none}), _evts, {next}) AS _seq_run_end",
+                    flag = flag_pos(0),
+                    next = shift("_seq_end2"),
+                ),
+                &current_query,
+            );
+            let complete = match maxspan_seconds {
+                Some(secs) => format!(
+                    "tupleElement(r, 2) > 0 AND tupleElement(r, 1) - t <= {}",
+                    secs * 1000
+                ),
+                None => "tupleElement(r, 2) > 0".to_string(),
+            };
+            current_query = wrap(
+                &format!(
+                    "arrayFirstIndex((r, t) -> {complete}, _seq_run_end, _seq_ts) AS _seq_a, \
+                     length(arrayDistinct(arrayMap(r -> tupleElement(r, 2), arrayFilter((r, t) -> {complete}, _seq_run_end, _seq_ts)))) AS sequence_count"
+                ),
+                &current_query,
+            );
+            // Walk the one reported run with scalar lookups.
+            let mut walk = vec!["_seq_a AS _seq_s1".to_string()];
+            for step in 2..=n_conds {
+                walk.push(format!(
+                    "_seq_nxt{step}[_seq_s{prev} + 1] AS _seq_s{step}",
+                    prev = step - 1
+                ));
+            }
+            let steps = (1..=n_conds)
+                .map(|step| format!("_evts[_seq_s{step}] AS _step_{step}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            current_query = format!(
+                "SELECT *, {steps}\n    FROM (\n    SELECT *, {walk}\n    FROM (\n    {current_query}\n    )\n    WHERE _seq_a > 0\n    )",
+                walk = walk.join(", ")
+            );
         }
 
         // -------- Outermost layer: project step columns + duration + timestamp. --------
         let mut outer_cols: Vec<String> = Vec::new();
-        for f in &group_fields {
-            outer_cols.push(f.clone());
+        for alias in &group_aliases {
+            outer_cols.push(alias.clone());
         }
-        outer_cols.push("step1_time".to_string());
-        outer_cols.push("step1_event_id".to_string());
-        for f in &per_step_captures[0] {
-            outer_cols.push(format!("step1_{}", f.replace('.', "_")));
+        if n_conds == 1 {
+            outer_cols.push("step1_time".to_string());
+            outer_cols.push("step1_event_id".to_string());
+            for f in &per_step_captures[0] {
+                outer_cols.push(format!("step1_{}", f.replace('.', "_")));
+            }
         }
-        for k_idx in 1..n_conds {
+        let first_step = if n_conds == 1 { 1 } else { 0 };
+        for k_idx in first_step..n_conds {
             let step_num = k_idx + 1;
             let tup = format!("_step_{}", step_num);
             outer_cols.push(format!(
-                "toDateTime({tup}.1) AS step{n}_time",
-                tup = tup,
-                n = step_num
+                "fromUnixTimestamp64Milli(tupleElement({tup}, 1), 'UTC') AS step{step_num}_time"
             ));
-            outer_cols.push(format!("{tup}.2 AS step{n}_event_id", tup = tup, n = step_num));
+            outer_cols.push(format!("tupleElement({tup}, 2) AS step{step_num}_event_id"));
             for f in &per_step_captures[k_idx] {
                 outer_cols.push(format!(
-                    "{tup}.{pos} AS step{n}_{f}",
-                    tup = tup,
+                    "tupleElement({tup}, {pos}) AS step{step_num}_{f}",
                     pos = field_pos(f),
-                    n = step_num,
                     f = f.replace('.', "_")
                 ));
             }
@@ -994,24 +1183,26 @@ impl ClickHouseSqlGenerator {
         if let Some(secs) = maxspan_seconds {
             outer_cols.push(format!("{} AS maxspan_seconds", secs));
         }
-        // Duration: step1_time → last step's time. Always ≥ 0 because steps are
-        // chronologically walked; can be 0 only when events share the same second.
-        let last_step_ts = if n_conds == 1 {
-            "step1_time".to_string()
+        // Duration: first step → last step of the reported run.
+        let duration = if n_conds == 1 {
+            "toInt64(0)".to_string()
         } else {
-            format!("toDateTime(_step_{}.1)", n_conds)
+            format!(
+                "(tupleElement(_step_{n_conds}, 1) - tupleElement(_step_1, 1)) / 1000"
+            )
         };
-        outer_cols.push(format!(
-            "dateDiff('second', step1_time, {}) AS sequence_duration_seconds",
-            last_step_ts
-        ));
-        outer_cols.push("step1_time AS _seq_timestamp".to_string());
+        outer_cols.push(format!("{duration} AS sequence_duration_seconds"));
+        outer_cols.push(if n_conds == 1 {
+            "step1_time AS _seq_timestamp".to_string()
+        } else {
+            "fromUnixTimestamp64Milli(tupleElement(_step_1, 1), 'UTC') AS _seq_timestamp".to_string()
+        });
 
         // Wrap again to rename _seq_timestamp → timestamp for downstream CTEs
         // (| table, | where, | risk). Same pattern as before — keeping `timestamp`
         // visible to downstream commands without shadowing the inner aggregation.
         Ok(format!(
-            "  SELECT *, _seq_timestamp AS timestamp FROM (\n    SELECT {}\n    FROM (\n    {}\n    )\n    ORDER BY step1_time DESC\n  )",
+            "  SELECT *, _seq_timestamp AS {time_column} FROM (\n    SELECT {}\n    FROM (\n    {}\n    )\n    ORDER BY _seq_timestamp DESC\n  )",
             outer_cols.join(", "),
             current_query
         ))
@@ -1037,12 +1228,10 @@ impl ClickHouseSqlGenerator {
             .map(|(_, cond)| self.generate_search_expr(cond))
             .collect();
         let condition_sqls = condition_sqls?;
+        let time_column = escape_identifier(&self.time_column);
 
         // Group by fields
-        let group_fields: Vec<String> = group_by
-            .iter()
-            .map(|f| by_field_sql(f, self))
-            .collect();
+        let group_fields: Vec<String> = group_by.iter().map(|f| by_field_sql(f, self)).collect();
 
         let seconds = window.as_secs();
 
@@ -1085,40 +1274,63 @@ impl ClickHouseSqlGenerator {
         // column for are SKIPPED (None) rather than emitting an unknown-column
         // reference. For UDM `udm_column_sql` returns the escaped column itself,
         // so this is byte-identical (`dest_port` keeps its zero-filtered argMaxIf).
+        let dropper_fields =
+            crate::search::query_processing::funnel_dropper_fields(self.profile.as_ref());
+        let dropper_column = |name: &str| -> Option<String> {
+            if self.profile.uses_strict_canonical_fields() {
+                self.resolves_to_column(name)
+                    .then(|| self.field_access_expr(name, "String"))
+            } else {
+                self.profile.udm_column_sql(name)
+            }
+        };
         let argmax_expr = |name: &str| -> Option<String> {
-            let col = self.profile.udm_column_sql(name)?;
+            let col = dropper_column(name)?;
+            let last_alias = escape_identifier(&format!("_last_{name}"));
             // Port fields default to 0 for portless events; argMaxIf skips that
             // noise so it never surfaces as a top dropper attribute.
-            let is_port = name.ends_with("_port") || name == "port";
+            let is_port = name.ends_with("_port") || name.ends_with(".port") || name == "port";
             if is_port {
                 Some(format!(
-                    "argMaxIf(toString({col}), timestamp, {col} != 0) AS _last_{name}"
+                    "argMaxIf(toString({col}), {time_column}, {col} != 0) AS {last_alias}"
                 ))
             } else {
-                Some(format!("argMax({col}, timestamp) AS _last_{name}"))
+                Some(format!("argMax({col}, {time_column}) AS {last_alias}"))
             }
         };
 
-        let entity_argmax: Vec<String> = crate::search::query_processing::FUNNEL_DROPPER_FIELDS
+        let entity_argmax: Vec<String> = dropper_fields
             .iter()
             .filter_map(|name| argmax_expr(name))
             .collect();
+        let argmax_projection = if entity_argmax.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", entity_argmax.join(", "))
+        };
 
         // Outer aggregation: one groupArraySampleIf per curated field, capped
         // at 1000 per stage to bound memory. Use the -If combinator (matches
         // the rest of this generator's style) rather than the SQL-standard
         // FILTER clause for older ClickHouse compatibility.
-        let dropper_samples: Vec<String> = crate::search::query_processing::FUNNEL_DROPPER_FIELDS
+        let dropper_samples: Vec<String> = dropper_fields
             .iter()
             // Mirror `entity_argmax`: only emit a sampler for fields the active
             // schema actually produced a `_last_<name>` column for.
-            .filter(|name| self.profile.udm_column_sql(name).is_some())
+            .filter(|name| dropper_column(name).is_some())
             .map(|name| {
+                let last_alias = escape_identifier(&format!("_last_{name}"));
+                let droppers_alias = escape_identifier(&format!("_droppers_{name}"));
                 format!(
-                    "groupArraySampleIf(1000)(_last_{name}, _fl == funnel_level) AS _droppers_{name}"
+                    "groupArraySampleIf(1000)({last_alias}, _fl == funnel_level) AS {droppers_alias}"
                 )
             })
             .collect();
+        let drop_samples_projection = if dropper_samples.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", dropper_samples.join(", "))
+        };
 
         // Idle span: seconds between the first and last timestamp per entity.
         // Median across the set of droppers at this stage.
@@ -1126,13 +1338,20 @@ impl ClickHouseSqlGenerator {
         // `_span_s` is captured in the entity CTE; `medianIf` in the outer
         // aggregation restricts to droppers (entities whose max level equals
         // this stage — i.e., they reached stage N but not N+1).
-        let span_expr = "toUnixTimestamp(max(timestamp)) - toUnixTimestamp(min(timestamp)) AS _span_s";
+        let span_expr = format!(
+            "toUnixTimestamp(max({time_column})) - toUnixTimestamp(min({time_column})) AS _span_s"
+        );
         let dropper_median_idle = "medianIf(_span_s, _fl == funnel_level) AS dropper_median_idle_s";
 
         // Dropper count: entities where _fl == this stage (reached this stage
         // but not the next). The final stage's dropper_count is always 0 by
         // construction since there's no "next" stage to drop to.
         let dropper_count_expr = "countIf(_fl == funnel_level) AS dropper_count";
+
+        // NAN-3258: an event without the funnel key never joins an entity.
+        let funnel_key_filter = group_keys_present_sql(&group_fields)
+            .map(|p| format!("\n    WHERE {p}"))
+            .unwrap_or_default();
 
         // 1) Inner: per `by`-group max level reached via windowFunnel (0..N).
         // 2) ARRAY JOIN [1..N] explodes each entity row into N rows, one per
@@ -1144,17 +1363,18 @@ impl ClickHouseSqlGenerator {
         //  in the main format string below; the redesign branch added the
         //  dropper-attribution columns on top.)
         Ok(format!(
-            "  SELECT funnel_level, {step_name}, countIf(_fl >= funnel_level) AS count, {drop_count}, {drop_idle}, {drop_samples}\n  FROM (\n    SELECT {group}, windowFunnel({seconds})(toUInt32(timestamp), {conds}) AS _fl, {argmax}, {span}\n    FROM {source}\n    GROUP BY {group}\n  )\n  ARRAY JOIN [{stages}] AS funnel_level\n  GROUP BY funnel_level\n  ORDER BY funnel_level ASC",
+            "  SELECT funnel_level, {step_name}, countIf(_fl >= funnel_level) AS count, {drop_count}, {drop_idle}{drop_samples}\n  FROM (\n    SELECT {group}, windowFunnel({seconds})(toUInt32({time_column}), {conds}) AS _fl{argmax}, {span}\n    FROM {source}{key_filter}\n    GROUP BY {group}\n  )\n  ARRAY JOIN [{stages}] AS funnel_level\n  GROUP BY funnel_level\n  ORDER BY funnel_level ASC",
             step_name = step_name_expr,
             drop_count = dropper_count_expr,
             drop_idle = dropper_median_idle,
-            drop_samples = dropper_samples.join(", "),
+            drop_samples = drop_samples_projection,
             group = group_fields.join(", "),
             seconds = seconds,
             conds = condition_sqls.join(", "),
-            argmax = entity_argmax.join(", "),
+            argmax = argmax_projection,
             span = span_expr,
             source = source,
+            key_filter = funnel_key_filter,
             stages = stage_array,
         ))
     }
@@ -1168,12 +1388,14 @@ impl ClickHouseSqlGenerator {
         threshold: f64,
         method: &AnomalyMethod,
         stability: &SourceStability,
+        // An earlier aggregating stage (`stats`, `timechart`, …) replaced the
+        // raw events: the source has no event-time column and its columns are
+        // that stage's outputs (NAN-3059).
+        aggregated: bool,
     ) -> Result<String, SqlGenError> {
+        let time_column = escape_identifier(&self.time_column);
         let source_rows_are_stable = stability.rows_stable;
-        let by_exprs: Vec<String> = by_fields
-            .iter()
-            .map(|b| by_field_sql(b, self))
-            .collect();
+        let by_exprs: Vec<String> = by_fields.iter().map(|b| by_field_sql(b, self)).collect();
 
         // Aggregation-first syntax: field contains "(" like "count()" or "sum(bytes_out)"
         // → compute the aggregation per by_fields group, then detect anomalies on the result
@@ -1195,9 +1417,7 @@ impl ClickHouseSqlGenerator {
         // windows, which buffered every wide row of the partition and OOM'd
         // (Code 241) at production scale. The scoring math is unchanged.
         let lookup_key = (!by_exprs.is_empty()).then(|| null_canonical_key_sql(&by_exprs));
-        let keys = lookup_key
-            .as_deref()
-            .map(|k| (k, k));
+        let keys = lookup_key.as_deref().map(|k| (k, k));
 
         // Non-column numeric fields: aggregation/alias names that are not part of
         // any schema's column universe but are still numeric when statistical
@@ -1233,8 +1453,16 @@ impl ClickHouseSqlGenerator {
         ];
 
         let normalized = normalize_field_name(field);
+        // NAN-3059: after an aggregation, a field computed upstream that is
+        // not a schema column (a group key is) is that stage's measure —
+        // `stats sum(bytes) as bytes | anomaly field=bytes` — not a label. Scoring it as a
+        // category counted each distinct value and ordered by an event-time
+        // column the aggregated rows no longer have (Code 47 on the lake).
         let is_numeric = self.profile.is_numeric_field(normalized.as_ref())
-            || NUMERIC_COMPUTED_FIELDS.contains(&normalized.as_ref());
+            || NUMERIC_COMPUTED_FIELDS.contains(&normalized.as_ref())
+            || (aggregated
+                && self.is_upstream_computed_field(field)
+                && !self.profile.is_known_field(normalized.as_ref()));
 
         if is_numeric {
             // Direct anomaly on numeric values
@@ -1260,7 +1488,12 @@ impl ClickHouseSqlGenerator {
             match method {
                 AnomalyMethod::ZScore => {
                     let attach = zscore_attach_sql(&plan);
-                    Ok(Self::zscore_outer_sql(&field_expr, threshold, &attach, true))
+                    Ok(Self::zscore_outer_sql(
+                        &field_expr,
+                        threshold,
+                        &attach,
+                        true,
+                    ))
                 }
                 AnomalyMethod::Mad => {
                     let attach = mad_attach_sql(&plan);
@@ -1284,11 +1517,18 @@ impl ClickHouseSqlGenerator {
             } else {
                 field_expr.clone()
             };
+            // Aggregated rows have no event-time column to prefer the newest
+            // representative by; any row of the (by, field) pair is the pair.
+            let representative_order = if aggregated {
+                String::new()
+            } else {
+                format!(" ORDER BY {time_column} DESC")
+            };
             let count_source = format!(
                 "(SELECT * FROM (\
                 SELECT *, \
                 count() OVER (PARTITION BY {pcols}) as _anomaly_count, \
-                row_number() OVER (PARTITION BY {pcols} ORDER BY timestamp DESC) as _rn \
+                row_number() OVER (PARTITION BY {pcols}{representative_order}) as _rn \
                 FROM {source}\
                 ) WHERE _rn = 1)",
                 pcols = partition_cols,
@@ -1340,7 +1580,12 @@ impl ClickHouseSqlGenerator {
             match method {
                 AnomalyMethod::ZScore => {
                     let attach = zscore_attach_sql(&plan);
-                    Ok(Self::zscore_outer_sql(count_field, threshold, &attach, true))
+                    Ok(Self::zscore_outer_sql(
+                        count_field,
+                        threshold,
+                        &attach,
+                        true,
+                    ))
                 }
                 AnomalyMethod::Mad => {
                     let attach = mad_attach_sql(&plan);
@@ -1361,6 +1606,7 @@ impl ClickHouseSqlGenerator {
         method: &AnomalyMethod,
         source_rows_are_stable: bool,
     ) -> Result<String, SqlGenError> {
+        let time_column = escape_identifier(&self.time_column);
         // Build the GROUP BY and aggregation source
         // e.g., SELECT user, url_domain, count() as _agg_value FROM source GROUP BY user, url_domain
         let group_cols = if by_exprs.is_empty() {
@@ -1393,10 +1639,22 @@ impl ClickHouseSqlGenerator {
             }
             _ => func_mapped.clone(),
         };
+        let aggregate_alias = match (agg_expr.find('('), agg_expr.rfind(')')) {
+            (Some(lp), Some(rp)) if rp > lp => {
+                let function = agg_expr[..lp].trim().to_ascii_lowercase();
+                let inner = agg_expr[lp + 1..rp].trim();
+                if inner.is_empty() || inner == "*" {
+                    function
+                } else {
+                    format!("{}_{}", function, inner.replace('.', "_"))
+                }
+            }
+            _ => "aggregate_value".to_string(),
+        };
 
         let agg_source = format!(
             "(SELECT {group_cols}, {agg} as _agg_value, \
-            max(timestamp) as timestamp \
+            max({time_column}) as {time_column} \
             FROM {source} \
             GROUP BY {group_cols})",
             group_cols = group_cols,
@@ -1426,11 +1684,23 @@ impl ClickHouseSqlGenerator {
         match method {
             AnomalyMethod::ZScore => {
                 let attach = zscore_attach_sql(&plan);
-                Ok(Self::zscore_outer_sql(val, threshold, &attach, false))
+                Ok(Self::zscore_outer_sql_with_alias(
+                    val,
+                    threshold,
+                    &attach,
+                    false,
+                    Some(&aggregate_alias),
+                ))
             }
             AnomalyMethod::Mad => {
                 let attach = mad_attach_sql(&plan);
-                Ok(Self::mad_outer_sql(val, threshold, &attach, false))
+                Ok(Self::mad_outer_sql_with_alias(
+                    val,
+                    threshold,
+                    &attach,
+                    false,
+                    Some(&aggregate_alias),
+                ))
             }
         }
     }

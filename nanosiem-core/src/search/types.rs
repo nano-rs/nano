@@ -48,12 +48,53 @@ pub enum SearchError {
     ResponseTooLarge(usize, usize),
     #[error("Admission denied: {0}")]
     AdmissionDenied(String),
+    #[error("Enterprise-shared search admission is unavailable")]
+    AdmissionBackendUnavailable,
+    /// A required query dependency is temporarily unavailable. Unlike a
+    /// validation error, retrying the exact request later is safe.
+    #[error("Search dependency is temporarily unavailable: {0}")]
+    ServiceUnavailable(String),
+
+    #[error("{0}")]
+    SearchAdmissionUnavailable(String),
+
+    #[error("{0}")]
+    TenantLakePublicationDegraded(String),
+    /// NAN-3644: the reader's OOM safety net, never a cold-data refusal. One
+    /// pass of the query needs more uncached bytes than the tenant's reader
+    /// can stage at once (`ceiling_bytes`, derived from its cache size). A
+    /// cold read under the ceiling queues and runs. `background_ceiling_bytes`
+    /// is what a durable (async) search may stage, when the cell reports it.
+    #[error("{}", cold_scan_too_large_message(*needed_bytes, *ceiling_bytes, *background_ceiling_bytes))]
+    ColdScanTooLarge { needed_bytes: u64, ceiling_bytes: u64, background_ceiling_bytes: Option<u64> },
+    /// The interactive execution lane reached a bounded resource ceiling.
+    /// Callers may preserve the exact request and escalate it to the isolated
+    /// durable job lane instead of asking the user to rewrite a valid query.
+    #[error("Interactive query exhausted its {0} budget")]
+    ResourceExhausted(String),
     /// The query was killed (`KILL QUERY` via the search-cancel endpoint, or an
     /// admin kill) — ClickHouse error code 394 / `QUERY_WAS_CANCELLED`.
     /// Distinct from the generic `DatabaseError` so the HTTP layer can return
     /// a deliberate status instead of a misleading 500 (NAN-1436).
     #[error("Query was cancelled")]
     Cancelled,
+    /// NAN-2361 wave 8: the tenant's lake query worker did not answer its
+    /// identity/health probe in time. Distinct from `Timeout` (which is the
+    /// query itself exceeding its budget) because the remedy is different:
+    /// the worker is starting, rolling a generation, or under load, and the
+    /// exact request is safe to retry shortly. The HTTP layer renders it as a
+    /// typed 503 (`tenant_lake_worker_not_ready`), never a 500.
+    #[error("Tenant lake worker is not ready: {0}")]
+    LakeWorkerNotReady(String),
+    /// NAN-3282: one product view (Asset / Cloud / tree / prevalence) needs
+    /// more working memory than its per-request budget. Deterministic for the
+    /// same window: the user must narrow it. HTTP 413 `VIEW_TOO_LARGE`.
+    #[error("This {view} view is too large to assemble ({needed_mib} MiB needed, budget {budget_mib} MiB); narrow the time window and try again", needed_mib = needed_bytes.div_ceil(1024 * 1024), budget_mib = budget_bytes / (1024 * 1024))]
+    ViewTooLarge { view: String, needed_bytes: u64, budget_bytes: u64 },
+    /// NAN-3282: concurrent product views already hold the process-wide view
+    /// memory budget and none freed within the wait window. Retryable 503.
+    #[error("Search is busy assembling other views ({view} waited {waited_ms} ms for memory); retry shortly")]
+    ViewMemoryBusy { view: String, waited_ms: u64 },
 }
 
 /// Parse a ClickHouse error message and convert to a user-friendly SearchError
@@ -156,9 +197,10 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
         if let Some(start) = error_msg.find('`') {
             if let Some(end) = error_msg[start + 1..].find('`') {
                 let func = error_msg[start + 1..start + 1 + end].to_string();
-                return SearchError::SqlValidationError(
-                    format!("Unknown function '{}'. Check the function name or see documentation for available functions.", func)
-                );
+                return SearchError::SqlValidationError(format!(
+                    "Unknown function '{}'. Check the function name or see documentation for available functions.",
+                    func
+                ));
             }
         }
         return SearchError::SqlValidationError("Unknown function. Check the function name or see documentation for available functions.".to_string());
@@ -178,7 +220,10 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
         // Try to extract position info
         let message = if let Some(pos) = error_msg.find("at position") {
             let snippet = &error_msg[pos..].chars().take(50).collect::<String>();
-            format!("Query syntax error {}. Check for missing commas, parentheses, or invalid keywords.", snippet)
+            format!(
+                "Query syntax error {}. Check for missing commas, parentheses, or invalid keywords.",
+                snippet
+            )
         } else {
             "Query syntax error. Check for missing commas, parentheses, or invalid keywords."
                 .to_string()
@@ -235,9 +280,10 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
             let after = &error_msg[start + 9..];
             if let Some(end) = after.find(' ') {
                 let func = after[..end].trim_matches('\'').to_string();
-                return SearchError::SqlValidationError(
-                    format!("Wrong number of arguments for function '{}'. Check the function documentation for correct usage.", func)
-                );
+                return SearchError::SqlValidationError(format!(
+                    "Wrong number of arguments for function '{}'. Check the function documentation for correct usage.",
+                    func
+                ));
             }
         }
         return SearchError::SqlValidationError(
@@ -299,7 +345,7 @@ pub struct ErrorSuggestion {
 }
 
 /// Input for search requests
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SearchRequest {
     /// The piped query string
     pub query: String,
@@ -338,10 +384,10 @@ pub struct SearchRequest {
     /// Only "interactive" and "analytics" are accepted from API clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
-    /// Dataset to run the nPL pipeline against (NAN-1534).
+    /// Dataset to run the nPL pipeline against.
     /// `"logs"` (default) | `"spans"` | `"metrics"` | `"risk"`. Selects the FROM
     /// source and the time-bound column (spans → `start_time`, logs/metrics →
-    /// `timestamp`) in the SQL generator. `"risk"` (NAN-1798 P2) targets the
+    /// `timestamp`) in the SQL generator. `"risk"`  targets the
     /// DERIVED accumulated-entity-risk grain (one row per entity; fixed trailing
     /// 24h/7d score windows the time picker does not reshape). Unknown values
     /// fall back to `logs` (never an error) via
@@ -350,6 +396,18 @@ pub struct SearchRequest {
     /// to the prior generator, so existing clients are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset: Option<String>,
+}
+
+impl std::fmt::Debug for SearchRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchRequest")
+            .field("query", &crate::inputlookup::storage_policy::redact_url_credentials(&self.query))
+            .field("time_range", &self.time_range)
+            .field("limit", &self.limit)
+            .field("dataset", &self.dataset)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Internal hard limits for unattended query execution.
@@ -416,14 +474,42 @@ pub struct SearchResponse {
     pub results: Vec<serde_json::Value>,
     /// Total count of matching records (before limit/offset).
     ///
-    /// Exact for first-page requests (offset 0). Page flips (offset > 0) skip
-    /// the count companion (NAN-1645) and report a monotonic estimate instead:
-    /// `offset + returned + limit` when a full page came back (signals "more"),
-    /// `offset + returned` (exact) on a partial last page. Clients should keep
-    /// the page-1 total across flips.
+    /// Read this together with [`Self::total_count_exact`], which says whether
+    /// the number is a total or a floor. It is a total for first-page ClickHouse
+    /// requests (offset 0, count companion ran, no `max_limit` clamp). It is a
+    /// floor for a lake page, a native-OTLP page with more rows, a clamped
+    /// raw-event count, and for page flips (offset > 0), which skip the count
+    /// companion and report the monotonic `offset + returned + limit`
+    /// estimate. Clients should keep the page-1 total across flips.
+    ///
+    /// a bounded count is no longer inflated by one to signal "more"
+    /// (`offset + returned + 1` for a 50-row page reported 51 hits, a number no
+    /// row supports). The bound is reported as itself and flagged as a bound.
     pub total_count: u64,
-    /// Query execution time in milliseconds
+    /// Whether [`Self::total_count`] is the exact number of matching rows.
+    ///
+    /// "this count is a lower bound" is a property of the result, not
+    /// a warning. When this is `false`, `total_count` is a *proven lower bound* —
+    /// at least that many rows match, and more may exist. Render it as `N+`, do
+    /// not present it as a total, and use it (not a `warnings[]` string match) to
+    /// decide whether a result set is complete.
+    ///
+    /// Wire compatibility: `#[serde(default)]` makes a **missing** field decode as
+    /// `false`, i.e. "assume not exact". That is the conservative direction — an
+    /// older peer that omits the field is treated as possibly-bounded rather than
+    /// having its estimate trusted as a total.
+    #[serde(default)]
+    pub total_count_exact: bool,
+    /// Query execution time in milliseconds (the rows query only).
     pub execution_time_ms: u64,
+    /// total server wall time of this request in milliseconds,
+    /// from the search handler's entry to its response: admission, lake
+    /// readiness waits and retries, a cold query-process start, companions
+    /// (counts, histogram, field stats) and the rows query. This is what the
+    /// analyst waited for; `execution_time_ms` alone hid a 23 s cold search
+    /// behind "1.92 s". Absent from older servers and cached replays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_wall_ms: Option<u64>,
     /// Field information with statistics
     pub fields: Vec<FieldInfo>,
     /// The generated SQL (if requested)
@@ -431,7 +517,7 @@ pub struct SearchResponse {
     /// Event histogram for timeline visualization.
     ///
     /// Omitted when `skip_histogram` was set, when the display type renders no
-    /// timeline (NAN-1429), and on page flips (offset > 0, NAN-1645) — the
+    /// timeline, and on page flips (offset > 0) — the
     /// histogram is page-invariant, so clients keep the page-1 timeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub histogram: Option<Vec<HistogramBucket>>,
@@ -447,6 +533,126 @@ pub struct SearchResponse {
     /// Column order for table display (from | table command)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column_order: Option<Vec<String>>,
+    /// Event-completeness envelope for degraded-but-served lake results
+    /// Present ONLY when the lake worker served this response over
+    /// a stale hot-tail publication: the visible rows are correct and
+    /// immutable, but events newer than `events_complete_through_ms` may be
+    /// missing. Absent means the event view was complete at execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completeness: Option<EventCompleteness>,
+}
+
+/// Structured completeness envelope carried when a lake search was served over
+/// a degraded (stale) hot-tail publication instead of failing closed.
+///
+/// A silently incomplete result set is the worst possible outcome, so a
+/// degraded response must say so with numbers, not a boolean: what the view is
+/// complete through, how much is unpublished, and how close the publisher is
+/// to its serving bounds. Mirrors the lake worker's wire envelope
+/// (`HotTailServingAssessment::completeness_envelope`).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct EventCompleteness {
+    /// Serving verdict: "stale" for a degraded publication, "ok" when the
+    /// envelope is present only to name the bootstrap generation.
+    pub status: String,
+    /// "bootstrap" when the tenant has no compacted Iceberg
+    /// snapshot yet and the worker served the signed hot tail alone. Absent
+    /// for every real generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// Machine reason, e.g. "publication_attempts_failing",
+    /// "publication_backlog_stale", "publication_bound_exhausted".
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Event-time watermark (unix ms) through which the served view is
+    /// complete; events newer than this may be missing.
+    #[serde(default)]
+    pub events_complete_through_ms: Option<i64>,
+    /// Worker display decision for routine consumer lag. Absent on older workers;
+    /// absence preserves the existing warning behavior. Never a serving gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_notice_required: Option<bool>,
+    /// Ledger revisions staged but not yet visible in the served tail.
+    #[serde(default)]
+    pub unpublished_revisions: i64,
+    /// Age (ms) of the oldest unpublished revision, when one exists.
+    #[serde(default)]
+    pub oldest_unpublished_age_ms: Option<i64>,
+    /// Served-tail byte pressure against its serving bound, 0-100.
+    #[serde(default)]
+    pub byte_pressure_percent: u64,
+    /// Served-tail object-count pressure against its serving bound, 0-100.
+    #[serde(default)]
+    pub object_pressure_percent: u64,
+    /// present when the signed hot tail exceeded the reader's cache
+    /// bound and the worker served only its newest objects. Status is
+    /// "partial" unless publication is also stale. Rendered as the
+    /// HOT_TAIL_PARTIAL search warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_tail_partial: Option<HotTailPartialCoverage>,
+    /// present when the result is COMPLETE but part of the hot
+    /// tail was served beyond the reader's RAM tier: decrypted from its
+    /// encrypted disk tier and/or read through from R2 (each object verified
+    /// against the signed manifest). Rendered as HOT_TAIL_SLOW_PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_tail_slow_path: Option<HotTailSlowPathCoverage>,
+}
+
+/// what the reader served beyond its RAM tier for one request.
+/// Coverage is complete; this only explains why the request was slower.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HotTailSlowPathCoverage {
+    #[serde(default)]
+    pub objects: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub disk_objects: u64,
+    #[serde(default)]
+    pub disk_bytes: u64,
+    #[serde(default)]
+    pub r2_objects: u64,
+    #[serde(default)]
+    pub r2_bytes: u64,
+    /// Event-time range served beyond the RAM tier.
+    #[serde(default)]
+    pub from_ms: Option<i64>,
+    #[serde(default)]
+    pub through_ms: Option<i64>,
+    /// Event-time range read through from R2.
+    #[serde(default)]
+    pub r2_from_ms: Option<i64>,
+    #[serde(default)]
+    pub r2_through_ms: Option<i64>,
+    #[serde(default)]
+    pub staging_ms: u64,
+}
+
+/// the event-time range a newest-first partial hot tail leaves out.
+/// Every event newer than `uncovered_through_ms` is searchable; events in
+/// `[uncovered_from_ms, uncovered_through_ms]` may be missing. A `None` bound
+/// is unknown.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct HotTailPartialCoverage {
+    #[serde(default)]
+    pub uncovered_from_ms: Option<i64>,
+    #[serde(default)]
+    pub uncovered_through_ms: Option<i64>,
+    #[serde(default)]
+    pub total_objects: u64,
+    #[serde(default)]
+    pub served_objects: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub served_bytes: u64,
+    #[serde(default)]
+    pub cache_max_bytes: u64,
+    /// why the slow path could not cover the range
+    /// (`slow_path_r2_unavailable`, `slow_path_over_budget`,
+    /// `slow_path_busy`). Absent on a RAM-only reader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Query warning output for API responses
@@ -470,8 +676,11 @@ impl SearchResponse {
     /// Create a new empty search response
     pub fn empty() -> Self {
         Self {
+            server_wall_ms: None,
             results: Vec::new(),
             total_count: 0,
+            // An empty result set is exactly zero rows, not "zero or more".
+            total_count_exact: true,
             execution_time_ms: 0,
             fields: Vec::new(),
             generated_sql: None,
@@ -480,6 +689,7 @@ impl SearchResponse {
             cost_score: None,
             display_type: None,
             column_order: None,
+            completeness: None,
         }
     }
 }
@@ -498,6 +708,12 @@ pub struct FieldInfo {
     /// Total unique values (cardinality) for this field across all matching events
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cardinality: Option<u64>,
+    /// set when `count`, `top_values` and `cardinality` were
+    /// counted over a row sample of this many events rather than the whole
+    /// window (the primary lake's field-stats sample), so a client can say
+    /// the values are sampled. `None` means exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_rows: Option<u64>,
 }
 
 impl FieldInfo {
@@ -509,6 +725,7 @@ impl FieldInfo {
             count: 0,
             top_values: Vec::new(),
             cardinality: None,
+            sampled_rows: None,
         }
     }
 }
@@ -520,8 +737,9 @@ pub struct FieldValueInfo {
     pub value: String,
     /// Number of events with this value
     pub count: u64,
-    /// Percentage of the event count covered by the returned top values
-    /// (0-100), not necessarily of the full matching event population.
+    /// Percentage (0-100). On the lake: share of all events matching the base
+    /// search. The ClickHouse path still reports the share of the returned
+    /// top values.
     pub percentage: f64,
 }
 
@@ -553,14 +771,62 @@ impl FieldStatistics {
 
     /// Process a single field value
     fn process_field(&mut self, field: &str, value: &serde_json::Value) {
+        let is_ocsf_unmapped = field == "unmapped" || field.starts_with("unmapped.");
+
+        // OCSF uses arrays of objects for hashes, groups, data sources, and
+        // other repeated attributes. They are queryable as canonical paths
+        // without numeric indexes, so aggregate every member under that same
+        // path instead of dropping the array from the field inventory.
+        if let Some(values) = value.as_array() {
+            for item in values {
+                if let Some(object) = item.as_object() {
+                    for (nested_key, nested_value) in object {
+                        self.process_field(&format!("{}.{}", field, nested_key), nested_value);
+                    }
+                } else {
+                    self.process_field(field, item);
+                }
+            }
+            return;
+        }
+
+        // The OCSF writer keeps `unmapped` as a stable sparse struct. Its null
+        // placeholders describe what a source *could* emit, not fields that
+        // occurred in this result sample. The field rail is an observed-value
+        // index, so expose only populated scalar leaves and never the
+        // `unmapped`/`unmapped.details` container objects themselves. This also
+        // avoids recreating the legacy UDM `ext` JSON-tail behavior where a
+        // schema inventory was mistaken for actual event data.
+        if is_ocsf_unmapped {
+            if let Some(obj) = value.as_object() {
+                for (nested_key, nested_value) in obj {
+                    self.process_field(&format!("{}.{}", field, nested_key), nested_value);
+                }
+                return;
+            }
+            if value.is_null() || value.as_str().is_some_and(|value| value.trim().is_empty()) {
+                return;
+            }
+        }
+
         // Update field count
         *self.field_counts.entry(field.to_string()).or_insert(0) += 1;
 
-        // Detect and update field type
+        // Detect and update field type. The first row decides unless it was
+        // null: a column that is null on the first row but populated later
+        // (sparse OCSF paths such as `user.name`) is typed by its first real
+        // value, not reported as `"null"` (audit #15).
         let field_type = detect_json_type(value);
-        self.field_types
-            .entry(field.to_string())
-            .or_insert_with(|| field_type.to_string());
+        match self.field_types.get_mut(field) {
+            Some(existing) if existing == "null" && field_type != "null" => {
+                *existing = field_type.to_string();
+            }
+            Some(_) => {}
+            None => {
+                self.field_types
+                    .insert(field.to_string(), field_type.to_string());
+            }
+        }
 
         // Update value counts (only for scalar values)
         if !value.is_null() && !value.is_object() && !value.is_array() {
@@ -602,6 +868,7 @@ impl FieldStatistics {
                         .take(top_n)
                         .map(|(v, &c)| (v.clone(), c))
                         .collect();
+                    info.cardinality = Some(values.len() as u64);
                 }
 
                 info
@@ -649,6 +916,21 @@ fn value_to_string(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// NAN-3008: `server_wall_ms` is on the wire when set, omitted when not,
+    /// and an older server's response (no field) still decodes.
+    #[test]
+    fn server_wall_ms_is_optional_on_the_wire() {
+        let mut response = SearchResponse::empty();
+        assert!(serde_json::to_value(&response).unwrap().get("server_wall_ms").is_none());
+        response.server_wall_ms = Some(23_300);
+        response.execution_time_ms = 1_920;
+        let wire = serde_json::to_value(&response).unwrap();
+        assert_eq!((wire["server_wall_ms"].as_u64(), wire["execution_time_ms"].as_u64()), (Some(23_300), Some(1_920)));
+        let mut old = wire;
+        old.as_object_mut().unwrap().remove("server_wall_ms");
+        assert_eq!(serde_json::from_value::<SearchResponse>(old).unwrap().server_wall_ms, None);
+    }
 
     #[test]
     fn test_time_range_validation() {
@@ -698,6 +980,96 @@ mod tests {
         // 192.168.1.1 should be first (count 2)
         assert_eq!(src_ip.top_values[0].0, "192.168.1.1");
         assert_eq!(src_ip.top_values[0].1, 2);
+        assert_eq!(src_ip.cardinality, Some(2));
+    }
+
+    /// Audit #15: a sparse field that is null on the first row is typed by
+    /// its first populated value, not `"null"`.
+    #[test]
+    fn field_statistics_types_sparse_fields_by_first_populated_value() {
+        let mut stats = FieldStatistics::new();
+        stats.process_row(&json!({"user.name": null, "logon_type": null, "always_null": null}));
+        stats.process_row(&json!({"user.name": "alice", "logon_type": 3, "always_null": null}));
+        stats.process_row(&json!({"user.name": null, "logon_type": "x", "always_null": null}));
+        let fields = stats.get_field_info(10);
+        let field_type = |name: &str| fields.iter().find(|f| f.name == name).unwrap().field_type.clone();
+        assert_eq!(field_type("user.name"), "string");
+        // First non-null value wins; later values never overwrite it.
+        assert_eq!(field_type("logon_type"), "number");
+        assert_eq!(field_type("always_null"), "null");
+    }
+
+    #[test]
+    fn field_statistics_flattens_ocsf_arrays_without_numeric_indexes() {
+        let mut stats = FieldStatistics::new();
+        stats.process_row(&json!({
+            "actor": {
+                "process": {
+                    "file": {
+                        "hashes": [
+                            {"algorithm_id": 3, "value": "abc"},
+                            {"algorithm_id": 4, "value": "def"}
+                        ]
+                    },
+                    "groups": ["admins", "operators"]
+                }
+            }
+        }));
+
+        let fields = stats.get_field_info(10);
+        let hashes = fields
+            .iter()
+            .find(|field| field.name == "actor.process.file.hashes.value")
+            .unwrap();
+        assert_eq!(hashes.count, 2);
+        assert_eq!(hashes.cardinality, Some(2));
+        assert!(fields
+            .iter()
+            .any(|field| field.name == "actor.process.file.hashes.algorithm_id"));
+        assert!(fields
+            .iter()
+            .any(|field| field.name == "actor.process.groups"));
+        assert!(!fields.iter().any(|field| field.name.contains(".0.")));
+    }
+
+    #[test]
+    fn field_statistics_only_exposes_observed_ocsf_unmapped_leaves() {
+        let mut stats = FieldStatistics::new();
+        stats.process_row(&json!({
+            "unmapped": {
+                "action": null,
+                "empty": "  ",
+                "details": {
+                    "reason": null,
+                    "vendor_code": "E42"
+                },
+                "retry": false,
+                "sequence": 0
+            }
+        }));
+
+        let fields = stats.get_field_info(10);
+        let names = fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "unmapped.details.vendor_code",
+                "unmapped.retry",
+                "unmapped.sequence",
+            ])
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.name == "unmapped.details.vendor_code")
+                .unwrap()
+                .top_values,
+            vec![("E42".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -767,7 +1139,9 @@ mod tests {
             SearchError::SqlValidationError(_)
         ));
         assert!(matches!(
-            parse_clickhouse_error("Code: 159. DB::Exception: Timeout exceeded: elapsed 1.2 seconds (TIMEOUT_EXCEEDED)"),
+            parse_clickhouse_error(
+                "Code: 159. DB::Exception: Timeout exceeded: elapsed 1.2 seconds (TIMEOUT_EXCEEDED)"
+            ),
             SearchError::Timeout(_)
         ));
         // Anything unrecognized still falls through to DatabaseError
@@ -856,7 +1230,7 @@ pub struct RetroRequest {
     pub sort: Option<String>,
 }
 
-/// Verdict rarity band for a retro indicator/entity (NAN-1580).
+/// Verdict rarity band for a retro indicator/entity.
 ///
 /// `ratio = distinct_hosts_touched / total_hosts_in_env`; `rare <= 0.02`,
 /// `uncommon <= 0.15`, else `common`.
@@ -1026,7 +1400,7 @@ pub struct RetroPivotRow {
     pub worst_verdict: String,
 }
 
-/// Response from the IOC retro-hunt companion endpoint (NAN-1580).
+/// Response from the IOC retro-hunt companion endpoint.
 ///
 /// Shaped by `submode`: `summary` populates `indicator`; `list` populates
 /// `rows`/`no_hits`/`total_indicators`; `pivot` populates `pivot_rows`. Common
@@ -1167,6 +1541,18 @@ impl UdmFieldCategory {
 // Asset Pagination Types
 // ============================================================================
 
+/// Stable continuation key for immutable, newest-first product-view pages.
+///
+/// Offsets are retained as display metadata, but lake readers use this key to
+/// avoid rescanning and discarding every earlier row on deep pages. OCSF event
+/// publication guarantees a non-empty `metadata.uid`, which breaks timestamp
+/// ties without coupling the API to a physical Parquet row number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct ProductViewCursor {
+    pub time: DateTime<Utc>,
+    pub event_uid: String,
+}
+
 /// Pagination metadata for asset events
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetPagination {
@@ -1188,20 +1574,20 @@ pub struct AssetFacets {
     /// Source type facet: [(value, count), ...]
     pub source_type: Vec<(String, u64)>,
     /// Event-kind facet — the classifier label (`PROCESS`, `AUTH_FAILURE`, …),
-    /// NOT the UDM `event_type` field value (NAN-2211).
+    /// NOT the UDM `event_type` field value.
     pub event_kind: Vec<(String, u64)>,
     /// User facet: [(value, count), ...]
     pub user: Vec<(String, u64)>,
 }
 
 /// Filters for paginated asset event queries
-#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct AssetEventFilters {
     /// Filter by source types (OR)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_types: Option<Vec<String>>,
     /// Filter by event kinds (OR) — classifier labels, not UDM `event_type`
-    /// field values (NAN-2211).
+    /// field values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_kinds: Option<Vec<String>>,
     /// Filter by users (OR)
@@ -1234,7 +1620,7 @@ pub struct CloudFacets {
 }
 
 /// Filters for paginated cloud event queries
-#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 pub struct CloudEventFilters {
     /// Filter by cloud providers (OR)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1291,7 +1677,7 @@ pub struct CloudUserActivity {
 }
 
 /// Session summary for a single user's cloud activity timeline
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudUserSessionSummary {
     /// Cloud services accessed
     pub services: Vec<String>,
@@ -1379,5 +1765,33 @@ mod asset_pagination_tests {
         assert!(filters.event_kinds.is_none());
         assert!(filters.users.is_none());
         assert!(filters.search_text.is_none());
+    }
+}
+
+impl From<super::admission::AdmissionError> for SearchError {
+    fn from(error: super::admission::AdmissionError) -> Self {
+        match error {
+            super::admission::AdmissionError::Unavailable => Self::AdmissionBackendUnavailable,
+            other => Self::AdmissionDenied(other.to_string()),
+        }
+    }
+}
+
+/// NAN-3644: the analyst-facing text of [`SearchError::ColdScanTooLarge`].
+/// It offers a background (async) search only when the reader would admit
+/// the read there; otherwise it says how to split the read.
+pub fn cold_scan_too_large_message(needed_bytes: u64, ceiling_bytes: u64, background_ceiling_bytes: Option<u64>) -> String {
+    let gb = |bytes: u64| bytes as f64 / 1_000_000_000.0;
+    let head = format!(
+        "This search would read ~{:.1} GB of uncached data in one pass, more than the ~{:.1} GB this tenant's reader can stage at once, so it is too large to run interactively.",
+        gb(needed_bytes),
+        gb(ceiling_bytes),
+    );
+    match background_ceiling_bytes {
+        Some(background) if background >= needed_bytes => format!(
+            "{head} Run it as a background search (async), which can stage up to ~{:.1} GB, or narrow the time range.",
+            gb(background)
+        ),
+        _ => format!("{head} Narrow the time range or add a filter so each pass reads less."),
     }
 }

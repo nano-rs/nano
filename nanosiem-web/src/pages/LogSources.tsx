@@ -9,7 +9,6 @@ import {
   Eye,
   EyeOff,
   Globe,
-  Loader2,
   MoreHorizontal,
   Network,
   Pencil,
@@ -21,6 +20,7 @@ import {
   Search,
   Trash2,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
@@ -56,22 +56,22 @@ import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import type { LogSource } from '@/lib/api';
 import { logSourceTransportLabel } from '@/lib/log-source-transports';
+import { formatCompactNumber, formatRelativeCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
+import { LogSourcesPageShell } from '@/components/add-data/LogSourcesPageShell';
+import { TenzirBucketDropLead } from '@/components/add-data/TenzirBucketDropLead';
+import { TenzirOnlyNote } from '@/components/add-data/TenzirOnlyNote';
+import { useIngestGate } from '@/hooks/use-capabilities';
+import { IngestionActivityChart } from '@/components/log-sources/IngestionActivityChart';
+import { PlatformUpdateBanner } from '@/components/parser-rollout/PlatformUpdateBanner';
+import { logSourceSlugLabel, logSourceSlugs, platformLaneRows, type PlatformLaneRow } from '@/lib/log-source-lanes';
+import { usePipeInputSummary } from '@/hooks/use-pipe-inputs';
+import type { PipeInputAttention } from '@/lib/api/pipelines';
+import { DeliveryAttentionBadge } from '@/components/log-sources/DeliveryAttentionBadge';
+import { RefusedEventsBadge } from '@/components/log-sources/RefusedEventsBadge';
 
 type DerivedStatus = 'deployed' | 'ready' | 'paused' | 'draft';
 type FilterId = 'all' | 'deployed' | 'ready' | 'warn' | 'draft';
-
-const CHART_PALETTE = [
-  'oklch(72% 0.15 200)', // cyan
-  'oklch(70% 0.17 250)', // blue
-  'oklch(72% 0.15 160)', // teal
-  'oklch(74% 0.14 110)', // lime
-  'oklch(76% 0.14 80)', // gold
-  'oklch(72% 0.16 40)', // orange
-  'oklch(70% 0.16 10)', // coral
-  'oklch(68% 0.17 320)', // magenta
-  'oklch(68% 0.16 280)', // violet
-];
 
 function deriveStatus(ls: LogSource): DerivedStatus {
   // NAN-1920: a wizard draft (never deployed, still being built) is the most
@@ -89,18 +89,16 @@ function derivePendingDeploy(ls: LogSource): boolean {
 
 const TRANSPORT_COLOR = 'oklch(72% 0.15 200)';
 
-function fmtRate(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return Math.round(n).toString();
-}
-
 export function LogSources() {
   useDocumentTitle('Log Sources');
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const { hasPermission } = useAuth();
+  const { hasPermission, user } = useAuth();
+  // NAN-2361: on the hosted-shared lake data reaches the tenant's own ingest
+  // endpoint and is parsed by the platform parser cell; "deploy" activates the
+  // registry entry instead of rendering a Vector configuration.
+  const sharedTenant = user?.deployment_mode === 'enterprise_shared';
 
   const { data: logSources, loading, refetch } = useLogSources();
   const { data: ingestionHistory } = useIngestionHistory(24);
@@ -109,14 +107,33 @@ export function LogSources() {
   const { mutate: deployLogSource } = useDeployLogSource();
   const { mutate: undeployLogSource } = useUndeployLogSource();
 
-  const canCreate = hasPermission('log_sources:create');
+  // NAN-3844: an `install.sh --tenzir` install has no Vector. New sources
+  // (push / pull) and parser deploys are off; the page leads with the
+  // Tenzir bucket drop instead.
+  const { tenzirOnly, blocked } = useIngestGate();
+  const canCreate = hasPermission('log_sources:create') && !blocked;
   const canEdit = hasPermission('log_sources:edit');
   const canDelete = hasPermission('log_sources:delete');
-  const canDeploy = hasPermission('log_sources:deploy');
+  const canDeploy = hasPermission('log_sources:deploy') && !blocked;
+
+  // NAN-3661: a failed, blocked or paused pull source / connector feed into a
+  // source's lane is flagged on its row (the reason is on hover; the detail
+  // page's Delivery panel has the fix).
+  const inputSummary = usePipeInputSummary({ enabled: sharedTenant && hasPermission('log_sources:view') });
+  const attentionBySource = useMemo(() => {
+    const map = new Map<string, PipeInputAttention[]>();
+    for (const lane of inputSummary.data?.sources ?? []) {
+      if (lane.attention?.length) map.set(lane.log_source_id, lane.attention);
+    }
+    return map;
+  }, [inputSummary.data]);
 
   // Per-source RBAC scoping (NAN-1802): mark feeds whose `source_type` is in the
   // restricted registry. Only fetched for admins who can view scopes — others
   // never see the badge (and don't fire a 403). An empty registry = allow-all.
+  // Hosted-shared (NAN-2361 wave 8): the registry is the read-only view of the
+  // group-based model and its values are lake source slugs, matched against
+  // the entry's `ingest.source_slugs`.
   const canViewScopes = hasPermission('source_scopes:view');
   const { data: restrictedResp } = useQuery({
     queryKey: ['source-scopes-restricted'],
@@ -148,7 +165,7 @@ export function LogSources() {
   >([]);
   const [checkingAssociatedRules, setCheckingAssociatedRules] = useState(false);
 
-  const sources = logSources ?? [];
+  const sources = useMemo(() => logSources ?? [], [logSources]);
 
   const stats = useMemo(() => {
     let deployed = 0;
@@ -174,13 +191,23 @@ export function LogSources() {
       if (filter === 'draft' && status !== 'draft') return false;
       if (filter === 'warn' && !derivePendingDeploy(ls)) return false;
       if (!q) return true;
-      const hay = [ls.name, ls.description, ls.vendor, ls.product, ls.source_type, ls.namespace]
+      const hay = [ls.name, ls.description, ls.vendor, ls.product, ls.source_type, ls.namespace, ls.origin?.label, ...(ls.origin?.deliveries ?? []).map((d) => d.name), ...(logSourceSlugs(ls) ?? [])]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
       return hay.includes(q);
     });
   }, [sources, searchQuery, filter]);
+
+  // NAN-3248: platform-managed lanes (OTLP logs, audit) with data but no
+  // log-source entry get read-only rows from the ingestion history.
+  const platformRows = useMemo(() => {
+    if (!sharedTenant || (filter !== 'all' && filter !== 'deployed')) return [];
+    const q = searchQuery.trim().toLowerCase();
+    return platformLaneRows(ingestionHistory, sources).filter(
+      (r) => !q || `${r.name} ${r.slug} ${r.description}`.toLowerCase().includes(q),
+    );
+  }, [sharedTenant, filter, searchQuery, ingestionHistory, sources]);
 
   // ----- mutations -----
 
@@ -222,7 +249,9 @@ export function LogSources() {
       await deployLogSource(logSourceToAction.id);
       toast({
         title: 'Deployed',
-        description: `"${logSourceToAction.name}" has been deployed to Vector.`,
+        description: sharedTenant
+          ? `"${logSourceToAction.name}" is active in your source registry; your parser cell handles its events.`
+          : `"${logSourceToAction.name}" has been deployed to Vector.`,
       });
       setDeployDialogOpen(false);
       setLogSourceToAction(null);
@@ -329,11 +358,18 @@ export function LogSources() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="flex flex-col h-full min-h-0 -m-3 bg-background">
+      {/* NAN-3248: normal document flow inside the app scroller. A fill-height
+          column (h-full + an inner min-h-0 scroll box) gave the table only the
+          height left over by the banner and chart, often ~0, and nothing scrolled. */}
+      <LogSourcesPageShell active="sources" testId="log-sources-page">
+        {tenzirOnly && <TenzirBucketDropLead />}
         <HeroStrip stats={stats} />
 
-        <div className="shrink-0 border-b border-border bg-background px-4 pt-3 pb-3">
-          <IngestionActivityCard history={ingestionHistory ?? []} />
+        <div className="shrink-0 border-b border-border bg-background px-4 pt-3 pb-3 flex flex-col gap-3">
+          {tenzirOnly && <TenzirOnlyNote />}
+          {/* NAN-2607 decision (a): a platform release never overwrites a custom parser; offer the merge. */}
+          {sharedTenant && <PlatformUpdateBanner />}
+          <IngestionActivityChart history={ingestionHistory ?? []} />
         </div>
 
         <Toolbar
@@ -347,12 +383,12 @@ export function LogSources() {
           onNew={() => navigate('/ingestion/log-sources/new')}
         />
 
-        <div className="flex-1 min-h-0 overflow-auto">
+        <div className="overflow-x-auto" data-testid="log-sources-table-region">
           {loading ? (
             <div className="flex items-center justify-center py-16">
-              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-6 h-6 text-muted-foreground" />
             </div>
-          ) : filtered.length === 0 ? (
+          ) : filtered.length === 0 && platformRows.length === 0 ? (
             <EmptyState
               hasQuery={!!searchQuery || filter !== 'all'}
               canCreate={canCreate}
@@ -362,7 +398,9 @@ export function LogSources() {
           ) : (
             <LogSourceTable
               rows={filtered}
+              platformRows={platformRows}
               restrictedSet={restrictedSet}
+              attentionBySource={attentionBySource}
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
@@ -435,7 +473,7 @@ export function LogSources() {
           confirmTone={logSourceToAction?.enabled ? 'warn' : 'default'}
           onConfirm={handleToggle}
         />
-      </div>
+      </LogSourcesPageShell>
     </TooltipProvider>
   );
 }
@@ -567,182 +605,13 @@ function Toolbar({
   );
 }
 
-// ----- Activity chart -----
-
-type IngestionPoint = { source_type: string; timestamp: string; count: number };
-
-function IngestionActivityCard({ history }: { history: IngestionPoint[] }) {
-  // Stack ingestion-history points by source_type. Real history is coarse (per-bucket
-  // counts from ClickHouse) — we render it directly without smoothing. If the backend
-  // returns nothing, we still show the chrome with a flat line so the chart slot stays
-  // legible while the user reads the rest of the page.
-  const { stacked, sourceTypes, maxY, bucketSeconds } = useMemo(() => {
-    if (!history.length) return { stacked: [], sourceTypes: [] as string[], maxY: 0, bucketSeconds: 0 };
-    const types = Array.from(new Set(history.map((p) => p.source_type)));
-    const byTime = new Map<string, Map<string, number>>();
-    for (const p of history) {
-      let row = byTime.get(p.timestamp);
-      if (!row) {
-        row = new Map();
-        byTime.set(p.timestamp, row);
-      }
-      row.set(p.source_type, (row.get(p.source_type) ?? 0) + p.count);
-    }
-    const timestamps = Array.from(byTime.keys()).sort();
-    const series = types.map((t, i) => ({
-      id: t,
-      label: t,
-      color: CHART_PALETTE[i % CHART_PALETTE.length],
-      points: timestamps.map((ts) => byTime.get(ts)?.get(t) ?? 0),
-    }));
-    const N = timestamps.length;
-    const running = new Array(N).fill(0) as number[];
-    const out = series.map((s) => {
-      const lower = [...running];
-      for (let i = 0; i < N; i++) running[i] += s.points[i];
-      const upper = [...running];
-      return { ...s, lower, upper };
-    });
-    const maxYv = Math.max(1, ...out.flatMap((l) => l.upper));
-    let bucket = 0;
-    if (timestamps.length >= 2) {
-      bucket =
-        (new Date(timestamps[1]).getTime() - new Date(timestamps[0]).getTime()) / 1000;
-    }
-    return { stacked: out, sourceTypes: types, maxY: maxYv, bucketSeconds: bucket };
-  }, [history]);
-
-  const N = stacked[0]?.upper.length ?? 0;
-  const W = 1360;
-  const H = 150;
-  const PAD_L = 44;
-  const PAD_R = 12;
-  const PAD_T = 6;
-  const PAD_B = 24;
-  const innerW = W - PAD_L - PAD_R;
-  const innerH = H - PAD_T - PAD_B;
-
-  const xAt = (i: number) => (N <= 1 ? PAD_L : PAD_L + (i / (N - 1)) * innerW);
-  const yAt = (v: number) => PAD_T + innerH - (v / Math.max(maxY, 1)) * innerH;
-
-  const pathFor = (layer: { lower: number[]; upper: number[] }) => {
-    const top = layer.upper.map((v, i) => `${i === 0 ? 'M' : 'L'}${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(' ');
-    const bot = layer.lower
-      .map((_, i) => `L${xAt(N - 1 - i).toFixed(1)},${yAt(layer.lower[N - 1 - i]).toFixed(1)}`)
-      .join(' ');
-    return `${top} ${bot} Z`;
-  };
-
-  // Estimate evt/min for the peak label. If we can compute the bucket size from the
-  // timestamps, normalize per-bucket counts to per-minute. Otherwise leave the peak
-  // label blank rather than mislead the analyst.
-  const peakPerMin = bucketSeconds > 0 ? (maxY * 60) / bucketSeconds : 0;
-
-  return (
-    <div className="rounded-lg border border-border bg-card overflow-hidden">
-      <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border">
-        <Rss className="w-3.5 h-3.5 text-muted-foreground" />
-        <div className="text-[11.5px] font-medium text-foreground whitespace-nowrap">Ingestion activity</div>
-        <span className="text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground whitespace-nowrap">
-          24h · stacked by source type
-        </span>
-        <div className="flex-1" />
-        {peakPerMin > 0 && (
-          <div className="text-[10.5px] font-mono text-muted-foreground tabular-nums whitespace-nowrap">
-            Peak ≈ <span className="text-foreground">{fmtRate(peakPerMin)}</span>{' '}
-            <span className="text-muted-foreground/70">evt/min</span>
-          </div>
-        )}
-      </div>
-      <div className="p-2">
-        {stacked.length === 0 ? (
-          <div className="h-[150px] flex items-center justify-center text-[11px] text-muted-foreground">
-            No ingestion activity in the last 24 hours.
-          </div>
-        ) : (
-          <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[150px]" preserveAspectRatio="none">
-            {[0, 0.25, 0.5, 0.75, 1].map((f, i) => {
-              const y = PAD_T + innerH - f * innerH;
-              return (
-                <line
-                  key={i}
-                  x1={PAD_L}
-                  x2={W - PAD_R}
-                  y1={y}
-                  y2={y}
-                  stroke="var(--border)"
-                  strokeWidth="1"
-                  strokeDasharray={i === 0 ? '' : '2,3'}
-                />
-              );
-            })}
-            {[0, 0.5, 1].map((f, i) => {
-              const y = PAD_T + innerH - f * innerH;
-              const v = peakPerMin > 0 ? f * peakPerMin : f * maxY;
-              return (
-                <text
-                  key={i}
-                  x={PAD_L - 6}
-                  y={y + 3}
-                  textAnchor="end"
-                  fontFamily="var(--font-mono, ui-monospace)"
-                  fontSize="9"
-                  fill="var(--muted-foreground)"
-                >
-                  {fmtRate(v)}
-                </text>
-              );
-            })}
-            {[0, 0.25, 0.5, 0.75, 1].map((f, i) => {
-              const x = PAD_L + f * innerW;
-              const h = Math.round(24 - f * 24);
-              return (
-                <text
-                  key={i}
-                  x={x}
-                  y={H - 8}
-                  textAnchor="middle"
-                  fontFamily="var(--font-mono, ui-monospace)"
-                  fontSize="9"
-                  fill="var(--muted-foreground)"
-                >
-                  {h === 0 ? 'now' : `-${h}h`}
-                </text>
-              );
-            })}
-            {stacked.map((layer) => (
-              <path
-                key={layer.id}
-                d={pathFor(layer)}
-                fill={layer.color}
-                fillOpacity="0.72"
-                stroke={layer.color}
-                strokeWidth="0.75"
-                strokeOpacity="0.9"
-              />
-            ))}
-          </svg>
-        )}
-        {sourceTypes.length > 0 && (
-          <div className="flex items-center gap-3 flex-wrap px-2 pt-1.5 pb-1">
-            {stacked.map((s) => (
-              <div key={s.id} className="flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-sm" style={{ background: s.color }} />
-                <span className="text-[10.5px] text-foreground/80">{s.label}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 // ----- Table -----
 
 function LogSourceTable({
   rows,
+  platformRows = [],
   restrictedSet,
+  attentionBySource,
   canEdit,
   canDeploy,
   canDelete,
@@ -752,7 +621,9 @@ function LogSourceTable({
   onDelete,
 }: {
   rows: LogSource[];
+  platformRows?: PlatformLaneRow[];
   restrictedSet: Set<string>;
+  attentionBySource?: Map<string, PipeInputAttention[]>;
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
@@ -761,6 +632,9 @@ function LogSourceTable({
   onUndeploy: (ls: LogSource) => void;
   onDelete: (ls: LogSource) => void;
 }) {
+  // NAN-2361 hosted-shared tenants: the list carries a per-source 24h lake
+  // ingestion summary; dedicated deployments do not (column hidden).
+  const showIngest = rows.some((ls) => ls.ingest != null) || platformRows.length > 0;
   return (
     <div className="@container/table">
       <table className="w-full text-[12px]">
@@ -775,6 +649,11 @@ function LogSourceTable({
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[200px] @max-[1100px]/table:hidden">
               Vendor / Product
             </th>
+            {showIngest && (
+              <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[170px] @max-[760px]/table:hidden">
+                Ingest 24h
+              </th>
+            )}
             <th className="text-left font-medium text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground py-2 w-[140px]">
               Status
             </th>
@@ -789,7 +668,12 @@ function LogSourceTable({
             <LogSourceRow
               key={ls.id}
               source={ls}
-              restricted={restrictedSet.has(ls.source_type)}
+              restricted={
+                restrictedSet.has(ls.source_type) ||
+                (ls.ingest?.source_slugs ?? []).some((slug) => restrictedSet.has(slug))
+              }
+              showIngest={showIngest}
+              attention={attentionBySource?.get(ls.id)}
               canEdit={canEdit}
               canDeploy={canDeploy}
               canDelete={canDelete}
@@ -799,8 +683,51 @@ function LogSourceTable({
               onDelete={onDelete}
             />
           ))}
+          {platformRows.map((lane) => (
+            <PlatformLaneTableRow
+              key={lane.slug}
+              lane={lane}
+              showIngest={showIngest}
+              restricted={restrictedSet.has(lane.slug)}
+            />
+          ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+const INGEST_HEALTH_DOT: Record<string, string> = {
+  healthy: 'bg-emerald-500',
+  stale: 'bg-amber-500',
+  no_data: 'bg-muted-foreground/40',
+  disabled: 'bg-muted-foreground/40',
+  error: 'bg-red-500',
+};
+
+function IngestSummaryCell({ summary }: { summary: LogSource['ingest'] | null }) {
+  if (!summary) {
+    return <div className="text-[10.5px] text-muted-foreground/70">—</div>;
+  }
+  const failures = summary.parse_failures_24h;
+  return (
+    <div className="min-w-0">
+      <div className="flex items-center gap-1.5">
+        <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', INGEST_HEALTH_DOT[summary.health_status] ?? 'bg-muted-foreground/40')} />
+        <span className="text-[11.5px] font-mono text-foreground tabular-nums">
+          {formatCompactNumber(summary.events_last_24h)}
+        </span>
+        <span className="text-[10px] font-mono text-muted-foreground">ev</span>
+        {failures > 0 && (
+          <span className="text-[10px] font-mono text-red-500 tabular-nums" title={`${failures} parse failures in 24h`}>
+            {formatCompactNumber(failures)} fail
+          </span>
+        )}
+        <RefusedEventsBadge count={summary.refused_events_24h} sample={summary.last_refusal} compact />
+      </div>
+      <div className="text-[10.5px] font-mono text-muted-foreground">
+        {summary.last_event_at ? `last ${formatRelativeCompact(summary.last_event_at)}` : 'no events'}
+      </div>
     </div>
   );
 }
@@ -808,6 +735,8 @@ function LogSourceTable({
 function LogSourceRow({
   source,
   restricted,
+  showIngest,
+  attention,
   canEdit,
   canDeploy,
   canDelete,
@@ -818,6 +747,8 @@ function LogSourceRow({
 }: {
   source: LogSource;
   restricted: boolean;
+  showIngest: boolean;
+  attention?: PipeInputAttention[];
   canEdit: boolean;
   canDeploy: boolean;
   canDelete: boolean;
@@ -864,6 +795,7 @@ function LogSourceRow({
                   </TooltipContent>
                 </Tooltip>
               )}
+              {attention && attention.length > 0 && <DeliveryAttentionBadge items={attention} />}
               {/* Inline transport surfaces when Type col hidden */}
               <span className="hidden @max-[900px]/table:inline-flex items-center gap-1 h-[15px] px-1 rounded-[3px] border border-border bg-foreground/[0.03]">
                 <Globe className="w-[8px] h-[8px]" style={{ color: TRANSPORT_COLOR }} />
@@ -876,7 +808,9 @@ function LogSourceRow({
               </div>
             )}
             <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
-              <span className="text-[10px] font-mono text-muted-foreground">{source.source_type}</span>
+              <span className="text-[10px] font-mono text-muted-foreground" data-testid="log-source-slugs">
+                {logSourceSlugLabel(source)}
+              </span>
               {restricted && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -935,6 +869,13 @@ function LogSourceRow({
           <div className="text-[10.5px] text-muted-foreground/70">—</div>
         )}
       </td>
+
+      {/* Ingest 24h (hosted-shared tenants) */}
+      {showIngest && (
+        <td className="py-3 align-top @max-[760px]/table:hidden">
+          <IngestSummaryCell summary={source.ingest ?? null} />
+        </td>
+      )}
 
       {/* Status */}
       <td className="py-3 align-top">
@@ -1031,6 +972,71 @@ function LogSourceRow({
           </DropdownMenu>
         </div>
       </td>
+    </tr>
+  );
+}
+
+/** NAN-3248: a platform-managed lane (no tenant parser): read-only, not clickable. */
+function PlatformLaneTableRow({
+  lane,
+  showIngest,
+  restricted,
+}: {
+  lane: PlatformLaneRow;
+  showIngest: boolean;
+  restricted: boolean;
+}) {
+  return (
+    <tr className="border-b border-border" data-testid={`platform-lane-row-${lane.slug}`}>
+      <td className="pl-4 py-3 align-top">
+        <div className="flex items-start gap-3">
+          <div className="w-[30px] h-[30px] rounded-md border border-border bg-foreground/[0.03] flex items-center justify-center shrink-0 mt-0.5">
+            <Network className="w-[13px] h-[13px] text-muted-foreground" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[12.5px] font-medium text-foreground truncate">{lane.name}</span>
+              <span className="inline-flex items-center h-[15px] px-1 rounded-[3px] border border-border font-mono text-[9px] uppercase tracking-wider text-muted-foreground">
+                Platform managed
+              </span>
+            </div>
+            <div className="text-[11px] text-muted-foreground truncate mt-0.5 leading-relaxed max-w-[620px]">{lane.description}</div>
+            <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+              <span className="text-[10px] font-mono text-muted-foreground">{lane.slug}</span>
+              {restricted && (
+                <span className="inline-flex items-center gap-1 h-[15px] px-1 rounded-[3px] bg-amber-500/12 text-amber-500 font-mono text-[9px] uppercase tracking-wider">
+                  <EyeOff className="w-[9px] h-[9px]" />
+                  Restricted
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      </td>
+      <td className="py-3 align-top @max-[900px]/table:hidden">
+        <div className="inline-flex items-center gap-1.5 h-[22px] px-1.5 rounded-[4px] border border-border bg-foreground/[0.03]">
+          <Globe className="w-3 h-3" style={{ color: TRANSPORT_COLOR }} />
+          <span className="text-[10.5px] font-mono text-foreground/80">{lane.transport}</span>
+        </div>
+      </td>
+      <td className="py-3 align-top @max-[1100px]/table:hidden">
+        <div className="text-[11.5px] text-foreground">nano</div>
+        <div className="text-[10.5px] text-muted-foreground">Platform</div>
+      </td>
+      {showIngest && (
+        <td className="py-3 align-top @max-[760px]/table:hidden">
+          <IngestSummaryCell summary={lane.ingest} />
+        </td>
+      )}
+      <td className="py-3 align-top">
+        <span className="inline-flex items-center gap-1.5 h-[22px] px-2 rounded-[4px] border border-border text-[10.5px] font-mono uppercase tracking-wider text-muted-foreground">
+          Platform
+        </span>
+      </td>
+      <td className="py-3 align-top">
+        <span className="text-[10px] font-mono uppercase tracking-wider text-muted-foreground">Always on</span>
+      </td>
+      <td className="pr-3 py-3 align-top" />
     </tr>
   );
 }
@@ -1257,7 +1263,7 @@ function DeleteDialog({
           )}
           {checking ? (
             <div className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <LoadingIcon className="h-3.5 w-3.5" />
               Checking for associated routing rules…
             </div>
           ) : associatedRules.length > 0 ? (

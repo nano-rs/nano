@@ -144,7 +144,7 @@ export function stripLateralCommand(query: string): string {
 // is clean. Mirrors cloud-dossier's `appendCloudArg` rewrite pattern.
 export function rewriteLateralSeed(
   _query: string,
-  field: 'src_host' | 'user' | 'src_ip',
+  field: string,
   value: string
 ): string {
   const escaped = nplQuotedBody(value);
@@ -152,6 +152,8 @@ export function rewriteLateralSeed(
   // Prior base filters were often entity-filters that conflict with the new
   // seed, so we drop the whole prior search and let the new seed become the
   // entire query.
-  const seedMode = field === 'user' ? 'seed=user' : 'seed=host';
+  const seedMode = field === 'user' || field === 'actor.user.name' || field === 'user.name'
+    ? 'seed=user'
+    : 'seed=host';
   return `${filter} | lateral ${seedMode}`;
 }

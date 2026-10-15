@@ -1,0 +1,1844 @@
+[
+ {
+  "method": "POST",
+  "host": "oauth2.googleapis.com",
+  "path": "/token",
+  "status": 200,
+  "body": {
+   "access_token": "gws-mock-access",
+   "token_type": "Bearer",
+   "expires_in": 3600
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/users",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#users",
+   "users": [
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000000",
+     "primaryEmail": "gws0@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User0",
+      "fullName": "Gws User0"
+     },
+     "isAdmin": true,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "contractor",
+       "primary": true
+      }
+     ],
+     "relations": [],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0100",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10000"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000001",
+     "primaryEmail": "gws1@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User1",
+      "fullName": "Gws User1"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": true,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0101",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10001"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000002",
+     "primaryEmail": "gws2@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User2",
+      "fullName": "Gws User2"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0102",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10002"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000003",
+     "primaryEmail": "gws3@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User3",
+      "fullName": "Gws User3"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": true,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0103",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10003"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000004",
+     "primaryEmail": "gws4@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User4",
+      "fullName": "Gws User4"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "1970-01-01T00:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0104",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10004"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000005",
+     "primaryEmail": "gws5@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User5",
+      "fullName": "Gws User5"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": true,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0105",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10005"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000006",
+     "primaryEmail": "gws6@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User6",
+      "fullName": "Gws User6"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0106",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10006"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000007",
+     "primaryEmail": "gws7@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User7",
+      "fullName": "Gws User7"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "contractor",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0107",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10007"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000008",
+     "primaryEmail": "gws8@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User8",
+      "fullName": "Gws User8"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0108",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10008"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000009",
+     "primaryEmail": "gws9@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User9",
+      "fullName": "Gws User9"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "1970-01-01T00:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0109",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10009"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    }
+   ],
+   "nextPageToken": "MTA="
+  },
+  "query": {
+   "customer": "my_customer",
+   "projection": "full"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/users",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#users",
+   "users": [
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000010",
+     "primaryEmail": "gws10@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User10",
+      "fullName": "Gws User10"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 010a",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10010"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000011",
+     "primaryEmail": "gws11@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User11",
+      "fullName": "Gws User11"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 010b",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10011"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000012",
+     "primaryEmail": "gws12@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User12",
+      "fullName": "Gws User12"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 010c",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10012"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000013",
+     "primaryEmail": "gws13@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User13",
+      "fullName": "Gws User13"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 010d",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10013"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000014",
+     "primaryEmail": "gws14@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User14",
+      "fullName": "Gws User14"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "1970-01-01T00:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "contractor",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 010e",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10014"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000015",
+     "primaryEmail": "gws15@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User15",
+      "fullName": "Gws User15"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 010f",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10015"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000016",
+     "primaryEmail": "gws16@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User16",
+      "fullName": "Gws User16"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0110",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10016"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000017",
+     "primaryEmail": "gws17@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User17",
+      "fullName": "Gws User17"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0111",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10017"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000018",
+     "primaryEmail": "gws18@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User18",
+      "fullName": "Gws User18"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0112",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10018"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000019",
+     "primaryEmail": "gws19@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User19",
+      "fullName": "Gws User19"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "1970-01-01T00:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0113",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10019"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    }
+   ],
+   "nextPageToken": "MjA="
+  },
+  "query": {
+   "customer": "my_customer",
+   "projection": "full",
+   "pageToken": "MTA="
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/users",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#users",
+   "users": [
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000020",
+     "primaryEmail": "gws20@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User20",
+      "fullName": "Gws User20"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": true,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0114",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10020"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000021",
+     "primaryEmail": "gws21@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User21",
+      "fullName": "Gws User21"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "contractor",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0115",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10021"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000022",
+     "primaryEmail": "gws22@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User22",
+      "fullName": "Gws User22"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0116",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10022"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000023",
+     "primaryEmail": "gws23@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User23",
+      "fullName": "Gws User23"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "2026-10-09T12:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": true,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Engineering",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0117",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10023"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    },
+    {
+     "kind": "admin#directory#user",
+     "id": "100000000000000024",
+     "primaryEmail": "gws24@example.com",
+     "name": {
+      "givenName": "Gws",
+      "familyName": "User24",
+      "fullName": "Gws User24"
+     },
+     "isAdmin": false,
+     "isDelegatedAdmin": false,
+     "lastLoginTime": "1970-01-01T00:00:00.000Z",
+     "creationTime": "2025-01-01T00:00:00.000Z",
+     "suspended": false,
+     "archived": false,
+     "isEnrolledIn2Sv": false,
+     "orgUnitPath": "/",
+     "organizations": [
+      {
+       "name": "Example Corp",
+       "title": "Synthetic",
+       "department": "Finance",
+       "costCenter": "CC-1",
+       "description": "employee",
+       "primary": true
+      }
+     ],
+     "relations": [
+      {
+       "type": "manager",
+       "value": "gws0@example.com"
+      }
+     ],
+     "phones": [
+      {
+       "type": "work",
+       "value": "+1 555 0118",
+       "primary": true
+      }
+     ],
+     "externalIds": [
+      {
+       "type": "organization",
+       "value": "E10024"
+      }
+     ],
+     "addresses": [
+      {
+       "type": "work",
+       "locality": "Ottawa",
+       "countryCode": "CA",
+       "primary": true
+      }
+     ],
+     "locations": [
+      {
+       "type": "desk",
+       "area": "desk",
+       "buildingId": "HQ"
+      }
+     ]
+    }
+   ]
+  },
+  "query": {
+   "customer": "my_customer",
+   "projection": "full",
+   "pageToken": "MjA="
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/groups",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#groups",
+   "groups": [
+    {
+     "kind": "admin#directory#group",
+     "id": "0000000000000000",
+     "email": "admins@example.com",
+     "name": "Admins",
+     "directMembersCount": "6"
+    },
+    {
+     "kind": "admin#directory#group",
+     "id": "0000000000000001",
+     "email": "group1@example.com",
+     "name": "Group 1",
+     "directMembersCount": "5"
+    },
+    {
+     "kind": "admin#directory#group",
+     "id": "0000000000000002",
+     "email": "group2@example.com",
+     "name": "Group 2",
+     "directMembersCount": "5"
+    }
+   ]
+  },
+  "query": {
+   "customer": "my_customer"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/groups/0000000000000000/members",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#members",
+   "members": [
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000000",
+     "email": "gws0@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000001",
+     "email": "gws1@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000002",
+     "email": "gws2@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000003",
+     "email": "gws3@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000004",
+     "email": "gws4@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000005",
+     "email": "gws5@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000006",
+     "email": "gws6@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000007",
+     "email": "gws7@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000008",
+     "email": "gws8@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000009",
+     "email": "gws9@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "query": {
+   "includeDerivedMembership": "true"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/groups/0000000000000001/members",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#members",
+   "members": [
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000005",
+     "email": "gws5@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000006",
+     "email": "gws6@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000007",
+     "email": "gws7@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000008",
+     "email": "gws8@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000009",
+     "email": "gws9@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "query": {
+   "includeDerivedMembership": "true"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "admin.googleapis.com",
+  "path": "/admin/directory/v1/groups/0000000000000002/members",
+  "status": 200,
+  "body": {
+   "kind": "admin#directory#members",
+   "members": [
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000010",
+     "email": "gws10@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000011",
+     "email": "gws11@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000012",
+     "email": "gws12@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000013",
+     "email": "gws13@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    },
+    {
+     "kind": "admin#directory#member",
+     "id": "100000000000000014",
+     "email": "gws14@example.com",
+     "role": "MEMBER",
+     "type": "USER",
+     "status": "ACTIVE"
+    }
+   ]
+  },
+  "query": {
+   "includeDerivedMembership": "true"
+  }
+ }
+]

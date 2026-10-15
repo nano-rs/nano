@@ -25,7 +25,11 @@ pub(crate) fn generate_settings(
     has_selective_indexed_eq: bool,
     is_non_timechart_aggregation: bool,
 ) -> String {
-    let read_in_order = if has_selective_indexed_eq || is_non_timechart_aggregation { 0 } else { 1 };
+    let read_in_order = if has_selective_indexed_eq || is_non_timechart_aggregation {
+        0
+    } else {
+        1
+    };
     let agg_in_order = if is_non_timechart_aggregation { 0 } else { 1 };
     if use_cache {
         format!(
@@ -673,7 +677,12 @@ pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) 
                 .iter()
                 .map(|p| format!("'{}'", escape_string(p)))
                 .collect();
-            format!("JSONExtract{}({}, {})", json_type, col, path_args.join(", "))
+            format!(
+                "JSONExtract{}({}, {})",
+                json_type,
+                col,
+                path_args.join(", ")
+            )
         }
     }
 }
@@ -693,9 +702,9 @@ pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) 
 pub(crate) fn map_tail_access_sql(col: &str, fallback: Option<&str>, key: &str) -> String {
     let k = escape_string(key);
     match fallback {
-        Some(fb) => format!(
-            "if(has({col}, '{k}'), {col}['{k}'], if(has({fb}, '{k}'), {fb}['{k}'], ''))"
-        ),
+        Some(fb) => {
+            format!("if(has({col}, '{k}'), {col}['{k}'], if(has({fb}, '{k}'), {fb}['{k}'], ''))")
+        }
         None => format!("if(has({col}, '{k}'), {col}['{k}'], '')"),
     }
 }
@@ -875,8 +884,16 @@ pub(crate) fn anchored_guard_token(literal_lower: &str) -> Option<&str> {
 /// `lower(if(raw_data != '', raw_data, message))`. ClickHouse builds the index but
 /// the planner NEVER considers it (EXPLAIN shows no `Skip` entry at all) — text
 /// indexes do not match a non-trivial expression. Do not retry it.
+///
+/// NULL columns: the lean lake reads Parquet where an absent `message` /
+/// `raw_data` is NULL, so a leg here can evaluate to NULL. That is harmless for a
+/// positive search (NULL filters like false, and `NULL OR true` is true) but not
+/// under negation — see [`null_safe_not`], which every `NOT` goes through.
 pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str]) -> String {
-    debug_assert!(!cols.is_empty(), "keyword_search_columns() must never be empty");
+    debug_assert!(
+        !cols.is_empty(),
+        "keyword_search_columns() must never be empty"
+    );
     match cols {
         [col] => bare_keyword_predicate_for_column(kw, col),
         _ => {
@@ -893,6 +910,33 @@ pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str]) -> String {
     }
 }
 
+/// Negate a search predicate with two-valued (search) semantics, not SQL's
+/// three-valued logic (NAN-3037).
+///
+/// In search, a field or body column that is absent does not match any
+/// positive term, so `NOT <term>` must match it. SQL disagrees: on a NULL
+/// column `hasAllTokens(lower(message), 'x')` is NULL, `NOT NULL` is NULL, and
+/// WHERE drops the row. On the lean lake (Parquet, nullable columns) this made
+/// `svchost NOT <absent token>` return only the rows that had BOTH body columns
+/// set (6,821 of 116,486 live). `ifNull(inner, false)` turns "unknown" into
+/// "did not match" before negating.
+///
+/// This is the only place NULL needs folding. AND/OR are monotone, so under
+/// Kleene logic a NULL result means "false once every NULL leaf is false";
+/// WHERE already reads a top-level NULL as false, and every nested NOT is
+/// folded here. The result is exactly "a missing value never matches a leaf".
+///
+/// That gives the Splunk contract:
+/// - `field!=value` is a LEAF and excludes rows missing the field (NULL leaf);
+/// - `NOT field=value` includes them (NULL leaf, folded to false, negated).
+///
+/// Gen1 (MergeTree) body and UDM columns are non-Nullable, so `ifNull` is a
+/// no-op there and the results are unchanged. Skip indexes cannot prune a
+/// negated text/bloom predicate, so no index use is lost.
+pub(crate) fn null_safe_not(inner_sql: &str) -> String {
+    format!("NOT ifNull(({inner_sql}), false)")
+}
+
 /// The single-column predicate. Every arm below must stay index-compatible: the
 /// emitted expression is matched by ClickHouse against the text index BY
 /// EXPRESSION, so `lower(<col>)` here must mirror the DDL exactly.
@@ -907,17 +951,90 @@ fn bare_keyword_predicate_for_column(kw: &str, col: &str) -> String {
     // wildcard upstream; this covers single-sided forms that reach here as a bare
     // Keyword and stops `hasAllTokens` from tokenizing a `*`/`?` needle.)
     if lowered.contains('*') || lowered.contains('?') {
-        return format!("lower({col}) iLike '{}'", wildcard_to_like_pattern(&lowered));
+        return wildcard_keyword_predicate_for_column(&lowered, col);
     }
 
     let escaped = escape_string(&lowered);
 
     // All-separator needles (`!!!`) tokenize to nothing — keep the substring iLike.
-    if lowered.chars().all(|c| c.is_ascii() && !c.is_ascii_alphanumeric()) {
+    if lowered
+        .chars()
+        .all(|c| c.is_ascii() && !c.is_ascii_alphanumeric())
+    {
         return format!("lower({col}) iLike '%{}%'", escape_like_pattern(&escaped));
     }
 
     format!("hasAllTokens(lower({col}), '{}')", escaped)
+}
+
+/// A bare keyword carrying `*`/`?` (NAN-3041): Splunk TERM semantics.
+///
+/// `svch*` matches any term that STARTS with `svch` (`svchost.exe` anywhere in
+/// the body), `*host.exe` any term that ends with it, `svc*exe` a term that
+/// starts `svc` and ends `exe`. The old lowering was a whole-value
+/// `iLike 'svch%'`, which only matched when the ENTIRE message/raw_data began
+/// with `svch` — effectively never.
+///
+/// Emitted as `lower(col) iLike '%<pieces>%' AND match(col, <term regex>)`:
+/// - the `iLike` guard is the pre-existing substring form, implied by the term
+///   match (so it never drops a row), and keeps the gen1 `lower(col)` text
+///   index and the lean fragment/`positionCaseInsensitive` prefilters working;
+/// - the regex adds the term boundaries. A boundary is a character outside
+///   `[a-z0-9]` — the `splitByNonAlpha` / `nano_split_lower_v1` token rule — and
+///   is only required on a side that is not already a wildcard and whose
+///   needle character is itself alphanumeric. Inside the term, `*` spans any
+///   non-whitespace run and `?` one non-whitespace character.
+///
+/// `*kw*` (wildcards on both ends only) needs no boundary and stays the plain
+/// substring `iLike` (NAN-3034). Candidate hints for these needles are
+/// `contains`-mode (lake_query_compile), whose pruning only requires pieces as
+/// substrings — a superset of the term match, so the keyword index never
+/// prunes a matching block.
+fn wildcard_keyword_predicate_for_column(lowered: &str, col: &str) -> String {
+    let like = wildcard_to_like_pattern(lowered);
+    let first = lowered.chars().next();
+    let last = lowered.chars().last();
+    let is_wild = |c: Option<char>| matches!(c, Some('*' | '?'));
+    let is_alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let needs_start = !is_wild(first) && is_alnum(first);
+    let needs_end = !is_wild(last) && is_alnum(last);
+    let body = lowered.trim_matches('*');
+    if !needs_start && !needs_end && !body.contains(['*', '?']) {
+        // `*kw*` / `*-enc*` / all-wildcard: substring semantics already.
+        return format!("lower({col}) iLike '{like}'");
+    }
+
+    // Substring guard: the needle unanchored on both ends.
+    let guard_like = format!(
+        "{}{}{}",
+        if lowered.starts_with('*') { "" } else { "%" },
+        like,
+        if lowered.ends_with('*') { "" } else { "%" }
+    );
+
+    let mut term_regex = String::from("(?i)");
+    if needs_start {
+        term_regex.push_str("(?:^|[^a-z0-9])");
+    }
+    let mut literal = String::new();
+    for c in body.chars() {
+        match c {
+            '*' | '?' => {
+                term_regex.push_str(&regex::escape(&literal));
+                literal.clear();
+                term_regex.push_str(if c == '*' { r"\S*" } else { r"\S" });
+            }
+            other => literal.push(other),
+        }
+    }
+    term_regex.push_str(&regex::escape(&literal));
+    if needs_end {
+        term_regex.push_str("(?:$|[^a-z0-9])");
+    }
+    format!(
+        "(lower({col}) iLike '{guard_like}' AND match({col}, '{}'))",
+        escape_regex_pattern(&term_regex)
+    )
 }
 
 /// Add LIKE-pattern escaping on top of an already SQL-escaped string (single
@@ -997,6 +1114,7 @@ pub(crate) fn validate_regex_pattern(pattern: &str) -> Result<(), String> {
 /// Simple patterns like "explorer" can use hasToken() which leverages bloom filter indexes.
 /// Returns Some(token) if simple, None if it contains regex metacharacters.
 pub(crate) fn extract_simple_regex_token(pattern: &str) -> Option<String> {
+    let pattern = pattern.strip_prefix("(?i)").unwrap_or(pattern);
     // Regex metacharacters that indicate a complex pattern
     const REGEX_METACHARACTERS: &[char] = &[
         '^', '$', '.', '*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '\\',
@@ -1213,29 +1331,34 @@ fn extract_literal_alternation(pat: &str) -> Option<Vec<String>> {
 /// winning piece is a substring of it, so the new guard is implied by the old
 /// one — the soundness profile is exactly the pre-existing behavior, never
 /// worse.
+///
+/// SOUNDNESS (NAN-2361). The returned literal becomes an ANDed `iLike` guard in
+/// front of `match()`, so it must be present in EVERY string the pattern
+/// matches. The original implementation split the raw pattern on
+/// metacharacters and took the longest piece, which silently harvested
+/// literals out of alternation branches and optional groups:
+/// `/^(ws|wks)/` produced the guard `%wks%` and therefore returned ZERO rows
+/// for `ws-sales-131`, and `/admin(istrator)?/` produced `%istrator%` and lost
+/// every bare `admin`. The guard is now derived from the parsed HIR and only
+/// from literal runs that every match must contain.
 fn extract_longest_literal(pat: &str) -> Option<String> {
-    let mut best = String::new();
-    let mut current = String::new();
-    let mut chars = pat.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            // Escaped character — the next char is a literal
-            if let Some(escaped) = chars.next() {
-                current.push(escaped);
-            }
-        } else if is_regex_metachar(c) {
-            if current.len() > best.len() {
-                best = current.clone();
-            }
-            current.clear();
+    // A leading global flag is stripped by the caller; strip again so direct
+    // callers behave identically and so `(?i)` does not explode the literals
+    // into character classes (which would yield no guard at all).
+    let pat = pat.strip_prefix("(?i)").unwrap_or(pat);
+    // An unparseable pattern (lookaround, or anything regex-syntax rejects
+    // that RE2/ClickHouse would accept) yields NO guard. Losing a guard costs
+    // a scan; inventing one costs correctness.
+    let hir = regex_syntax::Parser::new().parse(pat).ok()?;
+    let mut runs = Vec::new();
+    mandatory_literal_runs(&hir, &mut runs);
+    let best = runs.into_iter().fold(String::new(), |accumulator, run| {
+        if run.len() > accumulator.len() {
+            run
         } else {
-            current.push(c);
+            accumulator
         }
-    }
-    if current.len() > best.len() {
-        best = current;
-    }
+    });
 
     if best.is_empty() {
         return None;
@@ -1254,6 +1377,43 @@ fn extract_longest_literal(pat: &str) -> Option<String> {
         Some(best)
     } else {
         Some(token.to_string())
+    }
+}
+
+/// Walk the HIR collecting every literal run that EVERY match must contain.
+///
+/// A run is mandatory only when it is reachable unconditionally: literals in
+/// a concatenation, inside a capture, or inside a repetition with `min >= 1`.
+/// Alternation branches and zero-min repetitions contribute NOTHING — see
+/// [`extract_longest_literal`] for why picking a branch literal is a silent
+/// wrong answer.
+fn mandatory_literal_runs(hir: &regex_syntax::hir::Hir, out: &mut Vec<String>) {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Literal(literal) => {
+            if let Ok(text) = std::str::from_utf8(&literal.0) {
+                if !text.is_empty() {
+                    out.push(text.to_string());
+                }
+            }
+        }
+        HirKind::Capture(capture) => mandatory_literal_runs(&capture.sub, out),
+        HirKind::Repetition(repetition) if repetition.min > 0 => {
+            mandatory_literal_runs(&repetition.sub, out)
+        }
+        HirKind::Concat(expressions) => {
+            for expression in expressions {
+                mandatory_literal_runs(expression, out);
+            }
+        }
+        // Alternation: no literal is common to every branch in the SUBSTRING
+        // sense a guard needs, so contribute none. Zero-min repetition
+        // (`(istrator)?`, `(foo)*`): the sub may not appear at all.
+        HirKind::Alternation(_)
+        | HirKind::Empty
+        | HirKind::Class(_)
+        | HirKind::Look(_)
+        | HirKind::Repetition(_) => {}
     }
 }
 
@@ -1322,10 +1482,74 @@ fn unescape_regex_literal(s: &str) -> String {
 /// syntax uses and what the corpus leans on.
 /// Example: "(?<user>\w+)@(?P<domain>\w+)" -> ["user", "domain"]
 pub(crate) fn extract_named_groups(pattern: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"\(\?P?<([^>]+)>").unwrap();
-    re.captures_iter(pattern)
-        .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+    named_capture_groups(pattern)
+        .into_iter()
+        .map(|(name, _)| name)
         .collect()
+}
+
+/// NAN-3327: true when `spath input=<column> path=<p>` must parse the JSON
+/// TEXT held in `<column>` (`raw_data`, `message`) rather than address the
+/// nested schema path `<column>.<p>` (`input=src_endpoint path=ip`).
+pub(crate) fn spath_reads_column_text(
+    profile: &dyn crate::schema::SchemaProfile,
+    input: Option<&str>,
+    path: &str,
+) -> bool {
+    let Some(input) = input else { return false };
+    if matches!(input, "ext" | "event" | "unmapped") {
+        return false;
+    }
+    profile.is_known_field(input) && !profile.is_known_field(&format!("{input}.{path}"))
+}
+
+/// `a.b.c` → `'a', 'b', 'c'` for `JSONExtract*` key arguments.
+pub(crate) fn spath_path_args(path: &str) -> String {
+    path.split('.')
+        .filter(|part| !part.is_empty())
+        .map(|part| format!("'{}'", escape_string(part)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Every named capture group of `pattern` with its 1-based index among ALL
+/// capturing groups, the numbering `extractGroups` uses (NAN-3327). An unnamed
+/// `( … )` group counts; `(?: … )`, lookarounds, inline flags, escaped parens
+/// and parens inside a `[ … ]` class do not. Assigning names by their order
+/// among NAMED groups put `port` on the unnamed `(:(?<port>…))` wrapper.
+pub(crate) fn named_capture_groups(pattern: &str) -> Vec<(String, usize)> {
+    let bytes = pattern.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    let mut in_class = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => {
+                let rest = &pattern[i + 1..];
+                let named = rest
+                    .strip_prefix("?P<")
+                    .or_else(|| rest.strip_prefix("?<"))
+                    .filter(|r| !r.starts_with('=') && !r.starts_with('!'))
+                    .and_then(|r| r.find('>').map(|end| &r[..end]));
+                if let Some(name) = named {
+                    index += 1;
+                    out.push((name.to_string(), index));
+                } else if !rest.starts_with('?') {
+                    index += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Convert named capture groups to numbered groups for ClickHouse.
@@ -1468,6 +1692,19 @@ mod inline_tests {
         assert_eq!(
             extract_named_groups(r"(?P<method>GET|POST)\s+(?P<path>/\S+)"),
             vec!["method".to_string(), "path".to_string()]
+        );
+    }
+
+    /// NAN-3327: names map to their index among ALL capturing groups.
+    #[test]
+    fn named_groups_index_counts_unnamed_groups_nan3327() {
+        assert_eq!(
+            named_capture_groups(r"https?://(?<host>[^/:]+)(:(?<port>\d+))?(?<path>/.*)"),
+            vec![("host".to_string(), 1), ("port".to_string(), 3), ("path".to_string(), 4)]
+        );
+        assert_eq!(
+            named_capture_groups(r"(?:a)(?=b)\((?P<x>[(]y)(?<!z)(?i)(w)(?<v>.)"),
+            vec![("x".to_string(), 1), ("v".to_string(), 3)]
         );
     }
 
@@ -1739,15 +1976,133 @@ mod inline_tests {
         );
     }
 
+    /// NAN-2361 CANDIDATE-SUPERSET INVARIANT.
+    ///
+    /// `analyze_regex_for_optimization` feeds an ANDed `iLike '%token%'` guard
+    /// in front of `match()`. The guard is a candidate filter, never the
+    /// predicate — so it MUST NOT exclude any string the regex accepts.
+    ///
+    /// This models the emitted SQL in Rust: `match()` is the compiled regex
+    /// (case-insensitive, unanchored `is_match`, exactly what ClickHouse runs
+    /// for `'(?i)<pat>'`) and the guard is a case-insensitive substring test,
+    /// exactly what `lower(col) iLike '%tok%'` computes. Any sample the regex
+    /// matches but the guard rejects is a silently lost row.
+    ///
+    /// The anchored-alternation-with-unequal-branch-lengths shape is the one
+    /// that shipped broken (`/^(ws|wks)/` → guard `%wks%` → zero rows for
+    /// `ws-sales-131.corp.local`), so it leads the corpus.
+    #[test]
+    fn regex_guard_never_excludes_a_row_the_pattern_matches() {
+        // (pattern, samples). Every sample the pattern matches must survive
+        // whatever guard the optimizer chooses.
+        let corpus: &[(&str, &[&str])] = &[
+            // Anchored alternation, unequal branch lengths — the shipped bug.
+            ("^(ws|wks)", &["ws-sales-131.corp.local", "wks-eng-7"]),
+            ("^(wks|ws)", &["ws-sales-131.corp.local", "wks-eng-7"]),
+            ("^(ws-|wks-)", &["ws-sales-131.corp.local", "wks-eng-7"]),
+            // Anchored alternation, EQUAL branch lengths >= 3: also broken
+            // before the fix (the first longest piece won).
+            ("^(abc|xyz)", &["abc-1", "xyz-1"]),
+            ("^(corp|corporate)", &["corp-dc-01", "corporate-dc-01"]),
+            // Unanchored alternations and alternations with a metachar branch.
+            ("(ws|wks)", &["a-ws-1", "a-wks-1"]),
+            ("(error|warn.*)", &["an error here", "warning here"]),
+            ("x(y|z)", &["axy", "axz"]),
+            // Optional / zero-min groups.
+            ("admin(istrator)?", &["admin", "administrator"]),
+            ("(mimikatz)*sekurlsa", &["sekurlsa::logonpasswords"]),
+            // Suffix alternation.
+            (r"\.(exe|scr)$", &["payload.exe", "payload.scr"]),
+            // Mandatory literals mixed with alternation — the guard should
+            // still be taken, from the mandatory part only.
+            (
+                r"svchost\.exe (started|stopped)",
+                &["svchost.exe started", "svchost.exe stopped"],
+            ),
+            ("(net|net1) user", &["net user", "net1 user"]),
+            (r"foo.*(bar|bazlong)", &["foo bar", "foo bazlong"]),
+            // Plain mandatory-literal patterns (guard must stay effective).
+            (r"powershell.*-enc.*", &["powershell -enc AAA"]),
+            (r".*mimikatz.*sekurlsa.*", &["x mimikatz y sekurlsa z"]),
+            ("[ab]cdef", &["acdef", "bcdef"]),
+        ];
+
+        for (pattern, samples) in corpus {
+            let compiled = regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .unwrap_or_else(|error| panic!("test pattern `{pattern}` is invalid: {error}"));
+            let guard = match analyze_regex_for_optimization(pattern) {
+                Some(RegexOptimization::BloomGuard(token)) => Some(token),
+                // Prefix/Suffix/LiteralAlternation are complete rewrites, not
+                // ANDed guards; this invariant covers the guard arm.
+                _ => None,
+            };
+            for sample in *samples {
+                assert!(
+                    compiled.is_match(sample),
+                    "test corpus is wrong: `{pattern}` does not match `{sample}`"
+                );
+                if let Some(token) = &guard {
+                    assert!(
+                        sample.to_lowercase().contains(&token.to_lowercase()),
+                        "CANDIDATE-SUPERSET VIOLATION: guard `%{token}%` excludes \
+                         `{sample}`, which `/{pattern}/` matches"
+                    );
+                }
+            }
+        }
+    }
+
+    /// NAN-2361: the exact shapes observed against the live OCSF lake. An
+    /// alternation branch is never a mandatory literal, so no guard is taken.
+    #[test]
+    fn anchored_alternation_takes_no_bloom_guard() {
+        for pattern in [
+            "^(ws|wks)",
+            "^(wks|ws)",
+            "^(ws-|wks-)",
+            "^(abc|xyz)",
+            "^(corp|corporate)",
+            "^(ws|wks)$",
+            "(?i)^(ws|wks)",
+        ] {
+            assert_eq!(
+                extract_longest_literal(pattern.strip_prefix("(?i)").unwrap_or(pattern)),
+                None,
+                "`{pattern}` must yield no mandatory literal"
+            );
+            assert_eq!(
+                analyze_regex_for_optimization(pattern),
+                None,
+                "`{pattern}` must fall back to a bare match()"
+            );
+        }
+    }
+
+    /// NAN-2361: a zero-min repetition is optional, so its literal is not
+    /// mandatory. `admin(istrator)?` keeps the mandatory `admin` guard and
+    /// must NOT keep `istrator`.
+    #[test]
+    fn optional_group_literal_is_not_a_mandatory_guard() {
+        assert_eq!(
+            extract_longest_literal("admin(istrator)?"),
+            Some("admin".to_string())
+        );
+        assert_eq!(
+            extract_longest_literal("(mimikatz)*sekurlsa"),
+            Some("sekurlsa".to_string())
+        );
+        // `.` alone is the only mandatory literal and is below the 3-char bar.
+        assert_eq!(analyze_regex_for_optimization(r"\.(exe|scr)$"), None);
+    }
+
     #[test]
     fn test_longest_guard_token() {
         // Multi-token needles → longest qualifying token; ties → first.
         assert_eq!(longest_guard_token("failed login"), Some("failed"));
         assert_eq!(longest_guard_token("svchost.exe"), Some("svchost"));
-        assert_eq!(
-            longest_guard_token("failed_login_attempt"),
-            Some("attempt")
-        );
+        assert_eq!(longest_guard_token("failed_login_attempt"), Some("attempt"));
         assert_eq!(
             longest_guard_token("news.ycombinator.com"),
             Some("ycombinator")
@@ -1818,7 +2173,10 @@ mod inline_tests {
         // Multi-token literal → longest qualifying token (ties → first), same
         // as the keyword guard.
         assert_eq!(anchored_guard_token("svchost.exe started"), Some("svchost"));
-        assert_eq!(anchored_guard_token("run mimikatz64.log"), Some("mimikatz64"));
+        assert_eq!(
+            anchored_guard_token("run mimikatz64.log"),
+            Some("mimikatz64")
+        );
         // NAN-1416 bar still applies: short tokens never guard…
         assert_eq!(anchored_guard_token(".exe"), None);
         assert_eq!(anchored_guard_token("admin"), None);

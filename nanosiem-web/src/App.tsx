@@ -1,28 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { lazyWithRetry } from '@/lib/lazyWithRetry';
+import { customInventoryRedirect } from '@/lib/api/marketplace-inventory';
 
-import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, Link } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, useSearchParams, Link } from 'react-router-dom';
 import { useTier, TierProvider } from '@/hooks/use-tier';
 import { useState, useEffect, lazy, Suspense, ComponentType } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ThemeProvider } from '@/components/theme-provider';
-
-// Helper to handle chunk load failures after deployments
-// When a new version is deployed, old chunk files may no longer exist
-// This wrapper auto-refreshes the page to load the new bundle
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function lazyWithRetry<T extends ComponentType<any>>(
-  importFn: () => Promise<{ default: T }>
-): React.LazyExoticComponent<T> {
-  return lazy(() =>
-    importFn().catch(() => {
-      // Chunk failed to load - likely a new deployment
-      // Refresh to get the new bundle
-      window.location.reload();
-      // Return a never-resolving promise to prevent error flash
-      return new Promise(() => {});
-    })
-  );
-}
 
 // Variant for named exports
 // NAN-998: throw loudly if the named export is missing (e.g. caller mismatched
@@ -58,25 +41,26 @@ function lazyWithRetryNamed<T extends ComponentType<any>>(
   );
 }
 
-// Create a QueryClient instance for React Query
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 1000 * 60, // 1 minute
-      retry: 1,
-    },
-  },
-});
-
 // Context providers and core components - keep eager
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
+import { TenantRuntimeBoundary } from '@/components/auth/TenantRuntimeBoundary';
+import {
+  tenantBasename,
+  tenantSlugFromLoginPath,
+  tenantSlugFromMfaSetupPath,
+} from '@/lib/tenant-auth-shell';
 import { UserPreferencesProvider, useUserPreferences } from '@/contexts/UserPreferencesContext';
 import { useOnboardingProgress } from '@/hooks/use-api';
+import { SsoRouteGate } from '@/pages/Settings/SsoRouteGate';
+import { IocListsRouteGate } from '@/pages/IocListsRouteGate';
 import { useRegisterSchemaHighlightFields } from '@/hooks/useRegisterSchemaHighlightFields';
 import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
 import { LayoutProvider } from '@/contexts/LayoutContext';
 import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
 import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
+import { RetiredOnSharedRoute } from '@/components/auth/RetiredOnSharedRoute';
+import { VectorRequiredRoute } from '@/components/add-data/VectorRequiredRoute';
+import { CLOUD_PULL_PATH } from '@/lib/shared-credentials-retired';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { PageContextProvider } from '@/contexts/PageContext';
 import { Toaster } from '@/components/ui/sonner';
@@ -100,10 +84,18 @@ import { Demo } from '@/enterprise/pages/Demo';
 import { DemoClaim } from '@/enterprise/pages/DemoClaim';
 import { Setup } from '@/pages/Setup';
 import { AuthCallback } from '@/enterprise/pages/AuthCallback';
+import {
+  EnterpriseSharedOidcCallback,
+  EnterpriseSharedOidcEntry,
+} from '@/pages/EnterpriseSharedOidc';
+import { EnterpriseSharedActivation } from '@/pages/EnterpriseSharedActivation';
+import { EnterpriseSharedMembershipAcceptance } from '@/pages/EnterpriseSharedMembershipAcceptance';
 import Denied from '@/pages/Denied';
 
 // Dashboard and Search are lazy-loaded — they pull in heavy visualization deps
 // (recharts, @xyflow/react, react-markdown) that would bloat the main bundle
+// On-demand threat-intel enrichment sheet; listens for Enrich actions app-wide.
+const EnrichSheetHost = lazyWithRetryNamed(() => import('@/components/threat-intel/EnrichSheet'), 'EnrichSheetHost');
 const Dashboard = lazyWithRetryNamed(() => import('@/pages/Dashboard'), 'Dashboard');
 const Search = lazyWithRetryNamed(() => import('@/pages/Search'), 'Search');
 const TracePage = lazyWithRetryNamed(() => import('@/pages/TracePage'), 'TracePage');
@@ -144,8 +136,14 @@ const Rules = lazyWithRetryNamed(() => import('@/pages/Rules'), 'Rules');
 const Matches = lazyWithRetryNamed(() => import('@/pages/Matches'), 'Matches');
 // NAN-1791: auto retro-hunt rules (new + config/run-history).
 const RetroHunt = lazyWithRetryNamed(() => import('@/pages/RetroHunt'), 'RetroHunt');
+const SourceOnboarding = lazyWithRetryNamed(() => import('@/pages/SourceOnboarding'), 'SourceOnboarding');
 const LogSources = lazyWithRetryNamed(() => import('@/pages/LogSources'), 'LogSources');
+const Pipelines = lazyWithRetryNamed(() => import('@/pages/Pipelines'), 'Pipelines');
+const IngestCredentials = lazyWithRetryNamed(() => import('@/pages/IngestCredentials'), 'IngestCredentials');
+const ConnectorFeeds = lazyWithRetryNamed(() => import('@/pages/ConnectorFeeds'), 'ConnectorFeeds');
+const CloudPull = lazyWithRetryNamed(() => import('@/pages/CloudPull'), 'CloudPull');
 const Risk = lazyWithRetryNamed(() => import('@/enterprise/pages/Risk'), 'Risk');
+const RiskWatchlists = lazyWithRetryNamed(() => import('@/enterprise/pages/RiskWatchlists'), 'RiskWatchlists');
 const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
 const Dashboards = lazyWithRetryNamed(() => import('@/pages/Dashboards'), 'Dashboards');
 const DashboardView = lazyWithRetryNamed(() => import('@/pages/DashboardView'), 'DashboardView');
@@ -187,6 +185,7 @@ const Credentials = lazyWithRetryNamed(() => import('@/pages/Credentials'), 'Cre
 // module['Upload'] was undefined.
 const Upload = lazyWithRetry(() => import('@/pages/Upload'));
 const LookupTables = lazyWithRetryNamed(() => import('@/pages/LookupTables'), 'LookupTables');
+const IocLists = lazyWithRetryNamed(() => import('@/pages/IocLists'), 'IocLists');
 const LookupTableCreate = lazyWithRetryNamed(() => import('@/pages/LookupTableCreate'), 'LookupTableCreate');
 const LookupTableView = lazyWithRetryNamed(() => import('@/pages/LookupTableView'), 'LookupTableView');
 const Notebooks = lazyWithRetryNamed(() => import('@/enterprise/pages/Notebooks'), 'Notebooks');
@@ -211,6 +210,7 @@ const CaseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Setting
 const QueueSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/QueueSettings'), 'QueueSettings');
 const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSettings'), 'UserSettings');
 const NotificationSettings = lazyWithRetryNamed(() => import('@/pages/Settings/NotificationSettings'), 'NotificationSettings');
+const LookupUrlAllowlist = lazyWithRetryNamed(() => import('@/pages/Settings/LookupUrlAllowlist'), 'LookupUrlAllowlist');
 const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
 const SourceScopes = lazyWithRetryNamed(() => import('@/pages/Settings/SourceScopes'), 'SourceScopes');
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
@@ -230,8 +230,9 @@ function SetupRedirect({ children }: { children: React.ReactNode }) {
   const location = useLocation();
 
   useEffect(() => {
-    // Skip check if already on setup page
-    if (location.pathname === '/setup') {
+    // Shared auth-shell routes cannot call the legacy global setup endpoint.
+    if (location.pathname === '/setup' || location.pathname.startsWith('/t/')) {
+      setNeedsSetup(false);
       setIsChecking(false);
       return;
     }
@@ -268,6 +269,56 @@ function SetupRedirect({ children }: { children: React.ReactNode }) {
   }
 
   return <>{children}</>;
+}
+
+function rawBrowserPath(fallback: string): string {
+  return typeof window === 'undefined' ? fallback : window.location.pathname;
+}
+
+/**
+ * `/login` under a tenant basename IS the tenant login: the slug comes from
+ * the browser path (`/t/<slug>/login`), validated against the auth contract.
+ * Outside a tenant prefix it is the plain product login.
+ */
+function LoginRoute() {
+  const raw = rawBrowserPath('/');
+  if (!raw.startsWith('/t/')) return <Login />;
+  try {
+    return <Login tenantSlug={tenantSlugFromLoginPath(raw)} />;
+  } catch {
+    return <Denied />;
+  }
+}
+
+/** `/mfa-setup` under a tenant basename must agree with the continuation state. */
+function MfaSetupRoute() {
+  const location = useLocation();
+  const raw = rawBrowserPath('/');
+  if (!raw.startsWith('/t/')) return <MfaSetup />;
+  try {
+    const tenantSlug = tenantSlugFromMfaSetupPath(raw);
+    const stateTenant = (location.state as { tenantSlug?: string } | null)?.tenantSlug;
+    if (stateTenant !== undefined && stateTenant !== tenantSlug) return <Denied />;
+    return <MfaSetup />;
+  } catch {
+    return <Denied />;
+  }
+}
+
+/**
+ * A shared-lake tenant gets the FULL product. This used to redirect every
+ * hosted-shared session into a three-surface "tenant shell" under
+ * `/t/<slug>/`, which is what the first real tenant landed on after two
+ * months of infrastructure work (2026-09-16) -- no rail, no product. The API
+ * mounts the whole product in hosted-shared mode (only risk analytics,
+ * entity context and notebooks are held back), and capabilities already gate
+ * what the tenant's plan enables, so there is nothing for a reduced shell to
+ * protect. `/t/<slug>/...` survives as redirects for the links already in
+ * inboxes and bookmarks.
+ */
+function ProductRouteGate({ children }: { children: React.ReactNode }) {
+  // Under a tenant basename `/login` already resolves to `/t/<slug>/login`.
+  return <ProtectedRoute>{children}</ProtectedRoute>;
 }
 
 // Helper component to wrap routes with permission checks
@@ -382,6 +433,15 @@ function LegacyEnrichmentRoute() {
       }
     />
   );
+}
+
+function CustomInventoryRoute() {
+  const { user } = useAuth();
+  const { id } = useParams();
+  const [params] = useSearchParams();
+  const redirect = customInventoryRedirect(id ?? '', user?.deployment_mode === 'enterprise_shared', params.toString());
+  if (redirect) return <Navigate to={redirect} replace />;
+  return <Suspense fallback={<EditorLoadingFallback />}><CustomEnrichmentWizard /></Suspense>;
 }
 
 // NAN-1111: the agent-enrichment deep-link only ever dispatched
@@ -651,6 +711,14 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          {/* NAN-3228: risk watchlists; NAN-3232: own grant (plus risk:view server-side) */}
+          <Route path="/risk/watchlists" element={
+            <PermissionRoute permission="risk:watchlists" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <RiskWatchlists key={resetKey} />
+              </Suspense>
+            } />
+          } />
           <Route path="/settings/risk" element={
             <PermissionRoute permission="risk:configure" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
@@ -823,19 +891,19 @@ function ProtectedAppRoutes() {
           } />
           <Route path="/enrichments/custom/:id" element={
             <PermissionRoute permission="enrichments:view" element={
-              <Suspense fallback={<EditorLoadingFallback />}>
-                <CustomEnrichmentWizard key={resetKey} />
-              </Suspense>
+              <CustomInventoryRoute key={resetKey} />
             } />
           } />
 
           {/* Custom scheduled API integrations */}
           <Route path="/integrations/custom/new" element={
-            <PermissionRoute permission="log_sources:create" element={
-              <Suspense fallback={<EditorLoadingFallback />}>
-                <CustomIntegrationWizard key={resetKey} />
-              </Suspense>
-            } />
+            <VectorRequiredRoute title="New custom integration">
+              <PermissionRoute permission="log_sources:create" element={
+                <Suspense fallback={<EditorLoadingFallback />}>
+                  <CustomIntegrationWizard key={resetKey} />
+                </Suspense>
+              } />
+            </VectorRequiredRoute>
           } />
           <Route path="/integrations/custom/:id" element={
             <PermissionRoute permission="log_sources:view" element={
@@ -845,6 +913,16 @@ function ProtectedAppRoutes() {
             } />
           } />
 
+          <Route path="/ingestion/pipelines" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}><Pipelines key={resetKey} /></Suspense>
+            } />
+          } />
+          <Route path="/ingestion/pipelines/:id" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}><Pipelines key={resetKey} /></Suspense>
+            } />
+          } />
           {/* Log Sources */}
           <Route path="/ingestion/log-sources" element={
             <PermissionRoute permission="log_sources:view" element={
@@ -853,17 +931,48 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          <Route path="/ingestion/log-sources/onboarding" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}><SourceOnboarding key={resetKey} /></Suspense>
+            } />
+          } />
+          {/* NAN-3844: the Add data wizard creates Vector-delivered sources. */}
           <Route path="/ingestion/log-sources/new" element={
-            <PermissionRoute permission="log_sources:create" element={
-              <Suspense fallback={<WizardLoadingFallback />}>
-                <AddFeed key={resetKey} />
+            <VectorRequiredRoute title="Add data">
+              <PermissionRoute permission="log_sources:create" element={
+                <Suspense fallback={<WizardLoadingFallback />}>
+                  <AddFeed key={resetKey} />
+                </Suspense>
+              } />
+            </VectorRequiredRoute>
+          } />
+          <Route path="/ingestion/log-sources/wizard" element={
+            <VectorRequiredRoute title="Add data">
+              <PermissionRoute permission="log_sources:create" element={
+                <Suspense fallback={<WizardLoadingFallback />}>
+                  <AddFeed key={resetKey} />
+                </Suspense>
+              } />
+            </VectorRequiredRoute>
+          } />
+          {/* NAN-2593: hosted-shared ingest credentials (Log Sources → Credentials). */}
+          <Route path="/ingestion/log-sources/credentials" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <IngestCredentials key={resetKey} />
               </Suspense>
             } />
           } />
-          <Route path="/ingestion/log-sources/wizard" element={
-            <PermissionRoute permission="log_sources:create" element={
-              <Suspense fallback={<WizardLoadingFallback />}>
-                <AddFeed key={resetKey} />
+          {/* NAN-3596: hosted-shared cloud pull (Log Sources → Cloud pull). */}
+          <Route path="/ingestion/connector-feeds" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}><ConnectorFeeds key={resetKey} /></Suspense>
+            } />
+          } />
+          <Route path="/ingestion/log-sources/cloud-pull" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <CloudPull key={resetKey} />
               </Suspense>
             } />
           } />
@@ -876,23 +985,31 @@ function ProtectedAppRoutes() {
           } />
 
           {/* Cloud Credentials — single consolidated page; legacy /new and /:id
-              routes redirect into it via query params. */}
+              routes redirect into it via query params. Retired on hosted-shared
+              (NAN-3620): cloud pull is keyless, so every credentials route
+              lands on Log Sources → Cloud pull there. */}
           <Route path="/ingestion/credentials" element={
-            <PermissionRoute permission="credentials:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <Credentials key={resetKey} />
-              </Suspense>
-            } />
+            <RetiredOnSharedRoute to={CLOUD_PULL_PATH}>
+              <PermissionRoute permission="credentials:view" element={
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <Credentials key={resetKey} />
+                </Suspense>
+              } />
+            </RetiredOnSharedRoute>
           } />
           <Route path="/ingestion/credentials/new" element={
-            <Navigate to="/ingestion/credentials?add=aws_s3" replace />
+            <RetiredOnSharedRoute to={CLOUD_PULL_PATH}>
+              <Navigate to="/ingestion/credentials?add=aws_s3" replace />
+            </RetiredOnSharedRoute>
           } />
           <Route path="/ingestion/credentials/:id" element={
-            <PermissionRoute permission="credentials:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <Credentials key={resetKey} />
-              </Suspense>
-            } />
+            <RetiredOnSharedRoute to={CLOUD_PULL_PATH}>
+              <PermissionRoute permission="credentials:view" element={
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <Credentials key={resetKey} />
+                </Suspense>
+              } />
+            </RetiredOnSharedRoute>
           } />
 
           {/* Upload & Lookup */}
@@ -908,6 +1025,17 @@ function ProtectedAppRoutes() {
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <LookupTables key={resetKey} />
               </Suspense>
+            } />
+          } />
+          {/* NAN-3467: gated on capabilities.iocLists — only hosted-shared
+              tenants mount /api/ioc-lists. */}
+          <Route path="/rules/ioc-lists" element={
+            <PermissionRoute permission="enrichments:view" element={
+              <IocListsRouteGate>
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <IocLists key={resetKey} />
+                </Suspense>
+              </IocListsRouteGate>
             } />
           } />
           <Route path="/rules/lookup-tables/new" element={
@@ -940,6 +1068,11 @@ function ProtectedAppRoutes() {
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <NotificationSettings key={resetKey} />
               </Suspense>
+            } />
+          } />
+          <Route path="/settings/integrations/lookup-url-allowlist" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}><LookupUrlAllowlist key={resetKey} /></Suspense>
             } />
           } />
           <Route path="/settings/search" element={
@@ -1069,15 +1202,19 @@ function ProtectedAppRoutes() {
           <Route path="/settings/roles" element={
             <Navigate to="/settings/access-control?tab=roles" replace />
           } />
+          {/* NAN-3378: gated on capabilities.sso — open builds have no
+              OIDC API, so render a notice instead of a page that 404s. */}
           <Route path="/settings/oidc" element={
             <PermissionRoute permission="settings:system" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <OidcProvidersPage key={resetKey} />
-              </Suspense>
+              <SsoRouteGate>
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <OidcProvidersPage key={resetKey} />
+                </Suspense>
+              </SsoRouteGate>
             } />
           } />
           {/* NAN-1005: `/settings/sso` is the spec'd path; the canonical
-              implementation lives at /settings/oidc. */}
+              implementation lives at /settings/oidc (which carries the gate). */}
           <Route path="/settings/sso" element={
             <Navigate to="/settings/oidc" replace />
           } />
@@ -1144,41 +1281,58 @@ function ProtectedAppRoutes() {
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <ThemeProvider>
-        <BrowserRouter>
-          <CapabilitiesProvider>
-          <AuthProvider>
+    <ThemeProvider>
+      {/*
+        A shared-lake tenant's whole product lives under `/t/<slug>/…` (the
+        way a workspace-scoped SaaS URL does): the router's basename carries
+        the selector, so every absolute link in the product resolves inside
+        the tenant and every auth continuation can read it off the URL.
+        Outside a tenant prefix the basename is unset and nothing changes.
+      */}
+      <BrowserRouter basename={tenantBasename(rawBrowserPath('/'))}>
+        <AuthProvider>
+          <TenantRuntimeBoundary>
+            <CapabilitiesProvider>
             <UserPreferencesProvider>
               <SetupRedirect>
                 <Routes>
                 {/* Public routes - outside ProtectedRoute */}
-                <Route path="/login" element={<Login />} />
-                <Route path="/mfa-setup" element={<MfaSetup />} />
+                <Route path="/login" element={<LoginRoute />} />
+                <Route path="/mfa-setup" element={<MfaSetupRoute />} />
                 <Route path="/demo" element={<Demo />} />
                 <Route path="/d/:token" element={<DemoClaim />} />
                 <Route path="/denied" element={<Denied />} />
                 <Route path="/setup" element={<Setup />} />
                 <Route path="/auth/callback/:provider" element={<AuthCallback />} />
+                <Route path="/auth/shared/oidc/entry" element={<EnterpriseSharedOidcEntry />} />
+                <Route path="/auth/shared/oidc/callback" element={<EnterpriseSharedOidcCallback />} />
+                <Route path="/auth/shared/activate" element={<EnterpriseSharedActivation />} />
+                <Route
+                  path="/auth/shared/memberships/accept"
+                  element={<EnterpriseSharedMembershipAcceptance />}
+                />
 
                 {/* Protected routes - require authentication */}
                 <Route
                   path="/*"
                   element={
-                    <ProtectedRoute>
+                    <ProductRouteGate>
                       <ProtectedAppRoutes />
-                    </ProtectedRoute>
+                    </ProductRouteGate>
                   }
                 />
               </Routes>
               </SetupRedirect>
               <Toaster />
+              <Suspense fallback={null}>
+                <EnrichSheetHost />
+              </Suspense>
             </UserPreferencesProvider>
-          </AuthProvider>
-          </CapabilitiesProvider>
-        </BrowserRouter>
-      </ThemeProvider>
-    </QueryClientProvider>
+            </CapabilitiesProvider>
+          </TenantRuntimeBoundary>
+        </AuthProvider>
+      </BrowserRouter>
+    </ThemeProvider>
   );
 }
 

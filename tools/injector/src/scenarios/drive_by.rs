@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Drive-by download campaign — search ad redirect, archive delivery, script
 //! execution, discovery, persistence, C2, and cleanup.
 //!
@@ -592,6 +594,8 @@ mod tests {
         assert!(proxy_wire.contains(r#""username":"CORP\\alice""#));
         assert!(proxy_wire.contains(r#""client_ip":"10.1.4.2""#));
         assert!(proxy_wire.contains(r#""content_type":"application/zip""#));
-        assert!(proxy_wire.contains(r#""referrer":"https://www.google.com/"#));
+        assert!(proxy_wire.contains(r#""referer":"https://www.google.com/"#));
+        assert!(!proxy_wire.contains(r#""referrer""#));
+        assert!(proxy_wire.contains(r#""user_agent":"Mozilla/5.0 "#));
     }
 }

@@ -15,7 +15,8 @@ pub struct SearchAdmissionConfig {
     // Admission limits
     /// Maximum concurrent ad-hoc queries (1-500, default 30)
     pub global_adhoc_limit: u32,
-    /// Maximum concurrent queries per user (1-50, default 5)
+    /// Maximum concurrent queries per user (1-50, default 10). Overflow waits
+    /// in the admission queue.
     pub per_user_limit: u32,
     /// Maximum queue depth (10-1000, default 100)
     pub max_queue_depth: u32,
@@ -41,7 +42,7 @@ impl Default for SearchAdmissionConfig {
     fn default() -> Self {
         Self {
             global_adhoc_limit: 30,
-            per_user_limit: 5,
+            per_user_limit: crate::search::admission::DEFAULT_PER_USER_LIMIT,
             max_queue_depth: 100,
             // NAN-714: aligned with interactive_max_execution_time below.
             queue_timeout_seconds: 300,

@@ -137,6 +137,8 @@ let checkedSites = 0;
 
 for (const file of walk(srcRoot)) {
   const rel = relative(webRoot, file);
+  // Tests intentionally mount stubs without production capability gates.
+  if (/\.(test|spec)\.tsx?$/.test(file) || rel.split('/').includes('__tests__')) continue;
   // Enterprise code may use its own components freely — it never resolves to
   // the stub tree. Skip the stub tree itself too.
   if (rel.includes('src/enterprise/') || rel.includes('src/enterprise-stubs/')) continue;

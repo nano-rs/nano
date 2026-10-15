@@ -7,8 +7,8 @@ WORKDIR /app
 ARG VITE_API_URL=
 ENV VITE_API_URL=$VITE_API_URL
 
-# Edition flag (NAN-745). `enterprise` (default) keeps the @/enterprise/*
-# alias pointed at the real implementations under src/enterprise/. `open`
+# Edition flag (NAN-745). `enterprise` keeps the @/enterprise/*
+# alias pointed at the real implementations under src/enterprise/. `open` (the default)
 # swaps it to the no-op stubs under src/enterprise-stubs/ for the open-core
 # release. Mirrors the cargo edition flag in the root Dockerfile.
 ARG VITE_EDITION=open
@@ -57,6 +57,14 @@ http { \
         listen 5173; \
         root /usr/share/nginx/html; \
         index index.html; \
+        add_header Cache-Control "no-cache" always; \
+        location = /index.html { \
+            try_files $uri =404; \
+        } \
+        location ^~ /assets/ { \
+            add_header Cache-Control "public, max-age=31536000, immutable"; \
+            try_files $uri =404; \
+        } \
         location / { \
             try_files $uri $uri/ /index.html; \
         } \
@@ -66,9 +74,14 @@ http { \
     chown -R nginx:nginx /usr/share/nginx/html /var/cache/nginx /etc/nginx && \
     chmod -R 755 /usr/share/nginx/html
 
+COPY scripts/check-cache-headers.sh /tmp/check-cache-headers.sh
+
 EXPOSE 5173
 
 # Use numeric UID for K8s runAsNonRoot validation (nginx = 101 in alpine)
 USER 101
+
+# Exercise the actual runtime config and assets as the runtime user on every build.
+RUN sh /tmp/check-cache-headers.sh --local
 
 CMD ["nginx", "-g", "daemon off;"]

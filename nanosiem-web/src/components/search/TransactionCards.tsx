@@ -10,6 +10,9 @@ import {
   Search as SearchIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isPlaceholderValue } from '@/lib/is-placeholder-value';
+import { parseTimestampAsUTC } from '@/lib/date-utils';
+import { formatCellValue } from '@/lib/format-cell-value';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { buildSecondaryPrefs, TRANSACTION_SECONDARY_BASE } from '@/lib/secondary-identity-prefs';
 
@@ -49,7 +52,11 @@ function toTs(value: unknown): number | null {
   if (value == null) return null;
   if (typeof value === 'number') return value;
   if (typeof value === 'string') {
-    const d = new Date(value);
+    // UTC-safe parse: naive "YYYY-MM-DD HH:MM:SS" strings are treated as UTC.
+    // Don't rely on the backend's Z-normalization allow-list — a future
+    // caller passing an un-allow-listed naive timestamp would silently render
+    // shifted by the local offset.
+    const d = parseTimestampAsUTC(value);
     if (!isNaN(d.getTime())) return d.getTime();
   }
   if (value instanceof Date) return value.getTime();
@@ -128,6 +135,8 @@ interface Transaction {
   start: number | null;     // ms
   end: number | null;       // ms
   rawEvents: string[];
+  rawEventsTruncated: boolean;
+  rawEventsMaterialized: number;
   fields: Record<string, unknown>;
   notable: boolean;
 }
@@ -137,6 +146,9 @@ const RESERVED_KEYS = new Set([
   'duration',
   'transaction_start', 'transaction_end',
   '_raw_events',
+  '_raw_events_returned',
+  '_raw_events_materialized',
+  '_raw_events_truncated',
   '_display_type',
 ]);
 
@@ -152,27 +164,33 @@ function toTransaction(
   const start = toTs(f.transaction_start);
   const end = toTs(f.transaction_end);
   const rawEvents = Array.isArray(f._raw_events)
-    ? (f._raw_events as unknown[]).map((x) => String(x))
+    ? (f._raw_events as unknown[]).map((x) => formatCellValue(x))
     : [];
+  const rawEventsMaterialized = Number(f._raw_events_materialized ?? rawEvents.length);
+  const rawEventsTruncated = f._raw_events_truncated === true;
 
   const groupingFields = parsedFields.length
     ? parsedFields.filter((k) => k in f)
     : Object.keys(f).filter((k) => !RESERVED_KEYS.has(k.toLowerCase()));
 
   const groupKey = groupingFields[0] ?? 'transaction';
-  const groupValue = String(f[groupKey] ?? `#${idx + 1}`);
+  // "-" is the OCSF "no value" placeholder — never let it become the card
+  // headline; formatCellValue keeps Array(String) columns from leaking JSON.
+  const groupValue = isPlaceholderValue(f[groupKey])
+    ? `#${idx + 1}`
+    : formatCellValue(f[groupKey]);
 
   let secondary: string | null = null;
   for (const k of secondaryPrefs) {
-    if (k !== groupKey && f[k] != null && String(f[k]).trim() !== '') {
-      secondary = String(f[k]);
+    if (k !== groupKey && !isPlaceholderValue(f[k])) {
+      secondary = formatCellValue(f[k]);
       break;
     }
   }
   if (!secondary) {
     // Fall back to the next grouping field if one exists
     const extra = groupingFields.find((k) => k !== groupKey);
-    if (extra) secondary = String(f[extra] ?? '');
+    if (extra && !isPlaceholderValue(f[extra])) secondary = formatCellValue(f[extra]);
     if (!secondary) secondary = null;
   }
 
@@ -186,6 +204,8 @@ function toTransaction(
     start,
     end,
     rawEvents,
+    rawEventsTruncated,
+    rawEventsMaterialized,
     fields: f,
     notable: false, // computed later against maxspan or global thresholds
   };
@@ -433,6 +453,11 @@ function TransactionDetail({ tx }: { tx: Transaction }) {
       </div>
 
       <div className="px-3 pb-3 pt-1">
+        {tx.rawEventsTruncated && (
+          <div className="mb-2 rounded border border-amber-500/25 bg-amber-500/5 px-2.5 py-1.5 font-mono text-[10px] text-amber-300/90">
+            Showing {tx.rawEvents.length} of {tx.rawEventsMaterialized.toLocaleString()} materialized samples from {tx.eventCount.toLocaleString()} exact transaction members. Narrow or drill into the transaction to inspect individual events.
+          </div>
+        )}
         <div className="relative">
           <div className="absolute left-[9px] top-[4px] bottom-[4px] w-px bg-border" />
           <div className="flex flex-col">

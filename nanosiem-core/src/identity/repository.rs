@@ -57,6 +57,10 @@ pub enum IdentityRepositoryError {
     DatabaseError(#[from] sqlx::Error),
     #[error("ClickHouse error: {0}")]
     ClickHouse(#[from] clickhouse::error::Error),
+    #[error("Lake identity error: {0}")]
+    Lake(#[from] super::lake::LakeIdentityError),
+    #[error("Identity directory error: {0}")]
+    Directory(#[from] super::lean_directory::LeanDirectoryError),
 }
 
 // =============================================================================
@@ -66,6 +70,83 @@ pub enum IdentityRepositoryError {
 /// CHUNK size for batched ClickHouse INSERTs of directory rows (mirrors the
 /// IOC/IP enrichment writers).
 const CH_INSERT_CHUNK: usize = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityPayloadBackend {
+    ClickHouse,
+    Postgres,
+    Lake,
+    /// NAN-3767: the trusted-local lean cell's `query[T]` directory view.
+    LeanDirectory,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PgUserRegistryRow {
+    provider_id: String,
+    external_id: String,
+    username: Option<String>,
+    upn: Option<String>,
+    email: Option<String>,
+    display_name: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+    department: Option<String>,
+    title: Option<String>,
+    manager_upn: Option<String>,
+    manager_display_name: Option<String>,
+    company: Option<String>,
+    office_location: Option<String>,
+    city: Option<String>,
+    country: Option<String>,
+    groups: Option<Vec<String>>,
+    account_enabled: Option<bool>,
+    account_status: Option<String>,
+    mfa_enabled: Option<bool>,
+    last_sign_in_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_in_directory_at: Option<chrono::DateTime<chrono::Utc>>,
+    phone: Option<String>,
+    employee_id: Option<String>,
+    employee_type: Option<String>,
+    last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    sync_hash: Option<String>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<PgUserRegistryRow> for UserRecord {
+    fn from(row: PgUserRegistryRow) -> Self {
+        Self {
+            id: UserRecord::composite_id(&row.provider_id, &row.external_id),
+            provider_id: row.provider_id,
+            external_id: row.external_id,
+            username: row.username,
+            upn: row.upn,
+            email: row.email,
+            display_name: row.display_name,
+            first_name: row.first_name,
+            last_name: row.last_name,
+            department: row.department,
+            title: row.title,
+            manager_upn: row.manager_upn,
+            manager_display_name: row.manager_display_name,
+            company: row.company,
+            office_location: row.office_location,
+            city: row.city,
+            country: row.country,
+            groups: row.groups,
+            account_enabled: row.account_enabled,
+            account_status: row.account_status,
+            mfa_enabled: row.mfa_enabled,
+            last_sign_in_at: row.last_sign_in_at,
+            created_in_directory_at: row.created_in_directory_at,
+            phone: row.phone,
+            employee_id: row.employee_id,
+            employee_type: row.employee_type,
+            last_synced_at: row.last_synced_at,
+            sync_hash: row.sync_hash,
+            updated_at: row.updated_at,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct IdentityRepository {
@@ -78,6 +159,9 @@ pub struct IdentityRepository {
     /// construct the repo without a CH client; the payload methods error with
     /// `ClickHouseNotConfigured` rather than silently writing PG.
     clickhouse: Option<clickhouse::Client>,
+    lake: Option<super::lake::LakeIdentityClient>,
+    directory: Option<super::lean_directory::LeanIdentityDirectoryClient>,
+    payload_backend: IdentityPayloadBackend,
     encryption: EncryptionService,
 }
 
@@ -89,6 +173,9 @@ impl IdentityRepository {
             encryption: EncryptionService::from_env(),
             pool,
             clickhouse: None,
+            lake: None,
+            directory: None,
+            payload_backend: IdentityPayloadBackend::Postgres,
         }
     }
 
@@ -99,7 +186,61 @@ impl IdentityRepository {
             encryption: EncryptionService::from_env(),
             pool,
             clickhouse: Some(clickhouse),
+            lake: None,
+            directory: None,
+            payload_backend: IdentityPayloadBackend::ClickHouse,
         }
+    }
+
+    /// Construct a repository whose directory payload is served by the
+    /// tenant-pinned lake enrichment coordinator. PostgreSQL retains provider
+    /// configuration, credentials, and sync status only.
+    pub fn new_with_lake(pool: PgPool, lake: super::lake::LakeIdentityClient) -> Self {
+        Self {
+            encryption: EncryptionService::from_env(),
+            pool,
+            clickhouse: None,
+            lake: Some(lake),
+            directory: None,
+            payload_backend: IdentityPayloadBackend::Lake,
+        }
+    }
+
+    /// Construct a repository whose directory payload is read from the
+    /// trusted-local lean cell's `query[T]` (NAN-3767): the lean enrichment
+    /// coordinator's tenant snapshot. Read-only; PostgreSQL keeps provider
+    /// and feed state only.
+    pub fn new_with_lean_directory(
+        pool: PgPool,
+        directory: super::lean_directory::LeanIdentityDirectoryClient,
+    ) -> Self {
+        Self {
+            encryption: EncryptionService::from_env(),
+            pool,
+            clickhouse: None,
+            lake: None,
+            directory: Some(directory),
+            payload_backend: IdentityPayloadBackend::LeanDirectory,
+        }
+    }
+
+    fn directory(
+        &self,
+    ) -> Result<&super::lean_directory::LeanIdentityDirectoryClient, IdentityRepositoryError> {
+        self.directory.as_ref().ok_or_else(|| {
+            super::lean_directory::LeanDirectoryError::Configuration(
+                "lean identity directory client not configured".to_string(),
+            )
+            .into()
+        })
+    }
+
+    fn lake(&self) -> Result<&super::lake::LakeIdentityClient, IdentityRepositoryError> {
+        self.lake.as_ref().ok_or_else(|| {
+            IdentityRepositoryError::EncryptionError(
+                "lake identity client not configured for identity directory".to_string(),
+            )
+        })
     }
 
     /// Get the ClickHouse client or a typed error if it was never configured.
@@ -120,7 +261,9 @@ impl IdentityRepository {
         let providers = sqlx::query_as::<_, IdentityProvider>(
             "SELECT id, name, provider_type, enabled, credentials_encrypted, config,
                     sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                    user_count, deprovisioned_count, delta_link, created_at, updated_at
+                    user_count, deprovisioned_count, last_sync_records_total,
+                    last_sync_records_synced, last_sync_records_dead_lettered,
+                    delta_link, created_at, updated_at
              FROM identity_providers ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -136,7 +279,9 @@ impl IdentityRepository {
         sqlx::query_as::<_, IdentityProvider>(
             "SELECT id, name, provider_type, enabled, credentials_encrypted, config,
                     sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                    user_count, deprovisioned_count, delta_link, created_at, updated_at
+                    user_count, deprovisioned_count, last_sync_records_total,
+                    last_sync_records_synced, last_sync_records_dead_lettered,
+                    delta_link, created_at, updated_at
              FROM identity_providers WHERE id = $1",
         )
         .bind(id)
@@ -161,7 +306,9 @@ impl IdentityRepository {
              VALUES ($1, $2, $3, $4, $5)
              RETURNING id, name, provider_type, enabled, credentials_encrypted, config,
                        sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                       user_count, deprovisioned_count, delta_link, created_at, updated_at",
+                       user_count, deprovisioned_count, last_sync_records_total,
+                    last_sync_records_synced, last_sync_records_dead_lettered,
+                    delta_link, created_at, updated_at",
         )
         .bind(&req.id)
         .bind(&req.name)
@@ -199,7 +346,9 @@ impl IdentityRepository {
              WHERE id = $1
              RETURNING id, name, provider_type, enabled, credentials_encrypted, config,
                        sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                       user_count, deprovisioned_count, delta_link, created_at, updated_at",
+                       user_count, deprovisioned_count, last_sync_records_total,
+                    last_sync_records_synced, last_sync_records_dead_lettered,
+                    delta_link, created_at, updated_at",
         )
         .bind(id)
         .bind(&req.name)
@@ -213,6 +362,9 @@ impl IdentityRepository {
 
     #[instrument(skip(self))]
     pub async fn delete_provider(&self, id: &str) -> Result<(), IdentityRepositoryError> {
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            self.lake()?.delete_provider(id).await?;
+        }
         let rows = sqlx::query("DELETE FROM identity_providers WHERE id = $1")
             .bind(id)
             .execute(&self.pool)
@@ -312,6 +464,67 @@ impl IdentityRepository {
         Ok(())
     }
 
+    /// NAN-3483: record a finished (or failed) sync with its record counts.
+    /// `last_sync_at` advances for `completed` and `partial` — a partial sync
+    /// did run, so the scheduler waits its interval rather than retrying every
+    /// tick.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_sync(
+        &self,
+        id: &str,
+        status: &str,
+        error: Option<&str>,
+        user_count: Option<i32>,
+        duration_ms: Option<i64>,
+        counts: Option<&super::gate::SyncTally>,
+    ) -> Result<(), IdentityRepositoryError> {
+        let as_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE identity_providers
+             SET sync_status = $2,
+                 last_sync_error = $3,
+                 user_count = COALESCE($4, user_count),
+                 last_sync_duration_ms = $5,
+                 last_sync_records_total = $6,
+                 last_sync_records_synced = $7,
+                 last_sync_records_dead_lettered = $8,
+                 last_sync_at = CASE WHEN $2 IN ('completed', 'partial') THEN NOW() ELSE last_sync_at END
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(error)
+        .bind(user_count)
+        .bind(duration_ms)
+        .bind(counts.map(|c| as_i64(c.total)))
+        .bind(counts.map(|c| as_i64(c.synced())))
+        .bind(counts.map(|c| as_i64(c.dead_lettered)))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// NAN-3483: the normalize VRL the lane runs for `source` when an
+    /// enrichment parser for it is imported and enabled — the first by name,
+    /// matching the lane generator, which keeps the first parser per source
+    /// in the name-ordered effective deployed set. `None` means the built-in
+    /// normalizer applies.
+    pub async fn deployed_identity_normalizer(
+        &self,
+        source: &str,
+    ) -> Result<Option<(String, String)>, IdentityRepositoryError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT name, normalize_vrl FROM log_sources
+             WHERE kind = 'enrichment' AND enabled AND enrich_source = $1
+             ORDER BY name
+             LIMIT 1",
+        )
+        .bind(source)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(name, vrl)| (name, vrl.unwrap_or_default())))
+    }
+
     // ========================================================================
     // User Registry — Bulk Operations
     // ========================================================================
@@ -376,7 +589,11 @@ impl IdentityRepository {
                 .bind(r.groups.clone())
                 .bind(if r.account_enabled { 1u8 } else { 0u8 })
                 .bind(&r.account_status)
-                .bind(if r.mfa_enabled.unwrap_or(false) { 1u8 } else { 0u8 })
+                .bind(if r.mfa_enabled.unwrap_or(false) {
+                    1u8
+                } else {
+                    0u8
+                })
                 .bind(opt_ms(&r.last_sign_in_at))
                 .bind(opt_ms(&r.created_in_directory_at))
                 .bind(opt_str(&r.phone))
@@ -400,6 +617,29 @@ impl IdentityRepository {
         provider_id: &str,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, IdentityRepositoryError> {
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            return Ok(self.lake()?.reconcile(provider_id, cutoff).await?);
+        }
+        if self.payload_backend == IdentityPayloadBackend::LeanDirectory {
+            // The lean coordinator owns the snapshot and reconciles its own
+            // feeds; the API never writes it.
+            tracing::warn!(
+                provider_id,
+                "identity reconcile skipped: the lean directory is read-only here"
+            );
+            return Ok(0);
+        }
+        if self.payload_backend == IdentityPayloadBackend::Postgres {
+            let result = sqlx::query(
+                "UPDATE user_registry SET account_enabled = false, account_status = 'deleted' \
+                 WHERE provider_id = $1 AND account_status != 'deleted' AND last_synced_at < $2",
+            )
+            .bind(provider_id)
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+            return Ok(result.rows_affected());
+        }
         let cutoff_ms = cutoff.timestamp_millis();
         let live = self.fetch_live_rows_for_provider(provider_id).await?;
         let stale: Vec<UserRegistryRow> = live
@@ -534,12 +774,82 @@ impl IdentityRepository {
         toUnixTimestamp64Milli(created_in_directory_at) AS created_in_directory_at, \
         phone, employee_id, employee_type, sync_hash, \
         toUnixTimestamp64Milli(last_synced_at) AS last_synced_at, version";
+    const PG_SELECT_COLS: &'static str = "provider_id, external_id, username, upn, email, \
+        display_name, first_name, last_name, department, title, manager_upn, \
+        manager_display_name, company, office_location, city, country, groups, \
+        account_enabled, account_status, mfa_enabled, last_sign_in_at, \
+        created_in_directory_at, phone, employee_id, employee_type, last_synced_at, \
+        sync_hash, updated_at";
 
     async fn list_users_inner(
         &self,
         params: &ListUsersParams,
         offset: i64,
     ) -> Result<(Vec<UserRecord>, i64), IdentityRepositoryError> {
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            let result = self.lake()?.list(params).await?;
+            return Ok((result.users, result.total));
+        }
+        if self.payload_backend == IdentityPayloadBackend::LeanDirectory {
+            let result = self.directory()?.list(params).await?;
+            return Ok((result.users, result.total));
+        }
+        if self.payload_backend == IdentityPayloadBackend::Postgres {
+            let mut filters = Vec::new();
+            let mut next = 1;
+            filters.push("account_status != 'deleted'".to_string());
+            if params.provider_id.is_some() {
+                filters.push(format!("provider_id = ${next}"));
+                next += 1;
+            }
+            if params.account_status.is_some() {
+                filters.push(format!("account_status = ${next}"));
+                next += 1;
+            }
+            if params.search.is_some() {
+                filters.push(format!(
+                    "(lower(username) LIKE ${0} OR lower(display_name) LIKE ${0} OR lower(email) LIKE ${0} OR lower(department) LIKE ${0})",
+                    next
+                ));
+            }
+            let where_clause = filters.join(" AND ");
+            let count_sql = format!("SELECT count(*) FROM user_registry WHERE {where_clause}");
+            let mut count = sqlx::query_scalar::<_, i64>(&count_sql);
+            if let Some(value) = &params.provider_id {
+                count = count.bind(value);
+            }
+            if let Some(value) = &params.account_status {
+                count = count.bind(value);
+            }
+            if let Some(value) = &params.search {
+                count = count.bind(format!("%{}%", value.to_lowercase()));
+            }
+            let total = count.fetch_one(&self.pool).await?;
+
+            let limit_param = next + usize::from(params.search.is_some());
+            let data_sql = format!(
+                "SELECT {} FROM user_registry WHERE {where_clause} \
+                 ORDER BY display_name NULLS LAST LIMIT ${limit_param} OFFSET ${}",
+                Self::PG_SELECT_COLS,
+                limit_param + 1
+            );
+            let mut data = sqlx::query_as::<_, PgUserRegistryRow>(&data_sql);
+            if let Some(value) = &params.provider_id {
+                data = data.bind(value);
+            }
+            if let Some(value) = &params.account_status {
+                data = data.bind(value);
+            }
+            if let Some(value) = &params.search {
+                data = data.bind(format!("%{}%", value.to_lowercase()));
+            }
+            let rows = data
+                .bind(params.page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await?;
+            return Ok((rows.into_iter().map(UserRecord::from).collect(), total));
+        }
         let ch = self.ch()?;
 
         // Build the WHERE predicate (deduped via FINAL). All user values are
@@ -575,7 +885,11 @@ impl IdentityRepository {
                 q = q.bind(status.clone());
             }
             if let Some(like) = &search_like {
-                q = q.bind(like.clone()).bind(like.clone()).bind(like.clone()).bind(like.clone());
+                q = q
+                    .bind(like.clone())
+                    .bind(like.clone())
+                    .bind(like.clone())
+                    .bind(like.clone());
             }
             q
         };
@@ -586,9 +900,7 @@ impl IdentityRepository {
         // over the collapsed source avoids the ~Nx over-count a bare
         // `Distributed FINAL` would produce (FINAL only dedups within a shard).
         let src = user_registry_read_source();
-        let count_sql = format!(
-            "SELECT count() FROM {src} WHERE {where_clause}"
-        );
+        let count_sql = format!("SELECT count() FROM {src} WHERE {where_clause}");
         let total: u64 = apply_binds(ch.query(&count_sql)).fetch_one().await?;
 
         // Page of rows (same deduped source).
@@ -615,6 +927,25 @@ impl IdentityRepository {
         &self,
         identifier: &str,
     ) -> Result<Option<UserRecord>, IdentityRepositoryError> {
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            return Ok(self.lake()?.lookup(identifier).await?);
+        }
+        if self.payload_backend == IdentityPayloadBackend::LeanDirectory {
+            return Ok(self.directory()?.lookup(identifier).await?);
+        }
+        if self.payload_backend == IdentityPayloadBackend::Postgres {
+            let row = sqlx::query_as::<_, PgUserRegistryRow>(&format!(
+                "SELECT {} FROM user_registry \
+                 WHERE account_status != 'deleted' AND \
+                   (lower(username) = $1 OR lower(upn) = $1 OR lower(email) = $1) \
+                 ORDER BY (account_status = 'active') DESC, updated_at DESC LIMIT 1",
+                Self::PG_SELECT_COLS
+            ))
+            .bind(identifier.to_lowercase())
+            .fetch_optional(&self.pool)
+            .await?;
+            return Ok(row.map(UserRecord::from));
+        }
         let ch = self.ch()?;
         let lower = identifier.to_lowercase();
         let src = user_registry_read_source();
@@ -640,9 +971,36 @@ impl IdentityRepository {
     /// (NAN-1117: replaced the BIGSERIAL id — CH has no synthetic key).
     #[instrument(skip(self))]
     pub async fn get_user(&self, id: &str) -> Result<UserRecord, IdentityRepositoryError> {
-        let ch = self.ch()?;
         let (provider_id, external_id) = UserRecord::split_composite_id(id)
             .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)))?;
+        if self.payload_backend == IdentityPayloadBackend::LeanDirectory {
+            return self
+                .directory()?
+                .get_user(provider_id, external_id)
+                .await?
+                .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)));
+        }
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            return self
+                .lake()?
+                .get_user(provider_id, external_id)
+                .await?
+                .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)));
+        }
+        if self.payload_backend == IdentityPayloadBackend::Postgres {
+            let row = sqlx::query_as::<_, PgUserRegistryRow>(&format!(
+                "SELECT {} FROM user_registry WHERE provider_id = $1 AND external_id = $2 LIMIT 1",
+                Self::PG_SELECT_COLS
+            ))
+            .bind(provider_id)
+            .bind(external_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            return row
+                .map(UserRecord::from)
+                .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)));
+        }
+        let ch = self.ch()?;
         // Deduped source (wrapper + cross-shard collapse on clusters): without it
         // a `Distributed FINAL … LIMIT 1` could return a stale-version row from
         // one shard. The collapse keeps one latest-version row per user, so
@@ -667,6 +1025,21 @@ impl IdentityRepository {
 
     #[instrument(skip(self))]
     pub async fn get_user_count(&self, provider_id: &str) -> Result<i64, IdentityRepositoryError> {
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            return Ok(self.lake()?.count(provider_id).await?);
+        }
+        if self.payload_backend == IdentityPayloadBackend::LeanDirectory {
+            let stats = self.directory()?.stats().await?;
+            return Ok(i64::try_from(stats.provider_users(provider_id)).unwrap_or(i64::MAX));
+        }
+        if self.payload_backend == IdentityPayloadBackend::Postgres {
+            return Ok(sqlx::query_scalar(
+                "SELECT count(*) FROM user_registry WHERE provider_id = $1 AND account_status != 'deleted'",
+            )
+            .bind(provider_id)
+            .fetch_one(&self.pool)
+            .await?);
+        }
         let ch = self.ch()?;
         let src = user_registry_read_source();
         let count: u64 = ch
@@ -686,6 +1059,98 @@ impl IdentityRepository {
 
     #[instrument(skip(self))]
     pub async fn get_stats(&self) -> Result<IdentityStats, IdentityRepositoryError> {
+        if self.payload_backend == IdentityPayloadBackend::LeanDirectory {
+            let stats = self.directory()?.stats().await?;
+            let providers: Vec<IdentityProvider> = self.list_providers().await?;
+            let feeds = self.identity_connector_feeds().await;
+            return Ok(lean_directory_stats(&stats, providers, &feeds));
+        }
+        if self.payload_backend == IdentityPayloadBackend::Lake {
+            let counts = self.lake()?.counts().await?;
+            #[derive(sqlx::FromRow)]
+            struct ProviderMetaRow {
+                provider_id: String,
+                provider_name: String,
+                provider_type: String,
+                last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
+                sync_status: Option<String>,
+            }
+            let providers: Vec<ProviderMetaRow> = sqlx::query_as(
+                "SELECT id AS provider_id, name AS provider_name, provider_type, \
+                        last_sync_at, sync_status \
+                 FROM identity_providers ORDER BY name",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            return Ok(IdentityStats {
+                total_users: counts.total_users,
+                active_users: counts.active_users,
+                disabled_users: counts.disabled_users,
+                providers: providers
+                    .into_iter()
+                    .map(|row| ProviderStatsSummary {
+                        user_count: *counts.provider_counts.get(&row.provider_id).unwrap_or(&0),
+                        provider_id: row.provider_id,
+                        provider_name: row.provider_name,
+                        provider_type: row.provider_type,
+                        last_sync_at: row.last_sync_at,
+                        sync_status: row.sync_status,
+                    })
+                    .collect(),
+            });
+        }
+        if self.payload_backend == IdentityPayloadBackend::Postgres {
+            #[derive(sqlx::FromRow)]
+            struct Counts {
+                total_users: i64,
+                active_users: i64,
+                disabled_users: i64,
+            }
+            #[derive(sqlx::FromRow)]
+            struct ProviderRow {
+                provider_id: String,
+                provider_name: String,
+                provider_type: String,
+                user_count: i64,
+                last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
+                sync_status: Option<String>,
+            }
+            let counts: Counts = sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE account_status != 'deleted') AS total_users, \
+                        count(*) FILTER (WHERE account_status = 'active') AS active_users, \
+                        count(*) FILTER (WHERE account_status IN ('disabled', 'suspended')) AS disabled_users \
+                 FROM user_registry",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let providers: Vec<ProviderRow> = sqlx::query_as(
+                "SELECT p.id AS provider_id, p.name AS provider_name, p.provider_type, \
+                        count(u.id) FILTER (WHERE u.account_status != 'deleted') AS user_count, \
+                        p.last_sync_at, p.sync_status \
+                 FROM identity_providers p \
+                 LEFT JOIN user_registry u ON u.provider_id = p.id \
+                 GROUP BY p.id, p.name, p.provider_type, p.last_sync_at, p.sync_status \
+                 ORDER BY p.name",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            return Ok(IdentityStats {
+                total_users: counts.total_users,
+                active_users: counts.active_users,
+                disabled_users: counts.disabled_users,
+                providers: providers
+                    .into_iter()
+                    .map(|row| ProviderStatsSummary {
+                        provider_id: row.provider_id,
+                        provider_name: row.provider_name,
+                        provider_type: row.provider_type,
+                        user_count: row.user_count,
+                        last_sync_at: row.last_sync_at,
+                        sync_status: row.sync_status,
+                    })
+                    .collect(),
+            });
+        }
         let ch = self.ch()?;
 
         // Aggregate counts over the deduped CH set — wrapper + cross-shard
@@ -771,5 +1236,138 @@ impl IdentityRepository {
                 })
                 .collect(),
         })
+    }
+}
+
+/// `/api/identity/stats` from the lean directory (NAN-3767): legacy
+/// providers keep their PostgreSQL rows (a provider id the snapshot does not
+/// name counts 0), and every snapshot users feed not already listed is shown
+/// as its own provider so directory-sync feeds are visible.
+/// An identity connector feed as the stats page names it (NAN-3767).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct IdentityConnectorFeed {
+    id: uuid::Uuid,
+    name: String,
+    connector: String,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_status: Option<String>,
+}
+
+impl IdentityRepository {
+    /// The deployment's identity connector feeds, so snapshot feeds
+    /// (`<feed uuid>:users`) are shown by name. Best effort: a database
+    /// without the connector tables shows raw feed ids.
+    async fn identity_connector_feeds(&self) -> Vec<IdentityConnectorFeed> {
+        match sqlx::query_as::<_, IdentityConnectorFeed>(
+            "SELECT id, name, connector, last_success_at, last_status \
+               FROM public.connector_feeds WHERE sink = 'identity'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(feeds) => feeds,
+            Err(error) => {
+                tracing::warn!(%error, "identity stats: connector feed names unavailable");
+                Vec::new()
+            }
+        }
+    }
+}
+
+fn lean_directory_stats(
+    stats: &super::lean_directory::DirectoryStats,
+    providers: Vec<IdentityProvider>,
+    feeds: &[IdentityConnectorFeed],
+) -> IdentityStats {
+    let count = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+    let mut summaries: Vec<ProviderStatsSummary> = providers
+        .into_iter()
+        .map(|provider| ProviderStatsSummary {
+            user_count: count(stats.provider_users(&provider.id)),
+            provider_id: provider.id,
+            provider_name: provider.name,
+            provider_type: provider.provider_type,
+            last_sync_at: provider.last_sync_at,
+            sync_status: provider.sync_status,
+        })
+        .collect();
+    for (feed, users) in stats.user_feeds() {
+        if summaries.iter().any(|summary| summary.provider_id == feed) {
+            continue;
+        }
+        let connector_feed = feed
+            .split_once(':')
+            .and_then(|(id, _)| uuid::Uuid::parse_str(id).ok())
+            .and_then(|id| feeds.iter().find(|f| f.id == id));
+        summaries.push(match connector_feed {
+            Some(f) => ProviderStatsSummary {
+                provider_id: feed.to_string(),
+                provider_name: f.name.clone(),
+                provider_type: f.connector.clone(),
+                user_count: count(users),
+                last_sync_at: f.last_success_at,
+                sync_status: f.last_status.clone(),
+            },
+            None => ProviderStatsSummary {
+                provider_id: feed.to_string(),
+                provider_name: feed.to_string(),
+                provider_type: feed
+                    .split_once(':')
+                    .map_or(feed, |(prefix, _)| prefix)
+                    .to_string(),
+                user_count: count(users),
+                last_sync_at: None,
+                sync_status: None,
+            },
+        });
+    }
+    IdentityStats {
+        total_users: count(stats.total_users()),
+        active_users: count(stats.active_users()),
+        disabled_users: count(stats.disabled_users()),
+        providers: summaries,
+    }
+}
+
+#[cfg(test)]
+mod lean_directory_stats_tests {
+    use super::{lean_directory_stats, IdentityConnectorFeed};
+    use crate::identity::lean_directory::DirectoryStats;
+
+    /// NAN-3767: a snapshot feed of a connector feed is shown by the feed's
+    /// name, connector and last sync; other feeds keep their raw id.
+    #[test]
+    fn snapshot_feeds_are_named_after_their_connector_feed() {
+        let id = uuid::Uuid::parse_str("0b8a7e1c-0000-4000-8000-000000003767").unwrap();
+        let mut stats = DirectoryStats::default();
+        stats.by_feed.insert(format!("{id}:users"), 4);
+        stats.by_feed.insert(format!("{id}:groups"), 3);
+        stats.by_feed.insert("push:okta".into(), 2);
+        let synced = chrono::Utc::now();
+        let feeds = vec![IdentityConnectorFeed {
+            id,
+            name: "Okta directory".into(),
+            connector: "okta_users".into(),
+            last_success_at: Some(synced),
+            last_status: Some("succeeded".into()),
+        }];
+        let out = lean_directory_stats(&stats, Vec::new(), &feeds);
+        assert_eq!(out.providers.len(), 2, "{:?}", out.providers);
+        let named = out
+            .providers
+            .iter()
+            .find(|p| p.provider_id == format!("{id}:users"))
+            .unwrap();
+        assert_eq!(named.provider_name, "Okta directory");
+        assert_eq!(named.provider_type, "okta_users");
+        assert_eq!(named.user_count, 4);
+        assert_eq!(named.last_sync_at, Some(synced));
+        assert_eq!(named.sync_status.as_deref(), Some("succeeded"));
+        let raw = out
+            .providers
+            .iter()
+            .find(|p| p.provider_id == "push:okta")
+            .unwrap();
+        assert_eq!((raw.provider_name.as_str(), raw.provider_type.as_str()), ("push:okta", "push"));
     }
 }

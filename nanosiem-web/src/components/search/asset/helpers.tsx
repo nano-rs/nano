@@ -218,6 +218,40 @@ export function formatTimestampHMS(iso: string | null | undefined): string {
   return d.toISOString().slice(11, 19) + ' UTC';
 }
 
+const BARE_TIME = /^\d{2}:\d{2}:\d{2}(\.\d+)?$/;
+
+/** Parse only date-led strings: V8 accepts junk like `garbage.123Z` as a year-2001 date. */
+function parseEventTime(value: string): Date | null {
+  return /^\d{4}-\d{2}-\d{2}/.test(value) ? parseAsUTC(value) : null;
+}
+
+/**
+ * NAN-3408: compact, fixed-width event time for dossier "recent" lists —
+ * `MM-DD HH:MM:SS` in UTC (the app-wide display zone; see `lib/date-utils`),
+ * second precision. The lake path sends raw `2026-10-09 11:39:46.419000`
+ * strings (which wrapped over three lines), the ClickHouse path a bare
+ * `HH:MM:SS`; both render on one line. Unparseable input passes through with
+ * any fractional seconds dropped.
+ */
+export function formatEventTimeShort(value: string | null | undefined): string {
+  if (!value) return '';
+  if (BARE_TIME.test(value)) return value.slice(0, 8);
+  const d = parseEventTime(value);
+  if (!d) return value.replace(/\.\d+/, '');
+  const iso = d.toISOString();
+  return `${iso.slice(5, 10)} ${iso.slice(11, 19)}`;
+}
+
+/** Full UTC timestamp for a tooltip: `YYYY-MM-DD HH:MM:SS UTC`. */
+export function formatEventTimeFull(value: string | null | undefined): string {
+  if (!value) return '';
+  if (BARE_TIME.test(value)) return `${value.slice(0, 8)} UTC`;
+  const d = parseEventTime(value);
+  if (!d) return value;
+  const iso = d.toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 19)} UTC`;
+}
+
 export function formatDate(iso: string | null | undefined): string {
   const d = parseAsUTC(iso);
   if (!d) return iso ?? '';
@@ -235,8 +269,11 @@ export function formatDate(iso: string | null | undefined): string {
 // user/server-provided value that callers want to interpolate must be added as
 // a top-level key in the filter dict (which `handleDrilldown` then escapes) —
 // do NOT inline it into a `_tableCommand` string, since those are appended
-// verbatim. The legacy `components/search/AssetView.tsx:1105` helper does the
-// same shape; converge fixes here so both surfaces stay in sync.
+// verbatim. This is now the ONLY asset drilldown surface: the legacy
+// `components/search/AssetView.tsx` was deleted (NAN-2370) because it was
+// orphaned — nothing imported it — and it still emitted retired UDM clauses
+// (`src_ip=` / `src_host=`) that the strict OCSF validator rejects outright,
+// so re-importing it would have silently broken every asset drilldown.
 // ---------------------------------------------------------------------------
 
 interface AssetIdentityRecordLike {
@@ -249,6 +286,7 @@ const escDQ = (s: string) => nplQuotedBody(s);
 
 export function buildIdentityClause(
   identities: AssetIdentityRecordLike[] | undefined,
+  ocsf = false,
 ): string | null {
   const ips = new Set<string>();
   const hostnames = new Set<string>();
@@ -262,11 +300,21 @@ export function buildIdentityClause(
     if (user) users.add(user);
   }
   const clauses: string[] = [];
-  for (const ip of ips) clauses.push(`src_ip="${escDQ(ip)}"`);
-  for (const ip of ips) clauses.push(`dest_ip="${escDQ(ip)}"`);
-  for (const h of hostnames) clauses.push(`src_host="${escDQ(h)}"`);
-  for (const h of hostnames) clauses.push(`dest_host="${escDQ(h)}"`);
-  for (const u of users) clauses.push(`user="${escDQ(u)}"`);
+  if (ocsf) {
+    for (const ip of ips) clauses.push(`src_endpoint.ip="${escDQ(ip)}"`);
+    for (const ip of ips) clauses.push(`dst_endpoint.ip="${escDQ(ip)}"`);
+    for (const h of hostnames) clauses.push(`src_endpoint.hostname="${escDQ(h)}"`);
+    for (const h of hostnames) clauses.push(`device.hostname="${escDQ(h)}"`);
+    for (const h of hostnames) clauses.push(`dst_endpoint.hostname="${escDQ(h)}"`);
+    for (const u of users) clauses.push(`user.name="${escDQ(u)}"`);
+    for (const u of users) clauses.push(`actor.user.name="${escDQ(u)}"`);
+  } else {
+    for (const ip of ips) clauses.push(`src_ip="${escDQ(ip)}"`);
+    for (const ip of ips) clauses.push(`dest_ip="${escDQ(ip)}"`);
+    for (const h of hostnames) clauses.push(`src_host="${escDQ(h)}"`);
+    for (const h of hostnames) clauses.push(`dest_host="${escDQ(h)}"`);
+    for (const u of users) clauses.push(`user="${escDQ(u)}"`);
+  }
   if (clauses.length === 0) return null;
   return `(${clauses.join(' OR ')})`;
 }
@@ -305,9 +353,10 @@ export function withAssetIdentity(
   filters: Record<string, unknown>,
   identities: AssetIdentityRecordLike[] | undefined,
   primary?: { field: string; value: string } | null,
+  ocsf = false,
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...filters };
-  const clause = buildIdentityClause(identities);
+  const clause = buildIdentityClause(identities, ocsf);
   if (clause) {
     merged._identityClause = clause;
   } else if (primary?.field && primary.value) {

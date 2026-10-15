@@ -1,0 +1,318 @@
+[
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/users/delta()",
+  "status": 200,
+  "body": {
+   "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users",
+   "value": [
+    {
+     "id": "00000001-0000-4000-8000-000000000003",
+     "userPrincipalName": "entra3@example.onmicrosoft.com",
+     "mail": "entra3@example.onmicrosoft.com",
+     "displayName": "Entra User3",
+     "givenName": "Entra",
+     "surname": "User3",
+     "department": "Security",
+     "jobTitle": "Analyst",
+     "companyName": "Example Corp",
+     "officeLocation": "HQ 2",
+     "city": "Ottawa",
+     "country": "CA",
+     "accountEnabled": true,
+     "employeeId": "E20003",
+     "employeeType": "Employee",
+     "userType": "Member",
+     "createdDateTime": "2025-01-01T00:00:00Z",
+     "mobilePhone": null,
+     "businessPhones": [
+      "+1 555 0100"
+     ],
+     "manager@delta": [
+      {
+       "@odata.type": "#microsoft.graph.user",
+       "id": "00000001-0000-4000-8000-000000000000"
+      }
+     ]
+    },
+    {
+     "id": "00000001-0000-4000-8000-000000000004",
+     "userPrincipalName": "entra4@example.onmicrosoft.com",
+     "mail": "entra4@example.onmicrosoft.com",
+     "displayName": "Entra User4",
+     "givenName": "Entra",
+     "surname": "User4",
+     "department": "Finance",
+     "jobTitle": "Synthetic",
+     "companyName": "Example Corp",
+     "officeLocation": "HQ 2",
+     "city": "Ottawa",
+     "country": "CA",
+     "accountEnabled": true,
+     "employeeId": "E20004",
+     "employeeType": "Employee",
+     "userType": "Member",
+     "createdDateTime": "2025-01-01T00:00:00Z",
+     "mobilePhone": "+1 555 0204",
+     "businessPhones": [
+      "+1 555 0100"
+     ],
+     "manager@delta": [
+      {
+       "@odata.type": "#microsoft.graph.user",
+       "id": "00000001-0000-4000-8000-000000000002"
+      }
+     ]
+    },
+    {
+     "id": "00000001-0000-4000-8000-000000000006",
+     "userPrincipalName": "entra6@example.onmicrosoft.com",
+     "mail": "entra6@example.onmicrosoft.com",
+     "displayName": "Entra User6",
+     "givenName": "Entra",
+     "surname": "User6",
+     "department": "Finance",
+     "jobTitle": "Synthetic",
+     "companyName": "Example Corp",
+     "officeLocation": "HQ 2",
+     "city": "Ottawa",
+     "country": "CA",
+     "accountEnabled": false,
+     "employeeId": "E20006",
+     "employeeType": "Employee",
+     "userType": "Member",
+     "createdDateTime": "2025-01-01T00:00:00Z",
+     "mobilePhone": null,
+     "businessPhones": [
+      "+1 555 0100"
+     ],
+     "manager@delta": [
+      {
+       "@odata.type": "#microsoft.graph.user",
+       "id": "00000001-0000-4000-8000-000000000001"
+      }
+     ]
+    }
+   ],
+   "@odata.nextLink": "https://graph.microsoft.com/v1.0/users/delta()?$skiptoken=eyJzZXEiOjAsInNlbCI6WyJpZCIsInVzZXJQcmluY2lwYWxOYW1lIiwibWFpbCIsImRpc3BsYXlOYW1lIiwiZ2l2ZW5OYW1lIiwic3VybmFtZSIsImRlcGFydG1lbnQiLCJqb2JUaXRsZSIsImNvbXBhbnlOYW1lIiwib2ZmaWNlTG9jYXRpb24iLCJjaXR5IiwiY291bnRyeSIsImFjY291bnRFbmFibGVkIiwiZW1wbG95ZWVJZCIsImVtcGxveWVlVHlwZSIsInVzZXJUeXBlIiwiY3JlYXRlZERhdGVUaW1lIiwibW9iaWxlUGhvbmUiLCJidXNpbmVzc1Bob25lcyIsIm1hbmFnZXIiXSwidXB0byI6NCwib2Zmc2V0IjozfQ"
+  },
+  "query": {
+   "$deltatoken": "eyJzZXEiOjAsInNlbCI6WyJpZCIsInVzZXJQcmluY2lwYWxOYW1lIiwibWFpbCIsImRpc3BsYXlOYW1lIiwiZ2l2ZW5OYW1lIiwic3VybmFtZSIsImRlcGFydG1lbnQiLCJqb2JUaXRsZSIsImNvbXBhbnlOYW1lIiwib2ZmaWNlTG9jYXRpb24iLCJjaXR5IiwiY291bnRyeSIsImFjY291bnRFbmFibGVkIiwiZW1wbG95ZWVJZCIsImVtcGxveWVlVHlwZSIsInVzZXJUeXBlIiwiY3JlYXRlZERhdGVUaW1lIiwibW9iaWxlUGhvbmUiLCJidXNpbmVzc1Bob25lcyIsIm1hbmFnZXIiXX0"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/users/delta()",
+  "status": 200,
+  "body": {
+   "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users",
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000005",
+     "@removed": {
+      "reason": "deleted"
+     }
+    }
+   ],
+   "@odata.deltaLink": "https://graph.microsoft.com/v1.0/users/delta()?$deltatoken=eyJzZXEiOjQsInNlbCI6WyJpZCIsInVzZXJQcmluY2lwYWxOYW1lIiwibWFpbCIsImRpc3BsYXlOYW1lIiwiZ2l2ZW5OYW1lIiwic3VybmFtZSIsImRlcGFydG1lbnQiLCJqb2JUaXRsZSIsImNvbXBhbnlOYW1lIiwib2ZmaWNlTG9jYXRpb24iLCJjaXR5IiwiY291bnRyeSIsImFjY291bnRFbmFibGVkIiwiZW1wbG95ZWVJZCIsImVtcGxveWVlVHlwZSIsInVzZXJUeXBlIiwiY3JlYXRlZERhdGVUaW1lIiwibW9iaWxlUGhvbmUiLCJidXNpbmVzc1Bob25lcyIsIm1hbmFnZXIiXX0"
+  },
+  "query": {
+   "$skiptoken": "eyJzZXEiOjAsInNlbCI6WyJpZCIsInVzZXJQcmluY2lwYWxOYW1lIiwibWFpbCIsImRpc3BsYXlOYW1lIiwiZ2l2ZW5OYW1lIiwic3VybmFtZSIsImRlcGFydG1lbnQiLCJqb2JUaXRsZSIsImNvbXBhbnlOYW1lIiwib2ZmaWNlTG9jYXRpb24iLCJjaXR5IiwiY291bnRyeSIsImFjY291bnRFbmFibGVkIiwiZW1wbG95ZWVJZCIsImVtcGxveWVlVHlwZSIsInVzZXJUeXBlIiwiY3JlYXRlZERhdGVUaW1lIiwibW9iaWxlUGhvbmUiLCJidXNpbmVzc1Bob25lcyIsIm1hbmFnZXIiXSwidXB0byI6NCwib2Zmc2V0IjozfQ"
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/groups",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "id": "00000002-0000-4000-8000-000000000000",
+     "displayName": "Privileged Ops",
+     "securityEnabled": true
+    },
+    {
+     "id": "00000002-0000-4000-8000-000000000001",
+     "displayName": "Group 1",
+     "securityEnabled": true
+    },
+    {
+     "id": "00000002-0000-4000-8000-000000000002",
+     "displayName": "Group 2",
+     "securityEnabled": true
+    },
+    {
+     "id": "00000002-0000-4000-8000-000000000003",
+     "displayName": "Group 3",
+     "securityEnabled": true
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/groups/00000002-0000-4000-8000-000000000000/transitiveMembers/microsoft.graph.user",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000000"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000001"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000002"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000003"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000004"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000006"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000007"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/groups/00000002-0000-4000-8000-000000000001/transitiveMembers/microsoft.graph.user",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000004"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000006"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000007"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/groups/00000002-0000-4000-8000-000000000002/transitiveMembers/microsoft.graph.user",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000008"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000009"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-00000000000a"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-00000000000b"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/groups/00000002-0000-4000-8000-000000000003/transitiveMembers/microsoft.graph.user",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-00000000000c"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-00000000000d"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-00000000000e"
+    },
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-00000000000f"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/directoryRoles",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "id": "00000003-0000-4000-8000-000000000000",
+     "displayName": "Global Administrator"
+    },
+    {
+     "id": "00000003-0000-4000-8000-000000000001",
+     "displayName": "User Administrator"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/directoryRoles/00000003-0000-4000-8000-000000000000/members",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000000"
+    }
+   ]
+  }
+ },
+ {
+  "method": "GET",
+  "host": "graph.microsoft.com",
+  "path": "/v1.0/directoryRoles/00000003-0000-4000-8000-000000000001/members",
+  "status": 200,
+  "body": {
+   "value": [
+    {
+     "@odata.type": "#microsoft.graph.user",
+     "id": "00000001-0000-4000-8000-000000000002"
+    },
+    {
+     "@odata.type": "#microsoft.graph.servicePrincipal",
+     "id": "00000004-0000-4000-8000-000000000000"
+    }
+   ]
+  }
+ }
+]

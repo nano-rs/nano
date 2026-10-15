@@ -234,6 +234,9 @@ fn validate_filters(query: &ListHealthEventsQuery) -> Result<(), ApiError> {
 }
 
 fn map_error(error: SystemHealthError) -> ApiError {
+    if nanosiem_core::db::contention::is_lock_contention(&error) {
+        return ApiError::ResourceLockContention;
+    }
     match error {
         SystemHealthError::NotFound(id) => {
             ApiError::NotFound(format!("System health event {id} not found"))
@@ -258,3 +261,13 @@ fn map_error(error: SystemHealthError) -> ApiError {
     components(schemas(HealthEventList, HealthBusSummary, SystemHealthEvent, HealthDelivery,))
 )]
 pub struct SystemHealthEventsApiDoc;
+
+#[cfg(test)]
+mod lock_contention_contract_tests {
+    use super::*;
+    use crate::handlers::lock_contention_contract_tests::{database_error, assert_contention};
+    #[tokio::test]
+    async fn lock_contention_is_retryable() {
+        assert_contention(axum::response::IntoResponse::into_response(map_error(SystemHealthError::Database(database_error("55P03"))))).await;
+    }
+}

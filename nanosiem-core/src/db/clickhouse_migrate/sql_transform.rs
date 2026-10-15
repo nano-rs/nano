@@ -77,7 +77,6 @@ impl ClickHouseMigrator {
         sql.contains("nano:keep-local-engine")
     }
 
-
     /// Escape a value for use inside a single-quoted ClickHouse string literal.
     ///
     /// CH treats `\` as an escape character inside `'...'` strings, so a
@@ -107,8 +106,7 @@ impl ClickHouseMigrator {
     pub(super) fn substitute_clickhouse_self_vars(sql: &str) -> String {
         let ch_self_host =
             std::env::var("CLICKHOUSE_SELF_HOST").unwrap_or_else(|_| "localhost".into());
-        let ch_self_port =
-            std::env::var("CLICKHOUSE_SELF_PORT").unwrap_or_else(|_| "9000".into());
+        let ch_self_port = std::env::var("CLICKHOUSE_SELF_PORT").unwrap_or_else(|_| "9000".into());
         let ch_self_user = std::env::var("CLICKHOUSE_SELF_USER")
             .or_else(|_| std::env::var("CLICKHOUSE_USER"))
             .unwrap_or_else(|_| "default".into());
@@ -223,12 +221,7 @@ impl ClickHouseMigrator {
             .map(str::trim)
             .filter(|cluster| !cluster.is_empty())
             .filter(|cluster| !is_cloud && *cluster != default_db)
-            .map(|cluster| {
-                format!(
-                    " ON CLUSTER '{}'",
-                    Self::escape_for_string_literal(cluster)
-                )
-            })
+            .map(|cluster| format!(" ON CLUSTER '{}'", Self::escape_for_string_literal(cluster)))
             .unwrap_or_default();
         sql.replace("{grant_on_cluster}", &clause)
     }
@@ -339,11 +332,7 @@ impl ClickHouseMigrator {
     }
 
     /// Env-free variant exposed for tests. See `substitute_postgres_vars`.
-    pub(super) fn substitute_postgres_vars_with(
-        sql: &str,
-        host: &str,
-        password: &str,
-    ) -> String {
+    pub(super) fn substitute_postgres_vars_with(sql: &str, host: &str, password: &str) -> String {
         // NAN-788: pg_host/pg_password are spliced into `'...'` literals;
         // SQL-escape `'` and `\` so a generated password can't break the literal.
         let pg_host = Self::escape_for_string_literal(host);
@@ -470,8 +459,7 @@ impl ClickHouseMigrator {
         }
 
         // AggregatingMergeTree (with or without empty parens)
-        let re_amt =
-            Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
+        let re_amt = Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
         if re_amt.is_match(&s) {
             s = re_amt
                 .replace(
@@ -702,8 +690,7 @@ impl ClickHouseMigrator {
             // MVs have no `ENGINE =`, so `replicate_engine` is a no-op for them.
             let re_engine = Regex::new(r"(?i)\bENGINE\s*=\s*\w*MergeTree").unwrap();
             if re_engine.is_match(&s) && !view_name.is_empty() {
-                let zoo_path =
-                    format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, view_name);
+                let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, view_name);
                 s = Self::replicate_engine(s, &zoo_path, replicated_db);
             }
             return s;

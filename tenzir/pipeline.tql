@@ -1,3 +1,7 @@
+// LEGACY (ClickHouse era). This pipeline writes to ClickHouse, which lean
+// installs no longer run. On the lean lake use lean/sysmon-http.tql (stopgap)
+// and see AGENTS.md plus DIRECT-OCSF-INGEST-DESIGN.md (NAN-3807).
+//
 // nano — bundled Tenzir → OCSF → ClickHouse starter pipeline (NAN-1604).
 //
 // This runs in the `nano-tenzir` container that `install.sh` adds when you pick
@@ -6,7 +10,7 @@
 // OCSF store over the native ClickHouse protocol. The SINK is pre-wired and
 // correct — you own the SOURCE and the OCSF MAPPING in between.
 //
-// As shipped it accepts newline-delimited JSON that is ALREADY OCSF 1.8.0 (each
+// As shipped it accepts newline-delimited JSON that is ALREADY OCSF 1.9.0 (each
 // record an `event` object carrying at least `class_uid` and `time` in epoch
 // ms) on :9095, and lands it in `nanosiem.ocsf_logs`. For raw logs, replace the
 // EDIT block with your own parsing + OCSF mapping.
@@ -34,7 +38,7 @@ let $listen  = env("NANO_TENZIR_LISTEN").otherwise("0.0.0.0:9095")
 // `load_kafka`, `load_file`, syslog, ...). The listener keeps the node alive.
 accept_http $listen { read_ndjson }
 
-// ── EDIT ME: parse + map your events to OCSF 1.8.0 ─────────────────────────
+// ── EDIT ME: parse + map your events to OCSF 1.9.0 ─────────────────────────
 // As shipped, records are assumed to ALREADY be OCSF objects, so we just wrap
 // them in nano's wire shape {event, source_type}. For raw logs, do your
 // parsing + OCSF mapping here and set a lowercase `source_type` per feed.
@@ -83,10 +87,11 @@ unordered { batch 65536, timeout=2s }
 // into `nanosiem.ocsf_logs`; you send only {event, source_type} and the server
 // fills the timestamp (from event.time) and the row id.
 //
-// Requires Tenzir >= 6.6.0 — the first release whose `to_clickhouse` accepts
-// ocsf_logs_raw's LowCardinality(String) + DateTime64(3, 'UTC') columns AND
-// omits the server-derived columns it doesn't send (timestamp, id) so their
-// DEFAULTs fire. On Tenzir 6.4.0–6.5.x, target the legacy
+// Requires Tenzir >= 6.10.0 for the OCSF 1.9.0 contract above. Tenzir 6.6.0 was
+// the first release whose `to_clickhouse` accepts ocsf_logs_raw's
+// LowCardinality(String) + DateTime64(3, 'UTC') columns AND omits the
+// server-derived columns it doesn't send (timestamp, id) so their DEFAULTs
+// fire, but it does not know OCSF 1.9.0. On Tenzir 6.4.0–6.5.x, target the legacy
 // `nanosiem.ocsf_logs_native_raw` entrypoint instead (a thin JSON/String shim
 // that forwards into ocsf_logs_raw) — see tenzir/AGENTS.md.
 // `tls=false` — the native port is plaintext on the internal docker network.

@@ -285,7 +285,7 @@ function RuleRowWithContext({
             Unarchive
           </ContextMenuItem>
         )}
-        {actions.onDelete && (
+        {actions.onDelete && !rule.archived && (
           <ContextMenuItem
             onClick={() => actions.onDelete?.(rule.id)}
             className="text-[var(--destructive,_#F87171)] focus:text-[var(--destructive,_#F87171)]"

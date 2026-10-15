@@ -123,67 +123,71 @@ if deleted != 1 { deleted = 0 }
 
 '''
 
-[sinks.clickhouse_ip_enrichments]
-type = "clickhouse"
+[sinks.lake_ip_context]
+type = "http"
 inputs = ["enrichment_normalize_custom"]
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "ip_enrichments"
-auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
-compression = "gzip"
-date_time_best_effort = true
-skip_unknown_fields = true
+uri = "${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/ip-context/batch"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+acknowledgements.enabled = true
 
-[sinks.clickhouse_ip_enrichments.buffer]
-type = "memory"
-max_events = 50000
-when_full = "drop_newest"
+[sinks.lake_ip_context.buffer]
+type = "disk"
+max_size = 1073741824
+when_full = "block"
 
-[sinks.clickhouse_ip_enrichments.acknowledgements]
+[sinks.lake_ip_context.batch]
+max_bytes = 33554432
+max_events = 100000
+timeout_secs = 2
+
+[sinks.lake_ip_context.request]
+concurrency = 1
+timeout_secs = 300
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 3600
+
+[sinks.lake_ip_context.request.headers]
+Authorization = "Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}"
+Content-Type = "application/x-ndjson"
+X-Nano-Tenant-ID = "${NANO_LAKE_TENANT_ID:-default}"
+
+[sinks.lake_ip_context.healthcheck]
 enabled = false
 
-[sinks.clickhouse_ip_enrichments.batch]
-max_events = 1000
-timeout_secs = 5
-
-[sinks.clickhouse_ip_enrichments.request]
-concurrency = "adaptive"
-timeout_secs = 60
-retry_initial_backoff_secs = 1
-retry_max_duration_secs = 60
-
-[sinks.clickhouse_user_registry]
-type = "clickhouse"
+[sinks.lake_identity_directory]
+type = "http"
 inputs = ["enrichment_normalize_ad"]
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "user_registry"
-auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
-compression = "gzip"
-date_time_best_effort = true
-skip_unknown_fields = true
+uri = "${NANO_LAKE_ENRICHMENT_COORDINATOR_URL:-http://127.0.0.1:9}/v1/identity/users/batch"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+acknowledgements.enabled = true
 
-[sinks.clickhouse_user_registry.buffer]
-type = "memory"
-max_events = 50000
-when_full = "drop_newest"
+[sinks.lake_identity_directory.buffer]
+type = "disk"
+max_size = 1073741824
+when_full = "block"
 
-[sinks.clickhouse_user_registry.acknowledgements]
-enabled = false
+[sinks.lake_identity_directory.batch]
+max_bytes = 33554432
+max_events = 100000
+timeout_secs = 2
 
-[sinks.clickhouse_user_registry.batch]
-max_events = 1000
-timeout_secs = 5
-
-[sinks.clickhouse_user_registry.request]
-concurrency = "adaptive"
-timeout_secs = 60
+[sinks.lake_identity_directory.request]
+concurrency = 1
+timeout_secs = 300
 retry_initial_backoff_secs = 1
-retry_max_duration_secs = 60
+retry_max_duration_secs = 3600
+
+[sinks.lake_identity_directory.request.headers]
+Authorization = "Bearer ${NANO_LAKE_ENRICHMENT_TOKEN:-lake-disabled-lake-disabled}"
+Content-Type = "application/x-ndjson"
+X-Nano-Tenant-ID = "${NANO_LAKE_TENANT_ID:-default}"
+
+[sinks.lake_identity_directory.healthcheck]
+enabled = false
 
 [sinks.enrichment_dead_letter]
 type = "blackhole"

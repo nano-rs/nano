@@ -261,12 +261,18 @@ pub async fn get_onboarding_status(
         });
     let has_users = user_count > 1;
 
-    let has_sso = check(
-        &state.pool,
-        "sso",
-        "SELECT EXISTS(SELECT 1 FROM oidc_providers WHERE enabled = true)",
-    )
-    .await;
+    // SSO is enterprise-only and `oidc_providers` exists only under the
+    // enterprise overlay; the open edition has no SSO to detect (NAN-3463).
+    let has_sso = if crate::handlers::capabilities::SSO_AVAILABLE {
+        check(
+            &state.pool,
+            "sso",
+            "SELECT EXISTS(SELECT 1 FROM oidc_providers WHERE enabled = true)",
+        )
+        .await
+    } else {
+        false
+    };
 
     let has_log_sources = check(
         &state.pool,

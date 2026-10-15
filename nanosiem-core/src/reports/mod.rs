@@ -16,16 +16,19 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use render::PanelOutput;
-pub use repository::{ReportRepository, ReportRepositoryError};
-pub use service::{report_artifact_download_allowed, ReportError, ReportService};
-pub use types::{
-    report_run_requires_search_sql, ArtifactScope, ClaimedReportDefinition, NewReportDefinition,
-    RenderedArtifact, ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportRun,
-    ReportRunAuthorizationScope, ReportRunStatus, ReportSourceType, UpdateReportDefinition,
-};
 pub use authz::{
     dashboard_executes_search_sql, dashboard_panel_executes_search_sql,
     required_report_permissions, ReportAuthorizationError, ReportAuthorizationIntent,
     ReportAuthorizer, ReportDashboardAuthorization, ReportExecutionAuthorization,
+};
+pub use render::PanelOutput;
+pub use repository::{ReportRepository, ReportRepositoryError, COMPATIBILITY_TENANT_ID};
+pub use service::{
+    artifact_basename, produce_search_report, report_artifact_download_allowed,
+    validate_cron_interval, ExecutionOutput, ReportError, ReportService,
+};
+pub use types::{
+    report_run_requires_search_sql, ArtifactScope, ClaimedReportDefinition, NewReportDefinition,
+    RenderedArtifact, ReportArtifactContent, ReportArtifactMeta, ReportDefinition, ReportRun,
+    ReportRunAuthorizationScope, ReportRunStatus, ReportSourceType, UpdateReportDefinition,
 };

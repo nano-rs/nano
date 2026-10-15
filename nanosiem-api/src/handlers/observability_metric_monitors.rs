@@ -53,7 +53,7 @@ pub struct MetricMonitorRequest {
     /// Aggregate: `avg`|`sum`|`min`|`max`|`count`|`rate`|`p50`|`p95`|`p99`.
     pub agg: String,
     /// Optional service scope; NULL evaluates the metric fleet-wide. The
-    /// promoted `otel_metrics.service_name` column (NAN-1564), NOT a tag filter.
+    /// promoted `otel_metrics.service_name` column, NOT a tag filter.
     #[serde(default)]
     pub service_name: Option<String>,
     /// Optional tag/attribute key to split into per-series evaluation.

@@ -6,15 +6,16 @@
 //! shared links, page refreshes, and repeat queries return instantly
 //! without re-executing SQL or calling the LLM.
 
-use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use nanosiem_core::auth::ScopeSet;
+use nanosiem_core::search::{SearchTenantScope, ServingGenerationKey};
 use nanosiem_core::{SearchRequest, SearchResponse};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use nanosiem_core::redis_transport::ReconnectingConnection as ConnectionManager;
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use tracing::{debug, info, warn};
@@ -52,7 +53,7 @@ const MAX_CACHEABLE_ROWS: usize = 10_000;
 /// an empty query is trivial vs. the correctness risk.
 fn skip_cache_reason(response: &SearchResponse) -> Option<&'static str> {
     if response.results.is_empty() {
-        return Some("empty result set (NAN-1027)");
+        return Some("empty result set");
     }
     if response.results.len() > MAX_CACHEABLE_ROWS {
         return Some("result row count exceeds MAX_CACHEABLE_ROWS");
@@ -67,9 +68,11 @@ pub struct SearchResultCache {
 }
 
 impl SearchResultCache {
+    const ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX: &'static str =
+        "enterprise-shared-retention-cache-disabled:";
     /// Connect to Dragonfly/Redis. Returns None if connection fails (graceful degradation).
     pub async fn connect(redis_url: &str) -> Option<Self> {
-        let client = match redis::Client::open(redis_url) {
+        let client = match nanosiem_core::redis_transport::client_from_url(redis_url) {
             Ok(c) => c,
             Err(e) => {
                 warn!("Search result cache: failed to create Redis client: {}", e);
@@ -79,13 +82,13 @@ impl SearchResultCache {
 
         match ConnectionManager::new(client).await {
             Ok(conn) => {
-                info!("Search result cache connected to {}", redis_url);
+                info!("Search result cache connected");
                 Some(Self { conn })
             }
             Err(e) => {
                 warn!(
-                    "Search result cache: failed to connect to {} (caching disabled): {}",
-                    redis_url, e
+                    "Search result cache: failed to connect (caching disabled): {}",
+                    e
                 );
                 None
             }
@@ -105,19 +108,58 @@ impl SearchResultCache {
     /// be part of result identity or two users collide on one key and one is
     /// served the other's rows from cache (cross-user data leak).
     pub fn cache_key(request: &SearchRequest, scope: &ScopeSet) -> String {
+        Self::cache_key_for(SearchTenantScope::dedicated(), request, scope, None)
+    }
+
+    /// Tenant-pinned cache identity for enterprise-shared search. Callers must
+    /// already hold a server-resolved [`SearchTenantScope`]; a raw slug/header
+    /// cannot reach this boundary. `generation` is the tenant's serving
+    /// generation (NAN-2361 wave 6): folding it makes an erasure or retention
+    /// swap — a new generation on a new Iceberg snapshot — miss every entry
+    /// cached under the predecessor at once.
+    pub fn cache_key_for(
+        tenant: SearchTenantScope,
+        request: &SearchRequest,
+        scope: &ScopeSet,
+        generation: Option<&ServingGenerationKey>,
+    ) -> String {
+        let mut generation_bytes = Vec::new();
+        if let Some(generation) = generation {
+            generation.fold_identity(&mut generation_bytes);
+        }
         // Length-prefixed components (see `companion_key`): the query is
         // free-form and contains `|`, so a delimiter join is collision-prone.
-        Self::companion_key(
+        Self::companion_key_with_generation(
+            tenant,
             "search",
             &[
+                generation_bytes.as_slice(),
                 request.query.as_bytes(),
-                request.time_range.start.timestamp_micros().to_string().as_bytes(),
-                request.time_range.end.timestamp_micros().to_string().as_bytes(),
+                request
+                    .time_range
+                    .start
+                    .timestamp_micros()
+                    .to_string()
+                    .as_bytes(),
+                request
+                    .time_range
+                    .end
+                    .timestamp_micros()
+                    .to_string()
+                    .as_bytes(),
                 request.limit.unwrap_or(100).to_string().as_bytes(),
                 request.offset.unwrap_or(0).to_string().as_bytes(),
                 if request.table_view { b"tv1" } else { b"tv0" },
-                if request.skip_histogram { b"sh1" } else { b"sh0" },
-                if request.skip_field_stats { b"sf1" } else { b"sf0" },
+                if request.skip_histogram {
+                    b"sh1"
+                } else {
+                    b"sh0"
+                },
+                if request.skip_field_stats {
+                    b"sf1"
+                } else {
+                    b"sf0"
+                },
                 // NAN-1569: the same nPL string runs against different physical
                 // tables per dataset (logs / otel_spans / otel_metrics). Without
                 // this, a query cached for one dataset is served for another →
@@ -125,13 +167,51 @@ impl SearchResultCache {
                 request.dataset.as_deref().unwrap_or("logs").as_bytes(),
             ],
             scope,
+            generation.is_some(),
         )
     }
 
     /// Try to get a cached search response for this request under the
     /// caller's effective scope (NAN-1799 — see [`Self::cache_key`]).
     pub async fn get(&self, request: &SearchRequest, scope: &ScopeSet) -> Option<SearchResponse> {
-        let key = Self::cache_key(request, scope);
+        self.get_for(SearchTenantScope::dedicated(), request, scope, None)
+            .await
+    }
+
+    /// Whether a shared tenant's request may touch the result cache at all.
+    /// NAN-2922: a query that reads tenant lookup tables, IOC sources or the
+    /// tenant-billed `| ai` pipe is never cached, because the serving
+    /// generation does not change when that state does, and a cached `| ai`
+    /// answer would bypass per-member billing.
+    ///
+    /// NAN-2361 wave 6: the key must carry the serving generation (so a
+    /// swap invalidates it) and the requested window must lie entirely
+    /// inside retention at this instant (so a fixed-TTL entry can never
+    /// cross the moving cutoff). Dedicated deployments are unconditional.
+    fn shared_cache_admitted(
+        tenant: SearchTenantScope,
+        request: &SearchRequest,
+        generation: Option<&ServingGenerationKey>,
+    ) -> bool {
+        if !crate::is_shared_scope(tenant) {
+            return true;
+        }
+        generation.is_some()
+            && tenant.cacheable_window(request.time_range.start, chrono::Utc::now())
+            && !reads_state_outside_the_generation(&request.query)
+    }
+
+    pub async fn get_for(
+        &self,
+        tenant: SearchTenantScope,
+        request: &SearchRequest,
+        scope: &ScopeSet,
+        generation: Option<&ServingGenerationKey>,
+    ) -> Option<SearchResponse> {
+        if !Self::shared_cache_admitted(tenant, request, generation) {
+            return None;
+        }
+        let key = Self::cache_key_for(tenant, request, scope, generation);
         let mut conn = self.conn.clone();
 
         let data: Option<Vec<u8>> = match conn.get::<_, Option<Vec<u8>>>(&key).await {
@@ -215,12 +295,27 @@ impl SearchResultCache {
     /// Store a search response in the cache under the caller's effective
     /// scope (NAN-1799 — see [`Self::cache_key`]).
     pub async fn set(&self, request: &SearchRequest, response: &SearchResponse, scope: &ScopeSet) {
+        self.set_for(SearchTenantScope::dedicated(), request, response, scope, None)
+            .await;
+    }
+
+    pub async fn set_for(
+        &self,
+        tenant: SearchTenantScope,
+        request: &SearchRequest,
+        response: &SearchResponse,
+        scope: &ScopeSet,
+        generation: Option<&ServingGenerationKey>,
+    ) {
+        if !Self::shared_cache_admitted(tenant, request, generation) {
+            return;
+        }
         if let Some(reason) = skip_cache_reason(response) {
             debug!("Skipping cache: {}", reason);
             return;
         }
 
-        let key = Self::cache_key(request, scope);
+        let key = Self::cache_key_for(tenant, request, scope, generation);
         let mut conn = self.conn.clone();
 
         // Serialize
@@ -333,6 +428,29 @@ impl SearchResultCache {
     /// the key match result identity again; the added component rotates every
     /// existing key once on deploy (a cold cache, not a correctness event).
     pub fn companion_key(prefix: &str, components: &[&[u8]], scope: &ScopeSet) -> String {
+        Self::companion_key_for(SearchTenantScope::dedicated(), prefix, components, scope)
+    }
+
+    pub fn companion_key_for(
+        tenant: SearchTenantScope,
+        prefix: &str,
+        components: &[&[u8]],
+        scope: &ScopeSet,
+    ) -> String {
+        Self::companion_key_with_generation(tenant, prefix, components, scope, false)
+    }
+
+    /// `generation_bound` is true only for the main search key, whose
+    /// components carry the serving generation; companion keys stay
+    /// release-closed for shared tenants (their payloads are not
+    /// generation-keyed).
+    fn companion_key_with_generation(
+        tenant: SearchTenantScope,
+        prefix: &str,
+        components: &[&[u8]],
+        scope: &ScopeSet,
+        generation_bound: bool,
+    ) -> String {
         fn fold(hasher: &mut Sha256, denied: &std::collections::BTreeSet<String>) {
             let mut bytes: Vec<u8> = Vec::new();
             for value in denied {
@@ -343,19 +461,39 @@ impl SearchResultCache {
             hasher.update(&bytes);
         }
 
+        let mut identity = Vec::new();
+        tenant.fold_identity(&mut identity);
         let mut hasher = Sha256::new();
+        hasher.update(identity);
         for c in components {
             hasher.update((c.len() as u64).to_le_bytes());
             hasher.update(c);
         }
         fold(&mut hasher, scope.deny_set());
         fold(&mut hasher, scope.artifact_deny_set());
-        format!("{}:{}", prefix, hex::encode(hasher.finalize()))
+        // NAN-3406: a request running with authorized per-request perf
+        // overrides keys its entries apart, so an A/B mode's answer is never
+        // served to an ordinary request (or to the other mode). Without
+        // overrides the key is unchanged.
+        if let Some(overrides) = nanosiem_core::search::lake_debug::perf_overrides() {
+            hasher.update(b"nan3406-perf-overrides");
+            hasher.update((overrides.len() as u64).to_le_bytes());
+            hasher.update(overrides.as_bytes());
+        }
+        let key = format!("{}:{}", prefix, hex::encode(hasher.finalize()));
+        if crate::is_shared_scope(tenant) && !generation_bound {
+            format!("{}{}", Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX, key)
+        } else {
+            key
+        }
     }
 
     /// Fetch and decompress a cached companion response. Returns `None` on
     /// miss, connection error, or any decode failure (graceful degradation).
     pub async fn get_cached<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        if key.starts_with(Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX) {
+            return None;
+        }
         let mut conn = self.conn.clone();
         let compressed: Vec<u8> = match conn.get::<_, Option<Vec<u8>>>(key).await {
             Ok(Some(d)) => d,
@@ -394,6 +532,9 @@ impl SearchResultCache {
 
     /// Compress and store a companion response under `key` with the shared TTL.
     pub async fn set_cached<T: Serialize>(&self, key: &str, value: &T) {
+        if key.starts_with(Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX) {
+            return;
+        }
         let mut conn = self.conn.clone();
         let json_bytes = match serde_json::to_vec(value) {
             Ok(b) => b,
@@ -448,6 +589,9 @@ impl SearchResultCache {
     /// shared-link follower whose client cache is cold) can show how stale a
     /// served-from-cache result is (NAN-1595).
     pub async fn age_secs(&self, key: &str) -> Option<u64> {
+        if key.starts_with(Self::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX) {
+            return None;
+        }
         let mut conn = self.conn.clone();
         let pttl_ms: i64 = conn.pttl(key).await.ok()?;
         if pttl_ms < 0 {
@@ -477,7 +621,10 @@ pub fn cache_status_headers(hit: bool, age_secs: Option<u64>) -> axum::http::Hea
         HeaderValue::from_static(if hit { "hit" } else { "miss" }),
     );
     if let Some(age) = age_secs {
-        headers.insert(HeaderName::from_static(HEADER_CACHE_AGE), HeaderValue::from(age));
+        headers.insert(
+            HeaderName::from_static(HEADER_CACHE_AGE),
+            HeaderValue::from(age),
+        );
     }
     headers
 }
@@ -518,8 +665,10 @@ mod tests {
             .map(|i| serde_json::json!({ "id": format!("row-{}", i) }))
             .collect();
         SearchResponse {
+            server_wall_ms: None,
             results,
             total_count: rows as u64,
+            total_count_exact: true,
             execution_time_ms: 10,
             fields: Vec::new(),
             generated_sql: None,
@@ -528,6 +677,7 @@ mod tests {
             cost_score: None,
             display_type: None,
             column_order: None,
+            completeness: None,
         }
     }
 
@@ -538,7 +688,7 @@ mod tests {
         let resp = make_response(0);
         assert_eq!(
             skip_cache_reason(&resp),
-            Some("empty result set (NAN-1027)")
+            Some("empty result set")
         );
     }
 
@@ -546,11 +696,7 @@ mod tests {
     fn non_empty_response_is_cached() {
         for n in [1, 2, 3, 5, 100, MAX_CACHEABLE_ROWS] {
             let resp = make_response(n);
-            assert_eq!(
-                skip_cache_reason(&resp),
-                None,
-                "n={n} should be cacheable"
-            );
+            assert_eq!(skip_cache_reason(&resp), None, "n={n} should be cacheable");
         }
     }
 
@@ -647,17 +793,38 @@ mod tests {
         );
     }
 
+    /// NAN-3406: keys computed under per-request perf overrides are their
+    /// own (per mode); a debug request without overrides keys as before.
+    #[tokio::test]
+    async fn perf_overrides_separate_cache_keys_per_mode() {
+        use nanosiem_core::search::lake_debug::{collect, collect_with_perf_overrides};
+        let scope = ScopeSet::unrestricted();
+        let key = || SearchResultCache::companion_key("fstats", &[b"q", b"100"], &scope);
+        let plain = key();
+        let (debug, _) = collect(async { key() }).await;
+        let (flat_on, _) = collect_with_perf_overrides(Some("flat_filter_leaves=1".into()), async { key() }).await;
+        let (flat_off, _) = collect_with_perf_overrides(Some("flat_filter_leaves=0".into()), async { key() }).await;
+        assert_eq!(plain, debug, "no overrides: the ordinary key");
+        assert_ne!(plain, flat_on);
+        assert_ne!(plain, flat_off);
+        assert_ne!(flat_on, flat_off);
+        assert!(flat_on.starts_with("fstats:"));
+    }
+
     #[test]
     fn companion_key_is_deterministic_and_keyspace_isolated() {
         let scope = ScopeSet::unrestricted();
 
         // NAN-1593: same prefix + same components → identical key.
-        let a = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
-        let b = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
+        let a =
+            SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
+        let b =
+            SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"], &scope);
         assert_eq!(a, b);
 
         // A changed component → different key.
-        let c = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"], &scope);
+        let c =
+            SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"], &scope);
         assert_ne!(a, c);
 
         // Different keyspace prefixes never collide, even with identical
@@ -682,6 +849,124 @@ mod tests {
             SearchResultCache::companion_key("retro", &[b"ioc=x | retro", b"100"], &scope),
             SearchResultCache::companion_key("retro", &[b"ioc=x", b" retro|100"], &scope),
         );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn enterprise_shared_cache_identity_is_tenant_pinned() {
+        let scope = ScopeSet::unrestricted();
+        let tenant_a = SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(1));
+        let tenant_b = SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(2));
+        let components: &[&[u8]] = &[b"same-query", b"same-window"];
+
+        let a = SearchResultCache::companion_key_for(tenant_a, "search", components, &scope);
+        let b = SearchResultCache::companion_key_for(tenant_b, "search", components, &scope);
+        assert_ne!(a, b, "identical queries must not collide across tenants");
+
+        assert_eq!(
+            SearchResultCache::companion_key("search", components, &scope),
+            SearchResultCache::companion_key_for(
+                SearchTenantScope::dedicated(),
+                "search",
+                components,
+                &scope,
+            ),
+            "dedicated cache identity must remain byte-compatible"
+        );
+    }
+
+    /// NAN-2711: `| risk` results are cached under the caller's tenant only.
+    /// Tenant B issuing A's exact RBA query (same text, same window) can never
+    /// be served A's scored rows from the result cache.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn risk_projection_results_are_cached_per_tenant() {
+        let scope = ScopeSet::unrestricted();
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "metadata.log_source=windows_sysmon | risk score=80 entity=device.hostname",
+            "time_range": {"start": "2026-09-23T00:00:00Z", "end": "2026-09-23T01:00:00Z"},
+        }))
+        .unwrap();
+        let key = |tenant: u128| {
+            SearchResultCache::cache_key_for(
+                SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(tenant)),
+                &request,
+                &scope,
+                None,
+            )
+        };
+        assert_ne!(key(0xa), key(0xb));
+        assert_eq!(key(0xa), key(0xa));
+    }
+
+    /// NAN-2361 wave 6: a shared tenant's result identity carries the serving
+    /// generation, so an erasure / retention swap (new generation, new
+    /// snapshot) misses every entry cached under the predecessor; and a
+    /// shared tenant is admitted to the cache only when the requested window
+    /// lies inside retention at delivery.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn shared_cache_identity_is_generation_keyed_and_retention_fenced() {
+        let scope = ScopeSet::unrestricted();
+        let now = chrono::Utc::now();
+        let tenant = SearchTenantScope::enterprise_shared_retained(
+            uuid::Uuid::from_u128(7),
+            3,
+            30,
+            0,
+        )
+        .unwrap();
+        let request = SearchRequest {
+            query: "error".into(),
+            time_range: TimeRangeInput {
+                start: now - chrono::Duration::hours(2),
+                end: now,
+            },
+            limit: Some(100),
+            offset: None,
+            include_sql: None,
+            skip_histogram: false,
+            skip_field_stats: false,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: None,
+        };
+        let before = ServingGenerationKey {
+            generation_id: "gen-1".into(),
+            snapshot_id: 100,
+        };
+        let after = ServingGenerationKey {
+            generation_id: "gen-2".into(),
+            snapshot_id: 101,
+        };
+        let key_before = SearchResultCache::cache_key_for(tenant, &request, &scope, Some(&before));
+        let key_after = SearchResultCache::cache_key_for(tenant, &request, &scope, Some(&after));
+        assert_ne!(key_before, key_after, "a generation swap rotates the key");
+        assert!(
+            !key_before.starts_with(SearchResultCache::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX),
+            "a generation-bound shared key is live"
+        );
+        assert!(
+            SearchResultCache::cache_key_for(tenant, &request, &scope, None)
+                .starts_with(SearchResultCache::ENTERPRISE_SHARED_CACHE_DISABLED_PREFIX),
+            "without a generation the shared key stays release-closed"
+        );
+        assert!(SearchResultCache::shared_cache_admitted(tenant, &request, Some(&before)));
+        assert!(!SearchResultCache::shared_cache_admitted(tenant, &request, None));
+        // A window that reaches past the 30-day cutoff is never cached for
+        // a shared tenant, whatever the generation.
+        let mut stale = request.clone();
+        stale.time_range.start = now - chrono::Duration::days(31);
+        assert!(!SearchResultCache::shared_cache_admitted(tenant, &stale, Some(&before)));
+        // Dedicated identity is unchanged and unconditional.
+        assert_eq!(
+            SearchResultCache::cache_key(&request, &scope),
+            SearchResultCache::cache_key_for(SearchTenantScope::dedicated(), &request, &scope, None)
+        );
+        assert!(SearchResultCache::shared_cache_admitted(SearchTenantScope::dedicated(), &stale, None));
     }
 
     fn scope_of(items: &[&str]) -> ScopeSet {
@@ -812,5 +1097,63 @@ mod tests {
             SearchResultCache::companion_key("fstats", comps, &analyst),
             SearchResultCache::companion_key("fstats", comps, &audit_restricted),
         );
+    }
+}
+
+/// Whether an nPL query reads tenant state that the serving generation does
+/// not version: lookup tables, IOC lookup/feed sources, or `| ai` (NAN-2922).
+/// An unparseable query is treated as uncacheable.
+fn reads_state_outside_the_generation(query: &str) -> bool {
+    use nanosiem_core::query::{Command, Query, SearchExpr};
+    fn expr(e: &SearchExpr) -> bool {
+        match e {
+            SearchExpr::IocMatch { feed, lookup, .. } => feed.is_some() || lookup.is_some(),
+            SearchExpr::And(l, r) | SearchExpr::Or(l, r) => expr(l) || expr(r),
+            SearchExpr::Not(i) | SearchExpr::Group(i) => expr(i),
+            SearchExpr::InSubsearch { subsearch, .. } => node(subsearch),
+            _ => false,
+        }
+    }
+    fn node(q: &Query) -> bool {
+        match q {
+            Query::Search(e) => expr(e),
+            Query::Piped { source, command } => {
+                node(source)
+                    || matches!(
+                        command,
+                        Command::Lookup { .. } | Command::InputLookup { .. } | Command::Ai { .. }
+                    )
+                    || match command {
+                        Command::Append { subsearch, .. } | Command::Join { subsearch, .. } => {
+                            node(subsearch)
+                        }
+                        Command::Where { condition } => expr(condition),
+                        _ => false,
+                    }
+            }
+        }
+    }
+    nanosiem_core::query::parse_query(query).map_or(true, |parsed| node(&parsed))
+}
+
+#[cfg(test)]
+mod shared_state_cache_tests {
+    use super::reads_state_outside_the_generation as uncacheable;
+
+    #[test]
+    fn tenant_state_reads_are_never_cached_on_shared() {
+        for query in [
+            "* | lookup assets user.name OUTPUT owner",
+            "* | inputlookup assets",
+            "* | ai prompt=\"x\"",
+            "ioc in lookup(\"threats\")",
+            "ioc in threatfox(\"apt29\")",
+            "user.name=a | append [* | lookup assets user.name OUTPUT owner]",
+        ] {
+            assert!(uncacheable(query), "{query}");
+        }
+        for query in ["* | stats count() by user.name", "* | output x", "ioc=\"1.2.3.4\""] {
+            assert!(!uncacheable(query), "{query}");
+        }
     }
 }

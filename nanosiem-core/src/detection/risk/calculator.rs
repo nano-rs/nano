@@ -221,9 +221,7 @@ impl ScoreCalculator {
     /// row (`filter_map`) → empty groups → the grouped path misread that as
     /// "already alerted" and suppressed the whole alert.
     pub fn has_query_risk_score(event: &Value) -> bool {
-        event
-            .get("raw_risk_score")
-            .is_some_and(|v| !v.is_null())
+        event.get("raw_risk_score").is_some_and(|v| !v.is_null())
     }
 
     /// Get a numeric field value from an event

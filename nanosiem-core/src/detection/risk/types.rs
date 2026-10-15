@@ -254,7 +254,14 @@ mod tests {
 
     #[test]
     fn field_name_extracts_the_token_before_each_operator() {
-        let f = |c: &str| RiskModifier { condition: c.to_string(), score: 10 }.field_name().map(str::to_string);
+        let f = |c: &str| {
+            RiskModifier {
+                condition: c.to_string(),
+                score: 10,
+            }
+            .field_name()
+            .map(str::to_string)
+        };
         assert_eq!(f("auth_result = failure").as_deref(), Some("auth_result"));
         assert_eq!(f("bytes_out > 1000000").as_deref(), Some("bytes_out"));
         assert_eq!(f("count >= 5").as_deref(), Some("count"));

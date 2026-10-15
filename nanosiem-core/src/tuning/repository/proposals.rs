@@ -1271,10 +1271,10 @@ impl TuningRepository {
                  pr_approval_provenance = COALESCE(pr_approval_provenance, $2)
              WHERE proposal_id = $1",
         )
-            .bind(proposal_id)
-            .bind(&approval_provenance)
-            .execute(&mut *tx)
-            .await?;
+        .bind(proposal_id)
+        .bind(&approval_provenance)
+        .execute(&mut *tx)
+        .await?;
         if audited.rows_affected() == 0 {
             tx.rollback().await?;
             return Err(PrOperationError::InvalidState {

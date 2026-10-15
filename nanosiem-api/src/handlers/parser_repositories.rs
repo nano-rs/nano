@@ -107,7 +107,7 @@ pub struct ImportParserRequest {
     pub source_type: Option<String>,
     /// Ingestion method: routed, kafka, aws_s3, gcp_pubsub, splunk_hec, vector
     pub ingestion_method: Option<String>,
-    /// NAN-928: source-configuration whose route should dispatch events
+    /// source-configuration whose route should dispatch events
     /// into this parser. Captured by the parser-import UI's
     /// "DISPATCH FROM" picker. When set, the generator emits a `filter`
     /// on the source-config's `*_route` instead of a parser-owned source.
@@ -139,7 +139,7 @@ pub struct BatchImportParserItem {
     pub source_type: Option<String>,
     /// Ingestion method: routed, kafka, aws_s3, gcp_pubsub, splunk_hec, vector
     pub ingestion_method: Option<String>,
-    /// NAN-928: source-configuration whose route should dispatch events
+    /// source-configuration whose route should dispatch events
     /// into this parser. See `ImportParserRequest` for semantics.
     #[serde(default, with = "nanosiem_core::typeid::source_config::opt")]
     #[schema(value_type = Option<String>)]
@@ -425,6 +425,7 @@ pub async fn delete_parser_repository(
     ),
     responses(
         (status = 200, description = "Sync started", body = ParserSyncStartResponse),
+        (status = 202, description = "Shared tenant sync accepted; poll the repository", body = nanosiem_core::rule_repository::SyncAccepted),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
     ),
@@ -1240,6 +1241,7 @@ pub struct FixupMatchValuesResponse {
         BatchRemoveParsersResponse,
         ParserUpstreamUpdatesResponse,
         ParserSyncStartResponse,
+        nanosiem_core::rule_repository::SyncAccepted,
         ParserSyncStatusResponse,
         FixupMatchValuesResponse,
         ApplyUpstreamUpdateResult,

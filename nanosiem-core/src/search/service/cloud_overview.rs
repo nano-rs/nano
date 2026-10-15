@@ -29,6 +29,14 @@ use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudOverview {
+    /// The independently fetched section; absent for an exact full overview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_events: Vec<super::cloud_dossier::CloudDossierStreamEvent>,
+    /// A section exceeded the interactive envelope; fetch full once to admit a job.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_durable: bool,
     pub header: CloudOverviewHeader,
     pub accounts: Vec<CloudOverviewAccount>,
     pub risky_principals: Vec<CloudOverviewPrincipal>,
@@ -36,6 +44,10 @@ pub struct CloudOverview {
     pub anomalies: Vec<CloudOverviewAnomaly>,
     pub service_health: Vec<CloudOverviewServiceHealth>,
     pub changes: Vec<CloudOverviewChange>,
+    /// Present when the exact overview exceeded the interactive resource
+    /// envelope and was admitted to the isolated durable query lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_job: Option<crate::search::AsyncSearchResponse>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
@@ -267,6 +279,18 @@ impl SearchService {
         time_range: &TimeRange,
         scope: &ScopeSet,
     ) -> Result<CloudOverview, SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok(CloudOverview::default());
+        };
+        let time_range = &retention_time_range;
+
+        if self.backend() == crate::search::config::SearchBackend::Lake {
+            return self
+                .query_lake_cloud_overview(provider_filter, account_filter, time_range, scope)
+                .await;
+        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return Ok(CloudOverview::default()),
@@ -288,9 +312,7 @@ impl SearchService {
         // does not map (`udm_column_sql` → None) are SKIPPED — we never emit a
         // dead `ext.` reference (that 500s on OCSF) nor the bare literal name.
         let profile = self.active_profile.as_ref();
-        let logs_table = self
-            .table_names
-            .read(Self::logs_table_key(profile));
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
         let signals_table = self.table_names.read("signals");
 
         // Resolve the cloud-context columns once. `cloud_provider` /
@@ -313,14 +335,10 @@ impl SearchService {
 
         // The provider/account filters can only apply when the schema actually
         // has the gating column; otherwise drop the clause (and its bind).
-        let provider_filter_active = provider_filter
-            .filter(|p| !p.is_empty())
-            .is_some()
-            && cloud_provider_col.is_some();
-        let account_filter_active = account_filter
-            .filter(|a| !a.is_empty())
-            .is_some()
-            && cloud_account_id_col.is_some();
+        let provider_filter_active =
+            provider_filter.filter(|p| !p.is_empty()).is_some() && cloud_provider_col.is_some();
+        let account_filter_active =
+            account_filter.filter(|a| !a.is_empty()).is_some() && cloud_account_id_col.is_some();
         let provider_clause = match (&cloud_provider_col, provider_filter_active) {
             (Some(col), true) => format!(" AND lower({col}) = lower(?)"),
             _ => String::new(),
@@ -370,10 +388,14 @@ impl SearchService {
         // across whichever of provider/service/account the schema maps; if none
         // map there is no cloud context to scope on and we omit the predicate.
         let cloud_scope_predicate = {
-            let terms: Vec<String> = [&cloud_provider_col, &cloud_service_col, &cloud_account_id_col]
-                .into_iter()
-                .filter_map(|c| c.as_ref().map(|col| format!("{col} != ''")))
-                .collect();
+            let terms: Vec<String> = [
+                &cloud_provider_col,
+                &cloud_service_col,
+                &cloud_account_id_col,
+            ]
+            .into_iter()
+            .filter_map(|c| c.as_ref().map(|col| format!("{col} != ''")))
+            .collect();
             if terms.is_empty() {
                 String::new()
             } else {
@@ -827,11 +849,14 @@ impl SearchService {
             None => "'' AS service".to_string(),
         };
         let anomaly_cloud_predicate = {
-            let terms: Vec<String> =
-                [&cloud_service_col, &cloud_provider_col, &cloud_account_id_col]
-                    .into_iter()
-                    .filter_map(|c| c.as_ref().map(|col| format!("l.{col} != ''")))
-                    .collect();
+            let terms: Vec<String> = [
+                &cloud_service_col,
+                &cloud_provider_col,
+                &cloud_account_id_col,
+            ]
+            .into_iter()
+            .filter_map(|c| c.as_ref().map(|col| format!("l.{col} != ''")))
+            .collect();
             if terms.is_empty() {
                 // No cloud context to gate on — keep the feed empty rather than
                 // surfacing every (non-cloud) signal.
@@ -1012,7 +1037,10 @@ impl SearchService {
             .into_iter()
             .next()
             .map(|row| HeaderRow {
-                events_total: row.get("events_total").and_then(|v| v.as_u64()).unwrap_or(0),
+                events_total: row
+                    .get("events_total")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
                 events_failed: row
                     .get("events_failed")
                     .and_then(|v| v.as_u64())
@@ -1063,12 +1091,7 @@ impl SearchService {
             .first()
             .map(|a| a.name.clone())
             .filter(|n| !n.is_empty());
-        let posture_score = accounts
-            .iter()
-            .take(5)
-            .map(|a| a.risk)
-            .max()
-            .unwrap_or(0);
+        let posture_score = accounts.iter().take(5).map(|a| a.risk).max().unwrap_or(0);
         let posture_reason = top_account_label
             .as_ref()
             .map(|name| format!("driven by {name}"));
@@ -1089,8 +1112,11 @@ impl SearchService {
             &window_label(time_range),
         );
 
-        let service_health =
-            build_service_health(&service_health_rows, &service_trend_rows, SERVICE_TREND_BUCKETS);
+        let service_health = build_service_health(
+            &service_health_rows,
+            &service_trend_rows,
+            SERVICE_TREND_BUCKETS,
+        );
 
         let anomalies = build_anomalies(&anomaly_rows);
 
@@ -1116,6 +1142,7 @@ impl SearchService {
         };
 
         Ok(CloudOverview {
+            section: None, preview_events: Vec::new(), requires_durable: false,
             header,
             accounts,
             risky_principals,
@@ -1123,6 +1150,7 @@ impl SearchService {
             anomalies,
             service_health,
             changes,
+            durable_job: None,
         })
     }
 }
@@ -1252,6 +1280,7 @@ async fn build_accounts(
                     crate::risk::clickhouse_sql::CLOUD_ACCOUNT_ENTITY_TYPE.to_string(),
                 ),
                 min_score: None,
+                max_score: None,
                 risk_level: None,
                 limit: Some(200),
                 offset: None,
@@ -1374,17 +1403,13 @@ fn build_timeline(
             accent: lane_accent(i).into(),
         })
         .collect();
-    let lane_ids: std::collections::HashSet<String> =
-        lanes.iter().map(|l| l.id.clone()).collect();
+    let lane_ids: std::collections::HashSet<String> = lanes.iter().map(|l| l.id.clone()).collect();
 
     // Normalize bucket weights to {1, 2, 3} per lane so the heatmap reads
     // consistently regardless of absolute event volume.
     let mut per_lane_max: BTreeMap<String, u64> = BTreeMap::new();
     for row in rows {
-        let lane_id = row
-            .get("account_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let lane_id = row.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
         if lane_id.is_empty() || !lane_ids.contains(lane_id) {
             continue;
         }
@@ -1489,7 +1514,9 @@ fn build_service_health(
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            let trend = trends.remove(&id).unwrap_or_else(|| vec![0u64; trend_buckets as usize]);
+            let trend = trends
+                .remove(&id)
+                .unwrap_or_else(|| vec![0u64; trend_buckets as usize]);
             Some(CloudOverviewServiceHealth {
                 label: id.to_uppercase(),
                 accent: service_accent(&id).into(),
@@ -1553,10 +1580,7 @@ fn build_anomalies(rows: &[serde_json::Value]) -> Vec<CloudOverviewAnomaly> {
                     None
                 })
                 .unwrap_or_default();
-            let at_raw = row
-                .get("ts")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let at_raw = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");
             let at = format_hhmm(at_raw);
             let principal = row
                 .get("principal")
@@ -1597,8 +1621,10 @@ fn build_changes(
     rows: &[serde_json::Value],
     accounts: &[CloudOverviewAccount],
 ) -> Vec<CloudOverviewChange> {
-    let account_name: HashMap<String, String> =
-        accounts.iter().map(|a| (a.id.clone(), a.name.clone())).collect();
+    let account_name: HashMap<String, String> = accounts
+        .iter()
+        .map(|a| (a.id.clone(), a.name.clone()))
+        .collect();
     rows.iter()
         .filter_map(|row| {
             let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");

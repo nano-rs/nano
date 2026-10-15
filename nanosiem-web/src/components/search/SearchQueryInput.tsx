@@ -34,6 +34,7 @@ interface SearchQueryInputProps {
   pinnedSearchIds?: string[];
   onSelectHistoryItem?: (query: string, mode: 'piped' | 'sql') => void;
   timeRange?: { start: string; end: string };
+  isOcsf?: boolean;
 }
 
 
@@ -53,6 +54,7 @@ export function SearchQueryInput({
   pinnedSearchIds = [],
   onSelectHistoryItem,
   timeRange,
+  isOcsf = false,
 }: SearchQueryInputProps) {
   const editorRef = useRef<SearchQueryEditorRef>(null);
   const historyDropdownRef = useRef<HTMLDivElement>(null);
@@ -183,7 +185,9 @@ export function SearchQueryInput({
   }, [historySuggestions]);
 
   const placeholder = queryMode === 'piped'
-    ? 'Search logs… try source_type=syslog or status=500'
+    ? isOcsf
+      ? 'Search logs… try metadata.log_source=syslog or status_id=2'
+      : 'Search logs… try source_type=syslog or status=500'
     : 'SELECT … FROM logs';
 
   // Show hint when focused and not dismissed (and no dropdowns open)

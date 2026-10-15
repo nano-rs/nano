@@ -282,13 +282,17 @@ pub fn validate_retro_hunt_fields(
     }
     if let Some(cap) = max_indicators_per_run {
         if !(1..=MAX_RETRO_HUNT_MAX_INDICATORS).contains(&cap) {
-            return Err(RetroHuntConfigValidationError::MaxIndicatorsOutOfBounds(cap));
+            return Err(RetroHuntConfigValidationError::MaxIndicatorsOutOfBounds(
+                cap,
+            ));
         }
     }
     if let Some(types) = artifact_types {
         for t in types {
             if !VALID_RETRO_HUNT_ARTIFACT_TYPES.contains(&t.as_str()) {
-                return Err(RetroHuntConfigValidationError::InvalidArtifactType(t.clone()));
+                return Err(RetroHuntConfigValidationError::InvalidArtifactType(
+                    t.clone(),
+                ));
             }
         }
     }

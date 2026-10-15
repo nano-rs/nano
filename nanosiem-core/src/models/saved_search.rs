@@ -48,6 +48,7 @@ pub struct SavedSearchWithContext {
 
 /// A group that a saved search is shared with
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+#[schema(as = SavedSearchSharedGroup)]
 pub struct SharedGroup {
     #[serde(with = "typeid::group")]
     #[schema(value_type = String)]

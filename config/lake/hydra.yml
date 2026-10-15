@@ -1,0 +1,35 @@
+serve:
+  public:
+    port: 4444
+  admin:
+    port: 4445
+  cookies:
+    same_site_mode: Lax
+
+urls:
+  self:
+    issuer: http://lake-oidc:4444
+  login: http://127.0.0.1:1/login
+  consent: http://127.0.0.1:1/consent
+  logout: http://127.0.0.1:1/logout
+
+strategies:
+  access_token: jwt
+  jwt:
+    # Lakekeeper validates OAuth scope while other consumers commonly use scp.
+    scope_claim: both
+
+oidc:
+  subject_identifiers:
+    supported_types:
+      - public
+    pairwise:
+      # The real salt is supplied through OIDC_SUBJECT_IDENTIFIERS_PAIRWISE_SALT.
+      salt: overridden-by-environment
+
+log:
+  level: info
+  leak_sensitive_values: false
+
+oauth2:
+  expose_internal_errors: false

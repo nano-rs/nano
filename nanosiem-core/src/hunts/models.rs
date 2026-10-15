@@ -450,7 +450,7 @@ pub struct HuntSweep {
     /// action can never leave a stale counter behind. `#[serde(default)]` is
     /// for DESERIALIZING an older server's JSON only; every query in the
     /// repository selects the count, so a serialized sweep always carries it
-    /// (NAN-2243 — the ledger rendered `undefined leads` off this absence).
+    /// (the ledger rendered `undefined leads` off this absence).
     #[serde(default)]
     pub leads_produced: i64,
     pub trail: serde_json::Value,
@@ -893,7 +893,7 @@ pub struct HuntProfile {
     /// row — its own probes, against its own recomputation of `census` and
     /// `huntable_surface`. A statement about the stored artifact.
     pub degraded_detail: Option<String>,
-    /// What the recon AGENT reported about its OWN run (NAN-2324).
+    /// What the recon AGENT reported about its OWN run.
     ///
     /// Not a statement about `census` or `huntable_surface`: the server
     /// recomputes both on save, so anything claimed here may have been
@@ -1057,7 +1057,7 @@ pub struct HuntSummary {
     #[serde(rename = "profile_degraded")]
     pub recon_degraded: bool,
     /// The SERVER's record. May be `None` while `recon_degraded` is true, when
-    /// only the agent's own probing failed — see `recon_agent_notes` (NAN-2324).
+    /// only the agent's own probing failed — see `recon_agent_notes`.
     pub recon_degraded_detail: Option<String>,
     /// What the agent said about its own run. Carried alongside rather than
     /// merged, so a consumer can attribute it; without it an agent-only

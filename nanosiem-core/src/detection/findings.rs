@@ -16,12 +16,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use crate::db::DualPool;
 use crate::detection::risk::RiskResult;
 use crate::models::{Alert, DetectionRule, RuleMode, Severity};
+use crate::schema::{active_profile_from_env, SchemaProfile};
 
 /// Finding type distinguishes between live mode matches and actual alerts
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +33,15 @@ pub enum FindingType {
     DetectionMatch,
     /// Alerting mode rule matched - alert was created
     Alert,
+}
+
+/// Pure, transaction-ready lake handoff payload. Shared detection execution
+/// uses this to keep the finding outbox write in the same tenant transaction
+/// as matches, alerts, risk evidence, and execution completion.
+pub(crate) struct LakeFindingPayload {
+    pub finding_id: String,
+    pub compact_finding: serde_json::Value,
+    pub ocsf_event: serde_json::Value,
 }
 
 impl std::fmt::Display for FindingType {
@@ -100,9 +111,80 @@ pub struct FindingEvent {
     /// metadata are kept.
     #[serde(default)]
     pub matched_events_redacted: bool,
+    /// NAN-3224: earliest / latest event time across ALL matched events (not
+    /// just the sample). Aggregate rows contribute their `_first_seen` /
+    /// `_last_seen` window. Emitted as OCSF `finding_info.first_seen_time` /
+    /// `last_seen_time` and `start_time` / `end_time`. Times are not entity
+    /// values, so redaction keeps them.
+    #[serde(default)]
+    pub first_seen_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
+    /// NAN-3224: when Nano raised the finding's alert (`alerts.created_at`),
+    /// emitted as `finding_info.created_time`. `None` for Live matches, which
+    /// use the source-event `detected_at` instead. Never `now()`: a replayed
+    /// outbox row must be byte-identical.
+    #[serde(default)]
+    pub alert_created_at: Option<DateTime<Utc>>,
 }
 
 impl FindingEvent {
+    fn event_value_at_path<'a>(
+        event: &'a serde_json::Value,
+        field: &str,
+    ) -> Option<&'a serde_json::Value> {
+        event.get(field).or_else(|| {
+            field
+                .split('.')
+                .try_fold(event, |current, component| current.get(component))
+        })
+    }
+
+    fn event_string_values_at_path<'a>(event: &'a serde_json::Value, field: &str) -> Vec<&'a str> {
+        fn descend<'a>(
+            value: &'a serde_json::Value,
+            components: &[&str],
+            values: &mut Vec<&'a str>,
+        ) {
+            if components.is_empty() {
+                match value {
+                    serde_json::Value::String(value) if !value.trim().is_empty() => {
+                        values.push(value)
+                    }
+                    serde_json::Value::Array(items) => {
+                        for item in items {
+                            descend(item, components, values);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(next) = object.get(components[0]) {
+                        descend(next, &components[1..], values);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        descend(item, components, values);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut values = Vec::new();
+        if let Some(literal) = event.get(field) {
+            descend(literal, &[], &mut values);
+        } else {
+            let components = field.split('.').collect::<Vec<_>>();
+            descend(event, &components, &mut values);
+        }
+        values
+    }
+
     /// Remove empty/null fields from an event to reduce storage size
     fn strip_empty_fields(event: &serde_json::Value) -> serde_json::Value {
         match event {
@@ -151,23 +233,67 @@ impl FindingEvent {
     fn source_event_time(events: &[serde_json::Value]) -> Option<DateTime<Utc>> {
         events
             .iter()
-            .filter_map(|e| {
-                let s = e.get("timestamp")?.as_str()?;
-                // Match the ClickHouse/serialized formats detection events use
-                // (see detection::service::helpers::event_field_time).
-                if let Ok(naive) =
-                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                {
-                    return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
-                }
-                if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-                    return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
-                }
-                DateTime::parse_from_rfc3339(s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
+            .filter_map(|event| {
+                ["time", "timestamp", "start_time", "last_finding_at"]
+                    .into_iter()
+                    .find_map(|field| {
+                        Self::event_value_at_path(event, field)
+                            .and_then(Self::parse_source_event_time)
+                    })
             })
             .max()
+    }
+
+    /// NAN-3224: the matched events' event-time window (see `first_seen_at`).
+    fn seen_window(events: &[serde_json::Value]) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+        match crate::detection::finding_ocsf::seen_window_ms(events, Self::parse_source_event_time) {
+            Some((first, last)) => (
+                DateTime::from_timestamp_millis(first),
+                DateTime::from_timestamp_millis(last),
+            ),
+            None => (None, None),
+        }
+    }
+
+    fn parse_source_event_time(value: &serde_json::Value) -> Option<DateTime<Utc>> {
+        if let Some(timestamp) = value.as_str() {
+            // Match the ClickHouse/serialized formats detection events use
+            // (see detection::service::helpers::event_field_time).
+            if let Ok(naive) =
+                chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S%.f")
+            {
+                return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+            }
+            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S")
+            {
+                return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+            }
+            return DateTime::parse_from_rfc3339(timestamp)
+                .ok()
+                .map(|date_time| date_time.with_timezone(&Utc));
+        }
+
+        // OCSF 1.9 serializes `time` as Unix epoch milliseconds. Native data
+        // sources can also surface seconds, microseconds, or nanoseconds as a
+        // JSON integer, so select the unit by contemporary epoch magnitude.
+        // Keeping the event timestamp deterministic is part of the finding ID:
+        // falling back to `Utc::now()` on every outbox retry would mint duplicate
+        // findings and double-count risk for the same alert.
+        let epoch = value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))?;
+        let magnitude = epoch.unsigned_abs();
+        if magnitude >= 100_000_000_000_000_000 {
+            let seconds = epoch.div_euclid(1_000_000_000);
+            let nanos = epoch.rem_euclid(1_000_000_000) as u32;
+            DateTime::from_timestamp(seconds, nanos)
+        } else if magnitude >= 100_000_000_000_000 {
+            DateTime::from_timestamp_micros(epoch)
+        } else if magnitude >= 100_000_000_000 {
+            DateTime::from_timestamp_millis(epoch)
+        } else {
+            DateTime::from_timestamp(epoch, 0)
+        }
     }
 
     /// Distinct normalized `source_type` values carried by the matched events
@@ -199,8 +325,8 @@ impl FindingEvent {
             // NAN-2155 (codex round 3): the per-event `source_type` is
             // ingest-controlled; only the engine's `_nano_source_types` stamp
             // may carry the reserved unresolved-provenance sentinel.
-            if let Some(st) = event
-                .get("source_type")
+            if let Some(st) = Self::event_value_at_path(event, "metadata.log_source")
+                .or_else(|| Self::event_value_at_path(event, "source_type"))
                 .and_then(|v| v.as_str())
                 .filter(|st| !crate::auth::is_reserved_source_type(st))
             {
@@ -263,6 +389,7 @@ impl FindingEvent {
             .iter()
             .map(|e| Self::strip_empty_fields(e))
             .collect();
+        let (first_seen_at, last_seen_at) = Self::seen_window(matched_events);
 
         Self {
             finding_type: FindingType::DetectionMatch,
@@ -289,6 +416,9 @@ impl FindingEvent {
             risk_factors: risk_result.factors,
             origin_source_types: Self::origin_source_types_from(matched_events),
             matched_events_redacted: false,
+            first_seen_at,
+            last_seen_at,
+            alert_created_at: None,
         }
     }
 
@@ -310,6 +440,7 @@ impl FindingEvent {
             .iter()
             .map(|e| Self::strip_empty_fields(e))
             .collect();
+        let (first_seen_at, last_seen_at) = Self::seen_window(&matched_events);
 
         Self {
             finding_type: FindingType::Alert,
@@ -334,7 +465,26 @@ impl FindingEvent {
             risk_factors: risk_result.factors,
             origin_source_types: Self::origin_source_types_from(&matched_events),
             matched_events_redacted: false,
+            first_seen_at,
+            last_seen_at,
+            alert_created_at: Some(alert.created_at),
         }
+    }
+
+    /// NAN-3226: a `domain`-typed risk object under one of the tenant's
+    /// internal suffixes (built-in or tenant-added) is an internal HOST, not an
+    /// internet domain: re-type it `hostname` so it is never scored or
+    /// projected as a domain (OCSF `evidences.query.hostname`). Host risk
+    /// objects are untouched. Returns whether the type changed.
+    pub fn retype_internal_domain(
+        &mut self,
+        internal: &crate::internal_domains::InternalDomains,
+    ) -> bool {
+        if self.risk_entity_type == "domain" && internal.is_internal(&self.risk_entity) {
+            self.risk_entity_type = "hostname".to_string();
+            return true;
+        }
+        false
     }
 
     /// Write-side entity type for the finding row (NAN-1806): field-name
@@ -376,13 +526,26 @@ impl FindingEvent {
             "risk_entity_field": self.risk_entity_field,
             "risk_entity_type": self.risk_entity_type,
             "risk_factors": self.risk_factors,
+            // NAN-3224: OCSF timing inputs (epoch milliseconds).
+            "first_seen_time": self.first_seen_at.map(|t| t.timestamp_millis()),
+            "last_seen_time": self.last_seen_at.map(|t| t.timestamp_millis()),
+            "alert_created_time": self.alert_created_at.map(|t| t.timestamp_millis()),
         })
     }
 
     /// Generate a human-readable message for the finding
     pub fn message(&self) -> String {
-        let entities = self.extract_entity_summary();
+        self.message_with_entities(self.extract_entity_summary())
+    }
 
+    /// [`Self::message`] under an explicit schema profile (tests pin the
+    /// profile instead of depending on the process environment).
+    #[cfg(test)]
+    fn message_with_profile(&self, profile: &dyn SchemaProfile) -> String {
+        self.message_with_entities(self.extract_entity_summary_with_profile(profile))
+    }
+
+    fn message_with_entities(&self, entities: String) -> String {
         match self.finding_type {
             FindingType::DetectionMatch => {
                 if entities.is_empty() {
@@ -406,24 +569,24 @@ impl FindingEvent {
 
     /// Extract a summary of key entities from matched events for display
     fn extract_entity_summary(&self) -> String {
-        // Priority fields to extract (most interesting first)
-        const ENTITY_FIELDS: &[&str] = &[
-            "src_user",
-            "dest_user",
-            "user",
-            "src_ip",
-            "dest_ip",
-            "dvc_ip",
-            "src_host",
-            "dest_host",
-            "host",
-            "hostname",
-            "app",
-            "action",
-            "file_name",
-            "process_name",
-        ];
+        // NAN-2361: no UdmProfile substitution. `extract_entity_summary_with_profile`
+        // walks `profile.entity_extraction_order()`, so the wrong profile names
+        // fields that do not exist in the event and the summary is wrong (or
+        // empty) with no explanation. An empty summary is already a supported
+        // degradation here — `message()` falls back to the count-only form (see
+        // `redact_matched_events`) — so fail closed and log the reason.
+        let Ok(profile) = active_profile_from_env().inspect_err(|error| {
+            tracing::error!(
+                %error,
+                "finding entity summary omitted: cannot resolve the active schema profile"
+            );
+        }) else {
+            return String::new();
+        };
+        self.extract_entity_summary_with_profile(profile.as_ref())
+    }
 
+    fn extract_entity_summary_with_profile(&self, profile: &dyn SchemaProfile) -> String {
         let mut found: Vec<(String, String)> = Vec::new();
         let mut seen_values: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -437,23 +600,16 @@ impl FindingEvent {
 
         // Then extract from the first matched event
         if let Some(first_event) = self.matched_events_sample.first() {
-            if let Some(obj) = first_event.as_object() {
-                for field in ENTITY_FIELDS {
+            for (_, field) in profile.entity_extraction_order() {
+                if found.len() >= 4 {
+                    break;
+                }
+                for value in Self::event_string_values_at_path(first_event, field) {
                     if found.len() >= 4 {
-                        break; // Limit to 4 entities for readability
+                        break;
                     }
-                    if let Some(value) = obj.get(*field) {
-                        let value_str = match value {
-                            serde_json::Value::String(s) if !s.is_empty() => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            _ => continue,
-                        };
-                        // Skip if we already have this value (avoid duplicates)
-                        if seen_values.contains(&value_str) {
-                            continue;
-                        }
-                        found.push((field.to_string(), value_str.clone()));
-                        seen_values.insert(value_str);
+                    if seen_values.insert(value.to_string()) {
+                        found.push((field.to_string(), value.to_string()));
                     }
                 }
             }
@@ -549,8 +705,7 @@ impl FindingLogger {
         // the event itself — a downstream no-op "redaction" would still write
         // the sample.
         let redacted_finding;
-        let finding = if !finding.matched_events_redacted && self.origin_restricted(finding).await
-        {
+        let finding = if !finding.matched_events_redacted && self.origin_restricted(finding).await {
             let mut event = finding.clone();
             event.redact_matched_events();
             debug!(
@@ -564,12 +719,172 @@ impl FindingLogger {
             finding
         };
 
+        // NAN-3226: internal names are host risk objects, never domains.
+        let retyped_finding;
+        let finding = if finding.risk_entity_type == "domain" {
+            let internal =
+                crate::internal_domains::dedicated_cached(self.dual_pool.postgres()).await;
+            let mut event = finding.clone();
+            if event.retype_internal_domain(&internal) {
+                retyped_finding = event;
+                &retyped_finding
+            } else {
+                finding
+            }
+        } else {
+            finding
+        };
+
         let metadata = finding.to_log_json();
         let message = finding.message();
         let timestamp = finding.detected_at;
 
+        if crate::schema::log_query_backend_is_lake() {
+            return self.log_to_lake_outbox(finding).await;
+        }
+
         self.log_to_clickhouse(&self.dual_pool, &message, &metadata, timestamp)
             .await
+    }
+
+    fn stable_finding_id(finding: &FindingEvent) -> String {
+        if let Some(alert_id) = finding.alert_id {
+            // A grouped alert can emit one risk finding per entity. The alert
+            // UUID alone therefore is not a finding identity: using it as the
+            // outbox key makes the first entity win and every later entity
+            // look like a conflicting replay. Bind the alert to the same
+            // source-event window + entity dimensions that distinguish the
+            // compact risk rows. Deliberately leave score/rule payload out of
+            // the identity so a replay whose content changed still fails the
+            // immutable conflict check below instead of silently becoming a
+            // second finding.
+            let identity = json!({
+                "alert_id": alert_id,
+                "detected_at_us": finding.detected_at.timestamp_micros(),
+                "risk_entity": finding.risk_entity,
+                "risk_entity_field": finding.risk_entity_field,
+                "risk_entity_type": finding.risk_entity_type,
+            });
+            let bytes = serde_json::to_vec(&identity).unwrap_or_default();
+            return format!("alert:{alert_id}:{}", hex::encode(Sha256::digest(bytes)));
+        }
+        let identity = json!({
+            "finding_type": finding.finding_type,
+            "rule_id": finding.rule_id,
+            "detected_at_us": finding.detected_at.timestamp_micros(),
+            "risk_entity": finding.risk_entity,
+            "risk_score": finding.risk_score,
+            "origin_source_types": finding.origin_source_types,
+        });
+        let bytes = serde_json::to_vec(&identity).unwrap_or_default();
+        format!("detection:{}", hex::encode(Sha256::digest(bytes)))
+    }
+
+    pub(crate) fn prepare_lake_outbox_payload(
+        finding: &FindingEvent,
+        logical_tenant_id: &str,
+    ) -> Result<LakeFindingPayload, FindingLogError> {
+        if logical_tenant_id.trim().is_empty() {
+            return Err(FindingLogError::LakeOutboxError(
+                "logical lake tenant is required for finding publication".to_string(),
+            ));
+        }
+        let finding_id = Self::stable_finding_id(finding);
+        let metadata = finding.to_log_json();
+        let message = finding.message();
+        let timestamp = finding.detected_at;
+        let compact_finding = json!({
+            "id": finding_id,
+            "timestamp_us": timestamp.timestamp_micros(),
+            "entity": if finding.risk_entity.trim().is_empty() { "unknown" } else { finding.risk_entity.as_str() },
+            "stamped_entity_type": finding.risk_entity_type,
+            "risk_score": finding.risk_score,
+            "rule_id": finding.rule_id.to_string(),
+            "rule_name": finding.rule_name,
+            "severity": format!("{:?}", finding.severity).to_lowercase(),
+            "origin_source_types": finding.origin_source_types,
+            "mitre_tactics": finding.mitre_tactics,
+        });
+        let ocsf_event = Self::build_ocsf_finding_event_for_lake(
+            &metadata,
+            &message,
+            timestamp,
+            &finding_id,
+            logical_tenant_id,
+        );
+        Ok(LakeFindingPayload {
+            finding_id,
+            compact_finding,
+            ocsf_event,
+        })
+    }
+
+    async fn log_to_lake_outbox(&self, finding: &FindingEvent) -> Result<(), FindingLogError> {
+        let tenant_id = std::env::var("NANO_LAKE_TENANT_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if tenant_id.is_empty() {
+            return Err(FindingLogError::LakeOutboxError(
+                "NANO_LAKE_TENANT_ID is required for lake finding publication".to_string(),
+            ));
+        }
+        let security_tenant_id = Self::lake_outbox_security_tenant(
+            &tenant_id,
+            crate::search::lake_cell::trusted_local_from_env(),
+        )?;
+        let payload = Self::prepare_lake_outbox_payload(finding, &tenant_id)?;
+        let finding_id = payload.finding_id;
+        let compact = payload.compact_finding;
+        let ocsf_event = payload.ocsf_event;
+        let mut transaction = self
+            .dual_pool
+            .postgres()
+            .begin()
+            .await
+            .map_err(|error| FindingLogError::LakeOutboxError(error.to_string()))?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO detection_finding_lake_outbox
+                (security_tenant_id, tenant_id, finding_id, compact_finding, ocsf_event)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(security_tenant_id)
+        .bind(&tenant_id)
+        .bind(&finding_id)
+        .bind(&compact)
+        .bind(&ocsf_event)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| FindingLogError::LakeOutboxError(error.to_string()))?
+        .rows_affected();
+        if inserted == 0 {
+            let existing = sqlx::query_as::<_, (serde_json::Value, serde_json::Value)>(
+                r#"
+                SELECT compact_finding, ocsf_event
+                FROM detection_finding_lake_outbox
+                WHERE security_tenant_id = $1 AND tenant_id = $2 AND finding_id = $3
+                "#,
+            )
+            .bind(security_tenant_id)
+            .bind(&tenant_id)
+            .bind(&finding_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|error| FindingLogError::LakeOutboxError(error.to_string()))?;
+            if !Self::outbox_replay_matches(&existing.0, &existing.1, &compact, &ocsf_event) {
+                return Err(FindingLogError::LakeOutboxError(format!(
+                    "finding ID {finding_id} was replayed with different content"
+                )));
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| FindingLogError::LakeOutboxError(error.to_string()))?;
+        Ok(())
     }
 
     /// Infer entity type from the entity value and optional field name
@@ -582,14 +897,16 @@ impl FindingLogger {
             return "ip";
         }
 
+        // An email address commonly contains a dot as well. Check it before
+        // the hostname heuristic so `alice@example.com` is not stamped as a
+        // hostname in the risk projection.
+        if entity.contains('@') {
+            return "email";
+        }
+
         // Check if it looks like a hostname (contains dots but not an IP)
         if entity.contains('.') && !entity.chars().all(|c| c.is_ascii_digit() || c == '.') {
             return "hostname";
-        }
-
-        // Check if it looks like an email
-        if entity.contains('@') {
-            return "email";
         }
 
         // Check if it looks like a hash (32+ hex chars)
@@ -873,24 +1190,193 @@ impl FindingLogger {
         Ok(())
     }
 
-    /// Build a standards-compliant OCSF Detection Finding (`class_uid` 2004)
-    /// `event` JSON from the nano finding metadata (NAN-1254).
+    fn ocsf_risk_level(risk_score: i64) -> (i64, &'static str) {
+        match risk_score {
+            ..=30 => (1, "Low"),
+            31..=50 => (2, "Medium"),
+            51..=70 => (3, "High"),
+            _ => (4, "Critical"),
+        }
+    }
+
+    fn metadata_strings(metadata: &serde_json::Value, field: &str) -> Vec<String> {
+        metadata
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// OCSF `analytic.state_id` / `state` for a Nano rule mode (OCSF 1.9.0
+    /// captions). Lossless: Alerting=Active, Live=Experimental (bake-in),
+    /// Paused=Suppressed, anything else (Staging rule tests) is Other with the
+    /// Nano mode as its `state`.
+    fn ocsf_analytic_state(rule_mode: &str) -> (i64, String) {
+        match rule_mode {
+            "alerting" => (1, "Active".to_string()),
+            "paused" => (2, "Suppressed".to_string()),
+            "live" => (3, "Experimental".to_string()),
+            "" => (0, "Unknown".to_string()),
+            other => (99, other.to_string()),
+        }
+    }
+
+    /// The scored entity as the finding's per-entity risk object (NAN-3224).
     ///
-    /// Native OCSF fields carry the parts OCSF models first-class: `risk_score`,
-    /// `severity[_id]`, `status_id`, `finding_info{title,uid,types,analytic}`.
-    /// The nano-specific risk attribution (`risk_entity` / `risk_entity_field`)
-    /// and the rest of the nano finding payload live under OCSF `unmapped` — the
-    /// sanctioned vendor-extension object — so the OCSF record stays valid while
-    /// the risk repository read path can pull `unmapped.risk_entity` etc. back.
+    /// Findings are the risk index: every finding scores exactly one entity
+    /// (grouped rules emit one finding per entity, NAN-2713), so the risk
+    /// object is `resources[0]` with a uniform `name` (the entity value) and
+    /// `type` (Nano's entity type: `user`, `hostname`, `ip`, `email`, `hash`,
+    /// `domain`, `url`, `cloud_account`), and the score added to it is the
+    /// finding's top-level `risk_score`. Where OCSF 1.9 has a typed risk home
+    /// (`user.risk_score`, `device.risk_score`) it is filled as well. Returns
+    /// `(resources, observables)`; the entity observable points at
+    /// `resources[0]`.
+    fn ocsf_entity_projection(
+        metadata: &serde_json::Value,
+        risk_score: i64,
+        risk_level_id: i64,
+        risk_level: &str,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        use crate::detection::finding_ocsf::{observable, observable_type as kind};
+        let entity = metadata
+            .get("risk_entity")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if entity.is_empty() || entity == "unknown" {
+            return (Vec::new(), Vec::new());
+        }
+        let field = metadata
+            .get("risk_entity_field")
+            .and_then(serde_json::Value::as_str);
+        let stamped_type = metadata
+            .get("risk_entity_type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| Self::infer_entity_type(entity, field));
+        let risk = json!({
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "risk_level_id": risk_level_id,
+        });
+        let mut resource = serde_json::Map::from_iter([
+            ("name".to_string(), json!(entity)),
+            ("type".to_string(), json!(stamped_type)),
+            ("role".to_string(), json!("Affected")),
+            ("role_id".to_string(), json!(3)),
+        ]);
+        let (extra, observable) = match stamped_type {
+            "ip" if entity.parse::<std::net::IpAddr>().is_ok() => (
+                json!({ "ip": entity }),
+                observable("resources[0].ip", kind::IP_ADDRESS, entity),
+            ),
+            "hostname" | "host" | "device" => {
+                let mut device = json!({ "name": entity, "hostname": entity, "type_id": 0 });
+                device.as_object_mut().expect("object").extend(risk.as_object().expect("object").clone());
+                (
+                    json!({ "hostname": entity, "device": device }),
+                    observable("resources[0].hostname", kind::HOSTNAME, entity),
+                )
+            }
+            "user" => {
+                let mut user = json!({ "name": entity });
+                user.as_object_mut().expect("object").extend(risk.as_object().expect("object").clone());
+                (
+                    json!({ "user": user }),
+                    observable("resources[0].user.name", kind::USER_NAME, entity),
+                )
+            }
+            "email" => (json!({}), observable("resources[0].name", kind::EMAIL_ADDRESS, entity)),
+            "domain" => (
+                json!({ "hostname": entity }),
+                observable("resources[0].hostname", kind::HOSTNAME, entity),
+            ),
+            "hash" => (json!({}), observable("resources[0].name", kind::HASH, entity)),
+            "url" => (json!({}), observable("resources[0].name", kind::URL_STRING, entity)),
+            "cloud_account" => (
+                json!({ "uid": entity }),
+                observable("resources[0].uid", kind::RESOURCE_UID, entity),
+            ),
+            _ => (json!({}), observable("resources[0].name", kind::OTHER, entity)),
+        };
+        if let Some(extra) = extra.as_object() {
+            resource.extend(extra.clone());
+        }
+        (vec![serde_json::Value::Object(resource)], vec![observable])
+    }
+
+    /// Build a backward-compatible OCSF Detection Finding (`class_uid` 2004)
+    /// for the temporary ClickHouse path. New lake publication uses
+    /// [`Self::build_ocsf_finding_event_for_lake`] so event and tenant identity
+    /// are explicit and Nano compatibility duplicates are omitted.
     pub fn build_ocsf_finding_event(
         metadata: &serde_json::Value,
         message: &str,
         timestamp: DateTime<Utc>,
     ) -> serde_json::Value {
+        Self::build_ocsf_finding_event_inner(metadata, message, timestamp, None, None, true)
+    }
+
+    fn build_ocsf_finding_event_for_lake(
+        metadata: &serde_json::Value,
+        message: &str,
+        timestamp: DateTime<Utc>,
+        finding_id: &str,
+        tenant_id: &str,
+    ) -> serde_json::Value {
+        Self::build_ocsf_finding_event_inner(
+            metadata,
+            message,
+            timestamp,
+            Some(finding_id),
+            Some(tenant_id),
+            false,
+        )
+    }
+
+    /// NAN-3224: the app-relative deep link of a finding's alert, the same
+    /// form in-app notifications use (`/alerts/<alert typeid>`). Relative so
+    /// the stored row never embeds a tenant host that can change.
+    fn alert_src_url(alert_id: &str) -> Option<String> {
+        let alert_id = Uuid::parse_str(alert_id).ok()?;
+        Some(format!(
+            "/alerts/{}",
+            crate::typeid::encode(crate::typeid::alert::PREFIX, &alert_id)
+        ))
+    }
+
+    /// NAN-3224 shape, every Nano `unmapped` key now has an OCSF 1.9 home
+    /// unless the spec has none:
+    ///
+    /// | was                         | now (OCSF 1.9)                                   |
+    /// |-----------------------------|--------------------------------------------------|
+    /// | `unmapped.alert_id`         | `finding_info.uid_alt` (+ `finding_info.src_url`) |
+    /// | `unmapped.signal_type`      | `is_alert` (+ `finding_info.types`, unchanged)    |
+    /// | `unmapped.rule_mode`        | `finding_info.analytic.state_id` / `state`        |
+    /// | `unmapped.risk_factors`     | `risk_details` (already emitted, joined)          |
+    /// | `unmapped.matched_events_sample` | `evidences[]` (curated + raw `data`)         |
+    /// | `unmapped.raw_risk_score`   | stays: OCSF has no pre-weight score attribute     |
+    /// | `unmapped.realtime`         | stays: no OCSF attribute                          |
+    /// | `unmapped.matched_events_redacted` | stays: no OCSF attribute                   |
+    ///
+    /// The ClickHouse compatibility event keeps every historical `unmapped`
+    /// key too (its readers extract them), and adds the native fields.
+    fn build_ocsf_finding_event_inner(
+        metadata: &serde_json::Value,
+        message: &str,
+        timestamp: DateTime<Utc>,
+        event_uid: Option<&str>,
+        tenant_uid: Option<&str>,
+        include_clickhouse_compat: bool,
+    ) -> serde_json::Value {
+        use crate::detection::finding_ocsf;
         let get_str = |k: &str| metadata.get(k).and_then(|v| v.as_str()).unwrap_or("");
-        let cloned = |k: &str, default: serde_json::Value| {
-            metadata.get(k).cloned().unwrap_or(default)
-        };
+        let cloned =
+            |k: &str, default: serde_json::Value| metadata.get(k).cloned().unwrap_or(default);
 
         // nano Severity (lowercased) -> OCSF severity_id + Title-case sibling.
         let (severity_id, severity_title) = match get_str("severity") {
@@ -909,11 +1395,106 @@ impl FindingLogger {
             .get("risk_score")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        let (risk_level_id, risk_level) = Self::ocsf_risk_level(risk_score);
         let signal_type = get_str("signal_type");
         let rule_id = get_str("rule_id");
         let rule_name = get_str("rule_name");
+        let alert_id = metadata
+            .get("alert_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty());
+        let event_uid = event_uid.unwrap_or(alert_id.unwrap_or(rule_id));
+        let data_sources = metadata
+            .get("origin_source_types")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let attacks = finding_ocsf::attacks(
+            &Self::metadata_strings(metadata, "mitre_tactics"),
+            &Self::metadata_strings(metadata, "mitre_techniques"),
+        );
+        let risk_details = Self::metadata_strings(metadata, "risk_factors").join("; ");
+        let (resources, mut observables) =
+            Self::ocsf_entity_projection(metadata, risk_score, risk_level_id, risk_level);
+        // The sample is already redaction-filtered (`log_finding` /
+        // `redact_matched_events` empty it), so restricted evidence never
+        // reaches `evidences[]` or the observables derived from it.
+        let sample = metadata
+            .get("matched_events_sample")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let projection = finding_ocsf::evidences(&sample);
+        finding_ocsf::evidence_observables(&mut observables, &projection.evidences);
 
-        json!({
+        let time_ms = timestamp.timestamp_millis();
+        let first_seen = metadata.get("first_seen_time").and_then(serde_json::Value::as_i64);
+        let last_seen = metadata.get("last_seen_time").and_then(serde_json::Value::as_i64);
+        let created_time = metadata
+            .get("alert_created_time")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(time_ms);
+        let (state_id, state) = Self::ocsf_analytic_state(get_str("rule_mode"));
+
+        let mut finding_info = json!({
+            "title": rule_name,
+            "uid": event_uid,
+            "types": [signal_type],
+            "data_sources": data_sources,
+            "attacks": attacks,
+            "analytic": {
+                "name": rule_name,
+                "uid": rule_id,
+                "type": "Rule",
+                "type_id": 1,
+                "state": state,
+                "state_id": state_id,
+            },
+            "created_time": created_time,
+            "first_seen_time": first_seen,
+            "last_seen_time": last_seen,
+            "related_events": projection.related_events,
+            "uid_alt": alert_id,
+            "src_url": alert_id.and_then(Self::alert_src_url),
+        });
+        finding_info = FindingEvent::strip_empty_fields(&finding_info);
+
+        let mut unmapped = json!({
+            "realtime": cloned("realtime", json!(false)),
+            "raw_risk_score": cloned("raw_risk_score", json!(0)),
+            "matched_events_redacted": cloned("matched_events_redacted", json!(false)),
+        });
+        if include_clickhouse_compat {
+            // ClickHouse readers (risk SQL, tuning, nPL bare-field aliases)
+            // extract these from the stored `unmapped` spill.
+            let compatibility = json!({
+                "rule_mode": get_str("rule_mode"),
+                "risk_factors": cloned("risk_factors", json!([])),
+                "matched_events_sample": cloned("matched_events_sample", json!([])),
+                "signal_type": signal_type,
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "risk_score": risk_score,
+                "risk_entity": get_str("risk_entity"),
+                "risk_entity_field": cloned("risk_entity_field", serde_json::Value::Null),
+                "risk_entity_type": get_str("risk_entity_type"),
+                "mitre_tactics": cloned("mitre_tactics", json!([])),
+                "mitre_techniques": cloned("mitre_techniques", json!([])),
+                "origin_source_types": cloned("origin_source_types", json!([])),
+            });
+            if let (Some(target), Some(values)) =
+                (unmapped.as_object_mut(), compatibility.as_object())
+            {
+                target.extend(values.clone());
+            }
+        } else if !projection.unmapped_samples.is_empty() {
+            // Matched rows with no OCSF evidence attribute (bare aggregate
+            // results) keep the historical home: canonical JSON strings, so
+            // free-form shapes never become typed lake columns.
+            unmapped["matched_events_sample"] = serde_json::Value::Array(projection.unmapped_samples);
+        }
+
+        let mut event = json!({
             "class_uid": CLASS_UID,
             "class_name": "Detection Finding",
             "category_uid": 2,
@@ -922,55 +1503,99 @@ impl FindingLogger {
             "activity_name": "Create",
             "type_uid": CLASS_UID * 100 + ACTIVITY_ID, // 200401
             // OCSF `time` is epoch milliseconds.
-            "time": timestamp.timestamp_millis(),
+            "time": time_ms,
+            "start_time": first_seen,
+            "end_time": last_seen,
             "severity_id": severity_id,
             "severity": severity_title,
-            "status_id": 1, // New
+            "status_id": 1,
+            "status": "New",
+            "is_alert": signal_type == "alert",
             "risk_score": risk_score,
+            "risk_level_id": risk_level_id,
+            "risk_level": risk_level,
+            "risk_details": risk_details,
             "message": message,
             "count": cloned("matched_event_count", json!(1)),
             "metadata": {
                 "product": { "name": "nano", "vendor_name": "nano" },
-                "log_name": "findings",
-                "uid": cloned("alert_id", serde_json::Value::Null),
+                "version": "1.9.0",
+                "log_name": FINDINGS_LOG_NAME,
+                // The lean drain stamps `findings` on the lake row; the outbox
+                // copy keeps `signals`, the durable event-kind contract of
+                // the hosted Iceberg publisher (`iceberg.rs`). ClickHouse
+                // rows carry `findings` like their `source_type` column.
+                "log_source": if include_clickhouse_compat { FINDINGS_LOG_NAME } else { "signals" },
+                "tenant_uid": tenant_uid,
+                "uid": event_uid,
             },
-            "finding_info": {
-                "title": rule_name,
-                "uid": rule_id,
-                "types": [signal_type],
-                "analytic": { "name": rule_name, "uid": rule_id, "type_id": 1 },
-            },
-            // nano vendor extension — read back by risk/repository.rs under OCSF.
-            "unmapped": {
-                "signal_type": signal_type,
-                "rule_id": rule_id,
-                "rule_name": rule_name,
-                "risk_score": risk_score,
-                "risk_entity": get_str("risk_entity"),
-                "risk_entity_field": cloned("risk_entity_field", serde_json::Value::Null),
-                "risk_entity_type": get_str("risk_entity_type"),
-                "rule_mode": get_str("rule_mode"),
-                "realtime": cloned("realtime", json!(false)),
-                "raw_risk_score": cloned("raw_risk_score", json!(0)),
-                "mitre_tactics": cloned("mitre_tactics", json!([])),
-                "mitre_techniques": cloned("mitre_techniques", json!([])),
-                "risk_factors": cloned("risk_factors", json!([])),
-                "matched_events_sample": cloned("matched_events_sample", json!([])),
-                // NAN-1800: redaction markers — mirrored from `to_log_json`
-                // so the OCSF surface carries the same origin/redaction
-                // signal as the UDM `metadata` column.
-                "origin_source_types": cloned("origin_source_types", json!([])),
-                "matched_events_redacted": cloned("matched_events_redacted", json!(false)),
-            },
-        })
+            "finding_info": finding_info,
+            "resources": resources,
+            "evidences": projection.evidences,
+            "observables": observables,
+            "unmapped": unmapped,
+        });
+        event = FindingEvent::strip_empty_fields(&event);
+        event
+    }
+
+    /// The outbox row's `security_tenant_id` (NAN-3492). A UUID lake tenant
+    /// is its own security tenant: the lean finding drain selects, and its
+    /// hosted RLS policy scopes, on `security_tenant_id = <tenant uuid>`
+    /// (`part_ingest/finding_outbox.rs`). A non-UUID (legacy gen1) tenant
+    /// keeps the migration-336 compatibility tenant. Only the trusted-local
+    /// install is strict: it must carry a non-nil UUID tenant, never the
+    /// compatibility fallback, because its drain would never select it.
+    pub(crate) fn lake_outbox_security_tenant(
+        lake_tenant_id: &str,
+        trusted_local: bool,
+    ) -> Result<Uuid, FindingLogError> {
+        if !trusted_local {
+            return Ok(Uuid::parse_str(lake_tenant_id)
+                .unwrap_or(crate::reports::COMPATIBILITY_TENANT_ID));
+        }
+        Uuid::parse_str(lake_tenant_id)
+            .ok()
+            .filter(|tenant| !tenant.is_nil())
+            .ok_or_else(|| {
+                FindingLogError::LakeOutboxError(
+                    "a trusted-local install needs a UUID NANO_LAKE_TENANT_ID for finding publication"
+                        .to_string(),
+                )
+            })
+    }
+
+    /// NAN-3224: is a stored outbox row an acceptable replay of `compact` /
+    /// `ocsf_event`? The compact finding (the risk record) must match exactly.
+    /// The OCSF event must match too, except that a row stored by a
+    /// pre-NAN-3224 producer (`metadata.log_name = "signals"`) is a valid
+    /// replay of the same finding re-emitted after the deploy: the stored
+    /// row wins and nothing is rewritten.
+    pub(crate) fn outbox_replay_matches(
+        stored_compact: &serde_json::Value,
+        stored_event: &serde_json::Value,
+        compact: &serde_json::Value,
+        ocsf_event: &serde_json::Value,
+    ) -> bool {
+        stored_compact == compact
+            && (stored_event == ocsf_event
+                || stored_event.pointer("/metadata/log_name").and_then(serde_json::Value::as_str)
+                    == Some(LEGACY_SIGNALS_LOG_NAME))
     }
 }
+
+/// `metadata.log_name` of every Detection Finding Nano emits (NAN-3224).
+pub const FINDINGS_LOG_NAME: &str = "findings";
+/// `metadata.log_name` of findings emitted before NAN-3224.
+pub const LEGACY_SIGNALS_LOG_NAME: &str = "signals";
 
 /// Errors that can occur during finding logging
 #[derive(Debug, thiserror::Error)]
 pub enum FindingLogError {
     #[error("ClickHouse error: {0}")]
     ClickHouseError(String),
+    #[error("Lake finding outbox error: {0}")]
+    LakeOutboxError(String),
 }
 
 /// NAN-1254: the OCSF Detection Finding (class_uid 2004) write contract.
@@ -1001,7 +1626,8 @@ mod ocsf_finding_tests {
             "risk_entity": "10.0.0.5",
             "risk_entity_field": "src_ip",
             "risk_entity_type": "ip",
-            "risk_factors": ["off-hours"]
+            "risk_factors": ["off-hours"],
+            "origin_source_types": ["windows_security"]
         })
     }
 
@@ -1010,7 +1636,11 @@ mod ocsf_finding_tests {
         let ts = DateTime::parse_from_rfc3339("2026-06-06T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let event = FindingLogger::build_ocsf_finding_event(&sample_metadata(), "Suspicious Login - src_ip=10.0.0.5", ts);
+        let event = FindingLogger::build_ocsf_finding_event(
+            &sample_metadata(),
+            "Suspicious Login - src_ip=10.0.0.5",
+            ts,
+        );
 
         // OCSF Detection Finding taxonomy
         assert_eq!(event["class_uid"], 2004);
@@ -1043,6 +1673,320 @@ mod ocsf_finding_tests {
 
         // product provenance (so OCSF consumers attribute it to nano)
         assert_eq!(event["metadata"]["product"]["name"], "nano");
+        assert_eq!(event["metadata"]["version"], "1.9.0");
+    }
+
+    #[test]
+    fn lake_finding_uses_native_ocsf_identity_risk_and_observables() {
+        let ts = DateTime::parse_from_rfc3339("2026-06-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event = FindingLogger::build_ocsf_finding_event_for_lake(
+            &sample_metadata(),
+            "Suspicious Login - src_endpoint.ip=10.0.0.5",
+            ts,
+            "detection:stable-finding-id",
+            "tenant-a",
+        );
+
+        assert_eq!(event["metadata"]["uid"], "detection:stable-finding-id");
+        assert_eq!(event["metadata"]["tenant_uid"], "tenant-a");
+        // NAN-3224: one name. The drain stamps `log_source=findings` on the
+        // lake row; the outbox copy keeps the publisher's `signals` kind.
+        assert_eq!(event["metadata"]["log_name"], "findings");
+        assert_eq!(event["metadata"]["log_source"], "signals");
+        assert_eq!(event["finding_info"]["uid"], "detection:stable-finding-id");
+        assert_eq!(event["finding_info"]["analytic"]["uid"], "rule-abc-123");
+        assert_eq!(event["finding_info"]["analytic"]["type"], "Rule");
+        // rule_mode=live -> analytic state Experimental (bake-in).
+        assert_eq!(event["finding_info"]["analytic"]["state_id"], 3);
+        assert_eq!(event["finding_info"]["analytic"]["state"], "Experimental");
+        assert_eq!(
+            event["finding_info"]["data_sources"],
+            json!(["windows_security"])
+        );
+        // NAN-3224: one attack per technique, paired with its tactic, named.
+        assert_eq!(
+            event["finding_info"]["attacks"],
+            json!([{
+                "technique": {"uid": "T1078", "name": "Valid Accounts"},
+                "tactic": {"uid": "TA0001", "name": "Initial Access"},
+                "version": "19.1",
+            }])
+        );
+        assert_eq!(event["risk_score"], 75);
+        assert_eq!(event["risk_level_id"], 4);
+        assert_eq!(event["risk_level"], "Critical");
+        assert_eq!(event["risk_details"], "off-hours");
+        // Per-entity risk object: resources[0] {name, type} + the score.
+        assert_eq!(event["resources"][0]["ip"], "10.0.0.5");
+        assert_eq!(event["resources"][0]["name"], "10.0.0.5");
+        assert_eq!(event["resources"][0]["type"], "ip");
+        assert_eq!(event["resources"][0]["role_id"], 3);
+        assert_eq!(event["observables"][0]["name"], "resources[0].ip");
+        assert_eq!(event["observables"][0]["type_id"], 2);
+        assert_eq!(event["observables"][0]["value"], "10.0.0.5");
+        assert_eq!(event["is_alert"], false);
+        assert_eq!(event["finding_info"]["types"], json!(["detection_match"]));
+        // No alert: nothing to pivot to.
+        assert!(event["finding_info"].get("uid_alt").is_none());
+        assert!(event["finding_info"].get("src_url").is_none());
+
+        // Every former Nano key with an OCSF home is gone from `unmapped`.
+        for gone in [
+            "risk_entity", "risk_entity_field", "risk_entity_type", "risk_score", "rule_id",
+            "mitre_tactics", "signal_type", "alert_id", "rule_mode", "risk_factors",
+            "matched_events_sample",
+        ] {
+            assert!(event["unmapped"].get(gone).is_none(), "unmapped.{gone}");
+        }
+        // Keys OCSF 1.9 has no attribute for stay in `unmapped`.
+        assert_eq!(event["unmapped"]["raw_risk_score"], 50);
+        assert_eq!(event["unmapped"]["realtime"], false);
+        assert_eq!(event["unmapped"]["matched_events_redacted"], false);
+
+        let mut alerting = sample_metadata();
+        alerting["signal_type"] = json!("alert");
+        alerting["rule_mode"] = json!("alerting");
+        alerting["alert_id"] = json!("5f0c7c9e-7f5a-4d0e-9a51-2b4f7a0e9c11");
+        alerting["alert_created_time"] = json!(1_780_000_123_000_i64);
+        let alert_event = FindingLogger::build_ocsf_finding_event_for_lake(
+            &alerting,
+            "alert",
+            ts,
+            "alert:stable-finding-id",
+            "tenant-a",
+        );
+        assert_eq!(alert_event["metadata"]["uid"], "alert:stable-finding-id");
+        assert_eq!(alert_event["is_alert"], true);
+        assert_eq!(alert_event["finding_info"]["types"], json!(["alert"]));
+        assert_eq!(alert_event["finding_info"]["analytic"]["state"], "Active");
+        assert_eq!(
+            alert_event["finding_info"]["uid_alt"],
+            "5f0c7c9e-7f5a-4d0e-9a51-2b4f7a0e9c11"
+        );
+        let alert_uuid = Uuid::parse_str("5f0c7c9e-7f5a-4d0e-9a51-2b4f7a0e9c11").unwrap();
+        assert_eq!(
+            alert_event["finding_info"]["src_url"],
+            format!(
+                "/alerts/{}",
+                crate::typeid::encode(crate::typeid::alert::PREFIX, &alert_uuid)
+            )
+        );
+        assert_eq!(alert_event["finding_info"]["created_time"], 1_780_000_123_000_i64);
+        assert!(alert_event["unmapped"].get("alert_id").is_none());
+        assert!(alert_event["unmapped"].get("signal_type").is_none());
+
+        // A matched event becomes structured evidence, with the raw event
+        // losslessly kept as a JSON string in `evidences[].data`.
+        let mut metadata = sample_metadata();
+        metadata["matched_events_sample"] = json!([{
+            "device.hostname": "WS-01",
+            "user": { "name": "Alice" }
+        }]);
+        let encoded = FindingLogger::build_ocsf_finding_event_for_lake(
+            &metadata,
+            "sample",
+            ts,
+            "detection:sample-json",
+            "tenant-a",
+        );
+        assert_eq!(encoded["evidences"][0]["device"]["hostname"], "WS-01");
+        assert_eq!(encoded["evidences"][0]["user"]["name"], "Alice");
+        let data = encoded["evidences"][0]["data"]
+            .as_str()
+            .expect("lake evidence data must be JSON text");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(data).unwrap(),
+            metadata["matched_events_sample"][0]
+        );
+        assert!(encoded["unmapped"].get("matched_events_sample").is_none());
+    }
+
+    /// The live load-test tenant finding (rule persistence_registry_run_key), built
+    /// end to end from a `FindingEvent`: paired ATT&CK, evidence, entity and
+    /// evidence observables, timing, and a valid OCSF 1.9.0 event.
+    fn registry_run_key_finding() -> FindingEvent {
+        let first = json!({
+            "metadata": {"uid": "evt-1", "log_source": "windows_sysmon"},
+            "class_name": "Registry Value Activity",
+            "type_uid": 201_403,
+            "time": "2026-10-07 14:00:00.000000",
+            "actor": {
+                "user": {"name": "CORP\\alice"},
+                "process": {"pid": 4242, "name": "reg.exe",
+                            "cmd_line": "reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x /d c:\\x.exe",
+                            "file": {"path": "C:\\Windows\\System32\\reg.exe",
+                                     "hashes": [{"algorithm_id": 3, "value": "ab".repeat(32)}]}},
+            },
+            "device": {"hostname": "ws-fin-011", "ip": "10.1.2.3"},
+            "reg_key": {"path": "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"},
+            "reg_value": {"path": "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", "name": "x"},
+        });
+        let mut second = first.clone();
+        second["metadata"]["uid"] = json!("evt-2");
+        second["time"] = json!("2026-10-07 14:05:00.000000");
+        let mut rule = super::tests::sample_rule();
+        rule.mitre_tactics = vec!["TA0003".into()];
+        rule.mitre_techniques = vec!["T1547.001".into()];
+        let alert = Alert {
+            id: Uuid::parse_str("5f0c7c9e-7f5a-4d0e-9a51-2b4f7a0e9c11").unwrap(),
+            rule_id: Some(rule.id),
+            rule_name: Some(rule.name.clone()),
+            severity: Severity::High,
+            status: crate::models::AlertStatus::New,
+            disposition: None,
+            matched_events: json!([first, second]),
+            matched_event_count: Some(2),
+            event_hash: None,
+            assigned_to: None,
+            acknowledged_by: None,
+            acknowledged_at: None,
+            closed_by: None,
+            closed_at: None,
+            created_at: DateTime::parse_from_rfc3339("2026-10-07T14:06:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            triage_verdict: None,
+            triage_confidence: None,
+            triage_verdict_details: None,
+            case_id: None,
+            kind: "detection".into(),
+            source_id: None,
+            source_types: vec![],
+        };
+        FindingEvent::alert(
+            &rule,
+            &alert,
+            false,
+            RiskResult::new(
+                40,
+                60,
+                "ws-fin-011".into(),
+                Some("device.hostname".into()),
+                vec!["run key".into()],
+            ),
+        )
+    }
+
+    #[test]
+    fn registry_run_key_finding_has_the_nan3224_shape() {
+        let finding = registry_run_key_finding();
+        assert_eq!(
+            finding.first_seen_at.map(|t| t.to_rfc3339()),
+            Some("2026-10-07T14:00:00+00:00".into())
+        );
+        let payload = FindingLogger::prepare_lake_outbox_payload(&finding, "tenant-a").unwrap();
+        let event = &payload.ocsf_event;
+
+        assert_eq!(
+            event["finding_info"]["attacks"],
+            json!([{
+                "technique": {"uid": "T1547", "name": "Boot or Logon Autostart Execution"},
+                "sub_technique": {"uid": "T1547.001", "name": "Registry Run Keys / Startup Folder"},
+                "tactic": {"uid": "TA0003", "name": "Persistence"},
+                "version": "19.1",
+            }])
+        );
+        // Timing: matched-event window, alert creation, finding time.
+        let first_ms = 1_791_381_600_000_i64; // 2026-10-07T14:00:00Z
+        assert_eq!(event["finding_info"]["first_seen_time"], first_ms);
+        assert_eq!(event["finding_info"]["last_seen_time"], first_ms + 300_000);
+        assert_eq!(event["start_time"], first_ms);
+        assert_eq!(event["end_time"], first_ms + 300_000);
+        assert_eq!(event["time"], first_ms + 300_000);
+        assert_eq!(event["finding_info"]["created_time"], first_ms + 360_000);
+        // Evidence: structured actor.user / process / device / registry.
+        let evidence = &event["evidences"][0];
+        assert_eq!(evidence["actor"]["user"]["name"], "CORP\\alice");
+        assert_eq!(evidence["actor"]["process"]["name"], "reg.exe");
+        assert_eq!(evidence["actor"]["process"]["file"]["hashes"][0]["algorithm_id"], 3);
+        assert_eq!(evidence["device"]["hostname"], "ws-fin-011");
+        assert_eq!(evidence["reg_value"]["name"], "x");
+        assert_eq!(event["evidences"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            event["finding_info"]["related_events"],
+            json!([{"uid": "evt-1", "type_uid": 201_403}, {"uid": "evt-2", "type_uid": 201_403}])
+        );
+        // Observables: the scored host first, then evidence-derived ones,
+        // de-duplicated, with OCSF type_ids.
+        let observables = event["observables"].as_array().unwrap();
+        assert_eq!(observables[0]["name"], "resources[0].hostname");
+        let kinds = observables
+            .iter()
+            .map(|o| (o["type_id"].as_i64().unwrap(), o["value"].as_str().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&(1, "ws-fin-011")));
+        assert!(kinds.contains(&(2, "10.1.2.3")));
+        assert!(kinds.contains(&(4, "CORP\\alice")));
+        assert!(kinds.contains(&(9, "reg.exe")));
+        assert!(kinds.contains(&(8, "ab".repeat(32).as_str())));
+        assert_eq!(kinds.iter().filter(|(_, v)| *v == "ws-fin-011").count(), 1);
+        // Per-entity risk object.
+        assert_eq!(event["resources"][0]["name"], "ws-fin-011");
+        assert_eq!(event["resources"][0]["type"], "hostname");
+        assert_eq!(event["resources"][0]["device"]["risk_score"], 60);
+        assert_eq!(event["risk_score"], 60);
+        assert_eq!(event["unmapped"]["raw_risk_score"], 40);
+        // The compact risk record is unchanged by NAN-3224.
+        assert_eq!(
+            payload.compact_finding.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
+            ["entity", "id", "mitre_tactics", "origin_source_types", "risk_score", "rule_id",
+             "rule_name", "severity", "stamped_entity_type", "timestamp_us"]
+        );
+    }
+
+    /// Both emitted shapes validate against the bundled OCSF 1.9.0 contract,
+    /// so no attribute here is invented.
+    #[test]
+    fn emitted_findings_validate_against_bundled_ocsf_1_9_schema() {
+        let finding = registry_run_key_finding();
+        let lake = FindingLogger::prepare_lake_outbox_payload(&finding, "tenant-a")
+            .unwrap()
+            .ocsf_event;
+        let clickhouse = FindingLogger::build_ocsf_finding_event(
+            &finding.to_log_json(),
+            &finding.message(),
+            finding.detected_at,
+        );
+        let mut redacted = finding.clone();
+        redacted.redact_matched_events();
+        let redacted = FindingLogger::prepare_lake_outbox_payload(&redacted, "tenant-a")
+            .unwrap()
+            .ocsf_event;
+        let mut entity_kinds = Vec::new();
+        for (entity, kind) in [
+            ("10.0.0.5", "ip"), ("alice", "user"), ("a@example.com", "email"),
+            ("example.com", "domain"), (&"0".repeat(64), "hash"), ("https://x.test/a", "url"),
+            ("123456789012", "cloud_account"), ("thing", "other"),
+        ] {
+            let mut metadata = sample_metadata();
+            metadata["risk_entity"] = json!(entity);
+            metadata["risk_entity_type"] = json!(kind);
+            entity_kinds.push(FindingLogger::build_ocsf_finding_event_for_lake(
+                &metadata, "m", Utc::now(), "detection:x", "tenant-a",
+            ));
+        }
+        for event in [&lake, &clickhouse, &redacted].into_iter().chain(entity_kinds.iter()) {
+            let result = crate::parsers::validate_ocsf_event(event);
+            assert!(result.valid, "{:#?}\n{event:#}", result.errors);
+        }
+        assert!(redacted.get("evidences").is_none());
+        assert!(redacted.get("resources").is_none());
+        assert!(redacted.get("observables").is_none());
+    }
+
+    #[test]
+    fn outbox_replay_accepts_only_identical_or_pre_nan3224_rows() {
+        let compact = json!({"id": "alert:x", "risk_score": 60});
+        let event = json!({"metadata": {"log_name": "findings"}, "is_alert": true});
+        let legacy = json!({"metadata": {"log_name": "signals"}, "unmapped": {"alert_id": "x"}});
+        let other = json!({"metadata": {"log_name": "findings"}, "is_alert": false});
+        assert!(FindingLogger::outbox_replay_matches(&compact, &event, &compact, &event));
+        assert!(FindingLogger::outbox_replay_matches(&compact, &legacy, &compact, &event));
+        assert!(!FindingLogger::outbox_replay_matches(&compact, &other, &compact, &event));
+        let changed = json!({"id": "alert:x", "risk_score": 61});
+        assert!(!FindingLogger::outbox_replay_matches(&changed, &legacy, &compact, &event));
     }
 
     #[test]
@@ -1115,6 +2059,9 @@ mod redaction_tests {
             risk_factors: vec!["severity_default:High".to_string()],
             origin_source_types: vec!["hr_system".to_string()],
             matched_events_redacted: false,
+            first_seen_at: None,
+            last_seen_at: None,
+            alert_created_at: None,
         };
 
         finding.redact_matched_events();
@@ -1134,18 +2081,39 @@ mod redaction_tests {
         assert_eq!(metadata["origin_source_types"], json!(["hr_system"]));
         assert_eq!(metadata["risk_entity"], json!(""));
         assert_eq!(metadata["matched_event_count"], 3);
-        assert!(!metadata.to_string().contains("ceo"), "entity leaked into UDM metadata");
+        assert!(
+            !metadata.to_string().contains("ceo"),
+            "entity leaked into UDM metadata"
+        );
 
         // Branch 2: OCSF `ocsf_logs_raw` (build_ocsf_finding_event) — built
         // from the SAME metadata JSON, so a no-op redaction upstream would
         // still write the sample here. Both must be empty.
         let message = finding.message();
-        let ocsf = FindingLogger::build_ocsf_finding_event(&metadata, &message, finding.detected_at);
-        assert_eq!(ocsf["unmapped"]["matched_events_sample"], json!([]));
+        let ocsf =
+            FindingLogger::build_ocsf_finding_event(&metadata, &message, finding.detected_at);
+        assert!(
+            ocsf["unmapped"].get("matched_events_sample").is_none(),
+            "the compact OCSF writer removes the empty redacted sample"
+        );
         assert_eq!(ocsf["unmapped"]["matched_events_redacted"], json!(true));
-        assert_eq!(ocsf["unmapped"]["origin_source_types"], json!(["hr_system"]));
-        assert_eq!(ocsf["unmapped"]["risk_entity"], json!(""));
-        assert!(!ocsf.to_string().contains("ceo"), "entity leaked into OCSF event");
+        assert_eq!(
+            ocsf["unmapped"]["origin_source_types"],
+            json!(["hr_system"])
+        );
+        assert!(
+            ocsf["unmapped"].get("risk_entity").is_none(),
+            "the compact OCSF writer removes the empty redacted entity"
+        );
+        assert!(
+            !ocsf.to_string().contains("ceo"),
+            "entity leaked into OCSF event"
+        );
+        // NAN-3224: no evidence, risk object or observable survives redaction.
+        assert!(ocsf.get("evidences").is_none());
+        assert!(ocsf.get("resources").is_none());
+        assert!(ocsf.get("observables").is_none());
+        assert!(ocsf["finding_info"].get("related_events").is_none());
 
         // The human-readable message falls back to the count-only form — the
         // entity summary (seeded from risk_entity + sample) is neutralized.
@@ -1264,6 +2232,9 @@ mod redaction_tests {
             risk_factors: vec![format!("factor:src_ip={actor}")],
             origin_source_types: vec![origin.to_string()],
             matched_events_redacted: false,
+            first_seen_at: None,
+            last_seen_at: None,
+            alert_created_at: None,
         };
 
         // Sentinel decision is pure (no PG): audit yes, syslog no.
@@ -1294,16 +2265,25 @@ mod redaction_tests {
         assert_eq!(audit.risk_score, 75, "score is preserved");
         // The audit actor must NOT survive into EITHER physical write branch.
         let audit_md = audit.to_log_json();
-        assert!(!audit_md.to_string().contains(actor), "actor leaked into UDM metadata");
-        let ocsf = FindingLogger::build_ocsf_finding_event(&audit_md, &audit.message(), audit.detected_at);
-        assert!(!ocsf.to_string().contains(actor), "actor leaked into OCSF event");
+        assert!(
+            !audit_md.to_string().contains(actor),
+            "actor leaked into UDM metadata"
+        );
+        let ocsf =
+            FindingLogger::build_ocsf_finding_event(&audit_md, &audit.message(), audit.detected_at);
+        assert!(
+            !ocsf.to_string().contains(actor),
+            "actor leaked into OCSF event"
+        );
 
         // The non-audit finding is left fully intact — byte-identical to its
         // pre-snapshot, and the actor is still present (redaction did not
         // over-reach onto a non-audit origin).
         assert_eq!(nonaudit.to_log_json(), nonaudit_before);
         assert!(nonaudit.to_log_json().to_string().contains(actor));
-        assert!(nonaudit.message().contains(actor));
+        assert!(nonaudit
+            .message_with_profile(&crate::schema::UdmProfile::new())
+            .contains(actor));
         assert!(!nonaudit.matched_events_redacted);
     }
 }
@@ -1339,14 +2319,43 @@ mod timestamp_basis_tests {
     }
 
     #[test]
+    fn source_event_time_accepts_ocsf_epoch_milliseconds() {
+        let events = vec![json!({ "time": 1_780_317_300_500_i64 })];
+        let got = FindingEvent::source_event_time(&events).expect("OCSF event time");
+        assert_eq!(got.to_rfc3339(), "2026-06-01T12:35:00.500+00:00");
+    }
+
+    #[test]
+    fn numeric_source_event_time_normalizes_common_epoch_units() {
+        let expected = "2026-06-01T12:35:00.500+00:00";
+        for value in [
+            json!(1_780_317_300_500_i64),
+            json!(1_780_317_300_500_000_i64),
+            json!(1_780_317_300_500_000_000_i64),
+        ] {
+            assert_eq!(
+                FindingEvent::parse_source_event_time(&value)
+                    .expect("numeric event time")
+                    .to_rfc3339(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn source_event_time_none_when_no_parseable_timestamp() {
         // No `timestamp` field, or an unparseable one -> None (caller falls back
         // to now()). This must NOT panic or silently pick a wrong basis.
         assert!(FindingEvent::source_event_time(&[json!({ "user": "a" })]).is_none());
-        assert!(
-            FindingEvent::source_event_time(&[json!({ "timestamp": "not-a-time" })]).is_none()
-        );
+        assert!(FindingEvent::source_event_time(&[json!({ "timestamp": "not-a-time" })]).is_none());
         assert!(FindingEvent::source_event_time(&[]).is_none());
+    }
+
+    #[test]
+    fn source_event_time_accepts_native_otel_span_time() {
+        let events = vec![json!({ "start_time": "2026-06-01T09:15:00Z" })];
+        let got = FindingEvent::source_event_time(&events).expect("span time");
+        assert_eq!(got.to_rfc3339(), "2026-06-01T09:15:00+00:00");
     }
 
     #[test]
@@ -1356,19 +2365,32 @@ mod timestamp_basis_tests {
         assert_eq!(F::infer_entity_type("1.2.3.4", Some("src_ip")), "ip");
         assert_eq!(F::infer_entity_type("1.2.3.4", Some("dest_ip")), "ip");
         assert_eq!(F::infer_entity_type("1.2.3.4", Some("dvc_ip")), "ip");
-        assert_eq!(F::infer_entity_type("1.2.3.4", Some("src_endpoint.ip")), "ip");
+        assert_eq!(
+            F::infer_entity_type("1.2.3.4", Some("src_endpoint.ip")),
+            "ip"
+        );
         // `dvc` (device) is typed by its value, not hardcoded to "ip": an IP
         // value → "ip", a dotted hostname value → "hostname".
         assert_eq!(F::infer_entity_type("1.2.3.4", Some("dvc")), "ip");
-        assert_eq!(F::infer_entity_type("host1.corp.example", Some("dvc")), "hostname");
+        assert_eq!(
+            F::infer_entity_type("host1.corp.example", Some("dvc")),
+            "hostname"
+        );
         assert_eq!(F::infer_entity_type("host1", Some("src_host")), "hostname");
         assert_eq!(F::infer_entity_type("host1", Some("hostname")), "hostname");
-        assert_eq!(F::infer_entity_type("host1", Some("dest_hostname")), "hostname");
+        assert_eq!(
+            F::infer_entity_type("host1", Some("dest_hostname")),
+            "hostname"
+        );
         assert_eq!(F::infer_entity_type("bob", Some("src_user")), "user");
         assert_eq!(F::infer_entity_type("abc", Some("file_hash")), "hash");
         // OCSF plural hash path (tokenizes to `hashes`, not `hash`).
-        assert_eq!(F::infer_entity_type("abc", Some("file.hashes.sha256")), "hash");
+        assert_eq!(
+            F::infer_entity_type("abc", Some("file.hashes.sha256")),
+            "hash"
+        );
         assert_eq!(F::infer_entity_type("x.com", Some("dest_domain")), "domain");
+        assert_eq!(F::infer_entity_type("alice@example.com", None), "email");
 
         // R4d: field names that merely CONTAIN the substring "ip" must NOT be
         // classified as IP — they fall through to value-based inference.
@@ -1397,7 +2419,10 @@ mod timestamp_basis_tests {
         // Requires BOTH tokens: `account_name` is a user-ish field, and a
         // bare `cloud` field says nothing about accounts.
         assert_eq!(F::infer_entity_type("bob", Some("account_name")), "user");
-        assert_ne!(F::infer_entity_type("bob", Some("cloud_provider")), "cloud_account");
+        assert_ne!(
+            F::infer_entity_type("bob", Some("cloud_provider")),
+            "cloud_account"
+        );
         // Value-only inference still can't produce it (write-side stamp only).
         assert_ne!(F::infer_entity_type("123456789012", None), "cloud_account");
     }
@@ -1417,7 +2442,30 @@ mod tests {
     /// one-line fix here instead of across every test — this module sat disabled
     /// behind `#[cfg(any())]` for months precisely because inline struct literals
     /// went stale (NAN-1722).
-    fn sample_rule() -> DetectionRule {
+    #[test]
+    fn lake_outbox_security_tenant_keeps_hosted_uuid_and_is_strict_on_trusted_local() {
+        let tenant = "6f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00";
+        // Hosted / default: a UUID lake tenant is its own security tenant
+        // (the hosted drain and RLS select by it); a gen1 name keeps the
+        // migration-336 compatibility tenant.
+        assert_eq!(
+            FindingLogger::lake_outbox_security_tenant(tenant, false).unwrap(),
+            Uuid::parse_str(tenant).unwrap()
+        );
+        assert_eq!(
+            FindingLogger::lake_outbox_security_tenant("acme-gen1", false).unwrap(),
+            crate::reports::COMPATIBILITY_TENANT_ID
+        );
+        // Trusted-local: the install's own tenant; a non-UUID one is refused.
+        assert_eq!(
+            FindingLogger::lake_outbox_security_tenant(tenant, true).unwrap(),
+            Uuid::parse_str(tenant).unwrap()
+        );
+        assert!(FindingLogger::lake_outbox_security_tenant("acme-gen1", true).is_err());
+        assert!(FindingLogger::lake_outbox_security_tenant(&Uuid::nil().to_string(), true).is_err());
+    }
+
+    pub(super) fn sample_rule() -> DetectionRule {
         DetectionRule {
             id: Uuid::now_v7(),
             name: "Test Rule".to_string(),
@@ -1436,6 +2484,8 @@ mod tests {
             realtime_enabled: false,
             detection_mode: DetectionMode::Scheduled,
             materialized_view_name: None,
+            near_real_time_interval_seconds: None,
+            execution_mode: None,
             risk_score: None,
             risk_entity_field: None,
             risk_modifiers: sqlx::types::Json(vec![]),
@@ -1476,6 +2526,77 @@ mod tests {
     }
 
     #[test]
+    fn lake_outbox_finding_id_is_deterministic() {
+        let rule = DetectionRule {
+            mode: RuleMode::Live,
+            ..sample_rule()
+        };
+        let events = vec![serde_json::json!({
+            "time": "2026-08-11T00:00:00Z",
+            "metadata.log_source": "edr"
+        })];
+        let risk_result = RiskResult::new(
+            75,
+            75,
+            "192.0.2.10".to_string(),
+            Some("src_endpoint.ip".to_string()),
+            vec!["test".to_string()],
+        );
+        let first = FindingEvent::detection_match(&rule, &events, false, risk_result.clone());
+        let second = FindingEvent::detection_match(&rule, &events, false, risk_result);
+        assert_eq!(
+            FindingLogger::stable_finding_id(&first),
+            FindingLogger::stable_finding_id(&second)
+        );
+        assert!(FindingLogger::stable_finding_id(&first).starts_with("detection:"));
+    }
+
+    #[test]
+    fn lake_outbox_grouped_alert_ids_are_entity_scoped() {
+        let alert_id = Uuid::now_v7();
+        let detected_at = Utc::now();
+        let make = |entity: &str| FindingEvent {
+            finding_type: FindingType::Alert,
+            rule_id: Uuid::now_v7(),
+            rule_name: "Grouped host rule".to_string(),
+            rule_query: "* | stats count() by device.hostname".to_string(),
+            severity: Severity::Low,
+            rule_mode: RuleMode::Alerting,
+            mitre_tactics: Vec::new(),
+            mitre_techniques: Vec::new(),
+            alert_id: Some(alert_id),
+            matched_event_count: 1,
+            matched_events_sample: Vec::new(),
+            realtime: false,
+            detected_at,
+            raw_risk_score: 25,
+            risk_score: 25,
+            risk_entity: entity.to_string(),
+            risk_entity_field: Some("device.hostname".to_string()),
+            risk_entity_type: "hostname".to_string(),
+            risk_factors: Vec::new(),
+            origin_source_types: vec!["windows_sysmon".to_string()],
+            matched_events_redacted: false,
+            first_seen_at: None,
+            last_seen_at: None,
+            alert_created_at: None,
+        };
+
+        let first = make("host-a.example");
+        let replay = first.clone();
+        let second_entity = make("host-b.example");
+        let first_id = FindingLogger::stable_finding_id(&first);
+
+        assert_eq!(first_id, FindingLogger::stable_finding_id(&replay));
+        assert_ne!(
+            first_id,
+            FindingLogger::stable_finding_id(&second_entity),
+            "distinct entities in one grouped alert require distinct outbox rows"
+        );
+        assert!(first_id.starts_with(&format!("alert:{alert_id}:")));
+    }
+
+    #[test]
     fn test_finding_event_message() {
         let rule = DetectionRule {
             mode: RuleMode::Live,
@@ -1496,11 +2617,52 @@ mod tests {
         assert!(finding.message().contains("Test Rule"));
         // The entity summary is seeded from the risk entity (src_ip) even when
         // the sample event itself doesn't carry the field.
-        assert!(finding.message().contains("src_ip=192.168.1.1"));
+        assert!(finding
+            .message_with_profile(&crate::schema::UdmProfile::new())
+            .contains("src_ip=192.168.1.1"));
         assert_eq!(finding.matched_event_count, 1);
         assert_eq!(finding.raw_risk_score, 75);
         assert_eq!(finding.risk_score, 75);
         assert_eq!(finding.risk_entity, "192.168.1.1");
+    }
+
+    #[test]
+    fn finding_message_summary_reads_nested_and_repeated_ocsf_entities() {
+        let rule = DetectionRule {
+            mode: RuleMode::Live,
+            ..sample_rule()
+        };
+        let events = vec![serde_json::json!({
+            "actor": { "user": { "name": "alice" } },
+            "device": { "hostname": "ws-01" },
+            "src_endpoint": { "ip": "192.0.2.10" },
+            "file": { "hashes": [{
+                "algorithm_id": 3,
+                "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }] }
+        })];
+        let risk = RiskResult::new(0, 0, "unknown".to_string(), None, Vec::new());
+        let finding = FindingEvent::detection_match(&rule, &events, false, risk);
+        let summary =
+            finding.extract_entity_summary_with_profile(&crate::schema::OcsfProfile::lake_1_9());
+
+        for expected in [
+            "src_endpoint.ip=192.0.2.10",
+            "actor.user.name=alice",
+            "device.hostname=ws-01",
+            "file.hashes.value=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                summary.contains(expected),
+                "missing `{expected}`: {summary}"
+            );
+        }
+        for legacy in ["src_ip=", "user=", "src_host=", "file_hash="] {
+            assert!(
+                !summary.contains(legacy),
+                "legacy key `{legacy}` leaked: {summary}"
+            );
+        }
     }
 
     #[test]
@@ -1567,6 +2729,45 @@ mod tests {
         let empty = RiskResult::new(0, 0, String::new(), None, vec![]);
         let finding = FindingEvent::detection_match(&sample_rule(), &[], false, empty);
         assert_eq!(finding.risk_entity_type, "");
+    }
+
+    /// NAN-3226: a domain risk object under an internal suffix is re-typed as
+    /// a host; external domains and host objects are untouched.
+    #[test]
+    fn internal_domain_risk_objects_are_hosts() {
+        use crate::internal_domains::InternalDomains;
+        let finding_for = |entity: &str| {
+            let rule = DetectionRule {
+                risk_score: Some(40),
+                risk_entity_field: Some("domain".to_string()),
+                ..sample_rule()
+            };
+            let risk_result = RiskResult::new(
+                40,
+                40,
+                entity.to_string(),
+                Some("domain".to_string()),
+                vec![],
+            );
+            FindingEvent::detection_match(&rule, &[], false, risk_result)
+        };
+        let internal = InternalDomains::with_tenant(["prod"]);
+        let mut finding = finding_for("db1.prod");
+        assert_eq!(finding.risk_entity_type, "domain");
+        assert!(finding.retype_internal_domain(&internal));
+        assert_eq!(finding.risk_entity_type, "hostname");
+        assert_eq!(finding.to_log_json()["risk_entity_type"], "hostname");
+
+        let mut builtin = finding_for("fileserver.corp.local");
+        assert!(builtin.retype_internal_domain(&InternalDomains::builtin()));
+
+        let mut external = finding_for("myprod.com");
+        assert!(!external.retype_internal_domain(&internal));
+        assert_eq!(external.risk_entity_type, "domain");
+
+        // Tenant isolation: another tenant's list does not re-type it.
+        let mut other = finding_for("db1.prod");
+        assert!(!other.retype_internal_domain(&InternalDomains::with_tenant(["cloud"])));
     }
 
     #[test]

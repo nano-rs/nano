@@ -11,7 +11,8 @@
 //! - any principal whose account is no longer `active` (disabled / locked /
 //!   deleted), and
 //! - any access token issued BEFORE a forced-revocation watermark
-//!   (`users.tokens_valid_from`, stamped on disable + password change).
+//!   (`users.tokens_valid_from`, stamped on disable, password change, and bulk
+//!   session revocation/logout).
 //!
 //! FAIL-CLOSED: on a PostgreSQL error the resolver returns
 //! [`UserStatusError::Unavailable`] — it NEVER falls through as "active" and
@@ -26,6 +27,7 @@
 //! (safe for an ADD-only permission model); a status gate must never cache a
 //! stale "active".
 
+use crate::request_timing::RequestDb;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,7 +73,9 @@ impl UserStatusSnapshot {
     /// revoked (back-compat for users who were never disabled).
     pub fn token_predates_revocation(&self, iat: i64) -> bool {
         match self.tokens_valid_from {
-            Some(watermark) => iat < watermark.timestamp(),
+            // JWT iat has whole-second precision while PostgreSQL retains
+            // sub-seconds. Revoke the entire watermark second.
+            Some(watermark) => iat <= watermark.timestamp(),
             None => false,
         }
     }
@@ -116,7 +120,7 @@ impl UserStatusResolver {
             "SELECT status, tokens_valid_from FROM users WHERE id = $1",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.pool).request_db()
         .await
         {
             Ok(Some((status, tokens_valid_from))) => {
@@ -196,8 +200,8 @@ mod tests {
         let s = snap("active", Some(watermark));
         // Issued before the watermark → revoked.
         assert!(s.token_predates_revocation(999));
-        // Issued exactly at / after the watermark → still valid.
-        assert!(!s.token_predates_revocation(1_000));
+        // Issued in the same second is also revoked; only a later second passes.
+        assert!(s.token_predates_revocation(1_000));
         assert!(!s.token_predates_revocation(1_001));
     }
 

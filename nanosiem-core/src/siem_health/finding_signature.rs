@@ -75,12 +75,13 @@ mod tests {
     fn signature_differs_for_different_classes() {
         let a = signature_for_title("Fix src_ip extraction for windows_sysmon (7.7% fill rate)");
         let b = signature_for_title("Fix src_ip extraction for aws_cloudtrail (7.7% fill rate)");
-        assert_ne!(a, b, "different source_type must produce different signature");
+        assert_ne!(
+            a, b,
+            "different source_type must produce different signature"
+        );
 
         let c = signature_for_title("Configure at least one active webhook for alert delivery");
-        let d = signature_for_title(
-            "Investigate and restore the enrichment pipeline immediately",
-        );
+        let d = signature_for_title("Investigate and restore the enrichment pipeline immediately");
         assert_ne!(c, d);
     }
 

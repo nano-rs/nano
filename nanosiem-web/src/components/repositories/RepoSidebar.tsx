@@ -38,13 +38,14 @@ export function RepoSidebar({
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto p-2 flex flex-col gap-1.5">
+      {/* min-h-0: without it `flex-1` sizes to content and never scrolls (NAN-2361). */}
+      <div className="flex-1 min-h-0 overflow-auto p-2 flex flex-col gap-1.5">
         {repos.map((r) => (
           <RepoCard
             key={r.id}
             repo={r}
             active={activeRepoId === r.id}
-            syncing={syncingId === r.id}
+            syncing={syncingId === r.id || r.raw.last_sync_status === 'syncing'}
             onActivate={() => onActivate(r.id)}
             onSyncNow={() => onSyncNow(r.id)}
             onOpenHistory={() => onOpenHistory(r.id)}
@@ -128,12 +129,22 @@ function RepoCard({
             <span
               className={cn('w-1 h-1 rounded-full', repo.lastSync.result === 'failed' ? 'bg-destructive' : 'bg-success')}
             />
-            synced {repo.lastSync.relative}
+            {repo.raw.managed_by_platform ? 'Managed by nano · last synced' : 'synced'} {repo.lastSync.relative}
           </div>
           {repo.autoSync !== 'off' && (
-            <div className="truncate">
-              next in {repo.nextSync.in} · {repo.nextSync.cadence}
-            </div>
+            <>
+              {repo.lastSync.result === 'failed' ? (
+                <div className="truncate text-destructive" title={repo.raw.last_sync_error ?? undefined}>
+                  sync failed{repo.nextSync.overdue ? ' · overdue' : ''}
+                </div>
+              ) : repo.nextSync.overdue ? (
+                <div className="truncate text-warning">sync overdue · {repo.nextSync.cadence}</div>
+              ) : (
+                <div className="truncate">
+                  next in {repo.nextSync.in} · {repo.nextSync.cadence}
+                </div>
+              )}
+            </>
           )}
           {repo.autoSync === 'off' && <div className="truncate">manual sync</div>}
         </div>
@@ -186,10 +197,10 @@ function RepoCard({
               )}
             >
               <RefreshCw className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')} strokeWidth={1.5} />
-              {syncing ? 'Syncing' : 'Sync'}
+              {syncing ? 'Syncing' : repo.raw.managed_by_platform ? 'Sync now' : 'Sync'}
             </button>
           </TooltipTrigger>
-          <TooltipContent>{syncing ? 'Syncing…' : 'Sync now'}</TooltipContent>
+          <TooltipContent>{syncing ? (repo.raw.sync_started_at ? `Syncing since ${new Date(repo.raw.sync_started_at).toLocaleTimeString()}` : 'Syncing…') : 'Sync now'}</TooltipContent>
         </Tooltip>
       </div>
 

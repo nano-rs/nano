@@ -119,6 +119,15 @@ pub const UPLOAD_HISTORY: &str = "upload:history";
 pub const RISK_VIEW: &str = "risk:view";
 pub const RISK_CONFIGURE: &str = "risk:configure";
 pub const RISK_CLEAR: &str = "risk:clear";
+/// View and manage risk watchlists (NAN-3232).
+///
+/// Separate from `risk:view` / `risk:configure` on purpose: a watchlist's name
+/// and members say who the organization is watching (VIPs, insider-threat
+/// subjects). Every `/api/risk/watchlists*` endpoint requires it (together
+/// with `risk:view`), and risk reads omit the watch fields (`base_risk_score`,
+/// `watch_weight`, `base_decayed_score_*`) for callers without it. Granted to
+/// the built-in Admin role only; custom roles and API keys opt in.
+pub const RISK_WATCHLISTS: &str = "risk:watchlists";
 
 // Prevalence tracking permissions
 pub const PREVALENCE_VIEW: &str = "prevalence:view";
@@ -376,6 +385,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     RISK_VIEW,
     RISK_CONFIGURE,
     RISK_CLEAR,
+    RISK_WATCHLISTS,
     // Prevalence
     PREVALENCE_VIEW,
     PREVALENCE_CONFIGURE,

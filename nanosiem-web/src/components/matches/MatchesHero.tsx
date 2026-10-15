@@ -26,7 +26,7 @@ import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useDetectionMatches, useRuleDispositionStats } from '@/hooks/use-api';
 import { parseUTCTimestamp } from '@/lib/date-utils';
-import { SEV_META, normalizeSeverity, primaryTactic, primaryTechnique, meanTimeToDetect, type MatchView } from './helpers';
+import { SEV_META, normalizeSeverity, primaryTactic, primaryTechnique, meanTimeToDetect, extractIp, type MatchView } from './helpers';
 import { LatencyPill } from './LatencyPill';
 
 // 28-day heat strip — identical algorithm to design-ref/matches-hero.jsx.
@@ -175,8 +175,9 @@ export function MatchesHero({
 
   const uniqueIps = useMemo(() => {
     const s = new Set<string>();
-    for (const v of views) for (const ip of v.events.map((e) => (e as Record<string, unknown>)['src_ip'])) {
-      if (typeof ip === 'string' && ip) s.add(ip);
+    for (const view of views) for (const event of view.events) {
+      const ip = extractIp(event);
+      if (ip) s.add(ip);
     }
     return s.size;
   }, [views]);

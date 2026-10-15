@@ -14,7 +14,8 @@
 // queryMetricsV2 / listMetricTags / metric-monitor CRUD calls.
 
 import { useEffect, useState } from 'react';
-import { AlertCircle, LineChart, Loader2 } from 'lucide-react';
+import { AlertCircle, LineChart } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
 import { MetricsExplorer } from '@/components/observability/MetricsExplorer';
@@ -55,7 +56,7 @@ export function MetricsTab({ apiTimeRange }: ObservabilityTabProps) {
   if (catalogLoading) {
     return (
       <div className="flex items-center justify-center py-16">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }

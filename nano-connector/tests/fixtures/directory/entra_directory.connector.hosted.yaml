@@ -1,0 +1,200 @@
+# Hosted variant of connector.yaml (NAN-3503): identical collection, KEYLESS
+# auth. The customer's app registration trusts nano's pull broker through a
+# federated identity credential (issuer https://pull-broker.nano.rs, subject
+# nano-connector:entra:<nano tenant id>, audience api://AzureADTokenExchange).
+# The hosted runner asks the broker for a Graph token for exactly this
+# directory + client id; no client secret exists anywhere. Everything below
+# auth is byte-for-byte connector.yaml; the shadow contract test enforces it.
+version: 1
+name: entra_directory
+kind: identity
+allow:
+  - host: graph.microsoft.com
+    path_prefixes: ["/v1.0/users", "/v1.0/groups", "/v1.0/directoryRoles"]
+  # Self-hosted token endpoint (oauth2_client_credentials). The hosted spec
+  # never calls it (the pull broker mints the Graph token), but keeps the rule
+  # so the two specs stay identical outside auth.
+  - host: login.microsoftonline.com
+auth:
+  type: entra_fic_broker
+  directory_id: "{{config.DIRECTORY_ID}}"
+  client_id: "{{config.CLIENT_ID}}"
+schedule: "0 * * * *"
+limits: { max_run_secs: 3600, max_pages: 5000, max_requests: 20000 }
+rate_limit: { min_interval_ms: 50, max_retries_429: 8, max_wait_ms: 120000 }
+identity:
+  full_every_secs: 86400
+streams:
+  - id: users
+    identity: { role: users, mode: delta }
+    # No `request`: the program picks the first request from .identity.mode.
+    program: |
+      mode = string(.identity.mode) ?? "full"
+      st = object(.state) ?? {}
+      sel = "id,userPrincipalName,mail,displayName,givenName,surname,department,jobTitle,companyName,officeLocation,city,country,accountEnabled,employeeId,employeeType,userType,createdDateTime,mobilePhone,businessPhones"
+      full_url = "https://graph.microsoft.com/v1.0/users?$select=" + sel + "&$expand=manager&$top=100"
+      baseline_url = "https://graph.microsoft.com/v1.0/users/delta?$deltatoken=latest&$select=" + sel + ",manager"
+      if .response == null {
+        link = string(st.delta_link) ?? ""
+        if mode != "delta" {
+          {"state": {"delta_link": ""}, "next_request": {"url": baseline_url}}
+        } else if link == "" {
+          {"restart_full": true}
+        } else {
+          {"state": st, "next_request": {"url": link}}
+        }
+      } else {
+        status = to_int(.response.status) ?? 0
+        code = string(.response.body.error.code) ?? ""
+        msg = string(.response.body.error.message) ?? "no message"
+        url = string(.request.url) ?? ""
+        is_delta = contains(url, "/users/delta")
+        next = string(.response.body."@odata.nextLink") ?? ""
+        delta_link = string(.response.body."@odata.deltaLink") ?? ""
+        if status == 410 || code == "syncStateNotFound" || code == "resyncRequired" || code == "syncStateInvalid" {
+          if mode == "delta" {
+            {"restart_full": true}
+          } else {
+            {"error": "Graph refused the delta baseline (" + to_string(status) + " " + code + "): " + msg}
+          }
+        } else if status < 200 || status >= 300 {
+          {"error": "Graph returned " + to_string(status) + " " + code + ": " + msg}
+        } else if mode != "delta" && is_delta {
+          # Baseline answer: no rows, just the deltaLink. Then the full list.
+          if delta_link != "" {
+            {"state": {"delta_link": delta_link}, "next_request": {"url": full_url}}
+          } else if next != "" {
+            {"state": st, "next_request": {"url": next}}
+          } else {
+            {"error": "Graph users/delta baseline returned neither a deltaLink nor a nextLink"}
+          }
+        } else {
+          rows = map_values(array(.response.body.value) ?? []) -> |u| {
+            if u."@removed" != null {
+              {"external_id": u.id, "deleted": true}
+            } else {
+              mid = string(u.manager.id) ?? ""
+              md = u."manager@delta"
+              if mid == "" && is_array(md) && md[0]."@removed" == null { mid = string(md[0].id) ?? "" }
+              if mid == "" && is_object(md) && md."@removed" == null { mid = string(md.id) ?? "" }
+              enabled = u.accountEnabled
+              acct = "unknown"
+              if enabled == true { acct = "active" }
+              if enabled == false { acct = "disabled" }
+              etype = string(u.employeeType) ?? ""
+              ut = downcase(string(u.userType) ?? "")
+              if ut == "guest" { etype = "guest" }
+              if etype == "" && ut == "member" { etype = "member" }
+              phone = string(u.mobilePhone) ?? ""
+              if phone == "" { phone = string(u.businessPhones[0]) ?? "" }
+              compact({
+                "external_id": u.id,
+                "username": u.userPrincipalName,
+                "upn": u.userPrincipalName,
+                "email": u.mail,
+                "display_name": u.displayName,
+                "first_name": u.givenName,
+                "last_name": u.surname,
+                "department": u.department,
+                "title": u.jobTitle,
+                "company": u.companyName,
+                "office_location": u.officeLocation,
+                "city": u.city,
+                "country": u.country,
+                "manager_external_id": mid,
+                "manager_upn": u.manager.userPrincipalName,
+                "manager_display_name": u.manager.displayName,
+                "account_enabled": enabled,
+                "account_status": acct,
+                "employee_id": u.employeeId,
+                "employee_type": etype,
+                "phone": phone,
+                "created_in_directory_at": u.createdDateTime
+              })
+            }
+          }
+          if next != "" {
+            {"events": rows, "state": st, "next_request": {"url": next}}
+          } else if mode == "delta" && delta_link != "" {
+            {"events": rows, "state": {"delta_link": delta_link}}
+          } else {
+            {"events": rows, "state": st}
+          }
+        }
+      }
+  - id: groups
+    identity: { role: memberships }
+    fanout:
+      discover:
+        from: request
+        request:
+          url: "https://graph.microsoft.com/v1.0/groups"
+          query: { "$select": "id,displayName,securityEnabled", "$top": "999" }
+          headers: { Accept: application/json }
+        response: { events_path: value }
+        # NAN-3503 lane A: Graph pages with an absolute @odata.nextLink in the
+        # body. `next_url` follows a body field that holds a full URL (policy-
+        # checked like a Link header); `pointer` is an RFC 6901 JSON pointer
+        # because the key itself contains a dot.
+        pagination: { type: next_url, pointer: "/@odata.nextLink" }
+      item_key: id
+      concurrency: 4
+      max_items: 10000
+    request:
+      url: "https://graph.microsoft.com/v1.0/groups/{{item.id}}/transitiveMembers/microsoft.graph.user"
+      query: { "$select": "id", "$top": "999" }
+      headers: { Accept: application/json }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Graph group members returned " + to_string(status) + ": " + (string(.response.body.error.message) ?? "no message")}
+      } else {
+        name = string(.item.displayName) ?? ""
+        gid = downcase(string(.item.id) ?? "")
+        group = if name != "" { name } else { gid }
+        privs = []
+        for_each(split(downcase(string(.config.PRIVILEGED_GROUPS) ?? ""), ",")) -> |_i, p| {
+          p = strip_whitespace(p)
+          if p != "" { privs = push(privs, p) }
+        }
+        privileged = includes(privs, downcase(name)) || includes(privs, gid)
+        evs = map_values(array(.response.body.value) ?? []) -> |m| { {"member": m.id, "group": group, "privileged": privileged} }
+        next = string(.response.body."@odata.nextLink") ?? ""
+        if next == "" {
+          {"events": evs}
+        } else {
+          {"events": evs, "next_request": {"url": next}}
+        }
+      }
+  - id: roles
+    identity: { role: memberships }
+    fanout:
+      discover:
+        from: request
+        request:
+          url: "https://graph.microsoft.com/v1.0/directoryRoles"
+          query: { "$select": "id,displayName" }
+          headers: { Accept: application/json }
+        response: { events_path: value }
+      item_key: id
+      concurrency: 4
+      max_items: 500
+    request:
+      url: "https://graph.microsoft.com/v1.0/directoryRoles/{{item.id}}/members"
+      query: { "$select": "id" }
+      headers: { Accept: application/json }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Graph role members returned " + to_string(status) + ": " + (string(.response.body.error.message) ?? "no message")}
+      } else {
+        group = "role:" + (string(.item.displayName) ?? (string(.item.id) ?? ""))
+        users = filter(array(.response.body.value) ?? []) -> |_i, m| { m."@odata.type" == "#microsoft.graph.user" }
+        evs = map_values(users) -> |m| { {"member": m.id, "group": group, "privileged": true} }
+        next = string(.response.body."@odata.nextLink") ?? ""
+        if next == "" {
+          {"events": evs}
+        } else {
+          {"events": evs, "next_request": {"url": next}}
+        }
+      }

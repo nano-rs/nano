@@ -39,6 +39,17 @@ fn webhook_with_rule_filter(rule_ids: Option<Vec<Uuid>>) -> Webhook {
     w
 }
 
+#[test]
+fn webhook_validator_blocks_cluster_names_and_accepts_provider_https() {
+    let validator = super::service::WebhookService::validator();
+    for host in ["api.tenant.svc", "api.tenant.svc.cluster.local", "api.tenant.svc.cluster.local."] {
+        assert!(validator.validate_url(&format!("https://{host}/hook")).is_err(), "{host}");
+    }
+    for host in ["hooks.slack.com", "example.webhook.office.com", "events.pagerduty.com", "receiver.example.com"] {
+        assert!(validator.validate_url(&format!("https://{host}/hook")).is_ok(), "{host}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Subscription filtering
 // ---------------------------------------------------------------------------
@@ -177,7 +188,10 @@ fn create_rejects_unknown_event_type() {
     let err = create_req(Some(vec!["not_a_stream".to_string()]))
         .validate_event_types()
         .unwrap_err();
-    assert!(err.contains("not_a_stream"), "error names the bad value: {err}");
+    assert!(
+        err.contains("not_a_stream"),
+        "error names the bad value: {err}"
+    );
 }
 
 #[test]
@@ -436,7 +450,9 @@ fn egress_allowlist_parses_valid_and_skips_garbage() {
     let cidrs = parse_egress_allowlist("10.0.0.0/8, 192.168.5.7 , nonsense/9, fd00::/8");
     assert_eq!(cidrs.len(), 3, "3 valid entries, garbage dropped");
     // Membership sanity on the parsed set.
-    assert!(cidrs.iter().any(|c| c.contains("10.9.9.9".parse().unwrap())));
+    assert!(cidrs
+        .iter()
+        .any(|c| c.contains("10.9.9.9".parse().unwrap())));
     assert!(cidrs
         .iter()
         .any(|c| c.contains("192.168.5.7".parse().unwrap())));
@@ -560,12 +576,26 @@ fn channel_create_req(channel_type: Option<&str>, url: &str) -> CreateWebhookReq
 
 #[test]
 fn validate_channel_accepts_generic_and_providers() {
-    assert!(channel_create_req(None, "https://x").validate_channel().is_ok());
-    assert!(channel_create_req(Some("generic"), "https://x").validate_channel().is_ok());
-    assert!(channel_create_req(Some("slack"), "https://hooks.slack.com/x").validate_channel().is_ok());
-    assert!(channel_create_req(Some("teams"), "https://outlook.office.com/x").validate_channel().is_ok());
+    assert!(channel_create_req(None, "https://x")
+        .validate_channel()
+        .is_ok());
+    assert!(channel_create_req(Some("generic"), "https://x")
+        .validate_channel()
+        .is_ok());
+    assert!(
+        channel_create_req(Some("slack"), "https://hooks.slack.com/x")
+            .validate_channel()
+            .is_ok()
+    );
+    assert!(
+        channel_create_req(Some("teams"), "https://outlook.office.com/x")
+            .validate_channel()
+            .is_ok()
+    );
     // PagerDuty doesn't require a user URL (server sets the Events endpoint).
-    assert!(channel_create_req(Some("pagerduty"), "").validate_channel().is_ok());
+    assert!(channel_create_req(Some("pagerduty"), "")
+        .validate_channel()
+        .is_ok());
 }
 
 #[test]
@@ -681,8 +711,8 @@ fn webhook_response_never_contains_the_raw_url() {
 
 #[tokio::test]
 async fn encrypted_url_roundtrips_through_repository() {
-    use crate::crypto::EncryptionService;
     use super::repository::WebhookRepository;
+    use crate::crypto::EncryptionService;
 
     // Lazy pool: never connects (encrypt/decrypt touch only the in-memory key),
     // but building it spawns the pool's maintenance task, which needs a runtime.
@@ -700,7 +730,10 @@ async fn encrypted_url_roundtrips_through_repository() {
         "ciphertext must not contain the plaintext secret"
     );
     let decrypted = repo.decrypt_string(&ciphertext).expect("decrypts");
-    assert_eq!(decrypted, url, "encrypt→decrypt is lossless incl. query params");
+    assert_eq!(
+        decrypted, url,
+        "encrypt→decrypt is lossless incl. query params"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -713,13 +746,13 @@ fn validate_base_origin_rejects_deceptive_and_accepts_bare_origin() {
 
     // Deceptive / non-origin forms are rejected.
     for bad in [
-        "https://a@evil/x",  // userinfo + path
-        "https://u:p@h",     // userinfo (user:pass)
-        "https://h/path",    // non-root path
-        "https://h?q=1",     // query
-        "https://h#f",       // fragment
-        "ftp://h",           // non-http(s) scheme
-        "not a url",         // unparseable
+        "https://a@evil/x", // userinfo + path
+        "https://u:p@h",    // userinfo (user:pass)
+        "https://h/path",   // non-root path
+        "https://h?q=1",    // query
+        "https://h#f",      // fragment
+        "ftp://h",          // non-http(s) scheme
+        "not a url",        // unparseable
     ] {
         assert!(
             validate_base_origin(bad).is_err(),
@@ -750,7 +783,10 @@ fn normalize_base_url_canonicalizes_hostile_legacy_value() {
         "https://evil.example"
     );
     // Bare host still gets an https scheme; http(s) URLs keep their scheme.
-    assert_eq!(normalize_base_url("nano.example.com"), "https://nano.example.com");
+    assert_eq!(
+        normalize_base_url("nano.example.com"),
+        "https://nano.example.com"
+    );
     assert_eq!(normalize_base_url("http://host/"), "http://host");
 }
 

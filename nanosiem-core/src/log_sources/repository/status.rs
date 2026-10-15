@@ -9,6 +9,64 @@ use super::{LogSourceRepository, LogSourceRepositoryError};
 use crate::log_sources::types::LogSource;
 
 impl LogSourceRepository {
+    /// Whether this exact parser generation already passed Nano's OCSF sample
+    /// gate. The receipt stores no customer event content.
+    pub async fn has_ocsf_validation_attestation(
+        &self,
+        id: Uuid,
+        schema_version: &str,
+        parser_sha256: &str,
+    ) -> Result<bool, LogSourceRepositoryError> {
+        let present = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (\
+                SELECT 1 FROM log_sources \
+                WHERE id = $1 \
+                  AND ocsf_validation_schema_version = $2 \
+                  AND ocsf_validation_parser_sha256 = $3 \
+                  AND ocsf_validation_sample_count > 0 \
+                  AND ocsf_validated_at IS NOT NULL\
+            )",
+        )
+        .bind(id)
+        .bind(schema_version)
+        .bind(parser_sha256)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(present)
+    }
+
+    /// Atomically advance the sample-validation receipt for a parser
+    /// generation after every supplied sample passed VRL and OCSF validation.
+    pub async fn set_ocsf_validation_attestation(
+        &self,
+        id: Uuid,
+        schema_version: &str,
+        parser_sha256: &str,
+        sample_sha256: &str,
+        sample_count: i32,
+    ) -> Result<(), LogSourceRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE log_sources SET \
+                ocsf_validation_schema_version = $2, \
+                ocsf_validation_parser_sha256 = $3, \
+                ocsf_validation_sample_sha256 = $4, \
+                ocsf_validation_sample_count = $5, \
+                ocsf_validated_at = NOW() \
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(schema_version)
+        .bind(parser_sha256)
+        .bind(sample_sha256)
+        .bind(sample_count)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(LogSourceRepositoryError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Enable a log source
     pub async fn enable(&self, id: Uuid) -> Result<LogSource, LogSourceRepositoryError> {
         let row = sqlx::query(

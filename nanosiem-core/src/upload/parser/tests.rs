@@ -4,6 +4,63 @@
 mod tests {
     use crate::upload::parser::*;
 
+    #[test]
+    fn indicator_lists_detect_headers_and_keep_first_row() {
+        let parser = FileParser::new();
+        for (content, column) in [
+            ("1.0.164.165\n1.0.212.159\n", "ip"),
+            (
+                "d41d8cd98f00b204e9800998ecf8427e\n900150983cd24fb0d6963f7d28e17f72\n",
+                "hash",
+            ),
+            ("malware.example\nphishing.example\n", "domain"),
+            ("2001:db8::1\n2001:db8::2\n", "ip"),
+            ("192.0.2.0/24\n198.51.100.0/24\n", "cidr"),
+            ("https://example.com/a\nhttps://example.com/b\n", "url"),
+            ("analyst@example.com\nadmin@example.com\n", "email"),
+        ] {
+            assert!(!FileParser::detect_has_header(content.as_bytes(), ','));
+            let result = parser
+                .parse(content.as_bytes(), &ParserConfig::csv())
+                .unwrap();
+            assert_eq!(result.successful, 2);
+            assert_eq!(result.headers, Some(vec![column.to_string()]));
+        }
+        for content in ["name,age\nAlice,30\n", "ip\n1.0.164.165\n"] {
+            assert!(FileParser::detect_has_header(content.as_bytes(), ','));
+            assert_eq!(
+                parser
+                    .parse(content.as_bytes(), &ParserConfig::csv())
+                    .unwrap()
+                    .successful,
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_header_choice_and_legacy_column_recovery() {
+        let content = b"1.0.164.165\n1.0.212.159\n";
+        let config = ParserConfig::csv().with_headers(true);
+        assert_eq!(
+            FileParser::new()
+                .parse(content, &config)
+                .unwrap()
+                .successful,
+            1
+        );
+        let legacy: ParserConfig = serde_json::from_str("{\"format\":\"csv\"}").unwrap();
+        let recovered = FileParser::config_for_existing_column(content, &legacy, "col_1_0_164_165");
+        let result = FileParser::new().parse(content, &recovered).unwrap();
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.headers, Some(vec!["col_1_0_164_165".to_string()]));
+        let unknown = FileParser::new()
+            .parse(b"alpha\nbeta\n", &ParserConfig::csv().with_headers(false))
+            .unwrap();
+        assert_eq!(unknown.headers, Some(vec!["value".to_string()]));
+        assert_eq!(unknown.successful, 2);
+    }
+
     // ==================== CSV Parser Tests ====================
 
     #[test]

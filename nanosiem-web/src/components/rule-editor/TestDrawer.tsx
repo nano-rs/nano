@@ -23,12 +23,12 @@ import {
   Terminal,
   RefreshCw,
   Play,
-  Loader2,
   Database,
   ArrowLeft,
   Check,
   Undo2,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -38,8 +38,9 @@ import type { TestDetectionResult, TimeRange } from '@/lib/api/types';
 import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 import { QueryEditor } from '@/components/editor';
 import { isClickHouseDefault } from '@/lib/utils';
+import { eventFieldValue } from '@/lib/event-field-access';
 // Reuse the Matches extractors so rows + detail pane pick the same canonical
-// fields (action / entity / src_ip / region / timestamp) as `/rules/:id/matches`.
+// semantics (activity / entity / IP / region / time) as `/rules/:id/matches`.
 import {
   extractAction,
   extractEntity,
@@ -52,6 +53,27 @@ import {
 // the same first-N non-empty fields the /rules/:id/matches page surfaces.
 // Keep this list in sync with that one — any change there should land here too.
 const PREVIEW_KEYS = [
+  'actor.user.name',
+  'user.name',
+  'device.hostname',
+  'src_endpoint.ip',
+  'dst_endpoint.ip',
+  'src_endpoint.hostname',
+  'dst_endpoint.hostname',
+  'activity_name',
+  'action',
+  'status',
+  'http_request.http_method',
+  'http_request.url.url_string',
+  'http_response.code',
+  'actor.process.name',
+  'actor.process.cmd_line',
+  'process.name',
+  'process.cmd_line',
+  'file.hashes.value',
+  'file.name',
+  'file.path',
+  // Retiring UDM / vendor payload tail.
   'user',
   'src_ip',
   'dest_ip',
@@ -64,24 +86,9 @@ const PREVIEW_KEYS = [
   'event_type',
   'event_id',
   'process_name',
+  'command_line',
   'file_hash',
   'file_path',
-  // OCSF promoted (dotted) columns — NAN-1241; mirror of EventViewer.tsx. Under
-  // OCSF the row carries these instead of the UDM names; UDM rows never populate
-  // them, so the UDM preview is byte-identical.
-  'user.name',
-  'actor.user.name',
-  'src_endpoint.ip',
-  'dst_endpoint.ip',
-  'src_endpoint.hostname',
-  'dst_endpoint.hostname',
-  'http_request.http_method',
-  'http_response.code',
-  'url.url_string',
-  'actor.process.name',
-  'file.hashes.sha256',
-  'file.name',
-  'file.path',
   'eventName',
   'sourceIPAddress',
   'source_type',
@@ -90,12 +97,7 @@ const PREVIEW_MAX = 5;
 const FIELD_PREVIEW_MAX = 260;
 
 function getFieldValue(event: Record<string, unknown>, field: string): string {
-  const parts = field.split('.');
-  let v: unknown = event;
-  for (const p of parts) {
-    if (v === null || v === undefined || typeof v !== 'object') return '';
-    v = (v as Record<string, unknown>)[p];
-  }
+  const v = eventFieldValue(event, field);
   if (isClickHouseDefault(v, field)) return '';
   const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
   return s.length > FIELD_PREVIEW_MAX ? `${s.slice(0, FIELD_PREVIEW_MAX)}…` : s;
@@ -378,7 +380,7 @@ export function TestDrawer({
           <ScrollArea className="flex-1 min-h-0">
             {running && !run ? (
               <div className="h-48 flex items-center justify-center text-muted-foreground">
-                <Loader2 className="w-5 h-5 animate-spin" strokeWidth={1.75} />
+                <LoadingIcon className="w-5 h-5" strokeWidth={1.75} />
               </div>
             ) : events.length === 0 ? (
               <div className="h-48 flex items-center justify-center text-[11.5px] text-muted-foreground px-6 text-center">
@@ -566,7 +568,7 @@ function TestDrawerHeader({
         className="h-6 text-[10.5px] px-2 gap-1 font-mono"
       >
         {running ? (
-          <Loader2 className="w-3 h-3 animate-spin" strokeWidth={1.75} />
+          <LoadingIcon className="w-3 h-3" strokeWidth={1.75} />
         ) : (
           <RefreshCw className="w-3 h-3" strokeWidth={1.75} />
         )}
@@ -928,10 +930,10 @@ function EventDetail({ event }: { event: Record<string, unknown> }) {
   const ip = extractIp(event);
   const region = extractRegion(event);
   const canonical: Array<[string, string | undefined]> = [
-    ['timestamp', time?.toISOString()],
-    ['event_type', action],
+    ['event time', time?.toISOString()],
+    ['activity', action],
     [entity.type === 'other' ? 'entity' : entity.type, entity.label !== 'unknown' ? entity.label : undefined],
-    ['src_ip', ip],
+    ['ip', ip],
     ['region', region],
   ].filter((pair): pair is [string, string] => typeof pair[1] === 'string' && pair[1].length > 0);
 

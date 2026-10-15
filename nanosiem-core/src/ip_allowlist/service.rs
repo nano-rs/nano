@@ -12,6 +12,9 @@ use uuid::Uuid;
 use super::repository::{IpAllowlistRepository, IpAllowlistRepositoryError};
 use super::types::*;
 
+#[cfg(test)]
+mod tests;
+
 /// How often to refresh the cached allowlist from the database
 const CACHE_TTL_SECS: u64 = 30;
 
@@ -160,14 +163,24 @@ impl IpAllowlistService {
     /// - The IP is a loopback address (127.0.0.1, ::1)
     /// - The IP matches a global or scope-specific CIDR rule
     pub async fn is_allowed(&self, ip_str: &str, scope: IpAllowlistScope) -> bool {
+        self.check_allowed(ip_str, scope).await.unwrap_or(false)
+    }
+
+    /// Distinguish a denied address from unavailable policy. Database failure
+    /// must never be interpreted as an authoritative empty allowlist.
+    pub async fn check_allowed(
+        &self,
+        ip_str: &str,
+        scope: IpAllowlistScope,
+    ) -> Result<bool, IpAllowlistServiceError> {
         // Emergency bypass
         if self.disabled {
-            return true;
+            return Ok(true);
         }
 
         // Always allow loopback
         if ip_str == "127.0.0.1" || ip_str == "::1" {
-            return true;
+            return Ok(true);
         }
 
         // Parse the IP
@@ -175,28 +188,28 @@ impl IpAllowlistService {
             Ok(ip) => ip,
             Err(_) => {
                 tracing::warn!(ip = %ip_str, "Failed to parse IP for allowlist check — denying");
-                return false;
+                return Ok(false);
             }
         };
 
         // Refresh cache if needed
-        let cache = self.get_or_refresh_cache().await;
+        let cache = self.get_or_refresh_cache().await?;
 
         // If no rules exist, allowlist is inactive — allow everything
         if !cache.has_any_rules {
-            return true;
+            return Ok(true);
         }
 
         // Check against cached CIDRs (global + scope-specific)
         for entry in &cache.entries {
             if entry.scope == IpAllowlistScope::Global || entry.scope == scope {
                 if entry.network.contains(&ip) {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
 
-        false
+        Ok(false)
     }
 
     /// Force a cache refresh (call after CRUD operations)
@@ -205,34 +218,24 @@ impl IpAllowlistService {
         *cache = None;
     }
 
-    async fn get_or_refresh_cache(&self) -> CacheState {
+    async fn get_or_refresh_cache(&self) -> Result<CacheState, IpAllowlistServiceError> {
         // Fast path: check if cache is still valid
         {
             let cache = self.cache.read().await;
             if let Some(ref state) = *cache {
                 if state.last_refresh.elapsed().as_secs() < CACHE_TTL_SECS {
-                    return CacheState {
+                    return Ok(CacheState {
                         entries: state.entries.clone(),
                         last_refresh: state.last_refresh,
                         has_any_rules: state.has_any_rules,
-                    };
+                    });
                 }
             }
         }
 
         // Slow path: refresh from database
         let repo = self.repository();
-        let entries = match repo.list(None).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to load IP allowlist from database — allowing all traffic");
-                return CacheState {
-                    entries: Vec::new(),
-                    last_refresh: std::time::Instant::now(),
-                    has_any_rules: false,
-                };
-            }
-        };
+        let entries = repo.list(None).await?;
 
         let has_any_rules = entries.iter().any(|e| e.enabled);
 
@@ -270,7 +273,7 @@ impl IpAllowlistService {
             has_any_rules: state.has_any_rules,
         });
 
-        state
+        Ok(state)
     }
 
     // ========================================================================
@@ -339,7 +342,7 @@ impl IpAllowlistService {
             .map_err(|_| IpAllowlistServiceError::InvalidIp(admin_ip.to_string()))?;
 
         // After cache invalidation, check if the admin would still be allowed
-        let cache = self.get_or_refresh_cache().await;
+        let cache = self.get_or_refresh_cache().await?;
 
         if !cache.has_any_rules {
             return Ok(());
@@ -367,7 +370,7 @@ impl IpAllowlistService {
             .parse()
             .map_err(|_| IpAllowlistServiceError::InvalidIp(ip_str.to_string()))?;
 
-        let cache = self.get_or_refresh_cache().await;
+        let cache = self.get_or_refresh_cache().await?;
 
         if !cache.has_any_rules {
             return Ok(TestIpResponse {

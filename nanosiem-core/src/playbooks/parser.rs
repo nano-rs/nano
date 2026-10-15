@@ -105,7 +105,10 @@ pub fn normalize_answer(s: &str) -> String {
 /// Evaluate a `when:` clause against a set of resolved decision answers.
 /// Returns `pass` | `fail` | `pending`. Pending = the referenced decision
 /// has not yet been answered.
-pub fn eval_when(clause: &WhenClause, decision_answers: &serde_json::Map<String, Value>) -> WhenResult {
+pub fn eval_when(
+    clause: &WhenClause,
+    decision_answers: &serde_json::Map<String, Value>,
+) -> WhenResult {
     let ans = match decision_answers.get(&clause.ref_id) {
         Some(Value::String(s)) if !s.is_empty() => s.clone(),
         Some(Value::Null) | None => return WhenResult::Pending,
@@ -230,14 +233,20 @@ pub fn parse_playbook(src: &str) -> ParsedStepTree {
 
         // H1 = title
         if let Some(caps) = h1_re.captures(raw) {
-            out.title = caps.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+            out.title = caps
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
             i += 1;
             continue;
         }
 
         // H2 = phase
         if let Some(caps) = h2_re.captures(raw) {
-            let heading = caps.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+            let heading = caps
+                .get(1)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default();
             out.phases.push(PlaybookPhase {
                 heading,
                 body: Vec::new(),
@@ -251,7 +260,10 @@ pub fn parse_playbook(src: &str) -> ParsedStepTree {
         // Slash command
         if let Some(caps) = slash_re.captures(raw) {
             step_id_counter += 1;
-            let kind = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let kind = caps
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             let label = caps
                 .get(2)
                 .map(|m| m.as_str().trim().to_string())
@@ -401,9 +413,7 @@ fn close_step(
             step.note_required_on = value_to_plain_string(v);
         }
         step.suggested = parsed.get("_suggested").cloned();
-        step.suggested_conf = parsed
-            .get("_suggested_confidence")
-            .and_then(|v| v.as_f64());
+        step.suggested_conf = parsed.get("_suggested_confidence").and_then(|v| v.as_f64());
 
         *decision_counter += 1;
         let decision_id = if let Some(id_val) = parsed.get("id") {
@@ -494,12 +504,7 @@ fn parse_inline_array(v: &Value) -> Option<Vec<Value>> {
         return None;
     }
     let inner = &s[1..s.len() - 1];
-    Some(
-        inner
-            .split(',')
-            .map(|item| coerce(item))
-            .collect(),
-    )
+    Some(inner.split(',').map(|item| coerce(item)).collect())
 }
 
 /// Parse the indented body of a slash-command block into a JSON object.
@@ -552,8 +557,14 @@ fn parse_block(lines: &[String], i: &mut usize, base_indent: usize) -> Map<Strin
             }
         };
         let pad = caps.get(1).map(|m| m.as_str()).unwrap_or("").len();
-        let key = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
-        let val = caps.get(3).map(|m| m.as_str().to_string()).unwrap_or_default();
+        let key = caps
+            .get(2)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let val = caps
+            .get(3)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
 
         if pad != base_indent {
             *i += 1;
@@ -662,7 +673,10 @@ Agent-first identity investigation for the pattern **"account that shouldn't be 
         );
         assert_eq!(tree.phases.len(), 3, "three phases");
         assert_eq!(tree.phases[0].heading, "Phase 1 · establish state");
-        assert_eq!(tree.phases[1].heading, "Phase 2 · decide what we're looking at");
+        assert_eq!(
+            tree.phases[1].heading,
+            "Phase 2 · decide what we're looking at"
+        );
         assert_eq!(tree.phases[2].heading, "Phase 3 · containment");
     }
 
@@ -714,10 +728,7 @@ Agent-first identity investigation for the pattern **"account that shouldn't be 
         assert_eq!(decision.kind, "decision");
         let options = decision.options.as_ref().expect("options present");
         assert_eq!(options.len(), 3);
-        assert_eq!(
-            decision.note_required_on.as_deref(),
-            Some("no, partial")
-        );
+        assert_eq!(decision.note_required_on.as_deref(), Some("no, partial"));
         assert_eq!(decision.decision_id.as_deref(), Some("d1"));
         // Since author didn't override id, step.id should equal decision_id.
         assert_eq!(decision.id, "d1");
@@ -738,7 +749,10 @@ Agent-first identity investigation for the pattern **"account that shouldn't be 
         let tree = parse_playbook(CRED_REUSE);
         let enrichment = &tree.phases[0].steps[0];
         let params = &enrichment.params;
-        assert_eq!(params.get("system").and_then(Value::as_str), Some("workday"));
+        assert_eq!(
+            params.get("system").and_then(Value::as_str),
+            Some("workday")
+        );
         assert_eq!(
             params.get("fields").and_then(Value::as_str),
             Some("status, end_date, manager, team")
@@ -758,7 +772,10 @@ Agent-first identity investigation for the pattern **"account that shouldn't be 
         let clause = parse_when_clause("d1 in [yes, partial]").unwrap();
         assert_eq!(clause.ref_id, "d1");
         assert_eq!(clause.op, WhenOp::In);
-        assert_eq!(clause.values, vec!["yes".to_string(), "partial".to_string()]);
+        assert_eq!(
+            clause.values,
+            vec!["yes".to_string(), "partial".to_string()]
+        );
     }
 
     #[test]
@@ -793,7 +810,9 @@ Agent-first identity investigation for the pattern **"account that shouldn't be 
     fn intro_captured_before_first_phase() {
         let tree = parse_playbook(CRED_REUSE);
         assert!(
-            tree.intro.iter().any(|l| l.contains("Agent-first identity")),
+            tree.intro
+                .iter()
+                .any(|l| l.contains("Agent-first identity")),
             "intro should include prose before Phase 1"
         );
     }

@@ -193,7 +193,9 @@ fn walk_search_expr(
             negated,
             connector: connector.map(String::from),
         }),
-        SearchExpr::FieldFilter { field, op, value } => out.push(Predicate {
+        SearchExpr::FieldFilter {
+            field, op, value, ..
+        } => out.push(Predicate {
             kind: PredicateKind::FieldFilter,
             field: Some(field.clone()),
             operator: Some(op.as_str().to_string()),
@@ -331,9 +333,12 @@ fn summarise_command(cmd: &Command) -> PipeStage {
             command: "tail".to_string(),
             args: count.to_string(),
         },
-        Command::Timechart { span, .. } => PipeStage {
+        Command::Timechart { span, bins, .. } => PipeStage {
             command: "timechart".to_string(),
-            args: format!("span={}s", span.as_secs()),
+            args: match bins {
+                Some(n) => format!("bins={n}"),
+                None => format!("span={}s", span.as_secs()),
+            },
         },
         Command::Table { fields } => PipeStage {
             command: "table".to_string(),

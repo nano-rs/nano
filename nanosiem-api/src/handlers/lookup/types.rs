@@ -23,6 +23,8 @@ pub struct CreateLookupTableConfig {
     pub csv_delimiter: Option<String>,
     /// Whether CSV has headers
     pub csv_has_headers: Option<bool>,
+    /// Explicit first-row header choice; omitted values are detected from content.
+    pub has_header: Option<bool>,
     /// Update mode: "replace" or "append" (default: replace)
     pub mode: Option<String>,
     /// Column type overrides
@@ -46,7 +48,7 @@ pub struct CreateLookupTableResponse {
     pub records_inserted: usize,
     /// Columns whose original CSV/JSON header was sanitized to a SQL-safe
     /// identifier on upload (e.g. `Customer Id → customer_id`). Empty if all
-    /// original headers were already valid identifiers. See NAN-513.
+    /// original headers were already valid identifiers. See the identifier validation rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renamed_columns: Vec<RenamedColumn>,
 }

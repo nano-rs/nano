@@ -213,35 +213,39 @@ impl EnrichmentScheduler {
                                 duration_ms = sync_result.duration_ms,
                                 "Auto-sync completed successfully"
                             );
-                            // Reload the relevant ClickHouse dictionary
-                            if let Some(ref ch) = self.clickhouse_client {
-                                let dict_name = match source.source_type.as_str() {
-                                    "ipinfo_lite" => Some("nanosiem.ip_enrichment_dict"),
-                                    _ => None,
-                                };
-                                if let Some(dict) = dict_name {
-                                    // ON CLUSTER when clustered so every node's
-                                    // dict reloads after the auto-sync, not just
-                                    // the connected one (NAN-1728 H3). Empty
-                                    // clause on single-node → identical DDL.
-                                    // TODO(H3 follow-up): REFRESH VIEW (+ WAIT)
-                                    // before reload for immediate staging
-                                    // freshness — deferred.
-                                    match ch
-                                        .query(&format!(
-                                            "SYSTEM RELOAD DICTIONARY{on_cluster} {dict}",
-                                            on_cluster =
-                                                crate::db::dual_pool::on_cluster_clause()
-                                        ))
-                                        .execute()
-                                        .await
-                                    {
-                                        Ok(_) => info!(
-                                            dictionary = dict,
-                                            "Reloaded dictionary after auto-sync"
-                                        ),
-                                        Err(e) => {
-                                            warn!(dictionary = dict, error = %e, "Failed to reload dictionary after auto-sync")
+                            // MMDB publication swaps the serving generation
+                            // directly. Only the legacy lane has a ClickHouse
+                            // dictionary to reload.
+                            if !service.uses_ipinfo_mmdb() {
+                                if let Some(ref ch) = self.clickhouse_client {
+                                    let dict_name = match source.source_type.as_str() {
+                                        "ipinfo_lite" => Some("nanosiem.ip_enrichment_dict"),
+                                        _ => None,
+                                    };
+                                    if let Some(dict) = dict_name {
+                                        // ON CLUSTER when clustered so every node's
+                                        // dict reloads after the auto-sync, not just
+                                        // the connected one (NAN-1728 H3). Empty
+                                        // clause on single-node → identical DDL.
+                                        // TODO(H3 follow-up): REFRESH VIEW (+ WAIT)
+                                        // before reload for immediate staging
+                                        // freshness — deferred.
+                                        match ch
+                                            .query(&format!(
+                                                "SYSTEM RELOAD DICTIONARY{on_cluster} {dict}",
+                                                on_cluster =
+                                                    crate::db::dual_pool::on_cluster_clause()
+                                            ))
+                                            .execute()
+                                            .await
+                                        {
+                                            Ok(_) => info!(
+                                                dictionary = dict,
+                                                "Reloaded dictionary after auto-sync"
+                                            ),
+                                            Err(e) => {
+                                                warn!(dictionary = dict, error = %e, "Failed to reload dictionary after auto-sync")
+                                            }
                                         }
                                     }
                                 }
@@ -582,14 +586,26 @@ mod tests {
     #[test]
     fn explicit_disable_is_respected() {
         let cfg = EnrichmentSchedulerConfig::default();
-        let s = source(json!({"auto_sync_enabled": false}), true, Some("success"), Some(48), 60 * 48);
+        let s = source(
+            json!({"auto_sync_enabled": false}),
+            true,
+            Some("success"),
+            Some(48),
+            60 * 48,
+        );
         assert!(!source_needs_sync(&s, &cfg, now()));
     }
 
     #[test]
     fn disabled_source_never_syncs() {
         let cfg = EnrichmentSchedulerConfig::default();
-        let s = source(json!({"auto_sync_enabled": true}), false, Some("success"), Some(48), 60 * 48);
+        let s = source(
+            json!({"auto_sync_enabled": true}),
+            false,
+            Some("success"),
+            Some(48),
+            60 * 48,
+        );
         assert!(!source_needs_sync(&s, &cfg, now()));
     }
 

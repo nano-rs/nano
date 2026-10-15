@@ -215,7 +215,7 @@ impl NotebookRepository {
             SELECT $2, reference_type, reference_id, reference_name
             FROM notebook_references
             WHERE notebook_id = $1
-            ON CONFLICT (notebook_id, reference_type, reference_id) DO NOTHING
+            ON CONFLICT (tenant_id, notebook_id, reference_type, reference_id) DO NOTHING
             "#,
         )
         .bind(source_id)

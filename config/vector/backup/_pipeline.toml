@@ -73,10 +73,35 @@ ts = .metadata.timestamp
 if ts == null { ts = .timestamp }
 if ts == null { ts = now() }
 if is_string(ts) {
-    parsed_ts, err = parse_timestamp(ts, "%+")
-    if err == null { ts = parsed_ts }
+    raw_ts = to_string(ts) ?? ""
+    parsed_ts, ts_err = parse_timestamp(raw_ts, "%+")
+    if ts_err != null {
+        # Parsers overwhelmingly emit "YYYY-MM-DD HH:MM:SS[.fff]" — a space,
+        # no zone. `%+` needs the T AND an offset, so every one of those failed,
+        # fell through to now(), and shipped INGEST time as the log time
+        # (NAN-2275). It also made the dedupe transform below inert, since its
+        # key includes timestamp and now() never repeats.
+        #
+        # Parsed as UTC explicitly rather than by re-formatting: a bare
+        # parse_timestamp reads a zone-less string in the HOST timezone, which
+        # measured 4h off on a UTC-4 machine. The container runs UTC today, but
+        # Vector defaults to local and nothing pins it.
+        candidate_ts = replace(raw_ts, " ", "T")
+        if !match(candidate_ts, r'(Z|[+-]\d{2}:?\d{2})$') {
+            candidate_ts = candidate_ts + "Z"
+        }
+        parsed_ts, ts_err = parse_timestamp(candidate_ts, "%+")
+    }
+    if ts_err == null { ts = parsed_ts }
 }
-if !is_timestamp(ts) { ts = now() }
+if !is_timestamp(ts) {
+    # Marked, not silent. The previous version fell back with no error, no
+    # metric and no field, so a whole source read as "live" for five days
+    # before anyone noticed the timestamps were ingest time.
+    if !is_object(.metadata) { .metadata = {} }
+    .metadata.timestamp_fallback = true
+    ts = now()
+}
 .udm.timestamp = format_timestamp!(ts, "%+")
 '''
 
@@ -106,8 +131,22 @@ if src_type == null { src_type = "unknown" }
 raw_message = .message
 if raw_message == null { raw_message = "" }
 
+# NAN-1556: carry OTLP-mapped fields through the `. = {...}` rebuild below.
+# otlp_logs_prep (config/vector/03-otlp-source.toml) sets these at the top
+# level; without capturing them here the reset would drop them on the generic
+# path (the lane OTLP logs ride with no deployed parser). Null/empty for every
+# non-OTLP source, so behavior for HTTP/HEC/Vector/parsers is unchanged.
+otlp_severity = .severity
+otlp_ext = .ext
+otlp_trace_id = .trace_id
+otlp_span_id = .span_id
+
 . = {
     "timestamp": .udm.timestamp,
+    "severity": otlp_severity,
+    "ext": otlp_ext,
+    "trace_id": otlp_trace_id,
+    "span_id": otlp_span_id,
     "message": raw_message,
     "raw_content": .raw_content,
     "metadata": encode_json(.metadata),
@@ -167,19 +206,46 @@ source = '''
 # Internal marker exists only long enough for the per-parser sample transform
 # to retain failures. The durable diagnostic lives in metadata.parse_error.
 del(._nano_parser_failure)
+ts_fell_back = false
 if !exists(.timestamp) {
+    ts_fell_back = true
     .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
 } else if is_string(.timestamp) {
-    ts, err = parse_timestamp(.timestamp, "%+")
+    raw_ts = to_string(.timestamp) ?? ""
+    ts, err = parse_timestamp(raw_ts, "%+")
+    if err != null {
+        # The SECOND copy of this parse (NAN-2276). `normalize` has the same
+        # logic, but only `placeholder_combiner` and `generic_parser` feed it —
+        # DB-backed parsers arrive via `db_parsers_combined` and land HERE, so
+        # fixing normalize alone left every real parser still mis-stamped.
+        #
+        # Parsers emit "YYYY-MM-DD HH:MM:SS[.fff]"; `%+` needs the T and an
+        # offset, so every one of them fell through to now() and shipped INGEST
+        # time as the log time. Parsed as UTC explicitly rather than bare: a
+        # zone-less parse reads in the HOST timezone (4h off on UTC-4).
+        candidate_ts = replace(raw_ts, " ", "T")
+        if !match(candidate_ts, r'(Z|[+-]\d{2}:?\d{2})$') {
+            candidate_ts = candidate_ts + "Z"
+        }
+        ts, err = parse_timestamp(candidate_ts, "%+")
+    }
     if err == null {
         .timestamp = format_timestamp!(ts, format: "%Y-%m-%d %H:%M:%S")
     } else {
+        ts_fell_back = true
         .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
     }
 } else if is_timestamp(.timestamp) {
     .timestamp = format_timestamp!(.timestamp, format: "%Y-%m-%d %H:%M:%S")
 } else {
+    ts_fell_back = true
     .timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
+}
+# Marked, not silent. Written before `.metadata` is JSON-encoded below, and
+# guarded because a parser can leave `.metadata` as a non-object.
+if ts_fell_back {
+    if !is_object(.metadata) { .metadata = {} }
+    .metadata.timestamp_fallback = true
 }
 .message = to_string(.message) ?? ""
 if is_object(.metadata) {
@@ -270,6 +336,12 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 .user_type = to_string(.user_type) ?? ""
 .result = to_string(.result) ?? ""
 .severity = to_string(.severity) ?? ""
+# NAN-1556: OTLP log correlation ids (set by otlp_logs_prep, carried through
+# prepare_output). Downcased to match the lower(col) convention; empty for
+# non-correlated logs. Listed in explicit_columns below so they map to their
+# own columns instead of being swept into ext.
+.trace_id = downcase(to_string(.trace_id) ?? "")
+.span_id = downcase(to_string(.span_id) ?? "")
 .category = to_string(.category) ?? ""
 .authentication_method = to_string(.authentication_method) ?? ""
 .file_size = to_int(.file_size) ?? 0
@@ -291,7 +363,10 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 .risk_score = to_float(.risk_score) ?? 0.0
 .risk_level = to_string(.risk_level) ?? ""
 .dvc = to_string(.dvc) ?? ""
-.dvc_ip = to_string(.dvc_ip) ?? ""
+# NAN-1646: downcase on the same lane as src_ip/dest_ip so dvc_ip can join
+# LOWERCASE_NORMALIZED_FIELDS and equality hunts engage the raw bloom index.
+# Only affects IPv6 hex case - IPv4 is case-free.
+.dvc_ip = downcase(to_string(.dvc_ip) ?? "")
 .dvc_mac = to_string(.dvc_mac) ?? ""
 
 # Build ext JSON with all non-explicit fields
@@ -301,6 +376,7 @@ explicit_columns = [
     "bytes_in", "bytes_out", "packets_in", "packets_out", "direction", "src_mac", "dest_mac", "vlan",
     "user", "src_user", "dest_user", "user_id", "user_name", "user_domain", "user_type",
     "action", "status", "status_code", "result", "severity", "category",
+    "trace_id", "span_id",
     "auth_type", "auth_result", "session_id", "authentication_method",
     "process_name", "process_id", "process_path", "process_hash",
     "command_line", "parent_command_line", "parent_process_name", "parent_process_id", "parent_process_path",
@@ -336,96 +412,6 @@ for_each(keys(.)) -> |_idx, key| {
 .ingest_time = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S.%f")
 '''
 
-# =============================================================================
-# ClickHouse Sink
-#
-# Durability ACK (NAN-1406): the server-side profile sets async_insert=1 +
-# wait_for_async_insert=1, so ClickHouse's HTTP 200 means the async-insert
-# FLUSH succeeded (rows durably written), not merely buffered. A flush failure
-# (e.g. FAILED enrichment dict, NAN-1404) comes back as a sink error Vector
-# retries and surfaces in metrics, instead of a silently discarded pre-ACKed
-# batch. Measured: zero throughput cost at 5k eps; sustained-overload shedding
-# unchanged (the drop_newest buffer below sheds either way, now visibly).
-# =============================================================================
-[sinks.clickhouse_logs]
-type = "clickhouse"
-inputs = ["clickhouse_mapping"]
-
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_LOGS_TABLE:-logs}"
-
-auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
-
-compression = "gzip"
-date_time_best_effort = true
-skip_unknown_fields = true
-
-[sinks.clickhouse_logs.buffer]
-type = "memory"
-max_events = 100000
-when_full = "drop_newest"
-
-[sinks.clickhouse_logs.acknowledgements]
-enabled = false
-
-[sinks.clickhouse_logs.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
-
-[sinks.clickhouse_logs.request]
-concurrency = "adaptive"
-timeout_secs = 120
-retry_initial_backoff_secs = 1
-retry_max_duration_secs = 300
-
-# =============================================================================
-# Parser Health Sink (NAN-2164)
-#
-# `db_parser_health` sees parser output before optional sampling and reduces
-# each attempt to parser_id/source_type/observed_at/failure. The destination is
-# ENGINE=Null; its materialized view retains only five-minute aggregates.
-# =============================================================================
-[sinks.clickhouse_parser_health]
-type = "clickhouse"
-inputs = ["db_parser_health"]
-
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_PARSER_HEALTH_TABLE:-parser_health_ingest}"
-
-auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
-
-compression = "gzip"
-date_time_best_effort = true
-skip_unknown_fields = true
-
-[sinks.clickhouse_parser_health.query_settings.async_insert_settings]
-deduplicate = true
-
-[sinks.clickhouse_parser_health.buffer]
-type = "memory"
-max_events = 100000
-when_full = "drop_newest"
-
-[sinks.clickhouse_parser_health.acknowledgements]
-enabled = false
-
-[sinks.clickhouse_parser_health.batch]
-max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
-max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
-timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
-
-[sinks.clickhouse_parser_health.request]
-concurrency = "adaptive"
-timeout_secs = 120
-retry_initial_backoff_secs = 1
-retry_max_duration_secs = 300
 
 # =============================================================================
 # Generic OCSF Base Event lane (NAN-1325) — unparsed/unknown source types still
@@ -433,16 +419,122 @@ retry_max_duration_secs = 300
 # =============================================================================
 [transforms.generic_ocsf_prepare]
 type = "remap"
-inputs = ["generic_parser"]
+inputs = ["generic_parser", "db_parsers_combined"]
 drop_on_abort = false
 drop_on_error = false
 source = '''
-ocsf_event = .
-src_type = downcase(to_string(.metadata.original_source_type) ?? to_string(.source_type) ?? "unknown")
+raw_event = .
+# NAN-2612: the storage label (`metadata.log_source`, which source-visibility
+# RBAC keys on) must be the row's real source, never a blanket `unknown`.
+# Two inputs feed this lane, with different metadata shapes:
+#   * `generic_parser` keeps `.metadata` an object and stashes the pre-parser
+#     routing key in `.metadata.original_source_type`, because a parse error
+#     rewrites the top-level `source_type` to `parse_failure`.
+#   * `db_parsers_combined` (lake mode: every parser runtime failure and any
+#     parser output without a root `class_uid`) carries `.metadata` as a JSON
+#     STRING, and `<parser>_output` has already resolved `.source_type`.
+#     `.metadata.original_source_type` is null there and `to_string(null)` is
+#     `""` without an error, so a `??` fallback never reached `.source_type`
+#     and every such row was stored as `unknown`. The string is parser-authored,
+#     so it is never read for the label.
+# `unknown` stays only for an event that declared no source (design §10.5).
+src_type = ""
+if is_object(.metadata) {
+    src_type = to_string(.metadata.original_source_type) ?? ""
+}
+if src_type == "" {
+    src_type = to_string(.source_type) ?? ""
+}
+if src_type == "parse_failure" { src_type = "" }
+src_type = downcase(src_type)
 if src_type == "" { src_type = "unknown" }
 msg = to_string(.message) ?? ""
-if msg == "" { msg = encode_json(ocsf_event) }
-ocsf_event.class_uid = 0
-ocsf_event.message = msg
-. = { "event": ocsf_event, "timestamp": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+raw_json = encode_json(raw_event)
+if msg == "" { msg = raw_json }
+
+event_time = now()
+source_time = .timestamp
+if source_time == null { source_time = .created_at }
+if source_time == null && is_object(.id) { source_time = .id.time }
+if is_timestamp(source_time) {
+    event_time = source_time
+} else if is_integer(source_time) {
+    parsed_time, time_err = from_unix_timestamp(source_time, unit: "milliseconds")
+    if time_err == null { event_time = parsed_time }
+} else {
+    raw_time = to_string(source_time) ?? ""
+    if raw_time != "" {
+        parsed_time, time_err = parse_timestamp(raw_time, "%+")
+        if time_err != null {
+            candidate_time = replace(raw_time, " ", "T")
+            if !match(candidate_time, r'(Z|[+-]\d{2}:?\d{2})$') {
+                candidate_time = candidate_time + "Z"
+            }
+            parsed_time, time_err = parse_timestamp(candidate_time, "%+")
+        }
+        if time_err == null { event_time = parsed_time }
+    }
+}
+
+severity = strip_whitespace(to_string(.severity) ?? "")
+if severity == "" { severity = "Unknown" }
+severity_lower = downcase(severity)
+severity_id = if severity_lower == "fatal" { 6 } else if severity_lower == "critical" { 5 } else if severity_lower == "error" { 4 } else if severity_lower == "warn" || severity_lower == "warning" { 3 } else if severity_lower == "info" || severity_lower == "informational" || severity_lower == "debug" || severity_lower == "trace" { 1 } else { 0 }
+
+# OCSF Base Event does not carry the Trace Profile. Preserve OTLP correlation
+# identifiers as typed unmapped leaves instead of leaving them stranded inside
+# raw_data. Parsers that emit a trace-profile-bearing OCSF class can map these
+# to trace.uid / trace.span.uid directly.
+# NAN-2370: `source_type` is retired UDM vocabulary and must not be persisted
+# into new OCSF lake rows. The value is not lost: it is already on
+# `metadata.log_name` below, and the lake sink stamps `metadata.log_source`
+# from the same routing key. Carrying it a third time under `unmapped` only
+# taught analysts a field name the strict OCSF validator rejects.
+unmapped = { "raw_event": raw_json }
+otlp_trace_id = downcase(to_string(.trace_id) ?? "")
+otlp_span_id = downcase(to_string(.span_id) ?? "")
+if otlp_trace_id != "" { unmapped.trace_id = otlp_trace_id }
+if otlp_span_id != "" { unmapped.span_id = otlp_span_id }
+
+ocsf_event = {
+    "activity_id": 0,
+    "activity_name": "Unknown",
+    "category_name": "Uncategorized",
+    "category_uid": 0,
+    "class_name": "Base Event",
+    "class_uid": 0,
+    "message": msg,
+    "metadata": {
+        "log_name": src_type,
+        "product": { "name": "Nano Generic Source", "vendor_name": "Nano" },
+        "version": "1.9.0"
+    },
+    "raw_data": raw_json,
+    "raw_data_size": length(raw_json),
+    "severity": severity,
+    "severity_id": severity_id,
+    "time": to_unix_timestamp!(event_time, unit: "milliseconds"),
+    "type_name": "Base Event: Unknown",
+    "type_uid": 0,
+    "unmapped": unmapped
+}
+
+# NAN-1556: OTLP LogRecords (source_type=otlp_log) reach this generic lane with
+# canonical fields already set by otlp_logs_prep (.severity, .metadata.src_host
+# from resource service.name, .trace_id/.span_id).
+# NAN-3242: the OTLP resource `service.name` is a logical service, not a host,
+# and `device` is a Host-profile attribute that a class 0 Base Event without
+# `metadata.profiles: ["host"]` may not carry: the strict OCSF 1.9 lake refused
+# every such row. Map it to `metadata.product.feature.name`, valid on every
+# class without a profile and the slot the OTLP OCSF parsers already use for
+# service identity. Gated on the OTLP lane's provenance stamp (set by
+# otlp_logs_prep), so other parserless events are byte-unchanged.
+if (to_string(.metadata.forwarded_via) ?? "") == "otlp" {
+    otlp_service = strip_whitespace(to_string(.metadata.src_host) ?? "")
+    if otlp_service != "" {
+        ocsf_event.metadata.product.feature = { "name": otlp_service }
+    }
+}
+
+. = { "event": ocsf_event, "timestamp": event_time, "source_type": src_type }
 '''

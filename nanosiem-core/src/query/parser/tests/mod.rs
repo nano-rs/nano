@@ -16,7 +16,11 @@ use crate::query::{Comparator, RetroAxis, SearchExpr, Value};
 fn test_parse_ioc_equals_single_value() {
     let result = parse_query(r#"ioc="1.2.3.4""#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert_eq!(values, vec![Value::String("1.2.3.4".to_string())]);
             assert_eq!(feed, None);
             assert_eq!(lookup, None);
@@ -46,8 +50,7 @@ fn test_parse_ioc_unquoted_hash_starting_with_digit() {
 #[test]
 fn test_parse_ioc_in_list_unquoted_mixed() {
     // Unquoted IP + digit-leading hash + domain in one list.
-    let result =
-        parse_query("ioc in [1.2.3.4, 5fb90fde, evil.com]").unwrap();
+    let result = parse_query("ioc in [1.2.3.4, 5fb90fde, evil.com]").unwrap();
     match result {
         Query::Search(SearchExpr::IocMatch { values, .. }) => {
             assert_eq!(
@@ -67,7 +70,11 @@ fn test_parse_ioc_in_list_unquoted_mixed() {
 fn test_parse_ioc_in_list() {
     let result = parse_query(r#"ioc in ["1.2.3.4", "evil.com", "deadbeef"]"#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert_eq!(
                 values,
                 vec![
@@ -88,7 +95,11 @@ fn test_parse_ioc_in_list_parens() {
     // Parenthesized list form is also accepted.
     let result = parse_query(r#"ioc in ("a", "b")"#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert_eq!(values.len(), 2);
             assert_eq!(feed, None);
             assert_eq!(lookup, None);
@@ -101,7 +112,11 @@ fn test_parse_ioc_in_list_parens() {
 fn test_parse_ioc_in_feed() {
     let result = parse_query(r#"ioc in threatfox("apt29")"#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert!(values.is_empty());
             assert_eq!(lookup, None);
             let feed = feed.expect("expected feed source");
@@ -113,10 +128,43 @@ fn test_parse_ioc_in_feed() {
 }
 
 #[test]
+fn test_parse_ioc_in_tenant_defined_feed() {
+    let result = parse_query(r#"ioc in feed("nan2361-controlled") | retro"#).unwrap();
+    match result {
+        Query::Piped { source, command } => {
+            assert_eq!(
+                command,
+                Command::Retro {
+                    axis: RetroAxis::Indicator
+                }
+            );
+            match *source {
+                Query::Search(SearchExpr::IocMatch {
+                    values,
+                    feed: Some(feed),
+                    lookup,
+                }) => {
+                    assert!(values.is_empty());
+                    assert_eq!(lookup, None);
+                    assert_eq!(feed.name, "feed");
+                    assert_eq!(feed.arg, "nan2361-controlled");
+                }
+                other => panic!("Expected tenant-defined IOC feed, got {other:?}"),
+            }
+        }
+        other => panic!("Expected piped tenant-defined IOC feed, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_parse_ioc_in_lookup() {
     let result = parse_query(r#"ioc in lookup("threat_iocs")"#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert!(values.is_empty());
             assert_eq!(feed, None);
             let lookup = lookup.expect("expected lookup source");
@@ -131,7 +179,11 @@ fn test_parse_ioc_in_lookup() {
 fn test_parse_ioc_in_lookup_with_column() {
     let result = parse_query(r#"ioc in lookup("threat_iocs", "indicator")"#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert!(values.is_empty());
             assert_eq!(feed, None);
             let lookup = lookup.expect("expected lookup source");
@@ -147,7 +199,11 @@ fn test_parse_ioc_in_inputlookup_alias() {
     // `ioc in [inputlookup <name>]` aliases to the same lookup source.
     let result = parse_query(r#"ioc in [inputlookup threat_iocs]"#).unwrap();
     match result {
-        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+        Query::Search(SearchExpr::IocMatch {
+            values,
+            feed,
+            lookup,
+        }) => {
             assert!(values.is_empty());
             assert_eq!(feed, None);
             let lookup = lookup.expect("expected lookup source");
@@ -163,9 +219,16 @@ fn test_parse_ioc_in_lookup_with_retro_pipeline() {
     let result = parse_query(r#"ioc in lookup("threat_iocs") | retro"#).unwrap();
     match result {
         Query::Piped { source, command } => {
-            assert_eq!(command, Command::Retro { axis: RetroAxis::Indicator });
+            assert_eq!(
+                command,
+                Command::Retro {
+                    axis: RetroAxis::Indicator
+                }
+            );
             match *source {
-                Query::Search(SearchExpr::IocMatch { lookup: Some(l), .. }) => {
+                Query::Search(SearchExpr::IocMatch {
+                    lookup: Some(l), ..
+                }) => {
                     assert_eq!(l.table, "threat_iocs");
                 }
                 other => panic!("Expected IocMatch lookup source, got {other:?}"),
@@ -245,7 +308,12 @@ fn test_parse_ioc_feed_with_retro_pipeline() {
     let result = parse_query(r#"ioc in threatfox("apt29") | retro by asset"#).unwrap();
     match result {
         Query::Piped { source, command } => {
-            assert_eq!(command, Command::Retro { axis: RetroAxis::Asset });
+            assert_eq!(
+                command,
+                Command::Retro {
+                    axis: RetroAxis::Asset
+                }
+            );
             match *source {
                 Query::Search(SearchExpr::IocMatch { feed: Some(_), .. }) => {}
                 other => panic!("Expected IocMatch feed source, got {other:?}"),
@@ -329,8 +397,7 @@ fn test_ai_not_greedy() {
 // user clicks an account tile, and field_name-based parsing rejected them.
 #[test]
 fn test_cloud_account_numeric_aws_id() {
-    let query =
-        parse_query("source_type=aws_cloudtrail | cloud account=234567890123").unwrap();
+    let query = parse_query("source_type=aws_cloudtrail | cloud account=234567890123").unwrap();
     match query {
         Query::Piped { command, .. } => match command {
             Command::Cloud { account, .. } => {
@@ -377,7 +444,11 @@ fn test_services_command_bare() {
     let query = parse_query("* | services").unwrap();
     match query {
         Query::Piped { command, .. } => {
-            assert_eq!(command, Command::Services, "expected Services, got {command:?}")
+            assert_eq!(
+                command,
+                Command::Services,
+                "expected Services, got {command:?}"
+            )
         }
         _ => panic!("Expected Piped query"),
     }
@@ -558,7 +629,9 @@ fn test_parse_regex_match_operators() {
     // `=~ "pat"` builds the IDENTICAL FieldFilter AST as `=/pat/`, so it reuses the
     // same safely-escaped SQL-gen path (Comparator::Regex + Value::Regex).
     match parse_query(r#"user =~ "admin""#).unwrap() {
-        Query::Search(SearchExpr::FieldFilter { field, op, value }) => {
+        Query::Search(SearchExpr::FieldFilter {
+            field, op, value, ..
+        }) => {
             assert_eq!(field, "user");
             assert_eq!(op, Comparator::Regex);
             assert_eq!(value, Value::Regex("admin".to_string()));
@@ -585,4 +658,16 @@ fn test_parse_regex_match_operators() {
     assert!(parse_query(r#"* | where user =~ "admin""#).is_ok());
     assert!(parse_query(r#"user="admin""#).is_ok());
     assert!(parse_query("user=/admin/").is_ok());
+}
+
+#[test]
+fn inputlookup_rejects_an_oversized_row_request_instead_of_clamping_it() {
+    assert!(
+        parse_query(r#"* | inputlookup url="https://example.test/iocs.csv" max_rows=100000"#)
+            .is_ok()
+    );
+    assert!(
+        parse_query(r#"* | inputlookup url="https://example.test/iocs.csv" max_rows=100001"#)
+            .is_err()
+    );
 }

@@ -11,6 +11,7 @@
  */
 
 import { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -18,7 +19,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import {
   Play,
   Database,
-  Loader2,
   FlaskConical,
   Clipboard,
   CircleCheck,
@@ -26,12 +26,15 @@ import {
   ChevronRight,
   ChevronDown,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useTestLogSourceVrl, useTestLogSourceVrlLive } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
 import { extractFields } from './TestResultRow';
 import type { LiveTestResult } from '@/lib/api/types';
+import { api } from '@/lib/api';
 
 interface ParserTestLabProps {
+  logSourceId: string;
   vrlCode: string;
   sourceType: string;
   currentDeployedVrl?: string;
@@ -208,8 +211,15 @@ function EventRowHeader({
   );
 }
 
-export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
+export function ParserTestLab({ logSourceId, vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
   const { toast } = useToast();
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const validateOcsf = activeSchema?.schema === 'ocsf';
   const { mutate: testVrl, loading: testLoading } = useTestLogSourceVrl();
   const { mutate: testVrlLive, loading: liveLoading } = useTestLogSourceVrlLive();
 
@@ -250,7 +260,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
     try {
       const results = await Promise.all(
         capped.map((line) =>
-          testVrl({ vrlCode, sampleLog: line, extensionVrl }).then((r) => ({
+          testVrl({ vrlCode, sampleLog: line, extensionVrl, validateOcsf, logSourceId }).then((r) => ({
             input: line,
             success: r.success,
             output: r.output as Record<string, unknown> | undefined,
@@ -330,7 +340,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
             className="h-7 text-[11.5px] rounded-md border-border gap-1"
           >
             {liveLoading ? (
-              <Loader2 className="w-3 h-3 animate-spin" />
+              <LoadingIcon className="w-3 h-3" />
             ) : (
               <Database className="w-3 h-3" />
             )}
@@ -484,7 +494,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensi
             disabled={testLoading || !pasteInput.trim()}
           >
             {testLoading ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <LoadingIcon className="w-3.5 h-3.5" />
             ) : (
               <>
                 <Play className="w-3.5 h-3.5" />

@@ -1,7 +1,7 @@
 # OpenTelemetry (OTLP) Source — NAN-1528
 # =============================================================================
 # SYNC: the managed product generates its own copy of the traces/metrics
-# event-type conversion + OTLP/JSON reshape (NAN-1576) in the nano-main repo
+# event-type conversion + OTLP/JSON reshape (NAN-1576) in the platform
 # (apps/api/src/services/vector-otlp.ts, which adds TLS + a token gate). The two
 # repos can't share a literal — KEEP THEM IN SYNC. This copy is pinned by the
 # `otlp_traces_metrics_ingest_is_wired` test in deploy.rs.
@@ -189,9 +189,19 @@ otlp = {
 type = "metric_to_log"
 inputs = ["otlp_ingest.metrics"]
 
+# Route native telemetry exactly once. The legacy sink and the lake sink are
+# both present in the static topology so profile switches remain an install-time
+# environment choice, but only the selected backend receives events.
+[transforms.otlp_metrics_backend]
+type = "route"
+inputs = ["otlp_metrics_to_log"]
+reroute_unmatched = false
+route.lake = 'get_env_var!("NANO_LOG_QUERY_BACKEND") == "lake"'
+route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
+
 [transforms.otlp_metrics_prep]
 type = "remap"
-inputs = ["otlp_metrics_to_log"]
+inputs = ["otlp_metrics_backend.legacy"]
 source = '''
 ts = .timestamp
 if !is_timestamp(ts) { ts = now() }
@@ -336,7 +346,35 @@ if is_object(.attributes) { tail = merge(tail, object!(.attributes)) }
 .span_id = downcase(to_string(.span_id) ?? "")
 
 .metadata.forwarded_via = "otlp"
+
+# NAN-2370: stash the routing key into Vector EVENT METADATA, exactly as
+# `source_type_extract` does in 00-base.toml. The OCSF parsers replace the event
+# root (`. = {OCSF object}`), which wipes `.source_type`, and the generated
+# `_ocsf_prepare` reads `%source_type` back to stamp `metadata.log_source`.
+#
+# This lane feeds `source_router` DIRECTLY and never passes through
+# `source_type_extract`, so `%source_type` was never set for OTLP events and
+# every OTLP row landed with `metadata.log_source = "unknown"` — unsearchable by
+# source and indistinguishable from genuinely unattributed data. The HEC lane
+# (`hec_normalize`, 02-hec-source.toml) bypasses the same transform and needs
+# the same treatment.
+# `.source_type` is set to a literal string at the top of this transform, so
+# `to_string` here is infallible — coalescing it is an E651 compile error that
+# fails the whole reload (Vector restores the old topology, so the edit looks
+# like a no-op rather than a syntax error).
+%source_type = downcase(to_string!(.source_type))
+# NAN-2361 wave 8: ingress lane for the lake sink's `metadata.ingress_transport`
+# (see 00-base.toml `source_type_extract`). The hosted edge serves OTLP/HTTP
+# only; the open-core gRPC listener shares the label.
+%ingress_transport = "otlp"
 '''
+
+[transforms.otlp_traces_backend]
+type = "route"
+inputs = ["otlp_traces_prep"]
+reroute_unmatched = false
+route.lake = 'get_env_var!("NANO_LOG_QUERY_BACKEND") == "lake"'
+route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
 
 # =============================================================================
 # ClickHouse Sink — spans raw (ENGINE=Null; MV derives otel_spans)
@@ -357,15 +395,15 @@ if is_object(.attributes) { tail = merge(tail, object!(.attributes)) }
 # =============================================================================
 [sinks.clickhouse_otel_spans]
 type = "clickhouse"
-inputs = ["otlp_traces_prep"]
+inputs = ["otlp_traces_backend.legacy"]
 
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_OTEL_SPANS_TABLE:-otel_spans_raw}"
+endpoint = "${CLICKHOUSE_URL}"
+database = "${CLICKHOUSE_DATABASE}"
+table = "${CLICKHOUSE_OTEL_SPANS_TABLE}"
 
 auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+auth.user = "${CLICKHOUSE_USER}"
+auth.password = "${CLICKHOUSE_PASSWORD}"
 
 compression = "gzip"
 date_time_best_effort = true
@@ -400,6 +438,9 @@ when_full = "drop_newest"
 enabled = true
 
 [sinks.clickhouse_otel_spans.batch]
+# Vector 0.57 disables interpolation unless the process opts in explicitly.
+# Nano's deployment and validation commands use that guarded flag, preserving
+# typed tenant overrides instead of silently hard-coding one deployment size.
 max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
 max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
 timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
@@ -409,6 +450,9 @@ concurrency = "adaptive"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
+
+[sinks.clickhouse_otel_spans.healthcheck]
+enabled = false
 
 # =============================================================================
 # ClickHouse Sink — metrics raw (ENGINE=Null; MV derives otel_metrics)
@@ -420,13 +464,13 @@ retry_max_duration_secs = 300
 type = "clickhouse"
 inputs = ["otlp_metrics_prep"]
 
-endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
-database = "${CLICKHOUSE_DATABASE:-nanosiem}"
-table = "${CLICKHOUSE_OTEL_METRICS_TABLE:-otel_metrics_raw}"
+endpoint = "${CLICKHOUSE_URL}"
+database = "${CLICKHOUSE_DATABASE}"
+table = "${CLICKHOUSE_OTEL_METRICS_TABLE}"
 
 auth.strategy = "basic"
-auth.user = "${CLICKHOUSE_USER:-nanosiem}"
-auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+auth.user = "${CLICKHOUSE_USER}"
+auth.password = "${CLICKHOUSE_PASSWORD}"
 
 compression = "gzip"
 date_time_best_effort = true
@@ -462,3 +506,6 @@ concurrency = "adaptive"
 timeout_secs = 120
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 300
+
+[sinks.clickhouse_otel_metrics.healthcheck]
+enabled = false

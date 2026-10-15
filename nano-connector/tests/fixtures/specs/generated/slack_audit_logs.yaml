@@ -1,0 +1,34 @@
+version: 1
+name: slack_audit_logs
+kind: collector
+allow:
+  - host: api.slack.com
+    path_prefixes: ["/audit/v1/logs"]
+auth: { type: bearer, credential: SLACK_AUDIT_USER_TOKEN }   # xoxp- user token, auditlogs:read, Enterprise org owner
+schedule: "*/5 * * * *"
+limits: { max_run_secs: 600, max_pages: 500 }
+rate_limit:
+  min_interval_ms: 1250        # Tier 3: ~50 calls/min, org-wide
+  max_retries_429: 5           # Slack sends Retry-After on 429; always honored
+  max_retries_5xx: 3
+  backoff_ms: 5000
+streams:
+  - id: audit_logs
+    source_type: slack_audit
+    request:
+      url: "https://api.slack.com/audit/v1/logs"
+      query:
+        oldest: "{{window.start}}"   # inclusive, epoch seconds
+        latest: "{{window.end}}"     # inclusive; boundary-second overlap is deduped by id
+        limit: "1000"                # API max 9999; smaller pages stay under response caps
+      headers: { Accept: application/json }
+    response: { events_path: entries }
+    pagination: { type: cursor, from: response_metadata.next_cursor, param: cursor }
+    window:
+      time_field: date_create        # epoch seconds
+      uid_field: id
+      format: epoch_secs
+      lag_secs: 60
+      lookback_secs: 600
+      max_span_secs: 3600
+      initial_lookback_secs: 86400

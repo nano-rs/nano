@@ -19,11 +19,16 @@
  * meta line stamps "as of HH:MM" so users can see when the data was last
  * computed.
  *
+ * NAN-3762 — A row the server did not measure (`measured: false`, or the
+ * whole response `telemetry_available: false`) renders "not measured yet"
+ * with an empty neutral bar, never 0 %. The headline averages measured rows
+ * only, and shows "—" when none are measured.
+ *
  * Source of truth: design-ref/ui_kits/search/marketplace.html lines 290-349.
  */
 
 import { Check, Plus, RefreshCw } from 'lucide-react';
-import type { ArtifactCoverage, CoverageState, MarketplaceCoverage } from '@/lib/api/marketplace';
+import { isCoverageMeasured, type ArtifactCoverage, type CoverageState, type MarketplaceCoverage } from '@/lib/api/marketplace';
 import { Skeleton } from '@/components/ui/skeleton';
 import { formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
@@ -48,6 +53,8 @@ const STATE_TONE: Record<CoverageState, { color: string; label: string }> = {
   gap:     { color: 'oklch(64% 0.20 28)',  label: 'gap' },
 };
 
+const UNMEASURED_TONE = 'color-mix(in srgb, var(--foreground) 25%, transparent)';
+
 export function CoverageHero({
   coverage,
   isLoading = false,
@@ -70,12 +77,15 @@ export function CoverageHero({
   // artifact list). Hide rather than render an empty card.
   if (!coverage || coverage.artifacts.length === 0) return null;
 
-  const overall = Math.round(
-    coverage.artifacts.reduce((s, a) => s + a.pct, 0) / coverage.artifacts.length,
-  );
-  const totalProviders = coverage.artifacts.reduce((s, a) => s + a.have.length, 0);
+  const measured = coverage.artifacts.filter(a => isCoverageMeasured(coverage, a));
+  const overall = measured.length === 0
+    ? null
+    : Math.round(measured.reduce((s, a) => s + a.pct, 0) / measured.length);
+  const unmeasuredCount = coverage.artifacts.length - measured.length;
+  // A provider recommended for several types (IPinfo Lite: IP + ASN/geo) is one provider.
+  const totalProviders = new Set(coverage.artifacts.flatMap(a => a.have)).size;
   const totalMissing = coverage.artifacts.reduce((s, a) => s + a.missing.length, 0);
-  const thinCount = coverage.artifacts.filter(a => a.state !== 'good').length;
+  const thinCount = measured.filter(a => a.state !== 'good').length;
 
   return (
     <div className="bg-card border border-border/60 rounded-xl overflow-hidden shadow-none">
@@ -89,13 +99,23 @@ export function CoverageHero({
               className="font-semibold tabular-nums shrink-0 leading-none"
               style={{ fontSize: '36px', color: 'var(--primary)' }}
             >
-              {overall}
-              <span className="text-muted-foreground" style={{ fontSize: '18px' }}>%</span>
+              {overall === null ? (
+                <span className="text-muted-foreground">—</span>
+              ) : (
+                <>
+                  {overall}
+                  <span className="text-muted-foreground" style={{ fontSize: '18px' }}>%</span>
+                </>
+              )}
             </div>
             <div className="pb-0.5 min-w-0">
               <div className="text-[12.5px] text-foreground">
-                Of artifacts in your events get enriched.{' '}
-                {thinCount > 0 ? (
+                {overall === null ? (
+                  <>Coverage not measured yet.</>
+                ) : (
+                  <>Of measured artifacts in your events get enriched.</>
+                )}{' '}
+                {overall === null ? null : thinCount > 0 ? (
                   <>
                     <span className="text-foreground">{thinCount}</span>{' '}
                     {thinCount === 1 ? 'type is' : 'types are'} thin.
@@ -105,7 +125,9 @@ export function CoverageHero({
                 )}
               </div>
               <div className="text-[11px] text-muted-foreground mt-0.5 whitespace-nowrap">
-                {coverage.artifacts.length} artifact types · {totalProviders} active providers · {totalMissing} recommended
+                {coverage.artifacts.length} artifact types
+                {unmeasuredCount > 0 && overall !== null && <> · {unmeasuredCount} not measured yet</>}
+                {' · '}{totalProviders} active providers · {totalMissing} recommended
                 {coverage.computed_at && (
                   <>
                     {' · '}as of{' '}
@@ -152,6 +174,7 @@ export function CoverageHero({
           <CoverageRow
             key={row.id}
             row={row}
+            measured={isCoverageMeasured(coverage, row)}
             isAfterFirstColumn={i % 3 !== 0}
             isAfterFirstRow={i >= 3}
             onAddMissing={onAddMissing}
@@ -164,13 +187,14 @@ export function CoverageHero({
 
 interface CoverageRowProps {
   row: ArtifactCoverage;
+  measured: boolean;
   isAfterFirstColumn: boolean;
   isAfterFirstRow: boolean;
   onAddMissing: (name: string) => void;
 }
 
-function CoverageRow({ row, isAfterFirstRow, onAddMissing }: CoverageRowProps) {
-  const tone = STATE_TONE[row.state].color;
+function CoverageRow({ row, measured, isAfterFirstRow, onAddMissing }: CoverageRowProps) {
+  const tone = measured ? STATE_TONE[row.state].color : UNMEASURED_TONE;
   return (
     <div className={cn('p-4', isAfterFirstRow && 'border-t border-border/60')}>
       <div className="flex items-center gap-2 mb-2">
@@ -178,12 +202,21 @@ function CoverageRow({ row, isAfterFirstRow, onAddMissing }: CoverageRowProps) {
         <span className="text-[12.5px] font-medium text-foreground whitespace-nowrap truncate">
           {row.label}
         </span>
-        <span className="font-mono text-[11px] tabular-nums text-foreground ml-auto shrink-0">
-          {row.pct}
-          <span className="text-muted-foreground/60">%</span>
-        </span>
+        {measured ? (
+          <span className="font-mono text-[11px] tabular-nums text-foreground ml-auto shrink-0">
+            {row.pct}
+            <span className="text-muted-foreground/60">%</span>
+          </span>
+        ) : (
+          <span
+            className="font-mono text-[10.5px] text-muted-foreground ml-auto shrink-0 whitespace-nowrap"
+            title="This deployment has no coverage measurement for this artifact type yet"
+          >
+            not measured yet
+          </span>
+        )}
       </div>
-      <SegmentedBar pct={row.pct} tone={tone} />
+      <SegmentedBar pct={measured ? row.pct : 0} tone={tone} />
       {row.have.length > 0 && (
         <div className="mt-3 flex flex-wrap items-center gap-1">
           {row.have.slice(0, 3).map(h => (

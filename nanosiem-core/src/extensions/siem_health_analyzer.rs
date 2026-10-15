@@ -10,7 +10,7 @@
 //! `analyzer::fallback_report` which stays in core.
 //!
 //! The actual AI implementation — system prompt, AI invocation, JSON
-//! response parsing — lives in `nanosiem-enterprise::siem_health::ai_analyzer`
+//! response parsing — lives in `enterprise::siem_health::ai_analyzer`
 //! (lifted in Phase 3.6 of NAN-744). Open-core wires
 //! `NoopSiemHealthAiAnalyzer`; enterprise wires `AiPoweredSiemHealthAnalyzer`,
 //! which adapts an `Arc<dyn AiClient>` into this trait.

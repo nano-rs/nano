@@ -69,9 +69,13 @@ async fn staged_manager_raw(
 
     write_staging_tree(&manager, staged).await;
 
-    fs::create_dir_all(&manager.parsers_dir).await.expect("active");
+    fs::create_dir_all(&manager.parsers_dir)
+        .await
+        .expect("active");
     for (name, body) in active {
-        fs::write(manager.parsers_dir.join(name), body).await.expect("write active");
+        fs::write(manager.parsers_dir.join(name), body)
+            .await
+            .expect("write active");
     }
 
     (tmp, manager)
@@ -83,14 +87,19 @@ async fn write_staging_tree(manager: &VectorConfigManager, staged: &[(&str, &str
     let staged_parsers = manager.staged_parsers_dir();
     fs::create_dir_all(&staged_parsers).await.expect("staging");
     for (name, body) in staged {
-        fs::write(staged_parsers.join(name), body).await.expect("write staged");
+        fs::write(staged_parsers.join(name), body)
+            .await
+            .expect("write staged");
     }
 }
 
 async fn mark_staging_complete(manager: &VectorConfigManager) {
-    fs::write(manager.staging_dir().join(STAGING_COMPLETE_MARKER), "staged\n")
-        .await
-        .expect("marker");
+    fs::write(
+        manager.staging_dir().join(STAGING_COMPLETE_MARKER),
+        "staged\n",
+    )
+    .await
+    .expect("marker");
 }
 
 /// Every quarantined file name under the config root, across all batches.
@@ -169,8 +178,14 @@ fn enrichment_parser(name: &str) -> Parser {
 async fn promotion_removes_the_pre_rename_parser_file() {
     let (_tmp, manager) = staged_manager(
         &[
-            ("github_public_events.toml", "inputs = [\"source_router.github_public_events\"]"),
-            ("_router.toml", "github_public_events = '.source_type == \"github_public_events\"'"),
+            (
+                "github_public_events.toml",
+                "inputs = [\"source_router.github_public_events\"]",
+            ),
+            (
+                "_router.toml",
+                "github_public_events = '.source_type == \"github_public_events\"'",
+            ),
         ],
         &[
             // What the rename left behind.
@@ -192,7 +207,10 @@ async fn promotion_removes_the_pre_rename_parser_file() {
         "pre-rename parser file survived promotion — it references a router output \
          that no longer exists, which makes the whole Vector config unloadable"
     );
-    assert!(manager.parsers_dir.join("github_public_events.toml").exists());
+    assert!(manager
+        .parsers_dir
+        .join("github_public_events.toml")
+        .exists());
     assert!(manager.parsers_dir.join("_router.toml").exists());
 }
 
@@ -238,12 +256,18 @@ async fn promotion_keeps_staged_infrastructure_and_ignores_dotfiles() {
 async fn promotion_removes_an_underscore_prefixed_parser_orphan() {
     let (_tmp, manager) = staged_manager(
         &[
-            ("legacy_apache.toml", "inputs = [\"source_router.legacy_apache\"]"),
+            (
+                "legacy_apache.toml",
+                "inputs = [\"source_router.legacy_apache\"]",
+            ),
             ("_router.toml", "shared"),
         ],
         &[
             // safe_name("(Legacy) Apache")
-            ("_legacy__apache.toml", "inputs = [\"source_router._legacy__apache\"]"),
+            (
+                "_legacy__apache.toml",
+                "inputs = [\"source_router._legacy__apache\"]",
+            ),
         ],
     )
     .await;
@@ -723,11 +747,11 @@ async fn promotion_quarantines_a_toml_it_did_not_generate() {
     );
 }
 
-/// The quarantined copy must stop being a `.toml`. `deploy/src/s3.js`'s config
-/// sync walks the whole config root and uploads every `.toml` it finds, skipping
-/// only `backup` and `staging` by name — a quarantined parser that kept its
-/// extension would be replicated back out to every Vector pod, undoing the
-/// quarantine.
+/// The quarantined copy must stop being a `.toml`. A config sync that walks the
+/// whole config root and uploads every `.toml` it finds, skipping only `backup`
+/// and `staging` by name (the old `deploy/src/s3.js`, removed in NAN-3491), would
+/// replicate a quarantined parser that kept its extension back out to every
+/// Vector pod, undoing the quarantine.
 #[tokio::test]
 async fn quarantined_files_are_no_longer_toml() {
     let (_tmp, manager) = staged_manager(
@@ -760,9 +784,12 @@ async fn base_configs_delivered_as_symlinks_are_staged() {
     // The ConfigMap shape: real file in `..data/`, symlink beside it.
     let data = tmp.path().join("..data");
     fs::create_dir_all(&data).await.expect("..data");
-    fs::write(data.join("00-base.toml"), "[sources.http]\ntype = \"http_server\"\n")
-        .await
-        .expect("real file");
+    fs::write(
+        data.join("00-base.toml"),
+        "[sources.http]\ntype = \"http_server\"\n",
+    )
+    .await
+    .expect("real file");
     std::os::unix::fs::symlink(data.join("00-base.toml"), tmp.path().join("00-base.toml"))
         .expect("symlink");
 
@@ -834,7 +861,10 @@ async fn promotion_deletes_a_rename_orphan_it_generated_itself() {
 async fn fixed_name_infrastructure_is_owned_without_a_manifest() {
     let (_tmp, manager) = staged_manager(
         &[("_router.toml", "shared"), ("_combiner.toml", "shared")],
-        &[("_ocsf_sink.toml", "stale OCSF sink"), ("_ocsf.toml", "legacy")],
+        &[
+            ("_ocsf_sink.toml", "stale OCSF sink"),
+            ("_ocsf.toml", "legacy"),
+        ],
     )
     .await;
 

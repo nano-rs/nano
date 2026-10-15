@@ -6,7 +6,7 @@
 //! query/cron validation, and version management.
 
 use chrono::{DateTime, Utc};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::models::{DetectionRule, NewDetectionRule, RuleMode};
@@ -116,10 +116,8 @@ pub(crate) const REALTIME_DEDUP_BUCKET_SECS: i64 = 60;
 /// (not processing time), so replayed/backfilled events for an already-alerted
 /// historical window still collide with it.
 pub(crate) fn realtime_window_bucket(event_ts: DateTime<Utc>) -> DateTime<Utc> {
-    let secs = event_ts
-        .timestamp()
-        .div_euclid(REALTIME_DEDUP_BUCKET_SECS)
-        * REALTIME_DEDUP_BUCKET_SECS;
+    let secs =
+        event_ts.timestamp().div_euclid(REALTIME_DEDUP_BUCKET_SECS) * REALTIME_DEDUP_BUCKET_SECS;
     DateTime::from_timestamp(secs, 0).unwrap_or(event_ts)
 }
 
@@ -168,22 +166,40 @@ pub(crate) fn realtime_finding_candidate(
 
 /// Filter `candidates` down to the findings NOT yet emitted for this rule — a
 /// single batched `SELECT ... = ANY($hashes)` against the persistent dedup
-/// store (NAN-1305). Fails open: on a query error every candidate is treated as
-/// new (emit rather than silently drop).
+/// store (NAN-1305).
+///
+/// Fails CLOSED: a dedup read that errors propagates instead of degrading to an
+/// empty dedup set, because on an alert-emitting path an empty set means "emit
+/// everything again". A transient PostgreSQL failure must not become a burst of
+/// duplicate alerts; the caller retries on the next cycle instead.
 ///
 /// Pool-parameterized so both the scheduled path ([`DetectionService`]) and the
 /// real-time `SignalProcessor` (audit D13) share ONE dedup mechanism.
-pub(crate) async fn retain_unemitted_with_pool(
+pub(crate) async fn retain_unemitted_checked(
     pool: &sqlx::PgPool,
     rule_id: Uuid,
     candidates: Vec<ClaimedFinding>,
-) -> Vec<ClaimedFinding> {
+) -> Result<Vec<ClaimedFinding>, DetectionError> {
     if candidates.is_empty() {
-        return candidates;
+        return Ok(candidates);
     }
 
+    let existing = emitted_finding_hashes(pool, rule_id, &candidates).await?;
+
+    Ok(candidates
+        .into_iter()
+        .filter(|c| !existing.contains(&c.finding_hash))
+        .collect())
+}
+
+/// The already-emitted subset of these candidates' dedup identities.
+async fn emitted_finding_hashes(
+    pool: &sqlx::PgPool,
+    rule_id: Uuid,
+    candidates: &[ClaimedFinding],
+) -> Result<std::collections::HashSet<String>, DetectionError> {
     let hashes: Vec<String> = candidates.iter().map(|c| c.finding_hash.clone()).collect();
-    let existing: std::collections::HashSet<String> = match sqlx::query_scalar::<_, String>(
+    Ok(sqlx::query_scalar::<_, String>(
         r#"
         SELECT finding_hash
         FROM detection_finding_emissions
@@ -194,17 +210,38 @@ pub(crate) async fn retain_unemitted_with_pool(
     .bind(&hashes)
     .fetch_all(pool)
     .await
-    {
-        Ok(rows) => rows.into_iter().collect(),
+    .map_err(DetectionError::DatabaseError)?
+    .into_iter()
+    .collect())
+}
+
+/// Fail-open dedup for the Live bake-in paths ONLY.
+///
+/// Bake-in findings inflate entity risk and finding counts; they never open an
+/// alert or a case. Losing visibility entirely (dropping candidates) is worse
+/// there than double-counting one window, so a dedup read failure degrades to
+/// "treat every candidate as new" and says so loudly. Alert-emitting callers
+/// must use [`retain_unemitted_checked`] instead.
+pub(crate) async fn retain_unemitted_with_pool(
+    pool: &sqlx::PgPool,
+    rule_id: Uuid,
+    candidates: Vec<ClaimedFinding>,
+) -> Vec<ClaimedFinding> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let existing = match emitted_finding_hashes(pool, rule_id, &candidates).await {
+        Ok(existing) => existing,
         Err(e) => {
             warn!(
-                "finding-emission dedup read failed for rule {}: {}. Emitting all without dedup.",
-                rule_id, e
+                "finding-emission dedup read failed for rule {}: {}. Emitting all {} bake-in candidate(s) without dedup.",
+                rule_id,
+                e,
+                candidates.len()
             );
-            std::collections::HashSet::new()
+            return candidates;
         }
     };
-
     candidates
         .into_iter()
         .filter(|c| !existing.contains(&c.finding_hash))
@@ -236,7 +273,7 @@ pub(crate) async fn record_finding_emissions_with_pool(
             .push_bind(&f.finding_hash)
             .push_bind(f.window_end);
     });
-    qb.push(" ON CONFLICT (rule_id, finding_hash) DO NOTHING");
+    qb.push(concat!(" ON CONFLICT (", crate::tenant_key!(), "rule_id, finding_hash) DO NOTHING"));
 
     if let Err(e) = qb.build().execute(pool).await {
         warn!(
@@ -257,19 +294,7 @@ pub(crate) async fn record_finding_emissions_with_pool(
 /// evaluators, NAN-1563): the window is anchored to the persisted last-alert
 /// time, so a value dipping below a threshold and re-crossing within the
 /// window does NOT reset or re-open it. Anti-flap by construction.
-pub(super) fn within_alert_cooldown(
-    last_alert_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-    cooldown_minutes: i32,
-) -> bool {
-    match last_alert_at {
-        None => false,
-        Some(last) => {
-            let elapsed = now.signed_duration_since(last);
-            elapsed < chrono::Duration::minutes(cooldown_minutes.max(0) as i64)
-        }
-    }
-}
+pub(super) use crate::detection::entity_risk::within_alert_cooldown;
 
 impl DetectionService {
     // ========================================================================
@@ -316,15 +341,7 @@ impl DetectionService {
         .bind(&event_ids)
         .fetch_all(&self.pg_pool)
         .await
-        .unwrap_or_else(|e| {
-            // Fail open: if the query fails (e.g. table missing on a partial
-            // upgrade), log and treat nothing as already-matched.
-            warn!(
-                "Failed to query detection_matched_events: {}. Deduplication disabled.",
-                e
-            );
-            Vec::new()
-        });
+        .map_err(DetectionError::DatabaseError)?;
 
         let already_matched_set: std::collections::HashSet<String> =
             already_matched.into_iter().collect();
@@ -372,7 +389,7 @@ impl DetectionService {
                 .push_bind(timestamp);
         });
 
-        query_builder.push(" ON CONFLICT (rule_id, kind, event_id) DO NOTHING");
+        query_builder.push(concat!(" ON CONFLICT (", crate::tenant_key!(), "rule_id, kind, event_id) DO NOTHING"));
 
         query_builder
             .build()
@@ -406,8 +423,7 @@ impl DetectionService {
         // rows never land here as '{}' while the restricted registry is
         // non-empty. An empty stamp means non-source-derived events
         // (retro-hunt indicator summaries) = visible to everyone.
-        let source_types =
-            crate::db::repository::alerts::distinct_source_types(&matched_events);
+        let source_types = crate::db::repository::alerts::distinct_source_types(&matched_events);
 
         // Compute event hash for deduplication (`compute_event_hash` strips
         // `_nano_*` keys, so annotated and pre-annotation payloads dedup
@@ -418,11 +434,11 @@ impl DetectionService {
         // This prevents storing the same match multiple times when a rule runs
         // frequently with a long lookback window
         let result = sqlx::query(
-            r#"
+            concat!(r#"
             INSERT INTO detection_matches (rule_id, rule_name, severity, matched_events, event_count, event_hash, source_types)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (rule_id, event_hash) DO NOTHING
-            "#
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id, event_hash) DO NOTHING
+            "#)
         )
         .bind(rule.id)
         .bind(&rule.name)
@@ -472,12 +488,22 @@ impl DetectionService {
 
     /// Filter `candidates` down to the findings NOT yet emitted for this rule —
     /// a single batched `SELECT ... = ANY($hashes)` against the dedup store
-    /// (NAN-1305). Fails open: on a query error every candidate is treated as new
-    /// (emit rather than silently drop).
+    /// (NAN-1305). Fails CLOSED for alert-emitting callers: see
+    /// [`retain_unemitted_checked`].
     ///
-    /// Thin wrapper over [`retain_unemitted_with_pool`], which the real-time
+    /// Thin wrapper over [`retain_unemitted_checked`], which the real-time
     /// SignalProcessor shares (audit D13).
     pub(super) async fn retain_unemitted(
+        &self,
+        rule_id: Uuid,
+        candidates: Vec<ClaimedFinding>,
+    ) -> Result<Vec<ClaimedFinding>, DetectionError> {
+        retain_unemitted_checked(&self.pg_pool, rule_id, candidates).await
+    }
+
+    /// Bake-in variant: a dedup read failure double-counts a live finding rather
+    /// than dropping it. Never use on a path that can open an alert.
+    pub(super) async fn retain_unemitted_bake_in(
         &self,
         rule_id: Uuid,
         candidates: Vec<ClaimedFinding>,
@@ -577,11 +603,11 @@ impl DetectionService {
         // DISTINCT: the same entity may appear twice in a batch; a duplicate
         // inside one INSERT would trip "ON CONFLICT cannot affect row twice".
         let result = sqlx::query(
-            r#"
+            concat!(r#"
             INSERT INTO detection_alert_entity_cooldowns (rule_id, entity, last_alert_at)
             SELECT DISTINCT $1, unnest($2::text[]), now()
-            ON CONFLICT (rule_id, entity) DO UPDATE SET last_alert_at = EXCLUDED.last_alert_at
-            "#,
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id, entity) DO UPDATE SET last_alert_at = EXCLUDED.last_alert_at
+            "#),
         )
         .bind(rule_id)
         .bind(entities)
@@ -715,138 +741,6 @@ impl DetectionService {
         DateTime::parse_from_rfc3339(s)
             .ok()
             .map(|dt| dt.with_timezone(&Utc))
-    }
-
-    /// Group events by entity value for per-entity risk scoring
-    ///
-    /// When a detection rule matches multiple events, we need to create separate
-    /// signals for each unique entity so that each entity gets its own risk score.
-    ///
-    /// If entity_field is specified, groups by that field only.
-    /// If entity_field is None (auto-detect), extracts ALL entities from each event
-    /// and creates a group for each unique entity value found.
-    ///
-    /// Returns: HashMap<(entity_value, field_name), events>
-    pub(super) fn group_events_by_entity(
-        &self,
-        entity_field: Option<&str>,
-        events: &[serde_json::Value],
-    ) -> std::collections::HashMap<(String, String), Vec<serde_json::Value>> {
-        use std::collections::HashMap;
-
-        let mut grouped: HashMap<(String, String), Vec<serde_json::Value>> = HashMap::new();
-
-        match entity_field {
-            Some(field) => {
-                // Specific field: group by that field only
-                for event in events {
-                    let entity = Self::get_string_field_from_event(event, field)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let key = (entity, field.to_string());
-                    grouped.entry(key).or_default().push(event.clone());
-                }
-            }
-            None => {
-                // Auto-detect: Extract ALL entities from each event
-                // This ensures every entity in the event gets risk scored.
-                // The candidate physical fields come from the active profile's
-                // entity-extraction order (NAN-1241 Phase 5): for UDM this is the
-                // byte-identical superset list; for OCSF it yields the OCSF
-                // physical fields (`src_endpoint.ip`, `user.name`, …).
-                let order = self.active_profile.entity_extraction_order();
-
-                for event in events {
-                    let mut found_any = false;
-
-                    // Extract ALL entity values from this event
-                    for &(_role, field) in order {
-                        if let Some(entity_value) = Self::get_string_field_from_event(event, field)
-                        {
-                            debug!(
-                                "Auto-detect: Found entity '{}' in field '{}'",
-                                entity_value, field
-                            );
-                            let key = (entity_value, field.to_string());
-                            grouped.entry(key).or_default().push(event.clone());
-                            found_any = true;
-                        }
-                    }
-
-                    // If no entities found, fall back to the row's time bucket
-                    // when it has one (NAN-1711 / audit D15), else "unknown".
-                    //
-                    // Aggregate rows from an un-split `| timechart` (or
-                    // `stats … by time_bucket`) carry NO entity fields. Lumping
-                    // them all into one "unknown" group made the group's finding
-                    // identity (max `_last_seen` across rows) depend on WHICH
-                    // rows survived the already-matched pre-filter that cycle —
-                    // a changed old bucket shrank the group to just itself, the
-                    // group max regressed, and the finding re-keyed → re-emit.
-                    // Keying each bucket as its own finding entity gives every
-                    // row a self-contained identity (`bucket + its own
-                    // _last_seen`) that no other row's fate can perturb.
-                    if !found_any {
-                        let key = match Self::get_string_field_from_event(event, "time_bucket") {
-                            Some(bucket) => (bucket, "time_bucket".to_string()),
-                            None => ("unknown".to_string(), "unknown".to_string()),
-                        };
-                        grouped.entry(key).or_default().push(event.clone());
-                    }
-                }
-            }
-        }
-
-        grouped
-    }
-
-    /// Get a string field value from an event.
-    ///
-    /// ClickHouse `JSONEachRow` rows have FLAT keys that ARE the (possibly
-    /// dotted) physical column names: `SELECT *` over `ocsf_logs` returns a key
-    /// literally named `src_endpoint.ip`, not a nested object. So we resolve
-    /// `field` as a FLAT key first, and only fall back to walking it as a nested
-    /// JSON path when no such flat key exists.
-    ///
-    /// UDM stays byte-for-byte identical: single-segment UDM fields (`src_ip`)
-    /// hit the flat lookup; the UDM legacy paths (`metadata.src_ip`,
-    /// `metadata.user`, `metadata.hostname`) have no flat key and resolve through
-    /// the nested fall-back exactly as before. OCSF promoted dotted columns
-    /// (`src_endpoint.ip`, `user.name`, …) now resolve via the flat lookup
-    /// instead of collapsing every event into the `unknown` group (NAN-1241).
-    fn get_string_field_from_event(event: &serde_json::Value, field: &str) -> Option<String> {
-        // 1. Flat key: the dotted column name as-is (OCSF + single-segment UDM).
-        if let Some(v) = event.get(field) {
-            return Self::value_to_string(v);
-        }
-
-        // 2. Fall back to nested-path walk (UDM `metadata.*` legacy paths).
-        let parts: Vec<&str> = field.split('.').collect();
-        let mut current = event;
-        for part in parts {
-            match current.get(part) {
-                Some(v) => current = v,
-                None => return None,
-            }
-        }
-        Self::value_to_string(current)
-    }
-
-    /// Coerce a JSON leaf to a non-empty string, treating empty strings as
-    /// missing (shared by flat + nested resolution above).
-    fn value_to_string(current: &serde_json::Value) -> Option<String> {
-        match current {
-            serde_json::Value::String(s) => {
-                // Filter out empty strings - treat them as missing values
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.clone())
-                }
-            }
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            serde_json::Value::Bool(b) => Some(b.to_string()),
-            _ => None,
-        }
     }
 
     // ========================================================================
@@ -996,10 +890,25 @@ mod finding_dedup_tests {
             "_nano_detected_at": "2026-06-08T11:40:00Z",
         })];
 
-        let (h1, end1) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &run1);
-        let (h2, end2) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &run2);
+        let (h1, end1) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &run1,
+        );
+        let (h2, end2) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &run2,
+        );
 
-        assert_eq!(h1, h2, "same entity + window must collide across executions");
+        assert_eq!(
+            h1, h2,
+            "same entity + window must collide across executions"
+        );
         assert_eq!(end1, end2);
         // window_end is the source event time (_last_seen), not now().
         assert_eq!(end1.to_rfc3339(), "2026-06-07T11:00:00+00:00");
@@ -1020,9 +929,24 @@ mod finding_dedup_tests {
             "_last_seen": "2026-06-07 12:30:00.000",
         })];
 
-        let (h1, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &earlier);
-        let (h2, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &later);
-        assert_ne!(h1, h2, "a later _last_seen is new activity and must re-emit");
+        let (h1, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &earlier,
+        );
+        let (h2, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &later,
+        );
+        assert_ne!(
+            h1, h2,
+            "a later _last_seen is new activity and must re-emit"
+        );
     }
 
     /// Different entities (same window) must not collide.
@@ -1035,8 +959,20 @@ mod finding_dedup_tests {
                 "_last_seen": "2026-06-07 11:00:00.000",
             })]
         };
-        let (a, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &mk("10.1.1.10"));
-        let (b, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.100", &mk("10.1.1.100"));
+        let (a, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &mk("10.1.1.10"),
+        );
+        let (b, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.100",
+            &mk("10.1.1.100"),
+        );
         assert_ne!(a, b);
     }
 
@@ -1063,12 +999,23 @@ mod finding_dedup_tests {
         })];
 
         let (h1, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_ip", "10.1.1.10", &cycle_1,
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &cycle_1,
         );
         let (h2, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_ip", "10.1.1.10", &cycle_2,
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &cycle_2,
         );
-        assert_eq!(h1, h2, "count/percent/_first_seen drift must not re-key top rows");
+        assert_eq!(
+            h1, h2,
+            "count/percent/_first_seen drift must not re-key top rows"
+        );
     }
 
     /// NAN-1711 / audit D15: a `| timechart`-shaped row — the dedup "entity"
@@ -1105,7 +1052,11 @@ mod finding_dedup_tests {
 
         let ident = |events: &Vec<serde_json::Value>| {
             DetectionService::finding_dedup_identity(
-                "alert", rule_id(), "time_bucket", bucket, events,
+                "alert",
+                rule_id(),
+                "time_bucket",
+                bucket,
+                events,
             )
         };
         let (h1, end1) = ident(&cycle_1);
@@ -1125,7 +1076,11 @@ mod finding_dedup_tests {
             "_last_seen": "2026-06-07 10:04:00.000",
         })];
         let (h4, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "time_bucket", "2026-06-07T11:00:00Z", &other,
+            "alert",
+            rule_id(),
+            "time_bucket",
+            "2026-06-07T11:00:00Z",
+            &other,
         );
         assert_ne!(h1, h4, "distinct buckets must not collide");
     }
@@ -1153,9 +1108,27 @@ mod finding_dedup_tests {
             "timestamp": "2026-06-07 11:00:00.000",
         })];
 
-        let (a, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev_a);
-        let (a_again, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev_a_again);
-        let (b, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev_b);
+        let (a, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev_a,
+        );
+        let (a_again, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev_a_again,
+        );
+        let (b, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev_b,
+        );
 
         assert_eq!(a, a_again, "identical content (modulo _nano_) must collide");
         assert_ne!(a, b, "different content for the same entity must re-emit");
@@ -1176,8 +1149,20 @@ mod finding_dedup_tests {
             "timestamp": "2026-06-07 11:00:00.000",
             "_nano_detected_at": "2026-06-08T11:40:00Z",
         })];
-        let (h1, end1) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev);
-        let (h2, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev2);
+        let (h1, end1) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev,
+        );
+        let (h2, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev2,
+        );
         assert_eq!(h1, h2);
         assert_eq!(end1.to_rfc3339(), "2026-06-07T11:00:00+00:00");
     }
@@ -1192,9 +1177,19 @@ mod finding_dedup_tests {
             "_first_seen": "2026-06-07 10:00:00.000",
             "_last_seen": "2026-06-07 11:00:00.000",
         })];
-        let (live, _) = DetectionService::finding_dedup_identity("live", rule_id(), "src_ip", "10.1.1.10", &ev);
-        let (alert, _) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev);
-        assert_ne!(live, alert, "live and alert emissions must be namespaced apart");
+        let (live, _) =
+            DetectionService::finding_dedup_identity("live", rule_id(), "src_ip", "10.1.1.10", &ev);
+        let (alert, _) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev,
+        );
+        assert_ne!(
+            live, alert,
+            "live and alert emissions must be namespaced apart"
+        );
     }
 
     /// NAN-1308 regression: the real OCSF aggregate row shape uses USER-aliased
@@ -1223,13 +1218,24 @@ mod finding_dedup_tests {
         })];
 
         let (h1, end1) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_endpoint.ip", "10.1.4.238", &cycle1,
+            "alert",
+            rule_id(),
+            "src_endpoint.ip",
+            "10.1.4.238",
+            &cycle1,
         );
         let (h2, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_endpoint.ip", "10.1.4.238", &cycle2,
+            "alert",
+            rule_id(),
+            "src_endpoint.ip",
+            "10.1.4.238",
+            &cycle2,
         );
 
-        assert_eq!(h1, h2, "same window must collide despite count/exec-time drift");
+        assert_eq!(
+            h1, h2,
+            "same window must collide despite count/exec-time drift"
+        );
         // window_end is stamped from last_seen (source time), not now().
         assert_eq!(end1.to_rfc3339(), "2026-06-08T13:49:59.473+00:00");
     }
@@ -1246,8 +1252,18 @@ mod finding_dedup_tests {
             "first_seen": "1999-01-01 00:00:00.000",
             "last_seen": "1999-01-01 00:00:00.000",
         })];
-        let (_, end) = DetectionService::finding_dedup_identity("alert", rule_id(), "src_ip", "10.1.1.10", &ev);
-        assert_eq!(end.to_rfc3339(), "2026-06-07T11:00:00+00:00", "must use canonical _last_seen");
+        let (_, end) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.1.1.10",
+            &ev,
+        );
+        assert_eq!(
+            end.to_rfc3339(),
+            "2026-06-07T11:00:00+00:00",
+            "must use canonical _last_seen"
+        );
     }
 
     /// NAN-1309 regression: a sliding lookback window's trailing edge drops the
@@ -1271,10 +1287,18 @@ mod finding_dedup_tests {
             "_last_seen": "2026-06-08 13:50:16.652",
         })];
         let (h1, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_endpoint.ip", "10.1.1.234", &cycle1,
+            "alert",
+            rule_id(),
+            "src_endpoint.ip",
+            "10.1.1.234",
+            &cycle1,
         );
         let (h2, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_endpoint.ip", "10.1.1.234", &cycle2,
+            "alert",
+            rule_id(),
+            "src_endpoint.ip",
+            "10.1.1.234",
+            &cycle2,
         );
         assert_eq!(
             h1, h2,
@@ -1406,10 +1430,18 @@ mod finding_dedup_tests {
             "_last_seen": "2026-06-08 13:58:42.100", // new logon arrived
         })];
         let (h1, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_endpoint.ip", "10.1.1.234", &earlier,
+            "alert",
+            rule_id(),
+            "src_endpoint.ip",
+            "10.1.1.234",
+            &earlier,
         );
         let (h2, _) = DetectionService::finding_dedup_identity(
-            "alert", rule_id(), "src_endpoint.ip", "10.1.1.234", &later,
+            "alert",
+            rule_id(),
+            "src_endpoint.ip",
+            "10.1.1.234",
+            &later,
         );
         assert_ne!(h1, h2, "a later last_seen is new activity and must re-emit");
     }
@@ -1424,11 +1456,23 @@ mod matched_events_tests {
     fn kind_namespaces_live_and_alert() {
         // Audit D17: Live bake-in and Alerting must record/filter under distinct
         // namespaces so bake-in records don't suppress the first real alert.
-        assert_eq!(MatchedEventKind::for_mode(RuleMode::Alerting), MatchedEventKind::Alert);
-        assert_eq!(MatchedEventKind::for_mode(RuleMode::Live), MatchedEventKind::Live);
+        assert_eq!(
+            MatchedEventKind::for_mode(RuleMode::Alerting),
+            MatchedEventKind::Alert
+        );
+        assert_eq!(
+            MatchedEventKind::for_mode(RuleMode::Live),
+            MatchedEventKind::Live
+        );
         // Staging/Paused never reach execution; treated as bake-in if they did.
-        assert_eq!(MatchedEventKind::for_mode(RuleMode::Staging), MatchedEventKind::Live);
-        assert_eq!(MatchedEventKind::for_mode(RuleMode::Paused), MatchedEventKind::Live);
+        assert_eq!(
+            MatchedEventKind::for_mode(RuleMode::Staging),
+            MatchedEventKind::Live
+        );
+        assert_eq!(
+            MatchedEventKind::for_mode(RuleMode::Paused),
+            MatchedEventKind::Live
+        );
         assert_eq!(MatchedEventKind::Live.as_str(), "live");
         assert_eq!(MatchedEventKind::Alert.as_str(), "alert");
     }
@@ -1455,10 +1499,10 @@ mod matched_events_tests {
         // identical either way, or the event re-alerts forever.
         let raw = json!({"src_ip": "10.0.0.1", "action": "login"});
         let mut injected = raw.clone();
-        injected
-            .as_object_mut()
-            .unwrap()
-            .insert("_nano_detected_at".to_string(), json!("2026-07-05T12:00:00Z"));
+        injected.as_object_mut().unwrap().insert(
+            "_nano_detected_at".to_string(),
+            json!("2026-07-05T12:00:00Z"),
+        );
         assert_eq!(matched_event_id(&raw), matched_event_id(&injected));
     }
 }

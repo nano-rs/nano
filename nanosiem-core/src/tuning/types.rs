@@ -282,7 +282,7 @@ pub struct ThresholdBreach {
 
 /// Safety validation result for a tuning proposal
 ///
-/// NAN-2160: every field defaults, because `tuning_proposals.safety_validation`
+/// every field defaults, because `tuning_proposals.safety_validation`
 /// is `NOT NULL DEFAULT '{}'` — the schema permits a value strict
 /// deserialization rejected, and 21 live rows held `{}` or `{"is_safe": true}`.
 /// A single such row anywhere in a page turned the whole proposal list into a
@@ -345,8 +345,8 @@ pub struct TuningProposal {
     pub id: Uuid,
     /// Rule ID being tuned
     pub rule_id: Uuid,
-    /// Human-readable name of the rule this proposal targets. NAN-963:
-    /// populated server-side by joining `rules` on `rule_id` so the
+    /// Human-readable name of the rule this proposal targets.
+    /// Populated server-side by joining `rules` on `rule_id` so the
     /// queue UI doesn't fall back to a truncated UUID when the rules
     /// index hasn't loaded yet (or when a rule is archived but its
     /// proposal still in scope).
@@ -369,13 +369,13 @@ pub struct TuningProposal {
     pub changes_summary: Vec<String>,
     /// Alert patterns that triggered this proposal
     pub affected_patterns: Vec<AlertPattern>,
-    /// NAN-2085 / NAN-2088: DISTINCT normalized `source_type` manifest of the
+    /// DISTINCT normalized `source_type` manifest of the
     /// telemetry this proposal was derived from. Producers populate it via
     /// [`crate::tuning::scope::normalize_source_manifest`]; readers gate on it
     /// with [`crate::tuning::scope::TuningScope`].
     #[serde(default)]
     pub source_types: Vec<String>,
-    /// NAN-2085 / NAN-2088: whether `source_types` is a COMPLETE account of the
+    /// whether `source_types` is a COMPLETE account of the
     /// proposal's origin. `false` — the default, and what every pre-feature row
     /// carries — denies EVERY source-restricted reader, because the proposal's
     /// free-form text may contain values from any source.
@@ -396,7 +396,7 @@ pub struct TuningProposal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hints_diff: Option<HintsDiff>,
     /// URL of the GitHub PR opened for this proposal when a detection-as-code
-    /// push target is configured (NAN-1745). Set when `status` is `pr_opened`.
+    /// push target is configured. Set when `status` is `pr_opened`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
     /// GitHub PR number for this proposal.

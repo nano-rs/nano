@@ -81,6 +81,17 @@ export function getPipeCommands(q: string): string {
   return pipePos === -1 ? '' : q.substring(pipePos).trim();
 }
 
+/** Recognize a command at a real pipe boundary, including downstream stages. */
+export function hasStatsPipeline(query: string): boolean {
+  let remainder = query;
+  for (;;) {
+    const pipe = findFirstPipePosition(remainder);
+    if (pipe < 0) return false;
+    remainder = remainder.slice(pipe + 1).trimStart();
+    if (/^stats\b/i.test(remainder)) return true;
+  }
+}
+
 /** Rows returned by a one-click group-by before the analyst edits the query. */
 export const GROUP_BY_ROW_LIMIT = 20;
 

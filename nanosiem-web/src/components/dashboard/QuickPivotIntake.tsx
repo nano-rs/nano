@@ -12,10 +12,14 @@
 
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { Search as SearchIcon, ArrowRight } from 'lucide-react';
 import { nplQuoted } from '@/lib/npl-quote';
+import { api } from '@/lib/api';
+import { isInternalName } from '@/lib/internal-domains';
+import { useInternalDomains } from '@/hooks/use-internal-domains';
 
-type IocKind = 'ipv4' | 'ipv6' | 'sha256' | 'sha1' | 'md5' | 'email' | 'url' | 'domain' | 'text';
+type IocKind = 'ipv4' | 'ipv6' | 'sha256' | 'sha1' | 'md5' | 'email' | 'url' | 'domain' | 'host' | 'text';
 
 const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)$/;
 const IPV6 = /^(?=.*:)[0-9a-fA-F:]+$/;
@@ -26,7 +30,12 @@ const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const URL_RE = /^https?:\/\//i;
 const DOMAIN = /^(?!-)[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{2,63})+$/;
 
-function classify(raw: string): IocKind {
+/**
+ * `internalSuffixes` (NAN-3226): dotted names under an internal suffix are
+ * internal hosts, not internet domains. The query is the same hostname pivot;
+ * only the label changes.
+ */
+function classify(raw: string, internalSuffixes: readonly string[] = []): IocKind {
   const v = raw.trim();
   if (!v) return 'text';
   if (IPV4.test(v)) return 'ipv4';
@@ -36,7 +45,7 @@ function classify(raw: string): IocKind {
   if (MD5.test(v)) return 'md5';
   if (URL_RE.test(v)) return 'url';
   if (EMAIL.test(v)) return 'email';
-  if (DOMAIN.test(v)) return 'domain';
+  if (DOMAIN.test(v)) return isInternalName(v, internalSuffixes) ? 'host' : 'domain';
   return 'text';
 }
 
@@ -49,26 +58,34 @@ const KIND_LABEL: Record<IocKind, string> = {
   email: 'email / user',
   url: 'URL',
   domain: 'domain',
+  host: 'internal host',
   text: 'free text',
 };
 
-function buildQuery(kind: IocKind, raw: string): string {
+function buildQuery(kind: IocKind, raw: string, strictOcsf: boolean): string {
   const v = raw.trim();
   const q = (s: string) => nplQuoted(s);
   switch (kind) {
     case 'ipv4':
     case 'ipv6':
-      return `src_ip=${q(v)} OR dest_ip=${q(v)}`;
+      return strictOcsf
+        ? `src_endpoint.ip=${q(v)} OR dst_endpoint.ip=${q(v)}`
+        : `src_ip=${q(v)} OR dest_ip=${q(v)}`;
     case 'sha256':
     case 'sha1':
     case 'md5':
-      return `process_hash=${q(v)} OR file_hash=${q(v)}`;
+      return strictOcsf
+        ? `process.file.hashes.value=${q(v)} OR file.hashes.value=${q(v)}`
+        : `process_hash=${q(v)} OR file_hash=${q(v)}`;
     case 'email':
-      return `user=${q(v)}`;
+      return strictOcsf ? `user.name=${q(v)} OR actor.user.name=${q(v)}` : `user=${q(v)}`;
     case 'url':
-      return `url=${q(v)}`;
+      return strictOcsf ? `url.url_string=${q(v)} OR http_request.url.url_string=${q(v)}` : `url=${q(v)}`;
     case 'domain':
-      return `dest_host=${q(v)} OR src_host=${q(v)}`;
+    case 'host':
+      return strictOcsf
+        ? `dst_endpoint.hostname=${q(v)} OR src_endpoint.hostname=${q(v)} OR query.hostname=${q(v)} OR url.hostname=${q(v)}`
+        : `dest_host=${q(v)} OR src_host=${q(v)}`;
     case 'text':
       return v;
   }
@@ -76,6 +93,13 @@ function buildQuery(kind: IocKind, raw: string): string {
 
 export function QuickPivotIntake() {
   const navigate = useNavigate();
+  const { data: schemaFields } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const strictOcsf = schemaFields?.schema === 'ocsf';
   const [input, setInput] = useState('');
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -84,12 +108,13 @@ export function QuickPivotIntake() {
     return () => clearTimeout(t);
   }, []);
 
-  const kind = useMemo(() => classify(input), [input]);
+  const internalSuffixes = useInternalDomains();
+  const kind = useMemo(() => classify(input, internalSuffixes), [input, internalSuffixes]);
   const trimmed = input.trim();
 
   const submit = () => {
     if (!trimmed) return;
-    const q = buildQuery(kind, trimmed);
+    const q = buildQuery(kind, trimmed, strictOcsf);
     navigate(`/search?q=${encodeURIComponent(q)}&run=true`);
   };
 
@@ -140,7 +165,7 @@ export function QuickPivotIntake() {
             <div className="px-3 py-1.5 border-t border-border bg-muted/30 flex items-center gap-2 text-[10.5px] font-mono">
               <span className="text-muted-foreground uppercase tracking-[0.08em]">{KIND_LABEL[kind]}</span>
               <span className="text-muted-foreground/60">→</span>
-              <span className="text-foreground/80 truncate">{buildQuery(kind, trimmed)}</span>
+              <span className="text-foreground/80 truncate">{buildQuery(kind, trimmed, strictOcsf)}</span>
             </div>
           )}
         </div>

@@ -79,3 +79,27 @@ fn default_rule_id_is_stable() {
         "b8f3d2a1-6c4e-4f7a-9d2b-3e5a7c901f44"
     );
 }
+
+/// NAN-3073: the lean-gate risk check asked for `entity_type=host` and found
+/// nothing while the host's risk (stored as `hostname`) was 225.
+#[test]
+fn host_is_the_risk_stores_hostname() {
+    use super::{canonical_risk_entity_type, RiskFilter};
+    for alias in ["host", "HOST", " hostname ", "device", "computer", "endpoint"] {
+        assert_eq!(canonical_risk_entity_type(alias), "hostname", "{alias}");
+    }
+    assert_eq!(canonical_risk_entity_type("ip_address"), "ip");
+    assert_eq!(canonical_risk_entity_type("username"), "user");
+    assert_eq!(canonical_risk_entity_type("email"), "email");
+    assert_eq!(canonical_risk_entity_type("cloud_account"), "cloud_account");
+    // Unknown types stay unknown (they must not widen the filter).
+    assert_eq!(canonical_risk_entity_type("Process"), "process");
+
+    let filter = |entity_type: Option<&str>| RiskFilter {
+        entity_type: entity_type.map(str::to_string),
+        ..Default::default()
+    };
+    assert_eq!(filter(Some("host")).canonical_entity_type().as_deref(), Some("hostname"));
+    assert_eq!(filter(Some("  ")).canonical_entity_type(), None, "a blank filter is no filter");
+    assert_eq!(filter(None).canonical_entity_type(), None);
+}

@@ -40,8 +40,8 @@ import {
   ChartColumn,
   Clock,
   FileText,
-  Loader2,
-} from 'lucide-react';
+  } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 interface LibraryQuery {
   id: number;
@@ -231,7 +231,7 @@ export function QueryLibrary({ onSelectQuery }: QueryLibraryProps) {
           <ScrollArea className="h-[calc(100vh-280px)]">
             {isLoading ? (
               <div className="flex items-center justify-center py-8 text-muted-foreground">
-                <Loader2 className="h-5 w-5 animate-spin mr-2" />
+                <LoadingIcon className="h-5 w-5 mr-2" />
                 Loading library entries...
               </div>
             ) : queries.length === 0 ? (

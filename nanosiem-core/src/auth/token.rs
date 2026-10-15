@@ -10,6 +10,7 @@
 //! - Token validation and claims extraction
 //! - Token decoding for inspection
 
+use crate::request_timing::RequestDb;
 use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -21,19 +22,49 @@ use uuid::Uuid;
 
 use super::types::{config_defaults, TokenClaims, TokenPair};
 
+// Hosted tenant-bound token methods and claim types (NAN-3861).
+#[cfg(feature = "enterprise")]
+mod enterprise_shared_tokens;
+#[cfg(feature = "enterprise")]
+pub use enterprise_shared_tokens::{EnterpriseSharedRefreshTokenClaims, EnterpriseSharedTokenClaims};
+
+/// Immutable authentication provenance attached by enterprise-shared auth
+/// middleware. Handlers use this instead of JWT issuance time for fresh-auth
+/// and recent-local-MFA gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnterpriseSharedSessionAuthentication {
+    pub auth_time: i64,
+    pub credential_time_micros: i64,
+    pub mfa_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AccessTokenEnvelope {
+    #[serde(flatten)]
+    claims: TokenClaims,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_time_micros: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mfa_time: Option<i64>,
+}
+
 /// Redis key prefix for revoked JTIs. The key TTL matches the remaining
 /// access-token lifetime so Redis prunes entries automatically.
 const REDIS_REVOKED_JTI_PREFIX: &str = "auth:revoked_jti:";
 
 /// Shared Redis handle for the JTI denylist. Cloned across `TokenService`
 /// instances so revocations made on one pod are visible to all.
-pub type RedisDenylist = Arc<Mutex<redis::aio::ConnectionManager>>;
+pub type RedisDenylist = Arc<Mutex<crate::redis_transport::ReconnectingConnection>>;
 
 /// Build a [`RedisDenylist`] from a `redis://` URL. Lets callers wire the
 /// shared denylist without taking a direct dependency on the `redis` crate.
 pub async fn redis_denylist_from_url(url: &str) -> redis::RedisResult<RedisDenylist> {
-    let client = redis::Client::open(url)?;
-    let conn = redis::aio::ConnectionManager::new(client).await?;
+    let client = crate::redis_transport::client_from_url(url)?;
+    let conn = crate::redis_transport::ReconnectingConnection::new(client).await?;
     Ok(Arc::new(Mutex::new(conn)))
 }
 
@@ -253,8 +284,19 @@ impl TokenService {
             purpose: "access".to_string(),
         };
 
-        encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
-            .map_err(|e| TokenError::CreationFailed(e.to_string()))
+        let envelope = AccessTokenEnvelope {
+            claims,
+            tenant_id: None,
+            auth_time: None,
+            credential_time_micros: None,
+            mfa_time: None,
+        };
+        encode(
+            &Header::new(Algorithm::HS256),
+            &envelope,
+            &self.encoding_key,
+        )
+        .map_err(|e| TokenError::CreationFailed(e.to_string()))
     }
 
     /// Create a short-lived MFA challenge token (5 minutes)
@@ -277,8 +319,19 @@ impl TokenService {
             purpose: "mfa_challenge".to_string(),
         };
 
-        encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
-            .map_err(|e| TokenError::CreationFailed(e.to_string()))
+        let envelope = AccessTokenEnvelope {
+            claims,
+            tenant_id: None,
+            auth_time: None,
+            credential_time_micros: None,
+            mfa_time: None,
+        };
+        encode(
+            &Header::new(Algorithm::HS256),
+            &envelope,
+            &self.encoding_key,
+        )
+        .map_err(|e| TokenError::CreationFailed(e.to_string()))
     }
 
     /// Validate an MFA challenge token and return the user ID
@@ -286,13 +339,35 @@ impl TokenService {
     /// Ensures the token has purpose="mfa_challenge", is not expired,
     /// and has not been revoked (single-use).
     pub fn validate_mfa_challenge_token(&self, token: &str) -> Result<TokenClaims, TokenError> {
-        let claims = self.validate_access_token(token)?;
-        if claims.purpose != "mfa_challenge" {
+        let envelope = self.decode_and_validate_access_envelope(token)?;
+        if envelope.tenant_id.is_some() || envelope.claims.purpose != "mfa_challenge" {
             return Err(TokenError::Invalid(
                 "Not an MFA challenge token".to_string(),
             ));
         }
-        Ok(claims)
+        if self.is_revoked(&envelope.claims.jti) {
+            return Err(TokenError::Invalid("Token has been revoked".to_string()));
+        }
+        Ok(envelope.claims)
+    }
+
+    /// Production-safe challenge validation that also consults the shared
+    /// revocation denylist. Multi-replica MFA continuations must use this
+    /// variant so a consumed challenge cannot be replayed on another pod.
+    pub async fn validate_mfa_challenge_token_async(
+        &self,
+        token: &str,
+    ) -> Result<TokenClaims, TokenError> {
+        let envelope = self.decode_and_validate_access_envelope(token)?;
+        if envelope.tenant_id.is_some() || envelope.claims.purpose != "mfa_challenge" {
+            return Err(TokenError::Invalid(
+                "Not an MFA challenge token".to_string(),
+            ));
+        }
+        if self.is_revoked_async(&envelope.claims.jti).await {
+            return Err(TokenError::Invalid("Token has been revoked".to_string()));
+        }
+        Ok(envelope.claims)
     }
 
     /// Create a refresh token
@@ -370,18 +445,26 @@ impl TokenService {
     /// * `Ok(TokenClaims)` - The decoded and validated claims
     /// * `Err(TokenError)` - If validation fails (expired, invalid signature, etc.)
     pub fn validate_access_token(&self, token: &str) -> Result<TokenClaims, TokenError> {
-        let claims = self.decode_and_validate_claims(token)?;
+        let envelope = self.decode_and_validate_access_envelope(token)?;
+        if envelope.tenant_id.is_some() {
+            return Err(TokenError::Invalid(
+                "Enterprise-shared token is not valid in a dedicated deployment".to_string(),
+            ));
+        }
+        let claims = envelope.claims;
+        if claims.purpose != "access" {
+            return Err(TokenError::Invalid("Not an access token".to_string()));
+        }
         if self.is_revoked(&claims.jti) {
             return Err(TokenError::Invalid("Token has been revoked".to_string()));
         }
         Ok(claims)
     }
 
-    /// Crypto + iss/aud/exp validation, no revocation check. Shared by the
-    /// sync and async public validators so the JWT decoding path stays in
-    /// lockstep — the only difference between the two is *where* the
-    /// revocation lookup happens (local DashMap vs. local + Redis).
-    fn decode_and_validate_claims(&self, token: &str) -> Result<TokenClaims, TokenError> {
+    fn decode_and_validate_access_envelope(
+        &self,
+        token: &str,
+    ) -> Result<AccessTokenEnvelope, TokenError> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         validation.leeway = 0; // No leeway for expiration
@@ -390,7 +473,7 @@ impl TokenService {
         validation.set_issuer(&[&self.config.issuer]);
         validation.set_audience(&[&self.config.audience]);
 
-        decode::<TokenClaims>(token, &self.decoding_key, &validation)
+        decode::<AccessTokenEnvelope>(token, &self.decoding_key, &validation)
             .map(|data| data.claims)
             .map_err(|e| match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => TokenError::Expired,
@@ -419,11 +502,25 @@ impl TokenService {
     /// * `Ok(RefreshTokenClaims)` - The decoded and validated claims
     /// * `Err(TokenError)` - If validation fails
     pub fn validate_refresh_token(&self, token: &str) -> Result<RefreshTokenClaims, TokenError> {
+        let envelope = self.decode_and_validate_refresh_envelope(token)?;
+        if envelope.tenant_id.is_some() {
+            return Err(TokenError::Invalid(
+                "Enterprise-shared refresh token is not valid in a dedicated deployment"
+                    .to_string(),
+            ));
+        }
+        Ok(envelope.claims)
+    }
+
+    fn decode_and_validate_refresh_envelope(
+        &self,
+        token: &str,
+    ) -> Result<RefreshTokenEnvelope, TokenError> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
         validation.leeway = 0; // No leeway for expiration
 
-        let claims = decode::<RefreshTokenClaims>(token, &self.decoding_key, &validation)
+        let claims = decode::<RefreshTokenEnvelope>(token, &self.decoding_key, &validation)
             .map(|data| data.claims)
             .map_err(|e| match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => TokenError::Expired,
@@ -437,7 +534,7 @@ impl TokenService {
             })?;
 
         // Verify this is actually a refresh token
-        if claims.token_type != "refresh" {
+        if claims.claims.token_type != "refresh" {
             return Err(TokenError::Invalid("Not a refresh token".to_string()));
         }
 
@@ -540,7 +637,16 @@ impl TokenService {
         &self,
         token: &str,
     ) -> Result<TokenClaims, TokenError> {
-        let claims = self.decode_and_validate_claims(token)?;
+        let envelope = self.decode_and_validate_access_envelope(token)?;
+        if envelope.tenant_id.is_some() {
+            return Err(TokenError::Invalid(
+                "Enterprise-shared token is not valid in a dedicated deployment".to_string(),
+            ));
+        }
+        let claims = envelope.claims;
+        if claims.purpose != "access" {
+            return Err(TokenError::Invalid("Not an access token".to_string()));
+        }
         if self.is_revoked_async(&claims.jti).await {
             return Err(TokenError::Invalid("Token has been revoked".to_string()));
         }
@@ -589,7 +695,7 @@ pub async fn load_revoked_tokens(
         "SELECT jti, expires_at FROM revoked_tokens WHERE expires_at > $1",
     )
     .bind(now)
-    .fetch_all(pool)
+    .fetch_all(pool).request_db()
     .await?;
 
     let count = rows.len();
@@ -600,25 +706,84 @@ pub async fn load_revoked_tokens(
     // Clean up expired entries in PG
     let _ = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at <= $1")
         .bind(now)
-        .execute(pool)
+        .execute(pool).request_db()
         .await;
 
     Ok(count)
 }
 
 /// Persist a revoked JTI to PostgreSQL (call alongside in-memory revoke_token).
-pub async fn persist_revoked_token(pool: &sqlx::PgPool, jti: Uuid, exp: i64) {
-    let result = sqlx::query(
+///
+/// The caller decides whether a storage outage is availability-only (dedicated
+/// deployments) or must fail the request closed (enterprise-shared logout).
+pub async fn persist_revoked_token(
+    pool: &sqlx::PgPool,
+    jti: Uuid,
+    exp: i64,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().request_db().await?;
+    // Serialize an exact session revocation with pivt result persistence.
+    // Whichever transaction owns this JTI lock first defines the order:
+    // completion-before-revocation may commit, revocation-before-completion
+    // makes the completion predicate fail.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 2361))")
+        .bind(jti)
+        .execute(&mut *tx).request_db()
+        .await?;
+    sqlx::query(
         "INSERT INTO revoked_tokens (jti, expires_at) VALUES ($1, $2) ON CONFLICT (jti) DO NOTHING",
     )
     .bind(jti)
     .bind(exp)
-    .execute(pool)
-    .await;
+    .execute(&mut *tx).request_db()
+    .await?;
+    tx.commit().request_db().await
+}
 
-    if let Err(e) = result {
-        tracing::warn!(jti = %jti, error = %e, "Failed to persist token revocation to database");
-    }
+/// Authoritative durable exact-JTI check for enterprise-shared request paths.
+/// Redis and per-process caches are propagation accelerators, never the final
+/// revocation authority for a tenant-bearing token.
+pub async fn is_persisted_token_revoked(
+    pool: &sqlx::PgPool,
+    jti: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM revoked_tokens WHERE jti = $1)")
+        .bind(jti)
+        .fetch_one(pool).request_db()
+        .await
+}
+
+/// Durable enterprise-shared access-token revocation authority.
+///
+/// Exact JTI revocation covers one presented token. The per-user watermark
+/// covers every credential authenticated before logout/password/session
+/// revocation, including a refresh response minted after logout from an
+/// in-flight session. Shared callers pass immutable `auth_time`, not JWT iat.
+pub async fn is_persisted_access_token_revoked(
+    pool: &sqlx::PgPool,
+    jti: Uuid,
+    user_id: Uuid,
+    authentication_epoch: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT
+             EXISTS(SELECT 1 FROM revoked_tokens WHERE jti = $1)
+             OR EXISTS(
+                 SELECT 1 FROM users
+                 WHERE id = $2
+                   AND tokens_valid_from IS NOT NULL
+                   AND CASE
+                         WHEN $3 < 100000000000
+                           THEN $3 * 1000000
+                         ELSE $3
+                       END <= FLOOR(EXTRACT(EPOCH FROM tokens_valid_from) * 1000000)::bigint
+             )",
+    )
+    .bind(jti)
+    .bind(user_id)
+    .bind(authentication_epoch)
+    .fetch_one(pool).request_db()
+    .await
 }
 
 /// Claims for refresh tokens (minimal)
@@ -634,6 +799,14 @@ pub struct RefreshTokenClaims {
     pub jti: Uuid,
     /// Token type identifier
     pub token_type: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RefreshTokenEnvelope {
+    #[serde(flatten)]
+    claims: RefreshTokenClaims,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -687,6 +860,18 @@ mod tests {
         assert!(!pair.refresh_token.is_empty());
         assert_eq!(pair.token_type, "Bearer");
         assert_eq!(pair.expires_in, 900);
+    }
+
+    #[tokio::test]
+    async fn dedicated_mfa_challenge_is_not_valid_as_access_authority() {
+        let service = create_test_service();
+        let token = service
+            .create_mfa_challenge_token(Uuid::now_v7())
+            .expect("MFA challenge");
+
+        assert!(service.validate_mfa_challenge_token(&token).is_ok());
+        assert!(service.validate_access_token(&token).is_err());
+        assert!(service.validate_access_token_async(&token).await.is_err());
     }
 
     #[test]
@@ -981,9 +1166,7 @@ mod tests {
         assert!(!service.is_revoked_async(&Uuid::now_v7()).await);
         // And a positive local hit still returns true.
         let jti = Uuid::now_v7();
-        service
-            .revoke_token(jti, Utc::now().timestamp() + 60)
-            .await;
+        service.revoke_token(jti, Utc::now().timestamp() + 60).await;
         assert!(service.is_revoked_async(&jti).await);
     }
 }

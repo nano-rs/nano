@@ -30,6 +30,9 @@ export interface DetectionMetadata {
   // Non-logs datasets are scheduled-only, risk included — the editor forces
   // scheduled mode when this is set to a non-logs value.
   dataset?: 'logs' | 'spans' | 'metrics' | 'risk';
+  // Hosted-shared lake: ingest source slug the rule is bound to (sent as
+  // `source_slug`). Omitted = derived from the query when unambiguous.
+  source?: string;
   schedule?: string;
   lookback?: string; // e.g., "24h", "1h", "30m"
   folder?: string; // organization folder: network, identity, endpoint, cloud, stash
@@ -59,6 +62,19 @@ const FRONTMATTER_REGEX = /^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/;
 /**
  * Parse YAML frontmatter from a detection query
  */
+/**
+ * The single source slug a query's top level names via
+ * `metadata.log_source="<slug>"` (or `metadata.log_source=<slug>`), or null
+ * when it names none or several. Mirrors the server's unambiguous-source
+ * derivation closely enough to preview it in the editor.
+ */
+export function deriveQuerySource(query: string): string | null {
+  const re = /metadata\.log_source\s*=\s*["']?([a-z0-9][a-z0-9_-]*)["']?/gi;
+  const found = new Set<string>();
+  for (const m of query.matchAll(re)) found.add(m[1].toLowerCase());
+  return found.size === 1 ? [...found][0] : null;
+}
+
 export function parseDetectionMetadata(text: string): ParsedDetection {
   const match = text.match(FRONTMATTER_REGEX);
   
@@ -133,6 +149,7 @@ export function serializeDetectionMetadata(metadata: DetectionMetadata, query: s
     'mode',
     'detection_mode',
     'dataset',
+    'source',
     'schedule',
     'lookback',
     'folder',

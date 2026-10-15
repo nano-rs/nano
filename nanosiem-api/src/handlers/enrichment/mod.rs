@@ -19,7 +19,7 @@
 //! `LegacyEnrichmentRoute`.
 
 // Agent enrichment lookup uses agent_enrichment + custom_enrichment::sandbox,
-// both of which moved to nanosiem-enterprise in Phase 3.3 (NAN-744).
+// both of which moved to the enterprise crate in Phase 3.3 (NAN-744).
 #[cfg(feature = "enterprise")]
 mod agent;
 mod ipinfo;
@@ -75,6 +75,24 @@ pub(crate) fn sanitize_config(mut config: serde_json::Value) -> serde_json::Valu
         }
     }
     config
+}
+
+/// Return only the non-secret location of a configured enrichment download.
+///
+/// Provider URLs commonly carry API tokens in their query string. The stored
+/// URL is an execution credential, not presentation data, so list/read APIs
+/// must never round-trip its query, fragment, or user-info back to a browser.
+/// Invalid or non-HTTP legacy values fail closed instead of being reflected.
+pub(crate) fn sanitize_download_url(download_url: Option<String>) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(download_url.as_deref()?).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    Some(parsed.into())
 }
 
 /// Stale timeout for in_progress syncs (minutes)
@@ -236,5 +254,21 @@ mod tests {
             matches!(result, Err(ApiError::ValidationError(_))),
             "expected ValidationError, got {result:?}"
         );
+    }
+
+    #[test]
+    fn enrichment_download_url_never_reflects_credentials() {
+        let sanitized = sanitize_download_url(Some(
+            "https://reader:secret@example.com/ipinfo.csv.gz?token=top-secret#fragment"
+                .to_string(),
+        ));
+        assert_eq!(sanitized.as_deref(), Some("https://example.com/ipinfo.csv.gz"));
+    }
+
+    #[test]
+    fn enrichment_download_url_fails_closed_for_invalid_or_non_http_values() {
+        assert_eq!(sanitize_download_url(Some("not a url".to_string())), None);
+        assert_eq!(sanitize_download_url(Some("file:///tmp/feed".to_string())), None);
+        assert_eq!(sanitize_download_url(None), None);
     }
 }

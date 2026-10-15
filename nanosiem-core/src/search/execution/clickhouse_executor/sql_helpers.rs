@@ -372,7 +372,8 @@ mod tests {
     /// extraction), so literal-safe counting applies uniformly.
     #[test]
     fn count_query_wraps_simple_single_from() {
-        let simple = "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' WHERE source_type = 'x'";
+        let simple =
+            "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' WHERE source_type = 'x'";
         let count = build_count_query(simple, None);
         assert!(
             count.starts_with("SELECT count(*) AS cnt FROM (SELECT * FROM logs"),
@@ -601,11 +602,15 @@ mod tests {
 
         // The payload optimization must survive for raw events: a wide row with
         // mostly-empty UDM columns still comes back trimmed.
-        let line = r#"{"id":"1","message":"hello","src_ip":"","dest_ip":"","user":"","bytes_in":0}"#;
+        let line =
+            r#"{"id":"1","message":"hello","src_ip":"","dest_ip":"","user":"","bytes_in":0}"#;
         let row = ClickHouseExecutor::parse_and_postprocess_row(line, true).unwrap();
 
         let obj = row.as_object().unwrap();
-        assert!(!obj.contains_key("src_ip"), "empty columns should still be pruned");
+        assert!(
+            !obj.contains_key("src_ip"),
+            "empty columns should still be pruned"
+        );
         assert!(!obj.contains_key("user"));
         assert_eq!(obj.get("message").unwrap(), "hello");
     }

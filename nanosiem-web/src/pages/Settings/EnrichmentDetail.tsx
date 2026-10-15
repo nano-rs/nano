@@ -13,7 +13,8 @@ import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Loader2, ArrowLeft } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api, EnrichmentSource } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 
@@ -76,7 +77,7 @@ export function EnrichmentDetail() {
   if (loading) {
     return (
       <div className="p-8 flex items-center justify-center">
-        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-8 h-8 text-muted-foreground" />
       </div>
     );
   }

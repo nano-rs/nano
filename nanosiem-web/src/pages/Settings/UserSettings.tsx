@@ -20,6 +20,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link as RouterLink, useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { useResetOnboarding } from '@/hooks/use-api';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
@@ -33,10 +34,10 @@ import {
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import {
-  Loader2,
   Code,
   Terminal,
   Sun,
+  Contrast,
   Moon,
   Monitor,
   Lock,
@@ -59,6 +60,8 @@ import {
   X,
   RotateCcw,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import type { LucideIcon } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
@@ -70,7 +73,10 @@ import {
 } from '@/contexts/UserPreferencesContext';
 import { api } from '@/lib/api';
 import type { MfaStatusResponse, MfaSetupResponse } from '@/lib/api/types';
+import { PendingTenantInvitations } from '@/components/settings/PendingTenantInvitations';
 import { cn } from '@/lib/utils';
+import { THEMES, THEME_LABELS, type Theme } from '@/lib/theme';
+import { Checkbox } from '@/components/ui/checkbox';
 
 type MfaStep = 'idle' | 'scan' | 'verify' | 'backup';
 
@@ -82,6 +88,21 @@ const timeRangeLabels: Record<TimeRangePreset, string> = {
   last_24_hours: 'Last 24 hours',
   last_7_days: 'Last 7 days',
   last_30_days: 'Last 30 days',
+};
+
+/** Picker icons, keyed by theme. Labels live in `@/lib/theme`. */
+const THEME_ICONS: Record<Theme, LucideIcon> = {
+  light: Sun,
+  dark: Moon,
+  // Matte Black is dark-appearance but not "the dark theme" — a second moon
+  // would read as a duplicate, so it gets the contrast mark.
+  matte: Contrast,
+  mono: Contrast,
+  'dark-pink': Moon,
+  'dark-violet': Moon,
+  'dark-emerald': Moon,
+  'dark-amber': Moon,
+  paper: Sun,
 };
 
 const landingPageLabels: Record<LandingPage, string> = {
@@ -343,6 +364,14 @@ export function UserSettings() {
     }
   }, [resetOnboarding, navigate, toast]);
   const canSql = hasPermission('search:sql');
+  const { data: activeSchema } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const strictOcsf = activeSchema?.schema === 'ocsf';
+  const canRawSql = canSql && !strictOcsf;
   const {
     queryMode,
     setQueryMode,
@@ -578,7 +607,7 @@ export function UserSettings() {
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-8 h-8 animate-spin text-primary" />
+        <LoadingIcon className="w-8 h-8 text-primary" />
       </div>
     );
   }
@@ -626,6 +655,9 @@ export function UserSettings() {
           ))}
         </nav>
       </div>
+
+      {/* Hosted-shared: invitations from other organizations (NAN-2361 wave 5) */}
+      <PendingTenantInvitations />
 
       {/* General + Query Mode */}
       <div className="grid grid-cols-1 lg:grid-cols-[1.05fr_1fr] gap-5 items-start">
@@ -726,13 +758,16 @@ export function UserSettings() {
             />
           </Row>
 
-          <Row label="Theme" desc="Choose light, dark, or follow your system setting.">
+          <Row label="Theme" desc="Choose a theme, or follow your system setting.">
             <Select
               value={theme || 'system'}
               onValueChange={(v) => {
                 setTheme(v);
                 const root = document.documentElement;
-                root.classList.remove('light', 'dark');
+                // Clear EVERY theme class, not a hardcoded light/dark pair — a
+                // stranded `matte` next to a newly added `light` leaves both
+                // token blocks live, and the later one in index.css wins.
+                root.classList.remove(...THEMES);
                 if (v === 'system') {
                   const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches
                     ? 'dark'
@@ -751,16 +786,19 @@ export function UserSettings() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="light" className="text-[12.5px]">
-                  <span className="flex items-center gap-2">
-                    <Sun className="w-3 h-3" /> Light
-                  </span>
-                </SelectItem>
-                <SelectItem value="dark" className="text-[12.5px]">
-                  <span className="flex items-center gap-2">
-                    <Moon className="w-3 h-3" /> Dark
-                  </span>
-                </SelectItem>
+                {/* Driven off THEMES so a new theme appears here automatically —
+                    this list having been hardcoded is why Matte Black shipped
+                    invisible to the only picker the app actually renders. */}
+                {THEMES.map((name) => {
+                  const Icon = THEME_ICONS[name];
+                  return (
+                    <SelectItem key={name} value={name} className="text-[12.5px]">
+                      <span className="flex items-center gap-2">
+                        <Icon className="w-3 h-3" /> {THEME_LABELS[name]}
+                      </span>
+                    </SelectItem>
+                  );
+                })}
                 <SelectItem value="system" className="text-[12.5px]">
                   <span className="flex items-center gap-2">
                     <Monitor className="w-3 h-3" /> System
@@ -800,7 +838,7 @@ export function UserSettings() {
 
           <div className="p-4 space-y-3">
             <QueryModeOption
-              active={queryMode === 'standard'}
+              active={queryMode === 'standard' || strictOcsf}
               onSelect={() => handleQueryModeChange('standard')}
               icon={<Terminal className="w-[14px] h-[14px]" />}
               title="Standard (nPL)"
@@ -818,21 +856,23 @@ export function UserSettings() {
               ]}
             />
             <QueryModeOption
-              active={queryMode === 'advanced'}
+              active={queryMode === 'advanced' && !strictOcsf}
               onSelect={() => handleQueryModeChange('advanced')}
-              disabled={!canSql}
+              disabled={!canRawSql}
               icon={<Database className="w-[14px] h-[14px]" />}
               title="Advanced (SQL)"
               badge={
-                !canSql ? (
+                !canRawSql ? (
                   <span className="inline-flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
                     <Lock className="w-[10px] h-[10px]" />
-                    locked
+                    {strictOcsf ? 'unavailable' : 'locked'}
                   </span>
                 ) : undefined
               }
               desc={
-                canSql
+                strictOcsf
+                  ? 'Raw SQL is intentionally unavailable on the tenant-pinned OCSF lake path. nPL retains the full scoped query and durable-job contract.'
+                  : canSql
                   ? 'Full ClickHouse SQL power including window functions, CTEs, and complex JOINs.'
                   : 'Requires the search:sql permission. Contact your administrator.'
               }
@@ -875,7 +915,7 @@ export function UserSettings() {
 
             {saving && (
               <div className="flex items-center gap-2 text-[11.5px] text-muted-foreground">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <LoadingIcon className="w-3.5 h-3.5" />
                 Saving preference…
               </div>
             )}
@@ -976,7 +1016,7 @@ export function UserSettings() {
                           }
                         }}
                       >
-                        {regenLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                        {regenLoading && <LoadingIcon className="w-3 h-3" />}
                         Generate new codes
                       </Button>
                       <Button
@@ -1088,7 +1128,7 @@ export function UserSettings() {
                           }
                         }}
                       >
-                        {disabling && <Loader2 className="w-3 h-3 animate-spin" />}
+                        {disabling && <LoadingIcon className="w-3 h-3" />}
                         Confirm disable
                       </Button>
                       <Button
@@ -1128,7 +1168,7 @@ export function UserSettings() {
                   disabled={mfaActionLoading}
                 >
                   {mfaActionLoading ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <LoadingIcon className="w-3.5 h-3.5" />
                   ) : (
                     <ShieldCheck className="w-3.5 h-3.5" />
                   )}
@@ -1256,7 +1296,7 @@ export function UserSettings() {
                     disabled={mfaActionLoading || verifyCode.length < 6}
                   >
                     {mfaActionLoading ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <LoadingIcon className="w-3.5 h-3.5" />
                     ) : (
                       <ShieldCheck className="w-3.5 h-3.5" />
                     )}
@@ -1312,11 +1352,10 @@ export function UserSettings() {
                   </Button>
                 </div>
                 <label className="flex items-start gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
+                  <Checkbox
                     checked={savedConfirmed}
-                    onChange={(e) => setSavedConfirmed(e.target.checked)}
-                    className="mt-1 rounded border-border"
+                    onCheckedChange={(checked) => setSavedConfirmed(checked === true)}
+                    className="mt-1 h-3.5 w-3.5"
                   />
                   <span className="text-[12px] text-foreground/85">
                     I have saved these backup codes in a secure location

@@ -5,12 +5,13 @@ import type { CloudOverviewHeader as CloudOverviewHeaderData } from '@/lib/api/t
 import { CloudFact, CloudRiskGauge, cloudSevTone, fmtCount, postureBandForScore } from './shared';
 
 interface CloudOverviewHeaderProps {
+  deniedStatus?: string;
   data: CloudOverviewHeaderData;
   /** The full executed query, echoed in the bottom bar (e.g. "| cloud provider=aws") */
   query: string;
 }
 
-export function CloudOverviewHeader({ data, query }: CloudOverviewHeaderProps) {
+export function CloudOverviewHeader({ data, query, deniedStatus }: CloudOverviewHeaderProps) {
   const band = postureBandForScore(data.posture_score);
   const tone = cloudSevTone(band);
   return (
@@ -51,7 +52,7 @@ export function CloudOverviewHeader({ data, query }: CloudOverviewHeaderProps) {
                 <CloudFact
                   k="Events"
                   v={<span className="tabular-nums">{fmtCount(data.events_total)}</span>}
-                  sub={`${fmtCount(data.events_failed)} failed · ${fmtCount(data.events_denied)} denied`}
+                  sub={`${fmtCount(data.events_failed)} failed · ${!deniedStatus || deniedStatus === 'ready' ? fmtCount(data.events_denied) : deniedStatus === 'loading' ? 'loading' : 'unavailable'} denied`}
                 />
                 <CloudFact
                   k="Open alerts"

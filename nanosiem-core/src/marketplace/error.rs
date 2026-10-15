@@ -17,6 +17,11 @@ pub enum MarketplaceError {
     #[error("Slug already exists: {0}")]
     SlugAlreadyExists(String),
 
+    /// NAN-3490: `_mock` slugs and the `config.validation_mock` marker belong
+    /// to operator live-validation rows.
+    #[error("Reserved for live-validation mock entries: {0}")]
+    ReservedValidationMock(String),
+
     #[error("Repository already exists: {0}")]
     RepositoryAlreadyExists(String),
 
@@ -51,6 +56,14 @@ pub enum MarketplaceError {
     #[error("Sync already in progress for repository: {0}")]
     SyncInProgress(Uuid),
 
+    /// The entry's execution backend is not part of this build's edition.
+    ///
+    /// NAN-3463: Deno-backed feeds run in the enterprise custom-enrichment
+    /// sandbox and are stored in `custom_enrichments`, which the open schema
+    /// does not have. Installing one in open used to fail with a 500.
+    #[error("{0}")]
+    BackendUnavailable(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -65,6 +78,7 @@ impl MarketplaceError {
             MarketplaceError::CatalogEntryNotFound(_) => 404,
             MarketplaceError::RepositoryNotFound(_) => 404,
             MarketplaceError::SlugAlreadyExists(_) => 409,
+            MarketplaceError::ReservedValidationMock(_) => 409,
             MarketplaceError::RepositoryAlreadyExists(_) => 409,
             MarketplaceError::NotInstalled(_) => 400,
             MarketplaceError::AlreadyInstalled(_) => 409,
@@ -74,6 +88,7 @@ impl MarketplaceError {
             MarketplaceError::GitError(_) => 502,
             MarketplaceError::ManifestParseError(_) => 422,
             MarketplaceError::SyncInProgress(_) => 409,
+            MarketplaceError::BackendUnavailable(_) => 403,
             MarketplaceError::Database(_) => 500,
             MarketplaceError::Internal(_) => 500,
         }

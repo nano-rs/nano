@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import type { InventoryItem } from './marketplace-inventory';
+import type { HostedCollector, HostedCollectorFeed, HostedCollectorInstall, HostedCollectorRotation } from '@/enterprise/api/hosted-collectors';
 
 /**
  * Marketplace API client
@@ -88,6 +90,7 @@ export interface CredentialFieldDef {
 }
 
 export interface EnrichmentMarketplaceRepo {
+  managed_by_platform?: boolean;
   id: string;
   name: string;
   slug: string;
@@ -217,10 +220,22 @@ export interface ArtifactCoverage {
   have: string[];
   /** Display labels of recommended providers that are NOT installed */
   missing: string[];
+  /**
+   * NAN-3762: `false` when this deployment has no measurement for the
+   * artifact type yet (shared/lean lake before its first snapshot, or a type
+   * the lake has no signal for). `pct` is then meaningless and must render as
+   * "not measured yet", never 0 %. Absent (open core) means measured.
+   */
+  measured?: boolean;
 }
 
 export interface MarketplaceCoverage {
   artifacts: ArtifactCoverage[];
+  /**
+   * Shared/lean deployments report whether any telemetry backs the numbers.
+   * `false` → every row is unmeasured. Absent (open core) → measured.
+   */
+  telemetry_available?: boolean;
   /**
    * Wall-clock time (ISO-8601 UTC) the underlying SQL was last actually
    * run. Because the response is shared-cached for 6h on the server,
@@ -229,6 +244,11 @@ export interface MarketplaceCoverage {
    * at fresh vs. cached numbers.
    */
   computed_at: string;
+}
+
+/** NAN-3762: whether a coverage row carries a real measurement. */
+export function isCoverageMeasured(coverage: MarketplaceCoverage, row: ArtifactCoverage): boolean {
+  return coverage.telemetry_available !== false && row.measured !== false;
 }
 
 // =============================================================================
@@ -257,12 +277,65 @@ export const CC_BY_SA_4_URL = 'https://creativecommons.org/licenses/by-sa/4.0/';
 // API Client
 // =============================================================================
 
+export type RepositorySyncResponse =
+  | { message: string; managed_by_platform?: false }
+  | { request_id: string; repository_id: string; managed_by_platform: true; status: 'accepted' };
+
 export class MarketplaceApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
   ) {}
 
   // ── Catalog ──────────────────────────────────────────────────────────
+
+  listInventory(): Promise<InventoryItem[]> {
+    return this.request('/api/marketplace/items');
+  }
+
+  checkout(feedId: string, origin?: 'signup' | 'later'): Promise<import('./marketplace-inventory').CheckoutResponse> {
+    return this.request(`/api/marketplace/items/${encodeURIComponent(feedId)}/checkout`, origin ? {
+      method: 'POST', body: JSON.stringify({ origin }),
+    } : undefined);
+  }
+
+  inventoryEntitlement(feedId: string): Promise<import('./marketplace-inventory').MarketplaceEntitlement> {
+    return this.request(`/api/enrichment/entitlements/${encodeURIComponent(feedId)}`);
+  }
+
+  inventoryDetail(id: string): Promise<InventoryItem> {
+    return this.request(`/api/marketplace/items/${encodeURIComponent(id)}`);
+  }
+
+  toggleInventory(item: InventoryItem): Promise<InventoryItem> {
+    return this.request(`/api/marketplace/items/${encodeURIComponent(item.id)}/toggle`, {
+      method: 'POST', body: JSON.stringify({ enabled: !item.enabled, expected_revision: item.revision }),
+    });
+  }
+
+  hostedCollectors(): Promise<HostedCollector[]> {
+    return this.request('/api/marketplace/collectors');
+  }
+  hostedCollectorFeeds(slug: string): Promise<HostedCollectorFeed[]> {
+    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}`);
+  }
+  installHostedCollector(slug: string, input: HostedCollectorInstall): Promise<{ message: string }> {
+    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/install`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+    });
+  }
+  rotateHostedCollectorCredentials(slug: string, input: HostedCollectorRotation): Promise<{ message: string; feeds: string[] }> {
+    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/credentials`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+    });
+  }
+  enableHostedCollector(slug: string, enabled: boolean): Promise<{ message: string }> {
+    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }),
+    });
+  }
+  uninstallHostedCollector(slug: string): Promise<{ message: string }> {
+    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}`, { method: 'DELETE' });
+  }
 
   async listCatalog(filter?: CatalogFilter): Promise<CatalogListResponse> {
     const params = new URLSearchParams();
@@ -380,8 +453,8 @@ export class MarketplaceApi {
     });
   }
 
-  async syncRepo(id: string): Promise<{ message: string }> {
-    return this.request<{ message: string }>(`/api/marketplace/repos/${id}/sync`, {
+  async syncRepo(id: string): Promise<RepositorySyncResponse> {
+    return this.request<RepositorySyncResponse>(`/api/marketplace/repos/${id}/sync`, {
       method: 'POST',
     });
   }

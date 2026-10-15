@@ -18,6 +18,9 @@ use crate::{error::SearchError, metrics::record_search_query, SearchState};
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CloudDossierRequest {
+    /// "page" returns only a bounded newest-event preview; default "full" returns exact aggregates.
+    #[serde(default)]
+    pub fetch: Option<String>,
     /// IAM principal id (user / role / service account)
     pub principal: String,
     /// Optional account scope (AWS account id / GCP project id)
@@ -70,10 +73,15 @@ pub async fn get_cloud_dossier(
         ));
     }
 
+    let fetch = request.fetch.as_deref().unwrap_or("full");
+    if !matches!(fetch, "page" | "full") {
+        return Err(SearchError::BadRequest("fetch must be page or full".to_string()));
+    }
     // NAN-1801: compose the effective deny-set (per-user source scope ∪ audit
     // gate) ONCE, before the cache lookup — it changes the executed SQL, so it
     // is part of result identity and MUST be folded into the cache key.
     let scope = super::search::effective_scope(&auth);
+    let search = super::product_view_search(&state, &auth)?;
 
     // NAN-1593: the cloud principal dossier fires on every load / shared-link
     // follow and runs many parallel ClickHouse aggregates — cache it through
@@ -81,14 +89,26 @@ pub async fn get_cloud_dossier(
     // subquery, so they all change the result and MUST be part of the key
     // alongside the principal / account / provider scope, the time range, and
     // the caller's effective source scope.
-    let cache_key = crate::cache::SearchResultCache::companion_key(
+    let cache_key = crate::cache::SearchResultCache::companion_key_for(
+        auth.tenant_scope,
         "cdossier",
         &[
+            fetch.as_bytes(),
             request.principal.as_bytes(),
             request.account.as_deref().unwrap_or("").as_bytes(),
             request.provider.as_deref().unwrap_or("").as_bytes(),
-            request.time_range.start.timestamp_micros().to_string().as_bytes(),
-            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request
+                .time_range
+                .start
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
+            request
+                .time_range
+                .end
+                .timestamp_micros()
+                .to_string()
+                .as_bytes(),
             serde_json::to_string(&request.services)
                 .unwrap_or_default()
                 .as_bytes(),
@@ -112,6 +132,7 @@ pub async fn get_cloud_dossier(
             if let Some(cached) = cache.get_cached::<CloudDossier>(&cache_key).await {
                 record_search_query("cloud_dossier_cached", 0.0, true);
                 let age = cache.age_secs(&cache_key).await;
+                super::require_current_shared_authority(&state, &auth).await?;
                 return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
             }
         }
@@ -122,31 +143,63 @@ pub async fn get_cloud_dossier(
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
-    let result = state
-        .search
+    let filters = nanosiem_core::search::CloudDossierFacetFilters {
+        services: request.services,
+        regions: request.regions,
+        accounts: request.accounts,
+        resource_types: request.resource_types,
+        change_types: request.change_types,
+    };
+    let result = if fetch == "page" {
+        search.query_cloud_dossier_preview(
+            &request.principal, request.account.as_deref(), request.provider.as_deref(),
+            &filters, &time_range, &scope,
+        ).await
+    } else { search
         .query_cloud_dossier(
             &request.principal,
             request.account.as_deref(),
             request.provider.as_deref(),
-            &nanosiem_core::search::CloudDossierFacetFilters {
-                services: request.services,
-                regions: request.regions,
-                accounts: request.accounts,
-                resource_types: request.resource_types,
-                change_types: request.change_types,
-            },
+            &filters,
             &time_range,
             &scope,
         )
-        .await;
+        .await };
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if fetch == "full" && matches!(
+        &result,
+        Err(nanosiem_core::SearchError::ResourceExhausted(_))
+    ) {
+        let job_id = search
+            .enqueue_durable_cloud_dossier(
+                &request.principal,
+                request.account.as_deref(),
+                request.provider.as_deref(),
+                &filters,
+                &time_range,
+                &scope,
+                auth.claims.sub,
+                auth.durable_search_authority().as_ref(),
+            )
+            .await?;
+        record_search_query("cloud_dossier_queued", duration_ms, true);
+        super::require_current_shared_authority(&state, &auth).await?;
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(CloudDossier {
+                durable_job: Some(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                }),
+                ..Default::default()
+            }),
+        ));
+    }
     record_search_query("cloud_dossier", duration_ms, result.is_ok());
 
-    let response = result.map_err(|e| {
-        tracing::error!(error = %e, "Cloud dossier query failed");
-        SearchError::QueryError("Failed to fetch cloud dossier".to_string())
-    })?;
+    let response =
+        result.map_err(|e| crate::error::mask_query_failure(e, "Failed to fetch cloud dossier"))?;
 
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
@@ -156,5 +209,9 @@ pub async fn get_cloud_dossier(
         });
     }
 
-    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
+    super::require_current_shared_authority(&state, &auth).await?;
+    Ok((
+        crate::cache::cache_status_headers(false, None),
+        Json(response),
+    ))
 }

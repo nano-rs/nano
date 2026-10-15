@@ -247,7 +247,10 @@ mod tests {
         let accepted = ValidatedSignal::validate("T1021", &catalogue);
         let rejected = ValidatedSignal::validate("nonce-8f3a", &catalogue);
         assert!(accepted.is_some());
-        assert!(rejected.is_none(), "an unknown signal was accepted into the hash");
+        assert!(
+            rejected.is_none(),
+            "an unknown signal was accepted into the hash"
+        );
 
         let host = entity("host", "srv-web06");
         let with_junk: Vec<ValidatedSignal> = ["T1021", "nonce-8f3a"]
@@ -284,8 +287,14 @@ mod tests {
     #[test]
     fn framing_is_injective_across_field_boundaries() {
         // The collisions the previous \x1f-stripping revision had.
-        assert_ne!(fp(&entity("host", "srvweb"), &[]), fp(&entity("host", "srv\u{1f}web"), &[]));
-        assert_ne!(fp(&entity("host", "ab"), &[]), fp(&entity("host", "a"), &[]));
+        assert_ne!(
+            fp(&entity("host", "srvweb"), &[]),
+            fp(&entity("host", "srv\u{1f}web"), &[])
+        );
+        assert_ne!(
+            fp(&entity("host", "ab"), &[]),
+            fp(&entity("host", "a"), &[])
+        );
         let a = entity("host", "a");
         let ab = entity("hosta", "b");
         assert_ne!(fp(&a, &[]), fp(&ab, &[]));
@@ -319,7 +328,10 @@ mod tests {
     #[test]
     fn distinct_entities_and_hunts_differ() {
         let sigs = signals(&["t1021"]);
-        assert_ne!(fp(&entity("host", "srv-web06"), &sigs), fp(&entity("host", "srv-web07"), &sigs));
+        assert_ne!(
+            fp(&entity("host", "srv-web06"), &sigs),
+            fp(&entity("host", "srv-web07"), &sigs)
+        );
         let other_hunt = derive(&FingerprintInput {
             hunt_id: Uuid::parse_str("018f0000-0000-7000-8000-000000000002").unwrap(),
             entity: &entity("host", "srv-web06"),

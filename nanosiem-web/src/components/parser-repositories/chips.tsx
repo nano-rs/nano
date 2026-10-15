@@ -110,7 +110,7 @@ const TRANSPORT_META: Record<RepoTransport, { Icon: typeof Database; label: stri
   pubsub: { Icon: Download, label: 'Pub/Sub' },
   syslog: { Icon: GitBranch, label: 'Syslog' },
   kafka: { Icon: Tally1, label: 'Kafka' },
-  splunk_hec: { Icon: Package, label: 'Splunk HEC' },
+  splunk_hec: { Icon: Package, label: 'HEC' },
 };
 
 export function TransportChip({ t }: { t: RepoTransport | null | undefined }) {
@@ -190,10 +190,11 @@ export function Chk({ checked, indeterminate, disabled, onChange, ariaLabel }: C
   return (
     <label
       className={cn(
-        'inline-flex items-center justify-center',
+        'relative inline-flex items-center justify-center',
         disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer',
       )}
     >
+      {/* eslint-disable-next-line no-restricted-syntax -- visually hidden (sr-only) native input keeps native keyboard/form semantics; the styled sibling <span> draws the checkbox, incl. indeterminate */}
       <input
         ref={ref}
         type="checkbox"

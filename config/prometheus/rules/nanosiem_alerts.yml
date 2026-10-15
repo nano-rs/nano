@@ -98,7 +98,7 @@ groups:
       # Vector buffer filling up
       - alert: VectorBufferHigh
         expr: |
-          (vector_buffer_events{job="vector"} / vector_buffer_max_events{job="vector"}) > 0.8
+          (vector_buffer_size_events{job="vector"} / vector_buffer_max_size_events{job="vector"}) > 0.8
         for: 5m
         labels:
           severity: warning
@@ -116,3 +116,13 @@ groups:
         annotations:
           summary: "High event drop rate in Vector"
           description: "Vector is dropping more than 100 events per second"
+
+  - name: nanosiem_lake_part_gc
+    rules:
+      - alert: LakePartGcBlocked
+        expr: max by (tenant, reason, detail) (lake_part_gc_blocked_seconds) >= 7200
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lake part GC blocked for tenant {{ $labels.tenant }}"
+          description: "Superseded parts have been kept for at least two hours: {{ $labels.reason }} ({{ $labels.detail }}). Check the credential exchange lake_part_gc route and delete grant."

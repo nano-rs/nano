@@ -36,6 +36,17 @@ pub(super) fn eval_predicate_expression(input: &str) -> ParseResult<'_, EvalExpr
     comparison_expr(input)
 }
 
+/// Parse one comparison operand: arithmetic, function calls, literals and
+/// parenthesized expressions, but no comparison or logical operator at the top.
+///
+/// The right side of a search/`where` comparison (`time >= now() - INTERVAL 2
+/// HOUR`) uses this so a following `AND`/`OR` stays in the search grammar
+/// (NAN-3384); the full eval grammar turned `A >= B AND C < D` into
+/// `A >= (B AND C < D)`.
+pub(super) fn eval_operand_expression(input: &str) -> ParseResult<'_, EvalExpression> {
+    additive_expr(input)
+}
+
 /// Parse logical OR expressions (|| or OR)
 fn logical_or_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     let (input, first) = logical_and_expr(input)?;
@@ -70,7 +81,7 @@ fn logical_or_expr(input: &str) -> ParseResult<'_, EvalExpression> {
 
 /// Parse logical AND expressions (&& or AND)
 fn logical_and_expr(input: &str) -> ParseResult<'_, EvalExpression> {
-    let (input, first) = comparison_expr(input)?;
+    let (input, first) = not_expr(input)?;
     let (input, rest) = nom::multi::many0(pair(
         delimited(
             multispace0,
@@ -80,7 +91,7 @@ fn logical_and_expr(input: &str) -> ParseResult<'_, EvalExpression> {
             )),
             multispace0,
         ),
-        comparison_expr,
+        not_expr,
     ))
     .parse(input)?;
 
@@ -100,11 +111,86 @@ fn logical_and_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     Ok((input, expr))
 }
 
+/// Parse `NOT <predicate>` (NAN-3041). Splunk's eval accepts a unary `NOT`;
+/// nPL had none, so `if(NOT x IN (...), …)` could not be written. It lowers
+/// to the `not()` function, which the SQL generator makes null-safe like the
+/// search-side `NOT` (a missing value does not match the inner predicate).
+fn not_expr(input: &str) -> ParseResult<'_, EvalExpression> {
+    if let Ok((rest, _)) = nom::sequence::terminated(
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("NOT"),
+        multispace1,
+    )
+    .parse(input)
+    {
+        let _guard = super::enter_nesting(input)?;
+        let (rest, inner) = not_expr(rest)?;
+        return Ok((
+            rest,
+            EvalExpression::FunctionCall {
+                name: "not".to_string(),
+                args: vec![inner],
+            },
+        ));
+    }
+    comparison_expr(input)
+}
+
+/// Parse the `IN (v1, v2, …)` / `NOT IN (…)` membership suffix (NAN-3041).
+///
+/// `where` has always accepted `field IN (...)`; eval and `if()` did not, so a
+/// rule could filter with it but not score with it. It lowers to the
+/// `in(expr, v1, v2, …)` function (wrapped in `not()` for `NOT IN`), which is
+/// also directly callable.
+fn in_list_suffix(input: &str) -> ParseResult<'_, (bool, Vec<EvalExpression>)> {
+    let (input, _) = multispace1(input)?;
+    let (input, negated) = alt((
+        value(
+            true,
+            pair(tag_no_case("NOT"), pair(multispace1, tag_no_case("IN"))),
+        ),
+        value(false, pair(tag_no_case("IN"), multispace0)),
+    ))
+    .parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, values) = nom::multi::separated_list1(
+        delimited(multispace0, char(','), multispace0),
+        eval_expression,
+    )
+    .parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(')').parse(input)?;
+    Ok((input, (negated, values)))
+}
+
 /// Parse comparison expressions (==, =, !=, >, <, >=, <=, CONTAINS, LIKE)
 /// Note: Both = and == are supported for equality (PPL compatibility)
 /// In eval expressions, = means "equals" not "assign" (assignment is handled at top level)
+/// plus the `IN (…)` / `NOT IN (…)` membership suffix.
 fn comparison_expr(input: &str) -> ParseResult<'_, EvalExpression> {
     let (input, first) = additive_expr(input)?;
+    let (input, first) = match in_list_suffix(input) {
+        Ok((rest, (negated, values))) => {
+            let mut args = Vec::with_capacity(values.len() + 1);
+            args.push(first);
+            args.extend(values);
+            let membership = EvalExpression::FunctionCall {
+                name: "in".to_string(),
+                args,
+            };
+            let expr = if negated {
+                EvalExpression::FunctionCall {
+                    name: "not".to_string(),
+                    args: vec![membership],
+                }
+            } else {
+                membership
+            };
+            (rest, expr)
+        }
+        Err(_) => (input, first),
+    };
     let (input, rest) = nom::multi::many0(pair(
         delimited(
             multispace0,

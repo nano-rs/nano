@@ -8,7 +8,8 @@
  */
 
 import { Link } from 'react-router-dom';
-import { Loader2, CircleAlert } from 'lucide-react';
+import { CircleAlert } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useAlertCounts } from '@/hooks/use-api';
 
 const SEVERITY_CONFIG = {
@@ -41,7 +42,7 @@ export function AlertSummary() {
   if (loading) {
     return (
       <div className="flex items-center justify-center py-6">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }

@@ -1,0 +1,11 @@
+# Renderer-owned: overwrite any payload-supplied envelope with trusted values.
+._nano_pipe_metadata = [{
+  "tenant_id": %tenant_id,
+  "source_type": %source_type,
+  "ingress_transport": %ingress_transport
+}]
+._nano_pipe_keys = to_string(%nano_event_key) ?? ""
+.group_hash = sha2(encode_json([
+  %tenant_id, %source_type, %ingress_transport, .group_hash, ._nano_pipe_scope
+]), variant: "SHA-256")
+del(._nano_pipe_scope)

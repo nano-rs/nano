@@ -150,6 +150,19 @@ pub struct DetectionRule {
     /// Materialized view name for real-time rules (auto-generated)
     #[sqlx(default)]
     pub materialized_view_name: Option<String>,
+    /// hosted-shared near-real-time evaluation interval. The
+    /// shared lake has no materialized views, so a "real-time" rule there is a
+    /// short-interval scheduled evaluation over the hot tail; this is that
+    /// interval. `None` on dedicated deployments.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_real_time_interval_seconds: Option<i32>,
+    /// Derived execution label (`near_real_time` | `real_time` | `scheduled`),
+    /// a generated column since enterprise migration 9000680. `None` when the
+    /// row predates the column.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
     /// Base risk score (0-100), defaults based on severity if not set
     #[sqlx(default)]
     pub risk_score: Option<i32>,
@@ -186,7 +199,7 @@ pub struct DetectionRule {
     #[sqlx(default)]
     pub lookback_minutes: Option<i32>,
     /// Dataset this rule queries: None/"logs" (default UDM/OCSF), "spans", or
-    /// "metrics" (NAN-1561). Mirrors `SearchRequest.dataset`. Spans/metrics
+    /// "metrics". Mirrors `SearchRequest.dataset`. Spans/metrics
     /// rules are SCHEDULED-ONLY — the real-time MV path rejects them.
     ///
     /// NOTE: a spans/metrics rule that wants risk scoring must set an explicit
@@ -236,18 +249,18 @@ pub struct DetectionRule {
     #[schema(value_type = Option<String>)]
     pub playbook_id: Option<Uuid>,
     /// Path of this rule's file within its detection-as-code repo (NULL =
-    /// nano-native, not git-managed). When set, AI tuning PRs (NAN-1745) target
+    /// nano-native, not git-managed). When set, AI tuning PRs target
     /// this exact file instead of a name-templated path — so an existing rule in
-    /// the customer's repo is updated in place rather than duplicated (NAN-1764).
+    /// the customer's repo is updated in place rather than duplicated.
     #[sqlx(default)]
     #[serde(default)]
     pub source_path: Option<String>,
     /// Repo URL this rule was imported from (NULL = nano-native). Informational
-    /// in v1 — the push target is tenant-wide (NAN-1764).
+    /// in v1 — the push target is tenant-wide.
     #[sqlx(default)]
     #[serde(default)]
     pub source_repo_url: Option<String>,
-    /// Rule kind discriminator (NAN-1791): `"standard"` (default nPL detection)
+    /// Rule kind discriminator: `"standard"` (default nPL detection)
     /// or `"retro_hunt"` (auto retro-hunt of newly-landed threat-intel indicators
     /// against historical logs — see `retro_hunt_rule_config`). A retro-hunt rule
     /// ignores `query` at execution time and instead computes an indicator delta,
@@ -257,7 +270,7 @@ pub struct DetectionRule {
     #[sqlx(default)]
     #[serde(default = "default_rule_kind")]
     pub kind: String,
-    /// Per-(rule, entity) alert cooldown in minutes (NAN-1805). None/0 = off.
+    /// Per-(rule, entity) alert cooldown in minutes. None/0 = off.
     /// When set, an entity that alerted within the window is suppressed from
     /// re-alerting — TIME-based and anchored on the durable
     /// `detection_alert_entity_cooldowns` table, so it survives restart /
@@ -347,13 +360,13 @@ pub struct NewDetectionRule {
     #[schema(value_type = Option<String>)]
     pub playbook_id: Option<Uuid>,
     /// Detection-as-Code provenance: path of this rule's file within its DaC repo.
-    /// Set by the DaC pipeline on import so tuning PRs target the real file (NAN-1764).
+    /// Set by the DaC pipeline on import so tuning PRs target the real file.
     #[serde(default)]
     pub source_path: Option<String>,
-    /// Detection-as-Code provenance: repo URL this rule was imported from (NAN-1764).
+    /// Detection-as-Code provenance: repo URL this rule was imported from.
     #[serde(default)]
     pub source_repo_url: Option<String>,
-    /// Per-(rule, entity) alert cooldown in minutes (NAN-1805). None/0 = off.
+    /// Per-(rule, entity) alert cooldown in minutes. None/0 = off.
     /// Time-based re-fire throttle anchored on a durable table (see
     /// [`DetectionRule::alert_cooldown_minutes`]). 0-10080 (7 days).
     #[serde(default)]
@@ -426,13 +439,13 @@ pub struct UpdateDetectionRule {
     #[schema(value_type = Option<String>)]
     pub playbook_id: Option<Uuid>,
     /// Detection-as-Code provenance: path of this rule's file within its DaC repo.
-    /// Preserved across normal edits (COALESCE); only a re-import updates it (NAN-1764).
+    /// Preserved across normal edits (COALESCE); only a re-import updates it.
     #[serde(default)]
     pub source_path: Option<String>,
-    /// Detection-as-Code provenance: repo URL this rule was imported from (NAN-1764).
+    /// Detection-as-Code provenance: repo URL this rule was imported from.
     #[serde(default)]
     pub source_repo_url: Option<String>,
-    /// Per-(rule, entity) alert cooldown in minutes (NAN-1805). Set 0 to
+    /// Per-(rule, entity) alert cooldown in minutes. Set 0 to
     /// disable (COALESCE update semantics — None leaves the stored value).
     /// 0-10080 (7 days).
     #[serde(default)]
@@ -548,13 +561,23 @@ impl std::fmt::Display for FieldValidationError {
                 write!(f, "Invalid playbook_selector_mode '{}' (must be 'none', 'specific', or 'adaptive')", value)
             }
             FieldValidationError::SpecificPlaybookWithoutId => {
-                write!(f, "playbook_selector_mode is 'specific' but no playbook_id provided")
+                write!(
+                    f,
+                    "playbook_selector_mode is 'specific' but no playbook_id provided"
+                )
             }
             FieldValidationError::PlaybookIdWithoutSpecificMode => {
-                write!(f, "playbook_id provided but playbook_selector_mode is not 'specific'")
+                write!(
+                    f,
+                    "playbook_id provided but playbook_selector_mode is not 'specific'"
+                )
             }
             FieldValidationError::InvalidDataset(value) => {
-                write!(f, "Invalid dataset '{}' (must be 'logs', 'spans', 'metrics', or 'risk')", value)
+                write!(
+                    f,
+                    "Invalid dataset '{}' (must be 'logs', 'spans', 'metrics', or 'risk')",
+                    value
+                )
             }
             FieldValidationError::AlertCooldownOutOfBounds(minutes) => {
                 write!(
@@ -1023,7 +1046,10 @@ mod tests {
         for minutes in [0, 1, 240, MAX_ALERT_COOLDOWN_MINUTES] {
             let mut rule = new_rule_with_confidence(None);
             rule.alert_cooldown_minutes = Some(minutes);
-            assert!(rule.validate_fields().is_ok(), "cooldown {minutes} accepted");
+            assert!(
+                rule.validate_fields().is_ok(),
+                "cooldown {minutes} accepted"
+            );
         }
         for minutes in [-1, MAX_ALERT_COOLDOWN_MINUTES + 1] {
             let mut rule = new_rule_with_confidence(None);

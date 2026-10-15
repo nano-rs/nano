@@ -26,7 +26,10 @@
 
 use std::collections::BTreeSet;
 
-use super::execution::{classify_companion_rows, fail_closed_stamp, CompanionProvenance};
+use super::execution::{
+    classify_companion_rows, classify_companion_rows_with_field, fail_closed_stamp,
+    CompanionProvenance,
+};
 use crate::auth::{deny_bind_values, UNRESOLVED_SOURCE_SENTINEL};
 use crate::db::repository::alerts::distinct_source_types;
 
@@ -44,6 +47,21 @@ fn arrays_overlap(stamped: &[String], deny_bind: &[String]) -> bool {
 /// `source_type`, carrying only the engine's `_nano_source_types` annotation.
 fn aggregate_rows(stamp: &serde_json::Value) -> serde_json::Value {
     serde_json::json!([{ "count": 12, "_nano_source_types": stamp }])
+}
+
+#[test]
+fn canonical_ocsf_companion_reads_log_source_path() {
+    let rows = [
+        serde_json::json!({ "metadata.log_source": " Windows_Event " }),
+        serde_json::json!({ "metadata": { "log_source": "cloudtrail" } }),
+    ];
+    assert_eq!(
+        classify_companion_rows_with_field(&rows, "metadata.log_source"),
+        CompanionProvenance::Attributed(vec![
+            "cloudtrail".to_string(),
+            "windows_event".to_string(),
+        ])
+    );
 }
 
 /// THE bug. A restricted principal must not see a match whose provenance the
@@ -150,7 +168,10 @@ fn an_unresolved_finding_cannot_produce_a_complete_tuning_manifest() {
         matched_events: &sample,
     }]);
 
-    assert!(!manifest.is_empty(), "the manifest is non-empty — which is why the empty check missed it");
+    assert!(
+        !manifest.is_empty(),
+        "the manifest is non-empty — which is why the empty check missed it"
+    );
     assert!(
         !complete,
         "an unresolved origin must never be recorded as a complete manifest"
@@ -352,7 +373,10 @@ fn a_reserved_only_companion_window_is_not_treated_as_unresolved() {
         "reserved_only_visible"
     );
     // Genuinely unattributed window: MUST fail closed.
-    assert_eq!(classify(&[serde_json::json!({ "count": 4 })]), "fail_closed");
+    assert_eq!(
+        classify(&[serde_json::json!({ "count": 4 })]),
+        "fail_closed"
+    );
     assert_eq!(
         classify(&[serde_json::json!({ "source_type": "  " })]),
         "fail_closed"
@@ -439,7 +463,10 @@ fn a_forged_source_type_cannot_take_a_report_offline() {
         "source_type": UNRESOLVED_SOURCE_SENTINEL,
         "message": "x",
     }]));
-    assert!(stored.is_empty(), "a forged value must not enter the manifest");
+    assert!(
+        stored.is_empty(),
+        "a forged value must not enter the manifest"
+    );
     assert!(
         report_artifact_download_allowed(&deny(&["insider_threat"]), &stored, true),
         "a restricted requester must keep access to a report a forged event touched"
@@ -497,7 +524,12 @@ fn the_fail_closed_stamp_keeps_the_precise_registry_contribution() {
     let registry = deny(&["insider_threat", "hr_feed"]);
     let stamped = distinct_source_types(&aggregate_rows(&fail_closed_stamp(&registry)));
 
-    for value in ["insider_threat", "hr_feed", "audit", UNRESOLVED_SOURCE_SENTINEL] {
+    for value in [
+        "insider_threat",
+        "hr_feed",
+        "audit",
+        UNRESOLVED_SOURCE_SENTINEL,
+    ] {
         assert!(
             stamped.iter().any(|s| s == value),
             "fail-closed stamp must carry {value}"
@@ -508,7 +540,10 @@ fn the_fail_closed_stamp_keeps_the_precise_registry_contribution() {
     let with_audit = deny(&["audit"]);
     let stamped_audit = distinct_source_types(&aggregate_rows(&fail_closed_stamp(&with_audit)));
     assert_eq!(
-        stamped_audit.iter().filter(|s| s.as_str() == "audit").count(),
+        stamped_audit
+            .iter()
+            .filter(|s| s.as_str() == "audit")
+            .count(),
         1
     );
 }

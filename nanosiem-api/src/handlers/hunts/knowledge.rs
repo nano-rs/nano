@@ -46,7 +46,7 @@ use nanosiem_core::audit::{AuditEvent, AuditSource, HUNT_KNOWLEDGE_REVOKED};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::hunts::{
     clamp_ttl_days, normalize_category, normalize_evidence_refs, normalize_fact, normalize_subject,
-    EvidenceResolver, HuntKnowledge, KnowledgeCategoryCount, KnowledgeRepository, ListKnowledgeQuery,
+    HuntKnowledge, KnowledgeCategoryCount, KnowledgeRepository, ListKnowledgeQuery,
     sanitize_confidence, RecordKnowledgeRequest, RecordKnowledgeResponse, RevokeKnowledgeRequest,
     MAX_REVOKE_REASON_CHARS,
 };
@@ -55,7 +55,7 @@ use nanosiem_core::ClientContext;
 use serde::{Deserialize, Serialize};
 
 use super::types::page_size;
-use super::artifact_scope;
+use super::{artifact_scope, evidence_resolver};
 use crate::handlers::AuditExt;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
@@ -262,7 +262,7 @@ pub async fn record_knowledge(
     // then re-evaluated against every later reader's own scope, against the
     // manifest stamped here.
     let scope = auth.effective_viewer_scope();
-    let resolver = nanosiem_core::hunts::ClickHouseEvidenceResolver::new(state.dual_pool());
+    let resolver = evidence_resolver(&state);
     let resolved = resolver.resolve(&evidence_event_ids, &scope).await?;
 
     // `ResolvedEvidence::provenance` is complete only when NOTHING went

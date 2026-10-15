@@ -42,7 +42,7 @@ export function AccessSubnav({ activeTab, counts = {} }: AccessSubnavProps) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const { hasAnyPermission } = useAuth();
-
+  // Hosted-shared tenants have their own groups since NAN-2361 wave 5.
   const visibleTabs = TABS.filter(t => hasAnyPermission(t.permissions));
 
   const onJump = (tab: AccessTabId) => {

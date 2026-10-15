@@ -544,7 +544,7 @@ impl TuningRepository {
         let runtime_sync_claimed = runtime_sync_required && runtime_sync_owner.is_some();
         if runtime_sync_required {
             sqlx::query(
-                r#"
+                concat!(r#"
                 INSERT INTO detection_rule_runtime_sync_jobs (
                     rule_id, desired_version_id, status, attempts,
                     claimed_by, claimed_at, last_error
@@ -554,7 +554,7 @@ impl TuningRepository {
                     CASE WHEN $3::TEXT IS NULL THEN NULL ELSE NOW() END,
                     NULL
                 )
-                ON CONFLICT (rule_id) DO UPDATE SET
+                ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
                     desired_version_id = EXCLUDED.desired_version_id,
                     status = 'pending',
                     attempts = 0,
@@ -562,7 +562,7 @@ impl TuningRepository {
                     claimed_at = EXCLUDED.claimed_at,
                     last_error = NULL,
                     updated_at = NOW()
-                "#,
+                "#),
             )
             .bind(locked.rule_id)
             .bind(version_id.expect("runtime sync requires a created version"))

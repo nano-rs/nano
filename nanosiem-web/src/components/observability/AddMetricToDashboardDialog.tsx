@@ -12,7 +12,7 @@
 
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import {
   Sheet,
@@ -190,7 +190,7 @@ export function AddMetricToDashboardDialog({
             onClick={handleSave}
             disabled={!valid || saving}
           >
-            {saving && <Loader2 className="h-[11px] w-[11px] animate-spin" />}
+            {saving && <LoadingIcon className="h-[11px] w-[11px]" />}
             Add panel
           </Button>
         </div>

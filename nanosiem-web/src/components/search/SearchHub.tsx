@@ -47,16 +47,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Compass,
@@ -75,7 +65,6 @@ import {
   AlertTriangle,
   ChartColumn,
   FileText,
-  Loader2,
   X,
   List,
   Table as TableIcon,
@@ -91,9 +80,11 @@ import {
   CircleCheck,
   XCircle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useViewPreference } from '@/hooks/use-view-preference';
 import { getAccessToken } from '@/lib/auth-token';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { requestCredentials } from '@/lib/request-credentials';
 
 function getAuthHeaders(): HeadersInit {
   const token = getAccessToken();
@@ -231,7 +222,7 @@ function formatElapsed(ms: number): string {
 
 const JOB_STATUS_CONFIG: Record<string, { icon: typeof Clock; label: string; color: string }> = {
   queued: { icon: Clock, label: 'Queued', color: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20' },
-  running: { icon: Loader2, label: 'Running', color: 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20' },
+  running: { icon: LoadingIcon, label: 'Running', color: 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20' },
   completed: { icon: CircleCheck, label: 'Done', color: 'bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20' },
   failed: { icon: XCircle, label: 'Failed', color: 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20' },
   cancelled: { icon: X, label: 'Cancelled', color: 'bg-muted text-muted-foreground border-border' },
@@ -367,6 +358,7 @@ export function SearchHub({
       if (selectedCategory) params.set('category', selectedCategory);
       const response = await fetch(`${API_BASE}/api/query-library?${params}`, {
         headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/query-library', getAuthHeaders()),
       });
       if (response.ok) {
         const data = await response.json();
@@ -384,6 +376,7 @@ export function SearchHub({
     try {
       const response = await fetch(`${API_BASE}/api/query-library/categories`, {
         headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/query-library/categories', getAuthHeaders()),
       });
       if (response.ok) {
         const data = await response.json();
@@ -843,7 +836,7 @@ export function SearchHub({
           <ScrollArea className="h-[min(350px,calc(100vh-400px))]">
             {isLoading ? (
               <div className="flex items-center justify-center py-8 text-muted-foreground">
-                <Loader2 className="h-5 w-5 animate-spin mr-2" />
+                <LoadingIcon className="h-5 w-5 mr-2" />
                 Loading...
               </div>
             ) : queries.length === 0 ? (
@@ -906,9 +899,7 @@ export function SearchHub({
                       }`}
                       onClick={isClickable ? () => { onLoadJob?.(job.job_id); setOpen(false); } : undefined}
                     >
-                      <Icon className={`w-4 h-4 flex-shrink-0 ${
-                        job.status === 'running' ? 'animate-spin' : ''
-                      }`} />
+                      <Icon className="w-4 h-4 flex-shrink-0" />
                       <div className="flex-1 min-w-0">
                         <p className="truncate text-foreground font-mono text-xs">{job.query || 'Search query'}</p>
                         <div className="flex items-center gap-2 mt-0.5">
@@ -1093,49 +1084,52 @@ export function SearchHub({
         }}
       />
 
-      {/* Share Dialog */}
-      <AlertDialog open={!!shareSearch} onOpenChange={(open) => !open && setShareSearch(null)}>
-        <AlertDialogContent className="max-w-md">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Share "{shareSearch?.name}"</AlertDialogTitle>
-            <AlertDialogDescription>
+      {/* Share Dialog — a ≤3-field share form, so a centered Dialog (NAN-3209), matching Case / Dashboard share */}
+      <Dialog open={!!shareSearch} onOpenChange={(open) => !open && setShareSearch(null)}>
+        <DialogContent className="flex max-h-[85vh] flex-col gap-0 border-border bg-card p-0 text-foreground sm:max-w-[480px]">
+          <DialogHeader className="space-y-0.5 border-b border-border px-4 py-3 pr-10 text-left">
+            <DialogTitle className="flex min-w-0 items-center gap-2 text-[13px] leading-5">
+              <Shield className="h-[13px] w-[13px] shrink-0 text-primary" />
+              <span className="truncate">Share "{shareSearch?.name}"</span>
+            </DialogTitle>
+            <DialogDescription className="text-[11px]">
               Choose who can see this saved search.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-4 py-4">
-            <RadioGroup value={shareVisibility} onValueChange={(v) => setShareVisibility(v as 'private' | 'public' | 'group')} className="space-y-3">
-              <label className="flex items-center gap-3 p-3 rounded-lg border border-border cursor-pointer hover:bg-accent/50 transition-colors">
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-3">
+            <RadioGroup value={shareVisibility} onValueChange={(v) => setShareVisibility(v as 'private' | 'public' | 'group')} className="flex flex-col gap-1.5">
+              <label className="flex cursor-pointer items-center gap-2.5 rounded-md border border-border px-3 py-2 transition-colors hover:bg-foreground/[0.03]">
                 <RadioGroupItem value="private" />
-                <Lock className="h-4 w-4 text-muted-foreground" />
-                <div className="flex-1">
-                  <p className="text-sm font-medium">Private</p>
-                  <p className="text-xs text-muted-foreground">Only you can see this search</p>
+                <Lock className="h-[13px] w-[13px] shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[12.5px] font-semibold">Private</p>
+                  <p className="text-[10.5px] leading-[1.35] text-muted-foreground">Only you can see this search</p>
                 </div>
               </label>
-              <label className="flex items-center gap-3 p-3 rounded-lg border border-border cursor-pointer hover:bg-accent/50 transition-colors">
+              <label className="flex cursor-pointer items-center gap-2.5 rounded-md border border-border px-3 py-2 transition-colors hover:bg-foreground/[0.03]">
                 <RadioGroupItem value="public" />
-                <Globe2 className="h-4 w-4 text-green-500" />
-                <div className="flex-1">
-                  <p className="text-sm font-medium">Public</p>
-                  <p className="text-xs text-muted-foreground">Everyone in your organization can see this</p>
+                <Globe2 className="h-[13px] w-[13px] shrink-0 text-green-500" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[12.5px] font-semibold">Public</p>
+                  <p className="text-[10.5px] leading-[1.35] text-muted-foreground">Everyone in your organization can see this</p>
                 </div>
               </label>
-              <label className="flex items-center gap-3 p-3 rounded-lg border border-border cursor-pointer hover:bg-accent/50 transition-colors">
+              <label className="flex cursor-pointer items-center gap-2.5 rounded-md border border-border px-3 py-2 transition-colors hover:bg-foreground/[0.03]">
                 <RadioGroupItem value="group" />
-                <Users className="h-4 w-4 text-blue-500" />
-                <div className="flex-1">
-                  <p className="text-sm font-medium">Specific Groups</p>
-                  <p className="text-xs text-muted-foreground">Only members of selected groups can see this</p>
+                <Users className="h-[13px] w-[13px] shrink-0 text-blue-500" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-[12.5px] font-semibold">Specific Groups</p>
+                  <p className="text-[10.5px] leading-[1.35] text-muted-foreground">Only members of selected groups can see this</p>
                 </div>
               </label>
             </RadioGroup>
 
             {shareVisibility === 'group' && availableGroups.length > 0 && (
-              <div className="space-y-2 pl-6">
-                <p className="text-sm font-medium">Select groups:</p>
-                <div className="space-y-2 max-h-32 overflow-y-auto">
+              <div className="flex flex-col gap-1.5">
+                <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Select groups</p>
+                <div className="flex max-h-40 flex-col gap-0.5 overflow-y-auto rounded-md border border-border p-1.5">
                   {availableGroups.map((group) => (
-                    <label key={group.id} className="flex items-center gap-2 cursor-pointer">
+                    <label key={group.id} className="flex cursor-pointer items-center gap-2 rounded-[3px] px-2 py-1 hover:bg-foreground/[0.04]">
                       <Checkbox
                         checked={shareGroupIds.includes(group.id)}
                         onCheckedChange={(checked) => {
@@ -1146,7 +1140,7 @@ export function SearchHub({
                           }
                         }}
                       />
-                      <span className="text-sm">{group.name}</span>
+                      <span className="truncate text-[12px]">{group.name}</span>
                     </label>
                   ))}
                 </div>
@@ -1154,17 +1148,27 @@ export function SearchHub({
             )}
 
             {shareVisibility === 'group' && availableGroups.length === 0 && (
-              <p className="text-sm text-muted-foreground pl-6">No groups available</p>
+              <p className="text-[11.5px] text-muted-foreground">No groups available</p>
             )}
           </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleShareSave}>
+          <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-4 py-2.5">
+            <Button variant="ghost" size="sm" className="h-7 text-[11.5px]" onClick={() => setShareSearch(null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              className="h-7 text-[11.5px]"
+              onClick={() => {
+                handleShareSave();
+                // Close even without an onShareSavedSearch handler (old AlertDialogAction behaviour).
+                setShareSearch(null);
+              }}
+            >
               Save
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

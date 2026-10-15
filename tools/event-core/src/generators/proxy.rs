@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Conduit MITM Proxy event generator using real traffic patterns + top legit domains
 //!
 //! Generates Conduit proxy access log JSON matching the real format from the lab.
@@ -12,6 +14,7 @@ use uuid::Uuid;
 use crate::entity::Entity;
 use crate::event::Event;
 use crate::profiles;
+use crate::web_session::DrawnRequest;
 
 /// Top legitimate domains for realistic proxy traffic volume.
 /// These get mixed with the real lab traffic patterns.
@@ -383,8 +386,12 @@ impl ProxyGenerator {
         let full_url = format!("https://{}{}", spec.host, spec.path);
         let action = if spec.status >= 400 { "deny" } else { "allow" };
         let request_bytes = if spec.method == "GET" { 0 } else { 768 };
+        let user_agent = entity
+            .web_session()
+            .profile(&entity.hostname)
+            .browser_user_agent();
 
-        let log_entry = serde_json::json!({
+        let mut log_entry = serde_json::json!({
             "id": Uuid::now_v7().to_string(),
             "timestamp": ts.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
             "client_ip": entity.ip,
@@ -396,7 +403,7 @@ impl ProxyGenerator {
             "port": 443,
             "path": spec.path,
             "full_url": full_url,
-            "referrer": spec.referrer,
+            "user_agent": user_agent,
             "category": spec.category,
             "action": action,
             "rule_id": serde_json::Value::Null,
@@ -413,6 +420,10 @@ impl ProxyGenerator {
             "threat_blocked": false,
             "threat_signals": threat_signals,
         });
+        // The live proxy omits `referer` when the request had no Referer header.
+        if let Some(referer) = spec.referrer {
+            log_entry["referer"] = serde_json::Value::from(referer);
+        }
 
         Event {
             message: serde_json::to_string(&log_entry).unwrap(),
@@ -481,7 +492,7 @@ impl ProxyGenerator {
 
     /// Generate from legit domain browsing (bulk of traffic)
     fn from_legit_browsing(&self, ts: DateTime<Utc>, entity: &Entity, rng: &mut impl Rng) -> Event {
-        let (_, _referrer, dest_host) = entity.next_browse_request();
+        let (_, _referrer, dest_host) = entity.next_browse_request(rng);
         let host = if dest_host.is_empty() {
             TOP_DOMAINS.choose(rng).unwrap().to_string()
         } else {
@@ -528,13 +539,43 @@ impl ProxyGenerator {
         upstream_ip: &str,
         rng: &mut impl Rng,
     ) -> Event {
-        let path = PATHS.choose(rng).unwrap();
+        let drawn_path = PATHS.choose(rng).unwrap();
+        // NAN-3294: referer / user_agent from the client's web session. The
+        // plan keeps the drawn host/path for browser traffic (sub-resources may
+        // move to the open page's host) and replaces them for background
+        // agents and the rare phishing chain.
+        let plan = entity.web_session().plan(
+            &entity.hostname,
+            ts,
+            DrawnRequest {
+                scheme,
+                host,
+                path: drawn_path,
+            },
+            rng,
+        );
+        let ov = plan.overrides.as_ref();
+        let (scheme, port) = match ov {
+            Some(o) if o.force_https => ("https", 443u16),
+            // A sub-resource moved onto the open page's host takes that page's
+            // scheme; keep the port consistent with it.
+            _ if plan.scheme != scheme => {
+                let port = if plan.scheme == "https" { 443 } else { 80 };
+                (plan.scheme.as_str(), port)
+            }
+            _ => (plan.scheme.as_str(), port),
+        };
+        let host = plan.host.as_str();
+        let path = plan.path.as_str();
+        let method = ov.map_or(method, |o| o.method);
         let full_url = format!("{}://{}{}", scheme, host, path);
         let duration_ms = rng.random_range(5u64..2000);
         let tls_intercepted = scheme == "https" && rng.random_bool(0.70);
-        let category = CATEGORIES.choose(rng).unwrap();
+        let category = *CATEGORIES.choose(rng).unwrap();
+        let category = ov.map_or(category, |o| o.category);
         let cache_status = CACHE_STATUSES.choose(rng).unwrap();
-        let content_type = CONTENT_TYPES.choose(rng).unwrap();
+        let content_type = *CONTENT_TYPES.choose(rng).unwrap();
+        let content_type = ov.map_or(content_type, |o| o.content_type);
 
         let (request_bytes, response_bytes) = match status {
             304 => (0u64, 0u64),
@@ -544,6 +585,12 @@ impl ProxyGenerator {
                 rng.random_range(500u64..500000),
             ),
         };
+        let response_bytes = match ov {
+            Some(o) if status != 304 && status < 400 => {
+                rng.random_range(o.response_bytes.0..=o.response_bytes.1)
+            }
+            _ => response_bytes,
+        };
 
         // Threat scoring — most traffic is benign (tier0, low score)
         let threat_score: f64 = if rng.random_bool(0.92) {
@@ -552,6 +599,11 @@ impl ProxyGenerator {
             rng.random_range(0.15..0.5)
         } else {
             rng.random_range(0.5..1.0)
+        };
+        let threat_floor = ov.and_then(|o| o.threat);
+        let threat_score = match threat_floor {
+            Some((floor, _)) => threat_score.max(floor + threat_score * 0.3),
+            None => threat_score,
         };
         let threat_tier = if threat_score < 0.2 {
             "tier0"
@@ -576,7 +628,11 @@ impl ProxyGenerator {
         let mut threat_signals = vec![
             serde_json::json!({"name": "dga_entropy", "score": threat_score, "tier": threat_tier}),
         ];
-        if threat_score >= 0.5 {
+        if let Some((_, signal)) = threat_floor {
+            threat_signals.push(
+                serde_json::json!({"name": signal, "score": threat_score * 0.9, "tier": threat_tier}),
+            );
+        } else if threat_score >= 0.5 {
             let extra_signals = [
                 "reputation_low",
                 "newly_registered",
@@ -589,7 +645,7 @@ impl ProxyGenerator {
             );
         }
 
-        let log_entry = serde_json::json!({
+        let mut log_entry = serde_json::json!({
             "id": Uuid::now_v7().to_string(),
             "timestamp": ts.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string(),
             "client_ip": entity.ip,
@@ -601,6 +657,7 @@ impl ProxyGenerator {
             "port": port,
             "path": path,
             "full_url": full_url,
+            "user_agent": plan.user_agent,
             "category": category,
             "action": action,
             "rule_id": serde_json::Value::Null,
@@ -617,6 +674,10 @@ impl ProxyGenerator {
             "threat_blocked": threat_blocked,
             "threat_signals": threat_signals,
         });
+        // The live proxy omits `referer` when the request had no Referer header.
+        if let Some(referer) = &plan.referer {
+            log_entry["referer"] = serde_json::Value::from(referer.as_str());
+        }
 
         Event {
             message: serde_json::to_string(&log_entry).unwrap(),
@@ -647,5 +708,154 @@ fn gen_public_ip(rng: &mut impl Rng) -> String {
             continue;
         }
         return format!("{}.{}.{}.{}", a, b, c, d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::web_session::{ClientProfile, PAGE_PATHS};
+    use chrono::Duration;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+    use std::collections::{HashMap, HashSet};
+
+    fn wire(entities: &[Entity], n: usize, seed: u64) -> Vec<serde_json::Value> {
+        let gen = ProxyGenerator::new();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let t0 = DateTime::parse_from_rfc3339("2026-10-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        (0..n)
+            .map(|i| {
+                let e = &entities[i % entities.len()];
+                let ts = t0 + Duration::milliseconds(i as i64 * 400);
+                serde_json::from_str(&gen.generate(ts, e, &mut rng).message).unwrap()
+            })
+            .collect()
+    }
+
+    fn fleet() -> Vec<Entity> {
+        ["WS-ENG-001", "WS-FIN-002", "LT-HR-003", "SRV-CI01"]
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                Entity::new(
+                    h,
+                    &format!("user{i}"),
+                    &format!("10.1.0.{}", i + 10),
+                    "00:50:56:00:00:01",
+                    "corp.local",
+                )
+            })
+            .collect()
+    }
+
+    fn browser_ua(v: &serde_json::Value, entities: &[Entity]) -> bool {
+        let ip = v["client_ip"].as_str().unwrap();
+        let e = entities.iter().find(|e| e.ip == ip).unwrap();
+        ClientProfile::for_host(&e.hostname).browser_ua == v["user_agent"].as_str()
+    }
+
+    /// Every referer on a browser sub-resource is a page URL that same client
+    /// requested earlier, so `| tree web` gets real parent → child edges.
+    #[test]
+    fn subresource_referers_point_at_an_earlier_page_of_the_same_client() {
+        let entities = fleet();
+        let events = wire(&entities, 20_000, 1);
+        let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut checked = 0;
+        for v in &events {
+            let ip = v["client_ip"].as_str().unwrap().to_string();
+            let url = v["full_url"].as_str().unwrap().to_string();
+            let path = v["path"].as_str().unwrap();
+            if let Some(r) = v.get("referer").and_then(|r| r.as_str()) {
+                if !PAGE_PATHS.contains(&path) && !r.contains("mail") {
+                    checked += 1;
+                    assert!(
+                        seen.get(&ip).is_some_and(|s| s.contains(r)),
+                        "referer {r} for {url} was never a page of {ip}"
+                    );
+                }
+            }
+            seen.entry(ip).or_default().insert(url);
+        }
+        assert!(checked > 5_000, "only {checked} sub-resources checked");
+    }
+
+    #[test]
+    fn background_agents_omit_referer_and_browsers_keep_one_ua() {
+        let entities = fleet();
+        let events = wire(&entities, 20_000, 2);
+        let mut browser_uas: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut background = 0;
+        for v in &events {
+            assert!(v.get("referrer").is_none(), "legacy key emitted: {v}");
+            let ua = v["user_agent"].as_str().expect("user_agent always present");
+            if browser_ua(v, &entities) {
+                browser_uas
+                    .entry(v["client_ip"].as_str().unwrap())
+                    .or_default()
+                    .insert(ua);
+            } else {
+                background += 1;
+                assert!(v.get("referer").is_none(), "background with referer: {v}");
+                assert!(v["referer"].is_null());
+            }
+        }
+        assert!(background > 1_000, "background={background}");
+        // The headless Linux CI server has no browser at all.
+        assert_eq!(browser_uas.len(), 3);
+        assert!(
+            browser_uas.values().all(|s| s.len() == 1),
+            "{browser_uas:?}"
+        );
+    }
+
+    #[test]
+    fn output_is_deterministic_for_a_seed() {
+        let strip = |mut v: serde_json::Value| {
+            v.as_object_mut().unwrap().remove("id");
+            v
+        };
+        let a: Vec<_> = wire(&fleet(), 3_000, 77).into_iter().map(strip).collect();
+        let b: Vec<_> = wire(&fleet(), 3_000, 77).into_iter().map(strip).collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn existing_fields_are_kept() {
+        let events = wire(&fleet(), 200, 3);
+        for key in [
+            "id",
+            "timestamp",
+            "client_ip",
+            "username",
+            "auth_method",
+            "method",
+            "scheme",
+            "host",
+            "port",
+            "path",
+            "full_url",
+            "user_agent",
+            "category",
+            "action",
+            "rule_id",
+            "status_code",
+            "request_bytes",
+            "response_bytes",
+            "duration_ms",
+            "tls_intercepted",
+            "upstream_addr",
+            "cache_status",
+            "content_type",
+            "threat_score",
+            "threat_tier",
+            "threat_blocked",
+            "threat_signals",
+        ] {
+            assert!(events.iter().all(|v| v.get(key).is_some()), "missing {key}");
+        }
     }
 }

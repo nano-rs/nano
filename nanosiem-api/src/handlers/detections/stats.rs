@@ -81,7 +81,10 @@ pub async fn trigger_detection(
             .build(),
     );
 
-    Ok(Json(serde_json::json!({"triggered": true, "rule_id": *id})))
+    Ok(Json(serde_json::json!({
+        "triggered": true,
+        "rule_id": nanosiem_core::typeid::encode("rule", &*id),
+    })))
 }
 
 /// Get daily stats for all detection rules (for sparkline charts)
@@ -132,7 +135,7 @@ pub async fn get_detection_stats(
 /// Returns the number of detection_matches rows recorded today (UTC) for each rule.
 /// One row per Grouped-mode firing, one row per event for PerEvent rules — this
 /// matches what the rule-detail "Today · hour by hour" strip shows, rather than
-/// the summed underlying event count tracked in detection_daily_stats (NAN-812).
+/// the summed underlying event count tracked in detection_daily_stats.
 #[utoipa::path(
     get,
     path = "/api/rules/today-counts",

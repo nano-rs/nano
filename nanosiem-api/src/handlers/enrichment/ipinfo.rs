@@ -143,7 +143,7 @@ pub async fn sync_ipinfo(
                         // TODO(NAN-1728 H3 follow-up): dict reads staging refreshed on
                         // a schedule — a REFRESH VIEW (+ WAIT) before reload would make
                         // the freshly synced CIDRs visible immediately. Deferred.
-                        {
+                        if !enrichment_guard.uses_ipinfo_mmdb() {
                             let reload_sql = format!(
                                 "SYSTEM RELOAD DICTIONARY{on_cluster} nanosiem.ip_enrichment_dict",
                                 on_cluster = nanosiem_core::db::dual_pool::on_cluster_clause()

@@ -19,8 +19,10 @@
 //! Postgres regardless of backend; only the row data placement differs. Both
 //! impls therefore carry the Postgres pool for the registry methods.
 //!
-//! The active backend is selected at runtime by `LOOKUP_STORAGE_BACKEND`
-//! (default `clickhouse`; `postgres` is rollback-only) — see
+//! The active backend is selected at runtime by `LOOKUP_STORAGE_BACKEND`.
+//! Legacy ClickHouse event deployments retain the `clickhouse` default, while
+//! the primary lake lane defaults lookup rows to PostgreSQL so an unset flag
+//! cannot quietly reintroduce a ClickHouse data dependency — see
 //! [`LookupStorageBackend`].
 
 use async_trait::async_trait;
@@ -39,6 +41,8 @@ pub enum LookupRepositoryError {
     ClickHouseError(String),
     #[error("Lookup table not found: {0}")]
     TableNotFound(String),
+    #[error("Lookup table is still referenced by related records")]
+    ReferenceConflict,
     #[error("Lookup table already exists: {0}")]
     TableAlreadyExists(String),
     #[error("Invalid column name: {0}")]
@@ -68,10 +72,11 @@ pub struct RuleReferenceRow {
 /// Selects which storage backend holds lookup ROW DATA (NAN-1581).
 ///
 /// The registry always lives in Postgres; this only toggles where row data is
-/// read from and written to. Defaults to `ClickHouse` — moving lookup row data
-/// off Postgres is the intended state. `LOOKUP_STORAGE_BACKEND=postgres` remains
-/// solely as an emergency operator rollback (the legacy per-name PG tables are
-/// kept one release for that); it is not the default and not where we're going.
+/// read from and written to. The default follows the event backend: legacy
+/// deployments use ClickHouse, while the lake (`NANO_LOG_QUERY_BACKEND` unset
+/// or `lake`) uses PostgreSQL. An explicit `LOOKUP_STORAGE_BACKEND` remains available during
+/// migration. A larger lake-native reference-data service can implement the
+/// same [`LookupStore`] boundary without changing query semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupStorageBackend {
     Postgres,
@@ -81,14 +86,38 @@ pub enum LookupStorageBackend {
 impl LookupStorageBackend {
     /// Resolve the backend from the `LOOKUP_STORAGE_BACKEND` env var.
     ///
-    /// Default (unset) is `ClickHouse`. Accepts `clickhouse`/`postgres`
-    /// (case-insensitive); `postgres` is the emergency rollback only. An
-    /// unrecognized value logs a warning and uses the `ClickHouse` default
-    /// rather than failing boot.
+    /// Accepts `clickhouse`/`postgres` (case-insensitive). When unset, or when
+    /// an invalid value is supplied, the primary lake lane defaults to
+    /// PostgreSQL and all other modes retain the legacy ClickHouse default.
     pub fn from_env() -> Self {
+        let default = Self::default_for_log_backend(
+            std::env::var(crate::schema::LOG_QUERY_BACKEND_ENV)
+                .ok()
+                .as_deref(),
+        );
         match std::env::var("LOOKUP_STORAGE_BACKEND") {
-            Ok(v) => Self::from_str(&v),
-            Err(_) => Self::ClickHouse,
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "clickhouse" | "ch" => Self::ClickHouse,
+                "postgres" | "postgresql" | "pg" => Self::Postgres,
+                other => {
+                    tracing::warn!(
+                        value = %other,
+                        fallback = ?default,
+                        "Unrecognized LOOKUP_STORAGE_BACKEND; using event-backend default"
+                    );
+                    default
+                }
+            },
+            Err(_) => default,
+        }
+    }
+
+    fn default_for_log_backend(log_backend: Option<&str>) -> Self {
+        // NAN-3491: unset selects the lake, like every backend reader.
+        if crate::schema::runtime_profile::log_query_backend_from_value(log_backend).is_ok() {
+            Self::Postgres
+        } else {
+            Self::ClickHouse
         }
     }
 
@@ -104,6 +133,38 @@ impl LookupStorageBackend {
                 );
                 Self::ClickHouse
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_selection_tests {
+    use super::LookupStorageBackend;
+
+    #[test]
+    fn primary_lake_default_has_no_clickhouse_lookup_dependency() {
+        assert_eq!(
+            LookupStorageBackend::default_for_log_backend(Some("lake")),
+            LookupStorageBackend::Postgres
+        );
+        assert_eq!(
+            LookupStorageBackend::default_for_log_backend(Some(" LAKE ")),
+            LookupStorageBackend::Postgres
+        );
+        // NAN-3491: unset is the lake.
+        assert_eq!(
+            LookupStorageBackend::default_for_log_backend(None),
+            LookupStorageBackend::Postgres
+        );
+    }
+
+    #[test]
+    fn legacy_and_shadow_modes_keep_clickhouse_default() {
+        for backend in [Some("clickhouse"), Some("shadow"), Some("unknown")] {
+            assert_eq!(
+                LookupStorageBackend::default_for_log_backend(backend),
+                LookupStorageBackend::ClickHouse
+            );
         }
     }
 }
@@ -134,6 +195,13 @@ pub trait LookupStore: Send + Sync {
         size_bytes: i64,
     ) -> Result<(), LookupRepositoryError>;
     async fn unregister_table(&self, name: &str) -> Result<LookupTable, LookupRepositoryError>;
+    /// Remove row storage and its registry entry. PostgreSQL overrides this so
+    /// both changes commit (or roll back) together.
+    async fn delete_table(&self, table: &LookupTable) -> Result<(), LookupRepositoryError> {
+        self.drop_dynamic_table(&table.table_name).await?;
+        self.unregister_table(&table.name).await?;
+        Ok(())
+    }
     async fn update_table_columns(
         &self,
         name: &str,
@@ -153,8 +221,7 @@ pub trait LookupStore: Send + Sync {
         primary_key: Option<&str>,
     ) -> Result<(), LookupRepositoryError>;
     async fn drop_dynamic_table(&self, table_name: &str) -> Result<(), LookupRepositoryError>;
-    async fn truncate_dynamic_table(&self, table_name: &str)
-        -> Result<(), LookupRepositoryError>;
+    async fn truncate_dynamic_table(&self, table_name: &str) -> Result<(), LookupRepositoryError>;
     #[allow(clippy::too_many_arguments)]
     async fn swap_staged_table(
         &self,
@@ -238,8 +305,7 @@ pub trait LookupStore: Send + Sync {
         columns: &[LookupColumn],
         record: &HashMap<String, serde_json::Value>,
     ) -> Result<(), LookupRepositoryError>;
-    async fn delete_row(&self, table_name: &str, row_id: i64)
-        -> Result<(), LookupRepositoryError>;
+    async fn delete_row(&self, table_name: &str, row_id: i64) -> Result<(), LookupRepositoryError>;
     async fn delete_rows(
         &self,
         table_name: &str,

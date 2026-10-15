@@ -3,7 +3,10 @@
 //! Unit tests for report rendering + type parsing (NAN-1793). Pure — no DB.
 
 use super::render::*;
-use super::service::validate_cron_interval;
+use super::service::{
+    companion_provenance_field, distinct_source_types_over_field, report_companion_query,
+    validate_cron_interval,
+};
 use super::types::*;
 use serde_json::json;
 
@@ -27,7 +30,10 @@ fn cron_interval_accepts_reasonable_schedules() {
     assert!(validate_cron_interval("*/5 * * * *").is_ok(), "every 5 min");
     assert!(validate_cron_interval("0 * * * *").is_ok(), "hourly");
     assert!(validate_cron_interval("0 8 * * *").is_ok(), "daily 08:00");
-    assert!(validate_cron_interval("0 8 * * 1").is_ok(), "weekly Mon 08:00");
+    assert!(
+        validate_cron_interval("0 8 * * 1").is_ok(),
+        "weekly Mon 08:00"
+    );
 }
 
 fn rows_two_col() -> Vec<serde_json::Value> {
@@ -40,7 +46,10 @@ fn rows_two_col() -> Vec<serde_json::Value> {
 
 #[test]
 fn source_type_roundtrip() {
-    assert_eq!(ReportSourceType::from_str("search"), Some(ReportSourceType::Search));
+    assert_eq!(
+        ReportSourceType::from_str("search"),
+        Some(ReportSourceType::Search)
+    );
     assert_eq!(
         ReportSourceType::from_str("dashboard"),
         Some(ReportSourceType::Dashboard)
@@ -48,6 +57,34 @@ fn source_type_roundtrip() {
     assert_eq!(ReportSourceType::from_str("bogus"), None);
     assert_eq!(ReportSourceType::Search.as_str(), "search");
     assert_eq!(ReportSourceType::Dashboard.as_str(), "dashboard");
+}
+
+#[test]
+fn ocsf_report_provenance_reads_nested_and_projected_log_source() {
+    let rows = vec![
+        json!({"metadata": {"log_source": " Windows_Sysmon "}}),
+        json!({"metadata.log_source": "conduit_proxy", "count": 2}),
+    ];
+    assert_eq!(
+        distinct_source_types_over_field(&rows, "metadata.log_source")
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["conduit_proxy", "windows_sysmon"]
+    );
+    let (types, trustworthy) = companion_provenance_field(&rows, "metadata.log_source");
+    assert!(trustworthy);
+    assert_eq!(
+        types.into_iter().collect::<Vec<_>>(),
+        vec!["conduit_proxy", "windows_sysmon"]
+    );
+    assert_eq!(
+        report_companion_query(
+            "metadata.log_source=windows_sysmon | table class_uid",
+            "metadata.log_source"
+        )
+        .as_deref(),
+        Some("metadata.log_source=windows_sysmon | stats count by metadata.log_source")
+    );
 }
 
 #[test]
@@ -72,10 +109,7 @@ fn csv_escapes_commas_and_quotes_rfc4180() {
     // Header + CRLF line endings.
     assert!(text.starts_with("src_ip,count\r\n"));
     // A field with a comma and a quote must be quoted and its quotes doubled.
-    assert!(
-        text.contains("\"quote\"\"comma,val\",1\r\n"),
-        "got: {text}"
-    );
+    assert!(text.contains("\"quote\"\"comma,val\",1\r\n"), "got: {text}");
 }
 
 #[test]
@@ -128,9 +162,15 @@ fn csv_preserves_genuine_negative_numbers() {
     let (bytes, _) = render_csv(&rows, &cols, 100_000);
     let text = String::from_utf8(bytes).unwrap();
 
-    assert!(text.contains("-5,-1.25"), "negative numbers stay numeric: {text}");
+    assert!(
+        text.contains("-5,-1.25"),
+        "negative numbers stay numeric: {text}"
+    );
     // `-5+3` is a formula, not a number → neutralized.
-    assert!(text.contains("'-5+3"), "formula-shaped value neutralized: {text}");
+    assert!(
+        text.contains("'-5+3"),
+        "formula-shaped value neutralized: {text}"
+    );
 }
 
 #[test]
@@ -187,7 +227,10 @@ fn search_html_flags_result_truncation() {
         1_000_000,
     );
     let html = String::from_utf8(bytes).unwrap();
-    assert!(html.contains("truncated"), "must surface a truncation banner");
+    assert!(
+        html.contains("truncated"),
+        "must surface a truncation banner"
+    );
 }
 
 #[test]
@@ -236,13 +279,29 @@ fn dashboard_html_renders_chart_table_error_and_unsupported() {
         },
     ];
 
-    let (bytes, _trunc) =
-        render_dashboard_html("Ops", "Ops Dashboard", now - chrono::Duration::hours(6), now, now, &panels, 1_000_000);
+    let (bytes, _trunc) = render_dashboard_html(
+        "Ops",
+        "Ops Dashboard",
+        now - chrono::Duration::hours(6),
+        now,
+        now,
+        &panels,
+        1_000_000,
+    );
     let html = String::from_utf8(bytes).unwrap();
 
-    assert!(html.contains("<svg"), "line panel should render an inline SVG");
-    assert!(html.contains("Top hosts") && html.contains("<table>"), "table panel");
-    assert!(html.contains("Panel failed") && html.contains("parse error"), "error panel");
+    assert!(
+        html.contains("<svg"),
+        "line panel should render an inline SVG"
+    );
+    assert!(
+        html.contains("Top hosts") && html.contains("<table>"),
+        "table panel"
+    );
+    assert!(
+        html.contains("Panel failed") && html.contains("parse error"),
+        "error panel"
+    );
     assert!(html.contains("Metric widget"), "unsupported panel note");
     // Offline-safe.
     assert!(!html.contains("http://") && !html.contains("https://"));
@@ -259,7 +318,15 @@ fn dashboard_html_handles_empty_panel() {
         error: None,
         unsupported: None,
     }];
-    let (bytes, _) = render_dashboard_html("R", "D", now - chrono::Duration::hours(1), now, now, &panels, 1_000_000);
+    let (bytes, _) = render_dashboard_html(
+        "R",
+        "D",
+        now - chrono::Duration::hours(1),
+        now,
+        now,
+        &panels,
+        1_000_000,
+    );
     let html = String::from_utf8(bytes).unwrap();
     assert!(html.contains("No data in the window"));
 }
@@ -282,8 +349,16 @@ mod download_predicate {
     #[test]
     fn unrestricted_requester_always_allowed() {
         // Empty deny set → allow regardless of manifest/completeness.
-        assert!(report_artifact_download_allowed(&deny(&[]), &manifest(&["insider_threat"]), true));
-        assert!(report_artifact_download_allowed(&deny(&[]), &manifest(&[]), false));
+        assert!(report_artifact_download_allowed(
+            &deny(&[]),
+            &manifest(&["insider_threat"]),
+            true
+        ));
+        assert!(report_artifact_download_allowed(
+            &deny(&[]),
+            &manifest(&[]),
+            false
+        ));
     }
 
     #[test]
@@ -309,7 +384,11 @@ mod download_predicate {
     fn incomplete_manifest_denies_every_restricted_requester() {
         // The pre-feature default ('{}' + complete=false): a restricted requester
         // is denied even though the manifest is empty (bytes may contain anything).
-        assert!(!report_artifact_download_allowed(&deny(&["insider_threat"]), &manifest(&[]), false));
+        assert!(!report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &manifest(&[]),
+            false
+        ));
         // Even a non-overlapping incomplete manifest denies.
         assert!(!report_artifact_download_allowed(
             &deny(&["insider_threat"]),
@@ -333,7 +412,11 @@ mod download_predicate {
     fn complete_empty_manifest_allows_restricted_requester() {
         // A COMPLETE empty manifest means a genuinely empty artifact (0 rows) —
         // nothing to protect, so even a restricted requester may download.
-        assert!(report_artifact_download_allowed(&deny(&["insider_threat"]), &manifest(&[]), true));
+        assert!(report_artifact_download_allowed(
+            &deny(&["insider_threat"]),
+            &manifest(&[]),
+            true
+        ));
     }
 
     /// NAN-2155: an ENGINE-written unresolved-provenance manifest is denied to
@@ -350,7 +433,11 @@ mod download_predicate {
             true,
         ));
         // Unrestricted requesters are unaffected — the artifact stays triageable.
-        assert!(report_artifact_download_allowed(&deny(&[]), &unresolved, true));
+        assert!(report_artifact_download_allowed(
+            &deny(&[]),
+            &unresolved,
+            true
+        ));
     }
 }
 
@@ -460,16 +547,24 @@ fn execution_authorization_precedes_search_artifacts_and_notifications() {
     let authorize = body
         .find("self.authorize_execution(def)")
         .expect("authoritative execution gate");
-    let scope = body.find("self.owner_scope(def)").expect("source resolution");
+    let scope = body
+        .find("self.owner_scope(def)")
+        .expect("source resolution");
     let requester = body
         .find("requester_can_search_sql == Some(false)")
         .expect("manual requester SQL recheck");
     let produce = body
         .find("self.produce(def, &scope, &authorization)")
         .expect("search work from the authorized source snapshot");
-    let success = body.find(".store_run_success(").expect("artifact persistence");
-    let notify = body.find("self.notify_ready(").expect("notification side effect");
-    let failure = body.find(".store_run_failure(").expect("failed-run recording");
+    let success = body
+        .find(".store_run_success(")
+        .expect("artifact persistence");
+    let notify = body
+        .find("self.notify_ready(")
+        .expect("notification side effect");
+    let failure = body
+        .find(".store_run_failure(")
+        .expect("failed-run recording");
 
     assert!(
         running < authorize,

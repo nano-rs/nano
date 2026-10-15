@@ -175,7 +175,7 @@ fn parse_collector_error_rows(body: &str) -> (Vec<CollectorError>, i64) {
 /// in every hint we ever show. Vector's own text is always quoted alongside,
 /// so the reader can see what was actually said rather than only our reading
 /// of it.
-fn collector_error_hint(errors: &[CollectorError]) -> Option<String> {
+pub fn collector_error_hint(errors: &[CollectorError]) -> Option<String> {
     let fetch_failure = errors
         .iter()
         .find(|e| AWS_FETCH_ERROR_CODES.contains(&e.error_code.as_str()))?;
@@ -450,6 +450,9 @@ impl LogSourceRepository {
             collector_errors: Vec::new(),
             collector_errors_24h: 0,
             collector_error_hint: None,
+            refused_events_24h: None,
+            last_refusal: None,
+            pending_reason: None,
         })
     }
 
@@ -646,6 +649,9 @@ impl LogSourceRepository {
             collector_errors,
             collector_errors_24h,
             collector_error_hint,
+            refused_events_24h: None,
+            last_refusal: None,
+            pending_reason: None,
         })
     }
 
@@ -676,8 +682,9 @@ impl LogSourceRepository {
         while let Ok(Some(chunk)) = cursor.next().await {
             bytes.extend_from_slice(&chunk);
         }
-        let body = String::from_utf8(bytes)
-            .map_err(|e| LogSourceRepositoryError::ClickHouseError(format!("Invalid UTF-8: {e}")))?;
+        let body = String::from_utf8(bytes).map_err(|e| {
+            LogSourceRepositoryError::ClickHouseError(format!("Invalid UTF-8: {e}"))
+        })?;
         // (query construction lives in `build_collector_error_query` so it can
         // be asserted without a ClickHouse instance)
 

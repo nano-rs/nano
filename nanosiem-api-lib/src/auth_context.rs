@@ -1,8 +1,10 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Authentication context extracted from incoming requests, plus the
 //! permission-check helpers handlers use to enforce RBAC.
 //!
 //! These types are shared between `nanosiem-api` (where the auth middleware
-//! constructs them) and `nanosiem-enterprise` (where lifted handlers consume
+//! constructs them) and the enterprise crate (where lifted handlers consume
 //! them). The data shape mirrors the JWT/api-key payloads issued by
 //! `nanosiem-core::auth`.
 

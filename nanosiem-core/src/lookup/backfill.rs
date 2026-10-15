@@ -82,12 +82,11 @@ impl BackfillReport {
 /// being copied. Returns `false` on any query error (fail-open — never block the
 /// API on a bookkeeping read).
 pub async fn is_backfill_in_progress(pg: &PgPool) -> bool {
-    let res: Result<Option<(String,)>, _> = sqlx::query_as(
-        "SELECT state FROM lookup_backfill_state WHERE table_name = $1",
-    )
-    .bind(GLOBAL_CLAIM)
-    .fetch_optional(pg)
-    .await;
+    let res: Result<Option<(String,)>, _> =
+        sqlx::query_as("SELECT state FROM lookup_backfill_state WHERE table_name = $1")
+            .bind(GLOBAL_CLAIM)
+            .fetch_optional(pg)
+            .await;
     matches!(res, Ok(Some((s,))) if s == "claimed")
 }
 
@@ -167,14 +166,16 @@ pub async fn backfill_pg_to_clickhouse(
 
         // Read ALL rows from the physical Postgres table (paged), including the
         // `_row_id` surrogate which becomes the CH `row_id`.
-        let (rows, pg_count) =
-            match pg_repo.list_rows(&table.table_name, MAX_LOOKUP_TABLE_ROWS, 0).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(table = %table.name, error = %e, "lookup backfill: failed to read PG rows; leaving table for retry");
-                    continue;
-                }
-            };
+        let (rows, pg_count) = match pg_repo
+            .list_rows(&table.table_name, MAX_LOOKUP_TABLE_ROWS, 0)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(table = %table.name, error = %e, "lookup backfill: failed to read PG rows; leaving table for retry");
+                continue;
+            }
+        };
 
         // Copy into ClickHouse, preserving _row_id and deriving the key from the
         // primary-key column.
@@ -279,12 +280,11 @@ async fn release_global(pg: &PgPool) -> Result<(), sqlx::Error> {
 
 /// Whether a per-table DONE marker exists.
 async fn table_done(pg: &PgPool, name: &str) -> Result<bool, sqlx::Error> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT state FROM lookup_backfill_state WHERE table_name = $1",
-    )
-    .bind(name)
-    .fetch_optional(pg)
-    .await?;
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM lookup_backfill_state WHERE table_name = $1")
+            .bind(name)
+            .fetch_optional(pg)
+            .await?;
     Ok(matches!(row, Some((s,)) if s == "done"))
 }
 
@@ -346,7 +346,7 @@ mod tests {
             ClickHouseLookupRepository::encode_record(key_field, &cols, &rec);
         assert_eq!(key_raw, "Alice");
         assert_eq!(key_raw.to_lowercase(), "alice"); // key_lc derivation
-        // The key column is excluded from cols_json; the other columns remain.
+                                                     // The key column is excluded from cols_json; the other columns remain.
         assert!(!cols_json.contains_key("owner"));
         assert_eq!(cols_json.get("host"), Some(&serde_json::json!("WS01")));
         assert_eq!(cols_json.get("risk"), Some(&serde_json::json!(9)));
@@ -360,10 +360,7 @@ mod tests {
     fn pg_row_id_maps_to_ch_row_id() {
         let mut rec = HashMap::new();
         rec.insert("_row_id".to_string(), serde_json::json!(123));
-        let row_id = rec
-            .get("_row_id")
-            .and_then(|v| v.as_u64())
-            .unwrap();
+        let row_id = rec.get("_row_id").and_then(|v| v.as_u64()).unwrap();
         assert_eq!(row_id, 123);
     }
 

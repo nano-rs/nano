@@ -5,9 +5,14 @@
  * Handles search operations, saved searches, query explanations, and asset artifacts
  */
 
+import { abortableDelay } from '../abortable-delay';
+import { authenticatedFetch } from '../authenticated-fetch';
+import { SessionExpiredError } from '../request-credentials';
+
 import type {
   SearchRequest,
   SearchResponse,
+  SearchJobResultPage,
   RawSqlRequest,
   TimeRange,
   SavedSearch,
@@ -55,8 +60,21 @@ import type {
   ListTracesResponse,
   MetricNamesResponse,
   RetroRequest,
-  RetroResponse,
+  SearchHistogramRequest,
+  SearchHistogramResponse,
 } from './types';
+import { browserTenantRuntime } from '@/lib/tenant-runtime';
+
+import { retrySearchAuthority, type AuthorityRetryOptions } from './search-authority-retry';
+
+/**
+ * NAN-3229: tells `POST /api/search` whether this caller polls an
+ * `AsyncSearchResponse`. NAN-3474: the server moves a search still running at
+ * its interactive deadline to a job for every caller that does not send `0`;
+ * `searchInteractive` follows the job, the atomic `search` (rows only) opts
+ * out and keeps the synchronous answer.
+ */
+export const ACCEPT_ASYNC_HEADER = 'x-nano-accept-async';
 
 export class SearchApi {
   constructor(
@@ -65,15 +83,49 @@ export class SearchApi {
       options?: RequestInit,
       cacheOpts?: import('./index').CacheRequestOpts
     ) => Promise<T>,
-    private getAccessToken?: () => string | null,
+    _getAccessToken?: () => string | null,
     private searchBaseUrl?: string
   ) {}
 
   // Core search endpoints
   async search(request: SearchRequest): Promise<SearchResponse> {
     return this.request('/api/search', {
+      // Callers render `results` only; never hand them a job id at the deadline.
+      headers: { [ACCEPT_ASYNC_HEADER]: '0' },
       method: 'POST',
       body: JSON.stringify(request),
+    });
+  }
+
+  /**
+   * Interactive admission may escalate to an existing durable job: when the
+   * query is resource-bound, or (NAN-3229, `x-nano-accept-async`) when it is
+   * still running at the server's interactive deadline (45 s), so a slow
+   * search never sits on a request past the 60 s edge.
+   */
+  async searchInteractive(
+    request: Omit<SearchRequest, 'async_mode'>,
+    retry?: AuthorityRetryOptions,
+    // NAN-3809: a settled re-served job answers `x-nano-cache: hit` + age.
+    onCacheMeta?: (meta: import('./index').CacheMeta) => void,
+  ): Promise<SearchResponse | AsyncSearchResponse> {
+    return retrySearchAuthority(() => this.request<SearchResponse | AsyncSearchResponse>('/api/search', {
+      headers: { 'x-nano-progressive-views': '1', [ACCEPT_ASYNC_HEADER]: '1' },
+      method: 'POST',
+      body: JSON.stringify(request),
+    }, onCacheMeta ? { onMeta: onCacheMeta } : undefined), retry);
+  }
+
+  /**
+   * NAN-3093: the search's timeline alone. The Search page asks for it beside
+   * a rows request sent with `skip_histogram`, so rows paint without waiting
+   * for the histogram companion.
+   */
+  async searchHistogram(request: SearchHistogramRequest, signal?: AbortSignal): Promise<SearchHistogramResponse> {
+    return this.request('/api/search/histogram', {
+      method: 'POST',
+      body: JSON.stringify(request),
+      signal,
     });
   }
 
@@ -108,8 +160,9 @@ export class SearchApi {
   // NAN-1032: pass sourceType when known so ClickHouse can use the
   // (source_type, timestamp, ...) PK index for a tight range read — without it,
   // S3-backed historical lookups scan every source_type's marks in the time window.
-  async fetchLog(id: string, timeRange?: TimeRange, sourceType?: string): Promise<{ event: Record<string, unknown> | null }> {
+  async fetchLog(id: string, timeRange?: TimeRange, sourceType?: string, signal?: AbortSignal): Promise<{ event: Record<string, unknown> | null }> {
     return this.request('/api/search/log', {
+      signal,
       method: 'POST',
       body: JSON.stringify({ id, time_range: timeRange, source_type: sourceType }),
     });
@@ -339,7 +392,7 @@ export class SearchApi {
   async getRetro(
     request: RetroRequest,
     cacheOpts?: import('./index').CacheRequestOpts
-  ): Promise<RetroResponse> {
+  ): Promise<import('./types').RetroResultResponse> {
     return this.request(
       '/api/search/retro',
       {
@@ -432,19 +485,30 @@ export class SearchApi {
    * Start an async search and return immediately with a job ID.
    * Use getSearchJob() to poll for results.
    */
-  async searchAsync(request: Omit<SearchRequest, 'async_mode'>): Promise<AsyncSearchResponse> {
-    return this.request('/api/search', {
+  async searchAsync(request: Omit<SearchRequest, 'async_mode'>, retry?: AuthorityRetryOptions, signal?: AbortSignal): Promise<AsyncSearchResponse> {
+    return retrySearchAuthority(() => this.request<AsyncSearchResponse>('/api/search', {
+      signal,
       method: 'POST',
       body: JSON.stringify({ ...request, async_mode: true }),
-    });
+    }), signal ? { ...retry, isCancelled: () => signal.aborted || !!retry?.isCancelled?.() } : retry, ms => abortableDelay(ms, signal));
+  }
+
+  async getTreePage(request: import('./types').TreePageRequest, signal?: AbortSignal): Promise<import('./types').TreePageResponse> {
+    return retrySearchAuthority(() => this.request<import('./types').TreePageResponse>('/api/search/tree-page', { method: 'POST', body: JSON.stringify(request), signal }), signal ? { isCancelled: () => signal.aborted } : undefined, ms => abortableDelay(ms, signal));
   }
 
   /**
    * Get the status of an async search job.
    * Returns progress while running, results when completed.
    */
-  async getSearchJob(jobId: string): Promise<SearchJobStatus> {
-    return this.request(`/api/search/jobs/${jobId}`);
+  async getSearchJob(jobId: string, retry?: AuthorityRetryOptions, signal?: AbortSignal): Promise<SearchJobStatus> {
+    return retrySearchAuthority(() => this.request<SearchJobStatus>(`/api/search/jobs/${jobId}`, { signal }), signal ? { ...retry, isCancelled: () => signal.aborted || !!retry?.isCancelled?.() } : retry, ms => abortableDelay(ms, signal));
+  }
+
+  async getSearchJobResultPage(jobId: string, page: number, signal?: AbortSignal): Promise<SearchJobResultPage> {
+    return this.request(
+      `/api/search/jobs/${encodeURIComponent(jobId)}/results/${page}`, { signal }
+    );
   }
 
   /**
@@ -498,36 +562,46 @@ export class SearchApi {
   searchStreamSSE(
     request: Omit<SearchRequest, 'async_mode'>,
     callbacks: SearchStreamCallbacks,
-    opts?: { bypass?: boolean }
+    opts?: { bypass?: boolean; follow?: boolean }
   ): AbortController {
     const controller = new AbortController();
+    const capturedRuntime = browserTenantRuntime.current();
 
-    const token = this.getAccessToken?.();
     const baseUrl = this.searchBaseUrl ?? '';
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream',
       // NAN-1595: refresh forces a live server recompute (bypasses Dragonfly).
       ...(opts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
+      ...(opts?.follow ? { 'x-nano-follow': 'true' } : {}),
     };
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-
-    fetch(`${baseUrl}/api/search/stream`, {
+    authenticatedFetch('/api/search/stream', `${baseUrl}/api/search/stream`, {
       method: 'POST',
       headers,
       body: JSON.stringify(request),
       signal: controller.signal,
-    }).then(async (response) => {
+    }, () => browserTenantRuntime.assertCurrent(capturedRuntime)).then(async (response) => {
+      if (!browserTenantRuntime.isCurrent(capturedRuntime)) {
+        controller.abort();
+        return;
+      }
       if (!response.ok) {
         const errorText = await response.text();
         let errorMsg = errorText;
+        let errorCode = 'HTTP_ERROR';
+        let coldScan: Partial<import('./types').SearchStreamError> = {};
         try {
           const errorJson = JSON.parse(errorText);
           errorMsg = errorJson?.error?.message || errorJson?.message || errorText;
+          // NAN-3644: the reader's cold-read ceiling; COLD_BUDGET_EXCEEDED is
+          // the retired per-query refusal a mid-roll service may still send.
+          if (errorJson?.error?.code === 'COLD_SCAN_TOO_LARGE' || errorJson?.error?.code === 'COLD_BUDGET_EXCEEDED') {
+            errorCode = errorJson.error.code;
+            const { reason, needed_bytes, ceiling_bytes, background_ceiling_bytes, budget_bytes, retryable } = errorJson.error;
+            coldScan = { reason, needed_bytes, ceiling_bytes, background_ceiling_bytes, budget_bytes, retryable };
+          }
         } catch { /* use raw text */ }
-        callbacks.onError?.({ code: 'HTTP_ERROR', message: errorMsg });
+        callbacks.onError?.({ ...coldScan, code: errorCode, message: errorMsg });
         return;
       }
 
@@ -553,6 +627,10 @@ export class SearchApi {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (!browserTenantRuntime.isCurrent(capturedRuntime)) {
+          await reader.cancel();
+          return;
+        }
 
         buffer += decoder.decode(value, { stream: true });
 
@@ -567,7 +645,12 @@ export class SearchApi {
         }
 
         for (const line of lines) {
-          // SSE comment (keepalive)
+          if (!browserTenantRuntime.isCurrent(capturedRuntime)) {
+            await reader.cancel();
+            return;
+          }
+          // SSE comment (transport keepalive). Not a follow heartbeat: the
+          // handler writes it even while the follow itself is stuck (NAN-3264).
           if (line.startsWith(':')) continue;
 
           // Event type line
@@ -591,8 +674,14 @@ export class SearchApi {
                 case 'started':
                   callbacks.onStarted?.(parsed.data ?? parsed);
                   break;
+                case 'heartbeat':
+                  callbacks.onHeartbeat?.(parsed.data ?? parsed);
+                  break;
                 case 'progress':
                   callbacks.onProgress?.(parsed.data ?? parsed);
+                  break;
+                case 'view_update':
+                  callbacks.onViewUpdate?.(parsed.data ?? parsed);
                   break;
                 case 'rows':
                   callbacks.onRows?.(parsed.data ?? parsed);
@@ -607,6 +696,12 @@ export class SearchApi {
                   callbacks.onError?.(parsed.data ?? parsed);
                   return;
                 case 'done':
+                  // NAN-3244: a follow stream that ends without `completed`
+                  // or `error` must still tell the caller, or the tail
+                  // silently stops while the UI says it is live.
+                  if (opts?.follow && !controller.signal.aborted && browserTenantRuntime.isCurrent(capturedRuntime)) {
+                    callbacks.onError?.({ code: 'NETWORK_ERROR', message: 'Follow stream closed' });
+                  }
                   return;
               }
             } catch (e) {
@@ -617,8 +712,11 @@ export class SearchApi {
           }
         }
       }
+      if (opts?.follow && !controller.signal.aborted && browserTenantRuntime.isCurrent(capturedRuntime)) {
+        callbacks.onError?.({ code: 'NETWORK_ERROR', message: 'Follow stream closed' });
+      }
     }).catch((error) => {
-      if (error.name !== 'AbortError') {
+      if (!(error instanceof SessionExpiredError) && error.name !== 'AbortError' && browserTenantRuntime.isCurrent(capturedRuntime)) {
         callbacks.onError?.({ code: 'NETWORK_ERROR', message: error.message });
       }
     });

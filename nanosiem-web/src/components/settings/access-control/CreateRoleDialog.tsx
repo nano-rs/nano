@@ -8,7 +8,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { Shield, Loader2, Check } from 'lucide-react';
+import { Shield, Check } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import {
@@ -282,7 +283,7 @@ export function CreateRoleDialog({
             Cancel
           </Button>
           <Button size="sm" onClick={handleSubmit} disabled={!canSubmit} className="h-7 text-[11.5px]">
-            {saving && <Loader2 className="w-3 h-3 animate-spin" />}
+            {saving && <LoadingIcon className="w-3 h-3" />}
             {isEditing ? 'Save role' : isDuplicating ? 'Create copy' : 'Create role'}
           </Button>
         </SheetFooter>

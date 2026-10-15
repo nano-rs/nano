@@ -11,7 +11,7 @@ pub struct ParseError {
     pub position: usize,
     /// Line number (1-indexed)
     pub line: usize,
-    /// Column number (1-indexed)  
+    /// Column number (1-indexed)
     pub column: usize,
     /// The problematic token text
     pub token: Option<String>,
@@ -92,6 +92,25 @@ pub(crate) fn convert_error(input: &str, error: nom::error::Error<&str>) -> Pars
             context_before: None,
             expected: vec![],
             suggestions: vec![],
+            full_query: Some(input.to_string()),
+        };
+    }
+
+    // NAN-2361: a bare or misspelled command unwinds the parser all the way to
+    // the PIPE, so nom's position points at the one character that was fine
+    // (`| tree` reported `Unexpected token '|'` with the caret on the pipe).
+    // Re-anchor onto the command word before any position-based analysis runs.
+    if let Some(diagnostic) = bare_command_diagnostic(input) {
+        let (line, column) = calculate_position(input, diagnostic.position);
+        return ParseError {
+            message: diagnostic.message,
+            position: diagnostic.position,
+            line,
+            column,
+            token: Some(diagnostic.token),
+            context_before: extract_context_before(input, diagnostic.position),
+            expected: diagnostic.expected,
+            suggestions: diagnostic.suggestions,
             full_query: Some(input.to_string()),
         };
     }
@@ -261,6 +280,146 @@ pub(crate) fn rewrite_spl_escaped_double_quote(
 /// conditions are needed: a query that merely CONTAINS `\"` may be a perfectly
 /// valid trailing-backslash path (`file_path="C:\Windows\"`) that failed later
 /// for an unrelated reason, and must not be mislabelled.
+/// Commands that cannot stand alone, with the shape they actually want.
+///
+/// NAN-2361: a bare argument-taking command reported `Unexpected token '|'`,
+/// pointing the caret at the PIPE — the one character that was fine. `| tree`
+/// is the common way to hit it, but 24 commands share the failure: the parser
+/// consumes the name, needs whitespace-then-arguments, finds end-of-input, and
+/// unwinds until the pipe is the only thing left to blame. Naming the command
+/// and showing its form is strictly more useful than any position-based guess.
+///
+/// Verified by parsing `* | <cmd>` for every known command: `head`, `tail`,
+/// `fillnull`, `spath`, `format`, `asset` and `retro` are legitimately bare and
+/// are therefore absent here.
+pub(crate) const COMMANDS_REQUIRING_ARGUMENTS: &[(&str, &str)] = &[
+    ("tree", "tree process"),
+    ("stats", "stats count by src_ip"),
+    ("table", "table timestamp, src_ip, user"),
+    ("sort", "sort -count"),
+    ("dedup", "dedup src_ip"),
+    ("where", "where count > 10"),
+    ("eval", "eval total = bytes_in + bytes_out"),
+    ("search", "search error"),
+    ("rex", "rex field=message \"(?<user>\\w+)\""),
+    ("rename", "rename src_ip AS source"),
+    ("fields", "fields src_ip, dest_ip"),
+    ("top", "top 10 src_ip"),
+    ("rare", "rare 10 src_ip"),
+    ("timechart", "timechart span=1h count"),
+    ("transaction", "transaction session_id"),
+    ("lookup", "lookup assets host OUTPUT owner"),
+    ("join", "join type=inner src_ip [search ...]"),
+    ("append", "append [search ...]"),
+    ("bin", "bin span=1h timestamp"),
+    ("mvexpand", "mvexpand tags"),
+    ("return", "return src_ip"),
+    ("risk", "risk score=20 object=user"),
+    ("prevalence", "prevalence file_hash"),
+    ("output", "output my_lookup"),
+];
+
+/// Split on `|` while ignoring pipes inside quoted strings.
+///
+/// Each element is `(byte_offset_of_segment, segment)`; the offset lets the
+/// caret point at the offending COMMAND rather than at the pipe.
+fn pipe_segments(input: &str) -> Vec<(usize, &str)> {
+    let mut segments = Vec::new();
+    let (mut start, mut quote) = (0usize, None::<char>);
+    for (index, character) in input.char_indices() {
+        match quote {
+            Some(open) if character == open => quote = None,
+            Some(_) => {}
+            None if character == '"' || character == '\'' => quote = Some(character),
+            None if character == '|' => {
+                segments.push((start, &input[start..index]));
+                start = index + character.len_utf8();
+            }
+            None => {}
+        }
+    }
+    segments.push((start, &input[start..]));
+    segments
+}
+
+/// Commands that are valid with no arguments at all.
+const COMMANDS_VALID_BARE: &[&str] = &[
+    "head", "tail", "fillnull", "spath", "format", "asset", "retro", "services",
+];
+
+/// Is this word a command the parser knows about?
+fn is_known_command(word: &str) -> bool {
+    COMMANDS_REQUIRING_ARGUMENTS
+        .iter()
+        .any(|(name, _)| word.eq_ignore_ascii_case(name))
+        || COMMANDS_VALID_BARE
+            .iter()
+            .any(|name| word.eq_ignore_ascii_case(name))
+}
+
+/// Blame the command in a pipe segment rather than the pipe itself.
+///
+/// Covers two failures that both unwind to the pipe and so were reported as
+/// `Unexpected token '|'`: a known command with no arguments, and a misspelled
+/// command. The typo case had suggestion machinery (`find_similar_command`)
+/// that was unreachable in practice — it is handed the error token, which is
+/// the pipe, never the misspelled word.
+struct BareCommandDiagnostic {
+    /// Byte offset of the command word, so the caret lands on it.
+    position: usize,
+    token: String,
+    message: String,
+    expected: Vec<String>,
+    suggestions: Vec<ErrorSuggestion>,
+}
+
+fn bare_command_diagnostic(input: &str) -> Option<BareCommandDiagnostic> {
+    // Skip the first segment: it is the search expression, not a command.
+    for (offset, segment) in pipe_segments(input).into_iter().skip(1) {
+        let trimmed = segment.trim();
+        let word_offset = offset + (segment.len() - segment.trim_start().len());
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some((command, example)) = COMMANDS_REQUIRING_ARGUMENTS
+            .iter()
+            .find(|(name, _)| trimmed.eq_ignore_ascii_case(name))
+        {
+            return Some(BareCommandDiagnostic {
+                position: word_offset,
+                token: (*command).to_string(),
+                message: format!("The '{command}' command needs arguments"),
+                expected: vec![format!("arguments for '{command}', e.g. `{example}`")],
+                suggestions: vec![ErrorSuggestion {
+                    description: format!("give '{command}' its arguments"),
+                    replacement: format!("| {example}"),
+                }],
+            });
+        }
+
+        let word = trimmed.split_whitespace().next().unwrap_or(trimmed);
+        if is_known_command(word) {
+            // A known command with arguments that failed for some other
+            // reason — leave it to the position-based analysis below.
+            continue;
+        }
+        if let Some(similar) = find_similar_command(word) {
+            return Some(BareCommandDiagnostic {
+                position: word_offset,
+                token: word.to_string(),
+                message: format!("Unknown command '{word}'"),
+                expected: vec![format!("a command name, e.g. '{similar}'")],
+                suggestions: vec![ErrorSuggestion {
+                    description: format!("did you mean the '{similar}' command?"),
+                    replacement: format!("| {similar}"),
+                }],
+            });
+        }
+    }
+    None
+}
+
 fn escaped_double_quote_diagnostic(
     input: &str,
     position: usize,
@@ -271,7 +430,7 @@ fn escaped_double_quote_diagnostic(
     }
 
     let message = "`\\\"` is not an escape sequence in nPL: a double-quoted string ends at the \
-                   FIRST `\"`, so everything after it is read as query syntax (NAN-1157 — this \
+                   FIRST `\"`, so everything after it is read as query syntax (this \
                    is what lets Windows paths like \"C:\\Windows\\System32\\\" parse). Use a \
                    SINGLE-quoted string for a pattern containing double quotes; `\"` is an \
                    ordinary character inside `'…'`."

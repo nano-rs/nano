@@ -90,15 +90,15 @@ impl DetectionRuleRepository {
         alert_count: i64,
     ) -> Result<(), DetectionRuleRepositoryError> {
         sqlx::query(
-            r#"
+            concat!(r#"
             INSERT INTO detection_daily_stats (rule_id, date, match_count, alert_count)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (rule_id, date)
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id, date)
             DO UPDATE SET
                 match_count = detection_daily_stats.match_count + EXCLUDED.match_count,
                 alert_count = detection_daily_stats.alert_count + EXCLUDED.alert_count,
                 updated_at = NOW()
-            "#,
+            "#),
         )
         .bind(rule_id)
         .bind(date)

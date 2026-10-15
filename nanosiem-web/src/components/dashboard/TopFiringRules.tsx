@@ -9,7 +9,8 @@
 
 import { Link } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Loader2, Flame, TrendingUp } from 'lucide-react';
+import { Flame, TrendingUp } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useDetections, fromApiDetection } from '@/hooks/use-api';
 import { useMemo } from 'react';
 
@@ -55,7 +56,7 @@ export function TopFiringRules() {
       <CardContent className="px-2 pb-2">
         {loading ? (
           <div className="flex items-center justify-center py-6">
-            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+            <LoadingIcon className="w-4 h-4 text-muted-foreground" />
           </div>
         ) : topRules.length === 0 ? (
           <div className="text-center py-6">

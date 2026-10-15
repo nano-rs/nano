@@ -69,8 +69,8 @@ impl K8sSecretClient {
         let ca_pem = tokio::fs::read(SA_CA_PATH)
             .await
             .map_err(|e| K8sSecretError::ReadFile(SA_CA_PATH.to_string(), e))?;
-        let host = std::env::var("KUBERNETES_SERVICE_HOST")
-            .map_err(|_| K8sSecretError::MissingApiHost)?;
+        let host =
+            std::env::var("KUBERNETES_SERVICE_HOST").map_err(|_| K8sSecretError::MissingApiHost)?;
         let port = std::env::var("KUBERNETES_SERVICE_PORT").unwrap_or_else(|_| "443".to_string());
 
         let cert = reqwest::Certificate::from_pem(&ca_pem).map_err(K8sSecretError::InvalidCa)?;

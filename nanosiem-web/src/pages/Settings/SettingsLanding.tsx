@@ -23,7 +23,7 @@ import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { useSystemConfig } from '@/hooks/use-api';
-import { useAuditLog } from '@/hooks/use-api';
+import { useRecentAuditChanges } from '@/hooks/use-api';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -262,7 +262,7 @@ function relativeAge(ts: string): string {
 function RecentChangesPreview() {
   const navigate = useNavigate();
   const query = useMemo(() => ({ limit: 6 }), []);
-  const { data, loading } = useAuditLog(query);
+  const { data, loading } = useRecentAuditChanges(query);
   const entries = data?.logs ?? [];
 
   return (
@@ -321,7 +321,7 @@ function RecentChangesPreview() {
 
 export function SettingsLanding() {
   useDocumentTitle('Settings');
-  const { hasPermission, hasAnyPermission, isDemoUser } = useAuth();
+  const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
   const { capabilities } = useCapabilities();
   const { data: systemConfig } = useSystemConfig();
   const isAirGap = systemConfig?.air_gap === true;
@@ -331,6 +331,7 @@ export function SettingsLanding() {
       .map(s => {
         if (s.capability && !capabilities[s.capability]) return null;
         if (s.demoHidden && isDemoUser) return null;
+        if (s.sharedOnly && user?.deployment_mode !== 'enterprise_shared') return null;
         if (s.airgapOnly && !isAirGap) return null;
         const ok = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
@@ -339,7 +340,7 @@ export function SettingsLanding() {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap, user?.deployment_mode]);
 
   const attention = useAttentionItems(visibleSections);
 

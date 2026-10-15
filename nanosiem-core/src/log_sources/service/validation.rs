@@ -2,14 +2,19 @@
 
 //! VRL validation operations for log sources
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::helpers::truncate;
 use super::LogSourceService;
 use super::LogSourceServiceError;
 use crate::log_sources::types::{
-    LiveTestResult, ParserTestResult, VrlDiagnostic, VrlValidationResult,
+    LiveTestResult, LogSource, ParserTestResult, VrlDiagnostic, VrlValidationResult,
 };
+
+const OCSF_DEPLOY_MAX_SAMPLES: usize = 50;
+const OCSF_DEPLOY_MAX_SAMPLE_BYTES: usize = 256 * 1024;
+const OCSF_DEPLOY_MAX_TOTAL_SAMPLE_BYTES: usize = 2 * 1024 * 1024;
 
 /// `test-live` is an interactive endpoint behind a 30-second upstream
 /// deadline. A one-day window keeps the raw-message read on recent partitions
@@ -65,11 +70,85 @@ fn live_parser_result(
         output: result.output,
         error: result.error,
         extracted_field_count,
+        schema_validation: None,
+    }
+}
+
+/// Convert the VRL engine's result into the Log Sources response, applying the
+/// OCSF contract only after VRL compiled and executed successfully.
+pub(crate) fn parser_test_result(
+    sample_log: &str,
+    result: crate::parsers::ParserTestResult,
+    validate_ocsf: bool,
+) -> ParserTestResult {
+    let extracted_field_count = count_extracted_fields(&result.output);
+    let schema_validation = if validate_ocsf && result.success {
+        result
+            .output
+            .as_ref()
+            .map(crate::parsers::validate_ocsf_event)
+    } else {
+        None
+    };
+    let schema_error = schema_validation
+        .as_ref()
+        .filter(|validation| !validation.valid)
+        .map(|validation| {
+            validation
+                .errors
+                .iter()
+                .take(5)
+                .map(|error| format!("{}: {}", error.attribute_path, error.message))
+                .collect::<Vec<_>>()
+                .join("; ")
+        });
+
+    ParserTestResult {
+        input: truncate(sample_log, 200),
+        success: result.success && schema_error.is_none(),
+        output: result.output,
+        error: result
+            .error
+            .or_else(|| schema_error.map(|error| format!("OCSF validation failed: {error}"))),
+        extracted_field_count,
+        schema_validation,
     }
 }
 
 fn distinct_current_vrl<'a>(new_vrl: &str, current_vrl: Option<&'a str>) -> Option<&'a str> {
     current_vrl.filter(|vrl| !vrl.trim().is_empty() && *vrl != new_vrl)
+}
+
+fn hash_part(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn ocsf_parser_sha256(log_source: &LogSource) -> String {
+    let mut digest = Sha256::new();
+    hash_part(&mut digest, b"nano.log-source.ocsf-parser-attestation.v1");
+    hash_part(
+        &mut digest,
+        crate::parsers::OCSF_VALIDATION_VERSION.as_bytes(),
+    );
+    hash_part(&mut digest, log_source.parser_vrl.as_bytes());
+    hash_part(&mut digest, &[u8::from(log_source.extension_enabled)]);
+    if log_source.extension_enabled {
+        hash_part(
+            &mut digest,
+            log_source.extension_vrl.as_deref().unwrap_or("").as_bytes(),
+        );
+    }
+    hex::encode(digest.finalize())
+}
+
+fn ocsf_samples_sha256(samples: &[String]) -> String {
+    let mut digest = Sha256::new();
+    hash_part(&mut digest, b"nano.log-source.ocsf-samples.v1");
+    for sample in samples {
+        hash_part(&mut digest, sample.as_bytes());
+    }
+    hex::encode(digest.finalize())
 }
 
 /// Try to extract a `line:col` position from the start of a VRL diagnostic
@@ -114,7 +193,7 @@ fn extract_code(text: &str) -> Option<String> {
 
 /// Convert a free-form error string (often a multi-line VRL formatter dump)
 /// into a structured diagnostic.
-fn diagnostic_from_error(message: &str) -> VrlDiagnostic {
+pub(crate) fn diagnostic_from_error(message: &str) -> VrlDiagnostic {
     let (line, col) = extract_line_col(message);
     VrlDiagnostic {
         severity: "error".to_string(),
@@ -128,7 +207,7 @@ fn diagnostic_from_error(message: &str) -> VrlDiagnostic {
 
 /// Convert a warning string into a structured diagnostic. Strips a leading
 /// "Warning: " prefix if present so the message doesn't double-up.
-fn diagnostic_from_warning(message: &str) -> VrlDiagnostic {
+pub(crate) fn diagnostic_from_warning(message: &str) -> VrlDiagnostic {
     let stripped = message
         .strip_prefix("Warning: ")
         .or_else(|| message.strip_prefix("VRL warning: "))
@@ -146,6 +225,223 @@ fn diagnostic_from_warning(message: &str) -> VrlDiagnostic {
 }
 
 impl LogSourceService {
+    /// Persist a receipt for the current stored parser after the interactive
+    /// test endpoint successfully validates one raw sample. If the caller was
+    /// testing an unsaved editor buffer, return `false` and leave the stored
+    /// generation untouched.
+    pub async fn record_ocsf_test_attestation(
+        &self,
+        id: Uuid,
+        parser_vrl: &str,
+        extension_vrl: Option<&str>,
+        sample: &str,
+    ) -> Result<bool, LogSourceServiceError> {
+        let profile = crate::schema::active_profile_from_env()
+            .map_err(LogSourceServiceError::OcsfValidationFailed)?;
+        if profile.id() != crate::schema::SchemaId::Ocsf {
+            return Ok(false);
+        }
+        let log_source = self.repository().find_by_id(id).await?;
+        if log_source.kind != "log" || log_source.parser_vrl != parser_vrl {
+            return Ok(false);
+        }
+        let stored_extension = log_source
+            .extension_enabled
+            .then_some(log_source.extension_vrl.as_deref())
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        let tested_extension = extension_vrl.filter(|value| !value.trim().is_empty());
+        if stored_extension != tested_extension {
+            return Ok(false);
+        }
+        if sample.len() > OCSF_DEPLOY_MAX_SAMPLE_BYTES {
+            return Err(LogSourceServiceError::OcsfValidationFailed(format!(
+                "a sample exceeds the {} byte limit",
+                OCSF_DEPLOY_MAX_SAMPLE_BYTES
+            )));
+        }
+        self.repository()
+            .set_ocsf_validation_attestation(
+                id,
+                crate::parsers::OCSF_VALIDATION_VERSION,
+                &ocsf_parser_sha256(&log_source),
+                &ocsf_samples_sha256(&[sample.to_string()]),
+                1,
+            )
+            .await?;
+        Ok(true)
+    }
+
+    /// The representative raw events a first-party library parser shipped with.
+    ///
+    /// NAN-2361: the OCSF deploy gate is a real bound — an unvalidated parser must
+    /// not reach the lake — but it was rejecting library parsers that already
+    /// carry their own evidence. 50 of the 64 parsers on the `ocsf-1.9` branch
+    /// ship a `samples:` block, and those are the same events
+    /// `scripts/validate-ocsf.sh` certifies upstream. This is NOT a bypass: the
+    /// caller still executes the parser over each sample and validates the emitted
+    /// event against the OCSF contract before any receipt is written.
+    ///
+    /// The parser is matched by EXACT `parser_vrl`, which is copied verbatim at
+    /// import. That is the property we want: edit the VRL and the match stops
+    /// resolving, so a hand-modified parser is once again required to supply its
+    /// own sample rather than inheriting the library's.
+    ///
+    /// Best-effort by design — any lookup or parse failure returns empty and the
+    /// caller falls through to asking the operator for a sample.
+    async fn library_parser_samples(&self, log_source: &LogSource) -> Vec<String> {
+        if log_source.parser_vrl.trim().is_empty() {
+            return Vec::new();
+        }
+        let rows: Vec<(String,)> = match sqlx::query_as(
+            "SELECT raw_content FROM repository_parsers \
+             WHERE parser_vrl = $1 ORDER BY updated_at DESC LIMIT 4",
+        )
+        .bind(&log_source.parser_vrl)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    log_source_id = %log_source.id,
+                    %error,
+                    "could not look up bundled parser samples"
+                );
+                return Vec::new();
+            }
+        };
+        for (raw_content,) in rows {
+            let Ok(parsed) = crate::parser_repository::parse_parser_yaml(&raw_content) else {
+                continue;
+            };
+            let samples: Vec<String> = parsed
+                .samples
+                .unwrap_or_default()
+                .into_iter()
+                .map(|sample| sample.raw)
+                .filter(|raw| !raw.trim().is_empty() && raw.len() <= OCSF_DEPLOY_MAX_SAMPLE_BYTES)
+                .take(OCSF_DEPLOY_MAX_SAMPLES)
+                .collect();
+            if !samples.is_empty() {
+                tracing::info!(
+                    log_source_id = %log_source.id,
+                    samples = samples.len(),
+                    "validating the OCSF deploy receipt against the parser's bundled samples"
+                );
+                return samples;
+            }
+        }
+        Vec::new()
+    }
+
+    /// Enforce the deploy-bound OCSF receipt. An unchanged parser can reuse a
+    /// prior receipt; a new parser generation must supply representative raw
+    /// samples and pass VRL execution followed by OCSF validation.
+    pub(super) async fn enforce_ocsf_deploy_attestation(
+        &self,
+        log_source: &LogSource,
+        samples: &[String],
+    ) -> Result<(), LogSourceServiceError> {
+        let profile = crate::schema::active_profile_from_env()
+            .map_err(LogSourceServiceError::OcsfValidationFailed)?;
+        if profile.id() != crate::schema::SchemaId::Ocsf || log_source.kind != "log" {
+            return Ok(());
+        }
+
+        let parser_sha256 = ocsf_parser_sha256(log_source);
+        // Samples the caller supplied win. With none, an unchanged parser reuses
+        // its receipt, and a library parser falls back to the samples it shipped
+        // with (see `library_parser_samples`). Only a parser with neither is
+        // asked for a raw event.
+        let bundled: Vec<String>;
+        let samples: &[String] = if samples.is_empty() {
+            let current = self
+                .repository()
+                .has_ocsf_validation_attestation(
+                    log_source.id,
+                    crate::parsers::OCSF_VALIDATION_VERSION,
+                    &parser_sha256,
+                )
+                .await?;
+            if current {
+                return Ok(());
+            }
+            bundled = self.library_parser_samples(log_source).await;
+            if bundled.is_empty() {
+                return Err(LogSourceServiceError::OcsfValidationFailed(
+                    "this parser generation has no OCSF sample-validation receipt; supply at least one representative raw event"
+                        .to_string(),
+                ));
+            }
+            &bundled
+        } else {
+            samples
+        };
+
+        if samples.len() > OCSF_DEPLOY_MAX_SAMPLES {
+            return Err(LogSourceServiceError::OcsfValidationFailed(format!(
+                "at most {OCSF_DEPLOY_MAX_SAMPLES} samples may be validated per deployment"
+            )));
+        }
+        let total_bytes = samples.iter().try_fold(0_usize, |total, sample| {
+            if sample.len() > OCSF_DEPLOY_MAX_SAMPLE_BYTES {
+                return Err(LogSourceServiceError::OcsfValidationFailed(format!(
+                    "a sample exceeds the {} byte limit",
+                    OCSF_DEPLOY_MAX_SAMPLE_BYTES
+                )));
+            }
+            total.checked_add(sample.len()).ok_or_else(|| {
+                LogSourceServiceError::OcsfValidationFailed(
+                    "sample payload size overflow".to_string(),
+                )
+            })
+        })?;
+        if total_bytes > OCSF_DEPLOY_MAX_TOTAL_SAMPLE_BYTES {
+            return Err(LogSourceServiceError::OcsfValidationFailed(format!(
+                "sample payload exceeds the {} byte deployment limit",
+                OCSF_DEPLOY_MAX_TOTAL_SAMPLE_BYTES
+            )));
+        }
+
+        let extension_vrl = log_source
+            .extension_enabled
+            .then_some(log_source.extension_vrl.as_deref())
+            .flatten();
+        // NAN-2385: one compile of the chain for the whole sample set. Looping
+        // `test_vrl_chain` per sample compiled the parser once per sample (and
+        // twice at that), which for a 1k-line OCSF parser pushed a deploy past
+        // the UI's request timeout.
+        for (index, result) in self
+            .test_vrl_chain_batch(&log_source.parser_vrl, extension_vrl, samples, true)
+            .await
+            .into_iter()
+            .enumerate()
+        {
+            if !result.success {
+                return Err(LogSourceServiceError::OcsfValidationFailed(format!(
+                    "sample {} failed: {}",
+                    index + 1,
+                    result
+                        .error
+                        .as_deref()
+                        .unwrap_or("unknown validation error")
+                )));
+            }
+        }
+
+        self.repository()
+            .set_ocsf_validation_attestation(
+                log_source.id,
+                crate::parsers::OCSF_VALIDATION_VERSION,
+                &parser_sha256,
+                &ocsf_samples_sha256(samples),
+                samples.len() as i32,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Validate VRL code without saving
     pub async fn validate_vrl(&self, vrl_code: &str) -> VrlValidationResult {
         match self.vrl_validator.validate_vrl(vrl_code).await {
@@ -179,7 +475,7 @@ impl LogSourceService {
 
     /// Test VRL against a sample log
     pub async fn test_vrl(&self, vrl_code: &str, sample_log: &str) -> ParserTestResult {
-        self.test_vrl_chain(vrl_code, None, sample_log).await
+        self.test_vrl_chain(vrl_code, None, sample_log, false).await
     }
 
     /// Test a parser VRL plus an optional extension overlay (NAN-874) against a
@@ -191,6 +487,7 @@ impl LogSourceService {
         parser_vrl: &str,
         extension_vrl: Option<&str>,
         sample_log: &str,
+        validate_ocsf: bool,
     ) -> ParserTestResult {
         let input_json = serde_json::json!({
             "message": sample_log
@@ -209,23 +506,55 @@ impl LogSourceService {
         };
 
         match result {
-            Ok(result) => {
-                let extracted_field_count = count_extracted_fields(&result.output);
-                ParserTestResult {
-                    input: truncate(sample_log, 200),
-                    success: result.success,
-                    output: result.output,
-                    error: result.error,
-                    extracted_field_count,
-                }
-            }
+            Ok(result) => parser_test_result(sample_log, result, validate_ocsf),
             Err(e) => ParserTestResult {
                 input: truncate(sample_log, 200),
                 success: false,
                 output: None,
                 error: Some(format!("VRL execution error: {}", e)),
                 extracted_field_count: 0,
+                schema_validation: None,
             },
+        }
+    }
+
+    /// Run the parser (+ optional extension) chain over many raw samples with a
+    /// single compile (NAN-2385). Results are index-aligned with `sample_logs`.
+    pub async fn test_vrl_chain_batch(
+        &self,
+        parser_vrl: &str,
+        extension_vrl: Option<&str>,
+        sample_logs: &[String],
+        validate_ocsf: bool,
+    ) -> Vec<ParserTestResult> {
+        let inputs: Vec<String> = sample_logs
+            .iter()
+            .map(|sample_log| {
+                serde_json::to_string(&serde_json::json!({ "message": sample_log }))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let stages: Vec<&str> = match extension_vrl {
+            Some(ext) if !ext.trim().is_empty() => vec![parser_vrl, ext],
+            _ => vec![parser_vrl],
+        };
+        match self.vrl_validator.test_vrl_chain_batch(&stages, &inputs).await {
+            Ok(results) => sample_logs
+                .iter()
+                .zip(results)
+                .map(|(sample_log, result)| parser_test_result(sample_log, result, validate_ocsf))
+                .collect(),
+            Err(e) => sample_logs
+                .iter()
+                .map(|sample_log| ParserTestResult {
+                    input: truncate(sample_log, 200),
+                    success: false,
+                    output: None,
+                    error: Some(format!("VRL execution error: {}", e)),
+                    extracted_field_count: 0,
+                    schema_validation: None,
+                })
+                .collect(),
         }
     }
 
@@ -358,7 +687,10 @@ impl LogSourceService {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_live_sample_sql, distinct_current_vrl};
+    use super::{
+        build_live_sample_sql, distinct_current_vrl, ocsf_parser_sha256, ocsf_samples_sha256,
+        parser_test_result,
+    };
     use crate::auth::ScopeSet;
     use std::collections::BTreeSet;
 
@@ -439,5 +771,144 @@ mod tests {
             distinct_current_vrl(".ok = true", Some(".ok = false")),
             Some(".ok = false")
         );
+    }
+
+    fn parser_result(
+        success: bool,
+        output: Option<serde_json::Value>,
+        error: Option<&str>,
+    ) -> crate::parsers::ParserTestResult {
+        crate::parsers::ParserTestResult {
+            success,
+            input: r#"{"message":"sample"}"#.to_string(),
+            output,
+            error: error.map(str::to_string),
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn ocsf_validation_does_not_run_after_vrl_failure() {
+        let result = parser_test_result(
+            "sample",
+            parser_result(false, None, Some("VRL compilation failed")),
+            true,
+        );
+
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("VRL compilation failed"));
+        assert!(result.schema_validation.is_none());
+    }
+
+    #[test]
+    fn invalid_ocsf_output_fails_the_sample_with_structured_paths() {
+        let result = parser_test_result(
+            "sample",
+            parser_result(true, Some(serde_json::json!({"class_uid": 4002})), None),
+            true,
+        );
+
+        assert!(!result.success);
+        let validation = result.schema_validation.expect("OCSF result");
+        assert!(!validation.valid);
+        assert!(validation
+            .errors
+            .iter()
+            .any(|diagnostic| diagnostic.attribute_path == "metadata"));
+        assert!(result.error.as_deref().is_some_and(|error| {
+            error.starts_with("OCSF validation failed:") && error.contains("metadata")
+        }));
+    }
+
+    #[test]
+    fn valid_ocsf_output_passes_after_vrl_success() {
+        let event = serde_json::json!({
+            "activity_id": 3,
+            "category_uid": 4,
+            "class_uid": 4002,
+            "type_uid": 400203,
+            "severity_id": 1,
+            "time": 1786406400000_i64,
+            "metadata": {
+                "product": {"name": "Nano", "vendor_name": "Nanos"},
+                "version": "1.9.0"
+            },
+            "http_request": {
+                "http_method": "GET",
+                "url": {"path": "/"}
+            }
+        });
+        let result = parser_test_result("sample", parser_result(true, Some(event), None), true);
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result
+            .schema_validation
+            .is_some_and(|validation| validation.valid));
+    }
+
+    #[test]
+    fn sample_receipt_is_framed_and_order_sensitive() {
+        assert_ne!(
+            ocsf_samples_sha256(&["ab".to_string(), "c".to_string()]),
+            ocsf_samples_sha256(&["a".to_string(), "bc".to_string()])
+        );
+        assert_ne!(
+            ocsf_samples_sha256(&["first".to_string(), "second".to_string()]),
+            ocsf_samples_sha256(&["second".to_string(), "first".to_string()])
+        );
+    }
+
+    #[test]
+    fn parser_receipt_changes_when_enabled_extension_changes() {
+        let base = crate::log_sources::types::LogSource {
+            id: uuid::Uuid::nil(),
+            name: "test".to_string(),
+            description: None,
+            namespace: "default".to_string(),
+            timezone: "UTC".to_string(),
+            source_type: "routed".to_string(),
+            dispatch_source_config_id: None,
+            dispatch_source_config_type: None,
+            parser_vrl: ".class_uid = 4002".to_string(),
+            output_fields: None,
+            extension_vrl: Some(".metadata.uid = \"one\"".to_string()),
+            extension_enabled: true,
+            category: None,
+            vendor: None,
+            product: None,
+            icon: None,
+            color: None,
+            match_field: None,
+            match_pattern: None,
+            match_values: None,
+            validated: false,
+            validation_error: None,
+            deployed: false,
+            deployed_at: None,
+            enabled: false,
+            lifecycle_status: "draft".to_string(),
+            stale_alert_enabled: false,
+            stale_threshold_minutes: 60,
+            sampling_ratio: None,
+            sampling_exclude_condition: None,
+            kind: "log".to_string(),
+            enrich_kind: None,
+            enrich_source: None,
+            target_table: None,
+            normalize_vrl: None,
+            source_parser_repository_id: None,
+            source_parser_path: None,
+            source_parser_linked: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let first = ocsf_parser_sha256(&base);
+        let mut changed = base.clone();
+        changed.extension_vrl = Some(".metadata.uid = \"two\"".to_string());
+        assert_ne!(first, ocsf_parser_sha256(&changed));
+        changed.extension_enabled = false;
+        let disabled = ocsf_parser_sha256(&changed);
+        changed.extension_vrl = Some("ignored while disabled".to_string());
+        assert_eq!(disabled, ocsf_parser_sha256(&changed));
     }
 }

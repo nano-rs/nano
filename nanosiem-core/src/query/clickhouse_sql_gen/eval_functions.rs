@@ -54,7 +54,8 @@ fn convert_strftime_to_clickhouse(format: &str) -> String {
                     // Time
                     'H' => result.push_str("%H"), // Hour 24-hour (00-23)
                     'I' => result.push_str("%I"), // Hour 12-hour (01-12)
-                    'M' => result.push_str("%M"), // Minute (00-59)
+                    // ClickHouse %M is the month NAME; minutes are %i.
+                    'M' => result.push_str("%i"), // Minute (00-59)
                     'S' => result.push_str("%S"), // Second (00-59)
                     'p' => result.push_str("%p"), // AM/PM
 
@@ -146,6 +147,9 @@ fn typed_eval_expression_to_sql_inner(
     numeric_context: bool,
     field_override: Option<&EvalFieldOverride<'_>>,
 ) -> Result<String, SqlGenError> {
+    if let Some(sql) = datetime_operand_sql(gen, expr, numeric_context, field_override)? {
+        return Ok(sql);
+    }
     match expr {
         EvalExpression::Field(name) => {
             if let Some(sql) = field_override.and_then(|resolve| resolve(name, numeric_context)) {
@@ -187,6 +191,26 @@ fn typed_eval_expression_to_sql_inner(
                     | BinaryOperator::Gte
                     | BinaryOperator::Lte
             );
+            if let Some(sql) = datetime_difference_sql(gen, left, *op, right, field_override)? {
+                return Ok(sql);
+            }
+            if let Some(sql) =
+                array_field_predicate(gen, left, *op, right, field_override, |side| {
+                    typed_eval_expression_to_sql_inner(gen, side, false, field_override)
+                })?
+            {
+                return Ok(sql);
+            }
+            if let Some(sql) = regex_literal_comparison(left, *op, right, |side| {
+                typed_eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
+            if let Some(sql) = string_literal_comparison(left, *op, right, |side| {
+                typed_eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             let left_sql = typed_eval_expression_to_sql_inner(
                 gen,
                 left,
@@ -200,10 +224,8 @@ fn typed_eval_expression_to_sql_inner(
                 field_override,
             )?;
             match op {
-                BinaryOperator::Contains => {
-                    Ok(format!("(position({}, {}) > 0)", left_sql, right_sql))
-                }
-                BinaryOperator::Like => Ok(format!("({} LIKE {})", left_sql, right_sql)),
+                BinaryOperator::Contains => Ok(contains_sql(&left_sql, &right_sql)),
+                BinaryOperator::Like => Ok(like_sql(&left_sql, &right_sql)),
                 _ => {
                     let op_sql = match op {
                         BinaryOperator::Add => "+",
@@ -228,6 +250,127 @@ fn typed_eval_expression_to_sql_inner(
         }
     }
 }
+/// Eval functions whose result is a Date/DateTime.
+fn is_datetime_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "now"
+            | "today"
+            | "relative_time"
+            | "relativetime"
+            | "from_epoch"
+            | "fromepoch"
+            | "date_add"
+            | "dateadd"
+            | "date_sub"
+            | "datesub"
+            | "date_trunc"
+            | "datetrunc"
+            | "timezone"
+            | "at_timezone"
+            | "to_timestamp"
+            | "totimestamp"
+            | "to_date"
+            | "todate"
+            | "time_bucket"
+            | "timebucket"
+            | "make_timestamp"
+            | "maketimestamp"
+            | "make_date"
+            | "makedate"
+    )
+}
+
+/// The DateTime SQL of a datetime-valued expression, or `None`: the event
+/// time column, a datetime function, or `<datetime> ± INTERVAL …`.
+fn datetime_sql(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Result<Option<String>, SqlGenError> {
+    match expr {
+        EvalExpression::Field(name) => {
+            if field_override.is_some_and(|resolve| resolve(name, false).is_some())
+                || gen.is_upstream_computed_field(name)
+            {
+                return Ok(None);
+            }
+            let (sql, _) = field_to_sql_expr(name, gen);
+            Ok((sql == field_to_sql_expr(gen.time_column(), gen).0).then_some(sql))
+        }
+        EvalExpression::FunctionCall { name, args } if is_datetime_function(name) => {
+            eval_function_to_sql(gen, name, args, field_override).map(Some)
+        }
+        EvalExpression::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::Add | BinaryOperator::Sub),
+            right,
+        } if matches!(**right, EvalExpression::Literal(Value::Interval(..))) => {
+            let Some(base) = datetime_sql(gen, left, field_override)? else {
+                return Ok(None);
+            };
+            let interval = eval_expression_to_sql_inner(gen, right, false, field_override)?;
+            let op = if matches!(op, BinaryOperator::Add) { "+" } else { "-" };
+            Ok(Some(format!("({base} {op} {interval})")))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// NAN-3329: a datetime operand of arithmetic or an ordering comparison is
+/// epoch SECONDS as Float64 (Splunk `_time` semantics, the unit of
+/// `epoch(time)`, millisecond fraction kept), on BOTH sides: `time - 1000`,
+/// `now() - time` and `time > now() - INTERVAL 1 HOUR` all compare numbers.
+/// The string cast made `time - 1000` NULL; casting only `time` made
+/// `now() - time` a DateTime. Outside numeric context the value stays a
+/// DateTime (`eval t = now() - INTERVAL 1 HOUR`).
+fn datetime_operand_sql(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    numeric_context: bool,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Result<Option<String>, SqlGenError> {
+    // A bare field outside numeric context keeps its ordinary path.
+    if !numeric_context && matches!(expr, EvalExpression::Field(_)) {
+        return Ok(None);
+    }
+    Ok(datetime_sql(gen, expr, field_override)?.map(|sql| {
+        if numeric_context {
+            format!("toFloat64(toDateTime64({sql}, 3, 'UTC'))")
+        } else {
+            sql
+        }
+    }))
+}
+
+/// NAN-3382: `<datetime> - <datetime>` (`now() - time`, the `_time` /
+/// `timestamp` aliases, `<datetime> ± INTERVAL`) is the elapsed time in whole
+/// seconds, an Int64. The difference is taken in integer milliseconds so a
+/// Float64 rounding error can never drop a second; floor keeps a negative
+/// (future) difference monotonic. `<datetime> - <number>` stays epoch
+/// seconds (NAN-3329).
+fn datetime_difference_sql(
+    gen: &ClickHouseSqlGenerator,
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Result<Option<String>, SqlGenError> {
+    if op != BinaryOperator::Sub {
+        return Ok(None);
+    }
+    let Some(left_sql) = datetime_sql(gen, left, field_override)? else {
+        return Ok(None);
+    };
+    let Some(right_sql) = datetime_sql(gen, right, field_override)? else {
+        return Ok(None);
+    };
+    Ok(Some(format!(
+        "toInt64(floor((toUnixTimestamp64Milli(toDateTime64({left_sql}, 3, 'UTC')) - \
+         toUnixTimestamp64Milli(toDateTime64({right_sql}, 3, 'UTC'))) / 1000))"
+    )))
+}
+
 /// Convert eval expression to SQL, optionally casting for numeric context
 fn eval_expression_to_sql_inner(
     gen: &ClickHouseSqlGenerator,
@@ -235,12 +378,23 @@ fn eval_expression_to_sql_inner(
     numeric_context: bool,
     field_override: Option<&EvalFieldOverride<'_>>,
 ) -> Result<String, SqlGenError> {
+    if let Some(sql) = datetime_operand_sql(gen, expr, numeric_context, field_override)? {
+        return Ok(sql);
+    }
     match expr {
         EvalExpression::Field(name) => {
             if let Some(sql) = field_override.and_then(|resolve| resolve(name, numeric_context)) {
                 return Ok(sql);
             }
             let (sql_expr, _needs_alias) = field_to_sql_expr(name, gen);
+            if numeric_context && gen.is_upstream_computed_field(name) {
+                // NAN-3329: a stage column may hold a time (`streamstats
+                // last(time) as prev_time`); its string form is not a number,
+                // so read it as epoch seconds too (`time - prev_time`).
+                return Ok(format!(
+                    "coalesce(toFloat64OrNull(toString({sql_expr})), toFloat64(parseDateTime64BestEffortOrNull(toString({sql_expr}), 3, 'UTC')))"
+                ));
+            }
             if numeric_context {
                 // In numeric context (comparisons, arithmetic), cast field to Float64
                 // This handles fields extracted from JSON as strings
@@ -290,6 +444,26 @@ fn eval_expression_to_sql_inner(
                     | BinaryOperator::Lte
             );
 
+            if let Some(sql) = datetime_difference_sql(gen, left, *op, right, field_override)? {
+                return Ok(sql);
+            }
+            if let Some(sql) =
+                array_field_predicate(gen, left, *op, right, field_override, |side| {
+                    eval_expression_to_sql_inner(gen, side, false, field_override)
+                })?
+            {
+                return Ok(sql);
+            }
+            if let Some(sql) = regex_literal_comparison(left, *op, right, |side| {
+                eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
+            if let Some(sql) = string_literal_comparison(left, *op, right, |side| {
+                eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             let left_sql = eval_expression_to_sql_inner(gen, left, is_numeric_op, field_override)?;
             let right_sql =
                 eval_expression_to_sql_inner(gen, right, is_numeric_op, field_override)?;
@@ -313,17 +487,307 @@ fn eval_expression_to_sql_inner(
             };
 
             match op {
-                BinaryOperator::Contains => {
-                    // CONTAINS maps to: position(haystack, needle) > 0
-                    Ok(format!("(position({}, {}) > 0)", left_sql, right_sql))
-                }
-                BinaryOperator::Like => Ok(format!("({} LIKE {})", left_sql, right_sql)),
+                BinaryOperator::Contains => Ok(contains_sql(&left_sql, &right_sql)),
+                BinaryOperator::Like => Ok(like_sql(&left_sql, &right_sql)),
                 _ => Ok(format!("({} {} {})", left_sql, op_sql, right_sql)),
             }
         }
         EvalExpression::FunctionCall { name, args } => {
             eval_function_to_sql(gen, name, args, field_override)
         }
+    }
+}
+
+/// An IP predicate that is false (never NULL, never a query error) for a
+/// missing or non-IP value. `isIPAddressInRange` throws CANNOT_PARSE_TEXT on
+/// a non-IP string, which failed the whole search when one event carried a
+/// hostname in an IP field; the old `length(x) > 0` guard only caught ''.
+/// The Rust post-processing evaluator implements the same.
+fn guarded_ip_predicate(ip: &str, predicate: &str) -> String {
+    format!(
+        "ifNull((isIPv4String(toString({ip})) OR isIPv6String(toString({ip}))) AND ({predicate}), 0)"
+    )
+}
+
+/// `x` as a non-Nullable String for functions that build an array
+/// internally (`extractAll`, `splitByChar`, `extractGroups`): ClickHouse
+/// rejects `Nullable(Array)`, and every lean OCSF leaf is Nullable, so these
+/// functions failed the whole search on a real column.
+fn non_null_text(sql: &str) -> String {
+    format!("ifNull(toString({sql}), '')")
+}
+
+/// `value` computed over [`non_null_text`], NULL again when the input is.
+fn null_propagating(input: &str, value: &str) -> String {
+    format!("if(isNull({input}), NULL, {value})")
+}
+
+/// The array leaf a predicate subject names, if any: a raw event field the
+/// schema types `Array(T)` (OCSF repeated leaves such as
+/// `module.file.signatures.state`), never an eval/stats alias.
+fn array_subject<'e>(
+    gen: &ClickHouseSqlGenerator,
+    expr: &'e EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> Option<&'e str> {
+    let EvalExpression::Field(name) = expr else {
+        return None;
+    };
+    if field_override.is_some_and(|resolve| resolve(name, false).is_some())
+        || gen.is_upstream_computed_field(name)
+    {
+        return None;
+    }
+    gen.field_is_array(gen.canonicalize_field(name))
+        .then_some(name.as_str())
+}
+
+/// A comparison between an `Array(T)` field and a scalar in eval / `if()` /
+/// `risk` (multivalue semantics, the same as `| where`):
+///
+/// - `f = x`, `f = /re/`, `f CONTAINS x`, `f LIKE p`, `f > n`: true when ANY
+///   element satisfies it (`arrayExists`);
+/// - `f != x`, `f != /re/`: true when NO element equals / matches, so
+///   `f != x` is exactly `NOT (f = x)` over the same rows.
+///
+/// Before this, eval compared the stringified array (`"['Valid']"`) with the
+/// scalar, which never matched (or, before NAN-3041, was a ClickHouse type
+/// error the search API surfaced as a 503).
+fn array_field_predicate(
+    gen: &ClickHouseSqlGenerator,
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+    lower_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if !matches!(
+        op,
+        BinaryOperator::Eq
+            | BinaryOperator::Ne
+            | BinaryOperator::Contains
+            | BinaryOperator::Like
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::Gte
+            | BinaryOperator::Lte
+    ) {
+        return Ok(None);
+    }
+    // The array may sit on either side of a symmetric operator; CONTAINS/LIKE
+    // and the ordered comparisons read `array OP scalar` only.
+    let (array_expr, scalar) = match (
+        array_subject(gen, left, field_override),
+        array_subject(gen, right, field_override),
+    ) {
+        (Some(_), Some(_)) => return Ok(None),
+        (Some(_), None) => (left, right),
+        (None, Some(_)) if matches!(op, BinaryOperator::Eq | BinaryOperator::Ne) => (right, left),
+        (None, Some(_)) => return Ok(None),
+        (None, None) => return Ok(None),
+    };
+    let array_sql = lower_side(array_expr)?;
+    let element = "toString(x)";
+    let exists = |predicate: String| format!("arrayExists(x -> {predicate}, {array_sql})");
+    let sql = match (op, scalar) {
+        (
+            BinaryOperator::Eq | BinaryOperator::Ne,
+            EvalExpression::Literal(Value::Regex(pattern)),
+        ) => {
+            super::validate_regex_pattern(pattern).map_err(SqlGenError::InvalidQuery)?;
+            let pattern = if pattern.starts_with("(?i)") {
+                pattern.clone()
+            } else {
+                format!("(?i){pattern}")
+            };
+            exists(format!(
+                "match({element}, '{}')",
+                escape_regex_pattern(&pattern)
+            ))
+        }
+        (BinaryOperator::Eq | BinaryOperator::Ne, EvalExpression::Literal(literal)) => {
+            let needle = match literal {
+                Value::String(text) => text.to_lowercase(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                other => other.to_string().to_lowercase(),
+            };
+            exists(format!(
+                "lower({element}) = '{}'",
+                super::escape_string(&needle)
+            ))
+        }
+        (BinaryOperator::Eq | BinaryOperator::Ne, other) => {
+            let other_sql = lower_side(other)?;
+            exists(format!("lower({element}) = lower(toString({other_sql}))"))
+        }
+        (BinaryOperator::Contains, other) => {
+            let other_sql = lower_side(other)?;
+            exists(contains_sql("x", &other_sql))
+        }
+        (BinaryOperator::Like, other) => {
+            let other_sql = lower_side(other)?;
+            exists(like_sql("x", &other_sql))
+        }
+        (_, other) => {
+            let op_sql = match op {
+                BinaryOperator::Gt => ">",
+                BinaryOperator::Lt => "<",
+                BinaryOperator::Gte => ">=",
+                _ => "<=",
+            };
+            let other_sql = lower_side(other)?;
+            exists(format!(
+                "toFloat64OrNull({element}) {op_sql} toFloat64OrNull(toString({other_sql}))"
+            ))
+        }
+    };
+    Ok(Some(if op == BinaryOperator::Ne {
+        format!("(NOT {sql})")
+    } else {
+        format!("({sql})")
+    }))
+}
+
+/// `CONTAINS` in eval / `if()` (NAN-3041): case-insensitive substring, the
+/// same semantics as `| where f CONTAINS "x"` and search (`iLike '%x%'`).
+/// It used to be `position()`, which is case-SENSITIVE, so a rule condition
+/// `command_line CONTAINS "IEX"` silently missed `iex`.
+fn contains_sql(haystack: &str, needle: &str) -> String {
+    format!("(positionCaseInsensitiveUTF8(toString({haystack}), toString({needle})) > 0)")
+}
+
+/// `LIKE` / `like()` in eval (NAN-3041): case-insensitive, the same as the
+/// `| where f LIKE "…"` comparator (`iLike`).
+fn like_sql(value: &str, pattern: &str) -> String {
+    format!("(toString({value}) iLike {pattern})")
+}
+
+/// `f = /re/[i]` / `f != /re/` in eval (NAN-3041). A regex literal on either
+/// side of `=`/`==`/`!=` is a regex match, as it is in `| where f=/re/`. The
+/// old lowering compared the field to the pattern TEXT (`f = '(?i)re'`), so
+/// the condition never matched. Like `where`, the match is case-insensitive
+/// with or without the `/i` flag; `match(f, "re")` stays the case-sensitive,
+/// explicit form.
+fn regex_literal_comparison(
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    lower_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if !matches!(op, BinaryOperator::Eq | BinaryOperator::Ne) {
+        return Ok(None);
+    }
+    let (subject, pattern) = match (left, right) {
+        (subject, EvalExpression::Literal(Value::Regex(pattern)))
+        | (EvalExpression::Literal(Value::Regex(pattern)), subject) => (subject, pattern),
+        _ => return Ok(None),
+    };
+    super::validate_regex_pattern(pattern).map_err(SqlGenError::InvalidQuery)?;
+    let pattern = if pattern.starts_with("(?i)") {
+        pattern.clone()
+    } else {
+        format!("(?i){pattern}")
+    };
+    let subject_sql = lower_side(subject)?;
+    let matched = format!(
+        "match(toString({subject_sql}), '{}')",
+        escape_regex_pattern(&pattern)
+    );
+    Ok(Some(if op == BinaryOperator::Ne {
+        format!("(NOT {matched})")
+    } else {
+        format!("({matched})")
+    }))
+}
+
+/// `f = "x"` / `f != "x"` in eval (NAN-3041): case-insensitive against a
+/// quoted string, exactly like `| where f="x"` and the search term. A rule
+/// could not move `process.name="WINWORD.EXE"` from `where` into `if()`
+/// without it silently missing `winword.exe`. Only a comparison between an
+/// expression and a string LITERAL is folded; field-to-field and numeric
+/// comparisons keep their typed semantics.
+fn string_literal_comparison(
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    lower_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if !matches!(op, BinaryOperator::Eq | BinaryOperator::Ne) {
+        return Ok(None);
+    }
+    let (subject, literal) = match (left, right) {
+        (EvalExpression::Literal(_), EvalExpression::Literal(_)) => return Ok(None),
+        (subject, EvalExpression::Literal(Value::String(literal)))
+        | (EvalExpression::Literal(Value::String(literal)), subject) => (subject, literal),
+        _ => return Ok(None),
+    };
+    let subject_sql = lower_side(subject)?;
+    Ok(Some(format!(
+        "(lower(toString({subject_sql})) {} '{}')",
+        if op == BinaryOperator::Eq { "=" } else { "!=" },
+        super::escape_string(&literal.to_lowercase())
+    )))
+}
+
+/// `in(expr, v1, v2, …)` — also the lowering of `expr IN (v1, v2, …)`
+/// (NAN-3041). String members compare case-insensitively, exactly like
+/// `| where f IN ("a", "b")`; all-numeric members compare as numbers.
+fn in_sql(args: &[EvalExpression], arg_sqls: &[String]) -> Result<String, SqlGenError> {
+    if arg_sqls.len() < 2 {
+        return Err(SqlGenError::InvalidQuery(
+            "in() requires a value and at least one candidate: in(field, \"a\", \"b\")".into(),
+        ));
+    }
+    let subject = &arg_sqls[0];
+    let members = &args[1..];
+    let literal = |member: &EvalExpression| matches!(member, EvalExpression::Literal(_));
+    if members.iter().all(literal) {
+        let all_numeric = members
+            .iter()
+            .all(|member| matches!(member, EvalExpression::Literal(Value::Number(_))));
+        if all_numeric {
+            return Ok(format!("({subject} IN ({}))", arg_sqls[1..].join(", ")));
+        }
+        let lowered = members
+            .iter()
+            .map(|member| match member {
+                EvalExpression::Literal(Value::String(s)) => {
+                    format!("'{}'", super::escape_string(&s.to_lowercase()))
+                }
+                EvalExpression::Literal(Value::Number(n)) => format!("'{n}'"),
+                EvalExpression::Literal(Value::Bool(b)) => format!("'{b}'"),
+                EvalExpression::Literal(Value::Ip(ip)) => format!("'{ip}'"),
+                EvalExpression::Literal(other) => {
+                    format!(
+                        "'{}'",
+                        super::escape_string(&other.to_string().to_lowercase())
+                    )
+                }
+                _ => unreachable!("guarded by all(literal)"),
+            })
+            .collect::<Vec<_>>();
+        return Ok(format!(
+            "(lower(toString({subject})) IN ({}))",
+            lowered.join(", ")
+        ));
+    }
+    // Non-constant members: ClickHouse needs a constant IN set, so compare
+    // pairwise (still case-insensitive for strings).
+    let legs = arg_sqls[1..]
+        .iter()
+        .map(|member| format!("lower(toString({subject})) = lower(toString({member}))"))
+        .collect::<Vec<_>>();
+    Ok(format!("({})", legs.join(" OR ")))
+}
+
+/// The one SQL argument of a single-argument function, or a clear error.
+fn single_arg<'a>(arg_sqls: &'a [String], name: &str) -> Result<&'a str, SqlGenError> {
+    match arg_sqls {
+        [arg] => Ok(arg),
+        _ => Err(SqlGenError::InvalidQuery(format!(
+            "{name}() requires 1 argument"
+        ))),
     }
 }
 
@@ -424,7 +888,13 @@ fn eval_function_to_sql(
                     "split() requires 2 arguments".into(),
                 ));
             }
-            Ok(format!("splitByString({}, {})", arg_sqls[1], arg_sqls[0]))
+            // Array functions reject Nullable input (every lean OCSF leaf is
+            // Nullable): split a NULL to [] instead of failing the search.
+            Ok(format!(
+                "if(isNull({s}), [], splitByString({sep}, ifNull(toString({s}), '')))",
+                s = arg_sqls[0],
+                sep = arg_sqls[1]
+            ))
         }
         "concat" => Ok(format!("concat({})", arg_sqls.join(", "))),
 
@@ -441,7 +911,11 @@ fn eval_function_to_sql(
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("base64_decode() requires 1 argument".into())
             })?;
-            Ok(format!("base64Decode({})", arg))
+            // NAN-3326: the non-throwing form. `base64Decode` aborts the whole
+            // search on the first malformed value (truncated / mis-padded
+            // PowerShell blobs are common); a hunter needs that row to yield
+            // NULL and the rest to decode.
+            Ok(format!("nullIf(tryBase64Decode(toString({arg})), '')"))
         }
         "hex_encode" | "hexencode" | "tohex" => {
             let arg = arg_sqls.first().ok_or_else(|| {
@@ -512,20 +986,18 @@ fn eval_function_to_sql(
                     // or both args look like a CIDR (ip-first is the documented form)
                     (&arg_sqls[0], &arg_sqls[1])
                 };
-                // Guard against empty strings which crash isIPAddressInRange.
-                Ok(format!(
-                    "(length({}) > 0 AND isIPAddressInRange({}, {}))",
-                    ip, ip, cidr
+                Ok(guarded_ip_predicate(
+                    ip,
+                    &format!("isIPAddressInRange(toString({ip}), {cidr})"),
                 ))
             } else if arg_sqls.len() > 2 {
                 // Multi-CIDR: cidr_match(ip, cidr1, cidr2, ...) → OR chain
                 let ip = &arg_sqls[0];
                 let checks: Vec<String> = arg_sqls[1..]
                     .iter()
-                    .map(|cidr| format!("isIPAddressInRange({}, {})", ip, cidr))
+                    .map(|cidr| format!("isIPAddressInRange(toString({ip}), {cidr})"))
                     .collect();
-                // Guard against empty strings which crash isIPAddressInRange
-                Ok(format!("(length({}) > 0 AND ({}))", ip, checks.join(" OR ")))
+                Ok(guarded_ip_predicate(ip, &checks.join(" OR ")))
             } else {
                 return Err(SqlGenError::InvalidQuery(
                     "cidr_match() requires at least 2 arguments".into(),
@@ -534,37 +1006,36 @@ fn eval_function_to_sql(
         }
         "is_private_ip" | "isprivateip" | "is_rfc1918" => {
             // Check if IP is in private ranges (RFC1918)
-            // Guard against empty strings which crash isIPAddressInRange
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("is_private_ip() requires 1 argument".into())
             })?;
-            Ok(format!(
-                    "(length({}) > 0 AND (isIPAddressInRange({}, '10.0.0.0/8') OR isIPAddressInRange({}, '172.16.0.0/12') OR isIPAddressInRange({}, '192.168.0.0/16')))",
-                    arg, arg, arg, arg
-                ))
+            Ok(guarded_ip_predicate(arg, &format!(
+                "isIPAddressInRange(toString({arg}), '10.0.0.0/8') OR isIPAddressInRange(toString({arg}), '172.16.0.0/12') OR isIPAddressInRange(toString({arg}), '192.168.0.0/16')"
+            )))
         }
         "is_public_ip" | "ispublicip" => {
-            // Guard against empty strings which crash isIPAddressInRange
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("is_public_ip() requires 1 argument".into())
             })?;
-            Ok(format!(
-                    "(length({}) > 0 AND NOT (isIPAddressInRange({}, '10.0.0.0/8') OR isIPAddressInRange({}, '172.16.0.0/12') OR isIPAddressInRange({}, '192.168.0.0/16') OR isIPAddressInRange({}, '127.0.0.0/8')))",
-                    arg, arg, arg, arg, arg
-                ))
+            Ok(guarded_ip_predicate(arg, &format!(
+                "NOT (isIPAddressInRange(toString({arg}), '10.0.0.0/8') OR isIPAddressInRange(toString({arg}), '172.16.0.0/12') OR isIPAddressInRange(toString({arg}), '192.168.0.0/16') OR isIPAddressInRange(toString({arg}), '127.0.0.0/8'))"
+            )))
         }
         "is_loopback" | "isloopback" => {
-            // Guard against empty strings which crash isIPAddressInRange
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("is_loopback() requires 1 argument".into())
             })?;
-            Ok(format!("(length({}) > 0 AND isIPAddressInRange({}, '127.0.0.0/8'))", arg, arg))
+            Ok(guarded_ip_predicate(
+                arg,
+                &format!("isIPAddressInRange(toString({arg}), '127.0.0.0/8')"),
+            ))
         }
         "ipv4_to_int" | "ip_to_int" => {
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("ipv4_to_int() requires 1 argument".into())
             })?;
-            Ok(format!("IPv4StringToNum({})", arg))
+            // Invalid input is 0, never a query error.
+            Ok(format!("IPv4StringToNumOrDefault(toString({}))", arg))
         }
         "int_to_ipv4" | "int_to_ip" => {
             let arg = arg_sqls.first().ok_or_else(|| {
@@ -645,7 +1116,13 @@ fn eval_function_to_sql(
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("entropy() requires 1 argument".into()))?;
-            Ok(format!("arrayReduce('entropy', extractAll({}, '.'))", arg))
+            Ok(null_propagating(
+                arg,
+                &format!(
+                    "arrayReduce('entropy', extractAll({}, '.'))",
+                    non_null_text(arg)
+                ),
+            ))
         }
 
         // ============================================================
@@ -1096,6 +1573,40 @@ fn eval_function_to_sql(
         // ============================================================
         // Conditional Functions
         // ============================================================
+        "in" => match args
+            .first()
+            .and_then(|a| array_subject(gen, a, field_override))
+        {
+            // `arr IN (...)`: any element is a member (multivalue semantics).
+            Some(_) => {
+                let mut element_sqls = arg_sqls.clone();
+                let numeric_members = args.len() > 1
+                    && args[1..]
+                        .iter()
+                        .all(|m| matches!(m, EvalExpression::Literal(Value::Number(_))));
+                element_sqls[0] = if numeric_members {
+                    "toFloat64OrNull(toString(x))".to_string()
+                } else {
+                    "x".to_string()
+                };
+                Ok(format!(
+                    "arrayExists(x -> {}, {})",
+                    in_sql(args, &element_sqls)?,
+                    arg_sqls[0]
+                ))
+            }
+            None => in_sql(args, &arg_sqls),
+        },
+        "not" => {
+            if arg_sqls.len() != 1 {
+                return Err(SqlGenError::InvalidQuery(
+                    "not() requires 1 argument".into(),
+                ));
+            }
+            // Search semantics (NAN-3037): a NULL (missing) value does not
+            // satisfy the inner predicate, so NOT of it is true.
+            Ok(format!("({})", super::null_safe_not(&arg_sqls[0])))
+        }
         "if" | "iif" => {
             if arg_sqls.len() != 3 {
                 return Err(SqlGenError::InvalidQuery(
@@ -1134,6 +1645,78 @@ fn eval_function_to_sql(
                 SqlGenError::InvalidQuery("isnotnull() requires 1 argument".into())
             })?;
             Ok(format!("isNotNull({})", arg))
+        }
+        // NAN-3313: Splunk type tests. They were in the `where` boolean-function
+        // allowlist but had no SQL arm, so they parsed and then failed. NULL
+        // is never a number/int/string/bool.
+        "isnum" => {
+            let arg = single_arg(&arg_sqls, "isnum")?;
+            Ok(format!("isNotNull(toFloat64OrNull(toString({arg})))"))
+        }
+        "isint" => {
+            let arg = single_arg(&arg_sqls, "isint")?;
+            Ok(format!("isNotNull(toInt64OrNull(toString({arg})))"))
+        }
+        "isstr" => {
+            // Type test, not a content test: `"5"` is a string, `5` is not.
+            let arg = single_arg(&arg_sqls, "isstr")?;
+            Ok(format!(
+                "(isNotNull({arg}) AND match(toTypeName({arg}), '^(LowCardinality[(])?(Nullable[(])?(Fixed)?String'))"
+            ))
+        }
+        "isbool" => {
+            let arg = single_arg(&arg_sqls, "isbool")?;
+            Ok(format!(
+                "(isNotNull({arg}) AND match(toTypeName({arg}), '^(Nullable[(])?Bool'))"
+            ))
+        }
+        "searchmatch" => {
+            // searchmatch("<search terms>"): true when the row matches the
+            // search expression, with base-search semantics (wildcards,
+            // case-insensitive equality, keywords).
+            let text = match args {
+                [EvalExpression::Literal(Value::String(s))] => s,
+                _ => {
+                    return Err(SqlGenError::InvalidQuery(
+                        "searchmatch() requires 1 quoted search string".into(),
+                    ))
+                }
+            };
+            // Parse errors get their own message; the shared helper (also used
+            // by the field collectors) yields the expression itself.
+            if let Err(e) = crate::query::parse_query(text) {
+                return Err(SqlGenError::InvalidQuery(format!("searchmatch(): {}", e.message)));
+            }
+            let call = EvalExpression::FunctionCall {
+                name: name.to_string(),
+                args: args.to_vec(),
+            };
+            let Some(expr) = crate::query::searchmatch_search_expr(&call) else {
+                return Err(SqlGenError::InvalidQuery(
+                    "searchmatch() takes search terms only, not piped commands".into(),
+                ));
+            };
+            // The inner text is invisible to every AST walk (source-scope /
+            // RBAC gates, subsearch and post-processing classifiers), so only
+            // row-local terms are allowed: no subsearches, IOC feed lookups or
+            // nested function filters.
+            fn row_local(expr: &SearchExpr) -> bool {
+                match expr {
+                    SearchExpr::Keyword(_)
+                    | SearchExpr::FieldFilter { .. }
+                    | SearchExpr::InList { .. } => true,
+                    SearchExpr::And(l, r) | SearchExpr::Or(l, r) => row_local(l) && row_local(r),
+                    SearchExpr::Not(e) | SearchExpr::Group(e) => row_local(e),
+                    _ => false,
+                }
+            }
+            if !row_local(&expr) {
+                return Err(SqlGenError::InvalidQuery(
+                    "searchmatch() supports field=value, keyword, IN (...), AND/OR/NOT terms only"
+                        .into(),
+                ));
+            }
+            Ok(format!("({})", gen.generate_search_expr(&expr)?))
         }
         "case" => {
             // case(condition1, value1, condition2, value2, ..., [default]) →
@@ -1238,7 +1821,7 @@ fn eval_function_to_sql(
                     "like() requires 2 arguments (string, pattern)".into(),
                 ));
             }
-            Ok(format!("({} LIKE {})", arg_sqls[0], arg_sqls[1]))
+            Ok(like_sql(&arg_sqls[0], &arg_sqls[1]))
         }
         "match" | "regex_match" => {
             if arg_sqls.len() != 2 {
@@ -1261,7 +1844,7 @@ fn eval_function_to_sql(
                         // Use extractGroups to get all groups, then index into the array
                         // ClickHouse arrays are 1-indexed, and extractGroups returns [group1, group2, ...]
                         // So user's group 1 = array[1], group 2 = array[2], etc.
-                        Ok(format!("extractGroups({}, {})[{}]", arg_sqls[0], arg_sqls[1], arg_sqls[2]))
+                        Ok(null_propagating(&arg_sqls[0], &format!("extractGroups({}, {})[{}]", non_null_text(&arg_sqls[0]), arg_sqls[1], arg_sqls[2])))
                     }
                     _ => Err(SqlGenError::InvalidQuery("regex_extract() requires 2 or 3 arguments: regex_extract(string, pattern[, group_num])".into())),
                 }
@@ -1361,13 +1944,16 @@ fn eval_function_to_sql(
             Ok(format!("firstSignificantSubdomain({})", arg))
         }
         "domain_depth" | "subdomain_count" => {
-            // Count subdomain levels: www.mail.google.com -> 4
+            // Count subdomain levels, ignoring a leading www: www.mail.google.com -> 3
             let arg = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("domain_depth() requires 1 argument".into())
             })?;
-            Ok(format!(
-                "length(splitByChar('.', domainWithoutWWW({})))",
-                arg
+            Ok(null_propagating(
+                arg,
+                &format!(
+                    "length(splitByChar('.', domainWithoutWWW({})))",
+                    non_null_text(arg)
+                ),
             ))
         }
 
@@ -1397,16 +1983,32 @@ fn eval_function_to_sql(
             }
         }
         "array_contains" | "arraycontains" | "has" => {
-            // Check if array/string contains element
-            // ClickHouse `has()` only works on Array types, but many fields (e.g. ioc_tags)
-            // are stored as comma-separated strings in ext JSON. Use positionCaseInsensitive()
-            // which works on any string type and returns non-zero (truthy) if found.
             if arg_sqls.len() != 2 {
                 return Err(SqlGenError::InvalidQuery(
                     "array_contains() requires 2 arguments (array, element)".into(),
                 ));
             }
-            Ok(format!("positionCaseInsensitive(toString({}), {})", arg_sqls[0], arg_sqls[1]))
+            // Canonical OCSF repeated leaves are real Array(Nullable(String))
+            // columns. Stringifying them and doing a substring search both
+            // fails exact IOC attribution and can produce false positives
+            // ("abc" would match "xabcx"). Preserve the historical fallback
+            // for string-backed fields, but give schema-known arrays exact,
+            // case-insensitive element membership semantics.
+            if let EvalExpression::Field(field) = &args[0] {
+                let field = gen.canonicalize_field(field);
+                if super::is_array_column(field) || gen.profile.is_string_array_field(field) {
+                    return Ok(format!(
+                        "arrayExists(x -> lower(ifNull(x, '')) = lower(toString({})), {})",
+                        arg_sqls[1], arg_sqls[0]
+                    ));
+                }
+            }
+            // Some legacy fields are comma-separated strings rather than
+            // arrays. Keep their existing case-insensitive contains behavior.
+            Ok(format!(
+                "positionCaseInsensitive(toString({}), {})",
+                arg_sqls[0], arg_sqls[1]
+            ))
         }
 
         // ============================================================
@@ -1622,7 +2224,7 @@ mod tests {
 
         let modern = cidr("cidr_match", vec![ip(), net()]); // cidr_match(ip, cidr)
         assert!(
-            modern.contains("isIPAddressInRange(src_ip,"),
+            modern.contains("isIPAddressInRange(toString(src_ip),"),
             "ip must be the address arg: {modern}"
         );
         assert!(
@@ -1630,13 +2232,13 @@ mod tests {
             "cidr must NOT be the address arg (swapped): {modern}"
         );
         assert!(
-            modern.contains("length(src_ip) > 0"),
-            "empty-string guard must be on the ip arg: {modern}"
+            modern.contains("isIPv4String(toString(src_ip))"),
+            "the IP-validity guard must be on the ip arg: {modern}"
         );
 
         let legacy = cidr("cidrmatch", vec![net(), ip()]); // cidrmatch(cidr, ip)
         assert!(
-            legacy.contains("isIPAddressInRange(src_ip,"),
+            legacy.contains("isIPAddressInRange(toString(src_ip),"),
             "legacy order must still resolve ip as address: {legacy}"
         );
     }
@@ -1652,7 +2254,10 @@ mod tests {
                 EvalExpression::Literal(Value::String("192.168.0.0/16".to_string())),
             ],
         );
-        assert!(sql.contains("isIPAddressInRange(src_ip,"), "{sql}");
+        assert!(
+            sql.contains("isIPAddressInRange(toString(src_ip),"),
+            "{sql}"
+        );
         assert!(!sql.contains("isIPAddressInRange('10.0.0.0/8'"), "{sql}");
     }
 
@@ -1679,8 +2284,8 @@ mod tests {
     #[test]
     fn date_trunc_legit_units_unchanged() {
         let gen = ClickHouseSqlGenerator::new();
-        let ts = eval_expression_to_sql(&gen, &EvalExpression::Field("timestamp".to_string()))
-            .unwrap();
+        let ts =
+            eval_expression_to_sql(&gen, &EvalExpression::Field("timestamp".to_string())).unwrap();
         for (unit, func) in [
             ("second", "toStartOfSecond"),
             ("minute", "toStartOfMinute"),
@@ -1715,11 +2320,19 @@ mod tests {
         assert!(!udm.contains("source_port"), "{udm}");
         assert!(!udm.contains("destination_port"), "{udm}");
 
+        let canonical_expression = EvalExpression::BinaryOp {
+            left: Box::new(EvalExpression::Field("src_endpoint.port".into())),
+            op: BinaryOperator::Sub,
+            right: Box::new(EvalExpression::Field("dst_endpoint.port".into())),
+        };
         let ocsf = ClickHouseSqlGenerator::new()
-            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
-        let ocsf_sql =
-            typed_eval_expression_to_sql_with_field_override(&ocsf, &expression, &no_override)
-                .unwrap();
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()));
+        let ocsf_sql = typed_eval_expression_to_sql_with_field_override(
+            &ocsf,
+            &canonical_expression,
+            &no_override,
+        )
+        .unwrap();
         assert!(ocsf_sql.contains("src_endpoint.port"), "{ocsf_sql}");
         assert!(ocsf_sql.contains("dst_endpoint.port"), "{ocsf_sql}");
         assert!(!ocsf_sql.contains("source_port"), "{ocsf_sql}");
@@ -1753,5 +2366,25 @@ mod tests {
             &override_first_seen,
         )
         .is_err());
+    }
+
+    #[test]
+    fn array_contains_uses_exact_membership_for_ocsf_repeated_leaves() {
+        let expression = EvalExpression::FunctionCall {
+            name: "array_contains".into(),
+            args: vec![
+                EvalExpression::Field("file.hashes.value".into()),
+                EvalExpression::Literal(Value::String("ABC123".into())),
+            ],
+        };
+        let ocsf = ClickHouseSqlGenerator::new()
+            .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::lake_1_9()));
+        assert!(ocsf.profile.uses_strict_canonical_fields());
+        assert!(ocsf.profile.is_string_array_field("file.hashes.value"));
+        assert!(ocsf.resolves_to_column("file.hashes.value"));
+        let sql = typed_eval_expression_to_sql(&ocsf, &expression).unwrap();
+        assert!(sql.contains("arrayExists"), "{sql}");
+        assert!(sql.contains("file.hashes.value"), "{sql}");
+        assert!(!sql.contains("positionCaseInsensitive"), "{sql}");
     }
 }

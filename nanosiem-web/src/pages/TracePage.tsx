@@ -15,13 +15,15 @@
 import { useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { Loader2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { TraceWaterfall } from '@/components/observability/TraceWaterfall';
+import { TelemetryUnavailable } from '@/components/observability/TelemetryUnavailable';
+import { useTelemetryAvailability } from '@/hooks/use-telemetry-availability';
 
 export function TracePage() {
   const { traceId = '' } = useParams<{ traceId: string }>();
@@ -37,6 +39,10 @@ export function TracePage() {
   const [refreshing, setRefreshing] = useState(false);
   const bypassRef = useRef(false);
 
+  // NAN-2361: a shared-lake tenant without telemetry renders the empty state
+  // and never asks the (fenced) trace route.
+  const { loading: telemetryLoading, telemetry, unavailable } = useTelemetryAvailability();
+
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['otel-trace', traceId],
     queryFn: () => {
@@ -44,7 +50,7 @@ export function TracePage() {
       bypassRef.current = false;
       return api.observability.getTrace(traceId, { onMeta: setCacheMeta, bypass });
     },
-    enabled: traceId.length > 0,
+    enabled: traceId.length > 0 && !telemetryLoading && !unavailable,
   });
 
   const refresh = () => {
@@ -58,9 +64,11 @@ export function TracePage() {
 
   return (
     <div className="px-4 py-3 w-full">
-      {isLoading ? (
+      {unavailable ? (
+        <TelemetryUnavailable telemetry={telemetry} subject="Traces" />
+      ) : isLoading || telemetryLoading ? (
         <div className="flex items-center justify-center py-16">
-          <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+          <LoadingIcon className="w-5 h-5 text-muted-foreground" />
         </div>
       ) : error ? (
         <div className="text-center py-16 text-sm text-muted-foreground">

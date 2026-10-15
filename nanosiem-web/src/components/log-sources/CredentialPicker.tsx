@@ -2,14 +2,17 @@
 
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Key, Plus, Loader2, CircleAlert } from 'lucide-react';
+import { Key, Plus, CircleAlert } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Label } from '@/components/ui/label';
 import { api } from '@/lib/api';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
+import { CLOUD_PULL_PATH } from '@/lib/shared-credentials-retired';
 import type { CloudCredential } from '@/lib/api/types';
 
 interface CredentialPickerProps {
-  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka';
+  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka' | 'azure_event_hubs';
   value: string | undefined;
   onChange: (credentialId: string | undefined) => void;
   disabled?: boolean;
@@ -19,6 +22,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   aws_s3: 'AWS',
   gcp_pubsub: 'GCP',
   kafka: 'Kafka',
+  azure_event_hubs: 'Azure Event Hubs',
 };
 
 // What "no credential selected" actually means depends on the provider:
@@ -30,9 +34,29 @@ const NONE_OPTION_LABEL: Record<string, string> = {
   aws_s3: 'None (use environment / IAM role)',
   gcp_pubsub: 'None (use Application Default Credentials)',
   kafka: 'None (unauthenticated — local / dev brokers)',
+  azure_event_hubs: 'None (use managed identity)',
 };
 
-export function CredentialPicker({ provider, value, onChange, disabled }: CredentialPickerProps) {
+/**
+ * Stored cloud credential picker. Retired on hosted-shared tenants (NAN-3620):
+ * nothing there consumes stored keys (transports are platform-managed and
+ * hosted cloud pull is keyless), so shared renders a pointer to Log Sources →
+ * Cloud pull instead of a picker and never lists or links credentials.
+ */
+export function CredentialPicker(props: CredentialPickerProps) {
+  const shared = useSharedTenant();
+  if (shared) {
+    return (
+      <p className="text-[11px] text-muted-foreground leading-relaxed" data-testid="credential-picker-retired">
+        Stored cloud credentials are not used on hosted tenants. Cloud pull is keyless:{' '}
+        <Link to={CLOUD_PULL_PATH} className="text-primary hover:underline">Log Sources → Cloud pull</Link>.
+      </p>
+    );
+  }
+  return <StoredCredentialPicker {...props} />;
+}
+
+function StoredCredentialPicker({ provider, value, onChange, disabled }: CredentialPickerProps) {
   const [credentials, setCredentials] = useState<CloudCredential[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -78,7 +102,7 @@ export function CredentialPicker({ provider, value, onChange, disabled }: Creden
 
       {loading ? (
         <div className="flex items-center gap-2 px-2.5 py-1.5 bg-muted/30 rounded-md">
-          <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
+          <LoadingIcon className="w-3 h-3 text-muted-foreground" />
           <span className="text-[11px] text-muted-foreground">Loading credentials…</span>
         </div>
       ) : error ? (

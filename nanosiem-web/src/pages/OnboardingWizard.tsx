@@ -23,7 +23,6 @@ import {
   Code,
   Search,
   Check,
-  Loader2,
   X,
   ExternalLink,
   ArrowRight,
@@ -32,6 +31,7 @@ import {
   Sparkles,
   ArrowUpRight,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
   useOnboardingProgress,
   useOnboardingStatus,
@@ -39,7 +39,10 @@ import {
   useSkipOnboardingStep,
   useDismissOnboarding,
   useSystemConfig,
+  useLogSources,
 } from '@/hooks/use-api';
+import { useSharedTenant } from '@/hooks/use-shared-tenant';
+import { overlayLogSourceStatus } from '@/lib/onboarding-status';
 import { useTierContext } from '@/hooks/use-tier';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import type { Capabilities } from '@/hooks/use-capabilities';
@@ -149,7 +152,15 @@ const Eyebrow = ({ children }: { children: React.ReactNode }) => (
 export function OnboardingWizard() {
   const navigate = useNavigate();
   const { data: progress, loading: progressLoading, refetch: refetchProgress } = useOnboardingProgress();
-  const { data: status } = useOnboardingStatus();
+  const { data: probedStatus } = useOnboardingStatus();
+  // NAN-3241: shared/lean tenants keep sources + parsers in the tenant
+  // registry (/api/log-sources); the status probe cannot see them.
+  const isSharedTenant = useSharedTenant();
+  const { data: registrySources } = useLogSources({ skip: !isSharedTenant });
+  const status = useMemo(
+    () => (isSharedTenant ? overlayLogSourceStatus(probedStatus, registrySources) : probedStatus),
+    [isSharedTenant, probedStatus, registrySources],
+  );
   const { data: systemConfig } = useSystemConfig();
   const { hasSso } = useTierContext();
   const { capabilities } = useCapabilities();
@@ -182,7 +193,11 @@ export function OnboardingWizard() {
     () =>
       steps.map((s) => {
         const isLocked = s.key === 'sso_setup' && !hasSso;
-        const isDone = (status?.[s.statusKey] ?? false) || completedSteps.includes(s.key);
+        // SSO "done" comes from the live probe only (NAN-3189): a provider
+        // can be disabled or retired after the step was persisted as
+        // complete, and a stale completion must not keep the green check.
+        const liveDone = status?.[s.statusKey] ?? false;
+        const isDone = s.key === 'sso_setup' ? liveDone : liveDone || completedSteps.includes(s.key);
         const isSkipped = skippedSteps.includes(s.key);
         // A locked step counts as "satisfied" for progress purposes so the bar
         // can fill to 100% without forcing the user onto an unavailable tier.
@@ -248,7 +263,7 @@ export function OnboardingWizard() {
   if (progressLoading) {
     return (
       <div className="flex h-[60vh] items-center justify-center">
-        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+        <LoadingIcon className="h-6 w-6 text-muted-foreground" />
       </div>
     );
   }
@@ -386,7 +401,7 @@ export function OnboardingWizard() {
                   style={{ textWrap: 'pretty' }}
                 >
                   {isLocked
-                    ? 'SSO is available on Pro and above. Upgrade to connect your identity provider.'
+                    ? 'SSO is included on every enterprise plan. Ask an administrator to enable the enterprise SSO service.'
                     : step.description}
                 </p>
               </div>

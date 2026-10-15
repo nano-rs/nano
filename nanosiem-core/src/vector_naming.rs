@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 //! Canonical Vector component naming (NAN-2196).
 //!
 //! Vector component IDs are derived from user-supplied names, and that mapping
@@ -166,7 +168,9 @@ pub fn generated_identity_conflict<Id: PartialEq + Copy>(
             .filter(|(id, _)| Some(*id) != exclude)
             .map(|(_, existing_name)| (safe_name(existing_name), existing_name.clone())),
     )?;
-    Some(describe_identity_conflict(subject, name, &generated, &holder))
+    Some(describe_identity_conflict(
+        subject, name, &generated, &holder,
+    ))
 }
 
 /// Operator-facing deploy refusal when a whole staged/deployed set contains a

@@ -81,8 +81,19 @@ export function SourceConfigForm({
         />
       );
 
+    case 'azure_event_hubs':
+      return (
+        <EventHubsConfigForm
+          config={config}
+          onChange={onConfigChange}
+          credentialId={credentialId}
+          onCredentialChange={onCredentialChange}
+          disabled={disabled}
+        />
+      );
+
     case 'splunk_hec':
-      return <SplunkHecConfigForm />;
+      return <HecConfigForm />;
 
     case 'vector':
       return (
@@ -614,17 +625,114 @@ function GcpPubSubConfigForm({ config, onChange, credentialId, onCredentialChang
   );
 }
 
+// NAN-3764: Azure Event Hubs on the Vector fork's `azure_event_hubs` source.
+// Secrets (SAS / storage connection strings, an Entra client secret) live in
+// the sealed credential; these are coordinates only. Point-forward: there is
+// no start-position or backfill field on purpose.
+function EventHubsConfigForm({ config, onChange, credentialId, onCredentialChange, disabled }: FormWithCredentialsProps) {
+  const text = (key: string) => (config[key] as string) || '';
+  const set = (key: string, value: string) =>
+    onChange({ ...config, [key]: value.trim() === '' ? undefined : value.trim() });
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>Event Hub *</Label>
+          <Input
+            value={text('event_hub_name')}
+            onChange={(e) => set('event_hub_name', e.target.value)}
+            placeholder="insights-activity-logs"
+            disabled={disabled}
+            className={INPUT_MONO}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>Consumer group</Label>
+          <Input
+            value={text('consumer_group')}
+            onChange={(e) => set('consumer_group', e.target.value)}
+            placeholder="$Default"
+            disabled={disabled}
+            className={INPUT_MONO}
+          />
+        </div>
+      </div>
+      <p className={HELP_TEXT}>
+        Use a consumer group no other reader uses: readers sharing one compete for partitions.
+      </p>
+
+      <div className="space-y-1.5">
+        <Label className={FIELD_LABEL}>Namespace</Label>
+        <Input
+          value={text('namespace')}
+          onChange={(e) => set('namespace', e.target.value)}
+          placeholder="acme-logs"
+          disabled={disabled}
+          className={INPUT_MONO}
+        />
+        <p className={HELP_TEXT}>
+          Namespace name or host (<span className="font-mono">acme-logs.servicebus.windows.net</span>).
+          Required with an Entra service principal or managed identity; ignored when the credential
+          carries an Event Hubs connection string.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>Checkpoint container *</Label>
+          <Input
+            value={text('checkpoint_container')}
+            onChange={(e) => set('checkpoint_container', e.target.value)}
+            placeholder="nano-checkpoints"
+            disabled={disabled}
+            className={INPUT_MONO}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label className={FIELD_LABEL}>Storage account</Label>
+          <Input
+            value={text('checkpoint_account')}
+            onChange={(e) => set('checkpoint_account', e.target.value)}
+            placeholder="acmecheckpoints"
+            disabled={disabled}
+            className={INPUT_MONO}
+          />
+        </div>
+      </div>
+      <p className={HELP_TEXT}>
+        Positions are checkpointed in this existing Blob container, so a restart resumes where it
+        stopped without gaps or duplicates. The storage account is only needed when the credential
+        has no storage connection string.
+      </p>
+
+      <div className="p-2.5 bg-muted/30 border border-border rounded-md text-[11px] text-muted-foreground leading-relaxed">
+        Starts at the newest events: messages already in the hub when the source is first deployed
+        are not ingested. Azure Monitor batches (<span className="font-mono">{'{"records": [...]}'}</span>)
+        are split into one event per record.
+      </div>
+
+      <CredentialPicker
+        provider="azure_event_hubs"
+        value={credentialId}
+        onChange={onCredentialChange}
+        disabled={disabled}
+      />
+    </div>
+  );
+}
+
 // NAN-883 / NAN-855: HEC is served by the OOTB `splunk_hec_ingest` listener
 // (config/vector/02-hec-source.toml, :8088, shared `${VECTOR_AUTH_TOKEN}`).
 // A user HEC source config is a routing profile only — `address`,
 // `valid_tokens`, `permit_origin`, and `tls` no longer have any effect at
 // deploy time, so the form has nothing per-config to ask for.
-function SplunkHecConfigForm() {
+function HecConfigForm() {
   return (
     <div className="p-4 bg-muted/30 rounded-md text-center text-muted-foreground">
       <Zap className="w-8 h-8 mx-auto mb-2 opacity-50" />
       <p className="text-[12px]">
-        Splunk HEC events arrive on the platform-managed listener.
+        HEC events arrive on the platform-managed listener.
       </p>
       <p className="text-[10.5px] mt-2 leading-relaxed">
         No per-config connection settings. Events are accepted on{' '}

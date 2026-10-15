@@ -449,13 +449,24 @@ impl SchedulerService {
             }
         }
 
+        // Resolve the first fetched payload once, then store that choice for
+        // later runs. Explicit user settings remain authoritative.
+        let mut parser_config = job.parser_config.clone();
+        let detected_header = if parser_config.format == crate::upload::FileFormat::Csv && parser_config.has_header.is_none() {
+            let value = crate::upload::FileParser::resolve_has_header(&content, &parser_config);
+            parser_config.has_header = Some(value);
+            Some(value)
+        } else {
+            None
+        };
+
         // Process through upload service
         let upload_service = crate::upload::UploadService::new(self.pool.clone());
         let upload_request = crate::upload::UploadRequest {
             filename: format!("scheduled_{}_{}.data", job.name, Utc::now().timestamp()),
             content: content.to_vec(),
             destination: job.destination.clone(),
-            config: job.parser_config.clone(),
+            config: parser_config,
             idempotency_key: Some(run_id),
         };
 
@@ -463,6 +474,12 @@ impl SchedulerService {
             .upload(upload_request)
             .await
             .map_err(|e| SchedulerError::UploadError(e.to_string()))?;
+
+        if let Some(has_header) = detected_header {
+            if let Err(error) = self.repository.persist_detected_header(job.id, has_header).await {
+                warn!(job_id = %job.id, ?error, "Could not persist detected lookup header setting");
+            }
+        }
 
         Ok((result.records_processed, result.records_ingested))
     }

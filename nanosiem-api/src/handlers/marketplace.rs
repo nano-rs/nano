@@ -26,6 +26,7 @@ use nanosiem_core::audit::{
 #[cfg(feature = "enterprise")]
 use nanosiem_core::audit::MARKETPLACE_PREVIEW_EXECUTED;
 use nanosiem_core::auth::permissions;
+use nanosiem_core::marketplace::platform_sync::SyncNowAccepted;
 use nanosiem_core::marketplace::{
     ArtifactCoverage, CatalogFilter, CatalogStats, CollectorManifestFields, ConfigureRequest,
     CoverageState, CreateMarketplaceRepo, CredentialFieldDef, EnrichmentMarketplaceRepo,
@@ -90,6 +91,10 @@ pub struct ExportResponse {
     pub manifest_yaml: String,
     /// code.ts content
     pub code: String,
+    /// connector.yaml content, for entries that ship a nano
+    /// connector spec. The manifest names it as `connector_spec`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector_spec: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -625,6 +630,7 @@ pub async fn export_enrichment(
     // `config` — leaving them nested would produce a manifest that re-imports
     // as an enrichment with no streams.
     let collector = CollectorManifestFields::take_from(&entry.config.0);
+    let connector_spec = collector.connector_spec.clone();
 
     // Build manifest struct
     let manifest = MarketplaceManifest {
@@ -664,6 +670,16 @@ pub async fn export_enrichment(
         config_fields: collector.config_fields,
         allowed_domain_suffixes: collector.allowed_domain_suffixes,
         streams: collector.streams,
+        runtime: collector.runtime,
+        connector_spec: connector_spec
+            .as_ref()
+            .map(|_| CollectorManifestFields::CONNECTOR_SPEC_FILE.to_string()),
+        // Platform-only; the export carries the portable spec.
+        hosted_connector_spec: None,
+        // NAN-3503: platform marketplace layout; component specs are stored
+        // as text and are not exported.
+        categories: Vec::new(),
+        components: Vec::new(),
     };
 
     let manifest_yaml = serde_yaml::to_string(&manifest)
@@ -682,6 +698,7 @@ pub async fn export_enrichment(
         directory,
         manifest_yaml,
         code,
+        connector_spec,
     }))
 }
 
@@ -831,6 +848,8 @@ pub async fn delete_repo(
     params(("id" = String, Path, description = "Repository ID")),
     responses(
         (status = 200, description = "Sync started", body = MessageResponse),
+        (status = 202, description = "Shared platform repository sync queued", body = SyncNowAccepted),
+        (status = 429, description = "Shared platform sync request rate limit", headers(("Retry-After" = i64, description = "Seconds until another request is allowed"))),
         (status = 409, description = "Sync already in progress"),
     ),
     security(("api_key" = []))
@@ -1612,7 +1631,7 @@ mod preview_tests {
 // =============================================================================
 
 /// Get marketplace coverage by artifact type. Backed by a 6h
-/// Dragonfly-shared cache (NAN-609) — `computed_at` in the response is the
+/// Dragonfly-shared cache — `computed_at` in the response is the
 /// time the SQL was last *actually* run, not the time this request was
 /// served. Use `POST /api/marketplace/coverage/refresh` to force a
 /// recompute from the UI.
@@ -1681,7 +1700,7 @@ fn build_coverage_service(
         state.pool.clone(),
         state.dual_pool.clickhouse().clone(),
         (*state.marketplace_coverage_cache).clone(),
-        state.config.schema_profile(),
+        state.schema_profile(),
         denied_sources,
     )
 }
@@ -1810,6 +1829,7 @@ mod coverage_authz_tests {
     components(schemas(
         ListCatalogResponse,
         ListReposResponse,
+        SyncNowAccepted,
         BrowseRepoResponse,
         MessageResponse,
         ExportResponse,

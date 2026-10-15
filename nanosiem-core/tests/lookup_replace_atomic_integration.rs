@@ -97,3 +97,47 @@ async fn failed_replace_preserves_existing_data() {
 
     let _ = svc.drop_table(name).await;
 }
+
+#[tokio::test]
+#[ignore = "requires an explicitly disposable Postgres (DATABASE_URL)"]
+async fn successful_replace_and_delete_with_rule_conflict() {
+    let pool = common::migrated_pool().await;
+    let svc = LookupService::new(LookupRepository::new(pool.clone()));
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let name = format!("nan2875_replace_{suffix}");
+    let rule_name = format!("nan2875_rule_{suffix}");
+    let definition = |columns: Vec<LookupColumn>| NewLookupTable {
+        name: name.clone(),
+        description: None,
+        columns,
+        primary_key: Some("id".to_string()),
+    };
+
+    svc.create_table(definition(vec![col("id", ColumnType::Integer, false)]), None)
+        .await.expect("create table");
+    svc.insert_records(&name, vec![rec(&[("id", serde_json::json!(1))])])
+        .await.expect("seed table");
+    let replaced = svc.replace_table(
+        definition(vec![col("id", ColumnType::Integer, false), col("label", ColumnType::Text, true)]),
+        vec![rec(&[("id", serde_json::json!(2)), ("label", serde_json::json!("new"))])],
+    ).await.expect("replace existing table");
+    assert_eq!(replaced.row_count, 1);
+    assert!(replaced.columns.iter().any(|column| column.name == "label"));
+    let rows = svc.sample_rows(&name, 10).await.expect("sample replaced rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], serde_json::json!(2));
+
+    let rule_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO detection_rules (name, query, severity) VALUES ($1, $2, 'low') RETURNING id",
+    ).bind(&rule_name).bind(format!("search * | lookup @{name}.id")).fetch_one(&pool).await.expect("create referencing rule");
+    let conflict = svc.drop_table(&name).await.expect_err("referenced table must stay");
+    assert!(matches!(conflict, nanosiem_core::LookupError::TableInUse(rules) if rules.contains(&rule_name)));
+    assert_eq!(svc.get_table(&name).await.expect("table survives conflict").row_count, 1);
+
+    sqlx::query("DELETE FROM detection_rules WHERE id = $1").bind(rule_id).execute(&pool).await.expect("remove rule");
+    svc.drop_table(&name).await.expect("delete unreferenced table");
+    assert!(matches!(svc.get_table(&name).await, Err(nanosiem_core::LookupError::TableNotFound(_))));
+    let physical_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&replaced.table_name).fetch_one(&pool).await.expect("check physical table");
+    assert!(!physical_exists);
+}

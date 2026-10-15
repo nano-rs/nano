@@ -3,6 +3,8 @@
 // Open-edition stub for CasesApi. Cases (investigation management) is enterprise-only.
 
 import type {
+  InboxCountsResponse,
+  InboxIncidentsResponse,
   Case,
   CaseListResponse,
   CaseSummary,
@@ -47,6 +49,12 @@ export class CasesApi {
   }
 
   listCases(_params?: CaseFilter): Promise<CaseListResponse> {
+    return ENTERPRISE_ONLY();
+  }
+  getInboxCounts(_params?: { queue_group?: string; groups?: string[] }): Promise<InboxCountsResponse> {
+    return ENTERPRISE_ONLY();
+  }
+  getInboxIncidents(_params?: { queue_group?: string }): Promise<InboxIncidentsResponse> {
     return ENTERPRISE_ONLY();
   }
   getMyCases(_limit?: number): Promise<CaseSummary[]> {

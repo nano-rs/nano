@@ -38,6 +38,8 @@ fn rule_with_modifier() -> DetectionRule {
         realtime_enabled: true,
         detection_mode: DetectionMode::RealTime,
         materialized_view_name: Some("mv_rt_detection_x".to_string()),
+        near_real_time_interval_seconds: None,
+        execution_mode: None,
         risk_score: Some(50),
         risk_entity_field: Some("user".to_string()),
         risk_modifiers: sqlx::types::Json(vec![RiskModifier {

@@ -10,12 +10,12 @@ import { useNavigate } from 'react-router-dom';
 import {
   ChevronRight,
   Database,
-  Loader2,
   MoreHorizontal,
   Plus,
   Search,
   Trash2,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useDeleteLookupTable, useLookupTables } from '@/hooks/use-api';
@@ -213,7 +213,7 @@ export function LookupTables() {
       <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6">
         {loading ? (
           <div className="rounded-lg border border-border bg-card p-12 flex items-center justify-center">
-            <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" strokeWidth={2} />
+            <LoadingIcon className="w-5 h-5 text-muted-foreground" strokeWidth={2} />
           </div>
         ) : (
           <div className="rounded-lg border border-border bg-card overflow-hidden">

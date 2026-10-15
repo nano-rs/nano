@@ -22,7 +22,11 @@ struct FieldDef {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=WORKER_REVISION");
     println!("cargo:rerun-if-changed=docs/udmfields.csv");
+    // sqlx::migrate! embeds migrations at compile time. Watch the directories
+    // so a new SQL file invalidates cached test binaries on a warm CI runner.
+    println!("cargo:rerun-if-changed=../migrations/postgres");
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("generated_fields.rs");
@@ -42,6 +46,56 @@ fn main() {
 
     // Air-gap bundle signing public-key injection (NAN-1210).
     generate_airgap_pubkey(&out_dir);
+
+    // NAN-3767: the Vector config renderer's code identity.
+    generate_vector_renderer_source_hash();
+}
+
+/// Source trees whose code decides the rendered Vector configuration.
+const VECTOR_RENDERER_SOURCES: [&str; 2] = ["src/parsers/vector_config", "src/source_configs"];
+
+/// NAN-3767: a content hash of the Vector config renderer's own source,
+/// exported as `NANO_VECTOR_RENDERER_SOURCE_HASH` and folded into the
+/// publication's renderer fingerprint. Since NAN-3511 the crate version is
+/// frozen at 1.x, so without it an upgrade whose renderer emits different
+/// TOML for the same database revision kept serving the generation the old
+/// binary rendered (a new identity lane never reached Vector until someone
+/// redeployed a source). FNV-1a 64 over sorted relative paths and bytes:
+/// deterministic across hosts and toolchains.
+fn generate_vector_renderer_source_hash() {
+    fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    for root in VECTOR_RENDERER_SOURCES {
+        println!("cargo:rerun-if-changed={root}");
+        collect(Path::new(root), &mut files);
+    }
+    files.sort();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for file in &files {
+        feed(file.to_string_lossy().replace('\\', "/").as_bytes());
+        feed(&[0]);
+        feed(&std::fs::read(file).unwrap_or_default());
+        feed(&[0]);
+    }
+    println!("cargo:rustc-env=NANO_VECTOR_RENDERER_SOURCE_HASH={hash:016x}");
 }
 
 /// Env var carrying the 64-char hex encoding of the 32-byte production air-gap
@@ -73,7 +127,7 @@ const AIRGAP_PUBKEY_ENV: &str = "AIRGAP_BUNDLE_PUBLIC_KEY_HEX";
 ///   AIRGAP_BUNDLE_PUBLIC_KEY_HEX=<64 hex chars> cargo build --release --features enterprise
 /// ```
 ///
-/// The matching PRIVATE signing seed lives ONLY in the offline nano-main signer
+/// The matching PRIVATE signing seed lives ONLY in the offline platform signer
 /// / key-store and is never present in this repo or any build environment.
 fn generate_airgap_pubkey(out_dir: &str) {
     // Re-run only when the injection variable changes (not on every build).

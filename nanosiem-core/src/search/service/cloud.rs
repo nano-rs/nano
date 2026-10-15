@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::*;
 use super::lateral::source_scope_sql_predicate;
+use super::*;
 use crate::auth::ScopeSet;
 
 impl SearchService {
@@ -177,7 +177,10 @@ impl SearchService {
     /// (byte-identical). OCSF maps `change_type` onto the numeric `activity_id`
     /// enum (NAN-1248): decode the literal to its code and compare numerically;
     /// literals with no OCSF code (`permission_change`) match nothing (`0`).
-    pub(crate) fn change_type_equals(profile: &dyn crate::schema::SchemaProfile, literal: &str) -> String {
+    pub(crate) fn change_type_equals(
+        profile: &dyn crate::schema::SchemaProfile,
+        literal: &str,
+    ) -> String {
         match profile.udm_column_sql("change_type") {
             Some(col) if col == "change_type" => format!("change_type = '{literal}'"),
             Some(col) => match Self::change_type_activity_id(literal) {
@@ -192,7 +195,10 @@ impl SearchService {
     /// verbatim; OCSF decodes each literal to its `activity_id` code, dropping
     /// unrepresentable ones (`permission_change`), and emits a numeric IN-list.
     /// `0` (match nothing) when no literal maps under OCSF (NAN-1248).
-    pub(crate) fn change_type_in(profile: &dyn crate::schema::SchemaProfile, literals: &[&str]) -> String {
+    pub(crate) fn change_type_in(
+        profile: &dyn crate::schema::SchemaProfile,
+        literals: &[&str],
+    ) -> String {
         match profile.udm_column_sql("change_type") {
             Some(col) if col == "change_type" => {
                 let list = literals
@@ -242,7 +248,9 @@ impl SearchService {
     /// is usually empty for cloud events — so under OCSF we prefer
     /// `actor.user.name` and fall back to `user.name`. UDM byte-identical (returns
     /// the bare `user` column). `None` only if the schema maps neither. (NAN-1248)
-    pub(crate) fn cloud_principal_col(profile: &dyn crate::schema::SchemaProfile) -> Option<String> {
+    pub(crate) fn cloud_principal_col(
+        profile: &dyn crate::schema::SchemaProfile,
+    ) -> Option<String> {
         match profile.id() {
             crate::schema::SchemaId::Ocsf => {
                 let actor = crate::query::escape_identifier("actor.user.name");
@@ -706,11 +714,7 @@ impl SearchService {
                 mfa_count: u64,
                 no_mfa_count: u64,
             }
-            match clickhouse
-                .query(sql)
-                .fetch_all::<UserActivityRow>()
-                .await
-            {
+            match clickhouse.query(sql).fetch_all::<UserActivityRow>().await {
                 Ok(rows) => {
                     let activity = rows
                         .into_iter()
@@ -851,6 +855,20 @@ impl SearchService {
         ),
         SearchError,
     > {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((Vec::new(), 0, CloudFacets::default(), None, None));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_cloud_events_paginated(
+                    query_str, time_range, offset, limit, filters, scope,
+                )
+                .await;
+        }
         // NAN-2022: match build_cloud_view — clamp an over-wide window end-anchored to
         // the cap instead of rejecting, so the timeline "load more" stays consistent
         // with the (already clamped) primary cloud view rather than 400-ing on offset 0.
@@ -1162,10 +1180,7 @@ impl SearchService {
                     Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!(
-                            "Cloud paginated events query failed mid-stream: {}",
-                            e
-                        );
+                        tracing::warn!("Cloud paginated events query failed mid-stream: {}", e);
                         return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }
@@ -1337,10 +1352,92 @@ impl SearchService {
 
         tracing::info!(
             "Cloud paginated query: {} events (offset={}, limit={}), total={}, {} facet rows, panels={}",
-            events.len(), offset, limit, total_count, facet_rows.len(), include_panels
+            events.len(),
+            offset,
+            limit,
+            total_count,
+            facet_rows.len(),
+            include_panels
         );
 
         Ok((events, total_count, facets, resources, user_activity))
+    }
+
+    /// Fetch only the paintable Cloud event page. Canonical lake callers use
+    /// this before starting exact facets and panel aggregates, preventing those
+    /// companions from delaying visible rows. Legacy ClickHouse deployments
+    /// retain the established combined query path.
+    pub async fn query_cloud_events_page(
+        &self,
+        query_str: &str,
+        time_range: &TimeRange,
+        offset: usize,
+        limit: usize,
+        cursor: Option<&ProductViewCursor>,
+        filters: Option<&CloudEventFilters>,
+        scope: &ScopeSet,
+    ) -> Result<(Vec<serde_json::Value>, bool, Option<ProductViewCursor>), SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((Vec::new(), false, None));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_cloud_events_page(
+                    query_str, time_range, offset, limit, cursor, filters, scope,
+                )
+                .await;
+        }
+        let (events, total_count, _, _, _) = self
+            .query_cloud_events_paginated(query_str, time_range, offset, limit, filters, scope)
+            .await?;
+        let has_more = offset.saturating_add(events.len()) < total_count as usize;
+        Ok((events, has_more, None))
+    }
+
+    /// Fetch exact Cloud totals/facets and optionally the resources/users
+    /// panels without materializing the event page.
+    pub async fn query_cloud_events_summary(
+        &self,
+        query_str: &str,
+        time_range: &TimeRange,
+        filters: Option<&CloudEventFilters>,
+        scope: &ScopeSet,
+        include_panels: bool,
+    ) -> Result<
+        (
+            u64,
+            CloudFacets,
+            Option<Vec<serde_json::Value>>,
+            Option<Vec<CloudUserActivity>>,
+        ),
+        SearchError,
+    > {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((0, CloudFacets::default(), None, None));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_cloud_events_summary(
+                    query_str,
+                    time_range,
+                    filters,
+                    scope,
+                    include_panels,
+                )
+                .await;
+        }
+        let (_, total_count, facets, resources, user_activity) = self
+            .query_cloud_events_paginated(query_str, time_range, 0, 1, filters, scope)
+            .await?;
+        Ok((total_count, facets, resources, user_activity))
     }
 
     /// Query a single user's cloud activity timeline.
@@ -1354,6 +1451,18 @@ impl SearchService {
         user: &str,
         scope: &ScopeSet,
     ) -> Result<(Vec<serde_json::Value>, CloudUserSessionSummary), SearchError> {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((Vec::new(), CloudUserSessionSummary::default()));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_cloud_user_timeline(query_str, time_range, user, scope)
+                .await;
+        }
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => {
@@ -1370,7 +1479,7 @@ impl SearchService {
                         has_no_mfa: false,
                         risk_indicators: vec![],
                     },
-                ))
+                ));
             }
         };
 
@@ -1470,10 +1579,7 @@ impl SearchService {
                     Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!(
-                            "Cloud user timeline events query failed mid-stream: {}",
-                            e
-                        );
+                        tracing::warn!("Cloud user timeline events query failed mid-stream: {}", e);
                         return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }
@@ -1592,6 +1698,24 @@ impl SearchService {
         ),
         SearchError,
     > {
+        let Some(retention_time_range) =
+            self.retention_bound_query_range(time_range, chrono::Utc::now())?
+        else {
+            return Ok((Vec::new(), Vec::new(), serde_json::json!({})));
+        };
+        let time_range = &retention_time_range;
+
+        if self.lake_query.mode == super::LakeQueryMode::Primary {
+            return self
+                .query_lake_cloud_entity_pivot(
+                    query_str,
+                    time_range,
+                    entity_type,
+                    entity_value,
+                    scope,
+                )
+                .await;
+        }
         use serde_json::json;
 
         let clickhouse = match &self.ch_client {
@@ -1688,16 +1812,20 @@ impl SearchService {
         // UDM name). We build branches as a Vec so the per-branch `entity_binds`
         // copy is appended only for branches that are actually emitted — keeping
         // placeholder/bind counts aligned regardless of which dimensions map.
-        let ip_xref_branch = src_ip_col.as_ref().map(|col| format!(
-            "SELECT 'ip' AS entity_type, {col} AS entity_value, count() AS event_count \
+        let ip_xref_branch = src_ip_col.as_ref().map(|col| {
+            format!(
+                "SELECT 'ip' AS entity_type, {col} AS entity_value, count() AS event_count \
              FROM cloud_base WHERE {entity_filter} AND {col} != '' \
              GROUP BY {col} ORDER BY event_count DESC LIMIT 50"
-        ));
-        let user_xref_branch = user_col.as_ref().map(|col| format!(
-            "SELECT 'user' AS entity_type, {col} AS entity_value, count() AS event_count \
+            )
+        });
+        let user_xref_branch = user_col.as_ref().map(|col| {
+            format!(
+                "SELECT 'user' AS entity_type, {col} AS entity_value, count() AS event_count \
              FROM cloud_base WHERE {entity_filter} AND {col} != '' \
              GROUP BY {col} ORDER BY event_count DESC LIMIT 50"
-        ));
+            )
+        });
         let resource_xref_branch = format!(
             "SELECT 'resource' AS entity_type, {resource_id_col} AS entity_value, count() AS event_count \
              FROM cloud_base WHERE {entity_filter} AND {resource_id_col} != '' \
@@ -1759,10 +1887,7 @@ impl SearchService {
                     Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
                     Ok(None) => break,
                     Err(e) => {
-                        tracing::warn!(
-                            "Cloud entity pivot events query failed mid-stream: {}",
-                            e
-                        );
+                        tracing::warn!("Cloud entity pivot events query failed mid-stream: {}", e);
                         return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }

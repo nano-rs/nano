@@ -3,7 +3,8 @@
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { Monitor, Loader2 } from 'lucide-react';
+import { Monitor } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import type { IdentityResolveResponse } from '@/lib/api/types';
 
@@ -50,7 +51,7 @@ export function IpIdentityPopover({ ip }: IpIdentityPopoverProps) {
       >
         {isLoading && (
           <div className="flex items-center gap-2 p-3 text-muted-foreground text-xs">
-            <Loader2 className="w-3 h-3 animate-spin" />
+            <LoadingIcon className="w-3 h-3" />
             <span>Resolving identity...</span>
           </div>
         )}

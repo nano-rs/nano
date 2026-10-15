@@ -258,6 +258,34 @@ impl PostgresLookupRepository {
         Ok(())
     }
 
+    /// Publish a ClickHouse replacement's schema and statistics in one
+    /// PostgreSQL statement, so readers cannot see half-updated metadata.
+    pub async fn publish_replaced_table(
+        &self,
+        name: &str,
+        columns: &[LookupColumn],
+        primary_key: Option<&str>,
+        row_count: i64,
+    ) -> Result<(), LookupRepositoryError> {
+        let columns_json = serde_json::to_value(columns).map_err(|error| {
+            LookupRepositoryError::DatabaseError(sqlx::Error::Protocol(error.to_string()))
+        })?;
+        let updated = sqlx::query(
+            "UPDATE lookup_tables_registry SET columns = $2, primary_key = $3, row_count = $4, size_bytes = 0, updated_at = NOW() WHERE name = $1",
+        )
+        .bind(name)
+        .bind(columns_json)
+        .bind(primary_key)
+        .bind(row_count)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Err(LookupRepositoryError::TableNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
     // ========================================================================
     // Dynamic Table Operations
     // ========================================================================
@@ -390,9 +418,12 @@ impl PostgresLookupRepository {
 
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", old_physical))
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(&format!(
+            "DROP TABLE IF EXISTS \"{}\" CASCADE",
+            old_physical
+        ))
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(&format!(
             "ALTER TABLE \"{}\" RENAME TO \"{}\"",
@@ -529,9 +560,9 @@ impl PostgresLookupRepository {
     fn idempotent_pg_row_ids(idempotency_key: Uuid, record_count: usize) -> Vec<i64> {
         (0..record_count)
             .map(|index| {
-                let magnitude =
-                    (super::repository::idempotent_row_id(idempotency_key, index) & i64::MAX as u64)
-                        .max(1);
+                let magnitude = (super::repository::idempotent_row_id(idempotency_key, index)
+                    & i64::MAX as u64)
+                    .max(1);
                 -(magnitude as i64)
             })
             .collect()
@@ -1328,6 +1359,36 @@ impl LookupStore for PostgresLookupRepository {
         PostgresLookupRepository::unregister_table(self, name).await
     }
 
+    async fn delete_table(&self, table: &LookupTable) -> Result<(), LookupRepositoryError> {
+        if !Self::is_valid_identifier(&table.table_name) {
+            return Err(LookupRepositoryError::InvalidTableName(table.table_name.clone()));
+        }
+        let mut tx = self.pool.begin().await?;
+        // Remove the registry first so a constraint failure leaves the physical
+        // table untouched. Transactional DDL also rolls back the DROP on error.
+        let deleted = sqlx::query("DELETE FROM lookup_tables_registry WHERE id = $1 AND name = $2")
+            .bind(table.id)
+            .bind(&table.name)
+            .execute(&mut *tx)
+            .await.map_err(|error| {
+                if error.as_database_error().and_then(|db| db.code()).as_deref() == Some("23503") {
+                    tracing::warn!(table_name = %table.name, error = %error, "Lookup table delete blocked by database reference");
+                    LookupRepositoryError::ReferenceConflict
+                } else {
+                    LookupRepositoryError::DatabaseError(error)
+                }
+            })?
+            .rows_affected();
+        if deleted == 0 {
+            return Err(LookupRepositoryError::TableNotFound(table.name.clone()));
+        }
+        sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", table.table_name))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn update_table_columns(
         &self,
         name: &str,
@@ -1539,8 +1600,7 @@ mod tests {
     fn test_word_bounded_token_match() {
         // exact end-of-string match
         assert!(PostgresLookupRepository::has_word_bounded_token(
-            "foo @bar",
-            "@bar"
+            "foo @bar", "@bar"
         ));
         // followed by dot (column ref)
         assert!(PostgresLookupRepository::has_word_bounded_token(

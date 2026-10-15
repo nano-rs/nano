@@ -6,7 +6,8 @@
  * Compact horizontal stat cards with animated counters and glow effects.
  */
 
-import { Loader2, Activity, AlertTriangle, Shield, Zap } from 'lucide-react';
+import { Activity, AlertTriangle, Shield, Zap } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { AnimatedCounter } from './AnimatedCounter';
 
 interface Stat {
@@ -78,7 +79,7 @@ export function MiniStats({ events24h, openAlerts, activeRules, eventsPerSec, lo
             key={i}
             className="bg-card/80 backdrop-blur-sm rounded-2xl p-5 flex items-center justify-center border border-border"
           >
-            <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            <LoadingIcon className="w-5 h-5 text-muted-foreground" />
           </div>
         ))}
       </div>

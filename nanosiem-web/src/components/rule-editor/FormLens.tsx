@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { useAuth } from '@/contexts/AuthContext';
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // NAN-484 PR 2 — FORM lens. Labeled fields that round-trip through the
 // same YAML frontmatter the CODE lens edits. Everything here is a thin
 // controlled wrapper over `serializeDetectionMetadata` — switching lenses
@@ -10,12 +13,16 @@
 // adapted to the real primitives + token palette.
 
 import { useCallback, useMemo } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { List as ListIcon, Shield, Clock, Globe, Terminal, Signature } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
+import { api } from '@/lib/api';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
+  deriveQuerySource,
   parseDetectionMetadata,
   serializeDetectionMetadata,
   type DetectionMetadata,
@@ -92,9 +99,27 @@ const SEV_CHIP_FG: Record<SevKey, string> = {
 };
 
 export function FormLens({ value, onChange, readOnly }: FormLensProps) {
+  const { user } = useAuth();
+  const sharedLake = user?.deployment_mode === 'enterprise_shared';
   const parsed = useMemo(() => parseDetectionMetadata(value), [value]);
   const meta = parsed.metadata;
   const query = parsed.query;
+  // Lean audit #2: hosted-shared rules are bound to one ingest source. The
+  // picker lists the tenant's visible sources; "auto" lets the server bind
+  // the query's unambiguous source when the rule goes live.
+  const { data: sourceTypes } = useQuery({
+    queryKey: ['rule-editor-source-types'],
+    queryFn: () => api.getSourceTypes(),
+    enabled: sharedLake,
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+  const derivedSource = useMemo(() => deriveQuerySource(query), [query]);
+  const sourceOptions = useMemo(() => {
+    const names = new Set((sourceTypes || []).map(([name]) => name).filter(Boolean));
+    if (meta.source) names.add(meta.source);
+    return [...names].sort();
+  }, [sourceTypes, meta.source]);
 
   const setField = useCallback(
     <K extends keyof DetectionMetadata>(key: K, next: DetectionMetadata[K]) => {
@@ -304,14 +329,54 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                   </div>
                 )}
               </FormField>
+              {sharedLake && (
+                <FormField
+                  label="Source"
+                  yamlKey="source"
+                  hint="Ingest source the rule runs against. Auto binds the source the query names when the rule goes live."
+                >
+                  <div className="flex items-center gap-2">
+                    <Select
+                      value={meta.source || '__auto__'}
+                      onValueChange={(v) => setField('source', v === '__auto__' ? undefined : v)}
+                      disabled={readOnly}
+                    >
+                      <SelectTrigger className="h-8 w-56 text-[12px] font-mono" aria-label="Source">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="__auto__" className="text-[12px] font-mono">
+                          auto{derivedSource ? ` (${derivedSource})` : ''}
+                        </SelectItem>
+                        {sourceOptions.map((name) => (
+                          <SelectItem key={name} value={name} className="text-[12px] font-mono">
+                            {name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {!meta.source && !derivedSource && (
+                      <div className="text-[11px] text-muted-foreground">
+                        query names no source — pick one if the tenant has several
+                      </div>
+                    )}
+                    {meta.source && derivedSource && meta.source !== derivedSource && (
+                      <div className="text-[11px] text-[var(--destructive)]">
+                        query searches <span className="font-mono">{derivedSource}</span>
+                      </div>
+                    )}
+                  </div>
+                </FormField>
+              )}
               <FormField label="Detection mode" yamlKey="detection_mode">
                 <div className="inline-flex rounded-md border border-border p-0.5">
                   {(['realtime', 'scheduled'] as DetectionModeKey[]).map((m) => {
-                    const active = (meta.detection_mode || 'realtime') === m;
+                    const active = (meta.detection_mode || (sharedLake ? 'scheduled' : 'realtime')) === m;
                     // Lock to scheduled for non-logs datasets (spans/metrics/
-                    // risk have no real-time materialized-view path).
+                    // risk have no real-time materialized-view path), and on
+                    // the hosted-shared lake, which has none at all (NAN-2361).
                     const datasetLocked = (meta.dataset || 'logs') !== 'logs';
-                    const lockedOut = datasetLocked && m === 'realtime';
+                    const lockedOut = (datasetLocked || sharedLake) && m === 'realtime';
                     return (
                       <button
                         key={m}
@@ -321,7 +386,7 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
                           setField('detection_mode', m);
                         }}
                         disabled={readOnly || lockedOut}
-                        title={lockedOut ? 'non-logs datasets (spans/metrics/risk) are scheduled-only' : undefined}
+                        title={lockedOut ? (sharedLake ? 'the hosted-shared lake runs scheduled detections only' : 'non-logs datasets (spans/metrics/risk) are scheduled-only') : undefined}
                         className={cn(
                           'h-7 px-2.5 rounded text-[11px] font-mono',
                           active

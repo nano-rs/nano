@@ -469,6 +469,10 @@ pub async fn remove_grant(
 
 /// Router for the per-source RBAC scope admin endpoints. Merged into the main
 /// app router before `.with_state`, so it shares [`AppState`].
+///
+/// route-overlap-contract: not-mounted-in-shared — routes.rs merges this only
+/// when `!shared_product`; the hosted-shared settings port serves these
+/// paths for hosted-shared tenants.
 pub fn source_scopes_routes() -> Router<AppState> {
     Router::new()
         .route(

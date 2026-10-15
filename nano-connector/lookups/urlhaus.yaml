@@ -1,0 +1,57 @@
+# NAN-3763 official lookup spec. Matches the nano-enrichments `urlhaus`
+# agent catalog entry (abuse.ch URLhaus API v1; Auth-Key required since 2025).
+version: 1
+name: urlhaus
+display_name: URLhaus
+description: abuse.ch database of URLs and hosts used to distribute malware.
+homepage: https://auth.abuse.ch/
+allow:
+  - host: urlhaus-api.abuse.ch
+    path_prefixes: ["/v1"]
+auth: { type: api_key_header, header: Auth-Key, credential: AUTH_KEY }
+credentials:
+  - { name: AUTH_KEY, label: abuse.ch Auth-Key }
+defaults: { cache_ttl_secs: 21600, per_minute: 60, per_day: 10000 }
+types:
+  url:
+    request:
+      method: POST
+      url: "https://urlhaus-api.abuse.ch/v1/url/"
+      body: { form: { url: "{{input.artifact}}" } }
+    link_path: urlhaus_reference
+    result:
+      rules:
+        - when: [{ path: query_status, equals: no_results }]
+          verdict: not_found
+        - when: [{ path: query_status, equals: ok }, { path: url_status, equals: online }]
+          verdict: malicious
+          score: 95
+        - when: [{ path: query_status, equals: ok }]
+          verdict: malicious
+          score: 80
+      default_verdict: unknown
+      summary:
+        url_status: url_status
+        threat: threat
+        date_added: date_added
+        host: host
+      tags: [tags, threat]
+  domain:
+    request:
+      method: POST
+      url: "https://urlhaus-api.abuse.ch/v1/host/"
+      body: { form: { host: "{{input.artifact}}" } }
+    link_path: urlhaus_reference
+    result:
+      rules:
+        - when: [{ path: query_status, equals: no_results }]
+          verdict: not_found
+        - when: [{ path: query_status, equals: ok }, { path: url_count, gte: 1 }]
+          verdict: malicious
+          score: 85
+      default_verdict: unknown
+      summary:
+        url_count: url_count
+        first_seen: firstseen
+        spamhaus_dbl: blacklists.spamhaus_dbl
+        surbl: blacklists.surbl

@@ -2,6 +2,399 @@
 
 use super::*;
 
+/// Read a result-row field that may be keyed EITHER as a flat name or as a
+/// nested OCSF path.
+///
+/// The ClickHouse lanes hand back one JSON object per row whose keys are the
+/// SELECT aliases, so a promoted OCSF column arrives as the single literal key
+/// `"file.hashes.sha256"` and a plain `row.get(field)` is correct. The
+/// primary-lake lane hands back native OCSF JSON: the same value lives at
+/// `row["file"]["hashes"][*]["value"]`, and a flat lookup finds nothing.
+///
+/// NAN-2373: the flat-only lookup is why `| prevalence` was a silent
+/// pass-through on the lake — no artifact was ever extracted, so no row was
+/// ever decorated and `host_count` never existed for a downstream threshold to
+/// compare against. Flat is still tried FIRST, so the ClickHouse lanes are
+/// byte-identical; the nested walk is a pure addition for rows that do not
+/// carry the flat key.
+///
+/// Repeated objects are traversed element-wise, which is what makes the OCSF
+/// array-of-struct hash shape (`file.hashes[].value`) readable.
+fn result_field_strings<'a>(row: &'a serde_json::Value, field: &str) -> Vec<&'a str> {
+    if let Some(direct) = row.get(field) {
+        return value_strings(Some(direct));
+    }
+    if !field.contains('.') {
+        return Vec::new();
+    }
+    let mut current: Vec<&serde_json::Value> = vec![row];
+    for segment in field.split('.') {
+        let mut next: Vec<&serde_json::Value> = Vec::new();
+        for value in current {
+            match value {
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        if let Some(child) = item.get(segment) {
+                            next.push(child);
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(child) = value.get(segment) {
+                        next.push(child);
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            return Vec::new();
+        }
+        current = next;
+    }
+    current
+        .into_iter()
+        .flat_map(|value| value_strings(Some(value)))
+        .collect()
+}
+
+/// OCSF 1.9 lake row paths for the hash artifact concepts (`file_hash`,
+/// `process_hash`). The lake stores hashes as the native repeated
+/// `file.hashes[]` object — there is NO promoted scalar `file.hashes.sha256`
+/// column in that layout, and `OcsfProfile::udm_column_sql` returns `None` for
+/// every UDM concept on the lake profile (`schema/ocsf.rs`:
+/// `if self.is_lake_1_9() { return None; }`), so the UDM/ClickHouse resolution
+/// yields an EMPTY field list there.
+pub(crate) const LAKE_HASH_ARTIFACT_PATHS: &[&str] = &[
+    "file.hashes.value",
+    "process.file.hashes.value",
+    "actor.process.file.hashes.value",
+];
+
+/// OCSF 1.9 lake row paths for the domain artifact concepts (`dest_host`,
+/// `src_host`, `url_domain`, DNS query name). Destination-side first, matching
+/// the UDM default ordering (`dest_host` before `src_host`).
+///
+/// NAN-3070: only hostnames the event *reached* count. `device.hostname` (the
+/// reporting host) and `src_endpoint.hostname` (the initiating host) are the
+/// event's own identity: exactly one host ever "sees" them, so their host
+/// count is always 1. Because the convenience `host_count` prefers the domain
+/// artifact over the hash, listing them here made every endpoint and outbound
+/// row look rare (a hash seen on 1000 hosts reported host_count 1). gen1 UDM
+/// prevalence was keyed on file hash / destination IP / destination domain
+/// only. A rule that wants a host's own prevalence names it explicitly:
+/// `| prevalence src_endpoint.hostname`.
+pub(crate) const LAKE_DOMAIN_ARTIFACT_PATHS: &[&str] = &[
+    "dst_endpoint.hostname",
+    "http_request.url.hostname",
+    "url.hostname",
+    "query.hostname",
+];
+
+/// OCSF 1.9 lake row paths for the IP artifact concepts (`dest_ip`, `src_ip`).
+pub(crate) const LAKE_IP_ARTIFACT_PATHS: &[&str] = &["dst_endpoint.ip", "src_endpoint.ip"];
+
+/// Every lake artifact path, in one list. Consumed by the primary-lake
+/// candidate projection so an internal `| table …` rewrite cannot strip the
+/// columns the prevalence stage is about to read.
+pub(crate) fn lake_prevalence_artifact_paths() -> impl Iterator<Item = &'static str> {
+    LAKE_HASH_ARTIFACT_PATHS
+        .iter()
+        .chain(LAKE_DOMAIN_ARTIFACT_PATHS)
+        .chain(LAKE_IP_ARTIFACT_PATHS)
+        .copied()
+}
+
+/// The result-row keys a positional `prevalence <field>` reads on the lake:
+/// each name as given (a derived field such as `step2_file_hashes_value` is
+/// its own key), then the column the profile resolves it to.
+///
+/// NAN-3492: lake rows are native OCSF, so a UDM alias names no row key.
+/// `prevalence file_hash` (the parser's own suggested form) extracted no
+/// artifact and decorated nothing; the row's ingest-time
+/// `prevalence_file_hash` stamp then read as the command's answer.
+pub(crate) fn lake_positional_artifact_keys(
+    profile: &dyn crate::schema::SchemaProfile,
+    artifact_fields: &[String],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(artifact_fields.len() * 2);
+    for field in artifact_fields {
+        keys.push(field.clone());
+        if let crate::schema::FieldResolution::ExplicitColumn(column) = profile.resolve(field) {
+            if column != *field && !keys.contains(&column) {
+                keys.push(column);
+            }
+        }
+    }
+    keys
+}
+
+/// Decorate each row with the prevalence of the first artifact found per
+/// class (`_prevalence`) and the convenience `host_count` / `is_rare` /
+/// `prevalence_first_seen` fields (priority domain > hash > ip). Returns how
+/// many artifacts were matched. Pure over the looked-up maps so the field
+/// lists and the priority are unit-testable (NAN-3070).
+#[allow(clippy::ptr_arg)]
+pub(crate) fn enrich_rows_with_prevalence(
+    results: &mut [serde_json::Value],
+    hash_fields: &Vec<String>,
+    domain_fields: &Vec<String>,
+    ip_fields: &Vec<String>,
+    hash_prevalence: &std::collections::HashMap<String, PrevalenceData>,
+    domain_prevalence: &std::collections::HashMap<String, PrevalenceData>,
+    ip_prevalence: &std::collections::HashMap<String, PrevalenceData>,
+) -> usize {
+    let (hash_fields, domain_fields, ip_fields) = (hash_fields.clone(), domain_fields.clone(), ip_fields.clone());
+    let mut enriched_count = 0;
+    for row in results.iter_mut() {
+        // Resolve every candidate artifact field FIRST, on an immutable
+        // borrow: `result_field_strings` walks nested OCSF paths (lake
+        // rows) as well as flat keys (ClickHouse rows), which the later
+        // `as_object_mut()` borrow cannot do.
+        let field_values: std::collections::HashMap<&str, Vec<String>> = hash_fields
+            .iter()
+            .chain(domain_fields.iter())
+            .chain(ip_fields.iter())
+            .map(|field| {
+                (
+                    field.as_str(),
+                    result_field_strings(row, field)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let values_for = |field: &String| -> &[String] {
+            field_values
+                .get(field.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        };
+        if let Some(obj) = row.as_object_mut() {
+            let mut prevalence_info = serde_json::Map::new();
+            let mut found_hash: Option<String> = None;
+            let mut found_domain: Option<String> = None;
+            let mut found_ip: Option<String> = None;
+
+            // Try to find hash in multiple possible fields
+            for field in &hash_fields {
+                let mut matched = false;
+                for hash in values_for(field) {
+                    if let Some(data) = hash_prevalence.get(&hash.to_lowercase()) {
+                        enriched_count += 1;
+                        found_hash = Some(hash.to_string());
+                        prevalence_info.insert(
+                            "hash".to_string(),
+                            serde_json::json!({
+                                "artifact": hash,
+                                "host_count": data.host_count,
+                                "total_occurrences": data.total_occurrences,
+                                "first_seen": data.first_seen.to_rfc3339(),
+                                "last_seen": data.last_seen.to_rfc3339(),
+                                "is_rare": data.is_rare,
+                                "prevalence_score": data.prevalence_score,
+                                "field_name": field, // Track which field the hash came from
+                            }),
+                        );
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    break;
+                }
+            }
+
+            // Try to find domain in multiple possible fields
+            // If the field contains an IP address instead of a domain, fall back to IP prevalence
+            for field in &domain_fields {
+                let mut matched = false;
+                for value in values_for(field) {
+                    // Check if this is an IP address in a domain field (e.g., dest_host: 185.220.101.35)
+                    if value.parse::<std::net::IpAddr>().is_ok() {
+                        // It's an IP - try IP prevalence instead
+                        if let Some(data) = ip_prevalence.get(value.as_str()) {
+                            found_ip = Some(value.to_string());
+                            prevalence_info.insert("ip".to_string(), serde_json::json!({
+                                "artifact": value,
+                                "host_count": data.host_count,
+                                "total_occurrences": data.total_occurrences,
+                                "first_seen": data.first_seen.to_rfc3339(),
+                                "last_seen": data.last_seen.to_rfc3339(),
+                                "is_rare": data.is_rare,
+                                "prevalence_score": data.prevalence_score,
+                                "field_name": field, // Track which field the IP came from (e.g., dest_host)
+                                "is_private": matches!(data.artifact_type, crate::prevalence::ArtifactType::IpAddressPrivate),
+                                "source": "domain_field_fallback", // Indicate this came from a domain field containing an IP
+                            }));
+                            enriched_count += 1;
+                            matched = true;
+                            break;
+                        }
+                    } else if let Some(data) = domain_prevalence.get(&value.to_lowercase()) {
+                        // It's a domain - use domain prevalence
+                        found_domain = Some(value.to_string());
+                        prevalence_info.insert(
+                            "domain".to_string(),
+                            serde_json::json!({
+                                "artifact": value,
+                                "host_count": data.host_count,
+                                "total_occurrences": data.total_occurrences,
+                                "first_seen": data.first_seen.to_rfc3339(),
+                                "last_seen": data.last_seen.to_rfc3339(),
+                                "is_rare": data.is_rare,
+                                "prevalence_score": data.prevalence_score,
+                                "field_name": field, // Track which field the domain came from
+                            }),
+                        );
+                        enriched_count += 1;
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    break;
+                }
+            }
+
+            // Try to find IP in multiple possible fields (if not already found from domain field fallback)
+            if found_ip.is_none() {
+                for field in &ip_fields {
+                    let mut matched = false;
+                    for ip in values_for(field) {
+                        if let Some(data) = ip_prevalence.get(ip.as_str()) {
+                            found_ip = Some(ip.to_string());
+                            prevalence_info.insert("ip".to_string(), serde_json::json!({
+                                "artifact": ip,
+                                "host_count": data.host_count,
+                                "total_occurrences": data.total_occurrences,
+                                "first_seen": data.first_seen.to_rfc3339(),
+                                "last_seen": data.last_seen.to_rfc3339(),
+                                "is_rare": data.is_rare,
+                                "prevalence_score": data.prevalence_score,
+                                "field_name": field, // Track which field the IP came from
+                                "is_private": matches!(data.artifact_type, crate::prevalence::ArtifactType::IpAddressPrivate),
+                            }));
+                            enriched_count += 1;
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if matched {
+                        break;
+                    }
+                }
+            }
+
+            // Only add _prevalence field if we have data
+            if !prevalence_info.is_empty() {
+                // Determine which prevalence type(s) we have and what artifact
+                let mut prevalence_types = Vec::new();
+                let mut prevalence_artifacts = Vec::new();
+
+                if prevalence_info.get("domain").is_some() {
+                    prevalence_types.push("domain");
+                    if let Some(domain) = &found_domain {
+                        prevalence_artifacts.push(domain.clone());
+                    }
+                }
+                if prevalence_info.get("hash").is_some() {
+                    prevalence_types.push("hash");
+                    if let Some(hash) = &found_hash {
+                        // Truncate long hashes for display
+                        let display_hash = if hash.len() > 16 {
+                            format!("{}...{}", &hash[..8], &hash[hash.len() - 8..])
+                        } else {
+                            hash.clone()
+                        };
+                        prevalence_artifacts.push(display_hash);
+                    }
+                }
+                if prevalence_info.get("ip").is_some() {
+                    prevalence_types.push("ip");
+                    if let Some(ip) = &found_ip {
+                        prevalence_artifacts.push(ip.clone());
+                    }
+                }
+
+                // Add prevalence_type field to indicate what artifact is being tracked
+                let prevalence_type = if prevalence_types.len() > 1 {
+                    format!("{}", prevalence_types.join(", "))
+                } else {
+                    prevalence_types.first().unwrap_or(&"unknown").to_string()
+                };
+                obj.insert(
+                    "prevalence_type".to_string(),
+                    serde_json::Value::String(prevalence_type),
+                );
+
+                // Add prevalence_artifact field to show the actual artifact value(s)
+                if !prevalence_artifacts.is_empty() {
+                    obj.insert(
+                        "prevalence_artifact".to_string(),
+                        serde_json::Value::String(prevalence_artifacts.join(", ")),
+                    );
+                }
+
+                // Also add top-level convenience fields for easier filtering
+                // This allows queries like: | where host_count < 3
+                // Priority: domain > hash > ip
+                let convenience_source = prevalence_info
+                    .get("domain")
+                    .or_else(|| prevalence_info.get("hash"))
+                    .or_else(|| prevalence_info.get("ip"));
+
+                if let Some(source_data) = convenience_source {
+                    if let Some(host_count) = source_data.get("host_count") {
+                        obj.insert("host_count".to_string(), host_count.clone());
+                    }
+                    if let Some(is_rare) = source_data.get("is_rare") {
+                        obj.insert("is_rare".to_string(), is_rare.clone());
+                    }
+                    if let Some(prevalence_score) = source_data.get("prevalence_score") {
+                        obj.insert("prevalence_score".to_string(), prevalence_score.clone());
+                    }
+                    if let Some(first_seen) = source_data.get("first_seen") {
+                        obj.insert("prevalence_first_seen".to_string(), first_seen.clone());
+                        // Also write first_seen for backward compat, but only if event doesn't already have one
+                        if !obj.contains_key("first_seen") {
+                            obj.insert("first_seen".to_string(), first_seen.clone());
+                        }
+                    }
+                    if let Some(last_seen) = source_data.get("last_seen") {
+                        obj.insert("prevalence_last_seen".to_string(), last_seen.clone());
+                        if !obj.contains_key("last_seen") {
+                            obj.insert("last_seen".to_string(), last_seen.clone());
+                        }
+                    }
+                    if let Some(total_occurrences) = source_data.get("total_occurrences") {
+                        obj.insert("total_occurrences".to_string(), total_occurrences.clone());
+                    }
+                }
+
+                // Insert the _prevalence object after extracting convenience fields
+                obj.insert(
+                    "_prevalence".to_string(),
+                    serde_json::Value::Object(prevalence_info),
+                );
+            }
+        }
+    }
+    enriched_count
+}
+
+fn value_strings(value: Option<&serde_json::Value>) -> Vec<&str> {
+    match value {
+        Some(serde_json::Value::String(value)) if !value.is_empty() => vec![value.as_str()],
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 impl SearchService {
     /// Check if a search expression references _prevalence nested fields
     /// These fields are added by restructure_prevalence_fields_from_join and don't exist in SQL
@@ -75,7 +468,7 @@ impl SearchService {
         prevalence_commands: &[PrevalenceCommandInfo],
         artifact_scope: &crate::auth::ArtifactScope,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
-        let prevalence_service = match &self.prevalence_service {
+        let prevalence_service = match &self.prevalence_lookup {
             Some(service) => service,
             None => {
                 warn!("Prevalence command found but no prevalence service configured");
@@ -91,8 +484,9 @@ impl SearchService {
                 results = self
                     .apply_prevalence_enrichment(
                         results,
-                        prevalence_service,
+                        prevalence_service.as_ref(),
                         time_window,
+                        &cmd.artifact_fields,
                         artifact_scope,
                     )
                     .await?;
@@ -103,7 +497,7 @@ impl SearchService {
                     results = self
                         .apply_prevalence_filtering(
                             results,
-                            prevalence_service,
+                            prevalence_service.as_ref(),
                             &condition.field,
                             &condition.operator,
                             &condition.threshold,
@@ -125,7 +519,7 @@ impl SearchService {
     async fn apply_prevalence_filtering(
         &self,
         results: Vec<serde_json::Value>,
-        prevalence_service: &PrevalenceService,
+        prevalence_service: &dyn crate::prevalence::PrevalenceLookup,
         field: &PrevalenceField,
         operator: &PrevalenceOperator,
         threshold: &PrevalenceThreshold,
@@ -159,20 +553,40 @@ impl SearchService {
         // the JSON result map by the bare output key. UDM is unquoted → unchanged (byte-identical).
         // TODO(OCSF): the result-row KEY equals the promoted column's serde name; if OCSF
         // serialization ever renames it (vs the bare dotted column), these keys must follow.
-        let artifact_fields: Vec<String> = udm_concepts
+        // NAN-2373: on the primary-lake OCSF 1.9 layout `udm_column_sql`
+        // resolves NOTHING (it returns None for every concept), so this list
+        // came back empty and the filter below was SKIPPED — a prevalence-gated
+        // detection rule silently degraded to "match every row", the fail-OPEN
+        // inverse of the fail-CLOSED contract this path documents everywhere
+        // else. Resolve the native OCSF artifact paths instead.
+        let artifact_fields: Vec<String> = if profile.uses_strict_canonical_fields() {
+            match field {
+                PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => {
+                    LAKE_HASH_ARTIFACT_PATHS
+                }
+                PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => {
+                    LAKE_DOMAIN_ARTIFACT_PATHS
+                }
+            }
             .iter()
-            .filter_map(|concept| {
-                profile
-                    .udm_column_sql(concept)
-                    .map(|col| col.trim_matches('"').to_string())
-            })
-            .collect();
+            .map(|path| (*path).to_string())
+            .collect()
+        } else {
+            udm_concepts
+                .iter()
+                .filter_map(|concept| {
+                    profile
+                        .udm_column_sql(concept)
+                        .map(|col| col.trim_matches('"').to_string())
+                })
+                .collect()
+        };
         if artifact_fields.is_empty() {
-            debug!(
-                "Prevalence filtering: active schema has no column for {:?}; skipping filter",
-                udm_concepts
-            );
-            return Ok(results);
+            // Never "skip the filter": a threshold the backend cannot evaluate
+            // must fail the query, not pass every row through as if it had.
+            return Err(SearchError::PrevalenceError(format!(
+                "`prevalence` cannot evaluate {udm_concepts:?} on the active schema: it has no column for those artifacts"
+            )));
         }
 
         // For timestamp-based fields, we need different handling
@@ -208,7 +622,7 @@ impl SearchService {
         let mut prevalence_map: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         match prevalence_service
-            .get_bulk_prevalence_via_dict(artifacts.as_slice(), time_window, artifact_scope)
+            .lookup(artifacts.as_slice(), time_window, artifact_scope)
             .await
         {
             Ok(prevalence_data) => {
@@ -250,9 +664,12 @@ impl SearchService {
         // are therefore terminal; rescuing them would repeat the identical
         // source-summary query. Unrestricted callers retain the real-time
         // summary rescue for dictionary negative-cache misses.
-        if !missing.is_empty() && artifact_scope.is_unrestricted() {
+        if !missing.is_empty()
+            && artifact_scope.is_unrestricted()
+            && prevalence_service.needs_fresh_miss_rescue()
+        {
             match prevalence_service
-                .get_bulk_summary_prevalence(&missing, time_window, artifact_scope)
+                .lookup_fresh(&missing, time_window, artifact_scope)
                 .await
             {
                 Ok(rescued) => {
@@ -334,8 +751,9 @@ impl SearchService {
     async fn apply_prevalence_enrichment(
         &self,
         mut results: Vec<serde_json::Value>,
-        prevalence_service: &PrevalenceService,
+        prevalence_service: &dyn crate::prevalence::PrevalenceLookup,
         time_window: PrevalenceTimeWindow,
+        artifact_fields: &[String],
         artifact_scope: &crate::auth::ArtifactScope,
     ) -> Result<Vec<serde_json::Value>, SearchError> {
         if results.is_empty() {
@@ -371,6 +789,12 @@ impl SearchService {
         //     as raw `ext` keys on OCSF rows, where matching them is harmless).
         let profile = self.active_profile.as_ref();
         let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+        // NAN-2373: the primary-lake OCSF 1.9 layout resolves NO UDM concept
+        // through `udm_column_sql` (it returns None unconditionally there), so
+        // the OCSF branch below would collapse every artifact class to the
+        // UDM-only legacy aliases (`hash`, `domain`, `ip`, …) — names that do
+        // not exist on a lake row. Use the native OCSF paths instead.
+        let is_lake = profile.uses_strict_canonical_fields();
 
         // OCSF only: resolve a UDM-semantic field to its dotted result-row key (quotes stripped),
         // mirroring `apply_prevalence_filtering` above. None → schema has no column → drop.
@@ -402,39 +826,79 @@ impl SearchService {
 
         // UDM-semantic concepts (per-profile) + legacy aliases (UDM-only literals).
         // Under UDM these reduce to the exact previous arrays, byte-identical.
-        let hash_fields = build(
-            &[
-                "file_hash",        // Generic file hash (any algorithm)
-                "process_hash",     // Process/executable hash (Sysmon, EDR)
-                "service_hash",     // Windows service executable hash
-                "service_dll_hash", // Windows service DLL hash
-            ],
-            &["hash", "md5", "sha256", "sha1"],
-        );
-        let domain_fields = build(
-            &[
-                "dest_host",            // Destination hostname (most common)
-                "src_host",             // Source hostname
-                "dest_nt_domain",       // Windows NT domain (destination)
-                "src_nt_domain",        // Windows NT domain (source)
-                "http_referrer_domain", // HTTP referrer domain
-                "recipient_domain",     // Email recipient domain
-                "src_user_domain",      // Source user's domain
-                "url_domain",           // Domain extracted from URL
-            ],
-            &["domain", "query_name", "dns_query", "hostname"],
-        );
-        let ip_fields = build(
-            &[
-                "dest_ip",     // Destination IP address (most common)
-                "src_ip",      // Source IP address
-                "client_ip",   // Client IP (web logs)
-                "server_ip",   // Server IP
-                "nat_dest_ip", // NAT destination IP
-                "nat_src_ip",  // NAT source IP
-            ],
-            &["ip", "remote_ip", "target_ip"],
-        );
+        let lake_paths = |paths: &[&'static str]| -> Vec<String> {
+            paths.iter().map(|path| (*path).to_string()).collect()
+        };
+        let default_hash_fields = if is_lake {
+            lake_paths(LAKE_HASH_ARTIFACT_PATHS)
+        } else {
+            build(
+                &[
+                    "file_hash",        // Generic file hash (any algorithm)
+                    "process_hash",     // Process/executable hash (Sysmon, EDR)
+                    "service_hash",     // Windows service executable hash
+                    "service_dll_hash", // Windows service DLL hash
+                ],
+                &["hash", "md5", "sha256", "sha1"],
+            )
+        };
+        let default_domain_fields = if is_lake {
+            lake_paths(LAKE_DOMAIN_ARTIFACT_PATHS)
+        } else {
+            build(
+                &[
+                    "dest_host",            // Destination hostname (most common)
+                    "src_host",             // Source hostname
+                    "dest_nt_domain",       // Windows NT domain (destination)
+                    "src_nt_domain",        // Windows NT domain (source)
+                    "http_referrer_domain", // HTTP referrer domain
+                    "recipient_domain",     // Email recipient domain
+                    "src_user_domain",      // Source user's domain
+                    "url_domain",           // Domain extracted from URL
+                ],
+                &["domain", "query_name", "dns_query", "hostname"],
+            )
+        };
+        let default_ip_fields = if is_lake {
+            lake_paths(LAKE_IP_ARTIFACT_PATHS)
+        } else {
+            build(
+                &[
+                    "dest_ip",     // Destination IP address (most common)
+                    "src_ip",      // Source IP address
+                    "client_ip",   // Client IP (web logs)
+                    "server_ip",   // Server IP
+                    "nat_dest_ip", // NAT destination IP
+                    "nat_src_ip",  // NAT source IP
+                ],
+                &["ip", "remote_ip", "target_ip"],
+            )
+        };
+        // Positional `prevalence field1, field2` is an exact result-field
+        // contract. Try each explicit value in all three artifact classes;
+        // `ArtifactType::detect` in the lookup service determines whether the
+        // value is a hash, domain, or IP. This is required for derived fields
+        // such as `step2_file_hashes_value` emitted by `sequence`.
+        let explicit_fields = if is_lake {
+            lake_positional_artifact_keys(profile, artifact_fields)
+        } else {
+            artifact_fields.to_vec()
+        };
+        let hash_fields = if artifact_fields.is_empty() {
+            default_hash_fields
+        } else {
+            explicit_fields.clone()
+        };
+        let domain_fields = if artifact_fields.is_empty() {
+            default_domain_fields
+        } else {
+            explicit_fields.clone()
+        };
+        let ip_fields = if artifact_fields.is_empty() {
+            default_ip_fields
+        } else {
+            explicit_fields
+        };
 
         let mut hashes: Vec<String> = Vec::new();
         let mut domains: Vec<String> = Vec::new();
@@ -443,12 +907,9 @@ impl SearchService {
         for row in &results {
             // Try multiple hash field names
             for field in &hash_fields {
-                if let Some(hash) = row
-                    .get(field.as_str())
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    hashes.push(hash.to_string());
+                let values = result_field_strings(row, field);
+                if !values.is_empty() {
+                    hashes.extend(values.into_iter().map(str::to_string));
                     break; // Only take first hash found
                 }
             }
@@ -457,11 +918,7 @@ impl SearchService {
             let mut found_domain = false;
             let mut found_ip_in_domain_field = false;
             for field in &domain_fields {
-                if let Some(value) = row
-                    .get(field.as_str())
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
+                for value in result_field_strings(row, field) {
                     if value.parse::<std::net::IpAddr>().is_ok() {
                         // It's an IP in a domain field (e.g., dest_host: 193.32.162.159)
                         if !found_ip_in_domain_field {
@@ -478,16 +935,17 @@ impl SearchService {
             // Try multiple IP field names (if we didn't already find an IP in domain fields)
             if !found_ip_in_domain_field {
                 for field in &ip_fields {
-                    if let Some(ip) = row
-                        .get(field.as_str())
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
+                    let mut found = false;
+                    for ip in result_field_strings(row, field) {
                         // Validate it's an IP address
                         if ip.parse::<std::net::IpAddr>().is_ok() {
                             ips.push(ip.to_string());
-                            break; // Only take first IP found
+                            found = true;
+                            break;
                         }
+                    }
+                    if found {
+                        break; // Only take first IP found
                     }
                 }
             }
@@ -517,6 +975,47 @@ impl SearchService {
             unique_ips.len()
         );
 
+        // NAN-2373 — FAIL LOUDLY, never silently pass through.
+        //
+        // If not one row in a non-empty result set carries ANY of the artifact
+        // fields this schema resolves, the command physically cannot emit
+        // `host_count` / `is_rare` / `prevalence_score`. Returning the rows
+        // unchanged (the old behavior) is the worst outcome for a SIEM: the
+        // downstream `| where host_count < N` then compares against a column
+        // that does not exist and drops every row, so the query reports 200 OK
+        // with zero results and a detection rule written that way can never
+        // fire and never errors. This is NOT the same as "artifacts were found
+        // but none are in the prevalence state" — that case leaves the rows
+        // undecorated on purpose (a dict miss is not host_count 0) and is
+        // handled by the enrichment below.
+        // The hard error is scoped to the case the backend cannot serve AT ALL:
+        // the schema resolved NO artifact field, so no row could ever carry one.
+        // That is the lake defect this fix exists for — `udm_column_sql` returns
+        // None for every UDM concept on the strict OCSF 1.9 profile, leaving an
+        // empty field list, and the command then silently passed rows through.
+        //
+        // "Fields resolved, but no row happens to carry a value" is NOT that. It
+        // is ordinary and data-dependent: `| stats count by user | prevalence`,
+        // `| table time, message | prevalence`, or simply a window of events with
+        // no hash, domain or IP. Erroring there would reject working pipelines —
+        // the same reason the runtime half of the output-column guard is a
+        // warning rather than an error. Those rows stay undecorated, and the
+        // guard's MISSING_OUTPUT_COLUMN warning names the stage.
+        let mut probed: Vec<&str> = hash_fields
+            .iter()
+            .chain(domain_fields.iter())
+            .chain(ip_fields.iter())
+            .map(String::as_str)
+            .collect();
+        probed.sort_unstable();
+        probed.dedup();
+        if probed.is_empty() {
+            return Err(SearchError::PrevalenceError(format!(
+                "`prevalence` resolved no artifact field at all for this deployment's schema, so it cannot produce host_count / is_rare / prevalence_score for {} result rows. This is a backend/schema resolution failure, not a property of the data.",
+                results.len()
+            )));
+        }
+
         // One dict-based call covers all three artifact kinds (the service
         // categorizes by `ArtifactType::detect` internally). This replaces
         // the previous `ceil(N/100) × 3` fan-out against the
@@ -539,7 +1038,7 @@ impl SearchService {
 
         if !combined.is_empty() {
             match prevalence_service
-                .get_bulk_prevalence_via_dict(&combined, time_window, artifact_scope)
+                .lookup(&combined, time_window, artifact_scope)
                 .await
             {
                 Ok(data) => {
@@ -570,218 +1069,15 @@ impl SearchService {
         );
 
         // Count how many results will get enriched
-        let mut enriched_count = 0;
-
-        // Enrich each result with prevalence data
-        for row in &mut results {
-            if let Some(obj) = row.as_object_mut() {
-                let mut prevalence_info = serde_json::Map::new();
-                let mut found_hash: Option<String> = None;
-                let mut found_domain: Option<String> = None;
-                let mut found_ip: Option<String> = None;
-
-                // Try to find hash in multiple possible fields
-                for field in &hash_fields {
-                    if let Some(hash) = obj
-                        .get(field.as_str())
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        if let Some(data) = hash_prevalence.get(&hash.to_lowercase()) {
-                            enriched_count += 1;
-                            found_hash = Some(hash.to_string());
-                            prevalence_info.insert(
-                                "hash".to_string(),
-                                serde_json::json!({
-                                    "artifact": hash,
-                                    "host_count": data.host_count,
-                                    "total_occurrences": data.total_occurrences,
-                                    "first_seen": data.first_seen.to_rfc3339(),
-                                    "last_seen": data.last_seen.to_rfc3339(),
-                                    "is_rare": data.is_rare,
-                                    "prevalence_score": data.prevalence_score,
-                                    "field_name": field, // Track which field the hash came from
-                                }),
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                // Try to find domain in multiple possible fields
-                // If the field contains an IP address instead of a domain, fall back to IP prevalence
-                for field in &domain_fields {
-                    if let Some(value) = obj
-                        .get(field.as_str())
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        // Check if this is an IP address in a domain field (e.g., dest_host: 185.220.101.35)
-                        if value.parse::<std::net::IpAddr>().is_ok() {
-                            // It's an IP - try IP prevalence instead
-                            if let Some(data) = ip_prevalence.get(value) {
-                                found_ip = Some(value.to_string());
-                                prevalence_info.insert("ip".to_string(), serde_json::json!({
-                                    "artifact": value,
-                                    "host_count": data.host_count,
-                                    "total_occurrences": data.total_occurrences,
-                                    "first_seen": data.first_seen.to_rfc3339(),
-                                    "last_seen": data.last_seen.to_rfc3339(),
-                                    "is_rare": data.is_rare,
-                                    "prevalence_score": data.prevalence_score,
-                                    "field_name": field, // Track which field the IP came from (e.g., dest_host)
-                                    "is_private": matches!(data.artifact_type, crate::prevalence::ArtifactType::IpAddressPrivate),
-                                    "source": "domain_field_fallback", // Indicate this came from a domain field containing an IP
-                                }));
-                                enriched_count += 1;
-                                break;
-                            }
-                        } else if let Some(data) =
-                            domain_prevalence.get(&value.to_lowercase())
-                        {
-                            // It's a domain - use domain prevalence
-                            found_domain = Some(value.to_string());
-                            prevalence_info.insert(
-                                "domain".to_string(),
-                                serde_json::json!({
-                                    "artifact": value,
-                                    "host_count": data.host_count,
-                                    "total_occurrences": data.total_occurrences,
-                                    "first_seen": data.first_seen.to_rfc3339(),
-                                    "last_seen": data.last_seen.to_rfc3339(),
-                                    "is_rare": data.is_rare,
-                                    "prevalence_score": data.prevalence_score,
-                                    "field_name": field, // Track which field the domain came from
-                                }),
-                            );
-                            enriched_count += 1;
-                            break;
-                        }
-                    }
-                }
-
-                // Try to find IP in multiple possible fields (if not already found from domain field fallback)
-                if found_ip.is_none() {
-                    for field in &ip_fields {
-                        if let Some(ip) = obj
-                            .get(field.as_str())
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                        {
-                            if let Some(data) = ip_prevalence.get(ip) {
-                                found_ip = Some(ip.to_string());
-                                prevalence_info.insert("ip".to_string(), serde_json::json!({
-                                    "artifact": ip,
-                                    "host_count": data.host_count,
-                                    "total_occurrences": data.total_occurrences,
-                                    "first_seen": data.first_seen.to_rfc3339(),
-                                    "last_seen": data.last_seen.to_rfc3339(),
-                                    "is_rare": data.is_rare,
-                                    "prevalence_score": data.prevalence_score,
-                                    "field_name": field, // Track which field the IP came from
-                                    "is_private": matches!(data.artifact_type, crate::prevalence::ArtifactType::IpAddressPrivate),
-                                }));
-                                enriched_count += 1;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                // Only add _prevalence field if we have data
-                if !prevalence_info.is_empty() {
-                    // Determine which prevalence type(s) we have and what artifact
-                    let mut prevalence_types = Vec::new();
-                    let mut prevalence_artifacts = Vec::new();
-
-                    if prevalence_info.get("domain").is_some() {
-                        prevalence_types.push("domain");
-                        if let Some(domain) = &found_domain {
-                            prevalence_artifacts.push(domain.clone());
-                        }
-                    }
-                    if prevalence_info.get("hash").is_some() {
-                        prevalence_types.push("hash");
-                        if let Some(hash) = &found_hash {
-                            // Truncate long hashes for display
-                            let display_hash = if hash.len() > 16 {
-                                format!("{}...{}", &hash[..8], &hash[hash.len() - 8..])
-                            } else {
-                                hash.clone()
-                            };
-                            prevalence_artifacts.push(display_hash);
-                        }
-                    }
-                    if prevalence_info.get("ip").is_some() {
-                        prevalence_types.push("ip");
-                        if let Some(ip) = &found_ip {
-                            prevalence_artifacts.push(ip.clone());
-                        }
-                    }
-
-                    // Add prevalence_type field to indicate what artifact is being tracked
-                    let prevalence_type = if prevalence_types.len() > 1 {
-                        format!("{}", prevalence_types.join(", "))
-                    } else {
-                        prevalence_types.first().unwrap_or(&"unknown").to_string()
-                    };
-                    obj.insert(
-                        "prevalence_type".to_string(),
-                        serde_json::Value::String(prevalence_type),
-                    );
-
-                    // Add prevalence_artifact field to show the actual artifact value(s)
-                    if !prevalence_artifacts.is_empty() {
-                        obj.insert(
-                            "prevalence_artifact".to_string(),
-                            serde_json::Value::String(prevalence_artifacts.join(", ")),
-                        );
-                    }
-
-                    // Also add top-level convenience fields for easier filtering
-                    // This allows queries like: | where host_count < 3
-                    // Priority: domain > hash > ip
-                    let convenience_source = prevalence_info
-                        .get("domain")
-                        .or_else(|| prevalence_info.get("hash"))
-                        .or_else(|| prevalence_info.get("ip"));
-
-                    if let Some(source_data) = convenience_source {
-                        if let Some(host_count) = source_data.get("host_count") {
-                            obj.insert("host_count".to_string(), host_count.clone());
-                        }
-                        if let Some(is_rare) = source_data.get("is_rare") {
-                            obj.insert("is_rare".to_string(), is_rare.clone());
-                        }
-                        if let Some(prevalence_score) = source_data.get("prevalence_score") {
-                            obj.insert("prevalence_score".to_string(), prevalence_score.clone());
-                        }
-                        if let Some(first_seen) = source_data.get("first_seen") {
-                            obj.insert("prevalence_first_seen".to_string(), first_seen.clone());
-                            // Also write first_seen for backward compat, but only if event doesn't already have one
-                            if !obj.contains_key("first_seen") {
-                                obj.insert("first_seen".to_string(), first_seen.clone());
-                            }
-                        }
-                        if let Some(last_seen) = source_data.get("last_seen") {
-                            obj.insert("prevalence_last_seen".to_string(), last_seen.clone());
-                            if !obj.contains_key("last_seen") {
-                                obj.insert("last_seen".to_string(), last_seen.clone());
-                            }
-                        }
-                        if let Some(total_occurrences) = source_data.get("total_occurrences") {
-                            obj.insert("total_occurrences".to_string(), total_occurrences.clone());
-                        }
-                    }
-
-                    // Insert the _prevalence object after extracting convenience fields
-                    obj.insert(
-                        "_prevalence".to_string(),
-                        serde_json::Value::Object(prevalence_info),
-                    );
-                }
-            }
-        }
+        let enriched_count = enrich_rows_with_prevalence(
+            &mut results,
+            &hash_fields,
+            &domain_fields,
+            &ip_fields,
+            &hash_prevalence,
+            &domain_prevalence,
+            &ip_prevalence,
+        );
 
         tracing::debug!(
             "Prevalence enrichment: enriched {} results with prevalence data",
@@ -810,7 +1106,10 @@ impl SearchService {
                     .unwrap_or_default();
                 tracing::debug!(
                     "Sample enriched result: has_host_count={}, has_prevalence={}, host_count={}, prevalence_keys={:?}",
-                    has_host_count, has_prevalence, host_count_val, prevalence_keys
+                    has_host_count,
+                    has_prevalence,
+                    host_count_val,
+                    prevalence_keys
                 );
             }
         } else {
@@ -929,12 +1228,32 @@ impl SearchService {
         scope: &crate::auth::ScopeSet,
     ) -> Result<crate::prevalence::PrevalenceScatterData, SearchError> {
         use crate::prevalence::{PrevalenceScatterData, TimeWindow};
+        let Some(retention_time_range) =
+            self.retention_bound_input_range(&request.time_range, chrono::Utc::now())?
+        else {
+            return Ok(PrevalenceScatterData {
+                hash_points: Vec::new(),
+                domain_points: Vec::new(),
+                ip_points: Vec::new(),
+                rarity_threshold: 0,
+            });
+        };
+        let mut retention_request = request.clone();
+        retention_request.time_range = retention_time_range;
+        let request = &retention_request;
+
         // NAN-2219: the artifact half. The DISTINCT artifact extraction below
         // still runs under the full row-filter deny set via
         // `enforce_source_scope`, so a caller cannot enumerate artifacts out of
         // denied (or audit) LOG ROWS; only the prevalence numbers looked up for
         // the artifacts they legitimately extracted come from the artifact half.
         let artifact_scope = crate::auth::ArtifactScope::from_scope(scope);
+
+        if self.lake_query.mode == LakeQueryMode::Primary {
+            return self
+                .get_lake_prevalence_artifacts(request, scope, &artifact_scope)
+                .await;
+        }
 
         // Need ClickHouse for this operation
         let clickhouse = self.ch_client.as_ref().ok_or_else(|| {
@@ -1210,6 +1529,228 @@ impl SearchService {
             })
         }
     }
+
+    /// Build the search-page prevalence scatter from the same immutable lake
+    /// snapshot used by the prevalence explorer. The event scan is a bounded,
+    /// compiler-validated nPL aggregation over canonical OCSF fields; storage
+    /// coordinates and arbitrary SQL never cross this boundary.
+    async fn get_lake_prevalence_artifacts(
+        &self,
+        request: &SearchRequest,
+        scope: &crate::auth::ScopeSet,
+        artifact_scope: &crate::auth::ArtifactScope,
+    ) -> Result<crate::prevalence::PrevalenceScatterData, SearchError> {
+        use crate::prevalence::{PrevalenceScatterData, PrevalenceScatterPoint, TimeWindow};
+
+        const ARTIFACT_CAP_PER_KIND: usize = 1_000;
+        const LOOKUP_BATCH_SIZE: usize = 100;
+
+        let query = parse_query(&request.query).map_err(convert_parse_error)?;
+        let filter_prefix = lake_prevalence_filter_prefix(&query);
+        let artifact_query = format!(
+            "{} | stats values(file.hashes.value) as _nano_file_hashes, \
+             values(process.file.hashes.value) as _nano_process_hashes, \
+             values(src_endpoint.ip) as _nano_src_ips, \
+             values(dst_endpoint.ip) as _nano_dst_ips, \
+             values(src_endpoint.hostname) as _nano_src_domains, \
+             values(dst_endpoint.hostname) as _nano_dst_domains, \
+             values(http_request.url.hostname) as _nano_http_domains",
+            filter_prefix.pretty_print()
+        );
+
+        let mut artifact_request = request.clone();
+        artifact_request.query = artifact_query;
+        artifact_request.limit = Some(1);
+        artifact_request.offset = Some(0);
+        artifact_request.include_sql = Some(false);
+        artifact_request.skip_histogram = true;
+        artifact_request.skip_field_stats = true;
+        artifact_request.table_view = false;
+        artifact_request.request_id = None;
+        artifact_request.async_mode = false;
+        artifact_request.priority = Some("interactive".to_string());
+        artifact_request.dataset = Some("logs".to_string());
+
+        let query_id = uuid::Uuid::now_v7().to_string();
+        let response = self
+            .lake_query
+            .client
+            .as_ref()
+            .ok_or_else(|| {
+                SearchError::SqlValidationError(
+                    "lake prevalence artifact scan is unavailable".to_string(),
+                )
+            })?
+            .search(&artifact_request, &query_id, None, scope.deny_set())
+            .await?;
+
+        let mut artifacts = LakeScatterArtifacts::default();
+        if let Some(row) = response.results.first() {
+            collect_lake_hashes(row.get("_nano_file_hashes"), &mut artifacts.hashes);
+            collect_lake_hashes(row.get("_nano_process_hashes"), &mut artifacts.hashes);
+            collect_lake_ips(row.get("_nano_src_ips"), &mut artifacts.ips);
+            collect_lake_ips(row.get("_nano_dst_ips"), &mut artifacts.ips);
+            collect_lake_domains(row.get("_nano_src_domains"), &mut artifacts.domains);
+            collect_lake_domains(row.get("_nano_dst_domains"), &mut artifacts.domains);
+            collect_lake_domains(row.get("_nano_http_domains"), &mut artifacts.domains);
+        }
+        artifacts.truncate(ARTIFACT_CAP_PER_KIND);
+
+        let prevalence = self.prevalence_lookup.as_ref().ok_or_else(|| {
+            SearchError::PrevalenceError(
+                "lake prevalence snapshot lookup is not configured".to_string(),
+            )
+        })?;
+        let time_window = TimeWindow::TwentyFourHours;
+        let hashes = artifacts.hashes.into_iter().collect::<Vec<_>>();
+        let domains = artifacts.domains.into_iter().collect::<Vec<_>>();
+        let ips = artifacts.ips.into_iter().collect::<Vec<_>>();
+
+        async fn lookup_points(
+            prevalence: &dyn crate::prevalence::PrevalenceLookup,
+            artifacts: &[String],
+            time_window: TimeWindow,
+            artifact_scope: &crate::auth::ArtifactScope,
+        ) -> Result<Vec<PrevalenceScatterPoint>, SearchError> {
+            let mut points = Vec::new();
+            for chunk in artifacts.chunks(LOOKUP_BATCH_SIZE) {
+                points.extend(
+                    prevalence
+                        .lookup(chunk, time_window, artifact_scope)
+                        .await
+                        .map_err(|error| SearchError::PrevalenceError(error.to_string()))?
+                        .into_iter()
+                        .map(PrevalenceScatterPoint::from),
+                );
+            }
+            Ok(points)
+        }
+
+        let hash_points =
+            lookup_points(prevalence.as_ref(), &hashes, time_window, artifact_scope).await?;
+        let domain_points =
+            lookup_points(prevalence.as_ref(), &domains, time_window, artifact_scope).await?;
+        let ip_points =
+            lookup_points(prevalence.as_ref(), &ips, time_window, artifact_scope).await?;
+
+        tracing::info!(
+            hashes = hash_points.len(),
+            domains = domain_points.len(),
+            ips = ip_points.len(),
+            "built search prevalence scatter from the immutable lake snapshot"
+        );
+
+        Ok(PrevalenceScatterData {
+            hash_points,
+            domain_points,
+            ip_points,
+            rarity_threshold: prevalence.rarity_threshold().await,
+        })
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LakeScatterArtifacts {
+    hashes: std::collections::BTreeSet<String>,
+    domains: std::collections::BTreeSet<String>,
+    ips: std::collections::BTreeSet<String>,
+}
+
+impl LakeScatterArtifacts {
+    fn truncate(&mut self, cap: usize) {
+        self.hashes = self.hashes.iter().take(cap).cloned().collect();
+        self.domains = self.domains.iter().take(cap).cloned().collect();
+        self.ips = self.ips.iter().take(cap).cloned().collect();
+    }
+}
+
+/// Preserve the base search and only leading row filters. Once a pipeline
+/// command transforms or limits the row shape, later `where` clauses may refer
+/// to derived fields and therefore cannot safely drive raw-event extraction.
+fn lake_prevalence_filter_prefix(query: &Query) -> Query {
+    fn walk(query: &Query) -> (Query, bool) {
+        match query {
+            Query::Search(_) => (query.clone(), false),
+            Query::Piped { source, command } => {
+                let (prefix, transformed) = walk(source);
+                if !transformed && matches!(command, Command::Where { .. }) {
+                    (
+                        Query::Piped {
+                            source: Box::new(prefix),
+                            command: command.clone(),
+                        },
+                        false,
+                    )
+                } else {
+                    (prefix, true)
+                }
+            }
+        }
+    }
+
+    walk(query).0
+}
+
+fn visit_lake_aggregate_strings(value: Option<&serde_json::Value>, visit: &mut impl FnMut(&str)) {
+    match value {
+        Some(serde_json::Value::String(value)) => visit(value),
+        Some(serde_json::Value::Array(values)) => {
+            for value in values {
+                visit_lake_aggregate_strings(Some(value), visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_lake_hashes(
+    value: Option<&serde_json::Value>,
+    output: &mut std::collections::BTreeSet<String>,
+) {
+    visit_lake_aggregate_strings(value, &mut |value| {
+        for token in value.split(|character: char| !character.is_ascii_hexdigit()) {
+            if matches!(token.len(), 32 | 40 | 64) {
+                output.insert(token.to_ascii_lowercase());
+            }
+        }
+    });
+}
+
+fn visit_lake_scalar_candidates(value: Option<&serde_json::Value>, visit: &mut impl FnMut(&str)) {
+    visit_lake_aggregate_strings(value, &mut |value| {
+        for candidate in value.split(',') {
+            let candidate = candidate
+                .trim()
+                .trim_matches(|character| matches!(character, '[' | ']' | '\'' | '"'))
+                .trim();
+            if !candidate.is_empty() && candidate != "-" {
+                visit(candidate);
+            }
+        }
+    });
+}
+
+fn collect_lake_ips(
+    value: Option<&serde_json::Value>,
+    output: &mut std::collections::BTreeSet<String>,
+) {
+    visit_lake_scalar_candidates(value, &mut |candidate| {
+        if let Ok(ip) = candidate.parse::<std::net::IpAddr>() {
+            output.insert(ip.to_string());
+        }
+    });
+}
+
+fn collect_lake_domains(
+    value: Option<&serde_json::Value>,
+    output: &mut std::collections::BTreeSet<String>,
+) {
+    visit_lake_scalar_candidates(value, &mut |candidate| {
+        let candidate = candidate.to_ascii_lowercase();
+        if crate::prevalence::ArtifactType::is_valid_domain_value(&candidate) {
+            output.insert(candidate);
+        }
+    });
 }
 
 /// Decide whether a row whose looked-up prevalence host_count is `prevalence`
@@ -1249,9 +1790,7 @@ pub(crate) fn prevalence_passes_filter(
 /// path and the pushed-down path. Domain filters use `dest_host`, matching the domain
 /// alias. If this diverges from `prevalence_filter_condition_to_sql`, the filter form
 /// returns different row sets depending on whether it pushed down.
-pub(crate) fn prevalence_filter_udm_concepts(
-    field: &PrevalenceField,
-) -> &'static [&'static str] {
+pub(crate) fn prevalence_filter_udm_concepts(field: &PrevalenceField) -> &'static [&'static str] {
     match field {
         PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => {
             &["file_hash", "process_hash"]
@@ -1267,10 +1806,12 @@ pub(crate) fn extract_prevalence_artifact(
     row: &serde_json::Value,
     fields: &[String],
 ) -> Option<String> {
+    // Path-aware (NAN-2373): flat result-row keys on the ClickHouse lanes,
+    // nested OCSF paths (incl. the repeated `file.hashes[]` object) on the lake.
     fields.iter().find_map(|f| {
-        row.get(f.as_str())
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
+        result_field_strings(row, f)
+            .into_iter()
+            .next()
             .map(|s| s.to_string())
     })
 }
@@ -1582,7 +2123,9 @@ pub(crate) fn decorated_filter_rescue_threshold(
         out: &mut Vec<u64>,
     ) {
         match expr {
-            SearchExpr::FieldFilter { field, op, value } => {
+            SearchExpr::FieldFilter {
+                field, op, value, ..
+            } => {
                 match field.as_str() {
                     "host_count" => {
                         if matches!(op, Comparator::Lt | Comparator::Lte | Comparator::Eq) {

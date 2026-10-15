@@ -22,24 +22,11 @@ AGPL-3.0-or-later via the [contributor license agreement](./.github/ICLA.md).
 
 ## What's proprietary
 
-Two paths in this repository contain proprietary code owned by Nano LLC.
-They are **not** licensed under AGPL-3.0. They are conditionally compiled —
-only included in the enterprise build (`cargo build --features enterprise`,
-`VITE_EDITION=enterprise`):
-
-- `nanosiem-enterprise/` — the enterprise crate (whole directory)
-- `nanosiem-web/src/enterprise/` — enterprise frontend code
-
-`nanosiem-enterprise/Cargo.toml` declares `license = "Proprietary"`.
-`tools/apply-spdx-headers.py` excludes both paths from the AGPL-header
-sweep.
-
-The presence of proprietary code in this repository **does not** affect the
-AGPL licensing of the rest of the codebase. AGPL permits other code in the
-same source tree under different licenses, provided the AGPL portions
-themselves remain AGPL-licensed. The proprietary paths above are excluded
-from the open-core distribution by the sync-mirror workflow that publishes
-the AGPL portions to the public `nano-rs/nano` repository.
+The enterprise edition adds proprietary code owned by Nano LLC. That code is
+not part of this repository and is not licensed under AGPL-3.0; it is compiled
+in only by the enterprise build (`cargo build --features enterprise`,
+`VITE_EDITION=enterprise`), which this repository cannot produce on its own.
+The AGPL portions are published here by the sync-mirror workflow.
 
 ## Commercial licensing
 

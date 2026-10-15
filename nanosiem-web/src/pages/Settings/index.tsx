@@ -14,9 +14,6 @@ export { RetentionSettings } from './RetentionSettings';
 // RiskSettings lifted to @/enterprise/pages/Settings/RiskSettings (NAN-745).
 // MelodSettings lifted to @/enterprise/pages/Settings/MelodSettings (NAN-745).
 export { PrevalenceSettings } from './PrevalenceSettings';
-export { DebugSettings } from './DebugSettings';
-export { DeveloperSettings } from './DeveloperSettings';
-// Feedback page lifted to @/enterprise/pages/Settings/Feedback (NAN-745).
 export { EnrichmentDetail } from './EnrichmentDetail';
 
 export { SearchSettings } from './SearchSettings';

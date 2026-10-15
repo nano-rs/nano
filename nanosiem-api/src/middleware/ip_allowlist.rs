@@ -88,7 +88,19 @@ pub async fn ip_allowlist_middleware(
     };
 
     // Check against the allowlist
-    if !state.service.is_allowed(ip_str, state.scope).await {
+    let allowed = match state.service.check_allowed(ip_str, state.scope).await {
+        Ok(allowed) => allowed,
+        Err(_) => {
+            tracing::error!(scope = %state.scope, "IP allowlist policy unavailable; request not admitted");
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(IpDeniedResponse {
+                error: IpDeniedError {
+                    code: "IP_POLICY_UNAVAILABLE",
+                    message: "Access policy is temporarily unavailable. Please retry later.".into(),
+                },
+            })).into_response();
+        }
+    };
+    if !allowed {
         tracing::info!(
             ip = %ip_str,
             path = %path,
@@ -113,4 +125,36 @@ fn ip_denied_response(ip: &str) -> Response {
     };
 
     (StatusCode::FORBIDDEN, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, middleware, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn ip_policy_outage_blocks_api_but_preserves_health_probe() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fixture:fixture@127.0.0.1:1/never_connect").unwrap();
+        pool.close().await;
+        let state = IpAllowlistState {
+            service: Arc::new(IpAllowlistService::new(pool)), scope: IpAllowlistScope::Api,
+        };
+        let app = Router::new().route("/api/protected", get(|| async { "handler reached" }))
+            .route("/health", get(|| async { "healthy" }))
+            .layer(middleware::from_fn_with_state(state, ip_allowlist_middleware));
+        let mut request = Request::builder().uri("/api/protected").body(Body::empty()).unwrap();
+        request.extensions_mut().insert(ConnectInfo("203.0.113.5:1234".parse::<SocketAddr>().unwrap()));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body, serde_json::json!({"error": {
+            "code": "IP_POLICY_UNAVAILABLE",
+            "message": "Access policy is temporarily unavailable. Please retry later."
+        }}));
+        let response = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

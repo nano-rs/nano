@@ -18,8 +18,15 @@
 //! CH failure rate (240/hr on therange, one per 15s).
 //!
 //! A mocked-client unit test cannot catch this: the defect is in how ClickHouse
-//! types the expression, not in the Rust. So this guard pins the two facts that
-//! together make the query legal, and fails if either drifts.
+//! types the expression, not in the Rust.
+//!
+//! NAN-2361 moved scheduling out of ClickHouse entirely: the runner now claims
+//! due checks atomically from the PostgreSQL watermark
+//! (`SyntheticCheckRepository::claim_due_enabled`), so the ClickHouse
+//! `max(timestamp)` read — and the bug with it — no longer exists. Main's
+//! NAN-2381 fix to that read is therefore subsumed. The guard below keeps the
+//! lesson: scheduling must stay on the PG claim, and nothing in the runner may
+//! do arithmetic on the DateTime64 column again.
 
 const SYNTHETIC_RUNNER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -39,48 +46,33 @@ fn synthetic_timestamp_column_is_datetime64() {
     assert!(
         normalized.contains("timestampDateTime64(3,'UTC')"),
         "synthetic_check_results.timestamp is no longer DateTime64(3, 'UTC'). \
-         If that is deliberate, revisit due_for's conversion in \
+         If that is deliberate, revisit any timestamp conversion in \
          nanosiem-core/src/observability/synthetic_runner.rs and this guard."
     );
 }
 
-/// `due_for` must convert with `toUnixTimestamp64Milli`, never with arithmetic.
+/// Scheduling is the PostgreSQL claim, not a ClickHouse last-run read.
 #[test]
-fn due_for_converts_datetime64_without_arithmetic() {
+fn scheduling_uses_pg_claim_not_clickhouse_last_run_read() {
     assert!(
-        SYNTHETIC_RUNNER.contains("toUnixTimestamp64Milli(max(timestamp))"),
-        "due_for must read the last-run time with \
-         toUnixTimestamp64Milli(max(timestamp)) — ClickHouse rejects arithmetic \
-         on a DateTime64 (Code 43), which silently disabled every synthetic \
-         check between 2026-07-06 and NAN-2381."
-    );
-    assert!(
-        !SYNTHETIC_RUNNER.contains("max(timestamp) * 1000"),
-        "due_for has regressed to multiplying a DateTime64 by 1000. That query \
-         fails with Code 43 ILLEGAL_TYPE_OF_ARGUMENT on every tick, and because \
-         run_tick logs-and-skips per check (NAN-1102) the failure is silent: \
-         checks simply never probe."
+        SYNTHETIC_RUNNER.contains("claim_due_enabled("),
+        "the synthetic runner no longer claims due checks from PostgreSQL. If \
+         scheduling moves back to a ClickHouse last-run read, it must convert the \
+         DateTime64 with toUnixTimestamp64Milli (NAN-2381), and this guard must \
+         be updated to pin that."
     );
 }
 
-/// Both the single-node and clustered table names flow through the same
-/// `due_for` string, so the conversion must be built once and shared. A
-/// `Distributed` table needs no `REMOTE` grant here (verified against saturn),
-/// so the clustered path is legal as soon as the type conversion is.
+/// Nothing in the runner may multiply the DateTime64 column (Code 43).
 #[test]
-fn due_for_query_is_shared_by_local_and_distributed_paths() {
-    assert!(
-        SYNTHETIC_RUNNER.contains("nanosiem.synthetic_check_results_distributed"),
-        "the clustered read target disappeared; NAN-1721 O1 requires the \
-         last-run time to reflect every shard"
-    );
-    assert_eq!(
-        SYNTHETIC_RUNNER
-            .matches("toUnixTimestamp64Milli(max(timestamp))")
-            .count(),
-        1,
-        "the last-run conversion should be built once and shared by the local \
-         and _distributed paths — a second copy is how one of them drifts back \
-         to an illegal expression"
-    );
+fn runner_never_does_arithmetic_on_datetime64_timestamp() {
+    for bad in ["max(timestamp) * 1000", "max(timestamp)*1000", "timestamp * 1000"] {
+        assert!(
+            !SYNTHETIC_RUNNER.contains(bad),
+            "synthetic_runner.rs contains `{bad}`. ClickHouse rejects arithmetic on a \
+             DateTime64 with Code 43 ILLEGAL_TYPE_OF_ARGUMENT on every tick, and \
+             because run_tick logs-and-skips per check (NAN-1102) the failure is \
+             silent: checks simply never probe. Use toUnixTimestamp64Milli."
+        );
+    }
 }

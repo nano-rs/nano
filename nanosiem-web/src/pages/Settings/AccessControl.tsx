@@ -41,11 +41,12 @@ function useResolveTab(): AccessTabId {
   const { hasSso, isEnforced } = useTierContext();
   const requested = params.get('tab') as AccessTabId | null;
 
-  // Build the visible tab set (mirroring AccessSubnav's filter).
+  // Build the visible tab set (mirroring AccessSubnav's filter). Since
+  // NAN-2361 wave 5 a hosted-shared tenant has its own groups and custom
+  // roles, so every tab is permission-gated only.
   const visible = useMemo<AccessTabId[]>(() => {
     const all: AccessTabId[] = ['users', 'groups', 'roles', 'api-keys', 'sessions'];
     return all.filter(t => hasAnyPermission(TAB_PERMISSION[t]));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasAnyPermission]);
 
   // Legacy compat: ?tab=sso/audit/feedback (from the old AccessControl tabs)

@@ -1,0 +1,135 @@
+[package]
+name = "nanosiem-lake-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Tenant-pinned native chDB query worker for Nano's OCSF Iceberg lake"
+
+[features]
+enrichment-read-audit = ["nanosiem-core/enrichment-read-audit"]
+default = []
+part-lab = []
+
+
+# NAN-2869 parity/budget lab: needs the phase 2 writer (`part_ingest`),
+# so it builds only with `--features part-lab` once that has landed.
+[[bin]]
+name = "lake_part_query_lab"
+path = "src/bin/lake_part_query_lab.rs"
+required-features = ["part-lab"]
+
+[[bin]]
+name = "lake_search_bench"
+path = "src/bin/lake_search_bench.rs"
+required-features = ["part-lab"]
+
+[[bin]]
+name = "lake_prevalence_maintenance"
+path = "src/bin/lake_prevalence_maintenance.rs"
+
+[[bin]]
+name = "lake_part_receipt_reconcile"
+path = "src/bin/lake_part_receipt_reconcile.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow.workspace = true
+async-trait = "0.1"
+arc-swap = "1.7"
+arrow-array = { version = "58", features = ["chrono-tz"] }
+arrow-cast = "58"
+arrow-json = "58"
+arrow-ipc = "58"
+arrow-ord = "58"
+arrow-schema = "58"
+arrow-select = "58"
+axum.workspace = true
+base64 = "0.22"
+bytes = "1"
+chrono.workspace = true
+ed25519-dalek = "2"
+libloading = "0.8"
+libc = "0.2"
+maxminddb = "0.30"
+memmap2 = "0.9"
+hex = "0.4"
+hmac = "0.12"
+iceberg = "=0.10.1"
+iceberg-catalog-rest = "=0.10.1"
+iceberg-storage-opendal = { version = "=0.10.1", default-features = false, features = ["opendal-s3"] }
+opendal = { version = "=0.57.0", default-features = false, features = ["layers-retry", "layers-timeout", "services-s3"] }
+futures = "0.3"
+fs2 = "0.4"
+flate2 = "1"
+nanosiem-core = { path = "../nanosiem-core" }
+nanosiem-lake-cell = { path = "../nanosiem-lake-cell" }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+regex = "1"
+regex-syntax = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rayon = "1"
+parquet = "58"
+reqwest = { version = "0.13", features = ["form", "json", "query", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+# Runtime-dispatched ARMv8 SHA and x86 SHA-NI acceleration. Unsupported AMD64
+# CPUs use sha2-asm's assembly fallback instead of executing SHA-NI blindly.
+sha2 = { version = "0.10", features = ["asm"] }
+sqlx.workspace = true
+slatedb = { version = "=0.15.0", default-features = false, features = ["aws", "foyer", "zstd", "wal_disable"] }
+subtle = "2.6"
+tantivy = "=0.26.0"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["io"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+tempfile = "3"
+twox-hash = "2.1"
+# Binary fuse filters for the v2 token block index (NAN-3032).
+xorf = { version = "0.13", default-features = false, features = ["binary-fuse"] }
+zeroize = "1.8"
+
+[dev-dependencies]
+http-body-util = "0.1"
+# NAN-3807: the landing converter tests run against an in-memory store.
+opendal = { version = "=0.57.0", default-features = false, features = ["services-memory"] }
+# Owner-sign private-CA TLS tests (part_ingest::cell).
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

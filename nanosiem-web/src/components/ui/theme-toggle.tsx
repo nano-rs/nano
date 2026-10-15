@@ -4,6 +4,7 @@ import { Moon, Sun } from "lucide-react"
 import { useTheme } from "next-themes"
 import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
+import { THEMES, THEME_LABELS } from "@/lib/theme"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,9 +24,12 @@ export function ThemeToggle() {
   const handleThemeChange = (newTheme: string) => {
     console.log('Setting theme to:', newTheme)
     setTheme(newTheme)
-    // Force update the class on html element as a fallback
+    // Force update the class on html element as a fallback. Clear EVERY theme
+    // class, not a hardcoded light/dark pair — a leftover `matte` alongside a
+    // newly added `light` leaves both token blocks live, and the later one in
+    // the stylesheet wins regardless of what was picked.
     const root = document.documentElement
-    root.classList.remove('light', 'dark')
+    root.classList.remove(...THEMES)
     if (newTheme === 'system') {
       const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
       root.classList.add(systemTheme)
@@ -54,12 +58,15 @@ export function ThemeToggle() {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
-        <DropdownMenuItem onClick={() => handleThemeChange("light")} className={theme === "light" ? "bg-accent" : ""}>
-          Light
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => handleThemeChange("dark")} className={theme === "dark" ? "bg-accent" : ""}>
-          Dark
-        </DropdownMenuItem>
+        {THEMES.map((name) => (
+          <DropdownMenuItem
+            key={name}
+            onClick={() => handleThemeChange(name)}
+            className={theme === name ? "bg-accent" : ""}
+          >
+            {THEME_LABELS[name]}
+          </DropdownMenuItem>
+        ))}
         <DropdownMenuItem onClick={() => handleThemeChange("system")} className={theme === "system" ? "bg-accent" : ""}>
           System
         </DropdownMenuItem>

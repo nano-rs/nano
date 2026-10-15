@@ -2,7 +2,7 @@
 
 // NAN-526 — left-rail repo list. Port of design-ref/shadcn/log-repos-sidebar.jsx.
 // NAN-532 — custom-repo connect affordances hidden; only the bundled
-// nano-sh/parsers library is supported in the current ship.
+// nano-rs/parsers library is supported in the current ship.
 
 import { Clock, RefreshCw, AlertTriangle, Trash2 } from 'lucide-react';
 import { SiGithub } from '@icons-pack/react-simple-icons';
@@ -48,7 +48,7 @@ export function ParserRepoSidebar({
             key={r.id}
             repo={r}
             active={activeRepoId === r.id}
-            syncing={syncingId === r.id}
+            syncing={syncingId === r.id || r.raw.last_sync_status === 'syncing'}
             onActivate={() => onActivate(r.id)}
             onSyncNow={() => onSyncNow(r.id)}
             onOpenHistory={() => onOpenHistory(r.id)}
@@ -168,9 +168,19 @@ function RepoCard({
             synced {repo.lastSync.relative}
           </div>
           {repo.autoSync !== 'off' ? (
-            <div className="truncate">
-              next in {repo.nextSync.in} · {repo.nextSync.cadence}
-            </div>
+            <>
+              {repo.lastSync.result === 'failed' ? (
+                <div className="truncate text-destructive" title={repo.raw.last_sync_error ?? undefined}>
+                  sync failed{repo.nextSync.overdue ? ' · overdue' : ''}
+                </div>
+              ) : repo.nextSync.overdue ? (
+                <div className="truncate text-warning">sync overdue · {repo.nextSync.cadence}</div>
+              ) : (
+                <div className="truncate">
+                  next in {repo.nextSync.in} · {repo.nextSync.cadence}
+                </div>
+              )}
+            </>
           ) : (
             <div className="truncate">manual sync</div>
           )}

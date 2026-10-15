@@ -43,7 +43,11 @@ pub struct Alert {
     // NAN-1356: nullable — the FK `alerts_rule_id_fkey ... ON DELETE SET NULL`
     // sets this to NULL when the source detection rule is deleted. Decoding it as
     // a non-optional `Uuid` 500'd the entire `GET /api/alerts` list.
-    #[serde(with = "typeid::rule::opt", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        with = "typeid::rule::opt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schema(value_type = Option<String>)]
     pub rule_id: Option<Uuid>,
     #[sqlx(default)]
@@ -89,21 +93,21 @@ pub struct Alert {
     #[serde(skip_serializing_if = "Option::is_none", with = "typeid::case::opt")]
     #[schema(value_type = Option<String>)]
     pub case_id: Option<Uuid>,
-    /// NAN-1541: alert-spine discriminator — what produced this alert.
+    /// alert-spine discriminator — what produced this alert.
     /// One of `detection`, `metric_monitor`, `slo`, `synthetic`, or
-    /// `risk_notable` (NAN-1792). Defaults to `detection` for every pre-spine
+    /// `risk_notable`. Defaults to `detection` for every pre-spine
     /// row (migration 212).
     #[sqlx(default)]
     #[serde(default = "default_alert_kind")]
     pub kind: String,
-    /// NAN-1541: the producer's identifier as text — the detection rule UUID
+    /// the producer's identifier as text — the detection rule UUID
     /// for `detection` alerts, the monitor/check typeid for observability
-    /// alerts, or `<entity_type>:<entity>` for risk notables (NAN-1792).
+    /// alerts, or `<entity_type>:<entity>` for risk notables.
     /// NULL for legacy rows whose rule was deleted.
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_id: Option<String>,
-    /// NAN-1800: distinct normalized (trimmed + lowercased) `source_type`
+    /// distinct normalized (trimmed + lowercased) `source_type`
     /// values of the matched events, stamped at insert by
     /// `AlertRepository::create_alert` (migration 246). Empty = pre-feature
     /// row or a producer whose events carry no source_type (observability /

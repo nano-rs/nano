@@ -45,6 +45,8 @@ pub struct UploadConfig {
     pub csv_delimiter: Option<String>,
     /// Whether CSV has headers
     pub csv_has_headers: Option<bool>,
+    /// Explicit first-row header choice; omitted values are detected from content.
+    pub has_header: Option<bool>,
 }
 
 /// Response for upload operations
@@ -268,9 +270,7 @@ fn build_parser_config(
         }
     }
 
-    if let Some(has_headers) = config.csv_has_headers {
-        parser_config.csv_has_headers = has_headers;
-    }
+    parser_config.has_header = config.has_header.or(config.csv_has_headers);
 
     Ok(parser_config)
 }

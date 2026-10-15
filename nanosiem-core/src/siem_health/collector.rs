@@ -13,6 +13,7 @@ use super::types::*;
 use crate::auth::ScopeSet;
 use crate::db::TableNames;
 use crate::search::service::source_scope_sql_predicate;
+use crate::search::{SearchRequest, SearchService, TimeRangeInput};
 
 /// Collect all health metrics from ClickHouse and PostgreSQL.
 ///
@@ -38,6 +39,445 @@ pub async fn collect_metrics(
         detection,
         alerting,
         collected_at: Utc::now(),
+    }
+}
+
+/// Collect SIEM-health metrics through the storage-neutral search boundary.
+///
+/// This is the canonical collector for the primary lake backend. It deliberately
+/// issues normal, source-scoped OCSF queries through [`SearchService`] instead
+/// of reaching around the worker to ClickHouse or object storage. Detection,
+/// alerting, and provider state remain PostgreSQL-owned control-plane data.
+///
+/// Storage-engine integrity is not fabricated here. ClickHouse's
+/// `system.query_log` / `system.part_log` / dictionary probes have no semantic
+/// equivalent for an Iceberg object-store writer, so `insert_integrity` stays
+/// explicitly unavailable until the writer publishes its own health ledger.
+pub async fn collect_metrics_from_search(
+    pool: &PgPool,
+    search_service: &SearchService,
+    scope: &ScopeSet,
+) -> CollectedMetrics {
+    let now = Utc::now();
+    let current_start = now - chrono::Duration::hours(24);
+    let prior_start = now - chrono::Duration::hours(48);
+
+    let current_ingestion = lake_health_rows(
+        search_service,
+        scope,
+        "metadata.log_source!=\"\" | stats count() as events by metadata.log_source | head 10000",
+        current_start,
+        now,
+    );
+    let prior_ingestion = lake_health_rows(
+        search_service,
+        scope,
+        "metadata.log_source!=\"\" | stats count() as events by metadata.log_source | head 10000",
+        prior_start,
+        current_start,
+    );
+    let field_coverage = lake_health_rows(
+        search_service,
+        scope,
+        concat!(
+            "metadata.log_source!=\"\" | stats count() as total_events, ",
+            "count(eval(src_endpoint.ip!=\"\")) as src_ip_filled, ",
+            "count(eval(user.name!=\"\")) as user_filled, ",
+            "count(eval(class_uid!=0)) as class_filled, ",
+            "count(eval(message!=\"\")) as message_filled ",
+            "by metadata.log_source | head 10000"
+        ),
+        current_start,
+        now,
+    );
+    let current_enrichment = lake_health_rows(
+        search_service,
+        scope,
+        concat!(
+            "metadata.log_source!=\"\" | stats count() as total_events, ",
+            "count(eval(src_endpoint.location.country!=\"\" OR dst_endpoint.location.country!=\"\")) as geo_filled, ",
+            "count(eval(src_endpoint.autonomous_system.number>0 OR dst_endpoint.autonomous_system.number>0)) as asn_filled, ",
+            "count(eval(user.name!=\"\")) as identity_filled ",
+            "by metadata.log_source | head 10000"
+        ),
+        current_start,
+        now,
+    );
+    let prior_identity = lake_health_rows(
+        search_service,
+        scope,
+        concat!(
+            "metadata.log_source!=\"\" | stats count() as total_events, ",
+            "count(eval(user.name!=\"\")) as identity_filled"
+        ),
+        prior_start,
+        current_start,
+    );
+
+    let (current_rows, prior_rows, coverage_rows, enrichment_rows, prior_identity_rows) = tokio::join!(
+        current_ingestion,
+        prior_ingestion,
+        field_coverage,
+        current_enrichment,
+        prior_identity,
+    );
+
+    let mut ingestion = lake_ingestion_metrics(&current_rows, &prior_rows);
+    ingestion.lake_publication = collect_lake_publication_health(pool).await;
+    let parsing = lake_parsing_metrics(&coverage_rows);
+    let enrichment = lake_enrichment_metrics(
+        pool,
+        &enrichment_rows,
+        &prior_identity_rows,
+        ingestion.total_events_24h,
+    )
+    .await;
+    let detection = collect_detection_metrics(pool).await;
+    let alerting = collect_alerting_metrics(pool).await;
+
+    info!(
+        "Collected lake SIEM health metrics: {} source types, {} events (24h)",
+        ingestion.source_volumes.len(),
+        ingestion.total_events_24h
+    );
+
+    CollectedMetrics {
+        ingestion,
+        parsing,
+        enrichment,
+        detection,
+        alerting,
+        collected_at: now,
+    }
+}
+
+async fn lake_health_rows(
+    search_service: &SearchService,
+    scope: &ScopeSet,
+    query: &str,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Vec<serde_json::Value> {
+    let request = SearchRequest {
+        query: query.to_string(),
+        time_range: TimeRangeInput::new(start, end),
+        limit: Some(10_000),
+        offset: None,
+        include_sql: Some(false),
+        skip_histogram: true,
+        skip_field_stats: true,
+        use_cache: true,
+        table_view: false,
+        request_id: None,
+        async_mode: false,
+        priority: Some("analytics".to_string()),
+        dataset: Some("logs".to_string()),
+    };
+
+    match search_service.search(request, scope).await {
+        Ok(response) => response.results,
+        Err(error) => {
+            warn!(query, %error, "Failed to collect lake SIEM-health metric");
+            Vec::new()
+        }
+    }
+}
+
+fn json_u64(row: &serde_json::Value, key: &str) -> u64 {
+    row.get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn json_string(row: &serde_json::Value, key: &str) -> Option<String> {
+    row.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn percentage(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 * 100.0 / denominator as f64
+    }
+}
+
+fn source_counts(rows: &[serde_json::Value]) -> std::collections::BTreeMap<String, u64> {
+    rows.iter()
+        .filter_map(|row| {
+            Some((
+                json_string(row, "metadata.log_source")?,
+                json_u64(row, "events"),
+            ))
+        })
+        .collect()
+}
+
+fn lake_ingestion_metrics(
+    current_rows: &[serde_json::Value],
+    prior_rows: &[serde_json::Value],
+) -> IngestionMetrics {
+    let current = source_counts(current_rows);
+    let prior = source_counts(prior_rows);
+    let mut sources = current
+        .keys()
+        .chain(prior.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+
+    let source_volumes = sources
+        .into_iter()
+        .map(|source_type| {
+            let count_24h = current.get(&source_type).copied().unwrap_or(0);
+            let count_prior_24h = prior.get(&source_type).copied().unwrap_or(0);
+            let change_pct = if count_prior_24h > 0 {
+                (count_24h as f64 - count_prior_24h as f64) * 100.0 / count_prior_24h as f64
+            } else if count_24h > 0 {
+                100.0
+            } else {
+                0.0
+            };
+            SourceVolumeMetric {
+                source_type,
+                count_24h,
+                count_prior_24h,
+                change_pct,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    IngestionMetrics {
+        total_events_24h: source_volumes.iter().map(|row| row.count_24h).sum(),
+        total_events_prior_24h: source_volumes.iter().map(|row| row.count_prior_24h).sum(),
+        silent_sources: source_volumes
+            .iter()
+            .filter(|row| row.count_24h == 0 && row.count_prior_24h > 0)
+            .map(|row| row.source_type.clone())
+            .collect(),
+        source_volumes,
+        insert_integrity: InsertIntegrityMetrics::default(),
+        lake_publication: None,
+    }
+}
+
+async fn collect_lake_publication_health(pool: &PgPool) -> Option<LakePublicationHealth> {
+    let tenant_id = std::env::var("NANO_LAKE_TENANT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let table_location_prefix = std::env::var("NANO_LAKE_EVENT_TABLE_LOCATION_PREFIX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let row = sqlx::query_as::<
+        _,
+        (
+            Option<i64>,
+            i64,
+            Option<i64>,
+            Option<i32>,
+            Option<i64>,
+            Option<String>,
+            Option<chrono::DateTime<Utc>>,
+            bool,
+        ),
+    >(
+        r#"
+        SELECT
+            CASE WHEN health.last_reconciled_at IS NULL THEN NULL ELSE
+                GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                    clock_timestamp() - health.last_reconciled_at)))::bigint
+            END AS last_reconciled_age_seconds,
+            GREATEST(
+                0,
+                COALESCE(revision.revision, 0) -
+                    COALESCE(health.published_ledger_revision, 0)
+            )::bigint AS unpublished_revisions,
+            CASE WHEN COALESCE(revision.revision, 0) >
+                           COALESCE(health.published_ledger_revision, 0)
+                 THEN GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                          clock_timestamp() - COALESCE(
+                              health.last_reconciled_at,
+                              revision.updated_at
+                          ))))::bigint
+                 ELSE NULL
+            END AS oldest_age_seconds,
+            health.visible_objects,
+            health.visible_bytes,
+            health.manifest_sha256::text,
+            health.newest_visible_event_time,
+            (health.tenant_id IS NOT NULL OR revision.revision IS NOT NULL) AS publisher_present
+        FROM (SELECT 1) AS singleton
+        LEFT JOIN LATERAL (
+            SELECT * FROM lake_hot_tail_publication_health
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR table_location_prefix = $2)
+            ORDER BY last_reconciled_at DESC
+            LIMIT 1
+        ) AS health ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT revision, updated_at
+            FROM lake_hot_tail_ledger_revisions
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR table_location_prefix = $2)
+            ORDER BY updated_at DESC
+            LIMIT 1
+        ) AS revision ON TRUE
+        "#,
+    )
+    .bind(&tenant_id)
+    .bind(table_location_prefix.as_deref())
+    .fetch_one(pool)
+    .await;
+    match row {
+        Ok(row) => lake_publication_health_from_row(row),
+        Err(error) => {
+            warn!(%error, "Failed to collect lake hot-tail publication health");
+            None
+        }
+    }
+}
+
+type LakePublicationRow = (
+    Option<i64>,
+    i64,
+    Option<i64>,
+    Option<i32>,
+    Option<i64>,
+    Option<String>,
+    Option<chrono::DateTime<Utc>>,
+    bool,
+);
+
+/// NAN-3769: the staged hot-tail publisher (`lake_staged_tail_manage`) is not
+/// part of every lake topology; the lean cell (open core, dedicated) writes
+/// straight to the lake and never records a publication-health row or a
+/// ledger revision for its tenant. With neither present there is nothing to
+/// be stalled, so report "no publisher" (None) instead of a never-reconciled
+/// publisher, which used to cost open core 40 ingestion points and a false
+/// critical "publication is stalled" finding. A ledger revision without a
+/// publication row is still a real stall and keeps alerting.
+fn lake_publication_health_from_row(row: LakePublicationRow) -> Option<LakePublicationHealth> {
+    let (
+        reconciled_age,
+        unpublished,
+        unpublished_age,
+        visible_objects,
+        visible_bytes,
+        manifest_sha256,
+        newest_visible_event_time,
+        publisher_present,
+    ) = row;
+    if !publisher_present {
+        return None;
+    }
+    Some(LakePublicationHealth {
+        last_reconciled_age_seconds: reconciled_age.and_then(|value| value.try_into().ok()),
+        unpublished_revisions: unpublished.try_into().unwrap_or_default(),
+        oldest_unpublished_age_seconds: unpublished_age.and_then(|value| value.try_into().ok()),
+        visible_objects: visible_objects
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default(),
+        visible_bytes: visible_bytes
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default(),
+        manifest_sha256,
+        newest_visible_event_time,
+    })
+}
+
+fn lake_parsing_metrics(rows: &[serde_json::Value]) -> ParsingMetrics {
+    let field_coverage = rows
+        .iter()
+        .filter_map(|row| {
+            let source_type = json_string(row, "metadata.log_source")?;
+            let total_events = json_u64(row, "total_events");
+            (total_events >= 100).then(|| FieldCoverageMetric {
+                source_type,
+                total_events,
+                src_ip_filled_pct: percentage(json_u64(row, "src_ip_filled"), total_events),
+                user_filled_pct: percentage(json_u64(row, "user_filled"), total_events),
+                event_type_filled_pct: percentage(json_u64(row, "class_filled"), total_events),
+                message_filled_pct: percentage(json_u64(row, "message_filled"), total_events),
+            })
+        })
+        .collect();
+
+    ParsingMetrics {
+        field_coverage,
+        // OCSF overflow belongs under `unmapped.*`; there is intentionally no
+        // `ext` compatibility field in the lake contract.
+        high_ext_sources: Vec::new(),
+        // Canonical OCSF values preserve display case. Selective sidecar keys
+        // are normalized independently, so the UDM raw-column invariant is not
+        // applicable here.
+        lowercase_invariant_violations: Vec::new(),
+    }
+}
+
+async fn lake_enrichment_metrics(
+    pool: &PgPool,
+    rows: &[serde_json::Value],
+    prior_identity_rows: &[serde_json::Value],
+    total_events_24h: u64,
+) -> EnrichmentMetrics {
+    let mut geo_filled = 0_u64;
+    let mut asn_filled = 0_u64;
+    let mut identity_filled = 0_u64;
+    let mut per_source_coverage = Vec::new();
+
+    for row in rows {
+        let Some(source_type) = json_string(row, "metadata.log_source") else {
+            continue;
+        };
+        let total_events = json_u64(row, "total_events");
+        let source_geo = json_u64(row, "geo_filled");
+        let source_asn = json_u64(row, "asn_filled");
+        let source_identity = json_u64(row, "identity_filled");
+        geo_filled = geo_filled.saturating_add(source_geo);
+        asn_filled = asn_filled.saturating_add(source_asn);
+        identity_filled = identity_filled.saturating_add(source_identity);
+        if total_events >= 100 {
+            per_source_coverage.push(EnrichmentCoverageMetric {
+                source_type,
+                total_events,
+                geoip_pct: percentage(source_geo, total_events),
+                // IOC state is lookup/prevalence-owned in the lake model, not
+                // denormalized into each immutable OCSF event.
+                ioc_pct: 0.0,
+                identity_pct: percentage(source_identity, total_events),
+            });
+        }
+    }
+
+    let prior_total = prior_identity_rows
+        .iter()
+        .map(|row| json_u64(row, "total_events"))
+        .sum();
+    let prior_identity = prior_identity_rows
+        .iter()
+        .map(|row| json_u64(row, "identity_filled"))
+        .sum();
+
+    EnrichmentMetrics {
+        total_events_24h,
+        geoip_fill_pct: percentage(geo_filled, total_events_24h),
+        asn_fill_pct: percentage(asn_filled, total_events_24h),
+        ioc_hit_pct: 0.0,
+        identity_fill_pct: percentage(identity_filled, total_events_24h),
+        identity_fill_prior_pct: percentage(prior_identity, prior_total),
+        per_source_coverage,
+        providers: collect_enrichment_providers(pool).await,
     }
 }
 
@@ -136,6 +576,7 @@ async fn collect_ingestion_metrics(
         total_events_prior_24h: total_prior_24h,
         silent_sources,
         insert_integrity,
+        lake_publication: None,
     }
 }
 
@@ -298,7 +739,10 @@ async fn collect_insert_integrity(
                 Some(rows)
             }
             Err(e) => {
-                warn!("Insert-integrity probe: system.query_log unavailable cluster-wide (grant missing? NAN-1405): {}", e);
+                warn!(
+                    "Insert-integrity probe: system.query_log unavailable cluster-wide (grant missing?): {}",
+                    e
+                );
                 None
             }
         };
@@ -314,7 +758,10 @@ async fn collect_insert_integrity(
                 Some(rows)
             }
             Err(e) => {
-                warn!("Insert-integrity probe: system.part_log unavailable cluster-wide (grant missing? NAN-1405/1461): {}", e);
+                warn!(
+                    "Insert-integrity probe: system.part_log unavailable cluster-wide (grant missing?): {}",
+                    e
+                );
                 None
             }
         };
@@ -333,7 +780,7 @@ async fn collect_insert_integrity(
                 if let Some((host, n)) = stalled {
                     warn!(
                         "Insert-integrity: node {} finished {} inserts in 1h but created 0 new parts \
-                         (per-node NAN-1404 stall — other nodes may be masking it in aggregate)",
+                         (per-node insert stall — other nodes may be masking it in aggregate)",
                         host, n
                     );
                     m.logs_inserts_1h = *n;
@@ -357,7 +804,7 @@ async fn collect_insert_integrity(
                 m.logs_inserts_1h = inserts;
             }
             Err(e) => warn!(
-                "Insert-integrity probe: system.query_log unavailable (grant missing? NAN-1405): {}",
+                "Insert-integrity probe: system.query_log unavailable (grant missing?): {}",
                 e
             ),
         }
@@ -369,7 +816,7 @@ async fn collect_insert_integrity(
                 m.new_parts_1h = new_parts;
             }
             Err(e) => warn!(
-                "Insert-integrity probe: system.part_log unavailable (grant missing? NAN-1405/1461): {}",
+                "Insert-integrity probe: system.part_log unavailable (grant missing?): {}",
                 e
             ),
         }
@@ -389,7 +836,7 @@ async fn collect_insert_integrity(
             }
         }
         Err(e) => warn!(
-            "Insert-integrity probe: system.errors unavailable (grant missing? NAN-1405): {}",
+            "Insert-integrity probe: system.errors unavailable (grant missing?): {}",
             e
         ),
     }
@@ -441,7 +888,7 @@ async fn collect_insert_integrity(
             Ok(rows) if rows.is_empty() => warn!(
                 "Insert-integrity probe: logs DDL references {} dictionaries but \
                  system.dictionaries shows none — GRANT SHOW DICTIONARIES ON *.* \
-                 missing? (NAN-1437); unhealthy-dict detection is blind",
+                 missing?; unhealthy-dict detection is blind",
                 referenced.len()
             ),
             Ok(rows) => {
@@ -452,9 +899,7 @@ async fn collect_insert_integrity(
                 // (NAN-1667, gap G2).
                 m.failed_logs_dictionaries = rows
                     .into_iter()
-                    .filter(|(_, status, last_exception)| {
-                        dict_is_unhealthy(status, last_exception)
-                    })
+                    .filter(|(_, status, last_exception)| dict_is_unhealthy(status, last_exception))
                     .map(|(name, _, last_exception)| FailedDictionary {
                         name,
                         last_exception,
@@ -462,7 +907,7 @@ async fn collect_insert_integrity(
                     .collect();
             }
             Err(e) => warn!(
-                "Insert-integrity probe: system.dictionaries unavailable (grant missing? NAN-1405): {}",
+                "Insert-integrity probe: system.dictionaries unavailable (grant missing?): {}",
                 e
             ),
         }
@@ -518,15 +963,17 @@ async fn collect_insert_integrity(
             m.probes_available = true;
             m.stale_dict_refreshes = rows
                 .into_iter()
-                .map(|(view, exception, last_success_age_secs)| StaleDictRefresh {
-                    view,
-                    exception,
-                    last_success_age_secs,
-                })
+                .map(
+                    |(view, exception, last_success_age_secs)| StaleDictRefresh {
+                        view,
+                        exception,
+                        last_success_age_secs,
+                    },
+                )
                 .collect();
         }
         Err(e) => warn!(
-            "Insert-integrity probe: system.view_refreshes unavailable (grant missing? NAN-1407): {}",
+            "Insert-integrity probe: system.view_refreshes unavailable (grant missing?): {}",
             e
         ),
     }
@@ -591,7 +1038,7 @@ async fn collect_insert_integrity(
                         warn!(
                             "Insert-integrity: distribution queue erroring on {} for {}.{} \
                              ({} pending .bin files, {} errors): {} — acked rows may not be \
-                             durable on the target shard (NAN-1728 H7)",
+                             durable on the target shard",
                             host, db, table, data_files, error_count, last_exception
                         );
                     } else {
@@ -1080,15 +1527,20 @@ fn native_provider_run_status(
 async fn collect_enrichment_providers(pool: &PgPool) -> Vec<EnrichmentProviderStatus> {
     let mut providers = Vec::new();
 
-    // Installed Deno data/agent enrichments.
-    match sqlx::query_as::<_, (String, String, bool, Option<String>)>(
+    // Installed Deno data/agent enrichments. `custom_enrichments` is an
+    // enterprise table; the open edition skips the read (NAN-3463).
+    let custom_enrichments = if cfg!(feature = "enterprise") {
+        sqlx::query_as::<_, (String, String, bool, Option<String>)>(
         "SELECT name, enrichment_type, enabled, last_run_status \
          FROM custom_enrichments \
          ORDER BY enrichment_type, name",
-    )
-    .fetch_all(pool)
-    .await
-    {
+        )
+        .fetch_all(pool)
+        .await
+    } else {
+        Ok(Vec::new())
+    };
+    match custom_enrichments {
         Ok(rows) => {
             for (name, enrichment_type, enabled, last_run_status) in rows {
                 let last_run_status =
@@ -1269,6 +1721,7 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
             vec![]
         }
     };
+    let late_replay = collect_late_replay_health(pool).await;
 
     info!(
         "Collected detection metrics: {} enabled rules, {} stale, {} noisy",
@@ -1284,6 +1737,79 @@ async fn collect_detection_metrics(pool: &PgPool) -> DetectionMetrics {
         stale_rules,
         noisy_rules,
         alerts_24h_by_severity: alerts_24h,
+        late_replay,
+    }
+}
+
+async fn collect_late_replay_health(pool: &PgPool) -> LateReplayHealth {
+    let tenant_id = std::env::var("NANO_LAKE_TENANT_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let row = sqlx::query_as::<_, (i64, Option<i64>, i64, i64, i64, Option<i64>)>(
+        r#"
+        SELECT
+            publications.unplanned,
+            publications.oldest_unplanned_age_seconds,
+            jobs.pending,
+            jobs.running,
+            jobs.dead_letter,
+            jobs.oldest_outstanding_age_seconds
+        FROM (
+            SELECT COUNT(*) FILTER (
+                       WHERE planned_at IS NULL AND expired_at IS NULL
+                   )::bigint AS unplanned,
+                   CASE WHEN MIN(published_at) FILTER (
+                       WHERE planned_at IS NULL AND expired_at IS NULL
+                   ) IS NULL THEN NULL ELSE
+                       GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                           clock_timestamp() - MIN(published_at) FILTER (
+                               WHERE planned_at IS NULL AND expired_at IS NULL
+                           ))))::bigint
+                   END AS oldest_unplanned_age_seconds
+            FROM lake_detection_event_publications
+            WHERE ($1::text IS NULL OR tenant_id = $1)
+        ) AS publications
+        CROSS JOIN (
+            SELECT COUNT(*) FILTER (WHERE status = 'pending')::bigint AS pending,
+                   COUNT(*) FILTER (WHERE status = 'running')::bigint AS running,
+                   COUNT(*) FILTER (WHERE status = 'dead_letter')::bigint AS dead_letter,
+                   CASE WHEN MIN(created_at) FILTER (
+                       WHERE status IN ('pending', 'running')
+                   ) IS NULL THEN NULL ELSE
+                       GREATEST(0, FLOOR(EXTRACT(EPOCH FROM
+                           clock_timestamp() - MIN(created_at) FILTER (
+                               WHERE status IN ('pending', 'running')
+                           ))))::bigint
+                   END AS oldest_outstanding_age_seconds
+            FROM detection_late_replay_jobs
+            -- Scheduler drains are global control-plane work for the same
+            -- tenant-pinned rule fleet. Hiding their dead letters behind the
+            -- synthetic `scheduler` tenant would make a partial detection
+            -- window look healthy forever.
+            WHERE ($1::text IS NULL OR tenant_id = $1 OR tenant_id = 'scheduler')
+        ) AS jobs
+        "#,
+    )
+    .bind(tenant_id.as_deref())
+    .fetch_one(pool)
+    .await;
+    match row {
+        Ok((unplanned, unplanned_age, pending, running, dead_letter, outstanding_age)) => {
+            LateReplayHealth {
+                unplanned_publications: unplanned.try_into().unwrap_or_default(),
+                oldest_unplanned_age_seconds: unplanned_age.and_then(|value| value.try_into().ok()),
+                pending_jobs: pending.try_into().unwrap_or_default(),
+                running_jobs: running.try_into().unwrap_or_default(),
+                dead_letter_jobs: dead_letter.try_into().unwrap_or_default(),
+                oldest_outstanding_job_age_seconds: outstanding_age
+                    .and_then(|value| value.try_into().ok()),
+            }
+        }
+        Err(error) => {
+            warn!(%error, "Failed to collect detection late-replay health");
+            LateReplayHealth::default()
+        }
     }
 }
 
@@ -1383,15 +1909,25 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
             }
         };
 
-    let active_routing_rules: i64 =
+    // Queue routing belongs to Cases and `queue_routing_rules` exists only
+    // under the enterprise overlay. The open edition does not issue the read
+    // (it failed on every health run, NAN-3463).
+    let active_routing_rules: i64 = if cfg!(feature = "enterprise") {
         sqlx::query_scalar("SELECT COUNT(*) FROM queue_routing_rules WHERE enabled = true")
             .fetch_one(pool)
             .await
-            .unwrap_or(0);
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     info!(
         "Collected alerting metrics: {} alerts (24h, prior {}), MTTA {:?}m, {} webhooks, {} routing rules",
-        total_alerts_24h, total_alerts_prior_24h, mean_mtta_minutes, active_webhooks, active_routing_rules
+        total_alerts_24h,
+        total_alerts_prior_24h,
+        mean_mtta_minutes,
+        active_webhooks,
+        active_routing_rules
     );
 
     AlertingMetrics {
@@ -1573,6 +2109,30 @@ fn build_ext_usage_sql(logs_table: &str, ocsf: bool, scope: &ScopeSet) -> String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lake_publication_absent_publisher_is_not_a_stall() {
+        // NAN-3769: lean cell tenant with no staged-tail publisher at all.
+        assert!(super::lake_publication_health_from_row((
+            None, 0, None, None, None, None, None, false
+        ))
+        .is_none());
+        // A ledger revision that was never published is a real stall.
+        let stalled = super::lake_publication_health_from_row((
+            None,
+            1,
+            Some(120),
+            None,
+            None,
+            None,
+            None,
+            true,
+        ))
+        .expect("publisher present");
+        assert_eq!(stalled.last_reconciled_age_seconds, None);
+        assert_eq!(stalled.unpublished_revisions, 1);
+        assert_eq!(stalled.oldest_unpublished_age_seconds, Some(120));
+    }
+
     use super::*;
 
     fn scope(denied: &[&str]) -> ScopeSet {
@@ -1598,7 +2158,10 @@ mod tests {
     fn error_counter_sql_excludes_the_boot_window_in_both_shapes() {
         for (name, sql) in [
             ("single-node", build_error_counters_sql(None)),
-            ("cluster", build_error_counters_sql(Some("nanosiem_cluster"))),
+            (
+                "cluster",
+                build_error_counters_sql(Some("nanosiem_cluster")),
+            ),
         ] {
             assert!(
                 sql.contains("last_error_time >= now() - INTERVAL 24 HOUR"),
@@ -1623,7 +2186,10 @@ mod tests {
     fn boot_grace_covers_only_the_dictionary_counter() {
         for (shape, sql) in [
             ("single-node", build_error_counters_sql(None)),
-            ("cluster", build_error_counters_sql(Some("nanosiem_cluster"))),
+            (
+                "cluster",
+                build_error_counters_sql(Some("nanosiem_cluster")),
+            ),
         ] {
             // The uptime predicate must sit inside a disjunction that exempts
             // every OTHER error name, not as a bare top-level AND.
@@ -1651,8 +2217,14 @@ mod tests {
     #[test]
     fn error_counter_sql_keeps_cluster_aggregation() {
         let sql = build_error_counters_sql(Some("nanosiem_cluster"));
-        assert!(sql.contains("sum(value)"), "cluster shape lost sum(): {sql}");
-        assert!(sql.contains("GROUP BY name"), "cluster shape lost GROUP BY: {sql}");
+        assert!(
+            sql.contains("sum(value)"),
+            "cluster shape lost sum(): {sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY name"),
+            "cluster shape lost GROUP BY: {sql}"
+        );
         assert!(
             sql.contains("clusterAllReplicas"),
             "cluster shape must read every replica: {sql}"
@@ -1667,6 +2239,64 @@ mod tests {
             single.contains("FROM system.errors"),
             "single-node shape should read the local table: {single}"
         );
+    }
+
+    #[test]
+    fn lake_ingestion_merges_current_prior_and_marks_silent_sources() {
+        let current = vec![
+            serde_json::json!({"metadata.log_source": "sysmon", "events": 90}),
+            serde_json::json!({"metadata.log_source": "cloudtrail", "events": 10}),
+        ];
+        let prior = vec![
+            serde_json::json!({"metadata.log_source": "sysmon", "events": 45}),
+            serde_json::json!({"metadata.log_source": "retired_source", "events": 8}),
+        ];
+
+        let metrics = lake_ingestion_metrics(&current, &prior);
+
+        assert_eq!(metrics.total_events_24h, 100);
+        assert_eq!(metrics.total_events_prior_24h, 53);
+        assert_eq!(metrics.silent_sources, vec!["retired_source"]);
+        let sysmon = metrics
+            .source_volumes
+            .iter()
+            .find(|row| row.source_type == "sysmon")
+            .unwrap();
+        assert_eq!(sysmon.change_pct, 100.0);
+        assert!(!metrics.insert_integrity.probes_available);
+    }
+
+    #[test]
+    fn lake_parsing_uses_exact_ocsf_result_columns_and_minimum_volume() {
+        let rows = vec![
+            serde_json::json!({
+                "metadata.log_source": "sysmon",
+                "total_events": 200,
+                "src_ip_filled": 150,
+                "user_filled": 100,
+                "class_filled": 200,
+                "message_filled": 180
+            }),
+            serde_json::json!({
+                "metadata.log_source": "tiny",
+                "total_events": 99,
+                "src_ip_filled": 99,
+                "user_filled": 99,
+                "class_filled": 99,
+                "message_filled": 99
+            }),
+        ];
+
+        let metrics = lake_parsing_metrics(&rows);
+
+        assert_eq!(metrics.field_coverage.len(), 1);
+        assert_eq!(metrics.field_coverage[0].source_type, "sysmon");
+        assert_eq!(metrics.field_coverage[0].src_ip_filled_pct, 75.0);
+        assert_eq!(metrics.field_coverage[0].user_filled_pct, 50.0);
+        assert_eq!(metrics.field_coverage[0].event_type_filled_pct, 100.0);
+        assert_eq!(metrics.field_coverage[0].message_filled_pct, 90.0);
+        assert!(metrics.high_ext_sources.is_empty());
+        assert!(metrics.lowercase_invariant_violations.is_empty());
     }
 
     #[test]

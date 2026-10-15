@@ -13,8 +13,15 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft, BarChart2, EyeOff, Group as GroupIcon } from 'lucide-react';
+import { ChevronDown, Plus, Minus, Copy, Search, X, Filter, ChevronLeft, BarChart2, EyeOff, Group as GroupIcon } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
+import {
+  canonicalSpillFieldName,
+  hasObservedSpillValue,
+  isSpillFieldName,
+  sortFieldStatsByName,
+} from './field-rail-policy';
 
 interface FieldValueInfo {
   value: string;
@@ -33,6 +40,14 @@ export interface FieldStat {
   // on demand when the row is expanded (the get_field_values path resolves
   // `ext.{field}` correctly via field_access_expr).
   onDemand?: boolean;
+  // NAN-3566: count/uniqueCount/topValues were counted over a sample of this
+  // many newest events, not the whole window. Unset = exact.
+  sampledRows?: number;
+}
+
+/** "sample · 1,000 events" for a field counted over a row sample (NAN-3566). */
+function sampledRowsLabel(rows: number): string {
+  return `sample · ${rows.toLocaleString()} events`;
 }
 
 // Server-side field values (fetched on-demand)
@@ -40,6 +55,15 @@ interface ServerFieldValues {
   values: FieldValueInfo[];
   loading: boolean;
   error?: string;
+  /** NAN-3093: counted over the newest slice of the window only. */
+  sampled?: { start: string; end: string };
+}
+
+/** "last 1h" for a sampled slice of the window (NAN-3093). */
+function sampledSliceLabel(sampled: { start: string; end: string }): string {
+  const minutes = Math.round((Date.parse(sampled.end) - Date.parse(sampled.start)) / 60_000);
+  if (!Number.isFinite(minutes) || minutes <= 0) return 'sample';
+  return minutes % 60 === 0 ? `sample · last ${minutes / 60}h` : `sample · last ${minutes}m`;
 }
 
 // Format cardinality display - just show the unique count.
@@ -68,7 +92,13 @@ interface FieldsPanelProps {
   // For on-demand field value fetching
   query?: string;
   timeRange?: { start: string; end: string };
-  onFetchFieldValues?: (field: string, query: string, start: string, end: string) => Promise<{ values: FieldValueInfo[]; total_count: number }>;
+  onFetchFieldValues?: (field: string, query: string, start: string, end: string) => Promise<{
+    values: FieldValueInfo[];
+    total_count: number;
+    approximate?: boolean;
+    sampled_start?: string;
+    sampled_end?: string;
+  }>;
   // NAN-1427: the server stats were computed over a reduced column set
   // (visible + pinned columns); offer "Index all fields" to fetch the rest.
   isReducedFieldSet?: boolean;
@@ -81,13 +111,12 @@ const INITIAL_VALUES_SHOWN = 10;
 // entries the distinct count is "N+", not exact (NAN-1506).
 const ON_DEMAND_VALUE_LIMIT = 100;
 
-// Key fields pinned to a "Selected" section at the top of the field index — the
+// Key fields pinned to the "Selected" section at the top of the field index — the
 // ones analysts land on for most searches. Any field in this list that the
 // current result set produced gets surfaced first; the rest fall under
 // "Available". The set is profile-aware (OCSF Phase 7, NAN-1241): under OCSF a
-// row carries `src_endpoint.ip`/`user.name`/`class_uid`/`activity`, so the UDM
-// set would leave only `source_type`+`timestamp` pinned.
-const SELECTED_FIELDS_UDM = new Set([
+// row carries canonical OCSF paths, so no Nano serving aliases belong here.
+export const SELECTED_FIELDS_UDM = new Set([
   'source_type',
   'sourcetype',
   'src_ip',
@@ -104,16 +133,23 @@ const SELECTED_FIELDS_UDM = new Set([
   'timestamp',
   '_time',
 ]);
-const SELECTED_FIELDS_OCSF = new Set([
-  'source_type',
-  'timestamp',
-  'time_dt',
+// Host identity mirrors the UDM set (NAN-3251): src_host/dest_host are
+// src_endpoint.hostname/dst_endpoint.hostname, and device.hostname is the host
+// of endpoint-class events (Sysmon, Windows Event Log). protocol_name is the
+// OCSF analog of UDM `protocol`.
+export const SELECTED_FIELDS_OCSF = new Set([
+  'metadata.log_source',
+  'time',
   'class_uid',
-  'activity',
+  'activity_name',
   'severity',
+  'device.hostname',
   'src_endpoint.ip',
+  'src_endpoint.hostname',
   'dst_endpoint.ip',
+  'dst_endpoint.hostname',
   'dst_endpoint.port',
+  'connection_info.protocol_name',
   'user.name',
   'actor.user.name',
   'actor.process.name',
@@ -243,7 +279,10 @@ export function FieldsPanel({
               // "-" rows (percentages stay server-relative: "X% of all
               // matching events", which remains honest after the drop).
               values: response.values.filter(v => v.value !== ''),
-              loading: false
+              loading: false,
+              sampled: response.approximate && response.sampled_start && response.sampled_end
+                ? { start: response.sampled_start, end: response.sampled_end }
+                : undefined,
             }));
           })
           .catch(error => {
@@ -264,10 +303,10 @@ export function FieldsPanel({
   }, [fieldStats]);
 
   // Helper to get values to display for a field (server values if available, else client-side)
-  const getFieldValues = useCallback((stat: FieldStat): { values: FieldValueInfo[]; loading: boolean; isServerData: boolean } => {
+  const getFieldValues = useCallback((stat: FieldStat): { values: FieldValueInfo[]; loading: boolean; isServerData: boolean; sampled?: { start: string; end: string } } => {
     const serverData = serverFieldValues.get(stat.field);
     if (serverData && serverData.values.length > 0) {
-      return { values: serverData.values, loading: false, isServerData: true };
+      return { values: serverData.values, loading: false, isServerData: true, sampled: serverData.sampled };
     }
     if (serverData?.loading) {
       return { values: stat.topValues, loading: true, isServerData: false };
@@ -276,23 +315,38 @@ export function FieldsPanel({
     return { values: stat.topValues, loading: false, isServerData: false };
   }, [serverFieldValues]);
 
-  // NAN-1503: ext.* (UDM) / unmapped (OCSF) JSON keys never come back in field
-  // stats — those only enumerate explicit table columns. Pull the key list and
-  // merge any not surfaced as a real column in as on-demand entries so they're
-  // discoverable + expandable.
+  // NAN-1503: legacy UDM ext.* JSON keys never come back in field stats. The
+  // OCSF lake instead returns its stable struct shape, including null
+  // `unmapped.*` placeholders. Pull legacy names on demand, but show OCSF spill
+  // leaves only when this search's sample observed a real value.
   // NAN-1505/1510: scope enumeration to the active search QUERY + window (keyed on
   // both) so the list matches what a field expand can return. Keying on the window
   // alone (1505) listed ext keys from other source types in the window that then
   // expanded empty; passing the query scopes it to the same predicate as the
   // per-field value fetch. Only fetch while the panel is open.
+  // NAN-3299: the names only merge into a built field index (see mergedStats),
+  // so wait for one — before it the panel would fetch for the pre-run window
+  // and again for the run's own. The signal aborts a superseded fetch.
+  const hasFieldIndex = (showBaseFields ? baseFieldStats : fieldStats).length > 0;
   const { data: extFieldNames } = useQuery({
-    queryKey: ['ext-field-names', query, timeRange?.start, timeRange?.end],
-    queryFn: () => api.getExtFieldNames(query, timeRange?.start, timeRange?.end),
+    // Version the key so a hot-reloaded UI cannot retain the old lake response
+    // that mixed schema-only names into this observed-field list.
+    queryKey: ['ext-field-names-observed-v2', query, timeRange?.start, timeRange?.end],
+    queryFn: ({ signal }) => api.getExtFieldNames(query, timeRange?.start, timeRange?.end, signal),
     staleTime: 5 * 60 * 1000,
-    enabled: !!onFetchFieldValues && !!timeRange && isExpanded,
+    enabled: !!onFetchFieldValues && !!timeRange && isExpanded && hasFieldIndex,
   });
 
-  const baseStats = showBaseFields ? baseFieldStats : fieldStats;
+  const isOcsf = schemaFields?.schema === 'ocsf';
+  const unfilteredBaseStats = showBaseFields ? baseFieldStats : fieldStats;
+  const baseStats = useMemo(
+    () => unfilteredBaseStats.filter((stat) => {
+      if (!isOcsf) return true;
+      const isUnmapped = stat.field === 'unmapped' || isSpillFieldName(stat.field, true);
+      return !isUnmapped || hasObservedSpillValue(stat.topValues);
+    }),
+    [unfilteredBaseStats, isOcsf],
+  );
   // Merge in ext keys (deduped against real columns) once a search has produced
   // a field index — before that we keep the clean "run a query" empty state.
   // NAN-1504: render with the namespace prefix the inspector/results already use
@@ -300,8 +354,6 @@ export function FieldsPanel({
   // view. The prefixed form is also the query form: field_access_expr strips the
   // `ext.` prefix (NAN-1411) and OcsfProfile::resolve strips `unmapped.`, so
   // expand + add-to-filter resolve to the same spill access as the bare key.
-  const isOcsf = schemaFields?.schema === 'ocsf';
-  const extPrefix = isOcsf ? 'unmapped.' : 'ext.';
   const mergedStats = useMemo<FieldStat[]>(() => {
     if (!extFieldNames || extFieldNames.length === 0 || baseStats.length === 0) {
       return baseStats;
@@ -309,11 +361,15 @@ export function FieldsPanel({
     const present = new Set(baseStats.map(s => s.field));
     const extStats: FieldStat[] = extFieldNames
       .filter(name => !!name)
-      .map(name => `${extPrefix}${name}`)
+      // ClickHouse returns relative ext paths while the lake returns canonical
+      // `unmapped.*` paths. Never prefix an already-canonical path a second
+      // time; also heal stale cached `unmapped.unmapped.*` responses.
+      .map(name => canonicalSpillFieldName(name, !!isOcsf))
+      .filter(name => isSpillFieldName(name, !!isOcsf))
       .filter(name => !present.has(name))
       .map(name => ({ field: name, count: 0, uniqueCount: 0, topValues: [], onDemand: true }));
     return extStats.length > 0 ? [...baseStats, ...extStats] : baseStats;
-  }, [baseStats, extFieldNames, extPrefix]);
+  }, [baseStats, extFieldNames, isOcsf]);
 
   const displayStats = searchTerm
     ? mergedStats.filter(stat =>
@@ -412,7 +468,7 @@ export function FieldsPanel({
             </div>
             {isLoadingMore && (
               <div className="flex items-center gap-1.5 px-2 py-1 text-[10.5px] text-muted-foreground animate-in fade-in duration-300">
-                <Loader2 className="w-3 h-3 animate-spin" />
+                <LoadingIcon className="w-3 h-3" />
                 <span>Indexing more fields…</span>
               </div>
             )}
@@ -421,7 +477,7 @@ export function FieldsPanel({
         {isExpanded && <div>
           {isLoading ? (
             <div className="flex items-center justify-center gap-2 py-4 text-muted-foreground">
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <LoadingIcon className="w-4 h-4" />
               <span className="text-[12px] font-mono">Indexing fields...</span>
             </div>
           ) : displayStats.length === 0 ? (
@@ -430,7 +486,7 @@ export function FieldsPanel({
               // full-inventory fetch is in flight — show progress, not the
               // "run a query" dead-end.
               <div className="flex items-center justify-center gap-2 py-4 text-muted-foreground">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <LoadingIcon className="w-4 h-4" />
                 <span className="text-[12px] font-mono">Indexing all fields…</span>
               </div>
             ) : searchTerm ? (
@@ -439,12 +495,23 @@ export function FieldsPanel({
               <p className="text-muted-foreground text-[11.5px] font-mono py-4 text-center">Execute a query to build the field index</p>
             )
           ) : (() => {
-            const selectedStats = displayStats.filter(s => selectedFieldSet.has(s.field));
+            const selectedStats = sortFieldStatsByName(
+              displayStats.filter(s => selectedFieldSet.has(s.field)),
+            );
             // On-demand ext/unmapped JSON fields get their own section (below),
             // matching the inspector's Extended/Unmapped buckets — keep them out
             // of "Available" (which is promoted/indexed schema columns).
-            const availableStats = displayStats.filter(s => !selectedFieldSet.has(s.field) && !s.onDemand);
-            const extStats = displayStats.filter(s => s.onDemand);
+            const availableStats = sortFieldStatsByName(
+              displayStats.filter(
+                s => !selectedFieldSet.has(s.field) && !isSpillFieldName(s.field, !!isOcsf),
+              ),
+            );
+            // Categorize by the canonical namespace, not by whether the row was
+            // synthetically discovered. Populated `unmapped.*` leaves derived
+            // from visible OCSF events belong here too.
+            const extStats = sortFieldStatsByName(
+              displayStats.filter(s => isSpillFieldName(s.field, !!isOcsf)),
+            );
             const renderRow = (stat: FieldStat) => {
               const isOpen = expandedFields.has(stat.field);
               // Expanding a field fetches its values on-demand over the FULL
@@ -477,6 +544,9 @@ export function FieldsPanel({
                 : stat.onDemand
                   ? null
                   : stat.count;
+              // NAN-3566: until the exact drill-in loads, a sampled field's
+              // unique count only covers the newest events: disclose in the tooltip.
+              const sampledRows = !hasLoaded && !stat.onDemand ? stat.sampledRows : undefined;
               return (
               <div key={stat.field}>
                 <div
@@ -496,11 +566,13 @@ export function FieldsPanel({
                     title={
                       stat.onDemand && !hasLoaded
                         ? 'Expand to load values'
-                        : `${(displayUnique ?? 0).toLocaleString()}${plus} unique values`
+                        : sampledRows != null
+                          ? `${(displayUnique ?? 0).toLocaleString()} unique values in a sample of ${sampledRows.toLocaleString()} events. Expand to load field statistics.`
+                          : `${(displayUnique ?? 0).toLocaleString()}${plus} unique values`
                     }
                   >
                     {serverData?.loading ? (
-                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <LoadingIcon className="w-3 h-3" />
                     ) : hasLoaded ? (
                       `${formatCardinality(displayUnique ?? 0)}${plus}`
                     ) : stat.onDemand ? (
@@ -509,7 +581,7 @@ export function FieldsPanel({
                       // `{ }` glyph that read as a value.
                       <BarChart2 className="w-3 h-3 text-muted-foreground/50" />
                     ) : isLoadingMore && stat.uniqueCount === 0 ? (
-                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <LoadingIcon className="w-3 h-3" />
                     ) : (
                       formatCardinality(stat.uniqueCount)
                     )}
@@ -555,7 +627,10 @@ export function FieldsPanel({
                       </button>
                     </div>
                     {(() => {
-                      const { values: fieldValues, loading: fieldLoading } = getFieldValues(stat);
+                      const { values: fieldValues, loading: fieldLoading, sampled: fieldSampled, isServerData } = getFieldValues(stat);
+                      // NAN-3566: values shown from the field-stats row sample
+                      // (the drill-in is loading or failed) are not the window's.
+                      const rowSampled = !isServerData && stat.sampledRows != null ? stat.sampledRows : undefined;
                       const isShowingAll = expandedValueFields.has(stat.field);
                       const valuesToShow = isShowingAll
                         ? fieldValues
@@ -567,13 +642,13 @@ export function FieldsPanel({
                         <>
                           {fieldLoading && valuesToShow.length === 0 && (
                             <div className="flex items-center gap-2 p-1.5 text-xs text-muted-foreground">
-                              <Loader2 className="w-3 h-3 animate-spin" />
+                              <LoadingIcon className="w-3 h-3" />
                               <span>Loading values...</span>
                             </div>
                           )}
                           {fieldLoading && valuesToShow.length > 0 && (
                             <div className="flex items-center gap-1.5 px-1.5 pb-1 text-[11px] text-muted-foreground">
-                              <Loader2 className="w-3 h-3 animate-spin" />
+                              <LoadingIcon className="w-3 h-3" />
                               <span>Loading full stats…</span>
                             </div>
                           )}
@@ -601,7 +676,7 @@ export function FieldsPanel({
                                       <span className="text-str whitespace-nowrap overflow-hidden text-ellipsis" title={valueInfo.value}>
                                         {valueInfo.value}
                                       </span>
-                                      {(stat.field === 'source_type' || stat.field === 'sourcetype') &&
+                                      {(stat.field === 'metadata.log_source' || stat.field === 'source_type' || stat.field === 'sourcetype') &&
                                         restrictedSourceTypes.has(valueInfo.value) && (
                                           <span
                                             title="Visibility-scoped source — only granted groups can see its events"
@@ -701,6 +776,22 @@ export function FieldsPanel({
                               <span>{isShowingAll ? 'Show less' : `Show ${remainingCount} more`}</span>
                             </button>
                           )}
+                          {fieldSampled && (
+                            <div
+                              className="px-1.5 pt-1 font-mono text-[10.5px] text-muted-foreground"
+                              title={`Approximate: counted over ${fieldSampled.start} – ${fieldSampled.end}, the newest slice of this window. Narrow the window for exact values.`}
+                            >
+                              {sampledSliceLabel(fieldSampled)}
+                            </div>
+                          )}
+                          {!fieldSampled && rowSampled != null && valuesToShow.length > 0 && (
+                            <div
+                              className="px-1.5 pt-1 font-mono text-[10.5px] text-muted-foreground"
+                              title={`Approximate: counted over a sample of ${rowSampled.toLocaleString()} matching events. Rare values can be missing.`}
+                            >
+                              {sampledRowsLabel(rowSampled)}
+                            </div>
+                          )}
                         </>
                       );
                     })()}
@@ -773,7 +864,7 @@ export function FieldsPanel({
                     <div className="absolute inset-x-0 bottom-0 flex justify-center">
                       {isLoadingMore ? (
                         <span className="inline-flex items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground bg-card border border-border rounded-md px-2.5 py-1">
-                          <Loader2 className="w-3 h-3 animate-spin" />
+                          <LoadingIcon className="w-3 h-3" />
                           Indexing fields…
                         </span>
                       ) : (

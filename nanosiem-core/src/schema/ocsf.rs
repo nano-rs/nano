@@ -28,8 +28,8 @@
 //! instead.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, OnceLock};
 
 use serde::Deserialize;
 
@@ -66,6 +66,244 @@ const OCSF_TAIL_COLUMN: &str = "unmapped";
 /// `timestamp`/`_inserted_at` bookkeeping columns — see [`OcsfProfile::resolve`].
 const OCSF_SOURCE_TYPE_COLUMN: &str = "source_type";
 
+/// Storage binding for one OCSF profile instance. The ClickHouse layout keeps
+/// its historical serving columns. The lake layout is strict canonical OCSF
+/// 1.9: product aliases resolve to canonical paths without serving columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OcsfStorageLayout {
+    ClickHouse18,
+    Lake19,
+}
+
+const OCSF_1_9_NATIVE_FIELDS: &[&str] = &[
+    "time",
+    "type_uid",
+    "class_uid",
+    "class_name",
+    "category_uid",
+    "category_name",
+    "activity_id",
+    "activity_name",
+    "severity_id",
+    "severity",
+    "status_id",
+    "status",
+    "status_code",
+    "status_detail",
+    "count",
+    "risk_score",
+    "risk_level_id",
+    "risk_level",
+    "risk_details",
+    "message",
+    "raw_data",
+    "raw_data_size",
+    "unmapped",
+    "actor.user.domain",
+    "metadata.uid",
+    "metadata.version",
+    "metadata.log_name",
+    "metadata.log_provider",
+    "metadata.log_source",
+    "metadata.original_event_uid",
+    "metadata.tenant_uid",
+    "metadata.processed_time",
+    "metadata.logged_time",
+    "metadata.transformation_info_list",
+    // Nano platform stamps the platform base lake prepare writes on source
+    // rows (NAN-3003; admitted by `nanosiem-lake-worker` normalize as the
+    // closed `PLATFORM_METADATA_STAMPS` list): which ingest credential sent
+    // the row and which parser bundle parsed it.
+    "metadata.nano_credential_id",
+    "metadata.nano_parser_bundle_sha256",
+    // Nano-authored OCSF 1.9 Detection Finding (2004) leaves. These are part
+    // of the product's canonical writer contract, so validation must recognize
+    // them even before a tenant snapshot happens to contain a Signal.
+    "finding_info.uid",
+    "finding_info.title",
+    "finding_info.analytic.uid",
+    "finding_info.analytic.name",
+    "finding_info.analytic.type",
+    "finding_info.analytic.type_id",
+    "finding_info.types",
+    "finding_info.data_sources",
+    "finding_info.attacks.tactic.uid",
+    "finding_info.attacks.technique.uid",
+    // NAN-3224: paired ATT&CK names, timing, alert link, analytic state.
+    "is_alert",
+    "start_time",
+    "end_time",
+    "finding_info.created_time",
+    "finding_info.first_seen_time",
+    "finding_info.last_seen_time",
+    "finding_info.uid_alt",
+    "finding_info.src_url",
+    "finding_info.analytic.state",
+    "finding_info.analytic.state_id",
+    "finding_info.attacks.tactic.name",
+    "finding_info.attacks.technique.name",
+    "finding_info.attacks.sub_technique.uid",
+    "finding_info.attacks.sub_technique.name",
+    "finding_info.related_events.uid",
+    "resources.name",
+    "resources.role",
+    "resources.role_id",
+    "resources.ip",
+    "resources.hostname",
+    "resources.uid",
+    "resources.type",
+    "resources.device.name",
+    "resources.device.hostname",
+    "resources.device.type_id",
+    "resources.device.risk_score",
+    "resources.device.risk_level",
+    "resources.device.risk_level_id",
+    "resources.user.name",
+    "resources.user.uid",
+    "resources.user.risk_score",
+    "resources.user.risk_level",
+    "resources.user.risk_level_id",
+    "evidences.name",
+    "evidences.query.hostname",
+    "evidences.url.url_string",
+    // NAN-3224: curated matched-event evidence.
+    "evidences.uid",
+    "evidences.actor.user.name",
+    "evidences.actor.process.name",
+    "evidences.actor.process.cmd_line",
+    "evidences.process.name",
+    "evidences.process.cmd_line",
+    "evidences.user.name",
+    "evidences.device.hostname",
+    "evidences.src_endpoint.ip",
+    "evidences.dst_endpoint.ip",
+    "evidences.file.name",
+    "evidences.file.path",
+    "evidences.reg_key.path",
+    "enrichments.name",
+    "enrichments.value",
+    "enrichments.type",
+    "enrichments.provider",
+    "enrichments.short_desc",
+    "observables.name",
+    "observables.type",
+    "observables.type_id",
+    "observables.value",
+];
+
+/// Canonical OCSF leaves whose parent object is repeated. ClickHouse exposes
+/// these Parquet leaves as `Array(Nullable(String))`; nPL treats equality as
+/// membership and text operators as an element-wise predicate. These are
+/// schema paths, not persisted scalar aliases.
+const OCSF_1_9_STRING_ARRAY_FIELDS: &[&str] = &[
+    "actor.process.file.hashes.value",
+    "answers.rdata",
+    // NAN-2379: `email.to[]` and `vulnerabilities[].cve.uid` are advertised by
+    // the field universe but had NO addressable dotted sibling — the only two of
+    // the nine `[]` paths with no other way in. They are genuine OCSF 1.9
+    // repeated attributes (`email.to` is `email_address[]`; `vulnerabilities` is
+    // `vulnerability[]`), so they belong here with the rest of the array leaves.
+    "email.to",
+    "vulnerabilities.cve.uid",
+    "file.hashes.value",
+    "finding_info.types",
+    "finding_info.data_sources",
+    "finding_info.attacks.tactic.uid",
+    "finding_info.attacks.technique.uid",
+    // NAN-3224: paired ATT&CK names and related events.
+    "finding_info.attacks.tactic.name",
+    "finding_info.attacks.technique.name",
+    "finding_info.attacks.sub_technique.uid",
+    "finding_info.attacks.sub_technique.name",
+    "finding_info.related_events.uid",
+    "http_request.url.categories",
+    "metadata.transformation_info_list.lang",
+    "metadata.transformation_info_list.name",
+    "metadata.transformation_info_list.uid",
+    "privileges",
+    "process.file.hashes.value",
+    "resources.name",
+    "resources.role",
+    "resources.role_id",
+    "resources.ip",
+    "resources.hostname",
+    "resources.type",
+    "resources.uid",
+    "resources.device.name",
+    "resources.device.hostname",
+    "resources.device.type_id",
+    "resources.device.risk_score",
+    "resources.device.risk_level",
+    "resources.device.risk_level_id",
+    "resources.user.name",
+    "resources.user.uid",
+    "resources.user.risk_score",
+    "resources.user.risk_level",
+    "resources.user.risk_level_id",
+    "evidences.name",
+    "evidences.query.hostname",
+    "evidences.url.url_string",
+    // NAN-3224: curated matched-event evidence.
+    "evidences.uid",
+    "evidences.actor.user.name",
+    "evidences.actor.process.name",
+    "evidences.actor.process.cmd_line",
+    "evidences.process.name",
+    "evidences.process.cmd_line",
+    "evidences.user.name",
+    "evidences.device.hostname",
+    "evidences.src_endpoint.ip",
+    "evidences.dst_endpoint.ip",
+    "evidences.file.name",
+    "evidences.file.path",
+    "evidences.reg_key.path",
+    "enrichments.name",
+    "enrichments.value",
+    "enrichments.type",
+    "enrichments.provider",
+    "enrichments.short_desc",
+    "observables.name",
+    "observables.type",
+    "observables.type_id",
+    "observables.value",
+];
+
+const OCSF_1_9_CORE_FIELDS: &[&str] = &["metadata.uid", "time", "message", "metadata.log_source"];
+
+const OCSF_1_9_DEFAULT_TABLE_FIELDS: &[&str] = &[
+    "time",
+    "class_uid",
+    "src_endpoint.ip",
+    "dst_endpoint.ip",
+    "user.name",
+    "message",
+];
+
+const OCSF_1_9_PRIORITY_FIELDS: &[&str] = &[
+    "time",
+    "metadata.log_source",
+    "class_uid",
+    "type_uid",
+    "severity_id",
+    "src_endpoint.ip",
+    "dst_endpoint.ip",
+    "user.name",
+    "process.name",
+];
+
+const OCSF_1_9_PREWHERE_FIELDS: &[&str] = &[
+    "metadata.log_source",
+    "class_uid",
+    "type_uid",
+    "src_endpoint.ip",
+    "dst_endpoint.ip",
+    "user.name",
+    "actor.user.name",
+    "device.hostname",
+    "file.hashes.value",
+    "process.file.hashes.value",
+];
+
 /// Promoted columns the DDL declares `DEFAULT` (NOT `MATERIALIZED`) because they
 /// sit in the sort key, which ClickHouse forbids MATERIALIZED columns from
 /// joining — the same carve-out that already applies to `timestamp` (NAN-1334).
@@ -93,6 +331,8 @@ struct ManifestEntry {
     /// UDM field name → the OCSF column via [`OcsfProfile::udm_column_sql`].
     #[serde(default)]
     udm_field: Option<String>,
+    #[serde(default)]
+    ocsf_path: Option<String>,
     ch_column_name: String,
     ch_type: String,
     #[serde(default)]
@@ -163,6 +403,26 @@ const OCSF_ENTITY_EXTRACTION_ORDER: &[(EntityRole, &str)] = &[
     (EntityRole::Domain, "http_request.url.hostname"),
 ];
 
+/// Detection entity-extraction priority for the canonical OCSF 1.9 lake
+/// contract. Repeated hash objects expose their value through the canonical
+/// `hashes.value` leaf; the ClickHouse-era scalar `hashes.sha256` projections
+/// above do not exist in strict lake rows.
+const OCSF_1_9_ENTITY_EXTRACTION_ORDER: &[(EntityRole, &str)] = &[
+    (EntityRole::SrcIp, "src_endpoint.ip"),
+    (EntityRole::DestIp, "dst_endpoint.ip"),
+    (EntityRole::User, "user.name"),
+    (EntityRole::SrcUser, "actor.user.name"),
+    (EntityRole::User, "user.uid"),
+    (EntityRole::SrcUser, "actor.user.uid"),
+    (EntityRole::SrcHost, "src_endpoint.hostname"),
+    (EntityRole::DestHost, "dst_endpoint.hostname"),
+    (EntityRole::SrcHost, "device.hostname"),
+    (EntityRole::FileHash, "file.hashes.value"),
+    (EntityRole::ProcessHash, "process.file.hashes.value"),
+    (EntityRole::ProcessHash, "actor.process.file.hashes.value"),
+    (EntityRole::Domain, "http_request.url.hostname"),
+];
+
 /// Promoted columns whose MATERIALIZED expression in `clickhouse/ocsf/init.sql`
 /// is wrapped in `lower(...)` at ingest — IPs, MACs, hostnames, users, domain,
 /// hashes, email addresses. For these the SQL generator's
@@ -203,6 +463,11 @@ struct OcsfRegistry {
     /// Every queryable promoted field, in manifest order, deduplicated by name
     /// (`activity_id` appears twice in the manifest — taxonomy + file_action).
     fields: Vec<FieldDef>,
+    /// Canonical OCSF paths and metadata for the object-lake contract. This is
+    /// distinct from `fields`, whose names are historical ClickHouse serving
+    /// columns and include Nano-only names such as `time_dt` and `activity`.
+    canonical_fields: Vec<FieldDef>,
+    canonical_paths: HashSet<String>,
     /// Promoted-column membership for O(1) `resolve()` / `is_known_field()`.
     promoted: HashSet<String>,
     /// PREWHERE-eligible promoted columns (manifest `prewhere == true`).
@@ -224,6 +489,8 @@ struct OcsfRegistry {
     /// First mapping wins. Powers [`OcsfProfile::udm_column_sql`] so UDM-semantic
     /// raw-SQL builders resolve to the right OCSF column (NAN-1241).
     udm_to_column: std::collections::HashMap<String, String>,
+    /// Product aliases → canonical lake paths (never ClickHouse serving columns).
+    udm_to_lake: std::collections::HashMap<String, String>,
     /// Enum-int column → fixed `lowercase label → id` table (manifest
     /// `enum_values`, NAN-1382). Keys are column names (`status_id`); labels are
     /// stored lowercased so lookup is case-insensitive.
@@ -244,9 +511,12 @@ fn registry() -> &'static OcsfRegistry {
         let mut materialized = Vec::new();
         let mut search_stems = HashSet::new();
         let mut fields: Vec<FieldDef> = Vec::new();
+        let mut canonical_fields: Vec<FieldDef> = Vec::new();
+        let mut canonical_paths: HashSet<String> = HashSet::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut udm_to_column: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut udm_to_lake = std::collections::HashMap::new();
         let mut enum_values: std::collections::HashMap<
             String,
             std::collections::HashMap<String, i64>,
@@ -256,9 +526,40 @@ fn registry() -> &'static OcsfRegistry {
 
         for e in &entries {
             let name = leak_str(&e.ch_column_name);
+            if let Some(path) = e.ocsf_path.as_deref() {
+                // NAN-2379: `enrichments[name=<x>].value` is a PROMOTION RECIPE
+                // (which array element the ClickHouse-1.8 DDL materializes),
+                // not an addressable field path — no tokenizer accepts a
+                // key-selector, and there is no flat spelling to fall back to.
+                // Keep it out of the advertised universe rather than publish a
+                // name no query can use; the addressable enrichment surface is
+                // the `enrichments.{name,value,type,provider}` array leaves.
+                let advertisable = !path.contains("[name=");
+                if canonical_paths.insert(path.to_string()) && advertisable {
+                    canonical_fields.push(FieldDef {
+                        name: leak_str(path),
+                        field_type: map_ch_type(&e.ch_type),
+                        category: map_category(e.category.as_deref()),
+                        entity_type: map_entity_type(e.entity_type.as_deref()),
+                    });
+                }
+            }
             // UDM-semantic → OCSF-column index (first mapping wins; the manifest
             // occasionally maps two UDM fields to one column, e.g. file_action).
             if let Some(udm) = &e.udm_field {
+                // Prevalence counters and selected enrichment values are derived
+                // data, not aliases for the artifact/name in their recipe.
+                if !udm.starts_with("prevalence_") {
+                    if let Some(path) = e.ocsf_path.as_deref().filter(|p| !p.contains("[name=")) {
+                        let path = path.replace("[]", "");
+                        let path = if path.ends_with(".hashes") {
+                            format!("{path}.value")
+                        } else {
+                            path
+                        };
+                        udm_to_lake.entry(udm.clone()).or_insert(path);
+                    }
+                }
                 udm_to_column
                     .entry(udm.clone())
                     .or_insert_with(|| e.ch_column_name.clone());
@@ -298,6 +599,24 @@ fn registry() -> &'static OcsfRegistry {
             }
         }
 
+        // Source routing is metadata, not the taxonomy IDs that share its
+        // UDM correspondence in the 1.8 promotion manifest.
+        udm_to_lake.insert("source_type".into(), "metadata.log_source".into());
+        udm_to_lake.insert("host".into(), "device.hostname".into());
+        // Directory enrichment has no manifest OCSF counterpart. Address
+        // these known UDM attributes in the explicit producer spill namespace;
+        // this does not imply a join to the separate identity directory.
+        // Missing leaves are typed NULLs in the lake compatibility projection.
+        for field in crate::udm::UdmField::all() {
+            let name = field.column_name();
+            if name.starts_with("user_identity_")
+                || name.starts_with("src_user_identity_")
+                || name.starts_with("dest_user_identity_")
+            {
+                udm_to_lake.insert(name.into(), format!("unmapped.{name}"));
+            }
+        }
+
         // `time_dt` is an ALIAS column in the DDL (not MATERIALIZED) — keep it in
         // the field universe / promoted set but drop it from the re-add list so a
         // CTE SELECT does not try to project an alias.
@@ -324,12 +643,15 @@ fn registry() -> &'static OcsfRegistry {
 
         OcsfRegistry {
             fields,
+            canonical_fields,
+            canonical_paths,
             promoted,
             prewhere,
             materialized,
             search_stems,
             lowercased,
             udm_to_column,
+            udm_to_lake,
             enum_values,
             enum_label_columns,
         }
@@ -532,7 +854,229 @@ fn map_ch_type(ch_type: &str) -> FieldType {
     }
 }
 
+/// Why a strict lake snapshot may not carry `path` (`None`: admissible).
+fn snapshot_field_path_error(path: &str) -> Option<String> {
+    if matches!(
+        path,
+        "id" | "timestamp"
+            | "source_type"
+            | "src_ip"
+            | "dest_ip"
+            | "src_host"
+            | "dest_host"
+            | "user"
+            | "process_name"
+            | "command_line"
+            | "file_hash"
+            | "process_hash"
+            | "ext"
+            | "udm"
+    ) || path.starts_with("ext.")
+        || path.starts_with("udm.")
+    {
+        return Some(format!(
+            "strict OCSF snapshot exposes forbidden compatibility field {path}"
+        ));
+    }
+    if !is_snapshot_identifier_path(path) {
+        return Some(format!("invalid OCSF snapshot field path: {path}"));
+    }
+    None
+}
+
+/// Whether every dot-separated segment of `path` is a plain query identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Producer keys such as `unmapped.@timestamp` or
+/// `unmapped.Event-ID` are storable but not addressable (NAN-3422).
+fn is_snapshot_identifier_path(path: &str) -> bool {
+    path.split('.').all(|segment| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+            && segment
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    })
+}
+
 /// Map the manifest `category` string onto the schema-agnostic [`FieldCategory`].
+/// A scalar leaf of the pinned OCSF 1.9 schema (NAN-2994), derived from the
+/// same embedded contract the parser validator enforces at ingest, so the
+/// query surface can never lag what producers are allowed to store.
+fn ocsf_1_9_leaf(path: &str) -> Option<crate::parsers::OcsfAttributeLeaf> {
+    if path == OCSF_TAIL_COLUMN || path.starts_with("unmapped.") {
+        return None;
+    }
+    // The `*_dt` datetime-profile siblings are not stored by the lake (`time`
+    // is the physical timestamp); `time_dt` stays a rejected legacy alias.
+    crate::parsers::ocsf_attribute_leaf(path).filter(|leaf| !leaf.datetime_profile_only)
+}
+
+/// Physical lake type of an OCSF 1.9 contract leaf that the snapshot does not
+/// type. Repeated leaves are arrays at rest (see [`OCSF_1_9_STRING_ARRAY_FIELDS`]).
+fn ocsf_1_9_leaf_field_type(leaf: crate::parsers::OcsfAttributeLeaf) -> FieldType {
+    if leaf.repeated {
+        return FieldType::Array;
+    }
+    match leaf.primitive_type {
+        "integer_t" => FieldType::Integer,
+        "long_t" => FieldType::Long,
+        "float_t" => FieldType::Float,
+        "boolean_t" => FieldType::Boolean,
+        _ => FieldType::String,
+    }
+}
+
+/// Physical type of a strict-lake native/array column, shared by
+/// [`SchemaProfile::field_type`] and the advertised-universe builder so the
+/// inventory can never publish a type the resolver disagrees with.
+fn lake_1_9_field_type(column: &str) -> FieldType {
+    match column {
+        _ if OCSF_1_9_STRING_ARRAY_FIELDS.contains(&column) => FieldType::Array,
+        "time" => FieldType::Timestamp,
+        "raw_data_size" | "metadata.processed_time" | "metadata.logged_time" => FieldType::Long,
+        "type_uid" | "class_uid" | "category_uid" => FieldType::Long,
+        "activity_id" | "severity_id" | "status_id" | "risk_score" | "risk_level_id"
+        | "finding_info.analytic.state_id" => FieldType::Integer,
+        // NAN-3224: OCSF `timestamp_t` leaves of findings (epoch ms).
+        "start_time" | "end_time" | "finding_info.created_time" | "finding_info.first_seen_time"
+        | "finding_info.last_seen_time" => FieldType::Long,
+        "is_alert" => FieldType::Boolean,
+        "metadata.transformation_info_list" => FieldType::Array,
+        _ => FieldType::String,
+    }
+}
+
+/// Display bucket for a strict-lake native/array column that has no manifest
+/// entry to inherit a category from. Prefix-keyed because these are whole OCSF
+/// objects (`finding_info`, `evidences`, `resources`, `enrichments`), not
+/// one-off leaves.
+fn lake_1_9_category(column: &str) -> FieldCategory {
+    if column.starts_with("metadata.") {
+        return FieldCategory::System;
+    }
+    if column.starts_with("enrichments.") {
+        return FieldCategory::Enrichment;
+    }
+    if column.starts_with("observables.") {
+        return FieldCategory::Detection;
+    }
+    if column.starts_with("finding_info.")
+        || column.starts_with("evidences.")
+        || column.starts_with("resources.")
+    {
+        return FieldCategory::Alerts;
+    }
+    if column.starts_with("vulnerabilities.") {
+        return FieldCategory::Vulnerability;
+    }
+    if column.starts_with("risk_") {
+        return FieldCategory::Risk;
+    }
+    match column {
+        "time" | "class_uid" | "class_name" | "category_uid" | "category_name" | "type_uid"
+        | "activity_id" | "activity_name" | "severity" | "severity_id" | "status" | "status_id"
+        | "status_code" | "status_detail" | "count" | "message" | "raw_data" | "raw_data_size" => {
+            FieldCategory::System
+        }
+        _ => FieldCategory::Custom,
+    }
+}
+
+/// Entity role for a strict-lake native/array column, so drilldowns and
+/// detection entity panels treat a finding's evidence exactly like the
+/// top-level endpoint columns they mirror.
+fn lake_1_9_entity_type(column: &str) -> Option<EntityType> {
+    match column {
+        "evidences.query.hostname"
+        | "resources.hostname"
+        | "resources.device.hostname"
+        | "resources.device.name" => Some(EntityType::Host),
+        "evidences.url.url_string" => Some(EntityType::Url),
+        "resources.ip" => Some(EntityType::Ip),
+        "resources.user.name" | "resources.user.uid" => Some(EntityType::User),
+        "file.hashes.value" | "process.file.hashes.value" | "actor.process.file.hashes.value" => {
+            Some(EntityType::Hash)
+        }
+        _ => None,
+    }
+}
+
+/// The advertised field universe for the strict OCSF 1.9 lake layout.
+///
+/// Historically this was `registry().canonical_fields` alone — the OCSF paths
+/// the 1.8 promotion manifest happens to carry. That silently hid 65 paths
+/// which [`OcsfProfile::lake_1_9_column`] already accepts, resolves to a real
+/// serving column, and executes correctly: the whole ATT&CK surface
+/// (`finding_info.attacks.{tactic,technique}.uid`), the Detection Finding
+/// evidence surface (`evidences.*`), the affected-resource surface
+/// (`resources.user.*`, `resources.ip`, `resources.device.*`),
+/// `vulnerabilities.cve.uid`, `email.to`, and the core taxonomy leaves
+/// (`severity`, `status*`, `risk_*`, `raw_data`, `metadata.log_*`). They were
+/// queryable but undiscoverable — absent from `/api/schema/fields`, the
+/// FieldsPanel, and every meloD prompt that enumerates the schema.
+///
+/// Two exclusions keep the inventory honest:
+/// - `unmapped` is the bookkeeping spill root (see [`OCSF_BOOKKEEPING_COLUMNS`]),
+///   reached through the `unmapped.*` tail namespace, never as a bare field.
+/// - A path that is the parent OBJECT of another advertised path (e.g.
+///   `metadata.transformation_info_list`) is dropped: advertising an object
+///   rather than the leaf that carries a value is exactly the NAN-2379
+///   advertised-but-unqueryable shape.
+fn lake_field_universe() -> &'static [FieldDef] {
+    static UNIVERSE: OnceLock<Vec<FieldDef>> = OnceLock::new();
+    UNIVERSE.get_or_init(|| {
+        let allowlist: Vec<&'static str> = OCSF_1_9_NATIVE_FIELDS
+            .iter()
+            .chain(OCSF_1_9_STRING_ARRAY_FIELDS.iter())
+            .copied()
+            .collect();
+        let is_parent_object = |name: &str| {
+            allowlist.iter().any(|other| {
+                other.len() > name.len()
+                    && other.starts_with(name)
+                    && other.as_bytes()[name.len()] == b'.'
+            })
+        };
+
+        let mut fields = registry().canonical_fields.clone();
+        for &name in super::stored_enrichment::FIELDS {
+            fields.push(FieldDef { name,
+                field_type: super::stored_enrichment::selector(name).unwrap().field_type,
+                category: FieldCategory::Enrichment, entity_type: None });
+        }
+        let mut seen: HashSet<&'static str> = fields.iter().map(|f| f.name).collect();
+        for name in allowlist.iter().copied() {
+            if name == OCSF_TAIL_COLUMN || !seen.insert(name) || is_parent_object(name) {
+                continue;
+            }
+            fields.push(FieldDef {
+                name,
+                field_type: lake_1_9_field_type(name),
+                category: lake_1_9_category(name),
+                entity_type: lake_1_9_entity_type(name),
+            });
+        }
+
+        // A manifest `X[]` spelling and the flat leaf it canonicalizes to are
+        // the SAME serving column. Advertising both puts two names for one
+        // column in every field picker, and only one of them is what a parsed
+        // query actually carries (the tokenizer drops `[]`). Keep the flat
+        // leaf; the bracket spelling stays ACCEPTED by `is_known_field` — it is
+        // simply no longer a second advertised name.
+        let lake = OcsfProfile::lake_1_9();
+        fields.retain(|field| {
+            if !field.name.contains("[]") {
+                return true;
+            }
+            let addressable = field.name.replace("[]", "");
+            let canonical = lake.canonicalize(&addressable).into_owned();
+            !seen.contains(canonical.as_str())
+        });
+        fields
+    })
+}
+
 fn map_category(cat: Option<&str>) -> FieldCategory {
     match cat {
         Some("Network") => FieldCategory::Network,
@@ -572,9 +1116,21 @@ fn map_entity_type(ent: Option<&str>) -> Option<EntityType> {
 ///
 /// Cheap to construct; all parsed manifest state lives in the process-wide
 /// [`registry`] `OnceLock`. The only per-instance state is the enrichment mode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OcsfProfile {
     enrichment_mode: EnrichmentMode,
+    storage_layout: OcsfStorageLayout,
+    /// Exact producer-owned non-OCSF leaf types from the trusted immutable lake
+    /// manifest. These are physical `unmapped.*` struct leaves, not aliases.
+    lake_unmapped_field_types: Arc<BTreeMap<String, FieldType>>,
+    /// Exact physical leaves published by the immutable, schema-validated OCSF
+    /// snapshot. This keeps minor OCSF upgrades data-driven: a newly standard
+    /// field is queryable as its native path without adding a Nano alias.
+    lake_snapshot_field_types: Arc<BTreeMap<String, FieldType>>,
+    /// Lake 1.9 only: paths every part of the queried window proves were
+    /// lowercased at rest (signed part provenance, admission v2). String
+    /// equality on them compares raw, so Parquet blooms/statistics prune.
+    lake_lowercased_at_rest: Arc<BTreeSet<String>>,
 }
 
 impl Default for OcsfProfile {
@@ -596,6 +1152,10 @@ impl OcsfProfile {
     pub fn new() -> Self {
         Self {
             enrichment_mode: EnrichmentMode::Read,
+            storage_layout: OcsfStorageLayout::ClickHouse18,
+            lake_unmapped_field_types: Arc::new(BTreeMap::new()),
+            lake_snapshot_field_types: Arc::new(BTreeMap::new()),
+            lake_lowercased_at_rest: Arc::new(BTreeSet::new()),
         }
     }
 
@@ -604,7 +1164,148 @@ impl OcsfProfile {
     pub fn with_enrichment_mode(mode: EnrichmentMode) -> Self {
         Self {
             enrichment_mode: mode,
+            storage_layout: OcsfStorageLayout::ClickHouse18,
+            lake_unmapped_field_types: Arc::new(BTreeMap::new()),
+            lake_snapshot_field_types: Arc::new(BTreeMap::new()),
+            lake_lowercased_at_rest: Arc::new(BTreeSet::new()),
         }
+    }
+
+    /// Construct the canonical OCSF 1.9 object-lake profile. This is selected
+    /// only by the tenant-pinned lake compiler; the existing ClickHouse OCSF
+    /// deployment keeps [`new`](Self::new) and remains byte-compatible.
+    pub fn lake_1_9() -> Self {
+        Self {
+            enrichment_mode: EnrichmentMode::Read,
+            storage_layout: OcsfStorageLayout::Lake19,
+            lake_unmapped_field_types: Arc::new(BTreeMap::new()),
+            lake_snapshot_field_types: Arc::new(BTreeMap::new()),
+            lake_lowercased_at_rest: Arc::new(BTreeSet::new()),
+        }
+    }
+
+    /// Construct the strict OCSF 1.9 lake profile with the producer-field type
+    /// contract published beside an immutable event snapshot.
+    pub fn try_lake_1_9_with_unmapped_field_types(
+        field_types: BTreeMap<String, FieldType>,
+    ) -> Result<Self, String> {
+        Self::try_lake_1_9_with_snapshot_field_types(field_types)
+    }
+
+    /// Whether [`Self::try_lake_1_9_with_snapshot_field_types`] admits `path`
+    /// (NAN-2997: a lean tenant's part schema can hold producer keys that are
+    /// not query identifiers, e.g. `unmapped.Event-ID`; the caller drops those
+    /// leaves instead of losing the whole inventory).
+    pub fn is_admissible_snapshot_field_path(path: &str) -> bool {
+        snapshot_field_path_error(path).is_none()
+    }
+
+    /// Construct the strict lake profile from the field inventory signed into
+    /// the immutable snapshot manifest. Producer validation is responsible for
+    /// proving that non-`unmapped` paths belong to the selected OCSF release;
+    /// this seam drops leaves that are not safe native identifiers and rejects
+    /// every legacy compatibility namespace.
+    pub fn try_lake_1_9_with_snapshot_field_types(
+        field_types: BTreeMap<String, FieldType>,
+    ) -> Result<Self, String> {
+        // NAN-3422: a producer key that is not a query identifier (Beats'
+        // `unmapped.@timestamp`) is storable but cannot be addressed. Drop that
+        // leaf instead of refusing the whole inventory: one odd field name must
+        // never fail queries that do not reference it. Legacy compatibility
+        // namespaces are still refused outright.
+        let mut field_types = field_types;
+        field_types.retain(|path, _| is_snapshot_identifier_path(path));
+        for path in field_types.keys() {
+            if let Some(error) = snapshot_field_path_error(path) {
+                return Err(error);
+            }
+        }
+        let unmapped = field_types
+            .iter()
+            .filter(|(path, _)| path.starts_with("unmapped."))
+            .map(|(path, field_type)| (path.clone(), *field_type))
+            .collect();
+        Ok(Self {
+            enrichment_mode: EnrichmentMode::Read,
+            storage_layout: OcsfStorageLayout::Lake19,
+            lake_unmapped_field_types: Arc::new(unmapped),
+            lake_snapshot_field_types: Arc::new(field_types),
+            lake_lowercased_at_rest: Arc::new(BTreeSet::new()),
+        })
+    }
+
+    /// Lake 1.9: treat `paths` as lowercased at rest (raw string equality).
+    /// The caller must hold proof that every row of the queried source was
+    /// lowercased on these paths; an unproven path silently drops mixed-case
+    /// rows. Only string leaves of the snapshot are accepted.
+    pub fn with_lake_lowercased_at_rest(mut self, paths: &[String]) -> Result<Self, String> {
+        if !self.is_lake_1_9() {
+            return Err("lowercased-at-rest paths apply to the OCSF 1.9 lake profile only".to_string());
+        }
+        for path in paths {
+            if self.lake_snapshot_field_types.get(path) != Some(&FieldType::String) {
+                return Err(format!("lowercased-at-rest path {path} is not a string leaf of the snapshot"));
+            }
+        }
+        self.lake_lowercased_at_rest = Arc::new(paths.iter().cloned().collect());
+        Ok(self)
+    }
+
+    fn is_lake_1_9(&self) -> bool {
+        self.storage_layout == OcsfStorageLayout::Lake19
+    }
+
+    /// Rewrite a repeated-object path that names an OBJECT rather than a leaf
+    /// onto the leaf that carries its value (NAN-2379).
+    ///
+    /// The field universe advertises `file.hashes[]` / `process.file.hashes[]` /
+    /// `actor.process.file.hashes[]`. The tokenizer drops the `[]` marker
+    /// (`parser::values::strip_repeated_marker`), which leaves `<p>.hashes` —
+    /// an array of `fingerprint` objects, not something a predicate can compare
+    /// against. The value lives one level down, and WHICH leaf depends on the
+    /// storage layout: strict lake rows expose the canonical `hashes.value`
+    /// array, while the ClickHouse-1.8 table carries the scalar first-SHA-256
+    /// projection `hashes.sha256` (see `OCSF_1_9_ENTITY_EXTRACTION_ORDER`).
+    ///
+    /// Gated on the target actually resolving to a physical column, so this can
+    /// only ever turn an unresolvable name into a resolvable one.
+    fn repeated_object_leaf(&self, npl_field: &str) -> Option<String> {
+        if !(npl_field == "hashes" || npl_field.ends_with(".hashes")) {
+            return None;
+        }
+        let leaf = if self.is_lake_1_9() {
+            format!("{npl_field}.value")
+        } else {
+            format!("{npl_field}.sha256")
+        };
+        self.resolves_to_physical_column(&leaf).then_some(leaf)
+    }
+
+    fn lake_1_9_column<'a>(&self, field: &'a str) -> Option<&'a str> {
+        if !self.is_lake_1_9() {
+            return None;
+        }
+        (OCSF_1_9_NATIVE_FIELDS.contains(&field) || OCSF_1_9_STRING_ARRAY_FIELDS.contains(&field))
+            .then_some(field)
+    }
+
+    /// NAN-3451: the snapshot carries the aligned `enrichments[]` prevalence
+    /// stamp arrays the `prevalence_*` scalars are derived from.
+    fn has_lake_prevalence_stamp(&self) -> bool {
+        self.is_lake_1_9()
+            && super::lake_prevalence::has_stamp(&|field| {
+                self.lake_snapshot_field_types.get(field).copied()
+            })
+    }
+
+    /// NAN-3451: a `prevalence_*` scalar derived from `enrichments[]` on an
+    /// open-core lake. Never when the snapshot has the physical column: lean
+    /// signed parts carry immutable ingest-time stamps (NAN-2915), and those
+    /// must not be shadowed.
+    fn derives_lake_prevalence_scalar(&self, field: &str) -> bool {
+        super::lake_prevalence::is_scalar(field)
+            && !self.lake_snapshot_field_types.contains_key(field)
+            && self.has_lake_prevalence_stamp()
     }
 
     /// Whether `name` — taken verbatim, with NO alias canonicalization — resolves
@@ -626,6 +1327,55 @@ impl OcsfProfile {
     /// recursions (the `ext.` / `event.` prefix remaps) stay on this method so
     /// stripped tails are never re-aliased.
     fn resolve_canonical(&self, npl_field: &str) -> FieldResolution {
+        if self.is_lake_1_9() {
+            // Unstamped lake data has no prevalence (#4644). Lean signed parts
+            // carry physical ingest-time columns (NAN-2915); open-core lake
+            // generations derive them from the enrichment arrays (NAN-3451).
+            if super::lake_prevalence::is_scalar(npl_field)
+                && !self.has_lake_prevalence_stamp()
+                && !self.lake_snapshot_field_types.contains_key(npl_field)
+            {
+                return FieldResolution::Unknown;
+            }
+            if super::stored_enrichment::selector(npl_field).is_some()
+                || super::lake_prevalence::is_scalar(npl_field)
+                || self.lake_1_9_column(npl_field).is_some()
+                || registry().canonical_paths.contains(npl_field)
+                || self.lake_snapshot_field_types.contains_key(npl_field)
+            {
+                return FieldResolution::ExplicitColumn(npl_field.to_string());
+            }
+            if let Some(target) = registry()
+                .udm_to_lake
+                .get(npl_field)
+                .filter(|t| t.as_str() != npl_field)
+            {
+                return self.resolve_canonical(target);
+            }
+            if let Some(rest) = npl_field.strip_prefix("unmapped.") {
+                if !rest.is_empty() {
+                    // Iceberg exposes the typed `unmapped` struct as dotted leaf
+                    // columns. Missing leaves are supplied as typed NULLs by the
+                    // snapshot compatibility plan, so no Dynamic/JSON probe is
+                    // valid or necessary in this storage layout.
+                    return FieldResolution::ExplicitColumn(npl_field.to_string());
+                }
+            }
+            // NAN-2994: every scalar leaf of the OCSF 1.9 schema is a canonical
+            // path, whether or not this profile's snapshot inventory lists it.
+            // A lean-lake cell tenant's front-door profile has NO inventory
+            // (query[T] owns the part schema), so the hand lists above were the
+            // whole universe and `metadata.event_code` / `action_id` 400'd while
+            // being stored on every matching row. A leaf absent from the data is
+            // a typed NULL at plan time, never a missing-column fault.
+            if ocsf_1_9_leaf(npl_field).is_some() {
+                return FieldResolution::ExplicitColumn(npl_field.to_string());
+            }
+            return FieldResolution::Unknown;
+        }
+        if let Some(column) = self.lake_1_9_column(npl_field) {
+            return FieldResolution::ExplicitColumn(column.to_string());
+        }
         // The physical sort column `timestamp` (and its bookkeeping sibling
         // `_inserted_at`) are real, non-promoted columns of the OCSF table. They
         // MUST resolve to a direct column, not a JsonPath: the query layer injects
@@ -730,8 +1480,34 @@ impl OcsfProfile {
 }
 
 impl SchemaProfile for OcsfProfile {
+    fn source_computed_column(&self, field: &str) -> Option<(String, Vec<&'static str>)> {
+        if self.is_lake_1_9() {
+            if let Some(selector) = super::stored_enrichment::selector(field) {
+                return Some(selector.expression(|name| self.lake_snapshot_field_types.contains_key(name)));
+            }
+        }
+        // Lean signed parts carry immutable ingest-time scalar stamps; the
+        // enrichment derivation is only for open-core lake generations that
+        // have no physical stamp column (NAN-3451, see `lake_prevalence`).
+        if !self.derives_lake_prevalence_scalar(field) {
+            return None;
+        }
+        // An artifact source is usable when this lake can address it: an
+        // inventory column or an OCSF 1.9 contract leaf (typed NULL when the
+        // data never carried it).
+        super::lake_prevalence::expression(field, |name| self.resolves_to_physical_column(name))
+    }
+
     fn id(&self) -> SchemaId {
         SchemaId::Ocsf
+    }
+
+    fn uses_strict_canonical_fields(&self) -> bool {
+        self.is_lake_1_9()
+    }
+
+    fn lowercased_host_prefix_compares_raw(&self) -> bool {
+        self.is_lake_1_9()
     }
 
     /// OCSF's JSON tail is the stored `unmapped` spill column (UDM uses `ext`) —
@@ -761,7 +1537,21 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn fields(&self) -> &[FieldDef] {
-        &registry().fields
+        if self.is_lake_1_9() {
+            lake_field_universe()
+        } else {
+            &registry().fields
+        }
+    }
+
+    fn snapshot_fields(&self) -> Vec<(String, FieldType)> {
+        if !self.is_lake_1_9() {
+            return Vec::new();
+        }
+        self.lake_snapshot_field_types
+            .iter()
+            .map(|(name, field_type)| (name.clone(), *field_type))
+            .collect()
     }
 
     fn resolve(&self, npl_field: &str) -> FieldResolution {
@@ -774,6 +1564,38 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn canonicalize<'a>(&self, npl_field: &'a str) -> Cow<'a, str> {
+        // A `<p>.hashes` object path (the `[]`-stripped `<p>.hashes[]` the field
+        // universe advertises) addresses the leaf that carries the value —
+        // layout-dependent, so it is resolved here rather than in the tokenizer
+        // (NAN-2379). Runs ahead of the lake short-circuit because both layouts
+        // advertise the bracket form.
+        if let Some(leaf) = self.repeated_object_leaf(npl_field) {
+            return Cow::Owned(leaf);
+        }
+        if self.is_lake_1_9() {
+            if super::stored_enrichment::selector(npl_field).is_some()
+                || super::lake_prevalence::is_scalar(npl_field)
+                || self.lake_1_9_column(npl_field).is_some()
+                || registry().canonical_paths.contains(npl_field)
+                || self.lake_snapshot_field_types.contains_key(npl_field)
+            {
+                return Cow::Borrowed(npl_field);
+            }
+            let normalized = if npl_field.contains('.') {
+                npl_field
+            } else {
+                normalize_field_name(crate::search::field_utils::normalize_field_alias(npl_field))
+            };
+            // Keep class-spanning concepts intact until codegen chooses the
+            // value expression; canonical OCSF paths always stay single-column.
+            if self.class_split_source_fields(normalized).is_some() {
+                return Cow::Borrowed(normalized);
+            }
+            if let Some(target) = registry().udm_to_lake.get(normalized) {
+                return Cow::Borrowed(target);
+            }
+            return Cow::Borrowed(normalized);
+        }
         // Dotted OCSF paths are already canonical and MUST NOT be mangled by
         // UDM-style snake_case aliasing (scoping §Phase 4 ⚠️) — this also keeps
         // the dotted `normalize_field_name` entries (`cloud.provider` →
@@ -805,17 +1627,90 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn is_known_field(&self, name: &str) -> bool {
+        if self.is_lake_1_9() {
+            return matches!(self.resolve(name), FieldResolution::ExplicitColumn(_));
+        }
         // Alias-aware (NAN-1422): judge the canonical spelling, so the flat
         // operational aliases (`sourcetype` → `source_type`) belong to the field
         // universe. This is the gate the input-side field validator consults
         // (NAN-1380 G5) — `sourcetype` sits one edit from `source_type`, so
         // without this it was 400-rejected as a typo while codegen handled it.
         let canonical = self.canonicalize(name);
-        canonical.as_ref() == OCSF_SOURCE_TYPE_COLUMN
+        self.lake_1_9_column(canonical.as_ref()).is_some()
+            || canonical.as_ref() == OCSF_SOURCE_TYPE_COLUMN
             || registry().promoted.contains(canonical.as_ref())
     }
 
     fn field_type(&self, field: &str) -> Option<FieldType> {
+        if self.is_lake_1_9() {
+            if let Some(selector) = super::stored_enrichment::selector(field) {
+                return Some(selector.field_type);
+            }
+        }
+        if super::lake_prevalence::is_scalar(field) && self.has_lake_prevalence_stamp() {
+            return Some(FieldType::Integer);
+        }
+        if self.is_lake_1_9() {
+            if let FieldResolution::ExplicitColumn(column) = self.resolve(field) {
+                if column != field {
+                    return self.field_type(&column);
+                }
+            }
+        }
+        // NAN-2361: PHYSICAL array-ness wins over the logical element type.
+        //
+        // The OCSF contract types the ELEMENT of a list-of-struct: `file.hashes`
+        // is an array of Hash objects, so `file.hashes.value` is a String *per
+        // element*. On disk it is `Array(String)`. Typing it String made the
+        // codegen emit `lower(toString("file.hashes.value")) = '<hash>'`, which
+        // compares against the rendered whole array (`['abc','def']`) and
+        // matches NOTHING while returning HTTP 200 — a hash hunt that silently
+        // finds nothing. 61 leaves are affected in the live manifest, including
+        // file/process hashes, observables.*, resources.*, answers.rdata and
+        // every enrichments.* path.
+        //
+        // Only the Array verdict is promoted; every other snapshot type keeps
+        // its previous precedence, so no other field changes shape.
+        if self.is_lake_1_9()
+            && self.lake_snapshot_field_types.get(field) == Some(&FieldType::Array)
+        {
+            return Some(FieldType::Array);
+        }
+        // NOTE: the `enrichments[].data` leaves are deliberately NOT in the
+        // static universe. They exist only once the ingest enrichment stage has
+        // written them, and `is_known_field` already consults
+        // `lake_snapshot_field_types`, so a tenant that has them can query them
+        // and a tenant that has not deployed prevalence stamping gets a clean
+        // "unknown canonical OCSF field" instead of a reference to a column its
+        // Iceberg schema lacks. Advertising them statically broke exactly that
+        // invariant (`lake_field_universe_is_a_subset_of_what_a_query_can_address`).
+        if let Some(column) = self.lake_1_9_column(field) {
+            return Some(lake_1_9_field_type(column));
+        }
+        if self.is_lake_1_9() {
+            if let Some(field_type) = self.lake_snapshot_field_types.get(field) {
+                return Some(*field_type);
+            }
+            if field.starts_with("unmapped.") {
+                return self
+                    .lake_unmapped_field_types
+                    .get(field)
+                    .copied()
+                    .or(Some(match field {
+                        "unmapped.risk_score" | "unmapped.raw_risk_score" => FieldType::Float,
+                        _ => FieldType::String,
+                    }));
+            }
+            if let Some(field_type) = lake_field_universe()
+                .iter()
+                .find(|candidate| candidate.name == field)
+                .map(|candidate| candidate.field_type)
+            {
+                return Some(field_type);
+            }
+            // NAN-2994: a contract leaf the snapshot does not (yet) type.
+            return ocsf_1_9_leaf(field).map(ocsf_1_9_leaf_field_type);
+        }
         // The operational `source_type` column is a String (LowCardinality).
         if field == OCSF_SOURCE_TYPE_COLUMN {
             return Some(FieldType::String);
@@ -847,7 +1742,7 @@ impl SchemaProfile for OcsfProfile {
         // `lower(source_type) = '...'`; on a LowCardinality column lower() is
         // evaluated per dictionary entry, so the cost is negligible. UDM keeps
         // its fast-path: `logs` ingestion is exclusively Vector-owned.
-        registry().lowercased.contains(field)
+        registry().lowercased.contains(field) || self.lake_lowercased_at_rest.contains(field)
     }
 
     fn is_numeric_field(&self, field: &str) -> bool {
@@ -862,18 +1757,48 @@ impl SchemaProfile for OcsfProfile {
         // (NAN-1241), so equality compares as a UUID — never toString-wrapped.
         // Everything else: OCSF identifiers (uid/message_uid/session.uid) are
         // opaque String_t, not CH `UUID` columns — they compare as plain strings.
-        field == "id"
+        !self.is_lake_1_9() && field == "id"
+    }
+
+    fn is_string_array_field(&self, field: &str) -> bool {
+        if !self.is_lake_1_9() {
+            return false;
+        }
+        // Canonicalized, so a repeated-object path gets ARRAY predicate
+        // semantics rather than a scalar compare against an Array column
+        // (a ClickHouse type error, not a silent miss) — NAN-2379.
+        self.field_type(field) == Some(FieldType::Array)
     }
 
     fn prewhere_fields(&self) -> &[&str] {
-        prewhere_fields_slice()
+        if self.is_lake_1_9() {
+            OCSF_1_9_PREWHERE_FIELDS
+        } else {
+            prewhere_fields_slice()
+        }
     }
 
     fn materialized_columns(&self) -> &[&str] {
-        materialized_columns_slice()
+        if self.is_lake_1_9() {
+            &[]
+        } else {
+            materialized_columns_slice()
+        }
     }
 
     fn category(&self, field: &str) -> FieldCategory {
+        if self.is_lake_1_9() {
+            if let FieldResolution::ExplicitColumn(column) = self.resolve(field) {
+                if column != field {
+                    return self.category(&column);
+                }
+            }
+            return lake_field_universe()
+                .iter()
+                .find(|candidate| candidate.name == field)
+                .map(|candidate| candidate.category)
+                .unwrap_or(FieldCategory::Custom);
+        }
         // Operational provenance key → System/Metadata bucket (source identity).
         if field == OCSF_SOURCE_TYPE_COLUMN {
             return FieldCategory::System;
@@ -887,23 +1812,54 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn entity_type(&self, field: &str) -> Option<EntityType> {
-        registry()
-            .fields
+        if self.is_lake_1_9() {
+            if let FieldResolution::ExplicitColumn(column) = self.resolve(field) {
+                if column != field {
+                    return self.entity_type(&column);
+                }
+            }
+        }
+        let fields = if self.is_lake_1_9() {
+            lake_field_universe()
+        } else {
+            &registry().fields
+        };
+        fields
             .iter()
             .find(|f| f.name == field)
             .and_then(|f| f.entity_type)
     }
 
     fn default_table_fields(&self) -> &[&str] {
-        OCSF_DEFAULT_TABLE_FIELDS
+        if self.is_lake_1_9() {
+            OCSF_1_9_DEFAULT_TABLE_FIELDS
+        } else {
+            OCSF_DEFAULT_TABLE_FIELDS
+        }
     }
 
     fn priority_fields(&self) -> &[&str] {
-        OCSF_PRIORITY_FIELDS
+        if self.is_lake_1_9() {
+            OCSF_1_9_PRIORITY_FIELDS
+        } else {
+            OCSF_PRIORITY_FIELDS
+        }
+    }
+
+    fn core_fields(&self) -> &[&str] {
+        if self.is_lake_1_9() {
+            OCSF_1_9_CORE_FIELDS
+        } else {
+            &["id", "timestamp", "message", "source_type"]
+        }
     }
 
     fn entity_extraction_order(&self) -> &[(EntityRole, &str)] {
-        OCSF_ENTITY_EXTRACTION_ORDER
+        if self.is_lake_1_9() {
+            OCSF_1_9_ENTITY_EXTRACTION_ORDER
+        } else {
+            OCSF_ENTITY_EXTRACTION_ORDER
+        }
     }
 
     fn risk_entity_default(&self) -> Option<&str> {
@@ -916,6 +1872,9 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn udm_column_sql(&self, udm_field: &str) -> Option<String> {
+        if self.is_lake_1_9() {
+            return None;
+        }
         // NAN-1276: a handful of UDM process/identity/url concepts are SPLIT
         // across two OCSF columns by event class — the "primary/acting" object
         // sits in the top-level `process`/`user`/`url` on some classes and in
@@ -933,8 +1892,10 @@ impl SchemaProfile for OcsfProfile {
         // value expr + the materialization definition; this just swaps the emitted
         // reference. Falls through to the inline `if(...)` only if the column lookup
         // ever diverges (it cannot — both keyed off the same field set).
-        if let Some(col) = class_split_column(udm_field) {
-            return Some(crate::query::escape_identifier(col));
+        if !self.is_lake_1_9() {
+            if let Some(col) = class_split_column(udm_field) {
+                return Some(crate::query::escape_identifier(col));
+            }
         }
         if let Some(expr) = self.class_split_value_sql(udm_field) {
             return Some(expr);
@@ -950,6 +1911,20 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn class_split_value_sql(&self, udm_field: &str) -> Option<String> {
+        if self.is_lake_1_9() {
+            return self
+                .class_split_source_fields(udm_field)
+                .map(|(primary, fallback)| {
+                    let p = crate::query::escape_identifier(primary);
+                    let f = crate::query::escape_identifier(fallback);
+                    let present = match self.field_type(primary) {
+                        Some(FieldType::Array) => format!("notEmpty({p})"),
+                        Some(FieldType::Long | FieldType::Integer) => format!("{p} != 0"),
+                        _ => format!("{p} != ''"),
+                    };
+                    format!("if({present}, {p}, {f})")
+                });
+        }
         // The single source of truth for the class-spanning `if(...)` value
         // expression (NAN-1276/1319). `udm_column_sql` consumes it for raw-SQL
         // builders; `field_to_sql_expr` consumes it for projection / GROUP BY /
@@ -966,16 +1941,44 @@ impl SchemaProfile for OcsfProfile {
         })
     }
 
+    fn class_split_source_fields(&self, udm_field: &str) -> Option<(&'static str, &'static str)> {
+        if self.is_lake_1_9() {
+            return match normalize_field_name(udm_field) {
+                "process_hash" => Some((
+                    "process.file.hashes.value",
+                    "actor.process.file.hashes.value",
+                )),
+                "user_domain" => Some(("user.domain", "actor.user.domain")),
+                // NAN-3242: `service_name` (rewritten to `cloud_service`) means the
+                // API service on API Activity rows and the OTLP resource
+                // `service.name` on the generic lane's OTLP logs, which carry it on
+                // `metadata.product.feature.name` (class 0 has no service slot).
+                "cloud_service" | "service_name" => {
+                    Some(("api.service.name", "metadata.product.feature.name"))
+                }
+                normalized => class_split_udm_field(normalized).map(|(p, f, _)| (p, f)),
+            };
+        }
+        class_split_udm_field(udm_field).map(|(primary, fallback, _)| (primary, fallback))
+    }
+
     fn class_split_column(&self, udm_field: &str) -> Option<String> {
         // NAN-1333: the indexed unified column that materializes the
         // `class_split_value_sql` union, so WHERE / GROUP BY / SORT / raw-SQL on a
         // split concept reference a plain indexed column (words-index prunable)
         // rather than the skip-index-opaque inline `if(...)`. `None` for non-split
         // concepts (caller keeps single-column / value-pick resolution).
-        class_split_column(udm_field).map(|c| c.to_string())
+        if self.is_lake_1_9() {
+            None
+        } else {
+            class_split_column(udm_field).map(|c| c.to_string())
+        }
     }
 
     fn display_field_name(&self, udm_field: &str) -> Option<String> {
+        if self.is_lake_1_9() {
+            return None;
+        }
         // The bare native OCSF column name a result row should be keyed by (no
         // quoting). For class-split concepts there is no single native column, so
         // use the primary (acting) one for display. Mirrors `udm_column_sql`'s
@@ -1000,6 +2003,9 @@ impl SchemaProfile for OcsfProfile {
         if let Some(values) = reg.enum_values.get(&col) {
             return Some(EnumIntMapping::Values(values));
         }
+        if self.is_lake_1_9() && col == "activity_id" {
+            return Some(EnumIntMapping::LabelColumn("activity_name"));
+        }
         reg.enum_label_columns
             .get(&col)
             .map(|sibling| EnumIntMapping::LabelColumn(sibling.as_str()))
@@ -1011,6 +2017,7 @@ impl SchemaProfile for OcsfProfile {
             EnrichmentKind::SrcAsn => "src_endpoint.autonomous_system.number",
             EnrichmentKind::DestCountry => "dst_endpoint.location.country",
             EnrichmentKind::DestAsn => "dst_endpoint.autonomous_system.number",
+            EnrichmentKind::IocMatch if self.is_lake_1_9() => "ioc_src_ip_threat_type",
             EnrichmentKind::IocMatch => "enrichments.ioc_src_ip_threat_type",
             // OCSF has no prevalence concept of its own (client-side; Phase 6).
             EnrichmentKind::Prevalence => return None,
@@ -1023,7 +2030,11 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn timestamp_expr(&self) -> &str {
-        OCSF_TIMESTAMP_EXPR
+        if self.is_lake_1_9() {
+            "time"
+        } else {
+            OCSF_TIMESTAMP_EXPR
+        }
     }
 }
 
@@ -1042,7 +2053,13 @@ fn prewhere_fields_slice() -> &'static [&'static str] {
 /// `&'static [&'static str]` view of the MATERIALIZED columns to re-add in CTEs.
 fn materialized_columns_slice() -> &'static [&'static str] {
     static SLICE: OnceLock<Vec<&'static str>> = OnceLock::new();
-    SLICE.get_or_init(|| registry().materialized.iter().map(|s| leak_str(s)).collect())
+    SLICE.get_or_init(|| {
+        registry()
+            .materialized
+            .iter()
+            .map(|s| leak_str(s))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -1058,12 +2075,581 @@ mod tests {
         assert_eq!(p.enrichment_mode(), EnrichmentMode::Read);
     }
 
+    /// NAN-2361: the advertised lake universe must stay a SUBSET of what the
+    /// tokenizer can produce and the resolver can turn into a physical column.
+    ///
+    /// The failure this pins is the NAN-2379 shape: a name published by
+    /// `/api/schema/fields` that no query can address. The tokenizer drops the
+    /// `[]` repeated marker, so the check runs on the stripped spelling — the
+    /// exact string a parsed query carries.
+    #[test]
+    fn lake_field_universe_is_a_subset_of_what_a_query_can_address() {
+        let profile = OcsfProfile::lake_1_9();
+        assert!(!profile.fields().is_empty());
+        for field in profile.fields() {
+            let addressable = field.name.replace("[]", "");
+            let canonical = profile.canonicalize(&addressable).into_owned();
+            assert!(
+                profile.is_known_field(&addressable),
+                "advertised lake field {} is rejected by field validation",
+                field.name,
+            );
+            assert!(
+                matches!(
+                    profile.resolve(&addressable),
+                    FieldResolution::ExplicitColumn(_)
+                ),
+                "advertised lake field {} does not resolve to a physical column",
+                field.name,
+            );
+            assert!(
+                !addressable.contains(['[', ']', '=']),
+                "advertised lake field {} is not tokenizable as a field name",
+                field.name,
+            );
+            assert!(
+                profile.field_type(&canonical).is_some(),
+                "advertised lake field {} has no resolvable type",
+                field.name,
+            );
+        }
+    }
+
+    /// Every path `lake_1_9_column` accepts is queryable, so every one of them
+    /// must also be DISCOVERABLE. Before NAN-2361 the universe was the 1.8
+    /// promotion manifest alone, which hid the entire ATT&CK / evidence /
+    /// affected-resource surface behind a name an analyst had to already know.
+    #[test]
+    fn lake_field_universe_advertises_every_accepted_native_path() {
+        let profile = OcsfProfile::lake_1_9();
+        let advertised: HashSet<&str> = profile.fields().iter().map(|f| f.name).collect();
+        for path in OCSF_1_9_NATIVE_FIELDS
+            .iter()
+            .chain(OCSF_1_9_STRING_ARRAY_FIELDS.iter())
+            .copied()
+        {
+            // The spill root is bookkeeping and the object roots are addressed
+            // through their leaves — both are deliberate exclusions.
+            if path == OCSF_TAIL_COLUMN || path == "metadata.transformation_info_list" {
+                assert!(!advertised.contains(path), "{path} must stay unadvertised");
+                continue;
+            }
+            assert!(
+                advertised.contains(path) || advertised.contains(format!("{path}[]").as_str()),
+                "accepted lake path {path} is queryable but not advertised",
+            );
+        }
+        // The paths this change actually unhides — the ranked gaps from the
+        // NAN-2361 measurement that the serving generation already carries.
+        for path in [
+            "finding_info.attacks.technique.uid",
+            "finding_info.attacks.tactic.uid",
+            "evidences.name",
+            "evidences.query.hostname",
+            "evidences.url.url_string",
+            "resources.ip",
+            "resources.user.name",
+            "resources.user.uid",
+            "vulnerabilities.cve.uid",
+            "severity",
+            "status_detail",
+            "risk_level",
+        ] {
+            assert!(advertised.contains(path), "{path} must be advertised");
+        }
+    }
+
+    /// Advertising a field also advertises its metadata; a lake-only path with
+    /// no manifest row must not silently land in `Custom`/`None`.
+    #[test]
+    fn lake_only_paths_carry_category_and_entity_metadata() {
+        let profile = OcsfProfile::lake_1_9();
+        assert_eq!(
+            profile.category("finding_info.attacks.technique.uid"),
+            FieldCategory::Alerts
+        );
+        assert_eq!(profile.category("evidences.name"), FieldCategory::Alerts);
+        assert_eq!(profile.category("metadata.log_name"), FieldCategory::System);
+        assert_eq!(
+            profile.category("enrichments.provider"),
+            FieldCategory::Enrichment
+        );
+        assert_eq!(
+            profile.entity_type("resources.user.name"),
+            Some(EntityType::User)
+        );
+        assert_eq!(profile.entity_type("resources.ip"), Some(EntityType::Ip));
+        assert_eq!(
+            profile.entity_type("evidences.url.url_string"),
+            Some(EntityType::Url)
+        );
+        // Array-typed lake paths keep array predicate semantics once advertised.
+        assert_eq!(
+            profile.field_type("finding_info.attacks.technique.uid"),
+            Some(FieldType::Array)
+        );
+        assert!(profile.is_string_array_field("finding_info.attacks.technique.uid"));
+    }
+
+    /// The ClickHouse-1.8 layout is untouched: its universe stays the manifest
+    /// column set, so no OCSF-1.9-only path leaks into a deployment whose DDL
+    /// has no such column.
+    #[test]
+    fn clickhouse_1_8_universe_is_unchanged_by_the_lake_universe() {
+        let profile = OcsfProfile::new();
+        let advertised: HashSet<&str> = profile.fields().iter().map(|f| f.name).collect();
+        for path in [
+            "finding_info.attacks.technique.uid",
+            "evidences.name",
+            "resources.user.name",
+            "resources.ip",
+        ] {
+            assert!(
+                !advertised.contains(path),
+                "{path} must not be advertised by the ClickHouse 1.8 layout",
+            );
+        }
+    }
+
+    #[test]
+    fn lake_product_aliases_share_resolution_and_types() {
+        let profile = OcsfProfile::lake_1_9();
+        for (alias, column) in &registry().udm_to_lake {
+            assert!(profile.is_known_field(alias), "{alias} -> {column}");
+            assert!(
+                matches!(profile.resolve(alias), FieldResolution::ExplicitColumn(_)),
+                "{alias}"
+            );
+            assert!(
+                profile.field_type(alias).is_some(),
+                "missing type: {alias} -> {column}"
+            );
+        }
+        for (alias, column) in [
+            ("user", "user.name"),
+            ("user_domain", "user.domain"),
+            ("src_ip", "src_endpoint.ip"),
+            ("dest_ip", "dst_endpoint.ip"),
+            ("src_host", "src_endpoint.hostname"),
+            ("dest_host", "dst_endpoint.hostname"),
+            ("src_port", "src_endpoint.port"),
+            ("dest_port", "dst_endpoint.port"),
+            ("process_name", "process.name"),
+            ("command_line", "process.cmd_line"),
+            ("parent_command_line", "actor.process.cmd_line"),
+            ("process_hash", "process.file.hashes.value"),
+            ("file_path", "file.path"),
+            ("file_hash", "file.hashes.value"),
+            ("auth_result", "status_id"),
+            ("message", "message"),
+            ("timestamp", "time"),
+            ("source_type", "metadata.log_source"),
+            ("sourcetype", "metadata.log_source"),
+            ("user_identity_email", "unmapped.user_identity_email"),
+        ] {
+            assert_eq!(
+                profile.resolve(alias),
+                FieldResolution::ExplicitColumn(column.into()),
+                "{alias}"
+            );
+            assert_eq!(
+                profile.field_type(alias),
+                profile.field_type(column),
+                "{alias}"
+            );
+        }
+        assert_eq!(profile.field_type("risk_score"), Some(FieldType::Integer));
+        assert_eq!(profile.entity_type("src_host"), Some(EntityType::Host));
+        assert_eq!(profile.entity_type("src_hostname"), Some(EntityType::Host));
+        assert_eq!(profile.category("src_ip"), profile.category("src_endpoint.ip"));
+        assert!(profile.is_string_array_field("process_hash"));
+        assert!(profile.is_string_array_field("file_hash"));
+        assert!(!profile.is_known_field("user_identity_emali"));
+        // Native attributes retain their meanings even if the old manifest
+        // associates that UDM spelling with another taxonomy column.
+        assert_eq!(
+            profile.resolve("severity"),
+            FieldResolution::ExplicitColumn("severity".into())
+        );
+        assert!(matches!(
+            profile.enum_int_mapping("event_type"),
+            Some(EnumIntMapping::LabelColumn("activity_name"))
+        ));
+    }
+
+    /// NAN-3003: the platform stamps lean ingest admits on source rows are
+    /// queryable by name (not only through the tail namespace).
+    #[test]
+    fn lake_1_9_resolves_the_platform_metadata_stamps() {
+        let p = OcsfProfile::lake_1_9();
+        for field in ["metadata.nano_parser_bundle_sha256", "metadata.nano_credential_id"] {
+            assert_eq!(
+                p.resolve(field),
+                FieldResolution::ExplicitColumn(field.to_string()),
+                "lake field {field}",
+            );
+            assert!(p.is_known_field(field), "lake field {field}");
+            assert_eq!(p.field_type(field), Some(FieldType::String), "{field}");
+        }
+    }
+
+    #[test]
+    fn lake_1_9_accepts_only_canonical_fields_and_explicit_unmapped_paths() {
+        let p = OcsfProfile::lake_1_9();
+        for field in [
+            "metadata.uid",
+            "metadata.log_source",
+            "metadata.original_event_uid",
+            "time",
+            "raw_data_size",
+            "activity_name",
+            "category_name",
+            "src_endpoint.ip",
+            "finding_info.analytic.name",
+            "finding_info.attacks.technique.uid",
+            "resources.hostname",
+            "observables.value",
+        ] {
+            assert_eq!(
+                p.resolve(field),
+                FieldResolution::ExplicitColumn(field.to_string()),
+                "lake field {field}",
+            );
+            assert!(p.is_known_field(field), "lake field {field}");
+        }
+        assert_eq!(
+            p.resolve("unmapped.vendor_key"),
+            FieldResolution::ExplicitColumn("unmapped.vendor_key".to_string())
+        );
+        for legacy in [
+            "time_dt",
+            "event_bytes",
+            "activity",
+            "ext.vendor_key",
+            "vendor_key",
+        ] {
+            assert_eq!(p.resolve(legacy), FieldResolution::Unknown, "{legacy}");
+            assert!(!p.is_known_field(legacy), "{legacy}");
+            assert_eq!(p.canonicalize(legacy).as_ref(), legacy);
+        }
+        assert_eq!(p.timestamp_expr(), "time");
+        assert!(!p.is_uuid_field("id"));
+        assert!(p.materialized_columns().is_empty());
+        assert_eq!(p.class_split_column("user"), None);
+        assert_eq!(p.udm_column_sql("src_ip"), None);
+        assert_eq!(p.core_fields(), OCSF_1_9_CORE_FIELDS);
+        assert_eq!(
+            p.field_type("finding_info.analytic.name"),
+            Some(FieldType::String)
+        );
+        assert_eq!(p.field_type("resources.hostname"), Some(FieldType::Array));
+        assert!(p.is_string_array_field("finding_info.data_sources"));
+
+        let clickhouse = OcsfProfile::new();
+        assert_eq!(
+            clickhouse.resolve("source_type"),
+            FieldResolution::ExplicitColumn("source_type".to_string())
+        );
+        assert_eq!(clickhouse.timestamp_expr(), "timestamp");
+        assert!(clickhouse.is_uuid_field("id"));
+        assert!(clickhouse.class_split_column("user").is_some());
+    }
+
+    /// NAN-2994: a lean-lake cell tenant's front-door profile carries NO
+    /// snapshot inventory (query[T] owns the part schema), so canonical OCSF
+    /// 1.9 leaves must resolve from the OCSF contract itself, not from hand
+    /// lists. `metadata.event_code` and `action_id` 400'd on lean while being
+    /// stored on every Windows / proxy row.
+    /// NAN-3422: a stored producer key that is not a query identifier
+    /// (`unmapped.@timestamp` from Winlogbeat) is dropped from the profile
+    /// instead of refusing the whole inventory; legacy namespaces still refuse.
+    #[test]
+    fn nan3422_snapshot_profile_drops_unaddressable_leaves() {
+        let profile = OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::from([
+            ("unmapped.@timestamp".to_string(), FieldType::String),
+            ("unmapped.@metadata.beat".to_string(), FieldType::String),
+            ("unmapped.Event-ID".to_string(), FieldType::String),
+            ("unmapped..empty".to_string(), FieldType::String),
+            ("unmapped.winlog.event_id".to_string(), FieldType::Integer),
+        ]))
+        .expect("odd producer keys must not refuse the inventory");
+        assert_eq!(profile.field_type("unmapped.winlog.event_id"), Some(FieldType::Integer));
+        assert!(!profile.lake_snapshot_field_types.keys().any(|path| path.contains('@') || path.contains('-')));
+        assert!(OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::from([(
+            "ext.legacy".to_string(),
+            FieldType::String,
+        )]))
+        .is_err());
+        assert!(!OcsfProfile::is_admissible_snapshot_field_path("unmapped.@timestamp"));
+    }
+
+    #[test]
+    fn nan2994_inventoryless_lake_profile_accepts_every_ocsf_1_9_leaf() {
+        let p = OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::new()).unwrap();
+        for (field, field_type) in [
+            ("metadata.event_code", FieldType::String),
+            ("action_id", FieldType::Integer),
+            ("disposition_id", FieldType::Integer),
+            ("logon_type_id", FieldType::Integer),
+            ("dst_endpoint.port", FieldType::Integer),
+            ("traffic.bytes_in", FieldType::Long),
+            ("is_remote", FieldType::Boolean),
+            ("metadata.product.vendor_name", FieldType::String),
+            // Recursive objects resolve by walking, with no depth bound.
+            (
+                "actor.process.parent_process.parent_process.cmd_line",
+                FieldType::String,
+            ),
+            // A leaf under a repeated object is an array at rest.
+            ("metadata.profiles", FieldType::Array),
+            ("module.file.signatures.algorithm_id", FieldType::Array),
+        ] {
+            assert_eq!(
+                p.resolve(field),
+                FieldResolution::ExplicitColumn(field.to_string()),
+                "{field}"
+            );
+            assert!(p.is_known_field(field), "{field}");
+            assert_eq!(p.field_type(field), Some(field_type), "{field}");
+        }
+        for rejected in [
+            // Objects are not leaves (NAN-2379).
+            "metadata",
+            "actor.process",
+            // `json_t` keys are producer-defined: only an inventory vouches.
+            "enrichments.data.host_count",
+            // Not OCSF.
+            "metadata.not_an_attribute",
+            "event_code",
+            // Datetime-profile siblings are not stored; `time_dt` stays legacy.
+            "time_dt",
+            "metadata.logged_time_dt",
+        ] {
+            assert_eq!(p.resolve(rejected), FieldResolution::Unknown, "{rejected}");
+            assert!(!p.is_known_field(rejected), "{rejected}");
+        }
+        // A snapshot type still wins over the contract's.
+        let typed = OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::from([(
+            "metadata.event_code".to_string(),
+            FieldType::Integer,
+        )]))
+        .unwrap();
+        assert_eq!(
+            typed.field_type("metadata.event_code"),
+            Some(FieldType::Integer)
+        );
+    }
+
+    /// NAN-2994: every leaf of a real stored lake event schema (the live
+    /// tenant read schema fixture) is queryable, both through the
+    /// inventory-less front-door profile and through the snapshot-backed
+    /// profile query[T]'s compiler builds from the part schema. The only
+    /// leaves the front door cannot vouch for are producer-defined ones
+    /// (`unmapped.*` is accepted by namespace; `enrichments.data.*` is a
+    /// `json_t` bag and needs the inventory).
+    #[test]
+    fn nan2994_every_stored_lake_leaf_is_queryable() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../nanosiem-lake-worker/tests/fixtures/nan2469-live-tail-read-schema.json"
+        ))
+        .unwrap();
+        let paths: Vec<String> =
+            serde_json::from_value(fixture["available_paths"].clone()).unwrap();
+        assert!(paths.iter().any(|path| path == "metadata.event_code"));
+        assert!(paths.iter().any(|path| path == "action_id"));
+
+        let front_door =
+            OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::new()).unwrap();
+        let inventory = OcsfProfile::try_lake_1_9_with_snapshot_field_types(
+            paths
+                .iter()
+                .map(|path| (path.clone(), FieldType::String))
+                .collect(),
+        )
+        .unwrap();
+        let mut front_door_rejects = Vec::new();
+        for path in &paths {
+            let query = crate::query::parse_query(&format!("{path}=\"x\"")).unwrap();
+            assert!(
+                crate::query::validate_query_fields_with_profile(&query, Some(&inventory))
+                    .is_empty(),
+                "inventory profile rejects stored leaf {path}"
+            );
+            if !crate::query::validate_query_fields_with_profile(&query, Some(&front_door))
+                .is_empty()
+            {
+                front_door_rejects.push(path.as_str());
+            }
+        }
+        assert!(
+            front_door_rejects
+                .iter()
+                .all(|path| path.starts_with("enrichments.data.")),
+            "front door rejects stored canonical leaves: {front_door_rejects:?}"
+        );
+    }
+
+    #[test]
+    fn lake_1_9_uses_manifest_types_for_exact_unmapped_leaves() {
+        let profile = OcsfProfile::try_lake_1_9_with_unmapped_field_types(BTreeMap::from([
+            ("unmapped.score".to_string(), FieldType::Float),
+            ("unmapped.blocked".to_string(), FieldType::Boolean),
+            ("unmapped.tags".to_string(), FieldType::Array),
+        ]))
+        .unwrap();
+
+        assert_eq!(profile.field_type("unmapped.score"), Some(FieldType::Float));
+        assert!(profile.is_numeric_field("unmapped.score"));
+        assert_eq!(
+            profile.field_type("unmapped.blocked"),
+            Some(FieldType::Boolean)
+        );
+        assert!(profile.is_string_array_field("unmapped.tags"));
+        assert_eq!(
+            profile.resolve("unmapped.score"),
+            FieldResolution::ExplicitColumn("unmapped.score".to_string())
+        );
+        assert!(
+            OcsfProfile::try_lake_1_9_with_unmapped_field_types(BTreeMap::from([(
+                "src_ip".to_string(),
+                FieldType::String,
+            )]))
+            .is_err()
+        );
+
+        let evolved = OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::from([
+            ("ai_operation.name".to_string(), FieldType::String),
+            ("ai_operation.tools".to_string(), FieldType::Array),
+        ]))
+        .unwrap();
+        assert!(evolved.is_known_field("ai_operation.name"));
+        assert_eq!(
+            evolved.resolve("ai_operation.name"),
+            FieldResolution::ExplicitColumn("ai_operation.name".to_string())
+        );
+        assert!(evolved.is_string_array_field("ai_operation.tools"));
+    }
+
+    #[test]
+    fn lean_physical_prevalence_stamp_takes_priority_over_legacy_array_derivation() {
+        let profile = OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::from([
+            ("prevalence_dest_ip".to_string(), FieldType::Integer),
+            ("prevalence_file_hash".to_string(), FieldType::Integer),
+            ("prevalence_min".to_string(), FieldType::Integer),
+            ("enrichments.data.host_count".to_string(), FieldType::Array),
+            ("enrichments.data.host_count_saturated".to_string(), FieldType::Array),
+        ])).unwrap();
+        assert!(profile.is_known_field("prevalence_dest_ip"));
+        assert!(profile.is_known_field("prevalence_file_hash"));
+        assert!(profile.is_known_field("prevalence_min"));
+        assert!(profile.source_computed_column("prevalence_dest_ip").is_none());
+    }
+
+    fn open_core_stamped_inventory() -> BTreeMap<String, FieldType> {
+        [
+            "enrichments.name",
+            "enrichments.provider",
+            "enrichments.value",
+            "enrichments.data.host_count",
+            "enrichments.data.host_count_saturated",
+            "file.hashes.value",
+            "process.file.hashes.value",
+        ]
+        .into_iter()
+        .map(|name| (name.to_string(), FieldType::Array))
+        .chain(
+            ["dst_endpoint.ip", "dst_endpoint.hostname", "query.hostname"]
+                .into_iter()
+                .map(|name| (name.to_string(), FieldType::String)),
+        )
+        .collect()
+    }
+
+    /// NAN-3451: every scalar `prevalence_*` field resolves on an open-core
+    /// lake as an integer computed from `enrichments[]`, reading only the
+    /// stamp arrays and that column's own artifact source(s).
+    #[test]
+    fn open_core_lake_derives_every_prevalence_scalar_from_enrichments() {
+        let profile =
+            OcsfProfile::try_lake_1_9_with_snapshot_field_types(open_core_stamped_inventory())
+                .unwrap();
+        let stamp = [
+            "enrichments.data.host_count",
+            "enrichments.data.host_count_saturated",
+            "enrichments.name",
+            "enrichments.provider",
+            "enrichments.value",
+        ];
+        for (field, sources) in [
+            ("prevalence_file_hash", vec!["file.hashes.value"]),
+            ("prevalence_process_hash", vec!["process.file.hashes.value"]),
+            (
+                "prevalence_dest_domain",
+                vec!["dst_endpoint.hostname", "query.hostname"],
+            ),
+            ("prevalence_dest_ip", vec!["dst_endpoint.ip"]),
+            (
+                "prevalence_min",
+                vec![
+                    "dst_endpoint.hostname",
+                    "dst_endpoint.ip",
+                    "file.hashes.value",
+                    "process.file.hashes.value",
+                    "query.hostname",
+                ],
+            ),
+        ] {
+            assert!(profile.is_known_field(field), "{field}");
+            assert_eq!(profile.field_type(field), Some(FieldType::Integer), "{field}");
+            assert_eq!(
+                profile.resolve(field),
+                FieldResolution::ExplicitColumn(field.to_string())
+            );
+            let (sql, inputs) = profile
+                .source_computed_column(field)
+                .unwrap_or_else(|| panic!("{field} is not derived"));
+            assert!(sql.contains("p = 'nano'"), "{field}: {sql}");
+            let mut expected = stamp.to_vec();
+            expected.extend(sources);
+            expected.sort_unstable();
+            assert_eq!(inputs, expected, "{field}");
+        }
+    }
+
+    /// NAN-3451: lean keeps its physical ingest-time columns for every scalar,
+    /// and an unstamped open-core snapshot keeps all five unknown (#4644).
+    #[test]
+    fn prevalence_scalars_never_shadow_lean_columns_and_need_the_stamp() {
+        let mut lean = open_core_stamped_inventory();
+        for field in super::super::lake_prevalence::SCALARS {
+            lean.insert(field.to_string(), FieldType::Integer);
+        }
+        let lean = OcsfProfile::try_lake_1_9_with_snapshot_field_types(lean).unwrap();
+        let unstamped = OcsfProfile::try_lake_1_9_with_snapshot_field_types(BTreeMap::from([(
+            "dst_endpoint.ip".to_string(),
+            FieldType::String,
+        )]))
+        .unwrap();
+        for field in super::super::lake_prevalence::SCALARS {
+            assert!(lean.source_computed_column(field).is_none(), "{field}");
+            assert_eq!(
+                lean.resolve(field),
+                FieldResolution::ExplicitColumn(field.to_string())
+            );
+            assert_eq!(unstamped.resolve(field), FieldResolution::Unknown, "{field}");
+            assert!(unstamped.source_computed_column(field).is_none(), "{field}");
+        }
+    }
+
     /// NAN-1303: display_field_name gives the native OCSF column a result row
     /// should be keyed by for a UDM-semantic concept (asset stream renders native).
     #[test]
     fn display_field_name_maps_udm_concept_to_native_ocsf_column() {
         let p = OcsfProfile::new();
-        assert_eq!(p.display_field_name("src_ip").as_deref(), Some("src_endpoint.ip"));
+        assert_eq!(
+            p.display_field_name("src_ip").as_deref(),
+            Some("src_endpoint.ip")
+        );
         assert_eq!(
             p.display_field_name("dest_host").as_deref(),
             Some("dst_endpoint.hostname")
@@ -1102,6 +2688,29 @@ mod tests {
                 .any(|(_, f)| *f == "device.hostname"),
             "OCSF entity_extraction_order must include device.hostname (NAN-1302)"
         );
+    }
+
+    #[test]
+    fn lake_1_9_entity_extraction_uses_canonical_repeated_hash_values() {
+        let p = OcsfProfile::lake_1_9();
+        let fields: Vec<_> = p
+            .entity_extraction_order()
+            .iter()
+            .map(|(_, field)| *field)
+            .collect();
+
+        assert!(fields.contains(&"file.hashes.value"));
+        assert!(fields.contains(&"process.file.hashes.value"));
+        assert!(fields.contains(&"actor.process.file.hashes.value"));
+        assert!(fields.contains(&"device.hostname"));
+        assert!(!fields.iter().any(|field| field.ends_with(".sha256")));
+        for field in fields {
+            assert_eq!(
+                p.resolve(field),
+                FieldResolution::ExplicitColumn(field.to_string()),
+                "entity extraction path must be queryable in the strict lake profile: {field}",
+            );
+        }
     }
 
     #[test]
@@ -1255,7 +2864,13 @@ mod tests {
             );
         }
         // Non-aliased flat names are untouched as well.
-        for flat in ["class_uid", "message", "source_type", "timestamp", "severity"] {
+        for flat in [
+            "class_uid",
+            "message",
+            "source_type",
+            "timestamp",
+            "severity",
+        ] {
             assert!(
                 matches!(p.canonicalize(flat), Cow::Borrowed(s) if s == flat),
                 "non-aliased flat name {flat} must pass through byte-identical"
@@ -1330,6 +2945,10 @@ mod tests {
         assert!(p.is_numeric_field("src_endpoint.port"));
         assert!(!p.is_numeric_field("src_endpoint.ip"));
         assert!(!p.is_uuid_field("user.uid"));
+
+        let lake = OcsfProfile::lake_1_9();
+        assert_eq!(lake.field_type("status_code"), Some(FieldType::String));
+        assert_eq!(lake.field_type("status_detail"), Some(FieldType::String));
     }
 
     #[test]
@@ -1453,30 +3072,63 @@ mod tests {
         // so WHERE/GROUP BY prunes via the words index. The `if(...)` survives as
         // `class_split_value_sql` (the column's materialization def + source of
         // truth) — see `udm_column_sql_emits_unified_column_for_class_split`.
-        assert_eq!(p.udm_column_sql("src_host").as_deref(), Some("src_host_unified"));
-        assert_eq!(p.udm_column_sql("src_ip").as_deref(), Some("\"src_endpoint.ip\""));
+        assert_eq!(
+            p.udm_column_sql("src_host").as_deref(),
+            Some("src_host_unified")
+        );
+        assert_eq!(
+            p.udm_column_sql("src_ip").as_deref(),
+            Some("\"src_endpoint.ip\"")
+        );
         // NAN-1276 class-split resolution: OCSF puts the primary process in the
         // top-level `process.*` (Process Activity 1007) but in `actor.process.*`
         // on Module/Network/File/DNS/Registry. NAN-1333 routes these to their
         // indexed unified columns (same union, words-index prunable).
-        assert_eq!(p.udm_column_sql("process_name").as_deref(), Some("process_name_unified"));
-        assert_eq!(p.udm_column_sql("command_line").as_deref(), Some("command_line_unified"));
-        assert_eq!(p.udm_column_sql("process_id").as_deref(), Some("process_id_unified"));
+        assert_eq!(
+            p.udm_column_sql("process_name").as_deref(),
+            Some("process_name_unified")
+        );
+        assert_eq!(
+            p.udm_column_sql("command_line").as_deref(),
+            Some("command_line_unified")
+        );
+        assert_eq!(
+            p.udm_column_sql("process_id").as_deref(),
+            Some("process_id_unified")
+        );
         // `user` spans Authentication subject (`user.name`) vs initiator
         // (`actor.user.name`); NAN-1333 → indexed unified column.
         assert_eq!(p.udm_column_sql("user").as_deref(), Some("user_unified"));
         // parent_command_line stays the parent column (not class-split).
-        assert_eq!(p.udm_column_sql("parent_command_line").as_deref(), Some("\"actor.process.cmd_line\""));
-        assert_eq!(p.udm_column_sql("dest_ip").as_deref(), Some("\"dst_endpoint.ip\""));
+        assert_eq!(
+            p.udm_column_sql("parent_command_line").as_deref(),
+            Some("\"actor.process.cmd_line\"")
+        );
+        assert_eq!(
+            p.udm_column_sql("dest_ip").as_deref(),
+            Some("\"dst_endpoint.ip\"")
+        );
         // NAN-1241/1254: the additional UDM-semantic fields that the findings,
         // prevalence-artifact, case-extraction and GDPR fixes resolve through this
         // map. `file_hash` flattens the OCSF `file.hashes` array to a scalar
         // `file.hashes.sha256` column — locking it here guards the artifact/finding
         // hash lookups from silently regressing to the array form.
-        assert_eq!(p.udm_column_sql("dest_host").as_deref(), Some("\"dst_endpoint.hostname\""));
-        assert_eq!(p.udm_column_sql("file_hash").as_deref(), Some("\"file.hashes.sha256\""));
-        assert_eq!(p.udm_column_sql("file_name").as_deref(), Some("\"file.name\""));
-        assert_eq!(p.udm_column_sql("file_path").as_deref(), Some("\"file.path\""));
+        assert_eq!(
+            p.udm_column_sql("dest_host").as_deref(),
+            Some("\"dst_endpoint.hostname\"")
+        );
+        assert_eq!(
+            p.udm_column_sql("file_hash").as_deref(),
+            Some("\"file.hashes.sha256\"")
+        );
+        assert_eq!(
+            p.udm_column_sql("file_name").as_deref(),
+            Some("\"file.name\"")
+        );
+        assert_eq!(
+            p.udm_column_sql("file_path").as_deref(),
+            Some("\"file.path\"")
+        );
         // Prevalence is real now (NAN-1248): the prevalence_* columns are promoted
         // OCSF columns keyed on the OCSF hash/domain/ip cols, so UDM-semantic
         // prevalence field names resolve to them. The column names are non-dotted
@@ -1572,7 +3224,10 @@ mod tests {
     fn udm_column_sql_emits_unified_column_for_class_split() {
         use crate::schema::SchemaProfile;
         let ocsf = OcsfProfile::new();
-        assert_eq!(ocsf.udm_column_sql("src_host").as_deref(), Some("src_host_unified"));
+        assert_eq!(
+            ocsf.udm_column_sql("src_host").as_deref(),
+            Some("src_host_unified")
+        );
         assert_eq!(ocsf.udm_column_sql("user").as_deref(), Some("user_unified"));
         assert_eq!(
             ocsf.udm_column_sql("process_name").as_deref(),
@@ -1679,7 +3334,10 @@ mod tests {
             other => panic!("auth_result must map to a fixed enum table, got {other:?}"),
         }
         // Native column spelling resolves to the same table.
-        assert_eq!(p.enum_int_mapping("status_id"), p.enum_int_mapping("auth_result"));
+        assert_eq!(
+            p.enum_int_mapping("status_id"),
+            p.enum_int_mapping("auth_result")
+        );
         match p.enum_int_mapping("auth_type") {
             Some(EnumIntMapping::Values(m)) => {
                 assert_eq!(m.get("kerberos"), Some(&2));
@@ -1700,8 +3358,18 @@ mod tests {
             );
         }
         // String columns / plain numerics / unknowns expose nothing.
-        for f in ["status", "severity", "action", "src_ip", "src_endpoint.port", "nonexistent"] {
-            assert!(p.enum_int_mapping(f).is_none(), "{f} must have no enum mapping");
+        for f in [
+            "status",
+            "severity",
+            "action",
+            "src_ip",
+            "src_endpoint.port",
+            "nonexistent",
+        ] {
+            assert!(
+                p.enum_int_mapping(f).is_none(),
+                "{f} must have no enum mapping"
+            );
         }
     }
 
@@ -1737,5 +3405,72 @@ mod tests {
         // the read. Explicit `raw_data` hunts get the idx_raw_data_words index;
         // bare keywords stay on `message` alone.
         assert_eq!(p.keyword_search_column(), "message");
+    }
+}
+
+
+/// NAN-3492: a worker-served (hot-swapped) schema only ever ADDS fields to
+/// the profile a lake process resolves at boot. Search, API and jobs re-pin to
+/// it at runtime (#5974), so a field the boot profile accepted and the
+/// refreshed one refused would turn a working query into a 400 mid-flight.
+#[cfg(test)]
+mod refreshed_schema_tests {
+    use super::*;
+    use crate::schema::SchemaProfile;
+
+    fn refreshed(fields: &[(&str, FieldType)]) -> OcsfProfile {
+        OcsfProfile::try_lake_1_9_with_snapshot_field_types(
+            fields.iter().map(|(name, ty)| (name.to_string(), *ty)).collect(),
+        )
+        .unwrap()
+    }
+
+    fn errors(profile: &OcsfProfile, npl: &str) -> Vec<String> {
+        let query = crate::query::parse_query(npl).unwrap();
+        crate::query::validate_query_fields_with_profile(&query, Some(profile))
+            .into_iter()
+            .map(|error| error.message)
+            .collect()
+    }
+
+    #[test]
+    fn refreshed_schema_keeps_every_field_and_alias_the_boot_schema_accepted() {
+        let boot = OcsfProfile::lake_1_9();
+        let mut names: Vec<String> = boot.fields().iter().map(|f| f.name.to_string()).collect();
+        names.extend(crate::udm::UdmField::all().iter().map(|f| f.column_name().to_string()));
+        names.extend(["source_type", "sourcetype", "metadata.log_source", "risk_score"].map(String::from));
+        // A sparse inventory (one source's leaves) and one without the source
+        // column at all: neither may narrow what the boot profile accepted.
+        for refreshed in [
+            refreshed(&[("metadata.log_source", FieldType::String), ("class_uid", FieldType::Integer)]),
+            refreshed(&[("class_uid", FieldType::Integer)]),
+        ] {
+            let lost: Vec<_> =
+                names.iter().filter(|n| boot.is_known_field(n) && !refreshed.is_known_field(n)).collect();
+            assert!(lost.is_empty(), "the refreshed schema dropped {lost:?}");
+            for npl in [
+                "metadata.log_source=findings",
+                "source_type=findings",
+                "sourcetype=findings",
+                "metadata.log_source=risk",
+                "source_type=risk",
+                "metadata.log_source IN (risk, signals)",
+            ] {
+                assert_eq!(errors(&refreshed, npl), Vec::<String>::new(), "{npl}");
+                assert_eq!(errors(&boot, npl), Vec::<String>::new(), "{npl}");
+            }
+        }
+    }
+
+    /// Bare `log_source` is not a source spelling on the lake, before or after
+    /// a refresh: the source field is `metadata.log_source` (aliases
+    /// `source_type` / `sourcetype`).
+    #[test]
+    fn bare_log_source_is_refused_by_boot_and_refreshed_schema_alike() {
+        let refreshed = refreshed(&[("metadata.log_source", FieldType::String)]);
+        for profile in [OcsfProfile::lake_1_9(), refreshed] {
+            let errors = errors(&profile, "log_source=findings");
+            assert!(errors.iter().any(|e| e.contains("Unknown canonical OCSF field 'log_source'")), "{errors:?}");
+        }
     }
 }

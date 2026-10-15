@@ -12,6 +12,7 @@ import type {
   UpdateReportRequest,
 } from './types';
 import { getServiceUrl } from './utils';
+import { requestCredentials } from '@/lib/request-credentials';
 
 /**
  * Scheduled Reports API (NAN-1793).
@@ -100,7 +101,9 @@ export class ReportsApi {
     const response = await fetch(url, {
       method: 'GET',
       headers,
-      credentials: 'include',
+      // Bearer and cookie must not travel together (shared auth refuses
+      // two credentials with 401); mirror the JSON transport's rule.
+      credentials: requestCredentials(endpoint, headers),
     });
 
     if (!response.ok) {

@@ -11,7 +11,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { User as UserIcon, Check, Loader2, Copy, AlertCircle, Users as UsersIcon } from 'lucide-react';
+import { User as UserIcon, Check, Copy, AlertCircle, Users as UsersIcon } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { api, type GroupDetail } from '@/lib/api';
@@ -232,7 +233,7 @@ export function InviteUserDialog({ open, groups, onClose, onCreated }: InviteUse
                 Cancel
               </Button>
               <Button size="sm" onClick={handleSend} disabled={!canSend} className="h-7 text-[11.5px]">
-                {saving && <Loader2 className="w-3 h-3 animate-spin" />}
+                {saving && <LoadingIcon className="w-3 h-3" />}
                 Create user
               </Button>
             </SheetFooter>

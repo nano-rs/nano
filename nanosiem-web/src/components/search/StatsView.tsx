@@ -3,6 +3,7 @@
 import React from 'react';
 import { ArrowUp, ArrowDown, ArrowUpDown, Check, ChevronRight, Copy, Download, Table as TableIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { formatCellValue } from '@/lib/format-cell-value';
 import { FieldValueMenu } from './SearchResults';
 
 interface SearchResultLike {
@@ -60,9 +61,7 @@ export function parseStatsCommand(query: string): ParsedStats | null {
 type SortDir = 'asc' | 'desc';
 
 function formatCell(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
+  return formatCellValue(value);
 }
 
 function asNumber(value: unknown): number | null {

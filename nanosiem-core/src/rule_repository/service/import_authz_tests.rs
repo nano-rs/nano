@@ -211,8 +211,11 @@ mod update_branch {
             Some("*/30 * * * *"),
             Some(60),
         );
-        assert!(introduced
-            .requires_promote_for_update(&existing(Some("medium"), Some("*/30 * * * *"), None)));
+        assert!(introduced.requires_promote_for_update(&existing(
+            Some("medium"),
+            Some("*/30 * * * *"),
+            None
+        )));
     }
 
     #[test]
@@ -239,10 +242,16 @@ mod update_branch {
     /// Fail closed: we cannot prove the change is not a downgrade.
     #[test]
     fn an_unparseable_stored_severity_needs_promote() {
-        assert!(baseline()
-            .requires_promote_for_update(&existing(Some("¯\\_(ツ)_/¯"), Some("*/30 * * * *"), Some(60))));
-        assert!(baseline()
-            .requires_promote_for_update(&existing(None, Some("*/30 * * * *"), Some(60))));
+        assert!(baseline().requires_promote_for_update(&existing(
+            Some("¯\\_(ツ)_/¯"),
+            Some("*/30 * * * *"),
+            Some(60)
+        )));
+        assert!(baseline().requires_promote_for_update(&existing(
+            None,
+            Some("*/30 * * * *"),
+            Some(60)
+        )));
     }
 
     /// The CREATE predicate deliberately does NOT apply to updates: the update
@@ -324,7 +333,8 @@ mod derivations {
     /// plain import needs only `detections:create`.
     #[test]
     fn a_non_npl_import_defaults_to_staging_scheduled() {
-        let resolved = ImportLifecycle::resolve(&import_request(None, None, None), Some("high"), None);
+        let resolved =
+            ImportLifecycle::resolve(&import_request(None, None, None), Some("high"), None);
         assert_eq!(resolved.mode, RuleMode::Staging);
         assert_eq!(resolved.severity, Severity::High);
         assert_eq!(resolved.detection_mode, DetectionMode::Scheduled);
@@ -359,7 +369,10 @@ mod derivations {
     #[test]
     fn severity_parsing_is_strict_for_authorization_and_lenient_for_storage() {
         assert_eq!(try_parse_severity("critical"), Some(Severity::Critical));
-        assert_eq!(try_parse_severity("informational"), Some(Severity::Informational));
+        assert_eq!(
+            try_parse_severity("informational"),
+            Some(Severity::Informational)
+        );
         assert_eq!(try_parse_severity("nonsense"), None);
         // The storage path keeps its historic lenient default.
         assert_eq!(parse_severity("nonsense"), Severity::Informational);

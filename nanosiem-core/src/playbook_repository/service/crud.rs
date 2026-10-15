@@ -49,7 +49,10 @@ impl PlaybookRepositoryService {
 
         let key = format!("{}/{}", owner.to_lowercase(), repo_name.to_lowercase());
         if !Self::allowed_repos().contains(&key.as_str()) {
-            warn!("Attempted to add non-allowlisted playbook repository: {}", key);
+            warn!(
+                "Attempted to add non-allowlisted playbook repository: {}",
+                key
+            );
             return Err(PlaybookRepositoryError::RepositoryNotAllowed(key));
         }
 
@@ -81,15 +84,12 @@ impl PlaybookRepositoryService {
     }
 
     pub async fn delete_repository(&self, id: Uuid) -> Result<(), PlaybookRepositoryError> {
-        self.repo_repository
-            .delete(id)
-            .await
-            .map_err(|e| match e {
-                super::super::repository::PlaybookRepoRepositoryError::NotFound(_) => {
-                    PlaybookRepositoryError::RepositoryNotFound(id)
-                }
-                other => PlaybookRepositoryError::from_repo_error(other),
-            })
+        self.repo_repository.delete(id).await.map_err(|e| match e {
+            super::super::repository::PlaybookRepoRepositoryError::NotFound(_) => {
+                PlaybookRepositoryError::RepositoryNotFound(id)
+            }
+            other => PlaybookRepositoryError::from_repo_error(other),
+        })
     }
 
     pub async fn list_repository_playbooks(

@@ -39,6 +39,84 @@ fn effective_viewer_scope(auth: &AuthContext) -> nanosiem_core::auth::ScopeSet {
     auth.effective_viewer_scope()
 }
 
+/// Field names referenced by `field <op> value` comparisons in a query.
+///
+/// NAN-2361: the dotted-path group is required under OCSF. UDM fields are flat
+/// (`src_ip`), so the original `([a-zA-Z_][a-zA-Z0-9_]*)` was sufficient; OCSF
+/// 1.9 fields are paths (`connection_info.protocol_num`, `src_endpoint.ip`,
+/// `metadata.log_source`). Without the dot it matched only the segment after the
+/// last dot, so the validator asked `is_known_field("protocol_num")` — correctly
+/// false — and rejected every canonical OCSF field in the rule editor as
+/// unknown. The `(?:^|[^\w.])` prefix stops a path being captured mid-way, which
+/// is exactly how the bare leaf segment leaked through before.
+///
+/// Deliberately a rough lexical pass, not a parse: it feeds a "did you mean"
+/// hint, and the parser above already reported real syntax errors.
+pub(crate) fn extract_referenced_fields(clean_query: &str) -> Vec<String> {
+    // Literal-aware: text inside "…"/'…'/regex literals is never a field.
+    nanosiem_core::query::extract_comparator_field_candidates(clean_query)
+}
+
+/// Nearest known field names in the ACTIVE schema profile, by edit distance.
+///
+/// NAN-2361: replaces a hardcoded UDM list (`src_ip`, `dest_ip`, `user`,
+/// `src_host`) that was wrong for every OCSF tenant. Reads `profile.fields()`,
+/// so an OCSF deployment is offered OCSF paths and a UDM one is unchanged in
+/// spirit. Returns empty rather than reaching for a far-away match, so the
+/// caller can omit the "did you mean" clause entirely.
+fn nearest_profile_fields(
+    profile: &dyn nanosiem_core::schema::SchemaProfile,
+    field_name: &str,
+    max_suggestions: usize,
+) -> Vec<String> {
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let b_chars: Vec<char> = b.chars().collect();
+        let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+        let mut curr = vec![0usize; b_chars.len() + 1];
+        for (i, ac) in a.chars().enumerate() {
+            curr[0] = i + 1;
+            for (j, bc) in b_chars.iter().enumerate() {
+                let cost = usize::from(ac != *bc);
+                curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+            }
+            std::mem::swap(&mut prev, &mut curr);
+        }
+        prev[b_chars.len()]
+    }
+
+    let needle = field_name.to_lowercase();
+    // A dotted path should be judged against its leaf too, so `protocol_num`
+    // still finds `connection_info.protocol_num` rather than scoring the whole
+    // path length against it.
+    let leaf = needle.rsplit('.').next().unwrap_or(&needle).to_string();
+
+    let mut scored: Vec<(String, usize)> = profile
+        .fields()
+        .iter()
+        .map(|f| {
+            let candidate = f.name.to_lowercase();
+            let candidate_leaf = candidate
+                .rsplit('.')
+                .next()
+                .unwrap_or(&candidate)
+                .to_string();
+            let distance = edit_distance(&needle, &candidate)
+                .min(edit_distance(&leaf, &candidate_leaf))
+                .min(edit_distance(&leaf, &candidate));
+            (f.name.to_string(), distance)
+        })
+        .collect();
+    scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let max_distance = std::cmp::max(3, leaf.len() / 2);
+    scored
+        .into_iter()
+        .filter(|(_, d)| *d <= max_distance)
+        .take(max_suggestions)
+        .map(|(name, _)| name)
+        .collect()
+}
+
 /// Resolve the test time window from the request. Falls back to the legacy
 /// `days` field for back-compat with older clients, then to a 1-hour default.
 fn resolve_test_range(request: &TestRuleRequest) -> TimeRangeInput {
@@ -55,7 +133,7 @@ fn resolve_test_range(request: &TestRuleRequest) -> TimeRangeInput {
 }
 
 /// Test a detection rule against historical data using the same per-window
-/// evaluation the production scheduler would perform (NAN-741).
+/// evaluation the production scheduler would perform.
 ///
 /// For a rule with `schedule: */5 * * * *` and `lookback: 15m`, a 1-hour test
 /// runs the query 12 times — once per cron tick within the user-selected
@@ -140,7 +218,7 @@ pub async fn test_detection(
     Ok(Json(result))
 }
 
-/// Test a query without creating a rule (NAN-741).
+/// Test a query without creating a rule.
 ///
 /// Uses the same stepped per-window evaluator as `test_detection`. The
 /// caller can pass `schedule_cron` and `lookback_minutes` in the request to
@@ -339,15 +417,9 @@ pub async fn validate_detection(
         errors.push(format!("Query syntax error: {}", e));
     }
 
-    // Extract field names from the query (basic extraction)
-    // This is a simple approach - just look for field=value patterns
-    let field_regex = regex::Regex::new(r#"([a-zA-Z_][a-zA-Z0-9_]*)\s*[=!<>]"#).unwrap();
-    for cap in field_regex.captures_iter(&clean_query) {
-        if let Some(field) = cap.get(1) {
-            let field_name = field.as_str().to_string();
-            if !referenced_fields.contains(&field_name) {
-                referenced_fields.push(field_name);
-            }
+    for field_name in extract_referenced_fields(&clean_query) {
+        if !referenced_fields.contains(&field_name) {
+            referenced_fields.push(field_name);
         }
     }
 
@@ -360,7 +432,7 @@ pub async fn validate_detection(
     //    of branches 1+2, so UDM validation stays byte-identical.
     use nanosiem_core::udm::UdmField;
 
-    let profile = state.config.schema_profile();
+    let profile = state.schema_profile();
 
     static CLICKHOUSE_COLUMNS: &[&str] = &[
         "_inserted_at",
@@ -570,11 +642,23 @@ pub async fn validate_detection(
         if profile.is_known_field(field_name) || profile.is_known_field(&lower) {
             continue;
         }
-        // Not valid - suggest common fields
-        errors.push(format!(
-            "Unknown field '{}'. Did you mean 'src_ip', 'dest_ip', 'user', 'src_host'?",
-            field_name
-        ));
+        // Not valid — suggest near matches from the ACTIVE profile. The old
+        // hardcoded list was UDM-only, so an OCSF tenant mistyping an OCSF path
+        // was pointed at four fields that do not exist in its schema.
+        let suggestions = nearest_profile_fields(profile.as_ref(), field_name, 4);
+        if suggestions.is_empty() {
+            errors.push(format!("Unknown field '{}'.", field_name));
+        } else {
+            errors.push(format!(
+                "Unknown field '{}'. Did you mean {}?",
+                field_name,
+                suggestions
+                    .iter()
+                    .map(|f| format!("'{f}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
     }
 
     // Determine detection mode
@@ -597,14 +681,14 @@ pub async fn validate_detection(
     // Dataset (logs-only) and risk-entity gating is applied by the UI, which
     // knows the rule's dataset.
     let realtime_shape: Result<(), String> = match parse_result.as_ref() {
-        Ok(parsed) => MaterializedViewGenerator::check_query_realtime_eligible(parsed).map_err(
-            |e| match e {
+        Ok(parsed) => {
+            MaterializedViewGenerator::check_query_realtime_eligible(parsed).map_err(|e| match e {
                 // `check_query_realtime_eligible` only ever returns `InvalidRule`,
                 // whose inner string is already user-facing.
                 MaterializedViewError::InvalidRule(msg) => msg,
                 other => other.to_string(),
-            },
-        ),
+            })
+        }
         Err(_) => Err("query has parse errors".to_string()),
     };
 
@@ -642,10 +726,9 @@ pub async fn validate_detection(
     };
 
     // Determine effective mode and whether an MV will be created.
-    let (effective_mode, creates_mv, mode_reason) = if requested_mode == "real-time"
-        || requested_mode == "realtime"
-    {
-        match &realtime_shape {
+    let (effective_mode, creates_mv, mode_reason) =
+        if requested_mode == "real-time" || requested_mode == "realtime" {
+            match &realtime_shape {
             Ok(()) => (
                 "real-time".to_string(),
                 true,
@@ -674,13 +757,13 @@ pub async fn validate_detection(
                 )
             }
         }
-    } else {
-        (
-            "scheduled".to_string(),
-            false,
-            "Scheduled mode: will run on a cron schedule".to_string(),
-        )
-    };
+        } else {
+            (
+                "scheduled".to_string(),
+                false,
+                "Scheduled mode: will run on a cron schedule".to_string(),
+            )
+        };
 
     // valid is false if parsing failed OR if we found invalid fields
     let valid = valid && errors.is_empty();
@@ -703,3 +786,7 @@ pub async fn validate_detection(
         referenced_fields,
     }))
 }
+
+#[cfg(test)]
+#[path = "query_field_extraction_tests.rs"]
+mod query_field_extraction_tests;

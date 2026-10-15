@@ -1,0 +1,42 @@
+# nano-connector spec that replaces code.ts in this directory (NAN-3490).
+# Fully declarative: bounded [since, until) windows walked by Okta's own
+# rel="next" links, a short lag so late events land before their window
+# closes, a lookback overlap re-read every pass, and dedupe by `uuid`.
+version: 1
+name: okta_system_log
+kind: collector
+allow:
+  - host: "{{config.OKTA_DOMAIN}}"
+    host_suffixes: [".okta.com", ".oktapreview.com", ".okta-emea.com", ".okta-gov.com", ".okta.mil"]
+    path_prefixes: ["/api/v1/logs"]
+auth: { type: okta_ssws, credential: API_TOKEN }
+schedule: "*/2 * * * *"
+limits: { max_run_secs: 600, max_pages: 500 }
+rate_limit:
+  reset_header: X-Rate-Limit-Reset
+  remaining_header: X-Rate-Limit-Remaining
+  remaining_floor: 2
+  max_retries_429: 5
+  max_wait_ms: 120000
+streams:
+  - id: system_log
+    source_type: okta
+    request:
+      url: "https://{{config.OKTA_DOMAIN}}/api/v1/logs"
+      query:
+        since: "{{window.start}}"
+        until: "{{window.end}}"
+        sortOrder: ASCENDING
+        limit: "1000"
+      headers: { Accept: application/json }
+    pagination: { type: link_header }
+    window:
+      time_field: published
+      uid_field: uuid
+      max_span_secs: 3600
+      lag_secs: 30
+      lookback_secs: 120
+      # The first window starts at the engine's initial cursor (activation -
+      # 5 min, NAN-3697) whatever this says; initial_lookback_secs only bounds
+      # the tenant checkpoint-reset API.
+      initial_lookback_secs: 300

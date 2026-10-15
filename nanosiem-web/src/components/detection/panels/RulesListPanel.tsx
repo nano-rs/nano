@@ -24,7 +24,6 @@ import {
 import {
   Search,
   Plus,
-  Loader2,
   FileCode,
   Copy,
   Pencil,
@@ -47,6 +46,7 @@ import {
   Power,
   CircleCheck,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { DEFAULT_FOLDERS, UNCATEGORIZED_FOLDER, type FolderDefinition } from '@/lib/detection-folders';
 
 export interface DetectionRule {
@@ -578,7 +578,7 @@ export function RulesListPanel({
         <div className="p-2 space-y-1">
           {loading ? (
             <div className="flex items-center justify-center py-8">
-              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-5 h-5 text-muted-foreground" />
             </div>
           ) : filteredRules.length === 0 ? (
             <p className="text-sm text-muted-foreground text-center py-8">

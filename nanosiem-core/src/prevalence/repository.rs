@@ -184,9 +184,40 @@ pub struct PrevalenceRepository {
     hash_prevalence_source_summary: String,
     domain_prevalence_source_summary: String,
     ip_prevalence_source_summary: String,
+    /// NAN-3226: ` AND NOT arrayExists(...)` over the tenant's internal
+    /// suffixes for the domain LIST reads (rare / new), or empty. The built-in
+    /// suffixes are already excluded at write time by the domain MVs.
+    internal_domain_filter: String,
+}
+
+/// The SQL predicate excluding `domain` values equal to or under a tenant
+/// internal suffix (label boundary: `endsWith('.' || domain, '.' || s)`).
+/// Empty when the tenant added no suffixes, so queries stay byte-identical.
+pub(crate) fn internal_domain_predicate(
+    internal: &crate::internal_domains::InternalDomains,
+) -> String {
+    let suffixes = internal.tenant_suffixes();
+    if suffixes.is_empty() {
+        return String::new();
+    }
+    let list = suffixes
+        .iter()
+        .map(|s| format!("'{}'", escape_sql_string(s)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND NOT arrayExists(s -> endsWith(concat('.', domain), concat('.', s)), [{list}])")
 }
 
 impl PrevalenceRepository {
+    /// Exclude the tenant's internal suffixes from domain list reads (NAN-3226).
+    pub fn with_internal_domains(
+        mut self,
+        internal: &crate::internal_domains::InternalDomains,
+    ) -> Self {
+        self.internal_domain_filter = internal_domain_predicate(internal);
+        self
+    }
+
     /// Create a new PrevalenceRepository with a ClickHouse client
     pub fn new(client: ClickHouseClient, table_names: TableNames) -> Self {
         Self {
@@ -216,6 +247,7 @@ impl PrevalenceRepository {
             hash_prevalence_source_summary: table_names.read("hash_prevalence_source_summary"),
             domain_prevalence_source_summary: table_names.read("domain_prevalence_source_summary"),
             ip_prevalence_source_summary: table_names.read("ip_prevalence_source_summary"),
+            internal_domain_filter: String::new(),
         }
     }
 
@@ -1044,7 +1076,7 @@ impl PrevalenceRepository {
                            max(last_seen) AS last_seen_dt,
                            sum(total_count) AS total_count
                     FROM {table}
-                    WHERE {source_filter}
+                    WHERE {source_filter}{internal}
                     GROUP BY domain
                 )
                 WHERE last_seen_dt >= toDateTime64('{cutoff_str}', 6)
@@ -1059,6 +1091,7 @@ impl PrevalenceRepository {
                 threshold = threshold,
                 limit = limit,
                 settings = SOURCE_SUMMARY_SETTINGS,
+                internal = self.internal_domain_filter,
             );
             return self.client.query(&query).fetch_all().await;
         }
@@ -1084,7 +1117,7 @@ impl PrevalenceRepository {
                     argMax(total_occurrences, version) AS total_count
                 FROM (
                     SELECT * FROM {domain_prevalence_final}
-                    WHERE {recency}
+                    WHERE {recency}{internal}
                 )
                 GROUP BY domain
             )
@@ -1098,6 +1131,7 @@ impl PrevalenceRepository {
             threshold = threshold,
             limit = limit,
             settings = FINAL_AGG_SETTINGS,
+            internal = self.internal_domain_filter,
         );
 
         debug!("Executing rare domains query with threshold {}", threshold);
@@ -1225,7 +1259,7 @@ impl PrevalenceRepository {
                            max(last_seen) AS last_seen_dt,
                            sum(total_count) AS total_count
                     FROM {table}
-                    WHERE {source_filter}
+                    WHERE {source_filter}{internal}
                     GROUP BY domain
                 )
                 WHERE first_seen_dt >= toDateTime64('{since_str}', 6)
@@ -1238,6 +1272,7 @@ impl PrevalenceRepository {
                 since_str = since_str,
                 limit = limit,
                 settings = SOURCE_SUMMARY_SETTINGS,
+                internal = self.internal_domain_filter,
             );
             return self.client.query(&query).fetch_all().await;
         }
@@ -1264,7 +1299,7 @@ impl PrevalenceRepository {
                     argMax(total_occurrences, version) AS total_count
                 FROM (
                     SELECT * FROM {domain_prevalence_final}
-                    WHERE {recency}
+                    WHERE {recency}{internal}
                 )
                 GROUP BY domain
             )
@@ -1276,6 +1311,7 @@ impl PrevalenceRepository {
             recency = recency,
             limit = limit,
             settings = FINAL_AGG_SETTINGS,
+            internal = self.internal_domain_filter,
         );
 
         debug!("Executing new domains query since {}", since);
@@ -1480,6 +1516,7 @@ impl PrevalenceRepository {
             artifact: row.file_hash,
             artifact_type,
             host_count: row.host_count,
+            host_count_saturated: false,
             total_occurrences: row.total_count,
             first_seen: Self::micros_to_datetime(row.first_seen),
             last_seen: Self::micros_to_datetime(row.last_seen),
@@ -1507,6 +1544,7 @@ impl PrevalenceRepository {
             artifact: row.domain,
             artifact_type,
             host_count: row.source_host_count,
+            host_count_saturated: false,
             total_occurrences: row.total_count,
             first_seen: Self::micros_to_datetime(row.first_seen),
             last_seen: Self::micros_to_datetime(row.last_seen),
@@ -1534,6 +1572,7 @@ impl PrevalenceRepository {
             artifact: row.ip,
             artifact_type,
             host_count: row.source_host_count,
+            host_count_saturated: false,
             total_occurrences: row.total_count,
             first_seen: Self::micros_to_datetime(row.first_seen),
             last_seen: Self::micros_to_datetime(row.last_seen),
@@ -1710,6 +1749,7 @@ impl PrevalenceRepository {
             network: Vec::new(),
             geo: Vec::new(),
             threat_intel: Vec::new(),
+            coverage: None,
         }
     }
 
@@ -1838,7 +1878,10 @@ impl PrevalenceRepository {
                     "SELECT {u} AS user, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {u} != '' \
                      GROUP BY {u} ORDER BY cnt DESC LIMIT 10",
-                    logs_table, time_filter, where_clause, u = user
+                    logs_table,
+                    time_filter,
+                    where_clause,
+                    u = user
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1894,7 +1937,11 @@ impl PrevalenceRepository {
                     "SELECT {pn} AS process_name, {cl} AS command_line, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {pn} != '' \
                      GROUP BY {pn}, {cl} ORDER BY cnt DESC LIMIT 5",
-                    logs_table, time_filter, where_clause, pn = process_name, cl = command_line
+                    logs_table,
+                    time_filter,
+                    where_clause,
+                    pn = process_name,
+                    cl = command_line
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1931,7 +1978,10 @@ impl PrevalenceRepository {
                     "SELECT {fn_} AS file_name, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {fn_} != '' \
                      GROUP BY {fn_} ORDER BY cnt DESC LIMIT 5",
-                    logs_table, time_filter, where_clause, fn_ = file_name
+                    logs_table,
+                    time_filter,
+                    where_clause,
+                    fn_ = file_name
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1966,7 +2016,11 @@ impl PrevalenceRepository {
                     "SELECT {dp} AS dest_port, {proto} AS protocol, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {dp} > 0 \
                      GROUP BY {dp}, {proto} ORDER BY cnt DESC LIMIT 10",
-                    logs_table, time_filter, where_clause, dp = dest_port, proto = protocol
+                    logs_table,
+                    time_filter,
+                    where_clause,
+                    dp = dest_port,
+                    proto = protocol
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -2005,7 +2059,11 @@ impl PrevalenceRepository {
                     "SELECT {cc} AS country, {asn} AS asn, count() AS cnt \
                      FROM {} WHERE {} AND {} AND {cc} != '' \
                      GROUP BY country, asn ORDER BY cnt DESC LIMIT 5",
-                    logs_table, time_filter, where_clause, cc = country_col, asn = asn_col
+                    logs_table,
+                    time_filter,
+                    where_clause,
+                    cc = country_col,
+                    asn = asn_col
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -2032,6 +2090,7 @@ impl PrevalenceRepository {
             // Populated at the service layer where the EnrichmentService
             // handle is available — the repository only knows about CH.
             threat_intel: Vec::new(),
+            coverage: None,
         })
     }
 
@@ -2363,6 +2422,20 @@ impl PrevalenceRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-3226 dedicated parity: no tenant suffixes keeps the SQL unchanged;
+    /// tenant suffixes become a label-boundary `endsWith` exclusion.
+    #[test]
+    fn internal_domain_predicate_is_label_bounded_and_empty_by_default() {
+        use crate::internal_domains::InternalDomains;
+        assert_eq!(internal_domain_predicate(&InternalDomains::builtin()), "");
+        let predicate =
+            internal_domain_predicate(&InternalDomains::with_tenant(["prod", "corp.example.com"]));
+        assert_eq!(
+            predicate,
+            " AND NOT arrayExists(s -> endsWith(concat('.', domain), concat('.', s)), ['corp.example.com', 'prod'])"
+        );
+    }
 
     /// NAN-1729 (P2-B): the recency predicate must compare the RAW DateTime64
     /// column so the idx_last_seen / idx_first_seen minmax indexes (migration

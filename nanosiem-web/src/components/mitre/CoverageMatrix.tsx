@@ -287,7 +287,13 @@ export function CoverageMatrix({
   };
 
   return (
-    <div className="flex-1 min-h-0 overflow-auto bg-background">
+    // NAN-3250: bounded so the sticky tactic headers and the horizontal scroll
+    // keep working, but never below 60vh: it is sized to content up to the
+    // app scroller's height and can no longer collapse under the page header.
+    <div
+      className="overflow-auto bg-background max-h-[max(60vh,calc(100dvh-4rem))]"
+      data-testid="coverage-matrix-scroll"
+    >
       <div className="flex gap-1 p-3 min-w-max">
         {tacticsOrdered.map((tactic) => {
           const tacticStats = statsByTactic.get(tactic.tactic_id)

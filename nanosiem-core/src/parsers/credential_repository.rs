@@ -131,7 +131,7 @@ impl CredentialRepository {
         req: &CreateCloudCredential,
         created_by: Option<Uuid>,
     ) -> Result<CloudCredential, CredentialRepositoryError> {
-        if req.provider != "aws_s3" && req.provider != "gcp_pubsub" && req.provider != "kafka" {
+        if !super::types::is_supported_credential_provider(&req.provider) {
             return Err(CredentialRepositoryError::InvalidProvider(
                 req.provider.clone(),
             ));
@@ -515,14 +515,13 @@ impl CredentialRepository {
         &self,
         id: Uuid,
     ) -> Result<serde_json::Value, CredentialRepositoryError> {
-        let row =
-            sqlx::query(
-                "SELECT credentials_encrypted, nonce, external_id FROM cloud_credentials WHERE id = $1",
-            )
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or(CredentialRepositoryError::NotFound(id))?;
+        let row = sqlx::query(
+            "SELECT credentials_encrypted, nonce, external_id FROM cloud_credentials WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(CredentialRepositoryError::NotFound(id))?;
 
         let ciphertext: Vec<u8> = row.get("credentials_encrypted");
         let nonce: String = row.get("nonce");

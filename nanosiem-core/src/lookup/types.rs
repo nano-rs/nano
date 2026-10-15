@@ -19,7 +19,7 @@ use crate::upload::ColumnType;
 /// Summary of the user who created a lookup table.
 ///
 /// Hydrated via LEFT JOIN on `users` from the registry's `created_by_user_id`
-/// column. Optional because legacy rows (created before NAN-514) and rows
+/// column. Optional because legacy rows (created before) and rows
 /// whose creator account was deleted both surface as `None`, which the UI
 /// renders as `—`.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -299,12 +299,12 @@ pub struct LookupUsage {
     pub tactic: Option<String>,
     /// Number of signal hits in the last 24 hours.
     ///
-    /// TODO(NAN-511): currently stubbed to 0 — wiring up per-rule signal counts
+    /// TODO: currently stubbed to 0 — wiring up per-rule signal counts
     /// from the ClickHouse signals table is deferred to a follow-up.
     pub hits_24h: i64,
     /// Timestamp of the most recent signal, if any.
     ///
-    /// TODO(NAN-511): currently stubbed to None — see `hits_24h`.
+    /// TODO: currently stubbed to None — see `hits_24h`.
     pub last_hit: Option<DateTime<Utc>>,
     /// Substring of the rule's nPL query containing the lookup reference.
     /// Best-effort — returns the matching line, or the whole query truncated
@@ -314,7 +314,7 @@ pub struct LookupUsage {
 
 /// Kind of activity recorded for a lookup table.
 ///
-/// Powers the History tab on the redesigned LookupTableView (NAN-510 slice 3 PR 3).
+/// Powers the History tab on the redesigned LookupTableView .
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LookupHistoryKind {
@@ -347,7 +347,7 @@ pub struct LookupHistoryEntry {
     ///
     /// For `refresh` entries: `"completed"` / `"failed: <error>"`. Row deltas
     /// (`"+N rows · −M rows · K total"`) are deferred — see
-    /// `TODO(NAN-512)` in the handler — because the current `scheduled_jobs`
+    /// `TODO` in the handler — because the current `scheduled_jobs`
     /// schema does not persist per-run row counts.
     ///
     /// For `edit` / `upload` entries: derived from the audit event action

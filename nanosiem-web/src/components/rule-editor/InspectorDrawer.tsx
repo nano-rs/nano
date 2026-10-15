@@ -2,12 +2,15 @@
 
 // NAN-484 PR 3 — right-side Inspector drawer.
 //
-// Collapsed: 40px icon rail (expand + AI / Tests / Docs entry buttons).
+// Collapsed: 40px icon rail (expand + pivt / Cases / Versions entry buttons).
 // Expanded: 360px panel with tab header + one of:
-//   • AI      — AiTriageHintsEditor + RulePlaybookSelector + LinkedPlaybooksPreview
-//   • Tests   — fires `POST /api/rules/:id/test` (or /api/rules/test for unsaved),
-//               shows sample matched events + re-run
-//   • Docs    — MITRE tactic/technique links + reference URL + related rules
+//   • pivt     — Hints / Playbook sub-views (AiTriageHintsEditor,
+//                RulePlaybookSelector + LinkedPlaybooksPreview)
+//   • Cases    — InspectorCasesTab (case visibility + default queue)
+//   • Versions — InspectorVersionsTab (history, inline diff, revert)
+//
+// NAN-3023: styling follows the "Rules pivt Panel" handoff mapped onto the app
+// type scale; shared pieces live in ./InspectorPrimitives.
 //
 // Mirrors `design-ref/shadcn/editor-inspector.jsx` structure but composes the
 // existing AiTriageHintsEditor, RulePlaybookSelector, and LinkedPlaybooksPreview
@@ -30,6 +33,7 @@ import { RulePlaybookSelector, type PlaybookSelectorMode } from '@/enterprise/co
 import { LinkedPlaybooksPreview } from '@/enterprise/components/detection/editor/LinkedPlaybooksPreview';
 import { InspectorCasesTab } from '@/enterprise/components/rule-editor/InspectorCasesTab';
 import { InspectorVersionsTab } from './InspectorVersionsTab';
+import { CountBadge, HelperText } from './InspectorPrimitives';
 
 type TabId = 'ai' | 'cases' | 'versions';
 
@@ -87,24 +91,22 @@ interface InspectorDrawerProps {
 function TabButton({
   active,
   onClick,
-  icon,
   label,
 }: {
   active: boolean;
   onClick: () => void;
-  icon: React.ReactNode;
   label: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      aria-pressed={active}
       className={cn(
-        'flex-1 inline-flex items-center justify-center gap-1.5 h-8 text-[10.5px] font-mono font-semibold uppercase tracking-[0.1em] border-b-2 transition-colors',
-        active ? 'border-[var(--primary)] text-[var(--primary)]' : 'border-transparent text-muted-foreground hover:text-foreground',
+        'flex-1 h-7 inline-flex items-center justify-center rounded-[4px] text-[10.5px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors',
+        active ? 'bg-foreground/[0.07] text-foreground' : 'text-muted-foreground hover:text-foreground',
       )}
     >
-      {icon}
       {label}
     </button>
   );
@@ -149,7 +151,7 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
           aria-label="Expand inspector"
           className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center disabled:opacity-40"
         >
-          <PanelRight className="w-4 h-4" strokeWidth={1.75} />
+          <PanelRight className="w-4 h-4" strokeWidth={1.5} />
         </button>
         <div className="h-px w-6 bg-border my-1" />
         {showAiTab && (
@@ -179,7 +181,7 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
             title="Case permissions"
             className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center disabled:opacity-40"
           >
-            <Shield className="w-4 h-4" strokeWidth={1.75} />
+            <Shield className="w-4 h-4" strokeWidth={1.5} />
           </button>
         )}
         <button
@@ -193,7 +195,7 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
           title="Version history"
           className="h-8 w-8 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center disabled:opacity-40"
         >
-          <History className="w-4 h-4" strokeWidth={1.75} />
+          <History className="w-4 h-4" strokeWidth={1.5} />
         </button>
       </aside>
     );
@@ -201,23 +203,17 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
 
   return (
     <aside className="w-[360px] bg-[var(--panel)] border-l border-border flex flex-col shrink-0 min-h-0">
-      <div className="h-10 border-b border-border flex items-center px-2 shrink-0">
-        <div className="flex-1 flex items-center gap-0">
-          {showAiTab && (
-            <TabButton active={tab === 'ai'} onClick={() => setTab('ai')} icon={<PivtIcon className="w-3 h-3" />} label="pivt" />
-          )}
-          {showCasesTab && (
-            <TabButton active={tab === 'cases'} onClick={() => setTab('cases')} icon={<Shield className="w-3 h-3" strokeWidth={1.75} />} label="Cases" />
-          )}
-          <TabButton active={tab === 'versions'} onClick={() => setTab('versions')} icon={<History className="w-3 h-3" strokeWidth={1.75} />} label="Versions" />
-        </div>
+      <div className="h-10 border-b border-border flex items-center gap-0.5 px-1.5 shrink-0">
+        {showAiTab && <TabButton active={tab === 'ai'} onClick={() => setTab('ai')} label="pivt" />}
+        {showCasesTab && <TabButton active={tab === 'cases'} onClick={() => setTab('cases')} label="Cases" />}
+        <TabButton active={tab === 'versions'} onClick={() => setTab('versions')} label="Versions" />
         <button
           type="button"
           onClick={onToggle}
           aria-label="Collapse inspector"
-          className="h-7 w-7 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center ml-1"
+          className="h-7 w-7 shrink-0 rounded hover:bg-[color-mix(in_srgb,var(--foreground)_5%,transparent)] text-muted-foreground hover:text-foreground inline-flex items-center justify-center ml-0.5"
         >
-          <ChevronRight className="w-3.5 h-3.5" strokeWidth={1.75} />
+          <ChevronRight className="w-3.5 h-3.5" strokeWidth={1.5} />
         </button>
       </div>
 
@@ -247,6 +243,51 @@ export function InspectorDrawer(props: InspectorDrawerProps) {
   );
 }
 
+type PivtSubTab = 'hints' | 'playbook';
+
+const PLAYBOOK_MODE_SHORT: Record<PlaybookSelectorMode, string> = {
+  none: 'None',
+  specific: 'Specific',
+  adaptive: 'Adaptive',
+};
+
+function hintCount(hints: AiTriageHints): number {
+  return (
+    (hints.ignore_when?.length ?? 0) +
+    (hints.suspicious_when?.length ?? 0) +
+    (hints.context?.trim() ? 1 : 0)
+  );
+}
+
+function SubTabButton({
+  active,
+  onClick,
+  label,
+  badge,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+  badge: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        'h-8 -mb-px inline-flex items-center gap-1.5 border-b-2 text-[12px] font-medium transition-colors',
+        active
+          ? 'border-ai-muted text-foreground'
+          : 'border-transparent text-muted-foreground hover:text-foreground',
+      )}
+    >
+      {label}
+      <CountBadge>{badge}</CountBadge>
+    </button>
+  );
+}
+
 function AiTab({
   hints,
   onHintsChange,
@@ -261,50 +302,54 @@ function AiTab({
 }: InspectorDrawerProps) {
   const { capabilities } = useCapabilities();
   const showPlaybooks = capabilities.playbooks;
+  const [sub, setSub] = useState<PivtSubTab>('hints');
+  // NAN-2356: playbooks are a SEPARATE capability from meloD. The tab is shown
+  // on `melod`, so the Playbook sub-view is gated on its own capability.
+  const activeSub: PivtSubTab = showPlaybooks ? sub : 'hints';
 
   return (
-    <ScrollArea className="flex-1 min-h-0">
-      <div className="p-3 space-y-4">
-        <div>
-          <div className="text-[10px] font-mono uppercase tracking-[0.12em] font-semibold text-muted-foreground mb-2">
-            pivt Triage Guidance
-          </div>
-          <div className="text-[11px] text-muted-foreground leading-relaxed mb-3">
-            Guide pivt when it investigates alerts from this rule. Hints help reach a confident verdict faster.
-          </div>
-          <AiTriageHintsEditor
-            hints={hints}
-            onChange={onHintsChange}
-            ruleMetadata={ruleMeta}
-            melodConnected={melodConnected}
-          />
-        </div>
-
-        {/* NAN-2356: playbooks are a SEPARATE capability from meloD. The tab is
-            shown on `melod`, so without this the section would render its header
-            and two null components the day the two are licensed independently. */}
+    <>
+      <div className="flex items-center gap-4 px-3 border-b border-border shrink-0">
+        <SubTabButton
+          active={activeSub === 'hints'}
+          onClick={() => setSub('hints')}
+          label="Hints"
+          badge={hintCount(hints)}
+        />
         {showPlaybooks && (
-        <div className="pt-4 border-t border-border">
-          <div className="text-[10px] font-mono uppercase tracking-[0.12em] font-semibold text-muted-foreground mb-2">
-            Playbook assignment
-          </div>
-          <div className="text-[11px] text-muted-foreground leading-relaxed mb-3">
-            What runs automatically when this rule fires and creates a case.
-          </div>
-          <RulePlaybookSelector
-            mode={playbookMode}
-            playbookId={playbookId}
-            onModeChange={onPlaybookModeChange}
-            onPlaybookIdChange={onPlaybookIdChange}
-            disabled={readOnly}
+          <SubTabButton
+            active={activeSub === 'playbook'}
+            onClick={() => setSub('playbook')}
+            label="Playbook"
+            badge={PLAYBOOK_MODE_SHORT[playbookMode]}
           />
-          <div className="mt-3">
-            <LinkedPlaybooksPreview ruleId={ruleId} />
-          </div>
-        </div>
         )}
       </div>
-    </ScrollArea>
+      <ScrollArea className="flex-1 min-h-0">
+        {activeSub === 'hints' ? (
+          <div className="p-3">
+            <AiTriageHintsEditor
+              hints={hints}
+              onChange={onHintsChange}
+              ruleMetadata={ruleMeta}
+              melodConnected={melodConnected}
+            />
+          </div>
+        ) : (
+          <div className="p-3 flex flex-col gap-3">
+            <HelperText>What runs when this rule opens a case.</HelperText>
+            <RulePlaybookSelector
+              mode={playbookMode}
+              playbookId={playbookId}
+              onModeChange={onPlaybookModeChange}
+              onPlaybookIdChange={onPlaybookIdChange}
+              disabled={readOnly}
+            />
+            <LinkedPlaybooksPreview ruleId={ruleId} />
+          </div>
+        )}
+      </ScrollArea>
+    </>
   );
 }
 

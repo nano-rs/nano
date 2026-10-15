@@ -19,7 +19,11 @@ fn publications_with_generation(generation: i64, ready: bool) -> (tempfile::Temp
     std::fs::create_dir_all(generation_dir.join("configs")).unwrap();
     std::fs::create_dir_all(generation_dir.join("parsers")).unwrap();
     std::fs::write(generation_dir.join("_manifest.json"), b"{\"version\":1}").unwrap();
-    std::fs::write(generation_dir.join("_checksums.sha256"), b"abc  configs/a.toml\n").unwrap();
+    std::fs::write(
+        generation_dir.join("_checksums.sha256"),
+        b"abc  configs/a.toml\n",
+    )
+    .unwrap();
     std::fs::write(generation_dir.join("configs/a.toml"), b"[x]\na = 1\n").unwrap();
     std::fs::write(generation_dir.join("parsers/p.toml"), b"[y]\nb = 2\n").unwrap();
     if ready {
@@ -58,17 +62,17 @@ async fn missing_generation_and_missing_file_are_none_not_errors() {
         .await
         .unwrap()
         .is_none());
-    assert!(read_generation_file(&publications, 47, "configs/absent.toml")
-        .await
-        .unwrap()
-        .is_none());
-    // Root that does not exist at all.
     assert!(
-        latest_ready_generation(&publications.join("nope"))
+        read_generation_file(&publications, 47, "configs/absent.toml")
             .await
             .unwrap()
             .is_none()
     );
+    // Root that does not exist at all.
+    assert!(latest_ready_generation(&publications.join("nope"))
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]

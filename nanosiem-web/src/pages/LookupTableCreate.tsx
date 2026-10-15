@@ -18,12 +18,12 @@ import {
   Check,
   CircleAlert,
   Download,
-  Loader2,
   Pencil,
   Plus,
   RotateCw,
   X,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
@@ -31,7 +31,6 @@ import {
   useAddLookupRows,
   useCreateLookupTable,
   useCreateLookupTableFromSchema,
-  useLookupTable,
   useLookupTables,
   usePreviewUpload,
   useTriggerLookupIngestion,
@@ -46,6 +45,7 @@ import type {
 import { parseValueForType } from '@/lib/lookup-utils';
 import { cn } from '@/lib/utils';
 import { Checkbox } from '@/components/ui/checkbox';
+import { firstRowIsHeader, urlFirstRowIsHeader } from '@/lib/lookup-header';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 
 
@@ -202,8 +202,9 @@ function CreateHeader({
           <input
             value={desc}
             onChange={(e) => setDesc(e.target.value)}
-            placeholder="Short description — what is this table for?"
-            className="w-full bg-transparent text-[12px] text-foreground/80 placeholder:text-muted-foreground/60 outline-none mt-0.5"
+            placeholder={isUpdate ? 'Description unchanged' : 'Short description — what is this table for?'}
+            disabled={isUpdate}
+            className="w-full bg-transparent text-[12px] text-foreground/80 placeholder:text-muted-foreground/60 outline-none mt-0.5 disabled:opacity-70"
           />
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -235,7 +236,7 @@ function CreateHeader({
                 : 'bg-foreground/10 text-muted-foreground cursor-not-allowed',
             )}
           >
-            {saving ? <Loader2 className="w-3 h-3 animate-spin" strokeWidth={2} /> : <Check className="w-3 h-3" strokeWidth={2} />}
+            {saving ? <LoadingIcon className="w-3 h-3" strokeWidth={2} /> : <Check className="w-3 h-3" strokeWidth={2} />}
             {saveLabel}
           </button>
         </div>
@@ -397,6 +398,7 @@ function ModeCardPreview({ mode }: { mode: Mode }) {
 interface UploadModeProps {
   onBack: () => void;
   onCancel: () => void;
+  onSaved?: (name: string) => void;
   initialName?: string;
   isUpdate?: boolean;
 }
@@ -409,7 +411,7 @@ function detectFormatFromFile(file: File): FileFormat | undefined {
   return undefined;
 }
 
-function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps) {
+function UploadMode({ onBack, onCancel, onSaved, initialName, isUpdate }: UploadModeProps) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { mutate: createTable } = useCreateLookupTable();
@@ -421,6 +423,7 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
 
   const [stage, setStage] = useState<'drop' | 'preview'>('drop');
   const [file, setFile] = useState<File | null>(null);
+  const [hasHeader, setHasHeader] = useState(true);
   const [name, setName] = useState(initialName ?? '');
   const [desc, setDesc] = useState('');
   const [primaryKey, setPrimaryKey] = useState('');
@@ -456,6 +459,8 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
       return;
     }
     setFile(selected);
+    const detectedHeader = firstRowIsHeader(await selected.slice(0, 4096).text());
+    setHasHeader(detectedHeader);
     if (!isUpdate && !name) {
       const inferred = selected.name
         .replace(/\.[^.]+$/, '')
@@ -463,13 +468,13 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
         .toLowerCase();
       setName(inferred);
     }
-    if (!desc) setDesc(`Imported from ${selected.name}`);
+    if (!desc && !isUpdate) setDesc(`Imported from ${selected.name}`);
     setStage('preview');
     setPreview(null);
     setPreviewError(null);
     setPreviewLoading(true);
     try {
-      const result = await previewUpload({ file: selected, format: detectFormatFromFile(selected) });
+      const result = await previewUpload({ file: selected, format: detectFormatFromFile(selected), hasHeader: detectedHeader });
       setPreview(result);
     } catch (err) {
       setPreviewError(err instanceof Error ? err.message : 'Preview failed');
@@ -498,7 +503,7 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
     handleSave();
   };
 
-  const handleSave = async () => {
+  const handleSave = async (selectedMode: 'replace' | 'append' = mode) => {
     if (!file || !name.trim()) {
       toast({ title: 'Missing information', description: 'File + name required', variant: 'destructive' });
       return;
@@ -508,11 +513,12 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
     try {
       const config: CreateLookupTableConfig = {
         name: name.trim(),
-        description: desc.trim() || undefined,
+        description: isUpdate ? undefined : desc.trim() || undefined,
         primary_key: primaryKey || undefined,
         format: detectFormatFromFile(file),
-        mode,
+        mode: isUpdate ? 'replace' : selectedMode,
         flatten_json: flattenJson,
+        has_header: hasHeader,
         column_types: Object.entries(columnTypes).map(([column, data_type]) => ({ column, data_type })),
       };
       const result = await createTable({ file, config });
@@ -529,7 +535,7 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
         title: isUpdate ? 'Data replaced' : 'Lookup table created',
         description: baseDesc + renameDesc,
       });
-      navigate(`/rules/lookup-tables/${encodeURIComponent(result.table.name)}`);
+      if (onSaved) onSaved(result.table.name); else navigate(`/rules/lookup-tables/${encodeURIComponent(result.table.name)}`);
     } catch (err) {
       toast({
         title: isUpdate ? 'Failed to replace data' : 'Failed to create table',
@@ -706,8 +712,24 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
                   className="h-[30px] rounded-md border border-border bg-background px-2 text-[12px] text-foreground outline-none focus:border-primary/50 font-mono"
                 >
                   <option value="append">append (add to existing)</option>
-                  <option value="replace">replace (drop existing)</option>
+                  <option value="replace">replace existing data</option>
                 </select>
+              </label>
+              <label className="flex items-center gap-2 col-span-full cursor-pointer">
+                <Checkbox
+                  checked={hasHeader}
+                  onCheckedChange={async (value) => {
+                    const next = Boolean(value);
+                    setHasHeader(next);
+                    if (!file) return;
+                    setPreviewLoading(true);
+                    setPreviewError(null);
+                    try { setPreview(await previewUpload({ file, format: detectFormatFromFile(file), hasHeader: next })); }
+                    catch (err) { setPreviewError(err instanceof Error ? err.message : 'Preview failed'); }
+                    finally { setPreviewLoading(false); }
+                  }}
+                />
+                <span className="text-[12px] text-foreground">First row is header</span>
               </label>
               <label className="flex items-center gap-2 col-span-full cursor-pointer">
                 <Checkbox
@@ -779,7 +801,7 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
           onClick={() => {
             setMode('replace');
             setCollisionConfirmOpen(false);
-            handleSave();
+            handleSave('replace');
           }}
           className="h-[36px] px-3 rounded-md border border-[color-mix(in_srgb,var(--warning)_30%,transparent)] bg-[color-mix(in_srgb,var(--warning)_10%,transparent)] text-[var(--warning)] text-[12px] font-mono hover:brightness-110"
         >
@@ -860,7 +882,7 @@ function DataPreview({
   if (loading) {
     return (
       <div className="rounded-md border border-border bg-card p-4 flex items-center gap-2 text-[11.5px] font-mono text-muted-foreground">
-        <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={2} />
+        <LoadingIcon className="w-3.5 h-3.5" strokeWidth={2} />
         parsing file…
       </div>
     );
@@ -948,7 +970,7 @@ function makeEmptyRows(colCount: number, rowCount: number): string[][] {
   return Array.from({ length: rowCount }, () => Array(colCount).fill(''));
 }
 
-function DefineMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => void }) {
+function DefineMode({ onBack, onCancel, onSaved }: { onBack: () => void; onCancel: () => void; onSaved?: (name: string) => void }) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { mutate: createFromSchema } = useCreateLookupTableFromSchema();
@@ -1070,7 +1092,7 @@ function DefineMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => 
         title: 'Lookup table created',
         description: `${validCols.length} columns${inserted > 0 ? ` · ${inserted} rows` : ''}`,
       });
-      navigate(`/rules/lookup-tables/${encodeURIComponent(result.name)}`);
+      if (onSaved) onSaved(result.name); else navigate(`/rules/lookup-tables/${encodeURIComponent(result.name)}`);
     } catch (err) {
       toast({
         title: 'Failed to create table',
@@ -1259,7 +1281,7 @@ function DefineMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => 
 // URL mode
 // --------------------------------------------------------------------
 
-function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => void }) {
+function UrlMode({ onBack, onCancel, onSaved }: { onBack: () => void; onCancel: () => void; onSaved?: (name: string) => void }) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { mutate: createFromSchema } = useCreateLookupTableFromSchema();
@@ -1269,6 +1291,8 @@ function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => voi
   const [name, setName] = useState('');
   const [desc, setDesc] = useState('');
   const [url, setUrl] = useState('');
+  const [hasHeader, setHasHeader] = useState(true);
+  const [headerEdited, setHeaderEdited] = useState(false);
   const [format, setFormat] = useState<'csv' | 'tsv' | 'json' | 'ndjson'>('csv');
   const [cron, setCron] = useState('0 0 * * *');
   const [mode, setMode] = useState<'replace' | 'append'>('replace');
@@ -1289,7 +1313,7 @@ function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => voi
       const ingestionReq: UpsertLookupIngestionRequest = {
         url,
         cron_expression: cron,
-        parser_config: { format, csv_has_headers: true },
+        parser_config: { format: format === 'tsv' ? 'csv' : format, csv_delimiter: format === 'tsv' ? '\t' : undefined, has_header: headerEdited ? hasHeader : undefined },
         mode,
         enabled,
       };
@@ -1308,7 +1332,7 @@ function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => voi
       } catch {
         toast({ title: 'Created · first fetch failed', description: 'Will run on schedule' });
       }
-      navigate(`/rules/lookup-tables/${encodeURIComponent(name.trim())}`);
+      if (onSaved) onSaved(name.trim()); else navigate(`/rules/lookup-tables/${encodeURIComponent(name.trim())}`);
     } catch (err) {
       toast({
         title: 'Failed to create table',
@@ -1347,7 +1371,10 @@ function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => voi
                 <ArrowUpRight className="w-3 h-3 absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--success)]" strokeWidth={2} />
                 <input
                   value={url}
-                  onChange={(e) => setUrl(e.target.value)}
+                  onChange={(e) => {
+                    setUrl(e.target.value);
+                    if (!headerEdited) setHasHeader(urlFirstRowIsHeader(e.target.value));
+                  }}
                   placeholder="https://intel.example.com/feeds/ips.csv"
                   className="w-full h-[32px] pl-8 pr-3 rounded-md border border-border bg-background text-[12px] text-foreground placeholder:text-muted-foreground/60 outline-none focus:border-primary/50 font-mono"
                 />
@@ -1374,6 +1401,11 @@ function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => voi
               <span className="text-muted-foreground">tip:</span> we'll GET this URL now and on the schedule below.
             </div>
           </div>
+
+          <label className="flex items-center gap-2 text-[11px] text-foreground cursor-pointer">
+            <Checkbox checked={hasHeader} onCheckedChange={(value) => { setHasHeader(Boolean(value)); setHeaderEdited(true); }} />
+            First row is header
+          </label>
 
           {/* Schedule */}
           <div className="rounded-md border border-border bg-card p-4">
@@ -1438,17 +1470,16 @@ function UrlMode({ onBack, onCancel }: { onBack: () => void; onCancel: () => voi
 // Main page
 // --------------------------------------------------------------------
 
-export function LookupTableCreate() {
+export function LookupTableCreate({ tableName, onClose, onSaved }: {
+  tableName?: string; onClose?: () => void; onSaved?: (name: string) => void;
+} = {}) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const updateName = searchParams.get('update');
+  const updateName = tableName ?? (onClose ? null : searchParams.get('update'));
   const isUpdate = !!updateName;
 
-  const { data: existingTable } = useLookupTable(updateName ?? undefined);
-
   // In update mode (replace data) we skip the picker entirely — the only
-  // sensible flow is upload, and the existing table's name + desc seed the
-  // form.
+  // sensible flow is upload, and the route's table name seeds the form.
   const [mode, setMode] = useState<Mode | null>(isUpdate ? 'upload' : null);
   useEffect(() => {
     if (isUpdate && mode === null) setMode('upload');
@@ -1456,7 +1487,7 @@ export function LookupTableCreate() {
 
   useDocumentTitle(isUpdate ? `Replace data · ${updateName}` : 'New lookup table');
 
-  const onCancel = () => navigate('/rules/lookup-tables');
+  const onCancel = () => { if (onClose) onClose(); else navigate('/rules/lookup-tables'); };
   const onBack = () => setMode(null);
 
   if (mode === null) {
@@ -1479,12 +1510,13 @@ export function LookupTableCreate() {
         <UploadMode
           onBack={onBack}
           onCancel={onCancel}
-          initialName={isUpdate ? existingTable?.name : undefined}
+          onSaved={onSaved}
+          initialName={updateName ?? undefined}
           isUpdate={isUpdate}
         />
       )}
-      {mode === 'define' && <DefineMode onBack={onBack} onCancel={onCancel} />}
-      {mode === 'url' && <UrlMode onBack={onBack} onCancel={onCancel} />}
+      {mode === 'define' && <DefineMode onBack={onBack} onCancel={onCancel} onSaved={onSaved} />}
+      {mode === 'url' && <UrlMode onBack={onBack} onCancel={onCancel} onSaved={onSaved} />}
     </div>
   );
 }

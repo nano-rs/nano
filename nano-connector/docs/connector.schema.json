@@ -1,0 +1,1480 @@
+{
+  "$defs": {
+    "AllowRule": {
+      "additionalProperties": false,
+      "description": "One allowed destination. `host` and `host_suffix` are mutually exclusive.",
+      "properties": {
+        "host": {
+          "default": null,
+          "description": "Exact host name. May be a single `{{config.X}}` reference (for\nper-tenant hosts such as an Okta org); the resolved value must then\nalso end with one of `host_suffixes`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host_suffixes": {
+          "default": [],
+          "description": "Suffixes a `{{config.X}}` host must end with, e.g. `.okta.com`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path_prefixes": {
+          "default": [],
+          "description": "Path prefixes, matched on whole segments. Default: `/` (any path).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "AuthConfig": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "No authentication",
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "NoParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Authorization: Bearer <credential>",
+          "properties": {
+            "credential": {
+              "description": "Credential field holding the secret.",
+              "type": "string"
+            },
+            "type": {
+              "const": "bearer"
+            }
+          },
+          "required": [
+            "credential",
+            "type"
+          ],
+          "title": "CredParam",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Okta API token: Authorization: SSWS <credential>",
+          "properties": {
+            "credential": {
+              "description": "Credential field holding the secret.",
+              "type": "string"
+            },
+            "type": {
+              "const": "okta_ssws"
+            }
+          },
+          "required": [
+            "credential",
+            "type"
+          ],
+          "title": "CredParam",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "<header>: [prefix]<credential>",
+          "properties": {
+            "credential": {
+              "type": "string"
+            },
+            "header": {
+              "type": "string"
+            },
+            "optional": {
+              "default": false,
+              "description": "Send the header only when the credential is set (keyless public tier).",
+              "type": "boolean"
+            },
+            "prefix": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "api_key_header"
+            }
+          },
+          "required": [
+            "header",
+            "credential",
+            "type"
+          ],
+          "title": "ApiKeyHeaderParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "?<param>=<credential>, applied by the engine",
+          "properties": {
+            "credential": {
+              "type": "string"
+            },
+            "param": {
+              "type": "string"
+            },
+            "type": {
+              "const": "api_key_query"
+            }
+          },
+          "required": [
+            "param",
+            "credential",
+            "type"
+          ],
+          "title": "ApiKeyQueryParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Authorization: Basic base64(user:password)",
+          "properties": {
+            "password_credential": {
+              "type": "string"
+            },
+            "type": {
+              "const": "basic"
+            },
+            "username_credential": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "username_credential",
+            "password_credential",
+            "type"
+          ],
+          "title": "BasicParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "RFC 6749 client credentials, cached, refreshed on 401",
+          "properties": {
+            "client_id": {
+              "default": null,
+              "description": "The client id itself, not a secret; may template `config.*` (for\nexample `{{config.CLIENT_ID}}`). Exactly one of this and\n`client_id_credential`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "client_id_credential": {
+              "default": null,
+              "description": "Credential field holding the client id. Exactly one of this and\n`client_id`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "client_secret_credential": {
+              "type": "string"
+            },
+            "scope": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token_url": {
+              "description": "The token endpoint; may template `config.*` (for example\n`https://login.microsoftonline.com/{{config.DIRECTORY_ID}}/oauth2/v2.0/token`).\nThe rendered URL must be in the spec allowlist.",
+              "type": "string"
+            },
+            "type": {
+              "const": "oauth2_client_credentials"
+            }
+          },
+          "required": [
+            "token_url",
+            "client_secret_credential",
+            "type"
+          ],
+          "title": "OAuth2Params",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Google service account JWT (RFC 7523, RS256), cached, refreshed on 401",
+          "properties": {
+            "client_email_credential": {
+              "type": "string"
+            },
+            "private_key_credential": {
+              "type": "string"
+            },
+            "scope": {
+              "type": "string"
+            },
+            "subject": {
+              "default": null,
+              "description": "Domain-wide delegation subject; a template such as `{{config.ADMIN_EMAIL}}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token_url": {
+              "type": "string"
+            },
+            "type": {
+              "const": "google_service_account"
+            }
+          },
+          "required": [
+            "token_url",
+            "private_key_credential",
+            "client_email_credential",
+            "scope",
+            "type"
+          ],
+          "title": "GoogleSaParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Keyless Google domain-wide delegation: the platform pull broker signs the assertion for the tenant's own service account (hosted only), cached, refreshed on 401",
+          "properties": {
+            "scope": {
+              "description": "The OAuth scope(s) requested, space-separated (the broker allowlists\neach).",
+              "type": "string"
+            },
+            "subject": {
+              "description": "The admin user to impersonate; a template such as `{{config.ADMIN_EMAIL}}`.",
+              "type": "string"
+            },
+            "token_url": {
+              "description": "Google's token endpoint (`https://oauth2.googleapis.com/token`); must\nbe in the spec allowlist.",
+              "type": "string"
+            },
+            "type": {
+              "const": "google_dwd_broker"
+            }
+          },
+          "required": [
+            "token_url",
+            "scope",
+            "subject",
+            "type"
+          ],
+          "title": "GoogleDwdBrokerParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Keyless Microsoft Entra (Graph): the platform pull broker mints a Graph access token for the tenant's app registration with nano's federated identity credential (hosted only), cached, refreshed on 401",
+          "properties": {
+            "client_id": {
+              "description": "The tenant's app registration (client) id that trusts nano's\nfederated credential, a GUID; a template such as `{{config.CLIENT_ID}}`.",
+              "type": "string"
+            },
+            "directory_id": {
+              "description": "The tenant's Entra directory (tenant) id, a GUID; a template such as\n`{{config.DIRECTORY_ID}}`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "entra_fic_broker"
+            }
+          },
+          "required": [
+            "directory_id",
+            "client_id",
+            "type"
+          ],
+          "title": "EntraFicBrokerParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Keyless Okta (API Services app, private_key_jwt): the platform pull broker signs the client assertion with the tenant's broker-held key; the runner trades it for an access token (hosted only), cached, refreshed on 401",
+          "properties": {
+            "client_id": {
+              "description": "The API Services app's client id; a template such as `{{config.CLIENT_ID}}`.",
+              "type": "string"
+            },
+            "okta_domain": {
+              "description": "The Okta org host (`acme.okta.com`); a template such as\n`{{config.OKTA_DOMAIN}}`. The token endpoint is\n`https://<okta_domain>/oauth2/v1/token` and must be in the allowlist.",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Okta scopes, space-separated (`okta.users.read okta.groups.read`).",
+              "type": "string"
+            },
+            "type": {
+              "const": "okta_broker_jwt"
+            }
+          },
+          "required": [
+            "okta_domain",
+            "client_id",
+            "scope",
+            "type"
+          ],
+          "title": "OktaBrokerJwtParams",
+          "type": "object"
+        },
+        {
+          "$defs": {
+            "HmacAlg": {
+              "enum": [
+                "sha256",
+                "sha512"
+              ],
+              "type": "string"
+            },
+            "SigEncoding": {
+              "enum": [
+                "hex",
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "description": "HMAC request signature over method/path/timestamp/body",
+          "properties": {
+            "algorithm": {
+              "$ref": "#/$defs/HmacAlg"
+            },
+            "credential": {
+              "type": "string"
+            },
+            "encoding": {
+              "$ref": "#/$defs/SigEncoding"
+            },
+            "header": {
+              "type": "string"
+            },
+            "key_id_credential": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "key_id_header": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Uses `{method}`, `{path}` (path and query), `{timestamp}` (epoch s), `{body}`.",
+              "type": "string"
+            },
+            "prefix": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "timestamp_header": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "hmac"
+            }
+          },
+          "required": [
+            "credential",
+            "header",
+            "message",
+            "type"
+          ],
+          "title": "HmacParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "AWS Signature Version 4",
+          "properties": {
+            "access_key_credential": {
+              "type": "string"
+            },
+            "region": {
+              "type": "string"
+            },
+            "secret_key_credential": {
+              "type": "string"
+            },
+            "service": {
+              "type": "string"
+            },
+            "session_token_credential": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "aws_sigv4"
+            }
+          },
+          "required": [
+            "region",
+            "service",
+            "access_key_credential",
+            "secret_key_credential",
+            "type"
+          ],
+          "title": "SigV4Params",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "TLS client certificate (PEM cert + key credentials), optional bearer",
+          "properties": {
+            "bearer_credential": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cert_credential": {
+              "type": "string"
+            },
+            "key_credential": {
+              "type": "string"
+            },
+            "type": {
+              "const": "mtls"
+            }
+          },
+          "required": [
+            "cert_credential",
+            "key_credential",
+            "type"
+          ],
+          "title": "MtlsParams",
+          "type": "object"
+        }
+      ]
+    },
+    "Body": {
+      "additionalProperties": false,
+      "description": "Request body: set exactly one of `form` or `json`.",
+      "properties": {
+        "form": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "`application/x-www-form-urlencoded`; values are templates.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "json": {
+          "default": null,
+          "description": "`application/json`; string leaves are templates."
+        }
+      },
+      "type": "object"
+    },
+    "CursorReduce": {
+      "enum": [
+        "max",
+        "last"
+      ],
+      "type": "string"
+    },
+    "CursorSpec": {
+      "additionalProperties": false,
+      "description": "Declarative cursor: `state[state_key] = <reduce>(event[field])` after\neach acknowledged page.",
+      "properties": {
+        "field": {
+          "type": "string"
+        },
+        "reduce": {
+          "$ref": "#/$defs/CursorReduce",
+          "default": "max"
+        },
+        "state_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state_key",
+        "field"
+      ],
+      "type": "object"
+    },
+    "Discover": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A fixed list.",
+          "properties": {
+            "from": {
+              "const": "static",
+              "type": "string"
+            },
+            "items": {
+              "items": true,
+              "type": "array"
+            }
+          },
+          "required": [
+            "from",
+            "items"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A comma-separated config field (e.g. the enabled applications).",
+          "properties": {
+            "from": {
+              "const": "config",
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A list request, paged like a stream; its events are the items.",
+          "properties": {
+            "from": {
+              "const": "request",
+              "type": "string"
+            },
+            "pagination": {
+              "$ref": "#/$defs/PaginationConfig",
+              "default": {
+                "type": "none"
+              }
+            },
+            "request": {
+              "$ref": "#/$defs/RequestTemplate"
+            },
+            "response": {
+              "$ref": "#/$defs/ResponseSpec",
+              "default": {
+                "events_path": "",
+                "format": "json"
+              }
+            }
+          },
+          "required": [
+            "from",
+            "request"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Fanout": {
+      "additionalProperties": false,
+      "description": "Discover items, then run the stream once per item with bounded\nconcurrency. Each item gets its own state under `state.items[<key>]`.",
+      "properties": {
+        "concurrency": {
+          "default": 4,
+          "description": "Concurrent per-item pulls (clamped to 1..=16).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "discover": {
+          "$ref": "#/$defs/Discover"
+        },
+        "item_key": {
+          "default": "",
+          "description": "Dotted path in an item that identifies it (state key). Empty = the item\nitself (strings).",
+          "type": "string"
+        },
+        "max_items": {
+          "default": 1000,
+          "description": "Maximum items (clamped to the engine ceiling: 10k; 100k for identity\nmemberships, where unset means 100k and more items fail the run).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "discover"
+      ],
+      "type": "object"
+    },
+    "Format": {
+      "oneOf": [
+        {
+          "enum": [
+            "json",
+            "ndjson",
+            "text"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "lines",
+          "description": "Text body split into non-empty lines; each line is a string event.",
+          "type": "string"
+        }
+      ]
+    },
+    "IdentityConfig": {
+      "additionalProperties": false,
+      "description": "`kind: identity` settings (NAN-3503).",
+      "properties": {
+        "full_every_secs": {
+          "default": 86400,
+          "description": "Force a full run (snapshot replace) at least this often, even for\n`mode: delta` users streams. Default 86400 (one day).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "IdentityMode": {
+      "description": "How a users stream syncs.",
+      "oneOf": [
+        {
+          "const": "full",
+          "description": "Every run is a complete snapshot that replaces the feed.",
+          "type": "string"
+        },
+        {
+          "const": "delta",
+          "description": "Runs after the first full one send only changes (adds, updates,\n`deleted: true` tombstones); a full run still happens every\n`identity.full_every_secs` or when the program returns\n`restart_full: true`.",
+          "type": "string"
+        }
+      ]
+    },
+    "IdentityRole": {
+      "description": "What an identity stream's events are.",
+      "oneOf": [
+        {
+          "const": "users",
+          "description": "Canonical user rows (`external_id`, `upn`, `email`, ...).",
+          "type": "string"
+        },
+        {
+          "const": "memberships",
+          "description": "`{member, group, privileged?}` pairs, aggregated by the engine into\none row per member on the `<feed>:groups` sub-feed. Always full.",
+          "type": "string"
+        }
+      ]
+    },
+    "IngestId": {
+      "additionalProperties": false,
+      "description": "`_nano_ingest_id` = the listed dotted paths, joined with `:`. An event\nmissing any of them gets a content hash (`h:<sha256>`) instead. Include a\nversion field (`lastUpdated`) when the vendor re-serves a changed record\nunder the same id: lake dedupe keeps the FIRST row per `metadata.uid` and\ndrops later ones even when their content differs.",
+      "properties": {
+        "fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "fields"
+      ],
+      "type": "object"
+    },
+    "Kind": {
+      "oneOf": [
+        {
+          "const": "agent_enrichment",
+          "description": "Per-artifact lookup (`input.artifact`, `input.artifact_type`); the\nfirst event is the enrichment result.",
+          "type": "string"
+        },
+        {
+          "const": "data_enrichment",
+          "description": "Scheduled feed pull; events are the records, `state.watermark` the\nwatermark.",
+          "type": "string"
+        },
+        {
+          "const": "collector",
+          "description": "Streaming pull into the tenant's ingest, checkpointed per stream.",
+          "type": "string"
+        },
+        {
+          "const": "identity",
+          "description": "Directory sync (users, group memberships) into the tenant's identity\ndirectory through its enrichment coordinator. No ingest, no parser.",
+          "type": "string"
+        }
+      ]
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "description": "Host-enforced caps. The engine clamps every value to its own ceiling.",
+      "properties": {
+        "max_checkpoint_bytes": {
+          "default": 4194304,
+          "description": "Largest checkpoint (program state, window bookkeeping, seen uids)\nthe engine will persist, in bytes of JSON.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_decompressed_bytes": {
+          "default": 67108864,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_event_bytes": {
+          "default": 268435456,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events": {
+          "default": 1000000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_identity_memberships": {
+          "default": 5000000,
+          "description": "`kind: identity`: most (member, group) pairs one run may aggregate.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_pages": {
+          "default": 500,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_redirects": {
+          "default": 5,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_requests": {
+          "default": 2000,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_response_bytes": {
+          "default": 33554432,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_run_secs": {
+          "default": 600,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vrl_timeout_ms": {
+          "default": 2000,
+          "description": "Per-invocation VRL budget (wall ms, enforced on an isolated worker).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Method": {
+      "enum": [
+        "GET",
+        "POST"
+      ],
+      "type": "string"
+    },
+    "PaginationConfig": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One page",
+          "properties": {
+            "type": {
+              "const": "none"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "Empty",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Follow Link: <...>; rel=\"next\" (policy-checked)",
+          "properties": {
+            "type": {
+              "const": "link_header"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "Empty",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Follow an absolute next-page URL from the body at a JSON pointer (e.g. /@odata.nextLink; policy-checked)",
+          "properties": {
+            "pointer": {
+              "description": "RFC 6901 JSON pointer to the next-page URL in the response body\n(`/@odata.nextLink`, `/links/next/href`). Absent, null or empty =\nlast page.",
+              "type": "string"
+            },
+            "type": {
+              "const": "next_url"
+            }
+          },
+          "required": [
+            "pointer",
+            "type"
+          ],
+          "title": "NextUrlParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Next cursor from a body field, sent as a query parameter",
+          "properties": {
+            "from": {
+              "description": "Dotted path of the next cursor in the response body.",
+              "type": "string"
+            },
+            "param": {
+              "description": "Query parameter that carries it.",
+              "type": "string"
+            },
+            "type": {
+              "const": "cursor"
+            }
+          },
+          "required": [
+            "from",
+            "param",
+            "type"
+          ],
+          "title": "CursorParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Page token from a body field, sent as a query parameter",
+          "properties": {
+            "from": {
+              "description": "Dotted path of the next cursor in the response body.",
+              "type": "string"
+            },
+            "param": {
+              "description": "Query parameter that carries it.",
+              "type": "string"
+            },
+            "type": {
+              "const": "token"
+            }
+          },
+          "required": [
+            "from",
+            "param",
+            "type"
+          ],
+          "title": "CursorParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "offset/limit; stops on a short page; max_offset triggers window narrowing",
+          "properties": {
+            "limit_param": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "max_offset": {
+              "default": null,
+              "description": "The API's largest accepted offset. Reaching it with full pages makes\nthe engine narrow the time window instead of failing.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "page_size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "param": {
+              "type": "string"
+            },
+            "type": {
+              "const": "offset"
+            }
+          },
+          "required": [
+            "param",
+            "page_size",
+            "type"
+          ],
+          "title": "OffsetParams",
+          "type": "object"
+        }
+      ]
+    },
+    "RateLimit": {
+      "additionalProperties": false,
+      "description": "Engine-owned rate limiting and retry.",
+      "properties": {
+        "backoff_ms": {
+          "default": 5000,
+          "description": "Backoff base: 5xx waits this times the attempt number; a 429 without\n`Retry-After` waits this doubled per attempt, capped at `max_wait_ms`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_retries_429": {
+          "default": 5,
+          "description": "Retries on 429 before the run fails.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_retries_5xx": {
+          "default": 3,
+          "description": "Retries on 5xx / connection errors before the run fails.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_wait_ms": {
+          "default": 120000,
+          "description": "Longest single wait the engine will accept from the server.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_interval_ms": {
+          "default": 0,
+          "description": "Minimum spacing between requests across the whole run (fan-out\nincluded).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_floor": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remaining_header": {
+          "default": null,
+          "description": "Header holding the remaining quota; when it drops to\n`remaining_floor` the engine pauses until the reset.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reset_header": {
+          "default": null,
+          "description": "Header holding a reset time in epoch seconds (e.g.\n`x-rate-limit-reset`). `retry-after` is always honored.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RequestTemplate": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Body"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Static headers. Values may use `{{config.X}}` only. Auth headers and\nhop-by-hop headers are refused.",
+          "type": "object"
+        },
+        "method": {
+          "$ref": "#/$defs/Method",
+          "default": "GET"
+        },
+        "query": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Query parameters. Values are templates; empty results are omitted.",
+          "type": "object"
+        },
+        "url": {
+          "description": "Absolute `https://` URL. Templates in the path are percent-encoded as\none segment; a template may form the whole host only as\n`{{config.X}}`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "ResponseSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "events_path": {
+          "default": "",
+          "description": "Dotted path to the event array in the body. Empty = the body itself.",
+          "type": "string"
+        },
+        "format": {
+          "$ref": "#/$defs/Format",
+          "default": "json"
+        }
+      },
+      "type": "object"
+    },
+    "RestartOn": {
+      "additionalProperties": false,
+      "description": "Which responses mean \"the page token expired\".",
+      "properties": {
+        "body_contains": {
+          "default": null,
+          "description": "Optional substring the body must contain as well.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_restarts": {
+          "default": 3,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "RetryRewrite": {
+      "additionalProperties": false,
+      "description": "On a retry, replace query parameter `param` when it currently equals\n`from` with `to`.",
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "param": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "param",
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "Stream": {
+      "additionalProperties": false,
+      "description": "One stream of events (one `source_type` in ingest).",
+      "properties": {
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CursorSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Declarative cursor, used when there is no `program`."
+        },
+        "fanout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Fanout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Discover-then-collect: run this stream once per discovered item."
+        },
+        "id": {
+          "type": "string"
+        },
+        "identity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StreamIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`kind: identity` only: the stream's role (`users` or `memberships`)."
+        },
+        "ingest_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IngestId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Which event fields make up `_nano_ingest_id` (default: the window's\n`uid_field`). The engine stamps it on every emitted event. It is an\ningest-side identity only: production Vector and the lake do not read\nit today, and lake dedupe keys on the parser's `metadata.uid`."
+        },
+        "initial_state": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "Initial state for a first run (no saved checkpoint). Values are\ntemplates (`{{config.X}}`, `{{initial_cursor}}`, `{{now}}`).",
+          "type": "object"
+        },
+        "pagination": {
+          "$ref": "#/$defs/PaginationConfig",
+          "default": {
+            "type": "none"
+          }
+        },
+        "program": {
+          "default": null,
+          "description": "Optional VRL. Input `.` is `{state, response, request, config, input,\nitem, now}`; it must evaluate to `{events, next_request, state}` and\nmay set `error` to fail the run with a message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestTemplate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The first request. Optional only when `program` is set: the program is\nthen called once with `response: null` and must return the first\n`next_request`."
+        },
+        "response": {
+          "$ref": "#/$defs/ResponseSpec",
+          "default": {
+            "events_path": "",
+            "format": "json"
+          }
+        },
+        "restart_window_on": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RestartOn"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Restart the current window (deduped by uid) when a page token expires."
+        },
+        "retry_rewrite": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RetryRewrite"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Rewrite one query parameter when a request is retried after a 5xx or a\nconnection failure. For server-side iterators that may have advanced\nbefore the failure (Netskope: `operation=next` becomes `resend`)."
+        },
+        "source_type": {
+          "default": null,
+          "description": "`X-Source-Type` for ingest. May use `{{item.X}}` under fan-out.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WindowSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Time-window stepping for APIs without a usable cursor."
+        },
+        "write_ahead_state": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Before each request, commit this state patch (write-ahead). Needed by\nserver-side iterators that advance when a page is *served* (Netskope):\nthe patch records \"resend\" until the page is acknowledged.",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "StreamIdentity": {
+      "additionalProperties": false,
+      "description": "Per-stream identity role (`kind: identity` only).",
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdentityMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Users streams only; memberships are always full."
+        },
+        "role": {
+          "$ref": "#/$defs/IdentityRole"
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "type": "object"
+    },
+    "TimeFormat": {
+      "enum": [
+        "rfc3339",
+        "epoch_secs",
+        "epoch_millis"
+      ],
+      "type": "string"
+    },
+    "WindowSpec": {
+      "additionalProperties": false,
+      "description": "Step through `[start, end)` windows. Request templates read\n`{{window.start}}` and `{{window.end}}`. Each window is paged with the\nstream's `pagination`; when it completes and is acknowledged, the next\nwindow starts at `end - lookback`. Events in the re-read overlap are\ndropped by `uid_field`, so a restart or overlap never ships a duplicate.",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/TimeFormat",
+          "default": "rfc3339",
+          "description": "Format of `{{window.start}}` / `{{window.end}}`."
+        },
+        "initial_lookback_secs": {
+          "default": 3600,
+          "description": "Unused, kept so existing specs parse (NAN-3697). It does NOT move a\nnew stream's first window (every stream starts at activation − the\npoint-forward overlap) and does not bound a checkpoint reset (a reset\nalways re-anchors at now − the overlap).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lag_secs": {
+          "default": 0,
+          "description": "Late-arrival lag: never query past `now - lag_secs`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lookback_secs": {
+          "default": 0,
+          "description": "Re-read this much before the previous window end (late arrivals).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_backfill_secs": {
+          "description": "Reserved, unused (NAN-3697): no backfill. A tenant checkpoint reset\nalways re-anchors the stream at now − the point-forward overlap\n(5 minutes) and this value does not widen it. Kept so specs that set\nit still parse.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_seen": {
+          "default": 50000,
+          "description": "Cap on remembered uids (oldest dropped first).",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_span_secs": {
+          "default": 3600,
+          "description": "Longest window per request sequence.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "time_field": {
+          "description": "Dotted path of the event timestamp (RFC 3339, epoch s or epoch ms).",
+          "type": "string"
+        },
+        "uid_field": {
+          "description": "Dotted path of the vendor's unique event id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "time_field",
+        "uid_field"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One connector: an agent enrichment, a data enrichment, a collector or an\nidentity directory sync.",
+  "properties": {
+    "allow": {
+      "description": "Outbound policy. Every request, every `next_request` and every redirect\nhop must match one rule. Nothing else is reachable.",
+      "items": {
+        "$ref": "#/$defs/AllowRule"
+      },
+      "type": "array"
+    },
+    "auth": {
+      "$ref": "#/$defs/AuthConfig",
+      "default": {
+        "type": "none"
+      }
+    },
+    "identity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/IdentityConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`kind: identity` only: directory sync settings."
+    },
+    "kind": {
+      "$ref": "#/$defs/Kind"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "default": {
+        "max_checkpoint_bytes": 4194304,
+        "max_decompressed_bytes": 67108864,
+        "max_event_bytes": 268435456,
+        "max_events": 1000000,
+        "max_identity_memberships": 5000000,
+        "max_pages": 500,
+        "max_redirects": 5,
+        "max_requests": 2000,
+        "max_response_bytes": 33554432,
+        "max_run_secs": 600,
+        "vrl_timeout_ms": 2000
+      }
+    },
+    "name": {
+      "description": "Slug, e.g. `okta_system_log`.",
+      "type": "string"
+    },
+    "rate_limit": {
+      "$ref": "#/$defs/RateLimit",
+      "default": {
+        "backoff_ms": 5000,
+        "max_retries_429": 5,
+        "max_retries_5xx": 3,
+        "max_wait_ms": 120000,
+        "min_interval_ms": 0,
+        "remaining_floor": 0,
+        "remaining_header": null,
+        "reset_header": null
+      }
+    },
+    "schedule": {
+      "default": null,
+      "description": "Cron expression for the scheduler (informational in the PoC).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "streams": {
+      "description": "Collectors and identity: one entry per stream. Enrichments: exactly one.",
+      "items": {
+        "$ref": "#/$defs/Stream"
+      },
+      "type": "array"
+    },
+    "version": {
+      "description": "Must be 1.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "name",
+    "kind",
+    "allow",
+    "streams"
+  ],
+  "title": "ConnectorSpec",
+  "type": "object"
+}

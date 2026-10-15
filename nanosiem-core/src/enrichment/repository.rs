@@ -153,9 +153,7 @@ impl EnrichmentRepository {
     /// leader-only (advisory-lock election in `jobs`), so at most one instance
     /// runs it.
     #[instrument(skip(self))]
-    pub async fn reset_interrupted_syncs(
-        &self,
-    ) -> Result<Vec<String>, EnrichmentRepositoryError> {
+    pub async fn reset_interrupted_syncs(&self) -> Result<Vec<String>, EnrichmentRepositoryError> {
         let ids: Vec<String> = sqlx::query_scalar(
             r#"
             UPDATE enrichment_sources SET
@@ -301,6 +299,21 @@ impl EnrichmentRepository {
             sqlx::query_as("SELECT COUNT(*) FROM enrichment_sources WHERE enabled = true")
                 .fetch_one(&self.pool)
                 .await?;
+        Ok(count)
+    }
+
+    /// Count networks in enabled IP feeds from the publisher's immutable
+    /// snapshot metadata. The MMDB request path must not scan the database to
+    /// render a settings-page statistic.
+    #[instrument(skip(self))]
+    pub async fn count_enabled_ip_records(&self) -> Result<i64, EnrichmentRepositoryError> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(record_count), 0)::BIGINT \
+             FROM enrichment_sources \
+             WHERE enabled = true AND source_type = 'ipinfo_lite'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count)
     }
 }

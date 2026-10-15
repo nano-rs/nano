@@ -274,43 +274,43 @@ impl LogSourceService {
         {
             let _deploy_guard = self.vector_config.lock_deploys().await;
 
-        // Regenerate the whole tree from the surviving sources, ALWAYS.
-        //
-        // NAN-2310: this used to be gated on `was_deployed`, with the other arm
-        // just unlinking the parser file on the reasoning that a
-        // never-deployed source has no live topology referencing it. That
-        // reasoning does not survive contact with the `deployed` flag, which
-        // `update` clears whenever a deployment-affecting field changes
-        // (`repository/crud.rs`: `deployed = CASE WHEN $18 THEN false ...`).
-        //
-        // So the ordinary sequence create -> publish -> edit the VRL -> delete
-        // left `deployed = false` while `_combiner.toml` and `_router.toml`
-        // still named the source's `<name>_output`. Unlinking only the parser
-        // file produced exactly the NAN-2296 failure: a dangling input that
-        // makes the ENTIRE Vector config unloadable, so every subsequent reload
-        // is rejected and the collector is frozen on its last good config.
-        // Reproduced on a live tenant: `vector validate` failed with
-        // `Input "…_output" for transform "db_parsers_combined" doesn't match
-        // any components`, and Vector logged `reload aborted`.
-        //
-        // Regeneration is the coherent operation in both cases: for a source
-        // that was live it rewrites the combiner and router without it, and for
-        // one that never deployed it is a no-op that still prunes any stale
-        // file. There is no case where unlinking alone is more correct, so the
-        // branch is gone rather than repaired.
-        {
-            // NAN-2304 gives us the canonical effective-deployed query (it also
-            // resolves dispatch route names internally). NAN-2305's `filter` is
-            // still required and must not be dropped in a merge: the row is
-            // deleted AFTER this regeneration, inside the deploy guard, so it is
-            // still present here — regenerating without the filter would write a
-            // config that still routes the source being deleted.
-            let parsers: Vec<_> = self
-                .effective_deployed_parsers()
-                .await?
-                .into_iter()
-                .filter(|parser| parser.id != id)
-                .collect();
+            // Regenerate the whole tree from the surviving sources, ALWAYS.
+            //
+            // NAN-2310: this used to be gated on `was_deployed`, with the other arm
+            // just unlinking the parser file on the reasoning that a
+            // never-deployed source has no live topology referencing it. That
+            // reasoning does not survive contact with the `deployed` flag, which
+            // `update` clears whenever a deployment-affecting field changes
+            // (`repository/crud.rs`: `deployed = CASE WHEN $18 THEN false ...`).
+            //
+            // So the ordinary sequence create -> publish -> edit the VRL -> delete
+            // left `deployed = false` while `_combiner.toml` and `_router.toml`
+            // still named the source's `<name>_output`. Unlinking only the parser
+            // file produced exactly the NAN-2296 failure: a dangling input that
+            // makes the ENTIRE Vector config unloadable, so every subsequent reload
+            // is rejected and the collector is frozen on its last good config.
+            // Reproduced on a live tenant: `vector validate` failed with
+            // `Input "…_output" for transform "db_parsers_combined" doesn't match
+            // any components`, and Vector logged `reload aborted`.
+            //
+            // Regeneration is the coherent operation in both cases: for a source
+            // that was live it rewrites the combiner and router without it, and for
+            // one that never deployed it is a no-op that still prunes any stale
+            // file. There is no case where unlinking alone is more correct, so the
+            // branch is gone rather than repaired.
+            {
+                // NAN-2304 gives us the canonical effective-deployed query (it also
+                // resolves dispatch route names internally). NAN-2305's `filter` is
+                // still required and must not be dropped in a merge: the row is
+                // deleted AFTER this regeneration, inside the deploy guard, so it is
+                // still present here — regenerating without the filter would write a
+                // config that still routes the source being deleted.
+                let parsers: Vec<_> = self
+                    .effective_deployed_parsers()
+                    .await?
+                    .into_iter()
+                    .filter(|parser| parser.id != id)
+                    .collect();
 
                 // Fail closed. The row is still present, so the DB and the
                 // config still agree and the operator can retry — far better

@@ -87,6 +87,8 @@ export function useReportPhase2Status(opts: {
  */
 export const PHASE2_REPORTING_MODES: ReadonlySet<DisplayType> = new Set<DisplayType>([
   'trace',
+  'lateral',
+  'tree',
   'retro',
   'cloud',
   'service',

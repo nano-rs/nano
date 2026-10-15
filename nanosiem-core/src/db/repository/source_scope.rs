@@ -108,6 +108,13 @@ impl SourceScopeRepository {
     /// Register a `source_type` as restricted (idempotent — re-adding an
     /// existing value refreshes its `description`). Returns the stored row.
     /// Bumps the cross-process version signal in the same transaction (NAN-1807).
+    // Upserts name the PRIMARY KEY constraint rather than its columns. The open
+    // schema (migration 244) keys `restricted_source_types` on `source_type` and
+    // `source_type_grants` on `(source_type, group_id)`; the enterprise overlay
+    // (9000420) re-keys both with a leading `tenant_id` under the same constraint
+    // names. A column list only matches one of the two, and d43d78c8d's
+    // `(tenant_id, ...)` target broke every insert on open-edition databases
+    // (42703), which serve this surface ungated.
     pub async fn add_restricted(
         &self,
         source_type: &str,
@@ -119,7 +126,7 @@ impl SourceScopeRepository {
             r#"
             INSERT INTO restricted_source_types (source_type, description, created_by)
             VALUES ($1, $2, $3)
-            ON CONFLICT (source_type) DO UPDATE SET
+            ON CONFLICT ON CONSTRAINT restricted_source_types_pkey DO UPDATE SET
                 description = EXCLUDED.description
             RETURNING source_type, description, created_by, created_at
             "#,
@@ -151,7 +158,7 @@ impl SourceScopeRepository {
             r#"
             INSERT INTO restricted_source_types (source_type, description, created_by)
             VALUES ($1, $2, $3)
-            ON CONFLICT (source_type) DO UPDATE SET
+            ON CONFLICT ON CONSTRAINT restricted_source_types_pkey DO UPDATE SET
                 description = EXCLUDED.description
             RETURNING source_type, description, created_by, created_at
             "#,
@@ -277,7 +284,7 @@ impl SourceScopeRepository {
             WITH upsert AS (
                 INSERT INTO source_type_grants (source_type, group_id, created_by)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (source_type, group_id) DO UPDATE SET
+                ON CONFLICT ON CONSTRAINT source_type_grants_pkey DO UPDATE SET
                     created_by = source_type_grants.created_by
                 RETURNING source_type, group_id, created_by, created_at
             )
@@ -315,7 +322,7 @@ impl SourceScopeRepository {
             WITH upsert AS (
                 INSERT INTO source_type_grants (source_type, group_id, created_by)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (source_type, group_id) DO UPDATE SET
+                ON CONFLICT ON CONSTRAINT source_type_grants_pkey DO UPDATE SET
                     created_by = source_type_grants.created_by
                 RETURNING source_type, group_id, created_by, created_at
             )

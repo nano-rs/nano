@@ -36,10 +36,15 @@ pub struct AnonymizationService {
 }
 
 impl AnonymizationService {
-    pub fn new(pool: PgPool, dual_pool: DualPool) -> Self {
+    /// `profile` is INJECTED rather than resolved from the environment here
+    /// (NAN-2361). This constructor used to fall back to `UdmProfile` when
+    /// resolution failed, which would point an irreversible erasure at the wrong
+    /// table and column set — a right-to-be-forgotten request reported as
+    /// executed while the subject's PII stays in the lake. Callers already hold
+    /// the once-resolved profile (`AppState::schema_profile()`), so a failure to
+    /// resolve now fails the request instead of quietly changing schemas.
+    pub fn new(pool: PgPool, dual_pool: DualPool, profile: Arc<dyn SchemaProfile>) -> Self {
         let table_names = dual_pool.table_names();
-        let profile = crate::schema::active_profile_from_env()
-            .unwrap_or_else(|_| Arc::new(crate::schema::UdmProfile::new()));
         Self {
             pool,
             dual_pool,
@@ -50,7 +55,9 @@ impl AnonymizationService {
 
     /// The active ingested-events table key ("ocsf_logs" under OCSF, else "logs").
     fn logs_key(&self) -> &'static str {
-        crate::schema::active_logs_table()
+        // Derived from the INJECTED profile, not a fresh env read: the erasure SQL
+        // and the table it targets must come from one resolution (NAN-2361).
+        crate::schema::logs_table_for(self.profile.id())
     }
 
     /// Quote a column for the anonymization SQL: dotted OCSF columns
@@ -740,8 +747,7 @@ impl AnonymizationService {
             // DELETE the subject's rows (see anonymize_user_fields for the full
             // rationale). Match on the OCSF endpoint IP columns.
             let ocsf_ip_cols: &[&str] = &["src_endpoint.ip", "dst_endpoint.ip"];
-            let where_match =
-                Self::build_hash_match_where(ocsf_ip_cols, &salt_escaped, anon_hash);
+            let where_match = Self::build_hash_match_where(ocsf_ip_cols, &salt_escaped, anon_hash);
             let ocsf_local = self.table_names.local(self.logs_key());
             format!(
                 "ALTER TABLE {ocsf_local}{on_cluster} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
@@ -964,7 +970,9 @@ mod ocsf_anonymization_tests {
     fn hash_match_where_joins_columns_with_salted_hash() {
         let w = A::build_hash_match_where(&["user.name", "actor.user.name"], "SALT", "HASH");
         assert!(w.contains("lower(hex(SHA256(concat('SALT', lower(\"user.name\"))))) = 'HASH'"));
-        assert!(w.contains("lower(hex(SHA256(concat('SALT', lower(\"actor.user.name\"))))) = 'HASH'"));
+        assert!(
+            w.contains("lower(hex(SHA256(concat('SALT', lower(\"actor.user.name\"))))) = 'HASH'")
+        );
         assert!(w.contains(" OR "));
     }
 

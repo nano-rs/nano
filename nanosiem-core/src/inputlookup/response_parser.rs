@@ -41,6 +41,16 @@ pub fn parse_response(
     let rows = match format {
         InputLookupFormat::Json => parse_json(body)?,
         InputLookupFormat::Csv => parse_csv(body)?,
+        InputLookupFormat::Ndjson => {
+            let mut rows = Vec::new();
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                if rows.len() >= max_rows { return Err(ParseError::MaxRowsExceeded { count: rows.len() + 1, limit: max_rows }); }
+                let value: Value = serde_json::from_str(line)?;
+                if !value.is_object() { return Err(ParseError::UnexpectedJsonStructure("NDJSON rows must be objects".into())); }
+                rows.extend(flatten_rows(vec![value]));
+            }
+            rows
+        },
     };
 
     // Check max rows

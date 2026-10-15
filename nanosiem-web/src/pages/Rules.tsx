@@ -18,6 +18,7 @@ import {
   useAlertCounts,
   useAlertVelocity,
   useFleetHealth,
+  useSchedulingLag,
 } from '@/hooks/use-api';
 import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
@@ -51,6 +52,10 @@ type SevFilter = 'all' | SeverityKey;
 type ModeFilter = 'all' | 'scheduled' | 'real-time';
 type StatusFilter = 'all' | 'live' | 'staging' | 'disabled';
 
+// NAN-2361: one Rules dashboard for every deployment mode. The hosted-shared
+// tenant is served the same stats / today-counts / alert-velocity / fleet-health
+// routes on the tenant substrate, so the earlier stripped "tenant rules" list
+// is gone.
 export function Rules() {
   useDocumentTitle('Rules');
   const navigate = useNavigate();
@@ -67,6 +72,7 @@ export function Rules() {
   const { data: alertCounts } = useAlertCounts(['detection']);
   const { data: alertVelocity } = useAlertVelocity(24, ['detection']);
   const { data: fleetHealth } = useFleetHealth();
+  const { data: schedulingLag } = useSchedulingLag();
 
   const [sev, setSev] = useState<SevFilter>('all');
   const [mode, setMode] = useState<ModeFilter>('all');
@@ -290,6 +296,7 @@ export function Rules() {
         alerts24h={alertCounts?.total ?? 0}
         velocity={alertVelocity}
         fleetHealth={fleetHealth}
+        schedulingLag={schedulingLag}
         onReviewSilent={() => navigate('/rules/tuning?tab=silent')}
       />
 
@@ -485,9 +492,9 @@ export function Rules() {
             title={`Delete ${count} rule${plural}?`}
             description={
               <>
-                This permanently removes the selected detection rule{plural}, their
-                configuration, and their materialized-view bindings. Historical signal logs
-                stay in ClickHouse but future matches stop immediately. This cannot be undone.
+                The selected detection rule{plural} stop running immediately and move to
+                Archived. Their matches, alerts and signal logs are kept and stay linked to
+                them.
               </>
             }
             confirmLabel={`Delete ${count} rule${plural}`}

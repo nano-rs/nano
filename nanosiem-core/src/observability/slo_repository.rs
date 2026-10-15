@@ -28,7 +28,9 @@ pub enum SloRepositoryError {
 /// The SLI kind an SLO is measured against. Mirrors the storage CHECK
 /// constraint (`'availability' | 'latency'`) and maps to the query layer's
 /// [`SliKind`] for spans-based compute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SloSliKind {
     Availability,
@@ -216,9 +218,8 @@ impl SloRepository {
 
     fn row_to_slo(row: &sqlx::postgres::PgRow) -> Result<SloDefinition, SloRepositoryError> {
         let kind_str: String = row.get("sli_kind");
-        let sli_kind = SloSliKind::from_str(&kind_str).ok_or_else(|| {
-            SloRepositoryError::Invalid(format!("unknown sli_kind '{kind_str}'"))
-        })?;
+        let sli_kind = SloSliKind::from_str(&kind_str)
+            .ok_or_else(|| SloRepositoryError::Invalid(format!("unknown sli_kind '{kind_str}'")))?;
         Ok(SloDefinition {
             id: row.get("id"),
             name: row.get("name"),

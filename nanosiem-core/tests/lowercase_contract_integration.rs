@@ -4,11 +4,11 @@
 //! ClickHouse.
 //!
 //! The SQL generator compares every field in `LOWERCASE_NORMALIZED_FIELDS`
-//! with raw equality (`"user" = 'dan lussier'`, no `lower()` wrapper) so the
+//! with raw equality (`"user" = 'jane analyst'`, no `lower()` wrapper) so the
 //! raw-column indexes prune. That is only correct if **every writer** stores
 //! those columns lowercase. The contract was silently broken once already: the
-//! audit emitter stored display-case actor names ('Dan Lussier'), so
-//! `user="dan lussier"` found 0 audit rows (QUERY_PERF_AUDIT.md B6).
+//! audit emitter stored display-case actor names ('Jane Analyst'), so
+//! `user="jane analyst"` found 0 audit rows (QUERY_PERF_AUDIT.md B6).
 //!
 //! This test asserts `countIf(f != lower(f)) = 0` per field over rows written
 //! after the contract-effective cutoff, so a future writer that breaks the

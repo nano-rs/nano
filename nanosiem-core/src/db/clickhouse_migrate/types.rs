@@ -119,7 +119,10 @@ mod tests {
             max_exec > ddl_timeout,
             "max_execution_time={max_exec}s must exceed distributed_ddl_task_timeout={ddl_timeout}s"
         );
-        assert!(max_exec >= 900, "max_execution_time={max_exec}s too short for real DDL");
+        assert!(
+            max_exec >= 900,
+            "max_execution_time={max_exec}s too short for real DDL"
+        );
     }
 
     #[test]

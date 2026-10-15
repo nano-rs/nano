@@ -98,7 +98,7 @@ pub async fn create_shared_search(
     let shared = repo
         .create(&new_shared)
         .await
-        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+        .map_err(|e| db_error_without_detail("create shared search", e))?;
 
     Ok(Json(CreateSharedSearchResponse {
         id: shared.id.clone(),
@@ -133,10 +133,21 @@ pub async fn get_shared_search(
         nanosiem_core::db::repository::SharedSearchRepositoryError::NotFound(_) => {
             ApiError::NotFound(format!("Shared search not found: {}", id))
         }
-        _ => ApiError::DatabaseError(e.to_string()),
+        _ => db_error_without_detail("read shared search", e),
     })?;
 
     Ok(Json(SharedSearchResponse::from(shared)))
+}
+
+/// Map a repository failure to a generic client error.
+///
+/// NAN-3462: the shared-search and explanation-cache handlers used to return
+/// `e.to_string()` as the response message, which put the raw PostgreSQL error
+/// (`column "tenant_id" does not exist`) in front of the caller. The detail
+/// goes to the server log only.
+fn db_error_without_detail(operation: &'static str, error: impl std::fmt::Display) -> ApiError {
+    tracing::error!(operation, error = %error, "search metadata repository error");
+    ApiError::DatabaseError("A database error occurred".to_string())
 }
 
 // =============================================================================
@@ -256,7 +267,7 @@ pub async fn store_query_explanation(
     let explanation = repo
         .upsert(&new_explanation, &explanation_scope_fingerprint(&auth))
         .await
-        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+        .map_err(|e| db_error_without_detail("store query explanation", e))?;
 
     Ok(Json(query_explanation_to_response(explanation)))
 }
@@ -298,44 +309,23 @@ pub async fn get_query_explanation(
             nanosiem_core::db::repository::QueryExplanationError::NotFound(_) => {
                 ApiError::NotFound("No explanation found for this query".to_string())
             }
-            _ => ApiError::DatabaseError(e.to_string()),
+            _ => db_error_without_detail("read query explanation", e),
         })?;
 
     Ok(Json(query_explanation_to_response(explanation)))
 }
 
-/// NAN-2049: fingerprint the caller's effective source-scope deny-set for the
-/// query-explanation cache key. The deny-set is a sorted `BTreeSet`, so the
-/// encoding is stable across requests: callers with the same effective
-/// visibility share cache entries (shared-URL explanations keep working), while
-/// a differently-scoped caller gets a distinct key and its own scope-correct
-/// entry. The empty (unrestricted) deny-set yields `""`.
-///
-/// NAN-2219: BOTH halves of the effective scope are encoded. The cached
-/// `generated_sql` is scope-specific, and the artifact half now selects a
-/// different prevalence shape (dictionary pushdown vs. the source-attributed
-/// residual path), so two callers sharing only the row-filter half must not
-/// share an entry. The halves are separated by a length-prefixed marker so the
-/// concatenation stays injective across the boundary.
+/// NAN-2049 / NAN-2219: the cache key's scope half. The encoding lives in
+/// `nanosiem_core::db::repository::query_explanations` so the tenant port
+/// (`shared_search_extras`) keys the cache identically (NAN-2361).
 fn explanation_scope_fingerprint(auth: &AuthContext) -> String {
-    let scope = auth.effective_viewer_scope();
-    let row = encode_scope_fingerprint(scope.deny_set().iter().map(String::as_str));
-    let artifact = encode_scope_fingerprint(scope.artifact_deny_set().iter().map(String::as_str));
-    format!("{}:{}{}", row.len(), row, artifact)
+    nanosiem_core::db::repository::query_explanations::explanation_scope_fingerprint(&auth.effective_viewer_scope())
 }
 
-/// Canonical, injective encoding of a set of source-type names (NAN-2049).
-///
-/// Each element is length-prefixed (`<byte-len>:<value>`) so the concatenation
-/// is unambiguous even when a value contains the delimiter — source names are
-/// only trimmed/lowercased on the way in and PostgreSQL accepts embedded
-/// newlines, so a naive `join` would let `{"a","b"}` and `{"a\nb"}` collide and
-/// reopen the cross-scope cache bypass this fix closes (codex). The length
-/// prefix is a byte count, so a reader consumes exactly that many bytes and the
-/// two sets can never produce the same string. Input order must be stable
-/// (the caller passes a sorted `BTreeSet`).
+/// Canonical, injective encoding of a set of source-type names (NAN-2049);
+/// delegates to the shared core encoder.
 fn encode_scope_fingerprint<'a>(sources: impl Iterator<Item = &'a str>) -> String {
-    sources.map(|s| format!("{}:{}", s.len(), s)).collect()
+    nanosiem_core::db::repository::query_explanations::encode_scope_fingerprint(sources)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

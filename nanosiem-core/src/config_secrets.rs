@@ -96,6 +96,11 @@ pub const SECRET_CONFIG_KEYS: &[&str] = &[
     "session_token",
     // GCP service-account JSON
     "credentials_json",
+    // Azure Event Hubs (NAN-3764): SAS / storage connection strings and the
+    // Entra service-principal secret.
+    "connection_string",
+    "checkpoint_connection_string",
+    "azure_client_secret",
     // TLS client private key (`connection_config.tls.key_content`).
     "key_content",
     // Custom-enrichment AuthConfig

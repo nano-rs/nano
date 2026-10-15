@@ -107,7 +107,7 @@ impl SourceConfigRepository {
     ///
     /// - HEC parsers (`source_type IN ('splunk_hec','splunk','hec')`) always
     ///   claim `splunk_hec_route` (the OOTB singleton).
-    /// - Fetch-source parsers (`source_type IN ('kafka','aws_s3','aws_sqs','gcp_pubsub')`)
+    /// - Fetch-source parsers (`source_type IN ('kafka','aws_s3','aws_sqs','gcp_pubsub','azure_event_hubs')`)
     ///   claim `<safe(name)>_route` of their `dispatch_source_config_id`.
     ///
     /// **safe_name is computed in Rust, not in SQL**, so the route name
@@ -116,9 +116,7 @@ impl SourceConfigRepository {
     /// `char::is_alphanumeric` vs PG's ASCII-only `[^A-Za-z0-9]` regex
     /// would otherwise drift on non-ASCII source-config names — e.g.
     /// `café-kafka` → Rust `café_kafka` vs PG `caf__kafka`).
-    pub async fn load_route_claims(
-        &self,
-    ) -> Result<Vec<RouteClaim>, SourceConfigRepositoryError> {
+    pub async fn load_route_claims(&self) -> Result<Vec<RouteClaim>, SourceConfigRepositoryError> {
         // Fetch raw fields — route name is derived in Rust to keep the
         // safe_name rule canonical. HEC parsers have no source-config
         // dispatch; the LEFT JOIN yields NULL for `sc_name` and the
@@ -136,7 +134,7 @@ impl SourceConfigRepository {
               AND (
                   ls.source_type IN ('splunk_hec', 'splunk', 'hec')
                   OR (
-                      ls.source_type IN ('kafka', 'aws_s3', 'aws_sqs', 'gcp_pubsub')
+                      ls.source_type IN ('kafka', 'aws_s3', 'aws_sqs', 'gcp_pubsub', 'azure_event_hubs')
                       AND ls.dispatch_source_config_id IS NOT NULL
                       AND sc.id IS NOT NULL
                   )
@@ -203,7 +201,10 @@ impl SourceConfigRepository {
 
         qb.push(" ORDER BY name ASC");
 
-        let limit = params.limit.unwrap_or(LIST_PAGE_MAX).clamp(1, LIST_PAGE_MAX);
+        let limit = params
+            .limit
+            .unwrap_or(LIST_PAGE_MAX)
+            .clamp(1, LIST_PAGE_MAX);
         let offset = params.offset.unwrap_or(0).max(0);
         qb.push(" LIMIT ").push_bind(limit);
         qb.push(" OFFSET ").push_bind(offset);
@@ -516,13 +517,16 @@ impl SourceConfigRepository {
         // NAN-2305: a rename racing another rename onto the same generated
         // stem lands here as a unique violation; without the mapping it would
         // surface as a 500 for something the operator fixes by renaming.
-        let updated = query_builder.fetch_optional(&self.pool).await.map_err(|e| {
-            request
-                .name
-                .as_deref()
-                .and_then(|name| Self::map_generated_stem_violation(&e, name))
-                .unwrap_or_else(|| SourceConfigRepositoryError::from(e))
-        })?;
+        let updated = query_builder
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                request
+                    .name
+                    .as_deref()
+                    .and_then(|name| Self::map_generated_stem_violation(&e, name))
+                    .unwrap_or_else(|| SourceConfigRepositoryError::from(e))
+            })?;
 
         match updated {
             Some(config) => Ok(config.into()),
@@ -826,10 +830,7 @@ impl SourceConfigRepository {
         // real rule.
         if let Some(req_priority) = request.priority {
             let current = self.get_rule(rule_id).await?;
-            let effective_type = request
-                .match_type
-                .as_deref()
-                .unwrap_or(&current.match_type);
+            let effective_type = request.match_type.as_deref().unwrap_or(&current.match_type);
             if effective_type == "default" {
                 let max_non_default: Option<i32> = sqlx::query_scalar(
                     "SELECT MAX(priority) FROM routing_rules \

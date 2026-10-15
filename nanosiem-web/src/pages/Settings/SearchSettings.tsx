@@ -3,9 +3,12 @@
 import { useState, useEffect, useId } from 'react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
+import { PlatformManagedNotice } from '@/components/settings/PlatformManagedNotice';
+import { platformManaged } from '@/lib/platform-managed';
 import { NumberInput } from '@/components/ui/number-input';
 import { Switch } from '@/components/ui/switch';
-import { AlertTriangle, Save, Loader2 } from 'lucide-react';
+import { AlertTriangle, Save } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import {
   useSearchAdmissionConfig,
   useUpdateSearchAdmissionConfig,
@@ -13,8 +16,45 @@ import {
   useUpdateSearchQueryLimits,
 } from '@/hooks/use-api';
 import { useToast } from '@/hooks/use-toast';
+import type { SharedLakeSettingApplicability } from '@/lib/api';
+import { cn } from '@/lib/utils';
 
 type Priority = 'realtime' | 'interactive' | 'analytics';
+type LakeVerdicts = Record<string, SharedLakeSettingApplicability> | undefined;
+
+/**
+ * NAN-3300: on hosted-shared tenants the API says, per field, whether the
+ * shared lake enforces it. A row covering several fields (a resource-budget
+ * row) counts as enforced when any of them is; the API keeps such rows uniform.
+ */
+function lakeVerdict(verdicts: LakeVerdicts, ...fields: string[]): SharedLakeSettingApplicability | null {
+  if (!verdicts) return null;
+  const found = fields.map((f) => verdicts[f]).filter((v): v is SharedLakeSettingApplicability => v != null);
+  if (found.length === 0) return null;
+  const applies = found.some((v) => v.applies_on_shared_lake);
+  return found.find((v) => v.applies_on_shared_lake === applies) ?? found[0];
+}
+
+function LakeApplicability({ verdict }: { verdict: SharedLakeSettingApplicability | null }) {
+  if (!verdict) return null;
+  return (
+    <div className="mt-1 flex items-baseline gap-1.5 text-[11px] leading-snug">
+      <span
+        className={cn(
+          'font-mono text-[10.5px] shrink-0',
+          verdict.applies_on_shared_lake ? 'text-emerald-500' : 'text-muted-foreground',
+        )}
+      >
+        {verdict.applies_on_shared_lake ? 'Enforced' : 'Not used on the shared lake'}
+      </span>
+      <span className="text-muted-foreground">{verdict.detail.replace(/^Not used on the shared lake:\s*/, '')}</span>
+    </div>
+  );
+}
+
+/** Dims a setting the shared lake doesn't use; its reason stays readable. */
+const dimmed = (verdict: SharedLakeSettingApplicability | null) =>
+  verdict && !verdict.applies_on_shared_lake ? 'opacity-50' : undefined;
 
 const PRIORITIES: Array<{
   key: Priority;
@@ -155,7 +195,7 @@ export function SearchSettings() {
   if ((loadingSettings && !settings) || (loadingLimits && !queryLimits)) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+        <LoadingIcon className="w-5 h-5 text-muted-foreground" />
       </div>
     );
   }
@@ -182,6 +222,17 @@ export function SearchSettings() {
     );
   }
 
+  // Hosted-shared tenant (NAN-2361): the platform sets admission and query
+  // limits; the values below are its defaults and the editors are read-only.
+  // NAN-3300: each field also carries whether the shared lake enforces it.
+  const managed = platformManaged(settings) ?? platformManaged(queryLimits);
+  const readOnly = !!managed;
+  const admissionLake: LakeVerdicts = managed ? settings?.shared_lake_applicability : undefined;
+  const limitsLake: LakeVerdicts = managed ? queryLimits?.shared_lake_applicability : undefined;
+  const budgetsUnusedOnLake = PRIORITIES.every(
+    (p) => lakeVerdict(admissionLake, `${p.key}_max_execution_time`, `${p.key}_max_memory_gb`)?.applies_on_shared_lake === false,
+  );
+
   // ID factories for a11y
   const id = (suffix: string) => `${baseId}-${suffix}`;
 
@@ -204,6 +255,8 @@ export function SearchSettings() {
         </p>
       </div>
 
+      {managed && <PlatformManagedNotice verdict={managed} title="Search limits" />}
+
       {/* CONCURRENCY LIMITS */}
       <section>
         <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium mb-1">
@@ -217,6 +270,7 @@ export function SearchSettings() {
           {[
             {
               key: 'global',
+              field: 'global_adhoc_limit',
               label: 'Global ad-hoc limit',
               hint: 'Maximum ad-hoc queries (Interactive + Analytics) running concurrently across all users. (1–500)',
               value: globalAdHocLimit,
@@ -227,6 +281,7 @@ export function SearchSettings() {
             },
             {
               key: 'per-user',
+              field: 'per_user_limit',
               label: 'Per-user limit',
               hint: 'Maximum concurrent searches per individual user. Must not exceed the global limit. (1–50)',
               value: perUserLimit,
@@ -237,6 +292,7 @@ export function SearchSettings() {
             },
             {
               key: 'queue-depth',
+              field: 'max_queue_depth',
               label: 'Max queue depth',
               hint: 'How many searches can wait in the queue before new ones are rejected. (10–1,000)',
               value: maxQueueDepth,
@@ -247,6 +303,7 @@ export function SearchSettings() {
             },
             {
               key: 'queue-timeout',
+              field: 'queue_timeout_seconds',
               label: 'Queue timeout',
               hint: 'How long a search waits in the queue before timing out. (10–600 sec)',
               value: queueTimeoutSeconds,
@@ -258,21 +315,24 @@ export function SearchSettings() {
           ].map((row) => {
             const inputId = id(row.key);
             const descId = id(`${row.key}-desc`);
+            const verdict = lakeVerdict(admissionLake, row.field);
             return (
-              <div key={row.key} className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
+              <div key={row.key} data-testid={`setting-${row.field}`} className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
                 <div className="min-w-0 flex-1">
-                  <label htmlFor={inputId} className="text-[12.5px] font-medium text-foreground cursor-pointer">
+                  <label htmlFor={inputId} className={cn('text-[12.5px] font-medium text-foreground', !readOnly && 'cursor-pointer', dimmed(verdict))}>
                     {row.label}
                   </label>
-                  <div id={descId} className="text-[11px] text-muted-foreground mt-0.5">{row.hint}</div>
+                  <div id={descId} className={cn('text-[11px] text-muted-foreground mt-0.5', dimmed(verdict))}>{row.hint}</div>
+                  <LakeApplicability verdict={verdict} />
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
+                <div className={cn('flex items-center gap-2 shrink-0', dimmed(verdict))}>
                   <NumberInput
                     id={inputId}
                     value={row.value}
                     onChange={row.onChange}
                     min={row.min}
                     max={row.max}
+                    disabled={readOnly}
                     aria-describedby={descId}
                     className="h-8 w-[80px] text-center font-mono text-[12px]"
                   />
@@ -293,6 +353,7 @@ export function SearchSettings() {
         </div>
         <p className="text-[11.5px] text-muted-foreground mb-3 max-w-[720px]">
           Per-query execution time and memory caps sent to ClickHouse for each priority tier.
+          {budgetsUnusedOnLake && ' The shared lake doesn’t use them.'}
         </p>
 
         <div className="flex flex-col">
@@ -306,47 +367,59 @@ export function SearchSettings() {
             const execId = id(`${p.key}-exec`);
             const memId = id(`${p.key}-mem`);
             const descId = id(`${p.key}-desc`);
+            const verdict = lakeVerdict(admissionLake, `${p.key}_max_execution_time`, `${p.key}_max_memory_gb`);
             return (
-              <div
-                key={p.key}
-                className="grid grid-cols-[160px_1fr_1fr] gap-3 items-center px-3 h-14 border-b border-border/60 hover:bg-foreground/[0.025] transition-colors"
-              >
-                <div className="min-w-0">
-                  <div className="text-[12.5px] font-medium text-foreground">{p.label}</div>
-                  <div id={descId} className="text-[11px] text-muted-foreground mt-0.5">{p.hint}</div>
+              <div key={p.key} data-testid={`setting-${p.key}-budget`} className="border-b border-border/60">
+                <div
+                  className={cn(
+                    'grid grid-cols-[160px_1fr_1fr] gap-3 items-center px-3 h-14 hover:bg-foreground/[0.025] transition-colors',
+                    dimmed(verdict),
+                  )}
+                >
+                  <div className="min-w-0">
+                    <div className="text-[12.5px] font-medium text-foreground">{p.label}</div>
+                    <div id={descId} className="text-[11px] text-muted-foreground mt-0.5">{p.hint}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <NumberInput
+                      id={execId}
+                      aria-label={`${p.label} max execution time`}
+                      aria-describedby={descId}
+                      value={exec[0]}
+                      onChange={exec[1]}
+                      min={p.execMin}
+                      max={p.execMax}
+                      disabled={readOnly}
+                      className="h-8 w-[80px] text-center font-mono text-[12px]"
+                    />
+                    <span className="font-mono text-[10.5px] text-muted-foreground">sec</span>
+                    <span className="font-mono text-[10.5px] text-muted-foreground/70 ml-1">
+                      ({p.execMin}–{p.execMax.toLocaleString()})
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <NumberInput
+                      id={memId}
+                      aria-label={`${p.label} max memory`}
+                      aria-describedby={descId}
+                      value={mem[0]}
+                      onChange={mem[1]}
+                      min={p.memMin}
+                      max={p.memMax}
+                      disabled={readOnly}
+                      className="h-8 w-[80px] text-center font-mono text-[12px]"
+                    />
+                    <span className="font-mono text-[10.5px] text-muted-foreground">GB</span>
+                    <span className="font-mono text-[10.5px] text-muted-foreground/70 ml-1">
+                      ({p.memMin}–{p.memMax})
+                    </span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <NumberInput
-                    id={execId}
-                    aria-label={`${p.label} max execution time`}
-                    aria-describedby={descId}
-                    value={exec[0]}
-                    onChange={exec[1]}
-                    min={p.execMin}
-                    max={p.execMax}
-                    className="h-8 w-[80px] text-center font-mono text-[12px]"
-                  />
-                  <span className="font-mono text-[10.5px] text-muted-foreground">sec</span>
-                  <span className="font-mono text-[10.5px] text-muted-foreground/70 ml-1">
-                    ({p.execMin}–{p.execMax.toLocaleString()})
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <NumberInput
-                    id={memId}
-                    aria-label={`${p.label} max memory`}
-                    aria-describedby={descId}
-                    value={mem[0]}
-                    onChange={mem[1]}
-                    min={p.memMin}
-                    max={p.memMax}
-                    className="h-8 w-[80px] text-center font-mono text-[12px]"
-                  />
-                  <span className="font-mono text-[10.5px] text-muted-foreground">GB</span>
-                  <span className="font-mono text-[10.5px] text-muted-foreground/70 ml-1">
-                    ({p.memMin}–{p.memMax})
-                  </span>
-                </div>
+                {verdict && (
+                  <div className="px-3 pb-2 -mt-1">
+                    <LakeApplicability verdict={verdict} />
+                  </div>
+                )}
               </div>
             );
           })}
@@ -366,11 +439,11 @@ export function SearchSettings() {
         )}
         <Button
           onClick={handleSave}
-          disabled={!hasChanges || saving || !!validationError}
+          disabled={!!managed || !hasChanges || saving || !!validationError}
           size="sm"
           className="h-7 text-[11.5px] px-2.5"
         >
-          {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+          {saving ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
           Save admission settings
         </Button>
       </div>
@@ -388,6 +461,7 @@ export function SearchSettings() {
           {[
             {
               key: 'group-array',
+              field: 'max_group_array_size',
               label: 'Max array aggregation size',
               hint: 'Max elements per group in groupArray / values() / list(). Arrays are truncated beyond this. (100–1,000,000)',
               value: maxGroupArraySize,
@@ -398,6 +472,7 @@ export function SearchSettings() {
             },
             {
               key: 'mvexpand',
+              field: 'max_mvexpand_rows',
               label: 'Max mvexpand rows',
               hint: 'Default row cap for mvexpand when the query doesn’t specify one. Array expansion runs before LIMIT. (1,000–10,000,000)',
               value: maxMvexpandRows,
@@ -408,6 +483,7 @@ export function SearchSettings() {
             },
             {
               key: 'post-groups',
+              field: 'max_post_processing_groups',
               label: 'Max post-processing groups',
               hint: 'Max groups in Rust-side post-processing (stats, top, rare). Excess dropped. Only applies to commands that can’t run in ClickHouse. (10,000–10,000,000)',
               value: maxPostProcessingGroups,
@@ -418,6 +494,7 @@ export function SearchSettings() {
             },
             {
               key: 'cache-rows',
+              field: 'max_streaming_cache_rows',
               label: 'Max streaming cache rows',
               hint: 'Max rows buffered for the streaming result cache. Beyond this, results still stream to the client but aren’t cached for re-display. (1,000–1,000,000)',
               value: maxStreamingCacheRows,
@@ -429,21 +506,24 @@ export function SearchSettings() {
           ].map((row) => {
             const inputId = id(row.key);
             const descId = id(`${row.key}-desc`);
+            const verdict = lakeVerdict(limitsLake, row.field);
             return (
-              <div key={row.key} className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
+              <div key={row.key} data-testid={`setting-${row.field}`} className="flex items-start justify-between gap-4 py-3 border-b border-border/60">
                 <div className="min-w-0 flex-1">
-                  <label htmlFor={inputId} className="text-[12.5px] font-medium text-foreground cursor-pointer">
+                  <label htmlFor={inputId} className={cn('text-[12.5px] font-medium text-foreground', !readOnly && 'cursor-pointer', dimmed(verdict))}>
                     {row.label}
                   </label>
-                  <div id={descId} className="text-[11px] text-muted-foreground mt-0.5">{row.hint}</div>
+                  <div id={descId} className={cn('text-[11px] text-muted-foreground mt-0.5', dimmed(verdict))}>{row.hint}</div>
+                  <LakeApplicability verdict={verdict} />
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
+                <div className={cn('flex items-center gap-2 shrink-0', dimmed(verdict))}>
                   <NumberInput
                     id={inputId}
                     value={row.value}
                     onChange={row.onChange}
                     min={row.min}
                     max={row.max}
+                    disabled={readOnly}
                     aria-describedby={descId}
                     className="h-8 w-[80px] text-center font-mono text-[12px]"
                   />
@@ -453,22 +533,29 @@ export function SearchSettings() {
             );
           })}
 
-          <div className="flex items-center justify-between gap-4 py-3 border-b border-border/60">
-            <div className="min-w-0 flex-1">
-              <label htmlFor={id('block-cost')} className="text-[12.5px] font-medium text-foreground cursor-pointer">
-                Block queries with cost-analysis errors
-              </label>
-              <div className="text-[11px] text-muted-foreground mt-0.5">
-                Reject queries that trigger Error-severity cost warnings (unbounded dedup, unbounded transaction, etc.) instead of just warning. Recommended for shared environments.
+          {(() => {
+            const verdict = lakeVerdict(limitsLake, 'block_on_cost_errors');
+            return (
+              <div data-testid="setting-block_on_cost_errors" className="flex items-center justify-between gap-4 py-3 border-b border-border/60">
+                <div className="min-w-0 flex-1">
+                  <label htmlFor={id('block-cost')} className={cn('text-[12.5px] font-medium text-foreground', !readOnly && 'cursor-pointer', dimmed(verdict))}>
+                    Block queries with cost-analysis errors
+                  </label>
+                  <div className={cn('text-[11px] text-muted-foreground mt-0.5', dimmed(verdict))}>
+                    Reject queries that trigger Error-severity cost warnings (unbounded dedup, unbounded transaction, etc.) instead of just warning. Recommended for shared environments.
+                  </div>
+                  <LakeApplicability verdict={verdict} />
+                </div>
+                <Switch
+                  id={id('block-cost')}
+                  checked={blockOnCostErrors}
+                  onCheckedChange={setBlockOnCostErrors}
+                  disabled={readOnly}
+                  className={cn('h-4 w-7', dimmed(verdict))}
+                />
               </div>
-            </div>
-            <Switch
-              id={id('block-cost')}
-              checked={blockOnCostErrors}
-              onCheckedChange={setBlockOnCostErrors}
-              className="h-4 w-7"
-            />
-          </div>
+            );
+          })()}
         </div>
 
         <div className="flex justify-end items-center gap-2 pt-4">
@@ -477,11 +564,11 @@ export function SearchSettings() {
           )}
           <Button
             onClick={handleSaveLimits}
-            disabled={!hasLimitsChanges || savingLimits}
+            disabled={!!managed || !hasLimitsChanges || savingLimits}
             size="sm"
             className="h-7 text-[11.5px] px-2.5"
           >
-            {savingLimits ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+            {savingLimits ? <LoadingIcon className="w-3 h-3" /> : <Save className="w-3 h-3" />}
             Save query limits
           </Button>
         </div>

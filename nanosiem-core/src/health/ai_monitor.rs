@@ -119,8 +119,7 @@ impl AiMonitor {
             // Defense-in-depth: `try_get` so an unexpectedly-NULL credentials
             // column skips the row instead of panicking the health monitor.
             .filter_map(|r| {
-                let credentials_encrypted: Vec<u8> =
-                    r.try_get("credentials_encrypted").ok()?;
+                let credentials_encrypted: Vec<u8> = r.try_get("credentials_encrypted").ok()?;
                 Some(ProviderInfo {
                     provider: r.get("provider"),
                     display_name: r.get("display_name"),

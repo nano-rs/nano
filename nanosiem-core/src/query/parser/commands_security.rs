@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use super::commands_core::{aggregation_list, duration, field_list};
 use super::eval_expr::eval_expression;
-use super::search_expr::{parse_paren_search_expr, search_expr};
+use super::search_expr::{parse_paren_search_expr, where_expr};
 use super::values::{field_name, quoted_string};
 use super::ParseResult;
 use crate::query::ast::*;
@@ -249,6 +249,7 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
             return Ok((
                 remaining,
                 Command::Prevalence {
+                    artifact_fields: vec![],
                     conditions: vec![],
                     time_window,
                     enrich: enrich_value,
@@ -272,8 +273,10 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
 
             // Check if this looks like a window/interval spec or enrich
             let trimmed_lower = trimmed.to_ascii_lowercase();
-            if trimmed_lower.starts_with("window=") || trimmed_lower.starts_with("window ")
-                || trimmed_lower.starts_with("interval=") || trimmed_lower.starts_with("interval ")
+            if trimmed_lower.starts_with("window=")
+                || trimmed_lower.starts_with("window ")
+                || trimmed_lower.starts_with("interval=")
+                || trimmed_lower.starts_with("interval ")
             {
                 remaining = trimmed;
                 break;
@@ -358,6 +361,7 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
         return Ok((
             remaining,
             Command::Prevalence {
+                artifact_fields: vec![],
                 conditions,
                 time_window,
                 enrich,
@@ -367,10 +371,10 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
 
     // Positional enrichment shorthand: prevalence field1, field2 [threshold=rare|uncommon|common]
     // Parse comma-separated field names
-    let (remaining, _fields) =
+    let (remaining, fields) =
         separated_list0(delimited(multispace0, char(','), multispace0), field_name).parse(input)?;
 
-    if _fields.is_empty() {
+    if fields.is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Tag,
@@ -402,6 +406,7 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
     Ok((
         remaining,
         Command::Prevalence {
+            artifact_fields: fields,
             conditions: vec![],
             time_window,
             enrich: true,
@@ -724,7 +729,7 @@ pub(super) fn sequence_command(input: &str) -> ParseResult<'_, Command> {
         let (input, _) = char(']').parse(input)?;
 
         // Parse the bracket content as a search expression
-        let (remaining, condition) = search_expr(content)?;
+        let (remaining, condition) = where_expr(content)?;
         if !remaining.trim().is_empty() {
             return Err(nom::Err::Error(nom::error::Error::new(
                 input,
@@ -778,7 +783,7 @@ pub(super) fn funnel_command(input: &str) -> ParseResult<'_, Command> {
             let (input, _) = char(']').parse(input)?;
 
             // Parse the bracket content as a search expression
-            let (remaining, condition) = search_expr(content)?;
+            let (remaining, condition) = where_expr(content)?;
             if !remaining.trim().is_empty() {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -1081,6 +1086,7 @@ pub(super) fn inputlookup_command(input: &str) -> ParseResult<'_, Command> {
                 break;
             }
             let (input, val) = alt((
+                value(InputLookupFormat::Ndjson, tag_no_case("ndjson")),
                 value(InputLookupFormat::Json, tag_no_case("json")),
                 value(InputLookupFormat::Csv, tag_no_case("csv")),
             ))
@@ -1113,8 +1119,13 @@ pub(super) fn inputlookup_command(input: &str) -> ParseResult<'_, Command> {
                 break;
             }
             let (input, val) = map_res(digit1, |s: &str| s.parse::<usize>()).parse(input)?;
-            // Clamp to valid range (1-100000)
-            max_rows = Some(val.clamp(1, 100000));
+            if !(1..=100_000).contains(&val) {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+            max_rows = Some(val);
             remaining = input;
         } else if let Ok((input, _)) =
             tag_no_case::<_, _, nom::error::Error<&str>>("cache_ttl=").parse(remaining)

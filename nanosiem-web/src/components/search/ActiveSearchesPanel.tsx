@@ -2,7 +2,8 @@
 
 import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronDown, ChevronRight, Clock, Loader2, CircleCheck, XCircle, X, Search } from 'lucide-react';
+import { ChevronDown, ChevronRight, Clock, CircleCheck, XCircle, X, Search } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
@@ -17,7 +18,7 @@ function formatElapsed(ms: number): string {
 
 const STATUS_CONFIG: Record<string, { icon: typeof Clock; label: string; color: string }> = {
   queued: { icon: Clock, label: 'Queued', color: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20' },
-  running: { icon: Loader2, label: 'Running', color: 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20' },
+  running: { icon: LoadingIcon, label: 'Running', color: 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20' },
   completed: { icon: CircleCheck, label: 'Done', color: 'bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20' },
   failed: { icon: XCircle, label: 'Failed', color: 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20' },
   cancelled: { icon: X, label: 'Cancelled', color: 'bg-muted text-muted-foreground border-border' },
@@ -86,10 +87,7 @@ export function ActiveSearchesPanel({ onLoadJob, onCancelJob }: ActiveSearchesPa
                 )}
                 onClick={isClickable ? () => onLoadJob?.(job.job_id) : undefined}
               >
-                <Icon className={cn(
-                  'w-4 h-4 flex-shrink-0',
-                  job.status === 'running' && 'animate-spin'
-                )} />
+                <Icon className="w-4 h-4 flex-shrink-0" />
                 <div className="flex-1 min-w-0">
                   <p className="truncate text-foreground font-mono text-sm">{job.query || 'Search query'}</p>
                   <div className="flex items-center gap-2 mt-0.5">

@@ -273,6 +273,8 @@ async fn dataset_scores_equal_the_canonical_entity_scores_query() {
     let config = RiskQueryConfig {
         decay: decay.clone(),
         cleared: cleared.clone(),
+        lake_cleared: None,
+        lake_minimum_clear_revision: None,
         now,
     };
 

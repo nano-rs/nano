@@ -232,6 +232,7 @@ async fn p4_reader_queries_match_the_canonical_computation() {
         RiskTimeWindow::Last7Days,
         None,
         0,
+        None,
         1_000_000,
         0,
     )
@@ -281,6 +282,7 @@ async fn p4_reader_queries_match_the_canonical_computation() {
         RiskTimeWindow::Last24Hours,
         None,
         0,
+        None,
         1_000_000,
         0,
     )
@@ -297,14 +299,14 @@ async fn p4_reader_queries_match_the_canonical_computation() {
 
     // Pagination: LIMIT/OFFSET slices the same ordering.
     let page1: Vec<EntityScoreRow> = risky_entities_query(
-        &source, now, &decay, &cleared, RiskTimeWindow::Last7Days, None, 0, 1, 0,
+        &source, now, &decay, &cleared, RiskTimeWindow::Last7Days, None, 0, None, 1, 0,
     )
     .to_clickhouse_query(&client)
     .fetch_all()
     .await
     .expect("page 1");
     let page2: Vec<EntityScoreRow> = risky_entities_query(
-        &source, now, &decay, &cleared, RiskTimeWindow::Last7Days, None, 0, 1, 1,
+        &source, now, &decay, &cleared, RiskTimeWindow::Last7Days, None, 0, None, 1, 1,
     )
     .to_clickhouse_query(&client)
     .fetch_all()
@@ -324,6 +326,7 @@ async fn p4_reader_queries_match_the_canonical_computation() {
         RiskTimeWindow::Last7Days,
         Some("cloud_account"),
         0,
+        None,
         200,
         0,
     )

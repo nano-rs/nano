@@ -4,20 +4,16 @@ import { useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import * as Diff from 'diff';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { DetailSheet } from '@/components/ui/detail-sheet';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Loader2, Check, X, Minus, Plus, ArrowUpCircle, Rocket } from 'lucide-react';
+import { Check, X, Minus, Plus, ArrowUpCircle, Rocket } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { useDeployLogSource } from '@/hooks/use-api';
+import { VrlLine } from '@/components/editor/VrlHighlight';
+import { useVrlHighlight } from '@/components/editor/use-vrl-highlight';
 import { PermissionAction } from './PermissionAction';
 import {
   repositoryQueryEnabled,
@@ -70,6 +66,9 @@ function DiffViewer({ oldText, newText }: { oldText: string; newText: string }) 
     return lines;
   }, [oldText, newText]);
 
+  const oldHl = useVrlHighlight(oldText);
+  const newHl = useVrlHighlight(newText);
+
   const stats = useMemo(() => {
     const added = diffLines.filter(l => l.type === 'added').length;
     const removed = diffLines.filter(l => l.type === 'removed').length;
@@ -78,7 +77,7 @@ function DiffViewer({ oldText, newText }: { oldText: string; newText: string }) 
 
   if (oldText === newText) {
     return (
-      <div className="p-4 text-center text-muted-foreground bg-muted/30 rounded-lg">
+      <div className="p-4 text-center text-muted-foreground bg-muted/30 rounded-md">
         <Check className="w-5 h-5 mx-auto mb-2 text-green-500" />
         No differences - VRL parsers are identical
       </div>
@@ -86,7 +85,7 @@ function DiffViewer({ oldText, newText }: { oldText: string; newText: string }) 
   }
 
   return (
-    <div className="border rounded-lg overflow-hidden">
+    <div className="overflow-hidden rounded-md border">
       <div className="flex items-center gap-4 px-3 py-2 bg-muted/50 border-b text-xs">
         <span className="text-muted-foreground">Changes:</span>
         <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
@@ -99,15 +98,15 @@ function DiffViewer({ oldText, newText }: { oldText: string; newText: string }) 
         </span>
       </div>
 
-      <div className="font-mono text-sm">
+      <div className="font-mono text-[11.5px]">
         {diffLines.map((line, idx) => (
           <div
             key={idx}
             className={`flex ${
               line.type === 'added'
-                ? 'bg-green-500/15 text-green-700 dark:text-green-300'
+                ? 'bg-green-500/15 text-foreground'
                 : line.type === 'removed'
-                ? 'bg-red-500/15 text-red-700 dark:text-red-300'
+                ? 'bg-red-500/15 text-foreground'
                 : 'text-foreground'
             }`}
           >
@@ -121,7 +120,10 @@ function DiffViewer({ oldText, newText }: { oldText: string; newText: string }) 
               {line.type === 'added' ? '+' : line.type === 'removed' ? '-' : ' '}
             </div>
             <pre className="flex-1 px-2 py-0.5 whitespace-pre-wrap break-all">
-              {line.content || ' '}
+              <VrlLine
+                segments={(line.type === 'removed' ? oldHl : newHl)[(line.lineNumber ?? 0) - 1]}
+                text={line.content || ' '}
+              />
             </pre>
           </div>
         ))}
@@ -206,159 +208,163 @@ export function ParserUpstreamDiffModal({
 
   const vrlMatch = diff ? diff.current_vrl === diff.upstream_vrl : true;
 
-  return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
-        <DialogHeader>
-          <DialogTitle>Upstream Parser Changes</DialogTitle>
-          <DialogDescription>
-            {diff?.file_path && (
-              <span className="font-mono text-xs">{diff.file_path}</span>
-            )}
-          </DialogDescription>
-        </DialogHeader>
-
-        {!diffAccess.allowed ? (
-          <div className="py-8 text-center text-sm text-muted-foreground">
-            {diffAccess.reason}
-          </div>
-        ) : appliedNeedsDeploy ? (
-          <div className="py-6 space-y-4">
-            <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-start gap-3">
-              <Rocket className="h-5 w-5 text-amber-500 mt-0.5 flex-shrink-0" />
-              <div className="text-sm">
-                <p className="font-medium text-amber-700 dark:text-amber-400">Parser updated — deploy to apply changes</p>
-                <p className="text-amber-600/90 dark:text-amber-400/80 mt-1">
-                  The VRL has been saved but the pipeline is still running the previous version. Deploy now to push changes to Vector, or deploy later from the source detail page.
-                </p>
-              </div>
-            </div>
-          </div>
-        ) : isLoading ? (
-          <div className="flex items-center justify-center py-12">
-            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-          </div>
-        ) : diff ? (
-          <div className="overflow-y-auto flex-1 min-h-0 space-y-4">
-            {/* Summary */}
-            <div className="flex items-center gap-4 text-sm flex-wrap">
-              {vrlMatch ? (
-                <Badge variant="outline" className="text-green-600 border-green-600">
-                  <Check className="w-3 h-3 mr-1" />
-                  VRL matches
-                </Badge>
-              ) : (
-                <Badge variant="outline" className="text-amber-600 border-amber-600">
-                  VRL changed
-                </Badge>
-              )}
-              {diff.upstream_version && (
-                <Badge variant="outline">
-                  v{diff.upstream_version}
-                </Badge>
-              )}
-              {diff.upstream_display_name && (
-                <span className="text-sm text-muted-foreground">
-                  {diff.upstream_display_name}
-                </span>
-              )}
-            </div>
-
-            {/* Diff view */}
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <h4 className="text-sm font-medium">VRL Changes</h4>
-                <span className="text-xs text-muted-foreground">
-                  (Your version → Upstream version)
-                </span>
-              </div>
-              <DiffViewer
-                oldText={diff.current_vrl}
-                newText={diff.upstream_vrl}
-              />
-            </div>
-          </div>
-        ) : (
-          <div className="text-center py-8 text-muted-foreground">
-            Failed to load diff
-          </div>
-        )}
-
-        <DialogFooter className="flex-shrink-0">
-          {!diffAccess.allowed ? (
-            <Button variant="outline" onClick={() => handleClose(false)}>
-              Close
-            </Button>
-          ) : appliedNeedsDeploy ? (
-            <>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  navigate(`/ingestion/log-sources/${logSourceId}`);
-                  handleClose(false);
-                }}
-              >
-                Go to Source
-              </Button>
-              <PermissionAction access={deployAccess}>
-                <Button
-                  onClick={handleDeployNow}
-                  disabled={deploying || !deployAccess.allowed}
-                >
-                  {deploying ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Rocket className="w-4 h-4" />
-                  )}
-                  Deploy Now
-                </Button>
-              </PermissionAction>
-            </>
+  const btn = 'h-7 text-[11.5px]';
+  const footer = !diffAccess.allowed ? (
+    <Button size="sm" variant="outline" className={btn} onClick={() => handleClose(false)}>
+      Close
+    </Button>
+  ) : appliedNeedsDeploy ? (
+    <>
+      <Button
+        size="sm"
+        variant="outline"
+        className={btn}
+        onClick={() => {
+          navigate(`/ingestion/log-sources/${logSourceId}`);
+          handleClose(false);
+        }}
+      >
+        Go to Source
+      </Button>
+      <PermissionAction access={deployAccess}>
+        <Button
+          size="sm"
+          className={btn}
+          onClick={handleDeployNow}
+          disabled={deploying || !deployAccess.allowed}
+        >
+          {deploying ? (
+            <LoadingIcon className="h-3.5 w-3.5" />
           ) : (
-            <>
-              <Button variant="outline" onClick={() => handleClose(false)}>
-                Close
-              </Button>
-              <PermissionAction access={dismissAccess}>
-                <Button
-                  variant="ghost"
-                  onClick={() => dismissMutation.mutate()}
-                  disabled={
-                    dismissMutation.isPending ||
-                    applyMutation.isPending ||
-                    !dismissAccess.allowed
-                  }
-                >
-                  {dismissMutation.isPending ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <X className="w-4 h-4" />
-                  )}
-                  Dismiss
-                </Button>
-              </PermissionAction>
-              <PermissionAction access={applyAccess}>
-                <Button
-                  onClick={() => applyMutation.mutate()}
-                  disabled={
-                    applyMutation.isPending ||
-                    dismissMutation.isPending ||
-                    vrlMatch ||
-                    !applyAccess.allowed
-                  }
-                >
-                  {applyMutation.isPending ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <ArrowUpCircle className="w-4 h-4" />
-                  )}
-                  Apply Update
-                </Button>
-              </PermissionAction>
-            </>
+            <Rocket className="h-3.5 w-3.5" />
           )}
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+          Deploy Now
+        </Button>
+      </PermissionAction>
+    </>
+  ) : (
+    <>
+      <Button size="sm" variant="outline" className={btn} onClick={() => handleClose(false)}>
+        Close
+      </Button>
+      <PermissionAction access={dismissAccess}>
+        <Button
+          size="sm"
+          variant="ghost"
+          className={btn}
+          onClick={() => dismissMutation.mutate()}
+          disabled={
+            dismissMutation.isPending ||
+            applyMutation.isPending ||
+            !dismissAccess.allowed
+          }
+        >
+          {dismissMutation.isPending ? (
+            <LoadingIcon className="h-3.5 w-3.5" />
+          ) : (
+            <X className="h-3.5 w-3.5" />
+          )}
+          Dismiss
+        </Button>
+      </PermissionAction>
+      <PermissionAction access={applyAccess}>
+        <Button
+          size="sm"
+          className={btn}
+          onClick={() => applyMutation.mutate()}
+          disabled={
+            applyMutation.isPending ||
+            dismissMutation.isPending ||
+            vrlMatch ||
+            !applyAccess.allowed
+          }
+        >
+          {applyMutation.isPending ? (
+            <LoadingIcon className="h-3.5 w-3.5" />
+          ) : (
+            <ArrowUpCircle className="h-3.5 w-3.5" />
+          )}
+          Apply Update
+        </Button>
+      </PermissionAction>
+    </>
+  );
+
+  return (
+    <DetailSheet
+      open={open}
+      onOpenChange={handleClose}
+      size="xl"
+      breadcrumb={['Parsers', 'Upstream']}
+      title="Upstream Parser Changes"
+      meta={
+        diff ? (
+          <>
+            {diff.file_path && <span className="truncate">{diff.file_path}</span>}
+            {diff.upstream_version && <span>v{diff.upstream_version}</span>}
+          </>
+        ) : undefined
+      }
+      footer={footer}
+    >
+      {!diffAccess.allowed ? (
+        <div className="py-8 text-center text-[12px] text-muted-foreground">
+          {diffAccess.reason}
+        </div>
+      ) : appliedNeedsDeploy ? (
+        <div className="flex items-start gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-3">
+          <Rocket className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-500" />
+          <div className="text-[12px]">
+            <p className="font-medium text-amber-700 dark:text-amber-400">Parser updated — deploy to apply changes</p>
+            <p className="mt-1 text-amber-600/90 dark:text-amber-400/80">
+              The VRL has been saved but the pipeline is still running the previous version. Deploy now to push changes to Vector, or deploy later from the source detail page.
+            </p>
+          </div>
+        </div>
+      ) : isLoading ? (
+        <div className="flex items-center justify-center py-12">
+          <LoadingIcon className="h-6 w-6 text-muted-foreground" />
+        </div>
+      ) : diff ? (
+        <div className="space-y-3">
+          {/* Summary */}
+          <div className="flex flex-wrap items-center gap-3 text-[12px]">
+            {vrlMatch ? (
+              <Badge variant="outline" className="border-green-600 text-green-600">
+                <Check className="mr-1 h-3 w-3" />
+                VRL matches
+              </Badge>
+            ) : (
+              <Badge variant="outline" className="border-amber-600 text-amber-600">
+                VRL changed
+              </Badge>
+            )}
+            {diff.upstream_display_name && (
+              <span className="text-muted-foreground">
+                {diff.upstream_display_name}
+              </span>
+            )}
+          </div>
+
+          {/* Diff view */}
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <h4 className="text-[12px] font-medium">VRL Changes</h4>
+              <span className="text-[11px] text-muted-foreground">
+                (Your version → Upstream version)
+              </span>
+            </div>
+            <DiffViewer
+              oldText={diff.current_vrl}
+              newText={diff.upstream_vrl}
+            />
+          </div>
+        </div>
+      ) : (
+        <div className="py-8 text-center text-muted-foreground">
+          Failed to load diff
+        </div>
+      )}
+    </DetailSheet>
   );
 }

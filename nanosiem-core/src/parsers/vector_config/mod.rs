@@ -17,9 +17,11 @@
 //! - [`validation`] - Vector validate integration via Docker
 
 mod backup;
+mod closure;
 mod credentials;
 pub mod delivery;
 mod deploy;
+pub(crate) use deploy::lake_ocsf_sink_text;
 mod parser_config;
 mod publication;
 pub mod redaction;
@@ -28,11 +30,13 @@ mod sources;
 mod staging;
 mod validation;
 
+pub use parser_config::ParserConfigOptions;
 pub use publication::{
     PublicationOutcome, SnapshotBundle, VectorConfigPublicationError, VectorConfigPublisher,
 };
 pub use redaction::redact_config_snapshot;
-pub use router::{base_router_inputs, hec_normalize_present};
+pub use router::{apply_hec_route_fallback, base_router_inputs, hec_normalize_present, HEC_ROUTE};
+pub(crate) use router::{otlp_source_present, transport_of, Transport};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

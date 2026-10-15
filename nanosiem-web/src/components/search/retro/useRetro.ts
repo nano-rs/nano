@@ -30,6 +30,7 @@ import type {
   RetroSubmode,
   TimeRange,
 } from '@/lib/api/types';
+import type { DurableProductJobState } from '../DurableJobNotice';
 
 const PAGE_SIZE = 50;
 
@@ -72,14 +73,48 @@ interface CachedPage {
 const pageCache = new Map<string, CachedPage>();
 const inflight = new Map<string, Promise<RetroResponse>>();
 
+function isDurableRetro(
+  response: import('@/lib/api/types').RetroResultResponse
+): response is import('@/lib/api/types').AsyncSearchResponse {
+  return 'job_id' in response;
+}
+
+async function waitForDurableRetro(
+  jobId: string,
+  onJob?: (job: DurableProductJobState) => void
+): Promise<RetroResponse> {
+  for (;;) {
+    const status = await api.getSearchJob(jobId);
+    onJob?.({
+      jobId,
+      status: status.status,
+      queuePosition: status.queue_position,
+      estimatedWaitSeconds: status.estimated_wait_seconds,
+      progress: status.progress,
+    });
+    if (status.status === 'completed') {
+      const page = await api.getSearchJobResultPage(jobId, 0);
+      const row = page.rows[0];
+      if (page.total_rows !== 1 || !row || typeof row.submode !== 'string') {
+        throw new Error('Durable Retro job returned an invalid typed result artifact');
+      }
+      return row as unknown as RetroResponse;
+    }
+    if (status.status === 'failed' || status.status === 'cancelled') {
+      throw new Error(status.error || `Durable Retro job ${status.status}`);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 750));
+  }
+}
+
 /** Bound the cache so a long session with many distinct retro queries can't
  * grow it without limit. Entries are evicted on stale-read (TTL) but ones never
  * read again wouldn't be, so cap by count and drop the oldest (Map preserves
  * insertion order). 48 ≈ 16 queries × 3 axes — comfortably more than a session. */
 const PAGE_CACHE_MAX = 48;
 
-function pageKey(p: RetroPageParams): string {
-  return `${p.query} ${p.axis} ${p.offset ?? ''} ${p.limit ?? ''}`;
+function pageKey(p: RetroPageParams, timeRange: TimeRange): string {
+  return `${p.query} ${p.axis} ${p.offset ?? ''} ${p.limit ?? ''} ${timeRange.start} ${timeRange.end}`;
 }
 
 /** Insert, evicting the oldest entry first if at capacity. */
@@ -110,15 +145,37 @@ function normalize(resp: RetroResponse): RetroResponse {
   return resp.submode === 'pivot' ? { ...resp, rows: resp.pivot_rows ?? [] } : resp;
 }
 
+/** Seed the product cache from a completed typed Search Jobs artifact. This
+ * lets “Load results” reopen RetroView without submitting the same expensive
+ * hunt again. The cache key is identical to the companion endpoint key used by
+ * the live hook, including the immutable time window and requested page. */
+export function primeDurableRetroResult(
+  query: string,
+  timeRange: TimeRange,
+  response: RetroResponse
+): void {
+  const paged = response.submode !== 'summary';
+  cacheSet(
+    pageKey({
+      query,
+      axis: response.axis,
+      offset: paged ? (response.offset ?? 0) : undefined,
+      limit: paged ? (response.limit ?? PAGE_SIZE) : undefined,
+    }, timeRange),
+    normalize(response)
+  );
+}
+
 /** Fetch one retro page, deduping concurrent identical requests and populating
  * the module cache. Shared by the live hook and the background prefetcher so
  * their cache keys (and therefore hits) line up exactly. */
 function fetchRetroPage(
   p: RetroPageParams,
   timeRange: TimeRange,
-  cacheOpts?: import('@/lib/api').CacheRequestOpts
+  cacheOpts?: import('@/lib/api').CacheRequestOpts,
+  onJob?: (job: DurableProductJobState) => void
 ): Promise<RetroResponse> {
-  const key = pageKey(p);
+  const key = pageKey(p, timeRange);
   // A bypass (refresh) must hit the server fresh — don't ride a non-bypass
   // in-flight request, and drop any stale client entry so it re-warms clean.
   if (cacheOpts?.bypass) {
@@ -139,7 +196,13 @@ function fetchRetroPage(
       },
       cacheOpts
     )
-    .then((resp) => {
+    .then(async (response) => {
+      if (isDurableRetro(response)) {
+        onJob?.({ jobId: response.job_id, status: 'queued' });
+      }
+      const resp = isDurableRetro(response)
+        ? await waitForDurableRetro(response.job_id, onJob)
+        : response;
       const norm = normalize(resp);
       cacheSet(key, norm);
       return norm;
@@ -160,15 +223,13 @@ function fetchRetroPage(
  * cache key matches the live fetch.
  */
 export function prefetchRetro(
-  query: string | null,
-  timeRange: TimeRange | undefined,
-  axis: RetroAxis
+  _query: string | null,
+  _timeRange: TimeRange | undefined,
+  _axis: RetroAxis
 ): void {
-  if (!query || !timeRange) return;
-  const p: RetroPageParams = { query, axis, offset: 0, limit: PAGE_SIZE };
-  const key = pageKey(p);
-  if (readFresh(key) || inflight.has(key)) return;
-  void fetchRetroPage(p, timeRange).catch(() => {});
+  // List/pivot Retro work is now a durable, user-visible job. Background
+  // prefetch must never manufacture expensive queue work the analyst did not
+  // request. Completed pages still use the module/Dragonfly caches above.
 }
 
 export interface UseRetroResult {
@@ -183,6 +244,8 @@ export interface UseRetroResult {
   cacheMeta: CacheMeta | null;
   /** Force a live re-fetch of page-0, bypassing both client + server caches. */
   refresh: () => void;
+  /** Active durable handoff, surfaced through the existing Search Jobs UI. */
+  durableJob: DurableProductJobState | null;
 }
 
 /**
@@ -199,6 +262,7 @@ export function useRetro(
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [durableJob, setDurableJob] = useState<DurableProductJobState | null>(null);
   const offsetRef = useRef(0);
   // NAN-1595: drop stale out-of-order page-0 responses (query/axis/window change
   // or refresh racing the in-flight load) so the badge/data match the latest request.
@@ -230,7 +294,7 @@ export function useRetro(
       // no network) so a pivot the analyst already warmed renders immediately.
       // That counts as cached too — surface it with the client-side age.
       if (!append && !bypass) {
-        const cached = readFresh(pageKey(params));
+        const cached = readFresh(pageKey(params, timeRange));
         if (cached) {
           setData(cached.data);
           setCacheMeta({ hit: true, ageSecs: Math.floor((Date.now() - cached.at) / 1000) });
@@ -248,12 +312,16 @@ export function useRetro(
         setCacheMeta(null); // clear stale badge while the fresh page loads
       }
       setError(null);
+      setDurableJob(null);
       try {
         // page-0 captures the server cache status; appends don't affect the badge.
         const norm = await fetchRetroPage(
           params,
           timeRange,
-          append ? undefined : { onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass }
+          append ? undefined : { onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass },
+          (job) => {
+            if (seq === reqSeq.current) setDurableJob(job);
+          }
         );
         if (seq !== reqSeq.current) return; // a newer request superseded this one
         offsetRef.current = offset;
@@ -268,6 +336,7 @@ export function useRetro(
         if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
       } finally {
         if (seq === reqSeq.current) {
+          setDurableJob(null);
           if (append) setLoadingMore(false);
           else setLoading(false);
         }
@@ -322,5 +391,6 @@ export function useRetro(
     loadMore,
     cacheMeta,
     refresh,
+    durableJob,
   };
 }

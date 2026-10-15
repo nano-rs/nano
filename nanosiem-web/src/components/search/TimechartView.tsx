@@ -19,6 +19,9 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { cn } from '@/lib/utils';
+import { isPlaceholderValue } from '@/lib/is-placeholder-value';
+import { parseTimestampAsUTC } from '@/lib/date-utils';
+import { CHART_OTHER, seriesColor as chartSeriesColor } from '@/lib/chart-colors';
 
 interface SearchResult {
   id: string;
@@ -48,7 +51,11 @@ function formatY(value: number): string {
 function parseTimeBucket(value: unknown): number | null {
   if (typeof value === 'number') return value;
   if (typeof value === 'string') {
-    const d = new Date(value);
+    // UTC-safe parse: the canonical `time_bucket` key arrives Z-normalized
+    // from the backend, but the fallback path (any alias containing "time")
+    // can hand us a naive "YYYY-MM-DD HH:MM:SS" string — treat it as UTC
+    // instead of local time.
+    const d = parseTimestampAsUTC(value);
     if (!isNaN(d.getTime())) return d.getTime();
   }
   return null;
@@ -68,23 +75,9 @@ function formatBucketTime(ts: number): string {
  * rotate through distinct hues at a consistent perceptual lightness. Tuned
  * so adjacent series don't collide.
  */
-const SERIES_PALETTE = [
-  '#5EE7F0', // cyan (brand)
-  '#FB7185', // rose
-  '#FBBF24', // amber
-  '#A78BFA', // violet
-  '#34D399', // emerald
-  '#60A5FA', // blue
-  '#FB923C', // orange
-  '#F472B6', // pink
-  '#22D3EE', // sky
-  '#C084FC', // purple
-];
-const OTHER_COLOR = '#71717A'; // zinc-500
-
 function seriesColor(i: number, isOther: boolean): string {
-  if (isOther) return OTHER_COLOR;
-  return SERIES_PALETTE[i % SERIES_PALETTE.length];
+  if (isOther) return CHART_OTHER;
+  return chartSeriesColor(i);
 }
 
 type Span = { n: number; unit: 's' | 'm' | 'h' | 'd' };
@@ -128,7 +121,7 @@ interface TransformedData {
 
 const TOP_N = 10;
 
-function transformResults(results: SearchResult[]): TransformedData {
+export function transformResults(results: SearchResult[]): TransformedData {
   if (!results.length) {
     return { rows: [], seriesKeys: [], seriesTotals: {}, timeKey: 'time_bucket', otherKeys: [] };
   }
@@ -155,9 +148,11 @@ function transformResults(results: SearchResult[]): TransformedData {
       const f = r.fields || {};
       const ts = parseTimeBucket(f[timeKey]);
       if (ts == null) continue;
+      // "-"/"--" are OCSF "no value" placeholders — fold them into the same
+      // bucket as null so "-" never gets a first-class series + legend slot.
       const key = stringKeys.length === 1
-        ? String(f[stringKeys[0]] ?? 'unknown')
-        : stringKeys.map((k) => String(f[k] ?? '')).join(' / ');
+        ? (isPlaceholderValue(f[stringKeys[0]]) ? 'unknown' : String(f[stringKeys[0]]))
+        : stringKeys.map((k) => (isPlaceholderValue(f[k]) ? '' : String(f[k]))).join(' / ');
       const v = Number(f[valueField] ?? 0);
       totalsMap.set(key, (totalsMap.get(key) ?? 0) + v);
       let row = bucketMap.get(ts);
@@ -183,8 +178,10 @@ function transformResults(results: SearchResult[]): TransformedData {
   }
 
   const sortedByTotal = Array.from(totalsMap.entries()).sort((a, b) => b[1] - a[1]);
-  const topKeys = sortedByTotal.slice(0, TOP_N).map((x) => x[0]);
-  const otherKeys = sortedByTotal.slice(TOP_N).map((x) => x[0]);
+  const serverPivot = Boolean(sample._timechart);
+  const effectiveLimit = serverPivot ? sortedByTotal.length : TOP_N;
+  const topKeys = sortedByTotal.slice(0, effectiveLimit).map((x) => x[0]);
+  const otherKeys = sortedByTotal.slice(effectiveLimit).map((x) => x[0]);
 
   const seriesKeys = otherKeys.length ? [...topKeys, 'Other'] : topKeys;
 
@@ -225,8 +222,8 @@ function ChartTooltip({ active, payload, label }: RechartsTooltipProps) {
     try { timeLabel = formatInTimeZone(new Date(label), 'UTC', 'MM/dd HH:mm'); }
     catch { timeLabel = String(label); }
   } else if (typeof label === 'string') {
-    const d = new Date(label);
-    timeLabel = !isNaN(d.getTime()) ? formatInTimeZone(d, 'UTC', 'MM/dd HH:mm') : label;
+    const ts = parseTimeBucket(label);
+    timeLabel = ts != null ? formatInTimeZone(new Date(ts), 'UTC', 'MM/dd HH:mm') : label;
   }
 
   const entries = [...payload]
@@ -459,7 +456,7 @@ export function TimechartView({
   const visibleKeys = React.useMemo(() => seriesKeys.filter(isVisible), [seriesKeys, isVisible]);
 
   const colorFor = React.useCallback(
-    (i: number, k: string) => seriesColor(i, k === 'Other'),
+    (i: number, k: string) => seriesColor(i, k === 'Other' || k === 'OTHER'),
     [seriesKeys.length],
   );
 
@@ -481,7 +478,9 @@ export function TimechartView({
     setMuted(new Set());
   };
 
-  const span = parseSpan(query);
+  const spanMetadata = results[0]?.fields?._timechart as { span_seconds?: number } | undefined;
+  const seconds = spanMetadata?.span_seconds;
+  const span: Span = seconds ? (seconds % 3600 === 0 ? { n: seconds / 3600, unit: 'h' } : seconds % 60 === 0 ? { n: seconds / 60, unit: 'm' } : { n: seconds, unit: 's' }) : parseSpan(query);
   const { aggLabel, by } = parseTimechartHeader(query);
 
   const handleSpan = (s: string) => {

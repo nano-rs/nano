@@ -48,7 +48,8 @@ const RECENT_METRICS_WINDOW_HOURS: i32 = 24;
 /// Detection health summary for the Home page "Detection health" pulse card.
 ///
 /// Three aggregate counts over existing tables:
-/// - `needs_tuning`: unread `tuning_notifications` rows (`read_at IS NULL`)
+/// - `needs_tuning`: unread `tuning_notifications` rows (`read_at IS NULL`);
+///   always 0 in the open edition, which has no AI tuning
 /// - `noisy_count`: rules whose 7-day `match_count` sum exceeds [`NOISY_WEEKLY_THRESHOLD`]
 /// - `silent_count`: rules in Live/Alerting mode with no matches in the last 7 days
 #[utoipa::path(
@@ -67,11 +68,17 @@ pub async fn get_detection_health_summary(
 ) -> Result<Json<DetectionHealthSummary>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
+    // `tuning_notifications` is an AI-tuning table that exists only under the
+    // enterprise overlay; the open edition has no tuning notifications to
+    // count (NAN-3463: this was a 500 on the Home "Detection health" card).
+    #[cfg(feature = "enterprise")]
     let needs_tuning: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::bigint FROM tuning_notifications WHERE read_at IS NULL"#,
     )
     .fetch_one(&state.pool)
     .await?;
+    #[cfg(not(feature = "enterprise"))]
+    let needs_tuning: i64 = 0;
 
     let noisy_count: i64 = sqlx::query_scalar(
         r#"
@@ -302,6 +309,29 @@ pub async fn get_fleet_health(
         slow: row.2,
         errors: row.3,
     }))
+}
+
+/// Detection scheduling lag over the schedulable fleet: rules
+/// behind schedule, max / p95 lag (`now - next_run_at` once due), and
+/// `degraded` when any rule lags more than twice its own interval.
+#[utoipa::path(
+    get,
+    path = "/api/rules/scheduling-lag",
+    tag = "detections",
+    responses(
+        (status = 200, description = "Detection scheduling lag", body = nanosiem_core::detection::schedule_lag::ScheduleLagSummary),
+        (status = 403, description = "Missing permission: detections:view", body = crate::error::ErrorResponse),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_scheduling_lag(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<nanosiem_core::detection::schedule_lag::ScheduleLagSummary>, ApiError> {
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
+    Ok(Json(
+        nanosiem_core::detection::schedule_lag::read_dedicated_schedule_lag(&state.pool).await?,
+    ))
 }
 
 fn classify_trend(current: i64, prior: i64) -> String {

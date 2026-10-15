@@ -10,6 +10,7 @@
 //! - get_action_types() - Get distinct action types
 //! - get_resource_types() - Get distinct resource types (now "sources")
 
+use nanosiem_core::csv_safe::escape_field as escape_csv_field;
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
@@ -139,13 +140,16 @@ impl From<ClickHouseAuditEntry> for AuditLogEntry {
     params(ListAuditLogsQuery),
     responses(
         (status = 200, description = "Successfully retrieved audit logs", body = AuditLogListResponse),
+        (status = 400, description = "Invalid bounded audit query", body = AuditApiError),
         (status = 403, description = "Permission denied", body = AuditApiError),
+        (status = 503, description = "Tenant audit unavailable", body = AuditApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn query_audit_logs(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
+    tenant: Option<axum::Extension<nanosiem_core::auth::TrustedTenantContext>>,
     Query(query): Query<ListAuditLogsQuery>,
 ) -> Result<Json<AuditLogListResponse>, (StatusCode, Json<AuditApiError>)> {
     check_permission(&auth, permissions::AUDIT_VIEW)
@@ -163,6 +167,14 @@ pub async fn query_audit_logs(
         nanosiem_api_lib::Pagination::new(query.limit, query.offset).resolved_capped(50, 1000);
 
     let ch_query = ClickHouseAuditQuery {
+        // Shared SQL validates the original selector before applying own-events scope.
+        #[cfg(feature = "enterprise")]
+        actor_id: if state.config.deployment_mode.is_enterprise_shared() {
+            query.user_id
+        } else {
+            effective_user_id
+        },
+        #[cfg(not(feature = "enterprise"))]
         actor_id: effective_user_id,
         action: query.action,
         source: query.source,
@@ -173,6 +185,34 @@ pub async fn query_audit_logs(
         limit: Some(limit),
         offset: Some(offset),
     };
+
+    // Shared mode never reaches the global legacy query service, including
+    // when signed context or the runtime is unavailable.
+    #[cfg(feature = "enterprise")]
+    if state.config.deployment_mode.is_enterprise_shared() {
+        #[cfg(feature = "enterprise")]
+        {
+            use nanosiem_core::audit::TenantAuditQueryError;
+            let unavailable=|| (StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuditApiError::new("audit_unavailable","Tenant audit is temporarily unavailable")));
+            let runtime=state.tenant_ai_rls_runtime.as_ref().ok_or_else(unavailable)?;
+            let tenant=tenant.as_ref().ok_or_else(unavailable)?;
+            let page=runtime.tenant_audit_query_service().query(&tenant.0,auth.user_id(),&ch_query)
+                .await.map_err(|e| match e {
+                    TenantAuditQueryError::InvalidInput=>(StatusCode::BAD_REQUEST,
+                        Json(AuditApiError::new("invalid_audit_query","Use a time range of at most 31 days and an offset of at most 10000"))),
+                    TenantAuditQueryError::AccessDenied=>(StatusCode::FORBIDDEN,
+                        Json(AuditApiError::new("forbidden","Tenant audit access denied"))),
+                    TenantAuditQueryError::Unavailable=>unavailable(),
+                })?;
+            return Ok(Json(AuditLogListResponse {logs:page.logs.into_iter().map(Into::into).collect(),
+                total:page.total,limit,offset}));
+        }
+        #[cfg(not(feature = "enterprise"))]
+        return Err((StatusCode::SERVICE_UNAVAILABLE,
+            Json(AuditApiError::new("audit_unavailable","Tenant audit is temporarily unavailable"))));
+    }
+    let _=tenant;
 
     let logs = state.audit_query_service.query(&ch_query).await.map_err(|e| {
         (
@@ -365,14 +405,14 @@ fn generate_csv(entries: &[AuditLogEntry]) -> Result<String, String> {
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             entry.id,
             entry.timestamp.to_rfc3339(),
-            entry.user_id.as_deref().unwrap_or(""),
+            escape_csv_field(entry.user_id.as_deref().unwrap_or("")),
             escape_csv_field(entry.user_name.as_deref().unwrap_or("")),
-            entry.api_key_id.as_deref().unwrap_or(""),
+            escape_csv_field(entry.api_key_id.as_deref().unwrap_or("")),
             escape_csv_field(entry.api_key_name.as_deref().unwrap_or("")),
             escape_csv_field(entry.action.as_deref().unwrap_or("")),
             escape_csv_field(entry.source.as_deref().unwrap_or("")),
             escape_csv_field(entry.resource_type.as_deref().unwrap_or("")),
-            entry.resource_id.as_deref().unwrap_or(""),
+            escape_csv_field(entry.resource_id.as_deref().unwrap_or("")),
             escape_csv_field(entry.resource_name.as_deref().unwrap_or("")),
             escape_csv_field(entry.ip_address.as_deref().unwrap_or("")),
             entry.success,
@@ -382,15 +422,6 @@ fn generate_csv(entries: &[AuditLogEntry]) -> Result<String, String> {
     }
 
     Ok(csv)
-}
-
-/// Escape a field for CSV output
-fn escape_csv_field(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
 }
 
 /// Get available action types
@@ -495,13 +526,13 @@ mod tests {
         ClickHouseAuditEntry {
             event_id: "evt_1".to_string(),
             timestamp: Utc::now(),
-            user: Some("Dan Lussier".to_string()),
+            user: Some("Jane Analyst".to_string()),
             action: Some("apikey_disabled".to_string()),
             source: Some("apikey".to_string()),
             src_ip: None,
             user_agent: None,
             status: Some("success".to_string()),
-            message: "[apikey] apikey_disabled on api_key 'foo' by Dan Lussier via API key 'ci-bot'"
+            message: "[apikey] apikey_disabled on api_key 'foo' by Jane Analyst via API key 'ci-bot'"
                 .to_string(),
             metadata: metadata.clone(),
             actor_id: metadata
@@ -555,7 +586,7 @@ mod tests {
             id: "evt_1".to_string(),
             timestamp: Utc::now(),
             user_id: None,
-            user_name: Some("Dan Lussier".to_string()),
+            user_name: Some("Jane Analyst".to_string()),
             action: Some("apikey_disabled".to_string()),
             source: Some("apikey".to_string()),
             resource_type: None,
@@ -577,5 +608,36 @@ mod tests {
 
         assert!(header.contains("api_key_id,api_key_name"), "header: {header}");
         assert!(row.contains("key_abc,ci-bot"), "row: {row}");
+    }
+
+    #[test]
+    fn audit_csv_export_neutralizes_spreadsheet_formulas() {
+        // Audit text is user/attacker-influenced (display names, resource
+        // names, messages); none may open as a live formula in Excel/Sheets.
+        let entry = AuditLogEntry {
+            id: "evt".into(),
+            timestamp: Utc::now(),
+            user_id: Some("=uid".into()),
+            user_name: Some("=HYPERLINK(\"https://evil\",\"x\")".into()),
+            action: Some("+act".into()),
+            source: Some("@src".into()),
+            resource_type: Some(" =rt".into()),
+            resource_id: Some("-1+1".into()),
+            resource_name: Some("=cmd|' /c calc'!A0".into()),
+            ip_address: Some("@ip".into()),
+            user_agent: None,
+            success: true,
+            message: Some("\t=1+1".into()),
+            details: None,
+            api_key_id: Some("=kid".into()),
+            api_key_name: Some("=kname".into()),
+        };
+        let csv = generate_csv(&[entry]).unwrap();
+        let row = csv.lines().nth(1).unwrap();
+        for cell in row.split(',').skip(2) {
+            let cell = cell.trim_start_matches('"');
+            assert!(!cell.trim_start().starts_with(['=', '+', '-', '@', '\t']), "raw formula {cell:?} in {row}");
+        }
+        assert!(row.contains("'=cmd|' /c calc'!A0") && row.contains("'\t=1+1"), "{row}");
     }
 }

@@ -1,0 +1,13 @@
+[
+  {
+    "method": "GET",
+    "host": "www.virustotal.com",
+    "path": "/api/v3/files/44d88612fea8a8f36de82e1278abb02f",
+    "body": {"data": {"attributes": {
+      "last_analysis_stats": {"malicious": 60, "suspicious": 0, "undetected": 10, "harmless": 0},
+      "tags": ["eicar"], "reputation": -50, "type_description": "Text", "size": 68,
+      "popular_threat_classification": {"suggested_threat_label": "eicar/test"},
+      "names": ["eicar.com"], "last_analysis_date": 1760000000
+    }}}
+  }
+]

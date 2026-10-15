@@ -93,3 +93,21 @@ fn staged_validation_does_not_touch_the_environment() {
         "every staged config dir must still be validated: {argv:?}"
     );
 }
+
+/// Vector 0.57 disables `${NAME:-default}` interpolation unless the opt-in
+/// flag is present. Nano's base and generated configs intentionally use those
+/// settings, and the running process already opts in, so staged validation has
+/// to parse the candidate under the same interpolation contract.
+#[test]
+fn staged_validation_allows_the_running_configs_environment_interpolation() {
+    let argv = validate_argv("nanosiem-vector", "/etc/vector/staging");
+
+    assert!(
+        argv.contains(&"--dangerously-allow-env-var-interpolation".to_string()),
+        "Vector 0.57 would reject every env-backed config before topology validation: {argv:?}"
+    );
+    assert!(
+        argv.contains(&"--no-environment".to_string()),
+        "interpolation must not re-enable listener binds or sink health checks: {argv:?}"
+    );
+}

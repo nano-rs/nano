@@ -17,3 +17,6 @@ chrono.workspace = true
 rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 parking_lot = "0.12"
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

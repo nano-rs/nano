@@ -150,9 +150,38 @@ impl ParserService {
         }
 
         // Stamp dispatch_route_name on every parser bound to a source-config.
-        crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut all_parsers)
+        let waiting = crate::parsers::resolve_parser_dispatch_routes(&self.pool, &mut all_parsers)
             .await
             .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+
+        // NAN-3765: the parser being deployed cannot be rendered yet (its
+        // source configuration is not deployed, or there is no listener for
+        // its transport). Say so instead of reporting a deploy that renders
+        // nothing for it.
+        if let Some(held) = waiting.iter().find(|w| w.parser_id == parser_id) {
+            let error_msg = format!(
+                "Log source '{}' is not deployable yet: {}",
+                parser.name, held.reason
+            );
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: None,
+                deployment_id: None,
+            });
+        }
 
         // Stage all enabled parsers including this one
         if let Err(e) = self.vector_config.stage_parsers(&all_parsers).await {
@@ -277,12 +306,12 @@ impl ParserService {
         let backup = match self.vector_config.backup_current().await {
             Ok(generation) => Some(generation),
             Err(e) => {
-            // Not fatal, and must not be. Two reasons it fails: a first deploy
-            // with nothing to back up, and (NAN-2301) an active tree that is
-            // already incoherent, which the backup gate refuses to record as a
-            // rollback target. Aborting on the second would be a trap — that
-            // deploy is what prunes the stale file and heals the tree, so
-            // refusing to run it would leave the pipeline broken permanently.
+                // Not fatal, and must not be. Two reasons it fails: a first deploy
+                // with nothing to back up, and (NAN-2301) an active tree that is
+                // already incoherent, which the backup gate refuses to record as a
+                // rollback target. Aborting on the second would be a trap — that
+                // deploy is what prunes the stale file and heals the tree, so
+                // refusing to run it would leave the pipeline broken permanently.
                 // Loud, because it means this deploy has NO rollback target —
                 // and deliberately no fallback to whatever older snapshot is
                 // lying around, which would restore an unrelated starting state.

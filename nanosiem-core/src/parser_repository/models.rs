@@ -28,6 +28,10 @@ pub struct ParserRepository {
     pub last_synced_at: Option<DateTime<Utc>>,
     pub last_sync_commit: Option<String>,
     pub last_sync_status: Option<String>,
+    #[sqlx(default)]
+    pub sync_started_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub sync_lease_expires_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
     pub parser_count: i32,
     pub enabled: bool,
@@ -84,7 +88,7 @@ pub struct RepositoryParser {
     pub vendor: Option<String>,
     pub product: Option<String>,
     pub parser_vrl: Option<String>,
-    /// NAN-1149: "parser" (log) or "enrichment". Enrichment rows carry
+    /// "parser" (log) or "enrichment". Enrichment rows carry
     /// `enrich_kind`/`enrich_source`/`target_table`/`normalize_vrl` instead of a
     /// log `parser_vrl`.
     #[serde(default = "default_repo_parser_kind")]

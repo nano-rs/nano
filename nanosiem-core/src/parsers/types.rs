@@ -25,6 +25,8 @@ pub enum SourceType {
     AwsSqs,
     /// GCP Pub/Sub subscription
     GcpPubSub,
+    /// Azure Event Hubs consumer group (NAN-3764)
+    AzureEventHubs,
 }
 
 impl SourceType {
@@ -39,6 +41,7 @@ impl SourceType {
             Self::AwsS3 => "aws_s3",
             Self::AwsSqs => "aws_sqs",
             Self::GcpPubSub => "gcp_pubsub",
+            Self::AzureEventHubs => "azure_event_hubs",
         }
     }
 
@@ -53,6 +56,7 @@ impl SourceType {
             "aws_s3" | "s3" => Some(Self::AwsS3),
             "aws_sqs" | "sqs" => Some(Self::AwsSqs),
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
+            "azure_event_hubs" => Some(Self::AzureEventHubs),
             _ => None,
         }
     }
@@ -69,8 +73,39 @@ impl SourceType {
             "aws_s3",
             "aws_sqs",
             "gcp_pubsub",
+            "azure_event_hubs",
         ]
     }
+}
+
+/// Canonical `cloud_credentials.provider` values a credential can be created
+/// with (the DB check constraint also admits the legacy `azure_blob` /
+/// `splunk_hec`, which nothing creates any more).
+pub const SUPPORTED_CREDENTIAL_PROVIDERS: &[&str] =
+    &["aws_s3", "gcp_pubsub", "kafka", "azure_event_hubs"];
+
+/// Whether `provider` is one a credential can be created or listed with.
+pub fn is_supported_credential_provider(provider: &str) -> bool {
+    SUPPORTED_CREDENTIAL_PROVIDERS.contains(&provider)
+}
+
+/// NAN-3764: an `azure_event_hubs` credential must authenticate the Event
+/// Hub: an Event Hubs connection string, or a complete Entra service
+/// principal (tenant id, client id, client secret). The storage connection
+/// string for checkpoints is optional (the principal can hold a Storage Blob
+/// role instead). A deployment that uses a managed identity attaches no
+/// credential at all.
+pub fn azure_event_hubs_credentials_complete(credentials: &serde_json::Value) -> bool {
+    let present = |key: &str| {
+        credentials
+            .get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    present("connection_string")
+        || (present("azure_tenant_id")
+            && present("azure_client_id")
+            && present("azure_client_secret"))
 }
 
 /// Cloud provider types
@@ -80,6 +115,9 @@ pub enum CloudProvider {
     AwsS3,
     GcpPubSub,
     Kafka,
+    /// NAN-3764: Event Hubs SAS / storage connection strings or an Entra
+    /// service principal.
+    AzureEventHubs,
 }
 
 impl CloudProvider {
@@ -88,6 +126,7 @@ impl CloudProvider {
             Self::AwsS3 => "aws_s3",
             Self::GcpPubSub => "gcp_pubsub",
             Self::Kafka => "kafka",
+            Self::AzureEventHubs => "azure_event_hubs",
         }
     }
 
@@ -96,6 +135,7 @@ impl CloudProvider {
             "aws_s3" | "s3" => Some(Self::AwsS3),
             "gcp_pubsub" | "pubsub" | "gcp" => Some(Self::GcpPubSub),
             "kafka" => Some(Self::Kafka),
+            "azure_event_hubs" => Some(Self::AzureEventHubs),
             _ => None,
         }
     }
@@ -111,7 +151,7 @@ pub struct CloudCredential {
     pub provider: String,
     pub description: Option<String>,
     pub region: Option<String>,
-    /// `sts:ExternalId` for a cross-account role assumption (NAN-2186).
+    /// `sts:ExternalId` for a cross-account role assumption.
     ///
     /// Stored and returned UNENCRYPTED, unlike the credential payload. An
     /// ExternalId is not a secret — it is an unguessable identifier the account

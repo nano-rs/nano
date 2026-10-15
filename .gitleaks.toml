@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Confirmed synthetic fixtures and documentation, matched by BOTH file and
+# exact line. Changes to a literal require fresh triage; never exclude a tree.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)config/vector/README\.md$''']
+regexes = ['''^curl\ \-X\ POST\ http://localhost:8080/\ \\$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)config/vector/README\.md$''']
+regexes = ['''^curl\ \-X\ POST\ http://localhost:8080/\ \\$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-core/src/config_secrets\.rs$''']
+regexes = ['''^\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ "key_content":\ "\-\-\-\-\-BEGIN\ PRIVATE\ KEY\-\-\-\-\-\\nMIIE\.\.\.",$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-api/src/middleware/auth\.rs$''']
+regexes = ['''^\ \ \ \ \ \ \ \ let\ key\ =\ "018f6f72\-84b6\-7a10\-9f11\-7ab36f022001";$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-core/src/enrichment/ioc/mod\.rs$''']
+regexes = ['''^\ \ \ \ \ \ \ \ std::fs::write\(\&token,\ "0123456789abcdef0123456789abcdef\\n"\)\.unwrap\(\);$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-core/src/enrichment/ioc/mod\.rs$''']
+regexes = ['''^\ \ \ \ \ \ \ \ std::fs::write\(\&credential,\ "0123456789abcdef0123456789abcdef\\n"\)\.unwrap\(\);$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-core/src/marketplace/install_service/tests\.rs$''']
+regexes = ['''^\ \ \ \ \ \ \ \ "API_KEY":\ "e6c7e5ed3c360c53e8fc66228751af99a21c45788fea66ad"$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-core/tests/webhook_delivery_integration\.rs$''']
+regexes = ['''^\ \ \ \ let\ secret\ =\ "s3cr3t\-signing\-key";$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-lake\-worker/tests/fixtures/nan3003/regenerate\.sh$''']
+regexes = ['''^\{"ingest_id":"nan3003\-a","credential":"0b7f7a5e\-3c1d\-4f7e\-9a2b\-1c2d3e4f5a6b","activity_id":1,"category_uid":6,"class_uid":6003,"type_uid":600301,"severity_id":1,"time":1786437600123,"message":"fixture","api":\{"operation":"test"\},"actor":\{"user":\{"name":"TESTER"\}\},"src_endpoint":\{"ip":"10\.1\.2\.3"\},"metadata":\{"product":\{"name":"fixture","vendor_name":"nano"\}\}\}$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-web/src/lib/ingest\-credential\-issuance\.test\.ts$''']
+regexes = ['''^const\ TOKEN\ =\ 'nano_tok_0123456789abcdefghijklmnopqrstuv';$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-web/src/lib/ingest\-credential\-issuance\.test\.ts$''']
+regexes = ['''^\ \ \ \ const\ server\ =\ fakeServer\(\{\ pendingPolls:\ 0,\ tokenFor:\ 'c575dfca\-39b7\-435a\-9f3a\-459a738bd607'\ \}\);$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-web/src/lib/enterprise\-shared\-membership\-acceptance\.test\.ts$''']
+regexes = ['''^const\ KEY\ =\ '018f6f72\-84b6\-7a10\-9f11\-7ab36f02200d';$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)nanosiem\-web/src/lib/credential\-seal\.test\.ts$''']
+regexes = ['''^const\ VECTOR_TOKEN\ =\ 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8';$''']
+
+[[allowlists]]
+description = "Reviewed synthetic fixture or documentation example"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)vendor/sqlx\-postgres/src/options/mod\.rs$''']
+regexes = ['''^\ \ \ \ ///\ This\ should\ be\ an\ ASCII\-encoded\ blob\ that\ starts\ with\ `\-\-\-\-\-BEGIN\ PRIVATE\ KEY\-\-\-\-\-`\.$''']
+
+[[allowlists]]
+description = "Container image digest, not a credential"
+condition = "AND"
+regexTarget = "line"
+paths = ['''(^|/)images\.lock$''']
+regexes = ['''^ghcr\.io/nano\-rs/nano\-api\ sha256:5d6c10222b998bfa2725348cddf3c9a8f116960a204d8f307318188415049d87$''']

@@ -51,6 +51,8 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/rules/editor/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: ':dynamic' }] },
   { path: '/rules/:id/matches', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: ':dynamic' }] },
   { path: '/rules/coverage', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'MITRE Coverage' }] },
+  { path: '/rules/retro-hunt/new', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'New retro-hunt' }] },
+  { path: '/rules/retro-hunt/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Retro-hunt' }] },
   { path: '/rules/repositories', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Repositories' }] },
   // Playbooks
   { path: '/playbooks', segments: [{ label: 'Home', href: '/' }, { label: 'Playbooks' }], capability: 'playbooks' },
@@ -66,8 +68,18 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/prevalence', segments: [{ label: 'Home', href: '/' }, { label: 'Prevalence' }] },
   { path: '/settings/prevalence', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Rarity Thresholds' }] },
   { path: '/risk', segments: [{ label: 'Home', href: '/' }, { label: 'Risk' }], capability: 'risk' },
+  { path: '/risk/watchlists', segments: [{ label: 'Home', href: '/' }, { label: 'Risk', href: '/risk' }, { label: 'Watchlists' }], capability: 'risk' },
   { path: '/settings/risk', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Risk Scoring' }], capability: 'risk' },
   { path: '/platform/health', segments: [{ label: 'Home', href: '/' }, { label: 'SIEM Health' }], capability: 'siemHealth' },
+
+  // Observability (NAN-1536 console; NAN-3280: these were missing, so the
+  // TopBar title fell back to "Home"). The console sets the :dynamic label to
+  // the active tab ("Traces") or the drilled-in service name.
+  { path: '/observability', segments: [{ label: 'Home', href: '/' }, { label: 'Observability' }] },
+  { path: '/observability/:tab', segments: [{ label: 'Home', href: '/' }, { label: 'Observability', href: '/observability' }, { label: ':dynamic' }] },
+  { path: '/trace/:traceId', segments: [{ label: 'Home', href: '/' }, { label: 'Observability', href: '/observability' }, { label: ':dynamic' }] },
+  { path: '/reports', segments: [{ label: 'Home', href: '/' }, { label: 'Reports' }] },
+  { path: '/getting-started', segments: [{ label: 'Home', href: '/' }, { label: 'Getting Started' }] },
 
   // Alerts — NAN-746: open-core triage surface. /alerts is the list page;
   // /alerts/:id is the detail. No capability tag — both ship in core.
@@ -76,6 +88,7 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
 
   // Lookup Tables (under Rules)
   { path: '/rules/lookup-tables', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Lookup Tables' }] },
+  { path: '/rules/ioc-lists', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'IOC Lists' }], capability: 'iocLists' },
   { path: '/rules/lookup-tables/new', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Lookup Tables', href: '/rules/lookup-tables' }, { label: 'New' }] },
   { path: '/rules/lookup-tables/:name', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Lookup Tables', href: '/rules/lookup-tables' }, { label: ':dynamic' }] },
 
@@ -83,9 +96,15 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/upload', segments: [{ label: 'Home', href: '/' }, { label: 'Upload' }] },
 
   // Ingestion
+  { path: '/ingestion/pipelines', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines' }] },
+  { path: '/ingestion/pipelines/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pipelines', href: '/ingestion/pipelines' }, { label: ':dynamic' }] },
+  { path: '/ingestion/connector-feeds', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Pull feeds' }] },
   { path: '/ingestion/log-sources', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources' }] },
-  { path: '/ingestion/log-sources/new', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add Feed' }] },
-  { path: '/ingestion/log-sources/wizard', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add Feed' }] },
+  { path: '/ingestion/log-sources/new', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add data' }] },
+  { path: '/ingestion/log-sources/wizard', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Add data' }] },
+  { path: '/ingestion/log-sources/credentials', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Credentials' }] },
+  { path: '/ingestion/log-sources/onboarding', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Source onboarding' }] },
+  { path: '/ingestion/log-sources/cloud-pull', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Cloud pull' }] },
   { path: '/ingestion/log-sources/repositories', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: 'Repositories' }] },
   { path: '/ingestion/log-sources/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Log Sources', href: '/ingestion/log-sources' }, { label: ':dynamic' }] },
   { path: '/ingestion/source-configurations', segments: [{ label: 'Home', href: '/' }, { label: 'Ingestion' }, { label: 'Source Configs' }] },
@@ -102,6 +121,12 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/enrichments/custom/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: ':dynamic' }], capability: 'customEnrichment' },
   { path: '/integrations/custom/new', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: 'New API Integration' }], capability: 'customEnrichment' },
   { path: '/integrations/custom/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Marketplace', href: '/marketplace' }, { label: ':dynamic' }], capability: 'customEnrichment' },
+  { path: '/settings', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }] },
+  { path: '/settings/notifications', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Notifications' }] },
+  { path: '/settings/source-scopes', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Source Visibility' }] },
+  { path: '/settings/airgap-import', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Air-gapped Import' }] },
+  { path: '/settings/cases/queues', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Queues & Routing' }] },
+  { path: '/settings/integrations/lookup-url-allowlist', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Lookup URL allowlist' }] },
   { path: '/settings/storage', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Storage' }] },
   { path: '/settings/ai', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'AI' }], capability: 'melod' },
   { path: '/settings/webhooks', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Webhooks' }] },

@@ -3,18 +3,25 @@
 import { ShieldCheck } from 'lucide-react';
 import type { AssetDossierAuth } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
-import { SectionCard, EmptyCell, StatCell } from './_shared';
-import { formatCompact } from '../helpers';
+import { SectionCard, EmptyCell, PendingCell, StatCell } from './_shared';
+import { formatCompact, formatEventTimeFull, formatEventTimeShort } from '../helpers';
+
+/** NAN-3408: one failure token for the header, the FAILURE tile (`warn`) and the rows. */
+const FAIL_TEXT = 'text-[oklch(72%_0.14_80)]';
+const FAIL_DOT = 'oklch(72% 0.14 80)';
+const OK_DOT = 'oklch(72% 0.16 160)';
 
 export type AuthStatKey = 'SUCCESS' | 'FAILURE' | 'INTERACT' | 'NETWORK';
 
 interface AuthCardProps {
+  /** NAN-3291: the dossier is still reading; an empty section is not yet known to be empty. */
+  pending?: boolean;
   auth: AssetDossierAuth;
   onOpenAll?: () => void;
   onStatClick?: (key: AuthStatKey) => void;
 }
 
-export function AuthCard({ auth, onOpenAll, onStatClick }: AuthCardProps) {
+export function AuthCard({ auth, onOpenAll, onStatClick, pending = false }: AuthCardProps) {
   const { success, failure, interactive, network, lateral, recent } = auth;
   const total = success + failure;
 
@@ -26,7 +33,7 @@ export function AuthCard({ auth, onOpenAll, onStatClick }: AuthCardProps) {
         onActionClick={onOpenAll}
         icon={<ShieldCheck className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
-        <EmptyCell>No auth events for this entity in range</EmptyCell>
+        {pending ? <PendingCell /> : <EmptyCell>No auth events for this entity in range</EmptyCell>}
       </SectionCard>
     );
   }
@@ -44,7 +51,7 @@ export function AuthCard({ auth, onOpenAll, onStatClick }: AuthCardProps) {
           <span
             className={cn(
               'tabular-nums',
-              failure > 0 ? 'text-[oklch(62%_0.18_28)]' : 'text-foreground'
+              failure > 0 ? FAIL_TEXT : 'text-foreground'
             )}
           >
             {formatCompact(failure)}
@@ -83,25 +90,24 @@ export function AuthCard({ auth, onOpenAll, onStatClick }: AuthCardProps) {
         {recent.length > 0 && (
           <div>
             <div className="text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70 mb-1.5">
-              Recent logons
+              Recent logons · UTC
             </div>
-            <ul className="space-y-1.5">
+            <ul>
               {recent.slice(0, 6).map((r, i) => (
                 <li
                   key={`${r.ts}-${i}`}
-                  className="flex items-center gap-2 text-[11.5px] font-mono"
+                  data-testid="auth-recent-row"
+                  className="flex items-center gap-2 h-6 min-w-0 whitespace-nowrap overflow-hidden text-[11.5px] font-mono"
                 >
-                  <span className="tabular-nums text-muted-foreground/70 w-[62px] shrink-0">
-                    {r.ts}
+                  <span
+                    className="tabular-nums text-muted-foreground/70 w-[14ch] shrink-0"
+                    title={formatEventTimeFull(r.ts)}
+                  >
+                    {formatEventTimeShort(r.ts)}
                   </span>
                   <span
                     className="w-1.5 h-1.5 rounded-full shrink-0"
-                    style={{
-                      background:
-                        r.result === 'failure'
-                          ? 'oklch(62% 0.18 28)'
-                          : 'oklch(72% 0.16 160)',
-                    }}
+                    style={{ background: r.result === 'failure' ? FAIL_DOT : OK_DOT }}
                   />
                   <span className="text-muted-foreground/70 w-[80px] truncate shrink-0">
                     {r.auth_type}
@@ -110,12 +116,12 @@ export function AuthCard({ auth, onOpenAll, onStatClick }: AuthCardProps) {
                     <span className="text-foreground truncate max-w-[140px]">{r.user}</span>
                   )}
                   {r.src && (
-                    <span className="text-muted-foreground/70 truncate">
+                    <span className="text-muted-foreground/70 truncate min-w-0">
                       via <span className="text-foreground">{r.src}</span>
                     </span>
                   )}
                   {r.result === 'failure' && r.reason && (
-                    <span className="ml-auto text-[oklch(62%_0.18_28)] truncate max-w-[120px]">
+                    <span className={cn('ml-auto truncate max-w-[120px]', FAIL_TEXT)}>
                       {r.reason}
                     </span>
                   )}

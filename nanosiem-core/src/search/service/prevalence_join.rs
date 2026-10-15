@@ -299,6 +299,7 @@ impl SearchService {
                     crate::query::Dataset::from_selector(
                         request.dataset.as_deref().unwrap_or("logs"),
                     ),
+                    &std::collections::BTreeSet::new(),
                 )
                 .await?;
             tracing::info!(
@@ -328,9 +329,7 @@ impl SearchService {
 
         // NAN-806: surface the implicit auto-sort decision here too — the
         // prevalence-join path bypasses the standard merge in `search()`.
-        if let Some(w) =
-            crate::search::query_processing::auto_sort_warning(auto_sort_decision)
-        {
+        if let Some(w) = crate::search::query_processing::auto_sort_warning(auto_sort_decision) {
             warnings_output.push(w);
         }
 
@@ -349,8 +348,11 @@ impl SearchService {
         let column_order = get_column_order(query);
 
         Ok(SearchResponse {
+            server_wall_ms: None,
             results,
             total_count,
+            // The prevalence-join path runs the exact count companion.
+            total_count_exact: true,
             execution_time_ms,
             fields,
             generated_sql: if request.include_sql.unwrap_or(false) {
@@ -363,6 +365,7 @@ impl SearchService {
             cost_score,
             display_type: Some(display_type),
             column_order,
+            completeness: None,
         })
     }
 
@@ -412,7 +415,8 @@ impl SearchService {
                     if existing != tw {
                         return Err(SearchError::SqlValidationError(
                             "multiple `| prevalence` commands with different windows are not \
-                             supported in one query; use a single window".to_string(),
+                             supported in one query; use a single window"
+                                .to_string(),
                         ));
                     }
                 }
@@ -491,7 +495,10 @@ impl SearchService {
             if branches.is_empty() {
                 "NULL".to_string()
             } else {
-                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
+                format!(
+                    "COALESCE(\n            {}\n        )",
+                    branches.join(",\n            ")
+                )
             }
         };
 
@@ -510,7 +517,10 @@ impl SearchService {
             if branches.is_empty() {
                 "NULL".to_string()
             } else {
-                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
+                format!(
+                    "COALESCE(\n            {}\n        )",
+                    branches.join(",\n            ")
+                )
             }
         };
 
@@ -601,12 +611,10 @@ impl SearchService {
             } else {
                 3
             };
-            if let Some(threshold) =
-                super::prevalence_processing::decorated_filter_rescue_threshold(
-                    post_prevalence_commands,
-                    rarity_threshold,
-                )
-            {
+            if let Some(threshold) = super::prevalence_processing::decorated_filter_rescue_threshold(
+                post_prevalence_commands,
+                rarity_threshold,
+            ) {
                 let syn = |field: PrevalenceField| PrevalenceCondition {
                     field,
                     operator: PrevalenceOperator::Lte,
@@ -1114,66 +1122,50 @@ impl SearchService {
         // key differs: domain/ip use `ifNull(_x_lookup, '')`, hash uses
         // `_hash_lookup` bare). The transform match-key always `ifNull(..)`s so
         // an empty/NULL lookup can never collide with a rescued (non-empty) key.
-        let build_projection =
-            |dict: &str, dict_key: &str, xform_key: &str, rescued: &[_]| {
-                let host_count_base = format!(
-                    "if(dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6)) >= {w},\n           dictGetOrDefault('{dict}', 'host_count', {dict_key}, toUInt16(9999)),\n           toUInt16(9999))",
-                    w = window_cutoff_sql,
-                );
-                let first_seen_base = format!(
-                    "dictGetOrDefault('{dict}', 'first_seen', {dict_key}, toDateTime64(0, 6))"
-                );
-                let last_seen_base = format!(
-                    "dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6))"
-                );
-                let total_occ_base = format!(
-                    "dictGetOrDefault('{dict}', 'total_occurrences', {dict_key}, toUInt64(0))"
-                );
-                (
-                    rescue_transform_sql(&host_count_base, xform_key, rescued, RescueAttr::HostCount),
-                    rescue_transform_sql(&first_seen_base, xform_key, rescued, RescueAttr::FirstSeen),
-                    rescue_transform_sql(&last_seen_base, xform_key, rescued, RescueAttr::LastSeen),
-                    rescue_transform_sql(
-                        &total_occ_base,
-                        xform_key,
-                        rescued,
-                        RescueAttr::TotalOccurrences,
-                    ),
-                )
-            };
-        let (
-            dp_host_count_expr,
-            dp_first_seen_expr,
-            dp_last_seen_expr,
-            dp_total_occurrences_expr,
-        ) = build_projection(
-            &domain_dict,
-            "ifNull(_domain_lookup, '')",
-            "ifNull(_domain_lookup, '')",
-            &rescue.domains,
-        );
-        let (
-            hp_host_count_expr,
-            hp_first_seen_expr,
-            hp_last_seen_expr,
-            hp_total_occurrences_expr,
-        ) = build_projection(
-            &hash_dict,
-            "_hash_lookup",
-            "ifNull(_hash_lookup, '')",
-            &rescue.hashes,
-        );
-        let (
-            ip_host_count_expr,
-            ip_first_seen_expr,
-            ip_last_seen_expr,
-            ip_total_occurrences_expr,
-        ) = build_projection(
-            &ip_dict,
-            "ifNull(_ip_lookup, '')",
-            "ifNull(_ip_lookup, '')",
-            &rescue.ips,
-        );
+        let build_projection = |dict: &str, dict_key: &str, xform_key: &str, rescued: &[_]| {
+            let host_count_base = format!(
+                "if(dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6)) >= {w},\n           dictGetOrDefault('{dict}', 'host_count', {dict_key}, toUInt16(9999)),\n           toUInt16(9999))",
+                w = window_cutoff_sql,
+            );
+            let first_seen_base =
+                format!("dictGetOrDefault('{dict}', 'first_seen', {dict_key}, toDateTime64(0, 6))");
+            let last_seen_base =
+                format!("dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6))");
+            let total_occ_base =
+                format!("dictGetOrDefault('{dict}', 'total_occurrences', {dict_key}, toUInt64(0))");
+            (
+                rescue_transform_sql(&host_count_base, xform_key, rescued, RescueAttr::HostCount),
+                rescue_transform_sql(&first_seen_base, xform_key, rescued, RescueAttr::FirstSeen),
+                rescue_transform_sql(&last_seen_base, xform_key, rescued, RescueAttr::LastSeen),
+                rescue_transform_sql(
+                    &total_occ_base,
+                    xform_key,
+                    rescued,
+                    RescueAttr::TotalOccurrences,
+                ),
+            )
+        };
+        let (dp_host_count_expr, dp_first_seen_expr, dp_last_seen_expr, dp_total_occurrences_expr) =
+            build_projection(
+                &domain_dict,
+                "ifNull(_domain_lookup, '')",
+                "ifNull(_domain_lookup, '')",
+                &rescue.domains,
+            );
+        let (hp_host_count_expr, hp_first_seen_expr, hp_last_seen_expr, hp_total_occurrences_expr) =
+            build_projection(
+                &hash_dict,
+                "_hash_lookup",
+                "ifNull(_hash_lookup, '')",
+                &rescue.hashes,
+            );
+        let (ip_host_count_expr, ip_first_seen_expr, ip_last_seen_expr, ip_total_occurrences_expr) =
+            build_projection(
+                &ip_dict,
+                "ifNull(_ip_lookup, '')",
+                "ifNull(_ip_lookup, '')",
+                &rescue.ips,
+            );
 
         // Build the final SQL using dictGet() against precomputed per-window prevalence dicts.
         // NAN-362: Replaces the old CTE + LEFT JOIN path which aggregated the entire
@@ -1365,7 +1357,9 @@ ORDER BY l.timestamp DESC"#,
         use crate::query::{Comparator, EvalExpression, SearchExpr, Value};
 
         match condition {
-            SearchExpr::FieldFilter { field, op, value } => {
+            SearchExpr::FieldFilter {
+                field, op, value, ..
+            } => {
                 // Normalize field name (e.g., command_line -> process)
                 let field = Self::normalize_prevalence_field(field);
                 let field_name = field.as_ref().to_string();
@@ -1436,7 +1430,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Unsupported value type".to_string(),
-                                ))
+                                ));
                             }
                         };
                         format!("{} {} {}", sql_field, sql_op, sql_value)
@@ -1455,7 +1449,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Contains requires string value".to_string(),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1470,7 +1464,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "StartsWith requires string value".to_string(),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1485,7 +1479,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "EndsWith requires string value".to_string(),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1505,7 +1499,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Like requires string value".to_string(),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -1516,7 +1510,7 @@ ORDER BY l.timestamp DESC"#,
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Regex requires string/regex value".to_string(),
-                                ))
+                                ));
                             }
                         };
                         let not_str = if negate { "NOT " } else { "" };
@@ -1565,7 +1559,7 @@ ORDER BY l.timestamp DESC"#,
                         return Err(SearchError::SqlGenError(format!(
                             "Unsupported operator: {:?}",
                             op
-                        )))
+                        )));
                     }
                 };
 
@@ -1620,7 +1614,9 @@ ORDER BY l.timestamp DESC"#,
                     eval_field_names,
                     rarity_threshold,
                 )?;
-                Ok(format!("NOT ({})", inner_sql))
+                // NAN-3037: search NOT — a NULL (missing) operand counts as
+                // "did not match", so NOT includes it (see `null_safe_not`).
+                Ok(format!("NOT ifNull(({}), false)", inner_sql))
             }
             SearchExpr::Group(inner) => {
                 let inner_sql = self.prevalence_condition_to_sql_with_eval(

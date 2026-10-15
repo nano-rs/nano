@@ -93,6 +93,14 @@ pub async fn list_repository_rules(
 
     let rules = service.list_rules(*id, filter).await?;
 
+    // NAN-2361: an OCSF rule carries no `requires_source_types`, so the SOURCE
+    // column needs the sources its `class_uid` resolves to against live
+    // telemetry. Same two gates as preview: the live-data capability, then the
+    // caller's per-source deny set.
+    let scope = auth.effective_viewer_scope();
+    let access = live_inventory_access(&auth, &scope);
+    let mut suggested_sources = service.suggested_source_types_for(&rules, &access).await;
+
     // Get import status for all rules in this repository
     let imports = service.get_imports_for_repository(*id).await?;
     let import_map: std::collections::HashMap<Uuid, Uuid> = imports
@@ -105,10 +113,12 @@ pub async fn list_repository_rules(
         .into_iter()
         .map(|rule| {
             let linked_detection_rule_id = import_map.get(&rule.id).copied();
+            let suggested_source_types = suggested_sources.remove(&rule.id).unwrap_or_default();
             RepositoryRuleResponse {
                 rule,
                 is_imported: linked_detection_rule_id.is_some(),
                 linked_detection_rule_id,
+                suggested_source_types,
             }
         })
         .collect();
@@ -344,7 +354,7 @@ pub async fn import_rule(
             let ai_client = melod_service.ai_client_arc();
             let converter = nanosiem_enterprise::melod::SigmaConverterAgent::new(
                 ai_client,
-                state.config.schema_profile(),
+                state.schema_profile(),
             );
             let context = nanosiem_enterprise::melod::ConversionContext {
                 available_source_types,

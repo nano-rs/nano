@@ -107,7 +107,7 @@ pub struct ListAlertsQuery {
     #[serde(default, with = "nanosiem_core::typeid::rule::opt")]
     #[param(value_type = Option<String>)]
     pub rule_id: Option<Uuid>,
-    /// NAN-1541: comma-separated alert-spine kinds to include
+    /// comma-separated alert-spine kinds to include
     /// (`detection`, `metric_monitor`, `slo`, `synthetic`). Omitted = all
     /// kinds. The SIEM Alerts view passes `detection`; the Observability
     /// Alerts view passes the monitor kinds.
@@ -175,7 +175,7 @@ pub struct AlertStreamResponse {
     pub has_more: bool,
 }
 
-/// Request for closing an alert. NAN-1068: the actor (`closed_by`) is
+/// Request for closing an alert. The actor (`closed_by`) is
 /// derived server-side from the JWT — only the disposition is supplied
 /// by the client.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -189,7 +189,7 @@ pub struct AssignRequest {
     pub assigned_to: String,
 }
 
-/// Request for bulk operations. NAN-1068: the actor is derived
+/// Request for bulk operations. The actor is derived
 /// server-side from the JWT.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct BulkRequest {
@@ -442,7 +442,7 @@ pub async fn get_alert(
 }
 
 /// Acknowledge an alert. The actor (`acknowledged_by`) is derived
-/// server-side from the JWT — no request body is required (NAN-1068).
+/// server-side from the JWT — no request body is required.
 #[utoipa::path(
     post,
     path = "/api/alerts/{id}/acknowledge",
@@ -931,7 +931,7 @@ pub struct VelocityBucket {
 pub struct VelocityQuery {
     #[serde(default = "default_velocity_hours")]
     pub hours: u32,
-    /// NAN-1541: comma-separated alert-spine kinds to include. Omitted = all
+    /// comma-separated alert-spine kinds to include. Omitted = all
     /// kinds. The SIEM Rules sparkline passes `detection`.
     #[serde(default)]
     pub kinds: Option<String>,

@@ -1,0 +1,48 @@
+# nano-connector spec that replaces code.ts in this directory (NAN-3490). Declarative:
+# engine-owned fan-out over the enabled applications (one checkpoint each),
+# [startTime, endTime) windows with lag + lookback for Google's late events,
+# nextPageToken paging (newest-first; the window commits only when walked),
+# and dedupe on id.uniqueQualifier. Auth is the google_service_account plugin.
+version: 1
+name: google_workspace
+kind: collector
+allow:
+  - host: admin.googleapis.com
+    path_prefixes: ["/admin/reports/v1/activity/users/all/applications/"]
+  - host: oauth2.googleapis.com
+    path_prefixes: ["/token"]
+auth:
+  type: google_service_account
+  token_url: "https://oauth2.googleapis.com/token"
+  private_key_credential: PRIVATE_KEY
+  client_email_credential: CLIENT_EMAIL
+  scope: "https://www.googleapis.com/auth/admin.reports.audit.readonly"
+  subject: "{{config.ADMIN_EMAIL}}"
+schedule: "*/5 * * * *"
+limits: { max_run_secs: 600, max_pages: 2000 }
+rate_limit: { min_interval_ms: 250, max_retries_429: 5, max_wait_ms: 60000 }
+streams:
+  - id: activities
+    source_type: "gws_{{item}}"
+    fanout:
+      discover: { from: config, key: STREAMS }
+      concurrency: 4
+    request:
+      url: "https://admin.googleapis.com/admin/reports/v1/activity/users/all/applications/{{item}}"
+      query:
+        startTime: "{{window.start}}"
+        endTime: "{{window.end}}"
+        maxResults: "1000"
+      headers: { Accept: application/json }
+    response: { events_path: items }
+    pagination: { type: token, from: nextPageToken, param: pageToken }
+    # uniqueQualifier is unique only together with the event time; the same
+    # composite as the google_workspace_ocsf parser's metadata.uid.
+    ingest_id: { fields: [id.applicationName, id.customerId, id.uniqueQualifier, id.time] }
+    window:
+      time_field: id.time
+      uid_field: id.uniqueQualifier
+      max_span_secs: 3600
+      lag_secs: 60
+      lookback_secs: 600
+      initial_lookback_secs: 86400

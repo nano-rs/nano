@@ -148,7 +148,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::auth::SourceProvenance;
+use crate::auth::{ScopeSet, SourceProvenance};
 use crate::db::TableNames;
 use crate::extensions::{AiClient, AiMessage};
 use crate::hunts::capabilities::{infer_source_capabilities, FieldObservation};
@@ -158,6 +158,8 @@ use crate::log_telemetry::repository::is_safe_source_type;
 use crate::log_telemetry::{BucketSize, LogTelemetryService, SourceTypeStats};
 use crate::mitre::data_sources::nanosiem_sources_for;
 use crate::mitre::{MitreRepository, TELEMETRY_STALE_AFTER_MINUTES};
+use crate::query::TimeRange;
+use crate::search::SearchService;
 
 // =============================================================================
 // Tunables
@@ -193,6 +195,25 @@ pub const FIELD_POPULATION_FIELDS: &[&str] = &[
     "auth_result",
 ];
 
+/// Canonical OCSF 1.9 fields used by the lake census.
+///
+/// These names are emitted in the stored profile and in generated nPL exactly
+/// as written. They are not aliases for the legacy UDM list above. Keeping the
+/// two lists attached to their respective storage backends lets the temporary
+/// ClickHouse lane remain readable without making UDM part of the lake
+/// contract.
+pub const OCSF_FIELD_POPULATION_FIELDS: &[&str] = &[
+    "actor.user.name",
+    "src_endpoint.ip",
+    "dst_endpoint.ip",
+    "device.hostname",
+    "process.name",
+    "process.cmd_line",
+    "file.path",
+    "http_request.url.url_string",
+    "status",
+];
+
 /// Dimension columns the DETERMINISTIC fingerprint path may aggregate over.
 ///
 /// Every entry must be a low-cardinality label rather than event content. This
@@ -209,6 +230,17 @@ pub const FINGERPRINT_DIMENSIONS: &[(&str, &str)] = &[
     ("enriched_src_country", "geography"),
     ("auth_type", "identity"),
     ("protocol", "network_edge"),
+];
+
+/// Canonical OCSF 1.9 dimensions for the lake fingerprint path.
+pub const OCSF_FINGERPRINT_DIMENSIONS: &[(&str, &str)] = &[
+    ("cloud.provider", "cloud"),
+    ("cloud.region", "cloud"),
+    ("api.service.name", "saas_estate"),
+    ("metadata.product.name", "saas_estate"),
+    ("src_endpoint.location.country", "geography"),
+    ("auth_protocol", "identity"),
+    ("connection_info.protocol_num", "network_edge"),
 ];
 
 /// Most values kept per dimension.
@@ -497,6 +529,9 @@ pub struct CensusInputs {
     pub sparklines: HashMap<String, Vec<u64>>,
     pub deep: Option<HashMap<String, DeepSourceFacts>>,
     pub history: Option<HashMap<String, DateTime<Utc>>>,
+    /// Query-facing field names measured by the deep probe. Empty means the
+    /// legacy UDM list for compatibility with existing callers/tests.
+    pub population_fields: Vec<String>,
 }
 
 /// Per-source output of the deep probe over the log table.
@@ -566,7 +601,15 @@ pub fn build_census(inputs: &CensusInputs, degraded: bool) -> Vec<CensusRow> {
                     (None, _, None) => (None, HistoryBasis::Unavailable),
                 };
 
-            let field_population = deep.map(field_population);
+            let population_fields = if inputs.population_fields.is_empty() {
+                FIELD_POPULATION_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                inputs.population_fields.clone()
+            };
+            let field_population = deep.map(|facts| field_population(facts, &population_fields));
             let reporters = deep.and_then(reporter_fraction);
             let row_degraded = degraded
                 && matches!(
@@ -652,11 +695,11 @@ fn classify_health(
     }
 }
 
-fn field_population(deep: &DeepSourceFacts) -> Vec<FieldPopulation> {
-    FIELD_POPULATION_FIELDS
+fn field_population(deep: &DeepSourceFacts, fields: &[String]) -> Vec<FieldPopulation> {
+    fields
         .iter()
         .map(|field| {
-            let populated = deep.populated.get(*field).copied().unwrap_or(0);
+            let populated = deep.populated.get(field).copied().unwrap_or(0);
             let pct = if deep.recent_events == 0 {
                 0.0
             } else {
@@ -666,7 +709,7 @@ fn field_population(deep: &DeepSourceFacts) -> Vec<FieldPopulation> {
                 ((populated as f64 / deep.recent_events as f64) * 1000.0).round() / 10.0
             };
             FieldPopulation {
-                field: (*field).to_string(),
+                field: field.clone(),
                 populated_pct: pct,
             }
         })
@@ -855,7 +898,7 @@ pub enum SurfaceDetail {
 /// least one blind technique, and how many it would unblind.
 ///
 /// This is what replaces 615 unactionable technique rows. On the deployment
-/// that motivated NAN-2243 it reads `linux_auditd: 542, windows_sysmon: 527,
+/// that motivated this change, it reads `linux_auditd: 542, windows_sysmon: 527,
 /// microsoft_sysmon__json_: 455, netflow: 225, azure_ad: 164, …` — a ranked
 /// onboarding backlog, which is a strictly more useful answer than the rows it
 /// replaces.
@@ -1310,6 +1353,34 @@ fn tactic_group_fields(tactic_id: &str) -> &'static [&'static str] {
     }
 }
 
+fn ocsf_tactic_group_fields(tactic_id: &str) -> &'static [&'static str] {
+    match tactic_id {
+        "TA0043" | "TA0042" => &["src_endpoint.ip", "http_request.url.hostname"],
+        "TA0001" => &[
+            "src_endpoint.ip",
+            "actor.user.name",
+            "http_request.url.hostname",
+        ],
+        "TA0002" => &["device.hostname", "process.name", "process.cmd_line"],
+        "TA0003" => &["device.hostname", "process.name", "reg_key.path"],
+        "TA0004" | "TA0006" | "TA0007" => &["device.hostname", "actor.user.name", "process.name"],
+        "TA0005" => &["device.hostname", "process.name", "file.path"],
+        "TA0008" => &[
+            "src_endpoint.hostname",
+            "dst_endpoint.hostname",
+            "actor.user.name",
+        ],
+        "TA0009" => &["device.hostname", "actor.user.name", "file.path"],
+        "TA0011" | "TA0010" => &[
+            "device.hostname",
+            "dst_endpoint.ip",
+            "http_request.url.hostname",
+        ],
+        "TA0040" => &["device.hostname", "actor.user.name", "activity_name"],
+        _ => &["device.hostname", "actor.user.name"],
+    }
+}
+
 /// Map a source type onto the `playbooks_category_check` value set. A hunt is
 /// filed under what it reads, not under what it is looking for.
 fn category_for_source(source_type: &str) -> &'static str {
@@ -1331,6 +1402,15 @@ pub fn draft_for_gap(
     primary_tactic: Option<&TacticRef>,
     volumes: &HashMap<String, u64>,
 ) -> Option<GeneratedDraft> {
+    draft_for_gap_schema(technique, primary_tactic, volumes, false)
+}
+
+pub fn draft_for_gap_schema(
+    technique: &SurfaceTechnique,
+    primary_tactic: Option<&TacticRef>,
+    volumes: &HashMap<String, u64>,
+    ocsf: bool,
+) -> Option<GeneratedDraft> {
     // Highest-volume available source wins: it is the one most likely to
     // actually contain the behaviour, and `source_type=` on a single value keeps
     // the opening nPL simple enough for a human to edit in one pass.
@@ -1346,12 +1426,23 @@ pub fn draft_for_gap(
         .clone();
 
     let tactic_id = primary_tactic.map(|t| t.id.as_str()).unwrap_or("");
-    let fields = tactic_group_fields(tactic_id).join(", ");
+    let fields = if ocsf {
+        ocsf_tactic_group_fields(tactic_id)
+    } else {
+        tactic_group_fields(tactic_id)
+    }
+    .join(", ");
     // Rare-combination first pass. `sort +count` puts the least common shapes at
     // the top, which is where a hunt starts; `head` bounds what the agent opens
     // with rather than what it may go on to read.
-    let sweep_query =
-        format!("source_type=\"{source_type}\" | stats count by {fields} | sort +count | head 100");
+    let source_field = if ocsf {
+        "metadata.log_source"
+    } else {
+        "source_type"
+    };
+    let sweep_query = format!(
+        "{source_field}=\"{source_type}\" | stats count by {fields} | sort +count | head 100"
+    );
 
     let tactic_name = primary_tactic
         .map(|t| t.name.clone())
@@ -1825,7 +1916,7 @@ pub struct ProfileFingerprint {
 /// authors neither — it authors `fingerprint` and `actor_weighting` — so
 /// requiring them made the agent hold two large server-computed structures for
 /// the sole purpose of shuttling them back unchanged. That is what made recon
-/// unusable from an agent (NAN-2243): the surface alone was 371 KB.
+/// unusable from an agent: the surface alone was 371 KB.
 ///
 /// Omit either and the server recomputes it here, from the same reads
 /// [`ReconService::census`] and [`ReconService::surface`] use. Recomputing is
@@ -2271,14 +2362,14 @@ pub fn sanitize_draft(draft: GeneratedDraft) -> Result<GeneratedDraft, String> {
 /// copies of that decision is exactly how a rail badge starts disagreeing with
 /// the page it links to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CensusDepth {
+pub enum CensusDepth {
     Inventory,
     Full,
 }
 
 /// Gathered census inputs, plus the one fact provenance depends on.
-struct GatheredInputs {
-    inputs: CensusInputs,
+pub struct GatheredInputs {
+    pub inputs: CensusInputs,
     /// The 7-day rollup read SUCCEEDED.
     ///
     /// This is the completeness half of the manifest, and it is tied to the
@@ -2288,14 +2379,14 @@ struct GatheredInputs {
     /// source the census does not already name. Tying completeness to
     /// `degraded` instead would make an unhealthy source — the case the flag
     /// EXISTS for — hide the whole profile from every source-scoped reader.
-    rollup_read: bool,
+    pub rollup_read: bool,
 }
 
 /// Note every hunt-required source type that is not healthy.
 ///
 /// This is the reason the degraded flag exists: the profile understates
 /// huntability and the UI has to be able to say so.
-fn note_unhealthy_required(census: &[CensusRow], degraded: &mut DegradedLog) {
+pub fn note_unhealthy_required(census: &[CensusRow], degraded: &mut DegradedLog) {
     let unhealthy: Vec<&CensusRow> = census
         .iter()
         .filter(|row| row.required_by_hunts && row.state != SourceHealth::Healthy)
@@ -2315,7 +2406,7 @@ fn note_unhealthy_required(census: &[CensusRow], degraded: &mut DegradedLog) {
 }
 
 /// The source types a technique's telemetry may be judged against.
-fn live_source_types(census: &[CensusRow]) -> BTreeSet<String> {
+pub fn live_source_types(census: &[CensusRow]) -> BTreeSet<String> {
     census
         .iter()
         .filter(|row| row.state == SourceHealth::Healthy)
@@ -2327,7 +2418,7 @@ fn live_source_types(census: &[CensusRow]) -> BTreeSet<String> {
 ///
 /// The single most alarming transition recon can report: detection did not
 /// change, visibility did.
-fn note_regressions(surface: &HuntableSurface, degraded: &mut DegradedLog) {
+pub fn note_regressions(surface: &HuntableSurface, degraded: &mut DegradedLog) {
     if surface.regressed_to_blind.is_empty() {
         return;
     }
@@ -2345,7 +2436,7 @@ fn note_regressions(surface: &HuntableSurface, degraded: &mut DegradedLog) {
 /// (without it we cannot enumerate), and
 /// [`SourceProvenance::from_parts`] additionally refuses to call an empty
 /// manifest complete.
-fn manifest(census: &[CensusRow], rollup_read: bool) -> SourceProvenance {
+pub fn manifest(census: &[CensusRow], rollup_read: bool) -> SourceProvenance {
     SourceProvenance::from_parts(
         census.iter().map(|row| row.source_type.as_str()),
         rollup_read,
@@ -2359,8 +2450,11 @@ fn manifest(census: &[CensusRow], rollup_read: bool) -> SourceProvenance {
 #[derive(Clone)]
 pub struct ReconService {
     pool: PgPool,
-    clickhouse: ClickHouseClient,
-    table_names: TableNames,
+    clickhouse: Option<ClickHouseClient>,
+    table_names: Option<TableNames>,
+    /// Present only for the canonical OCSF lake lane. All event reads stay
+    /// behind the tenant-pinned worker contract owned by SearchService.
+    lake_search: Option<SearchService>,
     ai: Option<Arc<dyn AiClient>>,
 }
 
@@ -2370,19 +2464,19 @@ pub struct ReconService {
 /// spent, probes are SKIPPED rather than started — a probe that begins with two
 /// seconds left burns two seconds and produces nothing.
 #[derive(Debug, Clone, Copy)]
-struct Deadline {
+pub struct Deadline {
     expires_at: tokio::time::Instant,
 }
 
 impl Deadline {
-    fn new(budget: StdDuration) -> Self {
+    pub fn new(budget: StdDuration) -> Self {
         Self {
             expires_at: tokio::time::Instant::now() + budget,
         }
     }
 
     /// `None` when the budget is spent.
-    fn allot(&self, requested: StdDuration) -> Option<StdDuration> {
+    pub fn allot(&self, requested: StdDuration) -> Option<StdDuration> {
         let remaining = self
             .expires_at
             .saturating_duration_since(tokio::time::Instant::now());
@@ -2402,12 +2496,12 @@ impl Deadline {
 /// whole run, and a later successful probe does not repair an earlier failed
 /// one.
 #[derive(Debug, Default)]
-struct DegradedLog {
-    reasons: Vec<String>,
+pub struct DegradedLog {
+    pub reasons: Vec<String>,
 }
 
 impl DegradedLog {
-    fn note(&mut self, reason: impl Into<String>) {
+    pub fn note(&mut self, reason: impl Into<String>) {
         self.reasons.push(reason.into());
     }
 
@@ -2420,7 +2514,7 @@ impl DegradedLog {
     ///
     /// `degraded_detail` has no length CHECK in the schema and is rendered in a
     /// rail badge, so it is capped here.
-    fn seal(&self) -> (bool, Option<String>) {
+    pub fn seal(&self) -> (bool, Option<String>) {
         if self.reasons.is_empty() {
             return (false, None);
         }
@@ -2459,7 +2553,7 @@ async fn refresh_inferred_source_capabilities(
                     source_type, capability, state, origin, confidence, basis,
                     evidence, last_observed_at
                 ) VALUES ($1, $2, 'mapped', 'inferred', $3, $4, $5, $6)
-                ON CONFLICT (source_type, capability, origin) DO UPDATE
+                ON CONFLICT ON CONSTRAINT hunt_source_capability_bindings_pkey DO UPDATE
                    SET state = 'mapped',
                        confidence = EXCLUDED.confidence,
                        basis = EXCLUDED.basis,
@@ -2490,8 +2584,25 @@ impl ReconService {
     ) -> Self {
         Self {
             pool,
-            clickhouse,
-            table_names,
+            clickhouse: Some(clickhouse),
+            table_names: Some(table_names),
+            lake_search: None,
+            ai,
+        }
+    }
+
+    /// Build recon over the canonical OCSF lake boundary.
+    ///
+    /// This constructor intentionally accepts no ClickHouse client or table
+    /// name. A lake recon request therefore cannot silently fall back to the
+    /// legacy store when a worker read fails; it returns a degraded profile
+    /// with the failed probe named, matching the existing recon contract.
+    pub fn new_lake(pool: PgPool, search: SearchService, ai: Option<Arc<dyn AiClient>>) -> Self {
+        Self {
+            pool,
+            clickhouse: None,
+            table_names: None,
+            lake_search: Some(search),
             ai,
         }
     }
@@ -2918,7 +3029,29 @@ impl ReconService {
             .collect();
         let required_by_hunts = self.hunt_required_source_types().await?;
 
-        let telemetry = LogTelemetryService::new(self.clickhouse.clone(), self.table_names.clone());
+        if self.lake_search.is_some() {
+            return self
+                .gather_lake(
+                    observed_at,
+                    deadline,
+                    degraded,
+                    depth,
+                    configured,
+                    required_by_hunts,
+                )
+                .await;
+        }
+
+        let telemetry = LogTelemetryService::new(
+            self.clickhouse
+                .as_ref()
+                .expect("legacy recon requires a ClickHouse client")
+                .clone(),
+            self.table_names
+                .as_ref()
+                .expect("legacy recon requires table names")
+                .clone(),
+        );
         let stats = probe(
             telemetry.stats_all(CENSUS_WINDOW_HOURS),
             "source rollup (7d)",
@@ -2989,6 +3122,211 @@ impl ReconService {
         })
     }
 
+    /// Lake-native census gather over exact OCSF 1.9 paths.
+    ///
+    /// The legacy implementation reads a ClickHouse materialized rollup. The
+    /// lake lane derives the same bounded facts from immutable event snapshots
+    /// through SearchService, so it works with the same tenant/source fencing,
+    /// byte budgets, cache, and horizontal worker pool as every other product
+    /// view. No object coordinate or SQL string is accepted from a caller.
+    async fn gather_lake(
+        &self,
+        observed_at: DateTime<Utc>,
+        deadline: Deadline,
+        degraded: &mut DegradedLog,
+        depth: CensusDepth,
+        configured: BTreeSet<String>,
+        required_by_hunts: BTreeSet<String>,
+    ) -> Result<GatheredInputs, HuntError> {
+        let search = self
+            .lake_search
+            .as_ref()
+            .expect("lake recon requires a lake SearchService");
+        gather_lake_inputs(search, observed_at, deadline, degraded, depth, configured, required_by_hunts).await
+    }
+
+    async fn populate_lake_fingerprint(
+        &self,
+        aggregates: &mut FingerprintAggregates,
+        since: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+        deadline: Deadline,
+        degraded: &mut DegradedLog,
+    ) {
+        let Some(search) = self.lake_search.as_ref() else { return };
+        populate_lake_fingerprint(search, aggregates, since, observed_at, deadline, degraded).await
+    }
+}
+
+/// Lake-native census gather over exact OCSF 1.9 paths (free function so the
+/// hosted-shared recon can drive it with a tenant-pinned `SearchService`;
+/// `ReconService::gather_lake` delegates here).
+///
+/// The legacy implementation reads a ClickHouse materialized rollup. The
+/// lake lane derives the same bounded facts from immutable event snapshots
+/// through SearchService, so it works with the same tenant/source fencing,
+/// byte budgets, cache, and horizontal worker pool as every other product
+/// view. No object coordinate or SQL string is accepted from a caller.
+#[allow(clippy::too_many_arguments)]
+pub async fn gather_lake_inputs(
+    search: &SearchService,
+    observed_at: DateTime<Utc>,
+    deadline: Deadline,
+    degraded: &mut DegradedLog,
+    depth: CensusDepth,
+    configured: BTreeSet<String>,
+    required_by_hunts: BTreeSet<String>,
+) -> Result<GatheredInputs, HuntError> {
+    {
+        let stats_rows = 
+            run_lake_rows(search, 
+                "metadata.log_source!=\"\" | stats count() as events, min(time) as first_event_at, max(time) as last_event_at by metadata.log_source",
+                observed_at - Duration::hours(CENSUS_WINDOW_HOURS),
+                observed_at,
+                "source inventory (7d)",
+                deadline,
+                degraded,
+                MAX_CENSUS_ROWS,
+            )
+            .await;
+        let rollup_read = stats_rows.is_some();
+        let stats = stats_rows.map(|rows| lake_source_stats(&rows));
+        let mut inputs = CensusInputs {
+            observed_at,
+            configured,
+            required_by_hunts,
+            stats,
+            population_fields: OCSF_FIELD_POPULATION_FIELDS
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect(),
+            ..Default::default()
+        };
+
+        if depth == CensusDepth::Inventory {
+            return Ok(GatheredInputs {
+                inputs,
+                rollup_read,
+            });
+        }
+
+        let recent_start = observed_at - Duration::hours(SPARKLINE_HOURS);
+        let stats_24h = run_lake_rows(search, 
+                "metadata.log_source!=\"\" | stats count() as events by metadata.log_source",
+                recent_start,
+                observed_at,
+                "source inventory (24h)",
+                deadline,
+                degraded,
+                MAX_CENSUS_ROWS,
+            )
+            .await;
+        inputs.events_24h = stats_24h
+            .as_deref()
+            .map(lake_event_counts)
+            .unwrap_or_default();
+
+        let bucket_rows = run_lake_rows(search, 
+                "metadata.log_source!=\"\" | timechart span=1h count() as events by metadata.log_source",
+                recent_start,
+                observed_at,
+                "24h ingestion buckets",
+                deadline,
+                degraded,
+                24 * MAX_CENSUS_ROWS,
+            )
+            .await;
+        inputs.sparklines = bucket_rows
+            .as_deref()
+            .map(|rows| collapse_sparklines(&lake_hourly_points(rows), observed_at))
+            .unwrap_or_default();
+
+        let deep_recent = run_lake_rows(search, 
+                "metadata.log_source!=\"\" | stats count() as recent_events, count(actor.user.name) as pop_actor_user_name, count(src_endpoint.ip) as pop_src_endpoint_ip, count(dst_endpoint.ip) as pop_dst_endpoint_ip, count(device.hostname) as pop_device_hostname, count(process.name) as pop_process_name, count(process.cmd_line) as pop_process_cmd_line, count(file.path) as pop_file_path, count(http_request.url.url_string) as pop_http_request_url_url_string, count(status) as pop_status, dc(device.hostname) as hosts_24h, dc(cloud.account.uid) as accounts_24h by metadata.log_source",
+                recent_start,
+                observed_at,
+                "OCSF field population probe",
+                deadline,
+                degraded,
+                MAX_CENSUS_ROWS,
+            )
+            .await;
+        let deep_window = run_lake_rows(search, 
+                "metadata.log_source!=\"\" | stats dc(device.hostname) as hosts_window, dc(cloud.account.uid) as accounts_window by metadata.log_source",
+                observed_at - Duration::hours(CENSUS_WINDOW_HOURS),
+                observed_at,
+                "OCSF reporter population probe",
+                deadline,
+                degraded,
+                MAX_CENSUS_ROWS,
+            )
+            .await;
+        inputs.deep = deep_recent.map(|rows| lake_deep_facts(&rows, deep_window.as_deref()));
+
+        let history_rows = run_lake_rows(search, 
+                "metadata.log_source!=\"\" | stats min(time) as first_event_at by metadata.log_source",
+                observed_at - Duration::days(HISTORY_PROBE_MAX_DAYS),
+                observed_at,
+                "history depth probe",
+                deadline,
+                degraded,
+                MAX_CENSUS_ROWS,
+            )
+            .await;
+        inputs.history = history_rows.map(|rows| lake_history(&rows));
+
+        Ok(GatheredInputs {
+            inputs,
+            rollup_read,
+        })
+    }
+}
+
+/// One bounded lake probe: nPL through `SearchService::execute_lake_view_query`
+/// under the recon wall budget. `None` (with a degraded note) on failure,
+/// timeout or a spent budget.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_lake_rows(
+    search: &SearchService,
+    query: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    label: &str,
+    deadline: Deadline,
+    degraded: &mut DegradedLog,
+    limit: usize,
+) -> Option<Vec<serde_json::Value>> {
+    {
+        let Some(budget) = deadline.allot(PROBE_TIMEOUT) else {
+            degraded.note(format!("{label} skipped: recon wall budget spent"));
+            return None;
+        };
+        let range = TimeRange::new(start, end);
+        let scope = ScopeSet::unrestricted();
+        let request = search.execute_lake_view_query(
+            query.to_string(),
+            &range,
+            &scope,
+            "hunt-recon",
+            limit.min(50_000),
+        );
+        match tokio::time::timeout(budget, request).await {
+            Ok(Ok(response)) => Some(response.results),
+            Ok(Err(error)) => {
+                tracing::warn!(probe = %label, error = %error, "lake recon probe failed");
+                degraded.note(format!("{label} failed: {error}"));
+                None
+            }
+            Err(_) => {
+                tracing::warn!(probe = %label, "lake recon probe timed out");
+                degraded.note(format!("{label} timed out after {}s", budget.as_secs()));
+                None
+            }
+        }
+    }
+}
+
+impl ReconService {
     /// Build the huntable surface for a given live-source set.
     ///
     /// Returns the tactic catalog alongside it because draft generation needs
@@ -3117,8 +3455,12 @@ impl ReconService {
         deadline: Deadline,
         degraded: &mut DegradedLog,
     ) -> Option<HashMap<String, DeepSourceFacts>> {
+        let table_names = self
+            .table_names
+            .as_ref()
+            .expect("legacy deep probe requires table names");
         let sql = build_deep_probe_sql(
-            &self.table_names.read(crate::schema::active_logs_table()),
+            &table_names.read(crate::schema::active_logs_table()),
             observed_at - Duration::hours(CENSUS_WINDOW_HOURS),
             observed_at - Duration::hours(SPARKLINE_HOURS),
             observed_at,
@@ -3140,8 +3482,12 @@ impl ReconService {
         deadline: Deadline,
         degraded: &mut DegradedLog,
     ) -> Option<HashMap<String, DateTime<Utc>>> {
+        let table_names = self
+            .table_names
+            .as_ref()
+            .expect("legacy history probe requires table names");
         let sql = build_history_probe_sql(
-            &self.table_names.read(crate::schema::active_logs_table()),
+            &table_names.read(crate::schema::active_logs_table()),
             observed_at - Duration::days(HISTORY_PROBE_MAX_DAYS),
             observed_at,
         );
@@ -3179,7 +3525,12 @@ impl ReconService {
             return None;
         };
         let fetch = async {
-            let mut cursor = self.clickhouse.query(sql).fetch_bytes("JSONEachRow")?;
+            let mut cursor = self
+                .clickhouse
+                .as_ref()
+                .expect("legacy JSON probe requires a ClickHouse client")
+                .query(sql)
+                .fetch_bytes("JSONEachRow")?;
             let mut buf = Vec::new();
             while let Some(chunk) = cursor.next().await? {
                 buf.extend_from_slice(&chunk);
@@ -3230,54 +3581,63 @@ impl ReconService {
             ..Default::default()
         };
 
-        let table = self.table_names.read(crate::schema::active_logs_table());
         let since = observed_at - Duration::hours(SPARKLINE_HOURS);
-        if let Some(body) = self
-            .run_json(
-                &build_fingerprint_scalars_sql(&table, since, observed_at),
-                "fingerprint scalars",
-                deadline,
-                degraded,
-            )
-            .await
-        {
-            apply_fingerprint_scalars(&mut aggregates, &body);
-        }
-        if let Some(body) = self
-            .run_json(
-                &build_hour_histogram_sql(&table, since, observed_at),
-                "hour-of-day histogram",
-                deadline,
-                degraded,
-            )
-            .await
-        {
-            aggregates.hour_of_day_events = parse_hour_histogram(&body);
-        }
-        for (column, plane) in FINGERPRINT_DIMENSIONS {
-            let Some(body) = self
+        if self.lake_search.is_some() {
+            self.populate_lake_fingerprint(&mut aggregates, since, observed_at, deadline, degraded)
+                .await;
+        } else {
+            let table = self
+                .table_names
+                .as_ref()
+                .expect("legacy fingerprint requires table names")
+                .read(crate::schema::active_logs_table());
+            if let Some(body) = self
                 .run_json(
-                    &build_dimension_sql(&table, column, since, observed_at),
-                    &format!("fingerprint dimension {column}"),
+                    &build_fingerprint_scalars_sql(&table, since, observed_at),
+                    "fingerprint scalars",
                     deadline,
                     degraded,
                 )
                 .await
-            else {
-                continue;
-            };
-            let values = parse_dimension_rows(&body);
-            if values.is_empty() {
-                continue;
+            {
+                apply_fingerprint_scalars(&mut aggregates, &body);
             }
-            aggregates.dimensions.push(DimensionAggregate {
-                column: (*column).to_string(),
-                plane: (*plane).to_string(),
-                values,
-            });
+            if let Some(body) = self
+                .run_json(
+                    &build_hour_histogram_sql(&table, since, observed_at),
+                    "hour-of-day histogram",
+                    deadline,
+                    degraded,
+                )
+                .await
+            {
+                aggregates.hour_of_day_events = parse_hour_histogram(&body);
+            }
+            for (column, plane) in FINGERPRINT_DIMENSIONS {
+                let Some(body) = self
+                    .run_json(
+                        &build_dimension_sql(&table, column, since, observed_at),
+                        &format!("fingerprint dimension {column}"),
+                        deadline,
+                        degraded,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                let values = parse_dimension_rows(&body);
+                if values.is_empty() {
+                    continue;
+                }
+                aggregates.dimensions.push(DimensionAggregate {
+                    column: (*column).to_string(),
+                    plane: (*plane).to_string(),
+                    values,
+                });
+            }
         }
 
-        let mut fingerprint = OrgFingerprint {
+        let fingerprint = OrgFingerprint {
             aggregates,
             summary: None,
             planes: BTreeMap::new(),
@@ -3287,8 +3647,20 @@ impl ReconService {
             // the only thing that may claim it.
             authored_by: FingerprintAuthor::ServerAggregates,
         };
+        narrate_fingerprint(self.ai.as_ref(), fingerprint, deadline).await
+    }
+}
 
-        let Some(ai) = self.ai.as_ref().filter(|ai| ai.is_available()) else {
+/// Ask the model for the one-sentence summary and per-plane readings of an
+/// aggregates-only fingerprint (free function shared with the hosted-shared
+/// recon). A missing provider is stated on the card, never a degraded run.
+pub async fn narrate_fingerprint(
+    ai: Option<&Arc<dyn AiClient>>,
+    mut fingerprint: OrgFingerprint,
+    deadline: Deadline,
+) -> OrgFingerprint {
+    {
+        let Some(ai) = ai.filter(|ai| ai.is_available()) else {
             // NOT a degraded run. A missing AI provider is a configuration
             // state the fingerprint card states outright; firing the rail's
             // degraded badge for it would train operators to ignore the badge
@@ -3342,7 +3714,103 @@ impl ReconService {
         }
         fingerprint
     }
+}
 
+/// Lake-native fingerprint aggregates (free function; see
+/// [`gather_lake_inputs`]).
+pub async fn populate_lake_fingerprint(
+    search: &SearchService,
+    aggregates: &mut FingerprintAggregates,
+    since: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
+    deadline: Deadline,
+    degraded: &mut DegradedLog,
+) {
+    {
+        if let Some(rows) = 
+            run_lake_rows(search, 
+                "metadata.log_source!=\"\" | stats count() as total_events, dc(actor.user.name) as distinct_users, dc(device.hostname) as distinct_hosts, dc(cloud.account.uid) as distinct_cloud_accounts",
+                since,
+                observed_at,
+                "OCSF fingerprint scalars",
+                deadline,
+                degraded,
+                1,
+            )
+            .await
+        {
+            if let Some(row) = rows.first() {
+                aggregates.total_events_24h = parse_u64(row, "total_events");
+                aggregates.distinct_users = parse_u64(row, "distinct_users");
+                aggregates.distinct_hosts = parse_u64(row, "distinct_hosts");
+                aggregates.distinct_cloud_accounts =
+                    parse_u64(row, "distinct_cloud_accounts");
+            }
+        }
+        if let Some(rows) = run_lake_rows(search, 
+                "is_mfa=true | stats count() as mfa_events",
+                since,
+                observed_at,
+                "OCSF MFA fingerprint",
+                deadline,
+                degraded,
+                1,
+            )
+            .await
+        {
+            let mfa = rows
+                .first()
+                .map(|row| parse_u64(row, "mfa_events"))
+                .unwrap_or(0);
+            aggregates.mfa_event_share_pct = if aggregates.total_events_24h == 0 {
+                0.0
+            } else {
+                ((mfa as f64 / aggregates.total_events_24h as f64) * 1000.0).round() / 10.0
+            };
+        }
+        if let Some(rows) = run_lake_rows(search, 
+                "metadata.log_source!=\"\" | timechart span=1h count() as events",
+                since,
+                observed_at,
+                "OCSF hour-of-day histogram",
+                deadline,
+                degraded,
+                24,
+            )
+            .await
+        {
+            aggregates.hour_of_day_events = lake_hour_histogram(&rows);
+        }
+        for (column, plane) in OCSF_FINGERPRINT_DIMENSIONS {
+            let query = format!(
+                "{column}!=\"\" | stats count() as events by {column} | sort -events | head {FINGERPRINT_TOP_N}"
+            );
+            let Some(rows) = run_lake_rows(search, 
+                    &query,
+                    since,
+                    observed_at,
+                    &format!("OCSF fingerprint dimension {column}"),
+                    deadline,
+                    degraded,
+                    FINGERPRINT_TOP_N,
+                )
+                .await
+            else {
+                continue;
+            };
+            let values = lake_dimension_values(&rows, column);
+            if !values.is_empty() {
+                aggregates.dimensions.push(DimensionAggregate {
+                    column: (*column).to_string(),
+                    plane: (*plane).to_string(),
+                    values,
+                });
+            }
+        }
+    }
+}
+
+impl ReconService {
     // -------------------------------------------------------------------------
     // Persistence
     // -------------------------------------------------------------------------
@@ -3451,7 +3919,12 @@ impl ReconService {
                         name: tactic.name.clone(),
                     })
                 });
-            let Some(draft) = draft_for_gap(technique, tactic_ref.as_ref(), volumes) else {
+            let Some(draft) = draft_for_gap_schema(
+                technique,
+                tactic_ref.as_ref(),
+                volumes,
+                self.lake_search.is_some(),
+            ) else {
                 continue;
             };
             // A draft that fails to write is COUNTED, not fatal. The profile is
@@ -3693,6 +4166,145 @@ fn parse_u64(json: &serde_json::Value, key: &str) -> u64 {
     }
 }
 
+fn lake_source(row: &serde_json::Value) -> Option<String> {
+    row.get("metadata.log_source")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn lake_source_stats(rows: &[serde_json::Value]) -> HashMap<String, SourceTypeStats> {
+    rows.iter()
+        .filter_map(|row| {
+            let source_type = lake_source(row)?;
+            Some((
+                source_type.clone(),
+                SourceTypeStats {
+                    source_type,
+                    events: parse_u64(row, "events"),
+                    // Exact compressed/uncompressed byte accounting belongs to
+                    // the worker response, not a guessed sum of event strings.
+                    bytes: 0,
+                    first_event_at: parse_ch_datetime(row.get("first_event_at")),
+                    last_event_at: parse_ch_datetime(row.get("last_event_at")),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn lake_event_counts(rows: &[serde_json::Value]) -> HashMap<String, u64> {
+    rows.iter()
+        .filter_map(|row| Some((lake_source(row)?, parse_u64(row, "events"))))
+        .collect()
+}
+
+fn lake_hourly_points(rows: &[serde_json::Value]) -> Vec<crate::log_telemetry::HourlyPoint> {
+    rows.iter()
+        .filter_map(|row| {
+            Some(crate::log_telemetry::HourlyPoint {
+                source_type: lake_source(row)?,
+                bucket_start: parse_ch_datetime(row.get("time_bucket"))?,
+                events: parse_u64(row, "events"),
+            })
+        })
+        .collect()
+}
+
+fn lake_deep_facts(
+    recent: &[serde_json::Value],
+    window: Option<&[serde_json::Value]>,
+) -> HashMap<String, DeepSourceFacts> {
+    let window_counts = window
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            Some((
+                lake_source(row)?,
+                (
+                    parse_u64(row, "hosts_window"),
+                    parse_u64(row, "accounts_window"),
+                ),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let aliases = [
+        ("actor.user.name", "pop_actor_user_name"),
+        ("src_endpoint.ip", "pop_src_endpoint_ip"),
+        ("dst_endpoint.ip", "pop_dst_endpoint_ip"),
+        ("device.hostname", "pop_device_hostname"),
+        ("process.name", "pop_process_name"),
+        ("process.cmd_line", "pop_process_cmd_line"),
+        ("file.path", "pop_file_path"),
+        (
+            "http_request.url.url_string",
+            "pop_http_request_url_url_string",
+        ),
+        ("status", "pop_status"),
+    ];
+    recent
+        .iter()
+        .filter_map(|row| {
+            let source = lake_source(row)?;
+            let (hosts_window, accounts_window) =
+                window_counts.get(&source).copied().unwrap_or_default();
+            let populated = aliases
+                .iter()
+                .map(|(field, alias)| ((*field).to_string(), parse_u64(row, alias)))
+                .collect();
+            Some((
+                source,
+                DeepSourceFacts {
+                    recent_events: parse_u64(row, "recent_events"),
+                    populated,
+                    hosts_24h: parse_u64(row, "hosts_24h"),
+                    hosts_window,
+                    accounts_24h: parse_u64(row, "accounts_24h"),
+                    accounts_window,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn lake_history(rows: &[serde_json::Value]) -> HashMap<String, DateTime<Utc>> {
+    rows.iter()
+        .filter_map(|row| {
+            Some((
+                lake_source(row)?,
+                parse_ch_datetime(row.get("first_event_at"))?,
+            ))
+        })
+        .collect()
+}
+
+fn lake_hour_histogram(rows: &[serde_json::Value]) -> Vec<u64> {
+    let mut hours = vec![0u64; 24];
+    for row in rows {
+        let Some(at) = parse_ch_datetime(row.get("time_bucket")) else {
+            continue;
+        };
+        hours[at.hour() as usize] += parse_u64(row, "events");
+    }
+    hours
+}
+
+fn lake_dimension_values(rows: &[serde_json::Value], column: &str) -> Vec<(String, u64)> {
+    rows.iter()
+        .filter_map(|row| {
+            let raw = row.get(column)?;
+            let value = match raw {
+                serde_json::Value::String(value) => value.clone(),
+                serde_json::Value::Number(value) => value.to_string(),
+                serde_json::Value::Bool(value) => value.to_string(),
+                _ => return None,
+            };
+            (!value.is_empty()).then(|| (sanitize_label(&value), parse_u64(row, "events")))
+        })
+        .take(FINGERPRINT_TOP_N)
+        .collect()
+}
+
 fn parse_ch_datetime(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
     let raw = value?.as_str()?;
     let parsed = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
@@ -3822,7 +4434,7 @@ pub fn collapse_sparklines(
 }
 
 /// Source types by 24h volume, capped at [`FINGERPRINT_TOP_N`].
-fn top_source_types(census: &[CensusRow]) -> Vec<(String, u64)> {
+pub fn top_source_types(census: &[CensusRow]) -> Vec<(String, u64)> {
     let mut rows: Vec<(String, u64)> = census
         .iter()
         .filter(|row| row.events_24h > 0)

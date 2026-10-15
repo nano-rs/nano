@@ -26,6 +26,8 @@ use chrono::{DateTime, Utc};
 use nanosiem_core::auth::{permissions, CredentialUseGrant};
 use nanosiem_core::inputlookup::SsrfValidator;
 use nanosiem_core::log_telemetry::repository::is_safe_source_type;
+use nanosiem_core::log_telemetry::SourceTypeStats;
+use nanosiem_core::{SearchBackend, SearchRequest, TimeRangeInput};
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, ROUTING_RULE_CREATED, ROUTING_RULE_DELETED,
     ROUTING_RULE_REORDERED, ROUTING_RULE_UPDATED, SOURCE_CONFIG_CREATED, SOURCE_CONFIG_DELETED,
@@ -39,7 +41,7 @@ use nanosiem_core::source_configs::{
 };
 use nanosiem_core::typeid::TypeIdParam;
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -158,8 +160,8 @@ pub async fn list_source_configs(
     // effective per-source deny set — a viewer denied a source (or lacking
     // `audit:view`) sees that source's contribution as 0 instead of its true
     // volume/last-seen. Unrestricted viewers get byte-identical SQL.
-    let deny_set = auth.effective_source_deny_set();
-    if let Err(e) = enrich_list_with_rollup(&state, &mut configs, want_telemetry, &deny_set).await {
+    let scope = auth.effective_viewer_scope();
+    if let Err(e) = enrich_list_with_rollup(&state, &mut configs, want_telemetry, &scope).await {
         tracing::warn!(
             error = %e,
             "Failed to enrich source configurations from rollup; returning without telemetry"
@@ -204,6 +206,118 @@ fn collect_target_source_types_for_configs(
     set.into_iter().collect()
 }
 
+/// Resolve source telemetry from the active event store. Lake mode uses the
+/// same tenant-pinned SearchService and source scope as every other event read;
+/// legacy mode retains the ClickHouse materialized rollup.
+async fn source_config_stats(
+    state: &AppState,
+    source_types: &[String],
+    scope: &nanosiem_core::auth::ScopeSet,
+) -> Result<HashMap<String, SourceTypeStats>, Box<dyn std::error::Error + Send + Sync>> {
+    if state.search_service.backend() != SearchBackend::Lake {
+        return Ok(state
+            .log_telemetry_service
+            .stats_by_source_type(source_types, 24, scope.deny_set())
+            .await?);
+    }
+
+    let mut safe = source_types
+        .iter()
+        .filter(|source_type| is_safe_source_type(source_type))
+        .map(|source_type| source_type.to_lowercase())
+        .collect::<Vec<_>>();
+    safe.sort_unstable();
+    safe.dedup();
+    if safe.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let literals = safe
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    let query = format!(
+        "metadata.log_source IN ({}) | stats count() as events, \
+         min(time) as first_event_at, max(time) as last_event_at by metadata.log_source",
+        literals.join(", ")
+    );
+    let end = Utc::now();
+    let response = state
+        .search_service
+        .search(
+            SearchRequest {
+                query,
+                time_range: TimeRangeInput::new(end - chrono::Duration::hours(24), end),
+                limit: Some(safe.len()),
+                offset: None,
+                include_sql: Some(false),
+                skip_histogram: true,
+                skip_field_stats: true,
+                use_cache: true,
+                table_view: false,
+                request_id: None,
+                async_mode: false,
+                priority: Some("analytics".to_string()),
+                dataset: Some("logs".to_string()),
+            },
+            scope,
+        )
+        .await?;
+
+    let mut stats = HashMap::new();
+    for row in response.results {
+        let Some(source_type) = row
+            .get("metadata.log_source")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_lowercase)
+        else {
+            continue;
+        };
+        if !safe.binary_search(&source_type).is_ok() {
+            continue;
+        }
+        let integer = |key: &str| {
+            row.get(key)
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                })
+                .unwrap_or(0)
+        };
+        let timestamp = |key: &str| {
+            row.get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| {
+                    chrono::DateTime::parse_from_rfc3339(value)
+                        .ok()
+                        .map(|value| value.to_utc())
+                        .or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(
+                                value,
+                                "%Y-%m-%d %H:%M:%S%.f",
+                            )
+                            .ok()
+                            .map(|value| value.and_utc())
+                        })
+                })
+        };
+        stats.insert(
+            source_type.clone(),
+            SourceTypeStats {
+                source_type,
+                events: integer("events"),
+                // Exact bytes require a writer-owned Iceberg rollup. Do not
+                // fake a full raw-event projection on this settings endpoint.
+                bytes: 0,
+                last_event_at: timestamp("last_event_at"),
+                first_event_at: timestamp("first_event_at"),
+            },
+        );
+    }
+    Ok(stats)
+}
+
 /// Best-effort enrichment of the LIST endpoint's response with rollup-backed
 /// `events_24h` (always) plus `bytes_per_day_24h` and `last_event_at`
 /// (when `include_bytes_and_last_event` is set, gated on `?include=telemetry`).
@@ -217,7 +331,7 @@ async fn enrich_list_with_rollup(
     state: &AppState,
     configs: &mut [SourceConfiguration],
     include_bytes_and_last_event: bool,
-    deny_set: &BTreeSet<String>,
+    scope: &nanosiem_core::auth::ScopeSet,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if configs.is_empty() {
         return Ok(());
@@ -234,10 +348,7 @@ async fn enrich_list_with_rollup(
         return Ok(());
     }
 
-    let stats = state
-        .log_telemetry_service
-        .stats_by_source_type(&union, 24, deny_set)
-        .await?;
+    let stats = source_config_stats(state, &union, scope).await?;
 
     for cfg in configs.iter_mut() {
         let Some(rules) = rules_by_config.get(&cfg.id) else {
@@ -297,17 +408,14 @@ async fn enrich_list_with_rollup(
 async fn enrich_full_with_rollup(
     state: &AppState,
     full: &mut SourceConfigurationWithRules,
-    deny_set: &BTreeSet<String>,
+    scope: &nanosiem_core::auth::ScopeSet,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let source_types = collect_target_source_types(&full.routing_rules);
     if source_types.is_empty() {
         return Ok(());
     }
 
-    let stats = state
-        .log_telemetry_service
-        .stats_by_source_type(&source_types, 24, deny_set)
-        .await?;
+    let stats = source_config_stats(state, &source_types, scope).await?;
 
     // Config-level: events + bytes + last_event_at across distinct
     // target_source_types.
@@ -427,8 +535,8 @@ pub async fn get_source_config_with_rules(
     //
     // NAN-1801: rollup read scoped by the viewer's effective per-source deny
     // set (see list_source_configs). Denied sources contribute 0 / None.
-    let deny_set = auth.effective_source_deny_set();
-    if let Err(e) = enrich_full_with_rollup(&state, &mut config, &deny_set).await {
+    let scope = auth.effective_viewer_scope();
+    if let Err(e) = enrich_full_with_rollup(&state, &mut config, &scope).await {
         tracing::warn!(
             source_config_id = %config.config.id,
             error = %e,
@@ -1028,7 +1136,7 @@ pub struct ReachabilityResult {
     pub source_config_enabled: bool,
     pub source_config_deployed: bool,
     pub target_log_source_exists: bool,
-    /// TCP-dial result for broker-bound configs (NAN-884 K-4).
+    /// TCP-dial result for broker-bound configs.
     /// `Some(true)` if at least one `bootstrap_servers` entry accepted a
     /// connection within the timeout; `Some(false)` if every entry failed;
     /// `None` for config types where the check does not apply (HTTP, Vector,
@@ -1411,7 +1519,7 @@ pub async fn check_routing_rule_reachability(
 // ============================================================================
 
 /// List metadata for every supported source-config driver (HTTP, Kafka,
-/// AWS S3, GCP Pub/Sub, Splunk HEC, Vector).
+/// AWS S3, GCP Pub/Sub, HEC, Vector).
 ///
 /// The frontend uses this to render the routing-rule UI in the right shape
 /// per driver: pull-source drivers (broker-bound) get a "single vs.

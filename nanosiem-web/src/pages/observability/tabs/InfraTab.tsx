@@ -67,12 +67,16 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
   }
 
   const tone = toDesignHealth(host.status);
-  // O34 (NAN-1721): pivot on the real UDM/OCSF host columns via an OR-query
-  // (mirrors ServiceSecuritySignals). The old `host.name="…"` resolved to
-  // `ext.host.name` on the logs table, which UDM/OCSF parsers never populate —
-  // so "Explore in search" always came back empty.
+  // O34 (NAN-1721) / NAN-2370: pivot on the canonical OCSF host path only.
+  //
+  // This used to OR the UDM names (`src_host` / `dest_host` / `hostname`)
+  // alongside the OCSF one. On the lake that is strictly worse than useless:
+  // field validation is all-or-nothing, so a single retired name rejects the
+  // WHOLE predicate and "Explore in search" 400s — the OCSF half never gets a
+  // chance to match. UDM is retired on this branch (NAN-2371), so emit the one
+  // path that resolves.
   const hq = nplQuotedBody(host.host);
-  const hostSearchQuery = `src_host="${hq}" OR dest_host="${hq}" OR hostname="${hq}" OR device.hostname="${hq}"`;
+  const hostSearchQuery = `device.hostname="${hq}"`;
   const fmtCell = (v: number | null, fmt: (n: number) => string) => (v == null ? '–' : fmt(v));
   const stats: Array<{ k: string; v: string; hot: boolean }> = [
     { k: 'CPU', v: fmtCell(host.cpu_pct, (n) => Math.round(n) + '%'), hot: (host.cpu_pct ?? 0) >= 90 },

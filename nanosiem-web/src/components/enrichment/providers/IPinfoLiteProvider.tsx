@@ -19,7 +19,6 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Globe,
   RefreshCw,
-  Loader2,
   CircleCheck,
   XCircle,
   Database,
@@ -29,6 +28,7 @@ import {
   Calendar,
   Save,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { api, EnrichmentSource, IpLookupResult, AutoSyncConfig } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 import { formatUTC, formatNumber } from '@/lib/date-utils';
@@ -386,7 +386,7 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
               }>
                 {source.last_sync_status === 'success' && <CircleCheck className="w-3 h-3 mr-1" />}
                 {source.last_sync_status === 'failed' && <XCircle className="w-3 h-3 mr-1" />}
-                {source.last_sync_status === 'in_progress' && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+                {source.last_sync_status === 'in_progress' && <LoadingIcon className="w-3 h-3 mr-1" />}
                 {source.last_sync_status || 'Not synced'}
               </Badge>
               {canConfigure && (
@@ -422,7 +422,7 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
                     className="bg-primary hover:bg-primary/90 text-foreground rounded-xl"
                   >
                     {configuring ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <LoadingIcon className="w-4 h-4" />
                     ) : (
                       <>
                         <Save className="w-4 h-4" />
@@ -468,7 +468,7 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
                 >
                   {syncing || source.last_sync_status === 'in_progress' ? (
                     <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <LoadingIcon className="w-4 h-4" />
                       Syncing...
                     </>
                   ) : (
@@ -584,7 +584,7 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
               disabled={lookingUp || !testIp.trim()}
               className="bg-ai hover:bg-ai-muted text-foreground rounded-xl"
             >
-              {lookingUp ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Lookup'}
+              {lookingUp ? <LoadingIcon className="w-4 h-4" /> : 'Lookup'}
             </Button>
           </div>
 

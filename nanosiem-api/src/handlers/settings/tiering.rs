@@ -172,6 +172,8 @@ pub async fn get_tiering_config(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<TieringConfigResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let service = get_tiering_service(&state)?;
     let config = service.get_config().await?;
@@ -205,6 +207,8 @@ pub async fn update_tiering_config(
     Json(request): Json<UpdateTieringRequest>,
 ) -> Result<Json<TieringConfigResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let service = get_tiering_service(&state)?;
     let config = service.update_config(request).await?;
@@ -253,6 +257,8 @@ pub async fn set_tiering_credentials(
     Json(request): Json<SetTieringCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let service = get_tiering_service(&state)?;
 
@@ -303,6 +309,8 @@ pub async fn test_tiering_connection(
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<TieringConnectionTestResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let service = get_tiering_service(&state)?;
     let result = service.test_connection().await?;
@@ -342,6 +350,8 @@ pub async fn apply_tiering_config(
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
 
     let service = get_tiering_service(&state)?;
     service.apply_config().await?;
@@ -385,9 +395,94 @@ pub async fn get_tier_stats(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<TierStatsResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
+    #[cfg(feature = "enterprise")]
+    super::reject_enterprise_shared_storage_settings(&state)?;
+
+    if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        let lake = super::retention::lake_storage_stats_or_none(
+            super::retention::lake_storage_stats_from_env(),
+        );
+        return Ok(Json(lake_tier_stats(lake)));
+    }
 
     let service = get_tiering_service(&state)?;
     let stats = service.get_tier_stats().await?;
 
     Ok(Json(TierStatsResponse::from(stats)))
+}
+
+/// Lake tier stats: everything is warm (object storage), nothing hot.
+///
+/// NAN-3492: `None` (no readable lake manifest, e.g. a lean trusted-local
+/// install) reports an all-zero tier instead of failing the request.
+fn lake_tier_stats(lake: Option<super::retention::LakeStorageStatsResponse>) -> TierStatsResponse {
+    let empty = || TierInfoResponse {
+        size_bytes: 0,
+        size_pretty: "0 B".to_string(),
+        row_count: 0,
+    };
+    let Some(lake) = lake else {
+        return TierStatsResponse {
+            hot: empty(),
+            warm: empty(),
+            total_size_bytes: 0,
+            total_size_pretty: "0 B".to_string(),
+            total_row_count: 0,
+            last_updated: chrono::Utc::now().to_rfc3339(),
+        };
+    };
+    TierStatsResponse {
+        hot: empty(),
+        warm: TierInfoResponse {
+            size_bytes: lake.total_size_bytes,
+            size_pretty: lake.total_size_pretty.clone(),
+            row_count: lake.row_count,
+        },
+        total_size_bytes: lake.total_size_bytes,
+        total_size_pretty: lake.total_size_pretty,
+        total_row_count: lake.row_count,
+        last_updated: lake
+            .manifest_modified_at
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::settings::retention::LakeStorageStatsResponse;
+
+    #[test]
+    fn unavailable_lake_stats_report_an_all_zero_tier() {
+        // NAN-3492: a lean install has no gen1 lake manifest; the tier stats
+        // must degrade to zeros rather than 500.
+        let stats = lake_tier_stats(None);
+        assert_eq!(stats.hot.size_bytes, 0);
+        assert_eq!(stats.warm.size_bytes, 0);
+        assert_eq!(stats.warm.row_count, 0);
+        assert_eq!(stats.total_size_bytes, 0);
+        assert_eq!(stats.total_row_count, 0);
+        assert_eq!(stats.total_size_pretty, "0 B");
+        assert!(chrono::DateTime::parse_from_rfc3339(&stats.last_updated).is_ok());
+    }
+
+    #[test]
+    fn available_lake_stats_are_all_warm() {
+        let stats = lake_tier_stats(Some(LakeStorageStatsResponse {
+            total_size_bytes: 4096,
+            total_size_pretty: "4.00 KiB".to_string(),
+            row_count: 12,
+            object_count: 2,
+            index_size_bytes: 0,
+            index_size_pretty: "0 B".to_string(),
+            index_overhead_percent: 0.0,
+            file_format: "Parquet".to_string(),
+            table_format: "Iceberg v2".to_string(),
+            manifest_modified_at: Some("2026-10-10T00:00:00+00:00".to_string()),
+        }));
+        assert_eq!(stats.hot.size_bytes, 0);
+        assert_eq!(stats.warm.size_bytes, 4096);
+        assert_eq!(stats.total_row_count, 12);
+        assert_eq!(stats.last_updated, "2026-10-10T00:00:00+00:00");
+    }
 }

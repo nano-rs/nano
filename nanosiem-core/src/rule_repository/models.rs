@@ -31,7 +31,13 @@ pub struct RuleRepository {
     pub sync_interval_hours: i32,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub last_sync_commit: Option<String>,
+    #[sqlx(default)]
+    pub next_sync_at: Option<DateTime<Utc>>,
     pub last_sync_status: Option<String>,
+    #[sqlx(default)]
+    pub sync_started_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub sync_lease_expires_at: Option<DateTime<Utc>>,
     pub last_sync_error: Option<String>,
     pub rule_count: i32,
     pub enabled: bool,
@@ -395,7 +401,7 @@ pub struct CoverageFilter {
 impl CoverageFilter {
     /// Return a canonical filter so equivalent API inputs share matching
     /// semantics across repository metadata from Sigma and nPL sources.
-    pub(crate) fn normalized(&self) -> Self {
+    pub fn normalized(&self) -> Self {
         Self {
             repository_id: self.repository_id,
             severity: normalize_optional_filter(
@@ -522,7 +528,7 @@ pub struct CoverageResult {
 /// Aggregated coverage analysis
 ///
 /// `Default` is the "nothing to report" shape returned when the caller may not
-/// consult live telemetry at all (NAN-2081) — all counts zero, all lists empty.
+/// consult live telemetry at all — all counts zero, all lists empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CoverageAnalysis {
     pub total_rules: i32,
@@ -698,4 +704,12 @@ mod coverage_filter_tests {
         assert_eq!(filter.mitre_technique, None);
         assert!(filter.matches_normalized(&rule));
     }
+}
+
+/// Public lease state; never exposes the fencing token.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct SyncAccepted {
+    pub sync_started_at: chrono::DateTime<chrono::Utc>,
+    pub sync_lease_expires_at: chrono::DateTime<chrono::Utc>,
+    pub status: String,
 }

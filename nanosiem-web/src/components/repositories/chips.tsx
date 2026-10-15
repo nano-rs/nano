@@ -137,10 +137,11 @@ export function Chk({ checked, indeterminate, disabled, onChange, ariaLabel }: C
   return (
     <label
       className={cn(
-        'inline-flex items-center justify-center',
+        'relative inline-flex items-center justify-center',
         disabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer',
       )}
     >
+      {/* eslint-disable-next-line no-restricted-syntax -- visually hidden (sr-only) native input keeps native keyboard/form semantics; the styled sibling <span> draws the checkbox, incl. indeterminate */}
       <input
         ref={ref}
         type="checkbox"

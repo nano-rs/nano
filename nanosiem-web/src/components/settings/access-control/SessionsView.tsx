@@ -20,7 +20,8 @@
  */
 
 import { useEffect, useMemo, useState } from 'react';
-import { Bolt, User as UserIcon, Search as SearchIcon, Loader2 } from 'lucide-react';
+import { Bolt, User as UserIcon, Search as SearchIcon } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
@@ -143,7 +144,10 @@ export function SessionsView() {
 
   return (
     <>
-      <div className="flex-1 flex flex-col min-h-0">
+      {/* NAN-3250: flows in the app scroller (no min-h-0 column with an inner
+          scroll box, which squeezed the list to the leftover height). The
+          column header sticks to the top of the app scroller instead. */}
+      <div className="flex-1 flex flex-col" data-testid="sessions-view">
         <div className="shrink-0 px-5 pt-4 pb-2.5 flex items-center gap-2 flex-wrap">
           <div className="h-8 rounded-md border border-border bg-card flex items-center gap-2 px-2.5 w-[300px]">
             <SearchIcon className="w-[12px] h-[12px] text-muted-foreground" />
@@ -171,7 +175,7 @@ export function SessionsView() {
           )}
         </div>
 
-        <div className="shrink-0 grid grid-cols-[minmax(140px,1.2fr)_minmax(160px,1.4fr)_minmax(120px,1fr)_100px_100px_80px] gap-3 px-3 py-1.5 border-y border-border bg-card/50 text-[10px] uppercase tracking-[0.08em] text-muted-foreground font-medium">
+        <div data-testid="sessions-column-header" className="shrink-0 sticky top-0 z-10 grid grid-cols-[minmax(140px,1.2fr)_minmax(160px,1.4fr)_minmax(120px,1fr)_100px_100px_80px] gap-3 px-3 py-1.5 border-y border-border bg-card text-[10px] uppercase tracking-[0.08em] text-muted-foreground font-medium">
           <span>User / client</span>
           <span>Device</span>
           <span>IP</span>
@@ -180,10 +184,10 @@ export function SessionsView() {
           <span />
         </div>
 
-        <div className="flex-1 overflow-y-auto scrollbar-thin">
+        <div data-testid="sessions-list">
           {loading && (
             <div className="flex items-center justify-center py-12">
-              <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+              <LoadingIcon className="w-5 h-5 text-muted-foreground" />
             </div>
           )}
           {!loading && filtered.length === 0 && (

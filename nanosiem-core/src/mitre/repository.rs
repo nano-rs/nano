@@ -33,7 +33,7 @@ impl MitreRepository {
         &self,
         lock_id: i64,
     ) -> Result<Option<PoolConnection<Postgres>>, sqlx::Error> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = crate::db::pooler::session_connection(&self.pool).await?;
         connection.close_on_drop();
         let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
             .bind(lock_id)
@@ -181,6 +181,14 @@ impl MitreRepository {
     /// NAN-1918: `aliases` (harvested from the bundle's `revoked-by` edges) is
     /// written before reconcile so renumbered techniques are migrated forward
     /// rather than deleted. Returns what that pass did to existing mappings.
+    /// Write the catalog and flip the sync state to `succeeded` in one
+    /// transaction. `reconcile_rules` runs the detection-rule mapping
+    /// repair/reconcile step (`public.repair_quarantined_mitre_mappings()` /
+    /// `public.reconcile_detection_rule_mitre_mappings()`) in the same
+    /// transaction; the hosted-shared platform sync passes `false` because
+    /// those SECURITY INVOKER functions touch the RLS-registered
+    /// `detection_rules` table the control login holds nothing on (tenant
+    /// rules are validated on write by the 9000262 definer trigger instead).
     pub(crate) async fn replace_catalog_on(
         connection: &mut PgConnection,
         tactics: &[MitreTactic],
@@ -189,6 +197,7 @@ impl MitreRepository {
         release_version: &str,
         source_url: &str,
         source_sha256: &str,
+        reconcile_rules: bool,
     ) -> Result<MitreReconcileOutcome, sqlx::Error> {
         let mut tx = connection.begin().await?;
 
@@ -317,10 +326,13 @@ impl MitreRepository {
         // Restore mappings a pre-alias sync destroyed, before reconcile runs —
         // otherwise reconcile would see the empty arrays it left behind and
         // treat the rule as intentionally unmapped. No-op once drained.
-        let repaired =
+        let repaired = if reconcile_rules {
             sqlx::query_scalar::<_, i64>("SELECT public.repair_quarantined_mitre_mappings()")
                 .fetch_one(&mut *tx)
-                .await?;
+                .await?
+        } else {
+            0
+        };
 
         // Reconcile existing detection-rule mappings against the freshly written
         // (but not yet committed) catalog: migrate what the alias map can carry
@@ -329,13 +341,16 @@ impl MitreRepository {
         // reconcile land (or roll back) atomically (NAN-1766 / D3). The catalog
         // tables above are fully populated within this transaction, so the
         // function's own empty-catalog guard never short-circuits here.
-        let (remapped, quarantined, quarantined_rule_ids) =
+        let (remapped, quarantined, quarantined_rule_ids) = if reconcile_rules {
             sqlx::query_as::<_, (i64, i64, Vec<Uuid>)>(
                 "SELECT remapped, quarantined, quarantined_rule_ids \
                  FROM public.reconcile_detection_rule_mitre_mappings()",
             )
             .fetch_one(&mut *tx)
-            .await?;
+            .await?
+        } else {
+            (0, 0, Vec::new())
+        };
 
         sqlx::query(
             r#"
@@ -512,11 +527,10 @@ impl MitreRepository {
     /// catalog. The SQL function is installed with the rule-mapping invariant
     /// so reconciliation and trigger validation share one database contract.
     pub async fn reconcile_rule_mappings(&self) -> Result<u64, sqlx::Error> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT public.reconcile_detection_rule_mitre_mappings()",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let count =
+            sqlx::query_scalar::<_, i64>("SELECT public.reconcile_detection_rule_mitre_mappings()")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
@@ -646,6 +660,26 @@ impl MitreRepository {
             q.fetch_all(&self.pool).await?
         };
 
+        Ok(build_mitre_coverage(
+            tactics,
+            techniques,
+            rule_technique_rows,
+            telemetry,
+        ))
+    }
+}
+
+/// Pure coverage assembly shared by the dedicated repository read above and
+/// the enterprise-shared tenant path (NAN-2361), which sources the catalog
+/// from the control connection and the rule rows from a signed tenant
+/// transaction. Byte-for-byte the former tail of `get_coverage`.
+pub fn build_mitre_coverage(
+    tactics: Vec<MitreTactic>,
+    techniques: Vec<MitreTechnique>,
+    rule_technique_rows: Vec<RuleTechniqueRow>,
+    telemetry: &TelemetryReadinessSnapshot,
+) -> MitreCoverageResponse {
+    {
         // Cache extracted source_types per rule id — the same rule may map to
         // many techniques and we don't want to re-parse the nPL each time.
         let mut rule_sources_cache: HashMap<uuid::Uuid, Vec<String>> = HashMap::new();
@@ -737,11 +771,11 @@ impl MitreRepository {
             total_rules_with_mitre: unique_rules_with_mitre.len() as i32,
         };
 
-        Ok(MitreCoverageResponse {
+        MitreCoverageResponse {
             tactics: tactic_coverages,
             techniques: technique_coverages,
             summary,
-        })
+        }
     }
 }
 
@@ -757,17 +791,20 @@ fn count_coverage_units<'a>(
         })
 }
 
-/// Row type for rule-technique mapping query
-#[derive(sqlx::FromRow)]
-struct RuleTechniqueRow {
-    id: uuid::Uuid,
-    name: String,
-    severity: String,
-    mode: String,
+/// Row type for rule-technique mapping query: one row per
+/// (rule, technique) edge. Public so the enterprise-shared tenant coverage
+/// path can feed rows read inside a signed tenant transaction into
+/// [`build_mitre_coverage`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RuleTechniqueRow {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub severity: String,
+    pub mode: String,
     /// nPL query text — used to extract `source_type=...` for
     /// `CoveringRule.source`; telemetry readiness never derives from rules.
-    query: String,
-    technique_id: String,
+    pub query: String,
+    pub technique_id: String,
 }
 
 // Internal row types for query mapping
@@ -928,11 +965,10 @@ mod sync_integration_tests {
         // rewriting three real rules' ATT&CK mappings during NAN-1918, and a
         // mapping the alias map cannot resolve would have been blanked outright.
         // Refuse rather than mutate.
-        let existing_rules: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM public.detection_rules")
-                .fetch_one(&mut *connection)
-                .await
-                .unwrap_or(0);
+        let existing_rules: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.detection_rules")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap_or(0);
         assert_eq!(
             existing_rules, 0,
             "refusing to run: this test commits reconcile/repair against \
@@ -1013,6 +1049,7 @@ mod sync_integration_tests {
             "test-v1",
             "https://example.invalid/v1.json",
             &"a".repeat(64),
+            true
         )
         .await
         .unwrap();
@@ -1029,6 +1066,7 @@ mod sync_integration_tests {
             "test-invalid",
             "https://example.invalid/invalid.json",
             &"b".repeat(64),
+            true
         )
         .await
         .expect_err("oversized tactic id must abort the snapshot");
@@ -1062,6 +1100,7 @@ mod sync_integration_tests {
             "test-v2",
             "https://example.invalid/v2.json",
             &"c".repeat(64),
+            true
         )
         .await
         .unwrap();

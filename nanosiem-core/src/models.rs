@@ -38,8 +38,6 @@ pub use case::{
     CaseGroupingRule,
     CaseHandoff,
     CasePendingState,
-    // Linked-case lookup (NAN-422)
-    LinkedCaseRef,
     CaseRelation,
     CaseRelationType,
     CaseResponseStats,
@@ -55,10 +53,13 @@ pub use case::{
     CaseWithDetailsRow,
     CaseWorkflowEvent,
     ChangeCaseStatus,
+    DuplicateCandidate,
     EntityTypeSummary,
     EscalateCase,
     GenerateAiSummaryRequest,
     GroupingType,
+    // Linked-case lookup (NAN-422)
+    LinkedCaseRef,
     NewCase,
     NewCaseCloseNote,
     NewCaseCloseNoteInline,
@@ -69,7 +70,6 @@ pub use case::{
     NewCaseRelation,
     NewCaseWallEntry,
     NewCaseWorkflowEvent,
-    DuplicateCandidate,
     RelatedCaseSummary,
     SeverityRule,
     ShareCaseRequest,
@@ -92,12 +92,6 @@ pub use detection_rule::{
 pub use incident::{
     CreateIncidentRequest, Incident, IncidentSummary, IncidentWithCases, NewIncident,
 };
-pub use retro_hunt::{
-    CreateRetroHuntRequest, RetroHuntConfig, RetroHuntRun, RetroHuntRuleView, RetroHuntState,
-    UpdateRetroHuntConfigRequest, RetroHuntConfigValidationError, DEFAULT_RETRO_HUNT_CRON,
-    DEFAULT_RETRO_HUNT_LOOKBACK_DAYS, DEFAULT_RETRO_HUNT_MAX_INDICATORS, MAX_RETRO_HUNT_LOOKBACK_DAYS,
-    MAX_RETRO_HUNT_MAX_INDICATORS, VALID_RETRO_HUNT_ARTIFACT_TYPES,
-};
 pub use log::{Log, NewLog};
 pub use notebook::{
     NewNotebook, NewNotebookEntry, NewNotebookReference, NewNotebookShare, Notebook, NotebookEntry,
@@ -110,6 +104,12 @@ pub use queue::{
     NewQueue, NewQueueRoutingRule, Queue, QueueKind, QueueRoutingPreviewRequest,
     QueueRoutingPreviewResponse, QueueRoutingRule, QueueRoutingRuleUpdate, QueueUpdate,
     QueueWithMembership, QueueWithMembershipRow,
+};
+pub use retro_hunt::{
+    CreateRetroHuntRequest, RetroHuntConfig, RetroHuntConfigValidationError, RetroHuntRuleView,
+    RetroHuntRun, RetroHuntState, UpdateRetroHuntConfigRequest, DEFAULT_RETRO_HUNT_CRON,
+    DEFAULT_RETRO_HUNT_LOOKBACK_DAYS, DEFAULT_RETRO_HUNT_MAX_INDICATORS,
+    MAX_RETRO_HUNT_LOOKBACK_DAYS, MAX_RETRO_HUNT_MAX_INDICATORS, VALID_RETRO_HUNT_ARTIFACT_TYPES,
 };
 pub use saved_search::{
     AffectedUser, NewSavedSearch, SavedSearch, SavedSearchWithContext, ShareResult,

@@ -7,9 +7,9 @@ import {
   Play,
   RefreshCw,
   ArrowUpToLine,
-  Loader2,
   AlertTriangle,
 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { QueryEditor } from '@/components/editor';
 import { useSearch, toApiTimeRange } from '@/hooks/use-api';
@@ -99,7 +99,7 @@ export function RuleTesterInline({
             disabled={isSearching || !state.panelQuery.trim()}
           >
             {isSearching
-              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ? <LoadingIcon className="w-3.5 h-3.5" />
               : <Play className="w-3.5 h-3.5" />
             }
             Run

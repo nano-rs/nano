@@ -349,10 +349,7 @@ impl ClickHouseExecutor {
             .with_option("priority", &settings.priority.to_string())
             .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
         if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-            query = query.with_option(
-                "max_memory_usage",
-                &max_memory_usage_bytes.to_string(),
-            );
+            query = query.with_option("max_memory_usage", &max_memory_usage_bytes.to_string());
         }
         let mut cursor = query
             .fetch_bytes("JSONEachRow")
@@ -447,10 +444,7 @@ impl ClickHouseExecutor {
                 .with_option("priority", &settings.priority.to_string())
                 .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
             if let Some(max_memory_usage_bytes) = settings.max_memory_usage_bytes {
-                query = query.with_option(
-                    "max_memory_usage",
-                    &max_memory_usage_bytes.to_string(),
-                );
+                query = query.with_option("max_memory_usage", &max_memory_usage_bytes.to_string());
             }
         }
 
@@ -483,11 +477,12 @@ impl ClickHouseExecutor {
         })?;
         let mut results = Vec::new();
         for line in response.lines().filter(|line| !line.is_empty()) {
-            let row = Self::parse_and_postprocess_row(line, !preserve_columns).ok_or_else(|| {
-                SearchError::DatabaseError(sqlx::Error::Protocol(
-                    "Invalid JSONEachRow value in bounded ClickHouse response".to_string(),
-                ))
-            })?;
+            let row =
+                Self::parse_and_postprocess_row(line, !preserve_columns).ok_or_else(|| {
+                    SearchError::DatabaseError(sqlx::Error::Protocol(
+                        "Invalid JSONEachRow value in bounded ClickHouse response".to_string(),
+                    ))
+                })?;
             results.push(row);
         }
         if u64::try_from(results.len()).unwrap_or(u64::MAX) > limits.max_result_rows {

@@ -55,10 +55,9 @@ impl ClickHouseMigrator {
         // `_migrations`. Single-node and Replicated-DB/cloud paths are unchanged.
         let is_cloud = self.is_cloud.unwrap_or(false);
         let (on_cluster, engine) = match self.cluster.as_ref().and_then(|c| c.as_ref()) {
-            Some(cluster) if is_cloud || cluster == &self.database => (
-                String::new(),
-                "ReplicatedMergeTree()".to_string(),
-            ),
+            Some(cluster) if is_cloud || cluster == &self.database => {
+                (String::new(), "ReplicatedMergeTree()".to_string())
+            }
             Some(cluster) => {
                 // No `{shard}` → one cluster-wide replication group.
                 let zoo_path = format!("/clickhouse/tables/{}/_migrations", self.database);

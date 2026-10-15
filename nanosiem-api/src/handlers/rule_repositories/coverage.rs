@@ -129,10 +129,8 @@ pub async fn convert_sigma(
         melod_service.detection_agent().ai_client_arc()
     };
     let model_id = ai_client.model_id().to_string();
-    let converter = nanosiem_enterprise::melod::SigmaConverterAgent::new(
-        ai_client,
-        state.config.schema_profile(),
-    );
+    let converter =
+        nanosiem_enterprise::melod::SigmaConverterAgent::new(ai_client, state.schema_profile());
 
     // Resolve against the client that will actually make the call. If the
     // configured detection provider fell back at service construction, this
@@ -405,6 +403,7 @@ detection:
         );
     }
 
+    #[cfg(feature = "enterprise")]
     #[test]
     fn provider_attempt_audit_attributes_agent_and_principal() {
         let source = include_str!("coverage.rs");

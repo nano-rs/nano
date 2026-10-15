@@ -5,7 +5,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import { ChevronDown, ChevronRight, Activity, Loader2, AlertTriangle, RefreshCw } from 'lucide-react';
+import { ChevronDown, ChevronRight, Activity, AlertTriangle, RefreshCw } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { PrevalenceScatterPlot, type PrevalenceScatterData } from './PrevalenceScatterPlot';
 import { usePrevalenceScatterData } from '@/hooks/use-api';
 
@@ -396,7 +397,7 @@ export function PrevalencePanel({
                 )}
               </div>
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                {isLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                {isLoading && <LoadingIcon className="w-3 h-3" />}
                 <span>Click to {isOpen ? 'collapse' : 'expand'}</span>
               </div>
             </div>
@@ -421,7 +422,7 @@ export function PrevalencePanel({
               </div>
             ) : isLoading && !scatterData ? (
               <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                <LoadingIcon className="w-4 h-4 mr-2" />
                 Loading prevalence data...
               </div>
             ) : scatterData ? (

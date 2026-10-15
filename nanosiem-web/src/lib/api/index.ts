@@ -1,3 +1,5 @@
+import { ConnectorFeedsApi } from './connector-feeds';
+import { SourceOnboardingApi } from './source-onboarding';
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 /**
@@ -11,6 +13,8 @@
  */
 
 import { getServiceUrl, API_BASE_URL } from './utils';
+import { sessionCredentials } from '../session-credentials';
+import { authenticatedFetch } from '../authenticated-fetch';
 import { getAccessToken as getInMemoryToken } from '../auth-token';
 import { AuthApi } from './auth';
 import { SearchApi } from './search';
@@ -25,37 +29,51 @@ import { QueuesApi } from '@/enterprise/api/queues';
 import { IncidentsApi } from '@/enterprise/api/incidents';
 import { NotebooksApi } from '@/enterprise/api/notebooks';
 import { LogSourcesApi } from './log-sources';
+import { PipelinesApi } from './pipelines';
 import { SourceConfigsApi } from './source-configs';
 import { SourceScopesApi } from './source-scopes';
+import { SourceVisibilityApi } from './source-visibility';
 import { AccessControlApi } from './access-control';
 import { DashboardsApi } from './dashboards';
 import { StorageApi } from './storage';
 import { RiskApi } from '@/enterprise/api/risk';
+import { RiskWatchlistsApi } from '@/enterprise/api/risk-watchlists';
 import { NotificationsApi } from './notifications';
 import { FeedbackApi } from '@/enterprise/api/feedback';
 import { EnrichmentApi } from './enrichment';
 import { IdentityApi } from './identity';
 import { CustomEnrichmentApi } from '@/enterprise/api/custom-enrichment';
-import { PrevalenceApi } from './prevalence';
+import { PrevalenceApi, leanPrevalencePath } from './prevalence';
 import { UploadApi } from './upload';
 import { LookupTablesApi } from './lookup-tables';
+import { IocListsApi } from './ioc-lists';
+import { AiTierApi } from './ai-tier';
+import { InternalDomainsApi } from './internal-domains';
+import { AiTuningApi } from './ai-tuning';
 import { AuditApi } from './audit';
 import { ContextApi } from './context';
 import { RuleRepositoriesApi } from './rule-repositories';
 import { DetectionCodeTargetsApi } from './detection-code-targets';
 import { ParserRepositoriesApi } from './parser-repositories';
 import { WebhooksApi } from './webhooks';
+import { PullSourcesApi } from './pull-sources';
 import { MarketplaceApi } from './marketplace';
+import { LookupUrlAllowlistApi } from './lookup-url-allowlist';
+import { ThreatIntelApi } from './threat-intel';
 import { IntegrationsApi } from './integrations';
 import { GdprApi } from './gdpr';
 import { TierApi } from './tier';
 import { IpAllowlistApi } from './ip-allowlist';
+import { IngestTokensApi } from './ingest-tokens';
+import { LandingSourcesApi } from './landing-sources';
 import { OnboardingApi } from './onboarding';
 import { DemoApi } from './demo';
 import { SiemHealthApi } from './siem-health';
 import { SystemHealthApi } from './system-health';
 import { PlaybooksApi } from '@/enterprise/api/playbooks';
 import { ReportsApi } from './reports';
+import { browserTenantRuntime } from '../tenant-runtime';
+import { withLockContentionRetry } from './lock-contention-retry';
 
 // Re-export types
 export * from './types';
@@ -107,6 +125,7 @@ export interface CacheMeta {
 
 /** Per-call cache controls threaded down to the low-level request. */
 export interface CacheRequestOpts {
+  signal?: AbortSignal;
   /** Invoked with the server cache status parsed from response headers. */
   onMeta?: (meta: CacheMeta) => void;
   /** When true, send `x-nano-cache-bypass: 1` so the server recomputes live (refresh). */
@@ -119,6 +138,19 @@ function parseCacheMeta(response: Response): CacheMeta {
   const ageRaw = response.headers.get('x-nano-cache-age');
   const age = ageRaw != null ? Number(ageRaw) : NaN;
   return { hit: status === 'hit', ageSecs: Number.isFinite(age) ? age : null };
+}
+
+function filenameFromDisposition(response: Response, fallback: string): string {
+  const disposition = response.headers.get('content-disposition');
+  const encoded = disposition?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      return fallback;
+    }
+  }
+  return disposition?.match(/filename="([^"]+)"/i)?.[1] ?? fallback;
 }
 
 // Re-export error class
@@ -139,6 +171,7 @@ export class ApiClientError extends Error {
  * Main API client that provides access to all API endpoints
  */
 class ApiClient {
+  readonly connectorFeeds: ConnectorFeedsApi;
   private baseUrl: string;
   private authFailureCallback: (() => void) | null = null;
   private refreshCallback: (() => Promise<boolean>) | null = null;
@@ -148,6 +181,7 @@ class ApiClient {
   private _search: SearchApi;
   private _observability: ObservabilityApi;
   private _detections: DetectionsApi;
+  readonly sourceOnboarding: SourceOnboardingApi;
   private _credentials: CredentialsApi;
   private _melod: MelodApi;
   private _core: CoreApi;
@@ -157,12 +191,15 @@ class ApiClient {
   private _incidents: IncidentsApi;
   private _notebooks: NotebooksApi;
   private _logSources: LogSourcesApi;
+  private _pipelines: PipelinesApi;
   private _sourceConfigs: SourceConfigsApi;
   private _sourceScopes: SourceScopesApi;
+  private _sourceVisibility: SourceVisibilityApi;
   private _accessControl: AccessControlApi;
   private _dashboards: DashboardsApi;
   private _storage: StorageApi;
   private _risk: RiskApi;
+  private _riskWatchlists: RiskWatchlistsApi;
   private _notifications: NotificationsApi;
   private _feedback: FeedbackApi;
   private _enrichment: EnrichmentApi;
@@ -171,6 +208,10 @@ class ApiClient {
   private _prevalence: PrevalenceApi;
   private _upload: UploadApi;
   private _lookupTables: LookupTablesApi;
+  private _iocLists: IocListsApi;
+  private _aiTier: AiTierApi;
+  private _internalDomains: InternalDomainsApi;
+  private _aiTuning: AiTuningApi;
   private _audit: AuditApi;
   private _context: ContextApi;
   private _ruleRepositories: RuleRepositoriesApi;
@@ -178,10 +219,15 @@ class ApiClient {
   private _parserRepositories: ParserRepositoriesApi;
   private _webhooks: WebhooksApi;
   private _marketplace: MarketplaceApi;
+  private _pullSources: PullSourcesApi;
+  private _lookupUrlAllowlist: LookupUrlAllowlistApi;
+  private _threatIntel: ThreatIntelApi;
   private _integrations: IntegrationsApi;
   private _gdpr: GdprApi;
   private _tier: TierApi;
   private _ipAllowlist: IpAllowlistApi;
+  private _ingestTokens: IngestTokensApi;
+  private _landingSources: LandingSourcesApi;
   private _onboarding: OnboardingApi;
   private _demo: DemoApi;
   private _siemHealth: SiemHealthApi;
@@ -190,6 +236,7 @@ class ApiClient {
   private _reports: ReportsApi;
 
   constructor(baseUrl: string = API_BASE_URL) {
+    this.connectorFeeds = new ConnectorFeedsApi(this.request.bind(this));
     this.baseUrl = baseUrl;
 
     // Initialize route modules with the request function
@@ -211,6 +258,7 @@ class ApiClient {
       (metricName, key) => this._search.listMetricTags(metricName, key)
     );
     this._detections = new DetectionsApi(this.request.bind(this));
+    this.sourceOnboarding = new SourceOnboardingApi(this.request.bind(this), this.requestRaw.bind(this));
     this._credentials = new CredentialsApi(this.request.bind(this));
     this._melod = new MelodApi(
       this.request.bind(this),
@@ -228,12 +276,15 @@ class ApiClient {
       this.baseUrl
     );
     this._logSources = new LogSourcesApi(this.request.bind(this));
+    this._pipelines = new PipelinesApi(this.request.bind(this));
     this._sourceConfigs = new SourceConfigsApi(this.request.bind(this));
     this._sourceScopes = new SourceScopesApi(this.request.bind(this));
+    this._sourceVisibility = new SourceVisibilityApi(this.request.bind(this));
     this._accessControl = new AccessControlApi(this.request.bind(this));
     this._dashboards = new DashboardsApi(this.request.bind(this));
     this._storage = new StorageApi(this.request.bind(this));
     this._risk = new RiskApi(this.request.bind(this));
+    this._riskWatchlists = new RiskWatchlistsApi(this.request.bind(this));
     this._notifications = new NotificationsApi(this.request.bind(this));
     this._feedback = new FeedbackApi(this.request.bind(this));
     this._enrichment = new EnrichmentApi(this.request.bind(this));
@@ -242,6 +293,10 @@ class ApiClient {
     this._prevalence = new PrevalenceApi(this.request.bind(this));
     this._upload = new UploadApi(this.request.bind(this), this.getAccessToken.bind(this));
     this._lookupTables = new LookupTablesApi(this.request.bind(this), this.getAccessToken.bind(this));
+    this._iocLists = new IocListsApi(this.request.bind(this));
+    this._aiTier = new AiTierApi(this.request.bind(this));
+    this._internalDomains = new InternalDomainsApi(this.request.bind(this));
+    this._aiTuning = new AiTuningApi(this.request.bind(this));
     this._audit = new AuditApi(this.request.bind(this));
     this._context = new ContextApi(this.request.bind(this));
     this._ruleRepositories = new RuleRepositoriesApi(this.request.bind(this));
@@ -249,10 +304,15 @@ class ApiClient {
     this._parserRepositories = new ParserRepositoriesApi(this.request.bind(this));
     this._webhooks = new WebhooksApi(this.request.bind(this));
     this._marketplace = new MarketplaceApi(this.request.bind(this));
+    this._pullSources = new PullSourcesApi(this.request.bind(this));
+    this._lookupUrlAllowlist = new LookupUrlAllowlistApi(this.request.bind(this));
+    this._threatIntel = new ThreatIntelApi(this.request.bind(this));
     this._integrations = new IntegrationsApi(this.request.bind(this));
     this._gdpr = new GdprApi(this.request.bind(this));
     this._tier = new TierApi(this.request.bind(this));
     this._ipAllowlist = new IpAllowlistApi(this.request.bind(this));
+    this._ingestTokens = new IngestTokensApi(this.request.bind(this));
+    this._landingSources = new LandingSourcesApi(this.request.bind(this));
     this._onboarding = new OnboardingApi(this.request.bind(this));
     this._demo = new DemoApi(this.request.bind(this));
     this._siemHealth = new SiemHealthApi(this.request.bind(this));
@@ -262,6 +322,34 @@ class ApiClient {
   }
 
   // Expose modules for direct access when needed
+  get iocLists(): IocListsApi {
+    return this._iocLists;
+  }
+
+  /** NAN-3228: weighted risk watchlists. */
+  get riskWatchlists(): RiskWatchlistsApi {
+    return this._riskWatchlists;
+  }
+
+  /** NAN-3191: hosted-shared tenant AI cost/quality tier. */
+  get aiTier(): AiTierApi {
+    return this._aiTier;
+  }
+
+  /** NAN-3226: tenant internal DNS suffixes (internal hosts, not domains). */
+  get internalDomains(): InternalDomainsApi {
+    return this._internalDomains;
+  }
+
+  /** NAN-3219: tenant-wide AI tuning mode (on / manual / off). */
+  get aiTuning(): AiTuningApi {
+    return this._aiTuning;
+  }
+
+  get pipelines(): PipelinesApi {
+    return this._pipelines;
+  }
+
   get auth(): AuthApi {
     return this._auth;
   }
@@ -302,6 +390,13 @@ class ApiClient {
     return this._marketplace;
   }
 
+  get pullSources(): PullSourcesApi {
+    return this._pullSources;
+  }
+
+  get lookupUrlAllowlist(): LookupUrlAllowlistApi { return this._lookupUrlAllowlist; }
+  get threatIntel(): ThreatIntelApi { return this._threatIntel; }
+
   /** Integration collectors (NAN-2189) — instances of collector-category
    *  marketplace entries. Enterprise only; the routes 404 on open builds. */
   get integrations(): IntegrationsApi {
@@ -314,6 +409,14 @@ class ApiClient {
 
   get ipAllowlist(): IpAllowlistApi {
     return this._ipAllowlist;
+  }
+
+  get ingestTokens(): IngestTokensApi {
+    return this._ingestTokens;
+  }
+
+  get landingSources(): LandingSourcesApi {
+    return this._landingSources;
   }
 
   get onboarding(): OnboardingApi {
@@ -348,16 +451,23 @@ class ApiClient {
     return this._sourceScopes;
   }
 
+  /** Hosted-shared lake source visibility (NAN-2361 wave 8). */
+  get sourceVisibility(): SourceVisibilityApi {
+    return this._sourceVisibility;
+  }
+
   private getAccessToken(): string | null {
     return getInMemoryToken();
   }
 
   setAuthFailureCallback(callback: (() => void) | null): void {
     this.authFailureCallback = callback;
+    sessionCredentials.configure(this.refreshCallback, this.authFailureCallback);
   }
 
   setRefreshCallback(callback: (() => Promise<boolean>) | null): void {
     this.refreshCallback = callback;
+    sessionCredentials.configure(this.refreshCallback, this.authFailureCallback);
   }
 
   private async request<T>(
@@ -365,6 +475,8 @@ class ApiClient {
     options: RequestInit = {},
     cacheOpts?: CacheRequestOpts
   ): Promise<T> {
+    if (cacheOpts?.signal) options = { ...options, signal: options.signal ? AbortSignal.any([options.signal, cacheOpts.signal]) : cacheOpts.signal };
+    const capturedRuntime = browserTenantRuntime.current();
     // Use service-aware routing for microservices architecture
     const serviceUrl = getServiceUrl(endpoint);
     const url = `${serviceUrl}${endpoint}`;
@@ -375,61 +487,32 @@ class ApiClient {
       ...options.headers,
     };
 
-    // Add Authorization header if we have a token
-    const token = this.getAccessToken();
-    if (token) {
-      (headers as Record<string, string>)['Authorization'] = `Bearer ${token}`;
-    }
-
     // Set up timeout using AbortController (60s — AI ops are async jobs now)
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     try {
-      const response = await fetch(url, {
+      const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+      // NAN-3761: a read deferred by 503 RESOURCE_LOCK_CONTENTION is retried
+      // with backoff + jitter before any caller sees it.
+      const response = await withLockContentionRetry(options.method, () => authenticatedFetch(endpoint, url, {
         ...options,
         headers,
-        credentials: 'include',
-        signal: controller.signal,
-      });
+        signal,
+      }, () => browserTenantRuntime.assertCurrent(capturedRuntime), capturedRuntime.scope.kind === 'enterprise_shared'), signal);
 
       if (!response.ok) {
-        // On 401, attempt a silent refresh and retry once
-        if (response.status === 401 && this.refreshCallback) {
-          const refreshed = await this.refreshCallback();
-          if (refreshed) {
-            // Retry the original request with the new token (fresh headers object)
-            const retryToken = this.getAccessToken();
-            const retryHeaders = { ...headers } as Record<string, string>;
-            if (retryToken) {
-              retryHeaders['Authorization'] = `Bearer ${retryToken}`;
-            }
-            const retryResponse = await fetch(url, {
-              ...options,
-              headers: retryHeaders,
-              credentials: 'include',
-              signal: controller.signal,
-            });
-            if (retryResponse.ok) {
-              cacheOpts?.onMeta?.(parseCacheMeta(retryResponse));
-              if (retryResponse.status === 204) return undefined as T;
-              return retryResponse.json();
-            }
-          }
-          // Refresh failed or retry still 401 — notify auth context
-          if (this.authFailureCallback) {
-            this.authFailureCallback();
-          }
-        } else if (response.status === 401 && this.authFailureCallback) {
-          this.authFailureCallback();
-        }
         const errorBody = await response.json().catch(() => ({
           error: {
             code: 'UNKNOWN_ERROR',
             message: response.statusText,
           }
         }));
-        const error = errorBody.error || errorBody;
+        // Flat `{ error: "<code>", message }` bodies (the shared auth-lifecycle
+        // and step-up admin APIs) carry the code as a string.
+        const error = typeof errorBody.error === 'string'
+          ? { code: errorBody.error, message: errorBody.message }
+          : (errorBody.error || errorBody);
 
         // Handle IP_DENIED — redirect to deny page instead of login
         if (error.code === 'IP_DENIED' && typeof window !== 'undefined') {
@@ -449,7 +532,56 @@ class ApiClient {
         return undefined as T;
       }
 
-      return response.json();
+      const value = await response.json();
+      browserTenantRuntime.assertCurrent(capturedRuntime);
+      return value;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new ApiClientError('Request timeout', 'TIMEOUT');
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /** Fetch a non-JSON response through the same auth, refresh, routing, and
+   * error contract as request(). Used for authenticated durable downloads. */
+  private async requestRaw(
+    endpoint: string,
+    options: RequestInit = {},
+    timeoutMs = 60_000,
+  ): Promise<Response> {
+    const capturedRuntime = browserTenantRuntime.current();
+    const serviceUrl = getServiceUrl(endpoint);
+    const url = `${serviceUrl}${endpoint}`;
+    const headers: HeadersInit = { ...options.headers };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await authenticatedFetch(endpoint, url, {
+        ...options,
+        headers,
+        signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
+      }, () => browserTenantRuntime.assertCurrent(capturedRuntime), capturedRuntime.scope.kind === 'enterprise_shared');
+      if (!response.ok) {
+        const errorBody = await response.clone().json().catch(async () => ({
+          error: {
+            code: 'UNKNOWN_ERROR',
+            message: (await response.text().catch(() => '')) || response.statusText,
+          },
+        }));
+        const error = errorBody.error || errorBody;
+        throw new ApiClientError(
+          error.message || 'Request failed',
+          error.code || 'UNKNOWN_ERROR',
+          error.details,
+          response.status,
+        );
+      }
+      browserTenantRuntime.assertCurrent(capturedRuntime);
+      return response;
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new ApiClientError('Request timeout', 'TIMEOUT');
@@ -489,8 +621,8 @@ class ApiClient {
   // Fetch single log by ID (for table_view mode row expansion).
   // NAN-1032: sourceType lets ClickHouse use the (source_type, timestamp, ...) PK
   // for a tight range read — without it, S3-backed historical lookups take 12–60s.
-  async fetchLog(id: string, timeRange?: import('./types').TimeRange, sourceType?: string): Promise<{ event: Record<string, unknown> | null }> {
-    return this._search.fetchLog(id, timeRange, sourceType);
+  async fetchLog(id: string, timeRange?: import('./types').TimeRange, sourceType?: string, signal?: AbortSignal): Promise<{ event: Record<string, unknown> | null }> {
+    return this._search.fetchLog(id, timeRange, sourceType, signal);
   }
 
   async getFieldStats(
@@ -582,21 +714,37 @@ class ApiClient {
     return this._search.cancelSearch(requestId);
   }
 
-  // Async search methods
-  async searchAsync(request: Omit<import('./types').SearchRequest, 'async_mode'>): Promise<import('./types').AsyncSearchResponse> {
-    return this._search.searchAsync(request);
+  // Interactive admission and async search methods
+  async searchInteractive(request: Omit<import('./types').SearchRequest, 'async_mode'>, retry?: import('./search-authority-retry').AuthorityRetryOptions, onCacheMeta?: (meta: CacheMeta) => void): Promise<import('./types').SearchResponse | import('./types').AsyncSearchResponse> {
+    return onCacheMeta ? this._search.searchInteractive(request, retry, onCacheMeta) : this._search.searchInteractive(request, retry);
+  }
+
+  async searchHistogram(request: import('./types').SearchHistogramRequest, signal?: AbortSignal): Promise<import('./types').SearchHistogramResponse> {
+    return this._search.searchHistogram(request, signal);
+  }
+
+  async getTreePage(request: import('./types').TreePageRequest, signal?: AbortSignal): Promise<import('./types').TreePageResponse> {
+    return this._search.getTreePage(request, signal);
+  }
+
+  async searchAsync(request: Omit<import('./types').SearchRequest, 'async_mode'>, retry?: import('./search-authority-retry').AuthorityRetryOptions, signal?: AbortSignal): Promise<import('./types').AsyncSearchResponse> {
+    return this._search.searchAsync(request, retry, signal);
   }
 
   searchStreamSSE(
     request: Omit<import('./types').SearchRequest, 'async_mode'>,
     callbacks: import('./types').SearchStreamCallbacks,
-    opts?: { bypass?: boolean }
+    opts?: { bypass?: boolean; follow?: boolean }
   ): AbortController {
     return this._search.searchStreamSSE(request, callbacks, opts);
   }
 
-  async getSearchJob(jobId: string): Promise<import('./types').SearchJobStatus> {
-    return this._search.getSearchJob(jobId);
+  async getSearchJob(jobId: string, retry?: import('./search-authority-retry').AuthorityRetryOptions, signal?: AbortSignal): Promise<import('./types').SearchJobStatus> {
+    return this._search.getSearchJob(jobId, retry, signal);
+  }
+
+  async getSearchJobResultPage(jobId: string, page: number, signal?: AbortSignal): Promise<import('./types').SearchJobResultPage> {
+    return this._search.getSearchJobResultPage(jobId, page, signal);
   }
 
   async cancelSearchJob(jobId: string): Promise<{ cancelled: boolean }> {
@@ -647,7 +795,7 @@ class ApiClient {
   async getRetro(
     request: import('./types').RetroRequest,
     cacheOpts?: CacheRequestOpts
-  ): Promise<import('./types').RetroResponse> {
+  ): Promise<import('./types').RetroResultResponse> {
     return this._search.getRetro(request, cacheOpts);
   }
 
@@ -802,6 +950,11 @@ class ApiClient {
     return this._detections.getFleetHealth();
   }
 
+  /** NAN-3064 — per-tenant detection scheduling lag. */
+  async getSchedulingLag(): Promise<import('./types').ScheduleLagSummary> {
+    return this._detections.getSchedulingLag();
+  }
+
   async getNoisyRules(limit?: number): Promise<import('./types').NoisyRulesResponse> {
     return this._detections.getNoisyRules(limit);
   }
@@ -823,12 +976,21 @@ class ApiClient {
     return this._detections.getRulePredicates(ruleId);
   }
 
-  async importDetections(data: string, format: 'yaml' | 'json'): Promise<{ imported: number }> {
+  async importDetections(
+    data: string,
+    format: 'yaml' | 'json',
+  ): Promise<{ imported: number; failed: number; errors: string[] }> {
     return this._detections.importDetections(data, format);
   }
 
-  async exportDetections(format: 'yaml' | 'json'): Promise<string> {
-    return this._detections.exportDetections(format);
+  /** Export all rules as a downloadable JSON or YAML file. The body is not
+   * JSON for `yaml`, so this goes through requestRaw rather than request(). */
+  async exportDetections(format: 'yaml' | 'json'): Promise<{ blob: Blob; filename: string }> {
+    const response = await this.requestRaw(`/api/rules/export?format=${format}`);
+    return {
+      blob: await response.blob(),
+      filename: filenameFromDisposition(response, `detection-rules.${format}`),
+    };
   }
 
   // Alerts
@@ -884,8 +1046,8 @@ class ApiClient {
     return this._core.getFieldValues(name, limit);
   }
 
-  async getExtFieldNames(query?: string, start?: string, end?: string): Promise<string[]> {
-    return this._core.getExtFieldNames(query, start, end);
+  async getExtFieldNames(query?: string, start?: string, end?: string, signal?: AbortSignal): Promise<string[]> {
+    return this._core.getExtFieldNames(query, start, end, signal);
   }
 
   async getSourceTypes(timeRange?: { start: string; end: string }): Promise<[string, number][]> {
@@ -999,6 +1161,16 @@ class ApiClient {
     return this._melod.getAiAvailability();
   }
 
+  async getTenantAiSettings(): Promise<import('./types').TenantAiSettings> {
+    return this._melod.getTenantAiSettings();
+  }
+
+  async updateTenantAiSettings(
+    request: import('./types').UpdateTenantAiSettingsRequest,
+  ): Promise<import('./types').TenantAiSettings> {
+    return this._melod.updateTenantAiSettings(request);
+  }
+
   async listAiProviders(): Promise<import('./types').ProviderCredentials[]> {
     return this._melod.listAiProviders();
   }
@@ -1070,15 +1242,6 @@ class ApiClient {
 
   async getSystemConfig(): Promise<import('./types').SystemConfig> {
     return this._core.getSystemConfig();
-  }
-
-  // Developer Settings (Scheduler Control)
-  async getDeveloperSettings(): Promise<import('./types').DeveloperSettings> {
-    return this._core.getDeveloperSettings();
-  }
-
-  async updateDeveloperSettings(request: import('./types').UpdateDeveloperSettingsRequest): Promise<import('./types').DeveloperSettings> {
-    return this._core.updateDeveloperSettings(request);
   }
 
   // Tuning
@@ -1526,8 +1689,8 @@ class ApiClient {
     return this._logSources.toggleLogSource(id, enabled);
   }
 
-  async deployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
-    return this._logSources.deployLogSource(id);
+  async deployLogSource(id: string, ocsfSampleLogs?: string[], samples?: string[]): Promise<import('./types').SharedDeploymentResponse> {
+    return this._logSources.deployLogSource(id, ocsfSampleLogs, samples);
   }
 
   async undeployLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
@@ -1538,8 +1701,80 @@ class ApiClient {
     return this._logSources.getLogSourceHealth(id);
   }
 
+  async getLogSourceStats(id: string, hours?: number): Promise<import('./types').TenantLogSourceStats> {
+    return this._logSources.getLogSourceStats(id, hours);
+  }
+
   async getIngestionHistory(hours?: number): Promise<import('./types').IngestionHistoryPoint[]> {
     return this._logSources.getIngestionHistory(hours);
+  }
+
+  async getHealthSeries(hours?: number): Promise<import('./types').LogSourceHealthSeries[]> {
+    return this._logSources.getHealthSeries(hours);
+  }
+
+  async getLogSourceHealthSeries(id: string, hours?: number): Promise<import('./types').LogSourceHealthSeries[]> {
+    return this._logSources.getLogSourceHealthSeries(id, hours);
+  }
+
+  // NAN-2361 hosted-shared tenants only
+  async getIngestEndpoint(): Promise<import('./types').TenantIngestEndpoint> {
+    return this._logSources.getIngestEndpoint();
+  }
+
+  async listIngestCredentials(): Promise<import('./types').TenantIngestCredentialList> {
+    return this._logSources.listIngestCredentials();
+  }
+
+  async getIngestCredentialRequest(requestId: string): Promise<import('./types').IngestCredentialReveal> {
+    return this._logSources.getIngestCredentialRequest(requestId);
+  }
+
+  async revealIngestCredential(requestId: string): Promise<import('./types').IngestCredentialReveal> {
+    return this._logSources.revealIngestCredential(requestId);
+  }
+
+  async revokeIngestCredential(
+    credentialId: string,
+    reason: string,
+  ): Promise<import('./types').IngestCredentialRevocation> {
+    return this._logSources.revokeIngestCredential(credentialId, reason);
+  }
+
+  async getSenderTemplates(): Promise<import('./types').SenderTemplateCatalog> {
+    return this._logSources.getSenderTemplates();
+  }
+
+  async getLogSourceCredentials(id: string): Promise<import('./types').TenantSourceWriters> {
+    return this._logSources.getLogSourceCredentials(id);
+  }
+
+  async getSourceWriters(sourceSlug: string): Promise<import('./types').TenantSourceWriters> {
+    return this._logSources.getSourceWriters(sourceSlug);
+  }
+
+  async getIngestCredentialActivity(credentialId: string, hours?: number): Promise<import('./types').IngestCredentialActivity> {
+    return this._logSources.getIngestCredentialActivity(credentialId, hours);
+  }
+
+  async getIngestSourceActivity(sourceSlug: string, hours?: number): Promise<import('./types').IngestSourceActivity> {
+    return this._logSources.getIngestSourceActivity(sourceSlug, hours);
+  }
+
+  async requestIngestCredential(
+    input: import('./types').IngestCredentialRequestInput,
+  ): Promise<import('./types').TenantIngestCredentialRequest> {
+    return this._logSources.requestIngestCredential(input);
+  }
+
+  async precheckIngestCredential(
+    input: import('./types').IngestCredentialPrecheckInput,
+  ): Promise<import('./types').IngestCredentialPrecheck> {
+    return this._logSources.precheckIngestCredential(input);
+  }
+
+  async getIngestionObserved(hours?: number): Promise<import('./types').TenantIngestObservation> {
+    return this._logSources.getIngestionObserved(hours);
   }
 
   async validateLogSource(id: string): Promise<import('./types').LogSourceVrlValidationResult> {
@@ -1554,8 +1789,10 @@ class ApiClient {
     vrlCode: string,
     sampleLog: string,
     extensionVrl?: string,
+    validateOcsf: boolean = false,
+    logSourceId?: string,
   ): Promise<import('./types').LogSourceTestResult> {
-    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl);
+    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl, validateOcsf, logSourceId);
   }
 
   async testLogSourceVrlLive(vrlCode: string, sourceType: string, currentVrl?: string, limit?: number): Promise<import('./types').LiveTestResult[]> {
@@ -1574,20 +1811,53 @@ class ApiClient {
     return this._logSources.getLogSourceVersions(id);
   }
 
-  async publishLogSource(id: string): Promise<import('./types').EnhancedDeploymentResponse> {
-    return this._logSources.publishLogSource(id);
+  async publishLogSource(id: string, samples?: string[]): Promise<import('./types').SharedDeploymentResponse> {
+    return this._logSources.publishLogSource(id, samples);
   }
 
-  async revertLogSourceVersion(id: string, versionId: number): Promise<import('./types').LogSourceVersion> {
+  async revertLogSourceVersion(id: string, versionId: number): Promise<import('./types').SharedRevertResponse> {
     return this._logSources.revertLogSourceVersion(id, versionId);
+  }
+
+  // Parser-bundle rollouts (hosted-shared, NAN-2607)
+  async requestParserRollout(id: string, input?: { samples?: string[]; reason?: string }): Promise<import('./types').TenantParserRollout> {
+    return this._logSources.requestParserRollout(id, input);
+  }
+
+  async listLogSourceRollouts(id: string, limit?: number): Promise<import('./types').TenantParserRollout[]> {
+    return this._logSources.listLogSourceRollouts(id, limit);
+  }
+
+  async listParserRollouts(filter?: { states?: string[]; limit?: number }): Promise<import('./types').TenantParserRollout[]> {
+    return this._logSources.listParserRollouts(filter);
+  }
+
+  async getParserRollout(rolloutId: string): Promise<import('./types').TenantParserRollout> {
+    return this._logSources.getParserRollout(rolloutId);
+  }
+
+  async listParserBaseOffers(): Promise<import('./types').TenantParserBaseOffer[]> {
+    return this._logSources.listParserBaseOffers();
+  }
+
+  async mergeParserBaseOffer(offerId: string, reason?: string): Promise<import('./types').TenantParserRollout> {
+    return this._logSources.mergeParserBaseOffer(offerId, reason);
+  }
+
+  async getLogSourceSamples(id: string): Promise<import('./types').TenantParserSamples> {
+    return this._logSources.getLogSourceSamples(id);
+  }
+
+  async putLogSourceSamples(id: string, samples: string[]): Promise<import('./types').TenantParserSamples> {
+    return this._logSources.putLogSourceSamples(id, samples);
   }
 
   async validateNamespace(namespace: string): Promise<import('./types').NamespaceValidationResult> {
     return this._logSources.validateNamespace(namespace);
   }
 
-  async discardLogSourceDraft(id: string): Promise<import('./types').LogSource> {
-    return this._logSources.discardLogSourceDraft(id);
+  async discardLogSourceDraft(id: string, expectedUpdatedAt?: string): Promise<import('./types').LogSource> {
+    return this._logSources.discardLogSourceDraft(id, expectedUpdatedAt);
   }
 
   async getLogSourceDraftStatus(id: string): Promise<import('./types').LogSourceWithDraftStatus> {
@@ -1697,6 +1967,58 @@ class ApiClient {
 
   async updateUser(id: string, request: import('./types').UpdateUserRequest): Promise<import('./types').UserDetail> {
     return this._accessControl.updateUser(id, request);
+  }
+
+  /** Hosted-shared tenant (NAN-2361): invite a member; the activation link is returned once. */
+  async inviteSharedTenantMember(request: import('./types').SharedTenantInviteRequest): Promise<import('./types').SharedTenantInviteResponse> {
+    return this._accessControl.inviteSharedTenantMember(request);
+  }
+
+  /** Hosted-shared tenant (NAN-2361): replace a member's roles and/or suspend / re-activate. */
+  async updateSharedTenantMember(id: string, request: import('./types').SharedTenantUpdateMemberRequest): Promise<import('./types').SharedTenantMember> {
+    return this._accessControl.updateSharedTenantMember(id, request);
+  }
+
+  // Hosted-shared tenant: existing-identity invitations (NAN-2361 wave 5)
+  async listSharedTenantMembershipInvitations(): Promise<import('./types').SharedTenantMembershipInvitationListResponse> {
+    return this._accessControl.listSharedTenantMembershipInvitations();
+  }
+
+  async revokeSharedTenantMembershipInvitation(id: string): Promise<void> {
+    return this._accessControl.revokeSharedTenantMembershipInvitation(id);
+  }
+
+  async listMySharedTenantInvitations(): Promise<import('./types').MySharedTenantInvitationListResponse> {
+    return this._accessControl.listMySharedTenantInvitations();
+  }
+
+  async acceptMySharedTenantInvitation(id: string, idempotencyKey: string): Promise<import('./types').AcceptMySharedTenantInvitationResponse> {
+    return this._accessControl.acceptMySharedTenantInvitation(id, idempotencyKey);
+  }
+
+  // Hosted-shared OIDC provider administration (step-up admin API, NAN-2361 wave 5)
+  async listSharedOidcAdminProviders(): Promise<import('./types').SharedOidcAdminProviderList> {
+    return this._accessControl.listSharedOidcAdminProviders();
+  }
+
+  async createSharedOidcAdminProvider(request: import('./types').SharedOidcAdminCreateRequest): Promise<import('./types').SharedOidcAdminMutationResponse> {
+    return this._accessControl.createSharedOidcAdminProvider(request);
+  }
+
+  async updateSharedOidcAdminProvider(id: string, request: import('./types').SharedOidcAdminUpdateRequest): Promise<import('./types').SharedOidcAdminMutationResponse> {
+    return this._accessControl.updateSharedOidcAdminProvider(id, request);
+  }
+
+  async rotateSharedOidcAdminProviderSecret(id: string, idempotencyKey: string, clientSecret: string): Promise<import('./types').SharedOidcAdminMutationResponse> {
+    return this._accessControl.rotateSharedOidcAdminProviderSecret(id, idempotencyKey, clientSecret);
+  }
+
+  async setSharedOidcAdminProviderEnabled(id: string, idempotencyKey: string, enabled: boolean): Promise<import('./types').SharedOidcAdminMutationResponse> {
+    return this._accessControl.setSharedOidcAdminProviderEnabled(id, idempotencyKey, enabled);
+  }
+
+  async deleteSharedOidcAdminProvider(id: string, idempotencyKey: string): Promise<import('./types').SharedOidcAdminMutationResponse> {
+    return this._accessControl.deleteSharedOidcAdminProvider(id, idempotencyKey);
   }
 
   async deleteUser(id: string): Promise<void> {
@@ -1949,13 +2271,22 @@ class ApiClient {
     return this._risk.getEntityRiskActivity(entities);
   }
 
-  async getEntityContext(entityType: string, entityValue: string, identities?: string[]): Promise<import('./types').EntityContextResponse> {
-    return this._risk.getEntityContext(entityType, entityValue, identities);
+  async getEntityContext(entityType: string, entityValue: string, identities?: string[], signal?: AbortSignal): Promise<import('./types').EntityContextResponse> {
+    return this._risk.getEntityContext(entityType, entityValue, identities, signal);
+  }
+
+  async getEntityRiskTimeline(entityType: string, entityValue: string, opts?: { identities?: string[]; at?: string }, signal?: AbortSignal): Promise<import('./types').EntityRiskTimelineResponse> {
+    return this._risk.getEntityRiskTimeline(entityType, entityValue, opts, signal);
   }
 
   // Dashboard Generation (AI)
   async melodGenerateDashboard(request: import('./types').GenerateDashboardRequest): Promise<import('./types').MelodJobStartResponse> {
     return this._melod.melodGenerateDashboard(request);
+  }
+
+  // NAN-3205: pivt playbook drafting (async job → PlaybookDraft)
+  async melodDraftPlaybook(request: import('./types').DraftPlaybookRequest): Promise<import('./types').MelodJobStartResponse> {
+    return this._melod.melodDraftPlaybook(request);
   }
 
   /** @deprecated Use getMelodJobStatus instead */
@@ -1992,18 +2323,6 @@ class ApiClient {
   // Feedback
   async createFeedback(request: import('./types').CreateFeedbackRequest): Promise<import('./types').Feedback> {
     return this._feedback.createFeedback(request);
-  }
-
-  async listFeedback(options?: { category?: string; status?: string; limit?: number; offset?: number }): Promise<import('./types').FeedbackListResponse> {
-    return this._feedback.listFeedback(options);
-  }
-
-  async updateFeedback(id: string, request: import('./types').UpdateFeedbackRequest): Promise<import('./types').Feedback> {
-    return this._feedback.updateFeedback(id, request);
-  }
-
-  async deleteFeedback(id: string): Promise<{ success: boolean }> {
-    return this._feedback.deleteFeedback(id);
   }
 
   // Enrichment
@@ -2216,8 +2535,70 @@ class ApiClient {
     return this._prevalence.getArtifactExplorer(params);
   }
 
-  async getArtifactDetail(artifact: string, window?: string): Promise<import('./types').ArtifactDetailResponse> {
-    return this._prevalence.getArtifactDetail(artifact, window);
+  async getArtifactDetail(artifact: string, window?: string, signal?: AbortSignal): Promise<import('./types').ArtifactDetailResponse> {
+    return this._prevalence.getArtifactDetail(artifact, window, signal);
+  }
+
+  async startPrevalenceExport(params: {
+    window: string;
+    type?: string;
+    format?: 'csv' | 'json';
+  }): Promise<
+    | { kind: 'completed'; blob: Blob; filename: string }
+    | { kind: 'queued'; job: import('./types').AsyncSearchResponse }
+  > {
+    const query = new URLSearchParams({
+      window: params.window,
+      format: params.format ?? 'csv',
+    });
+    if (params.type) query.set('type', params.type);
+    // NAN-3088: a lean tenant's export is always a durable cell job (202).
+    const response = await this.requestRaw(`${leanPrevalencePath('export')}?${query.toString()}`);
+    if (response.status === 202) {
+      return { kind: 'queued', job: await response.json() };
+    }
+    return {
+      kind: 'completed',
+      blob: await response.blob(),
+      filename: filenameFromDisposition(response, `prevalence_export.${params.format ?? 'csv'}`),
+    };
+  }
+
+  // NAN-2361 hosted-shared tenants: queued export jobs (prevalence, audit).
+  // These routes exist only under the hosted-shared profile.
+
+  async enqueueExport(kind: 'prevalence' | 'audit', request: import('./types').EnqueueExportRequest): Promise<import('./types').TenantExportJob> {
+    return this.request(`/api/exports/${kind}`, { method: 'POST', body: JSON.stringify(request) });
+  }
+
+  async listExportJobs(kind: 'prevalence' | 'audit', limit?: number): Promise<import('./types').TenantExportJob[]> {
+    const params = limit ? `?limit=${limit}` : '';
+    return this.request(`/api/exports/${kind}${params}`);
+  }
+
+  /** Poll one export job by its `status_url` (or kind + id). */
+  async getExportJob(statusUrl: string): Promise<import('./types').TenantExportJob> {
+    return this.request(statusUrl);
+  }
+
+  async downloadExportJob(downloadUrl: string, fallbackFilename = 'export.csv'): Promise<{ blob: Blob; filename: string }> {
+    const response = await this.requestRaw(downloadUrl, {}, 60 * 60 * 1000);
+    return {
+      blob: await response.blob(),
+      filename: filenameFromDisposition(response, fallbackFilename),
+    };
+  }
+
+  async downloadSearchJob(jobId: string): Promise<{ blob: Blob; filename: string }> {
+    const response = await this.requestRaw(
+      `/api/search/jobs/${encodeURIComponent(jobId)}/download`,
+      {},
+      60 * 60 * 1000,
+    );
+    return {
+      blob: await response.blob(),
+      filename: filenameFromDisposition(response, 'prevalence_export.csv'),
+    };
   }
 
   async getPrevalenceScatterData(request: import('./types').ScatterPlotRequest): Promise<import('./types').PrevalenceScatterDataResponse> {
@@ -2290,13 +2671,14 @@ class ApiClient {
       prevalence_score: number;
     }>;
     rarity_threshold: number;
+    artifacts_truncated: boolean;
   }> {
     return this._prevalence.getPrevalenceArtifactsForQuery(request);
   }
 
   // Upload
-  async previewUpload(file: File, format?: import('./types').FileFormat, delimiter?: string): Promise<import('./types').PreviewResult> {
-    return this._upload.previewUpload(file, format, delimiter);
+  async previewUpload(file: File, format?: import('./types').FileFormat, delimiter?: string, hasHeader?: boolean): Promise<import('./types').PreviewResult> {
+    return this._upload.previewUpload(file, format, delimiter, hasHeader);
   }
 
   async getUploadHistory(filter?: import('./types').UploadHistoryFilter): Promise<import('./types').UploadRecord[]> {
@@ -2392,16 +2774,6 @@ class ApiClient {
   // Audit
   async queryAuditLogs(query: import('./types').AuditLogQuery): Promise<import('./types').AuditLogResponse> {
     return this._audit.queryAuditLogs(query);
-  }
-
-  // AI Debug
-  async getAiFailures(request?: import('./types').GetAiFailuresRequest): Promise<import('./types').AiFailuresResponse> {
-    const params = new URLSearchParams();
-    if (request?.agent_type) params.set('agent_type', request.agent_type);
-    if (request?.limit) params.set('limit', String(request.limit));
-    if (request?.offset) params.set('offset', String(request.offset));
-    const query = params.toString();
-    return this.request(`/api/ai/failures${query ? `?${query}` : ''}`);
   }
 
   // Organizational Context

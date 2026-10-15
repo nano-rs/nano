@@ -7,20 +7,23 @@
 // Task #15 — until then the stub keeps the call sites compilable and
 // renders the buttons as inert.
 
+import type { MelodJobStartResponse } from '@/lib/api/types';
+
 export interface UseMelodJobReturn<TResult> {
   isRunning: boolean;
-  progress: number;
+  loading: boolean;
+  progress: string | null;
   status: string | null;
   error: string | null;
   result: TResult | null;
-  start: (fn: () => Promise<TResult>) => Promise<TResult>;
+  start: (fn: () => Promise<MelodJobStartResponse>) => Promise<TResult>;
   cancel: () => void;
   reset: () => void;
 }
 
 export async function pollMelodJob<TResult>(
-  _fn: () => Promise<TResult>,
-  _opts?: { signal?: AbortSignal },
+  _fn: () => Promise<MelodJobStartResponse>,
+  _opts?: { signal?: AbortSignal; onProgress?: (message: string | undefined) => void },
 ): Promise<TResult> {
   throw new Error(
     'pollMelodJob is unavailable in open-core builds. Gate callers with ' +
@@ -35,7 +38,7 @@ export async function pollMelodJob<TResult>(
 // down the React tree. Gate-the-caller cleanup is in Task #15.
 function rejectedStart() {
   console.warn(
-    '[NAN-745] useMelodJob.start() called in open-core build. ' +
+    '[open-core] useMelodJob.start() called in open-core build. ' +
       'Gate this caller with useCapabilities().capabilities.melod.',
   );
   return Promise.reject(
@@ -45,7 +48,8 @@ function rejectedStart() {
 
 const STUB_RETURN = {
   isRunning: false,
-  progress: 0,
+  progress: null,
+  loading: false,
   status: null,
   error: null,
   result: null,

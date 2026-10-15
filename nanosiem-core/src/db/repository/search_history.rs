@@ -60,6 +60,8 @@ impl SearchHistoryRepository {
         user_id: Uuid,
         entry: &NewSearchHistoryEntry,
     ) -> Result<SearchHistoryEntry, SearchHistoryError> {
+        let mut entry = entry.clone();
+        entry.query = crate::inputlookup::storage_policy::redact_url_credentials(&entry.query);
         // Check if the most recent entry is the same query (dedup)
         let recent = sqlx::query_scalar::<_, String>(
             r#"
@@ -164,6 +166,37 @@ impl SearchHistoryRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// History rows feeding search-autocomplete field ranking (NAN-3812).
+    ///
+    /// `Some(user)` reads that user's own piped queries (the "Recent" group);
+    /// `None` reads every user's piped queries in this deployment (the
+    /// "Popular" group). Open core is one tenant per deployment, so the
+    /// deployment-wide read is the tenant-wide read. Callers keep only field
+    /// names (see `search::field_usage`); query text never leaves the server.
+    pub async fn field_usage_rows(
+        &self,
+        user_id: Option<Uuid>,
+        limit: i64,
+        window_days: i64,
+    ) -> Result<Vec<crate::search::field_usage::FieldUsageRow>, SearchHistoryError> {
+        let rows = sqlx::query_as::<_, crate::search::field_usage::FieldUsageRow>(
+            r#"
+            SELECT user_id, query, created_at FROM search_history
+            WHERE query_mode = 'piped'
+              AND created_at >= NOW() - make_interval(days => $3::int)
+              AND ($1::uuid IS NULL OR user_id = $1)
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(window_days as i32)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Get user's history enabled preference

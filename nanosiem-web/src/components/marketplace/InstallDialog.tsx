@@ -9,8 +9,10 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
-import { Loader2, Eye, EyeOff, Lock, Download } from 'lucide-react';
+import { Eye, EyeOff, Lock, Download } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import type { MarketplaceCatalogEntry, CredentialFieldDef } from '@/lib/api/marketplace';
+import { humanizeEnum } from '@/lib/marketplace-labels';
 
 interface InstallDialogProps {
   entry: MarketplaceCatalogEntry | null;
@@ -61,8 +63,8 @@ export function InstallDialog({ entry, open, onOpenChange, onInstall }: InstallD
 
         <div className="space-y-4 py-4">
           <div className="flex gap-2 flex-wrap">
-            <Badge variant="outline" className="rounded-lg font-mono text-[10px] uppercase tracking-[0.12em]">{entry.category}</Badge>
-            <Badge variant="outline" className="rounded-lg font-mono text-[10px] uppercase tracking-[0.12em]">{entry.execution_backend}</Badge>
+            <Badge variant="outline" className="rounded-lg font-mono text-[10px] uppercase tracking-[0.12em]">{humanizeEnum(entry.category)}</Badge>
+            <Badge variant="outline" className="rounded-lg font-mono text-[10px] uppercase tracking-[0.12em]">{humanizeEnum(entry.execution_backend)}</Badge>
             {entry.author && <Badge variant="secondary" className="rounded-lg font-mono text-[10px]">{entry.author}</Badge>}
           </div>
 
@@ -119,7 +121,7 @@ export function InstallDialog({ entry, open, onOpenChange, onInstall }: InstallD
             Cancel
           </Button>
           <Button className="rounded-lg" onClick={handleInstall} disabled={installing || !canInstall()}>
-            {installing && <Loader2 className="w-4 h-4 animate-spin" />}
+            {installing && <LoadingIcon className="w-4 h-4" />}
             Install
           </Button>
         </SheetFooter>

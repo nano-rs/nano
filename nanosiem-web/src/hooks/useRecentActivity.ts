@@ -13,6 +13,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api, RecentActivityItem, RecentItemType, NotebookTabWithDetails } from '@/lib/api';
 import { getAccessToken } from '@/lib/auth-token';
+import { requestCredentials } from '@/lib/request-credentials';
 
 export interface UnifiedRecentItem {
   type: 'search' | 'notebook' | RecentItemType;
@@ -53,6 +54,7 @@ async function fetchSearchHistory(limit: number): Promise<SearchHistoryEntry[]> 
   try {
     const response = await fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/search/history?limit=${limit}`, {
       headers: getAuthHeaders(),
+        credentials: requestCredentials('/api/search/history', getAuthHeaders()),
     });
     if (response.ok) {
       const data = await response.json();

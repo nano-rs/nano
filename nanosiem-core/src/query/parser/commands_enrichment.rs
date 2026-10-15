@@ -39,6 +39,7 @@ pub(super) fn tree_command(input: &str) -> ParseResult<'_, Command> {
             return Ok((
                 remaining,
                 Command::Tree {
+                    preset: Some(TreePreset::Process),
                     parent_field: "parent_process_guid".to_string(),
                     child_field: "process_guid".to_string(),
                     label_field: "process_name".to_string(),
@@ -61,6 +62,7 @@ pub(super) fn tree_command(input: &str) -> ParseResult<'_, Command> {
             return Ok((
                 remaining,
                 Command::Tree {
+                    preset: Some(TreePreset::Web),
                     parent_field: "http_referrer".to_string(),
                     child_field: "url".to_string(),
                     label_field: "dest_host".to_string(),
@@ -161,6 +163,7 @@ pub(super) fn tree_command(input: &str) -> ParseResult<'_, Command> {
             return Ok((
                 remaining,
                 Command::Tree {
+                    preset: None,
                     parent_field,
                     child_field: positional_field.clone(),
                     label_field: positional_field,
@@ -318,6 +321,7 @@ pub(super) fn tree_command(input: &str) -> ParseResult<'_, Command> {
     Ok((
         remaining,
         Command::Tree {
+            preset: None,
             parent_field,
             child_field,
             label_field,
@@ -458,10 +462,12 @@ pub(super) fn resolve_identity_command(input: &str) -> ParseResult<'_, Command> 
         }
     }
 
+    let field_is_default = field.is_none();
     Ok((
         remaining,
         Command::ResolveIdentity {
             field: field.unwrap_or_else(|| "src_ip".to_string()),
+            field_is_default,
             max_age: max_age.unwrap_or(Duration::from_secs(24 * 3600)), // 24h default
         },
     ))

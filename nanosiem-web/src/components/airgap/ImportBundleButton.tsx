@@ -16,7 +16,8 @@
  */
 
 import { useRef, useState } from 'react';
-import { Upload, Loader2 } from 'lucide-react';
+import { Upload } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 
@@ -80,7 +81,7 @@ export function ImportBundleButton({
         )}
       >
         {uploading ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin" strokeWidth={1.5} />
+          <LoadingIcon className="w-3.5 h-3.5" strokeWidth={1.5} />
         ) : (
           <Upload className="w-3.5 h-3.5" strokeWidth={1.5} />
         )}

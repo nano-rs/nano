@@ -50,9 +50,23 @@ pub(crate) fn lookup_error_to_api(err: LookupError) -> ApiError {
             ApiError::ValidationError(format!("Primary key column not found: {}", col))
         }
         LookupError::RowNotFound(id) => ApiError::NotFound(format!("Row not found: {}", id)),
+        LookupError::TableInUse(rules) => ApiError::Conflict(format!(
+            "Lookup table is used by detection rules: {}. Remove those references before deleting it.", rules
+        )),
+        LookupError::ReferenceConflict => ApiError::Conflict(
+            "Lookup table is still referenced by related records. Remove those references before deleting it.".to_string()
+        ),
         LookupError::RepositoryError(e) => {
-            tracing::error!(error = %e, "Lookup repository error");
-            ApiError::InternalError("A database error occurred".to_string())
+            if e.contains("Code: 497") && e.contains("ACCESS_DENIED")
+                && e.contains("ALTER DELETE ON nanosiem.lookup_rows")
+            {
+                let grant = "ALTER DELETE ON nanosiem.lookup_rows";
+                tracing::error!(error = %e, "ClickHouse permission missing: {grant}");
+                ApiError::InternalError(format!("ClickHouse permission missing: {grant}"))
+            } else {
+                tracing::error!(error = %e, "Lookup repository error");
+                ApiError::InternalError("A database error occurred".to_string())
+            }
         }
     }
 }
@@ -108,6 +122,36 @@ pub(crate) fn lookup_error_to_api(err: LookupError) -> ApiError {
         ingestion::ValidateCronRequest,
         ingestion::ValidateCronResponse,
         ingestion::IngestionDeleteResponse,
+        nanosiem_core::UploadParserConfig,
+        nanosiem_core::FileFormat,
     ))
 )]
 pub struct LookupApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn referenced_lookup_is_a_conflict_with_rule_names() {
+        let error = lookup_error_to_api(LookupError::TableInUse("Suspicious login".into()));
+        assert!(matches!(error, ApiError::Conflict(message) if message.contains("Suspicious login")));
+    }
+
+    #[test]
+    fn database_reference_conflict_is_not_a_server_error() {
+        assert!(matches!(lookup_error_to_api(LookupError::ReferenceConflict), ApiError::Conflict(_)));
+    }
+
+    #[test]
+    fn missing_lookup_rows_delete_grant_is_actionable() {
+        let error = LookupError::RepositoryError(
+            "Code: 497. DB::Exception: Not enough privileges. To execute this query, it's necessary to have the grant ALTER DELETE ON nanosiem.lookup_rows. (ACCESS_DENIED)".into(),
+        );
+        assert!(matches!(
+            lookup_error_to_api(error),
+            ApiError::InternalError(message)
+                if message == "ClickHouse permission missing: ALTER DELETE ON nanosiem.lookup_rows"
+        ));
+    }
+}

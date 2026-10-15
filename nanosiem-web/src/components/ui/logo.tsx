@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useTheme } from 'next-themes';
-import { useEffect, useState } from 'react';
+import { useId } from 'react';
 
 interface LogoProps {
   className?: string;
@@ -10,35 +9,29 @@ interface LogoProps {
 }
 
 export function Logo({ className = "w-10 h-10", alt = "nano", size = 'normal' }: LogoProps) {
-  const { resolvedTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-  
-  // Avoid hydration mismatch by only rendering after mount
-  useEffect(() => {
-    setMounted(true);
-  }, []);
-  
-  if (!mounted) {
-    // Return a placeholder to avoid layout shift
-    return <div className={className} />;
-  }
-  
-  // Use resolvedTheme to handle 'system' theme properly
-  // Use light theme logo (dark colors) for light mode
-  // Use dark theme logo (light colors) for dark mode
-  let logoSrc: string;
-  if (size === 'small') {
-    logoSrc = resolvedTheme === 'dark' ? '/logo_small_dark_theme.svg' : '/logo_small_light_theme.svg';
-  } else {
-    logoSrc = resolvedTheme === 'dark' ? '/logo_dark_theme.svg' : '/logo_light_theme.svg';
-  }
-  
+  const titleId = useId();
+
   return (
-    <img 
-      src={logoSrc} 
-      alt={alt} 
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox={size === 'small' ? '0 0 110.53 110.53' : '0 0 480 110.53'}
+      role="img"
+      aria-labelledby={alt ? titleId : undefined}
+      aria-hidden={alt ? undefined : true}
       className={`${className} object-contain`}
-      style={{ objectPosition: 'center' }}
-    />
+      fill="currentColor"
+      fillRule="evenodd"
+    >
+      <title id={titleId}>{alt}</title>
+      <path d="M88.43,11.05c0-6.08-4.97-11.05-11.05-11.05h-44.21c-6.08,0-11.05,4.97-11.05,11.05s-4.97,11.05-11.05,11.05S0,27.08,0,33.16v22.11c0,6.08,4.97,11.05,11.05,11.05s11.05-4.97,11.05-11.05v-22.11c0-6.08,4.97-11.05,11.05-11.05h44.21c6.08,0,11.05,4.97,11.05,11.05v66.32c0,6.08,4.97,11.05,11.05,11.05s11.05-4.97,11.05-11.05V33.16c0-6.08-4.97-11.05-11.05-11.05s-11.05-4.97-11.05-11.05Z" />
+      {size === 'normal' && (
+        <>
+          <path d="M156.32,0c-6.08,0-11.05,4.97-11.05,11.05s-4.97,11.05-11.05,11.05-11.05,4.97-11.05,11.05v44.21c0,6.08,4.97,11.05,11.05,11.05s11.05,4.97,11.05,11.05,4.97,11.05,11.05,11.05h22.11c6.08,0,11.05-4.97,11.05-11.05s-4.97-11.05-11.05-11.05h-22.11c-6.08,0-11.05-4.97-11.05-11.05v-44.21c0-6.08,4.97-11.05,11.05-11.05h44.21c6.08,0,11.05,4.97,11.05,11.05v66.32c0,6.08,4.97,11.05,11.05,11.05s11.05-4.97,11.05-11.05V33.16c0-6.08-4.97-11.05-11.05-11.05s-11.05-4.97-11.05-11.05-4.97-11.05-11.05-11.05h-44.21Z" />
+          <path d="M268.42,11.05c0,6.08-4.97,11.05-11.05,11.05s-11.05,4.97-11.05,11.05v66.32c0,6.08,4.97,11.05,11.05,11.05s11.05-4.97,11.05-11.05V33.16c0-6.08,4.97-11.05,11.05-11.05h44.21c6.08,0,11.05,4.97,11.05,11.05v66.32c0,6.08,4.97,11.05,11.05,11.05s11.05-4.97,11.05-11.05V33.16c0-6.08-4.97-11.05-11.05-11.05s-11.05-4.97-11.05-11.05-4.97-11.05-11.05-11.05h-44.21c-6.08,0-11.05,4.97-11.05,11.05Z" />
+          <path d="M391.58,11.05c0,6.08-4.97,11.05-11.05,11.05s-11.05,4.97-11.05,11.05v44.21c0,6.08,4.97,11.05,11.05,11.05s11.05,4.97,11.05,11.05,4.97,11.05,11.05,11.05h44.21c6.08,0,11.05-4.97,11.05-11.05s4.97-11.05,11.05-11.05,11.05-4.97,11.05-11.05v-44.21c0-6.08-4.97-11.05-11.05-11.05s-11.05-4.97-11.05-11.05-4.97-11.05-11.05-11.05h-44.21c-6.08,0-11.05,4.97-11.05,11.05h0ZM446.84,22.11c6.08,0,11.05,4.97,11.05,11.05v44.21c0,6.08-4.97,11.05-11.05,11.05h-44.21c-6.08,0-11.05-4.97-11.05-11.05v-44.21c0-6.08,4.97-11.05,11.05-11.05h44.21Z" />
+        </>
+      )}
+      <path d="M22.11,99.48c0-6.08-4.97-11.05-11.05-11.05S0,93.4,0,99.48s4.97,11.05,11.05,11.05,11.05-4.97,11.05-11.05Z" fill="var(--primary)" />
+    </svg>
   );
 }

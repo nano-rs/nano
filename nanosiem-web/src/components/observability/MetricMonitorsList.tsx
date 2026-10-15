@@ -9,7 +9,8 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Bell, Loader2, Pencil, Trash2 } from 'lucide-react';
+import { Bell, Pencil, Trash2 } from 'lucide-react';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 
 import { api } from '@/lib/api';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -98,7 +99,7 @@ export function MetricMonitorsList({ reloadKey = 0 }: MetricMonitorsListProps) {
         </span>
         <div className="flex-1" />
         {loading ? (
-          <Loader2 className="w-3.5 h-3.5 animate-spin text-fg-4" />
+          <LoadingIcon className="w-3.5 h-3.5 text-fg-4" />
         ) : (
           <span className="font-mono text-[10.5px] text-fg-4 tabular-nums">
             {monitors.length}

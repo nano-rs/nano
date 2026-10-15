@@ -1,0 +1,373 @@
+{
+  "version": 1,
+  "placeholders": [
+    {
+      "marker": "{{hostname}}",
+      "source": "ingest-endpoint.hostname",
+      "description": "The tenant ingest hostname, `<tenant_slug>.ingest.nano.rs`.",
+      "secret": false
+    },
+    {
+      "marker": "{{base_url}}",
+      "source": "ingest-endpoint.base_url",
+      "description": "`https://<hostname>`.",
+      "secret": false
+    },
+    {
+      "marker": "{{hec_url}}",
+      "source": "ingest-endpoint.hec_url",
+      "description": "HEC event endpoint, `<base_url>/services/collector/event`.",
+      "secret": false
+    },
+    {
+      "marker": "{{nano_https_url}}",
+      "source": "ingest-endpoint.nano_https_url",
+      "description": "HTTPS JSON endpoint, `<base_url>/ingest`.",
+      "secret": false
+    },
+    {
+      "marker": "{{otlp_logs_url}}",
+      "source": "ingest-endpoint.otlp_logs_url",
+      "description": "OTLP/HTTP logs endpoint, `<base_url>/v1/logs`.",
+      "secret": false
+    },
+    {
+      "marker": "{{token}}",
+      "source": "the revealed credential (decrypted in the browser)",
+      "description": "The ingest token. Shown once; never stored.",
+      "secret": true
+    },
+    {
+      "marker": "{{label}}",
+      "source": "the credential label",
+      "description": "The credential's display label, used to name the sender output.",
+      "secret": false
+    },
+    {
+      "marker": "{{sources}}",
+      "source": "the collector credential's source_slugs and source_aliases",
+      "description": "Collector templates: every name an event may declare (allowlisted slugs, then aliases), comma-separated.",
+      "secret": false
+    },
+    {
+      "marker": "{{example_source}}",
+      "source": "the collector credential's first source slug",
+      "description": "Collector templates: one allowlisted slug used in examples; set the real source per event.",
+      "secret": false
+    }
+  ],
+  "templates": [
+    {
+      "id": "curl-hec",
+      "sender": "curl",
+      "sender_name": "curl",
+      "protocol": "hec",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "shell",
+      "title": "Send a test event (HEC)",
+      "description": "One JSON event to the HEC event endpoint. Expect {\"text\":\"Success\",\"code\":0}.",
+      "body": "curl -sS \"{{hec_url}}\" \\\n  -H \"Authorization: Splunk {{token}}\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"event\": {\"message\": \"hello from curl\"}}'\n"
+    },
+    {
+      "id": "curl-nano-https",
+      "sender": "curl",
+      "sender_name": "curl",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "shell",
+      "title": "Send a test event (HTTPS JSON)",
+      "description": "One JSON object. A JSON array or newline-delimited JSON also works; gzip with Content-Encoding: gzip.",
+      "body": "curl -sS \"{{nano_https_url}}\" \\\n  -H \"Authorization: Bearer {{token}}\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"message\": \"hello from curl\"}'\n"
+    },
+    {
+      "id": "vector-hec",
+      "sender": "vector",
+      "sender_name": "Vector",
+      "protocol": "hec",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "toml",
+      "title": "Vector: HEC sink",
+      "description": "Add to vector.toml and set `inputs` to your sources. Uses the `splunk_hec_logs` sink type; Vector appends /services/collector/event.",
+      "body": "[sinks.nano_{{label}}]\ntype = \"splunk_hec_logs\"\ninputs = [\"my_source\"]\nendpoint = \"{{base_url}}\"\ndefault_token = \"{{token}}\"\nendpoint_target = \"event\"\ncompression = \"gzip\"\nencoding.codec = \"json\"\n"
+    },
+    {
+      "id": "vector-http",
+      "sender": "vector",
+      "sender_name": "Vector",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "toml",
+      "title": "Vector: http sink (JSON)",
+      "description": "Newline-delimited JSON over HTTPS with a bearer token.",
+      "body": "[sinks.nano_{{label}}]\ntype = \"http\"\ninputs = [\"my_source\"]\nuri = \"{{nano_https_url}}\"\nmethod = \"post\"\ncompression = \"gzip\"\nauth.strategy = \"bearer\"\nauth.token = \"{{token}}\"\nencoding.codec = \"json\"\nframing.method = \"newline_delimited\"\nrequest.headers.Content-Type = \"application/x-ndjson\"\n"
+    },
+    {
+      "id": "fluent-bit-hec",
+      "sender": "fluent_bit",
+      "sender_name": "Fluent Bit",
+      "protocol": "hec",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "ini",
+      "title": "Fluent Bit: HEC output",
+      "description": "Add to fluent-bit.conf (HEC output plugin, `Name splunk`). TLS is required on port 443.",
+      "body": "[OUTPUT]\n    Name         splunk\n    Match        *\n    Host         {{hostname}}\n    Port         443\n    TLS          On\n    TLS.Verify   On\n    Splunk_Token {{token}}\n"
+    },
+    {
+      "id": "fluent-bit-http",
+      "sender": "fluent_bit",
+      "sender_name": "Fluent Bit",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "ini",
+      "title": "Fluent Bit: http output (JSON lines)",
+      "description": "Newline-delimited JSON over HTTPS with a bearer token.",
+      "body": "[OUTPUT]\n    Name        http\n    Match       *\n    Host        {{hostname}}\n    Port        443\n    URI         /ingest\n    Format      json_lines\n    Header      Authorization Bearer {{token}}\n    TLS         On\n    TLS.Verify  On\n"
+    },
+    {
+      "id": "fluent-bit-otlp",
+      "sender": "fluent_bit",
+      "sender_name": "Fluent Bit",
+      "protocol": "otlp_http",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "ini",
+      "title": "Fluent Bit: opentelemetry output",
+      "description": "OTLP/HTTP protobuf logs to /v1/logs.",
+      "body": "[OUTPUT]\n    Name        opentelemetry\n    Match       *\n    Host        {{hostname}}\n    Port        443\n    Logs_uri    /v1/logs\n    Header      Authorization Bearer {{token}}\n    TLS         On\n    TLS.Verify  On\n"
+    },
+    {
+      "id": "otel-collector-otlphttp",
+      "sender": "otel_collector",
+      "sender_name": "OpenTelemetry Collector",
+      "protocol": "otlp_http",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "yaml",
+      "title": "OpenTelemetry Collector: otlphttp exporter",
+      "description": "Add the exporter and reference it from your logs pipeline. The endpoint accepts protobuf only.",
+      "body": "exporters:\n  otlphttp/nano:\n    logs_endpoint: {{otlp_logs_url}}\n    encoding: proto\n    compression: gzip\n    headers:\n      Authorization: \"Bearer {{token}}\"\n\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [otlphttp/nano]\n"
+    },
+    {
+      "id": "otel-collector-hec",
+      "sender": "otel_collector",
+      "sender_name": "OpenTelemetry Collector",
+      "protocol": "hec",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "yaml",
+      "title": "OpenTelemetry Collector: HEC exporter",
+      "description": "Sends collector logs as HEC events with the `splunk_hec` exporter.",
+      "body": "exporters:\n  splunk_hec/nano:\n    endpoint: {{hec_url}}\n    token: \"{{token}}\"\n    tls:\n      insecure_skip_verify: false\n\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [splunk_hec/nano]\n"
+    },
+    {
+      "id": "cribl-hec",
+      "sender": "cribl",
+      "sender_name": "Cribl Stream",
+      "protocol": "hec",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "text",
+      "title": "Cribl Stream: HEC destination",
+      "description": "Data > Destinations > HEC-compatible destination > Add Destination. Values for the form.",
+      "body": "Output ID:           nano_{{label}}\nLoad balancing:      No\nHEC endpoint:        {{hec_url}}\nAuthentication:      Manual\nHEC auth token:      {{token}}\nCompress:            Yes\n"
+    },
+    {
+      "id": "cribl-webhook",
+      "sender": "cribl",
+      "sender_name": "Cribl Stream",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "text",
+      "title": "Cribl Stream: Webhook destination",
+      "description": "Data > Destinations > Webhook > Add Destination. Values for the form.",
+      "body": "Output ID:           nano_{{label}}\nURL:                 {{nano_https_url}}\nMethod:              POST\nFormat:              NDJSON\nCompress:            Yes\nAuthentication type: Auth token\nToken:               {{token}}\n"
+    },
+    {
+      "id": "cribl-otlp",
+      "sender": "cribl",
+      "sender_name": "Cribl Stream",
+      "protocol": "otlp_http",
+      "credential_kinds": [
+        "source"
+      ],
+      "format": "text",
+      "title": "Cribl Stream: OpenTelemetry destination",
+      "description": "Data > Destinations > OpenTelemetry > Add Destination. Values for the form.",
+      "body": "Output ID:           nano_{{label}}\nProtocol:            HTTP\nEndpoint:            {{base_url}}\nOTLP version:        1.3.1\nCompression:         Gzip\nAuthentication type: Auth token\nToken:               {{token}}\n"
+    },
+    {
+      "id": "curl-hec-collector",
+      "sender": "curl",
+      "sender_name": "curl",
+      "protocol": "hec",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "shell",
+      "title": "Send a test event (HEC, collector)",
+      "description": "Each HEC envelope declares its source in `sourcetype`. Expect {\"text\":\"Success\",\"code\":0}.",
+      "body": "# Allowed sourcetype values: {{sources}}\n# An event without a sourcetype lands as unknown; any other value rejects the request (403).\ncurl -sS \"{{hec_url}}\" \\\n  -H \"Authorization: Splunk {{token}}\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"sourcetype\": \"{{example_source}}\", \"event\": {\"message\": \"hello from curl\"}}'\n"
+    },
+    {
+      "id": "curl-nano-https-collector",
+      "sender": "curl",
+      "sender_name": "curl",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "shell",
+      "title": "Send a test event (HTTPS JSON, collector)",
+      "description": "Declare the source per request with X-Source-Type, or per event with a `source_type` field (it wins).",
+      "body": "# Allowed source values: {{sources}}\n# Without X-Source-Type or source_type the event lands as unknown.\ncurl -sS \"{{nano_https_url}}\" \\\n  -H \"Authorization: Bearer {{token}}\" \\\n  -H \"Content-Type: application/json\" \\\n  -H \"X-Source-Type: {{example_source}}\" \\\n  -d '{\"message\": \"hello from curl\"}'\n"
+    },
+    {
+      "id": "vector-hec-collector",
+      "sender": "vector",
+      "sender_name": "Vector",
+      "protocol": "hec",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "toml",
+      "title": "Vector: HEC sink (collector)",
+      "description": "Set `.nano_source` on every event (a remap per source) and the `splunk_hec_logs` sink sends it as the HEC sourcetype.",
+      "body": "# Allowed values for .nano_source: {{sources}}\n# Events without it land as unknown; any other value rejects the batch (403).\n[transforms.nano_{{label}}_source]\ntype = \"remap\"\ninputs = [\"my_source\"]\nsource = '.nano_source = \"{{example_source}}\"'\n\n[sinks.nano_{{label}}]\ntype = \"splunk_hec_logs\"\ninputs = [\"nano_{{label}}_source\"]\nendpoint = \"{{base_url}}\"\ndefault_token = \"{{token}}\"\nendpoint_target = \"event\"\nsourcetype = \"{{ nano_source }}\"\ncompression = \"gzip\"\nencoding.codec = \"json\"\n"
+    },
+    {
+      "id": "vector-http-collector",
+      "sender": "vector",
+      "sender_name": "Vector",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "toml",
+      "title": "Vector: http sink (JSON, collector)",
+      "description": "Each event declares its source in a `source_type` field; set it with a remap per source.",
+      "body": "# Allowed values for .source_type: {{sources}}\n# Events without it land as unknown; any other value rejects the batch (403).\n[transforms.nano_{{label}}_source]\ntype = \"remap\"\ninputs = [\"my_source\"]\nsource = '.source_type = \"{{example_source}}\"'\n\n[sinks.nano_{{label}}]\ntype = \"http\"\ninputs = [\"nano_{{label}}_source\"]\nuri = \"{{nano_https_url}}\"\nmethod = \"post\"\ncompression = \"gzip\"\nauth.strategy = \"bearer\"\nauth.token = \"{{token}}\"\nencoding.codec = \"json\"\nframing.method = \"newline_delimited\"\nrequest.headers.Content-Type = \"application/x-ndjson\"\n"
+    },
+    {
+      "id": "fluent-bit-hec-collector",
+      "sender": "fluent_bit",
+      "sender_name": "Fluent Bit",
+      "protocol": "hec",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "ini",
+      "title": "Fluent Bit: HEC output (collector)",
+      "description": "HEC output plugin (`Name splunk`). Add a nano_source key to each record (one modify filter per input) and send it as the HEC sourcetype.",
+      "body": "# Allowed nano_source values: {{sources}}\n# Records without it land as unknown; any other value rejects the batch (403).\n[FILTER]\n    Name   modify\n    Match  my_source.*\n    Add    nano_source {{example_source}}\n\n[OUTPUT]\n    Name                  splunk\n    Match                 *\n    Host                  {{hostname}}\n    Port                  443\n    TLS                   On\n    TLS.Verify            On\n    Splunk_Token          {{token}}\n    Event_Sourcetype_Key  $nano_source\n"
+    },
+    {
+      "id": "fluent-bit-http-collector",
+      "sender": "fluent_bit",
+      "sender_name": "Fluent Bit",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "ini",
+      "title": "Fluent Bit: http output (collector)",
+      "description": "Add a source_type key to each record (one modify filter per input); JSON lines over HTTPS.",
+      "body": "# Allowed source_type values: {{sources}}\n# Records without it land as unknown; any other value rejects the batch (403).\n[FILTER]\n    Name   modify\n    Match  my_source.*\n    Add    source_type {{example_source}}\n\n[OUTPUT]\n    Name        http\n    Match       *\n    Host        {{hostname}}\n    Port        443\n    URI         /ingest\n    Format      json_lines\n    Header      Authorization Bearer {{token}}\n    TLS         On\n    TLS.Verify  On\n"
+    },
+    {
+      "id": "fluent-bit-otlp-collector",
+      "sender": "fluent_bit",
+      "sender_name": "Fluent Bit",
+      "protocol": "otlp_http",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "ini",
+      "title": "Fluent Bit: opentelemetry output (collector)",
+      "description": "One output per source, each declaring it with the x-nano-source header.",
+      "body": "# Allowed x-nano-source values: {{sources}}\n# Requests without it land as unknown; any other value rejects the request (403).\n[OUTPUT]\n    Name        opentelemetry\n    Match       my_source.*\n    Host        {{hostname}}\n    Port        443\n    Logs_uri    /v1/logs\n    Header      Authorization Bearer {{token}}\n    Header      x-nano-source {{example_source}}\n    TLS         On\n    TLS.Verify  On\n"
+    },
+    {
+      "id": "otel-collector-otlphttp-collector",
+      "sender": "otel_collector",
+      "sender_name": "OpenTelemetry Collector",
+      "protocol": "otlp_http",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "yaml",
+      "title": "OpenTelemetry Collector: otlphttp exporter (collector)",
+      "description": "Declare the source per resource with the nano.source attribute (one resource processor per pipeline), or per exporter with the x-nano-source header. The attribute wins.",
+      "body": "# Allowed nano.source values: {{sources}}\n# Resources without it (and no x-nano-source header) land as unknown.\nprocessors:\n  resource/nano_source:\n    attributes:\n      - key: nano.source\n        value: {{example_source}}\n        action: upsert\n\nexporters:\n  otlphttp/nano:\n    logs_endpoint: {{otlp_logs_url}}\n    encoding: proto\n    compression: gzip\n    headers:\n      Authorization: \"Bearer {{token}}\"\n      # One source per exporter instead: x-nano-source: {{example_source}}\n\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      processors: [resource/nano_source]\n      exporters: [otlphttp/nano]\n"
+    },
+    {
+      "id": "otel-collector-hec-collector",
+      "sender": "otel_collector",
+      "sender_name": "OpenTelemetry Collector",
+      "protocol": "hec",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "yaml",
+      "title": "OpenTelemetry Collector: HEC exporter (collector)",
+      "description": "The `splunk_hec` exporter sends each record's `com.splunk.sourcetype` attribute (or the exporter default) as the HEC sourcetype.",
+      "body": "# Allowed sourcetype values: {{sources}}\n# Records without a sourcetype land as unknown; any other value rejects the batch (403).\nexporters:\n  splunk_hec/nano:\n    endpoint: {{hec_url}}\n    token: \"{{token}}\"\n    sourcetype: \"{{example_source}}\"\n    tls:\n      insecure_skip_verify: false\n\nservice:\n  pipelines:\n    logs:\n      receivers: [otlp]\n      exporters: [splunk_hec/nano]\n"
+    },
+    {
+      "id": "cribl-hec-collector",
+      "sender": "cribl",
+      "sender_name": "Cribl Stream",
+      "protocol": "hec",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "text",
+      "title": "Cribl Stream: HEC destination (collector)",
+      "description": "Data > Destinations > HEC-compatible destination > Add Destination. One destination for every source; each event's sourcetype declares it.",
+      "body": "Output ID:           nano_{{label}}\nLoad balancing:      No\nHEC endpoint:        {{hec_url}}\nAuthentication:      Manual\nHEC auth token:      {{token}}\nCompress:            Yes\n\nDeclare each event's source in its sourcetype field. Events from HEC senders\noften carry one already; otherwise add an Eval function to the route's pipeline:\n  sourcetype = '{{example_source}}'\nAllowed sourcetypes: {{sources}}\nEvents without a sourcetype land as unknown; any other value rejects the batch (403).\n"
+    },
+    {
+      "id": "cribl-webhook-collector",
+      "sender": "cribl",
+      "sender_name": "Cribl Stream",
+      "protocol": "nano_https",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "text",
+      "title": "Cribl Stream: Webhook destination (collector)",
+      "description": "Data > Destinations > Webhook > Add Destination. Each event's source_type field declares its source.",
+      "body": "Output ID:           nano_{{label}}\nURL:                 {{nano_https_url}}\nMethod:              POST\nFormat:              NDJSON\nCompress:            Yes\nAuthentication type: Auth token\nToken:               {{token}}\n\nDeclare each event's source with an Eval function on the route's pipeline:\n  source_type = '{{example_source}}'\nAllowed source_type values: {{sources}}\nEvents without one land as unknown; any other value rejects the batch (403).\n"
+    },
+    {
+      "id": "cribl-otlp-collector",
+      "sender": "cribl",
+      "sender_name": "Cribl Stream",
+      "protocol": "otlp_http",
+      "credential_kinds": [
+        "collector"
+      ],
+      "format": "text",
+      "title": "Cribl Stream: OpenTelemetry destination (collector)",
+      "description": "Data > Destinations > OpenTelemetry > Add Destination. Declare the source per resource (nano.source) or per destination (x-nano-source header).",
+      "body": "Output ID:           nano_{{label}}\nProtocol:            HTTP\nEndpoint:            {{base_url}}\nOTLP version:        1.3.1\nCompression:         Gzip\nAuthentication type: Auth token\nToken:               {{token}}\nExtra HTTP headers:  x-nano-source = {{example_source}}   (one source per destination)\n\nA nano.source resource attribute on the OTLP resource wins over the header.\nAllowed values: {{sources}}\nEvents with neither land as unknown; any other value rejects the request (403).\n"
+    }
+  ]
+}

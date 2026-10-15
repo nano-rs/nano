@@ -10,7 +10,7 @@ use crate::udm::fields::UdmField;
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use super::derived_fields::collect_command_output_fields;
+use super::derived_fields::{collect_command_output_fields, DYNAMIC_PIPELINE_SCHEMA};
 
 /// Error type for field validation
 #[derive(Debug, Clone)]
@@ -278,6 +278,17 @@ pub fn validate_query_fields_with_profile(
     errors
 }
 
+/// The output column a `sort` key of the form `func(field)` refers to — the
+/// bare function name, mirroring the Sort codegen arm. `None` for plain keys.
+fn sort_aggregate_column(key: &str) -> Option<&str> {
+    let open = key.find('(')?;
+    let func = &key[..open];
+    (key.ends_with(')')
+        && !func.is_empty()
+        && func.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some(func)
+}
+
 /// Check if a field is valid in pipeline context.
 ///
 /// A field is valid if it's:
@@ -306,6 +317,41 @@ fn is_valid_field(
     // exempt by the early return above: codegen owns their escaping (see the
     // output-name note in `validate_command_fields`).
     validate_field_name_format(field_name)?;
+    if derived.contains(DYNAMIC_PIPELINE_SCHEMA) {
+        return Ok(());
+    }
+
+    // Lake aliases are owned by the profile and resolve to the same physical
+    // columns used by codegen. Unknown names never fall through to a JSON tail.
+    if let Some(p) = profile.filter(|p| p.uses_strict_canonical_fields()) {
+        if p.is_known_field(field_name)
+            || matches!(
+                p.resolve(field_name),
+                crate::schema::FieldResolution::MapKey { .. }
+            )
+        {
+            return Ok(());
+        }
+        return Err(FieldValidationError {
+            field_name: field_name.to_string(),
+            message: format!(
+                "Unknown canonical OCSF field '{}' in query. Use an exact OCSF 1.9 path, or `unmapped.{}` for an intentionally unmapped source field",
+                field_name, field_name
+            ),
+            suggestions: {
+                let mut candidates: Vec<_> = p.fields().iter()
+                    .map(|f| f.name.to_string())
+                    .chain(UdmField::all().iter().map(|f| f.column_name().to_string())
+                        .filter(|f| p.is_known_field(f)))
+                    .map(|name| (levenshtein_distance(field_name, &name), name))
+                    .filter(|(distance, _)| *distance <= std::cmp::max(3, field_name.len() / 2))
+                    .collect();
+                candidates.sort();
+                candidates.dedup();
+                candidates.into_iter().take(5).map(|(_, name)| name).collect()
+            },
+        });
+    }
 
     match validate_field_name(field_name) {
         Ok(_) => Ok(()),
@@ -379,6 +425,36 @@ fn validate_query_fields_recursive(
     }
 }
 
+/// Reject a `=` / `!=` comparison whose bare right-hand side is as much a field
+/// as it is a value (NAN-2380). Shares [`classify_rhs`] with codegen so the two
+/// can never disagree about which comparisons are ambiguous.
+fn check_unambiguous_comparison(
+    field: &str,
+    op: &crate::query::ast::Comparator,
+    value: &crate::query::ast::Value,
+    rhs: crate::query::ast::RhsSyntax,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Result<(), FieldValidationError> {
+    use crate::query::clickhouse_sql_gen::search_expr::{
+        ambiguous_comparison_message, classify_rhs, RhsReading,
+    };
+
+    if classify_rhs(profile, field, op, value, rhs) != RhsReading::Ambiguous {
+        return Ok(());
+    }
+    let crate::query::ast::Value::String(rhs_text) = value else {
+        return Ok(());
+    };
+    Err(FieldValidationError {
+        field_name: field.to_string(),
+        message: ambiguous_comparison_message(field, op, rhs_text),
+        suggestions: vec![
+            format!("{field} {} `{rhs_text}`", op.as_str()),
+            format!("{field} {} \"{rhs_text}\"", op.as_str()),
+        ],
+    })
+}
+
 /// Validate field names in a search expression
 fn validate_search_expr_fields(
     expr: &SearchExpr,
@@ -390,9 +466,26 @@ fn validate_search_expr_fields(
         SearchExpr::Keyword(_) => {
             // Keywords don't reference fields
         }
-        SearchExpr::FieldFilter { field, .. } => {
+        SearchExpr::FieldFilter {
+            field,
+            op,
+            value,
+            rhs,
+        } => {
             if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
+            }
+            // NAN-2380: `a != b` where BOTH names are fields of the active
+            // schema and `b` was written bare. Rejecting it here rather than
+            // only in codegen matters for two reasons: the analyst gets the
+            // error before anything executes, and a `| where` that runs AFTER a
+            // prevalence/risk stage is evaluated in Rust — it never reaches the
+            // SQL generator, so codegen alone would leave that lane silently
+            // inverted.
+            if let Some(profile) = profile {
+                if let Err(err) = check_unambiguous_comparison(field, op, value, *rhs, profile) {
+                    errors.push(err);
+                }
             }
         }
         SearchExpr::FunctionFilter { function, .. } => {
@@ -434,7 +527,9 @@ fn validate_search_expr_fields(
             // it doesn't reference a named column, so there is nothing to
             // validate (and `ioc` is intentionally permitted as a pseudo-field).
         }
-        SearchExpr::InSubsearch { field, subsearch, .. } => {
+        SearchExpr::InSubsearch {
+            field, subsearch, ..
+        } => {
             if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
@@ -464,6 +559,12 @@ fn validate_eval_expr_fields(
             // Literals don't reference fields
         }
         EvalExpression::FunctionCall { args, .. } => {
+            // `searchmatch("<terms>")`: validate the fields named inside the
+            // string literal exactly like base-search terms.
+            if let Some(search) = crate::query::searchmatch_search_expr(expr) {
+                validate_search_expr_fields(&search, errors, derived, profile);
+                return;
+            }
             // Validate fields in function arguments
             for arg in args {
                 validate_eval_expr_fields(arg, errors, derived, profile);
@@ -536,7 +637,12 @@ fn validate_command_fields(
         }
         Command::Sort { fields, .. } => {
             for sf in fields {
-                if let Err(err) = is_valid_field(&sf.field, derived, profile) {
+                // NAN-3319: `sort -sum(x)` names an un-aliased aggregate. The
+                // parser accepts it and codegen orders by the aggregate's output
+                // column (the bare function name, `sum`), so validate that
+                // column — not the call text, whose `(` is an illegal character.
+                let field = sort_aggregate_column(&sf.field).unwrap_or(&sf.field);
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -588,12 +694,27 @@ fn validate_command_fields(
             }
         }
         Command::Lookup {
+            event_field,
             key_field,
             output_fields,
+            output_renames,
             ..
         } => {
-            if let Err(err) = is_valid_field(key_field, derived, profile) {
+            if let Err(err) = is_valid_field(event_field, derived, profile) {
                 errors.push(err);
+            }
+            // `key_field` belongs to the lookup table, not the event schema.
+            // It still needs the identifier-format security gate because it is
+            // passed to the parameterized lookup repository.
+            if let Err(err) = validate_field_name_format(key_field) {
+                errors.push(err);
+            }
+            for rename in output_renames {
+                for name in [&rename.from, &rename.to] {
+                    if let Err(err) = validate_field_name_format(name) {
+                        errors.push(err);
+                    }
+                }
             }
             // OUTPUT names are columns of the lookup TABLE that the command
             // adds to the result — not event-field references — so the UDM
@@ -795,7 +916,16 @@ fn validate_command_fields(
                 validate_eval_expr_fields(expr, errors, derived, profile);
             }
         }
-        Command::Prevalence { conditions, .. } => {
+        Command::Prevalence {
+            artifact_fields,
+            conditions,
+            ..
+        } => {
+            for field in artifact_fields {
+                if let Err(err) = is_valid_field(field, derived, profile) {
+                    errors.push(err);
+                }
+            }
             // Prevalence conditions use special PrevalenceField enum, not regular field names
             // So we don't validate them here
             let _ = conditions;
@@ -878,8 +1008,19 @@ fn validate_command_fields(
         Command::Anomaly {
             field, by_fields, ..
         } => {
-            // Skip validation for aggregation expressions like "count()" or "sum(bytes_out)"
-            if !field.contains('(') {
+            // Aggregation-first anomaly stores its expression as one string.
+            // Validate the inner event field while allowing argument-free
+            // count(), rather than letting unknown identifiers reach chDB.
+            if let (Some(open), Some(close)) = (field.find('('), field.rfind(')')) {
+                if close > open {
+                    let inner = field[open + 1..close].trim();
+                    if !inner.is_empty() && inner != "*" {
+                        if let Err(err) = is_valid_field(inner, derived, profile) {
+                            errors.push(err);
+                        }
+                    }
+                }
+            } else {
                 if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
@@ -909,6 +1050,30 @@ fn validate_command_fields(
                 local_derived.insert(assignment.field.to_lowercase());
             }
         }
+        Command::Tree {
+            parent_field,
+            child_field,
+            label_field,
+            detail_field,
+            prevalence_field,
+            ..
+        } => {
+            for field in [parent_field, child_field, label_field]
+                .into_iter()
+                .filter(|field| !field.is_empty())
+                .chain(detail_field.iter())
+                .chain(prevalence_field.iter())
+            {
+                if let Err(err) = is_valid_field(field, derived, profile) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::ResolveIdentity { field, .. } => {
+            if let Err(err) = is_valid_field(field, derived, profile) {
+                errors.push(err);
+            }
+        }
         // Commands that don't reference fields
         Command::Head { .. }
         | Command::Tail { .. }
@@ -916,8 +1081,6 @@ fn validate_command_fields(
         | Command::Sample { .. }
         | Command::Reverse
         | Command::InputLookup { .. }
-        | Command::Tree { .. }
-        | Command::ResolveIdentity { .. }
         | Command::Asset { .. }
         | Command::Cloud { .. }
         | Command::Lateral { .. }
@@ -1274,7 +1437,11 @@ mod tests {
         ] {
             let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
             let errors = validate_query_fields(&query);
-            assert_eq!(errors.len(), 0, "format-valid ext/OCSF field must pass: {q}");
+            assert_eq!(
+                errors.len(),
+                0,
+                "format-valid ext/OCSF field must pass: {q}"
+            );
         }
     }
 
@@ -1570,6 +1737,90 @@ mod tests {
         assert_eq!(errors[0].field_name, "src_ipp");
     }
 
+    #[test]
+    fn strict_ocsf_lookup_validates_event_side_not_lookup_table_key() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        let query = parse_query(
+            "* | lookup assets src_endpoint.ip AS ip OUTPUT owner, criticality | table src_endpoint.ip, owner, criticality",
+        )
+        .unwrap();
+        let errors = validate_query_fields_with_profile(&query, Some(&profile));
+        assert!(
+            errors.is_empty(),
+            "lookup-table column names must not be judged as OCSF event fields: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn strict_ocsf_lookup_splunk_outputs_are_derived_and_event_typos_fail() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        for clause in ["OUTPUT", "OUTPUTNEW"] {
+            let query = parse_query(&format!(
+                "* | stats count by src_endpoint.ip | lookup assets ip AS src_endpoint.ip {clause} owner AS asset_owner, confidence | table src_endpoint.ip, asset_owner, confidence"
+            )).unwrap();
+            assert!(validate_query_fields_with_profile(&query, Some(&profile)).is_empty());
+        }
+        let query = parse_query("* | lookup assets ip AS bad_event_field OUTPUT owner AS asset_owner").unwrap();
+        let errors = validate_query_fields_with_profile(&query, Some(&profile));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "bad_event_field");
+        let query = parse_query("* | lookup assets ip AS src_endpoint.ip OUTPUT owner AS asset_owner | table owner").unwrap();
+        assert!(!validate_query_fields_with_profile(&query, Some(&profile)).is_empty(),
+            "a renamed source is not a derived result field");
+    }
+
+    #[test]
+    fn nan3190_strict_ocsf_accepts_ai_pipe_outputs_downstream_only() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        let query = parse_query(
+            r#"metadata.log_source="conduit_proxy" | ai prompt="Classify each event" max_rows=5 | table _time, src_endpoint.ip, dst_endpoint.hostname, ai_verdict, ai_confidence, ai_reasoning"#,
+        )
+        .unwrap();
+        let errors = validate_query_fields_with_profile(&query, Some(&profile));
+        assert!(
+            errors.is_empty(),
+            "ai outputs must be derived fields: {errors:?}"
+        );
+
+        let query = parse_query(
+            r#"* | ai prompt="x" | where ai_verdict="MALICIOUS" and ai_confidence > 0.5 | stats count by ai_verdict"#,
+        )
+        .unwrap();
+        assert!(validate_query_fields_with_profile(&query, Some(&profile)).is_empty());
+
+        // Without an upstream `| ai`, the names are still unknown OCSF fields.
+        let query = parse_query("* | table ai_verdict").unwrap();
+        let errors = validate_query_fields_with_profile(&query, Some(&profile));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field_name, "ai_verdict");
+    }
+
+    /// NAN-3328 / NAN-3314: command-created columns (lateral view rows,
+    /// funnel, risk, anomaly helpers, bin window ends, table aliases) are
+    /// valid references for later stages under the strict lake profile.
+    #[test]
+    fn nan3328_command_created_columns_are_valid_downstream() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        for query in [
+            "* | lateral | where hop_number > 0 | table method_detail, hop_number",
+            "* | funnel by user.name window=1h [class_uid=3002] [class_uid=1007] | table funnel_level",
+            "* | risk score=10 entity=user.name | table risk_entity",
+            "* | anomaly field=traffic.bytes_out | table avg_val, stddev_val, expected",
+            "* | anomaly field=traffic.bytes_out method=mad | table median_val, mad_val",
+            "* | bin span=1h hop=30m | stats count by time_bucket_end",
+            "* | table user.name as u, time | sort u",
+        ] {
+            let errors = validate_query_fields_with_profile(&parse_query(query).unwrap(), Some(&profile));
+            assert!(errors.is_empty(), "{query}: {errors:?}");
+        }
+        // Still unknown without the creating command.
+        let errors = validate_query_fields_with_profile(
+            &parse_query("* | table hop_number").unwrap(),
+            Some(&profile),
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
     // --- NAN-1422: flat operational aliases pass under the OCSF profile ---
 
     #[test]
@@ -1604,8 +1855,56 @@ mod tests {
         let ocsf = crate::schema::OcsfProfile::new();
         let query = parse_query(r#"username="admin""#).unwrap();
         let errors = validate_query_fields_with_profile(&query, Some(&ocsf));
-        assert_eq!(errors.len(), 1, "gated alias must stay rejected: {errors:?}");
+        assert_eq!(
+            errors.len(),
+            1,
+            "gated alias must stay rejected: {errors:?}"
+        );
         assert_eq!(errors[0].field_name, "username");
+    }
+
+    #[test]
+    fn inputlookup_runtime_columns_are_valid_downstream_but_still_format_gated() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        let query = parse_query(
+            "| inputlookup threat_intel | where confidence > 80 | stats count() by threat_type",
+        )
+        .unwrap();
+        assert!(
+            validate_query_fields_with_profile(&query, Some(&profile)).is_empty(),
+            "runtime lookup columns must not be judged against the event schema"
+        );
+    }
+
+    #[test]
+    fn strict_lake_ocsf_accepts_product_aliases_and_rejects_unknowns() {
+        let profile = crate::schema::OcsfProfile::lake_1_9();
+        for field in ["source_typo", "src_ipp", "command_lien", "timestamp_typo"] {
+            let query = parse_query(&format!("{field}=x")).unwrap();
+            let errors = validate_query_fields_with_profile(&query, Some(&profile));
+            assert_eq!(errors.len(), 1, "bare legacy field must fail: {field}");
+            assert_eq!(errors[0].field_name, field);
+            assert!(errors[0].message.contains("canonical OCSF"));
+        }
+
+        for query_text in [
+            "source_type=windows_sysmon",
+            "src_ip=192.0.2.1",
+            "command_line=powershell",
+            "timestamp=*",
+            "user=* | stats count by user",
+            "metadata.log_source=windows_sysmon",
+            "src_endpoint.ip=192.0.2.1",
+            "process.cmd_line=powershell",
+            "unmapped.vendor_field=value",
+        ] {
+            let query = parse_query(query_text).unwrap();
+            let errors = validate_query_fields_with_profile(&query, Some(&profile));
+            assert!(
+                errors.is_empty(),
+                "canonical field must pass: {query_text}: {errors:?}"
+            );
+        }
     }
 
     // --- NAN-1425: the explicit alias set passes under the UDM profile ---

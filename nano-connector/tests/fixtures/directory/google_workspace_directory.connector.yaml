@@ -1,0 +1,145 @@
+# nano-connector identity spec (NAN-3503): Google Workspace directory users and
+# group memberships, synced into nano's identity snapshot (kind: identity; no
+# HEC, no parser, no log source). Self-hosted / open core variant: key-based
+# google_service_account auth, the same as connector.yaml. The hosted runner
+# reads directory.connector.hosted.yaml, which differs ONLY in its auth block
+# (keyless domain-wide delegation through nano's pull broker).
+#
+# users:  GET /admin/directory/v1/users (projection=full), nextPageToken paging,
+#         mapped to the canonical identity row. Every run is a full snapshot:
+#         the Directory API has no change feed for users.
+# groups: one sub-pull per group (fan-out discovered from /groups), members
+#         with includeDerivedMembership=true so nested groups count. Emits
+#         {member: <user id>, group: <group email>, privileged} per USER member.
+#         Groups named in PRIVILEGED_GROUPS (comma list of group emails or
+#         names, case-insensitive) mark their members privileged.
+version: 1
+name: google_workspace_directory
+kind: identity
+allow:
+  - host: admin.googleapis.com
+    path_prefixes: ["/admin/directory/v1/users", "/admin/directory/v1/groups"]
+  - host: oauth2.googleapis.com
+    path_prefixes: ["/token"]
+auth:
+  type: google_service_account
+  token_url: "https://oauth2.googleapis.com/token"
+  private_key_credential: PRIVATE_KEY
+  client_email_credential: CLIENT_EMAIL
+  scope: "https://www.googleapis.com/auth/admin.directory.user.readonly https://www.googleapis.com/auth/admin.directory.group.readonly"
+  subject: "{{config.ADMIN_EMAIL}}"
+schedule: "0 */6 * * *"
+limits: { max_run_secs: 3600, max_pages: 5000, max_requests: 20000 }
+rate_limit: { min_interval_ms: 100, max_retries_429: 8, max_wait_ms: 60000 }
+identity:
+  full_every_secs: 86400
+streams:
+  - id: users
+    identity: { role: users, mode: full }
+    request:
+      url: "https://admin.googleapis.com/admin/directory/v1/users"
+      query:
+        customer: my_customer
+        maxResults: "500"
+        projection: full
+      headers: { Accept: application/json }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Google Directory users returned " + to_string(status) + ": " + (string(.response.body.error.message) ?? "no message")}
+      } else {
+        users = array(.response.body.users) ?? []
+        evs = map_values(users) -> |u| {
+          orgs = array(u.organizations) ?? []
+          porgs = filter(orgs) -> |_i, x| { x.primary == true }
+          org = if length(porgs) > 0 { porgs[0] } else { orgs[0] }
+          mgrs = filter(array(u.relations) ?? []) -> |_i, x| { x.type == "manager" }
+          phones = array(u.phones) ?? []
+          pphones = filter(phones) -> |_i, x| { x.primary == true }
+          phone = if length(pphones) > 0 { pphones[0].value } else { phones[0].value }
+          eids = filter(array(u.externalIds) ?? []) -> |_i, x| { x.type == "organization" }
+          addrs = array(u.addresses) ?? []
+          paddrs = filter(addrs) -> |_i, x| { x.primary == true || x.type == "work" }
+          addr = if length(paddrs) > 0 { paddrs[0] } else { addrs[0] }
+          locs = array(u.locations) ?? []
+          suspended = u.suspended == true
+          archived = u.archived == true
+          last_login = string(u.lastLoginTime) ?? ""
+          if starts_with(last_login, "1970-01-01") { last_login = "" }
+          acct = "active"
+          if archived { acct = "disabled" }
+          if suspended { acct = "suspended" }
+          compact({
+            "external_id": u.id,
+            "username": u.primaryEmail,
+            "upn": u.primaryEmail,
+            "email": u.primaryEmail,
+            "display_name": u.name.fullName,
+            "first_name": u.name.givenName,
+            "last_name": u.name.familyName,
+            "department": org.department,
+            "title": org.title,
+            "company": org.name,
+            "employee_type": org.description,
+            "manager_upn": mgrs[0].value,
+            "office_location": locs[0].buildingId,
+            "city": addr.locality,
+            "country": addr.countryCode,
+            "phone": phone,
+            "employee_id": eids[0].value,
+            "account_enabled": !suspended && !archived,
+            "account_status": acct,
+            "is_admin": u.isAdmin == true || u.isDelegatedAdmin == true,
+            "mfa_enabled": u.isEnrolledIn2Sv == true,
+            "last_sign_in_at": last_login,
+            "created_in_directory_at": u.creationTime
+          })
+        }
+        tok = string(.response.body.nextPageToken) ?? ""
+        if tok == "" {
+          {"events": evs}
+        } else {
+          {"events": evs, "next_request": {"query": {"pageToken": tok}}}
+        }
+      }
+  - id: groups
+    identity: { role: memberships }
+    fanout:
+      discover:
+        from: request
+        request:
+          url: "https://admin.googleapis.com/admin/directory/v1/groups"
+          query: { customer: my_customer, maxResults: "200" }
+          headers: { Accept: application/json }
+        response: { events_path: groups }
+        pagination: { type: token, from: nextPageToken, param: pageToken }
+      item_key: id
+      concurrency: 4
+      max_items: 10000
+    request:
+      url: "https://admin.googleapis.com/admin/directory/v1/groups/{{item.id}}/members"
+      query: { maxResults: "200", includeDerivedMembership: "true" }
+      headers: { Accept: application/json }
+    program: |
+      status = to_int(.response.status) ?? 0
+      if status < 200 || status >= 300 {
+        {"error": "Google Directory members returned " + to_string(status) + ": " + (string(.response.body.error.message) ?? "no message")}
+      } else {
+        email = downcase(string(.item.email) ?? "")
+        name = string(.item.name) ?? ""
+        group = if email != "" { email } else { name }
+        privs = []
+        for_each(split(downcase(string(.config.PRIVILEGED_GROUPS) ?? ""), ",")) -> |_i, p| {
+          p = strip_whitespace(p)
+          if p != "" { privs = push(privs, p) }
+        }
+        privileged = includes(privs, email) || includes(privs, downcase(name))
+        members = filter(array(.response.body.members) ?? []) -> |_i, m| { m.type == "USER" }
+        evs = map_values(members) -> |m| { {"member": m.id, "group": group, "privileged": privileged} }
+        tok = string(.response.body.nextPageToken) ?? ""
+        if tok == "" {
+          {"events": evs}
+        } else {
+          {"events": evs, "next_request": {"query": {"pageToken": tok}}}
+        }
+      }

@@ -62,6 +62,9 @@ pub struct ParserConfig {
     /// Whether CSV has a header row (default: true)
     #[serde(default = "default_csv_has_headers")]
     pub csv_has_headers: bool,
+    /// Explicit header choice. None auto-detects single-column indicator lists.
+    #[serde(default)]
+    pub has_header: Option<bool>,
     /// Custom column headers (overrides first row if csv_has_headers is true)
     #[serde(default)]
     pub custom_headers: Option<Vec<String>>,
@@ -98,6 +101,7 @@ impl Default for ParserConfig {
             format: FileFormat::Csv,
             csv_delimiter: ',',
             csv_has_headers: true,
+            has_header: None,
             custom_headers: None,
             encoding: "utf-8".to_string(),
             max_records: None,
@@ -140,6 +144,7 @@ impl ParserConfig {
     /// Set whether CSV has headers
     pub fn with_headers(mut self, has_headers: bool) -> Self {
         self.csv_has_headers = has_headers;
+        self.has_header = Some(has_headers);
         self
     }
 

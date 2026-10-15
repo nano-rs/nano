@@ -24,8 +24,8 @@
 //! - GET    /api/identity/stats                         — identity stats
 
 use axum::{
-    Extension, Json,
     extract::{Path, Query, State},
+    Extension, Json,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use nanosiem_core::audit::{actions as audit_actions, AuditEvent, AuditSource};
@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::handlers::AuditExt;
-use crate::middleware::{AuthContext, ensure_permission};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // Note: `From<IdentityServiceError> for ApiError` lifted to
@@ -533,8 +533,10 @@ pub async fn lookup_identity_user(
 
 /// Resolve an IP address to the most recent observed identity mapping.
 ///
-/// Uses ClickHouse identity observations to find the latest hostname/user
-/// for an IP, optionally bounded to an event timestamp for temporal accuracy.
+/// Uses the active storage backend's identity observations to find the latest
+/// hostname/user for an IP, optionally bounded to an event timestamp for
+/// temporal accuracy. The lake backend reads its generation-matched immutable
+/// by-IP history and does not fall back to ClickHouse.
 #[utoipa::path(
     get,
     path = "/api/identity/resolve",
@@ -566,8 +568,6 @@ pub async fn resolve_identity_ip(
         None => Utc::now(),
     };
 
-    let dual_pool = state.dual_pool();
-
     // NAN-1801 (P3 side-doors): this hand-built SELECT bypasses the nPL
     // search-path scope gate, so fold the caller's source-scope deny set in
     // directly — otherwise a viewer denied a source (or lacking `audit:view`)
@@ -579,6 +579,28 @@ pub async fn resolve_identity_ip(
     // caller with `audit:view`) renders nothing — byte-identical SQL.
     // `source` is the identity_observations source_type column.
     let deny_set = auth.effective_source_deny_set();
+    let lake_row = if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        state
+            .search_service
+            .resolve_lake_identity_ip(&ip, reference_time, &deny_set)
+            .await?
+            .map(|observation| {
+                (
+                    observation.hostname,
+                    observation.fqdn,
+                    observation.user,
+                    observation.source,
+                    observation.observed_at,
+                )
+            })
+    } else {
+        None
+    };
+    if state.search_service.backend() == nanosiem_core::SearchBackend::Lake && lake_row.is_none() {
+        return Ok(Json(IdentityResolveResponse { ip, r#match: None }));
+    }
+
+    let dual_pool = state.dual_pool();
     let scope_clause =
         nanosiem_core::search::service::source_scope_sql_predicate("source", &deny_set)
             .map(|pred| format!("\n              AND ({pred})"))
@@ -606,18 +628,22 @@ pub async fn resolve_identity_ip(
     "#
     );
 
-    let row = match dual_pool
-        .clickhouse()
-        .query(&sql)
-        .bind(&ip)
-        .bind(reference_time.to_rfc3339())
-        .fetch_all::<(String, String, String, String, String)>()
-        .await
-    {
-        Ok(rows) => rows.into_iter().next(),
-        Err(err) => {
-            tracing::warn!(ip = %ip, error = %err, "Identity resolution query failed");
-            None
+    let row = if state.search_service.backend() == nanosiem_core::SearchBackend::Lake {
+        lake_row
+    } else {
+        match dual_pool
+            .clickhouse()
+            .query(&sql)
+            .bind(&ip)
+            .bind(reference_time.to_rfc3339())
+            .fetch_all::<(String, String, String, String, String)>()
+            .await
+        {
+            Ok(rows) => rows.into_iter().next(),
+            Err(err) => {
+                tracing::warn!(ip = %ip, error = %err, "Identity resolution query failed");
+                None
+            }
         }
     };
 
@@ -700,6 +726,16 @@ pub async fn list_identity_users(
     Query(params): Query<ListUsersParams>,
 ) -> Result<Json<UserListResponse>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
+    if params.page < 1 {
+        return Err(ApiError::BadRequest(
+            "identity user page must be at least 1".to_string(),
+        ));
+    }
+    if !(1..=200).contains(&params.page_size) {
+        return Err(ApiError::BadRequest(
+            "identity user page_size must be between 1 and 200".to_string(),
+        ));
+    }
 
     let result = state.identity_service.list_users(&params).await?;
     Ok(Json(result))
@@ -710,7 +746,7 @@ pub async fn list_identity_users(
     get,
     path = "/api/identity/users/{id}",
     tag = "identity",
-    params(("id" = String, Path, description = "Composite user id 'provider_id|external_id' (NAN-1117: replaced the legacy numeric id)")),
+    params(("id" = String, Path, description = "Composite user id 'provider_id|external_id'")),
     responses(
         (status = 200, description = "User details", body = UserRecord),
         (status = 403, description = "Forbidden"),

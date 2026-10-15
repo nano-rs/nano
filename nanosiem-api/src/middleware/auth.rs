@@ -26,16 +26,33 @@ use nanosiem_core::auth::{
     ApiKeyService, ApiKeyServiceError, PermissionResolver, SourceScopeResolver, TokenConfig,
     TokenService, UserStatusResolver,
 };
+#[cfg(feature = "enterprise")]
+use nanosiem_core::auth::TenantMembershipResolver;
+#[cfg(feature = "enterprise")]
+use nanosiem_core::enterprise_shared_automation_keys::TenantAutomationKeyService;
 
 // AuthContext, AuthErrorResponse, and the check_*/require_* permission helpers
 // were lifted to nanosiem-api-lib (NAN-751) so that handlers in
-// nanosiem-enterprise can consume them without creating a circular crate
+// the enterprise crate can consume them without creating a circular crate
 // dependency. Re-exported here so downstream `use crate::middleware::*`
 // imports continue to resolve.
 pub use nanosiem_api_lib::{
     check_all_permissions, check_any_permission, check_permission, ensure_interactive_session,
-    ensure_permission, require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
+    ensure_permission, require_session_auth, require_session_or_self, AuthContext,
+    AuthErrorResponse,
 };
+
+// Hosted shared-tenant authentication lives in a module that only enterprise
+// builds compile; open builds never configure the shared deployment mode.
+#[cfg(feature = "enterprise")]
+mod enterprise_shared_auth;
+#[cfg(feature = "enterprise")]
+pub(crate) use enterprise_shared_auth::shared_documented_operation;
+/// Open builds never serve the shared-tenant API documentation.
+#[cfg(not(feature = "enterprise"))]
+pub(crate) fn shared_documented_operation(_method: &axum::http::Method, _path: &str) -> bool {
+    false
+}
 
 /// Public endpoints that don't require authentication.
 /// All entries are matched exactly (no prefix matching).
@@ -68,10 +85,10 @@ const PUBLIC_ENDPOINTS: &[&str] = &[
     // deployments. NAN-807 bug #10.
     "/api/capabilities",
     "/api/auth/mfa/challenge",
-    // Forced-MFA enrolment: a user bounced by the global `Require MFA`
+    // Forced-MFA enrollment: a user bounced by the global `Require MFA`
     // policy holds only a 5-minute `mfa_challenge` token, not a session.
     // The handlers themselves authenticate via that token (or via Bearer
-    // for voluntary enrolment), so the middleware lets the request
+    // for voluntary enrollment), so the middleware lets the request
     // through unconditionally.
     "/api/auth/mfa/setup",
     "/api/auth/mfa/verify-setup",
@@ -200,9 +217,29 @@ pub struct AuthState {
     /// locked/deleted users and access tokens issued before a forced revocation.
     /// `None` in minimal setups (tests) — the gate is then skipped.
     pub user_status_resolver: Option<UserStatusResolver>,
+    /// Exact hosted-shared profile gate. When true, tenantless JWTs and all
+    /// legacy API keys are rejected and a trusted tenant context is required.
+    #[cfg(feature = "enterprise")]
+    pub enterprise_shared: bool,
+    #[cfg(feature = "enterprise")]
+    pub tenant_resolver: Option<TenantMembershipResolver>,
+    /// Durable exact-JTI authority for enterprise-shared access tokens.
+    /// Local memory and Redis remain acceleration layers only.
+    #[cfg(feature = "enterprise")]
+    pub shared_revocation_pool: Option<sqlx::PgPool>,
+    /// Exact shared-only tenant credential registry. The legacy global
+    /// `ApiKeyService` is never consulted by the hosted-shared branch.
+    #[cfg(feature = "enterprise")]
+    pub shared_automation_key_service: Option<Arc<TenantAutomationKeyService>>,
+    #[cfg(feature = "enterprise")]
+    pub shared_authorization_audit: Option<nanosiem_core::audit::TenantAuthorizationAudit>,
 }
 
 impl AuthState {
+    #[cfg(feature = "enterprise")]
+    pub fn with_shared_authorization_audit(mut self, audit: Option<nanosiem_core::audit::TenantAuthorizationAudit>) -> Self {
+        self.shared_authorization_audit=audit;self
+    }
     /// Create a new auth state
     pub fn new(
         token_service: TokenService,
@@ -216,6 +253,16 @@ impl AuthState {
             permission_resolver: None,
             source_scope_resolver: None,
             user_status_resolver: None,
+            #[cfg(feature = "enterprise")]
+            enterprise_shared: false,
+            #[cfg(feature = "enterprise")]
+            tenant_resolver: None,
+            #[cfg(feature = "enterprise")]
+            shared_revocation_pool: None,
+            #[cfg(feature = "enterprise")]
+            shared_automation_key_service: None,
+            #[cfg(feature = "enterprise")]
+            shared_authorization_audit: None,
         }
     }
 
@@ -232,6 +279,16 @@ impl AuthState {
             permission_resolver: None,
             source_scope_resolver: None,
             user_status_resolver: None,
+            #[cfg(feature = "enterprise")]
+            enterprise_shared: false,
+            #[cfg(feature = "enterprise")]
+            tenant_resolver: None,
+            #[cfg(feature = "enterprise")]
+            shared_revocation_pool: None,
+            #[cfg(feature = "enterprise")]
+            shared_automation_key_service: None,
+            #[cfg(feature = "enterprise")]
+            shared_authorization_audit: None,
         }
     }
 
@@ -247,6 +304,16 @@ impl AuthState {
             permission_resolver: None,
             source_scope_resolver: None,
             user_status_resolver: None,
+            #[cfg(feature = "enterprise")]
+            enterprise_shared: false,
+            #[cfg(feature = "enterprise")]
+            tenant_resolver: None,
+            #[cfg(feature = "enterprise")]
+            shared_revocation_pool: None,
+            #[cfg(feature = "enterprise")]
+            shared_automation_key_service: None,
+            #[cfg(feature = "enterprise")]
+            shared_authorization_audit: None,
         }
     }
 
@@ -267,6 +334,26 @@ impl AuthState {
     /// locked/deleted users and pre-revocation access tokens.
     pub fn with_user_status_resolver(mut self, resolver: UserStatusResolver) -> Self {
         self.user_status_resolver = Some(resolver);
+        self
+    }
+
+    /// Enable tenant-bound authentication for the exact hosted-shared
+    /// deployment profile. No generic managed/enterprise predicate calls this.
+    #[cfg(feature = "enterprise")]
+    pub fn with_enterprise_shared_tenant_resolver(
+        mut self,
+        resolver: TenantMembershipResolver,
+        revocation_pool: sqlx::PgPool,
+    ) -> Self {
+        self.enterprise_shared = true;
+        self.tenant_resolver = Some(resolver);
+        #[cfg(feature = "enterprise")]
+        {
+            self.shared_automation_key_service = Some(Arc::new(TenantAutomationKeyService::new(
+                revocation_pool.clone(),
+            )));
+        }
+        self.shared_revocation_pool = Some(revocation_pool);
         self
     }
 }
@@ -299,8 +386,9 @@ async fn resolve_source_scope(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(AuthErrorResponse {
                     error: "source_scope_unavailable".to_string(),
-                    message: "Source access scope is temporarily unavailable. Please retry shortly."
-                        .to_string(),
+                    message:
+                        "Source access scope is temporarily unavailable. Please retry shortly."
+                            .to_string(),
                 }),
             )
                 .into_response())
@@ -380,6 +468,17 @@ pub async fn auth_middleware(
 ) -> Result<Response, Response> {
     // Skip auth if not enabled
     if !auth_state.auth_enabled {
+        #[cfg(feature = "enterprise")]
+        if auth_state.enterprise_shared {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthErrorResponse {
+                    error: "shared_auth_disabled".to_string(),
+                    message: "Enterprise-shared authentication is unavailable".to_string(),
+                }),
+            )
+                .into_response());
+        }
         return Ok(next.run(request).await);
     }
 
@@ -395,12 +494,33 @@ pub async fn auth_middleware(
         .map(|ci| ci.0);
     let ip_address = extract_ip_address(&request, connect_info.as_ref());
     let user_agent = extract_user_agent(&request);
-    let client_context = ClientContext::new(ip_address.clone(), user_agent.clone());
+    let client_context = ClientContext::new(ip_address.clone(), user_agent.clone())
+        .with_request_id(request_id_of(&request));
     request.extensions_mut().insert(client_context);
 
-    // Skip auth for public endpoints
-    if is_public_endpoint(&path) {
+    // Shared OIDC exceptions are deployment-mode-local. Keeping them out of
+    // `is_public_endpoint` preserves the dedicated/open-core response surface
+    // for these otherwise nonexistent paths.
+    #[cfg(feature = "enterprise")]
+    let shared_public = auth_state.enterprise_shared
+        && enterprise_shared_auth::enterprise_shared_public_path(&path);
+    #[cfg(not(feature = "enterprise"))]
+    let shared_public = false;
+
+    // Skip auth for public endpoints.
+    if is_public_endpoint(&path) || shared_public {
+        #[cfg(feature = "enterprise")]
+        if auth_state.enterprise_shared && !enterprise_shared_auth::enterprise_shared_public_path(&path) {
+            tracing::warn!(path, "enterprise-shared API route unavailable");
+            return Err(enterprise_shared_auth::shared_closed_route_response());
+        }
         return Ok(next.run(request).await);
+    }
+
+    #[cfg(feature = "enterprise")]
+    if auth_state.enterprise_shared {
+        return enterprise_shared_auth::shared_auth_middleware(auth_state, request, next, path, ip_address)
+            .await;
     }
 
     // Try JWT token first (Authorization: Bearer <token>)
@@ -430,16 +550,21 @@ pub async fn auth_middleware(
                 }
                 // Resolve permissions server-side (not stored in JWT)
                 if let Some(ref resolver) = auth_state.permission_resolver {
-                    claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
+                    claims.permissions =
+                        resolver.resolve_with_roles(claims.sub, &claims.roles).await;
                 }
                 // Resolve the caller's source-scope deny set (fail-closed 503).
-                let scope =
-                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles, &claims.permissions)
-                        .await
-                    {
-                        Ok(scope) => scope,
-                        Err(response) => return Err(response),
-                    };
+                let scope = match resolve_source_scope(
+                    &auth_state,
+                    claims.sub,
+                    &claims.roles,
+                    &claims.permissions,
+                )
+                .await
+                {
+                    Ok(scope) => scope,
+                    Err(response) => return Err(response),
+                };
                 let mut auth_context = AuthContext::from_jwt(claims.clone());
                 auth_context.denied_sources = scope;
                 request.extensions_mut().insert(auth_context);
@@ -474,13 +599,17 @@ pub async fn auth_middleware(
                     // still drive the `source_scopes:view_all` positive bypass
                     // inside `resolve`. See `AuthContext::source_scope_principal`.
                     let scope_principal = auth_context.source_scope_principal();
-                    let scope =
-                        match resolve_source_scope(&auth_state, scope_principal, &claims.roles, &claims.permissions)
-                        .await
+                    let scope = match resolve_source_scope(
+                        &auth_state,
+                        scope_principal,
+                        &claims.roles,
+                        &claims.permissions,
+                    )
+                    .await
                     {
-                            Ok(scope) => scope,
-                            Err(response) => return Err(response),
-                        };
+                        Ok(scope) => scope,
+                        Err(response) => return Err(response),
+                    };
                     auth_context.denied_sources = scope;
                     request.extensions_mut().insert(auth_context);
                     request.extensions_mut().insert(claims);
@@ -557,16 +686,21 @@ pub async fn auth_middleware(
                 }
                 // Resolve permissions server-side (not stored in JWT)
                 if let Some(ref resolver) = auth_state.permission_resolver {
-                    claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
+                    claims.permissions =
+                        resolver.resolve_with_roles(claims.sub, &claims.roles).await;
                 }
                 // Resolve the caller's source-scope deny set (fail-closed 503).
-                let scope =
-                    match resolve_source_scope(&auth_state, claims.sub, &claims.roles, &claims.permissions)
-                        .await
-                    {
-                        Ok(scope) => scope,
-                        Err(response) => return Err(response),
-                    };
+                let scope = match resolve_source_scope(
+                    &auth_state,
+                    claims.sub,
+                    &claims.roles,
+                    &claims.permissions,
+                )
+                .await
+                {
+                    Ok(scope) => scope,
+                    Err(response) => return Err(response),
+                };
                 let mut auth_context = AuthContext::from_jwt(claims.clone());
                 auth_context.denied_sources = scope;
                 request.extensions_mut().insert(auth_context);
@@ -589,6 +723,27 @@ pub async fn auth_middleware(
         .into_response())
 }
 
+/// The per-request id set by `request_id_middleware` (outer layer), carried
+/// into audit events as OCSF `api.request.uid` (NAN-3227). The middleware
+/// echoes a caller-supplied `X-Request-ID`, so only a bounded token
+/// (≤128 chars of `[A-Za-z0-9._:-]`, e.g. a UUID) enters the audit trail;
+/// anything else is left out rather than stored verbatim.
+fn request_id_of(request: &Request) -> Option<String> {
+    request
+        .extensions()
+        .get::<crate::middleware::RequestId>()
+        .map(|id| id.as_str())
+        .filter(|id| audit_safe_request_id(id))
+        .map(str::to_string)
+}
+
+fn audit_safe_request_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
 /// Optional authentication middleware
 ///
 /// Similar to auth_middleware but doesn't fail if no auth is provided.
@@ -605,11 +760,23 @@ pub async fn optional_auth_middleware(
         .map(|ci| ci.0);
     let ip_address = extract_ip_address(&request, connect_info.as_ref());
     let user_agent = extract_user_agent(&request);
-    let client_context = ClientContext::new(ip_address, user_agent);
+    let client_context =
+        ClientContext::new(ip_address, user_agent).with_request_id(request_id_of(&request));
     request.extensions_mut().insert(client_context);
 
     // Skip auth if not enabled
     if !auth_state.auth_enabled {
+        #[cfg(feature = "enterprise")]
+        if auth_state.enterprise_shared {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(AuthErrorResponse {
+                    error: "shared_auth_disabled".to_string(),
+                    message: "Enterprise-shared authentication is unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        }
         return next.run(request).await;
     }
 
@@ -620,6 +787,11 @@ pub async fn optional_auth_middleware(
             .validate_access_token_async(&token)
             .await
         {
+            // Keep this explicit even though TokenService also rejects challenge
+            // purposes: optional auth must never attach a non-access principal.
+            if claims.purpose != "access" {
+                return next.run(request).await;
+            }
             // Resolve permissions server-side (not stored in JWT)
             if let Some(ref resolver) = auth_state.permission_resolver {
                 claims.permissions = resolver.resolve_with_roles(claims.sub, &claims.roles).await;
@@ -699,6 +871,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_bounded_request_ids_reach_the_audit_trail() {
+        assert!(super::audit_safe_request_id("0199c1d2-7b1e-7c3a-9f00-1234567890ab"));
+        assert!(super::audit_safe_request_id("edge:abc_1.2"));
+        for bad in ["", "a b", "x\n[auth] forged", "<script>", &"a".repeat(129)] {
+            assert!(!super::audit_safe_request_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn test_is_public_endpoint() {
         // Exact matches
         assert!(is_public_endpoint("/health"));
@@ -718,6 +899,12 @@ mod tests {
         assert!(!is_public_endpoint("/api/auth/oidc/settings"));
         assert!(!is_public_endpoint("/api/auth/oidc/azure/delete"));
         assert!(!is_public_endpoint("/api/auth/oidc/"));
+        // Shared-only exceptions are selected from `AuthState`, never opened
+        // in the build-wide dedicated/open-core public-path matcher.
+        assert!(!is_public_endpoint("/api/auth/shared/oidc/entry"));
+        assert!(!is_public_endpoint("/api/auth/shared/oidc/callback"));
+        assert!(!is_public_endpoint("/api/auth/shared/oidc/providers"));
+        assert!(!is_public_endpoint("/api/auth/shared/oidc/start"));
 
         // NAN-1931: internal Vector config delivery is session-auth-exempt
         // (the handlers gate on VECTOR_AUTH_TOKEN themselves)...

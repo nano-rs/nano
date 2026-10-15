@@ -1,0 +1,43 @@
+# NAN-3763 official lookup spec. Matches the nano-enrichments `greynoise`
+# agent catalog entry (Community API v3). The key is optional: without one
+# the community tier is shared per source IP and heavily limited.
+version: 1
+name: greynoise
+display_name: GreyNoise
+description: Whether an IP is mass-scanning the internet (noise) or a known benign service (RIOT).
+homepage: https://viz.greynoise.io/account/api-key
+allow:
+  - host: api.greynoise.io
+    path_prefixes: ["/v3/community"]
+auth: { type: api_key_header, header: key, credential: API_KEY, optional: true }
+credentials:
+  - { name: API_KEY, label: API key, required: false }
+defaults: { cache_ttl_secs: 86400, per_minute: 10, per_day: 50 }
+types:
+  ip:
+    request: { url: "https://api.greynoise.io/v3/community/{{input.artifact}}" }
+    link: "https://viz.greynoise.io/ip/{{input.artifact}}"
+    link_path: link
+    result:
+      rules:
+        - when: [{ path: classification, equals: malicious }]
+          verdict: malicious
+          score: 90
+        - when: [{ path: riot, equals: true }]
+          verdict: benign
+          score: 0
+        - when: [{ path: classification, equals: benign }]
+          verdict: benign
+          score: 0
+        - when: [{ path: noise, equals: true }]
+          verdict: suspicious
+          score: 40
+      default_verdict: unknown
+      summary:
+        classification: classification
+        noise: noise
+        riot: riot
+        name: name
+        last_seen: last_seen
+        message: message
+      tags: [name]

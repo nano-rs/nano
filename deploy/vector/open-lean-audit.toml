@@ -1,0 +1,104 @@
+# Open single-tenant platform audit lane. Mount as a separate Vector config.
+# Vector 0.59 requires --dangerously-allow-env-var-interpolation for this trusted
+# installation-owned configuration. Never mount customer-authored configuration.
+# Keep port 8081 private; API clients only use the installation-owned token.
+[sources.open_platform_audit]
+type = "http_server"
+address = "0.0.0.0:8081"
+path = "/audit"
+strict_path = true
+log_namespace = true
+framing.method = "newline_delimited"
+decoding.codec = "json"
+auth.strategy = "bearer"
+auth.token = "${NANO_LOCAL_AUDIT_TOKEN}"
+
+[transforms.open_platform_audit_bronze]
+type = "remap"
+inputs = ["open_platform_audit"]
+drop_on_error = true
+drop_on_abort = true
+source = '''
+tenant = "${NANO_LAKE_TENANT_ID}"
+if to_string!(.metadata.tenant_uid) != tenant { abort }
+if to_string!(.metadata.log_source) != "audit" { abort }
+class_uid = to_int!(.class_uid)
+if !includes([6003, 3001, 3002], class_uid) { abort }
+uid = to_string!(.metadata.uid)
+if !match(uid, r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') { abort }
+# Match the established platform_audit_lane's source admission preparation:
+# preserve raw input, anchor unknown API clients/actors, and drop unnamed resources.
+raw = encode_json(.)
+event = .
+service = to_string(event.api.service.name) ?? ""
+if service == "" || strlen(service) > 256 || match(service, r'[[:cntrl:]]') { service = "nano" }
+markable = is_object(event.unmapped) || event.unmapped == null
+src_anchored = false
+for_each(["ip", "uid", "name", "hostname", "svc_name", "instance_uid", "interface_uid", "interface_name", "domain"]) -> |_index, key| {
+    if (get(event.src_endpoint, [key]) ?? null) != null { src_anchored = true }
+}
+# API Activity requires a source endpoint; Authentication / Account Change
+# (NAN-3460) do not, and an unknown client there is simply absent.
+if !src_anchored && class_uid != 6003 {
+    event = remove!(event, ["src_endpoint"])
+} else if !src_anchored && markable {
+    event.unmapped.nano_src_endpoint = "synthesized:emitting_service"
+    event.src_endpoint = { "name": service, "svc_name": service, "type": "Other", "type_id": 99 }
+}
+user_anchored = false
+for_each(["account", "name", "uid"]) -> |_index, key| {
+    if (get(event.actor.user, [key]) ?? null) != null { user_anchored = true }
+}
+if !user_anchored && is_object(event.actor) {
+    event.actor = remove!(object!(event.actor), ["user"])
+}
+actor_anchored = false
+for_each(["process", "user", "iam_role", "invoked_by", "session", "application", "app_name", "app_uid"]) -> |_index, key| {
+    if (get(event.actor, [key]) ?? null) != null { actor_anchored = true }
+}
+if !actor_anchored && markable {
+    event.unmapped.nano_actor = "synthesized:emitting_service"
+    event.actor = merge(object(event.actor) ?? {}, { "app_name": service })
+}
+if is_array(event.resources) {
+    named = filter(array!(event.resources)) -> |_index, resource| {
+        (get(resource, ["uid"]) ?? null) != null || (get(resource, ["name"]) ?? null) != null
+    }
+    if length(named) == 0 { event = remove!(event, ["resources"]) } else { event.resources = named }
+}
+# NAN-3304: bronze carries `unmapped` as ONE JSON string, like every other lake
+# lane (NAN-3079): the sink infers one Parquet schema per batch, and an object
+# here (its `details` free-form) failed it and dropped the whole batch.
+# ingest[T] decodes it back before admission.
+if is_object(event.unmapped) { event.unmapped = encode_json(event.unmapped) }
+event.raw_data = raw
+event.raw_data_size = strlen(raw)
+# Preserve the audit ledger identity. ingest's uid ledger absorbs delivery replay.
+bronze_time = from_unix_timestamp!(to_int!(event.time), unit: "milliseconds")
+event = remove!(event, ["time"])
+. = {"time": bronze_time, "_nano_bronze_event": encode_json(event)}
+'''
+
+[sinks.open_platform_audit_s3]
+type = "aws_s3"
+inputs = ["open_platform_audit_bronze"]
+bucket = "${NANO_LAKE_BRONZE_BUCKET}"
+region = "${AWS_REGION:-us-east-1}"
+endpoint = "${NANO_LAKE_OBJECT_ENDPOINT}"
+force_path_style = true
+auth.access_key_id = "${AWS_ACCESS_KEY_ID}"
+auth.secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+key_prefix = "bronze-v2/tenant_id=${NANO_LAKE_TENANT_ID}/"
+filename_extension = "parquet"
+filename_append_uuid = true
+acknowledgements.enabled = true
+encoding.codec = "json"
+batch.max_bytes = 4194304
+batch.timeout_secs = 1
+batch_encoding.codec = "parquet"
+batch_encoding.schema_mode = "auto_infer"
+batch_encoding.compression.algorithm = "zstd"
+batch_encoding.compression.level = 6
+buffer.type = "memory"
+buffer.max_events = 1000
+buffer.when_full = "block"

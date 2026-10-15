@@ -195,7 +195,7 @@ pub async fn list_runs_for_case(
     Ok(Json(runs))
 }
 
-/// NAN-463 — upsert a single step's completion entry on an attached run.
+/// upsert a single step's completion entry on an attached run.
 ///
 /// Body fields are all optional; only fields present overwrite their
 /// counterpart on the step's entry (so clicking the checkbox doesn't
@@ -248,7 +248,7 @@ pub async fn update_step_completion(
     Ok(Json(run))
 }
 
-/// NAN-462 — resolve a playbook run against its frozen `run_context`
+/// resolve a playbook run against its frozen `run_context`
 /// snapshot. Returns the parsed step tree with `{{...}}` tokens
 /// substituted (or the original tree when the run has no context —
 /// see `has_context` in the response).
@@ -468,7 +468,7 @@ pub async fn reject_playbook(
     tag = "playbooks",
     params(
         ("id"   = String, Path, description = "Playbook TypeID"),
-        ("role" = String, Path, description = "Role NAME as it appears in the roles table (e.g. Editor), or the literal `api_key` for API-key principals. NAN-2097: an unknown role is rejected — an ACL entry matching nobody would hide the playbook from everyone."),
+        ("role" = String, Path, description = "Role NAME as it appears in the roles table (e.g. Editor), or the literal `api_key` for API-key principals. An unknown role is rejected — an ACL entry matching nobody would hide the playbook from everyone."),
     ),
     request_body = SetPermissionRequest,
     responses(
@@ -505,7 +505,7 @@ pub async fn set_permission(
     tag = "playbooks",
     params(
         ("id"   = String, Path, description = "Playbook TypeID"),
-        ("role" = String, Path, description = "Role NAME as it appears in the roles table (e.g. Editor), or the literal `api_key` for API-key principals. NAN-2097: an unknown role is rejected — an ACL entry matching nobody would hide the playbook from everyone."),
+        ("role" = String, Path, description = "Role NAME as it appears in the roles table (e.g. Editor), or the literal `api_key` for API-key principals. An unknown role is rejected — an ACL entry matching nobody would hide the playbook from everyone."),
     ),
     responses(
         (status = 204, description = "Permission removed (or didn't exist)"),
