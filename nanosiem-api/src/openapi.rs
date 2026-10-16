@@ -1685,8 +1685,8 @@ mod tests {
         // NAN-3881 adds hosted /api/threat-intel/indicator-lookup (POST).
         // NAN-3882 adds the ENTERPRISE IOC list viewer:
         //   /api/ioc-lists/{list_id}/indicators (GET). Open is unchanged.
-        // NAN-3904 documents four previously unregistered shared OIDC admin paths.
-        let min_paths = 664;
+        // NAN-3904 adds four shared OIDC admin paths; NAN-3910 adds two IOC upload paths.
+        let min_paths = 666;
         #[cfg(not(feature = "enterprise"))]
         // NAN-3577: floor matches the regenerated default-feature published spec.
         // NAN-3806: +1 (/api/ingest-tokens/{credential_id}/bind); NAN-3807: +2 (landing sources);

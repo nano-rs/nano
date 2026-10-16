@@ -265,6 +265,29 @@ pub struct WindowEntry {
     pub history: Option<String>,
     pub log_head: Option<u64>,
     pub built_at_us: i64,
+    /// Footer-only row count: no scan or query is needed to detect first artifacts.
+    #[serde(default)]
+    pub artifact_rows: Option<u64>,
+    /// At most one early rebuild per window, including across publisher restarts.
+    #[serde(default)]
+    pub warmup_complete: bool,
+}
+
+fn first_artifact_due(manifest: &Manifest, window: &str, head: Option<u64>) -> bool {
+    let Some(entry) = manifest.windows.get(window) else { return false };
+    !entry.warmup_complete
+        && entry.artifact_rows == Some(0)
+        && head.is_some()
+        && entry.log_head != head
+        && manifest.windows.get("1h").is_some_and(|recent|
+            recent.log_head == head && recent.artifact_rows.is_some_and(|rows| rows > 0))
+}
+
+fn artifact_rows(path: Option<&Path>) -> anyhow::Result<u64> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let Some(path) = path else { return Ok(0) };
+    let reader = SerializedFileReader::new(std::fs::File::open(path)?)?;
+    Ok(u64::try_from(reader.metadata().file_metadata().num_rows())?)
 }
 
 /// The newest demand- or cycle-built state of one logical key (a detail
@@ -457,8 +480,10 @@ pub(super) fn published_window(engine: &PartQueryEngine, window: &str) -> Option
         tracing::warn!(version = manifest.version, "published product window file is missing; warming");
         return Some(warming());
     }
-    Some(Ok(PublishedWindow { window, history, to_us: entry.to_us,
-        freshness: freshness(&manifest, entry.built_at_us, now_us(), stale_after) }))
+    let mut state = freshness(&manifest, entry.built_at_us, now_us(), stale_after);
+    state["warming"] = json!(!entry.warmup_complete && entry.artifact_rows == Some(0));
+    state["retry_after_s"] = json!(cycle_gap().as_secs());
+    Some(Ok(PublishedWindow { window, history, to_us: entry.to_us, freshness: state }))
 }
 
 /// A consumer's fallback for state it lacks exactly: the newest published
@@ -879,7 +904,7 @@ impl Publisher {
             return Cycle::Failed;
         }
         let head = engine.head().await.map(|(seq, _)| seq);
-        let plan = self.cadence.plan(&self.manifest, head, now_us());
+        let mut plan = self.cadence.plan(&self.manifest, head, now_us());
         // Head unmoved and nothing due (every window at this head, or a
         // deferred one not yet due): nothing to do.
         if head.is_some() && head == self.manifest.log_head && plan.rebuild.is_empty() {
@@ -892,7 +917,7 @@ impl Publisher {
         let meter = product_state::BuildMeter::start();
         let threads = product_state::build_threads();
         self.status.busy.store(true, Ordering::Relaxed);
-        let outcome = self.cycle_steps(head, &plan).await;
+        let outcome = self.cycle_steps(head, &mut plan).await;
         self.status.busy.store(false, Ordering::Relaxed);
         match outcome {
             Ok(()) => {
@@ -914,7 +939,7 @@ impl Publisher {
         }
     }
 
-    async fn cycle_steps(&mut self, head: Option<u64>, plan: &Plan) -> anyhow::Result<()> {
+    async fn cycle_steps(&mut self, head: Option<u64>, plan: &mut Plan) -> anyhow::Result<()> {
         let engine = self.engine.clone();
         let dir = self.dir();
         let anchor = now_us();
@@ -926,7 +951,13 @@ impl Publisher {
         let file = relative(&dir, &path).ok_or_else(|| anyhow::anyhow!("risk ledger is outside the product dir"))?;
         next.insert_latest(risk_key(from_us, to_us), LatestEntry { file, from_us, to_us, log_head: risk_head, built_at_us: now_us() });
         self.publish(next)?;
-        for window in plan.rebuild.iter().copied() {
+        for window in WINDOWS {
+            let warming = first_artifact_due(&self.manifest, window, head);
+            if !plan.rebuild.contains(&window) {
+                if !warming { continue; }
+                plan.rebuild.push(window);
+                plan.deferred.retain(|deferred| *deferred != window);
+            }
             // A consumer's demand never waits behind the whole cycle.
             self.serve_demands().await;
             let meter = product_state::BuildMeter::start();
@@ -941,8 +972,11 @@ impl Publisher {
             let name = |path: Option<PathBuf>| -> anyhow::Result<Option<String>> {
                 path.map(|path| relative(&dir, &path).ok_or_else(|| anyhow::anyhow!("window state is outside the product dir"))).transpose()
             };
+            let rows = artifact_rows(window_path.as_deref())?;
+            let warmup_complete = warming || rows > 0
+                || self.manifest.windows.get(window).is_some_and(|entry| entry.warmup_complete);
             let entry = WindowEntry { from_us, to_us, window: name(window_path)?, history: name(history_path)?,
-                log_head: head, built_at_us: now_us() };
+                log_head: head, built_at_us: now_us(), artifact_rows: Some(rows), warmup_complete };
             let mut next = self.manifest.clone();
             next.windows.insert(window.to_string(), entry);
             self.publish(next)?;
@@ -1040,7 +1074,7 @@ mod tests {
         let mut published = manifest(7);
         for (window, span, age) in [("1h", HOUR, 3 * HOUR), ("24h", 24 * HOUR, 3 * HOUR), ("7d", 168 * HOUR, 30 * HOUR)] {
             published.windows.insert(window.into(), WindowEntry { from_us: now - age - span, to_us: now - age,
-                window: None, history: None, log_head: Some(1), built_at_us: now - age });
+                window: None, history: None, log_head: Some(1), built_at_us: now - age, artifact_rows: None, warmup_complete: false });
         }
         assert_eq!(expired_windows(&published, now), vec!["1h".to_string()]);
         assert!(expired_windows(&published, now + 30 * HOUR).contains(&"24h".to_string()));
@@ -1101,7 +1135,7 @@ mod tests {
         let mut partial = manifest(1);
         for window in ["1h", "24h"] {
             partial.windows.insert(window.into(), WindowEntry { from_us: 0, to_us: 1, window: None, history: None,
-                log_head: Some(1), built_at_us: now_us() });
+                log_head: Some(1), built_at_us: now_us(), artifact_rows: None, warmup_complete: false });
         }
         write_manifest(dir.path(), &partial).unwrap();
         assert!(!partial.complete(), "7d/30d never published");
@@ -1189,7 +1223,63 @@ mod tests {
     const MIN_US: i64 = 60_000_000;
 
     fn entry(log_head: u64, built_at_us: i64) -> WindowEntry {
-        WindowEntry { from_us: 0, to_us: built_at_us, window: Some("w".into()), history: None, log_head: Some(log_head), built_at_us }
+        WindowEntry { from_us: 0, to_us: built_at_us, window: Some("w".into()), history: None, log_head: Some(log_head), built_at_us, artifact_rows: Some(1), warmup_complete: true }
+    }
+
+    #[test]
+    fn empty_startup_warms_on_first_artifacts_once_and_survives_restart() {
+        let now = 1_000 * MIN_US;
+        let cadence = Cadence::from_lookup(|_| None);
+        let mut manifest = Manifest::new("t");
+        for window in WINDOWS {
+            let mut empty = entry(1, now);
+            empty.artifact_rows = Some(0);
+            empty.warmup_complete = false;
+            manifest.windows.insert(window.into(), empty);
+        }
+        // Audit-only moved heads must not bypass any long-window cadence.
+        for window in ["24h", "7d", "30d"] {
+            assert!(!first_artifact_due(&manifest, window, Some(2)));
+        }
+        // The regular 1h build discovers artifacts on the next tick.
+        manifest.windows.insert("1h".into(), entry(2, now + 10 * MIN_US));
+        let plan = cadence.plan(&manifest, Some(2), now + 10 * MIN_US);
+        for window in ["24h", "7d", "30d"] {
+            assert!(!plan.rebuild.contains(&window), "normal cadence still defers {window}");
+            assert!(first_artifact_due(&manifest, window, Some(2)), "first artifacts bypass {window} cadence");
+            assert!(!first_artifact_due(&manifest, window, None));
+            assert!(!first_artifact_due(&manifest, window, Some(3)), "old 1h snapshot is not evidence");
+            // Even if a concurrent expiry leaves this build empty, never bypass twice.
+            let published = manifest.windows.get_mut(window).unwrap();
+            published.warmup_complete = true;
+            published.log_head = Some(2);
+        }
+        let restarted: Manifest = serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        manifest = restarted;
+        manifest.windows.insert("1h".into(), entry(3, now + 20 * MIN_US));
+        for window in ["24h", "7d", "30d"] {
+            assert!(!first_artifact_due(&manifest, window, Some(3)), "persisted bound for {window}");
+        }
+    }
+
+    #[test]
+    fn populated_backlogs_never_gain_extra_long_window_builds() {
+        let mut manifest = Manifest::new("t");
+        for window in WINDOWS {
+            manifest.windows.insert(window.into(), entry(1, 0));
+        }
+        for head in [2, 1_000, u64::MAX] {
+            manifest.windows.insert("1h".into(), entry(head, 1));
+            for window in ["24h", "7d", "30d"] {
+                assert!(!first_artifact_due(&manifest, window, Some(head)));
+            }
+        }
+        // Old manifests deserialize safely and don't invent empty-state evidence.
+        let old = json!({"from_us": 0, "to_us": 1, "window": "w", "history": null,
+            "log_head": 1, "built_at_us": 1});
+        let old: WindowEntry = serde_json::from_value(old).unwrap();
+        assert_eq!(old.artifact_rows, None);
+        assert!(!old.warmup_complete);
     }
 
     #[test]

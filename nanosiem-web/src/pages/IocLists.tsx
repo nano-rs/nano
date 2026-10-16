@@ -15,6 +15,8 @@ import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import {
   uploadFormatFor,
+  type IocLimits,
+  type IocListOverview,
   type IocListSummary,
   type IocType,
   type IocUploadFormat,
@@ -63,7 +65,7 @@ export function IocLists() {
     queryFn: () => api.iocLists.list(),
     retry: false,
     refetchInterval: (query) =>
-      query.state.data?.some((l) => l.publish_state === 'publishing') ? POLL_MS : false,
+      query.state.data?.lists.some((l) => l.publish_state === 'publishing') ? POLL_MS : false,
   });
   const [upload, setUpload] = useState<UploadTarget | null>(null);
   const [toDelete, setToDelete] = useState<IocListSummary | null>(null);
@@ -74,8 +76,8 @@ export function IocLists() {
   const publish = useMutation({
     mutationFn: (list: IocListSummary) => api.iocLists.publish(list.id),
     onSuccess: (result) => {
-      client.setQueryData<IocListSummary[]>(QUERY_KEY, (old) =>
-        old?.map((l) => (l.id === result.list.id ? result.list : l)),
+      client.setQueryData<IocListOverview>(QUERY_KEY, (old) =>
+        old ? { ...old, lists: old.lists.map((l) => (l.id === result.list.id ? result.list : l)) } : old,
       );
       if (!result.started) toast({ title: 'Already publishing', description: result.list.name });
       refresh();
@@ -86,7 +88,7 @@ export function IocLists() {
   // Announce a background publication's outcome once.
   const previous = useRef<Map<string, IocListSummary['publish_state']>>(new Map());
   useEffect(() => {
-    for (const list of lists.data ?? []) {
+    for (const list of lists.data?.lists ?? []) {
       const before = previous.current.get(list.id);
       if (before === 'publishing' && list.publish_state === 'published') {
         toast({
@@ -110,7 +112,7 @@ export function IocLists() {
     onError: (err) => toast({ title: 'Delete failed', description: errorMessage(err), variant: 'destructive' }),
   });
 
-  const all = lists.data ?? [];
+  const all = lists.data?.lists ?? [];
   const total = all.reduce((acc, l) => acc + l.indicator_count, 0);
 
   return (
@@ -122,9 +124,9 @@ export function IocLists() {
             <HowItWorks />
           </div>
           <p className="text-[11.5px] text-muted-foreground mt-0.5">
-            <span className="font-mono tabular-nums">{all.length.toLocaleString()}</span> list{all.length === 1 ? '' : 's'}
+            <span className="font-mono tabular-nums">{all.length.toLocaleString()} / {lists.data?.limits?.list_count.toLocaleString() ?? '—'}</span> list{all.length === 1 ? '' : 's'}
             {' · '}
-            <span className="font-mono tabular-nums">{total.toLocaleString()}</span> indicators
+            <span className="font-mono tabular-nums">{total.toLocaleString()} / {lists.data?.limits?.indicators_per_tenant.toLocaleString() ?? '—'}</span> indicators
             {' · '}static indicators stamped on ingest as <span className="font-mono">threat_intelligence</span>
           </p>
         </div>
@@ -143,6 +145,7 @@ export function IocLists() {
         {upload && (
           <UploadPanel
             target={upload.list}
+            limits={lists.data?.limits}
             onClose={() => setUpload(null)}
             onSaved={() => {
               setUpload(null);
@@ -328,8 +331,8 @@ function IconButton({
 }
 
 function UploadPanel({
-  target, onClose, onSaved,
-}: { target: IocListSummary | null; onClose: () => void; onSaved: () => void }) {
+  target, limits, onClose, onSaved,
+}: { target: IocListSummary | null; limits: IocLimits | undefined; onClose: () => void; onSaved: () => void }) {
   const { toast } = useToast();
   const fileInput = useRef<HTMLInputElement>(null);
   const [name, setName] = useState('');
@@ -337,6 +340,9 @@ function UploadPanel({
   const [risk, setRisk] = useState('75');
   const [tags, setTags] = useState('');
   const [content, setContent] = useState('');
+  const [file, setFile] = useState<File | undefined>();
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [fileRejected, setFileRejected] = useState(false);
   const [format, setFormat] = useState<IocUploadFormat>('text');
   const [mode, setMode] = useState<'append' | 'replace'>('append');
   const [expiry, setExpiry] = useState<ExpiryValue>(NO_EXPIRY);
@@ -345,6 +351,9 @@ function UploadPanel({
 
   const save = useMutation({
     mutationFn: async () => {
+      if (!limits) throw new Error('IOC limits are unavailable; retry after the page loads.');
+      const bytes = file?.size ?? new Blob([content]).size;
+      if (bytes > limits.upload_bytes) throw new Error(`Upload exceeds the ${limits.upload_bytes.toLocaleString()} byte file limit (attempted ${bytes.toLocaleString()}).`);
       const riskScore = Number(risk);
       const payload = {
         content: content.trim() ? content : undefined,
@@ -355,20 +364,33 @@ function UploadPanel({
         default_note: context.trim() || undefined,
       };
       return target
-        ? api.iocLists.update(target.id, { ...payload, mode })
-        : api.iocLists.create({ ...payload, name: name.trim(), description: description.trim() || undefined });
+        ? api.iocLists.update(target.id, { ...payload, mode }, file)
+        : api.iocLists.create({ ...payload, name: name.trim(), description: description.trim() || undefined }, file);
     },
     onSuccess: (list) => {
       toast({ title: target ? 'IOC list updated' : 'IOC list created', description: `${list.name}: ${list.indicator_count.toLocaleString()} indicators. Publish to start matching.` });
       onSaved();
     },
-    onError: (err) => toast({ title: 'Upload rejected', description: errorMessage(err), variant: 'destructive' }),
+    onError: (err) => {
+      setUploadError(errorMessage(err));
+      toast({ title: 'Upload rejected', description: errorMessage(err), variant: 'destructive' });
+    },
   });
 
-  const onFile = async (file: File | undefined) => {
-    if (!file) return;
-    setFormat(uploadFormatFor(file.name));
-    setContent(await file.text());
+  const onFile = (selected: File | undefined) => {
+    setFile(undefined);
+    setFileRejected(false);
+    if (!selected) return;
+    if (!limits) { setUploadError('IOC limits are unavailable; retry after the page loads.'); return; }
+    if (selected.size > limits.upload_bytes) {
+      setFileRejected(true);
+      setUploadError(`Upload exceeds the ${limits.upload_bytes.toLocaleString()} byte file limit (attempted ${selected.size.toLocaleString()}).`);
+      return;
+    }
+    setUploadError(null);
+    setFormat(uploadFormatFor(selected.name));
+    setContent('');
+    setFile(selected);
   };
 
   const label = 'text-[10px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70';
@@ -447,7 +469,7 @@ function UploadPanel({
             <option value="json">json</option>
           </select>
           <span className="flex-1" />
-          <input ref={fileInput} type="file" accept=".csv,.json,.txt,.list" className="hidden" onChange={(e) => onFile(e.target.files?.[0])} />
+          <input aria-label="IOC file" ref={fileInput} type="file" accept=".csv,.json,.txt,.list" className="hidden" onChange={(e) => onFile(e.target.files?.[0])} />
           <button
             type="button"
             onClick={() => fileInput.current?.click()}
@@ -456,9 +478,10 @@ function UploadPanel({
             <Upload className="w-3 h-3" strokeWidth={1.5} /> file
           </button>
         </div>
+        {file && <p className="text-[10.5px] font-mono">{file.name} · {file.size.toLocaleString()} bytes</p>}
         <textarea
           value={content}
-          onChange={(e) => setContent(e.target.value)}
+          onChange={(e) => { setContent(e.target.value); setFile(undefined); setFileRejected(false); setUploadError(null); }}
           rows={6}
           spellCheck={false}
           placeholder={'45.33.32.156\n198.51.100.0/28\nevil[.]example\nhxxps://evil.example/login\n9dfc3317c19f4ca2a1e6d09f180a9dbd01a65632f5f2c5cc2c52f8f186807db7\nphisher@evil.example'}
@@ -466,13 +489,14 @@ function UploadPanel({
         />
         <p className="text-[10.5px] text-muted-foreground">
           IPs, CIDRs (≤ 256 addresses), domains, MD5/SHA-1/SHA-256/SHA-512, URLs, e-mail. Defanged forms are accepted.
-          CSV columns: <span className="font-mono">indicator, type, risk_score, tags (a;b), expires_at, note</span>. Max 50,000 per list.
+          CSV columns: <span className="font-mono">indicator, type, risk_score, tags (a;b), expires_at, note</span>. Max {limits?.indicators_per_list.toLocaleString() ?? '—'} per list; max file {limits ? (limits.upload_bytes / 1024 / 1024).toLocaleString() : '—'} MiB.
         </p>
       </div>
+      {uploadError && <p role="alert" className="text-[11.5px] text-destructive">{uploadError}</p>}
       <div className="flex justify-end">
         <button
           type="button"
-          disabled={save.isPending || (!target && !name.trim()) || expiresAt === undefined}
+          disabled={!limits || fileRejected || save.isPending || (!target && !name.trim()) || expiresAt === undefined}
           onClick={() => save.mutate()}
           className="h-[28px] px-3 rounded-md bg-primary text-[var(--brand-ink)] hover:bg-primary/90 disabled:opacity-50 text-[12px] font-semibold flex items-center gap-1.5"
         >

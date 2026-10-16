@@ -3507,6 +3507,7 @@ fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
             axum::http::header::ACCEPT,
             axum::http::header::HeaderName::from_static("x-api-key"),
             axum::http::header::HeaderName::from_static("x-request-id"),
+            axum::http::header::HeaderName::from_static("x-ioc-list-options"),
         ]);
 
     // Only allow wildcard CORS if explicitly configured with "*"

@@ -1211,6 +1211,8 @@ impl SearchState {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(60),
+            // NAN-3891: the `| ai` pipe obeys the region's AI provider region.
+            ai_provider_region: nanosiem_core::ai_provider_region::AiProviderRegionPin::from_env(),
         };
 
         let credential_resolver = Arc::new(nanosiem_enterprise::melod::CredentialResolver::new(

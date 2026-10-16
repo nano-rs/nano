@@ -577,6 +577,9 @@ impl ArtifactExplorerItem {
 /// Response for the artifact explorer endpoint
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ArtifactExplorerResponse {
+    /// Published snapshot freshness and bounded first-artifact warm-up status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_state: Option<serde_json::Value>,
     /// Artifacts with daily breakdown data
     pub artifacts: Vec<ArtifactExplorerItem>,
     /// Total count of artifacts matching the query (before pagination)

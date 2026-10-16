@@ -1224,6 +1224,7 @@ impl PrevalenceService {
             .collect();
 
         Ok(ArtifactExplorerResponse {
+            product_state: None,
             artifacts,
             total,
             limit,

@@ -71,6 +71,9 @@ pub enum ApiError {
     #[error("Payload too large: {0}")]
     PayloadTooLarge(String),
 
+    #[error(transparent)]
+    IocLimitExceeded(nanosiem_core::ioc_limits::IocLimitExceeded),
+
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
 
@@ -176,6 +179,7 @@ impl ApiError {
             ApiError::TooManyRequests(_) => "TOO_MANY_REQUESTS",
             ApiError::AiAllowancePaused { .. } => nanosiem_core::AI_ALLOWANCE_PAUSED_CODE,
             ApiError::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
+            ApiError::IocLimitExceeded(_) => "IOC_LIMIT_EXCEEDED",
             ApiError::SearchAdmissionUnavailable(_) => "SEARCH_ADMISSION_UNAVAILABLE",
             ApiError::TenantLakePublicationDegraded(_) => "TENANT_LAKE_PUBLICATION_DEGRADED",
             ApiError::ServiceUnavailable(_) | ApiError::FeatureDisabled(_) => "SERVICE_UNAVAILABLE",
@@ -206,6 +210,8 @@ impl ApiError {
             | ApiError::TooManyRequests(_)
             | ApiError::AiAllowancePaused { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::IocLimitExceeded(limit) if limit.limit.ends_with("_bytes") => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::IocLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::SearchAdmissionUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::TenantLakePublicationDegraded(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::ServiceUnavailable(_) | ApiError::FeatureDisabled(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -272,6 +278,7 @@ impl IntoResponse for ApiError {
             );
         }
         let details = match &self {
+            ApiError::IocLimitExceeded(limit) => Some(serde_json::to_value(limit).unwrap_or_default()),
             ApiError::ColdScanTooLarge { needed_bytes, ceiling_bytes, background_ceiling_bytes } => Some(serde_json::json!({
                 "reason": "cold_scan_too_large", "needed_bytes": needed_bytes, "ceiling_bytes": ceiling_bytes,
                 "background_ceiling_bytes": background_ceiling_bytes, "retryable": false,
@@ -1318,6 +1325,20 @@ impl From<nanosiem_core::RuleRepositoryError> for ApiError {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn ioc_limit_errors_report_usage_and_attempt_with_typed_status() {
+        for (limit, expected) in [("upload_bytes", StatusCode::PAYLOAD_TOO_LARGE), ("indicators_per_tenant", StatusCode::UNPROCESSABLE_ENTITY)] {
+            let response = ApiError::IocLimitExceeded(nanosiem_core::ioc_limits::IocLimitExceeded {
+                limit, maximum: 10, current: 9, attempted: 11,
+            }).into_response();
+            assert_eq!(response.status(), expected);
+            let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "IOC_LIMIT_EXCEEDED");
+            assert_eq!(body["error"]["details"], serde_json::json!({"limit":limit,"maximum":10,"current":9,"attempted":11}));
+        }
+    }
 
     #[test]
     fn stale_log_source_version_maps_to_conflict() {

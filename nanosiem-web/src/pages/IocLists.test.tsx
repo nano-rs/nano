@@ -24,7 +24,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
-vi.mock('@/lib/api', () => ({ api: { iocLists: mocks } }));
+const limits = { indicators_per_list: 8000, indicators_per_tenant: 25000, list_count: 50, upload_bytes: 8 * 1024 * 1024 };
+vi.mock('@/lib/api', () => ({ api: { iocLists: { ...mocks, list: async () => ({ lists: await mocks.list(), limits }) } } }));
 
 const summary: IocListSummary = {
   id: '5fb667bb-2a93-4f33-9b60-72d683bd0dde',
@@ -63,6 +64,40 @@ describe('IocLists', () => {
     expect(await screen.findByText('apt-infra')).toBeTruthy();
     expect(screen.getByText('never')).toBeTruthy();
     expect(screen.getByText('campaign infrastructure')).toBeTruthy();
+  });
+
+  it('shows usage against tenant limits and upload maximum', async () => {
+    mocks.list.mockResolvedValue([summary]);
+    renderPage();
+    expect(await screen.findByText('1 / 50')).toBeTruthy();
+    expect(screen.getByText('3 / 25,000')).toBeTruthy();
+    fireEvent.click(screen.getByText('New IOC list'));
+    expect(screen.getByText(/max file 8 MiB/)).toBeTruthy();
+  });
+
+  it('rejects oversized files before reading or sending them', async () => {
+    mocks.list.mockResolvedValue([]);
+    renderPage();
+    fireEvent.click(await screen.findByText('New IOC list'));
+    const file = new File(['x'], 'huge.csv');
+    Object.defineProperty(file, 'size', { value: limits.upload_bytes + 1 });
+    const read = vi.fn();
+    Object.defineProperty(file, 'text', { value: read });
+    fireEvent.change(screen.getByLabelText('IOC file'), { target: { files: [file] } });
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('8,388,608 byte file limit'));
+    expect(read).not.toHaveBeenCalled();
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it('shows a server capacity refusal in the upload panel', async () => {
+    mocks.list.mockResolvedValue([]);
+    mocks.create.mockRejectedValue(new Error('IOC indicators_per_tenant limit 25000 exceeded: current usage 24999, attempted 25001'));
+    renderPage();
+    fireEvent.click(await screen.findByText('New IOC list'));
+    fireEvent.change(screen.getByPlaceholderText('apt29-infra'), { target: { value: 'campaign' } });
+    fireEvent.change(document.querySelector('textarea')!, { target: { value: 'a.example' } });
+    fireEvent.click(screen.getByText('Create'));
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', expect.stringContaining('current usage 24999, attempted 25001'));
   });
 
   it('publishes a list', async () => {

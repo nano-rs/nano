@@ -1211,11 +1211,15 @@ fn validate_ioc_row(row: &IocSnapshotRow, normalized_value: &str) -> Result<()> 
         row.enrichment_name.as_str(),
         row.threat_type.as_str(),
         row.malware.as_str(),
-        row.tags.as_str(),
     ] {
         if value.len() > MAX_IOC_TEXT_BYTES || value.chars().any(char::is_control) {
             bail!("IOC snapshot row has an invalid bounded text field");
         }
+    }
+    // The wire column joins valid tags with commas; bound the complete
+    // string before splitting/cloning it, without rejecting 16x64-byte lists.
+    if row.tags.len() > MAX_IOC_TAGS * (MAX_IOC_TEXT_BYTES + 1) - 1 {
+        bail!("IOC snapshot row exceeds its joined tag bound");
     }
     if row.ioc_type.trim().is_empty() || row.source_id.trim().is_empty() {
         bail!("IOC snapshot row lacks its type or source identity");
@@ -1262,7 +1266,7 @@ fn normalized_tags(value: &str) -> Result<Vec<String>> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    if tags.len() > MAX_IOC_TAGS {
+    if tags.len() > MAX_IOC_TAGS || tags.iter().any(|value| value.len() > MAX_IOC_TEXT_BYTES || value.chars().any(char::is_control)) {
         bail!("IOC snapshot row exceeds its tag bound");
     }
     Ok(tags)
@@ -1583,6 +1587,19 @@ mod tests {
             Some("2026-08-01T00:00:00Z")
         );
         assert!(snapshot.lookup_all("clean.example").is_empty());
+    }
+
+    #[test]
+    fn maximum_ioc_list_tags_round_trip_through_snapshot_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tags.parquet");
+        let tags: Vec<_> = (0..16).map(|n| format!("{n:02}{}", "x".repeat(62))).collect();
+        let digest = write_ioc_snapshot(&path, &[IocSnapshotInput {
+            ioc_value: "evil.example".into(), ioc_type: "domain".into(), source_id: "list".into(),
+            tags: tags.clone(), ..Default::default()
+        }]).unwrap();
+        let snapshot = IocSnapshot::open(&path, &digest).unwrap();
+        assert_eq!(snapshot.publication_rows()[0].tags, tags);
     }
 
     #[test]

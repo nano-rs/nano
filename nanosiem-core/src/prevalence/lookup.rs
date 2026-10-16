@@ -731,6 +731,18 @@ impl LakePrevalenceClient {
                     "lake prevalence explorer returned invalid JSON ({status}): {error}"
                 ))
             })?;
+        // A cold cell's typed 409 has no snapshot identity or tenant data.
+        // Keep it distinct from a definitive empty result and from other failures.
+        if self.lake_cell && status == reqwest::StatusCode::CONFLICT
+            && envelope.error.as_deref() == Some("product_state_warming")
+        {
+            return Ok(ArtifactExplorerResponse {
+                product_state: Some(serde_json::json!({"warming": true, "stale": false})),
+                artifacts: Vec::new(), total: 0, limit, offset, has_more: false,
+                next_cursor: None, rarity_threshold: self.effective_rarity_threshold(),
+                rare_count: 0, new_count: 0, high_risk_asset_count: 0, counts_approximate: false,
+            });
+        }
         if !status.is_success() || !envelope.ok {
             return Err(PrevalenceError::Backend(envelope.error.unwrap_or_else(
                 || format!("lake prevalence explorer returned HTTP {status}"),
@@ -754,6 +766,7 @@ impl LakePrevalenceClient {
         let mut result = envelope.result.ok_or_else(|| {
             PrevalenceError::Backend("lake prevalence explorer omitted its result".into())
         })?;
+        result.product_state = envelope.product_state;
         // NAN-3802: a not-yet-rolled cell may still answer with a legacy-form
         // cursor; hand the client the RFC 3339 form it can send back.
         if let Some(next) = result.next_cursor.as_ref() {
@@ -1078,6 +1091,9 @@ struct LakePrevalenceResponse {
 
 #[derive(Deserialize)]
 struct LakePrevalenceExplorerResponse {
+    #[serde(default)]
+    product_state: Option<serde_json::Value>,
+    #[serde(default)]
     ok: bool,
     #[serde(default)]
     tenant_id: Option<String>,
@@ -1931,6 +1947,7 @@ mod lake_cell_prevalence_tests {
             .and(body_partial_json(json!({"tenant_id": t, "window": "7d", "limit": 50, "rarity_threshold": 3})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "ok": true, "request_id": "x", "tenant_id": t, "route": "prevalence_explorer", "source_mode": "parts",
+                "product_state": {"warming": true, "stale": false, "retry_after_s": 600},
                 "result": {"artifacts": [], "total": 0, "limit": 50, "offset": 0, "has_more": false,
                            "next_cursor": null, "rarity_threshold": 3, "rare_count": 0, "new_count": 0,
                            "high_risk_asset_count": 0, "counts_approximate": false}
@@ -1944,7 +1961,39 @@ mod lake_cell_prevalence_tests {
             .await
             .unwrap();
         assert_eq!(page.total, 0);
+        assert_eq!(page.product_state.as_ref().unwrap()["warming"], true);
+        assert_eq!(page.product_state.as_ref().unwrap()["retry_after_s"], 600);
         assert!(client.export(None, TimeWindow::SevenDays, 3, 10, &ArtifactScope::system()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cell_explorer_warming_never_accepts_foreign_snapshot_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = uuid::Uuid::from_u128(0xa);
+        for (status, response_tenant, route, accepted) in [
+            (200, 0xb, "prevalence_explorer", false),
+            (200, 0xa, "prevalence_detail", false),
+            (409, 0xa, "prevalence_explorer", true),
+            (500, 0xa, "prevalence_explorer", false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                    "ok": status == 200, "tenant_id": uuid::Uuid::from_u128(response_tenant).to_string(),
+                    "route": route, "error": "product_state_warming",
+                    "product_state": {"warming": true, "retry_after_s": 600},
+                    "result": {"artifacts": [], "total": 0, "limit": 50, "offset": 0, "has_more": false,
+                        "rarity_threshold": 3, "rare_count": 0, "new_count": 0, "high_risk_asset_count": 0}
+                })))
+                .mount(&server).await;
+            let response = client(&server, &dir, tenant)
+                .explore(None, TimeWindow::TwentyFourHours, None, None, None, 50, 0, None, &ArtifactScope::system()).await;
+            assert_eq!(response.is_ok(), accepted);
+            if let Ok(page) = response {
+                assert!(page.artifacts.is_empty());
+                assert_eq!(page.product_state.unwrap()["warming"], true);
+            }
+        }
     }
 
     #[tokio::test]

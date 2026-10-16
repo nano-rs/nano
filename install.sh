@@ -1731,7 +1731,7 @@ elif [[ "$NANO_NONINTERACTIVE" != "1" && -n "${VECTOR_AUTH_TOKEN:-}" ]]; then
     printf "  HEC:      POST http://%s:8088/services/collector/event\n" "$INGEST_HOST"
     printf "              curl -X POST http://%s:8088/services/collector/event \\\\\n" "$INGEST_HOST"
     printf "                -H 'Authorization: Splunk %s' \\\\\n" "$VECTOR_AUTH_TOKEN"
-    printf "                -H 'X-Splunk-Request-Channel: 11111111-1111-4111-8111-111111111111' \\\n"
+    printf "                -H 'X-Splunk-Request-Channel: 11111111-1111-4111-8111-111111111111' \\\\\n"
     printf "                -d '{\"event\":\"hello nano\"}'\n"
     echo
     printf "  OTLP/HTTP: %s/otlp  (SDK/collector endpoint; /v1/logs, /v1/traces, /v1/metrics)\n" "$BASE_URL"

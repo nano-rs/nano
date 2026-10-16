@@ -127,12 +127,23 @@ export function uploadFormatFor(fileName: string): IocUploadFormat {
   return 'csv';
 }
 
+export interface IocLimits {
+  indicators_per_list: number;
+  indicators_per_tenant: number;
+  list_count: number;
+  upload_bytes: number;
+}
+export interface IocListOverview {
+  lists: IocListSummary[];
+  limits: IocLimits;
+  usage: { list_count: number; indicators: number };
+}
+
 export class IocListsApi {
   constructor(private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>) {}
 
-  async list(): Promise<IocListSummary[]> {
-    const response = await this.request<{ lists: IocListSummary[] }>('/api/ioc-lists');
-    return response.lists;
+  async list(): Promise<IocListOverview> {
+    return this.request('/api/ioc-lists');
   }
 
   async get(id: string, page = 1, pageSize = 100): Promise<IocListDetail> {
@@ -152,12 +163,26 @@ export class IocListsApi {
     return this.request(`/api/ioc-lists/${encodeURIComponent(id)}/indicators${qs ? `?${qs}` : ''}`);
   }
 
-  async create(request: CreateIocListRequest): Promise<IocListSummary> {
+  async create(request: CreateIocListRequest, file?: File): Promise<IocListSummary> {
+    if (file || (request.content !== undefined && !request.indicators?.length)) return this.upload('/api/ioc-lists/upload', 'POST', request, file);
     return this.request('/api/ioc-lists', { method: 'POST', body: JSON.stringify(request) });
   }
 
-  async update(id: string, request: UpdateIocListRequest): Promise<IocListSummary> {
-    return this.request(`/api/ioc-lists/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(request) });
+  async update(id: string, request: UpdateIocListRequest, file?: File): Promise<IocListSummary> {
+    const path = `/api/ioc-lists/${encodeURIComponent(id)}`;
+    if (file || (request.content !== undefined && !request.indicators?.length)) return this.upload(`${path}/upload`, 'PUT', request, file);
+    return this.request(path, { method: 'PUT', body: JSON.stringify(request) });
+  }
+
+  private upload(path: string, method: string, request: CreateIocListRequest | UpdateIocListRequest, file?: File): Promise<IocListSummary> {
+    const { content, format, ...options } = request;
+    const query = new URLSearchParams({ format: format ?? 'csv' });
+    // Headers are ASCII; JSON escapes preserve Unicode metadata without
+    // putting notes/defaults in the URL or reading the entire file.
+    const metadata = JSON.stringify(options).replace(/[\u007f-\uffff]/g, (character) =>
+      `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    return this.request(`${path}?${query}`, { method, headers: { 'Content-Type': 'application/octet-stream', 'x-ioc-list-options': metadata },
+      body: file ?? new Blob([content ?? '']) });
   }
 
   async remove(id: string): Promise<{ deleted: boolean; withdrawn: boolean }> {

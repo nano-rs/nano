@@ -31,6 +31,10 @@ pub struct HostedCoordinatorDeployment {
     /// Required for `hosted_regional`, forbidden for `isolated_test`.
     #[serde(default)]
     application_region: Option<String>,
+    /// NAN-3891: a spec region's rendered placement (from the region spec),
+    /// beside `application_region`; absent for legacy/table regions.
+    #[serde(default)]
+    region_placement: Option<serde_json::Value>,
     tenant_id: Uuid,
     worker_assignment_revision: u64,
     endpoint: String,
@@ -245,12 +249,16 @@ impl std::fmt::Debug for HostedCoordinatorDeployment {
 /// The region contract's coordinator endpoint. The region table is
 /// enterprise-only, so an open-core build refuses every regional config.
 #[cfg(feature = "enterprise")]
-fn regional_coordinator_endpoint(application_region: &str) -> Option<String> {
-    crate::enterprise_shared_region::lake_region(application_region)
+fn regional_coordinator_endpoint(
+    application_region: &str,
+    placement: Option<&serde_json::Value>,
+) -> Option<String> {
+    crate::enterprise_shared_region::resolve_lake_region(application_region, placement)
+        .ok()
         .map(|region| region.hosted_coordinator_endpoint())
 }
 #[cfg(not(feature = "enterprise"))]
-fn regional_coordinator_endpoint(_: &str) -> Option<String> {
+fn regional_coordinator_endpoint(_: &str, _: Option<&serde_json::Value>) -> Option<String> {
     None
 }
 fn invalid() -> DurableJobStoreError {
@@ -404,11 +412,13 @@ impl HostedCoordinatorDeployment {
     fn parse(bytes: &[u8]) -> Result<Self, DurableJobStoreError> {
         let value: Self = serde_json::from_slice(bytes).map_err(|_| invalid())?;
         let region_ok = match value.deployment_kind {
-            HostedCoordinatorDeploymentKind::IsolatedTest => value.application_region.is_none(),
+            HostedCoordinatorDeploymentKind::IsolatedTest => {
+                value.application_region.is_none() && value.region_placement.is_none()
+            }
             HostedCoordinatorDeploymentKind::HostedRegional => value
                 .application_region
                 .as_deref()
-                .and_then(regional_coordinator_endpoint)
+                .and_then(|region| regional_coordinator_endpoint(region, value.region_placement.as_ref()))
                 .is_some_and(|endpoint| value.endpoint == endpoint),
         };
         if value.schema_version != 1
@@ -767,5 +777,26 @@ mod tests {
                 "{kind} {region:?} {endpoint}"
             );
         }
+        // NAN-3891: a spec region with no table entry is accepted with its
+        // rendered placement and binds its own coordinator only.
+        let placement = serde_json::json!({
+            "durable_object_location_hint": "apac", "r2_jurisdiction": "default",
+            "r2_location_hint": "apac", "region_code": "jp",
+            "source_admission_script": "nano-source-admission-jp", "spot_region": "jp-tyo-1",
+            "farm_hostname": "farm.jp.nano.rs",
+        });
+        // (An id no other test treats as unknown: resolved regions are process-wide.)
+        let us_west = "https://jobs-jp.nano.rs/v1/coordinate";
+        let mut spec = config("hosted_regional", Some("jp-tyo-1"), us_west);
+        spec["region_placement"] = placement.clone();
+        assert!(load(&spec).is_ok());
+        spec["endpoint"] = serde_json::json!(us);
+        assert!(load(&spec).is_err());
+        let mut legacy = config("hosted_regional", Some("us-east-iad-2"), us);
+        legacy["region_placement"] = placement.clone();
+        assert!(load(&legacy).is_err(), "a legacy region takes no placement");
+        let mut isolated = config("isolated_test", None, "https://coordinator.invalid/v1/coordinate");
+        isolated["region_placement"] = placement;
+        assert!(load(&isolated).is_err());
     }
 }

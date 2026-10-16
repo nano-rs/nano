@@ -4463,6 +4463,12 @@ export interface ArtifactInlineContext {
 }
 
 export interface ArtifactExplorerResponse {
+  product_state?: {
+    warming?: boolean;
+    stale?: boolean;
+    age_s?: number;
+    retry_after_s?: number;
+  };
   artifacts: ArtifactExplorerItem[];
   total: number;
   limit: number;

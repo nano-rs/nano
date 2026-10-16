@@ -21,6 +21,8 @@
 //! - Unified audit logging to ClickHouse
 
 pub mod ai_provider;
+pub mod ai_provider_region;
+pub mod ioc_limits;
 pub mod allocator_trim;
 pub mod app_features;
 #[cfg(feature = "enterprise")]

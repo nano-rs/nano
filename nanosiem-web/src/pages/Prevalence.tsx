@@ -57,6 +57,7 @@ import {
 } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { useArtifactExplorer, useArtifactDetail, useArtifactLookup } from '@/hooks/use-api';
+import { explorerStatusLabel } from '@/lib/prevalence/explorerStatus';
 import { DETAIL_WARMING_MAX_POLLS, detailWarmingDelay } from '@/lib/prevalence/detailWarming';
 import { detailCoverageLabel, detailCoverageTitle, isPartialCoverage } from '@/lib/prevalence/detailCoverage';
 import { formatUTCCompact, formatRelativeCompact, buildHeatmapDays, expandPackedDaily } from '@/lib/date-utils';
@@ -432,6 +433,13 @@ export function Prevalence() {
     cursor_kind: pageCursor?.kind,
     cursor_artifact: pageCursor?.artifact,
   });
+
+  const snapshotStatus = explorerStatusLabel(data?.product_state);
+  useEffect(() => {
+    if (!data?.product_state?.warming && !data?.product_state?.stale) return;
+    const timer = window.setTimeout(() => void refetch(), 60_000);
+    return () => window.clearTimeout(timer);
+  }, [data, refetch]);
 
   const nextPage = useCallback(() => {
     if (!data?.has_more) return;
@@ -853,6 +861,11 @@ export function Prevalence() {
           </div>
         </div>
 
+        {snapshotStatus && artifacts.length > 0 && (
+          <p role="status" className="border-b border-border px-3 py-2 font-mono text-[11px] text-muted-foreground">
+            {snapshotStatus}
+          </p>
+        )}
         {/* Column header strip */}
         <div
           className="grid items-center border-b border-border bg-card/40 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/80"
@@ -882,7 +895,7 @@ export function Prevalence() {
         ) : artifacts.length === 0 ? (
           <div className="px-4 py-12 text-center text-[12px] text-muted-foreground">
             <Search className="mx-auto mb-2 h-5 w-5 opacity-50" />
-            <p>{data?.availability?.available === false ? 'Prevalence not computed yet' : 'No artifacts found'}</p>
+            <p>{snapshotStatus ?? (data?.availability?.available === false ? 'Prevalence not computed yet' : 'No artifacts found')}</p>
             {data?.availability?.available === false && data.availability.detail && (
               <p className="mt-1 text-muted-foreground/60">{data.availability.detail}</p>
             )}

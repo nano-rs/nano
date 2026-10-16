@@ -7,7 +7,7 @@ use std::{path::PathBuf, sync::Arc};
 use arc_swap::ArcSwap;
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -323,15 +323,18 @@ async fn replace(
     State(state): State<LeanCoordinatorState>,
     Path(source): Path<Uuid>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Json<Publication>, CoordinatorError> {
     authenticate(&state, &headers)?;
-    if body.len() > MAX_REQUEST_BYTES {
-        return Err(CoordinatorError(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "tenant IOC upload exceeds 64 MiB",
-        ));
-    }
+    // Reject before buffering/parsing a queued generation. The API serializes
+    // tenant publishes too, but timed-out retries and internal writers must
+    // not accumulate parsed snapshots behind the coordinator's writer lock.
+    let _writer = state.writer.clone().try_lock_owned().map_err(|_| {
+        CoordinatorError(StatusCode::CONFLICT, "tenant IOC publication already running; retry")
+    })?;
+    let body = axum::body::to_bytes(body, MAX_REQUEST_BYTES).await.map_err(|_| {
+        CoordinatorError(StatusCode::PAYLOAD_TOO_LARGE, "tenant IOC upload exceeds 64 MiB")
+    })?;
     let request: ReplaceRequest = serde_json::from_slice(&body)
         .map_err(|_| CoordinatorError(StatusCode::BAD_REQUEST, "invalid source replacement"))?;
     // NAN-3882: the coordinator runs in 256 MiB; never hold the raw body
@@ -355,7 +358,7 @@ async fn replace(
             "tenant or source identity differs from assignment",
         ));
     }
-    mutate(
+    mutate_locked(
         state,
         SourceUpdate::Replace {
             source_id: source.to_string(),
@@ -396,7 +399,15 @@ async fn mutate(
     update: SourceUpdate,
     operation: &'static str,
 ) -> Result<Json<Publication>, CoordinatorError> {
-    let _guard = state.writer.lock().await;
+    let _guard = state.writer.clone().lock_owned().await;
+    mutate_locked(state, update, operation).await
+}
+
+async fn mutate_locked(
+    state: LeanCoordinatorState,
+    update: SourceUpdate,
+    operation: &'static str,
+) -> Result<Json<Publication>, CoordinatorError> {
     let snapshots = LeanEnrichmentSnapshots::new(state.tenant_id, &*state.objects, &state.scratch)
         .map_err(|_| {
             CoordinatorError(
@@ -762,6 +773,84 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "farm-only RSS probe of chunked body + real coordinator replacement"]
+    async fn ioc_coordinator_memory_budget() {
+        fn kib(field: &str) -> u64 {
+            std::fs::read_to_string("/proc/self/status").unwrap().lines()
+                .find_map(|line| line.strip_prefix(field)).unwrap()
+                .split_whitespace().next().unwrap().parse().unwrap()
+        }
+        fn row(n: usize) -> IocSnapshotInput {
+            let prefix = format!("https://indicator.example.test/{n:08}/");
+            IocSnapshotInput {
+                ioc_value: format!("{prefix}{}", "\\".repeat(2048 - prefix.len())),
+                ioc_type: "url".into(), source_id: Uuid::from_u128(0x100 + (n / 8000) as u128).to_string(),
+                enrichment_name: "l".repeat(100), confidence_level: 75, risk_score: Some(75),
+                tags: (0..16).map(|n| format!("{n:02}{}", "\"".repeat(62))).collect(),
+                data: serde_json::json!({"note":"\"".repeat(512),"ioc_list":"l".repeat(100),
+                    "indicator_expires_at":"9999-12-31T23:59:59Z", "nano_marketplace":false,
+                    "nano_namespace":"00000000-0000-0000-0000-000000000100"}),
+                ..Default::default()
+            }
+        }
+        #[derive(Serialize)]
+        struct WireRequest { tenant_id: Uuid, records: Vec<IocSnapshotInput> }
+        let baseline = kib("VmRSS:");
+        let directory = tempfile::tempdir().unwrap();
+        let tenant = Uuid::from_u128(0x100);
+        let source = Uuid::from_u128(0x100);
+        let token = "ioc-memory-probe-only-token";
+        let objects: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(directory.path().join("r2")).unwrap());
+        let state = LeanCoordinatorState::new(tenant, auth_digest(token), objects.clone(), directory.path().join("scratch")).unwrap();
+        let total = nanosiem_core::ioc_limits::MAX_INDICATORS_PER_TENANT;
+        let count = nanosiem_core::ioc_limits::MAX_INDICATORS_PER_LIST;
+        let seed: Vec<_> = (0..total).map(row).collect();
+        LeanEnrichmentSnapshots::new(tenant, &*objects, &directory.path().join("seed")).unwrap()
+            .publish(&seed).await.unwrap();
+        drop(seed);
+        let seed_peak = kib("VmHWM:");
+        let records = (total..total + count).map(|n| {
+            let mut item = row(n); item.source_id = source.to_string(); item
+        }).collect();
+        let request = WireRequest { tenant_id: tenant, records };
+        let bytes = Bytes::from(serde_json::to_vec(&request).unwrap());
+        drop(request);
+        let input_bytes = bytes.len();
+        let chunks: Vec<_> = (0..bytes.len()).step_by(16 * 1024)
+            .map(|start| bytes.slice(start..(start + 16 * 1024).min(bytes.len()))).collect();
+        drop(bytes);
+        let body = Body::from_stream(futures::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)));
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap(),
+        )]);
+        let response = replace(State(state), Path(source), headers, body).await.unwrap();
+        assert_eq!(response.0.rows, total);
+        println!("IOC_COORDINATOR_MEMORY tenant_rows={total} replacement_rows={count} input_bytes={input_bytes} baseline_kib={baseline} seed_peak_kib={seed_peak} peak_kib={} final_rss_kib={}", kib("VmHWM:"), kib("VmRSS:"));
+    }
+
+    #[tokio::test]
+    async fn busy_writer_refuses_replacement_before_polling_the_body() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let token = "ioc-busy-writer-unit-test";
+        let objects: Arc<dyn ObjectStore> = Arc::new(LocalObjectStore::new(directory.path().join("r2")).unwrap());
+        let state = LeanCoordinatorState::new(Uuid::new_v4(), auth_digest(token), objects, directory.path().join("scratch")).unwrap();
+        let _writer = state.writer.clone().lock_owned().await;
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = reads.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from_static(b"invalid JSON must remain unread"))
+        }));
+        let headers = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap(),
+        )]);
+        let error = replace(State(state), Path(Uuid::new_v4()), headers, body).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn upload_cap_rejects_before_publication() {
         let directory = tempfile::tempdir().unwrap();
         let tenant = Uuid::new_v4();
@@ -780,7 +869,7 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         )]);
         let oversized = Bytes::from(vec![b' '; MAX_REQUEST_BYTES + 1]);
-        let error = replace(State(state), Path(Uuid::new_v4()), headers, oversized)
+        let error = replace(State(state), Path(Uuid::new_v4()), headers, Body::from(oversized))
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::PAYLOAD_TOO_LARGE);
@@ -829,7 +918,7 @@ mod tests {
                 State(state.clone()),
                 Path(Uuid::nil()),
                 HeaderMap::new(),
-                body(tenant)
+                Body::from(body(tenant))
             )
             .await
             .unwrap_err()
@@ -841,7 +930,7 @@ mod tests {
                 State(state.clone()),
                 Path(Uuid::nil()),
                 headers.clone(),
-                body(other)
+                Body::from(body(other))
             )
             .await
             .unwrap_err()
@@ -852,7 +941,7 @@ mod tests {
             State(state.clone()),
             Path(Uuid::nil()),
             headers.clone(),
-            body(tenant),
+            Body::from(body(tenant)),
         )
         .await
         .unwrap();

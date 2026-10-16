@@ -2088,6 +2088,48 @@ async fn nan3168_long_windows_are_deferred_between_their_rebuilds() {
     assert!(logs.contains("cpu_scope=\"process\" threads=1"), "{logs}");
 }
 
+/// NAN-3926: a real publication after an empty startup bypasses the long-window
+/// cadence once; the consumer immediately sees the first artifacts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn nan3926_empty_startup_publishes_first_artifacts_on_next_tick() {
+    let _serial = serial();
+    use super::super::product_publish::{write_manifest, Cycle, Manifest, Published, WindowEntry, WINDOWS};
+    use super::super::partials::{prevalence_explorer, PrevalenceExplorerRequest};
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let _fixture = engine_with_detail_fixture(root.path(), now, 1, true, false, false, true).await;
+    let product_dir = root.path().join("product");
+    std::fs::create_dir_all(product_dir.join("demand")).unwrap();
+    // The previous publication predates the fixture's artifact-bearing parts.
+    let mut startup = Manifest::new(TENANT);
+    for window in WINDOWS {
+        let (from_us, to_us) = super::super::partials::moving_bounds(window).unwrap();
+        startup.windows.insert(window.into(), WindowEntry { from_us, to_us,
+            window: None, history: None, log_head: None, built_at_us: now.timestamp_micros(),
+            artifact_rows: Some(0), warmup_complete: false });
+    }
+    write_manifest(&product_dir, &startup).unwrap();
+    let mut publisher = nan3168_publisher(root.path(), &product_dir).await;
+    assert_eq!(publisher.cycle().await, Cycle::Built);
+    let consumer = reopen_engine_at(root.path(), "query").await;
+    consumer.set_product_state(Published::consumer(product_dir)).unwrap();
+    for window in WINDOWS {
+        let entry = &publisher.manifest().windows[window];
+        assert!(entry.artifact_rows.unwrap() > 0, "{window} has first artifacts");
+        assert!(entry.warmup_complete, "{window} cannot bypass cadence again");
+        let request = PrevalenceExplorerRequest { request_id: "nan3926".into(), tenant_id: TENANT.into(),
+            window: window.into(), end: None, artifact_type: None, risk_level: None, first_seen_since: None,
+            search: None, limit: 50, offset: 0, cursor: None, rarity_threshold: Some(3), deny_source_types: vec![] };
+        let response = prevalence_explorer(&consumer, &request).await.unwrap();
+        assert!(response["result"]["total"].as_u64().unwrap() > 0);
+        assert_eq!(response["product_state"]["warming"], false);
+        let foreign = PrevalenceExplorerRequest { tenant_id: "00000000-0000-4000-8000-000000000002".into(), ..request };
+        assert!(prevalence_explorer(&consumer, &foreign).await.is_err());
+    }
+    assert_eq!(publisher.cycle().await, Cycle::Skipped);
+}
+
 // ---------------------------------------------------------------- NAN-3279
 
 /// A one-shot fold of `parts`' prevalence partials (the oracle every
