@@ -125,6 +125,24 @@ impl SearchTenantScope {
         }
     }
 
+    /// NAN-3894: the event-time cutoff for OTLP spans/metrics. They are kept
+    /// at least [`OTEL_MIN_RETENTION_DAYS`](crate::observability::slo_repository::OTEL_MIN_RETENTION_DAYS)
+    /// days (never less than the tenant's own retention), so the longest SLO
+    /// window stays readable. The irreversible floor still applies.
+    pub fn otel_event_time_cutoff(
+        self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        use crate::observability::slo_repository::OTEL_MIN_RETENTION_DAYS;
+        self.retention_identity().map(|(_, days, floor_micros)| {
+            let days = u32::from(days).max(OTEL_MIN_RETENTION_DAYS);
+            let rolling = now - chrono::Duration::days(i64::from(days));
+            let irreversible = chrono::DateTime::from_timestamp_micros(floor_micros)
+                .expect("validated enterprise-shared retention floor");
+            std::cmp::max(rolling, irreversible)
+        })
+    }
+
     /// Whether a cached result for `time_range` may be served to this tenant
     /// at `now` (NAN-2361 wave 6). A fixed-TTL cache entry can outlive the
     /// continuously moving retention cutoff, so a shared tenant is served
@@ -300,6 +318,33 @@ mod tests {
             SearchTenantScope::enterprise_shared_retained(Uuid::nil(), 1, 365, 0),
             Err(SearchTenantError::MissingTenant)
         );
+    }
+
+    /// NAN-3894: OTLP reads use a cutoff at least `OTEL_MIN_RETENTION_DAYS`
+    /// back, so a `SLO_WINDOW_DAYS_MAX` window plus the skew hour is never
+    /// clamped; a longer tenant retention and the irreversible floor still win.
+    #[test]
+    fn otel_cutoff_covers_the_longest_slo_window() {
+        use crate::observability::slo_repository::{OTEL_MIN_RETENTION_DAYS, SLO_WINDOW_DAYS_MAX};
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let scope = |days: u16, floor_micros: i64| SearchTenantScope::EnterpriseSharedRetained {
+            tenant_id: Uuid::from_u128(7),
+            retention_revision: 1,
+            retention_days: days,
+            irreversible_event_time_floor_micros: floor_micros,
+        };
+        let slo_start = now - chrono::Duration::days(i64::from(SLO_WINDOW_DAYS_MAX)) - chrono::Duration::hours(1);
+        let short = scope(30, 0);
+        assert!(short.event_time_cutoff(now).unwrap() > slo_start, "log retention alone would clamp it");
+        assert_eq!(
+            short.otel_event_time_cutoff(now),
+            Some(now - chrono::Duration::days(i64::from(OTEL_MIN_RETENTION_DAYS)))
+        );
+        assert!(short.otel_event_time_cutoff(now).unwrap() <= slo_start);
+        assert_eq!(scope(365, 0).otel_event_time_cutoff(now), scope(365, 0).event_time_cutoff(now));
+        let floor = now - chrono::Duration::days(3);
+        assert_eq!(scope(30, floor.timestamp_micros()).otel_event_time_cutoff(now), Some(floor));
+        assert_eq!(SearchTenantScope::Dedicated.otel_event_time_cutoff(now), None);
     }
 
     #[test]

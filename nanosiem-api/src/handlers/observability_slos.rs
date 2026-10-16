@@ -41,7 +41,7 @@ const SERVICE_MAX_LEN: usize = 200;
 // ~100% while the window still claims to cover them. We enforce ≤ 30 here in the
 // handler rather than in the shipped PG migration 209 CHECK (which still permits
 // ≤ 90 and must not be modified).
-const WINDOW_DAYS_MAX: i32 = 30;
+const WINDOW_DAYS_MAX: i32 = nanosiem_core::observability::slo_repository::SLO_WINDOW_DAYS_MAX;
 
 /// An SLO with its live attainment merged in. Flattens the stored
 /// [`SloDefinition`] and adds the computed fields.
@@ -168,30 +168,10 @@ async fn enrich(state: &AppState, def: SloDefinition) -> Result<Slo, ApiError> {
             ApiError::InternalError("Failed to compute SLO attainment".to_string())
         })?;
 
-    // Error budget: allowed failure fraction is (1 - target). Consumed is
-    // (1 - current). Remaining as a percentage of the allowed budget.
-    let allowed = (1.0 - def.target).max(f64::EPSILON);
-    let consumed = (1.0 - current).max(0.0);
-    let budget_remaining_pct = ((allowed - consumed) / allowed) * 100.0;
-    // Burn rate: consumed budget relative to the allowance (1.0 = exactly on
-    // track to exhaust by window end).
-    let burn_rate = consumed / allowed;
-
-    // O17 (NAN-1721): a zero-traffic window computes `current = 1.0` (no spans →
-    // nothing failed), which would otherwise read as a perfectly-met SLO. A
-    // hard-down service or a stopped collector produces exactly this, and the
-    // rolling window sliding past old errors makes the SLO *improve* while the
-    // service is dead. Surface `no_data` so the API does not report ok/attained;
-    // the FE renders it neutrally and the scheduler does not alert on it.
-    let status = if no_data {
-        "no_data"
-    } else if current < def.target {
-        "breaching"
-    } else if budget_remaining_pct < 25.0 {
-        "at_risk"
-    } else {
-        "ok"
-    };
+    let evaluation = nanosiem_core::observability::eval::slo_evaluation(def.target, current, no_data, false);
+    let budget_remaining_pct = evaluation.budget_remaining_pct;
+    let burn_rate = evaluation.burn_rate;
+    let status = evaluation.status;
 
     Ok(Slo {
         definition: def,

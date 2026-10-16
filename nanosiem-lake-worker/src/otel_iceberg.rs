@@ -418,28 +418,271 @@ impl OtelServicesSort {
     }
 }
 
+/// Per-series window over the whole query window (NAN-3886). A series is one
+/// attribute set + resource attribute set; cumulative points are differenced
+/// point-to-point inside it so interleaved series never difference against
+/// each other and deltas cross time-bucket boundaries.
+const METRIC_SERIES_WINDOW: &str = "OVER (PARTITION BY cityHash64(attributes_json, \
+    resource_attributes_json) ORDER BY timestamp ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)";
+
+/// Increase contributed by one gauge/sum row. Cumulative (temporality 2):
+/// first point of a series in the window contributes 0, a drop is a counter
+/// reset and contributes the new value (Prometheus semantics). Delta and
+/// gauge rows contribute their value as-is.
+const METRIC_VALUE_DELTA: &str = "if(aggregation_temporality = 2, if(nano_rn = 1, 0., \
+    if(value >= nano_prev_value, value - nano_prev_value, value)), value)";
+
+/// Observation-count increase of one histogram row (per-series delta for
+/// cumulative temporality, same reset rule as counters).
+fn hist_count_delta() -> String {
+    format!(
+        "toFloat64(if(aggregation_temporality = 2, if(nano_rn = 1, 0, \
+         if({METRIC_HIST_RESET}, m_count, m_count - nano_prev_count)), m_count))"
+    )
+}
+
+/// Observation-sum increase of one histogram row.
+fn hist_sum_delta() -> String {
+    format!(
+        "if(aggregation_temporality = 2, if(nano_rn = 1, 0., \
+         if({METRIC_HIST_RESET}, m_sum, m_sum - nano_prev_sum)), m_sum)"
+    )
+}
+
+/// Counter extrapolation range for time series: the bucket `[bucket, bucket+step)`.
+const METRIC_BUCKET_RANGE: (&str, &str) = (
+    "toUnixTimestamp64Micro(toDateTime64(bucket, 6, 'UTC')) / 1e6",
+    "toUnixTimestamp64Micro(toDateTime64(bucket, 6, 'UTC')) / 1e6 + {otel_step:UInt32}",
+);
+
+/// Counter extrapolation range for the scalar (monitor) plan: the request window.
+const METRIC_WINDOW_RANGE: (&str, &str) = (
+    "toUnixTimestamp64Micro(parseDateTime64BestEffort({otel_start:String}, 6, 'UTC')) / 1e6",
+    "toUnixTimestamp64Micro(parseDateTime64BestEffort({otel_end:String}, 6, 'UTC')) / 1e6",
+);
+
+/// Histogram reset: the observation count went down or the bucket layout changed.
+const METRIC_HIST_RESET: &str =
+    "(m_count < nano_prev_count OR length(bucket_counts) != length(nano_prev_buckets))";
+
 impl MetricAggregate {
-    fn sql(self) -> String {
-        const CUMULATIVE_DELTA: &str = "arraySum(arrayMap(d -> if(d > 0, d, 0), \
-            arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, \
-            groupArray((timestamp, value)))))))";
+    /// Whether the aggregate needs per-series previous-point columns.
+    fn needs_deltas(self) -> bool {
+        !matches!(self, Self::Min | Self::Max | Self::Count)
+    }
+
+    fn quantile(self) -> Option<&'static str> {
         match self {
-            Self::Avg => "avg(value)".to_string(),
-            Self::Sum => {
-                format!("if(max(aggregation_temporality) = 2, {CUMULATIVE_DELTA}, sum(value))")
-            }
-            Self::Min => "min(value)".to_string(),
-            Self::Max => "max(value)".to_string(),
-            Self::Count => "toFloat64(count())".to_string(),
-            Self::Rate => format!(
-                "if(max(aggregation_temporality) = 2, {CUMULATIVE_DELTA}, sum(value)) / \
-                 greatest(dateDiff('second', min(timestamp), max(timestamp)), 1)"
-            ),
-            Self::P50 => "quantileTDigest(0.50)(value)".to_string(),
-            Self::P95 => "quantileTDigest(0.95)(value)".to_string(),
-            Self::P99 => "quantileTDigest(0.99)(value)".to_string(),
+            Self::P50 => Some("0.50"),
+            Self::P95 => Some("0.95"),
+            Self::P99 => Some("0.99"),
+            _ => None,
         }
     }
+
+    /// Aggregate columns computed per (series_key[, bucket]) group over the
+    /// per-row subquery built by [`metric_aggregate_query`].
+    fn group_columns(self) -> String {
+        let (hist_count_delta, hist_sum_delta) = (hist_count_delta(), hist_sum_delta());
+        let hist = "max(metric_type = 'histogram') AS nano_is_hist";
+        match self {
+            Self::Avg => format!(
+                "{hist}, avg(value) AS nano_g, sumIf({hist_count_delta}, metric_type = \
+                 'histogram') AS nano_hcount, sumIf({hist_sum_delta}, metric_type = \
+                 'histogram') AS nano_hsum"
+            ),
+            // Counter aggregates read the per-series rows built by
+            // `metric_series_increase_query`, not raw data points.
+            Self::Sum | Self::Rate => "max(nano_s_is_hist) AS nano_is_hist, sum(nano_sinc) AS \
+                 nano_inc, count(nano_sinc) AS nano_contrib, sum(nano_s_hsum) AS nano_hsum, \
+                 sum(nano_s_hcount) AS nano_hcount"
+                .to_string(),
+            Self::Min => "min(value) AS nano_g".to_string(),
+            Self::Max => "max(value) AS nano_g".to_string(),
+            Self::Count => "toFloat64(count()) AS nano_g".to_string(),
+            Self::P50 | Self::P95 | Self::P99 => {
+                let q = self.quantile().unwrap_or("0.50");
+                // Bucket upper bounds with +Inf for the overflow bucket; rows
+                // whose layout is malformed contribute nothing.
+                let valid = "metric_type = 'histogram' AND length(bucket_counts) = \
+                             length(explicit_bounds) + 1";
+                let keys = format!(
+                    "if({valid}, arrayConcat(explicit_bounds, [inf]), emptyArrayFloat64())"
+                );
+                let deltas = format!(
+                    "if({valid}, if(aggregation_temporality = 2, if(nano_rn = 1, \
+                     arrayMap(c -> 0., bucket_counts), if({METRIC_HIST_RESET}, \
+                     arrayMap(c -> toFloat64(c), bucket_counts), arrayMap((c, i) -> \
+                     toFloat64(greatest(c - nano_prev_buckets[i], 0)), bucket_counts, \
+                     arrayEnumerate(bucket_counts)))), arrayMap(c -> toFloat64(c), \
+                     bucket_counts)), emptyArrayFloat64())"
+                );
+                // sumMap drops zero-sum keys, so the full bound set is kept
+                // separately to preserve each bucket's lower bound.
+                format!(
+                    "{hist}, quantileTDigest({q})(value) AS nano_g, sumMap({keys}, {deltas}) \
+                     AS nano_hmap, arraySort(groupUniqArrayArray({keys})) AS nano_hkeys"
+                )
+            }
+        }
+    }
+
+    /// Final value expression over the group columns. `rate_seconds` is the
+    /// rate denominator: the step for time series, the window for scalars.
+    fn value_expr(self, rate_seconds: &str) -> String {
+        match self {
+            Self::Avg => "if(nano_is_hist, if(nano_hcount > 0, nano_hsum / nano_hcount, NULL), \
+                          nano_g)"
+                .to_string(),
+            // No series with >= 2 samples (counters) => no data, not 0.
+            Self::Sum => {
+                "if(nano_is_hist, nano_hsum, if(nano_contrib > 0, nano_inc, NULL))".to_string()
+            }
+            Self::Rate => format!(
+                "if(nano_is_hist, nano_hcount, if(nano_contrib > 0, nano_inc, NULL)) / \
+                 {rate_seconds}"
+            ),
+            Self::Min | Self::Max | Self::Count => "nano_g".to_string(),
+            Self::P50 | Self::P95 | Self::P99 => {
+                let q = self.quantile().unwrap_or("0.50");
+                // Merged bucket counts aligned to every bound seen, cumulative
+                // counts, target rank, and the first bucket reaching it. Linear
+                // interpolation inside that bucket; the first bucket's lower
+                // bound is min(bound, 0); the +Inf bucket returns its lower bound.
+                format!(
+                    "if(nano_is_hist, if((arraySum(arrayMap(k -> (nano_hmap.2)[indexOf(\
+                     nano_hmap.1, k)], nano_hkeys) AS nano_hc) AS nano_htot) > 0, \
+                     (if((arrayFirstIndex(c -> c >= {q} * nano_htot, arrayCumSum(nano_hc) \
+                     AS nano_hcum) AS nano_hi) = 1, least(nano_hkeys[1], 0.), \
+                     nano_hkeys[nano_hi - 1]) AS nano_hlo) + if(isInfinite(nano_hkeys[nano_hi]), \
+                     0., (nano_hkeys[nano_hi] - nano_hlo) * ({q} * nano_htot - \
+                     (nano_hcum[nano_hi] - nano_hc[nano_hi])) / nano_hc[nano_hi]), NULL), nano_g)"
+                )
+            }
+        }
+    }
+}
+
+/// Prometheus `extrapolatedRate` over one series' samples in one range
+/// (NAN-3886). Inputs are the per-series columns of
+/// [`metric_series_increase_query`]; `range_start`/`range_end` are Float64
+/// unix seconds. The raw first->last increase (resets handled) is extended to
+/// each range edge when the gap is under 1.1x the average sample interval,
+/// otherwise by half that interval; the start extension never goes below a
+/// zero counter value. Fewer than 2 samples => NULL (contributes nothing).
+fn metric_extrapolated_increase(range_start: &str, range_end: &str) -> String {
+    format!(
+        "if(nano_s_n >= 2 AND nano_s_last_ts > nano_s_first_ts, nano_s_inc * \
+         (((nano_s_last_ts - nano_s_first_ts) AS nano_x_sampled) \
+         + if((if(nano_s_inc > 0 AND nano_s_first_value >= 0, least(nano_s_first_ts - \
+         ({range_start}), nano_x_sampled * nano_s_first_value / nano_s_inc), \
+         nano_s_first_ts - ({range_start})) AS nano_x_to_start) < 1.1 * \
+         ((nano_x_sampled / (nano_s_n - 1)) AS nano_x_avg), nano_x_to_start, nano_x_avg / 2) \
+         + if(((({range_end}) - nano_s_last_ts) AS nano_x_to_end) < 1.1 * nano_x_avg, \
+         nano_x_to_end, nano_x_avg / 2)) / nano_x_sampled, NULL)"
+    )
+}
+
+/// Per-series (and per-bucket) increase rows for `sum`/`rate`. One row per
+/// (series identity, series_key[, bucket]) carrying the raw increase, sample
+/// count, first/last sample and histogram count/sum deltas, then the
+/// extrapolated increase `nano_sinc` (cumulative non-histogram series) or the
+/// plain summed value (delta temporality / gauges).
+///
+/// Time-series range choice: each bucket is the range `[bucket, bucket+step)`
+/// and the series' previous sample (possibly in an earlier bucket) is the
+/// left anchor, so a counter with one point per bucket still has 2 samples
+/// and the start edge is interpolated (negative start gap) instead of lost.
+/// The scalar plan's range is the requested `[start, end)` with no anchor.
+/// Samples are counted by distinct timestamp, so a duplicated (retried) point
+/// neither shrinks the average interval nor adds increase (its delta is 0).
+fn metric_series_increase_query(pts: &str, bucketed: bool, range: (&str, &str)) -> String {
+    let (hist_count_delta, hist_sum_delta) = (hist_count_delta(), hist_sum_delta());
+    let bucket = if bucketed { ", bucket" } else { "" };
+    format!(
+        "SELECT series_key{bucket}, nano_s_is_hist, nano_s_hsum, nano_s_hcount, nano_s_rows, \
+         if(nano_s_cum, {}, nano_s_inc) AS nano_sinc FROM (\
+         SELECT nano_sid, series_key{bucket}, max(metric_type = 'histogram') AS nano_s_is_hist, \
+         min(aggregation_temporality = 2) AND NOT nano_s_is_hist AS nano_s_cum, \
+         sum({METRIC_VALUE_DELTA}) AS nano_s_inc, \
+         sumIf({hist_sum_delta}, metric_type = 'histogram') AS nano_s_hsum, \
+         sumIf({hist_count_delta}, metric_type = 'histogram') AS nano_s_hcount, \
+         count() AS nano_s_rows, min(nano_rn) > 1 AS nano_s_anchored, \
+         uniqExact(timestamp) + nano_s_anchored AS nano_s_n, \
+         toUnixTimestamp64Micro(if(nano_s_anchored, argMin(nano_prev_ts, nano_rn), \
+         min(timestamp))) / 1e6 AS nano_s_first_ts, \
+         if(nano_s_anchored, argMin(nano_prev_value, nano_rn), argMin(value, nano_rn)) \
+         AS nano_s_first_value, toUnixTimestamp64Micro(max(timestamp)) / 1e6 AS nano_s_last_ts \
+         FROM ({pts}) GROUP BY nano_sid, series_key{bucket})",
+        metric_extrapolated_increase(range.0, range.1),
+    )
+}
+
+/// Build the metric aggregate core shared by the time-series and scalar
+/// plans. Output columns: `series_key`, optional `bucket`, `v`, `row_count`
+/// (raw data-point rows in the group). `count` keeps meaning data-point rows
+/// for every metric type; histogram avg/p*/sum/rate read count/sum/buckets.
+/// `range` is the counter extrapolation range as Float64 unix-second SQL
+/// expressions (per bucket for time series, the window for scalars).
+fn metric_aggregate_query(
+    source: &str,
+    predicates: &str,
+    series_select: Option<&str>,
+    bucketed: bool,
+    aggregate: MetricAggregate,
+    rate_seconds: &str,
+    range: (&str, &str),
+) -> String {
+    let window_columns = if aggregate.needs_deltas() {
+        format!(
+            ", row_number() {METRIC_SERIES_WINDOW} AS nano_rn, \
+             lagInFrame(value) {METRIC_SERIES_WINDOW} AS nano_prev_value, \
+             lagInFrame(timestamp) {METRIC_SERIES_WINDOW} AS nano_prev_ts, \
+             lagInFrame(count) {METRIC_SERIES_WINDOW} AS nano_prev_count, \
+             lagInFrame(sum) {METRIC_SERIES_WINDOW} AS nano_prev_sum, \
+             lagInFrame(bucket_counts) {METRIC_SERIES_WINDOW} AS nano_prev_buckets"
+        )
+    } else {
+        String::new()
+    };
+    let series_row = series_select.unwrap_or("''");
+    let bucket_row = if bucketed {
+        ", toStartOfInterval(timestamp, toIntervalSecond({otel_step:UInt32})) AS bucket"
+    } else {
+        ""
+    };
+    let (series_group, bucket_group, group_clause) = match (series_select.is_some(), bucketed) {
+        (true, true) => ("series_key", ", bucket", " GROUP BY series_key, bucket"),
+        (true, false) => ("series_key", "", " GROUP BY series_key"),
+        (false, true) => ("''", ", bucket", " GROUP BY bucket"),
+        (false, false) => ("''", "", ""),
+    };
+    let pts = format!(
+        "SELECT {series_row} AS series_key{bucket_row}, \
+         cityHash64(attributes_json, resource_attributes_json) AS nano_sid, timestamp, \
+         metric_type, aggregation_temporality, value, count AS m_count, sum AS m_sum, \
+         bucket_counts, explicit_bounds{window_columns} \
+         FROM {source} AS metrics WHERE tenant_uid = {{otel_tenant_id:String}} \
+         AND metric_name = {{otel_metric_name:String}} \
+         AND metrics.timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
+         AND metrics.timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC')\
+         {predicates}"
+    );
+    let (rows, row_count) = if matches!(aggregate, MetricAggregate::Sum | MetricAggregate::Rate) {
+        (
+            metric_series_increase_query(&pts, bucketed, range),
+            "sum(nano_s_rows)",
+        )
+    } else {
+        (pts, "count()")
+    };
+    format!(
+        "SELECT series_key{bucket_group}, {} AS v, row_count FROM (\
+         SELECT {series_group} AS series_key{bucket_group}, {}, {row_count} AS row_count \
+         FROM ({rows}){group_clause})",
+        aggregate.value_expr(rate_seconds),
+        aggregate.group_columns(),
+    )
 }
 
 /// Normalize one Vector OTLP lane row into the fixed native Iceberg contract.
@@ -1395,16 +1638,19 @@ pub fn plan_metric_timeseries(
     } else {
         ""
     };
+    let core = metric_aggregate_query(
+        &source,
+        service_filter,
+        None,
+        true,
+        aggregate,
+        "toFloat64({otel_step:UInt32})",
+        METRIC_BUCKET_RANGE,
+    );
     let sql = format!(
-        "SELECT toStartOfInterval(timestamp, toIntervalSecond({{otel_step:UInt32}})) AS t, \
-         {} AS v FROM {source} WHERE tenant_uid = {{otel_tenant_id:String}} \
-         AND metric_name = {{otel_metric_name:String}}{service_filter} \
-         AND timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
-         AND timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC') \
-         GROUP BY t ORDER BY t ASC SETTINGS max_threads={}, max_execution_time={}, \
-         max_bytes_to_read={}, max_memory_usage={}, max_result_rows=100000, \
-         result_overflow_mode='throw'",
-        aggregate.sql(),
+        "SELECT bucket AS t, v FROM ({core}) ORDER BY t ASC SETTINGS max_threads={}, \
+         max_execution_time={}, max_bytes_to_read={}, max_memory_usage={}, \
+         max_result_rows=100000, result_overflow_mode='throw'",
         table.threads,
         table.max_execution_seconds,
         table.max_query_bytes,
@@ -1464,23 +1710,23 @@ pub fn plan_metric_timeseries_v2(
             json_tag_lookup(&key_name)
         ));
     }
-    let (series_select, group_clause) = if let Some(group_by) = group_by {
+    let series_select = group_by.map(|group_by| {
         params.push(("otel_group_key".to_string(), group_by.to_string()));
-        (json_tag_lookup("otel_group_key"), "series_key, bucket")
-    } else {
-        ("''".to_string(), "bucket")
-    };
+        json_tag_lookup("otel_group_key")
+    });
+    let core = metric_aggregate_query(
+        &source,
+        &predicates,
+        series_select.as_deref(),
+        true,
+        aggregate,
+        "toFloat64({otel_step:UInt32})",
+        METRIC_BUCKET_RANGE,
+    );
     let sql = format!(
-        "SELECT {series_select} AS series_key, \
-         toStartOfInterval(timestamp, toIntervalSecond({{otel_step:UInt32}})) AS bucket, \
-         {} AS v FROM {source} AS metrics WHERE tenant_uid = {{otel_tenant_id:String}} \
-         AND metric_name = {{otel_metric_name:String}} \
-         AND metrics.timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
-         AND metrics.timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC') \
-         {predicates} GROUP BY {group_clause} ORDER BY series_key ASC, bucket ASC \
+        "SELECT series_key, bucket, v FROM ({core}) ORDER BY series_key ASC, bucket ASC \
          LIMIT 200001 SETTINGS max_threads={}, max_execution_time={}, max_bytes_to_read={}, \
          max_memory_usage={}, max_result_rows=200001, result_overflow_mode='throw'",
-        aggregate.sql(),
         table.threads,
         table.max_execution_seconds,
         table.max_query_bytes,
@@ -1540,22 +1786,27 @@ pub fn plan_metric_scalar_v2(
             json_tag_lookup(&key_name)
         ));
     }
-    let (series_select, group_clause) = if let Some(group_by) = group_by {
+    let series_select = group_by.map(|group_by| {
         params.push(("otel_group_key".to_string(), group_by.to_string()));
-        (json_tag_lookup("otel_group_key"), " GROUP BY series_key")
-    } else {
-        ("''".to_string(), "")
-    };
+        json_tag_lookup("otel_group_key")
+    });
+    // Monitor rate = increase over the whole requested window, per second.
+    let window_seconds = ((end - start).num_microseconds().unwrap_or(i64::MAX) as f64 / 1e6)
+        .max(1e-6);
+    params.push(("otel_window_seconds".to_string(), window_seconds.to_string()));
+    let core = metric_aggregate_query(
+        &source,
+        &predicates,
+        series_select.as_deref(),
+        false,
+        aggregate,
+        "{otel_window_seconds:Float64}",
+        METRIC_WINDOW_RANGE,
+    );
     let sql = format!(
-        "SELECT {series_select} AS series_key, {} AS v, count() AS row_count \
-         FROM {source} AS metrics WHERE tenant_uid = {{otel_tenant_id:String}} \
-         AND metric_name = {{otel_metric_name:String}} \
-         AND metrics.timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
-         AND metrics.timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC') \
-         {predicates}{group_clause} ORDER BY series_key ASC LIMIT 10001 \
+        "SELECT series_key, v, row_count FROM ({core}) ORDER BY series_key ASC LIMIT 10001 \
          SETTINGS max_threads={}, max_execution_time={}, max_bytes_to_read={}, \
          max_memory_usage={}, max_result_rows=10001, result_overflow_mode='throw'",
-        aggregate.sql(),
         table.threads,
         table.max_execution_seconds,
         table.max_query_bytes,
@@ -2670,7 +2921,8 @@ mod tests {
             }],
         )
         .unwrap();
-        assert!(plan.sql.contains("max(aggregation_temporality) = 2"));
+        assert!(plan.sql.contains("PARTITION BY cityHash64(attributes_json"));
+        assert!(plan.sql.contains("/ toFloat64({otel_step:UInt32})"));
         assert!(plan.sql.contains("{otel_group_key:String}"));
         assert!(plan.sql.contains("{otel_filter_value_0:String}"));
         assert!(!plan.sql.contains("OR 1=1"));
@@ -2705,6 +2957,140 @@ mod tests {
         assert!(plan.sql.contains("LIMIT 10001"));
         assert!(plan.sql.contains("{otel_filter_value_0:String}"));
         assert!(!plan.sql.contains("OR 1=1"));
+    }
+
+    fn metric_window() -> (DateTime<Utc>, DateTime<Utc>) {
+        let start = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        (start, start + chrono::Duration::hours(1))
+    }
+
+    /// NAN-3886: cumulative deltas are taken per series over the whole query
+    /// window (never across interleaved series, never reset per bucket), and
+    /// rate divides by the step, not by the in-bucket point spread.
+    #[test]
+    fn metric_cumulative_deltas_are_per_series_and_rate_uses_step() {
+        let (start, end) = metric_window();
+        for aggregate in [MetricAggregate::Sum, MetricAggregate::Rate] {
+            let plan = plan_metric_timeseries_v2(
+                &table(), "tenant-a", "http.requests", None, start, end, 60, aggregate, None, &[],
+            )
+            .unwrap();
+            let sql = &plan.sql;
+            assert!(sql.contains(
+                "PARTITION BY cityHash64(attributes_json, resource_attributes_json) ORDER BY \
+                 timestamp ASC"
+            ));
+            assert!(sql.contains("lagInFrame(value)"));
+            assert!(sql.contains("if(value >= nano_prev_value, value - nano_prev_value, value)"));
+            assert!(!sql.contains("groupArray"));
+            assert!(!sql.contains("dateDiff"));
+            // Deltas are computed before bucketing: the window is in the
+            // per-row subquery, the GROUP BY one level up.
+            let window = sql.find("OVER (PARTITION BY").unwrap();
+            let group = sql.find("GROUP BY bucket").unwrap();
+            assert!(window < group);
+        }
+        let rate = plan_metric_timeseries_v2(
+            &table(), "tenant-a", "http.requests", None, start, end, 60, MetricAggregate::Rate,
+            None, &[],
+        )
+        .unwrap();
+        assert!(rate.sql.contains(
+            "if(nano_is_hist, nano_hcount, if(nano_contrib > 0, nano_inc, NULL)) / \
+             toFloat64({otel_step:UInt32})"
+        ));
+    }
+
+    /// NAN-3886 follow-up: counter sum/rate use Prometheus `extrapolatedRate`
+    /// per series — >= 2 samples, 1.1x average-interval edge threshold, zero
+    /// clamp at the start edge — over the bucket (time series, previous sample
+    /// as left anchor) or the requested window (scalar).
+    #[test]
+    fn metric_counter_increase_is_extrapolated_per_series_like_prometheus() {
+        let (start, end) = metric_window();
+        let scalar = plan_metric_scalar_v2(
+            &table(), "tenant-a", "http.requests", None, start, end, MetricAggregate::Rate, None,
+            &[],
+        )
+        .unwrap();
+        let sql = &scalar.sql;
+        assert!(sql.contains("if(nano_s_n >= 2 AND nano_s_last_ts > nano_s_first_ts"));
+        assert!(sql.contains("< 1.1 * ((nano_x_sampled / (nano_s_n - 1)) AS nano_x_avg)"));
+        assert!(sql.contains("nano_x_sampled * nano_s_first_value / nano_s_inc"));
+        assert!(sql.contains("GROUP BY nano_sid, series_key)"));
+        assert!(sql.contains(
+            "toUnixTimestamp64Micro(parseDateTime64BestEffort({otel_start:String}, 6, 'UTC'))"
+        ));
+        assert!(sql.contains("sum(nano_s_rows) AS row_count"));
+        let series = plan_metric_timeseries_v2(
+            &table(), "tenant-a", "http.requests", None, start, end, 60, MetricAggregate::Sum,
+            Some("http.route"), &[],
+        )
+        .unwrap();
+        assert!(series.sql.contains("GROUP BY nano_sid, series_key, bucket)"));
+        assert!(series.sql.contains("min(nano_rn) > 1 AS nano_s_anchored"));
+        assert!(series.sql.contains("uniqExact(timestamp) + nano_s_anchored AS nano_s_n"));
+        assert!(series.sql.contains(
+            "toUnixTimestamp64Micro(toDateTime64(bucket, 6, 'UTC')) / 1e6 + {otel_step:UInt32}"
+        ));
+        assert!(series.sql.contains("if(nano_contrib > 0, nano_inc, NULL)"));
+        // Non-counter aggregates keep reading raw rows.
+        let avg = plan_metric_scalar_v2(
+            &table(), "tenant-a", "http.requests", None, start, end, MetricAggregate::Avg, None,
+            &[],
+        )
+        .unwrap();
+        assert!(!avg.sql.contains("nano_s_n"));
+        assert!(avg.sql.contains("count() AS row_count"));
+    }
+
+    #[test]
+    fn metric_scalar_rate_divides_by_the_requested_window() {
+        let (start, end) = metric_window();
+        let plan = plan_metric_scalar_v2(
+            &table(), "tenant-a", "http.requests", None, start, end, MetricAggregate::Rate, None,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.sql.contains("/ {otel_window_seconds:Float64}"));
+        assert!(plan
+            .params
+            .iter()
+            .any(|(name, value)| name == "otel_window_seconds" && value == "3600"));
+        assert!(plan.sql.contains("sum(nano_s_rows) AS row_count"));
+        assert!(!plan.sql.contains("GROUP BY series_key)"));
+    }
+
+    #[test]
+    fn metric_histogram_aggregates_read_counts_sums_and_buckets() {
+        let (start, end) = metric_window();
+        let p95 = plan_metric_scalar_v2(
+            &table(), "tenant-a", "http.duration", None, start, end, MetricAggregate::P95, None,
+            &[],
+        )
+        .unwrap();
+        assert!(p95.sql.contains("sumMap("));
+        assert!(p95.sql.contains("arrayConcat(explicit_bounds, [inf])"));
+        assert!(p95.sql.contains("lagInFrame(bucket_counts)"));
+        assert!(p95.sql.contains("arrayFirstIndex(c -> c >= 0.95 * nano_htot"));
+        assert!(p95.sql.contains("quantileTDigest(0.95)(value)"));
+        let avg = plan_metric_timeseries_v2(
+            &table(), "tenant-a", "http.duration", None, start, end, 60, MetricAggregate::Avg,
+            None, &[],
+        )
+        .unwrap();
+        assert!(avg.sql.contains("nano_hsum / nano_hcount"));
+        assert!(avg.sql.contains("avg(value) AS nano_g"));
+        // count keeps meaning data-point rows and needs no per-series window.
+        let count = plan_metric_timeseries_v2(
+            &table(), "tenant-a", "http.duration", None, start, end, 60, MetricAggregate::Count,
+            None, &[],
+        )
+        .unwrap();
+        assert!(count.sql.contains("toFloat64(count()) AS nano_g"));
+        assert!(!count.sql.contains("OVER ("));
     }
 
     #[test]

@@ -66,6 +66,9 @@ struct SloComputeRequest<'a> {
 struct SloComputeResponse {
     total: i64,
     good: i64,
+    /// Missing on hot-tail-only readers: absence must never prove coverage.
+    #[serde(default)]
+    complete_window: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +120,47 @@ pub(crate) enum OtelNplQueryError {
 }
 
 impl OtelLakeEvaluator {
+    pub(crate) fn from_shared_assignment(
+        assignment: &crate::search::SharedLakeOtelIngestAssignment,
+    ) -> Result<Self, String> {
+        let base_url = Url::parse(&assignment.internal_endpoint)
+            .map_err(|error| error.to_string())?;
+        if !matches!(base_url.scheme(), "http" | "https")
+            || base_url.cannot_be_a_base()
+            || base_url.username() != ""
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+            || base_url.path() != "/"
+        {
+            return Err(String::from(
+                "shared OTLP ingest endpoint must be an http(s) origin without credentials, path, query, or fragment".to_string(),
+            ));
+        }
+        let token = std::fs::read_to_string(&assignment.credential_file)
+            .map_err(|error| error.to_string())?;
+        let token = token.trim_end_matches(['\r', '\n']).to_string();
+        if token.len() < 32 || token.len() > 4_096 || token.chars().any(char::is_control) {
+            return Err(String::from(
+                "shared OTLP ingest token must be 32-4096 non-control characters".to_string(),
+            ));
+        }
+        if !(1..=3_600).contains(&assignment.timeout_secs) {
+            return Err(String::from(
+                "shared OTLP ingest timeout must be between 1 and 3600".to_string(),
+            ));
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(assignment.timeout_secs))
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            base_url,
+            token,
+            http,
+        })
+    }
+
     pub(crate) fn from_env() -> Result<Option<Self>, String> {
 
         // Native telemetry shadowing is not implemented: Vector keeps spans
@@ -300,6 +344,17 @@ impl OtelLakeEvaluator {
         latency_threshold_ms: Option<f64>,
         time_range: &TimeRange,
     ) -> Result<(f64, i64, bool), String> {
+        let (current, total, no_data, _) = self.slo_compute_with_coverage(service, kind, latency_threshold_ms, time_range).await?;
+        Ok((current, total, no_data))
+    }
+
+    pub(crate) async fn slo_compute_with_coverage(
+        &self,
+        service: &str,
+        kind: SliKind,
+        latency_threshold_ms: Option<f64>,
+        time_range: &TimeRange,
+    ) -> Result<(f64, i64, bool, bool), String> {
         let mut url = self.base_url.clone();
         url.set_path("v1/otel/slos/compute");
         let response = self
@@ -335,7 +390,10 @@ impl OtelLakeEvaluator {
         } else {
             result.good as f64 / result.total as f64
         };
-        Ok((current, result.total, no_data))
+        if result.total < 0 || result.good < 0 || result.good > result.total {
+            return Err("invalid SLO count response".into());
+        }
+        Ok((current, result.total, no_data, result.complete_window))
     }
 
     pub(crate) async fn synthetic_summary(
@@ -457,4 +515,49 @@ mod tests {
         assert_eq!(metric_aggregate_name(MetricAgg::Rate), "rate");
         assert_eq!(metric_aggregate_name(MetricAgg::P99), "p99");
     }
+}
+
+#[cfg(test)]
+mod shared_evaluator_tests {
+    use super::*;
+    use crate::search::SharedLakeOtelIngestAssignment;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path, header}};
+
+    #[tokio::test]
+    async fn shared_metric_no_data_stays_absent_and_rotation_requires_fresh_client() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("query-token");
+        std::fs::write(&token, "a".repeat(48)).unwrap();
+        let assignment = SharedLakeOtelIngestAssignment { internal_endpoint:server.uri(), credential_file:token.clone(), timeout_secs:5 };
+        let old = OtelLakeEvaluator::from_shared_assignment(&assignment).unwrap();
+        Mock::given(method("POST")).and(path("/v1/otel/metrics/scalar"))
+            .and(header("authorization", format!("Bearer {}", "a".repeat(48))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"series":[{"key":"host-a","value":null,"row_count":0}]})))
+            .mount(&server).await;
+        let now = chrono::Utc::now();
+        let range = TimeRange::new(now-chrono::Duration::minutes(1),now);
+        let query = MetricQuery { metric_name:"test.gauge",service_name:None,agg:MetricAgg::Avg,group_by:None,filters:&[],step_secs:60 };
+        assert_eq!(old.metric_scalar(&query,&range).await.unwrap(),vec![("host-a".into(),None)]);
+        server.reset().await;
+        Mock::given(method("POST")).and(path("/v1/otel/metrics/scalar"))
+            .and(header("authorization", format!("Bearer {}", "a".repeat(48))))
+            .respond_with(ResponseTemplate::new(401)).mount(&server).await;
+        Mock::given(method("POST")).and(path("/v1/otel/metrics/scalar"))
+            .and(header("authorization", format!("Bearer {}", "b".repeat(48))))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"series":[]})))
+            .mount(&server).await;
+        std::fs::write(&token,"b".repeat(48)).unwrap();
+        assert!(old.metric_scalar(&query,&range).await.is_err());
+        let fresh = OtelLakeEvaluator::from_shared_assignment(&assignment).unwrap();
+        assert!(fresh.metric_scalar(&query,&range).await.unwrap().is_empty());
+    }
+    #[test]
+    fn slo_coverage_must_be_explicit_and_never_defaults_true() {
+        let legacy: SloComputeResponse = serde_json::from_value(serde_json::json!({"total":100,"good":99})).unwrap();
+        assert!(!legacy.complete_window);
+        let attested: SloComputeResponse = serde_json::from_value(serde_json::json!({"total":100,"good":99,"complete_window":true})).unwrap();
+        assert!(attested.complete_window);
+    }
+
 }

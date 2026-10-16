@@ -36,6 +36,7 @@ const STATUS_TONE: Record<SloStatusExt, { dot: string; text: string; border: str
   ok: { dot: 'bg-good', text: 'text-good', border: 'border-border', bg: 'bg-good/10', label: 'Healthy' },
   at_risk: { dot: 'bg-warn', text: 'text-warn', border: 'border-warn/30', bg: 'bg-warn/10', label: 'Burning' },
   breaching: { dot: 'bg-danger', text: 'text-danger', border: 'border-danger/30', bg: 'bg-danger/10', label: 'Breaching' },
+  partial: { dot: 'bg-border-2', text: 'text-fg-4', border: 'border-border', bg: 'bg-foreground/5', label: 'Partial' },
   no_data: { dot: 'bg-border-2', text: 'text-fg-4', border: 'border-border', bg: 'bg-foreground/5', label: 'No data' },
 };
 
@@ -103,12 +104,12 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
 
   // Sort by budget consumed (most consumed first), matching the design.
   const sorted = [...slos].sort(
-    (a, b) => a.budget_remaining_pct - b.budget_remaining_pct,
+    (a, b) => (a.budget_remaining_pct ?? Infinity) - (b.budget_remaining_pct ?? Infinity),
   );
   // A no-data SLO is neither healthy nor "burning" — exclude it from the count.
   const burning = slos.filter((s) => {
     const st = s.status as SloStatusExt;
-    return st !== 'ok' && st !== 'no_data';
+    return st === 'at_risk' || st === 'breaching';
   }).length;
 
   return (
@@ -158,13 +159,15 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
             const tone = STATUS_TONE[s.status];
             // O17: a no-data SLO has no meaningful budget/burn — render the
             // figures neutral ("–") instead of a fabricated 100% / 0% consumed.
-            const noData = (s.status as SloStatusExt) === 'no_data';
+            const noData = s.status === 'no_data' || s.status === 'partial' || s.current == null || s.budget_remaining_pct == null || s.burn_rate == null;
+            const budget = s.budget_remaining_pct ?? 0;
+            const burn = s.burn_rate ?? 0;
             // budget_remaining_pct: 100 = full budget, can go negative.
-            const consumedPct = 100 - s.budget_remaining_pct;
-            const remaining = Math.max(0, s.budget_remaining_pct);
+            const consumedPct = 100 - budget;
+            const remaining = Math.max(0, budget);
             const targetPct = s.target * 100;
-            const currentPct = s.current * 100;
-            const metPlan = s.current >= s.target;
+            const currentPct = (s.current ?? 0) * 100;
+            const metPlan = s.current != null && s.current >= s.target;
             return (
               <div
                 key={s.id}
@@ -225,22 +228,22 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
                     cls={
                       noData
                         ? 'text-fg-4'
-                        : s.budget_remaining_pct <= 0
+                        : budget <= 0
                           ? 'text-danger'
-                          : s.budget_remaining_pct < 25
+                          : budget < 25
                             ? 'text-warn'
                             : 'text-fg'
                     }
                   />
                   <Metric
                     label="burn rate"
-                    value={noData ? '–' : `${s.burn_rate.toFixed(1)}×`}
+                    value={noData ? '–' : `${burn.toFixed(1)}×`}
                     cls={
                       noData
                         ? 'text-fg-4'
-                        : s.burn_rate >= 5
+                        : burn >= 5
                           ? 'text-danger'
-                          : s.burn_rate >= 2
+                          : burn >= 2
                             ? 'text-warn'
                             : 'text-fg-2'
                     }

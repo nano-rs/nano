@@ -4547,32 +4547,42 @@ impl SearchService {
         scope: &ScopeSet,
         authority: Option<&crate::search::DurableSearchJobAuthority>,
     ) -> Option<super::jobs::SearchJob> {
-        use crate::search::settled_reuse;
-        let canonical = self.durable_plain_search_canonical(request, chrono::Utc::now())?;
-        let control = self.job_control();
-        let summaries = match control.list_for_user_checked(user_id).await {
-            Ok(summaries) => summaries,
-            Err(error) => {
-                tracing::debug!(%error, "in-flight search attach: job list unavailable; running the search");
+        use crate::search::{in_flight_jobs::InFlightJobs, settled_reuse};
+        crate::request_timing::timed(crate::request_timing::Phase::Attach, async {
+            // NAN-3920: only the jobs this process started for this caller
+            // over this exact window are candidates. Listing every job the
+            // caller ever ran cost ~2 s on every search.
+            let jobs = InFlightJobs::global();
+            let candidates = jobs.candidates(user_id, request.time_range.start, request.time_range.end);
+            if candidates.is_empty() {
                 return None;
             }
-        };
-        let caller = settled_reuse::ReuseCaller { user_id, deny: scope.deny_set(), authority };
-        for summary in summaries
-            .iter()
-            .filter(|job| {
-                matches!(job.status, super::jobs::SearchJobStatus::Queued | super::jobs::SearchJobStatus::Running)
-                    && job.task_kind.as_deref() == Some("search_npl_v1")
-            })
-            .take(8)
-        {
-            let Ok(Some(job)) = control.get_checked(&summary.job_id).await else { continue };
-            if settled_reuse::job_matches_attach_request(&job, request, &canonical, &caller) {
-                tracing::info!(job_id = %job.id, "attaching to an in-flight durable search job");
-                return Some(job);
+            let canonical = self.durable_plain_search_canonical(request, chrono::Utc::now())?;
+            let control = self.job_control();
+            let caller = settled_reuse::ReuseCaller { user_id, deny: scope.deny_set(), authority };
+            for job_id in candidates {
+                let job = match control.get_checked(&job_id).await {
+                    Ok(Some(job)) => job,
+                    // Not this tenant's job (a user can belong to several
+                    // tenants): skip it, never forget it; the TTL ages it out.
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::debug!(%error, "in-flight search attach: job read unavailable; running the search");
+                        return None;
+                    }
+                };
+                if !matches!(job.status, super::jobs::SearchJobStatus::Queued | super::jobs::SearchJobStatus::Running) {
+                    jobs.forget(&job_id);
+                    continue;
+                }
+                if settled_reuse::job_matches_attach_request(&job, request, &canonical, &caller) {
+                    tracing::info!(job_id = %job.id, "attaching to an in-flight durable search job");
+                    return Some(job);
+                }
             }
-        }
-        None
+            None
+        })
+        .await
     }
 
     async fn start_interactive_lake(

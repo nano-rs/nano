@@ -108,6 +108,7 @@ pub const CELL_FEATURES: &[&str] = &[
     // points the control plane's lean-assignment probe at the query token
     // (`NANO_LAKE_CELL_ROUTER_QUERY_TOKEN_FILE`) only for images with this.
     "router-query-token-wake",
+    "native_parser_landing_v1",
     // The image ships the lean durable-job runner
     // (`/usr/local/bin/lake_job_runner --cell-only`, enterprise build): a
     // separate per-tenant entrypoint, never a cell child. It claims the
@@ -589,6 +590,14 @@ mod tests {
                     && !admits(Scope::Query, RouteClass::Drain)
                     && !permits(Scope::Query, RouteClass::Signals)
                     && !permits(Scope::Query, RouteClass::Metrics)
+            }),
+            ("native_parser_landing_v1", || {
+                use crate::router::{classify, permits_with, RouteClass, Scope};
+                classify(&hyper::Method::POST, "/v1/tenants/t/landing") == RouteClass::Landing
+                    && permits_with(Scope::Query, RouteClass::Landing, false)
+                    && !permits_with(Scope::Query, RouteClass::Query, false)
+                    && !permits_with(Scope::AlertsRead, RouteClass::Landing, false)
+                    && !permits_with(Scope::TenantStatus, RouteClass::Landing, false)
             }),
             ("lean_job_runner_v1", || {
                 // The runner's two cell calls reach query[T] on the

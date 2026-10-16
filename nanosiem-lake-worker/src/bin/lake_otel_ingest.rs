@@ -25,7 +25,7 @@ use nanosiem_lake_worker::otel_handoff::{
 };
 use nanosiem_lake_worker::otel_lean::{
     compact_mirror, expire_handoff_objects, lean_dataset_location, lean_tenant_bucket,
-    prune_drained_markers, recover_compaction, LeanOtelHandoffLedger, LeanOtelR2Source,
+    load_lean_scan_state, prune_drained_markers, recover_compaction, recover_drain_journal, LeanOtelHandoffLedger, LeanOtelR2Source,
     PostgresOtelDrainPresence,
 };
 use nanosiem_lake_worker::iceberg::{CatalogConfig, catalog_session_expired, table_ident};
@@ -241,6 +241,17 @@ struct SloComputeRequest {
 struct SloComputeResponse {
     total: i64,
     good: i64,
+    /// NAN-3894: the reader attests it holds EVERY span of the window (lean
+    /// mirror coverage, `otel_lean::lean_window_complete`). False whenever it
+    /// cannot prove it — trusted_local and gen1 readers never attest.
+    complete_window: bool,
+}
+
+/// NAN-3894: `GET /v1/otel/coverage`. Empty when this reader does not
+/// attest coverage (not a lean drain).
+#[derive(Debug, Serialize)]
+struct CoverageResponse {
+    coverage: Vec<nanosiem_lake_worker::otel_lean::LeanCoverage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,6 +568,7 @@ async fn main() -> Result<()> {
         .route("/v1/otel/metrics/scalar", post(query_metric_scalar))
         .route("/v1/otel/query", post(query_otel_npl))
         .route("/v1/otel/slos/compute", post(query_slo_compute))
+        .route("/v1/otel/coverage", get(query_coverage))
         .route("/v1/otel/synthetics/summary", get(query_synthetic_summary))
         .route(
             "/v1/otel/synthetics/{check_id}/history",
@@ -1639,6 +1651,12 @@ async fn query_slo_compute(
     Json(request): Json<SloComputeRequest>,
 ) -> ApiResult<Json<SloComputeResponse>> {
     authorize(&headers, &state.query_token)?;
+    // Attested BEFORE the query reads the mirror: a drain that lands after
+    // the read must not vouch for rows the read did not see.
+    let complete_window = state
+        .hosted_drain
+        .as_ref()
+        .is_some_and(|drain| drain.lean_window_complete(OtelDataset::Spans, request.start, request.end));
     let kind = match request.sli_kind.trim().to_ascii_lowercase().as_str() {
         "availability" => OtelSliKind::Availability,
         "latency" => OtelSliKind::Latency,
@@ -1661,7 +1679,7 @@ async fn query_slo_compute(
         })?
     else {
         // No table yet == no telemetry yet. Answer empty, not 503.
-        return Ok(Json(SloComputeResponse { total: 0, good: 0 }));
+        return Ok(Json(SloComputeResponse { total: 0, good: 0, complete_window }));
     };
     let plan = plan_slo_compute(
         &table,
@@ -1682,7 +1700,27 @@ async fn query_slo_compute(
         good: row
             .map(|value| json_number(value, "good") as i64)
             .unwrap_or(0),
+        complete_window,
     }))
+}
+
+async fn query_coverage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<CoverageResponse>> {
+    authorize(&headers, &state.query_token)?;
+    let mut coverage = Vec::new();
+    if let Some(drain) = &state.hosted_drain {
+        for dataset in [OtelDataset::Spans, OtelDataset::Metrics] {
+            if let Some(report) = drain
+                .lean_coverage(dataset)
+                .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, "OTEL_COVERAGE_UNAVAILABLE", error))?
+            {
+                coverage.push(report);
+            }
+        }
+    }
+    Ok(Json(CoverageResponse { coverage }))
 }
 
 async fn query_synthetic_summary(
@@ -2410,8 +2448,21 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
     for dataset in [OtelDataset::Spans, OtelDataset::Metrics] {
         recover_compaction(&lean.mirror_dir, dataset)
             .with_context(|| format!("recover lean OTLP {} mirror", dataset.as_str()))?;
+        // NAN-3886: a drain cycle cut off mid-write (the mirror volume
+        // survives a roll) is rolled back before anything reads the mirror.
+        let rolled_back = recover_drain_journal(&lean.mirror_dir, dataset, tenant)
+            .with_context(|| format!("roll back the interrupted lean OTLP {} drain cycle", dataset.as_str()))?;
         let (resident, pruned) = drain.reconcile_mirror(dataset).await?;
-        tracing::info!(dataset = dataset.as_str(), resident = resident.len(), pruned, "lean OTLP query mirror settled");
+        let scan = load_lean_scan_state(&lean.mirror_dir, dataset);
+        tracing::info!(
+            dataset = dataset.as_str(),
+            resident = resident.len(),
+            pruned,
+            rolled_back,
+            watermark_hour = ?scan.watermark_hour,
+            sweep = ?scan.sweep,
+            "lean OTLP query mirror settled"
+        );
     }
     let (mirror, policy, drain_interval, maintenance_interval, credential_reload, expiry_batch) = (
         lean.mirror_dir.clone(),

@@ -3,11 +3,12 @@
 use std::{future::Future, sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}}, time::Instant};
 
 #[derive(Clone, Copy)]
-pub enum Phase { Auth, Scope, Authority, Ledger, Upstream, Audit }
+/// `Attach` (NAN-3920): looking for an in-flight durable job to follow.
+pub enum Phase { Auth, Scope, Authority, Ledger, Upstream, Audit, Attach }
 
 #[derive(Default)]
 pub struct RequestTiming {
-    micros: [AtomicI64; 6],
+    micros: [AtomicI64; 7],
     db_roundtrips: AtomicU64,
     lake_result_cache_hits: AtomicU64,
     admission: std::sync::atomic::AtomicU8,
@@ -73,10 +74,11 @@ impl RequestTiming {
     /// `total` is wall time until response headers, not response-body streaming.
     pub fn server_timing(&self, total_ms: f64) -> String {
         format!(
-            "total;dur={total_ms:.3}, auth;dur={:.3}, scope;dur={:.3}, authority;dur={:.3}, ledger;dur={:.3}, upstream;dur={:.3}, audit;dur={:.3}",
+            "total;dur={total_ms:.3}, auth;dur={:.3}, scope;dur={:.3}, authority;dur={:.3}, ledger;dur={:.3}, upstream;dur={:.3}, audit;dur={:.3}, attach;dur={:.3}",
             self.milliseconds(Phase::Auth), self.milliseconds(Phase::Scope),
             self.milliseconds(Phase::Authority), self.milliseconds(Phase::Ledger),
             self.milliseconds(Phase::Upstream), self.milliseconds(Phase::Audit),
+            self.milliseconds(Phase::Attach),
         )
     }
 }

@@ -158,7 +158,7 @@ export interface ServiceDetailResponse {
 // ---------------------------------------------------------------------------
 
 export type SloKind = 'availability' | 'latency';
-export type SloStatus = 'ok' | 'at_risk' | 'breaching' | 'no_data';
+export type SloStatus = 'ok' | 'at_risk' | 'breaching' | 'no_data' | 'partial';
 
 /** A service-level objective with its currently-computed budget figures. */
 export interface Slo {
@@ -174,11 +174,11 @@ export interface Slo {
   /** Required for `latency` SLIs: the threshold a request must beat. */
   latency_threshold_ms?: number;
   /** Current SLI value over the window, 0..1. */
-  current: number;
+  current: number | null;
   /** Error budget remaining, as a percentage (can be negative when breaching). */
-  budget_remaining_pct: number;
+  budget_remaining_pct: number | null;
   /** Burn rate (multiples of the sustainable spend rate). */
-  burn_rate: number;
+  burn_rate: number | null;
   status: SloStatus;
 }
 

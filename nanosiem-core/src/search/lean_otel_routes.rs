@@ -125,9 +125,13 @@ impl CredentialSnapshot {
 #[derive(Debug, Default, PartialEq)]
 pub struct LeanOtelRoutes {
     routes: HashMap<Uuid, SharedLakeOtelIngestAssignment>,
+    generation: u64,
 }
 
 impl LeanOtelRoutes {
+    /// Changes whenever routes or credential identities are republished.
+    pub fn generation(&self) -> u64 { self.generation }
+
     /// Parse the routes file. A structurally invalid file is an error (the
     /// caller keeps its previous map); a malformed ENTRY is dropped alone and
     /// reported in the second value.
@@ -185,7 +189,7 @@ impl LeanOtelRoutes {
                 Err(error) => rejected.push(error),
             }
         }
-        Ok((Self { routes }, rejected, watched))
+        Ok((Self { routes, generation: 0 }, rejected, watched))
     }
 
     fn entry(
@@ -339,12 +343,12 @@ impl LeanOtelRouteSource {
             return;
         }
         match LeanOtelRoutes::parse_watched(&bytes) {
-            Ok((routes, rejected, credentials)) => {
+            Ok((mut routes, rejected, credentials)) => {
                 let credentials_changed = credentials != last.credentials;
                 let map_changed = self
                     .current
                     .read()
-                    .map(|current| **current != routes)
+                    .map(|current| current.routes != routes.routes)
                     .unwrap_or(true);
                 let publish = map_changed || credentials_changed;
                 if publish || bytes_changed || rejected != last.rejected {
@@ -360,6 +364,7 @@ impl LeanOtelRouteSource {
                 }
                 if publish {
                     if let Ok(mut current) = self.current.write() {
+                        routes.generation = current.generation.saturating_add(1);
                         *current = Arc::new(routes);
                     }
                 }

@@ -57,6 +57,16 @@
 # created, the next run creates it (keyed on GET /api/setup/status, not on
 # whether .env exists) with the same credentials.
 
+# Keep this guard POSIX-safe: piped scripts ignore the Bash shebang.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ "$#" -gt 0 ]; then
+        printf '%s\n' "nano's installer needs bash: curl -fsSL https://get.nano.rs | bash -s -- $*" >&2
+    else
+        printf '%s\n' "nano's installer needs bash: curl -fsSL https://get.nano.rs | bash" >&2
+    fi
+    exit 1
+fi
+
 # Parse the complete script before any subprocess can consume curl's stdin.
 main() {
 set -euo pipefail

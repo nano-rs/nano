@@ -539,6 +539,19 @@ impl SearchService {
         }))
     }
 
+    /// Hosted evaluator read with an explicit full-window coverage attestation.
+    /// Older and hot-tail readers omit it and therefore return `false`.
+    pub async fn observability_slo_compute_with_coverage(
+        &self, service: &str, sli_kind: SliKind, latency_threshold_ms: Option<f64>, time_range: &TimeRange,
+    ) -> Result<(f64, i64, bool, bool), SearchError> {
+        let range = self.otel_retention_require_query_range(time_range, chrono::Utc::now())?;
+        let client = self.otel_lake.as_ref().ok_or_else(|| SearchError::ServiceUnavailable("tenant OTLP evaluator unavailable".into()))?;
+        let (current,total,no_data,complete) = client.slo_compute_with_coverage(service,sli_kind,latency_threshold_ms,&range)
+            .await.map_err(SearchError::ServiceUnavailable)?;
+        // Retention clamping also makes the originally requested window partial.
+        Ok((current,total,no_data,complete && range.start == time_range.start && range.end == time_range.end))
+    }
+
     /// Compute one SLO's spans-based attainment over `time_range` (NAN-1536).
     ///
     /// Returns `(current, total_spans, no_data)` where `current` is the SLI
@@ -563,7 +576,7 @@ impl SearchService {
         latency_threshold_ms: Option<f64>,
         time_range: &TimeRange,
     ) -> Result<(f64, i64, bool), SearchError> {
-        let retention_range = self.retention_require_query_range(time_range, chrono::Utc::now())?;
+        let retention_range = self.otel_retention_require_query_range(time_range, chrono::Utc::now())?;
         let time_range = &retention_range;
         if let Some(client) = self.otel_lake.as_ref() {
             return client

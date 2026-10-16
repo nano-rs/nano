@@ -630,6 +630,8 @@ impl AppState {
         // NAN-2361 wave 8: scheduled tenant SIEM-health reports (jobs binary).
         #[cfg(feature = "enterprise")]
         let mut tenant_siem_health_runtime: Option<Arc<nanosiem_enterprise::siem_health_shared_runtime::TenantSiemHealthRuntime>> = None;
+        #[cfg(feature = "enterprise")]
+        let mut tenant_observability_eval_runtime = None;
         // NAN-3196: shared feed-staleness monitor (leader-only, jobs binary).
         #[cfg(feature = "enterprise")]
         let mut tenant_feed_staleness_runtime: Option<Arc<nanosiem_enterprise::feed_staleness_shared_runtime::TenantFeedStalenessRuntime>> = None;
@@ -692,6 +694,14 @@ impl AppState {
                                 ) {
                                     Ok(runtime) => tenant_siem_health_runtime = Some(Arc::new(runtime)),
                                     Err(error) => tracing::error!(error = %error, "enterprise-shared SIEM-health runner unavailable"),
+                                }
+                                if std::env::var_os("NANO_LEAN_OTEL_ROUTES_FILE").is_some() {
+                                    match nanosiem_enterprise::observability_eval_shared_runtime::TenantObservabilityEvalRuntime::connect_startup(
+                                        pg_pool.clone(), Arc::clone(rls), search_service.clone(), Arc::clone(&registry),
+                                    ) {
+                                        Ok(runtime) => tenant_observability_eval_runtime = Some(Arc::new(runtime)),
+                                        Err(error) => tracing::error!(%error, "hosted observability evaluator unavailable"),
+                                    }
                                 }
                                 match nanosiem_enterprise::feed_staleness_shared_runtime::TenantFeedStalenessRuntime::connect_startup(
                                     pg_pool.clone(), Arc::clone(rls),
@@ -773,6 +783,14 @@ impl AppState {
                                 ) {
                                     Ok(runtime) => tenant_siem_health_runtime = Some(Arc::new(runtime)),
                                     Err(error) => tracing::error!(error = %error, "enterprise-shared SIEM-health runner unavailable"),
+                                }
+                                if std::env::var_os("NANO_LEAN_OTEL_ROUTES_FILE").is_some() {
+                                    match nanosiem_enterprise::observability_eval_shared_runtime::TenantObservabilityEvalRuntime::connect_startup(
+                                        pg_pool.clone(), Arc::clone(rls), search_service.clone(), Arc::clone(&registry),
+                                    ) {
+                                        Ok(runtime) => tenant_observability_eval_runtime = Some(Arc::new(runtime)),
+                                        Err(error) => tracing::error!(%error, "hosted observability evaluator unavailable"),
+                                    }
                                 }
                                 match nanosiem_enterprise::feed_staleness_shared_runtime::TenantFeedStalenessRuntime::connect_startup(
                                     pg_pool.clone(), Arc::clone(rls),
@@ -966,6 +984,8 @@ impl AppState {
             tenant_siem_health_runtime,
             #[cfg(feature = "enterprise")]
             tenant_feed_staleness_runtime,
+            #[cfg(feature = "enterprise")]
+            tenant_observability_eval_runtime,
             #[cfg(feature = "enterprise")]
             tenant_platform_readiness_attestor,
             #[cfg(feature = "enterprise")]

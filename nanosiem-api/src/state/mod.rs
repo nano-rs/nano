@@ -333,6 +333,8 @@ pub struct AppState {
     pub tenant_siem_health_runtime: Option<Arc<nanosiem_enterprise::siem_health_shared_runtime::TenantSiemHealthRuntime>>,
     /// NAN-3196: shared feed-staleness monitor (started leader-only).
     #[cfg(feature = "enterprise")]
+    pub tenant_observability_eval_runtime: Option<Arc<nanosiem_enterprise::observability_eval_shared_runtime::TenantObservabilityEvalRuntime>>,
+    #[cfg(feature = "enterprise")]
     pub tenant_feed_staleness_runtime: Option<Arc<nanosiem_enterprise::feed_staleness_shared_runtime::TenantFeedStalenessRuntime>>,
     /// NAN-2361 wave 8: platform readiness attestor (activation receipt sets).
     #[cfg(feature = "enterprise")]

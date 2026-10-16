@@ -1293,7 +1293,7 @@ impl AppState {
                 None => continue,
             };
 
-            if !monitor.comparator.breached(value, monitor.threshold) {
+            if !nanosiem_core::observability::eval::metric_breach(monitor, Some(value)) {
                 continue;
             }
 
@@ -1345,20 +1345,7 @@ impl AppState {
 
             // Breach payload — captured in the alert's matched_events so the
             // console can render which monitor/series/value tripped.
-            let payload = serde_json::json!([{
-                "monitor_id": monitor.id.to_string(),
-                "monitor_name": monitor.name,
-                "metric_name": monitor.metric_name,
-                "agg": monitor.agg,
-                "service_name": monitor.service_name,
-                "group_by": monitor.group_by,
-                "series_key": series_key,
-                "comparator": monitor.comparator.as_str(),
-                "threshold": monitor.threshold,
-                "value": value,
-                "window_secs": monitor.window_secs,
-                "evaluated_at": now.to_rfc3339(),
-            }]);
+            let payload = nanosiem_core::observability::eval::metric_payload(monitor, &series_key, value, now);
 
             // Metric-monitor alerts are not tied to a detection rule, so
             // `rule_id` is NULL (the FK is nullable) and the per-series key
@@ -1661,32 +1648,9 @@ impl AppState {
             return Ok(None);
         }
 
-        // Error budget math — identical to the read path's `enrich`.
-        let allowed = (1.0 - slo.target).max(f64::EPSILON);
-        let consumed = (1.0 - current).max(0.0);
-        let budget_remaining_pct = ((allowed - consumed) / allowed) * 100.0;
-        let burn_rate = consumed / allowed;
-
-        // Breach = SLI below target (the read path's "breaching" status).
-        let breaching = current < slo.target;
-        if !breaching {
-            return Ok(None);
-        }
-
-        let payload = serde_json::json!([{
-            "slo_id": slo.id.to_string(),
-            "name": slo.name,
-            "service": slo.service,
-            "sli_kind": slo.sli_kind.as_str(),
-            "target": slo.target,
-            "current": current,
-            "burn_rate": burn_rate,
-            "budget_remaining_pct": budget_remaining_pct,
-            "window_days": slo.window_days,
-            "total_spans": total_spans,
-            "status": "breaching",
-            "evaluated_at": now.to_rfc3339(),
-        }]);
+        let evaluation = nanosiem_core::observability::eval::slo_evaluation(slo.target, current, no_data, false);
+        if evaluation.status != "breaching" { return Ok(None); }
+        let payload = nanosiem_core::observability::eval::slo_payload(slo, current, total_spans as u64, now);
 
         Ok(Some(payload))
     }
@@ -1702,7 +1666,7 @@ impl AppState {
 /// injective, which is all the durable lookup needs (it never parses the key
 /// back). A no-`group_by` monitor yields `""` as the series key → `"<id>:"`.
 fn metric_monitor_source_id(monitor_id: uuid::Uuid, series_key: &str) -> String {
-    format!("{}:{}", monitor_id, series_key)
+    nanosiem_core::observability::eval::metric_monitor_source_id(monitor_id, series_key)
 }
 
 /// NAN-1563: pure re-arm decision for SLO alerting. Returns `true` when the most
@@ -1718,9 +1682,7 @@ fn slo_alert_within_rearm(
     now: chrono::DateTime<chrono::Utc>,
     rearm_secs: u64,
 ) -> bool {
-    let elapsed = (now - last_created).num_seconds();
-    // Future timestamp (elapsed < 0): treat as within window (skip / dedup).
-    elapsed < 0 || (elapsed as u64) < rearm_secs
+    nanosiem_core::observability::eval::within_rearm(last_created, now, rearm_secs)
 }
 
 /// NAN-3758: register the first-party catalogs on a first boot and reconcile

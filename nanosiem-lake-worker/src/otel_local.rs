@@ -465,8 +465,10 @@ impl LocalOtelStore {
         })
     }
 
-    /// Run with the same settings as log retention. A disabled policy never
-    /// expires telemetry. Bad/unreadable settings fail before deletion.
+    /// Run with the same settings as log retention, floored at
+    /// [`crate::otel_lean::OTEL_MIN_RETENTION_DAYS`] (NAN-3894: the longest
+    /// SLO window stays inside retention). A disabled policy never expires
+    /// telemetry. Bad/unreadable settings fail before deletion.
     pub fn maintain(
         &self,
         retention_days: Option<u32>,
@@ -485,7 +487,7 @@ impl LocalOtelStore {
                 let parts = self.root.join(dataset.as_str());
                 let before = durable_bytes(&parts)?;
                 crate::otel_lean::compact_mirror_durable(&self.root, dataset, current_hour)?;
-                if let Some(days) = retention_days {
+                if let Some(days) = retention_days.map(crate::otel_lean::otel_retention_days) {
                     let cutoff = now
                         .timestamp()
                         .saturating_sub(i64::from(days) * 86_400)
@@ -722,6 +724,27 @@ mod tests {
         store.maintain(Some(1), chrono::Utc::now()).unwrap();
         assert_eq!(count(dir.path()), 0);
         store.publish(OtelDataset::Spans, &rows).unwrap();
+        assert_eq!(count(dir.path()), 0);
+    }
+
+    /// NAN-3894: open core keeps OTLP for at least
+    /// `OTEL_MIN_RETENTION_DAYS` even when log retention is shorter, so the
+    /// longest SLO window stays inside retention.
+    #[test]
+    fn a_short_log_retention_keeps_otel_for_the_slo_floor() {
+        use crate::otel_lean::{OTEL_MIN_RETENTION_DAYS, SLO_WINDOW_DAYS_MAX};
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = Uuid::new_v4();
+        let store = LocalOtelStore::open(tenant, dir.path().into(), 1024 * 1024).unwrap();
+        store.publish(OtelDataset::Spans, &[row(tenant, "0123456789abcdef")]).unwrap();
+        // The row's event time (see `row`).
+        let event = chrono::DateTime::from_timestamp(1_788_220_800, 0).unwrap();
+        let at_slo_edge = event + chrono::Duration::days(i64::from(SLO_WINDOW_DAYS_MAX)) + chrono::Duration::hours(1);
+        store.maintain(Some(1), at_slo_edge).unwrap();
+        assert_eq!(count(dir.path()), 1, "a 1-day log retention must not expire SLO-window telemetry");
+        store
+            .maintain(Some(1), event + chrono::Duration::days(i64::from(OTEL_MIN_RETENTION_DAYS) + 2))
+            .unwrap();
         assert_eq!(count(dir.path()), 0);
     }
 

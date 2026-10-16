@@ -116,6 +116,10 @@ impl LeanOtelClients {
         nanosiem_core::search::LeanOtelRouteSource::from_env().map(Self::new)
     }
 
+    pub(crate) fn routes(&self) -> std::sync::Arc<nanosiem_core::search::LeanOtelRoutes> {
+        self.source.current()
+    }
+
     /// The client of exactly this authenticated tenant, or `None`.
     pub fn client(&self, tenant_id: uuid::Uuid) -> Option<std::sync::Arc<OtelLakeClient>> {
         let routes = self.source.current();

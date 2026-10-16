@@ -14,6 +14,7 @@
 //! | GET | `/v1/tenants/{t}/status` (that tenant only) | yes | yes† | `status` | 403 |
 //! | GET | `/v1/signals` | yes | 403 | 403 | 403 |
 //! | GET | `/v1/lean-cell-alerts` | yes | 403 | 403 | yes |
+//! | POST | `/v1/tenants/{t}/landing` (fixed aggregate only) | yes | yes | 403 | 403 |
 //! | POST | `/v1/tenants/{t}/wake` `{"role":"query",..}` | yes | yes | `query` | 403 |
 //! | POST | `/v1/tenants/{t}/wake` `{"role":"ingest"\|"detect",..}` | yes | 403 | 403 | 403 |
 //! | POST | `/v1/tenants/{t}/drain` | yes | 403 | 403 | 403 |
@@ -25,7 +26,7 @@
 //!
 //! † Only while `router_accept_cluster_query_token` is on (the default during
 //! the NAN-3289 rollout). Off, the cluster query token reaches `/healthz`,
-//! `GET /v1/status` and a query-role wake only.
+//! `GET /v1/status`, a query-role wake and fixed landing aggregates only.
 //!
 //! **Per-tenant tokens (NAN-3289, completes NAN-2904).** A `nct1.` bearer is
 //! derived from the full token for one tenant, one cell and one scope
@@ -94,6 +95,7 @@ pub enum RouteClass {
     Status,
     Signals,
     LeanCellAlerts,
+    Landing,
     Wake,
     Drain,
     Query,
@@ -115,6 +117,7 @@ pub fn classify(method: &Method, path: &str) -> RouteClass {
         (&Method::GET, "/v1/signals") => RouteClass::Signals,
         (&Method::GET, "/v1/lean-cell-alerts") => RouteClass::LeanCellAlerts,
         _ => match path.strip_prefix("/v1/tenants/").map(|r| r.split_once('/').map(|(_, t)| t).unwrap_or("")) {
+            Some("landing") if method == Method::POST => RouteClass::Landing,
             Some("wake") if method == Method::POST => RouteClass::Wake,
             Some("drain") if method == Method::POST => RouteClass::Drain,
             Some("status") if method == Method::GET => RouteClass::TenantStatus,
@@ -138,8 +141,8 @@ pub fn permits_with(scope: Scope, route: RouteClass, accept_cluster_query: bool)
     match scope {
         Scope::Full => true,
         Scope::Query if accept_cluster_query => matches!(route,
-            RouteClass::Query | RouteClass::Detect | RouteClass::Status | RouteClass::TenantStatus | RouteClass::Health),
-        Scope::Query => matches!(route, RouteClass::Status | RouteClass::Health),
+            RouteClass::Query | RouteClass::Detect | RouteClass::Status | RouteClass::TenantStatus | RouteClass::Health | RouteClass::Landing),
+        Scope::Query => matches!(route, RouteClass::Status | RouteClass::Health | RouteClass::Landing),
         Scope::AlertsRead => route == RouteClass::LeanCellAlerts,
         Scope::TenantQuery => matches!(route, RouteClass::Query | RouteClass::Health),
         Scope::TenantDetect => matches!(route, RouteClass::Detect | RouteClass::Health),
@@ -756,6 +759,43 @@ impl Router {
             Err(e) => return Ok(error(StatusCode::BAD_REQUEST, &e.to_string())),
         };
         match (method, tail) {
+            (Method::POST, "landing") => {
+                // Only fixed scalar queries are accepted here, including when the legacy
+                // cluster query token can no longer execute arbitrary tenant searches.
+                let bytes = match http_body_util::Limited::new(req.into_body(), 4096)
+                    .collect()
+                    .await
+                {
+                    Ok(b) => b.to_bytes(),
+                    Err(_) => return Ok(error(StatusCode::BAD_REQUEST, "invalid landing request")),
+                };
+                let payload = match landing_query(&tenant, &bytes) {
+                    Ok(p) => p,
+                    Err(()) => {
+                        return Ok(error(StatusCode::BAD_REQUEST, "invalid landing request"))
+                    }
+                };
+                let req = Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/query")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(
+                        Full::new(Bytes::from(payload.to_string()))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .expect("fixed landing request");
+                self.forward(
+                    tenant,
+                    Role::Query,
+                    "/v1/query".into(),
+                    req,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+            }
             (Method::POST | Method::GET, "admin/count-backfill") => {
                 if scope != Scope::Full {
                     return Ok(error(StatusCode::FORBIDDEN, "count backfill requires the full operator token"));
@@ -1656,6 +1696,102 @@ mod tests {
         assert!(healthz_shows_private(Some(Scope::Query)));
         for s in [None, Some(Scope::AlertsRead), Some(Scope::TenantQuery), Some(Scope::TenantDetect), Some(Scope::TenantStatus)] {
             assert!(!healthz_shows_private(s), "{s:?}");
+        }
+    }
+}
+
+/// Aggregate-only observation capability. No caller-supplied nPL, tenant, dataset,
+/// pagination, cache setting or arbitrary time range can reach query[T].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LandingBody {
+    request_id: uuid::Uuid,
+    source: String,
+    bundle: String,
+    since: chrono::DateTime<chrono::Utc>,
+}
+
+fn landing_query(tenant: &TenantId, bytes: &[u8]) -> Result<serde_json::Value, ()> {
+    let r: LandingBody = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let now = chrono::Utc::now();
+    if r.request_id.is_nil()
+        || r.source.is_empty()
+        || r.source.len() > 100
+        || !r.source.as_bytes()[0].is_ascii_alphanumeric()
+        || !r
+            .source
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        || r.bundle.len() != 64
+        || !r
+            .bundle
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || r.since >= now
+        || r.since < now - chrono::Duration::days(30)
+    {
+        return Err(());
+    }
+    let query = format!("source_type=\"{}\" | eval pending=if(metadata.nano_parser_bundle_sha256=\"{}\",1,0) | eval failed=if(pending=1 AND (class_uid=0 OR unmapped.parse_error!=\"\"),1,0) | stats count() as rows, sum(pending) as n, sum(failed) as errors", r.source, r.bundle);
+    Ok(
+        serde_json::json!({"request_id":r.request_id, "tenant_id":tenant.as_str(),
+        "route":"broad_npl", "dataset":"logs", "query":query,
+        "start":r.since.to_rfc3339(), "end":now.to_rfc3339(), "limit":2, "offset":0,
+        "table_view":false, "use_cache":false, "deny_source_types":[]}),
+    )
+}
+
+#[cfg(test)]
+mod native_landing_tests {
+    use super::*;
+    #[test]
+    fn native_landing_is_aggregate_only_even_with_legacy_queries_disabled() {
+        let route = classify(&Method::POST, "/v1/tenants/t/landing");
+        assert_eq!(route, RouteClass::Landing);
+        assert!(permits_with(Scope::Query, route, false));
+        assert!(!permits_with(Scope::Query, RouteClass::Query, false));
+        for scope in [
+            Scope::TenantQuery,
+            Scope::TenantDetect,
+            Scope::TenantStatus,
+            Scope::AlertsRead,
+        ] {
+            assert!(!permits_with(scope, route, false));
+        }
+        assert_eq!(
+            classify(&Method::GET, "/v1/tenants/t/landing"),
+            RouteClass::Other
+        );
+    }
+    #[test]
+    fn native_landing_pins_new_tenant_and_rejects_query_injection() {
+        let tenant = TenantId::new("22222222-2222-4222-8222-222222222222").unwrap();
+        let body = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"new_source", "bundle":"a".repeat(64),
+            "since":chrono::Utc::now() - chrono::Duration::minutes(5)});
+        let query = landing_query(&tenant, &serde_json::to_vec(&body).unwrap()).unwrap();
+        assert_eq!(query["tenant_id"], tenant.as_str());
+        assert_eq!(query["use_cache"], false);
+        assert_eq!(query["limit"], 2);
+        assert!(query["query"]
+            .as_str()
+            .unwrap()
+            .ends_with("stats count() as rows, sum(pending) as n, sum(failed) as errors"));
+        for (key, value) in [
+            ("query", serde_json::json!("*")),
+            ("tenant_id", serde_json::json!("other")),
+            ("source", serde_json::json!("x\" | head 1")),
+            ("bundle", serde_json::json!("bad")),
+            (
+                "since",
+                serde_json::json!(chrono::Utc::now() - chrono::Duration::days(31)),
+            ),
+        ] {
+            let mut bad = body.clone();
+            bad[key] = value;
+            assert!(
+                landing_query(&tenant, &serde_json::to_vec(&bad).unwrap()).is_err(),
+                "{key}"
+            );
         }
     }
 }

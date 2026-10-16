@@ -156,6 +156,7 @@ struct SharedQueryCapabilities {
     tenant_storage_inputlookup: bool,
     tenant_ai_pipe: bool,
     tenant_risk_dataset: bool,
+    tenant_otel_dataset: bool,
     tenant_lake_product_views: bool,
 }
 
@@ -176,6 +177,8 @@ pub(crate) fn require_shared_npl_contract_for_view(
             tenant_storage_inputlookup: view.storage_lookup_tenant_bound()
                 && view.assigned_tenant_id() == auth.tenant_scope.tenant_id(),
             tenant_ai_pipe: view.ai_pipe_tenant_bound(),
+            tenant_otel_dataset: view.tenant_otel_dataset_bound()
+                && view.assigned_tenant_id() == auth.tenant_scope.tenant_id(),
             tenant_risk_dataset: view.tenant_risk_dataset_bound()
                 && view.assigned_tenant_id() == auth.tenant_scope.tenant_id(),
             tenant_lake_product_views: view.serves_lake_cell()
@@ -261,8 +264,8 @@ fn shared_parsed_npl_contract(
 /// is always the tenant-pinned lake. `risk` is served only on a lean-lake
 /// cell view whose decay / clear state is bound to the caller's own tenant
 /// (see `SearchState::bind_shared_risk_dataset`); surfaces without such a
-/// view refuse it. Anything else is a caller error (400) naming what is
-/// unsupported. It is never a 503, because retrying will not help.
+/// view refuse it. Spans and metrics require an attached tenant OTLP evaluator;
+/// a missing route is unavailable (503). Unknown datasets remain caller errors.
 fn shared_dataset_contract(
     dataset: Option<&str>,
     capabilities: SharedQueryCapabilities,
@@ -270,6 +273,10 @@ fn shared_dataset_contract(
     let selector = dataset.unwrap_or("logs").trim().to_ascii_lowercase();
     match selector.as_str() {
         "logs" | "log" => Ok(()),
+        "spans" | "metrics" if capabilities.tenant_otel_dataset => Ok(()),
+        "spans" | "metrics" => Err(crate::error::SearchError::ServiceUnavailable(
+            "tenant OTLP dataset is unavailable until an exact tenant route is configured".into(),
+        )),
         "risk" if capabilities.tenant_risk_dataset => Ok(()),
         "risk" => Err(crate::error::SearchError::BadRequest(
             "dataset `risk` is served for enterprise-shared tenants only by search and \
@@ -279,7 +286,7 @@ fn shared_dataset_contract(
         )),
         other => Err(crate::error::SearchError::BadRequest(format!(
             "dataset `{}` is not supported for enterprise-shared tenants; supported \
-             datasets are `logs` and `risk` (lean-lake tenants). Detection findings and \
+             datasets are `logs`, `spans`, `metrics`, and `risk` (lean-lake tenants). Detection findings and \
              alerts are in `logs` as `source_type=findings`",
             other.chars().take(64).collect::<String>()
         ))),

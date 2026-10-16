@@ -1448,6 +1448,11 @@ impl SearchService {
             .and_then(|tenant| uuid::Uuid::parse_str(tenant).ok())
     }
 
+    /// Whether native OTLP queries have an evaluator on a tenant-pinned view.
+    pub fn tenant_otel_dataset_bound(&self) -> bool {
+        self.otel_lake.is_some() && self.assigned_tenant_id().is_some()
+    }
+
     /// The serving generation of the tenant-pinned primary-lake worker, as a
     /// result-cache identity (NAN-2361 wave 6). `None` off the primary lake
     /// or when the worker cannot report one stable generation; a shared
@@ -1904,6 +1909,29 @@ impl SearchService {
             .ok_or(SearchError::InvalidTimeRange)
     }
 
+    /// NAN-3894: [`Self::retention_require_query_range`] for OTLP SLO reads,
+    /// with the OTLP cutoff (kept at least `OTEL_MIN_RETENTION_DAYS`) in place
+    /// of the log cutoff, so a 30-day SLO window is not clamped to partial.
+    pub(crate) fn otel_retention_require_query_range(
+        &self,
+        range: &TimeRange,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<TimeRange, SearchError> {
+        // Same scope checks (and errors) as the log cutoff.
+        if self.retention_cutoff_at(now)?.is_none() {
+            return Ok(range.clone());
+        }
+        let cutoff = self.admission_scope.otel_event_time_cutoff(now).ok_or_else(|| {
+            SearchError::ServiceUnavailable(
+                "enterprise-shared query retention policy is invalid".to_string(),
+            )
+        })?;
+        if range.end <= cutoff {
+            return Err(SearchError::InvalidTimeRange);
+        }
+        Ok(TimeRange::new(range.start.max(cutoff), range.end))
+    }
+
     /// Release-close an event-bearing surface that does not yet carry a
     /// moving-cutoff proof. This is intentionally stricter than merely binding
     /// the retention revision: a cached aggregate or durable result can age
@@ -2142,6 +2170,49 @@ impl SearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-3894: a shared tenant with the shortest log retention (30 d)
+    /// still reads a full `SLO_WINDOW_DAYS_MAX`-day OTLP window unclamped,
+    /// so its SLO can attest complete; a window reaching past the OTLP
+    /// retention is clamped (and so reported partial).
+    #[tokio::test]
+    async fn otel_slo_window_is_not_clamped_by_a_short_log_retention() {
+        use crate::observability::slo_repository::{OTEL_MIN_RETENTION_DAYS, SLO_WINDOW_DAYS_MAX};
+        let pool = crate::db::DualPool::new_lake_control_plane(&crate::db::DualPoolConfig::with_auth(
+            "postgres://unused:unused@127.0.0.1:1/nanosiem", "http://127.0.0.1:1", "nanosiem", "unused", "nanosiem",
+        )).await.unwrap();
+        let mut service = SearchService::with_dual_pool(&pool);
+        let now = chrono::Utc::now();
+        let slo = TimeRange::new(now - chrono::Duration::days(i64::from(SLO_WINDOW_DAYS_MAX)), now);
+        // Dedicated: no cutoff at all.
+        let bounds = |range: TimeRange| (range.start, range.end);
+        assert_eq!(bounds(service.otel_retention_require_query_range(&slo, now).unwrap()), bounds(slo.clone()));
+
+        service.admission_scope = crate::search::tenant::SearchTenantScope::EnterpriseSharedRetained {
+            tenant_id: uuid::Uuid::from_u128(0x3894),
+            retention_revision: 1,
+            retention_days: 30,
+            irreversible_event_time_floor_micros: 0,
+        };
+        // The log cutoff a moment later clamps the SLO window...
+        let later = now + chrono::Duration::seconds(5);
+        assert_ne!(bounds(service.retention_require_query_range(&slo, later).unwrap()), bounds(slo.clone()));
+        // ...the OTLP cutoff does not.
+        assert_eq!(bounds(service.otel_retention_require_query_range(&slo, later).unwrap()), bounds(slo.clone()));
+        // Past OTLP retention: clamped to the OTLP cutoff.
+        let long = TimeRange::new(now - chrono::Duration::days(i64::from(OTEL_MIN_RETENTION_DAYS) + 5), now);
+        let clamped = service.otel_retention_require_query_range(&long, now).unwrap();
+        assert_eq!(clamped.start, now - chrono::Duration::days(i64::from(OTEL_MIN_RETENTION_DAYS)));
+        // Wholly expired: rejected before any backend access.
+        let expired = TimeRange::new(now - chrono::Duration::days(60), now - chrono::Duration::days(50));
+        assert!(matches!(
+            service.otel_retention_require_query_range(&expired, now),
+            Err(SearchError::InvalidTimeRange)
+        ));
+        // A tenant-only scope without a retention identity is still refused.
+        service.admission_scope = crate::search::tenant::SearchTenantScope::EnterpriseShared(uuid::Uuid::from_u128(0x3894));
+        assert!(service.otel_retention_require_query_range(&slo, now).is_err());
+    }
 
     /// Audit #10: transforming pipelines on the lake skip the base-search
     /// histogram, and only row-preserving pipelines take its sum as total.

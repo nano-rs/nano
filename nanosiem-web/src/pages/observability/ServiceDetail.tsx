@@ -234,15 +234,17 @@ function ExemplarTraces({
 
 function SloStrip({ slos }: { slos: Slo[] }) {
   // Surface the SLO under most budget pressure.
-  const worst = slos.slice().sort((a, b) => a.budget_remaining_pct - b.budget_remaining_pct)[0];
+  const worst = slos.slice().sort((a, b) => (a.budget_remaining_pct ?? Infinity) - (b.budget_remaining_pct ?? Infinity))[0];
   if (!worst) return null;
-  const consumed = 100 - worst.budget_remaining_pct;
+  const unavailable = worst.status === 'partial' || worst.status === 'no_data' || worst.current == null || worst.budget_remaining_pct == null;
+  const consumed = unavailable ? 0 : 100 - (worst.budget_remaining_pct ?? 0);
   const statusTone: Record<Slo['status'], string> =
     {
       ok: 'text-good',
       at_risk: 'text-warn',
       breaching: 'text-danger',
       no_data: 'text-fg-4',
+      partial: 'text-fg-4',
     };
   return (
     <div className="rounded-lg border border-border bg-card px-3.5 py-2.5 flex items-center gap-x-4 gap-y-2 flex-wrap text-[11.5px]">
@@ -256,7 +258,7 @@ function SloStrip({ slos }: { slos: Slo[] }) {
       </span>
       <div className="flex items-center gap-2">
         <span className="text-fg-4">current</span>
-        <span className="font-mono text-fg-2 tabular-nums">{(worst.current * 100).toFixed(2)}%</span>
+        <span className="font-mono text-fg-2 tabular-nums">{unavailable ? '–' : `${((worst.current ?? 0) * 100).toFixed(2)}%`}</span>
       </div>
       <div className="flex items-center gap-2">
         <span className="text-fg-4">target</span>
@@ -273,7 +275,7 @@ function SloStrip({ slos }: { slos: Slo[] }) {
             consumed >= 100 ? 'text-danger' : consumed >= 75 ? 'text-warn' : 'text-fg-3'
           )}
         >
-          {Math.max(0, worst.budget_remaining_pct).toFixed(0)}% budget
+          {unavailable ? '–' : `${Math.max(0, worst.budget_remaining_pct ?? 0).toFixed(0)}%`} budget
         </span>
         <span className={cn('font-mono text-[10.5px] uppercase tracking-wider', statusTone[worst.status])}>
           {worst.status.replace('_', ' ')}

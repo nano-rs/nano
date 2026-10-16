@@ -88,7 +88,9 @@ impl<'a> JobControlView<'a> {
     ) -> Result<String, DurableJobStoreError> {
     crate::request_timing::timed(crate::request_timing::Phase::Ledger, async {
 
-        match self.hosted {
+        let window = (request.time_range.start, request.time_range.end);
+        let plain_search = matches!(task, DurableLakeTask::SearchNplV1 | DurableLakeTask::SearchNplShedV1 { .. });
+        let created = match self.hosted {
             Some(s) => {
                 s.create_durable_queued(request, task, user, priority, scope, generation, authority)
                     .await
@@ -100,7 +102,11 @@ impl<'a> JobControlView<'a> {
                     )
                     .await
             }
+        };
+        if let (Ok(id), true) = (&created, plain_search) {
+            super::in_flight_jobs::InFlightJobs::global().record(id, user, window.0, window.1);
         }
+        created
 
     }).await
 }
@@ -113,9 +119,14 @@ impl<'a> JobControlView<'a> {
         generation: &DurableLakeGenerationPin,
         authority: Option<&DurableSearchJobAuthority>,
     ) -> Result<String, DurableJobStoreError> {
-        self.legacy
+        let window = (request.time_range.start, request.time_range.end);
+        let created = self.legacy
             .create_interactive_lake(request, user, priority, scope, generation, authority)
-            .await
+            .await;
+        if let Ok(id) = &created {
+            super::in_flight_jobs::InFlightJobs::global().record(id, user, window.0, window.1);
+        }
+        created
     }
 
     pub fn supports_interactive_lake(&self) -> bool {

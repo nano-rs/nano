@@ -139,7 +139,7 @@ pub struct SearchState {
     pub ip_allowlist_service: Arc<IpAllowlistService>,
 }
 
-type SharedSearchRuntimeKey = (uuid::Uuid, u64, u64, i64, u16, i64);
+type SharedSearchRuntimeKey = (uuid::Uuid, u64, u64, i64, u16, i64, u64);
 /// `base` when `installed` is absent or is the profile `base` was built
 /// with; otherwise the cached re-pinned copy for `installed`, built once per
 /// installed profile (see [`SearchState::dedicated_search`]).
@@ -240,6 +240,7 @@ fn shared_search_runtime_key(
         retention_revision,
         retention_days,
         irreversible_event_time_floor_micros,
+        0,
     )
 }
 

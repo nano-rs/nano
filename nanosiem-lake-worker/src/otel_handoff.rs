@@ -59,7 +59,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -100,6 +100,117 @@ pub const FULL_SCAN_EVERY_CYCLES: u64 = 720;
 /// Hard ceiling on one full-prefix scan.
 pub const FULL_SCAN_ENTRY_CEILING: usize = 262_144;
 const LEDGER_PAGE: usize = 512;
+/// NAN-3886 (lean): keys per backfill-sweep list call (one R2 ListObjectsV2
+/// page).
+pub const LEAN_SWEEP_PAGE_KEYS: usize = 1_000;
+/// NAN-3886 (lean): object-list calls one cycle's backfill sweep may make
+/// (plus one receipt-hour listing). A backlogged cycle usually needs one: a
+/// page of undrained keys already fills `max_objects`.
+pub const LEAN_SWEEP_LIST_CALLS_PER_CYCLE: usize = 8;
+/// NAN-3886 (lean): an idle drain re-sweeps every receipt hour below the live
+/// window this often, the safety net for objects that land in an hour the
+/// live window no longer lists (the gen1 cadence: 720 cycles of 10 s).
+pub const LEAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2 * 3_600);
+/// NAN-3886 (lean): the live window never reaches further back than this
+/// many hours before the current one. Older hours still owed (a restart
+/// after a long outage, a live backlog that outlasted the window) are handed
+/// to a bounded sweep instead of being re-listed by every cycle (one live tenant relisted
+/// a 48 h window of ~115k span keys per backlogged cycle).
+pub const LEAN_LIVE_WINDOW_HOURS: i32 = 2;
+
+/// NAN-3886: where the lean drain stands, per dataset, persisted next to the
+/// drain markers (`<mirror>/.drained/<dataset>.scan.json`) so a restarted
+/// process over the same mirror resumes instead of re-listing the prefix.
+///
+/// Every cycle lists the LIVE window (`watermark_hour`..now, the NAN-3359
+/// watermark, never more than [`LEAN_LIVE_WINDOW_HOURS`] back) newest
+/// first. Receipt hours below it are covered by the SWEEP: it walks the
+/// hours that exist from right below the live window down to the mirror
+/// floor (periodic, every [`LEAN_SWEEP_INTERVAL`] and on a fresh mirror) or
+/// to the old watermark (a hand-off of hours the live window dropped),
+/// newest hour first, one bounded page at a time; its position survives
+/// across cycles and restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct LeanScanState {
+    /// Oldest receipt hour that may still hold an undrained object
+    /// ([`next_watermark_hour`]); the live window starts here.
+    pub watermark_hour: Option<i32>,
+    /// The backfill sweep in progress, if any.
+    pub sweep: Option<LeanSweepCursor>,
+    /// Unix seconds when the last sweep reached the mirror floor.
+    pub last_sweep_completed_unix: Option<i64>,
+    /// Coverage (NAN-3894): every handoff object of a receipt hour at or
+    /// after this one is drained into the mirror, except `unproven_hours`.
+    /// `None` until a periodic sweep has reached the mirror floor: a fresh
+    /// or rebuilt mirror attests nothing.
+    #[serde(default)]
+    pub covered_since_hour: Option<i32>,
+    /// Receipt hours that may still hold an undrained object below the live
+    /// window: hours a hand-off gave to a sweep that has not passed them yet,
+    /// and hours where a sweep passed over a failed exact read.
+    #[serde(default)]
+    pub unproven_hours: BTreeSet<i32>,
+    /// Unix seconds (cycle start) of the last cycle that proved the whole
+    /// live window drained, with no retry left behind.
+    #[serde(default)]
+    pub live_proven_unix: Option<i64>,
+    /// The last cycle left undrained objects behind.
+    #[serde(default)]
+    pub backlogged: bool,
+}
+
+/// Position of the lean backfill sweep: every key of a receipt hour above
+/// `hour` (down from where the sweep began), and every key of `hour` up to
+/// and including `start_after`, is drained, rejected, or was retried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct LeanSweepCursor {
+    pub hour: i32,
+    pub start_after: Option<String>,
+    /// `None`: a periodic sweep, down to the mirror floor. `Some(h)`: a
+    /// hand-off sweep covering only the hours the live window dropped,
+    /// down to `h` (everything below it was already proven).
+    #[serde(default)]
+    pub stop_hour: Option<i32>,
+    /// Hours this sweep passed over with a failed exact read (they stay in
+    /// `unproven_hours` until a later sweep drains them).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retried: BTreeSet<i32>,
+}
+
+impl LeanSweepCursor {
+    fn top(hour: i32, stop_hour: Option<i32>) -> Self {
+        Self { hour, start_after: None, stop_hour, retried: BTreeSet::new() }
+    }
+}
+
+/// One undrained key the sweep found, with the cursor that re-lists it.
+struct SweepItem {
+    key: String,
+    hour: i32,
+    before: LeanSweepCursor,
+}
+
+/// What one sweep pass listed: the undrained keys (newest hour first, keys
+/// ascending inside an hour) and where the sweep stands once all of them
+/// are examined (`None`: it reached the mirror floor).
+struct SweepPass {
+    items: Vec<SweepItem>,
+    end: Option<LeanSweepCursor>,
+    seen: usize,
+    /// The lowest hour this pass may reach (mirror floor or hand-off stop).
+    floor: i32,
+}
+
+/// What [`OtelHandoffDrain::drain_pending`] did with a cycle's pending keys.
+struct FoldOutcome {
+    /// Pending keys consumed in order (fetched and folded); the rest were
+    /// cut by `max_rows`.
+    examined: usize,
+    /// Indexes (into the pending list) whose exact read failed.
+    retries: Vec<usize>,
+    /// At least one batch was acknowledged.
+    acknowledged: bool,
+}
 
 /// `event_table` value recorded for each dataset's hot-tail objects.
 pub fn otel_event_table(dataset: OtelDataset) -> &'static str {
@@ -182,6 +293,28 @@ pub fn parse_handoff_key(key: &str, tenant_uuid: Uuid) -> Result<OtelHandoffKey>
 pub fn receipt_epoch_hour(receipt_hour: &str) -> Option<i32> {
     let start = chrono::NaiveDateTime::parse_from_str(&format!("{receipt_hour}0000"), "%Y%m%d%H%M%S").ok()?;
     i32::try_from(start.and_utc().timestamp().div_euclid(3_600)).ok()
+}
+
+/// `YYYYMMDDHH` label of an epoch hour (the inverse of [`receipt_epoch_hour`]).
+pub fn receipt_hour_label(hour: i32) -> Result<String> {
+    let at = DateTime::<Utc>::from_timestamp(i64::from(hour) * 3_600, 0).context("OTLP receipt hour is out of range")?;
+    Ok(at.format("%Y%m%d%H").to_string())
+}
+
+/// The distinct receipt hours named by `hour=<H>` right under `prefix` in
+/// `paths` (object keys or `hour=<H>/` directory paths), newest first.
+pub fn receipt_hours_under<'a>(prefix: &str, paths: impl IntoIterator<Item = &'a str>) -> Vec<i32> {
+    let mut hours = paths
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(prefix))
+        .filter_map(|rest| rest.split('/').next())
+        .filter_map(|segment| segment.strip_prefix("hour="))
+        .filter(|label| label.len() == 10 && label.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter_map(receipt_epoch_hour)
+        .collect::<Vec<_>>();
+    hours.sort_unstable_by(|a, b| b.cmp(a));
+    hours.dedup();
+    hours
 }
 
 fn is_lower_sha256(value: &str) -> bool {
@@ -306,6 +439,18 @@ pub trait OtelHandoffSource: Send + Sync {
         start_after: Option<&'a str>,
         limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>>> + Send + 'a>>;
+    /// NAN-3886: the receipt hours (hours since the epoch) that hold at least
+    /// one object directly under the dataset prefix `prefix`
+    /// (`.../dataset=<d>/`). Production lists the `hour=<H>/` common
+    /// prefixes with a delimiter (one LIST page covers ~41 days of hours);
+    /// the default derives them from ONE recursive [`Self::list`] call,
+    /// which is what the in-memory test doubles use.
+    fn list_receipt_hours<'a>(&'a self, prefix: &'a str) -> Pin<Box<dyn Future<Output = Result<Vec<i32>>> + Send + 'a>> {
+        Box::pin(async move {
+            let keys = self.list(prefix, None, FULL_SCAN_ENTRY_CEILING).await?;
+            Ok(receipt_hours_under(prefix, keys.iter().map(String::as_str)))
+        })
+    }
     /// `(content_length, strong_etag)` of one object.
     fn head<'a>(&'a self, key: &'a str) -> Pin<Box<dyn Future<Output = Result<(u64, String)>> + Send + 'a>>;
     /// The exact bytes, fenced by byte length, SHA-256 and strong ETag.
@@ -351,6 +496,24 @@ impl OtelHandoffSource for Operator {
                 }
             }
             Ok(keys)
+        })
+    }
+
+    fn list_receipt_hours<'a>(&'a self, prefix: &'a str) -> Pin<Box<dyn Future<Output = Result<Vec<i32>>> + Send + 'a>> {
+        Box::pin(async move {
+            // Non-recursive: S3 ListObjectsV2 with delimiter `/`, so each
+            // `hour=<H>/` common prefix is one entry, not its objects.
+            let mut lister = self
+                .lister_with(prefix)
+                .await
+                .context("list OTLP handoff receipt hours")?;
+            let mut paths = Vec::new();
+            while let Some(entry) = lister.try_next().await? {
+                if entry.metadata().mode() == EntryMode::DIR {
+                    paths.push(entry.path().to_string());
+                }
+            }
+            Ok(receipt_hours_under(prefix, paths.iter().map(String::as_str)))
         })
     }
 
@@ -587,7 +750,9 @@ pub struct MirrorPolicy {
 
 impl MirrorPolicy {
     pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-    pub const DEFAULT_MAX_AGE_HOURS: u32 = 24 * 30;
+    /// NAN-3894: the OTLP retention floor (31 d), so the mirror holds the
+    /// longest SLO window plus the coverage skew hour.
+    pub const DEFAULT_MAX_AGE_HOURS: u32 = crate::otel_lean::OTEL_MIN_RETENTION_DAYS * 24;
 
     pub fn validate(&self) -> Result<()> {
         if !(64 * 1024 * 1024..=4 * 1024 * 1024 * 1024 * 1024).contains(&self.max_bytes)
@@ -688,13 +853,19 @@ pub struct DrainCycleReport {
     pub rows_published: u64,
     pub rows_rejected: u64,
     pub tail_objects_published: usize,
-    /// This cycle listed the whole prefix (from the mirror floor on lean)
-    /// instead of only the lookback window.
+    /// Gen1: this cycle listed the whole prefix instead of only the lookback
+    /// window. Always false on lean (NAN-3886): the lean drain never lists
+    /// the whole prefix in one cycle; see `sweep`.
     pub full_scan: bool,
     /// NAN-3290: the cycle made progress AND left undrained objects behind
     /// (it hit `max_objects` or `max_rows`). The drain loop runs the next
     /// cycle for this dataset immediately instead of sleeping.
     pub backlogged: bool,
+    /// NAN-3886 (lean): this cycle advanced the persisted backfill sweep
+    /// over the receipt hours below the live window.
+    pub sweep: bool,
+    /// NAN-3886 (lean): `list` / `list_receipt_hours` calls this cycle made.
+    pub list_calls: usize,
 }
 
 /// NAN-3359: the first receipt hour a NORMAL (non-full-scan) cycle lists.
@@ -767,7 +938,46 @@ pub fn next_watermark_hour(previous: Option<i32>, now_hour: i32, coverage: Cycle
     }
 }
 
-/// Per-dataset listing state of one drain (NAN-3290).
+/// Newest receipt hour first, keys ascending inside an hour (NAN-3290), as
+/// `(epoch_hours, keys)`. Safe for the query side: the mirror and the
+/// committed table are disjoint by OBJECT (reconcile_mirror prunes every
+/// object the ledger no longer stages before the pin is refreshed), never by
+/// a time or receipt-order watermark, and the exactly-once ledger is per
+/// key. An unparseable hour counts as the oldest possible (the lookback floor
+/// then binds the watermark).
+fn newest_first(mut candidates: Vec<(String, String)>) -> (Vec<i32>, Vec<String>) {
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates
+        .into_iter()
+        .map(|(hour, key)| (receipt_epoch_hour(&hour).unwrap_or(i32::MIN), key))
+        .unzip()
+}
+
+/// NAN-3359: what a cycle proved about the hours it listed. Saturated:
+/// candidates after the ledger cut-off (older hours, newest-first order) were
+/// never checked. Cut by max_rows: the unexamined pending objects and the
+/// retries are still pending. Otherwise only the retries are.
+fn cycle_coverage(
+    saturated: bool,
+    oldest_listed_hour: Option<i32>,
+    pending_hours: &[i32],
+    examined: usize,
+    oldest_retry_hour: Option<i32>,
+) -> CycleCoverage {
+    if saturated {
+        CycleCoverage::Incomplete { oldest_unproven_hour: oldest_listed_hour }
+    } else if examined < pending_hours.len() {
+        let unexamined = pending_hours[examined..].iter().copied().min();
+        CycleCoverage::Incomplete {
+            oldest_unproven_hour: [unexamined, oldest_retry_hour].into_iter().flatten().min(),
+        }
+    } else {
+        CycleCoverage::Complete { oldest_retry_hour }
+    }
+}
+
+/// Per-dataset listing state of one gen1 drain (NAN-3290). The lean drain
+/// keeps [`LeanScanState`] instead.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanState {
     /// Cycles run for this dataset (the periodic full scan is per dataset:
@@ -783,7 +993,7 @@ struct ScanState {
     recent_backlog: bool,
     /// NAN-3359: oldest receipt hour that may still hold an undrained
     /// object, as of the last successful cycle ([`next_watermark_hour`]).
-    /// In memory only: a restart begins with a full scan.
+    /// In memory only: a gen1 restart begins with a full scan.
     watermark_hour: Option<i32>,
 }
 
@@ -885,8 +1095,11 @@ pub struct OtelHandoffDrain {
     ledger: Arc<dyn OtelHandoffLedger>,
     mirror: Option<PathBuf>,
     mirror_policy: MirrorPolicy,
-    /// Listing state per dataset (index: [`DrainPacer::slot`]).
+    /// Listing state per dataset (index: [`DrainPacer::slot`]). Gen1 only.
     scan: std::sync::Mutex<[ScanState; 2]>,
+    /// NAN-3886: lean listing state per dataset, loaded from the mirror on
+    /// first use and persisted after every cycle that changes it.
+    lean_scan: std::sync::Mutex<[Option<LeanScanState>; 2]>,
     /// Handoff objects fetched concurrently per cycle (NAN-3290).
     fetch_concurrency: usize,
     /// The committed-table pins observed at the last hydration / drain
@@ -965,6 +1178,7 @@ impl OtelHandoffDrain {
             mirror,
             mirror_policy,
             scan: std::sync::Mutex::new([ScanState::default(); 2]),
+            lean_scan: std::sync::Mutex::new([None, None]),
             fetch_concurrency: DEFAULT_DRAIN_FETCH_CONCURRENCY,
             pins: std::sync::RwLock::new(BTreeMap::new()),
         })
@@ -1060,9 +1274,14 @@ impl OtelHandoffDrain {
     /// empty mirror after a restart serves the live hours within the first
     /// cycle and older hours backfill after), fetched with bounded
     /// concurrency, and folded into the publication in that same
-    /// deterministic order. A backlogged full scan keeps later cycles
-    /// scanning past the lookback window until the backlog is gone.
+    /// deterministic order. Gen1: a backlogged full scan keeps later cycles
+    /// scanning past the lookback window until the backlog is gone. Lean
+    /// (NAN-3886): the live window plus a persisted, paged backfill sweep;
+    /// see [`LeanScanState`].
     pub async fn drain_once(&self, dataset: OtelDataset) -> Result<DrainCycleReport> {
+        if self.is_lean() {
+            return self.drain_once_lean(dataset).await;
+        }
         let slot = DrainPacer::slot(dataset);
         let (full_scan, watermark) = self.with_scan_state(|states| states[slot].begin())?;
         // A failed cycle leaves the watermark where it was (nothing drained).
@@ -1079,8 +1298,20 @@ impl OtelHandoffDrain {
         Ok(apply(&mut states))
     }
 
-    /// One cycle. Returns the report and the next normal-cycle watermark
-    /// ([`next_watermark_hour`]).
+    /// Prune what the packer/compactor moved out of `staged` BEFORE the new
+    /// pin becomes visible: the query side unions the committed table with
+    /// the mirror positionally, so a committed object that is still mirrored
+    /// would be served twice.
+    async fn settle_mirror(&self, dataset: OtelDataset) -> Result<()> {
+        if self.mirror.is_some() {
+            self.reconcile_mirror(dataset).await?;
+            self.refresh_pin(dataset).await?;
+        }
+        Ok(())
+    }
+
+    /// One gen1 cycle. Returns the report and the next normal-cycle
+    /// watermark ([`next_watermark_hour`]).
     async fn drain_cycle(
         &self,
         dataset: OtelDataset,
@@ -1089,52 +1320,46 @@ impl OtelHandoffDrain {
     ) -> Result<(DrainCycleReport, Option<i32>)> {
         let now = Utc::now();
         let now_hour = i32::try_from(now.timestamp().div_euclid(3_600))?;
-        let advance = |coverage| next_watermark_hour(watermark, now_hour, coverage);
-        let complete = CycleCoverage::Complete { oldest_retry_hour: None };
         let mut report = DrainCycleReport { full_scan, ..DrainCycleReport::default() };
-        if self.mirror.is_some() {
-            // Prune what the packer/compactor moved out of `staged` BEFORE the
-            // new pin becomes visible: the query side unions the committed
-            // table with the mirror positionally, so a committed object that
-            // is still mirrored would be served twice.
-            self.reconcile_mirror(dataset).await?;
-            self.refresh_pin(dataset).await?;
-        }
+        self.settle_mirror(dataset).await?;
         let prefix = handoff_prefix(self.binding.tenant_uuid, dataset);
-        let mut newest_written_hour: Option<i32> = None;
-        // Lean: a key whose receipt hour is below the mirror floor holds only
-        // rows the mirror would prune again (event time <= receipt time).
-        let lean_floor_hour = match self.sink {
-            None => Some(self.mirror_floor_hour(now).await?),
-            Some(_) => None,
-        };
-        let cursor = match (full_scan, lean_floor_hour) {
-            // NAN-3359: only the receipt hours that can still hold undrained
-            // objects (always including the current and previous hour).
-            (false, _) => Some(Self::floor_cursor(
+        // NAN-3359: a normal cycle lists only the receipt hours that can still
+        // hold undrained objects (always including the current and previous
+        // hour); a full scan lists the whole prefix.
+        let cursor = if full_scan {
+            None
+        } else {
+            Some(Self::floor_cursor(
                 &prefix,
-                normal_cycle_start_hour(now_hour, self.binding.lookback_hours, lean_floor_hour, watermark),
-            )?),
-            // Lean full scan: start AT the mirror floor, never at the oldest
-            // retained key. The lean prefix keeps every object for the whole
-            // retention window (up to 365 days), so a scan from the start
-            // would spend its FULL_SCAN_ENTRY_CEILING on keys below the floor
-            // and an empty mirror would never re-drain past the lookback.
-            (true, Some(floor)) => Some(Self::floor_cursor(&prefix, floor)?),
-            (true, None) => None,
+                normal_cycle_start_hour(now_hour, self.binding.lookback_hours, None, watermark),
+            )?)
         };
-        let mut candidates = Vec::<(String, String)>::new();
-        for key in self
+        report.list_calls += 1;
+        let listed = self
             .source
             .list(&prefix, cursor.as_deref(), FULL_SCAN_ENTRY_CEILING)
-            .await?
-        {
+            .await?;
+        let candidates = self.dataset_candidates(dataset, listed)?;
+        report.objects_seen = candidates.len();
+        let (hours, candidates) = newest_first(candidates);
+        let oldest_listed_hour = hours.iter().copied().min();
+        let (pending, pending_hours, saturated) = self
+            .pending_newest_first(dataset, &candidates, &hours, self.binding.max_objects)
+            .await?;
+        let pending_count = pending.len();
+        let fold = self.drain_pending(dataset, pending, &pending_hours, &mut report).await?;
+        let oldest_retry_hour = fold.retries.iter().map(|index| pending_hours[*index]).min();
+        report.backlogged = (saturated || fold.examined < pending_count) && fold.acknowledged;
+        let coverage = cycle_coverage(saturated, oldest_listed_hour, &pending_hours, fold.examined, oldest_retry_hour);
+        Ok((report, next_watermark_hour(watermark, now_hour, coverage)))
+    }
+
+    /// `(receipt_hour, key)` of every listed key of `dataset`; foreign
+    /// objects are logged and skipped, a key of the other dataset fails.
+    fn dataset_candidates(&self, dataset: OtelDataset, listed: Vec<String>) -> Result<Vec<(String, String)>> {
+        let mut candidates = Vec::with_capacity(listed.len());
+        for key in listed {
             match parse_handoff_key(&key, self.binding.tenant_uuid) {
-                Ok(parsed)
-                    if parsed.dataset == dataset
-                        && lean_floor_hour.is_some_and(|floor| {
-                            receipt_epoch_hour(&parsed.receipt_hour).is_some_and(|hour| hour < floor)
-                        }) => {}
                 Ok(parsed) if parsed.dataset == dataset => candidates.push((parsed.receipt_hour, key)),
                 Ok(_) => bail!("OTLP handoff listing crossed its dataset prefix"),
                 Err(error) => {
@@ -1142,26 +1367,21 @@ impl OtelHandoffDrain {
                 }
             }
         }
-        report.objects_seen = candidates.len();
-        if candidates.is_empty() {
-            self.ledger.heartbeat().await?;
-            return Ok((report, advance(complete)));
-        }
-        // Newest receipt hour first, keys ascending inside an hour (NAN-3290).
-        // Safe for the query side: the mirror and the committed table are
-        // disjoint by OBJECT (reconcile_mirror prunes every object the ledger
-        // no longer stages before the pin is refreshed), never by a time or
-        // receipt-order watermark, and the exactly-once ledger is per key.
-        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        // Receipt hour per candidate for the watermark; an unparseable hour
-        // counts as the oldest possible (the lookback floor then binds).
-        let (hours, candidates): (Vec<i32>, Vec<String>) = candidates
-            .into_iter()
-            .map(|(hour, key)| (receipt_epoch_hour(&hour).unwrap_or(i32::MIN), key))
-            .unzip();
-        let oldest_listed_hour = hours.iter().copied().min();
-        // Page the ledger check so a long-lived prefix costs one bounded
-        // query per page instead of one unbounded ANY($2).
+        Ok(candidates)
+    }
+
+    /// The undrained keys among `candidates` (already newest first), at most
+    /// `limit`, with their receipt hours. The ledger check is paged so a
+    /// long-lived prefix costs one bounded query per page instead of one
+    /// unbounded ANY($2). `true` = saturated: there may be more pending
+    /// than this cycle takes.
+    async fn pending_newest_first(
+        &self,
+        dataset: OtelDataset,
+        candidates: &[String],
+        hours: &[i32],
+        limit: usize,
+    ) -> Result<(Vec<String>, Vec<i32>, bool)> {
         let mut pending = Vec::new();
         let mut pending_hours = Vec::new();
         for (page_index, page) in candidates.chunks(LEDGER_PAGE).enumerate() {
@@ -1172,26 +1392,357 @@ impl OtelHandoffDrain {
                     pending_hours.push(hours[page_index * LEDGER_PAGE + offset]);
                 }
             }
-            if pending.len() >= self.binding.max_objects {
+            if pending.len() >= limit {
                 break;
             }
         }
-        // At max_objects there may be more pending than this cycle takes.
-        let saturated = pending.len() >= self.binding.max_objects;
-        pending.truncate(self.binding.max_objects);
-        pending_hours.truncate(self.binding.max_objects);
-        if pending.is_empty() {
-            self.ledger.heartbeat().await?;
-            return Ok((report, advance(complete)));
+        let saturated = pending.len() >= limit;
+        pending.truncate(limit);
+        pending_hours.truncate(limit);
+        Ok((pending, pending_hours, saturated))
+    }
+
+    // ---- NAN-3886: the lean drain -----------------------------------------
+
+    fn with_lean_scan<T>(&self, apply: impl FnOnce(&mut [Option<LeanScanState>; 2]) -> T) -> Result<T> {
+        let mut states = self
+            .lean_scan
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lean OTLP drain scan state poisoned"))?;
+        Ok(apply(&mut states))
+    }
+
+    /// The lean scan state of `dataset` this drain is working from.
+    pub fn lean_scan_state(&self, dataset: OtelDataset) -> Result<Option<LeanScanState>> {
+        self.with_lean_scan(|states| states[DrainPacer::slot(dataset)].clone())
+    }
+
+    /// The lean state this drain works from, or (before its first cycle)
+    /// the one persisted in the mirror.
+    fn lean_state_or_persisted(&self, dataset: OtelDataset) -> Result<Option<(PathBuf, LeanScanState)>> {
+        let (true, Some(mirror)) = (self.is_lean(), self.mirror.as_ref()) else {
+            return Ok(None);
+        };
+        let state = match self.lean_scan_state(dataset)? {
+            Some(state) => state,
+            None => crate::otel_lean::load_lean_scan_state(mirror, dataset),
+        };
+        Ok(Some((mirror.clone(), state)))
+    }
+
+    /// NAN-3894: what this lean mirror attests for `dataset` (`None` on gen1).
+    pub fn lean_coverage(&self, dataset: OtelDataset) -> Result<Option<crate::otel_lean::LeanCoverage>> {
+        let Some((mirror, state)) = self.lean_state_or_persisted(dataset)? else {
+            return Ok(None);
+        };
+        let evicted = crate::otel_lean::newest_evicted_hour(&mirror, dataset)?;
+        Ok(Some(crate::otel_lean::lean_coverage(dataset, &state, evicted, Utc::now())))
+    }
+
+    /// NAN-3894: true only when this lean mirror holds every row of
+    /// `[start, end)` ([`crate::otel_lean::lean_window_complete`]). Any
+    /// error or a gen1 drain is `false`: absence never proves coverage.
+    pub fn lean_window_complete(&self, dataset: OtelDataset, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+        let Ok(Some((mirror, state))) = self.lean_state_or_persisted(dataset) else {
+            return false;
+        };
+        let Ok(evicted) = crate::otel_lean::newest_evicted_hour(&mirror, dataset) else {
+            return false;
+        };
+        crate::otel_lean::lean_window_complete(&state, evicted, start, end, Utc::now())
+    }
+
+    async fn drain_once_lean(&self, dataset: OtelDataset) -> Result<DrainCycleReport> {
+        let mirror = self.mirror.clone().context("a lean OTLP drain needs its query mirror")?;
+        let slot = DrainPacer::slot(dataset);
+        // First cycle of this process: resume where the previous process
+        // over the same mirror stopped.
+        let (previous, persisted) = match self.with_lean_scan(|states| states[slot].clone())? {
+            Some(state) => (state, true),
+            None => (crate::otel_lean::load_lean_scan_state(&mirror, dataset), false),
+        };
+        let (report, next) = self.drain_cycle_lean(dataset, &mirror, previous.clone()).await?;
+        if next != previous || !persisted {
+            // Best effort: the drain markers carry exactly-once; a lost state
+            // file only costs one re-sweep after the next restart.
+            if let Err(error) = crate::otel_lean::save_lean_scan_state(&mirror, dataset, &next) {
+                tracing::warn!(dataset = dataset.as_str(), error = %format!("{error:#}"), "lean OTLP drain scan state not persisted");
+            }
+        }
+        self.with_lean_scan(|states| states[slot] = Some(next))?;
+        Ok(report)
+    }
+
+    /// One lean cycle: the live window (newest first), then — when the live
+    /// window left room under `max_objects` — the backfill sweep, resumed
+    /// from its persisted cursor. Returns the report and the next state.
+    async fn drain_cycle_lean(
+        &self,
+        dataset: OtelDataset,
+        mirror: &Path,
+        mut state: LeanScanState,
+    ) -> Result<(DrainCycleReport, LeanScanState)> {
+        let now = Utc::now();
+        let now_hour = i32::try_from(now.timestamp().div_euclid(3_600))?;
+        let mut report = DrainCycleReport::default();
+        // A cycle that died between its first mirror write and its last
+        // marker is rolled back before anything reads the mirror.
+        let rolled_back = crate::otel_lean::recover_drain_journal(mirror, dataset, self.binding.tenant_uuid)?;
+        if rolled_back > 0 {
+            tracing::warn!(dataset = dataset.as_str(), rolled_back, "rolled back an interrupted lean OTLP drain cycle");
+        }
+        self.settle_mirror(dataset).await?;
+        // A key whose receipt hour is below the mirror floor holds only rows
+        // the mirror would prune again (event time <= receipt time).
+        let floor = self.mirror_floor_hour(now).await?;
+        let prefix = handoff_prefix(self.binding.tenant_uuid, dataset);
+        // No state yet (a fresh mirror): the live window is the current and
+        // previous hour, and the sweep starts right below it, so the newest
+        // hours fill first and older hours backfill newest first.
+        let mut watermark = *state.watermark_hour.get_or_insert(now_hour.saturating_sub(1));
+        let live_start = normal_cycle_start_hour(now_hour, self.binding.lookback_hours, Some(floor), Some(watermark))
+            .max(now_hour.saturating_sub(LEAN_LIVE_WINDOW_HOURS));
+        let top = live_start.saturating_sub(1);
+        if watermark < live_start {
+            // Hours [max(watermark, floor), live_start) are still owed but
+            // the live window no longer lists them: hand them to a sweep
+            // that stops at the old watermark (everything below it was
+            // proven), and move the watermark up to the live window.
+            let stop = watermark.max(floor);
+            if stop < live_start {
+                state.unproven_hours.extend(stop..live_start);
+                state.sweep = Some(match state.sweep.take() {
+                    // A sweep in progress may already be below the owed
+                    // hours: restart it from the top, keeping its reach.
+                    Some(LeanSweepCursor { stop_hour: None, .. }) => LeanSweepCursor::top(top, None),
+                    Some(LeanSweepCursor { stop_hour: Some(previous), .. }) => {
+                        LeanSweepCursor::top(top, Some(previous.min(stop)))
+                    }
+                    None => LeanSweepCursor::top(top, Some(stop)),
+                });
+            }
+            watermark = live_start;
+        }
+        if state.sweep.is_none() {
+            let interval = i64::try_from(LEAN_SWEEP_INTERVAL.as_secs()).unwrap_or(i64::MAX);
+            let due = state
+                .last_sweep_completed_unix
+                .is_none_or(|at| now.timestamp().saturating_sub(at) >= interval);
+            if due {
+                state.sweep = Some(LeanSweepCursor::top(top, None));
+            }
+        }
+        // The sweep never lists an hour the live window lists.
+        if let Some(cursor) = state.sweep.as_mut() {
+            if cursor.hour >= live_start {
+                *cursor = LeanSweepCursor::top(top, cursor.stop_hour);
+            }
         }
 
-        let tenant = self.binding.tenant_uuid.to_string();
+        report.list_calls += 1;
+        let listed = self
+            .source
+            .list(&prefix, Some(&Self::floor_cursor(&prefix, live_start)?), FULL_SCAN_ENTRY_CEILING)
+            .await?;
+        let live = self.dataset_candidates(dataset, listed)?;
+        report.objects_seen = live.len();
+        let (live_hours, live_keys) = newest_first(live);
+        let oldest_live_hour = live_hours.iter().copied().min();
+        let (mut pending, mut pending_hours, live_saturated) = self
+            .pending_newest_first(dataset, &live_keys, &live_hours, self.binding.max_objects)
+            .await?;
+        let live_count = pending.len();
+
+        // Freshness first: the sweep only gets what the live window left.
+        let mut sweep = None;
+        let periodic = state.sweep.as_ref().is_some_and(|cursor| cursor.stop_hour.is_none());
+        if let (false, Some(cursor)) = (live_saturated, state.sweep.clone()) {
+            let pass = self
+                .sweep_pass(dataset, &prefix, floor, cursor, self.binding.max_objects - live_count, &mut report)
+                .await?;
+            report.sweep = true;
+            report.objects_seen += pass.seen;
+            for item in &pass.items {
+                pending.push(item.key.clone());
+                pending_hours.push(item.hour);
+            }
+            sweep = Some(pass);
+        }
+
         let pending_count = pending.len();
+        let fold = self.drain_pending(dataset, pending, &pending_hours, &mut report).await?;
+
+        // The live window moves the watermark exactly as on gen1 (NAN-3359).
+        let live_examined = fold.examined.min(live_count);
+        let live_retry_hour = fold
+            .retries
+            .iter()
+            .filter(|index| **index < live_count)
+            .map(|index| pending_hours[*index])
+            .min();
+        let coverage = cycle_coverage(
+            live_saturated,
+            oldest_live_hour,
+            &pending_hours[..live_count],
+            live_examined,
+            live_retry_hour,
+        );
+        state.watermark_hour = next_watermark_hour(Some(watermark), now_hour, coverage);
+        if coverage == (CycleCoverage::Complete { oldest_retry_hour: None }) {
+            state.live_proven_unix = Some(now.timestamp());
+        }
+
+        // The sweep advances past everything it proved: up to its first
+        // undrained key the fold did not reach (cut by `max_rows`). A key
+        // whose exact read failed is passed over; the next sweep retries it.
+        let mut sweep_found = false;
+        if let Some(pass) = sweep {
+            let sweep_examined = fold.examined.saturating_sub(live_count);
+            sweep_found = !pass.items.is_empty();
+            let previous = state.sweep.take().context("a sweep pass ran without a sweep")?;
+            let mut retried = previous.retried.clone();
+            retried.extend(
+                fold.retries
+                    .iter()
+                    .filter(|index| **index >= live_count)
+                    .map(|index| pending_hours[*index]),
+            );
+            state.unproven_hours.extend(retried.iter().copied());
+            let next = match pass.items.get(sweep_examined) {
+                Some(item) => Some(item.before.clone()),
+                None => pass.end,
+            };
+            // Coverage: every hour the sweep has fully passed is proven,
+            // except the hours where it passed over a failed read.
+            let passed_below = next.as_ref().map_or(pass.floor.saturating_sub(1), |cursor| cursor.hour);
+            state
+                .unproven_hours
+                .retain(|hour| !(passed_below < *hour && *hour <= previous.hour) || retried.contains(hour));
+            state.sweep = next.map(|cursor| LeanSweepCursor { retried, ..cursor });
+            if state.sweep.is_none() {
+                if periodic {
+                    state.last_sweep_completed_unix = Some(now.timestamp());
+                    // Everything from the mirror floor up is now drained
+                    // (the live window proved the hours above the sweep).
+                    state.covered_since_hour = Some(pass.floor);
+                }
+                tracing::info!(dataset = dataset.as_str(), periodic, "lean OTLP backfill sweep completed");
+            }
+        }
+        // Hours below the mirror floor are pruned: coverage starts there.
+        if let Some(covered) = state.covered_since_hour.as_mut() {
+            *covered = (*covered).max(floor);
+        }
+        state.unproven_hours.retain(|hour| *hour >= floor);
+        report.backlogged = fold.acknowledged
+            && (live_saturated || fold.examined < pending_count || (sweep_found && state.sweep.is_some()));
+        state.backlogged = report.backlogged || live_saturated || fold.examined < pending_count;
+        Ok((report, state))
+    }
+
+    /// Continue the lean backfill sweep from `cursor`: the receipt hours that
+    /// exist (one delimiter listing), newest first, from `cursor.hour` down
+    /// to `floor`, one page per list call, at most
+    /// [`LEAN_SWEEP_LIST_CALLS_PER_CYCLE`] calls, stopping once `budget`
+    /// undrained keys are found.
+    async fn sweep_pass(
+        &self,
+        dataset: OtelDataset,
+        prefix: &str,
+        floor: i32,
+        cursor: LeanSweepCursor,
+        budget: usize,
+        report: &mut DrainCycleReport,
+    ) -> Result<SweepPass> {
+        report.list_calls += 1;
+        let top = cursor.hour;
+        let stop_hour = cursor.stop_hour;
+        let floor = stop_hour.map_or(floor, |stop| stop.max(floor));
+        let at = |hour: i32, start_after: Option<String>| LeanSweepCursor { hour, start_after, stop_hour, retried: BTreeSet::new() };
+        let hours = self
+            .source
+            .list_receipt_hours(prefix)
+            .await?
+            .into_iter()
+            .filter(|hour| (floor..=top).contains(hour))
+            .collect::<Vec<_>>();
+        let mut position = cursor;
+        let mut items = Vec::new();
+        let mut seen = 0usize;
+        let mut calls = 0usize;
+        for hour in hours {
+            if hour < position.hour {
+                position = at(hour, None);
+            }
+            let hour_prefix = format!("{prefix}hour={}/", receipt_hour_label(hour)?);
+            loop {
+                if calls >= LEAN_SWEEP_LIST_CALLS_PER_CYCLE || items.len() >= budget {
+                    return Ok(SweepPass { items, end: Some(position), seen, floor });
+                }
+                calls += 1;
+                report.list_calls += 1;
+                let keys = self
+                    .source
+                    .list(&hour_prefix, position.start_after.as_deref(), LEAN_SWEEP_PAGE_KEYS)
+                    .await?;
+                let exhausted = keys.len() < LEAN_SWEEP_PAGE_KEYS;
+                seen += keys.len();
+                let mut candidates = Vec::with_capacity(keys.len());
+                for key in &keys {
+                    match parse_handoff_key(key, self.binding.tenant_uuid) {
+                        Ok(parsed) if parsed.dataset == dataset => candidates.push(key.clone()),
+                        Ok(_) => bail!("OTLP handoff listing crossed its dataset prefix"),
+                        Err(error) => {
+                            tracing::warn!(key, %error, "ignoring foreign object under the OTLP handoff prefix");
+                        }
+                    }
+                }
+                let mut drained = std::collections::HashSet::new();
+                for page in candidates.chunks(LEDGER_PAGE) {
+                    drained.extend(self.ledger.drained_keys(dataset, page).await?);
+                }
+                let candidates = candidates.into_iter().collect::<std::collections::HashSet<_>>();
+                for key in keys {
+                    if candidates.contains(&key) && !drained.contains(&key) {
+                        if items.len() >= budget {
+                            return Ok(SweepPass { items, end: Some(position), seen, floor });
+                        }
+                        items.push(SweepItem { key: key.clone(), hour, before: position.clone() });
+                    }
+                    position = at(hour, Some(key));
+                }
+                if exhausted {
+                    break;
+                }
+            }
+            position = at(hour.saturating_sub(1), None);
+        }
+        Ok(SweepPass { items, end: None, seen, floor })
+    }
+
+    /// Fetch and fold `pending` (in order, until `max_rows`), write the
+    /// mirror / publish the staged tail, and acknowledge — or heartbeat when
+    /// nothing is acknowledged.
+    ///
+    /// Lean (NAN-3886): the mirror files and drain markers of one cycle are
+    /// written under a drain journal, so a crash between the first Parquet
+    /// write and the last marker is rolled back (files and markers) instead
+    /// of leaving rows that a re-drain with a different batch composition
+    /// would duplicate.
+    async fn drain_pending(
+        &self,
+        dataset: OtelDataset,
+        pending: Vec<String>,
+        pending_hours: &[i32],
+        report: &mut DrainCycleReport,
+    ) -> Result<FoldOutcome> {
+        let tenant = self.binding.tenant_uuid.to_string();
         let mut examined = 0usize;
         let mut rows = Vec::<OtelLakeRow>::new();
         let mut batches = Vec::<DrainedHandoffBatch>::new();
         let mut publication_batches = Vec::<usize>::new();
-        let mut oldest_retry_hour = None::<i32>;
+        let mut retries = Vec::<usize>::new();
+        debug_assert_eq!(pending.len(), pending_hours.len());
         {
             // `buffered` keeps at most `fetch_concurrency` fetches in flight
             // and yields their results in `pending` order, so the fold below
@@ -1208,12 +1759,10 @@ impl OtelHandoffDrain {
                 let Some(fetched) = fetches.next().await else {
                     break;
                 };
-                let hour = pending_hours[examined];
+                let index = examined;
                 examined += 1;
                 match fetched? {
-                    FetchedHandoff::Retry => {
-                        oldest_retry_hour = Some(oldest_retry_hour.map_or(hour, |oldest| oldest.min(hour)));
-                    }
+                    FetchedHandoff::Retry => retries.push(index),
                     FetchedHandoff::Rejected(batch) => {
                         report.rows_rejected += u64::from(batch.rows_rejected);
                         report.objects_rejected += 1;
@@ -1228,22 +1777,10 @@ impl OtelHandoffDrain {
                 }
             }
         }
-        report.backlogged = (saturated || examined < pending_count) && !batches.is_empty();
-        // NAN-3359: what this cycle proved. Saturated: candidates after the
-        // ledger cut-off (older hours, newest-first order) were never
-        // checked. Cut by max_rows: the unexamined pending objects and the
-        // retries are still pending. Otherwise only the retries are.
-        let coverage = if saturated {
-            CycleCoverage::Incomplete { oldest_unproven_hour: oldest_listed_hour }
-        } else if examined < pending_count {
-            let unexamined = pending_hours[examined..].iter().copied().min();
-            CycleCoverage::Incomplete {
-                oldest_unproven_hour: [unexamined, oldest_retry_hour].into_iter().flatten().min(),
-            }
-        } else {
-            CycleCoverage::Complete { oldest_retry_hour }
-        };
-        let next_watermark = advance(coverage);
+        if batches.is_empty() {
+            self.ledger.heartbeat().await?;
+            return Ok(FoldOutcome { examined, retries, acknowledged: false });
+        }
         // The newest event hour already resident, before this cycle writes:
         // the cap protects the hour just written only when it is the newest
         // (a backfilled OLDER hour must not push newer hours out — newest
@@ -1252,8 +1789,8 @@ impl OtelHandoffDrain {
             Some(mirror) if !rows.is_empty() => mirror_objects(mirror, dataset)?.last().map(|(hour, _, _)| *hour),
             _ => None,
         };
-
-        let mut objects = Vec::new();
+        let mut staged = Vec::new();
+        let mut logical = String::new();
         if !rows.is_empty() {
             // Collapse identical row identities across handoff objects (a
             // retried sink batch lands twice under two receipt keys).
@@ -1261,71 +1798,130 @@ impl OtelHandoffDrain {
             if collapsed > 0 {
                 tracing::info!(collapsed, "collapsed duplicate OTLP row identities across handoff objects");
             }
-            let logical = drain_batch_sha256(&deduped);
+            logical = drain_batch_sha256(&deduped);
             for index in &publication_batches {
                 batches[*index].tail_batch_sha256 = Some(logical.clone());
             }
-            let staged = encode_staged_otel_objects(dataset, self.binding.tenant_uuid, &deduped, &logical)?;
-            let table_key = self.binding.table_key(dataset).to_string();
-            for file in staged {
-                let key = format!("{table_key}/{}", file.relative_path);
-                validate_staged_key(&key, &table_key, &tenant, &file)?;
-                let publication = StagedTailPublication {
-                    tenant_id: self.binding.logical_tenant_key.clone(),
-                    partition_tenant_id: tenant.clone(),
-                    object_bucket: self.binding.bucket.clone(),
-                    object_key: key.clone(),
-                    event_hour: file.event_hour,
-                    min_time_ms: file.min_time_ms,
-                    max_time_ms: file.max_time_ms,
-                    content_length: u64::try_from(file.bytes.len())?,
-                    content_sha256: file.sha256.clone(),
-                };
-                crate::shared_mode::hooks().validate_staged_tail(&publication)?;
-                let published = match &self.sink {
-                    Some(sink) => Some(sink.publish(&publication, file.bytes.clone()).await?),
-                    None => None,
-                };
-                if let Some(mirror) = &self.mirror {
-                    let path = Self::mirror_path(mirror, dataset, file.event_hour, &file.sha256);
-                    write_mirror_object(&path, &file.bytes)?;
-                    newest_written_hour = Some(newest_written_hour.map_or(file.event_hour, |h: i32| h.max(file.event_hour)));
-                }
-                let Some(published) = published else {
-                    // Lean: the mirror is the store; nothing is staged.
-                    report.rows_published += file.rows;
-                    continue;
-                };
-                objects.push(AcknowledgedTailObject {
-                    dataset,
-                    table_location_prefix: self.binding.table_location_prefix(dataset),
-                    batch_sha256: logical.clone(),
-                    event_hour: file.event_hour,
-                    object_uri: format!("{}/{}", self.binding.table_location(dataset), file.relative_path),
-                    version_id: published.version_id,
-                    etag: published.etag,
-                    bytes: u64::try_from(file.bytes.len())?,
-                    sha256: file.sha256,
-                    rows: file.rows,
-                    min_time_ms: file.min_time_ms,
-                    max_time_ms: file.max_time_ms,
-                    deletion_unit_id: published.deletion_unit_id,
-                    writer_authority_sha256: published.writer_authority_sha256,
-                });
-                report.rows_published += file.rows;
+            staged = encode_staged_otel_objects(dataset, self.binding.tenant_uuid, &deduped, &logical)?;
+        }
+        drop(rows);
+        let journal = match (&self.mirror, self.is_lean()) {
+            (Some(mirror), true) => {
+                // Content-addressed: a path that already exists holds these
+                // exact bytes from an earlier, fully acknowledged cycle and
+                // is not this cycle's to roll back.
+                let new_files = staged
+                    .iter()
+                    .map(|file| Self::mirror_path(mirror, dataset, file.event_hour, &file.sha256))
+                    .filter(|path| !path.exists())
+                    .collect::<Vec<_>>();
+                let keys = batches.iter().map(|batch| batch.object_key.clone()).collect::<Vec<_>>();
+                crate::otel_lean::begin_drain_journal(mirror, dataset, &new_files, &keys)?;
+                Some(mirror.clone())
             }
-            report.tail_objects_published = objects.len();
+            _ => None,
+        };
+        let committed = self
+            .commit_cycle(dataset, staged, &logical, batches, resident_newest_hour, report)
+            .await;
+        if let Some(mirror) = journal {
+            match &committed {
+                Ok(()) => crate::otel_lean::finish_drain_journal(&mirror, dataset)?,
+                Err(_) => {
+                    if let Err(error) =
+                        crate::otel_lean::recover_drain_journal(&mirror, dataset, self.binding.tenant_uuid)
+                    {
+                        tracing::error!(dataset = dataset.as_str(), error = %format!("{error:#}"), "lean OTLP drain cycle failed and its rollback failed; retried next cycle");
+                    }
+                }
+            }
         }
+        committed?;
         report.objects_drained = publication_batches.len();
-        if batches.is_empty() {
-            self.ledger.heartbeat().await?;
-            return Ok((report, next_watermark));
+        Ok(FoldOutcome { examined, retries, acknowledged: true })
+    }
+
+    /// Write the cycle's staged objects (mirror and/or owner writer), enforce
+    /// the mirror cap, and acknowledge every batch.
+    async fn commit_cycle(
+        &self,
+        dataset: OtelDataset,
+        staged: Vec<StagedOtelObject>,
+        logical: &str,
+        batches: Vec<DrainedHandoffBatch>,
+        resident_newest_hour: Option<i32>,
+        report: &mut DrainCycleReport,
+    ) -> Result<()> {
+        let tenant = self.binding.tenant_uuid.to_string();
+        let mut newest_written_hour: Option<i32> = None;
+        let mut objects = Vec::new();
+        let table_key = self.binding.table_key(dataset).to_string();
+        for file in staged {
+            let key = format!("{table_key}/{}", file.relative_path);
+            validate_staged_key(&key, &table_key, &tenant, &file)?;
+            let publication = StagedTailPublication {
+                tenant_id: self.binding.logical_tenant_key.clone(),
+                partition_tenant_id: tenant.clone(),
+                object_bucket: self.binding.bucket.clone(),
+                object_key: key.clone(),
+                event_hour: file.event_hour,
+                min_time_ms: file.min_time_ms,
+                max_time_ms: file.max_time_ms,
+                content_length: u64::try_from(file.bytes.len())?,
+                content_sha256: file.sha256.clone(),
+            };
+            crate::shared_mode::hooks().validate_staged_tail(&publication)?;
+            let published = match &self.sink {
+                Some(sink) => Some(sink.publish(&publication, file.bytes.clone()).await?),
+                None => None,
+            };
+            if let Some(mirror) = &self.mirror {
+                let path = Self::mirror_path(mirror, dataset, file.event_hour, &file.sha256);
+                if self.is_lean() {
+                    // The markers that follow must never outlive the rows.
+                    write_mirror_object_synced(&path, &file.bytes)?;
+                } else {
+                    write_mirror_object(&path, &file.bytes)?;
+                }
+                newest_written_hour = Some(newest_written_hour.map_or(file.event_hour, |h: i32| h.max(file.event_hour)));
+            }
+            let Some(published) = published else {
+                // Lean: the mirror is the store; nothing is staged.
+                report.rows_published += file.rows;
+                continue;
+            };
+            objects.push(AcknowledgedTailObject {
+                dataset,
+                table_location_prefix: self.binding.table_location_prefix(dataset),
+                batch_sha256: logical.to_string(),
+                event_hour: file.event_hour,
+                object_uri: format!("{}/{}", self.binding.table_location(dataset), file.relative_path),
+                version_id: published.version_id,
+                etag: published.etag,
+                bytes: u64::try_from(file.bytes.len())?,
+                sha256: file.sha256,
+                rows: file.rows,
+                min_time_ms: file.min_time_ms,
+                max_time_ms: file.max_time_ms,
+                deletion_unit_id: published.deletion_unit_id,
+                writer_authority_sha256: published.writer_authority_sha256,
+            });
+            report.rows_published += file.rows;
         }
+        report.tail_objects_published = objects.len();
         if let (Some(mirror), Some(hour)) = (&self.mirror, newest_written_hour) {
             let protect = resident_newest_hour
                 .is_none_or(|resident| hour >= resident)
                 .then_some((dataset, hour));
-            enforce_mirror_cap(mirror, self.mirror_policy.max_bytes, protect)?;
+            if self.is_lean() {
+                // NAN-3894: the eviction is recorded (durably) BEFORE any
+                // file goes, so coverage never attests an evicted hour.
+                enforce_mirror_cap_with(mirror, self.mirror_policy.max_bytes, protect, |evicting| {
+                    crate::otel_lean::record_mirror_eviction(mirror, evicting)
+                })?;
+            } else {
+                enforce_mirror_cap(mirror, self.mirror_policy.max_bytes, protect)?;
+            }
         }
         self.ledger
             .acknowledge(&DrainAcknowledgement {
@@ -1334,8 +1930,7 @@ impl OtelHandoffDrain {
                 batches,
             })
             .await
-            .context("acknowledge OTLP handoff drain cycle")?;
-        Ok((report, next_watermark))
+            .context("acknowledge OTLP handoff drain cycle")
     }
 
     /// HEAD, exact GET, decode and normalize one pending handoff object.
@@ -1521,6 +2116,17 @@ pub fn mirror_total_bytes(mirror: &Path) -> Result<u64> {
 /// a single oversized hour is never evicted right after landing (the cap
 /// is then exceeded and logged rather than the newest data dropped).
 pub fn enforce_mirror_cap(mirror: &Path, max_bytes: u64, protect: Option<(OtelDataset, i32)>) -> Result<usize> {
+    enforce_mirror_cap_with(mirror, max_bytes, protect, |_| Ok(()))
+}
+
+/// [`enforce_mirror_cap`] that hands `record` every `(dataset, event_hour)`
+/// it is about to evict from, before the first file is removed.
+pub fn enforce_mirror_cap_with(
+    mirror: &Path,
+    max_bytes: u64,
+    protect: Option<(OtelDataset, i32)>,
+    record: impl FnOnce(&[(OtelDataset, i32)]) -> Result<()>,
+) -> Result<usize> {
     let mut objects = Vec::new();
     for dataset in [OtelDataset::Spans, OtelDataset::Metrics] {
         for (event_hour, path, bytes) in mirror_objects(mirror, dataset)? {
@@ -1533,7 +2139,7 @@ pub fn enforce_mirror_cap(mirror: &Path, max_bytes: u64, protect: Option<(OtelDa
     }
     // Oldest hour first; within an hour, larger objects first.
     objects.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.3.cmp(&a.3)));
-    let mut evicted = 0usize;
+    let mut victims = Vec::new();
     for (event_hour, dataset, path, bytes) in objects {
         if total <= max_bytes {
             break;
@@ -1541,8 +2147,15 @@ pub fn enforce_mirror_cap(mirror: &Path, max_bytes: u64, protect: Option<(OtelDa
         if protect == Some((dataset, event_hour)) {
             continue;
         }
-        std::fs::remove_file(&path).with_context(|| format!("evict mirrored OTLP object {}", path.display()))?;
         total = total.saturating_sub(bytes);
+        victims.push((dataset, event_hour, path));
+    }
+    if !victims.is_empty() {
+        record(&victims.iter().map(|(dataset, hour, _)| (*dataset, *hour)).collect::<Vec<_>>())?;
+    }
+    let mut evicted = 0usize;
+    for (_, _, path) in victims {
+        std::fs::remove_file(&path).with_context(|| format!("evict mirrored OTLP object {}", path.display()))?;
         evicted += 1;
     }
     if total > max_bytes {
@@ -1565,6 +2178,23 @@ pub(crate) fn write_mirror_object(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = parent.join(format!(".{}.tmp", Uuid::now_v7()));
     std::fs::write(&temporary, bytes)?;
     std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// [`write_mirror_object`] that survives a node crash, not only a process
+/// crash (NAN-3886: the lean mirror lives on a PersistentVolumeClaim): the
+/// bytes and the directory entry are synced before it returns.
+pub(crate) fn write_mirror_object_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("mirror path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{}.tmp", Uuid::now_v7()));
+    {
+        let mut file = std::fs::File::create(&temporary)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

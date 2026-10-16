@@ -23,6 +23,7 @@ pub mod job_coordinator_client;
 pub mod job_coordinator_config;
 #[cfg(feature = "enterprise")]
 pub mod hosted_producer_reload;
+mod in_flight_jobs;
 pub mod job_control_store;
 pub mod job_coordinator_transport;
 pub mod job_envelope;

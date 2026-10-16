@@ -2,13 +2,21 @@
 # =============================================================================
 # The existing 03-otlp-source.toml owns the OTLP listener and routes each native
 # record to exactly one selected backend. Legacy installs keep their ClickHouse
-# sink; lake installs use this durable HTTP-to-Iceberg path.
+# sink; lake installs POST native batches to `lake_otel_ingest`:
+#
+#   * open-core lean: `http://lean-otel:3014` (NANO_OTEL_LAKE_MODE=trusted_local),
+#     which writes durable native Parquet (nanosiem-lake-worker otel_local.rs);
+#   * hosted lean: `http://otel.internal`, the tenant Worker's outbound host,
+#     which lands each batch as one immutable object under
+#     `otel-handoff-v1/tenant_uuid=<T>/` in the tenant's R2 bucket; the tenant's
+#     `lake_otel_ingest` (NANO_OTEL_LAKE_MODE=lean) drains it into its query
+#     mirror (otel_lean.rs).
 #
 # The overlay consumes the one-record-per-event span shape from
 # `otlp_traces_prep` and the pre-ClickHouse native metric shape from
 # `otlp_metrics_to_log`. It does not normalize traces or metrics into OCSF:
 # OCSF is the event/log dataset, while spans and metrics retain their native
-# OTLP semantics in separate Iceberg datasets.
+# OTLP semantics in separate native datasets.
 #
 # Required environment variables:
 #   NANO_OTEL_LAKE_INGEST_URL
@@ -62,6 +70,12 @@ if nanos == "0" { abort }
 attrs = []
 res_attrs = []
 tags = object(.tags) ?? {}
+# NAN-3886: metric_to_log lifts a data-point attribute named `host` out of the
+# tags into the top-level `.host` field (its default `host_tag`), so the
+# attribute vanished from the stored point. Put it back.
+if !exists(tags.host) && exists(.host) {
+    tags = set!(tags, ["host"], to_string(.host) ?? encode_json(.host))
+}
 for_each(tags) -> |k, v| {
     sv = if is_object(v) || is_array(v) { encode_json(v) } else { to_string(v) ?? "" }
     if starts_with(k, "resource.") {
@@ -109,20 +123,57 @@ if exists(.gauge) {
     }
     event = set!(event, ["bucketCounts"], bucket_counts)
     event = set!(event, ["explicitBounds"], explicit_bounds)
-} else {
-    # The native Iceberg v1 schema intentionally supports gauge, sum, and
-    # histogram points. Reject unknown Vector metric variants instead of
-    # silently recording them as zero-valued gauges.
+}
+
+points = [event]
+if exists(.aggregated_summary) {
+    # NAN-3886: the native schema has gauge, sum and histogram points only, and
+    # a summary used to be dropped here without a trace (Prometheus client
+    # summaries, e.g. go_gc_duration_seconds, are common). Store it the way the
+    # OTel Prometheus exporter exposes it: one gauge per quantile under the
+    # metric name with a `quantile` attribute, plus `<name>_count` and
+    # `<name>_sum` cumulative sums.
+    name = to_string(.name) ?? ""
+    points = []
+    for_each(array(.aggregated_summary.quantiles) ?? []) -> |_i, q| {
+        quantile_attrs = push(attrs, { "key": "quantile", "value": { "stringValue": to_string(to_float(q.quantile) ?? 0.0) } })
+        points = push(points, merge(event, {
+            "attributes": quantile_attrs,
+            "type": "gauge",
+            "asDouble": to_float(q.value) ?? 0.0
+        }))
+    }
+    points = push(points, merge(event, {
+        "name": name + "_count",
+        "type": "sum",
+        "asDouble": to_float(.aggregated_summary.count) ?? 0.0,
+        "aggregationTemporality": temporality
+    }))
+    points = push(points, merge(event, {
+        "name": name + "_sum",
+        "type": "sum",
+        "asDouble": to_float(.aggregated_summary.sum) ?? 0.0,
+        "aggregationTemporality": temporality
+    }))
+} else if !exists(event.type) {
+    # Any other Vector metric variant (set, distribution, sketch) has no
+    # native OTLP point shape. Reject it instead of silently recording it as a
+    # zero-valued gauge.
     abort
 }
 
-. = {
-    "schema_version": "nano-otlp-lake-v1",
-    "dataset": "metrics",
-    "source_type": "otlp_metric",
-    "ingest_time_unix_nano": ingest_time_unix_nano,
-    "event": event
+# A root array makes remap emit one event per element (summary fan-out).
+envelopes = []
+for_each(points) -> |_i, point| {
+    envelopes = push(envelopes, {
+        "schema_version": "nano-otlp-lake-v1",
+        "dataset": "metrics",
+        "source_type": "otlp_metric",
+        "ingest_time_unix_nano": ingest_time_unix_nano,
+        "event": point
+    })
 }
+. = envelopes
 '''
 
 # The HTTP sink encodes each buffered batch as NDJSON. A batch is acknowledged
@@ -260,3 +311,83 @@ assert_eq!(.event.attributes[0].key, "route")
 assert_eq!(.event.resource.attributes[0].key, "service.name")
 assert!(!exists(.tenant_id))
 '''
+
+[[tests]]
+name = "otlp lake metric envelope keeps a data-point attribute named host"
+
+[tests.input]
+insert_at = "otlp_lake_metrics_envelope"
+type = "log"
+
+[tests.input.log_fields]
+name = "system.cpu.utilization"
+kind = "absolute"
+timestamp = "2026-08-12T22:00:00Z"
+host = "node-a"
+gauge = { value = 0.5 }
+tags = { "resource.service.name" = "node-exporter" }
+
+[[tests.outputs]]
+extract_from = "otlp_lake_metrics_envelope"
+
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.event.type, "gauge")
+assert_eq!(.event.asDouble, 0.5)
+assert_eq!(.event.attributes, [{ "key": "host", "value": { "stringValue": "node-a" } }])
+assert_eq!(.event.resource.attributes[0].key, "service.name")
+'''
+
+[[tests]]
+name = "otlp lake summary fans out to quantile gauges plus count and sum"
+
+[tests.input]
+insert_at = "otlp_lake_metrics_envelope"
+type = "log"
+
+[tests.input.log_fields]
+name = "go_gc_duration_seconds"
+kind = "absolute"
+timestamp = "2026-08-12T22:00:00Z"
+aggregated_summary = { count = 10, sum = 0.42, quantiles = [{ quantile = 0.5, value = 0.03 }, { quantile = 0.99, value = 0.095 }] }
+tags = { job = "api", "resource.service.name" = "api" }
+
+[[tests.outputs]]
+extract_from = "otlp_lake_metrics_envelope"
+
+[[tests.outputs.conditions]]
+type = "vrl"
+source = '''
+assert_eq!(.schema_version, "nano-otlp-lake-v1")
+assert_eq!(.dataset, "metrics")
+name = string!(.event.name)
+assert!(includes(["go_gc_duration_seconds", "go_gc_duration_seconds_count", "go_gc_duration_seconds_sum"], name))
+if name == "go_gc_duration_seconds" {
+    assert_eq!(.event.type, "gauge")
+    assert_eq!(.event.attributes[0].key, "job")
+    assert_eq!(.event.attributes[1].key, "quantile")
+    assert!(includes(["0.5", "0.99"], .event.attributes[1].value.stringValue))
+} else {
+    assert_eq!(.event.type, "sum")
+    assert_eq!(.event.aggregationTemporality, 2)
+    assert!(includes([10.0, 0.42], .event.asDouble))
+    assert_eq!(length!(.event.attributes), 1)
+}
+assert_eq!(.event.resource.attributes[0].key, "service.name")
+assert!(!exists(.tenant_id))
+'''
+
+[[tests]]
+name = "otlp lake metric envelope rejects a variant with no native point shape"
+no_outputs_from = ["otlp_lake_metrics_envelope"]
+
+[tests.input]
+insert_at = "otlp_lake_metrics_envelope"
+type = "log"
+
+[tests.input.log_fields]
+name = "unique.users"
+kind = "incremental"
+timestamp = "2026-08-12T22:00:00Z"
+set = { values = ["a", "b"] }

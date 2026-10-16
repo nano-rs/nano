@@ -172,18 +172,11 @@ impl AppState {
             // catalog allowlist here leaves dedicated/open behavior
             // byte-compatible.
             tracing::info!("Enterprise-shared legacy/global leader schedulers remain disabled");
-            // NAN-2361 Observability: the synthetic-check runner, metric-monitor
-            // evaluator and SLO burn-rate evaluator are refused here by name.
-            // The shared profile has no per-tenant OTLP data path (the native
-            // OTLP lake is tenant-pinned and the hosted ingest Worker does not
-            // deliver spans/metrics), so evaluating tenant rows would read an
-            // empty dataset, and the synthetic runner would additionally probe
-            // tenant-authored URLs from the control plane. Definitions stay
-            // persisted per tenant; the console reports `telemetry.available=false`.
-            tracing::info!(
-                refused = "synthetics_runner,metric_monitor_evaluator,slo_evaluator",
-                "Enterprise-shared observability evaluators are not started: no per-tenant telemetry data path"
-            );
+            // Tenant-authored URLs must never be probed from shared jobs.
+            tracing::info!(refused = "synthetics_runner", "Hosted synthetics runner refused (SSRF)");
+            if let Some(runtime) = self.tenant_observability_eval_runtime.as_ref() {
+                handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
+            }
             // NAN-3196: the legacy HealthScheduler stays off (global admins,
             // tenant-blind issue tracker, ClickHouse). Shared feed staleness
             // runs through signed tenant transactions over the lake counters
