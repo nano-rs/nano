@@ -343,10 +343,11 @@ pub struct TenantOidcRepository {
 
 impl TenantOidcRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            encryption: crate::crypto::EncryptionService::from_env(),
-        }
+        Self::with_encryption(pool, crate::crypto::EncryptionService::from_env())
+    }
+
+    pub fn with_encryption(pool: PgPool, encryption: crate::crypto::EncryptionService) -> Self {
+        Self { pool, encryption }
     }
 
     /// List only enabled providers for one exact active tenant whose current
@@ -881,10 +882,10 @@ impl TenantOidcRepository {
         &self,
         authorization: &ConsumedTenantOidcAuthorization,
     ) -> Result<String, TenantOidcError> {
-        self.decrypt_provider_secret(&authorization.client_secret_encrypted)
+        self.decrypt_provider_secret(authorization, &authorization.client_secret_encrypted, "oidc.client-secret")
     }
 
-    fn decrypt_provider_secret(&self, value: &[u8]) -> Result<String, TenantOidcError> {
+    fn decrypt_provider_secret(&self, authorization: &ConsumedTenantOidcAuthorization, value: &[u8], purpose: &'static str) -> Result<String, TenantOidcError> {
         let stored: serde_json::Value =
             serde_json::from_slice(value).map_err(|_| TenantOidcError::CredentialUnavailable)?;
         let encrypted = crate::crypto::EncryptedData {
@@ -901,6 +902,7 @@ impl TenantOidcRepository {
         };
         let plaintext = self
             .encryption
+            .with_context(crate::crypto::CredentialScope::Tenant(authorization.tenant.tenant_id), purpose, authorization.provider_id)
             .decrypt(&encrypted)
             .map_err(|_| TenantOidcError::CredentialUnavailable)?;
         String::from_utf8(plaintext).map_err(|_| TenantOidcError::CredentialUnavailable)
@@ -922,7 +924,7 @@ impl TenantOidcRepository {
                 return Ok(());
             }
             let credential = self
-                .decrypt_provider_secret(encrypted)
+                .decrypt_provider_secret(authorization, encrypted, "oidc.google-service-account")
                 .map_err(|_| TenantOidcError::GroupMembershipUnknown)?;
             identity.groups = super::google_workspace_groups(
                 &authorization.access_policy,

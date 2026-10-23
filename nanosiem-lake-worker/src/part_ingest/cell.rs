@@ -3026,6 +3026,7 @@ mod tests {
         use nanosiem_lake_cell::contract::{JailSpec, TenantId};
         let dir = std::path::PathBuf::from("/nonexistent");
         Assignment {
+            outbound_proxy: None,
             tenant: TenantId::new(tenant).unwrap(),
             role: Role::Ingest,
             cell_id: "cell-a".into(),

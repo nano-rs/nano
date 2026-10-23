@@ -1,0 +1,79 @@
+[
+  {
+    "kind": "map",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "{\"token\":\"fixture-token\"}",
+    "ciphertext": "RTa5UVQDBySfoBlLKnh1C9ZOb1KBwcvSzz/R1H3ZL+ILLx+87KrD+Zw=",
+    "nonce": "AQEBAQEBAQEBAQEB"
+  },
+  {
+    "kind": "soar",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "{\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"connection_id\":\"00000000-0000-0000-0000-000000000002\",\"values\":{\"token\":\"fixture-token\"}}",
+    "ciphertext": "sy7ymZA8Gl8KxEH7tcnOzCRfL5q6gi6Yd9BS2pFR6WYsfclgamrY1Jr+tQy8ydRe6YN5MSa8oSauiWAj10kAUKJhnGC9JZCsLtuMxVH8Y0RcHQJVR3FNs/5zv1kbokzrOsmf+Xqb7bOwYo3aDfXxOtT2R3r4hVHTIQywDwGizGEjdUHuJwoFhvzL1Wf0bsx11yTauLUAweiFLZ8DSIA=",
+    "nonce": "AgICAgICAgICAgIC"
+  },
+  {
+    "kind": "totp",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "JBSWY3DPEHPK3PXP",
+    "ciphertext": "08exiDW2KEyRL4X0q80OSlp9JtRCR5nNoKg3bKglqgg=",
+    "nonce": "AwMDAwMDAwMDAwMD"
+  },
+  {
+    "kind": "hashes",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "[\"fixture-bcrypt-hash\"]",
+    "ciphertext": "Dv+Scuow80wEqc3Pb3zWprQw0+QToc/hx9bXaIRn7YJUdRRyNIUd",
+    "nonce": "BAQEBAQEBAQEBAQE"
+  },
+  {
+    "kind": "locator",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "{\"store\":\"postgres\",\"definition_id\":\"00000000-0000-0000-0000-000000000002\"}",
+    "ciphertext": "kkSxkxGJvATQqdpLmckaHolCz375wTh3BkdfpAx1EIqkTC1dQZ7eUfdLE5BfdqSLeViF5boTXmO8HLbn4Q8e1u3N/NMbvCQ+/CA7Y1KRoOa5fKQCdPe1vkVF8Q==",
+    "nonce": "BQUFBQUFBQUFBQUF"
+  },
+  {
+    "kind": "oidc",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "fixture-client-secret",
+    "ciphertext": "bCpLky1gHDVq4aFz6tnF4YmSojdiogp/OKkgcOL42o78mzaLQQ==",
+    "nonce": "BgYGBgYGBgYGBgYG"
+  },
+  {
+    "kind": "google",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "{\"client_email\":\"fixture@example.test\",\"private_key\":\"fixture-key\"}",
+    "ciphertext": "z6CUa2b3KlcSqUD33x9sV53vhE2i5UgsmDGMcqB3TTFGAtkKDR7jRhYEIpBqBbvIza/htPSj3538sAexn+kHoKcRxgOgxUaKsmWVgJ2NGRrFfM4=",
+    "nonce": "BwcHBwcHBwcHBwcH"
+  },
+  {
+    "kind": "threat-intel",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "{\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"provider\":\"fixture\",\"values\":{\"token\":\"fixture-token\"}}",
+    "ciphertext": "EJWzgZFWyLjPzsed1jcqpyWdECKqxD5QfyYvJYVAnuaFaXDIt5vK6dloBGBIt0z0R1+dpyeAdbU5pmFUpbkR8L0HNxYIkGTvHAWa2GuWb5rTtb9Jrtyo1GOv9021/cx00S41/erzmSn5i9g1+NPoFcz9LsMdag5BVO5mpg==",
+    "nonce": "CAgICAgICAgICAgI"
+  },
+  {
+    "kind": "export",
+    "key_input": "0123456789abcdef0123456789abcdef",
+    "plaintext": "{\"tenant_id\":\"00000000-0000-0000-0000-000000000001\",\"access_key_id\":\"fixture\",\"secret_access_key\":\"fixture\",\"catalog_credential\":\"fixture\"}",
+    "ciphertext": "K5dmmLGjnAW5KroKmhESG2Kga86XN7Es4qqtq9JlTDZ912DqvsEqnF4zVIbQllAkNrFhm8Yvhn/NJaRwFyQkah3MrAQKBLPy/SF4u5nMibC+WBvra6SDn0sFiy4eQiMEkUn/NiXBwz0iEQWD/pYgPaUDqp0r+uiIOgvO7zZqU3rNjFnP7adLNya0EYVZW9uSgx5AHQpAgpyc9sI=",
+    "nonce": "CQkJCQkJCQkJCQkJ"
+  },
+  {
+    "kind": "short-legacy",
+    "key_input": "old-16-byte-key!!",
+    "plaintext": "{\"token\":\"old\"}",
+    "ciphertext": "LjGkKg4M+7m5qhYEa1845dfIe1jhDyrwI1UDGGdJDg==",
+    "nonce": "CgoKCgoKCgoKCgoK"
+  },
+  {
+    "kind": "public-default",
+    "key_input": "nanosiem-default-key-32bytes!!",
+    "plaintext": "{\"token\":\"public\"}",
+    "ciphertext": "1tOJA3Nx7sACr4XfLq04TRrWMu9gV25jA3x+q2ze+AN/cg==",
+    "nonce": "CwsLCwsLCwsLCwsL"
+  }
+]

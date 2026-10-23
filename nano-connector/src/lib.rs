@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod broker;
 pub mod egress_proxy;
+pub mod egress_policy;
 pub mod paging;
 pub mod policy;
 pub mod spec;

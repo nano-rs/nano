@@ -889,6 +889,10 @@ async fn main() -> Result<()> {
         .json()
         .init();
     if std::env::args().skip(1).any(|arg|arg=="--iceberg-export") {
+        if !nanosiem_core::iceberg_export::feature_enabled() {
+            return nanosiem_lake_worker::part_ingest::iceberg_export::runner::run_from_env().await;
+        }
+        nanosiem_core::crypto::EncryptionService::try_from_env()?;
         let mut termination=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         return tokio::select! {
             result=nanosiem_lake_worker::part_ingest::iceberg_export::runner::run_from_env()=>result.map_err(|_|anyhow::anyhow!("customer Iceberg export startup failed")),

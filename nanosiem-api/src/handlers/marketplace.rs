@@ -220,7 +220,7 @@ pub async fn install_enrichment(
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
-    let service = MarketplaceInstallService::new(state.pool.clone());
+    let service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let entry = service.install(&slug, &request, auth.user_id()).await?;
 
     state.emit_audit(
@@ -257,7 +257,7 @@ pub async fn uninstall_enrichment(
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
-    let service = MarketplaceInstallService::new(state.pool.clone());
+    let service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let entry = service.uninstall(&slug).await?;
 
     state.emit_audit(
@@ -305,7 +305,7 @@ pub async fn configure_enrichment(
     // Handle credential update if provided
     let creds_updated = request.credentials.is_some();
     if let Some(ref credentials) = request.credentials {
-        let install_service = MarketplaceInstallService::new(state.pool.clone());
+        let install_service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
         install_service
             .update_credentials(&slug, credentials)
             .await?;
@@ -393,7 +393,7 @@ pub async fn update_enrichment(
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
     ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
-    let service = MarketplaceInstallService::new(state.pool.clone());
+    let service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let entry = service.update(&slug).await?;
 
     state.emit_audit(
@@ -526,7 +526,7 @@ pub async fn sync_enrichment(
         "identity" => {
             // Same fire-and-forget treatment as the deno path (NAN-1113):
             // don't block the HTTP response on the provider sync.
-            let install_service = MarketplaceInstallService::new(state.pool.clone());
+            let install_service = MarketplaceInstallService::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
             let slug_spawn = slug.clone();
             tokio::spawn(async move {
                 if let Err(e) = install_service.trigger_sync(&slug_spawn).await {
@@ -984,6 +984,7 @@ trait MarketplacePreviewRuntime: Send + Sync {
 
     fn decrypt_credentials(
         &self,
+        catalog_id: uuid::Uuid,
         ciphertext: &[u8],
         nonce: &str,
     ) -> Result<std::collections::HashMap<String, String>, String>;
@@ -1018,10 +1019,12 @@ impl MarketplacePreviewRuntime for AppState {
 
     fn decrypt_credentials(
         &self,
+        catalog_id: uuid::Uuid,
         ciphertext: &[u8],
         nonce: &str,
     ) -> Result<std::collections::HashMap<String, String>, String> {
         self.encryption_service
+            .with_context(nanosiem_core::crypto::CredentialScope::Deployment, "marketplace.credentials", catalog_id)
             .decrypt_credentials_bytea(ciphertext, nonce)
             .map_err(|error| error.to_string())
     }
@@ -1243,7 +1246,7 @@ async fn run_marketplace_preview<R: MarketplacePreviewRuntime>(
         entry.credentials_encrypted.as_deref(),
         entry.credentials_nonce.as_deref(),
     ) {
-        (Some(ciphertext), Some(nonce)) => match runtime.decrypt_credentials(ciphertext, nonce) {
+        (Some(ciphertext), Some(nonce)) => match runtime.decrypt_credentials(entry.id, ciphertext, nonce) {
             Ok(credentials) => credentials,
             Err(error) => {
                 tracing::warn!(
@@ -1468,6 +1471,7 @@ mod preview_tests {
 
         fn decrypt_credentials(
             &self,
+            _catalog_id: uuid::Uuid,
             _ciphertext: &[u8],
             _nonce: &str,
         ) -> Result<HashMap<String, String>, String> {

@@ -102,6 +102,16 @@ pub fn bootstrap_with_native_init(init: impl FnOnce(&Assignment) -> anyhow::Resu
         Some((other, _)) => bail!("unexpected message before assignment: {other:?}"),
     };
 
+    // This synchronous bootstrap runs before any async runtime/thread. Only
+    // the delegated principal enters the tenant process, never the root key.
+    if let Some(proxy) = &assignment.outbound_proxy {
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            std::env::set_var(name, &proxy.0);
+        }
+        for name in ["NO_PROXY", "no_proxy"] {
+            std::env::set_var(name, "localhost,127.0.0.1,::1,.svc,.svc.cluster.local,lake-object-store,lake-catalog,lake-cell");
+        }
+    }
     if let Err(error) = init(&assignment) {
         let _ = send(&control, &ToSupervisor::Fatal { error: format!("native initialization: {error:#}") });
         return Err(error.context("native initialization before jail"));

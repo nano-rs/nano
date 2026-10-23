@@ -15,6 +15,21 @@ mod schedulers;
 mod schema_profile;
 mod vector_config;
 
+pub fn auth_enabled_from_env() -> bool {
+    std::env::var("AUTH_ENABLED")
+        .map(|value| value.to_lowercase() != "false" && value != "0")
+        .unwrap_or(true)
+}
+
+/// The actual API auth constructor and subprocess probes share this loader.
+pub fn load_jwt_secret(auth_enabled: bool) -> String {
+    if !auth_enabled {
+        tracing::warn!("Authentication is DISABLED - this should only be used in development");
+        return "dev-placeholder-secret".into();
+    }
+    nanosiem_core::auth::jwt_secret_from_env()
+}
+
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::source_scope_resolver::SourceScopeResolver;
 use nanosiem_core::auth::{
@@ -433,9 +448,7 @@ impl AppState {
         bool,
     ) {
         // Check if auth is enabled (default: true in production, can be disabled for dev)
-        let auth_enabled = std::env::var("AUTH_ENABLED")
-            .map(|v| v.to_lowercase() != "false" && v != "0")
-            .unwrap_or(true);
+        let auth_enabled = auth_enabled_from_env();
 
         #[cfg(feature = "enterprise")]
         if config.deployment_mode.is_enterprise_shared() && !auth_enabled {
@@ -443,31 +456,7 @@ impl AppState {
         }
 
         // Get JWT secret from environment - REQUIRED for security
-        let jwt_secret = if !auth_enabled {
-            // If auth is disabled, use a placeholder (dev/testing only)
-            tracing::warn!("Authentication is DISABLED - this should only be used in development");
-            "dev-placeholder-secret".to_string()
-        } else {
-            // In production with auth enabled, JWT_SECRET MUST be set
-            let secret = std::env::var("JWT_SECRET")
-                .expect("CRITICAL SECURITY ERROR: JWT_SECRET environment variable must be set when authentication is enabled");
-
-            // Validate that the secret is not the old insecure default
-            if secret == "nanosiem-dev-secret-change-in-production" {
-                panic!("CRITICAL SECURITY ERROR: JWT_SECRET is set to the insecure default value. Please generate a secure random secret.");
-            }
-
-            // Validate minimum length (at least 32 characters for security)
-            if secret.len() < 32 {
-                panic!("CRITICAL SECURITY ERROR: JWT_SECRET must be at least 32 characters long. Current length: {}", secret.len());
-            }
-
-            tracing::info!(
-                "JWT secret loaded successfully (length: {} characters)",
-                secret.len()
-            );
-            secret
-        };
+        let jwt_secret = load_jwt_secret(auth_enabled);
 
         // Create repositories
         let user_repo = UserRepository::new(pool.clone());
@@ -881,6 +870,7 @@ mod task_registry_tests {
 // satisfied by the existing impl.
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::oidc::OidcAppState for AppState {
+    fn oidc_encryption_service(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -916,6 +906,7 @@ impl nanosiem_enterprise::handlers::oidc::OidcAppState for AppState {
 
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::oidc::SharedOidcAppState for AppState {
+    fn tenant_oidc_encryption_service(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -943,6 +934,7 @@ impl nanosiem_enterprise::handlers::oidc::SharedOidcAppState for AppState {
 
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::oidc::SharedOidcAdminAppState for AppState {
+    fn shared_oidc_admin_encryption_service(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -1063,6 +1055,7 @@ impl nanosiem_enterprise::handlers::enterprise_shared_cases_notebooks::Enterpris
 
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::enterprise_shared_detections::EnterpriseSharedDetectionsAppState for AppState {
+    fn settings_encryption_service(&self) -> Option<Arc<nanosiem_core::crypto::EncryptionService>> { Some(self.encryption_service.clone()) }
     fn deployment_mode(&self) -> &str { self.config.deployment_mode.system_api_value() }
     fn detection_runtime(&self) -> Option<&TenantAiRlsRuntime> { self.tenant_ai_rls_runtime.as_deref() }
     fn detection_control_pool(&self) -> &PgPool { &self.pool }
@@ -1121,6 +1114,7 @@ impl nanosiem_enterprise::handlers::enterprise_shared_enrichment::EnterpriseShar
 }
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::enterprise_shared_melod::EnterpriseSharedMelodAppState for AppState {
+    fn melod_encryption_service(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn melod_rls_runtime(&self) -> Option<Arc<TenantAiRlsRuntime>> { self.tenant_ai_rls_runtime.clone() }
     fn melod_agent_registry(&self) -> &Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> { &self.agent_config_registry }
 }
@@ -1156,6 +1150,7 @@ impl nanosiem_enterprise::handlers::risk::RiskAppState for AppState {
 
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::agent_enrichment::AgentEnrichmentAppState for AppState {
+    fn agent_enrichment_cipher(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -1208,6 +1203,7 @@ impl nanosiem_enterprise::handlers::integration_generation::IntegrationGeneratio
 #[cfg(feature = "enterprise")]
 #[async_trait::async_trait]
 impl nanosiem_enterprise::handlers::melod::MelodAppState for AppState {
+    fn melod_encryption_service(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -1240,6 +1236,7 @@ impl nanosiem_enterprise::handlers::melod::MelodAppState for AppState {
 #[cfg(feature = "enterprise")]
 #[async_trait::async_trait]
 impl nanosiem_enterprise::handlers::cases::CasesAppState for AppState {
+    fn case_encryption_service(&self) -> &nanosiem_core::crypto::EncryptionService { self.encryption_service.as_ref() }
     fn pool(&self) -> &PgPool {
         &self.pool
     }

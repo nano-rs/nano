@@ -348,6 +348,8 @@ impl Runner {
         let fenced = Arc::new(FencedCheckpoints { store: Arc::clone(&self.store), claim: claim.clone(), commits: AtomicU64::new(0), lost: AtomicU64::new(0) });
         let run_secs = self.cfg.run_secs(feed.max_run_secs);
         let mut ecfg = self.cfg.engine.clone();
+        let egress_tenant = if claim.slot.actor_id.is_nil() { nanosiem_core::egress::LOCAL_TENANT } else { claim.slot.tenant_id };
+        crate::egress_proxy::configure_purpose_broker(&mut ecfg.broker, egress_tenant, crate::broker::GrantPurpose::Connector);
         ecfg.ceilings.max_run_secs = run_secs;
         let input = RunInput {
             config: feed.config.clone(),
@@ -425,7 +427,7 @@ impl Runner {
             }
             return Ok(RunSink::Identity(Arc::new(sink)));
         }
-        HecSink::new(&feed.ingest_url, feed.ingest_token.clone(), feed.feed_id, &feed.connector, self.cfg.hec.clone())
+        HecSink::for_tenant(if claim.slot.actor_id.is_nil() { nanosiem_core::egress::LOCAL_TENANT } else { claim.slot.tenant_id }, &feed.ingest_url, feed.ingest_token.clone(), feed.feed_id, &feed.connector, self.cfg.hec.clone())
             .map(|s| RunSink::Hec(Arc::new(s)))
             .map_err(|e| e.to_string())
     }

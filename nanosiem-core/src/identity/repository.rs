@@ -421,6 +421,7 @@ impl IdentityRepository {
             .map_err(|e| IdentityRepositoryError::EncryptionError(e.to_string()))?;
         let plaintext = self
             .encryption
+            .with_context(crate::crypto::CredentialScope::Deployment, "identity.credentials", id)
             .decrypt(&encrypted)
             .map_err(|e| IdentityRepositoryError::EncryptionError(e.to_string()))?;
         let value: serde_json::Value = serde_json::from_slice(&plaintext)

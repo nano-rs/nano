@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
+    nanosiem_core::crypto::EncryptionService::try_from_env()?;
 
     tracing::info!("Starting NanoSIEM Jobs Service");
 

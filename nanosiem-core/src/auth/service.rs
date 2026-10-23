@@ -723,7 +723,7 @@ impl AuthService {
                 "MFA enabled but no TOTP nonce".to_string(),
             ))?;
 
-        let secret = super::mfa::decrypt_secret(totp_encrypted, totp_nonce, encryption)
+        let secret = super::mfa::decrypt_secret(totp_encrypted, totp_nonce, &(encryption).with_context(crate::crypto::CredentialScope::Account(user.id), "account.totp", user.id))
             .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
         // Try TOTP verification first
@@ -737,14 +737,14 @@ impl AuthService {
                 (&user.backup_codes_encrypted, &user.backup_codes_nonce)
             {
                 let mut hashed_codes =
-                    super::mfa::decrypt_backup_codes(backup_enc, backup_nonce, encryption)
+                    super::mfa::decrypt_backup_codes(backup_enc, backup_nonce, &(encryption).with_context(crate::crypto::CredentialScope::Account(user.id), "account.backup-codes", user.id))
                         .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
                 if let Some(idx) = super::mfa::verify_backup_code(code, &hashed_codes) {
                     used_backup_code = true;
                     // Remove used backup code and re-encrypt
                     hashed_codes.remove(idx);
-                    let new_encrypted = super::mfa::encrypt_backup_codes(&hashed_codes, encryption)
+                    let new_encrypted = super::mfa::encrypt_backup_codes(&hashed_codes, &(encryption).with_context(crate::crypto::CredentialScope::Account(user.id), "account.backup-codes", user.id))
                         .map_err(|e| AuthError::InternalError(e.to_string()))?;
                     let ciphertext = base64::engine::general_purpose::STANDARD
                         .decode(&new_encrypted.ciphertext)

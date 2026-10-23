@@ -104,7 +104,18 @@ impl ProxyDialer {
 
     fn connect_request(&self, target: &DialTarget<'_>, now: i64) -> Result<String, ProxyRefusal> {
         let grant = target.grant.ok_or(ProxyRefusal::NoGrant)?;
+        if matches!(grant.purpose, GrantPurpose::Connector | GrantPurpose::ThreatIntel) {
+            let purpose = match grant.purpose {
+                GrantPurpose::Connector => nanosiem_core::egress::Purpose::Connector,
+                GrantPurpose::ThreatIntel => nanosiem_core::egress::Purpose::ThreatIntel,
+                _ => unreachable!(),
+            };
+            let principal = nanosiem_core::egress::Principal::new(&self.key, grant.tenant, purpose).map_err(|_| ProxyRefusal::NoGrant)?;
+            if !crate::policy::is_plain_hostname(target.host) || target.addr.port() != 443 { return Err(ProxyRefusal::Refused); }
+            return Ok(format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\nProxy-Authorization: {auth}\r\n\r\n", host=target.host, auth=principal.basic()));
+        }
         let purpose = match grant.purpose {
+            GrantPurpose::Connector | GrantPurpose::ThreatIntel => unreachable!(),
             GrantPurpose::Soar => EgressPurpose::Soar { connection: grant.connection, revision: grant.revision },
         };
         // The host passed the broker's allowlist check (a lowercase DNS
@@ -128,6 +139,18 @@ impl ProxyDialer {
             rev = grant.revision,
         ))
     }
+}
+
+/// Production runner/lookup setup. Missing authority refuses all connections;
+/// it never retains the BrokerConfig's direct dialer.
+pub fn configure_purpose_broker(config: &mut crate::broker::BrokerConfig, tenant: uuid::Uuid, purpose: GrantPurpose) {
+    if !nanosiem_core::egress::hosted_proxy_configured() { return; }
+    let tenant=nanosiem_core::egress::runtime_tenant(tenant);
+    config.dialer = match nanosiem_core::egress::key_from_env().ok().and_then(|key| ProxyDialer::new(nanosiem_core::egress::PROXY_URL, &key).ok()) {
+        Some(dialer) => std::sync::Arc::new(dialer),
+        None => std::sync::Arc::new(RefusingDialer),
+    };
+    config.egress_grant = Some(crate::broker::EgressGrant { tenant, purpose, connection: uuid::Uuid::nil(), revision: 0 });
 }
 
 /// Read exactly through the header terminator: never consume tunnel bytes,
@@ -212,4 +235,19 @@ mod tests {
         let split = DialTarget { host: "a.com\r\nX: y", ..target };
         assert_eq!(dialer.connect_request(&split, 1000).unwrap_err(), ProxyRefusal::Refused);
     }
+    #[test]
+    fn native_proxy_requests_bind_tenant_and_purpose_and_refuse_other_transports() {
+        let key=[7;32]; let dialer=ProxyDialer::new("http://proxy:3128",&key).unwrap();
+        let tenant=uuid::Uuid::from_u128(10);
+        for (purpose,core_purpose) in [(GrantPurpose::Connector,nanosiem_core::egress::Purpose::Connector),(GrantPurpose::ThreatIntel,nanosiem_core::egress::Purpose::ThreatIntel)] {
+            let grant=EgressGrant{tenant,connection:uuid::Uuid::nil(),revision:0,purpose};
+            let target=DialTarget{host:"tenant.okta.com",addr:"93.184.215.14:443".parse().unwrap(),grant:Some(&grant)};
+            let request=dialer.connect_request(&target,0).unwrap();
+            let auth=request.lines().find_map(|line|line.strip_prefix("Proxy-Authorization: ")).unwrap();
+            assert_eq!(nanosiem_core::egress::Principal::verify(&key,auth),Some((tenant,core_purpose)));
+            assert!(!request.contains("93.184.215.14"));
+            assert_eq!(dialer.connect_request(&DialTarget{addr:"93.184.215.14:80".parse().unwrap(),..target},0).unwrap_err(),ProxyRefusal::Refused);
+        }
+    }
+
 }

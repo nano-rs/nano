@@ -17,6 +17,10 @@
 #      invisible while the installer still printed a clean verification)
 #   4. an unpulled profile-gated third-party image is still skipped, not fatal
 #   5. NANO_SKIP_IMAGE_VERIFY=1 still bypasses everything
+#   6. NAN-4417: a pinned release older than the checkout fetches its lock with
+#      curl + python3 on a host with no node, and verifies its first-party
+#      digests; when no lock for that release can be found it fails closed
+#      instead of warning and starting unverified images
 #
 # Run from the repo root:  bash scripts/test-install-image-verification.sh
 
@@ -35,11 +39,14 @@ trap 'rm -rf "$WORK"' EXIT
 
 # Extract just the functions under test plus the one helper they call.
 {
+    sed -n '/^github_owner_repo() {/,/^}/p'   "$INSTALL_SH"
+    sed -n '/^github_lock_commit_shas() {/,/^}/p' "$INSTALL_SH"
+    sed -n '/^fetch_release_lock() {/,/^}/p'  "$INSTALL_SH"
     sed -n '/^repo_digest_of() {/,/^}/p'      "$INSTALL_SH"
     sed -n '/^verify_one_digest() {/,/^}/p'   "$INSTALL_SH"
     sed -n '/^verify_image_digests() {/,/^}/p' "$INSTALL_SH"
 } > "$WORK/under_test.sh"
-for fn in repo_digest_of verify_one_digest verify_image_digests; do
+for fn in github_owner_repo github_lock_commit_shas fetch_release_lock repo_digest_of verify_one_digest verify_image_digests; do
     grep -q "^${fn}() {" "$WORK/under_test.sh" \
         || { echo "could not extract ${fn}() from $INSTALL_SH" >&2; exit 2; }
 done
@@ -81,7 +88,38 @@ harness() {
         # shellcheck disable=SC2034
         COMPOSE_FILE="docker-compose.opensource.yml"
         # shellcheck disable=SC2034
-        NANO_VERSION="latest"
+        NANO_VERSION="${HARNESS_NANO_VERSION:-latest}"
+        # shellcheck disable=SC2034
+        NANO_REPO_URL="https://github.com/nano-rs/nano.git"
+
+        # NAN-4417: a Docker-only host has no node. Any call fails the case.
+        node() { echo "node was called on a host without node" >&2; exit 3; }
+        # No git history in the fixture dir: the checkout fallback finds nothing.
+        git() { return 128; }
+        # Fake GitHub: the commits API lists two lock commits (newest first);
+        # raw fetches serve fixture locks. HARNESS_GITHUB=down fails every call.
+        curl() {
+            [[ "${HARNESS_GITHUB:-up}" == "up" ]] || return 22
+            local url="" out="" a
+            while [[ $# -gt 0 ]]; do
+                a="$1"; shift
+                case "$a" in
+                    -o) out="$1"; shift ;;
+                    -H) shift ;;
+                    http*) url="$a" ;;
+                esac
+            done
+            case "$url" in
+                https://api.github.com/repos/nano-rs/nano/commits\?path=images.lock*)
+                    printf '[{"sha":"%s","commit":{"tree":{"sha":"%s"}},"parents":[]},{"sha":"%s"}]' \
+                        "$SHA_NEW" "$SHA_TREE" "$SHA_OLD" ;;
+                "https://raw.githubusercontent.com/nano-rs/nano/${SHA_NEW}/images.lock")
+                    cp lock_new.txt "$out" ;;
+                "https://raw.githubusercontent.com/nano-rs/nano/${SHA_OLD}/images.lock")
+                    cp lock_old.txt "$out" ;;
+                *) return 22 ;;
+            esac
+        }
 
         warn() { printf '! %s\n' "$*" >&2; }
         ok()   { printf 'ok %s\n' "$*"; }
@@ -143,6 +181,32 @@ run_case "NANO_SKIP_IMAGE_VERIFY=1 bypasses the whole check" 0 "skipping image d
         log() { printf "==> %s\n" "$*"; }; fail() { printf "FAIL %s\n" "$*" >&2; exit 1; }
         COMPOSE_FILE=x NANO_VERSION=latest
         source "$1/under_test.sh"; verify_image_digests' _ "$WORK" "$WORK"
+
+# NAN-4417: pinned older release on a node-less host. The checkout's lock is
+# v1.0.8; the pin is v1.0.7, whose lock lives at an older commit on GitHub.
+SHA_NEW=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+SHA_OLD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+SHA_TREE=cccccccccccccccccccccccccccccccccccccccc
+export SHA_NEW SHA_OLD SHA_TREE
+printf '# Release: v1.0.8\nghcr.io/nano-rs/nano-api %s\n' "$D2" > "$WORK/lock_new.txt"
+printf '# Release: v1.0.7\nghcr.io/nano-rs/nano-api %s\n' "$D1" > "$WORK/lock_old.txt"
+LOCK_108="# Release: v1.0.8
+ghcr.io/nano-rs/nano-api $D2"
+
+HARNESS_NANO_VERSION=1.0.7 run_case "pinned older release: lock fetched without node" 0 "Fetched images.lock for pinned release v1.0.7" \
+    harness "$LOCK_108" "ghcr.io/nano-rs/nano-api:1.0.7" "$D1"
+
+HARNESS_NANO_VERSION=1.0.7 run_case "pinned older release: first-party digests verified from the fetched lock" 0 "Verified 1 first-party" \
+    harness "$LOCK_108" "ghcr.io/nano-rs/nano-api:1.0.7" "$D1"
+
+HARNESS_NANO_VERSION=1.0.7 run_case "pinned older release: a wrong pulled digest is still caught" 1 "Image digest verification failed" \
+    harness "$LOCK_108" "ghcr.io/nano-rs/nano-api:1.0.7" "$D2"
+
+HARNESS_NANO_VERSION=1.0.7 HARNESS_GITHUB=down run_case "pinned release with no fetchable lock fails closed" 1 "first-party image digests cannot be verified" \
+    harness "$LOCK_108" "ghcr.io/nano-rs/nano-api:1.0.7" "$D1"
+
+HARNESS_NANO_VERSION=1.0.6 run_case "pinned release missing from every lock fails closed" 1 "Could not find images.lock for release v1.0.6" \
+    harness "$LOCK_108" "ghcr.io/nano-rs/nano-api:1.0.6" "$D1"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

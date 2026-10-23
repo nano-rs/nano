@@ -55,6 +55,7 @@ pub mod demo;
 pub mod detection;
 pub mod detection_code_target;
 pub mod enrichment;
+pub mod egress;
 pub mod internal_domains;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_activation;

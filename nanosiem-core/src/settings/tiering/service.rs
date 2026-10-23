@@ -62,10 +62,14 @@ pub struct TieringService {
 impl TieringService {
     /// Create a new tiering service
     pub fn new(pg_pool: PgPool, ch_client: ClickHouseClient, config_dir: PathBuf) -> Self {
+        Self::with_crypto(pg_pool, ch_client, config_dir, EncryptionService::from_env())
+    }
+
+    pub fn with_crypto(pg_pool: PgPool, ch_client: ClickHouseClient, config_dir: PathBuf, crypto: EncryptionService) -> Self {
         Self {
             pg_pool,
             ch_client,
-            crypto: EncryptionService::from_env(),
+            crypto,
             config_dir,
         }
     }
@@ -236,7 +240,8 @@ impl TieringService {
 
                 let creds: S3Credentials = self
                     .crypto
-                    .decrypt_json(&encrypted)
+                    .with_context(crate::crypto::CredentialScope::Deployment, "tiering.s3", "default")
+            .decrypt_json(&encrypted)
                     .map_err(|e| TieringError::Encryption(e.to_string()))?;
 
                 Ok(Some(creds))

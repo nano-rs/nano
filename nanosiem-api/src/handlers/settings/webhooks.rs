@@ -38,7 +38,7 @@ pub async fn list_webhooks(
 ) -> Result<Json<Vec<nanosiem_core::webhooks::WebhookResponse>>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let webhooks = repo
         .list()
         .await
@@ -46,7 +46,7 @@ pub async fn list_webhooks(
 
     let responses: Vec<nanosiem_core::webhooks::WebhookResponse> = webhooks
         .iter()
-        .map(nanosiem_core::webhooks::WebhookResponse::from)
+        .map(|w| nanosiem_core::webhooks::WebhookResponse::for_settings(w, &state.encryption_service.with_context(nanosiem_core::crypto::CredentialScope::Deployment, "webhook.url", w.id)))
         .collect();
 
     Ok(Json(responses))
@@ -82,7 +82,7 @@ pub async fn create_webhook(
         .await
         .map_err(|e| ApiError::BadRequest(e))?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let webhook = repo
         .create(&request)
         .await
@@ -99,9 +99,7 @@ pub async fn create_webhook(
         .build(),
     );
 
-    Ok(Json(nanosiem_core::webhooks::WebhookResponse::from(
-        &webhook,
-    )))
+    Ok(Json(nanosiem_core::webhooks::WebhookResponse::for_settings(&webhook, &state.encryption_service.with_context(nanosiem_core::crypto::CredentialScope::Deployment, "webhook.url", webhook.id))))
 }
 
 /// Get a webhook by ID
@@ -124,7 +122,7 @@ pub async fn get_webhook(
 ) -> Result<Json<nanosiem_core::webhooks::WebhookResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let webhook = repo.get(*id).await.map_err(|e| match e {
         nanosiem_core::webhooks::WebhookRepositoryError::NotFound(_) => {
             ApiError::NotFound(format!("Webhook {} not found", *id))
@@ -132,9 +130,7 @@ pub async fn get_webhook(
         _ => ApiError::InternalError(e.to_string()),
     })?;
 
-    Ok(Json(nanosiem_core::webhooks::WebhookResponse::from(
-        &webhook,
-    )))
+    Ok(Json(nanosiem_core::webhooks::WebhookResponse::for_settings(&webhook, &state.encryption_service.with_context(nanosiem_core::crypto::CredentialScope::Deployment, "webhook.url", webhook.id))))
 }
 
 /// Update a webhook
@@ -161,7 +157,7 @@ pub async fn update_webhook(
 
     request.validate_channel().map_err(ApiError::BadRequest)?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
 
     // A channel's TYPE is immutable. The stored secret is type-specific: for a
     // generic channel it is an HMAC signing key, for PagerDuty it is an Events
@@ -221,9 +217,7 @@ pub async fn update_webhook(
         .build(),
     );
 
-    Ok(Json(nanosiem_core::webhooks::WebhookResponse::from(
-        &webhook,
-    )))
+    Ok(Json(nanosiem_core::webhooks::WebhookResponse::for_settings(&webhook, &state.encryption_service.with_context(nanosiem_core::crypto::CredentialScope::Deployment, "webhook.url", webhook.id))))
 }
 
 /// Delete a webhook
@@ -247,7 +241,7 @@ pub async fn delete_webhook(
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     // Get name for audit before deleting
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let webhook_name = repo.get(*id).await.ok().map(|w| w.name);
 
     repo.delete(*id).await.map_err(|e| match e {
@@ -292,7 +286,7 @@ pub async fn test_webhook(
 ) -> Result<Json<nanosiem_core::webhooks::WebhookTestResult>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let svc = nanosiem_core::webhooks::WebhookService::new(repo);
 
     let result = svc
@@ -335,7 +329,7 @@ pub async fn list_webhook_deliveries(
 ) -> Result<Json<Vec<nanosiem_core::webhooks::WebhookDeliveryLog>>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let limit = params.limit.unwrap_or(50).max(1).min(200);
     let logs = repo
         .list_deliveries(*id, limit)
@@ -412,7 +406,7 @@ pub async fn get_notification_config(
 ) -> Result<Json<NotificationConfigResponse>, ApiError> {
     ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     let base_url = repo
         .notification_base_url()
         .await
@@ -461,7 +455,7 @@ pub async fn update_notification_config(
         _ => None, // null / blank clears the setting (env fallback)
     };
 
-    let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
+    let repo = nanosiem_core::webhooks::WebhookRepository::with_encryption(state.pool.clone(), state.encryption_service.as_ref().clone());
     repo.set_notification_base_url(base_url_to_store.as_deref())
         .await
         .map_err(|e| ApiError::InternalError(e.to_string()))?;

@@ -158,9 +158,14 @@ impl HecSink {
     /// `ingest_url` is the tenant ingress base (the HEC event path is
     /// appended) or the full event endpoint.
     pub fn new(ingest_url: &str, token: Secret, feed_id: Uuid, connector: &str, cfg: HecConfig) -> Result<Self, HecError> {
+        Self::for_tenant(nanosiem_core::egress::LOCAL_TENANT, ingest_url, token, feed_id, connector, cfg)
+    }
+    pub fn for_tenant(tenant: Uuid, ingest_url: &str, token: Secret, feed_id: Uuid, connector: &str, cfg: HecConfig) -> Result<Self, HecError> {
         let endpoint = hec_endpoint(ingest_url, cfg.allow_http)?;
         check_host(&endpoint, cfg.allowed_host_suffix.as_deref())?;
-        let client = reqwest::Client::builder()
+        let builder = if nanosiem_core::egress::is_internal_service(&endpoint) { reqwest::Client::builder().no_proxy() }
+            else { nanosiem_core::egress::client_builder(tenant, nanosiem_core::egress::Purpose::Storage).map_err(|_| HecError::Client("egress authority unavailable".into()))? };
+        let client = builder
             .connect_timeout(cfg.connect_timeout)
             .timeout(cfg.request_timeout)
             .redirect(reqwest::redirect::Policy::none())

@@ -155,11 +155,12 @@ impl PgFeedStore {
         }
     }
 
-    fn open(&self, feed_id: Uuid, ct: Option<Vec<u8>>, nonce: Option<String>) -> Result<HashMap<String, Secret>, StoreError> {
+    fn open(&self, tenant_id: Uuid, feed_id: Uuid, purpose: &'static str, ct: Option<Vec<u8>>, nonce: Option<String>) -> Result<HashMap<String, Secret>, StoreError> {
         let (Some(ct), Some(nonce)) = (ct, nonce) else {
             return Ok(HashMap::new());
         };
         self.cipher
+            .with_context(nanosiem_core::crypto::CredentialScope::Tenant(tenant_id), purpose, feed_id)
             .decrypt_credentials_bytea(&ct, &nonce)
             .map(|m| m.into_iter().map(|(k, v)| (k, Secret::new(v))).collect())
             .map_err(|e| StoreError::Feed { feed_id, message: format!("credentials could not be opened: {e}") })
@@ -176,13 +177,13 @@ impl PgFeedStore {
     fn row_to_feed(&self, tenant_id: Uuid, r: &sqlx::postgres::PgRow) -> Result<FeedDefinition, StoreError> {
         let feed_id: Uuid = r.try_get("id").map_err(db)?;
         let config: Value = r.try_get("config").map_err(db)?;
-        let vendor = self.open(feed_id, r.try_get("vendor_credentials_encrypted").map_err(db)?, r.try_get("vendor_credentials_nonce").map_err(db)?)?;
+        let vendor = self.open(tenant_id, feed_id, "connector.vendor", r.try_get("vendor_credentials_encrypted").map_err(db)?, r.try_get("vendor_credentials_nonce").map_err(db)?)?;
         // Identity feeds (`sink = 'identity'`) have no ingest credential.
         let identity = r.try_get::<String, _>("sink").map_err(db)? == SINK_IDENTITY;
         let ingest_token = if identity {
             Secret::new("")
         } else {
-            let ingest = self.open(feed_id, Some(r.try_get("ingest_token_encrypted").map_err(db)?), Some(r.try_get("ingest_token_nonce").map_err(db)?))?;
+            let ingest = self.open(tenant_id, feed_id, "connector.ingest-token", Some(r.try_get("ingest_token_encrypted").map_err(db)?), Some(r.try_get("ingest_token_nonce").map_err(db)?))?;
             ingest
                 .get("token")
                 .cloned()
@@ -939,7 +940,7 @@ impl PgFeedStore {
         let Some((ct, nonce)) = feed.reveal_key.clone() else {
             return Ok(failed("credential_reveal_key_missing", CREDENTIAL_RESTART_SECS, true, state.credential_id));
         };
-        let key = match self.open(feed.feed_id, Some(ct), Some(nonce)).ok().and_then(|m| m.get("seed").cloned()) {
+        let key = match self.open(slot.tenant_id, feed.feed_id, "connector.reveal-seed", Some(ct), Some(nonce)).ok().and_then(|m| m.get("seed").cloned()) {
             Some(seed) => RevealKey::from_seed_hex(seed.expose()),
             None => return Ok(failed("credential_reveal_key_unreadable", CREDENTIAL_RESTART_SECS, true, state.credential_id)),
         };
@@ -1549,4 +1550,64 @@ pub async fn remove_mock_catalog_entry(pool: &PgPool, slug: &str) -> Result<Uuid
     .await
     .map_err(|e| AdminError::Backend(format!("marketplace_catalog: {e}")))?;
     id.ok_or_else(|| AdminError::CatalogNotFound(slug.to_string()))
+}
+
+#[cfg(test)]
+mod credential_reader_tests {
+    use super::*;
+    #[tokio::test]
+    async fn feed_reader_binds_tenant_feed_and_each_credential_field() {
+        use nanosiem_core::crypto::CredentialScope;
+        let cipher = EncryptionService::from_config("0123456789abcdef0123456789abcdef").unwrap();
+        let tenant = Uuid::from_u128(1);
+        let feed = Uuid::from_u128(2);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fixture@127.0.0.1:1/never-connect")
+            .unwrap();
+        let store = PgFeedStore::new(Tenancy::Dedicated { pool }, cipher.clone());
+        for purpose in [
+            "connector.vendor",
+            "connector.ingest-token",
+            "connector.reveal-seed",
+        ] {
+            let (ct, nonce) = cipher
+                .with_context(CredentialScope::Tenant(tenant), purpose, feed)
+                .seal_v2(br#"{"token":"fixture"}"#)
+                .unwrap()
+                .to_bytea()
+                .unwrap();
+            assert_eq!(
+                store
+                    .open(tenant, feed, purpose, Some(ct.clone()), Some(nonce.clone()))
+                    .unwrap()["token"]
+                    .expose(),
+                "fixture"
+            );
+            for (other_tenant, other_feed, other_purpose) in [
+                (Uuid::from_u128(3), feed, purpose),
+                (tenant, Uuid::from_u128(4), purpose),
+                (tenant, feed, "wrong.field"),
+            ] {
+                assert!(store
+                    .open(
+                        other_tenant,
+                        other_feed,
+                        other_purpose,
+                        Some(ct.clone()),
+                        Some(nonce.clone())
+                    )
+                    .is_err());
+            }
+        }
+        let (ct, nonce) =
+            PgFeedStore::seal(&cipher, &HashMap::from([("token".into(), "legacy".into())]))
+                .unwrap();
+        assert_eq!(
+            store
+                .open(tenant, feed, "connector.vendor", Some(ct), Some(nonce))
+                .unwrap()["token"]
+                .expose(),
+            "legacy"
+        );
+    }
 }

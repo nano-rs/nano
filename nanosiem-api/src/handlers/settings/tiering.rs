@@ -139,10 +139,11 @@ fn get_tiering_service(state: &AppState) -> Result<TieringService, ApiError> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./clickhouse/config.d"));
 
-    Ok(TieringService::new(
+    Ok(TieringService::with_crypto(
         dual_pool.postgres().clone(),
         dual_pool.clickhouse().clone(),
         config_dir,
+        state.encryption_service.as_ref().clone(),
     ))
 }
 

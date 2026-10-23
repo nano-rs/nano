@@ -153,7 +153,7 @@ impl AiMonitor {
         }
 
         // Decrypt credentials
-        let api_key = match self.decrypt_api_key(&provider.credentials_encrypted) {
+        let api_key = match self.decrypt_api_key(&provider.provider, &provider.credentials_encrypted) {
             Ok(key) => key,
             Err(e) => {
                 return Some(AiProviderStatus {
@@ -205,7 +205,7 @@ impl AiMonitor {
     }
 
     /// Decrypt the API key from encrypted credentials
-    fn decrypt_api_key(&self, encrypted_bytes: &[u8]) -> Result<String, String> {
+    fn decrypt_api_key(&self, provider: &str, encrypted_bytes: &[u8]) -> Result<String, String> {
         use crate::crypto::EncryptedData;
 
         // The BYTEA column contains JSON: {"ciphertext": "...", "nonce": "..."}
@@ -225,6 +225,7 @@ impl AiMonitor {
 
         let decrypted_json = self
             .encryption
+            .with_context(crate::crypto::CredentialScope::Deployment, "ai.provider", provider)
             .decrypt(&encrypted_data)
             .map_err(|e| format!("Decryption failed: {}", e))?;
 

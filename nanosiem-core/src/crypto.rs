@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-
-//! Cryptographic utilities for NanoSIEM
-//!
-//! Provides AES-256-GCM encryption for sensitive data like cloud credentials.
-//! This module is used by multiple components that need to encrypt/decrypt secrets.
+//! Credential encryption. This reader release deliberately retains legacy writes.
+mod envelope;
+mod keyring;
+pub use envelope::{CredentialContext, CredentialScope};
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use base64::Engine;
-use rand::RngCore;
+use base64::{engine::general_purpose::STANDARD, Engine};
+use std::sync::Arc;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-/// Errors that can occur during cryptographic operations
 #[derive(Error, Debug)]
 pub enum CryptoError {
     #[error("Encryption failed: {0}")]
@@ -26,307 +25,234 @@ pub enum CryptoError {
     InvalidNonce,
     #[error("Serialization error: {0}")]
     SerializationError(String),
+    #[error("SECURITY ERROR: {0}")]
+    Configuration(&'static str),
+    #[error("Invalid or unauthorized credential envelope")]
+    InvalidEnvelope,
 }
 
-/// Encrypted data with its nonce
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// The outer shape is preserved by all existing hand-written JSON serializers.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedData {
-    /// Base64-encoded ciphertext
     pub ciphertext: String,
-    /// Base64-encoded 12-byte nonce
     pub nonce: String,
 }
-
-/// Service for encrypting and decrypting sensitive data using AES-256-GCM
-#[derive(Clone)]
-pub struct EncryptionService {
-    key: [u8; 32],
+// Even ciphertexts (including legacy public-key ciphertexts) do not belong in logs.
+impl std::fmt::Debug for EncryptedData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EncryptedData([redacted])")
+    }
 }
 
+#[derive(Clone)]
+pub struct EncryptionService {
+    ring: Arc<keyring::KeyRing>,
+    context: Option<CredentialContext>,
+}
 impl EncryptionService {
-    /// Create a new encryption service with a 32-byte key
-    ///
-    /// If the provided key is shorter than 32 bytes, it will be zero-padded.
-    /// If longer, it will be truncated.
+    /// Raw constructors enforce the same active-key policy. Historical padding is
+    /// confined to an explicitly decrypt-only entry in the configuration parser.
     pub fn new(key: &[u8]) -> Self {
-        let mut key_bytes = [0u8; 32];
-        let len = std::cmp::min(key.len(), 32);
-        key_bytes[..len].copy_from_slice(&key[..len]);
-        Self { key: key_bytes }
-    }
-
-    /// Create an encryption service using the environment variable
-    ///
-    /// Checks `NANOSIEM_ENCRYPTION_KEY` first, then falls back to `OIDC_SECRET_KEY`
-    /// for backward compatibility.
-    ///
-    /// # Panics
-    /// Panics if no encryption key is configured and `NANOSIEM_ALLOW_DEFAULT_KEYS` is not
-    /// set to "true". This ensures production deployments cannot accidentally run with the
-    /// built-in public default key — even when `NANOSIEM_DEV_MODE` is on for HTTP cookies.
-    pub fn from_env() -> Self {
-        let key =
-            std::env::var("NANOSIEM_ENCRYPTION_KEY").or_else(|_| std::env::var("OIDC_SECRET_KEY"));
-
-        match key {
-            Ok(key) if !key.is_empty() => {
-                if key.len() < 16 {
-                    panic!(
-                        "SECURITY ERROR: Encryption key must be at least 16 bytes. \
-                         Set NANOSIEM_ENCRYPTION_KEY to a secure random value (32 bytes recommended)."
-                    );
-                }
-                Self::new(key.as_bytes())
-            }
-            _ => {
-                // NAN-1355: gate the built-in public key behind NANOSIEM_ALLOW_DEFAULT_KEYS,
-                // not NANOSIEM_DEV_MODE. Dev-mode only relaxes the cookie Secure flag for
-                // plain-HTTP deploys; it must not also unlock the default encryption key, or
-                // an http:// deployment that enables dev-mode for cookies would encrypt all
-                // stored credentials under a publicly-known key.
-                let allow_default_keys = std::env::var("NANOSIEM_ALLOW_DEFAULT_KEYS")
-                    .map(|v| v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-
-                if allow_default_keys {
-                    tracing::warn!(
-                        "SECURITY WARNING: Using the built-in public development encryption key \
-                         (NANOSIEM_ALLOW_DEFAULT_KEYS=true). Only acceptable in development — \
-                         never set this in production!"
-                    );
-                    Self::new(b"nanosiem-default-key-32bytes!!")
-                } else {
-                    panic!(
-                        "SECURITY ERROR: No encryption key configured. \
-                         Set NANOSIEM_ENCRYPTION_KEY environment variable to a secure random 32-byte value. \
-                         For local development only, set NANOSIEM_ALLOW_DEFAULT_KEYS=true to use the \
-                         insecure built-in default key."
-                    );
-                }
-            }
+        Self {
+            ring: Arc::new(keyring::KeyRing::raw(key).unwrap_or_else(|error| panic!("{error}"))),
+            context: None,
         }
     }
-
-    /// Keyed integrity tag (HMAC-SHA512, 64 bytes) under this service's key,
-    /// domain-separated by `domain` so a tag from one ledger can never verify
-    /// in another. Used by the hosted-shared custom-enrichment artifact
-    /// ledger (`manifest_signature`, NAN-2361 wave 5).
-    pub fn keyed_mac_sha512(&self, domain: &[u8], message: &[u8]) -> [u8; 64] {
-        use hmac::{Hmac, KeyInit, Mac};
-        let mut mac = <Hmac<sha2::Sha512> as KeyInit>::new_from_slice(&self.key)
-            .expect("HMAC accepts any key length");
-        mac.update(domain);
-        mac.update(&[0u8]);
-        mac.update(message);
-        let tag = mac.finalize().into_bytes();
-        let mut out = [0u8; 64];
-        out.copy_from_slice(&tag);
-        out
-    }
-
-    /// Encrypt plaintext bytes and return the ciphertext with nonce
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedData, CryptoError> {
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
-
-        // Generate random 12-byte nonce
-        let mut nonce_bytes = [0u8; 12];
-        rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        // Encrypt
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| CryptoError::EncryptionFailed(e.to_string()))?;
-
-        Ok(EncryptedData {
-            ciphertext: base64::engine::general_purpose::STANDARD.encode(&ciphertext),
-            nonce: base64::engine::general_purpose::STANDARD.encode(&nonce_bytes),
+    pub fn from_config(config: &str) -> Result<Self, CryptoError> {
+        Ok(Self {
+            ring: Arc::new(keyring::KeyRing::parse(config)?),
+            context: None,
         })
     }
-
-    /// Decrypt ciphertext using the provided nonce
-    pub fn decrypt(&self, encrypted: &EncryptedData) -> Result<Vec<u8>, CryptoError> {
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))?;
-
-        // Decode base64
-        let ciphertext = base64::engine::general_purpose::STANDARD
-            .decode(&encrypted.ciphertext)
-            .map_err(|e| {
-                CryptoError::DecryptionFailed(format!("Invalid base64 ciphertext: {}", e))
-            })?;
-
-        let nonce_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&encrypted.nonce)
-            .map_err(|e| CryptoError::DecryptionFailed(format!("Invalid base64 nonce: {}", e)))?;
-
-        if nonce_bytes.len() != 12 {
-            return Err(CryptoError::InvalidNonce);
-        }
-
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        // Decrypt
-        cipher
-            .decrypt(nonce, ciphertext.as_ref())
-            .map_err(|e| CryptoError::DecryptionFailed(e.to_string()))
+    pub fn try_from_env() -> Result<Self, CryptoError> {
+        let value = Zeroizing::new(std::env::var("NANOSIEM_ENCRYPTION_KEY").map_err(|_| {
+            if std::env::var_os("OIDC_SECRET_KEY").is_some() {
+                CryptoError::Configuration("move the existing OIDC_SECRET_KEY value into NANOSIEM_ENCRYPTION_KEY; the OIDC fallback has been removed")
+            } else { CryptoError::Configuration("NANOSIEM_ENCRYPTION_KEY is required; configure a generated root or credential ring JSON") }
+        })?);
+        Self::from_config(&value)
+    }
+    pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_else(|error| panic!("{error}"))
     }
 
-    /// Encrypt a JSON-serializable value
+    /// Callers supply authenticated scope, stable purpose, and row identity.
+    pub fn with_context(
+        &self,
+        scope: CredentialScope,
+        purpose: &'static str,
+        row: impl ToString,
+    ) -> Self {
+        Self {
+            ring: Arc::clone(&self.ring),
+            context: Some(CredentialContext::new(scope, purpose, row)),
+        }
+    }
+    pub fn active_key_id(&self) -> &str {
+        &self.ring.active
+    }
+    /// Common field adapters retain the trusted caller scope and row identity.
+    pub fn with_purpose(&self, purpose: &'static str) -> Self {
+        let mut scoped = self.clone();
+        if let Some(context) = &mut scoped.context {
+            context.purpose = purpose;
+        }
+        scoped
+    }
+
+    /// Sign under the valid active root; the caller must persist active_key_id.
+    pub fn keyed_mac_sha512(&self, domain: &[u8], message: &[u8]) -> [u8; 64] {
+        use hmac::{Hmac, KeyInit, Mac};
+        let key = &self.ring.keys[&self.ring.active];
+        let mut mac =
+            <Hmac<sha2::Sha512> as KeyInit>::new_from_slice(key.as_ref()).expect("validated key");
+        mac.update(domain);
+        mac.update(&[0]);
+        mac.update(message);
+        mac.finalize().into_bytes().into()
+    }
+    /// Verify historical HMACs only under their recorded immutable key id.
+    pub fn verify_mac_sha512(
+        &self,
+        key_id: &str,
+        domain: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), CryptoError> {
+        use hmac::{Hmac, KeyInit, Mac};
+        let key = self
+            .ring
+            .keys
+            .get(key_id)
+            .ok_or(CryptoError::InvalidEnvelope)?;
+        let mut mac =
+            <Hmac<sha2::Sha512> as KeyInit>::new_from_slice(key.as_ref()).expect("validated key");
+        mac.update(domain);
+        mac.update(&[0]);
+        mac.update(message);
+        mac.verify_slice(signature)
+            .map_err(|_| CryptoError::InvalidEnvelope)
+    }
+    /// CP2a writes remain exactly the old AES-GCM bytes/nonce, using the active root.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedData, CryptoError> {
+        let nonce = random_nonce();
+        let cipher = Aes256Gcm::new_from_slice(self.ring.keys[&self.ring.active].as_ref())
+            .expect("validated key");
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), plaintext)
+            .map_err(|_| CryptoError::EncryptionFailed("authentication failed".into()))?;
+        Ok(EncryptedData {
+            ciphertext: STANDARD.encode(ciphertext),
+            nonce: STANDARD.encode(nonce),
+        })
+    }
+    /// Explicit v2 sealing supports compatibility fixtures and the later writer release.
+    /// Production callers continue using encrypt/encrypt_json until CP2b.
+    pub fn seal_v2(&self, plaintext: &[u8]) -> Result<EncryptedData, CryptoError> {
+        let context = self.context.as_ref().ok_or(CryptoError::InvalidEnvelope)?;
+        let header = envelope::header(&self.ring.active);
+        let key = derive(self.ring.keys[&self.ring.active].as_ref(), context)?;
+        let cipher = Aes256Gcm::new_from_slice(key.as_ref()).expect("derived key");
+        let nonce = random_nonce();
+        let mut bytes = header.clone();
+        bytes.extend(
+            cipher
+                .encrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad: &context.aad(&header)?,
+                    },
+                )
+                .map_err(|_| CryptoError::InvalidEnvelope)?,
+        );
+        Ok(EncryptedData {
+            ciphertext: STANDARD.encode(bytes),
+            nonce: format!(
+                "{}{nonce}",
+                envelope::V2_NONCE_PREFIX,
+                nonce = STANDARD.encode(nonce)
+            ),
+        })
+    }
+    pub fn decrypt(&self, encrypted: &EncryptedData) -> Result<Vec<u8>, CryptoError> {
+        let bytes = STANDARD
+            .decode(&encrypted.ciphertext)
+            .map_err(|_| CryptoError::InvalidEnvelope)?;
+        if let Some(nonce) = encrypted.nonce.strip_prefix(envelope::V2_NONCE_PREFIX) {
+            let context = self.context.as_ref().ok_or(CryptoError::InvalidEnvelope)?;
+            let nonce = decode_nonce(nonce)?;
+            let (id, header, ciphertext) = envelope::parse(&bytes)?;
+            let root = self.ring.keys.get(id).ok_or(CryptoError::InvalidEnvelope)?;
+            let key = derive(root.as_ref(), context)?;
+            return Aes256Gcm::new_from_slice(key.as_ref())
+                .expect("derived key")
+                .decrypt(
+                    Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: &context.aad(header)?,
+                    },
+                )
+                .map_err(|_| CryptoError::InvalidEnvelope);
+        }
+        let nonce = decode_nonce(&encrypted.nonce)?;
+        // Explicit, bounded candidates only. Never retry a marked v2 as legacy.
+        for id in &self.ring.legacy {
+            let cipher =
+                Aes256Gcm::new_from_slice(self.ring.keys[id].as_ref()).expect("validated key");
+            if let Ok(plain) = cipher.decrypt(Nonce::from_slice(&nonce), bytes.as_slice()) {
+                return Ok(plain);
+            }
+        }
+        Err(CryptoError::InvalidEnvelope)
+    }
     pub fn encrypt_json<T: serde::Serialize>(
         &self,
         value: &T,
     ) -> Result<EncryptedData, CryptoError> {
-        let plaintext = serde_json::to_vec(value)
-            .map_err(|e| CryptoError::SerializationError(e.to_string()))?;
-        self.encrypt(&plaintext)
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(value)
+                .map_err(|_| CryptoError::SerializationError("invalid JSON value".into()))?,
+        );
+        self.encrypt(&bytes)
     }
-
-    /// Decrypt and deserialize a JSON value
     pub fn decrypt_json<T: serde::de::DeserializeOwned>(
         &self,
         encrypted: &EncryptedData,
     ) -> Result<T, CryptoError> {
-        let plaintext = self.decrypt(encrypted)?;
-        serde_json::from_slice(&plaintext)
-            .map_err(|e| CryptoError::SerializationError(e.to_string()))
+        let bytes = Zeroizing::new(self.decrypt(encrypted)?);
+        serde_json::from_slice(&bytes)
+            .map_err(|_| CryptoError::SerializationError("invalid JSON value".into()))
     }
-
-    /// Decrypt raw ciphertext bytes + nonce string into a `HashMap<String, String>`.
-    ///
-    /// This is the standard pattern for marketplace credentials stored as
-    /// `(BYTEA ciphertext, VARCHAR nonce)` in PostgreSQL. The ciphertext is
-    /// re-encoded to base64 for the `EncryptedData` struct, then decrypted
-    /// and deserialized from JSON.
     pub fn decrypt_credentials_bytea(
         &self,
         ciphertext: &[u8],
         nonce: &str,
     ) -> Result<std::collections::HashMap<String, String>, CryptoError> {
-        let ciphertext_b64 = base64::engine::general_purpose::STANDARD.encode(ciphertext);
-        let encrypted = EncryptedData {
-            ciphertext: ciphertext_b64,
-            nonce: nonce.to_string(),
-        };
-        self.decrypt_json(&encrypted)
+        self.decrypt_json(&EncryptedData::from_bytea(ciphertext, nonce))
     }
+}
+fn random_nonce() -> [u8; 12] {
+    use aes_gcm::aead::rand_core::RngCore;
+    let mut nonce = [0; 12];
+    aes_gcm::aead::OsRng.fill_bytes(&mut nonce);
+    nonce
+}
+fn decode_nonce(value: &str) -> Result<[u8; 12], CryptoError> {
+    STANDARD
+        .decode(value)
+        .map_err(|_| CryptoError::InvalidNonce)?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidNonce)
+}
+fn derive(root: &[u8], context: &CredentialContext) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let mut key = Zeroizing::new([0; 32]);
+    hkdf::Hkdf::<sha2_10::Sha256>::new(Some(b"nano.credential-keys.hkdf.v2"), root)
+        .expand(&context.info()?, key.as_mut())
+        .map_err(|_| CryptoError::InvalidEnvelope)?;
+    Ok(key)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// NAN-1355: the built-in public default key must be unlocked ONLY by
-    /// `NANOSIEM_ALLOW_DEFAULT_KEYS` — never by `NANOSIEM_DEV_MODE` (which exists
-    /// solely to relax the cookie `Secure` flag for plain-HTTP deployments).
-    /// `from_env` reads `NANOSIEM_ENCRYPTION_KEY` / `OIDC_SECRET_KEY` /
-    /// `NANOSIEM_ALLOW_DEFAULT_KEYS`, none of which any other test sets, so this
-    /// single sequential test manipulates them without racing other tests.
-    #[test]
-    fn from_env_default_key_gated_by_allow_default_keys_not_dev_mode() {
-        fn save(k: &str) -> Option<String> {
-            std::env::var(k).ok()
-        }
-        fn restore(k: &str, v: Option<String>) {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-        let saved = [
-            ("NANOSIEM_ENCRYPTION_KEY", save("NANOSIEM_ENCRYPTION_KEY")),
-            ("OIDC_SECRET_KEY", save("OIDC_SECRET_KEY")),
-            (
-                "NANOSIEM_ALLOW_DEFAULT_KEYS",
-                save("NANOSIEM_ALLOW_DEFAULT_KEYS"),
-            ),
-            ("NANOSIEM_DEV_MODE", save("NANOSIEM_DEV_MODE")),
-        ];
-
-        // No real key configured.
-        std::env::remove_var("NANOSIEM_ENCRYPTION_KEY");
-        std::env::remove_var("OIDC_SECRET_KEY");
-
-        // (1) dev-mode ON, allow-default-keys OFF -> must STILL fail closed (panic).
-        std::env::set_var("NANOSIEM_DEV_MODE", "true");
-        std::env::remove_var("NANOSIEM_ALLOW_DEFAULT_KEYS");
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
-        let dev_mode_only = std::panic::catch_unwind(EncryptionService::from_env);
-        std::panic::set_hook(prev_hook);
-        assert!(
-            dev_mode_only.is_err(),
-            "NANOSIEM_DEV_MODE alone must NOT unlock the built-in default encryption key"
-        );
-
-        // (2) allow-default-keys ON -> default key used, encrypt/decrypt round-trips.
-        std::env::set_var("NANOSIEM_ALLOW_DEFAULT_KEYS", "true");
-        let svc = EncryptionService::from_env();
-        let ct = svc.encrypt(b"secret").unwrap();
-        assert_eq!(svc.decrypt(&ct).unwrap().as_slice(), b"secret");
-
-        for (k, v) in saved {
-            restore(k, v);
-        }
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_roundtrip() {
-        let service = EncryptionService::new(b"test-key-32-bytes-for-aes256!!");
-        let plaintext = b"Hello, World! This is a secret message.";
-
-        let encrypted = service.encrypt(plaintext).unwrap();
-        let decrypted = service.decrypt(&encrypted).unwrap();
-
-        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_json() {
-        use serde::{Deserialize, Serialize};
-
-        #[derive(Debug, Serialize, Deserialize, PartialEq)]
-        struct Secret {
-            access_key: String,
-            secret_key: String,
-        }
-
-        let service = EncryptionService::new(b"test-key-32-bytes-for-aes256!!");
-        let secret = Secret {
-            access_key: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-        };
-
-        let encrypted = service.encrypt_json(&secret).unwrap();
-        let decrypted: Secret = service.decrypt_json(&encrypted).unwrap();
-
-        assert_eq!(secret, decrypted);
-    }
-
-    #[test]
-    fn test_unique_nonces() {
-        let service = EncryptionService::new(b"test-key-32-bytes-for-aes256!!");
-        let plaintext = b"Same message";
-
-        let encrypted1 = service.encrypt(plaintext).unwrap();
-        let encrypted2 = service.encrypt(plaintext).unwrap();
-
-        // Nonces should be different
-        assert_ne!(encrypted1.nonce, encrypted2.nonce);
-        // Ciphertexts should also be different due to different nonces
-        assert_ne!(encrypted1.ciphertext, encrypted2.ciphertext);
-    }
-
-    #[test]
-    fn test_invalid_nonce_length() {
-        let service = EncryptionService::new(b"test-key-32-bytes-for-aes256!!");
-        let encrypted = EncryptedData {
-            ciphertext: base64::engine::general_purpose::STANDARD.encode(b"fake"),
-            nonce: base64::engine::general_purpose::STANDARD.encode(b"short"), // Only 5 bytes
-        };
-
-        let result = service.decrypt(&encrypted);
-        assert!(matches!(result, Err(CryptoError::InvalidNonce)));
-    }
-}
+mod tests;

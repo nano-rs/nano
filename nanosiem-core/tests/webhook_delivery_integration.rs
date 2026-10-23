@@ -12,7 +12,8 @@
 //! target opt-in). Because `fire_alert` fans out to ALL enabled webhooks, the
 //! suite MUST run single-threaded and each test starts from a clean table:
 //!
-//!   NANOSIEM_ALLOW_DEFAULT_KEYS=true \
+//! Set nondefault fixture JWT_SECRET and NANOSIEM_ENCRYPTION_KEY (32+ bytes), then run:
+//!
 //!   cargo test -p nanosiem-core --test webhook_delivery_integration \
 //!     -- --ignored --test-threads=1
 

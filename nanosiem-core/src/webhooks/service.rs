@@ -295,6 +295,20 @@ impl WebhookService {
             .map_err(|e| format!("HTTP client build failed: {e}"))
     }
 
+
+    async fn ssrf_checked_proxy_client(url: &str, tenant: Uuid) -> Result<reqwest::Client, String> {
+        if !crate::egress::hosted_proxy_configured() { return Self::ssrf_checked_client(url).await; }
+        // Keep config/delivery-time SSRF validation. Squid re-resolves and
+        // refuses private, special-use, and recorded infrastructure addresses;
+        // it additionally checks the tenant's current receiver origin.
+        Self::validator().validate_and_resolve(url).await
+            .map_err(|_| "blocked by SSRF guard".to_owned())?;
+        crate::egress::client_builder(tenant, crate::egress::Purpose::Webhook)
+            .map_err(str::to_owned)?
+            .timeout(std::time::Duration::from_secs(DELIVERY_TIMEOUT_SECS))
+            .build().map_err(|_| "webhook proxy client unavailable".to_owned())
+    }
+
     /// Read at most `RESPONSE_READ_CAP` bytes of a receiver's response, then
     /// drop the rest. Bounds memory against a hostile endpoint returning a huge
     /// body — `reqwest::Response::text()`/`bytes()` would buffer it all first.
@@ -935,7 +949,7 @@ impl WebhookService {
         payload_bytes: &[u8],
         sign_generic: bool,
     ) -> Result<reqwest::RequestBuilder, String> {
-        build_signed_request(self.repo.encryption(), client, webhook, payload_bytes, sign_generic)
+        build_signed_request(&self.repo.encryption().with_context(crate::crypto::CredentialScope::Deployment, "webhook.headers", webhook.id), client, webhook, payload_bytes, sign_generic)
     }
 
     /// Render the outbound body for a channel and whether it should be HMAC-
@@ -945,7 +959,7 @@ impl WebhookService {
         webhook: &super::models::Webhook,
         payload: &WebhookPayload,
     ) -> Result<(Vec<u8>, bool), String> {
-        render_channel_body(self.repo.encryption(), webhook, payload)
+        render_channel_body(&self.repo.encryption().with_context(crate::crypto::CredentialScope::Deployment, "webhook.secret", webhook.id), webhook, payload)
     }
 }
 
@@ -985,7 +999,7 @@ pub fn build_signed_request(
             // surfaces as a build error at send. A decrypt failure fails closed.
             if let Some(ref encrypted) = webhook.headers_encrypted {
                 if !encrypted.is_empty() {
-                    let headers = decrypt_envelope_json::<HashMap<String, String>>(encryption, encrypted)
+                    let headers = decrypt_envelope_json::<HashMap<String, String>>(&encryption.with_purpose("webhook.headers"), encrypted)
                         .map_err(|e| {
                             format!("configured custom headers could not be decrypted: {e}")
                         })?;
@@ -999,7 +1013,7 @@ pub fn build_signed_request(
             // decrypt failure fails closed rather than delivering unsigned.
             if let Some(ref encrypted_secret) = webhook.secret_encrypted {
                 if !encrypted_secret.is_empty() {
-                    let secret = decrypt_envelope_string(encryption, encrypted_secret).map_err(|e| {
+                    let secret = decrypt_envelope_string(&encryption.with_purpose("webhook.secret"), encrypted_secret).map_err(|e| {
                         format!("configured HMAC secret could not be decrypted: {e}")
                     })?;
                     // Sign `<unix_ts>.<body>` (Stripe-style) and send the
@@ -1045,7 +1059,7 @@ pub fn render_channel_body(
     let routing_key = if channel_type == ChannelType::PagerDuty {
         match &webhook.secret_encrypted {
             Some(enc) if !enc.is_empty() => Some(
-                decrypt_envelope_string(encryption, enc)
+                decrypt_envelope_string(&encryption.with_purpose("webhook.secret"), enc)
                     .map_err(|e| format!("PagerDuty routing key could not be decrypted: {e}"))?,
             ),
             _ => None, // build_channel_body reports the missing-key error
@@ -1104,12 +1118,21 @@ pub async fn attempt_webhook_delivery(
     webhook: &super::models::Webhook,
     payload: &WebhookPayload,
 ) -> WebhookAttemptOutcome {
+    attempt_webhook_delivery_for_tenant(crate::egress::LOCAL_TENANT, encryption, webhook, payload).await
+}
+
+pub async fn attempt_webhook_delivery_for_tenant(
+    tenant: Uuid,
+    encryption: &EncryptionService,
+    webhook: &super::models::Webhook,
+    payload: &WebhookPayload,
+) -> WebhookAttemptOutcome {
     let started = Instant::now();
     let (payload_bytes, sign_generic) = match render_channel_body(encryption, webhook, payload) {
         Ok(v) => v,
         Err(reason) => return WebhookAttemptOutcome::refused(reason, started),
     };
-    let client = match WebhookService::ssrf_checked_client(&webhook.url).await {
+    let client = match WebhookService::ssrf_checked_proxy_client(&webhook.url, tenant).await {
         Ok(c) => c,
         Err(reason) => return WebhookAttemptOutcome::refused(reason, started),
     };

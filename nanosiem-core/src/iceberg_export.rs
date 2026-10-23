@@ -198,7 +198,7 @@ pub fn seal(
         return Err(ExportError::Invalid);
     }
     credentials.insert("tenant_id".into(), tenant.to_string());
-    let encrypted = cipher
+    let encrypted = cipher.with_context(crate::crypto::CredentialScope::Tenant(tenant), "iceberg.export", tenant)
         .encrypt_json(&credentials)
         .map_err(|_| ExportError::Credential)?;
     Ok((
@@ -215,7 +215,7 @@ pub fn open(
     ciphertext: &[u8],
     nonce: &str,
 ) -> Result<HashMap<String, String>, ExportError> {
-    let mut values = cipher
+    let mut values = cipher.with_context(crate::crypto::CredentialScope::Tenant(tenant), "iceberg.export", tenant)
         .decrypt_credentials_bytea(ciphertext, nonce)
         .map_err(|_| ExportError::Credential)?;
     if values.remove("tenant_id").as_deref() != Some(&tenant.to_string()) {

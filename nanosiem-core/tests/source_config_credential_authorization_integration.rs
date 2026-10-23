@@ -2,8 +2,8 @@
 
 //! Live-Postgres regression for NAN-2125.
 //!
-//! Run with:
-//! `NANOSIEM_ALLOW_DEFAULT_KEYS=true cargo test -p nanosiem-core \
+//! Set nondefault fixture JWT_SECRET and NANOSIEM_ENCRYPTION_KEY (32+ bytes), then run:
+//! `cargo test -p nanosiem-core \
 //!   --test source_config_credential_authorization_integration -- --ignored`
 
 mod common;

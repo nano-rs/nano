@@ -639,16 +639,21 @@ github_owner_repo() {
 }
 
 # Echo (newest first) the commit SHAs that touched images.lock on the configured
-# GitHub repo, via the commits API. Needs Node to parse JSON (same
-# soft dep). Empty on any failure.
+# GitHub repo, via the commits API. Parsed with python3, which the installer
+# already requires (NAN-4417: Docker-only hosts have no node, and the old node
+# parser silently skipped first-party verification there). Empty on any failure.
 github_lock_commit_shas() {
     local owner_repo json
     owner_repo=$(github_owner_repo) || return 1
     json=$(curl -fsSL -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${owner_repo}/commits?path=images.lock&per_page=100" 2>/dev/null) \
         || return 1
-    printf '%s' "$json" | node -e '
-let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s))console.log(c.sha);});
+    printf '%s' "$json" | python3 -I -c '
+import json, re, sys
+for commit in json.load(sys.stdin):
+    sha = commit.get("sha", "") if isinstance(commit, dict) else ""
+    if re.fullmatch(r"[0-9a-f]{40}", sha):
+        print(sha)
 ' 2>/dev/null
 }
 
@@ -658,21 +663,31 @@ let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.pars
 # the commits that touched images.lock (newest first) and return the first whose
 # header matches — this works whether the repo keeps a commit per release (the
 # dev repo) or snapshot-sync commits (the public mirror), since both carry the
-# "# Release:" header in the file itself. Empty on failure.
+# "# Release:" header in the file itself. The checkout's own git history is
+# tried first (no network; a full clone or a non-GitHub remote has it), then the
+# GitHub commits API with raw file fetches. Empty on failure.
 fetch_release_lock() {
     local want="${1#v}" want_re owner_repo sha tmp tried=0
-    owner_repo=$(github_owner_repo) || return 1
     want_re="${want//./\\.}"   # dots are literal, not regex wildcards
+    tmp=$(mktemp "${TMPDIR:-/tmp}/nano-images-lock.XXXXXX") || return 1
     while read -r sha; do
         [[ -z "$sha" ]] && continue
-        tried=$((tried + 1)); [[ "$tried" -gt 40 ]] && break
-        tmp=$(mktemp) || return 1
-        if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" 2>/dev/null \
+        if git show "${sha}:images.lock" > "$tmp" 2>/dev/null \
            && grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$tmp"; then
             printf '%s' "$tmp"; return 0
         fi
-        rm -f "$tmp"
-    done < <(github_lock_commit_shas)
+    done < <(git log --format=%H -n 40 -- images.lock 2>/dev/null)
+    if owner_repo=$(github_owner_repo); then
+        while read -r sha; do
+            [[ -z "$sha" ]] && continue
+            tried=$((tried + 1)); [[ "$tried" -gt 40 ]] && break
+            if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" 2>/dev/null \
+               && grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$tmp"; then
+                printf '%s' "$tmp"; return 0
+            fi
+        done < <(github_lock_commit_shas)
+    fi
+    rm -f "$tmp"
     return 1
 }
 
@@ -745,8 +760,8 @@ verify_image_digests() {
             fp_lockfile="$fetched"
             ok "Fetched images.lock for pinned release v${NANO_VERSION#v}"
         else
-            fp_lockfile=""
-            warn "Could not fetch images.lock for pinned NANO_VERSION='$NANO_VERSION' — first-party digests not verified (base images still are)."
+            # NAN-4417: never start first-party images that nothing vouched for.
+            fail "Could not find images.lock for release v${NANO_VERSION#v}, so the first-party image digests cannot be verified. Check that v${NANO_VERSION#v} is a published release and that this host can reach api.github.com and raw.githubusercontent.com, or re-run without NANO_VERSION to install this checkout's release. NANO_SKIP_IMAGE_VERIFY=1 proceeds unverified."
         fi
     fi
 
@@ -1282,37 +1297,55 @@ if [[ -f .env ]] && ! grep -qE '^COMPOSE_PROFILES=lean$' .env; then
 fi
 
 # Pin the image release before any .env is written or reused. An explicit
-# NANO_VERSION wins, then a non-latest pin kept in an existing lean .env, then the
-# "# Release:" of this checkout's images.lock, which must list the lean cell.
+# NANO_VERSION in the environment wins: that is an operator pin or rollback for
+# this run. Otherwise the release is the "# Release:" of this checkout's
+# images.lock, which must list the lean cell. The pin a previous run wrote into
+# .env is NOT reused: re-runs are upgrades, and the checkout has just been moved
+# to the newest release, so its compose file and lock are the ones to deploy
+# (NAN-4417 — reusing the .env pin left an updated checkout on the old images).
+# The resolved release is written back to .env, which is where compose reads it.
 resolve_lean_version() {
-    local requested="$NANO_VERSION" release
+    local requested="$NANO_VERSION" release previous=""
+    # A gen1 install's pin names pre-lean images; a cutover never reports it.
+    if [[ -f .env && "$FRESH_LEAN_CUTOVER" != "1" ]]; then
+        previous=$(env_file_value NANO_VERSION)
+        [[ "$previous" == "latest" ]] && previous=""
+    fi
     if [[ "$requested" == "latest" ]]; then
         warn "NANO_VERSION=latest is frozen on the ClickHouse 0.1.703 release; pinning a lean release instead."
         requested=""
     fi
-    # A gen1 install's pin names pre-lean images; a cutover never keeps it.
-    if [[ -z "$requested" && -f .env && "$FRESH_LEAN_CUTOVER" != "1" ]]; then
-        requested=$(env_file_value NANO_VERSION)
-        [[ "$requested" == "latest" ]] && requested=""
-    fi
     if [[ -n "$requested" ]]; then
         NANO_VERSION="$requested"
-        return 0
+    else
+        release=$(sed -nE 's/^# Release: v?([0-9][0-9A-Za-z.+-]*).*$/\1/p' images.lock 2>/dev/null | head -1)
+        [[ -n "$release" ]] || fail "images.lock names no release. Set NANO_VERSION to a published lean release."
+        if ! grep -qE '^ghcr\.io/nano-rs/nano-lake-cell sha256:' images.lock; then
+            fail "Release v${release} in images.lock has no lean lake-cell image; no lean release is published on this branch yet. Set NANO_VERSION to a published lean release."
+        fi
+        NANO_VERSION="$release"
     fi
-    release=$(sed -nE 's/^# Release: v?([0-9][0-9A-Za-z.+-]*).*$/\1/p' images.lock 2>/dev/null | head -1)
-    [[ -n "$release" ]] || fail "images.lock names no release. Set NANO_VERSION to a published lean release."
-    if ! grep -qE '^ghcr\.io/nano-rs/nano-lake-cell sha256:' images.lock; then
-        fail "Release v${release} in images.lock has no lean lake-cell image; no lean release is published on this branch yet. Set NANO_VERSION to a published lean release."
+    if [[ -n "$previous" && "${previous#v}" != "${NANO_VERSION#v}" ]]; then
+        if [[ -n "$requested" ]]; then
+            ok "Image release: ${previous} → ${NANO_VERSION} (pinned by NANO_VERSION)"
+        else
+            ok "Image release: ${previous} → ${NANO_VERSION}"
+        fi
+    elif [[ -n "$requested" ]]; then
+        ok "Image release: ${NANO_VERSION} (pinned by NANO_VERSION)"
+    else
+        ok "Image release: ${NANO_VERSION}"
     fi
-    NANO_VERSION="$release"
+    # Compose reads the tag from .env: never leave an old pin or a gen1 `latest`.
+    if [[ -f .env ]]; then
+        upsert_env_file_value NANO_VERSION "$NANO_VERSION"
+    fi
 }
 resolve_lean_version
-ok "Image release: ${NANO_VERSION}"
 
 if [[ -f .env ]]; then
     warn ".env already exists — keeping existing secrets, will only (re)start the stack."
-    # Compose reads the tag from .env: never leave a gen1 `latest` behind.
-    upsert_env_file_value NANO_VERSION "$NANO_VERSION"
+    # resolve_lean_version above already wrote the resolved NANO_VERSION here.
     REUSE_ENV=1
     chmod 600 .env
     # Show the configured URL in the summary, not the localhost default.

@@ -92,15 +92,11 @@ export CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD="${CLICKHOUSE_RAWSQL_NOAUDIT_PASSWORD:
 # For development, we use a secure 64-character random secret
 # IMPORTANT: In production, set JWT_SECRET environment variable before running
 if [ -z "$JWT_SECRET" ]; then
-    # Generate a secure development JWT secret (64 characters)
-    export JWT_SECRET="dev-e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8"
+    # Ephemeral local JWT only; persisted bootstrap remains CP2b.
+    export JWT_SECRET="$(openssl rand -hex 32)"
     echo -e "${YELLOW}⚠️  Using generated development JWT_SECRET${NC}"
     echo -e "${YELLOW}   For production, set JWT_SECRET environment variable${NC}"
 fi
-# NAN-1355: allow the built-in public dev encryption key when none is set, so local
-# dev boots even if a credential-encryption path initializes. Production never sets
-# this (real secrets are required and the boot fails closed without them).
-export NANOSIEM_ALLOW_DEFAULT_KEYS="${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}"
 # Set AUTH_ENABLED=false to disable authentication (development only)
 export AUTH_ENABLED="${AUTH_ENABLED:-true}"
 
@@ -110,17 +106,9 @@ export AUTH_ENABLED="${AUTH_ENABLED:-true}"
 # legacy single-shot path. Production leaves this unset (off by default).
 export NANOSIEM_INVESTIGATION_TOOL_LOOP="${NANOSIEM_INVESTIGATION_TOOL_LOOP:-true}"
 
-# Encryption key settings
-# For development, we enable dev mode which uses a default key
-# IMPORTANT: In production, set NANOSIEM_ENCRYPTION_KEY to a secure 32-byte value
-if [ -z "$NANOSIEM_ENCRYPTION_KEY" ]; then
-    export NANOSIEM_DEV_MODE="true"
-    echo -e "${YELLOW}⚠️  No NANOSIEM_ENCRYPTION_KEY set, enabling dev mode${NC}"
-    echo -e "${YELLOW}   For production, set NANOSIEM_ENCRYPTION_KEY in .env${NC}"
-else
-    export NANOSIEM_DEV_MODE="${NANOSIEM_DEV_MODE:-false}"
-    echo -e "${GREEN}✓${NC} Using NANOSIEM_ENCRYPTION_KEY from environment"
-fi
+# Missing/default keys are refused by the shared production constructor.
+# Persist generated credential/JWT keys in .env; cookie dev mode is independent.
+export NANOSIEM_DEV_MODE="${NANOSIEM_DEV_MODE:-true}"
 
 # CORS settings
 # For development, allow localhost origins. In production, set specific origins.
@@ -1553,7 +1541,7 @@ fi
 # forwarded server-side to :3000/:3002).
 #
 # Set EXPOSE_LAN=0 to go back to localhost-only. Worth doing on untrusted
-# networks: NANOSIEM_ALLOW_DEFAULT_KEYS defaults to true here, so an exposed
+# networks: these processes hold credential material, so an exposed
 # :3000 is reachable by anyone who can route to this host.
 echo -e "\n${YELLOW}Starting Frontend on port 5173 (edition: ${EDITION})...${NC}"
 cd nanosiem-web

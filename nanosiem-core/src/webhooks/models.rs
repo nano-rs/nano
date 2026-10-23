@@ -158,6 +158,10 @@ pub struct WebhookResponse {
     /// URL itself is the bearer credential. `None` for legacy rows without a
     /// parsed host label yet.
     pub url_host: Option<String>,
+    /// Plain HTTP receivers remain supported, with an explicit security warning.
+    pub transport_warning: Option<String>,
+    /// Safe origin for read-only egress coverage; no path, query or token.
+    pub url_origin: Option<String>,
     /// F-39: whether a destination URL is configured (the URL is write-only).
     pub has_url: bool,
     /// Whether custom headers are configured (actual values never exposed)
@@ -180,6 +184,19 @@ pub struct WebhookResponse {
     pub updated_at: DateTime<Utc>,
 }
 
+impl WebhookResponse {
+    pub fn for_settings(w: &Webhook, cipher: &crate::crypto::EncryptionService) -> Self {
+        let mut response = Self::from(w);
+        if let Some(encrypted) = w.url_encrypted.as_deref() {
+            if let Ok(url) = super::repository::decrypt_envelope_string(cipher, encrypted) {
+                response.url_origin = crate::egress::Origin::from_url(&url, crate::egress::Purpose::Webhook).ok().map(|o| o.as_str().to_owned());
+                response.transport_warning = url::Url::parse(&url).is_ok_and(|u|u.scheme()=="http").then(|| crate::egress::INSECURE_HTTP_WARNING.to_owned());
+            }
+        }
+        response
+    }
+}
+
 impl From<&Webhook> for WebhookResponse {
     fn from(w: &Webhook) -> Self {
         let channel_type = if w.channel_type.is_empty() {
@@ -194,6 +211,8 @@ impl From<&Webhook> for WebhookResponse {
             // Fall back to parsing the internal `url` for legacy rows whose
             // `url_host` column hasn't been populated by a delivery-path hydrate.
             url_host: w.url_host.clone().or_else(|| url_host(&w.url)),
+            url_origin: crate::egress::Origin::from_url(&w.url, crate::egress::Purpose::Webhook).ok().map(|o| o.as_str().to_owned()),
+            transport_warning: url::Url::parse(&w.url).is_ok_and(|u|u.scheme()=="http").then(|| crate::egress::INSECURE_HTTP_WARNING.to_owned()),
             has_url: w.url_encrypted.as_ref().map_or(false, |u| !u.is_empty()) || !w.url.is_empty(),
             has_headers: w
                 .headers_encrypted
@@ -539,4 +558,45 @@ pub struct WebhookTestResult {
     pub status_code: Option<u16>,
     pub error: Option<String>,
     pub duration_ms: u64,
+}
+
+#[cfg(test)]
+mod egress_transport_tests {
+    use super::*;
+    #[test]
+    fn warning_is_present_for_legacy_and_encrypted_http_receivers_without_exposing_urls() {
+        let cipher=crate::crypto::EncryptionService::new(&[7;32]);
+        let mut webhook=Webhook {id:Uuid::from_u128(10),name:"receiver".into(),url:"http://receiver.example/private?token=secret".into(),
+          url_encrypted:None,url_host:Some("receiver.example".into()),headers_encrypted:None,secret_encrypted:None,severity_filter:None,
+          event_types:default_event_types(),channel_type:"generic".into(),channel_config:serde_json::json!({}),rule_filter:None,
+          health_category_filter:None,health_resource_filter:None,enabled:true,created_at:Utc::now(),updated_at:Utc::now()};
+        for encrypted in [false,true] {
+            if encrypted {
+                webhook.url_encrypted=Some(super::super::repository::encrypt_envelope_string(&cipher,&webhook.url).unwrap());
+                webhook.url.clear();
+            }
+            let response=WebhookResponse::for_settings(&webhook,&cipher);
+            assert!(response.transport_warning.is_some());
+            assert_eq!(response.url_origin.as_deref(),Some("http://receiver.example:80"));
+            let json=serde_json::to_string(&response).unwrap();
+            assert!(!json.contains("private")); assert!(!json.contains("token=secret"));
+        }
+        webhook.url_encrypted=Some(super::super::repository::encrypt_envelope_string(&cipher,"https://receiver.example/private?token=secret").unwrap());
+        assert!(WebhookResponse::for_settings(&webhook,&cipher).transport_warning.is_none());
+
+        let tenant = Uuid::from_u128(11);
+        let scoped = cipher.with_context(crate::crypto::CredentialScope::Tenant(tenant), "webhook.url", webhook.id);
+        webhook.url_encrypted = Some(scoped.seal_v2(b"http://receiver.example/private?token=secret").unwrap().to_json_bytes().unwrap());
+        let response = WebhookResponse::for_settings(&webhook, &scoped);
+        assert!(response.transport_warning.is_some());
+        assert_eq!(response.url_origin.as_deref(), Some("http://receiver.example:80"));
+        for wrong in [
+            cipher.with_context(crate::crypto::CredentialScope::Tenant(Uuid::from_u128(12)), "webhook.url", webhook.id),
+            cipher.with_context(crate::crypto::CredentialScope::Tenant(tenant), "webhook.url", Uuid::from_u128(13)),
+        ] {
+            let response = WebhookResponse::for_settings(&webhook, &wrong);
+            assert!(response.url_origin.is_none());
+            assert!(response.transport_warning.is_none());
+        }
+    }
 }

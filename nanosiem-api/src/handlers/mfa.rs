@@ -291,7 +291,7 @@ pub async fn setup_mfa(
 
     // Encrypt and store the secret (pending, not yet active)
     let encrypted =
-        mfa::encrypt_secret(&secret_base32, &state.encryption_service).map_err(|e| {
+        mfa::encrypt_secret(&secret_base32, &(&state.encryption_service).with_context(nanosiem_core::crypto::CredentialScope::Account(user.id), "account.totp", user.id)).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(MfaApiError {
@@ -523,7 +523,7 @@ pub async fn verify_mfa_setup(
         )
     })?;
 
-    let secret = mfa::decrypt_secret(totp_encrypted, totp_nonce, &state.encryption_service)
+    let secret = mfa::decrypt_secret(totp_encrypted, totp_nonce, &(&state.encryption_service).with_context(nanosiem_core::crypto::CredentialScope::Account(user.id), "account.totp", user.id))
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -558,7 +558,7 @@ pub async fn verify_mfa_setup(
     // Generate backup codes
     let backup_codes = mfa::generate_backup_codes();
     let hashed_codes = mfa::hash_backup_codes(&backup_codes);
-    let encrypted_backups = mfa::encrypt_backup_codes(&hashed_codes, &state.encryption_service)
+    let encrypted_backups = mfa::encrypt_backup_codes(&hashed_codes, &(&state.encryption_service).with_context(nanosiem_core::crypto::CredentialScope::Account(user.id), "account.backup-codes", user.id))
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1155,7 +1155,7 @@ pub async fn regenerate_backup_codes(
     // Generate new backup codes
     let backup_codes = mfa::generate_backup_codes();
     let hashed_codes = mfa::hash_backup_codes(&backup_codes);
-    let encrypted_backups = mfa::encrypt_backup_codes(&hashed_codes, &state.encryption_service)
+    let encrypted_backups = mfa::encrypt_backup_codes(&hashed_codes, &(&state.encryption_service).with_context(nanosiem_core::crypto::CredentialScope::Account(user.id), "account.backup-codes", user.id))
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

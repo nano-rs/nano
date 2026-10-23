@@ -185,8 +185,12 @@ for rollback. `NANO_DRAGONFLY_DATA_VOLUME` is installer-owned after bootstrap.
   compose, for example `docker compose -f docker-compose.opensource.yml logs
   nano-api` or `... exec nginx nginx -s reload`. Several installs can share a
   host with distinct `COMPOSE_PROJECT_NAME` values.
-- **Image pins.** `NANO_VERSION` is pinned from `images.lock` (never `latest`);
-  `latest` stays on the frozen ClickHouse 0.1.703 release.
+- **Image pins.** `NANO_VERSION` is pinned from the checkout's `images.lock`
+  (never `latest`; `latest` stays on the frozen ClickHouse 0.1.703 release) and
+  written to `.env`, where compose reads it. Every re-run re-resolves it from the
+  updated checkout, so a re-run upgrades the images too; the old `.env` pin is
+  not kept. `NANO_VERSION=<release>` in the environment pins or rolls back that
+  run, verified against that release's own `images.lock`.
 
 ## Pull feeds
 

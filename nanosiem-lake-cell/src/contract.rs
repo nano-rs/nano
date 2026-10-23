@@ -246,9 +246,19 @@ pub struct JailSpec {
     pub max_open_files: u64,
 }
 
+/// Redact credentials even when an assignment appears in a diagnostic.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutboundProxy(pub String);
+impl std::fmt::Debug for OutboundProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("OutboundProxy([redacted])") }
+}
+
 /// Directories and caps handed to the tenant process in `Assign`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Assignment {
+    /// Only this tenant's delegated storage principal; never the authority key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_proxy: Option<OutboundProxy>,
     pub tenant: TenantId,
     pub role: Role,
     pub cell_id: String,

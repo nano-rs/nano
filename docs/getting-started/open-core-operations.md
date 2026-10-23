@@ -98,19 +98,34 @@ Run it after every install, upgrade and restart.
 
 ## 2. Routine upgrade (same PostgreSQL major)
 
+Re-run the installer from the install directory. A re-run is the upgrade:
+
 ```bash
 cd ~/nano
-git pull                       # or re-run install.sh, which does this for you
-docker compose -f docker-compose.opensource.yml pull
-docker compose -f docker-compose.opensource.yml up -d
-docker compose -f docker-compose.opensource.yml exec nginx nginx -s reload    # re-resolve recreated upstream IPs
+curl -fsSL https://get.nano.rs | bash        # or ./install.sh from the checkout
 scripts/smoke-open-core.sh
 ```
 
-Re-running `install.sh` is equivalent and additionally re-verifies image
-digests, backfills any newly-required secret, and — on the lake profile — stages
-the query/compiler rollout through `scripts/rollout-lake-runtime.sh` before
-replacing the serving worker.
+The installer moves the checkout to the newest release, takes the image release
+from that checkout's `images.lock`, rewrites `NANO_VERSION` in `.env` to match
+(it prints `Image release: <old> → <new>`), pulls, verifies every image digest
+against the lock, backfills any newly required secret, re-runs the lean
+initializer, and recreates the services. The release recorded in `.env` by an
+earlier run is not reused; compose reads `NANO_VERSION` from `.env`, so a
+`git pull` + `docker compose pull` + `up -d` by hand would stay on the old
+images, and it skips digest verification. Use the installer.
+
+To pin or roll back to a specific release, name it for that run:
+
+```bash
+curl -fsSL https://get.nano.rs | NANO_VERSION=1.0.7 bash
+```
+
+The installer verifies a pinned release against that release's own
+`images.lock`, fetched from the repo with `curl` and `python3` (no Node needed).
+If it cannot find that lock, it refuses to start rather than run unverified
+images. The pin lasts for that run: the next re-run without `NANO_VERSION`
+upgrades to the checkout's release again.
 
 Migrations need no operator action: the one-shot `postgres-migrate` runs to
 completion before api/jobs/search start.

@@ -120,7 +120,7 @@ pub async fn list_credentials(
 ) -> Result<Json<CredentialListResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let credentials = repo.list().await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -152,7 +152,7 @@ pub async fn get_credential(
 ) -> Result<Json<CloudCredential>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let credential = repo.get(*id).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -274,7 +274,7 @@ pub async fn create_credential(
         expires_at: request.expires_at,
     };
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let credential = repo
         .create(&create_req, Some(auth.user_id()))
         .await
@@ -348,7 +348,7 @@ pub async fn update_credential(
         expires_at: request.expires_at,
     };
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let credential = repo.update(*id, &update_req).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -402,7 +402,7 @@ pub async fn delete_credential(
 ) -> Result<Json<DeleteResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:delete").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
 
     let cred_name = repo
         .get(*id)
@@ -456,7 +456,7 @@ pub async fn list_credentials_by_provider(
         return Err(invalid_provider());
     }
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let credentials = repo.list_by_provider(&provider).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -521,7 +521,7 @@ pub async fn rotate_credential(
 ) -> Result<Json<CredentialRotationResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, permissions::CREDENTIALS_ROTATE).map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
 
     // Same lift as create: `external_id` is readable metadata, not payload.
     // A rotation may switch posture (static keys -> cross-account role), so it
@@ -592,7 +592,7 @@ pub async fn list_credential_versions(
 ) -> Result<Json<CredentialVersionListResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, "credentials:view").map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let versions = repo.list_versions(*id).await.map_err(|e| {
         let (status, err) = CredentialApiError::from_repo_error(&e);
         (status, Json(err))
@@ -636,7 +636,7 @@ pub async fn rollback_credential(
 ) -> Result<Json<CredentialRotationResponse>, (StatusCode, Json<CredentialApiError>)> {
     check_permission(&auth, permissions::CREDENTIALS_ROTATE).map_err(|_| forbidden())?;
 
-    let repo = CredentialRepository::new(state.pool.clone());
+    let repo = CredentialRepository::with_crypto(state.pool.clone(), state.encryption_service.as_ref().clone());
     let rollback_req = RollbackCloudCredential {
         version: request.version,
         note: request.note.clone(),

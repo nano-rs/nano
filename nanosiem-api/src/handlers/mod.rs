@@ -151,6 +151,7 @@ pub mod system_health_events;
 pub mod source_configs;
 pub mod source_scopes;
 pub mod system;
+pub mod egress;
 pub mod tuning;
 pub mod upload;
 pub mod users;

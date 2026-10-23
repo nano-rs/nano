@@ -7554,6 +7554,8 @@ export interface WebhookConfig {
    * webhook the URL itself is the bearer credential (F-39).
    */
   url_host?: string;
+  transport_warning?: string | null;
+  url_origin?: string | null;
   /** Whether a destination URL is configured (the URL itself is write-only). */
   has_url: boolean;
   has_headers: boolean;

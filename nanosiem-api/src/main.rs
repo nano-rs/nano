@@ -37,6 +37,8 @@ fn main() -> Result<()> {
 
 async fn server_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-api");
+    nanosiem_core::crypto::EncryptionService::try_from_env()?;
+    nanosiem_api::state::load_jwt_secret(nanosiem_api::state::auth_enabled_from_env());
 
     tracing::info!("Starting NanoSIEM API server");
 
@@ -497,7 +499,8 @@ async fn server_main() -> Result<()> {
         .layer(prometheus_layer)
         .merge(app_metrics.metrics_router())
         .merge(nanosiem_api::hosted_config_router())
-        .merge(nanosiem_api::soar_egress_router(&state));
+        .merge(nanosiem_api::soar_egress_router(&state))
+        .merge(nanosiem_api::handlers::egress::runtime_router(&state, std::path::Path::new(nanosiem_api::handlers::egress::RUNTIME_ADMISSION_PATH)));
 
     let wait_for_shutdown = async {
         match nanosiem_core::shutdown::wait_for_shutdown_signal().await {

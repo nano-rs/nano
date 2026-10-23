@@ -107,51 +107,41 @@ pub struct TokenConfig {
     pub audience: String,
 }
 
+/// Shared policy for the API and search-service JWT environment loaders.
+pub fn validate_jwt_secret(secret: &str) -> Result<(), &'static str> {
+    if secret.len() < 32
+        || [
+            "default-dev-jwt-secret-32chars!!",
+            "nanosiem-dev-secret-change-in-production",
+            "your-jwt-secret-change-in-production",
+            "CHANGE_ME_GENERATE_WITH_OPENSSL_RAND_HEX_32",
+            "dev-e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8",
+        ]
+        .contains(&secret)
+        || secret.bytes().all(|byte| byte == 0)
+    {
+        return Err(
+            "SECURITY ERROR: JWT_SECRET must be a generated nondefault secret of at least 32 bytes",
+        );
+    }
+    Ok(())
+}
+
+pub fn jwt_secret_from_env() -> String {
+    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
+        panic!("SECURITY ERROR: JWT_SECRET is required; configure a generated persistent secret")
+    });
+    validate_jwt_secret(&secret).unwrap_or_else(|error| panic!("{error}"));
+    secret
+}
+
 impl Default for TokenConfig {
     /// Creates a TokenConfig from environment variables.
     ///
     /// # Panics
-    /// Panics if JWT_SECRET is not set (unless NANOSIEM_ALLOW_DEFAULT_KEYS=true)
-    /// or is shorter than 32 characters.
+    /// Panics if JWT_SECRET is missing, short, or a checked-in public default.
     fn default() -> Self {
-        let secret = match std::env::var("JWT_SECRET") {
-            Ok(secret) => {
-                if secret.len() < 32 {
-                    panic!(
-                        "SECURITY ERROR: JWT_SECRET must be at least 32 characters. \
-                         Set JWT_SECRET to a secure random value."
-                    );
-                }
-                secret
-            }
-            Err(_) => {
-                // NAN-1355: the public-key fallback is gated by its OWN flag,
-                // NANOSIEM_ALLOW_DEFAULT_KEYS — deliberately NOT NANOSIEM_DEV_MODE.
-                // NANOSIEM_DEV_MODE only relaxes the cookie Secure flag for plain-HTTP
-                // deployments (nanosiem-api-lib/src/cookies.rs); it must not also unlock
-                // built-in public keys, or an http:// deploy that enables dev-mode for
-                // cookies would silently run on a publicly-known JWT secret.
-                let allow_default_keys = std::env::var("NANOSIEM_ALLOW_DEFAULT_KEYS")
-                    .map(|v| v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
-
-                if allow_default_keys {
-                    tracing::warn!(
-                        "SECURITY WARNING: Using the built-in public development JWT secret \
-                         (NANOSIEM_ALLOW_DEFAULT_KEYS=true). Only acceptable in development — \
-                         never set this in production!"
-                    );
-                    "default-dev-jwt-secret-32chars!!".to_string()
-                } else {
-                    panic!(
-                        "SECURITY ERROR: JWT_SECRET not configured. \
-                         Set JWT_SECRET environment variable to a secure random value (32+ characters). \
-                         For local development only, set NANOSIEM_ALLOW_DEFAULT_KEYS=true to use the \
-                         insecure built-in default secret."
-                    );
-                }
-            }
-        };
+        let secret = jwt_secret_from_env();
 
         let issuer =
             std::env::var("JWT_ISSUER").unwrap_or_else(|_| DEFAULT_TOKEN_ISSUER.to_string());

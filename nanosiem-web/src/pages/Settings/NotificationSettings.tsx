@@ -120,7 +120,7 @@ const SEVERITY_COLOR: Record<string, string> = {
  *  F-39: the full URL is never returned — render the non-secret `url_host`. */
 function destinationLabel(w: WebhookConfig): string {
   if (w.channel_type === 'pagerduty') return 'PagerDuty Events API';
-  if (w.url_host) return w.url_host;
+  if (w.url_host) return w.transport_warning ? `${w.url_host} · insecure HTTP` : w.url_host;
   if (usesUrl(w.channel_type)) return w.has_url ? 'configured' : '—';
   return CHANNEL_LABEL[w.channel_type];
 }
@@ -712,6 +712,11 @@ function NotificationSettings() {
                   placeholder={editing ? '(configured — enter new to replace)' : urlPlaceholder(formType)}
                   className="h-8 text-[12px] font-mono"
                 />
+                {(formUrl.trim().toLowerCase().startsWith('http://') || (!formUrl.trim() && editing?.transport_warning)) && (
+                  <p role="alert" className="text-[11px] text-amber-400 mt-1.5">
+                    This receiver uses insecure plain HTTP. Notification data and credentials are sent without encryption. Use HTTPS when available.
+                  </p>
+                )}
                 {editing && (
                   <p className="text-[10.5px] text-muted-foreground mt-1">
                     Leave blank to keep the current destination{editing.url_host ? ` (${editing.url_host})` : ''}.

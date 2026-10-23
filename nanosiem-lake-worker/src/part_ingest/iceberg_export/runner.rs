@@ -389,6 +389,7 @@ pub async fn run_from_env() -> Result<()> {
     if !core::feature_enabled() {
         return Ok(());
     }
+    let cipher = EncryptionService::try_from_env()?;
     let path =
         std::env::var("NANO_ICEBERG_EXPORT_BOOTSTRAP_FILE").context("export bootstrap required")?;
     let bootstrap = load_bootstrap(Path::new(&path))?;
@@ -437,7 +438,6 @@ pub async fn run_from_env() -> Result<()> {
         tenant: bootstrap.tenant_id,
         actor: bootstrap.actor_id,
     };
-    let cipher = EncryptionService::from_env();
     let once = std::env::args().any(|arg| arg == "--once");
     let mut egress = None;
     loop {

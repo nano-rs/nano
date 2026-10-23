@@ -137,6 +137,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
     // notebooks); open builds use it read-only.
     let mut sub_docs: Vec<utoipa::openapi::OpenApi> = vec![
         handlers::health::HealthApiDoc::openapi(),
+        handlers::egress::EgressApiDoc::openapi(),
         handlers::capabilities::CapabilitiesApiDoc::openapi(),
         handlers::setup::SetupApiDoc::openapi(),
         handlers::auth::AuthApiDoc::openapi(),
@@ -1893,12 +1894,12 @@ mod tests {
         //   /api/marketplace/collectors/{slug}/feeds/{feed_id}/rotate-credential (POST).
         // NAN-4152 adds the shared /api/auth/shared/tenant-path-alias/{alias} (GET).
         // NAN-4152 adds the public demo claim /api/auth/shared/demo/claim (POST).
-        let min_paths = 670;
+        let min_paths = 674; // NAN-4402: proxy check, requirements, origin ACL, active-tenant roster.
         #[cfg(not(feature = "enterprise"))]
         // NAN-3577: floor matches the regenerated default-feature published spec.
         // NAN-3806: +1 (/api/ingest-tokens/{credential_id}/bind); NAN-3807: +2 (landing sources);
         // NAN-3812: +1 (/api/me/field-usage).
-        let min_paths = 481;
+        let min_paths = 485; // NAN-4402: proxy check, requirements, origin ACL, active-tenant roster.
 
         // Keep the SOAR increment separate so the baseline follows main.
         // M2: ten paths; M3c: nine; tenant settings: one (enterprise only);

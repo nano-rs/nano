@@ -85,7 +85,7 @@ impl OidcRepository {
     }
 
     /// Decrypt client secret using AES-256-GCM
-    fn decrypt_secret(&self, encrypted: &[u8]) -> Result<String, OidcRepositoryError> {
+    fn decrypt_secret(&self, id: Uuid, purpose: &'static str, encrypted: &[u8]) -> Result<String, OidcRepositoryError> {
         // Parse the stored JSON format
         let stored: serde_json::Value = serde_json::from_slice(encrypted).map_err(|e| {
             OidcRepositoryError::EncryptionError(format!("Failed to parse encrypted data: {}", e))
@@ -105,6 +105,7 @@ impl OidcRepository {
 
         let decrypted = self
             .encryption_service
+            .with_context(crate::crypto::CredentialScope::Deployment, purpose, id)
             .decrypt(&encrypted_data)
             .map_err(|e| OidcRepositoryError::EncryptionError(e.to_string()))?;
 
@@ -124,7 +125,7 @@ impl OidcRepository {
         .await?;
         value
             .as_deref()
-            .map(|bytes| self.decrypt_secret(bytes))
+            .map(|bytes| self.decrypt_secret(id, "oidc.google-service-account", bytes))
             .transpose()
     }
 
@@ -174,7 +175,7 @@ impl OidcRepository {
     /// Get decrypted client secret for a provider
     pub async fn get_client_secret(&self, id: Uuid) -> Result<String, OidcRepositoryError> {
         let provider = self.get_provider(id).await?;
-        self.decrypt_secret(&provider.client_secret_encrypted)
+        self.decrypt_secret(id, "oidc.client-secret", &provider.client_secret_encrypted)
     }
 
     /// Create a new OIDC provider

@@ -20,7 +20,7 @@ async fn open_feed_cursor_survives_store_restart_and_mutations_are_tenant_scoped
         .bind(tenant_b).execute(&pool).await.unwrap();
     let slot_a = TenantSlot { tenant_id: tenant_a, actor_id: Uuid::nil() };
     let slot_b = TenantSlot { tenant_id: tenant_b, actor_id: Uuid::nil() };
-    let cipher = EncryptionService::new(b"test-key-32-bytes-for-aes256!!");
+    let cipher = EncryptionService::new(b"test-key-32-bytes-for-aes256!!!!");
     let store = PgFeedStore::new(Tenancy::Dedicated { pool: pool.clone() }, cipher.clone()).probe_schema().await.unwrap();
     let plan = first_party::plan("okta_system_log").unwrap();
     let feed = NewFeed {
@@ -62,7 +62,7 @@ async fn open_identity_feed_delete_waits_for_the_directory_delete() {
     let pool = PgPoolOptions::new().max_connections(4).connect(&url).await.unwrap();
     nanosiem_core::db::migrations::run_postgres_migrations(&pool).await.unwrap();
     let slot = TenantSlot { tenant_id: nanosiem_core::reports::COMPATIBILITY_TENANT_ID, actor_id: Uuid::nil() };
-    let cipher = EncryptionService::new(b"test-key-32-bytes-for-aes256!!");
+    let cipher = EncryptionService::new(b"test-key-32-bytes-for-aes256!!!!");
     let store = PgFeedStore::new(Tenancy::Dedicated { pool: pool.clone() }, cipher).probe_schema().await.unwrap();
     let plan = first_party::plan("okta_users").unwrap();
     let feed = NewFeed {

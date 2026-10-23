@@ -282,6 +282,7 @@ impl DetectionCodeTargetRepository {
         };
         let plaintext = self
             .crypto
+            .with_context(crate::crypto::CredentialScope::Deployment, "detection.target", id)
             .decrypt(&encrypted)
             .map_err(|e| DetectionCodeTargetError::Encryption(e.to_string()))?;
         let token = String::from_utf8(plaintext)

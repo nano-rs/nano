@@ -2495,6 +2495,7 @@ impl Supervisor {
         let root = self.tenant_root(t);
         let jail = self.jail_spec(t, role, &slot.ids, &budget, cgroups, placement);
         let assignment = Assignment {
+            outbound_proxy: assignment_proxy(&self.cfg, t).await?,
             tenant: t.clone(),
             role,
             cell_id: self.cfg.cell_id.clone(),
@@ -5665,6 +5666,7 @@ mod signing_tests {
     fn assignment(role: Role, part_signing: Option<PartSigning>) -> Assignment {
         let p = PathBuf::from("/x");
         Assignment {
+            outbound_proxy: None,
             tenant: TenantId::new("t1").unwrap(),
             role,
             cell_id: "cell-a".into(),
@@ -6475,5 +6477,70 @@ mod refresh_pacer_tests {
             "the deferred mint starts a new interval");
         pacer.deferred_due(fired + REFRESH_MIN_INTERVAL);
         assert_eq!(pacer.request(fired + REFRESH_MIN_INTERVAL * 2), RefreshPace::MintNow, "after the interval: at once");
+    }
+}
+
+// Deployment mode is the explicit cell trust boundary. The accepted storage
+// stage adds proxy port 3128 to the existing jail contract. No root key is read.
+async fn assignment_proxy(cfg: &crate::config::CellConfig, tenant: &TenantId) -> Result<Option<crate::contract::OutboundProxy>, CellError> {
+    if cfg.trusted_local || !cfg.tcp_connect_ports.contains(&3128) { return Ok(None); }
+    let refuse = || CellError::Spawn("storage proxy delegation unavailable".into());
+    let control = cfg.control_url.as_deref().ok_or_else(refuse)?;
+    let identity = cfg.cell_identity_file.as_ref().ok_or_else(refuse)?;
+    let proxy = std::env::var("HTTPS_PROXY").map_err(|_| refuse())?;
+    let client = supervisor_proxy_client(&proxy)?;
+    let token = zeroize::Zeroizing::new(tokio::fs::read_to_string(identity).await.map_err(|_| refuse())?);
+    let endpoint = format!("{}/v1/lake/cells/{}/egress-proxy", control.trim_end_matches('/'), cfg.cell_id);
+    let mut response = client.post(endpoint).bearer_auth(token.trim()).json(&serde_json::json!({"tenant_id":tenant.as_str()}))
+        .send().await.map_err(|_| refuse())?;
+    if !response.status().is_success() { return Err(refuse()); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| refuse())? {
+        if bytes.len() + chunk.len() > 1024 { return Err(refuse()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Delegation { proxy_url: String }
+    let response: Delegation = serde_json::from_slice(&bytes).map_err(|_| refuse())?;
+    validate_cell_proxy(&response.proxy_url, "storage", Some(tenant.as_str()))?;
+    Ok(Some(crate::contract::OutboundProxy(response.proxy_url)))
+}
+
+fn validate_cell_proxy(raw: &str, purpose: &str, tenant: Option<&str>) -> Result<(), CellError> {
+    let refuse = || CellError::Spawn("storage proxy delegation refused".into());
+    let url = reqwest::Url::parse(raw).map_err(|_| refuse())?;
+    let (id, scope) = url.username().split_once("%2F").ok_or_else(refuse)?;
+    if url.scheme() != "http" || url.host_str() != Some("search-storage-proxy.nano-egress-proxy.svc.cluster.local")
+        || url.port() != Some(3128) || url.path() != "/" || url.query().is_some() || url.fragment().is_some()
+        || scope != purpose || uuid::Uuid::parse_str(id).map_or(true,|id|id.is_nil())
+        || tenant.is_some_and(|expected| expected != id)
+        || !url.password().is_some_and(|p| p.len()==64 && p.bytes().all(|b|b.is_ascii_hexdigit())) { return Err(refuse()); }
+    Ok(())
+}
+fn supervisor_proxy_client(proxy: &str) -> Result<reqwest::Client, CellError> {
+    validate_cell_proxy(proxy,"supervisor",None)?;
+    reqwest::Client::builder().no_proxy().proxy(reqwest::Proxy::all(proxy).map_err(|_|CellError::Spawn("cell proxy refused".into()))?)
+        .redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(10)).build()
+        .map_err(|_|CellError::Spawn("cell proxy unavailable".into()))
+}
+
+#[cfg(test)]
+mod assignment_egress_tests {
+    use super::*;
+    #[test]
+    fn supervisor_cannot_mint_or_move_storage_credentials() {
+        let a="11111111-2222-4333-8444-555555555555";
+        let b="22222222-2222-4333-8444-555555555555";
+        let url=format!("http://{a}%2Fsupervisor:{}@search-storage-proxy.nano-egress-proxy.svc.cluster.local:3128","a".repeat(64));
+        assert!(supervisor_proxy_client(&url).is_ok());
+        assert!(supervisor_proxy_client(&url.replace("supervisor","storage")).is_err());
+        let storage=url.replace("supervisor","storage");
+        assert!(validate_cell_proxy(&storage,"storage",Some(a)).is_ok());
+        assert!(validate_cell_proxy(&storage,"storage",Some(b)).is_err());
+        for bad in [storage.replace(":3128",":80"),storage.replace("search-storage-proxy.nano-egress-proxy.svc.cluster.local","evil.example"),format!("{storage}?secret=value")] {
+            assert!(validate_cell_proxy(&bad,"storage",Some(a)).is_err());
+        }
+        assert_eq!(format!("{:?}",crate::contract::OutboundProxy(storage)),"OutboundProxy([redacted])");
     }
 }

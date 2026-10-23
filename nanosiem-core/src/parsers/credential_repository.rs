@@ -536,6 +536,7 @@ impl CredentialRepository {
 
         let plaintext = self
             .crypto
+            .with_context(crate::crypto::CredentialScope::Deployment, "cloud.credential", id)
             .decrypt(&encrypted)
             .map_err(|e| CredentialRepositoryError::EncryptionError(e.to_string()))?;
 

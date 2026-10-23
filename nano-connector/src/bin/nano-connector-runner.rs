@@ -157,6 +157,10 @@ fn main() -> ExitCode {
         tracing::error!(error = %e, "nano-connector-runner could not make itself non-dumpable");
         return ExitCode::FAILURE;
     }
+    if let Err(error) = EncryptionService::try_from_env() {
+        tracing::error!(%error, "credential key configuration refused");
+        return ExitCode::FAILURE;
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {

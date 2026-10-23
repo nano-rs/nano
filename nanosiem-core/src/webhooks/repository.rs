@@ -398,8 +398,7 @@ impl WebhookRepository {
     /// encrypted column, lazy-encrypting legacy plaintext rows on read.
     ///
     /// - `url_encrypted` present → decrypt into `Webhook.url` (authoritative
-    ///   delivery URL). A decrypt failure is logged and leaves the plaintext
-    ///   fallback in place rather than sending to a wrong/empty target.
+    ///   delivery URL). A decrypt failure clears the destination and fails delivery closed.
     /// - `url_encrypted` NULL but plaintext `url` present (a pre-migration-254
     ///   row) → encrypt-and-persist it so the next read uses the encrypted
     ///   column, and keep using the plaintext meanwhile.
@@ -411,12 +410,12 @@ impl WebhookRepository {
         // small envelope first so the immutable borrow is released before we
         // mutate `webhook.url`.
         if let Some(enc) = webhook.url_encrypted.clone().filter(|e| !e.is_empty()) {
-            match self.decrypt_string(&enc) {
+            match decrypt_envelope_string(&self.encryption.with_context(crate::crypto::CredentialScope::Deployment, "webhook.url", webhook.id), &enc) {
                 Ok(url) => webhook.url = url,
-                Err(e) => tracing::error!(
-                    webhook_id = %webhook.id,
-                    "F-39: url_encrypted could not be decrypted, falling back to stored plaintext: {e}"
-                ),
+                Err(e) => {
+                    webhook.url.clear();
+                    tracing::error!(webhook_id = %webhook.id, "encrypted webhook destination unavailable: {e}");
+                }
             }
             return;
         }
@@ -620,4 +619,54 @@ pub fn decrypt_envelope_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, WebhookRepositoryError> {
     let decrypted = encryption.decrypt(&envelope_from_bytes(encrypted_bytes)?)?;
     serde_json::from_slice(&decrypted).map_err(|e| WebhookRepositoryError::SerializationError(e.to_string()))
+}
+
+#[cfg(test)]
+mod credential_reader_tests {
+    use super::*;
+    #[tokio::test]
+    async fn v2_destination_wrong_row_never_falls_back_to_plaintext() {
+        let id = Uuid::from_u128(1);
+        let cipher = EncryptionService::from_config("0123456789abcdef0123456789abcdef").unwrap();
+        let encrypted = cipher
+            .with_context(
+                crate::crypto::CredentialScope::Deployment,
+                "webhook.url",
+                id,
+            )
+            .seal_v2(b"https://example.test/credential")
+            .unwrap()
+            .to_json_bytes()
+            .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fixture@127.0.0.1:1/never-connect")
+            .unwrap();
+        let repo = WebhookRepository::with_encryption(pool, cipher);
+        let now = chrono::Utc::now();
+        let mut hook = Webhook {
+            id,
+            name: "fixture".into(),
+            url: "https://fallback.invalid/unsafe".into(),
+            url_encrypted: Some(encrypted),
+            url_host: None,
+            headers_encrypted: None,
+            secret_encrypted: None,
+            severity_filter: None,
+            event_types: vec![],
+            channel_type: "generic".into(),
+            channel_config: serde_json::json!({}),
+            rule_filter: None,
+            health_category_filter: None,
+            health_resource_filter: None,
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        repo.hydrate_delivery_url(&mut hook).await;
+        assert_eq!(hook.url, "https://example.test/credential");
+        hook.id = Uuid::from_u128(2);
+        hook.url = "https://fallback.invalid/unsafe".into();
+        repo.hydrate_delivery_url(&mut hook).await;
+        assert!(hook.url.is_empty());
+    }
 }
