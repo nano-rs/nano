@@ -290,3 +290,77 @@ fn otlp_logs_use_edge_identity_and_bound_route() {
     ));
     assert!(metadata.get("nano_credential_id").is_none());
 }
+
+/// Line numbers of every bare `$name` Vector would env-interpolate in `text`.
+/// Vector substitutes `$name` / `${name}` (name = word chars and `.`) on the
+/// raw config text, comments included; `$$` is the escape. A `$` followed by
+/// anything else (regex end anchors such as `$'` or `$)`) is left alone.
+fn bare_env_refs(text: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'$' {
+                i += 1;
+                continue;
+            }
+            match bytes.get(i + 1) {
+                Some(b'$') => i += 2,
+                Some(c) if c.is_ascii_alphanumeric() || *c == b'_' || *c == b'.' => {
+                    hits.push((index + 1, line.trim().to_string()));
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+    }
+    hits
+}
+
+fn collect_vector_configs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {dir:?}: {e}")) {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            collect_vector_configs(&path, out);
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("toml" | "yaml" | "yml" | "json")
+        ) {
+            out.push(path);
+        }
+    }
+}
+
+/// NAN-4407: a `$1.4` in a comment of 04-otlp-lake-sink.toml made Vector exit
+/// 78 ("Missing environment variable in config. name = \"1.4\"") on every fresh
+/// open-core install. Every static Vector config must use `${VAR}` for real
+/// references and `$$` (or no `$`) everywhere else.
+#[test]
+fn static_vector_configs_have_no_bare_env_refs() {
+    assert_eq!(
+        bare_env_refs("# ~$1.4/day"),
+        vec![(1, "# ~$1.4/day".into())]
+    );
+    assert!(bare_env_refs("a = \"${X:-1}\" # $$1 r'^a$' r'(b)$')").is_empty());
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/vector");
+    let mut files = Vec::new();
+    collect_vector_configs(&root, &mut files);
+    assert!(!files.is_empty(), "no Vector configs found under {root:?}");
+    let offenders: Vec<String> = files
+        .iter()
+        .flat_map(|path| {
+            let text =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            bare_env_refs(&text)
+                .into_iter()
+                .map(move |(line, src)| format!("{}:{line}: {src}", path.display()))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "bare `$name` is env-interpolated by Vector (even in comments); use ${{VAR}}, `$$`, or drop the `$`:\n{}",
+        offenders.join("\n")
+    );
+}

@@ -301,7 +301,20 @@ fn build_shared_openapi() -> utoipa::openapi::OpenApi {
     // First-operation-wins now preserves the tenant handler's wire contract.
     // Unported legacy paths are removed by the live shared route fences below.
     merge_sub_docs(&mut spec, sub_docs());
-    finish_openapi(spec)
+    let mut spec = finish_openapi(spec);
+    #[cfg(feature = "enterprise")]
+    for (path, item) in &mut spec.paths.paths {
+        for (method, operation) in [(axum::http::Method::GET, &mut item.get), (axum::http::Method::POST, &mut item.post)] {
+            if nanosiem_enterprise::handlers::enterprise_shared_agent_features::legacy_cell_route(&method, path) {
+                if let Some(operation) = operation {
+                    let note = "Session-only heavy read. Automation requires reason, narrow entities and a bounded window at POST /api/agent/features; use lake_sql stamps for discovery. Legacy calls are refused even if reason is supplied.";
+                    operation.description = Some(format!("{}\n\n{note}", operation.description.as_deref().unwrap_or_default()));
+                    operation.responses.responses.insert("400".into(), utoipa::openapi::response::Response::new(note).into());
+                }
+            }
+        }
+    }
+    spec
 }
 
 fn merge_sub_docs(spec: &mut utoipa::openapi::OpenApi, sub_docs: Vec<utoipa::openapi::OpenApi>) {
@@ -690,6 +703,53 @@ pub fn desktop_wire_spec() -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn legacy_heavy_reads_document_guarded_automation_requirement() {
+        let spec = serde_json::to_value(build_shared_openapi()).unwrap();
+        for (path, method) in [
+            ("/api/prevalence/hash/{hash}", "get"),
+            ("/api/prevalence/domain/{domain}", "get"),
+            ("/api/prevalence/new", "get"),
+            ("/api/prevalence/explorer", "get"),
+            ("/api/entities/{entity_type}/{entity_value}/context", "get"),
+            ("/api/identity/resolve", "get"),
+            ("/api/lookup-tables/query", "post"),
+            ("/api/threat-intel/indicator-lookup", "post"),
+        ] {
+            let operation = &spec["paths"][path][method];
+            assert!(operation["description"].as_str().unwrap().contains("POST /api/agent/features"), "{path}");
+            assert!(operation["responses"]["400"]["description"].as_str().unwrap().contains("reason"), "{path}");
+        }
+    }
+
+    #[test]
+    fn bulk_prevalence_documents_absolute_bounds_and_echo() {
+        #[cfg(not(feature="enterprise"))]
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        #[cfg(feature="enterprise")]
+        let spec = serde_json::to_value(build_shared_openapi()).unwrap();
+        let operation = &spec["paths"]["/api/prevalence/bulk"]["post"];
+        let request = operation["requestBody"]["content"]["application/json"]["schema"]["$ref"].as_str().unwrap();
+        let response = operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"].as_str().unwrap();
+        let schema = |reference: &str| &spec["components"]["schemas"][reference.rsplit('/').next().unwrap()];
+        for field in ["start", "end", "window"] {
+            assert!(schema(request)["properties"].get(field).is_some(), "{field}");
+        }
+        let response_schema = schema(response);
+        #[cfg(feature="enterprise")]
+        let response_schema = {
+            let variants = response_schema.get("oneOf").or_else(|| response_schema.get("anyOf")).unwrap_or_else(|| panic!("missing guarded response {response}: {response_schema}")).as_array().unwrap();
+            assert!(variants.iter().any(|v| v["$ref"].as_str().is_some_and(|r| r.ends_with("/FeatureResponse"))));
+            let session = variants.iter().find_map(|v| v["$ref"].as_str().filter(|r| r.ends_with("/EnterpriseSharedBulkPrevalenceResponse"))).unwrap();
+            assert!(operation["responses"].get("429").is_some());
+            assert!(schema(request)["properties"].get("reason").is_some());
+            schema(session)
+        };
+        for field in ["requested_window", "effective_window", "note"] { assert!(response_schema["properties"].get(field).is_some()); }
+        assert!(spec["components"]["schemas"]["ExactPrevalenceWindow"]["properties"].get("start").is_some());
+    }
+
     #[test]
     fn user_visible_openapi_contains_no_internal_ticket_ids() {
         fn walk(value: &serde_json::Value, path: &str, pattern: &regex::Regex, violations: &mut Vec<String>) {
@@ -1845,7 +1905,7 @@ mod tests {
         // NAN-4369: the internal egress check, one.
         // NAN-4380: tenant-bound agent query receipts, one.
         #[cfg(feature = "enterprise")]
-        let min_paths = min_paths + 22;
+        let min_paths = min_paths + 23;
 
         assert!(
             path_count >= min_paths,
@@ -2373,5 +2433,17 @@ mod tests {
                  client/server mismatch, not noise."
             );
         }
+    }
+
+    #[cfg(feature="enterprise")]
+    #[test]
+    fn guarded_cell_feature_contract_and_fence() {
+        let spec=serde_json::to_value(build_openapi()).unwrap();
+        let op=&spec["paths"]["/api/agent/features"]["post"];
+        assert!(op["responses"]["429"]["description"].as_str().unwrap().contains("budget"));
+        assert_eq!(nanosiem_enterprise::handlers::enterprise_shared_enrichment::enterprise_shared_enrichment_fence(&axum::http::Method::POST,"/api/agent/features"),Some("search:execute"));
+        let request=&spec["components"]["schemas"]["FeatureRequest"];
+        assert!(request["required"].as_array().unwrap().iter().any(|v|v=="reason"));
+        assert_eq!(request["additionalProperties"],false);
     }
 }

@@ -220,6 +220,10 @@ async fn engine_with_detail_fixture(root: &std::path::Path, now: DateTime<Utc>, 
 }
 
 async fn engine_with_detail_pattern(root: &std::path::Path, now: DateTime<Utc>, minutes: i64, variants: bool, asset: bool, ties: bool, details: bool, sparse: bool) -> PartQueryEngine {
+    engine_with_transformed_rows(root, now, minutes, variants, asset, ties, details, sparse, |_, row| row).await
+}
+
+async fn engine_with_transformed_rows(root: &std::path::Path, now: DateTime<Utc>, minutes: i64, variants: bool, asset: bool, ties: bool, details: bool, sparse: bool, transform: fn(usize, Value) -> Value) -> PartQueryEngine {
     let parts = LocalObjectStore::new(root.join("parts")).unwrap();
     let sources_dir = root.join("sources");
     std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
@@ -295,7 +299,7 @@ async fn engine_with_detail_pattern(root: &std::path::Path, now: DateTime<Utc>, 
                 row["actor"]["process"]["file"]["hashes"][0]["value"] = json!("c".repeat(64));
                 row["dst_endpoint"]["hostname"] = json!("other.test");
             }
-            row
+            transform(i, row)
         })
         .collect::<Vec<_>>();
     write_bronze(&sources_dir.join("bronze/0000.parquet"), &batch);
@@ -3169,4 +3173,60 @@ async fn nan4290_a_1h_listing_finishes_while_a_30d_aggregate_holds_the_general_l
     assert_eq!(total, ROWS as u64, "the 30 d aggregate counts every fixture event");
     assert!(aggregate_ms >= listing_ms + 1_000);
     println!("NAN4290 listing_1h_ms={listing_ms} aggregate_30d_ms={aggregate_ms} hold_s={}", HOLD.as_secs());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn agent_prevalence_reports_whole_part_coverage_on_the_production_reader() {
+    let _serial = serial();
+    let root = tempfile::tempdir().unwrap();
+    let now = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+    let engine = engine(root.path(), now).await;
+    let boundary = now - Duration::seconds(90);
+    // The independently generated ingest fixture has one literal-window event.
+    assert_eq!((0..ROWS).filter(|i| i % 5 == 0 && event_at(now, *i) >= boundary && event_at(now, *i) < now).count(), 1);
+    // The covering part has three: rarity intentionally counts the whole part.
+    let mut request: super::super::partials::PrevalenceLookupRequest = serde_json::from_value(json!({
+        "request_id": "agent-whole-parts", "tenant_id": TENANT, "window": "24h",
+        "start": boundary.to_rfc3339(), "end": now.to_rfc3339(), "artifacts": ["10.0.0.0"],
+        "rarity_threshold": 7,
+    })).unwrap();
+    let answer = super::super::partials::prevalence_lookup(&engine, &request).await.unwrap();
+    assert_eq!(answer["results"][0]["total_occurrences"], json!(3));
+    let requested: nanosiem_core::prevalence::ExactPrevalenceWindow = serde_json::from_value(answer["requested_window"].clone()).unwrap();
+    let effective: nanosiem_core::prevalence::ExactPrevalenceWindow = serde_json::from_value(answer["effective_window"].clone()).unwrap();
+    assert_eq!(requested.micros().unwrap(), (boundary.timestamp_micros(), now.timestamp_micros()));
+    assert!(effective.micros().unwrap().0 < boundary.timestamp_micros());
+    assert!(effective.micros().unwrap().1 >= now.timestamp_micros());
+    assert_eq!(answer["note"], "prevalence counted over whole parts; effective window shown");
+    assert_eq!(engine.fetcher().prevalence_raw_scans(), 0, "rarity must remain on partials");
+    request.tenant_id = "00000000-0000-4000-8000-00000000000b".into();
+    assert!(super::super::partials::prevalence_lookup(&engine, &request).await.is_err());
+}
+
+/// Same native observation-index SQL used by resolve_lake_identity_ip's cell
+/// batch route: ingest real parts, backfill, then resolve one IP at two times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: chDB artifact"]
+async fn agent_identity_as_of_returns_two_observations_for_one_ip() {
+    let _serial=serial();
+    use super::super::identity::{lookup,normalize_items,LookupKind};
+    let root=tempfile::tempdir().unwrap();
+    let now=Utc::now();
+    let engine=engine_with_transformed_rows(root.path(),now,1,false,false,false,true,false,|i,mut row| {
+        let hostname=if i>=120 {"previous-host.test"} else {"current-host.test"};
+        row["device"]["hostname"]=json!(hostname);row["src_endpoint"]["hostname"]=json!(hostname);
+        row["actor"]["user"]["name"]=json!(if i>=120 {"previous-user"}else{"current-user"});row
+    }).await;
+    let state=root.path().join("state");
+    let backfill=super::super::identity::backfill_once(&engine,&state,now.timestamp_micros(),512,None).await.unwrap();assert_eq!(backfill.remaining,0);
+    let earlier=now-Duration::hours(3);
+    let items=normalize_items(LookupKind::Ip,&[("10.0.0.1".into(),earlier.to_rfc3339()),("10.0.0.1".into(),now.to_rfc3339())]).unwrap();
+    let (rows,_)=lookup(&engine,&state,LookupKind::Ip,&items,&[]).await.unwrap();
+    assert_eq!(rows.len(),2,"{rows:?}");
+    assert_eq!(rows[0]["hostname"],"previous-host.test");assert_eq!(rows[1]["hostname"],"current-host.test");
+    assert_eq!(rows[0]["user"],"previous-user");assert_eq!(rows[1]["user"],"current-user");
+    let old=DateTime::parse_from_rfc3339(rows[0]["observed_at"].as_str().unwrap()).unwrap();
+    let new=DateTime::parse_from_rfc3339(rows[1]["observed_at"].as_str().unwrap()).unwrap();
+    assert!(old<=earlier && new<=now && old<new);
 }

@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Explicit audited recovery for the internal ops tenant. A fixed dry-run
-//! snapshot bounds the policy; missing/invalid times ALWAYS retain a segment.
+//! Explicit audited backlog recovery. A fixed dry-run snapshot bounds the
+//! policy; missing/invalid times ALWAYS retain a segment.
+//!
+//! Which tenants may run a recovery is decided by the edge-log authority that
+//! issues the plan in the lease (it refuses plan and apply for every other
+//! tenant), not here: shared code carries no deployment's tenant identity. The
+//! consumer binds the plan to its own tenant and re-verifies every bound.
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
-
-pub const OPS_TENANT: &str = "eb0126d5-dbd5-4e6a-8414-7310610074ac";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -33,7 +36,10 @@ pub struct BacklogSkipPlan {
 
 impl BacklogSkipPlan {
     pub fn validate(&self, tenant: &str, now_ms: i64) -> Result<()> {
-        ensure!(tenant == OPS_TENANT && self.tenant_uuid == tenant, "recovery tenant is not allowlisted");
+        // Canonical lowercase hyphenated form only, as the authority stamps it:
+        // a re-cased or braced spelling of the same id is refused, not normalized.
+        ensure!(uuid::Uuid::parse_str(tenant).is_ok_and(|id| id.hyphenated().to_string() == tenant)
+            && self.tenant_uuid == tenant, "recovery plan is not bound to this tenant");
         ensure!(self.version == 1 && self.cutoff_ms > 0 && self.cutoff_ms <= now_ms - 3_600_000,
             "invalid recovery age boundary");
         ensure!(self.first_seq > 0 && self.first_seq <= self.through_seq && self.through_seq <= super::protocol::MAX_SEQ,
@@ -130,15 +136,37 @@ pub(crate) mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
         writer.write(&batch).unwrap(); writer.close().unwrap(); bytes
     }
-    #[test]
-    fn backlog_plan_hash_matches_authority_wire_fixture() {
-        let mut plan = BacklogSkipPlan { version: 1, tenant_uuid: OPS_TENANT.into(), cutoff_ms: 6_000_000,
+    /// Neutral fixture tenant (RFC 4122 v4 shape, owned by no deployment).
+    pub(crate) const RECOVERY_TENANT: &str = "6f1d2c3b-4a59-4e68-9d7c-0b1a2f3e4d5c";
+
+    fn wire_fixture() -> BacklogSkipPlan {
+        BacklogSkipPlan { version: 1, tenant_uuid: RECOVERY_TENANT.into(), cutoff_ms: 6_000_000,
             first_seq: 1, through_seq: 4, summary: BacklogSummary { segments: 2, bytes: 12, rows: 4, kept: 2,
                 ranges: vec![[1, 1], [3, 3]], manifest_sha256: "a".repeat(64) }, at: 10_000_000,
-            plan_hash: "38c5b887be94c6672fbd48253518357a1376e80dab974d2ad44de8a05ecca8c6".into() };
-        plan.validate(OPS_TENANT, 10_000_000).unwrap();
+            // The authority's own test pins this hash for the same plan bytes.
+            plan_hash: "693acf418542bd47ae41aa9e3a758d9201d60eb183b829ac387ea8adf5d2202e".into() }
+    }
+    #[test]
+    fn backlog_plan_hash_matches_authority_wire_fixture() {
+        let mut plan = wire_fixture();
+        plan.validate(RECOVERY_TENANT, 10_000_000).unwrap();
         plan.summary.bytes += 1;
-        assert!(plan.validate(OPS_TENANT, 10_000_000).is_err());
+        assert!(plan.validate(RECOVERY_TENANT, 10_000_000).is_err());
+    }
+    #[test]
+    fn backlog_plan_binds_to_the_consuming_tenant_only() {
+        let plan = wire_fixture();
+        // Another tenant's consumer, or a non-canonical spelling of this one.
+        for tenant in ["0b9e8d7c-6a5f-4e3d-8c2b-1a0f9e8d7c6b", &RECOVERY_TENANT.to_uppercase(),
+            &format!("{{{RECOVERY_TENANT}}}"), "", "not-a-uuid"] {
+            assert!(plan.validate(tenant, 10_000_000).is_err(), "{tenant}");
+        }
+        // A plan that names a non-canonical tenant is refused even when the
+        // consumer echoes it back.
+        let mut upper = wire_fixture();
+        upper.tenant_uuid = RECOVERY_TENANT.to_uppercase();
+        upper.plan_hash = upper.canonical_hash().unwrap();
+        assert!(upper.validate(&RECOVERY_TENANT.to_uppercase(), 10_000_000).is_err());
     }
     #[test]
     fn backlog_native_timestamp_units_keep_boundary_and_nulls() {

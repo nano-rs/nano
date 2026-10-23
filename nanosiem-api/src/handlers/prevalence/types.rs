@@ -61,6 +61,10 @@ pub struct BulkPrevalenceRequest {
     pub artifacts: Vec<String>,
     /// Time window for prevalence calculation
     pub window: Option<String>,
+    /// Absolute half-open bounds (RFC3339, millisecond precision); paired, at most 30 days.
+    /// Cannot be combined with the legacy preset window.
+    pub start: Option<String>,
+    pub end: Option<String>,
 }
 
 /// Request body for query artifacts endpoint
@@ -133,6 +137,12 @@ pub struct PrevalenceResponse {
 pub struct BulkPrevalenceResponse {
     pub data: Vec<PrevalenceData>,
     pub total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_window: Option<nanosiem_core::prevalence::ExactPrevalenceWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_window: Option<nanosiem_core::prevalence::ExactPrevalenceWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Response for rare/new artifacts

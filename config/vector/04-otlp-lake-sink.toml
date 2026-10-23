@@ -187,7 +187,7 @@ for_each(points) -> |_i, point| {
 # NAN-4189: batches flush every 5 s, not every 1 s. On hosted lean every batch
 # is one `otel-handoff-v1/` object: 1 R2 PUT, 2 HEAD + 1 GET in the drain, and a
 # writer-DO lease + record (~6 SQLite rows). At 1 s the internal ops tenant
-# wrote ~4.7k objects/h (~$1.4/day of Cloudflare); 5 s coalesces bursts to ~2k/h.
+# wrote ~4.7k objects/h (~1.4 USD/day of Cloudflare); 5 s coalesces bursts to ~2k/h.
 # The ceiling is the ACK path: end-to-end acknowledgements hold the OTLP
 # response until this sink delivers, the hosted direct ACK cap is 15 s, and the
 # common OTel SDK export timeout is 10 s, so 5 s leaves room for the PUT.

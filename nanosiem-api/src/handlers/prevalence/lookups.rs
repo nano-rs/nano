@@ -173,6 +173,10 @@ pub async fn get_domain_prevalence(
 /// Get prevalence data for multiple artifacts in a single request.
 /// Limited to 100 artifacts per request.
 /// Requirements: 4.3
+/// Optional paired RFC3339 start/end select a half-open analysis window (maximum 30 days).
+/// Counts use whole covering parts, with requested and effective bounds echoed separately.
+/// A legacy preset window cannot be combined with absolute bounds.
+/// Older readers fail closed rather than silently serving a rolling lookback.
 #[utoipa::path(
     post,
     path = "/api/prevalence/bulk",
@@ -211,14 +215,23 @@ pub async fn get_bulk_prevalence(
         ));
     }
 
+    let bounds = nanosiem_core::prevalence::ExactPrevalenceWindow::parse(request.start.as_deref(), request.end.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if bounds.is_some() && request.window.is_some() {
+        return Err((StatusCode::BAD_REQUEST, "use absolute bounds or a preset window".into()));
+    }
     let time_window = parse_time_window(request.window.as_deref());
     let scope = effective_artifact_scope(&auth);
 
     if let Some(client) = super::primary_lake_prevalence_client(&state).await? {
-        return match client.lookup(&request.artifacts, time_window, &scope).await {
-            Ok(data) => {
-                let total = data.len();
-                Ok(Json(BulkPrevalenceResponse { data, total }))
+        let result = match &bounds {
+            Some(bounds) => client.lookup_between(&request.artifacts, bounds, &scope).await,
+            None => client.lookup(&request.artifacts, time_window, &scope).await.map(|data| nanosiem_core::prevalence::lookup::LakePrevalenceRead { data, requested_window: None, effective_window: None, note: None }),
+        };
+        return match result {
+            Ok(read) => {
+                let total = read.data.len();
+                Ok(Json(BulkPrevalenceResponse { data: read.data, total, requested_window: read.requested_window, effective_window: read.effective_window, note: read.note }))
             }
             Err(error) => {
                 error!("Lake bulk prevalence lookup failed: {}", error);
@@ -227,6 +240,9 @@ pub async fn get_bulk_prevalence(
         };
     }
 
+    if bounds.is_some() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "absolute prevalence requires a tenant cell".into()));
+    }
     let dual_pool = state.dual_pool();
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -242,7 +258,7 @@ pub async fn get_bulk_prevalence(
     {
         Ok(data) => {
             let total = data.len();
-            Ok(Json(BulkPrevalenceResponse { data, total }))
+            Ok(Json(BulkPrevalenceResponse { data, total, requested_window: None, effective_window: None, note: None }))
         }
         Err(e) => {
             error!("Failed to get bulk prevalence: {}", e);

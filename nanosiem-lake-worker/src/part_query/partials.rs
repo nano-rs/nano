@@ -1165,6 +1165,9 @@ pub struct PrevalenceLookupRequest {
     pub tenant_id: String,
     /// `1h`, `24h`, `7d` or `30d` (the reader's snapshot windows).
     pub window: String,
+    /// Exact inclusive start; requires end. Both are RFC3339 instants.
+    #[serde(default)]
+    pub start: Option<String>,
     /// Window end (RFC3339); defaults to now.
     #[serde(default)]
     pub end: Option<String>,
@@ -1207,11 +1210,38 @@ fn window_bounds(window: &str, end: Option<&str>) -> QueryResult<(i64, i64)> {
 
 /// Point lookups over the window relation, merged across allowed scopes.
 pub async fn prevalence_lookup(engine: &PartQueryEngine, request: &PrevalenceLookupRequest) -> QueryResult<Value> {
+    engine.pinned_if_needed(prevalence_lookup_pinned(engine, request)).await?
+}
+
+async fn prevalence_lookup_pinned(engine: &PartQueryEngine, request: &PrevalenceLookupRequest) -> QueryResult<Value> {
     if request.tenant_id != engine.settings().tenant_id {
         return Err(invalid("request tenant is not this process's tenant"));
     }
     let threshold = request.rarity_threshold.unwrap_or_else(crate::prevalence::tenant_rarity_threshold);
-    let (from_us, to_us) = window_bounds(&request.window, request.end.as_deref())?;
+    let exact = if request.start.is_some() {
+        nanosiem_core::prevalence::ExactPrevalenceWindow::parse(request.start.as_deref(), request.end.as_deref())
+            .map_err(invalid)?
+    } else { None };
+    let (mut from_us, mut to_us) = match &exact {
+        Some(bounds) => { let (start, end) = bounds.micros().map_err(invalid)?; (start, end - 1) },
+        None => window_bounds(&request.window, request.end.as_deref())?,
+    };
+    // A rarity lookup is whole-part only. Close the covering interval over
+    // this pinned inventory so the effective window also includes every part
+    // it names. No rows are leased and no caller bound is advertised as exact.
+    if exact.is_some() {
+        let mut settled = false;
+        for _ in 0..32 {
+            let (parts, _, _, _) = engine.snapshot(from_us, to_us).await?;
+            let start = parts.iter().map(|p| p.min_time_us).min().unwrap_or(from_us).min(from_us);
+            let end = parts.iter().map(|p| p.max_time_us).max().unwrap_or(to_us).max(to_us);
+            if (start, end) == (from_us, to_us) { settled = true; break; }
+            (from_us, to_us) = (start, end);
+        }
+        if !settled { return Err(invalid("prevalence covering window did not converge")); }
+    }
+    let effective = exact.as_ref().map(|_| nanosiem_core::prevalence::ExactPrevalenceWindow::from_micros(from_us, to_us.checked_add(1).ok_or_else(|| "invalid coverage".to_string())?))
+        .transpose().map_err(invalid)?;
     // Capture a conservative watermark before taking the query snapshot. A
     // later head could include parts that this response did not read.
     let log_head = engine.head_json().await;
@@ -1227,6 +1257,10 @@ pub async fn prevalence_lookup(engine: &PartQueryEngine, request: &PrevalenceLoo
         "window": request.window,
         "window_start_us": from_us,
         "window_end_us": to_us,
+        "window_end_exclusive_us": exact.as_ref().map(|_| to_us + 1),
+        "requested_window": exact,
+        "effective_window": effective,
+        "note": if exact.as_ref().zip(effective.as_ref()).is_some_and(|(r,e)| r.micros().ok() != e.micros().ok()) { Some("prevalence counted over whole parts; effective window shown") } else { None },
         "results": results,
     }))
 }

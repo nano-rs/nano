@@ -246,6 +246,14 @@ pub struct LakePrevalenceClient {
     router_token_file: Option<PathBuf>,
 }
 
+/// Bounds of the partials actually counted, alongside the caller's request.
+pub struct LakePrevalenceRead {
+    pub data: Vec<PrevalenceData>,
+    pub requested_window: Option<super::ExactPrevalenceWindow>,
+    pub effective_window: Option<super::ExactPrevalenceWindow>,
+    pub note: Option<String>,
+}
+
 impl LakePrevalenceClient {
     /// Construct from a previously validated, tenant-pinned detect lane.
     pub(crate) fn from_cell_detection_parts(base_url: &str, tenant_id: &str, token_file: &Path,
@@ -547,7 +555,8 @@ impl LakePrevalenceClient {
         artifacts: &[String],
         time_window: TimeWindow,
         scope: &ArtifactScope,
-    ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
+        bounds: Option<&super::ExactPrevalenceWindow>,
+    ) -> Result<LakePrevalenceRead, PrevalenceError> {
         let snapshot_id = self.snapshot_for(time_window)?;
         let request_id = uuid::Uuid::now_v7().to_string();
         let request = LakePrevalenceRequest {
@@ -555,6 +564,8 @@ impl LakePrevalenceClient {
             tenant_id: &self.tenant_id,
             snapshot_id,
             window: time_window.to_string(),
+            start: bounds.map(|w| w.start.as_str()),
+            end: bounds.map(|w| w.end.as_str()),
             artifacts,
             rarity_threshold: self.lake_cell.then_some(self.effective_rarity_threshold()),
             deny_source_types: scope.deny_bind_values(),
@@ -605,6 +616,17 @@ impl LakePrevalenceClient {
             ));
         }
 
+        if let Some(bounds) = bounds {
+            let requested = bounds.micros().map_err(PrevalenceError::Backend)?;
+            let echoed = envelope.requested_window.as_ref().ok_or_else(|| PrevalenceError::Backend("missing requested prevalence window".into()))?.micros().map_err(PrevalenceError::Backend)?;
+            let effective = envelope.effective_window.as_ref().ok_or_else(|| PrevalenceError::Backend("missing effective prevalence window".into()))?.micros().map_err(PrevalenceError::Backend)?;
+            if echoed != requested || effective.0 > requested.0 || effective.1 < requested.1
+                || envelope.window_start_us != Some(effective.0) || envelope.window_end_exclusive_us != Some(effective.1)
+                || (effective != requested && envelope.note.as_deref() != Some("prevalence counted over whole parts; effective window shown")) {
+                return Err(PrevalenceError::Backend("lake prevalence coverage was not honored".into()));
+            }
+        }
+
         let requested: BTreeSet<String> = artifacts.iter().map(|v| normalize_artifact(v)).collect();
         let mut seen = BTreeSet::new();
         for item in &envelope.results {
@@ -620,7 +642,10 @@ impl LakePrevalenceClient {
                 ));
             }
         }
-        Ok(envelope
+        let requested_window = envelope.requested_window;
+        let effective_window = envelope.effective_window;
+        let note = envelope.note;
+        let data = envelope
             .results
             .into_iter()
             .map(|mut item| {
@@ -636,7 +661,21 @@ impl LakePrevalenceClient {
                 };
                 item
             })
-            .collect())
+            .collect();
+        Ok(LakePrevalenceRead { data, requested_window, effective_window, note })
+    }
+
+    /// Absolute half-open lookup, using the guarded tenant cell assignment.
+    /// Immutable legacy snapshots cannot answer arbitrary historical bounds.
+    pub async fn lookup_between(
+        &self, artifacts: &[String], bounds: &super::ExactPrevalenceWindow, scope: &ArtifactScope,
+    ) -> Result<LakePrevalenceRead, PrevalenceError> {
+        if !self.lake_cell { return Err(self.lake_cell_unsupported("absolute prevalence windows")); }
+        super::ExactPrevalenceWindow::parse(Some(&bounds.start), Some(&bounds.end)).map_err(PrevalenceError::Backend)?;
+        if artifacts.is_empty() || artifacts.len() > 100 {
+            return Err(PrevalenceError::Backend("absolute prevalence requires 1-100 artifacts".into()));
+        }
+        self.lookup_chunk(artifacts, TimeWindow::TwentyFourHours, scope, Some(bounds)).await
     }
 
     /// Read the bounded ordered-list companion for the pinned immutable
@@ -996,7 +1035,7 @@ impl PrevalenceLookup for LakePrevalenceClient {
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
         let mut by_artifact = HashMap::new();
         for chunk in artifacts.chunks(MAX_LOOKUPS_PER_REQUEST) {
-            for item in self.lookup_chunk(chunk, time_window, scope).await? {
+            for item in self.lookup_chunk(chunk, time_window, scope, None).await?.data {
                 by_artifact.insert(normalize_artifact(&item.artifact), item);
             }
         }
@@ -1014,6 +1053,10 @@ struct LakePrevalenceRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_id: Option<&'a str>,
     window: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<&'a str>,
     artifacts: &'a [String],
     /// Cell (query[T]) requests only; gen1 readers take it from config.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1086,7 +1129,17 @@ struct LakePrevalenceResponse {
     #[serde(default)]
     results: Vec<PrevalenceData>,
     #[serde(default)]
+    window_start_us: Option<i64>,
+    #[serde(default)]
+    window_end_exclusive_us: Option<i64>,
+    #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    requested_window: Option<super::ExactPrevalenceWindow>,
+    #[serde(default)]
+    effective_window: Option<super::ExactPrevalenceWindow>,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 #[derive(Deserialize)]

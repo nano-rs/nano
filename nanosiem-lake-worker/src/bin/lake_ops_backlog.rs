@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Dry run: lake_ops_backlog --tenant UUID --token-file PATH --plan-file PATH
 //! Apply: same command plus --apply HASH. Credentials never appear in argv.
+//! The tenant is the operator's explicit confirmation, sent with every admin
+//! call; the edge-log authority decides whether that tenant may recover and
+//! refuses every other one. This binary carries no deployment's tenant id.
 use anyhow::{ensure, Context, Result};
-use nanosiem_lake_worker::edge_log::{backlog::{old_segment_rows, BacklogSkipPlan, BacklogSummary, OPS_TENANT}, protocol::{decode_pull, MAX_PULL_RESPONSE_BYTES}};
+use nanosiem_lake_worker::edge_log::{backlog::{old_segment_rows, BacklogSkipPlan, BacklogSummary}, protocol::{decode_pull, MAX_PULL_RESPONSE_BYTES}};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, time::Duration};
 use zeroize::Zeroizing;
 
-struct Admin { http: reqwest::Client, token: Zeroizing<String> }
+struct Admin { http: reqwest::Client, token: Zeroizing<String>, tenant: String }
 impl Admin {
     async fn call(&self, path: &str, body: Option<serde_json::Value>) -> Result<Vec<u8>> {
         use futures::StreamExt;
         let url = format!("https://ops.ingest.nano.rs/admin/edge-log/{path}");
         let request = match body { Some(body) => self.http.post(url).json(&body), None => self.http.get(url) };
-        let response = request.bearer_auth(self.token.as_str()).header("x-nano-confirm-backlog-tenant", OPS_TENANT)
+        let response = request.bearer_auth(self.token.as_str()).header("x-nano-confirm-backlog-tenant", self.tenant.as_str())
             .send().await.context("admin request failed")?;
         ensure!(response.status().is_success(), "admin recovery HTTP {}", response.status().as_u16());
         let mut bytes = Vec::new();
@@ -37,7 +40,9 @@ async fn run() -> Result<()> {
             "--plan-file" => &mut plan_file, "--apply" => &mut apply, _ => anyhow::bail!("unknown argument") };
         ensure!(slot.replace(pair[1].clone()).is_none(), "duplicate argument");
     }
-    ensure!(tenant.as_deref() == Some(OPS_TENANT), "explicit allowlisted tenant required");
+    let tenant = tenant.context("explicit tenant required")?;
+    ensure!(uuid::Uuid::parse_str(&tenant).is_ok_and(|id| id.hyphenated().to_string() == tenant),
+        "tenant must be a lowercase hyphenated UUID");
     let token_file = PathBuf::from(token_file.context("token-file required")?);
     let plan_file = PathBuf::from(plan_file.context("plan-file required")?);
     #[cfg(unix)] {
@@ -47,14 +52,14 @@ async fn run() -> Result<()> {
     let token = Zeroizing::new(std::fs::read_to_string(token_file)?);
     let token = Zeroizing::new(token.trim().to_string());
     ensure!(!token.is_empty() && !token.contains(char::is_whitespace), "invalid token");
-    let admin = Admin { token, http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+    let admin = Admin { token, tenant: tenant.clone(), http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60)).build()? };
     if let Some(hash) = apply {
         let plan: BacklogSkipPlan = serde_json::from_slice(&std::fs::read(&plan_file)?)?;
-        plan.validate(OPS_TENANT, chrono::Utc::now().timestamp_millis())?;
+        plan.validate(&tenant, chrono::Utc::now().timestamp_millis())?;
         ensure!(hash == plan.plan_hash, "apply hash differs from dry run");
         let result: serde_json::Value = serde_json::from_slice(&admin.call("backlog/apply",
-            Some(json!({"tenantUuid": OPS_TENANT, "planHash": hash}))).await?)?;
+            Some(json!({"tenantUuid": tenant, "planHash": hash}))).await?)?;
         ensure!(result["applied"] == true && result["planHash"].as_str() == Some(hash.as_str()), "apply receipt differs");
         println!("APPLIED hash={} replay={}", hash, result["replay"].as_bool().unwrap_or(false));
         return Ok(());
@@ -64,7 +69,7 @@ async fn run() -> Result<()> {
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
     let mut output = options.open(&plan_file)?;
     let state: serde_json::Value = serde_json::from_slice(&admin.call("state", None).await?)?;
-    ensure!(state["tenantUuid"].as_str() == Some(OPS_TENANT), "state tenant differs");
+    ensure!(state["tenantUuid"].as_str() == Some(tenant.as_str()), "state tenant differs");
     let through = state["head"].as_u64().context("missing head")?;
     let mut after = state["committedThrough"].as_u64().context("missing committed point")?;
     let first = after + 1;
@@ -73,7 +78,7 @@ async fn run() -> Result<()> {
     let mut summary = BacklogSummary { segments: 0, bytes: 0, rows: 0, kept: 0, ranges: Vec::new(), manifest_sha256: String::new() };
     let mut manifest = Sha256::new();
     while after < through {
-        let bytes = admin.call("backlog/scan", Some(json!({"tenantUuid": OPS_TENANT, "after": after}))).await?;
+        let bytes = admin.call("backlog/scan", Some(json!({"tenantUuid": tenant, "after": after}))).await?;
         let batch = decode_pull(&bytes, after)?;
         ensure!(!batch.segments.is_empty(), "snapshot no longer available; repeat dry run");
         for segment in batch.segments.into_iter().take_while(|s| s.seq <= through) {
@@ -93,10 +98,10 @@ async fn run() -> Result<()> {
         eprintln!("scan segments={} eligible={} kept={}", after - first + 1, summary.segments, summary.kept);
     }
     summary.manifest_sha256 = hex::encode(manifest.finalize());
-    let response = admin.call("backlog/plan", Some(json!({"tenantUuid": OPS_TENANT, "cutoffMs": cutoff,
+    let response = admin.call("backlog/plan", Some(json!({"tenantUuid": tenant, "cutoffMs": cutoff,
         "firstSeq": first, "throughSeq": through, "summary": summary}))).await?;
     let plan: BacklogSkipPlan = serde_json::from_slice(&response)?;
-    plan.validate(OPS_TENANT, chrono::Utc::now().timestamp_millis())?;
+    plan.validate(&tenant, chrono::Utc::now().timestamp_millis())?;
     use std::io::Write;
     output.write_all(&serde_json::to_vec_pretty(&plan)?)?; output.sync_all()?;
     println!("DRY-RUN hash={} segments={} bytes={} rows={} kept={} ranges={} cutoffMs={} through={}",

@@ -1,0 +1,815 @@
+{
+ "result": {
+  "request_id": "dqe-prod-01M5JT8N5C20KJ1DZM70YKRG75",
+  "schema": [
+   {
+    "name": "time",
+    "descriptor": {
+     "type": {
+      "name": "timestamp",
+      "time_unit": "microsecond",
+      "time_zone": "+00:00"
+     },
+     "nullable": false
+    }
+   },
+   {
+    "name": "enrichments",
+    "descriptor": {
+     "type": {
+      "name": "list",
+      "item": {
+       "type": {
+        "name": "struct",
+        "fields": [
+         {
+          "type": {
+           "name": "struct",
+           "fields": [
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "admitted_at"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "as_domain"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "continent_code"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "contract_version"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "country_name"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "feed_class"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "feed_id"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "feed_revision_id"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "freshness_at_ingest"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "mapping_revision"
+            },
+            {
+             "type": {
+              "name": "list",
+              "item": {
+               "type": {
+                "name": "string"
+               },
+               "nullable": true
+              }
+             },
+             "nullable": true,
+             "name": "owned_fields"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "payload_digest"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "status"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "upstream_at"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "valid_until"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "detector"
+            },
+            {
+             "type": {
+              "name": "float64"
+             },
+             "nullable": true,
+             "name": "score"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "tier"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "artifact_type"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "as_of"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "first_seen"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "host_count"
+            },
+            {
+             "type": {
+              "name": "bool"
+             },
+             "nullable": true,
+             "name": "host_count_saturated"
+            },
+            {
+             "type": {
+              "name": "bool"
+             },
+             "nullable": true,
+             "name": "is_new"
+            },
+            {
+             "type": {
+              "name": "bool"
+             },
+             "nullable": true,
+             "name": "is_rare"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "last_seen"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "prevalence_score"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "total_occurrences"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "confidence"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "ioc_type"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "matched_field"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "threat_type"
+            },
+            {
+             "type": {
+              "name": "bool"
+             },
+             "nullable": true,
+             "name": "is_ioc"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "malware"
+            },
+            {
+             "type": {
+              "name": "struct",
+              "fields": [
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "ioc_list"
+               },
+               {
+                "type": {
+                 "name": "bool"
+                },
+                "nullable": true,
+                "name": "nano_marketplace"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "nano_namespace"
+               },
+               {
+                "type": {
+                 "name": "int64"
+                },
+                "nullable": true,
+                "name": "effective_valid_until"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "first_seen"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "indicator_expires_at"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "ioc_type"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "ioc_value"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "malware"
+               },
+               {
+                "type": {
+                 "name": "string"
+                },
+                "nullable": true,
+                "name": "threat_type"
+               }
+              ]
+             },
+             "nullable": true,
+             "name": "record"
+            },
+            {
+             "type": {
+              "name": "int64"
+             },
+             "nullable": true,
+             "name": "risk_score"
+            },
+            {
+             "type": {
+              "name": "string"
+             },
+             "nullable": true,
+             "name": "source_id"
+            }
+           ]
+          },
+          "nullable": true,
+          "name": "data"
+         },
+         {
+          "type": {
+           "name": "string"
+          },
+          "nullable": true,
+          "name": "name"
+         },
+         {
+          "type": {
+           "name": "string"
+          },
+          "nullable": true,
+          "name": "provider"
+         },
+         {
+          "type": {
+           "name": "string"
+          },
+          "nullable": true,
+          "name": "type"
+         },
+         {
+          "type": {
+           "name": "string"
+          },
+          "nullable": true,
+          "name": "value"
+         },
+         {
+          "type": {
+           "name": "string"
+          },
+          "nullable": true,
+          "name": "short_desc"
+         }
+        ]
+       },
+       "nullable": true
+      }
+     },
+     "nullable": true
+    }
+   }
+  ],
+  "rows": [
+   {
+    "time": "2026-10-21T00:01:03.148000Z",
+    "enrichments": [
+     {
+      "data": {
+       "admitted_at": null,
+       "as_domain": null,
+       "continent_code": null,
+       "contract_version": null,
+       "country_name": null,
+       "feed_class": null,
+       "feed_id": null,
+       "feed_revision_id": null,
+       "freshness_at_ingest": null,
+       "mapping_revision": null,
+       "owned_fields": null,
+       "payload_digest": null,
+       "status": null,
+       "upstream_at": null,
+       "valid_until": null,
+       "detector": "dga_entropy",
+       "score": 0.039912730377832925,
+       "tier": "tier0",
+       "artifact_type": null,
+       "as_of": null,
+       "first_seen": null,
+       "host_count": null,
+       "host_count_saturated": null,
+       "is_new": null,
+       "is_rare": null,
+       "last_seen": null,
+       "prevalence_score": null,
+       "total_occurrences": null,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "http_request.url.hostname",
+      "provider": "Conduit Proxy",
+      "type": "threat_signal",
+      "value": "learn.microsoft.com",
+      "short_desc": null
+     },
+     {
+      "data": {
+       "admitted_at": "2026-10-21T00:01:15.836027775Z",
+       "as_domain": "austrianairlines.ag",
+       "continent_code": "EU",
+       "contract_version": 1,
+       "country_name": "Austria",
+       "feed_class": "baseline",
+       "feed_id": "ipinfo_lite",
+       "feed_revision_id": 5,
+       "freshness_at_ingest": "fresh",
+       "mapping_revision": 1,
+       "owned_fields": [
+        "dst_endpoint.location.country",
+        "dst_endpoint.location.continent",
+        "dst_endpoint.autonomous_system.name",
+        "dst_endpoint.autonomous_system.number"
+       ],
+       "payload_digest": "3a6dfefac7da485e655e7b8c5bab1011a0335e96cbc26705ce69533152d7ecb9",
+       "status": "match",
+       "upstream_at": "2026-10-21T00:01:15.836027775Z",
+       "valid_until": "2026-10-28T08:02:01Z",
+       "detector": null,
+       "score": null,
+       "tier": null,
+       "artifact_type": null,
+       "as_of": null,
+       "first_seen": null,
+       "host_count": null,
+       "host_count_saturated": null,
+       "is_new": null,
+       "is_rare": null,
+       "last_seen": null,
+       "prevalence_score": null,
+       "total_occurrences": null,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "dst_endpoint.ip",
+      "provider": "platform/ipinfo_lite",
+      "type": "geoip",
+      "value": "193.187.44.40",
+      "short_desc": null
+     },
+     {
+      "data": {
+       "admitted_at": null,
+       "as_domain": null,
+       "continent_code": null,
+       "contract_version": null,
+       "country_name": null,
+       "feed_class": null,
+       "feed_id": null,
+       "feed_revision_id": null,
+       "freshness_at_ingest": null,
+       "mapping_revision": null,
+       "owned_fields": null,
+       "payload_digest": null,
+       "status": null,
+       "upstream_at": null,
+       "valid_until": null,
+       "detector": null,
+       "score": null,
+       "tier": null,
+       "artifact_type": "subdomain",
+       "as_of": "ingest",
+       "first_seen": "2026-10-04T20:02:16.182000Z",
+       "host_count": 1000,
+       "host_count_saturated": true,
+       "is_new": false,
+       "is_rare": false,
+       "last_seen": "2026-10-20T23:59:55.246000Z",
+       "prevalence_score": 100,
+       "total_occurrences": 4688302,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "prevalence",
+      "provider": "nano",
+      "type": "reputation",
+      "value": "learn.microsoft.com",
+      "short_desc": "observed artifact"
+     },
+     {
+      "data": {
+       "admitted_at": null,
+       "as_domain": null,
+       "continent_code": null,
+       "contract_version": null,
+       "country_name": null,
+       "feed_class": null,
+       "feed_id": null,
+       "feed_revision_id": null,
+       "freshness_at_ingest": null,
+       "mapping_revision": null,
+       "owned_fields": null,
+       "payload_digest": null,
+       "status": null,
+       "upstream_at": null,
+       "valid_until": null,
+       "detector": null,
+       "score": null,
+       "tier": null,
+       "artifact_type": null,
+       "as_of": "ingest",
+       "first_seen": null,
+       "host_count": 1,
+       "host_count_saturated": false,
+       "is_new": true,
+       "is_rare": true,
+       "last_seen": null,
+       "prevalence_score": null,
+       "total_occurrences": null,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "prevalence",
+      "provider": "nano",
+      "type": "reputation",
+      "value": "193.187.44.40",
+      "short_desc": "new artifact"
+     }
+    ]
+   },
+   {
+    "time": "2026-10-21T00:01:03.156000Z",
+    "enrichments": [
+     {
+      "data": {
+       "admitted_at": null,
+       "as_domain": null,
+       "continent_code": null,
+       "contract_version": null,
+       "country_name": null,
+       "feed_class": null,
+       "feed_id": null,
+       "feed_revision_id": null,
+       "freshness_at_ingest": null,
+       "mapping_revision": null,
+       "owned_fields": null,
+       "payload_digest": null,
+       "status": null,
+       "upstream_at": null,
+       "valid_until": null,
+       "detector": "dga_entropy",
+       "score": 0.07301206603886444,
+       "tier": "tier0",
+       "artifact_type": null,
+       "as_of": null,
+       "first_seen": null,
+       "host_count": null,
+       "host_count_saturated": null,
+       "is_new": null,
+       "is_rare": null,
+       "last_seen": null,
+       "prevalence_score": null,
+       "total_occurrences": null,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "http_request.url.hostname",
+      "provider": "Conduit Proxy",
+      "type": "threat_signal",
+      "value": "production.dataviz.cnn.io",
+      "short_desc": null
+     },
+     {
+      "data": {
+       "admitted_at": "2026-10-21T00:01:15.835524933Z",
+       "as_domain": "fastly.com",
+       "continent_code": "NA",
+       "contract_version": 1,
+       "country_name": "United States",
+       "feed_class": "baseline",
+       "feed_id": "ipinfo_lite",
+       "feed_revision_id": 5,
+       "freshness_at_ingest": "fresh",
+       "mapping_revision": 1,
+       "owned_fields": [
+        "dst_endpoint.location.country",
+        "dst_endpoint.location.continent",
+        "dst_endpoint.autonomous_system.name",
+        "dst_endpoint.autonomous_system.number"
+       ],
+       "payload_digest": "3a6dfefac7da485e655e7b8c5bab1011a0335e96cbc26705ce69533152d7ecb9",
+       "status": "match",
+       "upstream_at": "2026-10-21T00:01:15.835524933Z",
+       "valid_until": "2026-10-28T08:02:01Z",
+       "detector": null,
+       "score": null,
+       "tier": null,
+       "artifact_type": null,
+       "as_of": null,
+       "first_seen": null,
+       "host_count": null,
+       "host_count_saturated": null,
+       "is_new": null,
+       "is_rare": null,
+       "last_seen": null,
+       "prevalence_score": null,
+       "total_occurrences": null,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "dst_endpoint.ip",
+      "provider": "platform/ipinfo_lite",
+      "type": "geoip",
+      "value": "151.101.1.67",
+      "short_desc": null
+     },
+     {
+      "data": {
+       "admitted_at": null,
+       "as_domain": null,
+       "continent_code": null,
+       "contract_version": null,
+       "country_name": null,
+       "feed_class": null,
+       "feed_id": null,
+       "feed_revision_id": null,
+       "freshness_at_ingest": null,
+       "mapping_revision": null,
+       "owned_fields": null,
+       "payload_digest": null,
+       "status": null,
+       "upstream_at": null,
+       "valid_until": null,
+       "detector": null,
+       "score": null,
+       "tier": null,
+       "artifact_type": "subdomain",
+       "as_of": "ingest",
+       "first_seen": "2026-10-04T20:02:16.182000Z",
+       "host_count": 1000,
+       "host_count_saturated": true,
+       "is_new": false,
+       "is_rare": false,
+       "last_seen": "2026-10-20T23:59:55.415000Z",
+       "prevalence_score": 100,
+       "total_occurrences": 5375890,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "prevalence",
+      "provider": "nano",
+      "type": "reputation",
+      "value": "production.dataviz.cnn.io",
+      "short_desc": "observed artifact"
+     },
+     {
+      "data": {
+       "admitted_at": null,
+       "as_domain": null,
+       "continent_code": null,
+       "contract_version": null,
+       "country_name": null,
+       "feed_class": null,
+       "feed_id": null,
+       "feed_revision_id": null,
+       "freshness_at_ingest": null,
+       "mapping_revision": null,
+       "owned_fields": null,
+       "payload_digest": null,
+       "status": null,
+       "upstream_at": null,
+       "valid_until": null,
+       "detector": null,
+       "score": null,
+       "tier": null,
+       "artifact_type": "ip_address",
+       "as_of": "ingest",
+       "first_seen": "2026-10-04T20:02:16.182000Z",
+       "host_count": 1000,
+       "host_count_saturated": true,
+       "is_new": false,
+       "is_rare": false,
+       "last_seen": "2026-10-20T23:59:54.985000Z",
+       "prevalence_score": 100,
+       "total_occurrences": 396320,
+       "confidence": null,
+       "ioc_type": null,
+       "matched_field": null,
+       "threat_type": null,
+       "is_ioc": null,
+       "malware": null,
+       "record": null,
+       "risk_score": null,
+       "source_id": null
+      },
+      "name": "prevalence",
+      "provider": "nano",
+      "type": "reputation",
+      "value": "151.101.1.67",
+      "short_desc": "observed artifact"
+     }
+    ]
+   }
+  ],
+  "metrics": {
+   "r2_requests_count": 616,
+   "files_scanned": 167,
+   "bytes_scanned": 252793934,
+   "cache_hits": 414
+  }
+ },
+ "success": true,
+ "errors": [],
+ "messages": []
+}

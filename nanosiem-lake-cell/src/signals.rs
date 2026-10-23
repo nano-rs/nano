@@ -464,7 +464,7 @@ mod tests {
 
     fn stalled(minutes: f64) -> Signal {
         // The unheld pages (`held_ingest_pages(None)`): warn 5 min, page 10 min.
-        Signal::evaluate(Some(TenantId::new("858f3709-a703-4b29-97a6-dd0ea314b84a").unwrap()), "ingest", "ingest",
+        Signal::evaluate(Some(TenantId::new("4b7e2a91-5c3d-4f60-8e1b-9a2c7d4f6e30").unwrap()), "ingest", "ingest",
             "ingest_progress_stalled", "minutes", minutes, 5.0, 10.0, None)
     }
 
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(ingest_stalled_minutes(at(11.0), true, false, commit, f64::NAN), 0.0);
     }
 
-    /// NAN-3773 replay: tenant-b (858f3709, cell-us-1) commits on
+    /// NAN-3773 replay: tenant-b (cell-us-1) commits on
     /// 2026-10-13, from the cell log (`ingest flush committed`, 1-5 rows
     /// each). Each batch is pending (busy) for the ~8 s before its commit;
     /// read every second for 2 h. The old value paged on these gaps; the

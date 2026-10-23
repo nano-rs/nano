@@ -849,6 +849,77 @@ ensure_bind_mounts_readable() {
     find "${sources[@]}" -type d -exec chmod go+rx {} + 2>/dev/null || true
 }
 
+# NAN-4408: a failed `up -d` (one container exited, a dependency wait timed
+# out) leaves its dependents Created, and Compose never starts them later. A
+# re-run whose API was already healthy then skipped every retry and failed the
+# connector-runner wait. Prints, one per line, each service of the active
+# profiles that is not running: no container yet, Created, Restarting, Dead,
+# or Exited. A one-shot job (restart policy no/on-failure) that exited 0 has
+# done its work and is not listed. Returns 1 if Compose cannot be queried.
+unconverged_services() {
+    local services ps_out svc line id state code policy
+    services=$(docker </dev/null compose -f "$COMPOSE_FILE" config --services 2>/dev/null) || return 1
+    ps_out=$(docker </dev/null compose -f "$COMPOSE_FILE" ps -a \
+        --format '{{.Service}} {{.ID}} {{.State}} {{.ExitCode}}' 2>/dev/null) || return 1
+    while IFS= read -r svc; do
+        [[ -n "$svc" ]] || continue
+        line=$(awk -v s="$svc" '$1 == s { print; exit }' <<< "$ps_out")
+        if [[ -z "$line" ]]; then
+            echo "$svc"
+            continue
+        fi
+        read -r _ id state code <<< "$line"
+        case "$state" in
+            running) ;;
+            exited)
+                if [[ "$code" == 0 ]]; then
+                    policy=$(docker </dev/null inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$id" 2>/dev/null || true)
+                    case "$policy" in ""|no|on-failure) continue ;; esac
+                fi
+                echo "$svc"
+                ;;
+            *) echo "$svc" ;;
+        esac
+    done <<< "$services"
+}
+
+# Bounded convergence after `up -d`: re-run `up -d` for exactly the services
+# that are not running, up to 3 attempts with backoff (5s, 10s, 20s). A
+# service still down afterwards — e.g. crash-looping on a config error — fails
+# the install with its name and the last 30 lines of its logs.
+converge_services() {
+    local attempt pending delay=5 retried=0 svc
+    for (( attempt = 1; attempt <= 3; attempt++ )); do
+        if ! pending=$(unconverged_services); then
+            warn "Could not read service states from docker compose; skipping the convergence check."
+            return 0
+        fi
+        [[ -z "$pending" ]] && break
+        warn "Services not running after docker compose up: $(echo "$pending" | tr '\n' ' ')— starting them again (attempt $attempt of 3)."
+        # shellcheck disable=SC2086 # one word per service name
+        docker </dev/null compose -f "$COMPOSE_FILE" up -d $pending >> "${COMPOSE_UP_LOG:-/dev/null}" 2>&1 || true
+        retried=1
+        sleep "$delay"
+        delay=$((delay * 2))
+    done
+    if (( attempt > 3 )); then
+        pending=$(unconverged_services) || pending=""
+    fi
+    if [[ -n "$pending" ]]; then
+        for svc in $pending; do
+            printf "%b✗ Service '%s' is not running after 3 attempts. Last 30 log lines:%b\n" "$c_red$c_bold" "$svc" "$c_reset" >&2
+            docker </dev/null compose -f "$COMPOSE_FILE" logs --no-color --tail 30 "$svc" 1>&2 || true
+        done
+        fail "Services did not start: $(echo "$pending" | tr '\n' ' ')— see the logs above. Fix the cause and re-run this installer."
+    fi
+    if (( retried )); then
+        ok "All services running after retry"
+        # Recreated app containers have new IPs; see compose_up (NAN-1237).
+        docker </dev/null compose -f "$COMPOSE_FILE" exec -T nginx nginx -s reload >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # Bring the stack up, then wait for the API through nginx.
 #
 # On a fresh lake, `up -d` itself can fail: nano-api depends on
@@ -868,7 +939,12 @@ start_and_wait_for_api() {
             warn "docker compose up -d did not finish (log: $COMPOSE_UP_LOG). On the lake profile this is expected while lake-query-worker waits for its bootstrap generation; retrying about once a minute while waiting."
             COMPOSE_RETRY_WHILE_WAITING=1
         else
-            fail "docker compose up -d failed (log: $COMPOSE_UP_LOG). Check 'docker compose -f $COMPOSE_FILE ps' and logs."
+            warn "docker compose up -d did not finish (log: $COMPOSE_UP_LOG). Retrying the services that did not start."
+            converge_services
+            # Confirm the whole stack now comes up; a persistent failure stays
+            # fatal here rather than surfacing later as an API health timeout.
+            compose_up quiet \
+                || fail "docker compose up -d failed (log: $COMPOSE_UP_LOG). Check 'docker compose -f $COMPOSE_FILE ps' and logs."
         fi
     fi
     if [[ "${ENABLE_LAKE_CONTROL_PLANE:-0}" == "1" && "${REUSE_ENV:-0}" != "1" ]]; then
@@ -879,6 +955,9 @@ start_and_wait_for_api() {
     if ! wait_for_api_health "${API_BASE}/api/health" "$timeout"; then
         fail "API did not become healthy within $((timeout / 60)) min. Check 'docker compose -f $COMPOSE_FILE logs nano-api nano-nginx' (compose up log: ${COMPOSE_UP_LOG:-none}). Re-running this installer is safe and will finish admin setup (raise NANO_HEALTH_TIMEOUT_SECONDS to wait longer)."
     fi
+    # NAN-4408: a healthy API does not mean every service started (a re-run
+    # whose first `up -d` failed partway leaves e.g. connector-runner Created).
+    converge_services
     # The compose profile also starts the dedicated pull-feed worker. Do not
     # report a successful upgrade while its boot/sandbox/database check fails.
     if docker </dev/null compose -f "$COMPOSE_FILE" config --services | grep -qx connector-runner; then

@@ -759,3 +759,6 @@ pub mod iceberg_export;
 
 /// Telemetry-derived source onboarding plans (NAN-3684).
 pub mod source_onboarding;
+
+#[cfg(feature = "enterprise")]
+pub mod enterprise_shared_agent_features;

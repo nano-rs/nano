@@ -329,3 +329,28 @@ mod tests {
         assert_eq!(RowPrevalence::for_field(&row, "file.hashes.value"), None);
     }
 }
+
+#[cfg(test)]
+mod basin_capture_tests {
+    use super::*;
+    #[test]
+    fn real_basin_nested_list_stamps_use_provider_and_artifact_not_a_fixed_position() {
+        let response:Value=serde_json::from_str(include_str!("../../tests/fixtures/basin-rows/select_enrichments_with_prevalence_proxy.json")).unwrap();
+        let rows=response["result"]["rows"].as_array().unwrap();
+        let mut positions=std::collections::BTreeSet::new();
+        let mut checked=0;
+        for row in rows {
+            for (position,entry) in row["enrichments"].as_array().unwrap().iter().enumerate() {
+                if entry["name"]!="prevalence" || entry["provider"]!="nano" {continue;}
+                positions.insert(position+1);
+                let artifact=entry["value"].as_str().unwrap();
+                let expected=if entry["data"]["host_count_saturated"]==true {PREVALENCE_COMMON} else {entry["data"]["host_count"].as_u64().map(|n|n.clamp(1,9998) as u16).unwrap_or(PREVALENCE_NA)};
+                let mut event=row.clone();event["candidate"]=Value::String(artifact.into());
+                assert_eq!(RowPrevalence::for_field(&event,"candidate"),if expected==PREVALENCE_NA {None}else{Some(expected)});
+                event["candidate"]=Value::String("never-stamped.invalid".into());assert_eq!(RowPrevalence::for_field(&event,"candidate"),None);
+                checked+=1;
+            }
+        }
+        assert!(checked>0);assert!(positions.len()>1,"real capture must exercise moving stamp positions: {positions:?}");
+    }
+}

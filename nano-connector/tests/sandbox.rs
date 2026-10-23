@@ -229,8 +229,8 @@ async fn worker_cannot_read_the_identity_assignments_mount() {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("nan3503-sandbox-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("tokens")).unwrap();
     let assignments = dir.join("assignments.json");
-    let token = dir.join("tokens").join("858f3709-a703-4b29-97a6-dd0ea314b84a");
-    std::fs::write(&assignments, r#"{"858f3709-a703-4b29-97a6-dd0ea314b84a":{"internal_endpoint":"http://10.0.0.1:8080"}}"#).unwrap();
+    let token = dir.join("tokens").join("4b7e2a91-5c3d-4f60-8e1b-9a2c7d4f6e30");
+    std::fs::write(&assignments, r#"{"4b7e2a91-5c3d-4f60-8e1b-9a2c7d4f6e30":{"internal_endpoint":"http://10.0.0.1:8080"}}"#).unwrap();
     std::fs::write(&token, "identity-writer-token-0123456789abcdef").unwrap();
     // SAFETY: test-only; no concurrent env readers in this test.
     unsafe { std::env::set_var("NANO_LAKE_LEAN_ENRICHMENT_ASSIGNMENTS_FILE", &assignments) };

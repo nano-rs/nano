@@ -670,8 +670,8 @@ struct RecoveryEdge(FakeEdge, super::backlog::BacklogSkipPlan);
 impl EdgeLogTransport for RecoveryEdge {
     async fn lease(&self, id: &str, at: Option<u64>) -> Result<Lease> {
         let mut lease = self.0.lease(id, at).await?;
-        if lease.committed_through == 0 { lease.committed_chain = edge_log_genesis(super::backlog::OPS_TENANT); }
-        if at == Some(0) { lease.at_chain = Some(edge_log_genesis(super::backlog::OPS_TENANT)); }
+        if lease.committed_through == 0 { lease.committed_chain = edge_log_genesis(super::backlog::tests::RECOVERY_TENANT); }
+        if at == Some(0) { lease.at_chain = Some(edge_log_genesis(super::backlog::tests::RECOVERY_TENANT)); }
         lease.backlog_skip = Some(self.1.clone());
         Ok(lease)
     }
@@ -682,21 +682,21 @@ impl EdgeLogTransport for RecoveryEdge {
 }
 
 fn recovery_fixture() -> RecoveryEdge {
-    use super::backlog::{BacklogSkipPlan, BacklogSummary, OPS_TENANT};
+    use super::backlog::{BacklogSkipPlan, BacklogSummary, tests::RECOVERY_TENANT};
     let cutoff = chrono::Utc::now().timestamp_millis() - 3_600_000;
     let edge = FakeEdge::default();
     for (i, times) in [vec![Some(1)], vec![Some(1), Some(cutoff)], vec![Some(1)], vec![None], vec![Some(1)]].into_iter().enumerate() {
-        edge.append(&format!("bronze-v2/shard=0/tenant_id={OPS_TENANT}/k{}.parquet", i + 1), &super::backlog::tests::parquet(times));
+        edge.append(&format!("bronze-v2/shard=0/tenant_id={RECOVERY_TENANT}/k{}.parquet", i + 1), &super::backlog::tests::parquet(times));
     }
     edge.set(|log| {
-        let mut previous = edge_log_genesis(OPS_TENANT);
+        let mut previous = edge_log_genesis(RECOVERY_TENANT);
         for segment in &mut log.segments {
             segment.prev_chain = previous;
             segment.chain = edge_log_next_chain(&segment.prev_chain, segment.seq, &segment.key, &segment.sha256, segment.length);
             previous = segment.chain.clone();
         }
     });
-    let mut plan = BacklogSkipPlan { version: 1, tenant_uuid: OPS_TENANT.into(), cutoff_ms: cutoff, first_seq: 1, through_seq: 4,
+    let mut plan = BacklogSkipPlan { version: 1, tenant_uuid: RECOVERY_TENANT.into(), cutoff_ms: cutoff, first_seq: 1, through_seq: 4,
         summary: BacklogSummary { segments: 3, bytes: 0, rows: 4, kept: 1, ranges: vec![[1, 3]], manifest_sha256: "a".repeat(64) },
         plan_hash: String::new(), at: cutoff + 3_600_000 };
     plan.plan_hash = plan.canonical_hash().unwrap();
@@ -705,9 +705,9 @@ fn recovery_fixture() -> RecoveryEdge {
 
 #[tokio::test]
 async fn backlog_recovery_preserves_mixed_unknown_unplanned_and_commits_only_after_durable_range() {
-    use super::backlog::OPS_TENANT;
+    use super::backlog::tests::RECOVERY_TENANT;
     let edge = recovery_fixture();
-    let source = EdgeLogSource::open(edge.clone(), OPS_TENANT, "ingest", None, EdgeLogSourceConfig::default()).await.unwrap();
+    let source = EdgeLogSource::open(edge.clone(), RECOVERY_TENANT, "ingest", None, EdgeLogSourceConfig::default()).await.unwrap();
     let pending = source.pending(10).await.unwrap();
     assert_eq!(pending.iter().map(|n| n.seq).collect::<Vec<_>>(), vec![2, 4, 5]);
     assert_eq!(edge.0.committed(), 0);
@@ -717,7 +717,7 @@ async fn backlog_recovery_preserves_mixed_unknown_unplanned_and_commits_only_aft
     assert!(floor.reason.contains("rows=1"));
     // Crash before EdgeFloor append: everything is replayed and no DO ACK.
     drop(source);
-    let restarted = EdgeLogSource::open(edge.clone(), OPS_TENANT, "restart", None, EdgeLogSourceConfig::default()).await.unwrap();
+    let restarted = EdgeLogSource::open(edge.clone(), RECOVERY_TENANT, "restart", None, EdgeLogSourceConfig::default()).await.unwrap();
     let pending = restarted.pending(10).await.unwrap();
     assert_eq!(pending.iter().map(|n| n.seq).collect::<Vec<_>>(), vec![2, 4, 5]);
     let floor = restarted.floor_due(0).await.unwrap();
@@ -726,15 +726,15 @@ async fn backlog_recovery_preserves_mixed_unknown_unplanned_and_commits_only_aft
     assert_eq!(edge.0.committed(), 1);
     let sources = pending[..2].iter().map(source_of).collect::<Vec<_>>();
     let range = restarted.range_for_flush(&sources, 0, 0).await.unwrap().unwrap();
-    range.validate(OPS_TENANT, &sources).unwrap();
+    range.validate(RECOVERY_TENANT, &sources).unwrap();
     assert_eq!((range.first_seq, range.through_seq), (2, 4));
     assert_eq!(range.skipped.iter().map(|s| (s.seq, s.rows, s.rows_rejected)).collect::<Vec<_>>(), vec![(3, 1, 1)]);
     assert_eq!(edge.0.committed(), 1, "range issuance must not acknowledge");
     // Crash after durable Add but before DO ACK; reopen reconciles that
     // exact chain point rather than publishing the retained rows twice.
-    let point = EdgePoint { log: format!("edgelog:{OPS_TENANT}"), through_seq: 4, through_chain: range.through_chain };
+    let point = EdgePoint { log: format!("edgelog:{RECOVERY_TENANT}"), through_seq: 4, through_chain: range.through_chain };
     drop(restarted);
-    let final_source = EdgeLogSource::open(edge.clone(), OPS_TENANT, "after-add", Some(&point), EdgeLogSourceConfig::default()).await.unwrap();
+    let final_source = EdgeLogSource::open(edge.clone(), RECOVERY_TENANT, "after-add", Some(&point), EdgeLogSourceConfig::default()).await.unwrap();
     assert_eq!(edge.0.committed(), 4);
     assert_eq!(final_source.pending(10).await.unwrap().iter().map(|n| n.seq).collect::<Vec<_>>(), vec![5]);
 }
@@ -744,5 +744,19 @@ async fn backlog_recovery_rejects_cross_tenant_and_modified_plan() {
     let edge = recovery_fixture();
     assert!(EdgeLogSource::open(edge.clone(), TENANT, "wrong", None, EdgeLogSourceConfig::default()).await.is_err());
     let mut tampered = edge.clone(); tampered.1.cutoff_ms -= 1;
-    assert!(EdgeLogSource::open(tampered, super::backlog::OPS_TENANT, "bad-hash", None, EdgeLogSourceConfig::default()).await.is_err());
+    assert!(EdgeLogSource::open(tampered, super::backlog::tests::RECOVERY_TENANT, "bad-hash", None, EdgeLogSourceConfig::default()).await.is_err());
+}
+
+// Production open path: the lease's plan must name the consuming tenant. A
+// correctly hashed plan for another tenant, served on this tenant's otherwise
+// valid log, is refused before any segment is pulled or skipped.
+#[tokio::test]
+async fn backlog_recovery_refuses_plan_bound_to_another_tenant() {
+    let mut edge = recovery_fixture();
+    edge.1.tenant_uuid = TENANT.into();
+    edge.1.plan_hash = edge.1.canonical_hash().unwrap();
+    let err = EdgeLogSource::open(edge.clone(), super::backlog::tests::RECOVERY_TENANT, "other", None,
+        EdgeLogSourceConfig::default()).await.err().expect("cross-tenant plan must be refused");
+    assert!(err.to_string().contains("not bound to this tenant"), "{err:#}");
+    assert_eq!(edge.0.committed(), 0);
 }

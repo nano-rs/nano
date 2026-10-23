@@ -50,7 +50,7 @@ use tokio::net::TcpListener;
 use uuid::Uuid;
 
 const KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-const TENANT: &str = "858f3709-a703-4b29-97a6-dd0ea314b84a";
+const TENANT: &str = "4b7e2a91-5c3d-4f60-8e1b-9a2c7d4f6e30";
 const TENANT_B: &str = "1b6f0e0a-2c4d-4e8f-9a1b-3c5d7e9f0a2b";
 const FEED: &str = "0199a0c4-2222-7000-8000-000000000001";
 const COORD_TOKEN: &str = "coordinator-bearer-token-0123456789abcdef";
