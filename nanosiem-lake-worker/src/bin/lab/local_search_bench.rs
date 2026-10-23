@@ -438,10 +438,7 @@ async fn companion_rows(
     let started = Instant::now();
     let result = nanosiem_lake_worker::query_timing::measure(
         &req.request_id,
-        nanosiem_lake_worker::enrichment_read::scope(
-            lab_authority(),
-            partials::count_aggregate(&lab.engine, &count),
-        ),
+        partials::count_aggregate(&lab.engine, &count),
     )
     .await;
     let envelope = match result {
@@ -654,10 +651,7 @@ pub(super) async fn run(work: &Path) -> Result<Value> {
                             log_source: None,
                             deny_source_types: BTreeSet::new(),
                         };
-                        let envelope = nanosiem_lake_worker::enrichment_read::scope(
-                            lab_authority(),
-                            lab.engine.fetch_log(&detail),
-                        )
+                        let envelope = lab.engine.fetch_log(&detail)
                         .await
                         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                         let rows = envelope["result"]["rows"]

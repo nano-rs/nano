@@ -72,8 +72,9 @@ pub(crate) fn strip_comments(query: &str) -> String {
             continue;
         }
 
-        // Check for comments
-        if c == '/' {
+        // Check for comments (NAN-4283: only at a token boundary, so a URL
+        // value such as `url=https://host/x` is never a comment).
+        if c == '/' && nanosiem_core::query::comment_may_start_after(result.chars().next_back()) {
             if let Some(&next) = chars.peek() {
                 if next == '/' {
                     // Single-line comment - skip until newline

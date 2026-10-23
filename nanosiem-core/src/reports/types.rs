@@ -373,7 +373,6 @@ pub struct ReportArtifactContent {
 /// A rendered artifact produced by the renderer, ready to persist.
 #[derive(Debug, Clone)]
 pub struct RenderedArtifact {
-    pub platform_read_fence: Option<crate::platform_enrichment::read::ReadFence>,
     pub kind: String,
     pub filename: String,
     pub content_type: String,

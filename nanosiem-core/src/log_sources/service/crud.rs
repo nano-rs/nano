@@ -135,6 +135,14 @@ impl LogSourceService {
         // NAN-2158: `match_field` is a SQL column identifier, not a value.
         validate_match_field(new.match_field.as_deref())?;
 
+        // NAN-4372: an extension supplied at create gets the same request
+        // guard a parser does (it is compiled again at publish, NAN-874).
+        if let Some(ext) = new.extension() {
+            crate::parsers::vrl_guard::check(ext).map_err(|e| {
+                LogSourceServiceError::InvalidVrl(format!("extension_vrl: {e}"))
+            })?;
+        }
+
         // NAN-2311: UNIQUE(name) accepts `my-source` beside `My Source`; the
         // generated Vector namespace does not.
         self.ensure_generated_identity_free(&new.name, None).await?;

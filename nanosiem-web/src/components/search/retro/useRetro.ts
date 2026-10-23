@@ -58,7 +58,7 @@ export function readRetroMarker(fields: Record<string, unknown> | undefined): Re
 
 // ── Module-level page-0 cache + in-flight dedup (NAN-1594) ──────────────────
 
-interface RetroPageParams {
+export interface RetroPageParams {
   query: string;
   axis: RetroAxis;
   offset: number | undefined;
@@ -169,7 +169,7 @@ export function primeDurableRetroResult(
 /** Fetch one retro page, deduping concurrent identical requests and populating
  * the module cache. Shared by the live hook and the background prefetcher so
  * their cache keys (and therefore hits) line up exactly. */
-function fetchRetroPage(
+export function fetchRetroPage(
   p: RetroPageParams,
   timeRange: TimeRange,
   cacheOpts?: import('@/lib/api').CacheRequestOpts,

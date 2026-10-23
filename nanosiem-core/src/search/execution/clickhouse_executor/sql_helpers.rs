@@ -97,7 +97,10 @@ pub fn wrap_query_for_count(sql: &str) -> String {
 /// broad: a false positive only costs skip-index pruning on one query (results
 /// are identical), a false negative wedges a core.
 pub(crate) fn raw_sql_needs_skip_index_guard(sql: &str) -> bool {
-    sql.to_ascii_lowercase().contains("mapfromarrays(")
+    let sql = sql.to_ascii_lowercase();
+    // NAN-4296: generated group lookups are folded `(keys, values)` arrays
+    // now, not a map; a copied generated query must keep the guard too.
+    sql.contains("mapfromarrays(") || sql.contains("grouparrayif(__nano_k")
 }
 
 /// Bounded input for the paginated count companion (NAN-1635, finding 2.3).
@@ -203,6 +206,10 @@ mod tests {
             "WITH (SELECT mapFromArrays(groupArray(k), groupArray(v)) FROM t) AS m SELECT 1"
         ));
         assert!(raw_sql_needs_skip_index_guard("select MAPFROMARRAYS(a, b)"));
+        // NAN-4296: the generated per-group lookup scalar.
+        assert!(raw_sql_needs_skip_index_guard(
+            "WITH (SELECT tuple(groupArrayIf(__nano_k, isNotNull(__nano_v)), groupArrayIf(__nano_v, isNotNull(__nano_v))) FROM t) AS m SELECT 1"
+        ));
         assert!(!raw_sql_needs_skip_index_guard(
             "SELECT count() FROM logs WHERE src_ip = '10.0.0.1'"
         ));

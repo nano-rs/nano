@@ -268,30 +268,125 @@ mod filter_pushdown {
         }
     }
 
+    /// NAN-4372: first_seen conditions push down onto the `_*_first_seen`
+    /// aliases (they used to return None and the JOIN path dropped them, so
+    /// the filter matched every row). Their presence guard is 30d presence
+    /// (a dict hit), not the window-masked host count: first_seen is judged
+    /// against the 30d dict whatever `window=` is, like the lake path's 30d
+    /// snapshot.
     #[test]
-    fn timestamp_fields_do_not_push_down() {
-        assert!(prevalence_filter_condition_to_sql(&cond(
-            PrevalenceField::HashFirstSeen,
-            PrevalenceOperator::Lt,
-            PrevalenceThreshold::Count(5),
-        ))
-        .is_none());
+    fn first_seen_fields_push_down_with_the_presence_guard() {
+        for (field, prefix) in [
+            (PrevalenceField::DomainFirstSeen, "_dp"),
+            (PrevalenceField::HashFirstSeen, "_hp"),
+        ] {
+            for (op, glyph) in [
+                (PrevalenceOperator::Lt, "<"),
+                (PrevalenceOperator::Lte, "<="),
+                (PrevalenceOperator::Gt, ">"),
+                (PrevalenceOperator::Gte, ">="),
+                (PrevalenceOperator::Eq, "="),
+                (PrevalenceOperator::Ne, "!="),
+            ] {
+                let sql = prevalence_filter_condition_to_sql(&cond(
+                    field,
+                    op,
+                    PrevalenceThreshold::Duration(std::time::Duration::from_secs(86_400)),
+                ))
+                .expect("first_seen must push down");
+                assert_eq!(
+                    sql,
+                    format!(
+                        "({prefix}_first_seen > toDateTime64(0, 6) AND {prefix}_first_seen {glyph} subtractSeconds(now64(6), 86400))"
+                    )
+                );
+            }
+        }
+    }
+
+    /// A field/threshold pairing the parser never produces is an error, never
+    /// a dropped (match-everything) predicate.
+    #[test]
+    fn mismatched_threshold_is_an_error_not_a_dropped_predicate() {
         assert!(prevalence_filter_condition_to_sql(&cond(
             PrevalenceField::DomainFirstSeen,
             PrevalenceOperator::Lt,
             PrevalenceThreshold::Count(5),
         ))
-        .is_none());
-    }
-
-    #[test]
-    fn duration_threshold_does_not_push_down() {
+        .is_err());
         assert!(prevalence_filter_condition_to_sql(&cond(
             PrevalenceField::HashPrevalence,
             PrevalenceOperator::Lt,
             PrevalenceThreshold::Duration(std::time::Duration::from_secs(3600)),
         ))
-        .is_none());
+        .is_err());
+    }
+}
+
+// NAN-4372: the in-memory comparison the lake (and ClickHouse fallback) path
+// applies per row.
+mod first_seen_comparison {
+    use super::super::{PrevalenceComparison, PrevalenceFacts};
+    use crate::query::{PrevalenceField, PrevalenceOperator, PrevalenceThreshold};
+    use chrono::{TimeZone, Utc};
+
+    fn facts(first_seen: chrono::DateTime<Utc>) -> Option<PrevalenceFacts> {
+        Some(PrevalenceFacts { host_count: 2, first_seen })
+    }
+
+    #[test]
+    fn newer_than_cutoff_passes_gt_and_older_fails() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 22, 12, 0, 0).unwrap();
+        let comparison = PrevalenceComparison::new(
+            &PrevalenceField::DomainFirstSeen,
+            &PrevalenceThreshold::Duration(std::time::Duration::from_secs(86_400)),
+            now,
+        )
+        .unwrap();
+        let fresh = facts(now - chrono::Duration::hours(2));
+        let old = facts(now - chrono::Duration::days(3));
+        assert!(comparison.passes(fresh, &PrevalenceOperator::Gt));
+        assert!(!comparison.passes(old, &PrevalenceOperator::Gt));
+        assert!(comparison.passes(old, &PrevalenceOperator::Lt));
+        assert!(!comparison.passes(fresh, &PrevalenceOperator::Lt));
+    }
+
+    #[test]
+    fn a_miss_fails_every_operator() {
+        let now = Utc::now();
+        let comparison = PrevalenceComparison::new(
+            &PrevalenceField::HashFirstSeen,
+            &PrevalenceThreshold::Duration(std::time::Duration::from_secs(3600)),
+            now,
+        )
+        .unwrap();
+        for op in [
+            PrevalenceOperator::Lt,
+            PrevalenceOperator::Lte,
+            PrevalenceOperator::Gt,
+            PrevalenceOperator::Gte,
+            PrevalenceOperator::Eq,
+            PrevalenceOperator::Ne,
+        ] {
+            assert!(!comparison.passes(None, &op), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn mismatched_pairings_are_errors() {
+        let now = Utc::now();
+        assert!(PrevalenceComparison::new(
+            &PrevalenceField::DomainFirstSeen,
+            &PrevalenceThreshold::Count(3),
+            now
+        )
+        .is_err());
+        assert!(PrevalenceComparison::new(
+            &PrevalenceField::DomainPrevalence,
+            &PrevalenceThreshold::Duration(std::time::Duration::from_secs(1)),
+            now
+        )
+        .is_err());
     }
 }
 
@@ -1242,5 +1337,143 @@ mod nan3070_self_hostname {
         assert!(!LAKE_DOMAIN_ARTIFACT_PATHS.contains(&"device.hostname"));
         assert!(!LAKE_DOMAIN_ARTIFACT_PATHS.contains(&"src_endpoint.hostname"));
         assert_eq!(LAKE_DOMAIN_ARTIFACT_PATHS[0], "dst_endpoint.hostname");
+    }
+}
+
+
+/// NAN-4372: lake prevalence snapshots are per-window, so a `window=24h`
+/// snapshot's first_seen is only the earliest sighting inside those 24 hours.
+/// first_seen conditions must read the 30d snapshot whatever `window=` is,
+/// while host counts keep `window=`.
+mod first_seen_window {
+    use super::super::{lookup_window_for, PrevalenceComparison};
+    use crate::prevalence::{ArtifactType, PrevalenceData, TimeWindow};
+    use crate::query::{PrevalenceCondition, PrevalenceField, PrevalenceThreshold};
+    use crate::search::query_processing::PrevalenceCommandInfo;
+    use crate::search::SearchService;
+    use chrono::{Duration, Utc};
+    use std::sync::{Arc, Mutex};
+
+    /// Serves per-window snapshots the way the lake does: inside the 24h
+    /// snapshot every artifact's first_seen is clamped to the window.
+    struct PerWindowLake {
+        requested: Arc<Mutex<Vec<TimeWindow>>>,
+    }
+
+    fn data(artifact: &str, first_seen: chrono::DateTime<Utc>) -> PrevalenceData {
+        PrevalenceData {
+            artifact: artifact.to_string(),
+            artifact_type: ArtifactType::Subdomain,
+            host_count: 2,
+            host_count_saturated: false,
+            total_occurrences: 6,
+            first_seen,
+            last_seen: Utc::now(),
+            is_rare: true,
+            prevalence_score: 50,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::prevalence::PrevalenceLookup for PerWindowLake {
+        async fn rarity_threshold(&self) -> u64 {
+            5
+        }
+
+        async fn lookup(
+            &self,
+            artifacts: &[String],
+            time_window: TimeWindow,
+            _scope: &crate::auth::ArtifactScope,
+        ) -> Result<Vec<PrevalenceData>, crate::prevalence::PrevalenceError> {
+            self.requested.lock().unwrap().push(time_window);
+            let now = Utc::now();
+            Ok(artifacts
+                .iter()
+                .map(|artifact| {
+                    let true_first_seen = if artifact == "old.example" {
+                        now - Duration::days(10)
+                    } else {
+                        now - Duration::hours(2)
+                    };
+                    let first_seen = match time_window {
+                        TimeWindow::ThirtyDays => true_first_seen,
+                        // Earliest sighting inside the window.
+                        _ => true_first_seen.max(now - Duration::hours(20)),
+                    };
+                    data(artifact, first_seen)
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn first_seen_reads_the_30d_window_and_counts_keep_the_requested_one() {
+        let first_seen = PrevalenceComparison::FirstSeen(Utc::now());
+        let count = PrevalenceComparison::HostCount(10);
+        for window in [TimeWindow::TwentyFourHours, TimeWindow::SevenDays, TimeWindow::ThirtyDays] {
+            assert_eq!(lookup_window_for(&first_seen, window), TimeWindow::ThirtyDays);
+            assert_eq!(lookup_window_for(&count, window), window);
+        }
+    }
+
+    /// `prevalence domain_prevalence < 10 domain_first_seen > now() - 24h
+    /// window=24h` on the lake: a domain first seen ten days ago is excluded.
+    #[tokio::test]
+    async fn lake_window_24h_excludes_an_artifact_first_seen_ten_days_ago() {
+        let pool = crate::db::DualPool::new_lake_control_plane(
+            &crate::db::DualPoolConfig::with_auth(
+                "postgres://unused:unused@127.0.0.1:1/nanosiem",
+                "http://127.0.0.1:1",
+                "nanosiem",
+                "unused",
+                "nanosiem",
+            ),
+        )
+        .await
+        .unwrap();
+        let mut service = SearchService::with_dual_pool(&pool);
+        service.set_active_profile(Arc::new(crate::schema::OcsfProfile::lake_1_9()));
+        let requested = Arc::new(Mutex::new(Vec::new()));
+        service.set_prevalence_lookup(Arc::new(PerWindowLake {
+            requested: requested.clone(),
+        }));
+        let rows = vec![
+            serde_json::json!({"dst_endpoint.hostname": "old.example"}),
+            serde_json::json!({"dst_endpoint.hostname": "new.example"}),
+        ];
+        let info = PrevalenceCommandInfo {
+            artifact_fields: Vec::new(),
+            conditions: vec![
+                PrevalenceCondition {
+                    field: PrevalenceField::DomainPrevalence,
+                    operator: crate::query::PrevalenceOperator::Lt,
+                    threshold: PrevalenceThreshold::Count(10),
+                },
+                PrevalenceCondition {
+                    field: PrevalenceField::DomainFirstSeen,
+                    operator: crate::query::PrevalenceOperator::Gt,
+                    threshold: PrevalenceThreshold::Duration(std::time::Duration::from_secs(
+                        86_400,
+                    )),
+                },
+            ],
+            time_window: Some(crate::query::PrevalenceTimeWindow::TwentyFourHours),
+            enrich: false,
+        };
+        let out = service
+            .apply_prevalence_processing(rows, &[info], &crate::auth::ArtifactScope::system())
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![serde_json::json!({"dst_endpoint.hostname": "new.example"})],
+            "a domain known for ten days is not new in the last 24h"
+        );
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec![TimeWindow::TwentyFourHours, TimeWindow::ThirtyDays],
+            "the count reads window=24h, first_seen the 30d snapshot"
+        );
     }
 }

@@ -143,6 +143,13 @@ fn runtime_contract() -> Result<&'static RuntimeContract, String> {
         .map_err(Clone::clone)
 }
 
+/// Whether `class_uid` names an event class of the pinned OCSF 1.9.0
+/// schema (the same table [`validate_ocsf_event`] checks `class_uid` against).
+/// `false` when the embedded contract cannot load.
+pub fn is_known_ocsf_class(class_uid: i64) -> bool {
+    runtime_contract().is_ok_and(|runtime| runtime.class_by_uid.contains_key(&class_uid))
+}
+
 /// Validate one transformed parser output against Nano's pinned OCSF schema.
 pub fn validate_ocsf_event(event: &Value) -> OcsfValidationResult {
     let runtime = match runtime_contract() {
@@ -416,7 +423,7 @@ fn validate_constraints(
             .constraints
             .at_least_one
             .iter()
-            .any(|name| value.contains_key(name))
+            .any(|name| constraint_attribute_present(value, name))
     {
         errors.push(diagnostic(
             "constraint_failed",
@@ -432,7 +439,7 @@ fn validate_constraints(
             .constraints
             .just_one
             .iter()
-            .filter(|name| value.contains_key(*name))
+            .filter(|name| constraint_attribute_present(value, name))
             .count();
         if count != 1 {
             errors.push(diagnostic(
@@ -444,6 +451,34 @@ fn validate_constraints(
                 ),
             ));
         }
+    }
+}
+
+/// Whether a constraint member is present on `value`, the object the
+/// constraint is declared on. OCSF constraint lists may name nested attributes
+/// by dotted path (class 5004 Patch State: `at_least_one: [device.os.sp_name,
+/// device.os.sp_ver, device.os.version]`), so each segment is walked from
+/// `value` (NAN-4392). Present means the key exists at every segment, exactly
+/// the `contains_key` rule constraints have always used: a null leaf counts as
+/// present, so undotted names behave as before. An intermediate null or scalar
+/// has nothing to descend into and counts as absent; an array on the way counts
+/// when any element carries the rest of the path.
+fn constraint_attribute_present(value: &serde_json::Map<String, Value>, name: &str) -> bool {
+    match name.split_once('.') {
+        None => value.contains_key(name),
+        Some((first, rest)) => value
+            .get(first)
+            .is_some_and(|child| nested_attribute_present(child, rest)),
+    }
+}
+
+fn nested_attribute_present(value: &Value, path: &str) -> bool {
+    match value {
+        Value::Object(object) => constraint_attribute_present(object, path),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| nested_attribute_present(item, path)),
+        _ => false,
     }
 }
 
@@ -717,6 +752,29 @@ mod tests {
     }
 
     #[test]
+    fn undotted_all_null_at_least_one_is_unchanged() {
+        // Explicit nulls satisfied undotted constraints before NAN-4392
+        // (`contains_key`) and still do: live parsers emit these.
+        let event = serde_json::json!({
+            "activity_id": 1,
+            "category_uid": 4,
+            "class_uid": 4003,
+            "type_uid": 400301,
+            "severity_id": 1,
+            "time": 1786406400000_i64,
+            "metadata": {
+                "product": {"name": "Sysmon", "vendor_name": "Microsoft"},
+                "version": "1.9.0"
+            },
+            "query": {"hostname": "example.com"},
+            "dst_endpoint": null,
+            "src_endpoint": null
+        });
+        let result = validate_ocsf_event(&event);
+        assert!(result.valid, "{:?}", result.errors);
+    }
+
+    #[test]
     fn rejects_unknown_field_and_wrong_type_with_paths() {
         let mut event = base_http();
         event["http_response"] = serde_json::json!({"code": "200"});
@@ -774,5 +832,104 @@ mod tests {
 
         let result = validate_ocsf_event(&event);
         assert!(result.valid, "{:?}", result.errors);
+    }
+
+    /// The exact Patch State event an open-core user reported (NAN-4392).
+    fn patch_state_repro() -> Value {
+        serde_json::json!({
+            "class_uid": 5004,
+            "category_uid": 5,
+            "activity_id": 1,
+            "type_uid": 500401,
+            "severity_id": 1,
+            "time": 1792689305000_i64,
+            "metadata": {
+                "version": "1.9.0",
+                "product": {"name": "Example", "vendor_name": "Example"}
+            },
+            "device": {
+                "type_id": 1,
+                "hostname": "host-1",
+                "os": {"name": "Ubuntu", "type_id": 200, "version": "24.04.3"}
+            },
+            "raw_data": "example"
+        })
+    }
+
+    const PATCH_STATE_CONSTRAINT: &str =
+        "at least one of [device.os.sp_name, device.os.sp_ver, device.os.version] is required";
+
+    #[test]
+    fn dotted_at_least_one_resolves_nested_attribute() {
+        let result = validate_ocsf_event(&patch_state_repro());
+        assert!(result.valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn dotted_at_least_one_fails_when_every_nested_member_is_absent() {
+        let mut event = patch_state_repro();
+        event["device"]["os"]
+            .as_object_mut()
+            .unwrap()
+            .remove("version");
+        let missing = validate_ocsf_event(&event);
+        assert!(!missing.valid);
+        assert!(missing.errors.iter().any(|error| {
+            error.code == "constraint_failed"
+                && error.attribute_path.is_empty()
+                && error.message == PATCH_STATE_CONSTRAINT
+        }));
+
+        // A null leaf is present, the `contains_key` rule constraints have
+        // always used for undotted names.
+        event["device"]["os"]["version"] = Value::Null;
+        let null_leaf = validate_ocsf_event(&event);
+        assert!(null_leaf.valid, "{:?}", null_leaf.errors);
+
+        // A null intermediate object has nothing to descend into.
+        event["device"]["os"] = Value::Null;
+        let null_parent = validate_ocsf_event(&event);
+        assert!(null_parent
+            .errors
+            .iter()
+            .any(|error| error.message == PATCH_STATE_CONSTRAINT));
+
+        // Any one member satisfies the constraint.
+        event["device"]["os"] = serde_json::json!({"name": "Ubuntu", "type_id": 200, "sp_ver": 3});
+        let sp_ver = validate_ocsf_event(&event);
+        assert!(sp_ver.valid, "{:?}", sp_ver.errors);
+    }
+
+    #[test]
+    fn dotted_just_one_counts_nested_attributes() {
+        let item: SchemaItem = serde_json::from_value(serde_json::json!({
+            "attributes": {},
+            "constraints": {"just_one": ["device.os.version", "device.hostname", "user"]}
+        }))
+        .unwrap();
+        let check = |event: Value| {
+            let mut errors = Vec::new();
+            validate_constraints(event.as_object().unwrap(), &item, "", &mut errors);
+            errors
+        };
+
+        assert!(check(serde_json::json!({"device": {"os": {"version": "1"}}})).is_empty());
+        assert!(check(serde_json::json!({"user": {"name": "a"}})).is_empty());
+        // An array on the path counts when any element carries the rest.
+        assert!(check(serde_json::json!({"device": [{"os": {}}, {"hostname": "h"}]})).is_empty());
+
+        // A null leaf is present; a null parent is not.
+        assert!(check(serde_json::json!({"device": {"os": {"version": null}}})).is_empty());
+        let none = check(serde_json::json!({"device": {"os": null}}));
+        assert_eq!(none.len(), 1);
+        assert!(none[0].message.ends_with("found 0"), "{:?}", none);
+
+        let two = check(serde_json::json!({"device": {"hostname": "h", "os": {"version": "1"}}}));
+        assert_eq!(two.len(), 1);
+        assert!(two[0].message.ends_with("found 2"), "{:?}", two);
+
+        // A scalar where an object is expected does not satisfy a deeper path.
+        let scalar = check(serde_json::json!({"device": "h"}));
+        assert!(scalar[0].message.ends_with("found 0"), "{:?}", scalar);
     }
 }

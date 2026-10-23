@@ -109,6 +109,8 @@ const SUPPORTED_FUNCTIONS: &[&str] = &[
     "fromepoch",
     "date_diff",
     "datediff",
+    "time_diff",
+    "timediff",
     "date_trunc",
     "datetrunc",
     "date_part",
@@ -542,6 +544,18 @@ fn evaluate_binary(
     let left_val = left_val?;
     let right_val = right_val?;
     match op {
+        // NAN-4303: `+` with a non-numeric string operand concatenates, as the
+        // SQL generator does for a string-typed operand (`"a" + "b"`).
+        BinaryOperator::Add
+            if (num(&left_val).is_none() || num(&right_val).is_none())
+                && (left_val.is_string() || right_val.is_string()) =>
+        {
+            Some(Json::String(format!(
+                "{}{}",
+                ch_string(&left_val)?,
+                ch_string(&right_val)?
+            )))
+        }
         BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul => {
             let (l, r) = (num(&left_val)?, num(&right_val)?);
             json_number(match op {
@@ -889,7 +903,7 @@ fn parse_ip(value: &Json) -> Option<std::net::IpAddr> {
     ch_string(value)?.trim().parse().ok()
 }
 
-fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
+pub(super) fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
     use std::net::IpAddr;
     let Some((network, bits)) = cidr.trim().split_once('/') else {
         return cidr
@@ -1264,6 +1278,7 @@ fn evaluate_function_call(name: &str, args: &[EvalExpression], row: &Row) -> Opt
                 _ => return None,
             })
         }
+        "time_diff" | "timediff" if args.len() == 2 => json_number(date_diff("second", &time(1)?, &time(0)?)? as f64),
         "date_diff" | "datediff" => match args.len() {
             2 => json_number(date_diff("second", &time(1)?, &time(0)?)? as f64),
             3 => json_number(date_diff(&text(0)?.to_lowercase(), &time(1)?, &time(2)?)? as f64),
@@ -1865,5 +1880,40 @@ mod nan3382_datetime_arithmetic_tests {
             eval("* | eval age=now()-time", serde_json::json!({"x": 1})),
             None
         );
+    }
+}
+
+/// NAN-4303: Nano-side `+` concatenates when an operand is text.
+#[cfg(test)]
+mod nan4303_string_plus_tests {
+    use super::*;
+
+    fn plus(left: EvalExpression, right: EvalExpression) -> EvalExpression {
+        EvalExpression::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::Add,
+            right: Box::new(right),
+        }
+    }
+    fn text(s: &str) -> EvalExpression {
+        EvalExpression::Literal(Value::String(s.into()))
+    }
+    fn number(n: f64) -> EvalExpression {
+        EvalExpression::Literal(Value::Number(n))
+    }
+
+    #[test]
+    fn plus_concatenates_text_and_adds_numbers() {
+        let mut row = Row::new();
+        row.insert("user".into(), Json::String("bob".into()));
+        let field = || EvalExpression::Field("user".into());
+        let eval = |expr: EvalExpression| evaluate_eval_expression(&expr, &row);
+        assert_eq!(eval(plus(text("a"), text("b"))), Some(Json::String("ab".into())));
+        assert_eq!(eval(plus(field(), text("@corp"))), Some(Json::String("bob@corp".into())));
+        assert_eq!(eval(plus(text("port "), number(443.0))), Some(Json::String("port 443".into())));
+        assert_eq!(eval(plus(number(1.0), number(2.0))), json_number(3.0));
+        // A missing operand is NULL, as concat() of a NULL is in SQL.
+        let missing = EvalExpression::Field("absent".into());
+        assert_eq!(eval(plus(missing, text("x"))), None);
     }
 }

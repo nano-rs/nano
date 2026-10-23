@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { BrowserTelemetry } from '@/components/observability/BrowserTelemetry';
 import { lazyWithRetry } from '@/lib/lazyWithRetry';
+import { reloadRouteChunk } from '@/lib/reload-route-chunk';
 import { authenticatedFetch } from '@/lib/authenticated-fetch';
 import { customInventoryRedirect } from '@/lib/api/marketplace-inventory';
 
@@ -36,7 +38,7 @@ function lazyWithRetryNamed<T extends ComponentType<any>>(
         if (err instanceof Error && err.message.startsWith('lazyWithRetryNamed:')) {
           throw err;
         }
-        window.location.reload();
+        reloadRouteChunk(err);
         return new Promise(() => {});
       })
   );
@@ -1292,6 +1294,7 @@ function App() {
       */}
       <BrowserRouter basename={tenantBasename(rawBrowserPath('/'))}>
         <AuthProvider>
+          <BrowserTelemetry />
           <TenantRuntimeBoundary>
             <CapabilitiesProvider>
             <UserPreferencesProvider>

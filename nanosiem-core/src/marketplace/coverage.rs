@@ -117,7 +117,7 @@ pub struct ArtifactCoverage {
     /// Display labels of recommended providers that are NOT installed
     pub missing: Vec<String>,
     /// Whether `pct` is a measurement. Omitted by the open-core
-    /// (ClickHouse) path, which always measures; the shared/lean path sets
+    /// (ClickHouse) path, which always measures; the shared lake path sets
     /// `false` for a type it has no measurement for, so the page renders
     /// "not measured yet" instead of a 0 % gap.
     #[serde(default, skip_serializing_if = "Option::is_none")]

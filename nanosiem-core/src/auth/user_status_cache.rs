@@ -59,6 +59,10 @@ pub struct UserStatusSnapshot {
     /// `users.tokens_valid_from` — forced-revocation watermark. `None` means no
     /// forced revocation has ever happened for this user.
     pub tokens_valid_from: Option<DateTime<Utc>>,
+    /// NAN-4152: the account is a shared demo identity
+    /// (`demo-<session>@demo.nano.local`), so the demo guard applies to it
+    /// whatever roles it holds.
+    pub demo_identity: bool,
 }
 
 impl UserStatusSnapshot {
@@ -116,17 +120,19 @@ impl UserStatusResolver {
             }
         }
 
-        match sqlx::query_as::<_, (String, Option<DateTime<Utc>>)>(
-            "SELECT status, tokens_valid_from FROM users WHERE id = $1",
+        match sqlx::query_as::<_, (String, Option<DateTime<Utc>>, bool)>(
+            "SELECT status, tokens_valid_from,
+                    COALESCE(lower(email) LIKE 'demo-%@demo.nano.local', FALSE) FROM users WHERE id = $1",
         )
         .bind(user_id)
         .fetch_optional(&self.pool).request_db()
         .await
         {
-            Ok(Some((status, tokens_valid_from))) => {
+            Ok(Some((status, tokens_valid_from, demo_identity))) => {
                 let snapshot = UserStatusSnapshot {
                     status,
                     tokens_valid_from,
+                    demo_identity,
                 };
                 self.cache.insert(
                     user_id,
@@ -143,6 +149,7 @@ impl UserStatusResolver {
                 let snapshot = UserStatusSnapshot {
                     status: String::new(),
                     tokens_valid_from: None,
+                    demo_identity: false,
                 };
                 self.cache.insert(
                     user_id,
@@ -182,6 +189,7 @@ mod tests {
         UserStatusSnapshot {
             status: status.to_string(),
             tokens_valid_from: tvf,
+            demo_identity: false,
         }
     }
 

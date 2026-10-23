@@ -102,7 +102,8 @@ pub(super) fn command(input: &str) -> ParseResult<'_, Command> {
 fn stats_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("stats").parse(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, aggregations) = aggregation_list(input)?;
+    let (input, mut aggregations) = aggregation_list(input)?;
+    Aggregation::disambiguate_default_aliases(&mut aggregations);
     let (input, group_by) = opt(preceded(
         delimited(multispace1, tag_no_case("by"), multispace1),
         field_list_fn,
@@ -126,7 +127,8 @@ fn stats_command(input: &str) -> ParseResult<'_, Command> {
 fn chart_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("chart").parse(input)?;
     let (input, _) = multispace1(input)?;
-    let (input, aggregations) = aggregation_list(input)?;
+    let (input, mut aggregations) = aggregation_list(input)?;
+    Aggregation::disambiguate_default_aliases(&mut aggregations);
 
     // Try "over" first, then "by"
     let (input, over_fields) = opt(preceded(
@@ -1030,10 +1032,7 @@ fn agg_func(input: &str) -> ParseResult<'_, AggFunc> {
             value(AggFunc::Stdev, tag_no_case("stdev")),
             value(AggFunc::Var, tag_no_case("var")),
             value(AggFunc::Median, tag_no_case("median")),
-            // perc95 must come before p95 to avoid partial match
-            value(AggFunc::Perc95, tag_no_case("perc95")),
-            value(AggFunc::Percentile(95), tag_no_case("p95")),
-            value(AggFunc::Percentile(99), tag_no_case("p99")),
+            percentile_shorthand,
             value(AggFunc::Mode, tag_no_case("mode")),
             value(AggFunc::Sparkline, tag_no_case("sparkline")),
             // NAN-1528 (OTLP metrics): per-second counter rate.
@@ -1041,6 +1040,27 @@ fn agg_func(input: &str) -> ParseResult<'_, AggFunc> {
         )),
     ))
     .parse(input)
+}
+
+/// `percN` / `pN` shorthand for `percentile(field, N)`, N in 0..=100
+/// (NAN-4279 F11: only `perc95`, `p95` and `p99` were registered, so the
+/// documented `perc99` was a parse error). `perc95` keeps its own variant and
+/// its `perc95` output name.
+fn percentile_shorthand(input: &str) -> ParseResult<'_, AggFunc> {
+    let (rest, prefix) = alt((tag_no_case("perc"), tag_no_case("p"))).parse(input)?;
+    let (rest, pct) = map_res(digit1, |s: &str| s.parse::<u8>()).parse(rest)?;
+    if pct > 100 {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    let func = if pct == 95 && prefix.len() == 4 {
+        AggFunc::Perc95
+    } else {
+        AggFunc::Percentile(pct)
+    };
+    Ok((rest, func))
 }
 
 /// Parse field list separated by commas or spaces.

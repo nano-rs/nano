@@ -32,6 +32,8 @@ const FEED_CREDENTIAL_LABELS: Record<string, string> = {
   pending: 'pending',
   not_required: 'not required',
   waiting_for_enrollment: 'waiting for enrollment',
+  // NAN-3660: the ingest endpoint refused the feed's credential.
+  revoked: 'revoked',
 };
 
 export function feedCredentialLabel(state: string | null | undefined): string {

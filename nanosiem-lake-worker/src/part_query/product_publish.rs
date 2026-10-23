@@ -648,14 +648,18 @@ pub struct Publisher {
     cadence: Cadence,
     failures: u32,
     status: Arc<PublisherStatus>,
+    /// NAN-4154: [`super::partials::SUPERSEDED_STATE_GRACE`] unless a test sets it.
+    state_grace: Duration,
+    /// NAN-4154: when each window's latest build in this process started.
+    rebuilt_at: std::collections::BTreeMap<&'static str, SystemTime>,
+    /// NAN-4154: the state budget, unless a test sets it (volume / divisor).
+    state_budget: Option<u64>,
 }
 
-/// Run `work` as product-state build authority, under the tenant's
-/// enrichment read authority (exactly as the in-process worker did).
+/// Run `work` as product-state build authority.
 async fn build<T>(engine: &PartQueryEngine, work: impl std::future::Future<Output = QueryResult<T>>) -> anyhow::Result<T> {
-    let tenant = engine.settings().tenant_id.clone();
     let scoped = engine.pinned_if_needed(product_state::BUILD.scope((), work));
-    let result = crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), product_state::with_progress(Box::pin(scoped))).await?;
+    let result = product_state::with_progress(Box::pin(scoped)).await;
     Ok(result??)
 }
 
@@ -694,7 +698,8 @@ impl Publisher {
         }
         status.version.store(manifest.version, Ordering::Relaxed);
         let gap = cycle_gap();
-        Ok(Self { engine, manifest, last_cycle_end: None, next_gap: gap, cycle_gap: gap, cadence: Cadence::from_env(), failures: 0, status })
+        Ok(Self { engine, manifest, last_cycle_end: None, next_gap: gap, cycle_gap: gap, cadence: Cadence::from_env(), failures: 0, status,
+            state_grace: super::partials::SUPERSEDED_STATE_GRACE, rebuilt_at: Default::default(), state_budget: None })
     }
 
     pub fn manifest(&self) -> &Manifest {
@@ -942,6 +947,8 @@ impl Publisher {
     async fn cycle_steps(&mut self, head: Option<u64>, plan: &mut Plan) -> anyhow::Result<()> {
         let engine = self.engine.clone();
         let dir = self.dir();
+        // NAN-4154: nothing this cycle uses is removed for budget.
+        let cycle_started = SystemTime::now();
         let anchor = now_us();
         let (from_us, to_us) = (anchor - 7 * DAY_US, anchor);
         let (path, risk_head) = build(&engine, async {
@@ -961,6 +968,8 @@ impl Publisher {
             // A consumer's demand never waits behind the whole cycle.
             self.serve_demands().await;
             let meter = product_state::BuildMeter::start();
+            // NAN-4154: every state this build uses is touched after this instant.
+            let window_started = SystemTime::now();
             let (from_us, to_us) = super::partials::moving_bounds(window)?;
             // NAN-3791: a 7d/30d window build runs for many minutes at the
             // product thread budget (tenant-a 7d: 1,245 s); serve demands while
@@ -980,11 +989,83 @@ impl Publisher {
             let mut next = self.manifest.clone();
             next.windows.insert(window.to_string(), entry);
             self.publish(next)?;
+            self.rebuilt_at.insert(window, window_started);
         }
         let mut next = self.manifest.clone();
         next.log_head = head;
-        self.publish(next)
+        self.publish(next)?;
+        self.sweep_superseded_states();
+        self.enforce_state_budget(cycle_started);
+        Ok(())
     }
+
+    /// NAN-4154: once this process has rebuilt every window, remove the
+    /// maintained states and day histories none of their latest builds used
+    /// (see [`sweep_cutoff`]). Runs in the publisher task between cycles, so
+    /// no build is in flight.
+    fn sweep_superseded_states(&self) {
+        let Some(used_before) = sweep_cutoff(&self.rebuilt_at, self.state_grace) else { return };
+        let swept = Instant::now();
+        let (files, bytes) = super::partials::sweep_superseded_states(&self.dir(), used_before);
+        if files > 0 {
+            tracing::info!(files, bytes, grace_secs = self.state_grace.as_secs(), wall_ms = swept.elapsed().as_millis() as u64,
+                "superseded prevalence states removed after every window was rebuilt");
+        }
+    }
+
+    /// NAN-4154: hold the maintained states and day histories to
+    /// 1/[`super::partials::STATE_BUDGET_DIVISOR`] of the product volume,
+    /// least recently used first; nothing used this cycle or within
+    /// [`super::partials::STATE_BUDGET_FLOOR`] goes. The superseded-state
+    /// sweep needs every window rebuilt first; this bound holds from the
+    /// first cycle after a restart and whatever a sweep misses.
+    fn enforce_state_budget(&self, cycle_started: SystemTime) {
+        let dir = self.dir();
+        let budget = match self.state_budget {
+            Some(budget) => budget,
+            None => match crate::local_hot_window::filesystem_total(&dir) {
+                Ok(total) => total / super::partials::STATE_BUDGET_DIVISOR,
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "product state budget unknown; not enforced this cycle");
+                    return;
+                }
+            },
+        };
+        let floor = SystemTime::now().checked_sub(super::partials::STATE_BUDGET_FLOOR).unwrap_or(SystemTime::UNIX_EPOCH);
+        let keep_after = cycle_started.min(floor);
+        let (files, bytes, left) = super::partials::enforce_state_budget(&dir, budget, keep_after);
+        if files > 0 {
+            tracing::info!(files, bytes, left_bytes = left, budget_bytes = budget,
+                "least recently used prevalence states removed to stay within the product state budget");
+        } else if left > budget {
+            tracing::warn!(left_bytes = left, budget_bytes = budget,
+                "product states over budget, all used within the floor; nothing removed");
+        }
+    }
+
+    /// Replace the state budget (tests).
+    pub fn set_state_budget(&mut self, budget_bytes: u64) {
+        self.state_budget = Some(budget_bytes);
+    }
+
+    /// Replace the superseded-state grace (tests).
+    pub fn set_state_grace(&mut self, grace: Duration) {
+        self.state_grace = grace;
+    }
+}
+
+/// NAN-4154: the last-use cutoff of the superseded-state sweep, from the
+/// start of each window's latest build in this process. A build touches every
+/// maintained state and day history it reads or writes, so a file untouched
+/// since the OLDEST of those starts is used by no published window. Windows
+/// rebuild in different cycles (7d/30d every 2 h, 1h/24h as the head moves),
+/// so this waits for each window once, never for one cycle that rebuilds
+/// all. `grace` more is kept (in-between hour and day blocks the next build
+/// reuses). None until every window has been rebuilt.
+pub fn sweep_cutoff(rebuilt_at: &std::collections::BTreeMap<&'static str, SystemTime>, grace: Duration) -> Option<SystemTime> {
+    let oldest = WINDOWS.iter().map(|window| rebuilt_at.get(window).copied()).collect::<Option<Vec<_>>>()?
+        .into_iter().min()?;
+    oldest.checked_sub(grace)
 }
 
 /// NAN-3720: product[T]'s niceness. The role is background work by
@@ -1359,5 +1440,27 @@ mod tests {
         assert!(plan.rebuild.is_empty(), "30d is behind but inside its interval: {plan:?}");
         let later = cadence.plan(&manifest, Some(7), now + 30 * MIN_US);
         assert_eq!(later.rebuild, vec!["30d"], "due once its interval elapses, head unmoved");
+    }
+
+    /// NAN-4154: superseded states are swept only once every window has
+    /// been rebuilt (in any cycles), up to the oldest latest build minus the
+    /// grace. On a large tenant 1h/24h, 7d and 30d were never rebuilt in one cycle.
+    #[test]
+    fn the_sweep_waits_for_every_window_and_keeps_the_oldest_builds_inputs() {
+        let grace = Duration::from_secs(6 * 3600);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 86_400);
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let mut rebuilt = std::collections::BTreeMap::new();
+        assert_eq!(sweep_cutoff(&rebuilt, grace), None, "nothing rebuilt yet");
+        // Staggered cycles, as seen live: 7d, then 1h + 30d, then 1h + 24h.
+        rebuilt.insert("7d", at(0));
+        rebuilt.insert("1h", at(600));
+        rebuilt.insert("30d", at(600));
+        assert_eq!(sweep_cutoff(&rebuilt, grace), None, "24h never rebuilt in this process");
+        rebuilt.insert("1h", at(2400));
+        rebuilt.insert("24h", at(2400));
+        assert_eq!(sweep_cutoff(&rebuilt, grace), Some(at(0) - grace), "the oldest latest build (7d) bounds it");
+        rebuilt.insert("7d", at(7200));
+        assert_eq!(sweep_cutoff(&rebuilt, grace), Some(at(600) - grace));
     }
 }

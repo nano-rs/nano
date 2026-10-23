@@ -403,3 +403,56 @@ fn unrecognised_entity_type_passes_through_lowercased() {
     let v = normalize(json!({ "entity": "1234567890", "entity_type": "Cloud_Account" }));
     assert_eq!(field(&v, MATCH_ENTITY_TYPE), "cloud_account");
 }
+
+#[test]
+fn declared_risk_subject_overrides_unrelated_actor_and_inherits_across_pipes() {
+    let mut rows = vec![json!({"actor.user.uid": "automation", "target": "203.0.113.8"})];
+    normalize_match_events_for_query(&mut rows,
+        "* | risk score=10 entity=target | risk score=20 | table target");
+    assert_eq!(rows[0][MATCH_ENTITY], "203.0.113.8");
+    assert_eq!(rows[0][MATCH_ENTITY_TYPE], "ip");
+
+    let mut rows = vec![json!({"first": "old", "second": "new"})];
+    normalize_match_events_for_query(&mut rows,
+        "* | risk score=10 entity=first | risk score=20 entity=second");
+    assert_eq!(rows[0][MATCH_ENTITY], "new");
+}
+
+#[test]
+fn risk_subject_handles_numeric_nested_and_missing_fields() {
+    for (row, expected, ty) in [
+        (json!({"subject": 42}), "42", "user"),
+        (json!({"subject": "person@example.org"}), "person@example.org", "email"),
+        (json!({"subject": "host.example.org"}), "host.example.org", "hostname"),
+    ] {
+        let mut rows = vec![row];
+        normalize_match_events_for_query(&mut rows, "* | risk score=10 entity=subject");
+        assert_eq!(rows[0][MATCH_ENTITY], expected);
+        assert_eq!(rows[0][MATCH_ENTITY_TYPE], ty);
+    }
+    let mut rows = vec![json!({"target": {"uid": "nested"}})];
+    normalize_match_events_for_query(&mut rows, "* | risk score=10 entity=target.uid");
+    assert_eq!(rows[0][MATCH_ENTITY], "nested");
+    for missing in [Value::Null, json!(""), json!(" "), json!([]), json!({})] {
+        let mut rows = vec![json!({"subject": missing})];
+        normalize_match_events_for_query(&mut rows, "* | risk score=10 entity=subject");
+        assert!(rows[0].get(MATCH_ENTITY).is_none());
+    }
+}
+
+#[test]
+fn risk_output_envelope_prefers_scored_entity_and_keeps_rows_isolated() {
+    let mut rows = vec![
+        json!({"risk_entity": "usr_one", "actor.user.uid": "automation"}),
+        json!({"risk_entity": "203.0.113.9"}),
+        json!({"risk_entity": "unknown"}),
+    ];
+    normalize_match_events_for_query(&mut rows, "*");
+    assert_eq!(rows[0][MATCH_ENTITY], "usr_one");
+    assert_eq!(rows[1][MATCH_ENTITY], "203.0.113.9");
+    assert_eq!(rows[1][MATCH_ENTITY_TYPE], "ip");
+    assert!(rows[2].get(MATCH_ENTITY).is_none());
+    let mut invalid = vec![json!({"actor.user.uid": "fallback"})];
+    normalize_match_events_for_query(&mut invalid, "| invalid command");
+    assert_eq!(invalid[0][MATCH_ENTITY], "fallback");
+}

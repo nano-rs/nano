@@ -142,6 +142,41 @@ mod tests {
         assert!(!p.allows(&["allowed".into()], false, true));
     }
     #[test]
+    fn provider_parity_admission_and_lookup_failure() {
+        for (issuer, idp_group) in [
+            ("https://example.okta.com", "nano-analysts"),
+            (
+                "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
+                "22222222-2222-4222-8222-222222222222",
+            ),
+            ("https://accounts.google.com", "analysts@example.test"),
+        ] {
+            let mut policy = policy();
+            policy.mappings[0].idp_group = idp_group.into();
+            for (scenario, groups, invited, known, expected) in [
+                ("mapped new user", vec![idp_group.into()], false, true, true),
+                ("outsider", vec!["outsider".into()], false, true, false),
+                ("invited member", vec![], true, true, true),
+                ("removal", vec![], false, true, false),
+                (
+                    "lookup failure",
+                    vec![idp_group.into()],
+                    false,
+                    false,
+                    false,
+                ),
+            ] {
+                assert_eq!(
+                    policy.allows(&groups, invited, known),
+                    expected,
+                    "{issuer}: {scenario}"
+                );
+            }
+            policy.mapped_groups_only = false;
+            assert!(!policy.allows(&[idp_group.into()], false, true));
+        }
+    }
+    #[test]
     fn tenant_roles_and_dedicated_groups_are_distinct() {
         assert!(policy().validate(true).is_err());
         assert!(policy().validate(false).is_ok());

@@ -1492,7 +1492,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FirstLoggedMessage
 }
 
 /// Convert serde_json::Value to vrl::value::Value
-fn json_to_vrl_value(json: &serde_json::Value) -> vrl::value::Value {
+pub(crate) fn json_to_vrl_value(json: &serde_json::Value) -> vrl::value::Value {
     match json {
         serde_json::Value::Null => vrl::value::Value::Null,
         serde_json::Value::Bool(b) => vrl::value::Value::Boolean(*b),
@@ -1522,7 +1522,7 @@ fn json_to_vrl_value(json: &serde_json::Value) -> vrl::value::Value {
 }
 
 /// Convert vrl::value::Value to serde_json::Value
-fn vrl_value_to_json(value: &vrl::value::Value) -> serde_json::Value {
+pub(crate) fn vrl_value_to_json(value: &vrl::value::Value) -> serde_json::Value {
     match value {
         vrl::value::Value::Null => serde_json::Value::Null,
         vrl::value::Value::Boolean(b) => serde_json::Value::Bool(*b),

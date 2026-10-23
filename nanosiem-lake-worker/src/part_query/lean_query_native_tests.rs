@@ -22,7 +22,6 @@ use crate::parts::provenance::LocalPartSigner;
 use crate::reader_object_cache::{ReaderObjectCache, ReaderObjectCacheSettings};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) const TENANT: &str = "7a3c1e5b-2d4f-4b6a-8c9e-0f1a2b3c4d5e";
@@ -105,6 +104,15 @@ pub(crate) async fn ingest(root: &std::path::Path, now: DateTime<Utc>) {
 
 /// `rows` events `spacing_ms` apart, newest first, as two bronze files.
 async fn ingest_rows(root: &std::path::Path, now: DateTime<Utc>, rows: usize, spacing_ms: i64) {
+    let half = rows / 2;
+    let batches = [(half..rows, false), (0..half, true)].into_iter().map(|(range, traffic)| {
+        range.map(|i| event(i, &(now - Duration::milliseconds(i as i64 * spacing_ms + 30_000)).to_rfc3339(), traffic)).collect::<Vec<_>>()
+    }).collect::<Vec<_>>();
+    ingest_batches(root, now, batches).await
+}
+
+/// Each batch is one bronze file and one part.
+async fn ingest_batches(root: &std::path::Path, now: DateTime<Utc>, batches: Vec<Vec<Value>>) {
     let parts = LocalObjectStore::new(root.join("parts")).unwrap();
     let sources_dir = root.join("sources");
     std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
@@ -116,9 +124,7 @@ async fn ingest_rows(root: &std::path::Path, now: DateTime<Utc>, rows: usize, sp
     let now_ms = now.timestamp_millis();
     let mut ingestor = Ingestor::open(config, &parts, &sources, &spool as &dyn NoticeQueue, &signer, signer.trusted(),
         BronzeIngestEnricher::disabled(), &seed_schema(), now_ms).await.expect("ingest opens");
-    let half = rows / 2;
-    for (n, (range, traffic)) in [(half..rows, false), (0..half, true)].into_iter().enumerate() {
-        let batch = range.map(|i| event(i, &(now - Duration::milliseconds(i as i64 * spacing_ms + 30_000)).to_rfc3339(), traffic)).collect::<Vec<_>>();
+    for (n, batch) in batches.into_iter().enumerate() {
         let key = format!("bronze/{n:04}.parquet");
         write_bronze(&sources_dir.join(&key), &batch);
         crate::bronze::admit_bronze_files(&[sources_dir.join(&key)], TENANT).expect("bronze admitted");
@@ -176,24 +182,9 @@ async fn rows(engine: &PartQueryEngine, query: &str, now: DateTime<Utc>, table_v
     // Production runs every statement under `query_timing::measure`
     // (the interactive deadline and streamed native execution).
     let request = request(query, now, table_view);
-    let answer = crate::query_timing::measure("nan3150", Box::pin(crate::enrichment_read::scope(granted(),
-        engine.broad_npl(&request)))).await
+    let answer = crate::query_timing::measure("nan3150", Box::pin(engine.broad_npl(&request))).await
         .unwrap_or_else(|error| panic!("{query} (table_view={table_view}): {error}"));
     answer["result"]["rows"].as_array().cloned().unwrap_or_else(|| panic!("{query}: no rows array in {answer}"))
-}
-
-/// The k6 grant cell's authority: the tenant holds the platform ipinfo read
-/// grant, so endpoint masks carry a real permission predicate.
-pub(crate) fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference};
-    let tenant: uuid::Uuid = TENANT.parse().unwrap();
-    let now = Utc::now();
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(tenant, now, &[AuthorizedRevision {
-        tenant_id: tenant,
-        reference: RevisionReference { feed_id: "ipinfo_lite".into(), feed_revision: 2, tier: "included".into(), grant_revision: 1, entitlement_revision: 1 },
-        class: FeedClass::Baseline, digest: "0".repeat(64), mapping_revision: 1, deny_epoch: 0,
-        valid_until: now + Duration::days(30), evaluated_at: now,
-    }])
 }
 
 fn uids(rows: &[Value]) -> Vec<String> {
@@ -317,8 +308,7 @@ async fn source_and_entity_timechart_sum_matches_where_equivalent() {
 }
 
 async fn envelope(engine: &PartQueryEngine, request: &BroadNplRequest) -> Value {
-    crate::query_timing::measure("nan3155", Box::pin(crate::enrichment_read::scope(granted(),
-        engine.broad_npl(request)))).await
+    crate::query_timing::measure("nan3155", Box::pin(engine.broad_npl(request))).await
         .unwrap_or_else(|error| panic!("{}: {error}", request.query))
 }
 
@@ -406,17 +396,17 @@ async fn two_pass_row_shapes_match_one_pass_order_and_cursor_pages() {
     let now = Utc::now();
     ingest(root.path(), now).await;
     let engine = engine(root.path()).await;
-    // A smaller index is a newer event; output order is newest first.
+    // A smaller index is a newer event. NAN-4278: rows come back in the
+    // query's own order (before, an explicit sort's head was re-sorted
+    // newest first, and these truths encoded that).
     let host3 = (0..ROWS).filter(|i| i % 11 == 3).collect::<Vec<_>>();
     let uid = |i: &usize| format!("uid-{i:08}");
     let newest = |n: usize| host3.iter().take(n).map(uid).collect::<Vec<_>>();
-    let oldest = |n: usize| { let mut v = host3.iter().rev().take(n).copied().collect::<Vec<_>>(); v.sort(); v.iter().map(uid).collect::<Vec<_>>() };
+    let oldest = |n: usize| host3.iter().rev().take(n).map(uid).collect::<Vec<_>>();
     let by_source = {
         let mut v = host3.clone();
         v.sort_by_key(|i| (source(*i), *i));
-        let mut top = v.into_iter().take(10).collect::<Vec<_>>();
-        top.sort();
-        top.iter().map(uid).collect::<Vec<_>>()
+        v.iter().take(10).map(uid).collect::<Vec<_>>()
     };
     let cases: Vec<(&str, usize, Vec<String>)> = vec![
         ("dst_endpoint.hostname=host3 | sort -time | head 20", 200, newest(20)),
@@ -435,7 +425,10 @@ async fn two_pass_row_shapes_match_one_pass_order_and_cursor_pages() {
         std::env::remove_var("NANO_LAKE_TWO_PASS");
         let two = envelope(&engine, &request).await;
         let planner = &two["planner"];
-        assert!(planner["two_pass"]["statements"].as_u64().unwrap_or(0) >= 2
+        // NAN-4263: `sort -time` restates the implicit newest-first order
+        // and compiles to the plain head (no sort statement to two-pass).
+        assert!(query.contains("sort -time")
+            || planner["two_pass"]["statements"].as_u64().unwrap_or(0) >= 2
             || planner["two_pass_chunks"].as_u64().unwrap_or(0) >= 1, "{query}: two-pass did not engage: {planner}");
         assert_eq!(two["result"]["rows"], one["result"]["rows"], "{query}: rows, values and order equal the one-pass statement");
         assert_eq!(two["result"]["page_has_more"], one["result"]["page_has_more"], "{query}");
@@ -457,6 +450,455 @@ async fn two_pass_row_shapes_match_one_pass_order_and_cursor_pages() {
         pages.extend(ordered_uids(&rows));
     }
     assert_eq!(pages, newest(30), "cursor pages continue the result exactly");
+}
+
+/// NAN-4214: a `| head N` with no explicit sort returns the NEWEST N events
+/// whatever per-row filters, enrichers or projections sit around it. Before
+/// the fix every shape below compiled to an unordered `SELECT * … LIMIT N`
+/// and returned whichever rows the reader produced first (the oldest here).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn head_without_sort_returns_the_newest_events_around_any_row_command() {
+    std::env::set_var("NANO_LAKE_PART_RESULT_CACHE", "1");
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    // A smaller index is a newer event.
+    let sysmon = (0..ROWS).filter(|i| source(*i) == "windows_sysmon").collect::<Vec<_>>();
+    let newest = |n: usize| sysmon.iter().take(n).map(|i| format!("uid-{i:08}")).collect::<Vec<_>>();
+    let oldest = |n: usize| sysmon.iter().rev().take(n).map(|i| format!("uid-{i:08}")).collect::<Vec<_>>();
+    for query in [
+        "metadata.log_source=windows_sysmon | head 20",
+        "metadata.log_source=windows_sysmon | table metadata.uid, time | head 20",
+        "metadata.log_source=windows_sysmon | table metadata.uid | head 20",
+        "metadata.log_source=windows_sysmon | fields metadata.uid | head 20",
+        "metadata.log_source=windows_sysmon | head 20 | table metadata.uid",
+        "metadata.log_source=windows_sysmon | eval marker=1 | head 20",
+        "metadata.log_source=windows_sysmon | where severity_id=1 | head 20",
+        "* | where metadata.log_source=\"windows_sysmon\" | table metadata.uid | head 20",
+        "metadata.log_source=windows_sysmon | eval marker=1 | table metadata.uid, marker | head 20",
+    ] {
+        for table_view in [true, false] {
+            let got = rows(&engine, query, now, table_view).await;
+            let got = got.iter().map(|row| row.get("metadata.uid").or_else(|| row.pointer("/metadata/uid"))
+                .and_then(Value::as_str).unwrap_or_else(|| panic!("{query}: {row}")).to_string()).collect::<Vec<_>>();
+            assert_eq!(got, newest(20), "{query} (table_view={table_view})");
+        }
+    }
+    // An explicit sort still owns the order.
+    let got = rows(&engine, "metadata.log_source=windows_sysmon | sort time | table metadata.uid | head 20", now, true).await;
+    assert_eq!(ordered_uids(&got), oldest(20));
+}
+
+/// NAN-4222: chDB keys its Parquet metadata (footer) cache by file path.
+/// Every statement used to read through a fresh per-lease hard link, so the
+/// cache never hit and every footer was re-parsed per statement; leased reads
+/// now go through one stable path per object, and a repeat statement over the
+/// same files hits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn repeat_statements_reuse_the_native_parquet_footer_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let runtime = NativeChdb::load_verified(
+        std::env::var("NANO_CHDB_LIBRARY_PATH").expect("NANO_CHDB_LIBRARY_PATH"),
+        &std::env::var("NANO_CHDB_LIBRARY_SHA256").expect("NANO_CHDB_LIBRARY_SHA256"),
+    ).unwrap();
+    std::mem::forget(runtime.clone());
+    let probe = runtime.connect(&["--memory_worker_use_cgroup=0", "--memory_worker_dynamic_hard_limit=0"]).unwrap();
+    let hits = || -> u64 {
+        let output = probe.query_with_params("SELECT sum(value) AS hits FROM system.events WHERE event = 'ParquetMetadataCacheHits'", "JSONEachRow", &[]).unwrap();
+        let row: Value = serde_json::from_slice(&output.data).unwrap_or(json!({"hits": 0}));
+        row["hits"].as_u64().or_else(|| row["hits"].as_str().and_then(|v| v.parse().ok())).unwrap_or(0)
+    };
+    // Distinct statements (no result reuse) over the same parts.
+    let first = rows(&engine, "metadata.log_source=windows_sysmon | stats count by dst_endpoint.hostname", now, false).await;
+    assert!(!first.is_empty());
+    let before = hits();
+    let second = rows(&engine, "metadata.log_source=windows_sysmon | stats count by src_endpoint.ip", now, false).await;
+    assert!(!second.is_empty());
+    let after = hits();
+    assert!(after > before, "the repeat statement must hit chDB's footer cache (hits {before} -> {after})");
+}
+
+/// NAN-4236: a tied sort is cut by a total order, so a 7 d top-N returns
+/// the same rows in the same order on every run, across both parts. The
+/// fixture's per-host counts tie (900 events over 11 hosts), every event
+/// shares one severity, and timechart series share each bucket. Before the
+/// fix windows over 24 h kept whichever tied rows chDB produced first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn tied_sorts_return_identical_rows_on_every_run() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let run = |query: &'static str| {
+        let engine = &engine;
+        async move {
+            let mut request = request(query, now, false);
+            request.start = (now - Duration::days(7)).to_rfc3339();
+            request.use_cache = false;
+            let answer = crate::query_timing::measure("nan4236", Box::pin(engine.broad_npl(&request))).await
+                .unwrap_or_else(|error| panic!("{query}: {error}"));
+            answer["result"]["rows"].as_array().cloned().unwrap_or_else(|| panic!("{query}: no rows in {answer}"))
+        }
+    };
+    let text = |row: &Value, key: &str| row.get(key).or_else(|| row.pointer(&format!("/{}", key.replace('.', "/"))))
+        .map(|value| value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string()))
+        .unwrap_or_else(|| panic!("{key} missing in {row}"));
+    // Truth: count desc, then the group key ascending.
+    let ranked = |events: Vec<usize>, n: usize| {
+        let mut counts = std::collections::BTreeMap::<String, u64>::new();
+        for i in events { *counts.entry(format!("host{}", i % 11)).or_default() += 1; }
+        let mut counts = counts.into_iter().collect::<Vec<_>>();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts.into_iter().take(n).map(|(host, _)| host).collect::<Vec<_>>()
+    };
+    let sysmon = (0..ROWS).filter(|i| source(*i) == "windows_sysmon").collect::<Vec<_>>();
+    let cases: Vec<(&'static str, Option<Vec<String>>, &'static str)> = vec![
+        ("metadata.log_source=windows_sysmon | stats count by dst_endpoint.hostname | sort -count | head 3",
+         Some(ranked(sysmon, 3)), "dst_endpoint.hostname"),
+        ("* | top 3 dst_endpoint.hostname", Some(ranked((0..ROWS).collect(), 3)), "dst_endpoint.hostname"),
+        ("* | sort -severity_id | head 20", Some((0..20).map(|i| format!("uid-{i:08}")).collect()), "metadata.uid"),
+        ("* | stats count by dst_endpoint.hostname, src_endpoint.ip | sort -count | head 5", None, "dst_endpoint.hostname"),
+        ("* | timechart span=1h count by dst_endpoint.hostname", None, "dst_endpoint.hostname"),
+    ];
+    for (query, truth, key) in cases {
+        let first = run(query).await;
+        assert!(!first.is_empty(), "{query}");
+        if let Some(truth) = truth {
+            assert_eq!(first.iter().map(|row| text(row, key)).collect::<Vec<_>>(), truth, "{query}");
+        }
+        for attempt in 1..5 {
+            assert_eq!(run(query).await, first, "{query}: run {attempt} differs from run 0");
+        }
+    }
+    // Series inside one timechart bucket come back in key order.
+    let chart = run("* | timechart span=1h count by dst_endpoint.hostname").await;
+    let bucket = |row: &Value| row.as_object().unwrap().iter()
+        .find(|(name, _)| name.contains("time")).map(|(_, value)| value.to_string()).unwrap_or_default();
+    for pair in chart.windows(2) {
+        if bucket(&pair[0]) == bucket(&pair[1]) {
+            assert!(text(&pair[0], "dst_endpoint.hostname") < text(&pair[1], "dst_endpoint.hostname"), "{chart:?}");
+        }
+    }
+}
+
+/// NAN-4263 (FP T67): a bare `*` with `head N` and a projection is the N
+/// newest events, newest first, read by the newest-first chunk walk -- in
+/// either command order, and in the form the lake search service sends
+/// (`lake_head_page_plan` pulls the head out: `* | table …` with limit N).
+/// Before, that form compiled to an unordered `SELECT … LIMIT n` over the
+/// whole window: 7 d on FP read 2291 files and returned rows from hours and
+/// days back, not time-ordered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn bare_star_projection_heads_return_the_newest_rows_newest_first() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    // Rows are newest first: a smaller index is a newer event.
+    let newest = |n: usize| (0..n).map(|i| format!("uid-{i:08}")).collect::<Vec<_>>();
+    let in_order = |rows: &[Value]| rows.iter().map(|row| row.get("metadata.uid").or_else(|| row.pointer("/metadata/uid"))
+        .and_then(Value::as_str).unwrap_or_else(|| panic!("row without metadata.uid: {row}")).to_string()).collect::<Vec<_>>();
+    for (query, limit, page) in [
+        // As the search service sends them (head pulled out, limit = N).
+        ("* | table time, metadata.uid", 120, 120),
+        ("* | fields time, metadata.uid, dst_endpoint.hostname", 120, 120),
+        ("* | rename dst_endpoint.hostname AS host", 120, 120),
+        ("* | sort -_time | table time, metadata.uid", 120, 120),
+        // As typed, both orders.
+        ("* | head 120 | table time, metadata.uid", 200, 120),
+        ("* | table time, metadata.uid | head 120", 200, 120),
+        ("* | fields time, metadata.uid | head 120", 200, 120),
+        ("* | eval x=1 | head 120", 200, 120),
+        ("* | sort -_time | table time, metadata.uid | head 120", 200, 120),
+    ] {
+        for table_view in [true, false] {
+            let mut request = request(query, now, table_view);
+            request.limit = limit;
+            request.use_cache = false;
+            let answer = crate::query_timing::measure("nan4263", Box::pin(engine.broad_npl(&request))).await
+                .unwrap_or_else(|error| panic!("{query}: {error}"));
+            let rows = answer["result"]["rows"].as_array().cloned().unwrap_or_else(|| panic!("{query}: no rows in {answer}"));
+            assert_eq!(in_order(&rows), newest(page), "{query} (table_view={table_view}): the newest {page}, newest first");
+            assert_eq!(answer["result"]["newest_first_event_rows"], json!(true), "{query}: {}", answer["result"]);
+            assert_eq!(answer["planner"]["kind"], json!("progressive_newest_first"), "{query}: {}", answer["planner"]);
+        }
+    }
+    // A projection without the cursor fields still returns the newest rows
+    // in order (the walk rereads a full chunk instead of continuing it).
+    let mut request = request("* | table dst_endpoint.hostname, severity_id", now, true);
+    request.limit = 120;
+    let answer = crate::query_timing::measure("nan4263", Box::pin(engine.broad_npl(&request))).await.unwrap();
+    let rows = answer["result"]["rows"].as_array().cloned().unwrap();
+    let hosts = rows.iter().map(|row| row["dst_endpoint.hostname"].as_str().map(str::to_string)
+        .or_else(|| row.pointer("/dst_endpoint/hostname").and_then(Value::as_str).map(str::to_string)).unwrap()).collect::<Vec<_>>();
+    assert_eq!(hosts, (0..120).map(|i| format!("host{}", i % 11)).collect::<Vec<_>>());
+    assert_eq!(answer["planner"]["kind"], json!("progressive_newest_first"), "{}", answer["planner"]);
+}
+
+/// NAN-4278 (searchfuzz F4/F8, FP T70): an explicit `sort` keeps its order to
+/// the end of the result, and `tail N` / `reverse` take the rows from the END
+/// of the current order, last first. Before, `sort -x | head N` came back
+/// re-sorted newest-first, and `tail N` returned the newest N rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn explicit_sorts_keep_their_order_and_tail_takes_the_end() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let uid = |i: &usize| format!("uid-{i:08}");
+    let in_order = |rows: &[Value]| rows.iter().map(|row| row.get("metadata.uid").or_else(|| row.pointer("/metadata/uid"))
+        .and_then(Value::as_str).unwrap_or_else(|| panic!("row without metadata.uid: {row}")).to_string()).collect::<Vec<_>>();
+    // Rows are newest first (a smaller index is newer); only the newer half
+    // carries `traffic.bytes_out`, so the older proxy rows sort as NULL.
+    let proxy = (0..ROWS).filter(|i| source(*i) == "conduit_proxy").collect::<Vec<_>>();
+    let mut by_bytes_desc = proxy.iter().copied().filter(|i| *i < ROWS / 2).collect::<Vec<_>>();
+    by_bytes_desc.sort_by(|a, b| bytes_out(*b).cmp(&bytes_out(*a)).then(a.cmp(b)));
+    let oldest_proxy_first = proxy.iter().rev().take(3).map(uid).collect::<Vec<_>>();
+    let mut newest_100_ascending = proxy[..100].to_vec();
+    newest_100_ascending.sort_by_key(|i| bytes_out(*i));
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        // The default newest-first listing: its end is the oldest rows.
+        ("* | tail 5", (ROWS - 5..ROWS).rev().map(|i| uid(&i)).collect()),
+        ("* | tail 5 | table time, metadata.uid", (ROWS - 5..ROWS).rev().map(|i| uid(&i)).collect()),
+        ("* | tail 5 | fields time, metadata.uid", (ROWS - 5..ROWS).rev().map(|i| uid(&i)).collect()),
+        ("* | reverse | head 4", (ROWS - 4..ROWS).rev().map(|i| uid(&i)).collect()),
+        // `sort ±x` followed by head / table / fields: the user's order.
+        ("metadata.log_source=conduit_proxy | sort -traffic.bytes_out | head 20", by_bytes_desc[..20].iter().map(uid).collect()),
+        ("metadata.log_source=conduit_proxy | sort -traffic.bytes_out | head 20 | table traffic.bytes_out, metadata.uid",
+         by_bytes_desc[..20].iter().map(uid).collect()),
+        ("metadata.log_source=conduit_proxy | sort -traffic.bytes_out | head 20 | fields traffic.bytes_out, metadata.uid",
+         by_bytes_desc[..20].iter().map(uid).collect()),
+        ("metadata.log_source=conduit_proxy | sort +traffic.bytes_out | head 5",
+         by_bytes_desc.iter().rev().take(5).map(uid).collect()),
+        // `sort x | tail N`: the end of the sort, NULLs included where the
+        // sort puts them (last, in both directions), last row first.
+        ("metadata.log_source=conduit_proxy | sort -traffic.bytes_out | tail 3", oldest_proxy_first.clone()),
+        ("metadata.log_source=conduit_proxy | sort +traffic.bytes_out | tail 3", oldest_proxy_first),
+        ("metadata.log_source=conduit_proxy | head 100 | sort -traffic.bytes_out | tail 3",
+         newest_100_ascending[..3].iter().map(uid).collect()),
+        // Unchanged: the default listing is the newest rows, newest first.
+        ("* | head 5", (0..5).map(|i| uid(&i)).collect()),
+        ("* | table time, metadata.uid | head 5", (0..5).map(|i| uid(&i)).collect()),
+    ];
+    for (query, truth) in cases {
+        for table_view in [true, false] {
+            let mut request = request(query, now, table_view);
+            request.use_cache = false;
+            let answer = crate::query_timing::measure("nan4278", Box::pin(engine.broad_npl(&request))).await
+                .unwrap_or_else(|error| panic!("{query}: {error}"));
+            let rows = answer["result"]["rows"].as_array().cloned().unwrap_or_else(|| panic!("{query}: no rows in {answer}"));
+            assert_eq!(in_order(&rows), truth, "{query} (table_view={table_view})");
+        }
+    }
+}
+
+/// NAN-4284 (searchfuzz F19, FP T70): a join whose subsearch has more rows
+/// than its cap still matches every main-side key. The subsearch is narrowed
+/// to those keys before the cap. Before, the cap kept an arbitrary subset:
+/// left-join fields read `0` and an inner join returned no rows. Unmatched
+/// left-join fields are NULL, not the type default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn capped_join_subsearch_matches_every_main_key_and_misses_are_null() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let ip = |i: usize| if proxy_hit(i) { PROXY_IP.to_string() } else { format!("10.0.{}.{}", i % 7, i % 200) };
+    let total = |key: &str| (0..ROWS).filter(|i| ip(*i) == key).count() as u64;
+    let run = |query: String| {
+        let engine = &engine;
+        async move {
+            let mut request = request(&query, now, false);
+            request.use_cache = false;
+            let answer = crate::query_timing::measure("nan4284", Box::pin(engine.broad_npl(&request))).await
+                .unwrap_or_else(|error| panic!("{query}: {error}"));
+            answer["result"]["rows"].as_array().cloned().unwrap_or_else(|| panic!("{query}: no rows in {answer}"))
+        }
+    };
+    let field = |row: &Value, key: &str| row.get(key).cloned().or_else(|| row.pointer(&format!("/{}", key.replace('.', "/"))).cloned())
+        .unwrap_or(Value::Null);
+    let as_u64 = |value: &Value| value.as_u64().or_else(|| value.as_str().and_then(|s| s.parse().ok()));
+    // The subsearch has one row per source IP (several hundred), far past
+    // maxout=3. The five newest CloudTrail rows have five distinct IPs.
+    let sub = "[search * | stats count as total by src_endpoint.ip]";
+    for join in ["type=left", "type=inner"] {
+        let rows = run(format!("metadata.log_source=aws_cloudtrail | head 5 | join {join} maxout=5 src_endpoint.ip {sub}")).await;
+        assert_eq!(rows.len(), 5, "{join}: {rows:?}");
+        for row in &rows {
+            let key = field(row, "src_endpoint.ip");
+            let key = key.as_str().unwrap_or_else(|| panic!("{row}"));
+            assert_eq!(as_u64(&field(row, "total")), Some(total(key)), "{join}: {row}");
+        }
+    }
+    // No CloudTrail IP occurs in sysmon: every left-join row is unmatched.
+    let rows = run(format!(
+        "metadata.log_source=aws_cloudtrail | head 5 | join type=left src_endpoint.ip \
+         [search metadata.log_source=windows_sysmon | stats count as total by src_endpoint.ip]"
+    )).await;
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    for row in &rows {
+        assert!(field(row, "total").is_null(), "an unmatched left join reads NULL, not 0: {row}");
+    }
+}
+
+/// NAN-4291 (F6): an ungrouped `stats` over no rows is one row, count 0 and
+/// every other aggregate null, whether the window holds parts that match
+/// nothing (the search the API sends for an expired window, `… NOT *`) or
+/// holds no parts at all (a future window). Grouped stats have no rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn ungrouped_stats_over_no_rows_is_count_zero_and_null_aggregates() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let aggregates = "stats count, dc(actor.user.name) as users, max(time) as mt, min(dst_endpoint.port) as lo, \
+                      avg(dst_endpoint.port) as a, sum(dst_endpoint.port) as s, values(actor.user.name) as v";
+    let future = |query: &str| {
+        let mut request = request(query, now, false);
+        request.start = (now + Duration::days(400)).to_rfc3339();
+        request.end = (now + Duration::days(401)).to_rfc3339();
+        request.use_cache = false;
+        request
+    };
+    let in_window = |query: &str| {
+        let mut request = request(query, now, false);
+        request.use_cache = false;
+        request
+    };
+    for request in [
+        in_window(&format!("(metadata.log_source=aws_cloudtrail) NOT * | {aggregates}")),
+        future(&format!("metadata.log_source=aws_cloudtrail | {aggregates}")),
+    ] {
+        let answer = crate::query_timing::measure("nan4291", Box::pin(engine.broad_npl(&request))).await
+            .unwrap_or_else(|error| panic!("{}: {error}", request.query));
+        let rows = answer["result"]["rows"].as_array().cloned().unwrap_or_default();
+        assert_eq!(rows.len(), 1, "{}: {answer}", request.query);
+        let row = &rows[0];
+        for zero in ["count", "users"] {
+            let value = &row[zero];
+            assert!(value.as_u64() == Some(0) || value.as_str() == Some("0"), "{}: {zero} in {row}", request.query);
+        }
+        for null in ["mt", "lo", "a", "s", "v"] {
+            assert!(row.get(null).is_some_and(Value::is_null), "{}: {null} is null over no rows: {row}", request.query);
+        }
+    }
+    // The two per-slice merge plans' statements (core `lake_stats_merge` and
+    // the distinct-state plan): an empty slice is count 0 and null states,
+    // which their merges read as "no rows"; a non-empty slice has values.
+    let sliced = "stats count, earliest(time) as first_seen, latest(time) as last_seen, \
+                  first(src_endpoint.ip) as first_user, last(src_endpoint.ip) as last_user";
+    let distinct = "eval __nano_distinct_token = base64_encode(tostring(src_endpoint.ip)) \
+                    | stats values(__nano_distinct_token) as __nano_distinct_values, count";
+    for (tail, states) in [
+        (sliced, &["first_seen", "last_seen", "first_user", "last_user"][..]),
+        (distinct, &["__nano_distinct_values"][..]),
+    ] {
+        for (request, empty) in [
+            (future(&format!("metadata.log_source=aws_cloudtrail | {tail}")), true),
+            (in_window(&format!("metadata.log_source=aws_cloudtrail | {tail}")), false),
+        ] {
+            let answer = crate::query_timing::measure("nan4291", Box::pin(engine.broad_npl(&request))).await
+                .unwrap_or_else(|error| panic!("{}: {error}", request.query));
+            let rows = answer["result"]["rows"].as_array().cloned().unwrap_or_default();
+            assert_eq!(rows.len(), 1, "{}: {answer}", request.query);
+            let row = &rows[0];
+            let count = row["count"].as_u64().or_else(|| row["count"].as_str().and_then(|s| s.parse().ok()));
+            assert_eq!(count == Some(0), empty, "{}: {row}", request.query);
+            for state in states {
+                assert_eq!(row.get(*state).is_some_and(Value::is_null), empty, "{}: {state} in {row}", request.query);
+            }
+        }
+    }
+    for request in [
+        in_window("(metadata.log_source=aws_cloudtrail) NOT * | stats count, max(time) as mt by actor.user.name"),
+        future("metadata.log_source=aws_cloudtrail | stats count, max(time) as mt by actor.user.name"),
+    ] {
+        let answer = crate::query_timing::measure("nan4291", Box::pin(engine.broad_npl(&request))).await
+            .unwrap_or_else(|error| panic!("{}: {error}", request.query));
+        let rows = answer["result"]["rows"].as_array().cloned().unwrap_or_default();
+        assert!(rows.is_empty(), "{}: {answer}", request.query);
+    }
+}
+
+/// NAN-4313: a scan-budget-sliced `stats sum / avg / min / max` is exact.
+/// The statement the search service sends each slice (avg as its sum and
+/// count partials) runs through the real compiler and engine over four
+/// half-open slices of a window, two of them empty, and the service's own
+/// merge of those rows equals the unsliced statement, ungrouped and grouped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn budget_sliced_numeric_stats_merge_to_the_unsliced_answer() {
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let profile = nanosiem_core::schema::OcsfProfile::lake_1_9();
+    let numeric = |field: &str| nanosiem_core::schema::SchemaProfile::is_numeric_field(&profile, field);
+    let run = |query: String, start: DateTime<Utc>, end: DateTime<Utc>| {
+        let engine = &engine;
+        async move {
+            let mut request = request(&query, now, false);
+            request.start = start.to_rfc3339();
+            request.end = end.to_rfc3339();
+            request.use_cache = false;
+            let answer = crate::query_timing::measure("nan4313", Box::pin(engine.broad_npl(&request))).await
+                .unwrap_or_else(|error| panic!("{query}: {error}"));
+            answer["result"]["rows"].as_array().cloned().unwrap_or_else(|| panic!("{query}: {answer}"))
+        }
+    };
+    // Rows span the last ~1 h 46 min: the oldest and newest slices are empty.
+    let cuts = [now - Duration::hours(24), now - Duration::hours(2), now - Duration::hours(1), now + Duration::minutes(1),
+                now + Duration::days(1)];
+    let number = |value: &Value| value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("{value}"));
+    for tail in ["", " by src_endpoint.hostname"] {
+        let query = format!(
+            "metadata.log_source=conduit_proxy | stats count, sum(traffic.bytes_out) as s, avg(traffic.bytes_out) as a, \
+             min(traffic.bytes_out) as lo, max(traffic.bytes_out) as hi{tail}"
+        );
+        let statement = nanosiem_core::search::service::sliced_stats_statement(&query, &numeric)
+            .unwrap_or_else(|| panic!("{query} must be slice-mergeable"));
+        assert!(statement.contains("__nano_avg_sum_") && statement.contains("__nano_avg_count_"), "{statement}");
+        let mut slices = Vec::new();
+        let mut empty = 0;
+        for window in cuts.windows(2) {
+            let rows = run(statement.clone(), window[0], window[1]).await;
+            empty += usize::from(rows.iter().all(|row| number(&row["count"]) == 0.0));
+            slices.push((nanosiem_core::search::TimeRangeInput::new(window[0], window[1]), rows));
+        }
+        assert_eq!(empty, 2, "{query}: two slices hold no rows");
+        let mut merged = nanosiem_core::search::service::merge_sliced_stats(&query, &numeric, slices).unwrap().unwrap();
+        let mut whole = run(query.clone(), cuts[0], cuts[4]).await;
+        let key = |row: &Value| row.get("src_endpoint.hostname").or_else(|| row.pointer("/src_endpoint/hostname"))
+            .map(Value::to_string).unwrap_or_default();
+        merged.sort_by_key(key);
+        whole.sort_by_key(key);
+        assert_eq!(merged.len(), whole.len(), "{query}: {merged:?} vs {whole:?}");
+        assert!(!whole.is_empty() && number(&whole[0]["count"]) > 0.0, "{query}: {whole:?}");
+        for (merged, whole) in merged.iter().zip(&whole) {
+            assert_eq!(key(merged), key(whole));
+            for state in ["count", "s", "lo", "hi"] {
+                assert_eq!(number(&merged[state]), number(&whole[state]), "{query}: {state} merged {merged} vs unsliced {whole}");
+            }
+            // The merged avg is the exact Float64 Σsum/Σcount; the worker's
+            // JSON prints a Float64 to 16 significant digits (9138/14 reads
+            // 1305.428571428571, the f64 is 1305.4285714285713).
+            let (merged_avg, whole_avg) = (number(&merged["a"]), number(&whole["a"]));
+            assert!((merged_avg - whole_avg).abs() <= whole_avg.abs() * 1e-12,
+                "{query}: a merged {merged} vs unsliced {whole}");
+        }
+    }
 }
 
 /// NAN-3154: ingest-lowercased paths compare RAW (the dotless hostname
@@ -605,9 +1047,108 @@ async fn full_event_needle_locator_matches_one_pass_rows_order_and_cursor_pages(
         pages.extend(ordered(&rows));
     }
     assert_eq!(pages, newest(&proxy_hit, 30), "cursor pages continue the result exactly");
-    // A predicate on a masked leaf is never located (it reads the masked value).
-    let mut masked_request = self::request("src_endpoint.location.country=US proxy", now, false);
-    masked_request.use_cache = false;
-    let masked = envelope(&engine, &masked_request).await;
-    assert_eq!(masked["planner"]["located_chunks"].as_u64().unwrap_or(0), 0, "{}", masked["planner"]);
+    // NAN-4307: an enrichment leaf is a plain stored column since NAN-4168
+    // (#7257, ingest-only enrichment, no read-time masks), so it is located
+    // like any other leaf, and the located page must equal the one-pass read
+    // (the fixture stores no location, so both are empty).
+    let mut enriched_request = self::request("src_endpoint.location.country=US proxy", now, false);
+    enriched_request.use_cache = false;
+    std::env::set_var("NANO_LAKE_FULL_EVENT_LOCATOR", "0");
+    let one = envelope(&engine, &enriched_request).await;
+    std::env::remove_var("NANO_LAKE_FULL_EVENT_LOCATOR");
+    engine.clear_locator_cache();
+    let located = envelope(&engine, &enriched_request).await;
+    assert!(located["planner"]["located_chunks"].as_u64().unwrap_or(0) >= 1, "{}", located["planner"]);
+    assert_eq!(located["result"]["rows"], one["result"]["rows"], "rows equal the one-pass read");
+    assert_eq!(located["result"]["page_has_more"], one["result"]["page_has_more"]);
+    assert!(ordered(located["result"]["rows"].as_array().unwrap()).is_empty(), "{located}");
+}
+
+/// NAN-4295 (F22, second half): `stats count by <array leaf>` groups by
+/// each element (SPL multivalue `by`), not by the whole array, and a
+/// repeated object's missing leaf is no `[null]` group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn stats_by_array_field_counts_each_element() {
+    const N: usize = 60;
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    // Even rows: Authorize Session (`privileges[]`); odd rows: Detection
+    // Finding (`evidences[]`, a repeated object).
+    let privileged = |i: usize| i % 2 == 0;
+    let events = (0..N).map(|i| {
+        let time = (now - Duration::seconds(i as i64 * 10 + 30)).to_rfc3339();
+        let metadata = json!({"uid": format!("uid-{i:08}"), "version": "1.9.0", "log_source": "fixture_arrays",
+            "tenant_uid": TENANT, "product": {"name": "fixture_arrays", "vendor_name": "fixture"}});
+        if privileged(i) {
+            let privileges = match (i / 2) % 3 {
+                0 => json!(["SeDebugPrivilege", "SeBackupPrivilege"]),
+                1 => json!(["SeDebugPrivilege"]),
+                _ => json!([]),
+            };
+            json!({"class_uid": 3003, "category_uid": 3, "activity_id": 1, "type_uid": 300301, "severity_id": 1,
+                "time": time, "message": format!("session seq {i}"), "raw_data": format!("raw seq {i}"), "raw_data_size": format!("raw seq {i}").len(), "status": "Success", "metadata": metadata,
+                "user": {"name": format!("user{}", i % 5)}, "privileges": privileges})
+        } else {
+            // The second evidence has no `src_endpoint`: a NULL leaf element.
+            let evidences = if (i / 2) % 2 == 0 {
+                json!([{"src_endpoint": {"hostname": "ev-a"}}, {"process": {"name": "no-endpoint.exe", "pid": 4242}}])
+            } else {
+                json!([{"src_endpoint": {"hostname": "ev-b"}}])
+            };
+            json!({"class_uid": 2004, "category_uid": 2, "activity_id": 1, "type_uid": 200401, "severity_id": 1,
+                "time": time, "message": format!("finding seq {i}"), "raw_data": format!("raw seq {i}"), "raw_data_size": format!("raw seq {i}").len(), "status": "Success", "metadata": metadata,
+                "finding_info": {"uid": format!("f-{i}"), "title": "fixture finding"}, "evidences": evidences})
+        }
+    }).collect::<Vec<_>>();
+    ingest_batches(root.path(), now, vec![events]).await;
+    let engine = engine(root.path()).await;
+    let groups = |rows: Vec<Value>, field: &str| -> std::collections::BTreeMap<String, u64> {
+        rows.iter().map(|row| {
+            let key = match row.get(field).unwrap_or_else(|| panic!("no {field} in {row}")) {
+                Value::String(value) => value.clone(),
+                Value::Number(value) => value.to_string(),
+                other => panic!("{field} group is not one element: {other} in {rows:?}"),
+            };
+            let count = &row["count"];
+            (key, count.as_u64().or_else(|| count.as_str().and_then(|s| s.parse().ok())).unwrap())
+        }).collect()
+    };
+    let by = |keep: &dyn Fn(usize) -> bool| (0..N).filter(|i| keep(*i)).count() as u64;
+    let privileges = std::collections::BTreeMap::from([
+        ("SeBackupPrivilege".to_string(), by(&|i| privileged(i) && (i / 2) % 3 == 0)),
+        ("SeDebugPrivilege".to_string(), by(&|i| privileged(i) && (i / 2) % 3 != 2)),
+    ]);
+    let hostnames = std::collections::BTreeMap::from([
+        ("ev-a".to_string(), by(&|i| !privileged(i) && (i / 2) % 2 == 0)),
+        ("ev-b".to_string(), by(&|i| !privileged(i) && (i / 2) % 2 == 1)),
+    ]);
+    for table_view in [false, true] {
+        let got = rows(&engine, "* | stats count by privileges", now, table_view).await;
+        assert_eq!(groups(got, "privileges"), privileges, "table_view={table_view}");
+        let got = rows(&engine, "* | stats count by evidences.src_endpoint.hostname", now, table_view).await;
+        assert_eq!(groups(got, "evidences.src_endpoint.hostname"), hostnames, "table_view={table_view}");
+    }
+    // A non-string repeated leaf (`evidences[].process.pid`, integer) splits
+    // the same way; the evidence without a process is no group.
+    let got = rows(&engine, "* | stats count by evidences.process.pid", now, false).await;
+    assert_eq!(groups(got, "evidences.process.pid"),
+        std::collections::BTreeMap::from([("4242".to_string(), by(&|i| !privileged(i) && (i / 2) % 2 == 0))]));
+    // A search filter on the same array keeps whole events: every element of
+    // a matching event is counted (SPL multivalue `by`).
+    let got = rows(&engine, "privileges=SeBackupPrivilege | stats count by privileges", now, false).await;
+    assert_eq!(groups(got, "privileges"), std::collections::BTreeMap::from([
+        ("SeBackupPrivilege".to_string(), by(&|i| privileged(i) && (i / 2) % 3 == 0)),
+        ("SeDebugPrivilege".to_string(), by(&|i| privileged(i) && (i / 2) % 3 == 0)),
+    ]));
+    // `mvexpand` first: the same per-element counts.
+    let got = rows(&engine, "* | mvexpand privileges | stats count by privileges", now, false).await;
+    assert_eq!(groups(got, "privileges"), privileges);
+    // Downstream the group key is one element: `where` compares it as such.
+    let got = rows(&engine, r#"* | stats count by privileges | where privileges="SeDebugPrivilege""#, now, false).await;
+    assert_eq!(groups(got, "privileges"), std::collections::BTreeMap::from([("SeDebugPrivilege".to_string(), by(&|i| privileged(i) && (i / 2) % 3 != 2))]));
+    // A scalar by-field next to the array one: one row per (scalar, element).
+    let got = rows(&engine, "* | stats count by metadata.log_source, privileges", now, false).await;
+    let total: u64 = got.iter().map(|row| row["count"].as_u64().or_else(|| row["count"].as_str().and_then(|s| s.parse().ok())).unwrap()).sum();
+    assert_eq!(total, privileges.values().sum::<u64>(), "{got:?}");
 }

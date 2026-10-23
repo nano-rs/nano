@@ -167,14 +167,14 @@ for rollback. `NANO_DRAGONFLY_DATA_VOLUME` is installer-owned after bootstrap.
 
 ## Release notes: changes operators must act on
 
-- **OTLP ports 4317/4318 bind to 127.0.0.1.** Vector's OTLP source has no
-  authentication, so the raw gRPC and HTTP ports now listen on loopback only.
-  Remote senders use OTLP/HTTP through nginx at `<base>/otlp` with the ingest
-  token (`Authorization: Bearer <VECTOR_AUTH_TOKEN>`); a missing or wrong token
-  gets 401. To re-expose the raw ports on a network where unauthenticated OTLP
-  (including gRPC) is acceptable, set `NANO_OTLP_BIND_ADDRESS=0.0.0.0` (or one
-  interface address) and re-run `./install.sh` or `docker compose up -d`; the
-  installer persists the value in `.env`.
+- **Raw OTLP ports 4317/4318 are no longer published.** Remote senders use
+  OTLP/HTTP through nginx at `<base>/otlp` with a named ingest credential
+  (`Authorization: Bearer <token>`). Bind it to the enabled OpenTelemetry Logs
+  parser for normal OTLP logs. Logs use the bound parser; traces and metrics
+  keep their native signal type and carry the same credential ID. Revocation
+  and disabling the install token apply on the next request. The install token
+  also requires an enabled bound source. `NANO_OTLP_BIND_ADDRESS` no longer
+  exposes unauthenticated HTTP or gRPC; configure exporters for HTTP/protobuf.
 - **Vector native :6000 and Fluent Forward :24224 bind to 127.0.0.1.** Neither
   checks the ingest token. On-prem Vector aggregators should ship
   with an `http` sink to `<base>/ingest` (or HEC) and the token. To re-expose a

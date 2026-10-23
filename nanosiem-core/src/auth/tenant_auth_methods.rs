@@ -14,8 +14,9 @@
 //!   `set_tenant_auth_methods`, which re-prove the signed tenant/actor, the
 //!   actor's membership and the tenant permission before touching the row;
 //!   the mutation and its audit row commit together;
-//! * the login path (`AuthService::login`) and the step-up SSO admin API read
-//!   the flag through the control login before any tenant context exists.
+//! * the login path (`AuthService::login`) reads the flag through the control
+//!   login before any tenant context exists. The step-up SSO admin service
+//!   reads its tenant's flag inside its authorized control transaction.
 //!
 //! The lockout guard is the dedicated one, verbatim (`auth_methods_change_allowed`
 //! / `removal_would_lock_out`, previously private to the dedicated OIDC admin
@@ -233,8 +234,8 @@ pub async fn tenant_login_local_password_enabled(
         .await
 }
 
-/// The same flag by tenant id, for the step-up SSO admin API's
-/// last-enabled-provider guard and the login-page discovery (control login).
+/// The same flag by tenant id for login-page discovery (control login).
+/// Authorized SSO admin mutations read the setting in their own transaction.
 pub async fn tenant_local_password_enabled<'e, E>(executor: E, tenant_id: Uuid) -> Result<bool, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = Postgres>,

@@ -900,6 +900,7 @@ impl AdmissionController {
             .unwrap_or_else(|| permit_lease(priority))
     }
 
+    #[tracing::instrument(name = "search.admission.wait", skip_all)]
     async fn acquire_subject_in_lane(
         &self,
         job_id: &str,

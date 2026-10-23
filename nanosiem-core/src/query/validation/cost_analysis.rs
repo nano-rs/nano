@@ -531,10 +531,17 @@ fn analyze_command(
             ..
         } => {
             let effective = maxout.unwrap_or(10_000);
+            // NAN-4284 (searchfuzz F19): a capped join is a wrong join --
+            // keys past the cap read as unmatched (NULL on a left join, no
+            // row on an inner join). Shown as a warning, not an info note.
             analysis.warnings.push(QueryWarning {
-                severity: WarningSeverity::Info,
+                severity: WarningSeverity::Warning,
                 code: "SUBSEARCH_RESULT_LIMIT".to_string(),
-                message: format!("join subsearch results are capped at {} rows", effective),
+                message: format!(
+                    "join matches against at most {} subsearch rows; if more subsearch rows match \
+                     the main results' keys, the rest read as unmatched and the results are incomplete",
+                    effective
+                ),
                 suggestion: Some(
                     format!("Use maxout=N to adjust the limit (max 100,000), or add filters to narrow the subsearch")
                 ),

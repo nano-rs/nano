@@ -106,7 +106,10 @@ function HostTile({
   const hot = reported && t >= 0.8;
 
   // Build a hover title with every reported metric so the cell is self-describing.
-  const titleParts: string[] = [host.host];
+  const titleParts: string[] = [host.node_name || host.host];
+  if (host.instance_type) titleParts.push(host.instance_type);
+  if (host.group) titleParts.push(host.group);
+  if (!reported) titleParts.push(`${metric.label}: no samples in range`);
   for (const m of INFRA_METRICS) {
     const v = m.value(host);
     if (v != null) titleParts.push(`${m.label} ${m.fmt(v)}`);
@@ -117,7 +120,7 @@ function HostTile({
       type="button"
       onClick={() => onSelect(host)}
       title={titleParts.join(' · ')}
-      aria-label={`${host.host} ${metric.label} ${reported ? metric.fmt(raw) : 'unreported'}`}
+      aria-label={`${host.host} ${metric.label} ${reported ? metric.fmt(raw) : 'no samples in range'}`}
       className={cn(
         'relative rounded-[3px] transition-all',
         selected

@@ -811,7 +811,7 @@ export function FieldValueMenu({
               } else {
                 params.set('time', ASSET_VIEW_TIME_PRESET);
               }
-              navigate(`/search?${params.toString()}`);
+              navigate(`/search#${params.toString()}`);
             }}
             className="gap-1.5 px-2 py-1 text-[12px]"
           >

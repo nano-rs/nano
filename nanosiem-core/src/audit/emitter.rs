@@ -400,6 +400,73 @@ pub async fn append_tenant_audit_in_transaction(
     ).await
 }
 
+/// Append a bounded batch through the existing execute-only audit capability.
+/// One database round trip preserves the same signed tenant/actor checks,
+/// canonical event rendering, immutable retry identity and emitter deadline.
+pub async fn append_tenant_audit_batch_in_transaction(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &crate::auth::TrustedTenantContext,
+    events: &[AuditEvent],
+) -> Result<(), AuditEmitError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if events.len() > 5_000 {
+        return Err(AuditEmitError::InvalidBatch);
+    }
+    let actor = events[0].actor_id;
+    if tenant.tenant_id.is_nil() || actor.is_none_or(|id| id.is_nil())
+        || events.iter().any(|event| event.actor_id != actor)
+    {
+        return Err(AuditEmitError::TenantContextRequired);
+    }
+    let tenant_id = tenant.tenant_id.to_string();
+    let mut payload = Vec::with_capacity(events.len());
+    let mut bytes = 0usize;
+    for event in events {
+        // Match SQLx's microsecond timestamp precision. PostgreSQL rounds
+        // finer JSON text timestamps, which could cross an OCSF millisecond.
+        let time = chrono::DateTime::from_timestamp_micros(event.occurred_at().timestamp_micros())
+            .ok_or(AuditEmitError::InvalidBatch)?;
+        let row = serde_json::json!({
+            "event_id": event.event_id(),
+            "occurred_at": time,
+            "actor_id": event.actor_id, "actor_name": event.actor_name,
+            "api_key_id": event.api_key_id, "api_key_name": event.api_key_name,
+            "action": event.action, "source": event.source.to_string(),
+            "resource_type": event.resource_type, "resource_id": event.resource_id,
+            "resource_name": event.resource_name, "ip_address": event.ip_address,
+            "user_agent": event.user_agent, "success": event.success,
+            "status": if event.success { "success" } else { "failure" },
+            "message": event.build_message(), "metadata": postgres_audit_metadata(event),
+            "ocsf_event": event.to_ocsf_event_for_lake(
+                time, event.event_id(), &tenant_id),
+        });
+        let row_bytes = serde_json::to_vec(&row).map_err(|_| AuditEmitError::InvalidBatch)?.len();
+        bytes = bytes.saturating_add(row_bytes);
+        if row_bytes > 262_144 || bytes > 16 * 1024 * 1024 {
+            return Err(AuditEmitError::InvalidBatch);
+        }
+        payload.push(row);
+    }
+    bounded_audit_insert(&AUDIT_INSERT_BOUND, AUDIT_INSERT_BACKSTOP_TIMEOUT, events, true, async {
+        sqlx::query(r#"
+            SELECT nano_shared.append_tenant_audit(
+                e.event_id,$1,e.ocsf_event,e.occurred_at,e.actor_id,e.actor_name,
+                e.api_key_id,e.api_key_name,e.action,e.source,e.resource_type,e.resource_id,
+                e.resource_name,e.ip_address,e.user_agent,e.success,e.status,e.message,e.metadata)
+              FROM jsonb_to_recordset($2::jsonb) AS e(
+                event_id uuid,occurred_at timestamptz,actor_id uuid,actor_name text,
+                api_key_id uuid,api_key_name text,action text,source text,resource_type text,
+                resource_id uuid,resource_name text,ip_address text,user_agent text,
+                success boolean,status text,message text,metadata jsonb,ocsf_event jsonb)
+        "#).bind(&tenant_id).bind(serde_json::Value::Array(payload))
+            .execute(&mut **transaction).request_db().await
+            .map_err(|error| retryable_database_or(error, |error| AuditEmitError::Storage(error.to_string())))?;
+        Ok(())
+    }).await
+}
+
 /// NAN-3790: actorless pre-authentication auth audit (login failure, lockout,
 /// password-reset request/completion) into one tenant, through the closed
 /// `nano_shared.append_tenant_preauth_audit` definer (9013575). There is no
@@ -534,17 +601,7 @@ fn bind_postgres_audit<'a>(
     event: &'a AuditEvent,
     tenant_id: &'a str,
 ) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    let metadata = serde_json::json!({
-        "actor_id": event.actor_id.map(|id| id.to_string()),
-        "actor_name": event.actor_name,
-        "api_key_id": event.api_key_id.map(|id| id.to_string()),
-        "api_key_name": event.api_key_name,
-        "resource_type": event.resource_type,
-        "resource_id": event.resource_id.map(|id| id.to_string()),
-        "resource_name": event.resource_name,
-        "success": event.success,
-        "details": event.details,
-    });
+    let metadata = postgres_audit_metadata(event);
     sqlx::query(statement)
         .bind(event.event_id())
         .bind(tenant_id)
@@ -565,6 +622,20 @@ fn bind_postgres_audit<'a>(
         .bind(if event.success { "success" } else { "failure" })
         .bind(event.build_message())
         .bind(metadata)
+}
+
+fn postgres_audit_metadata(event: &AuditEvent) -> serde_json::Value {
+    serde_json::json!({
+        "actor_id": event.actor_id.map(|id| id.to_string()),
+        "actor_name": event.actor_name,
+        "api_key_id": event.api_key_id.map(|id| id.to_string()),
+        "api_key_name": event.api_key_name,
+        "resource_type": event.resource_type,
+        "resource_id": event.resource_id.map(|id| id.to_string()),
+        "resource_name": event.resource_name,
+        "success": event.success,
+        "details": event.details,
+    })
 }
 
 /// Bound resource use without turning failed durability into a successful ACK.
@@ -592,6 +663,8 @@ where
 /// Errors that can occur when emitting audit events
 #[derive(Debug, thiserror::Error)]
 pub enum AuditEmitError {
+    #[error("Transactional audit batch exceeds its count or byte bounds")]
+    InvalidBatch,
     #[error("Shared audit requires a verified tenant and actor transaction")]
     TenantContextRequired,
     #[error("Audit event identity conflicts with retained content or tenant")]

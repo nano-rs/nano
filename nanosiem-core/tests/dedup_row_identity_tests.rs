@@ -18,7 +18,8 @@
 //! carrying that id through the filter.
 //!
 //! The fix keeps the sort-free property (no `ORDER BY` over the wide rows) by
-//! restricting each group to its oldest timestamp — an aggregate, not a sort —
+//! restricting each group to one extreme timestamp (the newest by default,
+//! NAN-4279) — an aggregate, not a sort —
 //! and collapsing the ties with `LIMIT 1 BY <keys>`, which guarantees one row
 //! per key by construction, independent of any id.
 //!
@@ -140,16 +141,23 @@ fn dedup_collapses_each_key_with_limit_1_by() {
     );
 }
 
-/// The candidate set must be each group's OLDEST row (keep-oldest semantics,
-/// unchanged since the legacy shape), computed as an aggregate rather than a
-/// sort.
+/// The candidate set is each group's first row in the newest-first event
+/// stream — its NEWEST row (NAN-4279 F12; it was the oldest) — and
+/// `keepfirst=false` keeps the oldest. Computed as an aggregate, not a sort.
 #[test]
-fn dedup_restricts_candidates_to_the_group_minimum_time() {
+fn dedup_restricts_candidates_to_the_group_extreme_time() {
     let sql = npl("* | dedup src_ip");
     assert!(
-        sql.contains("min(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
-        "dedup must restrict candidates to each key's oldest timestamp, got:\n{sql}"
+        sql.contains("max(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
+        "dedup must restrict candidates to each key's newest timestamp, got:\n{sql}"
     );
+    for keep_last in ["* | dedup src_ip keepfirst=false", "* | dedup src_ip keeplast=true"] {
+        let sql = npl(keep_last);
+        assert!(
+            sql.contains("min(timestamp) FROM stage_0"),
+            "{keep_last} must keep each key's oldest row, got:\n{sql}"
+        );
+    }
 }
 
 /// The regression NAN-1636 fixed and NAN-2264 must not undo: no `ORDER BY` over
@@ -268,7 +276,7 @@ fn nested_command_path_keeps_the_legacy_shape() {
         "the no-context command path must keep the legacy shape, got:\n{sql}"
     );
     assert!(
-        !sql.contains("argMin(id") && !sql.contains("min(timestamp)"),
+        !sql.contains("argMin(id") && !sql.contains("max(timestamp)"),
         "the no-context command path must not emit a double-scan rewrite, got:\n{sql}"
     );
 }
@@ -337,7 +345,7 @@ mod live_ch {
 
         // Two rows whose ids are the REAL content hash, computed by the
         // production ingestion path, plus a second key with two distinct rows so
-        // the probe also proves keep-oldest still holds.
+        // the probe also proves keep-newest (NAN-4279) holds.
         let ingest = Utc::now();
         let dup_a = ClickHouseLogRow::from_parsed_log(&parsed_log("dup content", "10.0.0.1", "alice"), ingest);
         let dup_b = ClickHouseLogRow::from_parsed_log(&parsed_log("dup content", "10.0.0.1", "bob"), ingest);
@@ -453,9 +461,9 @@ mod live_ch {
             probe.survivors
         );
         assert!(
-            probe.survivors.iter().any(|r| r.contains("b-oldest"))
-                && !probe.survivors.iter().any(|r| r.contains("b-newer")),
-            "dedup must keep each key's OLDEST row, got:\n{:#?}",
+            probe.survivors.iter().any(|r| r.contains("b-newer"))
+                && !probe.survivors.iter().any(|r| r.contains("b-oldest")),
+            "dedup must keep each key's NEWEST row (first in newest-first order, NAN-4279), got:\n{:#?}",
             probe.survivors
         );
 

@@ -108,11 +108,14 @@ fn the_bearer_expiry_is_used_when_the_exchange_states_it() {
     assert!(grant.expires_at <= soon + chrono::Duration::seconds(1));
 }
 
-/// Production timing, scaled to milliseconds (same ratios: the backoff cap
-/// equals REFRESH_AHEAD, the read timeout is far below it).
+/// Production timing, scaled to milliseconds (the compactor backoff cap is
+/// a sizeable part of the lifetime, the read timeout far below it).
 const FAST: LoopTiming = LoopTiming {
-    refresh_ahead: chrono::Duration::milliseconds(300),
-    refresh_retry: chrono::Duration::milliseconds(40),
+    min_request_interval: Duration::from_millis(40),
+    answer_timeout: Duration::from_millis(60),
+    exchange_timeout: Duration::from_millis(20),
+    refresh_backoff_base: Duration::from_millis(20),
+    refresh_backoff_max: Duration::from_millis(80),
     poll: Duration::from_millis(75),
     read_timeout: Duration::from_millis(50),
     backoff_base: Duration::from_millis(12),
@@ -149,7 +152,7 @@ impl FakeLoop {
         let outcome = tokio::time::timeout(run, drive(self, FAST)).await;
         assert!(outcome.is_err(), "the loop exited: {outcome:?} fatal={:?}", self.fatal.lock().unwrap());
         let refreshes = self.refreshes.lock().unwrap();
-        // 2.5 s of 1 s grants refreshed 300 ms early: at least three refreshes.
+        // 2.5 s of 1 s grants refreshed at half their lifetime: at least three refreshes.
         assert!(refreshes.len() >= 3, "only {} refreshes", refreshes.len());
         for (at, expired) in refreshes.iter() {
             assert!(at < expired, "refreshed at {at} after the grant expired at {expired}");
@@ -205,7 +208,7 @@ async fn a_hung_manifest_read_never_starves_the_refresh() {
 }
 
 /// NAN-3129: a tenant with no prevalence DB yet: the compactor stops every
-/// time and the restart backoff sits at its cap (== REFRESH_AHEAD). The
+/// time and the restart backoff sits at its cap (a third of the lifetime). The
 /// backoff is a deadline, not a sleep, so the credential never lapses.
 #[tokio::test]
 async fn a_no_manifest_tenant_keeps_its_credential_through_compactor_backoff() {
@@ -248,4 +251,272 @@ fn idle_prevalence_compaction_keeps_active_limits_and_heartbeat_cadence() {
     assert_eq!(worker.heartbeat_interval, default_worker.heartbeat_interval);
     assert_eq!(worker.max_concurrent_compactions, 1);
     assert_eq!(worker.max_sst_size, super::MAX_COMPACTED_SST_BYTES);
+}
+
+/// The production constants agree with the supervisor and the shared
+/// refresh module: a retry is never asked inside the mint interval, and a
+/// request the supervisor deferred is still answered within the wait.
+#[test]
+fn production_refresh_timing_cooperates_with_the_supervisor() {
+    assert_eq!(TIMING.min_request_interval, nanosiem_lake_cell::supervisor::REFRESH_MIN_INTERVAL);
+    assert_eq!(TIMING.min_request_interval.as_secs() as i64, crate::cell_refresh::SUPERVISOR_REFRESH_MIN_INTERVAL.num_seconds());
+    assert!(TIMING.answer_timeout > TIMING.min_request_interval, "a deferred answer arrives inside the wait");
+    assert_eq!(TIMING.answer_timeout.as_secs() as i64, super::super::cell::REFRESH_ANSWER_TIMEOUT.num_seconds());
+    for attempt in 1..20 {
+        let delay = TIMING.refresh_retry(attempt);
+        assert!(delay >= TIMING.min_request_interval && delay <= TIMING.refresh_backoff_max, "attempt {attempt}: {delay:?}");
+    }
+    // A 600 s owner bearer leaves 270 s between the scheduled refresh and
+    // the deadline: room for at least three attempts at the worst case
+    // (request spacing + full answer wait + exchange timeout are not all
+    // sequential, but even 60 + 15 s per attempt fits three).
+    // Whole milliseconds: the stats keep unix ms.
+    let issued = chrono::DateTime::from_timestamp_millis(chrono::Utc::now().timestamp_millis()).unwrap();
+    let stats = LoopStats::new(issued, issued + chrono::Duration::seconds(600));
+    assert_eq!((stats.refresh_due() - issued).num_seconds(), 300);
+    assert_eq!((stats.expires_at() - stats.deadline()).num_seconds(), 30);
+}
+
+// ---------------------------------------------------------------------------
+// NAN-4326: the production refresh path end to end. The real
+// MaintenanceService (start → serve → run_service + drive → refresh →
+// exchange) runs against a fake control-plane exchange over HTTP and a fake
+// supervisor on a real control socketpair that paces mints with the real
+// `RefreshPacer` and answers with real `Secrets` memfds.
+// ---------------------------------------------------------------------------
+
+use nanosiem_lake_cell::child::ControlChannel;
+use nanosiem_lake_cell::contract::{ToChild, ToSupervisor};
+use nanosiem_lake_cell::fdpass::{self, AsyncSeqpacket};
+use nanosiem_lake_cell::supervisor::{RefreshPace, RefreshPacer};
+use std::collections::VecDeque;
+use std::os::fd::AsFd;
+
+/// Each grant the fake control plane mints lives this long.
+const GRANT_MS: i64 = 3_000;
+
+/// Production ratios in milliseconds: retries never inside the mint
+/// interval, the answer wait longer than it, the backoff growing to a few
+/// intervals.
+const ROLE: LoopTiming = LoopTiming {
+    min_request_interval: Duration::from_millis(200),
+    answer_timeout: Duration::from_millis(400),
+    exchange_timeout: Duration::from_millis(150),
+    refresh_backoff_base: Duration::from_millis(100),
+    refresh_backoff_max: Duration::from_millis(400),
+    poll: Duration::from_millis(75),
+    read_timeout: Duration::from_millis(50),
+    backoff_base: Duration::from_millis(12),
+    backoff_max: Duration::from_millis(300),
+};
+
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// A valid maintenance grant.
+    Grant,
+    /// Never answers (the client's exchange timeout fires).
+    Hang,
+    /// This HTTP status, no body.
+    Status(u16),
+}
+
+/// The control plane's `credential-exchange`, scripted per call.
+struct FakeControlPlane {
+    script: std::sync::Mutex<VecDeque<Step>>,
+    otherwise: Step,
+    calls: AtomicU64,
+}
+
+impl FakeControlPlane {
+    async fn start(script: &[Step], otherwise: Step) -> (String, Arc<Self>) {
+        use axum::response::IntoResponse;
+        let plane = Arc::new(Self { script: std::sync::Mutex::new(script.iter().copied().collect()), otherwise, calls: AtomicU64::new(0) });
+        let handler = plane.clone();
+        let app = axum::Router::new().route("/v1/lake/cells/{cell}/credential-exchange", axum::routing::post(move || {
+            let plane = handler.clone();
+            async move {
+                plane.calls.fetch_add(1, Ordering::SeqCst);
+                let step = plane.script.lock().unwrap().pop_front().unwrap_or(plane.otherwise);
+                match step {
+                    Step::Grant => axum::Json(grant_response()).into_response(),
+                    Step::Hang => {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        axum::http::StatusCode::OK.into_response()
+                    }
+                    Step::Status(code) => axum::http::StatusCode::from_u16(code).unwrap().into_response(),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, plane)
+    }
+
+    fn calls(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+/// A maintenance grant living [`GRANT_MS`]; its stores point at a closed
+/// local port (the compactor and manifest reads fail fast, offline).
+fn grant_response() -> serde_json::Value {
+    let mut value = response();
+    value["credentials"][0]["endpoint"] = serde_json::json!("http://127.0.0.1:1");
+    value["credentials"][0]["expires_at"] =
+        serde_json::json!((chrono::Utc::now() + chrono::Duration::milliseconds(GRANT_MS)).to_rfc3339());
+    value["prevalence_owner"]["url"] = serde_json::json!("http://127.0.0.1:1/v1/prevalence-state/mutate");
+    value
+}
+
+/// The supervisor's side of the control socket: `RefreshSecrets` paced by
+/// the real [`RefreshPacer`] and answered with a `Secrets` memfd; `Fatal`
+/// recorded; heartbeats ignored.
+#[derive(Default)]
+struct FakeSupervisor {
+    requests: AtomicU64,
+    deferred: AtomicU64,
+    fatal: std::sync::Mutex<Option<String>>,
+}
+
+impl FakeSupervisor {
+    fn start(mint_interval: Duration) -> (ControlChannel, Arc<Self>) {
+        let (supervisor_end, child_end) = fdpass::seqpacket_pair().unwrap();
+        let control = ControlChannel::from_fd(child_end).unwrap();
+        let sock = Arc::new(AsyncSeqpacket::new(supervisor_end).unwrap());
+        let state = Arc::new(Self::default());
+        let pacer = Arc::new(std::sync::Mutex::new(RefreshPacer::new(mint_interval)));
+        let this = state.clone();
+        tokio::spawn(async move {
+            while let Ok(Some((message, _))) = sock.recv_json::<ToSupervisor>().await {
+                match message {
+                    ToSupervisor::RefreshSecrets => {
+                        this.requests.fetch_add(1, Ordering::SeqCst);
+                        let pace = pacer.lock().unwrap().request(std::time::Instant::now());
+                        match pace {
+                            RefreshPace::MintNow => send_secret(&sock).await,
+                            RefreshPace::DeferUntil(at) => {
+                                this.deferred.fetch_add(1, Ordering::SeqCst);
+                                let (sock, pacer) = (sock.clone(), pacer.clone());
+                                tokio::spawn(async move {
+                                    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                                    pacer.lock().unwrap().deferred_due(std::time::Instant::now());
+                                    send_secret(&sock).await;
+                                });
+                            }
+                            RefreshPace::AlreadyDeferred => {}
+                        }
+                    }
+                    ToSupervisor::Fatal { error } => *this.fatal.lock().unwrap() = Some(error),
+                    _ => {}
+                }
+            }
+        });
+        (control, state)
+    }
+
+    fn fatal(&self) -> Option<String> {
+        self.fatal.lock().unwrap().clone()
+    }
+
+    /// The `Fatal` the role sent before exiting (it may still be in the
+    /// socket when the role's future returns).
+    async fn wait_fatal(&self) -> Option<String> {
+        for _ in 0..100 {
+            if let Some(fatal) = self.fatal() {
+                return Some(fatal);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+}
+
+async fn send_secret(sock: &AsyncSeqpacket) {
+    let memfd = fdpass::secret_memfd(b"bootstrap-token").unwrap();
+    let _ = sock.send_json(&ToChild::Secrets, &[memfd.as_fd()]).await;
+}
+
+/// How one role run ended.
+struct RoleRun {
+    /// `None`: still running when the test stopped watching.
+    exited: Option<(Result<()>, chrono::DateTime<chrono::Utc>)>,
+    /// The expiry of the grant the role held when it exited (or at the end).
+    held_expiry: chrono::DateTime<chrono::Utc>,
+    started: chrono::DateTime<chrono::Utc>,
+}
+
+/// Start the real service (its startup exchange is the script's first
+/// step) and serve it for at most `watch`.
+async fn run_role(plane_url: &str, control: ControlChannel, watch: Duration) -> RoleRun {
+    let dir = tempfile::tempdir().unwrap();
+    let mut assignment = assignment();
+    assignment.control_url = Some(plane_url.to_owned());
+    assignment.state_dir = dir.path().join("maintenance");
+    let service = MaintenanceService::start_with(&assignment, Zeroizing::new(b"spawn-token".to_vec()), ROLE).await.unwrap();
+    let started = chrono::Utc::now();
+    let outcome = tokio::time::timeout(watch, service.clone().serve(control)).await;
+    let exited = outcome.ok().map(|result| (result, chrono::Utc::now()));
+    RoleRun { exited, held_expiry: service.stats.expires_at(), started }
+}
+
+/// One exchange times out; the retry (after the mint interval) succeeds
+/// and the role keeps running on fresh grants.
+#[tokio::test]
+async fn one_exchange_timeout_then_success_does_not_exit() {
+    let (url, plane) = FakeControlPlane::start(&[Step::Grant, Step::Hang], Step::Grant).await;
+    let (control, supervisor) = FakeSupervisor::start(ROLE.min_request_interval);
+    let run = run_role(&url, control, Duration::from_millis(5_000)).await;
+    assert!(run.exited.is_none(), "the role exited: {:?} fatal={:?}", run.exited.map(|(r, _)| r), supervisor.fatal());
+    assert!(plane.calls() >= 4, "start, the timed-out exchange, the retry and later refreshes: {}", plane.calls());
+    assert!(run.held_expiry > chrono::Utc::now(), "the held grant is current");
+    assert_eq!(supervisor.deferred.load(Ordering::SeqCst), 0, "the role never asks inside the mint interval");
+}
+
+/// The control plane answers 429 and the retry lands inside the
+/// supervisor's (longer) mint interval: the supervisor answers it at the
+/// interval's end instead of dropping it, the role is still waiting, and
+/// the exchange succeeds.
+#[tokio::test]
+async fn rate_limited_then_success_does_not_exit() {
+    let (url, plane) = FakeControlPlane::start(&[Step::Grant, Step::Status(429)], Step::Grant).await;
+    let (control, supervisor) = FakeSupervisor::start(ROLE.min_request_interval + Duration::from_millis(150));
+    let run = run_role(&url, control, Duration::from_millis(5_000)).await;
+    assert!(run.exited.is_none(), "the role exited: {:?} fatal={:?}", run.exited.map(|(r, _)| r), supervisor.fatal());
+    assert!(supervisor.deferred.load(Ordering::SeqCst) >= 1, "the retry was rate-limited by the supervisor");
+    assert!(plane.calls() >= 3);
+    assert!(run.held_expiry > chrono::Utc::now(), "the held grant is current");
+}
+
+/// Every refresh fails transiently: the role retries several times and
+/// exits only at the held grant's deadline, before it expires.
+#[tokio::test]
+async fn persistent_failure_exits_before_the_held_grant_expires() {
+    let (url, plane) = FakeControlPlane::start(&[Step::Grant], Step::Status(503)).await;
+    let (control, supervisor) = FakeSupervisor::start(ROLE.min_request_interval);
+    let run = run_role(&url, control, Duration::from_millis(6_000)).await;
+    let (result, exited_at) = run.exited.expect("the role must exit once its grant is about to lapse");
+    let error = format!("{:#}", result.expect_err("a lapsing grant is an error exit"));
+    assert!(error.contains("no replacement"), "{error}");
+    assert!(exited_at < run.held_expiry, "exited at {exited_at}, after the held grant expired at {}", run.held_expiry);
+    let lifetime = chrono::Duration::milliseconds(GRANT_MS);
+    assert!(exited_at >= run.held_expiry - lifetime / 5, "exited early at {exited_at}; grant expires {}", run.held_expiry);
+    assert!(plane.calls() >= 1 + 3, "the start plus at least three refresh attempts: {}", plane.calls());
+    assert!(supervisor.wait_fatal().await.is_some_and(|f| f.contains("no replacement")), "the supervisor is told why");
+}
+
+/// A 403 (revocation) stops the role at once, with no retry and long
+/// before the held grant would expire.
+#[tokio::test]
+async fn forbidden_exits_promptly() {
+    let (url, plane) = FakeControlPlane::start(&[Step::Grant, Step::Status(403)], Step::Grant).await;
+    let (control, supervisor) = FakeSupervisor::start(ROLE.min_request_interval);
+    let run = run_role(&url, control, Duration::from_millis(6_000)).await;
+    let (result, exited_at) = run.exited.expect("a 403 must stop the role");
+    let error = format!("{:#}", result.expect_err("a refusal is an error exit"));
+    assert!(error.contains("403"), "{error}");
+    let due = run.started + chrono::Duration::milliseconds(GRANT_MS / 2);
+    assert!(exited_at < due + chrono::Duration::milliseconds(500), "exited at {exited_at}, refresh due {due}: not prompt");
+    assert_eq!(plane.calls(), 2, "the start and the refused refresh; no retry");
+    assert!(supervisor.wait_fatal().await.is_some_and(|f| f.contains("403")), "the supervisor is told why");
 }

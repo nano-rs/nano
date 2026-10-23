@@ -292,10 +292,7 @@ pub(super) async fn run(
         if selection.manifest.objects.is_empty() {
             continue;
         }
-        let scalar = engine.scalar_plan(&selection, compiled).await?;
-        let plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || {
-            plan_logs(&selection, compiled, None)
-        })?;
+        let plan = plan_logs(&selection, compiled, None)?;
         let output = engine.execute(plan).await?;
         engine_seconds += output.elapsed.as_secs_f64();
         storage_rows += output.storage_rows_read;

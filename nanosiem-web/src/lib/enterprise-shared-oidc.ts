@@ -2,6 +2,9 @@
 
 import {
   tenantShellPath,
+  tenantPathSegment,
+  resolveTenantPathAlias,
+  safeReturnPath,
   canonicalTenantSlug,
   tenantContinuationBody,
   verifyServerAuthIdentity,
@@ -31,6 +34,17 @@ export class SharedOidcBrowserError extends Error {
   }
 }
 
+/** Only validated callback admission errors have actionable public copy. */
+export class SsoAdmissionError extends SharedOidcBrowserError {
+  constructor(code: 'sso_membership_unknown' | 'sso_group_not_allowed') {
+    super();
+    this.message = code === 'sso_membership_unknown'
+      ? 'Group membership could not be verified. Ask your administrator to check directory access.'
+      : 'Your account is not in a group allowed to access this tenant';
+  }
+}
+
+
 /** Exact nonsecret authority returned only after the server consumes an entry. */
 export interface SharedOidcEntryDocument {
   deploymentMode: 'enterprise_shared';
@@ -41,6 +55,13 @@ export interface SharedOidcEntryDocument {
 }
 
 interface PendingSharedOidcFlow {
+  returnPath?: string;
+  /**
+   * NAN-4152: the web path alias the login started under (`/t/<alias>`), so
+   * the callback returns the user there. Navigation only: it never reaches
+   * an auth body, and it is re-resolved against the verified tenant before use.
+   */
+  pathAlias?: string;
   tenantId: string;
   tenantSlug: string;
   providerSlug: string;
@@ -215,7 +236,7 @@ function readPending(storage: BrowserStorageLike): PendingSharedOidcFlow {
     throw new SharedOidcBrowserError();
   }
   if (!isRecord(value)) throw new SharedOidcBrowserError();
-  const keys = Object.keys(value).sort();
+  const keys = Object.keys(value).filter((key) => key !== 'returnPath' && key !== 'pathAlias').sort();
   if (
     keys.join(',')
       !== 'authorityRevision,providerSlug,runtimeEpoch,runtimeKey,tenantId,tenantSlug'
@@ -237,6 +258,8 @@ function readPending(storage: BrowserStorageLike): PendingSharedOidcFlow {
     authorityRevision: exactPositiveRevision(value.authorityRevision),
     runtimeEpoch: Number(value.runtimeEpoch),
     runtimeKey: value.runtimeKey,
+    ...(typeof value.returnPath === 'string' ? { returnPath: safeReturnPath(value.returnPath) } : {}),
+    ...(value.pathAlias !== undefined ? { pathAlias: canonicalTenantSlug(value.pathAlias) } : {}),
   };
 }
 
@@ -450,6 +473,7 @@ export async function startEnterpriseSharedOidcLogin(
   tenantSlug: string,
   providerSlug: string,
   dependencies: SharedOidcBrowserDependencies,
+  returnPath?: string,
 ): Promise<string> {
   dependencies.sessionStorage.removeItem(PENDING_KEY);
   try {
@@ -457,6 +481,7 @@ export async function startEnterpriseSharedOidcLogin(
     const provider = canonicalProviderSlug(providerSlug);
     const current = dependencies.runtime.current();
     if (current.scope.kind !== 'anonymous') throw new SharedOidcBrowserError();
+    const pathAlias = tenantPathSegment(tenant);
     const response = await dependencies.fetch('/api/auth/shared/oidc/start', {
       method: 'POST',
       credentials: 'include',
@@ -475,6 +500,8 @@ export async function startEnterpriseSharedOidcLogin(
       authorityRevision: entry.authorityRevision,
       runtimeEpoch: current.epoch,
       runtimeKey: current.key,
+      ...(returnPath ? { returnPath: safeReturnPath(returnPath) } : {}),
+      ...(pathAlias !== tenant ? { pathAlias } : {}),
     }));
     return entry.url;
   } catch {
@@ -516,6 +543,16 @@ export async function completeEnterpriseSharedOidc(
       body: JSON.stringify(callback),
     });
     if (callbackHttpResponse.ok) dependencies.onCookieMutation?.();
+    if (callbackHttpResponse.status === 403) {
+      let body: unknown;
+      try { body = await callbackHttpResponse.json(); } catch { /* Uniform failure below. */ }
+      dependencies.runtime.assertCurrent(capturedRuntime);
+      if (isRecord(body) && (body.error === 'sso_membership_unknown' || body.error === 'sso_group_not_allowed')) {
+        // Ignore the server message entirely; never render upstream details.
+        throw new SsoAdmissionError(body.error);
+      }
+      throw new SharedOidcBrowserError();
+    }
     const callbackResponse = exactCallbackResponse(await uniformJson(callbackHttpResponse));
     if (
       callbackResponse.tenant_id.toLowerCase() !== pending.tenantId
@@ -579,15 +616,30 @@ export async function completeEnterpriseSharedOidc(
       throw new SharedOidcBrowserError();
     }
     dependencies.runtime.assertCurrent(capturedRuntime);
+    // NAN-4152: return to the alias the login started under, but only when
+    // the server still resolves it to exactly the verified tenant.
+    const alias = pending.pathAlias === undefined
+      ? null
+      : await resolveTenantPathAlias(`/t/${pending.pathAlias}`, dependencies.fetch);
+    dependencies.runtime.assertCurrent(capturedRuntime);
+    const root = alias !== null && alias.canonicalSlug === verified.activeTenant.slug
+      ? `/t/${alias.pathSegment}`
+      : tenantShellPath(verified.activeTenant.slug);
+    const returnPath = safeReturnPath(pending.returnPath);
+    const target = new URL(root + (returnPath === '/' ? '' : returnPath), 'https://tenant.invalid');
+    // Dot segments must not escape the tenant whose identity was just verified.
+    const destination = target.pathname === root || target.pathname.startsWith(`${root}/`)
+      ? target.pathname + target.search + target.hash : root;
     return {
       user: currentUser,
       tenant,
       // The tenant's product root, reached by a full load (see the callback
       // page): the router that ran the callback has no tenant basename.
-      destination: tenantShellPath(verified.activeTenant.slug),
+      destination,
       session,
     };
-  } catch {
+  } catch (error) {
+    if (error instanceof SsoAdmissionError) throw error;
     throw new SharedOidcBrowserError();
   }
 }

@@ -93,6 +93,9 @@ fn main() -> Result<()> {
             if assignment.role == nanosiem_lake_cell::contract::Role::Maintenance {
                 return run_maintenance(assignment, secret, control).await;
             }
+            if assignment.role == nanosiem_lake_cell::contract::Role::Landing {
+                return run_landing(assignment, secret, control).await;
+            }
             // A 503 from the credential exchange at start is retried with a
             // FRESH bootstrap (tokens are single-use) on the refresh backoff;
             // 401/403 are final.
@@ -111,6 +114,11 @@ fn main() -> Result<()> {
                 match result {
                     Ok(service) => break service,
                     Err(error) => {
+                        // NAN-4052: the cell writer lease is held by another
+                        // pod generation (or unreachable): standby, no fatal.
+                        if nanosiem_lake_worker::part_ingest::writer_lease::is_standby(&error) {
+                            return Err(error);
+                        }
                         let retryable = error.downcast_ref::<ExchangeRefused>().is_some_and(|r| !r.is_final());
                         if !retryable || attempt >= REFRESH_BACKOFF_S.len() {
                             let _ = control.fatal(&format!("{error:#}")).await;
@@ -137,6 +145,13 @@ fn main() -> Result<()> {
             }
         });
         if let Err(error) = &result {
+            // NAN-4052: another pod generation holds (or took) the cell writer
+            // lease. Exit as standby: the supervisor neither counts a crash
+            // nor restarts ingest here until its standby window passed.
+            if nanosiem_lake_worker::part_ingest::writer_lease::is_standby(error) {
+                tracing::warn!(error = %format!("{error:#}"), "ingest standing by: the cell writer lease belongs to another pod generation");
+                std::process::exit(nanosiem_lake_cell::contract::WRITER_STANDBY_EXIT_CODE);
+            }
             // Exit non-zero NOW so the supervisor respawns ingest with a fresh
             // bootstrap: dropping the runtime would first wait for blocking
             // tasks (a merge can run for minutes).
@@ -187,9 +202,47 @@ async fn run_maintenance(
             }
         }
     };
+    service.serve(control).await
+}
+
+/// `landing[T]` (cell feature `lean_tenzir_landing_v1`, NAN-4137): the
+/// hosted OCSF bucket-drop converter. Start-up exchange retries like
+/// ingest's (a 503 with a fresh bootstrap; 401/403 final).
+async fn run_landing(
+    assignment: nanosiem_lake_cell::contract::Assignment,
+    secret: zeroize::Zeroizing<Vec<u8>>,
+    control: nanosiem_lake_cell::child::ControlChannel,
+) -> Result<()> {
+    use nanosiem_lake_worker::landing_cell::LandingService;
+    use nanosiem_lake_worker::part_ingest::cell::{ExchangeRefused, REFRESH_BACKOFF_S};
+    let mut secret = secret;
+    let mut attempt = 0;
+    let service = loop {
+        match LandingService::start(&assignment, secret).await {
+            Ok(service) => break service,
+            Err(error) => {
+                let retryable = error.downcast_ref::<ExchangeRefused>().is_some_and(|r| !r.is_final());
+                if !retryable || attempt >= REFRESH_BACKOFF_S.len() {
+                    let _ = control.fatal(&format!("{error:#}")).await;
+                    return Err(error);
+                }
+                tracing::warn!(error = %format!("{error:#}"), attempt, "landing credential exchange unavailable at start; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(REFRESH_BACKOFF_S[attempt])).await;
+                attempt += 1;
+                control.request_secrets().await?;
+                secret = loop {
+                    match control.next_event().await? {
+                        nanosiem_lake_cell::child::Event::Secrets(fresh) => break fresh,
+                        nanosiem_lake_cell::child::Event::Shutdown { .. } | nanosiem_lake_cell::child::Event::Closed => return Ok(()),
+                        _ => continue,
+                    }
+                };
+            }
+        }
+    };
     tokio::select! {
-        result = nanosiem_lake_cell::child::run_service(service.clone(), control.clone()) => result.context("maintenance control channel"),
-        result = service.run(control.clone()) => result.context("prevalence compactor loop"),
+        result = nanosiem_lake_cell::child::run_service(service.clone(), control.clone()) => result.context("landing control channel"),
+        result = service.run(control.clone()) => result.context("landing conversion loop"),
     }
 }
 

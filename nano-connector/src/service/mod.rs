@@ -32,6 +32,10 @@
 //!   the tenant's worker member with an X25519 reveal key, sealed to that key
 //!   by the platform, revealed once and sealed with the deployment cipher in the
 //!   same transaction. A feed without a token is never claimed.
+//! - An ingress 401/403 is recorded as `credential_revoked` /
+//!   `credential_rejected` and backs off; the runner never re-enrolls on its
+//!   own. Only the explicit rotate operation (`rotate`, NAN-3660) clears
+//!   the token so the credential pass issues a new one.
 
 pub mod admin;
 #[cfg(feature = "enterprise")]
@@ -42,6 +46,8 @@ pub mod hec;
 pub mod hosted_plan;
 pub mod pg;
 pub mod reset;
+#[cfg(feature = "enterprise")]
+pub mod rotate;
 pub mod runner;
 pub mod store;
 

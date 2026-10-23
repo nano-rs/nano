@@ -82,10 +82,27 @@ impl PrettyPrint for Aggregation {
         };
 
         match &self.alias {
+            // NAN-4279: a display-name alias (`dc(a)`) or one written quoted
+            // (`as "Total Bytes"`) must stay quoted to re-parse; the lake
+            // sends the printed query to the worker.
+            Some(alias) if !is_plain_alias(alias) => {
+                format!("{} as {}", base, super::helpers::npl_quoted_literal(alias))
+            }
             Some(alias) => format!("{} as {}", base, alias),
             None => base,
         }
     }
+}
+
+/// An alias the parser reads back as a bare `field_name`.
+fn is_plain_alias(alias: &str) -> bool {
+    alias.split('.').all(|segment| {
+        segment
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_alphabetic())
+            && segment.chars().all(|c| c == '_' || c.is_alphanumeric())
+    })
 }
 
 #[cfg(test)]

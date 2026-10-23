@@ -1499,6 +1499,65 @@ impl SearchJob {
     }
 }
 
+/// NAN-3911: stable `error_code` of a durable search that is too large to
+/// run at all (memory or scan capacity). It is deterministic: the runner
+/// fails it without spending retry attempts, and the UI shows actionable
+/// text instead of a generic execution failure.
+pub const QUERY_TOO_LARGE_ERROR_CODE: &str = "query_too_large";
+/// NAN-3911: published job error when query[T]'s per-query memory budget
+/// refused the durable attempt (a chDB memory limit or an oversized result).
+/// A static string: the coordinator only carries allowlisted categories.
+pub const QUERY_TOO_LARGE_MEMORY_MESSAGE: &str = "This search needs more memory than one query can use. Narrow the time range, add filters, or reduce distinct-count fields.";
+/// Published job error when the required scan exceeds the largest durable
+/// resource class.
+pub const QUERY_TOO_LARGE_SCAN_MESSAGE: &str = "This search exceeds the largest durable scan budget. Narrow the time range or add filters.";
+/// NAN-4277 (F18): published job error when a durable statement ran past
+/// its statement time limit (chDB `TIMEOUT_EXCEEDED`). It used to surface as
+/// the bare "isolated query execution failed".
+pub const QUERY_TOO_LARGE_TIME_MESSAGE: &str = "This search ran past the background job's time limit. Narrow the time range or add a source or field filter.";
+
+/// NAN-4290: the widest window (ms) a durable search may cover and still run
+/// on the small-job lane.
+///
+/// A day is the largest window the interactive path is sized to answer
+/// (its hot window, `NAN-3647`): such a job reads at most a day of the
+/// tenant's ingest, so it holds a lane for seconds, not the minutes a 7 d or
+/// 30 d aggregate takes. Window is the only signal every party can evaluate
+/// cheaply and identically before the job runs: the hosted coordinator sees
+/// the signed request but cannot parse nPL, and a listing's row cap does not
+/// bound its cost (a rare term over 30 d still reads all 30 d).
+pub const SMALL_JOB_MAX_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// NAN-4290: whether a durable job belongs to the small-job lane: a search
+/// (never a product view) over at most [`SMALL_JOB_MAX_WINDOW_MS`] that has
+/// not been promoted to the large resource class (a small-lane attempt that
+/// ran out of memory is retried once as large, on the general lane).
+///
+/// The hosted coordinator applies the same rule to the signed payload
+/// (`job-coordinator/contract.mjs` `smallJob`; both are pinned by
+/// `test/fixtures/small-lane-cases.json`), the runner's small slot claims
+/// only such jobs, and query[T] admits them to its small job lane.
+pub fn small_job_lane(
+    task: &DurableLakeTask,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    promoted_large: bool,
+) -> bool {
+    let window_ms = end.timestamp_millis().saturating_sub(start.timestamp_millis());
+    !promoted_large && task.is_search() && window_ms > 0 && window_ms <= SMALL_JOB_MAX_WINDOW_MS
+}
+
+/// NAN-3911: the stable error class of a failed job's published error, when
+/// it has one. Only exact, static runner categories map; free text never does.
+pub fn search_job_error_code(error: Option<&str>) -> Option<String> {
+    match error? {
+        QUERY_TOO_LARGE_MEMORY_MESSAGE | QUERY_TOO_LARGE_SCAN_MESSAGE | QUERY_TOO_LARGE_TIME_MESSAGE => {
+            Some(QUERY_TOO_LARGE_ERROR_CODE.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Response for job status API
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct SearchJobStatusResponse {
@@ -1522,6 +1581,9 @@ pub struct SearchJobStatusResponse {
     /// Error message (when failed)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Stable error class of a failed job (`query_too_large`: retrying will not help; narrow the time range or add filters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     /// Queue position (1-based, when status is Queued)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<u32>,
@@ -2126,6 +2188,7 @@ impl SearchJobStore for InMemoryJobStore {
                 result_ref: job.result_ref.clone(),
                 durable_result: None,
                 error: job.error.clone(),
+                error_code: search_job_error_code(job.error.as_deref()),
                 queue_position: job.queue_position,
                 estimated_wait_seconds: None,
                 task_kind: job.task.as_ref().map(|task| task.kind().to_string()),
@@ -3437,6 +3500,7 @@ impl RedisJobStore {
             )
         };
 
+        let error = (!fields[1].is_empty()).then(|| String::from_utf8_lossy(&fields[1]).to_string());
         Ok(Some(SearchJobStatusResponse {
             job_id: job_id.to_string(),
             status,
@@ -3444,7 +3508,8 @@ impl RedisJobStore {
             result,
             result_ref,
             durable_result: None,
-            error: (!fields[1].is_empty()).then(|| String::from_utf8_lossy(&fields[1]).to_string()),
+            error_code: search_job_error_code(error.as_deref()),
+            error,
             queue_position,
             estimated_wait_seconds: None,
             task_kind: None,
@@ -7106,5 +7171,56 @@ pub(crate) fn redact_redis_url(url: &str) -> String {
             None => url.to_string(),
         },
         None => url.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod small_job_lane_tests {
+    use super::*;
+
+    fn at(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn only_searches_of_a_day_or_less_that_were_not_promoted_are_small() {
+        let search = DurableLakeTask::SearchNplV1;
+        let hour = (at("2026-10-20T00:00:00Z"), at("2026-10-20T01:00:00Z"));
+        assert!(small_job_lane(&search, hour.0, hour.1, false));
+        assert!(!small_job_lane(&search, hour.0, hour.1, true), "a promoted job runs on the general lane");
+        assert!(small_job_lane(&search, at("2026-10-19T00:00:00Z"), at("2026-10-20T00:00:00Z"), false));
+        assert!(!small_job_lane(&search, at("2026-10-19T00:00:00Z"), at("2026-10-20T00:00:00.001Z"), false));
+        assert!(!small_job_lane(&search, at("2026-09-20T00:00:00Z"), at("2026-10-20T00:00:00Z"), false));
+        assert!(!small_job_lane(&search, hour.1, hour.0, false), "an inverted window is never small");
+    }
+
+    /// The coordinator Worker classifies the signed payload with the same
+    /// rule (`contract.mjs` `smallJob`); both run these cases. The Worker and
+    /// its fixtures ship only with the hosted build, so the test is compiled
+    /// only there (and still skips if that tree is not checked out).
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn small_job_lane_matches_the_coordinator_cases() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nanosiem-enterprise/cloudflare/job-coordinator/test/fixtures/small-lane-cases.json"
+        );
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let cases: Vec<serde_json::Value> = serde_json::from_str(&source).unwrap();
+        assert!(cases.len() >= 10);
+        for case in cases {
+            let task: DurableLakeTask = serde_json::from_value(case["task"].clone()).unwrap();
+            let start = at(case["start"].as_str().unwrap());
+            let end = at(case["end"].as_str().unwrap());
+            let promoted = case["resource_class"] == "large";
+            assert_eq!(
+                small_job_lane(&task, start, end, promoted),
+                case["small"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
     }
 }

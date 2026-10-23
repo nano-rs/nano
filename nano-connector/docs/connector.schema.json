@@ -330,33 +330,172 @@
           "type": "object"
         },
         {
-          "$defs": {
-            "HmacAlg": {
+          "additionalProperties": false,
+          "description": "Credential POST login; cached token or origin-scoped cookie, refreshed once on 401",
+          "properties": {
+            "credential_fields": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "Login field name -> credential field name. Values never live in a spec.",
+              "type": "object"
+            },
+            "encoding": {
+              "default": "json",
               "enum": [
-                "sha256",
-                "sha512"
+                "json",
+                "form"
               ],
               "type": "string"
             },
-            "SigEncoding": {
-              "enum": [
-                "hex",
-                "base64"
-              ],
+            "expires_in_secs": {
+              "default": 3600,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "fields": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Optional non-secret login fields; only config templates.",
+              "type": "object"
+            },
+            "login_url": {
+              "description": "HTTPS login endpoint; only config templates, always policy checked.",
               "type": "string"
+            },
+            "response": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "header": {
+                      "type": "string"
+                    },
+                    "pointer": {
+                      "type": "string"
+                    },
+                    "prefix": {
+                      "default": "",
+                      "type": "string"
+                    },
+                    "type": {
+                      "const": "json_token",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "pointer",
+                    "header"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "description": "Select exactly one Set-Cookie pair. No browser cookie jar: it is sent\nonly to the login origin and the explicitly configured path prefix.",
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "path_prefix": {
+                      "type": "string"
+                    },
+                    "type": {
+                      "const": "cookie",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "type",
+                    "name",
+                    "path_prefix"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": {
+              "const": "session_login"
             }
           },
+          "required": [
+            "login_url",
+            "credential_fields",
+            "response",
+            "type"
+          ],
+          "title": "SessionLoginParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One header composed from two named credentials",
+          "properties": {
+            "first_credential": {
+              "type": "string"
+            },
+            "header": {
+              "type": "string"
+            },
+            "prefix": {
+              "default": "",
+              "type": "string"
+            },
+            "second_credential": {
+              "type": "string"
+            },
+            "separator": {
+              "type": "string"
+            },
+            "type": {
+              "const": "composite_token"
+            }
+          },
+          "required": [
+            "header",
+            "first_credential",
+            "second_credential",
+            "separator",
+            "type"
+          ],
+          "title": "CompositeTokenParams",
+          "type": "object"
+        },
+        {
           "additionalProperties": false,
           "description": "HMAC request signature over method/path/timestamp/body",
           "properties": {
             "algorithm": {
-              "$ref": "#/$defs/HmacAlg"
+              "default": "sha256",
+              "oneOf": [
+                {
+                  "enum": [
+                    "sha384",
+                    "sha256",
+                    "sha512"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "const": "sha1",
+                  "description": "For vendor protocols that explicitly require legacy HMAC-SHA1.",
+                  "type": "string"
+                }
+              ]
             },
             "credential": {
               "type": "string"
             },
             "encoding": {
-              "$ref": "#/$defs/SigEncoding"
+              "default": "hex",
+              "enum": [
+                "hex",
+                "base64"
+              ],
+              "type": "string"
             },
             "header": {
               "type": "string"
@@ -376,7 +515,7 @@
               ]
             },
             "message": {
-              "description": "Uses `{method}`, `{path}` (path and query), `{timestamp}` (epoch s), `{body}`.",
+              "description": "Canonical fields: method, path (with query), uri_path, query, host,\ntimestamp, body, body_sha256 and body_sha512, in single braces.",
               "type": "string"
             },
             "prefix": {
@@ -385,6 +524,15 @@
                 "string",
                 "null"
               ]
+            },
+            "timestamp_format": {
+              "default": "unix_seconds",
+              "enum": [
+                "unix_seconds",
+                "rfc3339",
+                "rfc2822"
+              ],
+              "type": "string"
             },
             "timestamp_header": {
               "default": null,
@@ -808,7 +956,11 @@
     "Method": {
       "enum": [
         "GET",
-        "POST"
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD"
       ],
       "type": "string"
     },

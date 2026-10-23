@@ -930,6 +930,13 @@ pub struct TestVrlRequest {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub log_source_id: Option<TypeIdParam>,
+    /// How the sample reaches the parser: `http` (the HTTP front door merges
+    /// a JSON line onto the event root) or `message` (HEC, pull and fetch
+    /// sources: `{"message": <line>}`). Omitted: `message`. A dedicated
+    /// ingest token is accepted by both listeners, so a source's delivery
+    /// path is not known from its binding.
+    #[serde(default)]
+    pub delivery: Option<nanosiem_core::parsers::ingest_shaping::SampleDelivery>,
 }
 
 /// Test VRL against a sample log
@@ -954,6 +961,9 @@ pub async fn test_vrl(
         ensure_permission(&auth, LOG_SOURCES_EDIT)?;
     }
 
+    // NAN-4372: an explicit delivery shape, else `.message` (the shape HEC
+    // and the built-in collectors deliver; `routed` is not a delivery path).
+    let delivery = request.delivery.unwrap_or_default();
     let result = state
         .log_source_service
         .test_vrl_chain(
@@ -961,6 +971,7 @@ pub async fn test_vrl(
             request.extension_vrl.as_deref(),
             &request.sample_log,
             request.validate_ocsf,
+            delivery,
         )
         .await;
     if result.success && request.validate_ocsf {

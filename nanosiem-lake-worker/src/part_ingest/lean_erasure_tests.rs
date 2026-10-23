@@ -26,6 +26,9 @@ const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab
 const BASE_HOUR: i32 = 492_096;
 const HOUR_MS: i64 = 3_600_000;
 
+#[path = "lean_erasure_catalog_tests.rs"]
+mod catalog_tests;
+
 fn subject() -> ErasureSubject {
     ErasureSubject::new(ErasureIdentifierType::Username, SUBJECT).unwrap()
 }

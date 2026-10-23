@@ -5,16 +5,30 @@ use sha2::{Digest, Sha256};
 use nanosiem_core::request_timing::{timed, Phase, RequestDb};
 use crate::middleware::{AuthContext, SharedSearchCredentialAuthority};
 
+/// NAN-4215: how long a cold admission's identity is reused. Every reuse is
+/// re-proven by [`check`] (one statement covering every revocation input), so
+/// this bounds memory and the age of cosmetic fields, never revocation. At
+/// the old 30 s an analyst's next search usually missed and paid the cold
+/// admission (live: 250 ms of round trips, plus ~200 ms bcrypt for a key).
+pub(crate) const IDENTITY_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub context: AuthContext,
     pub source_version: i64,
+    /// End of the cached identity's reuse ([`IDENTITY_LIFETIME`]).
     pub deadline: Instant,
+    /// End of the proof's freshness: the last complete authority proof (cold
+    /// admission or a passed [`check`]) plus the proof window. Only this
+    /// lets a request skip the pre-release revalidation ([`current`]).
+    pub proven_until: Instant,
 }
 
 pub(crate) struct AuthCache {
     entries: Mutex<HashMap<[u8; 32], Entry>>,
-    ttl: Duration,
+    /// Proof freshness window (`NANO_SEARCH_AUTH_CACHE_SECONDS`, default 30).
+    proof: Duration,
+    lifetime: Duration,
     capacity: usize,
 }
 
@@ -22,13 +36,19 @@ impl Default for AuthCache {
     fn default() -> Self {
         let seconds = std::env::var("NANO_SEARCH_AUTH_CACHE_SECONDS").ok()
             .and_then(|value| value.parse::<u64>().ok()).unwrap_or(30).min(300);
-        Self::new(Duration::from_secs(seconds), 8192)
+        Self::new(Duration::from_secs(seconds), IDENTITY_LIFETIME, 8192)
     }
 }
 
 impl AuthCache {
-    fn new(ttl: Duration, capacity: usize) -> Self {
-        Self { entries: Mutex::new(HashMap::new()), ttl, capacity }
+    fn new(proof: Duration, lifetime: Duration, capacity: usize) -> Self {
+        Self { entries: Mutex::new(HashMap::new()), proof, lifetime: lifetime.max(proof), capacity }
+    }
+    /// A cached entry whose [`check`] (started at `started`) just passed: its
+    /// proof is fresh again; its identity lifetime is unchanged.
+    pub fn proven(&self, mut entry: Entry, started: Instant) -> Entry {
+        entry.proven_until = (started + self.proof).min(entry.deadline);
+        entry
     }
     pub fn key(kind: u8, credential: &str) -> [u8; 32] {
         let mut hash = Sha256::new();
@@ -48,8 +68,16 @@ impl AuthCache {
     pub fn remove(&self, key: &[u8; 32]) {
         self.entries.lock().unwrap_or_else(|error| error.into_inner()).remove(key);
     }
+    /// Test clock: every entry admitted `by` earlier (identity and proof).
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&self, by: Duration) {
+        for entry in self.entries.lock().unwrap().values_mut() {
+            entry.deadline -= by;
+            entry.proven_until -= by;
+        }
+    }
     pub fn insert(&self, key: [u8; 32], context: AuthContext, source_version: i64, started: Instant) -> Entry {
-        let entry = Entry { context, source_version, deadline: started + self.ttl };
+        let entry = Entry { context, source_version, deadline: started + self.lifetime, proven_until: started + self.proof };
         if self.capacity == 0 || entry.deadline <= Instant::now() { return entry; }
         let mut entries = self.entries.lock().unwrap_or_else(|error| error.into_inner());
         entries.retain(|_, value| value.deadline > Instant::now());
@@ -211,15 +239,16 @@ async fn check_key(
     .fetch_one(pool).request_db().await
 }
 
-// Only the admitted context can reuse the proof, and never beyond its ORIGINAL
-// cache deadline. Background jobs inherit no task local and revalidate fully.
+// Only the admitted context can reuse the proof, and never beyond the proof
+// window after its last complete authority proof (NAN-4215: not the identity
+// lifetime). Background jobs inherit no task local and revalidate fully.
 tokio::task_local! { static ADMISSION: Entry; }
 pub(crate) async fn admitted<F: std::future::Future>(entry: Entry, future: F) -> F::Output {
     ADMISSION.scope(entry, future).await
 }
 pub(crate) fn current(context: &AuthContext) -> bool {
     ADMISSION.try_with(|entry| context.shared_request_authority.is_some()
-        && entry.deadline > Instant::now()
+        && entry.proven_until > Instant::now()
         && credential_unexpired(context)
         && entry.context.shared_request_authority == context.shared_request_authority
         && entry.context.tenant_scope == context.tenant_scope
@@ -265,16 +294,17 @@ mod tests {
     }
     #[test]
     fn cache_miss_hit_expiry_eviction_and_explicit_revocation() {
-        let cache = AuthCache::new(Duration::from_secs(30), 2);
+        let cache = AuthCache::new(Duration::from_secs(30), Duration::from_secs(900), 2);
         let key = AuthCache::key(0, "session-one");
         assert!(cache.get(&key).is_none());
         let started = Instant::now();
         cache.insert(key, context(), 1, started);
-        assert_eq!(cache.get(&key).unwrap().deadline, started + Duration::from_secs(30));
+        assert_eq!(cache.get(&key).unwrap().deadline, started + Duration::from_secs(900));
+        assert_eq!(cache.get(&key).unwrap().proven_until, started + Duration::from_secs(30));
         assert_ne!(key, AuthCache::key(1, "session-one"));
         cache.remove(&key);
         assert!(cache.get(&key).is_none());
-        cache.insert(key, context(), 1, started - Duration::from_secs(31));
+        cache.insert(key, context(), 1, started - Duration::from_secs(901));
         assert!(cache.get(&key).is_none());
         for n in 0..3 { cache.insert(AuthCache::key(0, &n.to_string()), context(), 1, Instant::now()); }
         assert_eq!(cache.entries.lock().unwrap().len(), 2);
@@ -288,7 +318,7 @@ mod tests {
         let mut auth = context();
         // No shared proof can be constructed by a request outside middleware.
         assert!(!current(&auth));
-        let entry = Entry { context: auth.clone(), source_version: 1, deadline: Instant::now() + Duration::from_secs(1) };
+        let entry = Entry { context: auth.clone(), source_version: 1, deadline: Instant::now() + Duration::from_secs(900), proven_until: Instant::now() + Duration::from_secs(1) };
         admitted(entry, async {
             assert!(current(&auth));
             let background = auth.clone();
@@ -296,8 +326,28 @@ mod tests {
             auth.claims.permissions.clear();
             assert!(!current(&auth));
         }).await;
-        let entry = Entry { context: auth.clone(), source_version: 1, deadline: Instant::now() - Duration::from_secs(1) };
+        // NAN-4215: a live identity whose proof is stale is not current.
+        let entry = Entry { context: auth.clone(), source_version: 1, deadline: Instant::now() + Duration::from_secs(900), proven_until: Instant::now() - Duration::from_secs(1) };
         admitted(entry, async { assert!(!current(&auth)); }).await;
+    }
+
+    /// NAN-4215: an identity admitted 45 s ago (past the old 30 s TTL) is
+    /// still served from the cache, and a passed check re-arms only the
+    /// proof window, never past the identity lifetime.
+    #[test]
+    fn identity_outlives_the_proof_window_and_a_passed_check_rearms_only_the_proof() {
+        let cache = AuthCache::new(Duration::from_secs(30), Duration::from_secs(900), 4);
+        let key = AuthCache::key(1, "nan_tak_fixture");
+        let admitted_at = Instant::now() - Duration::from_secs(45);
+        cache.insert(key, context(), 7, admitted_at);
+        let entry = cache.get(&key).expect("identity reused after 45 s");
+        assert!(entry.proven_until <= Instant::now(), "the cold proof itself is stale");
+        let check_started = Instant::now();
+        let proven = cache.proven(entry, check_started);
+        assert_eq!(proven.proven_until, check_started + Duration::from_secs(30));
+        assert_eq!(proven.deadline, admitted_at + Duration::from_secs(900), "lifetime is never renewed");
+        let near_end = Entry { deadline: Instant::now() + Duration::from_secs(5), ..proven };
+        assert!(cache.proven(near_end.clone(), Instant::now()).proven_until <= near_end.deadline);
     }
     #[tokio::test]
     async fn unavailable_epoch_check_fails_closed() {

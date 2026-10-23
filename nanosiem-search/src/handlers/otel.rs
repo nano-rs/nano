@@ -815,13 +815,23 @@ pub struct MetricNamesResponse {
     pub names: Vec<serde_json::Value>,
     /// Number of distinct metric names returned.
     pub count: usize,
+    /// Start of the time window the names cover (end is now). Absent when
+    /// the backend does not report one (ClickHouse rollup path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<chrono::DateTime<chrono::Utc>>,
+    /// True while the catalog is still warming (covers less than its full
+    /// window) or was capped. The UI says so and still allows typed names.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// List distinct metric names.
 ///
 /// Returns the distinct `metric_name` values in `otel_metrics`, optionally
 /// restricted to a single `service`. Name-ordered, bounded by an internal
-/// `LIMIT 10000` — populates the Metrics explorer dropdown.
+/// `LIMIT 10000` — populates the Metrics explorer dropdown. On lake tenants
+/// the names come from the lake's per-tenant catalog of the last 24 h;
+/// `window_start` / `partial` describe its coverage.
 #[utoipa::path(
     get,
     path = "/api/search/metrics/names",
@@ -874,22 +884,29 @@ pub async fn list_metric_names(
         client
             .metric_names(service)
             .await
+            .map(|lake| (lake.names, lake.window_start, lake.partial))
             .map_err(|error| error.into_search_error())
     } else if !state.dual_pool.clickhouse_required() {
-        Ok(Vec::new())
+        Ok((Vec::new(), None, false))
     } else {
-        state.search.list_otel_metric_names(service).await
+        state
+            .search
+            .list_otel_metric_names(service)
+            .await
+            .map(|names| (names, None, false))
     };
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_metric_names", duration_ms, result.is_ok());
 
-    let names =
+    let (names, window_start, partial) =
         result.map_err(|e| crate::error::mask_query_failure(e, "Failed to list metric names"))?;
 
     let response = MetricNamesResponse {
         count: names.len(),
         names,
+        window_start,
+        partial,
     };
     if let Some(cache) = state.result_cache.as_ref() {
         let cache = cache.clone();
@@ -1330,7 +1347,10 @@ pub struct InfraHostsParams {
     pub offset: u32,
 }
 
-/// Response for the infrastructure hosts overview: one row per host.
+/// Response for infrastructure inventory: one row per cluster-scoped node or pod.
+/// Additive fields include kind, cluster/region, node_name, pod_name, namespace,
+/// workload, phase, instance_type, CPU cores, memory bytes and pod restarts.
+/// Unknown health is explicit when neither readiness nor utilization was reported.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct InfraHostsResponse {
     /// One object per host with `host`, `group` (`host.group` or service

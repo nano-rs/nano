@@ -263,5 +263,5 @@ function buildSearchUrl(entry: {
   params.set('q', entry.query);
   if (entry.query_mode === 'sql') params.set('mode', 'sql');
   if (entry.time_range_preset) params.set('range', entry.time_range_preset);
-  return `/search?${params.toString()}`;
+  return `/search#${params.toString()}`;
 }

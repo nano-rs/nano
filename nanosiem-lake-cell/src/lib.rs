@@ -43,6 +43,7 @@ pub mod resources;
 pub mod router;
 pub mod secrets;
 pub mod signals;
+pub mod spawn_flight;
 pub mod supervisor;
 pub mod tenant_token;
 pub mod tenant_dirs;

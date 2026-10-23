@@ -3,6 +3,7 @@
 //! Parser management module
 
 mod credential_repository;
+pub mod ingest_shaping;
 pub mod landing_ocsf;
 pub mod lake_bronze_row;
 pub mod pipe;
@@ -17,7 +18,7 @@ pub mod vrl_guard;
 
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
 pub use ocsf_validation::{
-    ocsf_attribute_leaf, validate_ocsf_event, OcsfAttributeLeaf, OcsfValidationDiagnostic,
+    is_known_ocsf_class, ocsf_attribute_leaf, validate_ocsf_event, OcsfAttributeLeaf, OcsfValidationDiagnostic,
     OcsfValidationResult, OCSF_VALIDATION_VERSION,
 };
 pub use repository::{

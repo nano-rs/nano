@@ -9,6 +9,11 @@
 //! When `SIEM_FORWARD_URL` is set, a background layer forwards log events as gzip'd
 //! NDJSON to the org SIEM for operational monitoring. Zero overhead when not configured.
 
+pub(crate) mod http;
+pub use http::ObservedRequestBuilderExt;
+mod otlp;
+pub use otlp::OtlpTraceLayer;
+
 use std::io::Write as IoWrite;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -28,6 +33,9 @@ pub struct TracingGuard {
 /// - `NANO_DEPLOYMENT_ID`: deployment identifier for centralized log collection
 /// - `SIEM_FORWARD_URL`: HTTP endpoint to forward logs to (disabled if unset)
 /// - `SIEM_FORWARD_TOKEN`: Bearer token for the forwarding endpoint
+/// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`: complete OTLP/HTTP trace endpoint (protobuf)
+/// - `NANO_OTLP_TRACE_TOKEN_FILE`: optional bearer credential file for direct export
+/// - `NANO_OTLP_TRACE_SAMPLE_EVERY`: root sampling interval (default 10)
 ///
 /// Returns a guard that must be held for the process lifetime to keep the root span active.
 pub fn init_tracing(service_name: &str) -> TracingGuard {
@@ -40,6 +48,7 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
     let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
 
     let forwarding_layer = SiemForwardingLayer::from_env(service_name);
+    let otlp_layer = otlp::OtlpTraceLayer::from_env(service_name);
 
     if log_format.eq_ignore_ascii_case("json") {
         tracing_subscriber::registry()
@@ -50,12 +59,14 @@ pub fn init_tracing(service_name: &str) -> TracingGuard {
                     .with_current_span(true),
             )
             .with(forwarding_layer)
+            .with(otlp_layer)
             .with(env_filter)
             .init();
     } else {
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer())
             .with(forwarding_layer)
+            .with(otlp_layer)
             .with(env_filter)
             .init();
     }
@@ -337,4 +348,9 @@ async fn flush_batch(client: &reqwest::Client, url: &str, token: &str, buffer: &
     }
 
     let _ = req.send().await;
+}
+
+/// Relay a browser page category after authentication and payload validation.
+pub fn record_browser_pageview(page: &'static str, duration_ms: u32) {
+    otlp::record_browser_pageview(page, duration_ms);
 }

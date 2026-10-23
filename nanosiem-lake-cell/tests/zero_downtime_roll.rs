@@ -15,6 +15,11 @@
 //! - **no loss, no duplicates**: every event the source produced is
 //!   committed exactly once, in order, across both handovers;
 //! - a **crashed** writer pod (no release) is taken over after the peer TTL.
+//! - NAN-4052, **partition**: two pods that cannot see each other both pass
+//!   the peer rule, but the cell writer lease (modelled on the fake store as
+//!   the Postgres lease) lets exactly one write; the other stands by quietly
+//!   (no crash count, no edge-log lease claimed, no fencing loop) and takes
+//!   over within the lease TTL plus one standby retry when the writer dies.
 //!
 //! Needs the same privileges as the isolation suite (uid switching,
 //! landlock); re-executes itself in the same user-namespace sandbox.
@@ -53,6 +58,8 @@ const QUERY_ONLY_WARM_MS: u64 = 9000;
 /// Every tenant the searches go to.
 const SEARCH_TENANTS: [&str; 3] = ["t1", "t2", QUERY_ONLY];
 const TTL_SECS: u64 = 5;
+/// NAN-4052: the cell writer lease TTL (standby retry = 5 s, its floor).
+const PG_LEASE_TTL_SECS: u64 = 2;
 /// The drain window (`drain_secs`): the pod serves after readiness is
 /// withdrawn, answering `Connection: close`.
 const DRAIN_SECS: u64 = 2;
@@ -167,6 +174,14 @@ struct TenantLog {
     stale_pulls: u64,
     stale_commits: u64,
     conflicts: u64,
+    /// NAN-4052: the cell writer lease (server-time expiry, epoch + 1 on
+    /// every acquisition, CAS renew), as `lake_cell_writer_leases`.
+    wl_holder: String,
+    wl_epoch: u64,
+    wl_expires: Option<Instant>,
+    /// (epoch, holder, at)
+    wl_acquisitions: Vec<(u64, String, Instant)>,
+    wl_refusals: u64,
 }
 
 #[derive(Default)]
@@ -216,6 +231,36 @@ impl Store {
                 log.commits.push((epoch, consumer, from, to, Instant::now()));
                 json!({"kind": "ok"})
             }
+            "wlease_acquire" => {
+                let now = Instant::now();
+                let holder = body["holder"].as_str().unwrap_or("").to_owned();
+                let ttl = Duration::from_millis(body["ttl_ms"].as_u64().unwrap_or(0));
+                if log.wl_expires.is_some_and(|e| e > now) && log.wl_holder != holder {
+                    log.wl_refusals += 1;
+                    return json!({"acquired": false, "holder": log.wl_holder, "epoch": log.wl_epoch});
+                }
+                log.wl_epoch += 1;
+                log.wl_holder = holder.clone();
+                log.wl_expires = Some(now + ttl);
+                log.wl_acquisitions.push((log.wl_epoch, holder, now));
+                json!({"acquired": true, "epoch": log.wl_epoch})
+            }
+            "wlease_renew" => {
+                let ok = body["holder"].as_str() == Some(log.wl_holder.as_str()) && epoch == log.wl_epoch;
+                if ok {
+                    log.wl_expires = Some(Instant::now() + Duration::from_millis(body["ttl_ms"].as_u64().unwrap_or(0)));
+                }
+                json!({"renewed": ok})
+            }
+            "wlease_release" => {
+                let now = Instant::now();
+                let ok = body["holder"].as_str() == Some(log.wl_holder.as_str()) && epoch == log.wl_epoch
+                    && log.wl_expires.is_some_and(|e| e > now);
+                if ok {
+                    log.wl_expires = Some(now);
+                }
+                json!({"released": ok})
+            }
             _ => json!({"kind": "bad_op"}),
         }
     }
@@ -261,6 +306,10 @@ async fn serve_store(store: Arc<Store>) -> u16 {
 // ------------------------------------------------------------------ cells
 
 async fn call(sock: &Path, method: Method, path: &str, token: Option<&str>) -> (u16, Value) {
+    call_with(sock, method, path, token, &[]).await
+}
+
+async fn call_with(sock: &Path, method: Method, path: &str, token: Option<&str>, headers: &[(&str, &str)]) -> (u16, Value) {
     let stream = match tokio::net::UnixStream::connect(sock).await {
         Ok(s) => s,
         Err(e) => return (0, json!({"client_error": e.to_string()})),
@@ -272,6 +321,9 @@ async fn call(sock: &Path, method: Method, path: &str, token: Option<&str>) -> (
     let mut req = Request::builder().method(method).uri(path).header("host", "cell");
     if let Some(t) = token {
         req = req.header(AUTHORIZATION, format!("Bearer {t}"));
+    }
+    for (k, v) in headers {
+        req = req.header(*k, *v);
     }
     let req = req.body(Full::new(Bytes::new())).unwrap();
     match s.send_request(req).await {
@@ -333,7 +385,17 @@ impl Cell {
 }
 
 fn config(mnt: &Path, name: &str, uid_base: u32, store_port: u16, handover: bool) -> CellConfig {
-    let peers: Vec<String> = ["a", "b", "c"].iter().map(|p| format!("unix:{}", mnt.join(format!("run/{p}.sock")).display())).collect();
+    config_with(mnt, name, uid_base, store_port, handover, false)
+}
+
+/// `partitioned`: the pod lists only itself as a peer (it can never see the
+/// other pod), and the cell writer lease TTL is 2 s.
+fn config_with(mnt: &Path, name: &str, uid_base: u32, store_port: u16, handover: bool, partitioned: bool) -> CellConfig {
+    let peers: Vec<String> = if partitioned {
+        vec![format!("unix:{}", mnt.join(format!("run/{name}.sock")).display())]
+    } else {
+        ["a", "b", "c"].iter().map(|p| format!("unix:{}", mnt.join(format!("run/{p}.sock")).display())).collect()
+    };
     let mut v = json!({
         "cell_id": CELL_ID,
         "mode": "pooled",
@@ -369,7 +431,8 @@ fn config(mnt: &Path, name: &str, uid_base: u32, store_port: u16, handover: bool
             "discovery_grace_secs": 2,
             "drain_secs": DRAIN_SECS,
             "inflight_secs": 3,
-            "standby_request_wait_secs": 5
+            "standby_request_wait_secs": 5,
+            "pg_writer_lease_ttl_secs": PG_LEASE_TTL_SECS
         }
     });
     if !handover {
@@ -383,14 +446,19 @@ async fn start_cell(mnt: &Path, name: &'static str, uid_base: u32, store_port: u
 }
 
 async fn start_cell_with(mnt: &Path, name: &'static str, uid_base: u32, store_port: u16, handover: bool) -> Arc<Cell> {
-    let cfg = config(mnt, name, uid_base, store_port, handover);
+    start_cell_full(mnt, name, uid_base, store_port, handover, false).await
+}
+
+async fn start_cell_full(mnt: &Path, name: &'static str, uid_base: u32, store_port: u16, handover: bool, partitioned: bool) -> Arc<Cell> {
+    let cfg = config_with(mnt, name, uid_base, store_port, handover, partitioned);
     let mut keys = StaticKeySource::default();
     let mut tenants = Vec::new();
     for t in SEARCH_TENANTS {
         let id = TenantId::new(t).unwrap();
         let warm_ms = if name == "abort" { 120_000 } else if t == QUERY_ONLY { QUERY_ONLY_WARM_MS } else { 1500 };
         for r in Role::ALL {
-            let secret = format!("bootstrap-token:{t}:{};store=127.0.0.1:{store_port};warm_ms={warm_ms};search_ms={SEARCH_MS};cell={name}", r.as_str());
+            let pg_lease = if partitioned { ";pg_lease=1" } else { "" };
+            let secret = format!("bootstrap-token:{t}:{};store=127.0.0.1:{store_port};warm_ms={warm_ms};search_ms={SEARCH_MS};cell={name}{pg_lease}", r.as_str());
             keys = keys.with(&id, r, secret.as_bytes());
         }
         let mut p = TenantPlacement::legacy(id, 20.0);
@@ -626,6 +694,75 @@ async fn drain_during_maintenance_mint(mnt: &Path, port: u16) -> bool {
     reported_while_spawning && refused && released
 }
 
+/// NAN-4052: two pods of the cell that cannot reach each other.
+async fn partition_phase(mnt: &Path, report: &mut Vec<(String, bool, String)>) {
+    let store = Arc::new(Store::default());
+    let port = serve_store(store.clone()).await;
+    let feeding = Arc::new(AtomicBool::new(true));
+    {
+        let (store, feeding) = (store.clone(), feeding.clone());
+        tokio::spawn(async move {
+            while feeding.load(Ordering::SeqCst) {
+                store.produce();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+    let p = start_cell_full(mnt, "p", 57_000, port, true, true).await;
+    wait_for("partitioned pod p writes", Duration::from_secs(30), || {
+        TENANTS.iter().all(|t| store.with(t, |l| l.committed > 0))
+    })
+    .await;
+    let q = start_cell_full(mnt, "q", 58_000, port, true, true).await;
+    // q passes the peer rule (it sees no peer) and tries ingest; the lease
+    // keeps it standby. Watch long enough for several standby retries.
+    tokio::time::sleep(Duration::from_secs(14)).await;
+    let ingest_counts = |c: &Cell, what: &str| -> u64 {
+        let st = c.sup.status();
+        st.tenants.iter().filter(|t| TENANTS.contains(&t.tenant_id.as_str()))
+            .map(|t| match what { "spawns" => &t.spawns, "crashes" => &t.crashes, _ => &t.reaps }.get("ingest").copied().unwrap_or(0))
+            .sum()
+    };
+    let (q_spawns, q_crashes) = (ingest_counts(&q, "spawns"), ingest_counts(&q, "crashes"));
+    // Sampled until it is seen whole (a retry's brief spawn is "writing").
+    let mut q_standby = 0;
+    for _ in 0..40 {
+        q_standby = q.sup.status().handover.map(|h| h.standby.len()).unwrap_or(0);
+        if q_standby == TENANTS.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let one_writer = TENANTS.iter().all(|t| store.with(t, |l| {
+        l.wl_acquisitions.len() == 1 && l.leases.len() == 1 && l.stale_pulls + l.stale_commits + l.conflicts == 0
+            && l.commits.iter().all(|c| c.1.starts_with("p/")) && l.wl_refusals > 0
+    }));
+    report.push(("partition: q stands by on the cell writer lease (no edge-log lease claimed, no fencing)".into(),
+        one_writer && q_crashes == 0 && q_standby == TENANTS.len() && p.ingest_tenants().len() == TENANTS.len(),
+        format!("q ingest spawns {q_spawns}, crashes {q_crashes}, standby {q_standby}, refusals {:?}",
+            TENANTS.iter().map(|t| store.with(t, |l| l.wl_refusals)).collect::<Vec<_>>())));
+    // Retries are paced by the standby window (5 s), not a crash loop.
+    report.push(("partition: standby retries are paced, not a restart loop".into(),
+        q_spawns >= TENANTS.len() as u64 && q_spawns <= 4 * TENANTS.len() as u64,
+        format!("{q_spawns} ingest spawns on q in ~14 s for {} tenants", TENANTS.len())));
+    // p's node dies: q takes over within the lease TTL + one standby retry.
+    let crash = Instant::now();
+    p.crash();
+    let takeover = wait_for("q takes over after p dies", Duration::from_secs(30), || {
+        TENANTS.iter().all(|t| store.with(t, |l| l.wl_epoch == 2 && l.commits.iter().any(|c| c.1.starts_with("q/"))))
+    })
+    .await;
+    let bound = Duration::from_secs(PG_LEASE_TTL_SECS + 5 + 4);
+    let (q_crashes2, epochs_ok) = (ingest_counts(&q, "crashes"),
+        TENANTS.iter().all(|t| store.with(t, |l| l.wl_acquisitions.iter().map(|a| a.0).collect::<Vec<_>>() == vec![1, 2]
+            && l.stale_pulls + l.stale_commits + l.conflicts == 0)));
+    report.push(("partition: when the writer pod dies, the other takes over within lease TTL + one retry".into(),
+        takeover < bound && q_crashes2 == 0 && epochs_ok,
+        format!("takeover {takeover:?} (bound {bound:?}) after the crash ({:?}), q crashes {q_crashes2}", crash.elapsed())));
+    feeding.store(false, Ordering::SeqCst);
+    q.terminate().await;
+}
+
 async fn suite() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())))
@@ -722,6 +859,27 @@ async fn suite() {
     report.push(("pod b: standby (no ingest) while pod a writes".into(),
         b_wrote_early.is_empty() && TENANTS.iter().all(|t| leases(t) == 1) && standby == TENANTS.len(),
         format!("early ingest {b_wrote_early:?}, standby {standby}")));
+
+    // NAN-4052: a detect call that lands on standby b is served by a's
+    // writer through b (forwarded with the caller's own bearer), at once;
+    // b starts no writer for it. A caller without a token is refused before
+    // any forward, and an already-forwarded request is never forwarded again.
+    let detect_path = format!("/v1/tenants/{}/detect/headers", TENANTS[0]);
+    let fwd_t0 = Instant::now();
+    let (fwd_status, fwd_body) = call(&b.sock, Method::GET, &detect_path, Some(QUERY_TOKEN)).await;
+    let fwd_took = fwd_t0.elapsed();
+    let (unauth_status, _) = call(&b.sock, Method::GET, &detect_path, None).await;
+    let loop_t0 = Instant::now();
+    let (loop_status, loop_body) = call_with(&b.sock, Method::GET, &detect_path, Some(QUERY_TOKEN),
+        &[(router::FORWARDED_HEADER, "test-claim")]).await;
+    let loop_took = loop_t0.elapsed();
+    report.push(("detect on standby b: forwarded to writer a, answered at once; never re-forwarded".into(),
+        fwd_status == 200 && fwd_took < Duration::from_secs(2) && fwd_body.get(router::FORWARDED_HEADER).is_none()
+            && fwd_body.get("authorization").is_none()
+            && b.sup.writer_tenants().is_empty() && unauth_status == 401
+            && loop_status == 503 && loop_body["reason"] == "writer_standby" && loop_took >= Duration::from_secs(4),
+        format!("forward {fwd_status} in {fwd_took:?}, unauth {unauth_status}, re-forward {loop_status} {} in {loop_took:?}, b writers {:?}",
+            loop_body["reason"], b.sup.writer_tenants())));
 
     let t1 = TenantId::new(TENANTS[0]).unwrap();
     report.push(("maintenance: incumbent holds compactor and standby rejects direct wake".into(),
@@ -835,6 +993,8 @@ async fn suite() {
         cell.sup.halt();
         cell.router_task.abort();
     }
+
+    partition_phase(&mnt, &mut report).await;
 
     report.push(("maintenance: SIGTERM during slow bootstrap mint prevents writer start".into(),
         drain_during_maintenance_mint(&mnt, port).await,

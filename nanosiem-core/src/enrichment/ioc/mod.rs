@@ -367,6 +367,125 @@ impl LakeIocClient {
     }
 }
 
+impl LakeIocClient {
+    /// NAN-4169: the tenant's granted platform IOC feeds (ThreatFox, Tor exit
+    /// nodes...) whose bundle revision differs from `known` (feed -> revision
+    /// the caller last processed), with every live row of each changed feed.
+    /// A worker without platform mounts (open core) answers with no feeds.
+    pub async fn platform_records(
+        &self,
+        known: &std::collections::BTreeMap<String, i64>,
+        artifact_types: &[String],
+        max_records: usize,
+    ) -> Result<Vec<LakePlatformFeedDelta>, IocLookupError> {
+        if max_records == 0 || max_records > MAX_PLATFORM_DELTA_RECORDS {
+            return Err(IocLookupError::Lake(format!(
+                "platform record limit must be between 1 and {MAX_PLATFORM_DELTA_RECORDS}"
+            )));
+        }
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let response = self
+            .http
+            .post(format!("{}/v1/ioc/platform-records", self.base_url))
+            .bearer_auth(&self.bearer_token)
+            .json(&serde_json::json!({
+                "request_id": request_id,
+                "tenant_id": self.tenant_id,
+                "snapshot_id": self.snapshot_id,
+                "known": known,
+                "artifact_types": artifact_types,
+                "max_records": max_records,
+            }))
+            .send_idempotent_with_recovery()
+            .await
+            .map_err(|error| IocLookupError::Lake(format!("request failed: {error}")))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| IocLookupError::Lake(format!("response read failed: {error}")))?;
+        let envelope: LakePlatformRecordsResponse = serde_json::from_slice(&body).map_err(|error| {
+            IocLookupError::Lake(format!("worker returned invalid JSON ({status}): {error}"))
+        })?;
+        if !status.is_success() || !envelope.ok {
+            return Err(IocLookupError::Lake(
+                envelope
+                    .error
+                    .unwrap_or_else(|| format!("worker returned HTTP {status}")),
+            ));
+        }
+        let total: usize = envelope.feeds.iter().map(|feed| feed.records.len()).sum();
+        if envelope.request_id.as_deref() != Some(request_id.as_str())
+            || envelope.tenant_id.as_deref() != Some(self.tenant_id.as_str())
+            || envelope.snapshot_id.as_deref() != Some(self.snapshot_id.as_str())
+            || envelope.feeds.len() > 64
+            || total > max_records
+            || envelope.feeds.iter().any(|feed| {
+                feed.feed.is_empty()
+                    || feed.feed.len() > 64
+                    || feed.revision <= 0
+                    || (!feed.changed && !feed.records.is_empty())
+                    || feed.records.iter().any(|record| {
+                        record.value.is_empty()
+                            || record.value.len() > 4_096
+                            || record.key_type.is_empty()
+                            || !(0..=100).contains(&record.confidence)
+                    })
+            })
+        {
+            return Err(IocLookupError::Lake(
+                "worker response did not match the pinned platform record request".to_string(),
+            ));
+        }
+        Ok(envelope.feeds)
+    }
+}
+
+/// Upper bound on platform rows one retro delta request may carry (the
+/// worker's own contract).
+pub const MAX_PLATFORM_DELTA_RECORDS: usize = 500_000;
+
+/// One granted platform IOC feed in a retro delta answer (NAN-4169).
+#[derive(Debug, Clone, SerdeDeserialize, Serialize)]
+pub struct LakePlatformFeedDelta {
+    pub feed: String,
+    #[serde(default)]
+    pub display_name: String,
+    pub revision: i64,
+    /// The bundle revision differs from the caller's known revision; only
+    /// then are `records` populated.
+    pub changed: bool,
+    #[serde(default)]
+    pub records: Vec<LakePlatformRecord>,
+}
+
+/// One live platform IOC row (lowercased value + coarse retro type).
+#[derive(Debug, Clone, SerdeDeserialize, Serialize)]
+pub struct LakePlatformRecord {
+    pub value: String,
+    pub key_type: String,
+    #[serde(default)]
+    pub confidence: i32,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(SerdeDeserialize)]
+struct LakePlatformRecordsResponse {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    snapshot_id: Option<String>,
+    #[serde(default)]
+    feeds: Vec<LakePlatformFeedDelta>,
+}
+
 fn valid_digest_not(version: &str) -> bool {
     version.len() != 64
         || !version

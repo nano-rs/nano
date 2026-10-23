@@ -136,7 +136,43 @@ Auth parameters name credential fields; they never hold the secrets themselves.
   `config.*` templates; the token endpoint path `/oauth2/v1/token` must be in
   `allow`. DPoP must be off on the app: `invalid_dpop_proof`,
   `use_dpop_nonce` or a DPoP-bound token fail with `okta_dpop_required`.
-- `hmac {...}`
+- `session_login {login_url, credential_fields, fields?, encoding?, response, expires_in_secs?}`:
+  POST named credential fields as JSON (default) or form data. `login_url` and
+  optional non-secret `fields` may template only `config.*`; credential values
+  are resolved by the plugin. The login endpoint must be in `allow`.
+  `response` selects either `{type: json_token, pointer, header, prefix?}`
+  (RFC 6901 JSON pointer to a string) or
+  `{type: cookie, name, path_prefix}` (one named `Set-Cookie` value). Both
+  variants send the session header only to the exact login origin. Cookie
+  auth additionally restricts that pair to the configured,
+  segment-aligned path prefix; it is not a browser cookie jar. Duplicate,
+  missing, short or malformed selected tokens fail closed. Login redirects
+  are never followed. Tokens are cached per plugin in the run/connection,
+  refreshed at most once per request after a 401, and redacted like credentials.
+  TTL defaults to 3,600 seconds (1–86,400 allowed, with early refresh). Every
+  login and refresh consumes the existing HTTP/request/deadline budgets and
+  collector request pacing. A login 429 reports rate limiting without sending
+  the data request. A late 401 invalidates only the token it rejected, leaving
+  a newer token available to other concurrent requests.
+- `composite_token {header, first_credential, second_credential, separator, prefix?}`:
+  forms one header from the two credential values in order. For example,
+  `separator: /` produces `<first>/<second>`. Both fields must be present;
+  values and the composed header are redacted. The spec stores field names,
+  never the credential values.
+- `hmac {credential, header, message, algorithm?, encoding?, prefix?, timestamp_header?, timestamp_format?, key_id_header?, key_id_credential?}`:
+  signs the canonical `message` with HMAC-SHA256 (default), SHA384, SHA512 or
+  explicitly selected legacy SHA1. Signature encoding is hex (default) or
+  base64. The message accepts `{method}`, `{path}` (path plus query),
+  `{uri_path}`, `{query}`, `{host}`, `{timestamp}`, `{body}`, `{body_sha256}`
+  and `{body_sha512}`. Substitutions happen once; request bytes are literal,
+  including placeholder-looking text, and binary bodies are signed exactly.
+  `timestamp_format` is `unix_seconds` (default), `rfc3339` or `rfc2822`.
+  Optional timestamp and key-ID headers must be valid, distinct auth headers;
+  key-ID header/credential must be supplied together. Header names that affect
+  routing/framing and unknown canonical placeholders are refused. The expanded
+  canonical message is bounded at 8 MiB. Reflected signatures are redacted;
+  retention is bounded by the compiled request cap and covers the entire run.
+  Signing beyond that cap fails closed instead of forgetting early signatures.
 - `aws_sigv4 {...}`
 - `mtls {...}`
 
@@ -427,3 +463,66 @@ risk_score?, tags?, data}`. `data_enrichment` returns records the same way.
   checkpoints that ships nothing.
 - Respect the vendor's documented page size, rate tier and error shapes. Put
   the vendor's error text in `error`.
+
+## Native request sequences and value helpers
+
+Hosts can use `sequence::compile` / `sequence::run` for bounded chained HTTP
+requests without a script or VRL program. Requests use the existing auth
+registry, broker, HTTPS host/path policy, public-address guards and platform
+deny rules. The caller supplies request usage accounting. Sequences do not retry transport errors or follow redirects. Session login
+may refresh once and resend after an explicit 401 refusal; other statuses
+and ambiguous writes do not enable this exception. Polling is read-only and
+bounded by time, request count and aggregate bytes. Once a write is accepted,
+an unverified completion returns an ambiguous outcome.
+
+Sequence scope adds `steps.<id>`, `poll`, `run`, `alert` and `case` to the existing
+template namespaces. A host controls which namespaces its format admits.
+Credentials, auth, secret and environment namespaces remain forbidden.
+
+The closed helpers are `coalesce a b`, `first array`, `join array delimiter`,
+`lower string` and `json_quote value`. JSON double-quoted literals and parenthesized
+nested calls are supported. Examples: `{{coalesce input.id steps.resolve.ids.0}}`
+and `{{join input.ids ","}}`. `coalesce` evaluates lazily. There is no general
+expression evaluation, scripting, filtering or access to host functions.
+Evaluation and aggregate rendering have byte budgets.
+
+Sequence response expectations can require multiple exact JSON values with
+`expect.fields`, a map of at most 16 dotted paths (256 bytes each) to literal
+values. Every field must exist and match its value and type. For example,
+`fields: {attempted: 1, succeeded: 1, "results.0.error": null}` combined with
+`path: results, items: 1` rejects zero, partial and multi-result receipts.
+An explicit null requires a present JSON null; missing fields fail. Paths use
+alphanumeric/underscore segments and array indexes. Values are not templates.
+Empty `fields` is omitted from serialization, preserving existing sequence bytes.
+
+A URL may start with a single `{{config.base_url}}` containing an HTTPS origin,
+or retain the existing `https://{{config.host}}/path` form with a bare host.
+Origins cannot contain userinfo, query, fragment, a path prefix or a non-443
+port. Dynamic origins still need constrained allow rules. Path substitutions
+are encoded as single segments, and dot-segment substitutions are refused.
+
+`preview::ReplayTransport::strict` consumes expected exchanges in order and
+checks the exact method, URL, query and JSON/form body. Unexpected duplicate
+query parameters, incorrect bodies and extra/missing exchanges are refused.
+Use `assert_complete()` after execution. Independent recordings have distinct
+identities so a host can isolate authentication caches from live execution.
+
+
+## Session auth example (synthetic protocol only)
+
+```yaml
+auth:
+  type: session_login
+  login_url: "https://{{config.HOST}}/login"
+  credential_fields: { username: USER, password: PASSWORD }
+  encoding: json
+  response: { type: json_token, pointer: /session/token, header: X-Session }
+```
+
+Allow the login route and the API routes explicitly. Construct a new auth
+plugin/plan for each connection or collector run; never share a cached plugin
+between tenants or credential sets. The native action host does this through
+its connection context. A context retains at most 1,024 session tokens for
+redaction; after that, re-create the context. Dry runs show authentication
+placeholders and make no login request or usage charge. This example is not a
+vendor action pack and contains no credential values.

@@ -131,6 +131,15 @@ pub struct ExchangeResponse {
     /// the executor idle, never fails the exchange.
     #[serde(default)]
     pub erasure_ledger: Option<serde_json::Value>,
+    /// NAN-4137, role=landing only: the tenant Worker's landing credential
+    /// (`NANO_LANDING_AUTH_TOKEN`; TZ-FRONT CONTRACT.md B): the ledger
+    /// routes `/landing-ledger/v1/*` and the producer route
+    /// `/edge-log/v1/produce`, never pull/commit. Held in memory only.
+    #[serde(default)]
+    pub landing_token: Option<String>,
+    /// The tenant Worker origin serving those routes (`https://<slug>.ingest.nano.rs`).
+    #[serde(default)]
+    pub landing_endpoint: Option<String>,
 }
 
 /// Credential class that reads the tenant's Vector bronze objects.
@@ -642,7 +651,8 @@ pub async fn credentials_from_secret(secret: &[u8], assignment: &Assignment) -> 
     let native_writer = Arc::new(super::native_writer::NativePartWriter::new(
         &super::native_writer::owner_origin(&signing.url)?, signing.ca_file.as_deref(), tenant,
         &assignment.cell_id, &fresh.parts.as_ref().context("parts")?.part.bucket,
-        fresh.write_permission.clone().context("signed ingest exchange omitted owner_write")?, &assignment.state_dir)?);
+        fresh.write_permission.clone().context("signed ingest exchange omitted owner_write")?, &assignment.state_dir)?
+        .with_ingest_eps(assignment.eps)?);
     // PartLog may discover the already uploaded LOG without beginning it again.
     // Recover completion evidence using the freshly exchanged owner permission.
     native_writer.replay_pending().await?;
@@ -978,6 +988,8 @@ pub struct IngestService {
     active_appends: AtomicUsize,
     wake: Arc<tokio::sync::Notify>,
     heartbeat: std::sync::Mutex<Heartbeat>,
+    pipeline_diagnostics: super::ingest::PipelineDiagnostics,
+    native_writer_diagnostics: Option<Arc<super::native_writer::NativePartWriter>>,
     assignment: Assignment,
     /// Exit after IDLE_EXIT with nothing to do (see `Assignment::ingest_idle_exit`).
     idle_exit: bool,
@@ -1009,6 +1021,56 @@ pub struct IngestService {
     part_gc_route: Option<Arc<CellSanctionedPartGc>>,
     /// NAN-3867: the erasure ledger login, re-fed on every credential refresh.
     erasure_ledger: super::lean_erasure::ErasureLedgerSlot,
+    /// NAN-4052: the cell writer lease every part-log append checks.
+    writer_lease: Option<Arc<super::writer_lease::WriterLease>>,
+    /// NAN-4129: its renewer, running since the lease was acquired (setup
+    /// included); `run` stops it on teardown, and dropping it stops it too.
+    lease_renewer: Option<super::writer_lease::LeaseRenewer>,
+}
+
+/// NAN-4052: take the cell writer lease when the supervisor asks for one
+/// (cells with the writer handover) and the exchange delivered the tenant's
+/// `publish` login. Held by another pod generation, or Postgres unreachable:
+/// a standby error (the supervisor retries without counting a crash).
+/// Without the login, or before the lease functions exist on the database
+/// (migration 9013980 not applied yet), ingest runs on the peer lease alone,
+/// as before.
+async fn acquire_writer_lease(
+    assignment: &Assignment,
+    ledger: &super::lean_erasure::ErasureLedgerSlot,
+) -> Result<Option<Arc<super::writer_lease::WriterLease>>> {
+    use super::writer_lease::{LeaseKey, LeaseLost, PgLeaseStore, WriterLease};
+    let Some(lease) = &assignment.writer_lease else { return Ok(None) };
+    let key = LeaseKey { cell_id: assignment.cell_id.clone(), holder: lease.holder.clone() };
+    let ttl = Duration::from_millis(lease.ttl_ms);
+    if !key.valid() || !(super::writer_lease::MIN_TTL..=super::writer_lease::MAX_TTL).contains(&ttl) {
+        tracing::warn!(cell = %key.cell_id, ttl_ms = lease.ttl_ms, "cell writer lease key or TTL unusable; writing on the peer lease alone");
+        return Ok(None);
+    }
+    if ledger.get().is_none() {
+        tracing::warn!("no lake publish login delivered; writing on the peer lease alone (no cell writer lease)");
+        return Ok(None);
+    }
+    let store: Arc<dyn super::writer_lease::LeaseStore> = Arc::new(PgLeaseStore::new(assignment.tenant.as_str(), ledger.clone()));
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match WriterLease::acquire(store.clone(), key.clone(), ttl).await {
+            Ok(lease) => return Ok(Some(lease)),
+            Err(error) if super::writer_lease::is_standby(&error) => return Err(error),
+            Err(error) if super::writer_lease::lease_functions_missing(&error) => {
+                tracing::warn!(error = %format!("{error:#}"), "cell writer lease functions unavailable on the database; writing on the peer lease alone");
+                return Ok(None);
+            }
+            Err(error) if attempt < 3 => {
+                tracing::warn!(error = %format!("{error:#}"), attempt, "cell writer lease acquire failed; retrying");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(LeaseLost { epoch: 0, reason: format!("lease store unreachable: {error:#}") }));
+            }
+        }
+    }
 }
 
 fn custom_context_assignment(root: &std::path::Path, tenant: &str) -> Result<(std::path::PathBuf, String)> {
@@ -1134,6 +1196,25 @@ async fn plan_enrichment_refresh(
     ))
 }
 
+/// The ingest role's sanctioned part GC, wired from its assignment exactly as
+/// [`IngestService::start`] does: only beside the R2 part store with pinned
+/// part signing, with the view on the hot volume (`part_gc_state_dir`) when
+/// the cell mounts one. NAN-4195: the boot-path test drives this, so a
+/// constructor change that panics every ingest role (NAN-4194) fails CI.
+fn assignment_part_gc(
+    assignment: &Assignment,
+    gc_store: Option<&Arc<super::r2_put::R2PartStore>>,
+    trusted: TenantKeySet,
+) -> Option<Arc<CellSanctionedPartGc>> {
+    match (gc_store, &assignment.part_signing) {
+        (Some(store), Some(signing)) => sanctioned_part_gc(
+            assignment.tenant.as_str(), store.clone(), signing, trusted, &assignment.state_dir,
+            assignment.part_gc_state_dir.as_deref(),
+        ),
+        _ => None,
+    }
+}
+
 /// The sanctioned lake-part GC pass over the cell's R2 part store and the
 /// release-pinned owner (`lean_part_gc_sanctioned_v1`). A wiring failure is
 /// logged and leaves the gate at `sanctioned_path_unavailable`; it never
@@ -1142,17 +1223,23 @@ async fn plan_enrichment_refresh(
 /// `store` is the pass's OWN part store (same credentials as ingest's,
 /// refreshed with it, but its own HTTP client), so none of its connections
 /// live on the ingest runtime; the pass runs on its own thread and persists
-/// its folded view under `state_dir`.
+/// its folded view under `view_dir` when the supervisor grants one (NAN-4183:
+/// the persistent A/B hot volume, so a roll resumes the view instead of
+/// refolding the log from seq 0), else under the per-pod `state_dir`.
 fn sanctioned_part_gc(
     tenant: &str,
     store: Arc<super::r2_put::R2PartStore>,
     signing: &PartSigning,
     trusted: TenantKeySet,
     state_dir: &std::path::Path,
+    view_dir: Option<&std::path::Path>,
 ) -> Option<Arc<CellSanctionedPartGc>> {
     let wired = (|| -> Result<CellSanctionedPartGc> {
+        if let Some(dir) = view_dir {
+            tracing::info!(dir = %dir.display(), "lake-part GC keeps its folded view on the persistent hot volume");
+        }
         CellSanctionedPartGc::new_guarded(
-            tenant, &signing.url, signing.ca_file.clone(), store, trusted, state_dir,
+            tenant, &signing.url, signing.ca_file.clone(), store, trusted, state_dir, view_dir,
         )
     })();
     match wired {
@@ -1202,10 +1289,59 @@ impl IngestService {
         // SAFETY: flock only changes the advisory lock on our owned fd.
         ensure!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
             "another tenant ingest process owns the part-log appender");
-        let tenant = assignment.tenant.as_str();
         let credentials = credentials_from_secret(&secret, assignment).await?;
         super::startup::advance("credentials ready");
         drop(secret);
+        // NAN-3867: the tenant's `publish` login (erasure orders, credential
+        // activity and, NAN-4052, the cell writer lease), re-fed on refresh.
+        let erasure_ledger = super::lean_erasure::ErasureLedgerSlot::default();
+        erasure_ledger.set(credentials.erasure_ledger.clone());
+        // NAN-4052: the cell writer lease, before anything that could fence
+        // a live writer on the peer pod (the edge-log DO lease, the part log).
+        let writer_lease = acquire_writer_lease(assignment, &erasure_ledger).await?;
+        super::startup::advance("writer lease");
+        // NAN-4129: renew from now on, not from the run loop. Setup can
+        // outlast the TTL on a slow node (TX: ~9.2 s against 8 s), and a lease
+        // that lapses during setup stops ingest in a loop. A loss during setup
+        // drops the setup at once (standby): nothing runs past it without the
+        // lease. A failed or dropped setup drops the renewer, which stops it.
+        let lease_renewer = writer_lease.clone().map(super::writer_lease::LeaseRenewer::start);
+        let lost = lease_renewer.as_ref().map(|renewer| renewer.lost_signal());
+        let service = super::writer_lease::abort_setup_on_loss(
+            lost,
+            Self::open_with_lease(assignment, credentials, lock, erasure_ledger, writer_lease, lease_renewer),
+        )
+        .await?;
+        if let Some(renewer) = &service.lease_renewer {
+            let held_for = renewer.held_for();
+            let ttl = renewer.lease().ttl();
+            let deadline = ttl.saturating_sub(super::writer_lease::margin(ttl));
+            if held_for >= deadline {
+                tracing::warn!(setup_ms = held_for.as_millis() as u64, ttl_ms = ttl.as_millis() as u64, epoch = renewer.lease().epoch(),
+                    "ingest setup outlasted the cell writer lease TTL; the lease was renewed in the background during setup");
+            } else {
+                tracing::info!(setup_ms = held_for.as_millis() as u64, ttl_ms = ttl.as_millis() as u64, epoch = renewer.lease().epoch(),
+                    "ingest setup finished under the cell writer lease");
+            }
+        }
+        Ok(service)
+    }
+
+    /// Everything [`Self::start`] does once the writer lease is held (or the
+    /// cell runs without one). Runs while the lease renews in the
+    /// background; [`Self::start`] drops it the moment the lease is lost.
+    async fn open_with_lease(
+        assignment: &Assignment,
+        credentials: IngestCredentials,
+        lock: std::fs::File,
+        erasure_ledger: super::lean_erasure::ErasureLedgerSlot,
+        writer_lease: Option<Arc<super::writer_lease::WriterLease>>,
+        lease_renewer: Option<super::writer_lease::LeaseRenewer>,
+    ) -> Result<Arc<Self>> {
+        let tenant = assignment.tenant.as_str();
+        // Setup checkpoints: never open anything that could fence the peer
+        // (the edge-log DO lease, the part log) without a live lease.
+        let ensure_lease = |phase: &str| lease_renewer.as_ref().map_or(Ok(()), |renewer| renewer.ensure_held(phase));
         // Enrichment is additive: a cell whose control plane does not yet mint
         // `enrichment_reader` (or render the platform mounts) keeps ingesting
         // unenriched, exactly as before enrichment shipped, instead of
@@ -1256,6 +1392,7 @@ impl IngestService {
                 (s3, queue, None, None, None)
             }
             InputCreds::Edge { endpoint, token } => {
+                ensure_lease("edge source open")?;
                 // Resume from the part log's edge point (or where edge mode
                 // last ended); genesis on a fresh tenant.
                 let live = crate::parts::part_log::load_log(parts, tenant).await?;
@@ -1451,13 +1588,9 @@ impl IngestService {
             }
             Some(authority)
         } else { None };
-        let part_gc_route = match (&r2_handle, &assignment.part_signing) {
-            (Some((_, gc)), Some(signing)) => {
-                sanctioned_part_gc(tenant, gc.clone(), signing, credentials.trusted.clone(), &assignment.state_dir)
-            }
-            _ => None,
-        };
+        let part_gc_route = assignment_part_gc(assignment, r2_handle.as_ref().map(|(_, gc)| gc), credentials.trusted.clone());
         super::startup::advance("ingestor open");
+        ensure_lease("ingestor open")?;
         let mut ingestor = Ingestor::open(
             cfg,
             parts,
@@ -1473,6 +1606,7 @@ impl IngestService {
             now_ms(),
         )
         .await?;
+        let pipeline_diagnostics = ingestor.diagnostics();
         ingestor.set_initial_enrichment_revision(initial_enrichment_pointer.as_ref().map(|pointer| pointer.revision.to_string()))?;
         // NAN-3077: the old-hour reindex fetches in the background with the
         // cell's 'static part store (it stays off unless enabled).
@@ -1508,9 +1642,23 @@ impl IngestService {
         // NAN-3867: ingest[T] executes the tenant's erasure orders when the
         // platform delivers the ledger login (it declares this cell the
         // executor only for `lean_erasure_v1` images).
-        let erasure_ledger = super::lean_erasure::ErasureLedgerSlot::default();
-        erasure_ledger.set(credentials.erasure_ledger.clone());
         ingestor.set_erasure_ledger(erasure_ledger.clone(), format!("lean-cell:{}", assignment.cell_id));
+        // NAN-3899: hosted lean ingest records per-credential activity (the
+        // Credentials table's last seen / 24 h events) through the same
+        // tenant-bound `publish` login; nothing is written without it.
+        if assignment.control_url.is_some() {
+            ingestor.set_credential_activity(super::credential_activity::ActivityExec::from_ledger(
+                tenant, Some(&assignment.state_dir), erasure_ledger.clone()));
+        }
+        if let Some(lease) = &writer_lease {
+            ingestor.set_append_gate(lease.clone());
+        }
+        // NAN-4338: quarantined edge segments are reported to the tenant's
+        // landing ledger over the edge-log consumer credential.
+        if let Some(source) = &edge_source {
+            ingestor.set_quarantine_ledger(source.clone());
+        }
+        ensure_lease("setup done")?;
         let finding_context = ingestor.finding_context();
         Ok(Arc::new(Self {
             ingestor: tokio::sync::Mutex::new(ingestor),
@@ -1525,6 +1673,8 @@ impl IngestService {
             active_appends: AtomicUsize::new(0),
             wake,
             heartbeat: std::sync::Mutex::new(Heartbeat::default()),
+            pipeline_diagnostics,
+            native_writer_diagnostics: credentials.native_writer.clone(),
             assignment: assignment.clone(),
             idle_exit,
             refresh,
@@ -1541,6 +1691,8 @@ impl IngestService {
             part_gc,
             part_gc_route,
             erasure_ledger,
+            writer_lease,
+            lease_renewer,
         }))
     }
 
@@ -1628,6 +1780,18 @@ impl IngestService {
                 crate::identity_enrichment::IDENTITY_REFRESH_EVERY,
             ))
         });
+        // NAN-4052: losing the cell writer lease stops this writer. NAN-4129:
+        // the renewer has run since the lease was acquired (`start`); this
+        // only watches it.
+        let lease_renewer = self.lease_renewer.as_ref().map(|renewer| {
+            let lost = renewer.lost_signal();
+            let this = self.clone();
+            tokio::spawn(async move {
+                let lost = lost.await;
+                this.wake.notify_one();
+                this.terminate(lost.to_string());
+            })
+        });
         let mut work = tokio::spawn({
             let this = self.clone();
             let control = control.clone();
@@ -1636,6 +1800,25 @@ impl IngestService {
         let result = tokio::select! {
             joined = &mut work => joined.unwrap_or_else(|error| Err(anyhow::anyhow!("ingest loop task: {error}"))),
             reason = terminal.wait_for(Option::is_some) => {
+                if let Some(lost) = self.writer_lease.as_ref().and_then(|lease| lease.lost()) {
+                    // Standby, not a failure: no fatal report; the binary exits
+                    // with the standby code and the supervisor retries later.
+                    std::thread::spawn(|| {
+                        std::thread::sleep(Duration::from_secs(30));
+                        std::process::exit(nanosiem_lake_cell::contract::WRITER_STANDBY_EXIT_CODE);
+                    });
+                    work.abort();
+                    refresher.abort();
+                    watchdog.abort();
+                    if let Some(task) = &lease_renewer {
+                        task.abort();
+                    }
+                    self.stop_lease_renewer();
+                    if let Some(task) = &identity_refresh {
+                        task.abort();
+                    }
+                    return Err(lost.into());
+                }
                 let reason = reason.map(|reason| reason.clone().unwrap_or_default())
                     .unwrap_or_else(|_| "terminal channel closed".into());
                 tracing::error!(reason = %reason, "ingest exiting for a respawn");
@@ -1652,10 +1835,21 @@ impl IngestService {
         };
         refresher.abort();
         watchdog.abort();
+        if let Some(task) = lease_renewer {
+            task.abort();
+        }
+        self.stop_lease_renewer();
         if let Some(task) = identity_refresh {
             task.abort();
         }
         result
+    }
+
+    /// NAN-4129: teardown stops renewing the cell writer lease.
+    fn stop_lease_renewer(&self) {
+        if let Some(renewer) = &self.lease_renewer {
+            renewer.stop();
+        }
     }
 
     async fn handle_finding_rpc(&self, mut stream: tokio::net::UnixStream) -> Result<()> {
@@ -1738,6 +1932,8 @@ impl IngestService {
         Ok(())
     }
 
+    // Close one static INFO span per tick so jailed children feed stdout tracing.
+    #[tracing::instrument(name = "cell.ingest.tick", skip_all)]
     async fn phased_tick(&self) -> Result<super::ingest::TickReport> {
         self.ingestor.lock().await.tick_prevalence(now_ms()).await;
         let (mut report, pending) = self.ingestor.lock().await.tick_ingest(now_ms()).await?;
@@ -1765,6 +1961,10 @@ impl IngestService {
             tracing::warn!(hold_eps = h.eps(), "over-commit hold: admitting at most hold_eps rows/s; the rest waits in the source");
         }
         loop {
+            if let Some(lost) = self.writer_lease.as_ref().and_then(|lease| lease.lost()) {
+                tracing::warn!(epoch = lost.epoch, reason = %lost.reason, "ingest stops: the cell writer lease is gone (standby)");
+                return Err(lost.into());
+            }
             if self.epoch_changed.load(Ordering::Relaxed) {
                 let error = anyhow::anyhow!("ingest writer epoch changed; restart required");
                 let _ = control.fatal(&format!("{error:#}")).await;
@@ -1878,6 +2078,10 @@ impl IngestService {
                     let fenced = super::ingest::fatal_ingest_error(&error);
                     let since = *failing_since.get_or_insert_with(Instant::now);
                     if fenced || since.elapsed() >= MAX_RETRY_WINDOW || self.epoch_changed.load(Ordering::Relaxed) {
+                        if super::writer_lease::is_standby(&error) {
+                            tracing::warn!(error = %format!("{error:#}"), "ingest stops: the cell writer lease is gone (standby)");
+                            return Err(error);
+                        }
                         tracing::error!(error = %format!("{error:#}"), fenced, failing_for_s = since.elapsed().as_secs(), "ingest exiting: tick failure is fatal (fenced, or failing longer than MAX_RETRY_WINDOW)");
                         let _ = control.fatal(&format!("{error:#}")).await;
                         return Err(error);
@@ -1923,6 +2127,7 @@ impl IngestService {
                 last_work = Instant::now();
             }
             *self.heartbeat.lock().expect("heartbeat lock") = Heartbeat {
+                ingest_diagnostics: None,
                 startup_progress: None,
                 busy,
                 lag_seconds: health.lag_ms as f64 / 1_000.0,
@@ -1956,6 +2161,10 @@ impl IngestService {
                 credential_refresh_at_risk: false,
                 identity_directory: None,
                 selection_evidence_cache: None,
+                // Filled in by `heartbeat()`.
+                writer_lease_epoch: None,
+                writer_ready: false,
+                landing: None,
             };
             if self.idle_exit && !busy && last_work.elapsed() >= IDLE_EXIT {
                 ingestor.flush_now(now_ms()).await?;
@@ -2144,9 +2353,76 @@ async fn prevalence_restamp_status(axum::extract::State(service): axum::extract:
     axum::Json(serde_json::json!({ "owed_hours": ingestor.prevalence_owed_hours(), "health": ingestor.health() }))
 }
 
+/// NAN-3643: an operator replay of one quarantined bronze object. The
+/// tenant must be this ingest's own (the router already bound the path).
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BronzeQuarantineReplay {
+    pub tenant_id: String,
+    /// The quarantined object's SHA-256 (its `id` in the listing).
+    pub id: String,
+}
+
+/// NAN-3643: bronze objects admission refused whole, kept for 7 days.
+#[utoipa::path(get, path = "/v1/tenants/{tenant}/admin/bronze-quarantine", tag = "lake-admin",
+    params(("tenant" = String, Path)),
+    responses((status = 200, body = serde_json::Value), (status = 403, description = "Full operator token required"),
+        (status = 503, description = "Quarantine unavailable")), security(("operator_bearer" = [])))]
+async fn bronze_quarantine_list(axum::extract::State(service): axum::extract::State<Arc<IngestService>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let ingestor = service.ingestor.lock().await;
+    match ingestor.quarantine_entries() {
+        Ok(entries) => axum::Json(serde_json::json!({
+            "entries": entries,
+            "objects_quarantined_total": ingestor.health().objects_quarantined_total,
+            "quarantine_replays_total": ingestor.health().quarantine_replays_total,
+        })).into_response(),
+        Err(error) => (axum::http::StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+/// NAN-3643: replay a quarantined object through normal admission once its
+/// cause is fixed. It is admitted alone, deduped like any object, and
+/// dropped from the quarantine when its flush commits.
+#[utoipa::path(post, path = "/v1/tenants/{tenant}/admin/bronze-quarantine/replay", tag = "lake-admin",
+    params(("tenant" = String, Path)), request_body = BronzeQuarantineReplay,
+    responses((status = 202, body = serde_json::Value), (status = 400, description = "Malformed request or id"),
+        (status = 403, description = "Full operator token required, or another tenant's quarantine"),
+        (status = 404, description = "No quarantined object with that id"),
+        (status = 503, description = "Quarantine unavailable")), security(("operator_bearer" = [])))]
+async fn bronze_quarantine_replay(axum::extract::State(service): axum::extract::State<Arc<IngestService>>, request: axum::extract::Request) -> axum::response::Response {
+    use super::quarantine::ReplayRefused;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Ok(bytes) = axum::body::to_bytes(request.into_body(), 1024).await else {
+        return (StatusCode::BAD_REQUEST, "invalid replay request").into_response();
+    };
+    let Ok(replay) = serde_json::from_slice::<BronzeQuarantineReplay>(&bytes) else {
+        return (StatusCode::BAD_REQUEST, "invalid replay request").into_response();
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let result = service.ingestor.lock().await.request_quarantine_replay(&replay.tenant_id, &replay.id, now);
+    match result {
+        Ok(entry) => {
+            service.wake.notify_one();
+            (StatusCode::ACCEPTED, axum::Json(serde_json::json!({ "queued": entry }))).into_response()
+        }
+        Err(error) => {
+            let status = match error.downcast_ref::<ReplayRefused>() {
+                Some(ReplayRefused::CrossTenant) => StatusCode::FORBIDDEN,
+                Some(ReplayRefused::InvalidId) => StatusCode::BAD_REQUEST,
+                Some(ReplayRefused::NotFound) => StatusCode::NOT_FOUND,
+                None => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, error.to_string()).into_response()
+        }
+    }
+}
+
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(count_backfill_status, start_count_backfill, prevalence_restamp_status, start_prevalence_restamp),
-    components(schemas(super::reindex::CountBackfill)))]
+#[openapi(paths(count_backfill_status, start_count_backfill, prevalence_restamp_status, start_prevalence_restamp,
+    bronze_quarantine_list, bronze_quarantine_replay),
+    components(schemas(super::reindex::CountBackfill, BronzeQuarantineReplay, super::quarantine::QuarantineEntry)))]
 pub struct CountBackfillApiDoc;
 
 #[async_trait]
@@ -2155,6 +2431,8 @@ impl TenantService for IngestService {
         let app = axum::Router::new()
             .route("/v1/admin/count-backfill", axum::routing::get(count_backfill_status).post(start_count_backfill))
             .route("/v1/admin/prevalence-restamp", axum::routing::get(prevalence_restamp_status).post(start_prevalence_restamp))
+            .route("/v1/admin/bronze-quarantine", axum::routing::get(bronze_quarantine_list))
+            .route("/v1/admin/bronze-quarantine/replay", axum::routing::post(bronze_quarantine_replay))
             .with_state(self);
         let _ = hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(app)).await;
@@ -2185,9 +2463,17 @@ impl TenantService for IngestService {
 
     fn heartbeat(&self) -> Heartbeat {
         let mut heartbeat = self.heartbeat.lock().expect("heartbeat lock").clone();
+        let mut diagnostics = self.pipeline_diagnostics.snapshot();
+        if let Some(writer) = &self.native_writer_diagnostics {
+            diagnostics["native_writer"] = writer.diagnostics();
+        }
+        heartbeat.ingest_diagnostics = Some(diagnostics);
         heartbeat.busy |= self.active_appends.load(Ordering::SeqCst) > 0;
         heartbeat.credential_refresh_at_risk = self.refresh.as_ref().is_some_and(|refresh| refresh.refresher.at_risk());
         heartbeat.identity_directory = self.identity.as_ref().map(|(_, handle)| handle.status());
+        // NAN-4052: start-up is over, so this process is the tenant's writer here.
+        heartbeat.writer_ready = self.writer_lease.as_ref().is_none_or(|lease| lease.lost().is_none());
+        heartbeat.writer_lease_epoch = self.writer_lease.as_ref().map(|lease| lease.epoch());
         heartbeat
     }
 
@@ -2315,6 +2601,10 @@ impl TenantService for IngestService {
         let mut ingestor = self.ingestor.lock().await;
         if let Err(error) = ingestor.flush_now(now_ms()).await {
             tracing::error!(error = %error, "flush on shutdown failed; unacked notices will replay");
+        }
+        // NAN-4052: no commit after this; the peer takes the lease at once.
+        if let Some(lease) = &self.writer_lease {
+            lease.release().await;
         }
     }
 }
@@ -2771,6 +3061,49 @@ mod tests {
             product_state_role: false,
             product_dir: None,
             trusted_local: false,
+            writer_lease: None,
+            part_gc_state_dir: None,
+        }
+    }
+
+    /// NAN-4195 (NAN-4194 regression guard): boot the ingest role's
+    /// sanctioned part GC through the production wiring (`assignment_part_gc`
+    /// -> `new_guarded`, R2 store guard installed), with and without the
+    /// persistent hot-volume `part_gc_state_dir`, then run one pass. T57
+    /// panicked every ingest role here (`Arc::get_mut` after the R2 guard took
+    /// its weak reference) while the unit test on the unguarded constructor
+    /// passed.
+    #[tokio::test]
+    async fn ingest_role_boots_the_sanctioned_part_gc_through_the_production_wiring() {
+        use super::super::part_gc_cell::transport_tests as gc;
+        for hot_volume in [false, true] {
+            let f = gc::fixture(64, Duration::ZERO, 200).await;
+            let pod = tempfile::tempdir().unwrap();
+            let hot = tempfile::tempdir().unwrap();
+            let mut assignment = assignment(gc::TENANT_UUID, Some("https://control.invalid"));
+            assignment.state_dir = pod.path().to_path_buf();
+            assignment.part_gc_state_dir = hot_volume.then(|| hot.path().to_path_buf());
+            assignment.part_signing = Some(PartSigning {
+                // Nothing listens: the pass folds the log, then pauses.
+                url: "http://127.0.0.1:1/".into(),
+                signer_key_id: "fixture".into(),
+                trusted_keys: vec![],
+                ca_file: None,
+            });
+            assert!(assignment_part_gc(&assignment, None, gc::fixture_keys()).is_none(), "no R2 part store, no route");
+            let route = assignment_part_gc(&assignment, Some(&f.store), gc::fixture_keys())
+                .expect("the ingest role wires its sanctioned part GC");
+            gc::permission(&route, 200, chrono::Duration::minutes(10));
+            let report = route.run_pass_now(chrono::Utc::now().timestamp_millis()).await
+                .unwrap_or_else(|error| panic!("hot_volume={hot_volume}: one GC pass: {error:#}"));
+            assert_eq!(report.deleted, 0, "hot_volume={hot_volume}");
+            assert!(route.reads() > 0, "hot_volume={hot_volume}: the pass read the part log");
+            let (view_on, not_on) = if hot_volume { (hot.path(), pod.path()) } else { (pod.path(), hot.path()) };
+            assert!(view_on.join("lake-part-gc").exists(), "hot_volume={hot_volume}: view under {}", view_on.display());
+            assert!(!not_on.join("lake-part-gc").exists(), "hot_volume={hot_volume}: no view under {}", not_on.display());
+            // NAN-4188: the same production-wired GC follows its writer's
+            // receipted appends into control's index.
+            gc::assert_follower_publishes_per_receipted_append(&route, 63).await;
         }
     }
 

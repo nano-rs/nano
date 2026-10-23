@@ -114,6 +114,10 @@ impl DetectionService {
         // with a timestamp but no value (impossible via this engine, but cheap to
         // guard) restarts from the beginning rather than skipping the tie group.
         let watermark_before = state.as_ref().and_then(|s| s.watermark);
+        let platform_known = state
+            .as_ref()
+            .map(|s| s.platform_revision_map())
+            .unwrap_or_default();
         let cursor_before: Option<(i64, String)> =
             state
                 .as_ref()
@@ -130,7 +134,7 @@ impl DetectionService {
         // Everything after the run row is opened runs through this inner result so
         // a failure still closes the run history row with status='error'.
         match self
-            .run_retro_hunt(rule, &config, &repo, cursor_before)
+            .run_retro_hunt(rule, &config, &repo, cursor_before, &platform_known)
             .await
         {
             Ok(outcome) => {
@@ -144,7 +148,7 @@ impl DetectionService {
                         outcome.truncated,
                         outcome.overflow_remaining as i32,
                         outcome.watermark_after,
-                        None,
+                        outcome.note.as_deref(),
                     )
                     .await
                 {
@@ -182,7 +186,9 @@ impl DetectionService {
         config: &RetroHuntConfig,
         repo: &RetroHuntRepository,
         cursor_before: Option<(i64, String)>,
+        platform_known: &std::collections::BTreeMap<String, i64>,
     ) -> Result<RetroHuntOutcome, DetectionError> {
+        let started = std::time::Instant::now();
         let cap = config.max_indicators_per_run.max(1) as usize;
 
         // Fetch the cap+1 candidates strictly after the cursor, ordered by
@@ -220,11 +226,58 @@ impl DetectionService {
             .already_hunted(rule.id, &covered_values)
             .await
             .map_err(|e| DetectionError::RepositoryError(e.to_string()))?;
-        let to_hunt: Vec<&RetroFeedCandidate> = covered
+        let mut to_hunt: Vec<&RetroFeedCandidate> = covered
             .iter()
             .copied()
             .filter(|c| !already.contains(&c.value))
             .collect();
+
+        // NAN-4169: the platform half of the delta (ThreatFox incl. ip:port,
+        // Tor exit nodes...), for a rule watching ALL feeds. Only feeds whose
+        // revision moved are enumerated; first sight baselines. A platform read
+        // failure never blocks the tenant-list half: it is noted on the run and
+        // no platform revision advances, so the next run retries it.
+        let mut platform_plan = PlatformDeltaPlan::default();
+        let mut note: Option<String> = None;
+        if config.feeds.is_empty() {
+            match self
+                .search_service
+                .retro_hunt_platform_delta(platform_known, &config.artifact_types)
+                .await
+            {
+                Ok(feeds) => {
+                    let values = platform_delta_values(&feeds);
+                    let seen = repo
+                        .already_hunted(rule.id, &values)
+                        .await
+                        .map_err(|e| DetectionError::RepositoryError(e.to_string()))?;
+                    let budget = cap.saturating_sub(to_hunt.len());
+                    platform_plan = plan_platform_delta(
+                        &feeds,
+                        platform_known,
+                        &seen,
+                        budget,
+                        Utc::now().timestamp_millis(),
+                    );
+                    if !platform_plan.baseline.is_empty() {
+                        repo.record_hunted(rule.id, &platform_plan.baseline)
+                            .await
+                            .map_err(|e| DetectionError::RepositoryError(e.to_string()))?;
+                        info!(
+                            rule_id = %rule.id,
+                            baselined = platform_plan.baseline.len(),
+                            "Retro-hunt baselined newly watched platform feeds"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(rule_id = %rule.id, %error, "Retro-hunt platform feed delta unavailable; tenant feeds only this run");
+                    note = Some(format!("platform feeds skipped: {error}"));
+                }
+            }
+        }
+        let platform_candidates = platform_plan.to_hunt.clone();
+        to_hunt.extend(platform_candidates.iter());
         // The batched retro hunt. Batched PER ARTIFACT TYPE (at most 4 queries —
         // ip/domain/hash/url — not one per indicator): the retro engine's
         // `scope_observables` narrows the scanned columns to those an indicator
@@ -267,6 +320,7 @@ impl DetectionService {
         // Record the hunted values AFTER emission (a crash before here re-hunts
         // rather than silently skipping). Record ALL to_hunt — including
         // no-hit indicators — so a value with no logs isn't re-scanned every run.
+        // Platform revisions advance only after their values are recorded.
         if !to_hunt.is_empty() {
             let pairs: Vec<(String, String)> = to_hunt
                 .iter()
@@ -274,6 +328,14 @@ impl DetectionService {
                 .collect();
             if let Err(e) = repo.record_hunted(rule.id, &pairs).await {
                 warn!(rule_id = %rule.id, "Failed to record hunted indicators: {}", e);
+            }
+        }
+        if note.is_none() && config.feeds.is_empty() && platform_plan.revisions_after != *platform_known {
+            if let Err(e) = repo
+                .set_platform_revisions(rule.id, &platform_plan.revisions_after)
+                .await
+            {
+                warn!(rule_id = %rule.id, "Failed to persist retro-hunt platform revisions: {}", e);
             }
         }
 
@@ -317,14 +379,27 @@ impl DetectionService {
             );
         }
 
+        // NAN-4169: the run's measured cost, for the bounded-cost budget.
+        info!(
+            rule_id = %rule.id,
+            wall_ms = started.elapsed().as_millis() as u64,
+            list_candidates = covered.len(),
+            platform_new = platform_plan.considered,
+            platform_baselined = platform_plan.baseline.len(),
+            hunted = to_hunt.len(),
+            hits = hits.len(),
+            "Retro-hunt run cost"
+        );
+
         Ok(RetroHuntOutcome {
-            candidates_considered: covered.len() as u64,
+            candidates_considered: (covered.len() + platform_plan.considered) as u64,
             indicators_hunted: to_hunt.len() as u64,
             hits: hits.len() as u64,
-            truncated,
-            overflow_remaining,
+            truncated: truncated || platform_plan.overflow > 0,
+            overflow_remaining: overflow_remaining + platform_plan.overflow as u64,
             watermark_after,
             alert,
+            note,
         })
     }
 
@@ -699,6 +774,8 @@ struct RetroHuntOutcome {
     overflow_remaining: u64,
     watermark_after: Option<chrono::DateTime<Utc>>,
     alert: Option<Alert>,
+    /// Non-fatal run note (e.g. platform feeds skipped this run).
+    note: Option<String>,
 }
 
 /// Decide `(truncated, cursor_after)` from the `cap + 1` candidate probe
@@ -739,6 +816,103 @@ pub fn plan_cursor(
         candidates.last()
     };
     (truncated, last_covered.cloned())
+}
+
+/// NAN-4169: what one run does with the platform half of its delta.
+#[derive(Debug, Default, Clone)]
+pub struct PlatformDeltaPlan {
+    /// First sight of a feed: its current values are recorded as hunted
+    /// WITHOUT a hunt. The retro hunt covers indicators learned after the
+    /// rule started watching the feed, never the whole feed at once.
+    pub baseline: Vec<(String, String)>,
+    /// New indicators of a feed revision to hunt this run.
+    pub to_hunt: Vec<RetroFeedCandidate>,
+    /// Feed -> revision to persist after the run. A feed whose new values did
+    /// not all fit the run budget keeps its previous revision, so the next run
+    /// re-enumerates it and the hunted-set anti-join resumes where this left off.
+    pub revisions_after: std::collections::BTreeMap<String, i64>,
+    /// New values considered (post anti-join).
+    pub considered: usize,
+    /// New values left for a later run.
+    pub overflow: usize,
+}
+
+/// Fold a platform feed delta into a run (pure; unit-tested).
+///
+/// * unchanged feed -> revision carried, nothing to do;
+/// * changed feed never seen before -> baseline (record, don't hunt);
+/// * changed known feed -> hunt values not in `already_hunted`, up to `budget`.
+///
+/// A feed the tenant is no longer granted drops out of `revisions_after`; a
+/// later re-grant is a first sight again (baseline), never a full-feed hunt.
+pub fn plan_platform_delta(
+    feeds: &[crate::enrichment::ioc::LakePlatformFeedDelta],
+    known: &std::collections::BTreeMap<String, i64>,
+    already_hunted: &std::collections::HashSet<String>,
+    budget: usize,
+    learned_at_ms: i64,
+) -> PlatformDeltaPlan {
+    let mut plan = PlatformDeltaPlan::default();
+    let mut chosen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for feed in feeds {
+        let Some(previous) = known.get(&feed.feed) else {
+            for record in &feed.records {
+                if !already_hunted.contains(&record.value) && chosen.insert(record.value.clone()) {
+                    plan.baseline.push((record.value.clone(), record.key_type.clone()));
+                }
+            }
+            plan.revisions_after.insert(feed.feed.clone(), feed.revision);
+            continue;
+        };
+        if !feed.changed {
+            plan.revisions_after.insert(feed.feed.clone(), feed.revision);
+            continue;
+        }
+        let mut complete = true;
+        for record in &feed.records {
+            if already_hunted.contains(&record.value) || chosen.contains(&record.value) {
+                continue;
+            }
+            plan.considered += 1;
+            if plan.to_hunt.len() >= budget {
+                complete = false;
+                plan.overflow += 1;
+                continue;
+            }
+            chosen.insert(record.value.clone());
+            plan.to_hunt.push(RetroFeedCandidate {
+                value: record.value.clone(),
+                key_type: record.key_type.clone(),
+                enrichment_name: if feed.display_name.is_empty() {
+                    feed.feed.clone()
+                } else {
+                    feed.display_name.clone()
+                },
+                confidence: record.confidence.clamp(0, 100) as u32,
+                fetched_at_ms: learned_at_ms,
+                feed_revision: Some(feed.revision),
+            });
+        }
+        plan.revisions_after.insert(
+            feed.feed.clone(),
+            if complete { feed.revision } else { *previous },
+        );
+    }
+    plan
+}
+
+/// Every value of a CHANGED feed in a platform delta answer: the set the
+/// hunted-set anti-join is asked about (first-sight feeds included, since a
+/// value may already be hunted through another feed or a list).
+pub fn platform_delta_values(feeds: &[crate::enrichment::ioc::LakePlatformFeedDelta]) -> Vec<String> {
+    let mut values: Vec<String> = feeds
+        .iter()
+        .filter(|feed| feed.changed)
+        .flat_map(|feed| feed.records.iter().map(|record| record.value.clone()))
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 /// Deterministic per-hit event id so the matched-event dedup is stable across
@@ -797,8 +971,12 @@ pub fn build_hit_events(
             obj.insert("indicator".into(), serde_json::json!(hit.value));
             obj.insert("indicator_type".into(), serde_json::json!(hit.indicator_type));
             // Populate the matched observable column too (realistic alert row).
+            // An `ip:port` hit matched through an IP column: the column
+            // carries the bare IP (`indicator` keeps the full `ip:port`).
             if !hit.field.is_empty() {
-                obj.insert(hit.field.clone(), serde_json::json!(hit.value));
+                let column_value = crate::search::service::retro_split_ip_port(&hit.value)
+                    .map_or_else(|| hit.value.clone(), |(ip, _)| ip);
+                obj.insert(hit.field.clone(), serde_json::json!(column_value));
             }
             obj.insert("message".into(), serde_json::json!(message));
             obj.insert("timestamp".into(), serde_json::json!(last_seen));
@@ -816,6 +994,23 @@ pub fn build_hit_events(
             obj.insert("retro_field".into(), serde_json::json!(hit.field));
             obj.insert("retro_first_seen".into(), serde_json::json!(first_seen));
             obj.insert("retro_last_seen".into(), serde_json::json!(last_seen));
+            // NAN-4169: the searchable retro signal. `retro=true` / `retro_ioc=true`
+            // tell an analyst the match was found AFTER ingest (the indicator was
+            // learned later); `retro_learned_at` is when the feed delivered it.
+            obj.insert("retro".into(), serde_json::json!(true));
+            obj.insert("retro_ioc".into(), serde_json::json!(true));
+            if let Some(learned) = cand
+                .and_then(|c| chrono::DateTime::from_timestamp_millis(c.fetched_at_ms))
+                .filter(|_| cand.is_some_and(|c| c.fetched_at_ms > 0))
+            {
+                obj.insert(
+                    "retro_learned_at".into(),
+                    serde_json::json!(learned.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                );
+            }
+            if let Some(revision) = cand.and_then(|c| c.feed_revision) {
+                obj.insert("retro_feed_revision".into(), serde_json::json!(revision));
+            }
             serde_json::Value::Object(obj)
         })
         .collect()

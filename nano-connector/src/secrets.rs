@@ -47,9 +47,20 @@ pub struct SecretSet {
 
 impl SecretSet {
     pub fn new<'a>(secrets: impl IntoIterator<Item = &'a str>) -> Self {
-        let raw: Vec<&str> = secrets.into_iter().filter(|s| s.len() >= MIN_SECRET_LEN).collect();
+        Self::with_derived(secrets, std::iter::empty())
+    }
+
+    /// Derived secrets retain every encoded shape, including aligned base64
+    /// cores inside compound values. Only credentials need the additional
+    /// HTTP Basic pairs; pairing a run's request signatures would build a
+    /// quadratic number of needles on every signed request.
+    pub fn with_derived<'a>(
+        credentials: impl IntoIterator<Item = &'a str>,
+        derived: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let raw: Vec<&str> = credentials.into_iter().filter(|s| s.len() >= MIN_SECRET_LEN).collect();
         let mut needles: Vec<Vec<u8>> = Vec::new();
-        for s in &raw {
+        for s in raw.iter().copied().chain(derived).filter(|s| s.len() >= MIN_SECRET_LEN) {
             needles.extend(shapes(s));
         }
         // HTTP Basic: base64("a:b") for every ordered pair of credentials.

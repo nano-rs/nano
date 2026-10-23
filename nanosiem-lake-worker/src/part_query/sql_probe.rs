@@ -369,6 +369,7 @@ pub fn validate_knobs(
             "flat_filter_leaves" => overrides.flat_filter_leaves = Some(number == 1),
             "lane_routing_v2" => overrides.lane_routing_v2 = Some(number == 1),
             "identity_merged_index" => overrides.identity_merged_index = Some(number == 1),
+            "entity_index" => overrides.entity_index = Some(number == 1),
             "payload_threads" => overrides.payload_threads = Some(number),
             "payload_block_rows" => overrides.payload_block_rows = Some(number),
             name => {
@@ -567,6 +568,7 @@ fn knob_evidence(scope: &crate::perf_overrides::Parsed) -> Value {
             "flat_filter_leaves" => overrides.flat_filter_leaves.map(u64::from),
             "lane_routing_v2" => overrides.lane_routing_v2.map(u64::from),
             "identity_merged_index" => overrides.identity_merged_index.map(u64::from),
+            "entity_index" => overrides.entity_index.map(u64::from),
             "payload_threads" => overrides.payload_threads,
             "payload_block_rows" => overrides.payload_block_rows,
             _ => None,
@@ -616,17 +618,7 @@ pub async fn run(
     let broad = broad_request(request, prepared)?;
     let mut answer = match prepared.mode {
         Mode::Engine => engine_mode(engine, &broad).await?,
-        Mode::Statement => {
-            let tenant = request.tenant_id.clone();
-            let work = statement_mode(engine, request, &broad);
-            crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), work)
-                .await
-                .map_err(|_| {
-                    PartQueryError::Unavailable(
-                        "enrichment read authority is unavailable".to_string(),
-                    )
-                })??
-        }
+        Mode::Statement => statement_mode(engine, request, &broad).await?,
     };
     answer["ok"] = json!(true);
     answer["schema"] = json!(SCHEMA);
@@ -759,11 +751,7 @@ async fn statement_mode_pinned(
         )
         .await?;
     lap("select", &mut laps);
-    let scalar = engine.scalar_plan(&selection, &compiled).await?;
-    lap("owner_probe", &mut laps);
-    let mut plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || {
-        super::engine::plan_logs(&selection, &compiled, None)
-    })?;
+    let mut plan = super::engine::plan_logs(&selection, &compiled, None)?;
     if crate::perf_overrides::probe_flag("threshold_first", false) {
         if let Some(sql) = super::engine::threshold_first(&plan.sql) {
             plan.sql = sql;
@@ -1117,7 +1105,7 @@ mod tests {
 mod native {
     use super::*;
     use crate::part_query::engine::lean_query_native::{
-        engine, granted, ingest, source, ROWS, TENANT,
+        engine, ingest, source, ROWS, TENANT,
     };
     use chrono::{Duration, Utc};
 
@@ -1136,10 +1124,7 @@ mod native {
         let scope = Some(std::sync::Arc::new(prepared.scope.clone()));
         crate::query_timing::measure(
             &prepared.request_id,
-            Box::pin(crate::enrichment_read::scope(
-                granted(),
-                crate::perf_overrides::scoped(scope, run(engine, &request, &prepared)),
-            )),
+            Box::pin(crate::perf_overrides::scoped(scope, run(engine, &request, &prepared))),
         )
         .await
         .unwrap_or_else(|error| panic!("probe failed: {error}"))

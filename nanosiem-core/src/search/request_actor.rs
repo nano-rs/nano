@@ -35,7 +35,6 @@ pub fn inherit<F: Future + Send + 'static>(future: F) -> std::pin::Pin<Box<dyn F
 where
     F::Output: Send + 'static,
 {
-    let future = crate::platform_enrichment::read::inherit_result_fence(future);
     let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
         match crate::inputlookup::shared::fetch_search_id() {
             Some(id) => Box::pin(crate::inputlookup::shared::with_fetch_search_id(id, future)),
@@ -53,6 +52,9 @@ where
             Some(scope) => Box::pin(crate::search::denied_source_audit::with_scope(scope, future)),
             None => future,
         };
+    use tracing::Instrument;
+    use tracing::instrument::WithSubscriber;
+    let future = Box::pin(future.instrument(tracing::Span::current()).with_current_subscriber());
     match current_request_actor() {
         Some(actor) => Box::pin(SEARCH_REQUEST_ACTOR.scope(actor, future)),
         None => future,

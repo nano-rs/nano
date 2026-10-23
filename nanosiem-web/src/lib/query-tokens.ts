@@ -48,7 +48,7 @@ export const EVAL_FUNCTIONS = [
   'tonumber', 'tostring', 'toint', 'toNumber', 'toString',
   // Date/time functions
   'now', 'relative_time', 'strftime', 'strptime', 'epoch', 'from_epoch', 'date_add', 'date_sub',
-  'date_diff', 'date_trunc', 'date_part', 'year', 'month', 'day', 'hour', 'minute', 'second',
+  'date_diff', 'time_diff', 'date_trunc', 'date_part', 'year', 'month', 'day', 'hour', 'minute', 'second',
   'dayofweek', 'week', 'quarter', 'timezone', 'to_timestamp', 'to_date', 'today', 'yesterday',
   // Multivalue functions
   'mvcount', 'mvindex', 'mvfilter', 'mvjoin', 'mvsort', 'mvdedup',

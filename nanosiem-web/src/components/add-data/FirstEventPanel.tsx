@@ -217,7 +217,7 @@ export function FirstEventPanel({
           )}
           {searchable && searchQuery && (
             <Link
-              to={`/search?q=${encodeURIComponent(searchQuery)}`}
+              to={`/search#q=${encodeURIComponent(searchQuery)}`}
               className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-accent"
               data-testid="first-event-search-link"
             >

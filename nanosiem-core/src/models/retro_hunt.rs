@@ -23,8 +23,9 @@ use uuid::Uuid;
 /// keeps the historical scans cheap.
 pub const DEFAULT_RETRO_HUNT_CRON: &str = "*/30 * * * *";
 
-/// Default lookback window (days) a retro hunt scans history over.
-pub const DEFAULT_RETRO_HUNT_LOOKBACK_DAYS: i32 = 90;
+/// Default lookback window (days) a retro hunt scans history over (NAN-4169:
+/// the retro IOC hunt covers the last 5 days, Chronicle-style).
+pub const DEFAULT_RETRO_HUNT_LOOKBACK_DAYS: i32 = 5;
 
 /// Maximum lookback (days) — the `logs` table carries a 365-day TTL, so a hunt
 /// can never usefully reach further.
@@ -80,6 +81,24 @@ pub struct RetroHuntState {
     pub watermark_value: Option<String>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Platform feed id -> the feed revision this rule last finished
+    /// (ThreatFox, Tor exit nodes...). A feed absent here is baselined on first
+    /// sight instead of hunted whole. NULL = no platform feed processed yet.
+    #[serde(default)]
+    #[sqlx(default)]
+    #[schema(value_type = Option<Object>)]
+    pub platform_revisions: Option<serde_json::Value>,
+}
+
+impl RetroHuntState {
+    /// The processed platform feed revisions as a typed map (empty when unset
+    /// or malformed — a malformed map baselines, it never hunts a whole feed).
+    pub fn platform_revision_map(&self) -> std::collections::BTreeMap<String, i64> {
+        self.platform_revisions
+            .clone()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// One retro-hunt execution's history row (`retro_hunt_runs`).

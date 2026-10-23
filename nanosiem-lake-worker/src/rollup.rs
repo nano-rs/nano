@@ -854,8 +854,7 @@ mod tests {
 
     /// NAN-3093: search plans rollup reads from its own mirror of this
     /// contract (`nanosiem_core::search::LAKE_COUNT_ROLLUP_FIELDS`); it must
-    /// name exactly these fields, in order, with the same multi-value flags,
-    /// and the same enrichment-sensitive set.
+    /// name exactly these fields, in order, with the same multi-value flags.
     #[test]
     fn search_mirrors_the_count_rollup_field_contract_exactly() {
         let worker = COUNT_ROLLUP_FIELDS
@@ -863,14 +862,6 @@ mod tests {
             .map(|field| (field.source_path, field.multi_value))
             .collect::<Vec<_>>();
         assert_eq!(nanosiem_core::search::LAKE_COUNT_ROLLUP_FIELDS, worker.as_slice());
-        for (path, _) in &worker {
-            if crate::enrichment_read::sensitive(path) {
-                assert!(
-                    nanosiem_core::search::lake_rollup_field_is_enrichment_sensitive(path),
-                    "{path}"
-                );
-            }
-        }
     }
 
     /// `plan_by_part` keeps every file's rows apart at the rollup bucket.

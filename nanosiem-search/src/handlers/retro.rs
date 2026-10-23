@@ -19,7 +19,7 @@ use crate::{error::SearchError, metrics::record_search_query, SearchState};
 
 /// A compact single-indicator hunt completes inline. Campaign and pivot hunts
 /// return a durable job handle and publish their typed result to object storage.
-/// On an enterprise-shared (lean) tenant every hunt is a durable job handle
+/// On an enterprise-shared (nano Security Lake) tenant every hunt is a durable job handle
 /// whose result carries a moving retention-cutoff proof.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[serde(untagged)]
@@ -47,7 +47,7 @@ pub enum RetroResultResponse {
         (status = 400, description = "Invalid retro query", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Missing search:execute permission"),
-        (status = 503, description = "The tenant's lean-cell job lane or retention identity is unavailable", body = ErrorResponse),
+        (status = 503, description = "The tenant's lake cell job lane or retention identity is unavailable", body = ErrorResponse),
     )
 )]
 pub async fn retro(

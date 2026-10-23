@@ -650,7 +650,7 @@ export default function SourceConfigurationDetail() {
             const field = activeSchema?.schema === 'ocsf' ? 'metadata.log_source' : 'source_type';
             const targets = [...new Set(config.routing_rules.map((rule) => rule.target_source_type).filter(Boolean))];
             const query = targets.map((target) => `${field}="${nplQuotedBody(target)}"`).join(' OR ');
-            navigate(query ? `/search?q=${encodeURIComponent(query)}&run=true` : '/search');
+            navigate(query ? `/search#q=${encodeURIComponent(query)}&run=true` : '/search');
           }}
           telemetry={config as AccessTelemetry}
         />

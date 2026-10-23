@@ -41,6 +41,19 @@ pub const MAX_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 /// Most first-time probes in flight per selection (NAN-3392 a-3).
 pub const PROBE_CONCURRENCY: usize = 8;
 
+/// NAN-4164: token-index probes in flight per selection (and per token-seed
+/// batch). A probe is one positioned read per row group of a local file,
+/// almost no CPU, so its wall is the hot volume's latency: on a large hosted tenant a
+/// cold 7 d keyword's 2,261 probes averaged 1.6 ms of blocked thread time and
+/// took 1.2 s of select_token at [`PROBE_CONCURRENCY`]. The network volume
+/// serves a far deeper queue; 32 overlaps that latency.
+pub const TOKEN_PROBE_CONCURRENCY: usize = 32;
+
+/// [`TOKEN_PROBE_CONCURRENCY`], or a probe's `token_probe_concurrency` knob.
+pub fn token_probe_concurrency() -> usize {
+    crate::perf_overrides::probe_count("token_probe_concurrency").map_or(TOKEN_PROBE_CONCURRENCY, |n| n as usize)
+}
+
 /// What the footer stage returns per data file: hint mask, membership time
 /// mask, row ranges, exact group times (as
 /// [`prune::FileMetadataCache::evidence_of_tokens`]).
@@ -138,6 +151,9 @@ pub struct Probe {
     pub file_key: String,
     pub tokens: Option<TokenFile>,
     pub buckets: Option<BTreeSet<i64>>,
+    /// NAN-4190: this file's hints when they differ from the selection's
+    /// (the window entity index already answered some of them exactly).
+    pub hints: Option<Arc<[CandidateHint]>>,
 }
 
 /// Per-probe cache outcome.
@@ -239,27 +255,48 @@ pub fn probe(
 /// pool (never inline on a runtime worker), in input order, with each
 /// probe's stats; plus the summed thread CPU (ms). A probe whose task
 /// panicked answers `None` (the engine's re-resolution path).
+///
+/// NAN-4171: each probe also hands back the file's footer summary, read
+/// here in parallel, so the engine's scan estimate does not look it up a
+/// second time, sequentially, after a sweep that may have evicted it.
 pub async fn probe_all(
     caches: &Caches,
     probes: Vec<Option<Probe>>,
     hints: Arc<[CandidateHint]>,
     combined: bool,
     cache_footer: bool,
-) -> (Vec<(Option<Footer>, ProbeStats)>, f64) {
+) -> (Vec<Probed>, f64) {
     let caches = caches.clone();
     let (results, cpu) = blocking_map(probes, move |one| {
         let mut stats = ProbeStats::default();
-        let footer = one.and_then(|one| probe(&caches, &one, &hints, combined, cache_footer, &mut stats));
-        (footer, stats)
+        let Some(one) = one else { return (None, stats, None) };
+        let summary = caches.metadata.summary(&one.path, &one.file_key);
+        let hints = one.hints.as_ref().unwrap_or(&hints);
+        let footer = summary.as_ref().and_then(|_| probe(&caches, &one, hints, combined, cache_footer, &mut stats));
+        (footer, stats, summary)
     })
     .await;
-    (results.into_iter().map(|result| result.unwrap_or((None, ProbeStats::default()))).collect(), cpu)
+    (results.into_iter().map(|result| result.unwrap_or((None, ProbeStats::default(), None))).collect(), cpu)
 }
+
+/// One file's probe: its footer evidence, cache stats and footer summary.
+pub type Probed = (Option<Footer>, ProbeStats, Option<Arc<prune::FileSummary>>);
 
 /// Run `work` per item, `PROBE_CONCURRENCY` at a time on the blocking pool,
 /// in input order, under the request's phase record. Returns each output
 /// and the summed thread CPU (ms).
 pub async fn blocking_map<T, R, F>(items: Vec<T>, work: F) -> (Vec<Option<R>>, f64)
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(T) -> R + Send + Sync + 'static,
+{
+    let concurrency = crate::perf_overrides::probe_count("evidence_probe_concurrency").map_or(PROBE_CONCURRENCY, |n| n as usize);
+    blocking_map_with(items, concurrency, work).await
+}
+
+/// [`blocking_map`] with `concurrency` items in flight (at least one).
+pub async fn blocking_map_with<T, R, F>(items: Vec<T>, concurrency: usize, work: F) -> (Vec<Option<R>>, f64)
 where
     T: Send + 'static,
     R: Send + 'static,
@@ -281,7 +318,7 @@ where
             })
         })
     }))
-    .buffered(crate::perf_overrides::probe_count("evidence_probe_concurrency").map_or(PROBE_CONCURRENCY, |n| n as usize))
+    .buffered(concurrency.max(1))
     .map(Result::ok)
     .collect()
     .await;
@@ -434,7 +471,7 @@ mod tests {
         let data = data_file();
         let caches = Caches { metadata: Arc::default(), evidence: Arc::default(), tokens: Arc::default() };
         assert!(caches.metadata.prewarm(data.path(), "signed-a"));
-        let one = Probe { path: data.path().into(), file_key: "signed-a".into(), tokens: None, buckets: None };
+        let one = Probe { path: data.path().into(), file_key: "signed-a".into(), tokens: None, buckets: None, hints: None };
         let hints = [CandidateHint::Entity { source_path: "user.name".into(), value: "alice".into() }];
         let mut stats = ProbeStats::default();
         let got = probe(&caches, &one, &hints, false, true, &mut stats).unwrap();
@@ -471,7 +508,7 @@ mod tests {
                             let expected = reference
                                 .evidence_of_tokens(data.path(), "data-digest", &hints, decoded.as_deref().map(Vec::as_slice), combined, true, buckets.as_ref())
                                 .unwrap();
-                            let one = Probe { path: data.path().to_path_buf(), file_key: "data-digest".into(), tokens: token_ref, buckets: buckets.clone() };
+                            let one = Probe { path: data.path().to_path_buf(), file_key: "data-digest".into(), tokens: token_ref, buckets: buckets.clone(), hints: None };
                             let mut stats = ProbeStats::default();
                             let got = probe(&caches, &one, &hints, combined, true, &mut stats).unwrap();
                             assert_eq!(got, expected, "pass {pass} combined={combined} token={token} buckets={} {hints:?}", buckets.is_some());
@@ -498,7 +535,7 @@ mod tests {
         let data = data_file();
         let hints = [entity("src_endpoint.hostname", "ws-exec-002.corp.local")];
         let caches = Caches { metadata: Arc::default(), evidence: Arc::default(), tokens: Arc::default() };
-        let one = Probe { path: data.path().to_path_buf(), file_key: "d".into(), tokens: None, buckets: None };
+        let one = Probe { path: data.path().to_path_buf(), file_key: "d".into(), tokens: None, buckets: None, hints: None };
         let mut stats = ProbeStats::default();
         let cold = probe(&caches, &one, &hints, false, false, &mut stats).unwrap();
         assert_eq!(stats, ProbeStats { hits: 0, misses: 1, token_decodes: 0 });
@@ -541,6 +578,7 @@ mod tests {
             file_key: "d".into(),
             tokens: Some(TokenFile { path: tokens.path().to_path_buf(), sha256: digest }),
             buckets: None,
+            hints: None,
         };
         let mut stats = ProbeStats::default();
         let cold = probe(&caches, &one, &hints, true, true, &mut stats).unwrap();
@@ -566,6 +604,7 @@ mod tests {
             file_key: "d".into(),
             tokens: Some(TokenFile { path: tokens.path().to_path_buf(), sha256: digest }),
             buckets: None,
+            hints: None,
         };
         let mut stats = ProbeStats::default();
         probe(&caches, &one, &hints, true, true, &mut stats).unwrap();
@@ -578,7 +617,7 @@ mod tests {
         let path = data.path().to_path_buf();
         let hints = [entity("user.name", "user1")];
         let caches = Caches { metadata: Arc::default(), evidence: Arc::default(), tokens: Arc::default() };
-        let one = Probe { path: path.clone(), file_key: "d".into(), tokens: None, buckets: None };
+        let one = Probe { path: path.clone(), file_key: "d".into(), tokens: None, buckets: None, hints: None };
         assert!(probe(&caches, &one, &hints, false, true, &mut ProbeStats::default()).is_some());
         drop(data);
         assert!(probe(&caches, &one, &hints, false, true, &mut ProbeStats::default()).is_none());
@@ -641,5 +680,33 @@ mod tests {
         let parallel = started.elapsed();
         println!("32 cold probes @10ms: sequential {sequential:?}, fan-out {parallel:?}");
         assert!(parallel * 4 < sequential, "sequential {sequential:?} vs fan-out {parallel:?}");
+    }
+
+    /// NAN-4164: token probes (I/O-bound) run [`TOKEN_PROBE_CONCURRENCY`]
+    /// at a time: 128 probes blocked 10 ms each finish in ~4 rounds, where
+    /// the footer fan-out ([`PROBE_CONCURRENCY`]) takes ~16.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_fan_out_overlaps_io_latency_four_times_deeper() {
+        let latency = std::time::Duration::from_millis(10);
+        let (inflight, peak) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let probe = {
+            let (inflight, peak) = (inflight.clone(), peak.clone());
+            move |_: usize| {
+                let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(latency);
+                inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+        let started = std::time::Instant::now();
+        let (out, _) = blocking_map_with((0..128).collect::<Vec<_>>(), TOKEN_PROBE_CONCURRENCY, probe.clone()).await;
+        let token = started.elapsed();
+        assert_eq!(out.len(), 128);
+        assert_eq!(peak.load(Ordering::SeqCst), TOKEN_PROBE_CONCURRENCY);
+        let started = std::time::Instant::now();
+        let _ = blocking_map_with((0..128).collect::<Vec<_>>(), PROBE_CONCURRENCY, probe).await;
+        let footer = started.elapsed();
+        println!("128 probes @10ms: token fan-out {token:?}, footer fan-out {footer:?}");
+        assert!(token * 2 < footer, "token {token:?} vs footer {footer:?}");
     }
 }

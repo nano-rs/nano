@@ -528,3 +528,23 @@ fn legacy_manifest_wire_format_omits_optional_predecessor() {
 
 #[cfg(feature = "enterprise")]
 mod hosted_tests;
+
+#[tokio::test]
+async fn customer_export_keeps_removal_tombstones_while_lifecycle_omits_them() {
+    let (_dir, catalog, table) = fixture().await;
+    let table = apply(&catalog, &table, &manifest(1, None, Some(HOUR_ID), &[]), files(HOUR_ID, "s3://fixture/")).await;
+    let removal = manifest(2, Some(1), None, &[HOUR_ID]);
+    let customer = prepare_snapshot_inner(&table, &removal, BTreeMap::new(), &contract(false).schema, "s3://fixture/", 100, false).await.unwrap().0;
+    let lifecycle = prepare_lifecycle_snapshot(&table, &removal, BTreeMap::new(), &contract(false).schema, "s3://fixture/", 100).await.unwrap().0;
+    for (snapshot, expected) in [(customer, 1), (lifecycle, 0)] {
+        let snapshot = Arc::new(snapshot);
+        let mut tombstones = 0;
+        for descriptor in table.manifest_list_reader(&snapshot).load().await.unwrap().entries() {
+            tombstones += descriptor.load_manifest(table.file_io()).await.unwrap().entries().iter().filter(|e| !e.is_alive()).count();
+        }
+        assert_eq!(tombstones, expected);
+    }
+}
+
+#[path = "lifecycle/rest_tests.rs"]
+mod lifecycle_rest;

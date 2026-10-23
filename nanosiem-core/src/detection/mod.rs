@@ -31,7 +31,7 @@ pub mod service;
 pub mod signal_processor;
 pub mod test_admission;
 
-pub use event_envelope::normalize_match_event;
+pub use event_envelope::{normalize_match_event, normalize_match_events_for_query};
 
 pub use distributed_scheduler::{
     generate_node_id, DistributedDetectionScheduler, DistributedSchedulerConfig,

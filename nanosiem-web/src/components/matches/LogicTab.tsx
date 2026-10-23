@@ -11,13 +11,15 @@ import type { DetectionRule } from '@/lib/api/types';
 import { QueryHighlight } from '@/lib/syntax-highlight';
 import { useToast } from '@/hooks/use-toast';
 import { useRuleVersions } from '@/hooks/use-api';
-import { relTime } from './helpers';
+import { relTime, type MatchView } from './helpers';
+import { matchSearchUrl } from './search-window';
 
 interface LogicTabProps {
   rule: DetectionRule;
+  match?: MatchView | null;
 }
 
-export function LogicTab({ rule }: LogicTabProps) {
+export function LogicTab({ rule, match }: LogicTabProps) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { data: versions, loading: versionsLoading } = useRuleVersions(rule.id);
@@ -56,7 +58,7 @@ export function LogicTab({ rule }: LogicTabProps) {
             </button>
             <button
               type="button"
-              onClick={() => navigate(`/search?q=${encodeURIComponent(rule.query)}`)}
+              onClick={() => navigate(matchSearchUrl(rule.query, match, rule.lookback_minutes))}
               className="h-6 px-2 rounded bg-primary/90 text-[var(--brand-ink)] text-[10.5px] font-mono font-medium flex items-center gap-1"
             >
               <Play className="w-3 h-3" strokeWidth={2} />

@@ -134,6 +134,8 @@ export interface SearchJobStatus {
   durable_result?: { rows: number; pages: number; page_rows: number; has_more?: boolean };
   /** Error message (when failed) */
   error?: string;
+  /** NAN-3911: stable error class (`query_too_large`: retrying will not help). */
+  error_code?: string;
   /** Queue position (1-based, when queued) */
   queue_position?: number;
   /** Estimated wait time in seconds (when queued) */
@@ -662,7 +664,18 @@ export interface MetricMonitorRequest {
   enabled: boolean;
 }
 
+export interface MetricMonitorEvaluation {
+  monitor_id: string;
+  series_key: string;
+  value: number | null;
+  breaching: boolean;
+  no_data: boolean;
+  evaluated_at: string;
+}
+
 export interface MetricMonitorListResponse {
+  /** Hosted jobs' recent per-series results. Absent on legacy dedicated readers. */
+  evaluations?: MetricMonitorEvaluation[];
   monitors: MetricMonitor[];
   /** Present on shared-lake tenants (NAN-2361): whether metrics back evaluation. */
   telemetry?: import('./observability').TelemetryAvailability;
@@ -724,6 +737,10 @@ export interface MetricNamesResponse {
   names: MetricName[];
   /** Number of distinct metric names returned (mirrors backend `count`). */
   count?: number;
+  /** Start of the window the names cover (lake catalog: up to the last 24 h). */
+  window_start?: string;
+  /** True while the catalog covers less than its full window (NAN-4098). */
+  partial?: boolean;
 }
 
 /** Completeness metadata from a served lake publication. */
@@ -1341,6 +1358,8 @@ export interface RetroHuntState {
   watermark_value?: string | null;
   last_run_at?: string | null;
   updated_at: string;
+  // NAN-4169: platform feed id -> feed revision last processed (Tor, ThreatFox...).
+  platform_revisions?: Record<string, number> | null;
 }
 
 export interface RetroHuntRuleView {

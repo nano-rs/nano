@@ -46,6 +46,47 @@ use crate::handlers::AuditExt;
 use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
+// Credential-authenticated nginx subrequest; no user session required.
+#[utoipa::path(get, path = "/api/internal/otlp-auth", tag = "ingest_tokens",
+    summary = "Authenticate an OTLP ingestion credential",
+    description = "Requires an active source-bound ingestion Bearer credential, not a user session. No positive cache.",
+    responses((status = 204, description = "Active OTLP credential; identity in X-Nano-Credential-Id and X-Nano-Source-Route headers"),
+              (status = 401, description = "Invalid or inactive credential"),
+              (status = 503, description = "Credential state unavailable")),
+    security(("bearer_auth" = [])))]
+pub async fn authenticate_otlp(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty() && !value.bytes().any(|b| b.is_ascii_whitespace()))
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state.ingest_token_service.authenticate_otlp(token).await {
+        Ok(Some(credential)) => {
+            let Ok(route) = HeaderValue::from_str(&credential.route) else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response.headers_mut().insert(
+                "x-nano-credential-id",
+                HeaderValue::from_str(&credential.id.to_string()).expect("UUID is a header value"),
+            );
+            response.headers_mut().insert("x-nano-source-route", route);
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Ok(None) => StatusCode::UNAUTHORIZED.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 /// Display name of the install-wide `VECTOR_AUTH_TOKEN`.
 pub const INSTALL_TOKEN_NAME: &str = "Install token (legacy)";
 
@@ -435,6 +476,7 @@ pub async fn update_install_token(
 #[derive(utoipa::OpenApi)]
 #[openapi(
     paths(
+        authenticate_otlp,
         list_ingest_tokens,
         create_ingest_token,
         bind_ingest_token,

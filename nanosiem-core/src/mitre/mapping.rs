@@ -87,6 +87,99 @@ fn is_technique_id(value: &str) -> bool {
             && bytes[6..].iter().all(u8::is_ascii_digit))
 }
 
+/// NAN-4372: the verdict a rule write would get on its MITRE mapping, for
+/// `POST /api/rules/validate` (which used to check none of it, so a mismatched
+/// tactic/technique pair surfaced only at create).
+///
+/// Runs exactly the checks a write runs, in the same order: the Rust shape
+/// canonicalization the repository applies before INSERT/UPDATE
+/// ([`canonicalize_mitre_mappings`]), then the catalog checks the
+/// `detection_rules_mitre_mapping_check` trigger applies, through the same SQL
+/// functions it calls (`resolve_mitre_technique_alias` /
+/// `remap_mitre_mapping` for renumbered techniques, then
+/// `mitre_mapping_rejection_reason`), including its air-gapped skip when the
+/// catalog is empty. Read-only. `Ok(None)` means a write would accept it.
+pub async fn validate_mitre_mapping_for_write<'e, E>(
+    executor: E,
+    tactics: &[String],
+    techniques: &[String],
+) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let mappings = match canonicalize_mitre_mappings(tactics, techniques) {
+        Ok(mappings) => mappings,
+        Err(error) => return Ok(Some(error.to_string())),
+    };
+    if mappings.tactics.is_empty() && mappings.techniques.is_empty() {
+        return Ok(None);
+    }
+    let reason: Option<String> = sqlx::query_scalar(
+        r#"
+        WITH input AS (SELECT $1::text[] AS tactics, $2::text[] AS techniques),
+        catalog AS (
+            SELECT EXISTS (SELECT 1 FROM public.mitre_tactics)
+               AND EXISTS (SELECT 1 FROM public.mitre_techniques) AS present
+        ),
+        remap AS (
+            SELECT EXISTS (
+                SELECT 1 FROM input, unnest(input.techniques) AS requested(id)
+                WHERE NOT EXISTS (SELECT 1 FROM public.mitre_techniques AS t WHERE t.id = requested.id)
+                  AND public.resolve_mitre_technique_alias(requested.id) IS NOT NULL
+            ) AS needed
+        ),
+        mapped AS (
+            SELECT
+                CASE WHEN remap.needed
+                    THEN (public.remap_mitre_mapping(input.tactics, input.techniques)).out_tactics
+                    ELSE input.tactics END AS tactics,
+                CASE WHEN remap.needed
+                    THEN (public.remap_mitre_mapping(input.tactics, input.techniques)).out_techniques
+                    ELSE input.techniques END AS techniques
+            FROM input, remap
+        )
+        SELECT CASE WHEN catalog.present
+            THEN public.mitre_mapping_rejection_reason(mapped.tactics, mapped.techniques)
+        END
+        FROM mapped, catalog
+        "#,
+    )
+    .bind(&mappings.tactics)
+    .bind(&mappings.techniques)
+    .fetch_one(executor)
+    .await?;
+    Ok(reason.map(|reason| format!("Invalid MITRE ATT&CK mapping: {reason}")))
+}
+
+/// NAN-4372: whether a validate for an UPDATE leaves the rule's stored MITRE
+/// mapping unchanged, in which case the write trigger skips its catalog checks
+/// (`TG_OP = 'UPDATE' AND NEW.* IS NOT DISTINCT FROM OLD.*`) and validate must
+/// not report the mapping invalid either.
+///
+/// `stored` is the edited rule's `(mitre_tactics, mitre_techniques)` row, or
+/// `None` for a create / unknown rule. A list absent from the request keeps
+/// its stored value, as an update that omits it does. The request side is
+/// canonicalized the way the repository canonicalizes it before the UPDATE;
+/// a request that fails canonicalization is never "unchanged".
+pub fn mitre_mapping_unchanged(
+    stored: Option<&(Option<Vec<String>>, Option<Vec<String>>)>,
+    tactics: Option<&[String]>,
+    techniques: Option<&[String]>,
+) -> bool {
+    let Some((stored_tactics, stored_techniques)) = stored else {
+        return false;
+    };
+    let stored_tactics = stored_tactics.as_deref().unwrap_or_default();
+    let stored_techniques = stored_techniques.as_deref().unwrap_or_default();
+    let Ok(requested) = canonicalize_mitre_mappings(
+        tactics.unwrap_or(stored_tactics),
+        techniques.unwrap_or(stored_techniques),
+    ) else {
+        return false;
+    };
+    requested.tactics == stored_tactics && requested.techniques == stored_techniques
+}
+
 pub(crate) fn database_mapping_violation(error: &sqlx::Error) -> Option<String> {
     let sqlx::Error::Database(database) = error else {
         return None;
@@ -97,6 +190,20 @@ pub(crate) fn database_mapping_violation(error: &sqlx::Error) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unchanged_mapping_mirrors_the_trigger_update_skip() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let stored = (Some(s(&["TA0002"])), Some(s(&["T1059.001"])));
+        // Same mapping (modulo case/whitespace the repository canonicalizes).
+        assert!(mitre_mapping_unchanged(Some(&stored), Some(&s(&[" ta0002"])), Some(&s(&["T1059.001"]))));
+        // An omitted list keeps its stored value.
+        assert!(mitre_mapping_unchanged(Some(&stored), None, Some(&s(&["T1059.001"]))));
+        // Changed, create (no stored row), or malformed: validate checks it.
+        assert!(!mitre_mapping_unchanged(Some(&stored), Some(&s(&["TA0003"])), Some(&s(&["T1059.001"]))));
+        assert!(!mitre_mapping_unchanged(None, Some(&s(&["TA0002"])), Some(&s(&["T1059.001"]))));
+        assert!(!mitre_mapping_unchanged(Some(&stored), Some(&s(&["TA02"])), Some(&s(&["T1059.001"]))));
+    }
+
     use super::*;
 
     async fn assert_database_rejects(
@@ -158,6 +265,56 @@ mod tests {
             Err(MitreMappingError::IncompleteMapping)
         );
         assert!(canonicalize_mitre_mappings(&[], &[]).is_ok());
+    }
+
+    /// NAN-4372: validate's verdict equals the write path's on the same
+    /// mappings — accepted when an INSERT would be, refused (with the same
+    /// reason) when the trigger would refuse it. Runs against the real
+    /// migrated catalog.
+    #[tokio::test]
+    #[ignore = "requires migrated PostgreSQL"]
+    async fn validate_verdict_matches_the_write_trigger() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".into());
+        let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+        let s = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        // (tactics, techniques, accepted)
+        let cases: &[(&[&str], &[&str], bool)] = &[
+            (&["TA0002"], &["T1059.001"], true),
+            (&["ta0002"], &[" t1059.001 "], true),
+            (&[], &[], true),
+            // Credential Access does not contain Command and Scripting Interpreter.
+            (&["TA0006"], &["T1059.001"], false),
+            (&["TA0002"], &[], false),
+            (&["BANANA"], &["T1059"], false),
+            (&["TA9990"], &["T1059"], false),
+        ];
+        for (tactics, techniques, accepted) in cases {
+            let verdict = validate_mitre_mapping_for_write(&pool, &s(tactics), &s(techniques))
+                .await
+                .unwrap();
+            assert_eq!(verdict.is_none(), *accepted, "{tactics:?}/{techniques:?}: {verdict:?}");
+
+            let mut transaction = pool.begin().await.unwrap();
+            let written = sqlx::query(
+                "INSERT INTO detection_rules (name, query, severity, mitre_tactics, mitre_techniques) \
+                 VALUES ($1, '*', 'medium', $2, $3)",
+            )
+            .bind(format!("NAN-4372 validate parity {}", uuid::Uuid::now_v7()))
+            .bind(s(tactics).iter().map(|v| v.trim().to_ascii_uppercase()).collect::<Vec<_>>())
+            .bind(s(techniques).iter().map(|v| v.trim().to_ascii_uppercase()).collect::<Vec<_>>())
+            .execute(&mut *transaction)
+            .await;
+            transaction.rollback().await.unwrap();
+            if *accepted {
+                written.unwrap();
+            } else if let Err(error) = written {
+                assert!(database_mapping_violation(&error).is_some(), "{error}");
+            } else {
+                // Shape errors are refused by the repository before the INSERT.
+                assert!(canonicalize_mitre_mappings(&s(tactics), &s(techniques)).is_err());
+            }
+        }
     }
 
     #[tokio::test]

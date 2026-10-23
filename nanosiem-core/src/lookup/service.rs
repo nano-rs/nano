@@ -758,16 +758,27 @@ impl LookupService {
         // Use the table's primary key column for querying, falling back to the provided key_field
         let lookup_key_field = table.primary_key.as_deref().unwrap_or(&query.key_field);
 
-        let results = self
-            .repository
-            .lookup_batch(
-                &table.table_name,
-                lookup_key_field,
-                &query.key_values,
-                query.output_fields.as_deref(),
-                query.case_insensitive,
-            )
-            .await?;
+        // NAN-4287: the tenant lookup store reads at most
+        // MAX_BATCH_LOOKUP_KEYS keys per batch and refuses more. A `| lookup`
+        // over a lake candidate set (up to 50k rows) routinely carries more
+        // distinct keys than that, and the refusal came back as a 503 on every
+        // run. Read the keys in bounded batches instead: at most
+        // ceil(keys / 10k) indexed reads, and the candidate set already
+        // bounds the key count.
+        let mut results = HashMap::new();
+        for keys in query.key_values.chunks(MAX_BATCH_LOOKUP_KEYS) {
+            results.extend(
+                self.repository
+                    .lookup_batch(
+                        &table.table_name,
+                        lookup_key_field,
+                        keys,
+                        query.output_fields.as_deref(),
+                        query.case_insensitive,
+                    )
+                    .await?,
+            );
+        }
 
         let matched_count = results.len();
         let total_count = query.key_values.len();

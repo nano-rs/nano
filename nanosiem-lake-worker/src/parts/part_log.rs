@@ -187,6 +187,29 @@ fn finding_receipts_only(tenant_id: &str, sources: &[SourceRef]) -> bool {
         })
 }
 
+/// NAN-3643: the source `version` of a refused bronze object re-admitted
+/// from the tenant's quarantine by an operator replay.
+pub const QUARANTINE_REPLAY_VERSION: &str = "nano.bronze-quarantine-replay.v1";
+
+/// NAN-3643: the source key a quarantine replay is consumed under. It names
+/// the tenant and the object's SHA-256, never another tenant's object, and
+/// it is outside every bronze prefix (nothing lists or retires it).
+pub fn quarantine_replay_key(tenant_id: &str, sha256: &str) -> String {
+    format!("bronze-quarantine/tenant_id={tenant_id}/{sha256}.parquet")
+}
+
+/// NAN-3643: an operator replay of quarantined bronze objects of THIS tenant
+/// (flushed on its own, never beside edge segments). Like a finding add, it
+/// is allowed while the edge cursor is active and leaves the cursor alone.
+pub fn quarantine_replays_only(tenant_id: &str, sources: &[SourceRef]) -> bool {
+    !sources.is_empty()
+        && sources.iter().all(|source| {
+            source.version == QUARANTINE_REPLAY_VERSION
+                && is_sha256_hex(&source.sha256)
+                && source.key == quarantine_replay_key(tenant_id, &source.sha256)
+        })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetireReason {
@@ -698,7 +721,10 @@ impl LiveSet {
                             range.follows_point(&format!("edgelog:{}", entry.tenant_id), 0, &genesis)?;
                         }
                     },
-                    (None, Some(_)) if !finding_receipts_only(&entry.tenant_id, consumed) => {
+                    (None, Some(_))
+                        if !finding_receipts_only(&entry.tenant_id, consumed)
+                            && !quarantine_replays_only(&entry.tenant_id, consumed) =>
+                    {
                         bail!("add without edge_log after the log consumed from an edge log")
                     }
                     (None, Some(_)) => {}
@@ -898,6 +924,10 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Exact immutable object length for bounded export verification.
     async fn object_size(&self, _key: &str) -> Result<Option<u64>> { bail!("object size unsupported") }
+    /// NAN-4181: the object's Last-Modified time (unix ms). `None` when the
+    /// object is absent OR the store cannot tell; callers must treat `None`
+    /// as "unknown" (finding attempt lookups then list every marker).
+    async fn modified_ms(&self, _key: &str) -> Result<Option<i64>> { Ok(None) }
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
     /// Stream an object to a local file; `Ok(false)` when it does not exist.
     /// Stores override this to avoid holding large objects in memory.
@@ -962,6 +992,17 @@ pub trait ObjectStore: Send + Sync {
     /// Keys under a prefix. Used by GC and checkpoint discovery only; never
     /// by the read path.
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// NAN-4160: one bounded page of [`Self::list`]: at most `limit` keys
+    /// under `prefix` strictly after `start_after`, in key order. Paged
+    /// stores override it so a caller never pays for the whole prefix; the
+    /// default (lab/test stores) filters a full listing.
+    async fn list_page(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        let mut keys = self.list(prefix).await?;
+        keys.retain(|key| start_after.is_none_or(|after| key.as_str() > after));
+        keys.sort_unstable();
+        keys.truncate(limit);
+        Ok(keys)
+    }
 }
 
 /// A directory-backed store with atomic conditional create (`O_EXCL` on a
@@ -1061,6 +1102,15 @@ impl ObjectStore for LocalObjectStore {
     async fn object_size(&self, key: &str) -> Result<Option<u64>> {
         match std::fs::metadata(self.path(key)?) {
             Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    async fn modified_ms(&self, key: &str) -> Result<Option<i64>> {
+        match std::fs::metadata(self.path(key)?) {
+            Ok(meta) => Ok(meta.modified().ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|at| at.as_millis() as i64)),
             Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -1316,6 +1366,14 @@ pub struct Fenced {
     pub seq: u64,
 }
 
+/// NAN-4052: an authority every append must pass right before its commit
+/// (the cell writer lease, `part_ingest::writer_lease`). Refusing stops the
+/// writer before it can race a successor; the storage fences stay the last
+/// line.
+pub trait AppendGate: Send + Sync {
+    fn check_append(&self) -> Result<()>;
+}
+
 /// The single appender for one tenant (contract 5.2).
 pub struct PartLogWriter<'a> {
     store: &'a dyn ObjectStore,
@@ -1329,6 +1387,8 @@ pub struct PartLogWriter<'a> {
     /// holds their receipt), for the GC index watermark. Only stores whose
     /// `Ok(true)` create includes that completion may set it.
     receipted: Option<std::sync::Arc<crate::lake_part_gc::index::ReceiptedAppends>>,
+    /// NAN-4052: checked before every commit.
+    gate: Option<std::sync::Arc<dyn AppendGate>>,
 }
 
 impl<'a> PartLogWriter<'a> {
@@ -1347,7 +1407,7 @@ impl<'a> PartLogWriter<'a> {
             }
         }
         let mut writer =
-            Self { store, tenant_id: tenant_id.to_string(), log_keys: LogKeys::new(tenant_id)?, writer_epoch, set, key_held_total: 0, receipted: None };
+            Self { store, tenant_id: tenant_id.to_string(), log_keys: LogKeys::new(tenant_id)?, writer_epoch, set, key_held_total: 0, receipted: None, gate: None };
         if writer.set.head().is_none() {
             writer.append(LogOp::Genesis { schema: LogSchema::from_arrow(initial_schema)? }, now_ms).await?;
         }
@@ -1369,6 +1429,11 @@ impl<'a> PartLogWriter<'a> {
     /// recorded.
     pub fn set_receipted_appends(&mut self, receipted: std::sync::Arc<crate::lake_part_gc::index::ReceiptedAppends>) {
         self.receipted = Some(receipted);
+    }
+
+    /// NAN-4052: refuse every later append unless `gate` admits it.
+    pub fn set_append_gate(&mut self, gate: std::sync::Arc<dyn AppendGate>) {
+        self.gate = Some(gate);
     }
 
     /// Appends refused because an earlier reservation still held the entry
@@ -1409,6 +1474,9 @@ impl<'a> PartLogWriter<'a> {
         let mut next = self.set.clone();
         next.apply(&entry, &sha)?;
         let key = self.log_keys.entry(seq);
+        if let Some(gate) = &self.gate {
+            gate.check_append()?;
+        }
         match self.store.put_if_absent_with(&key, &bytes, &Self::log_hints(now_ms)).await {
             Ok(true) => {
                 if let Some(receipted) = &self.receipted {
@@ -1581,6 +1649,30 @@ mod tests {
 
     fn source(n: u64) -> SourceRef {
         SourceRef { key: format!("bronze/{n}.parquet"), version: "1".into(), sha256: "d".repeat(64) }
+    }
+
+    /// NAN-4052: a refusing gate (a lost cell writer lease) stops the
+    /// commit before the entry is written; an admitting one changes nothing.
+    #[tokio::test]
+    async fn the_append_gate_refuses_before_the_commit() {
+        struct Gate(std::sync::atomic::AtomicBool);
+        impl AppendGate for Gate {
+            fn check_append(&self) -> Result<()> {
+                anyhow::ensure!(self.0.load(std::sync::atomic::Ordering::SeqCst), "writer lease lost");
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        let gate = std::sync::Arc::new(Gate(std::sync::atomic::AtomicBool::new(true)));
+        writer.set_append_gate(gate.clone());
+        writer.append(LogOp::Add { parts: vec![part(1, Level::L0)], consumed: vec![source(1)], edge_log: None }, 2).await.unwrap();
+        gate.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        let refused = writer.append(LogOp::Add { parts: vec![part(2, Level::L0)], consumed: vec![source(2)], edge_log: None }, 3).await;
+        assert!(refused.is_err());
+        assert_eq!(writer.live().head().unwrap().0, 1, "nothing appended");
+        assert!(store.get(&LogKeys::new(TENANT).unwrap().entry(2)).await.unwrap().is_none(), "no entry object written");
     }
 
     #[tokio::test]
@@ -1995,6 +2087,40 @@ mod tests {
         assert_eq!((point.through_seq, point.through_chain.as_str()), (9, c2.as_str()));
         assert!(check_edge_commit_monotonic(9, 8).is_err());
         check_edge_commit_monotonic(9, 9).unwrap();
+    }
+
+    /// NAN-3643: an operator replay of this tenant's quarantined object is
+    /// an add without an edge range that leaves the edge point alone; any
+    /// other tenant's key, a mixed add, or a second consume is refused.
+    #[tokio::test]
+    async fn quarantine_replay_adds_beside_edge_mode_for_this_tenant_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        let genesis = crate::parts::provenance::edge_log_genesis(TENANT);
+        let (c2, c3) = ("2".repeat(64), "3".repeat(64));
+        writer
+            .append(LogOp::Add { parts: vec![part(1, Level::L0)], consumed: vec![source(1)], edge_log: Some(range(1, 2, &genesis, &c2)) }, 2)
+            .await
+            .unwrap();
+        let id = "b".repeat(64);
+        let replay = SourceRef { key: quarantine_replay_key(TENANT, &id), version: QUARANTINE_REPLAY_VERSION.into(), sha256: id.clone() };
+        assert!(quarantine_replays_only(TENANT, std::slice::from_ref(&replay)));
+        let foreign_tenant = "00000000-0000-4000-8000-000000000001";
+        let foreign = SourceRef { key: quarantine_replay_key(foreign_tenant, &id), ..replay.clone() };
+        assert!(writer.append(LogOp::Add { parts: vec![part(8, Level::L0)], consumed: vec![foreign], edge_log: None }, 3).await.is_err());
+        let wrong_digest = SourceRef { sha256: "c".repeat(64), ..replay.clone() };
+        assert!(writer.append(LogOp::Add { parts: vec![part(8, Level::L0)], consumed: vec![wrong_digest], edge_log: None }, 3).await.is_err());
+        let mixed = vec![replay.clone(), source(2)];
+        assert!(writer.append(LogOp::Add { parts: vec![part(8, Level::L0)], consumed: mixed, edge_log: None }, 3).await.is_err());
+        writer.append(LogOp::Add { parts: vec![part(8, Level::L0)], consumed: vec![replay.clone()], edge_log: None }, 3).await.unwrap();
+        assert!(writer.append(LogOp::Add { parts: vec![part(9, Level::L0)], consumed: vec![replay], edge_log: None }, 3).await.is_err(),
+            "a replay is consumed once");
+        // The edge chain continues from the point the replay left alone.
+        writer
+            .append(LogOp::Add { parts: vec![part(2, Level::L0)], consumed: vec![source(2)], edge_log: Some(range(3, 3, &c2, &c3)) }, 4)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

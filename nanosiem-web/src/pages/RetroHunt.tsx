@@ -14,7 +14,7 @@
 // (list, promote/pause, matches) reuses the standard /rules surfaces.
 
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams, Link } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams, Link } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight, History } from 'lucide-react';
 
@@ -24,7 +24,9 @@ import { api } from '@/lib/api';
 import type { RetroHuntRun } from '@/lib/api/types';
 
 const ARTIFACT_TYPES = ['ip', 'domain', 'hash', 'url'] as const;
-const DEFAULT_LOOKBACK_DAYS = 90;
+// NAN-4169: the retro IOC hunt looks back 5 days by default (Chronicle-style
+// IOC matches over a short window; ingest stamps cover what was known then).
+const DEFAULT_LOOKBACK_DAYS = 5;
 const MAX_LOOKBACK_DAYS = 365;
 const DEFAULT_MAX_INDICATORS = 500;
 const MAX_MAX_INDICATORS = 1000;
@@ -104,13 +106,19 @@ export function RetroHunt() {
   const queryClient = useQueryClient();
 
   useDocumentTitle(isNew ? 'New retro-hunt' : 'Retro-hunt');
+  // NAN-4169: `?preset=ioc` (from the IOC lists page) pre-fills the retro IOC
+  // hunt: every feed the tenant has, polled often enough to follow refreshes.
+  const [searchParams] = useSearchParams();
+  const iocPreset = isNew && searchParams.get('preset') === 'ioc';
 
   // --- form state ---
-  const [name, setName] = useState('Retro-hunt: new threat intel');
-  const [description, setDescription] = useState('');
+  const [name, setName] = useState(iocPreset ? 'Retro IOC match' : 'Retro-hunt: new threat intel');
+  const [description, setDescription] = useState(
+    iocPreset ? 'Indicators added by a feed refresh or IOC list publish, matched against the last 5 days of logs.' : '',
+  );
   const [severity, setSeverity] = useState<'critical' | 'high' | 'medium' | 'low'>('high');
   const [mode, setMode] = useState<'live' | 'alerting'>('live');
-  const [cron, setCron] = useState('*/30 * * * *');
+  const [cron, setCron] = useState(iocPreset ? '*/15 * * * *' : '*/30 * * * *');
   const [feeds, setFeeds] = useState<string[]>([]);
   const [artifactTypes, setArtifactTypes] = useState<string[]>([]);
   const [lookbackDays, setLookbackDays] = useState(DEFAULT_LOOKBACK_DAYS);
@@ -163,6 +171,8 @@ export function RetroHunt() {
         artifact_types: artifactTypes,
         lookback_days: lookbackDays,
         max_indicators_per_run: maxIndicators,
+        // NAN-4169: retro hits are tagged so the alert queue can filter them.
+        tags: ['retro'],
       }),
     onSuccess: (created) => {
       toast({ title: 'Retro-hunt rule created', description: created.name });

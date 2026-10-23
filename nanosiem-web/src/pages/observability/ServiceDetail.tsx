@@ -22,9 +22,9 @@ import {
   GitBranch,
   ChevronRight,
   Target,
-  RefreshCw,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
@@ -38,6 +38,8 @@ import type { ServiceDetailResponse, SeriesPoint, Slo } from '@/lib/api/observab
 import type { TimeRange } from '@/lib/api/types';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 
+import { isBackgroundService, latencyClass, backgroundHealth, isBackgroundOperation } from '@/components/observability/workload';
+
 export interface ServiceDetailProps {
   service: string;
   apiTimeRange: TimeRange;
@@ -50,7 +52,7 @@ const HealthDot = ({ h, pulse }: { h: DesignHealth; pulse?: boolean }) => (
     className={cn(
       'inline-block w-[7px] h-[7px] rounded-full shrink-0',
       HEALTH[h].dot,
-      pulse && h !== 'good' && 'animate-pulse'
+      pulse && (h === 'warn' || h === 'danger') && 'animate-pulse'
     )}
   />
 );
@@ -92,7 +94,7 @@ function RedPanel({ title, icon, value, unit, sub, subTone, children }: RedPanel
 // Endpoints — per span_name breakdown
 // ---------------------------------------------------------------------------
 
-function EndpointsTable({ endpoints }: { endpoints: ServiceDetailResponse['endpoints'] }) {
+function EndpointsTable({ endpoints, service }: { endpoints: ServiceDetailResponse['endpoints']; service: string }) {
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <div className="px-3.5 py-2.5 border-b border-border font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2 font-semibold flex items-center gap-2">
@@ -131,7 +133,7 @@ function EndpointsTable({ endpoints }: { endpoints: ServiceDetailResponse['endpo
               <span
                 className={cn(
                   'font-mono text-[11.5px] tabular-nums text-right',
-                  e.p95_ms >= 600 ? 'text-warn' : 'text-fg-2'
+                  latencyClass(service, 'p95', e.p95_ms, e.span_name)
                 )}
               >
                 {fmtMs(e.p95_ms)}
@@ -150,9 +152,11 @@ function EndpointsTable({ endpoints }: { endpoints: ServiceDetailResponse['endpo
 
 function ExemplarTraces({
   exemplars,
+  service,
   onOpenTrace,
 }: {
   exemplars: ServiceDetailResponse['exemplars'];
+  service: string;
   onOpenTrace: (traceId: string) => void;
 }) {
   const scatter: ScatterTrace[] = useMemo(
@@ -203,7 +207,7 @@ function ExemplarTraces({
               <span
                 className={cn(
                   'w-1.5 h-1.5 rounded-full shrink-0',
-                  t.error ? 'bg-danger' : t.duration_ms >= 600 ? 'bg-warn' : 'bg-good'
+                  t.error ? 'bg-danger' : isBackgroundOperation(service, t.span_name) ? 'bg-fg-3' : t.duration_ms >= 600 ? 'bg-warn' : 'bg-good'
                 )}
               />
               <span className="font-mono text-[11px] text-fg-3 truncate w-[88px] shrink-0">
@@ -214,7 +218,7 @@ function ExemplarTraces({
               <span
                 className={cn(
                   'font-mono text-[11px] tabular-nums shrink-0',
-                  t.duration_ms >= 600 ? 'text-warn' : 'text-fg-2'
+                  latencyClass(service, 'p95', t.duration_ms, t.span_name)
                 )}
               >
                 {fmtMs(t.duration_ms)}
@@ -301,7 +305,7 @@ function bucketStepSecs(points: SeriesPoint[]): number {
   return secs > 0 ? secs : 1;
 }
 
-function summarize(detail: ServiceDetailResponse) {
+function summarize(detail: ServiceDetailResponse, service: string) {
   const { rate, errors, latency } = detail.red;
   const totalReq = rate.reduce((s, p) => s + p.v, 0);
   const totalErr = errors.reduce((s, p) => s + p.v, 0);
@@ -314,6 +318,7 @@ function summarize(detail: ServiceDetailResponse) {
   // O50: mirror the server's service_health thresholds (error_rate 5%/1%,
   // p95 1000/600 ms) so the badge agrees with the Services-tab classification.
   const health: DesignHealth =
+    isBackgroundService(service) ? backgroundHealth(errPct / 100) :
     errPct >= 5 || peakP95 >= 1000 ? 'danger' : errPct >= 1 || peakP95 >= 600 ? 'warn' : 'good';
   return { totalReq, totalErr, errPct, peakP50, peakP95, peakP99, health };
 }
@@ -405,12 +410,12 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
         <span
           className={cn(
             'inline-flex items-center gap-1.5 px-2 py-0.5 rounded border text-[10.5px] font-medium',
-            HEALTH[summarize(detail).health].bg,
-            HEALTH[summarize(detail).health].text
+            HEALTH[summarize(detail, service).health].bg,
+            HEALTH[summarize(detail, service).health].text
           )}
         >
-          <HealthDot h={summarize(detail).health} pulse />
-          {HEALTH[summarize(detail).health].label}
+          <HealthDot h={summarize(detail, service).health} pulse />
+          {HEALTH[summarize(detail, service).health].label}
         </span>
       )}
       <span className="flex-1" />
@@ -433,7 +438,7 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
       <div className="flex flex-col gap-3">
         {Header}
         <div className="flex items-center justify-center py-16 text-fg-3">
-          <RefreshCw className="w-4 h-4 animate-spin" />
+          <LoadingIcon className="w-4 h-4" />
         </div>
       </div>
     );
@@ -450,7 +455,7 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
     );
   }
 
-  const sum = summarize(detail);
+  const sum = summarize(detail, service);
   const buckets = detail.red.rate.map((p) => p.t);
   // O9: `rate[].v` is a per-bucket span COUNT (not a rate). The chart plots each
   // bucket's true req/s (count / bucket width); the header shows the window
@@ -515,7 +520,7 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
           title="Latency"
           icon={<LineChart className="w-[12px] h-[12px] text-brand" />}
           value={fmtMs(sum.peakP95)}
-          unit="peak p95"
+          unit={isBackgroundService(service) ? 'peak p95 · background · no latency objective' : 'peak p95'}
           sub={`peak p50 ${fmtMs(sum.peakP50)} · peak p99 ${fmtMs(sum.peakP99)}`}
         >
           <REDChart
@@ -531,8 +536,8 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-[1.5fr_1fr] gap-2.5">
-        <EndpointsTable endpoints={detail.endpoints} />
-        <ExemplarTraces exemplars={detail.exemplars} onOpenTrace={onOpenTrace} />
+        <EndpointsTable endpoints={detail.endpoints} service={service} />
+        <ExemplarTraces service={service} exemplars={detail.exemplars} onOpenTrace={onOpenTrace} />
       </div>
     </div>
   );

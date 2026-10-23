@@ -14,7 +14,8 @@ test('header matching is case insensitive and supports every HeadersInit shape',
   assert.equal(requestCredentials('/api/auth/me', [['authorization', 'Bearer test']]), 'omit');
 });
 test('login, MFA, and refresh preserve cookie installation and rotation', () => {
-  for (const endpoint of ['/api/auth/login', '/api/auth/mfa/verify', '/api/auth/refresh']) {
+  // NAN-4152: the shared demo claim installs the same session cookies as a login.
+  for (const endpoint of ['/api/auth/login', '/api/auth/mfa/verify', '/api/auth/refresh', '/api/auth/shared/demo/claim']) {
     assert.equal(requestCredentials(endpoint, {}), 'include');
   }
 });

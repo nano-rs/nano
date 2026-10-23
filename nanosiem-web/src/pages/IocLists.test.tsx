@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MemoryRouter } from 'react-router-dom';
 import type { IocListSummary } from '@/lib/api/ioc-lists';
 import { uploadFormatFor } from '@/lib/api/ioc-lists';
 import { IocLists } from './IocLists';
@@ -21,11 +22,20 @@ const mocks = vi.hoisted(() => ({
   remove: vi.fn(),
   publish: vi.fn(),
   indicators: vi.fn(),
+  listDetections: vi.fn(),
+  retro: vi.fn(),
 }));
+
+vi.mock('@/components/search/retro/useRetro', () => ({ fetchRetroPage: (...args: unknown[]) => mocks.retro(...args) }));
 
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 const limits = { indicators_per_list: 8000, indicators_per_tenant: 25000, list_count: 50, upload_bytes: 8 * 1024 * 1024 };
-vi.mock('@/lib/api', () => ({ api: { iocLists: { ...mocks, list: async () => ({ lists: await mocks.list(), limits }) } } }));
+vi.mock('@/lib/api', () => ({
+  api: {
+    iocLists: { ...mocks, list: async () => ({ lists: await mocks.list(), limits }) },
+    listDetections: (...args: unknown[]) => mocks.listDetections(...args),
+  },
+}));
 
 const summary: IocListSummary = {
   id: '5fb667bb-2a93-4f33-9b60-72d683bd0dde',
@@ -47,7 +57,9 @@ function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
-      <IocLists />
+      <MemoryRouter>
+        <IocLists />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }
@@ -271,5 +283,47 @@ describe('IocLists', () => {
     expect(uploadFormatFor('feed.json')).toBe('json');
     expect(uploadFormatFor('list.txt')).toBe('text');
     expect(uploadFormatFor('unknown.dat')).toBe('csv');
+  });
+
+  // NAN-4169: the retro IOC hunt strip shows the tenant's rule or offers setup.
+  it('offers to set up the retro IOC hunt when no retro-hunt rule exists', async () => {
+    mocks.list.mockResolvedValue([]);
+    mocks.listDetections.mockResolvedValue([{ id: 'r1', name: 'plain', kind: 'standard', mode: 'live' }]);
+    renderPage();
+    const strip = await screen.findByTestId('retro-ioc-hunt');
+    expect(strip.textContent).toContain('off');
+    expect(screen.getByRole('link', { name: /set up/ }).getAttribute('href')).toBe('/rules/retro-hunt/new?preset=ioc');
+  });
+
+  it("links the tenant's retro-hunt rule and its runs", async () => {
+    mocks.list.mockResolvedValue([]);
+    mocks.listDetections.mockResolvedValue([
+      { id: 'gone', name: 'old', kind: 'retro_hunt', mode: 'live', archived: true },
+      { id: 'r2', name: 'Retro IOC match', kind: 'retro_hunt', mode: 'alerting' },
+    ]);
+    renderPage();
+    const strip = await screen.findByTestId('retro-ioc-hunt');
+    expect(strip.textContent).toContain('Retro IOC match');
+    expect(strip.textContent).toContain('alerting');
+    expect(screen.getByRole('link', { name: /runs/ }).getAttribute('href')).toBe('/rules/retro-hunt/r2');
+  });
+
+  it('counts hits over the last 5 days on request and links each hit to the retro view', async () => {
+    mocks.list.mockResolvedValue([summary]);
+    mocks.listDetections.mockResolvedValue([]);
+    const row = (value: string) => ({ value, ioc_type: 'ip', risk_score: 75, tags: [], expires_at: null, note: null, added_at: new Date().toISOString(), expired: false });
+    mocks.indicators.mockResolvedValue({ indicators: [row('45.33.32.156'), row('10.9.9.9')], next_cursor: null, scanned: 2, scan_limited: false });
+    mocks.retro.mockResolvedValue({ submode: 'list', axis: 'indicator', total_hosts: 10, rows: [{ value: '45.33.32.156', hits: 1234 }], no_hits: ['10.9.9.9'] });
+    renderPage();
+    fireEvent.click(await screen.findByLabelText('View apt-infra indicators'));
+    expect(await screen.findByText('45.33.32.156')).toBeTruthy();
+    expect(mocks.retro).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText('count hits (5d)'));
+    const hit = await screen.findByRole('link', { name: '1,234' });
+    expect(hit.getAttribute('href')).toContain(encodeURIComponent('ioc="45.33.32.156" | retro').replace(/%20/g, '+'));
+    const [params, range] = mocks.retro.mock.calls[0];
+    expect(params).toMatchObject({ query: 'ioc in ["45.33.32.156","10.9.9.9"] | retro', axis: 'indicator', offset: 0 });
+    expect(Date.parse(range.end) - Date.parse(range.start)).toBe(5 * 24 * 60 * 60 * 1000);
+    expect(screen.getByText('0')).toBeTruthy();
   });
 });

@@ -219,14 +219,17 @@ fn eval_expression_until_keyword(input: &str) -> ParseResult<'_, EvalExpression>
 ///   | prevalence hash_first_seen > now() - 24h
 ///   | prevalence domain_prevalence < 10 domain_first_seen > now()-86400 window=24h
 ///
+/// `window=` scopes the host counts only: `*_first_seen` is always the first
+/// sighting in the 30d prevalence data, whatever `window=` is (NAN-4372).
+///
 /// Enrichment mode (explicit):
 ///   | prevalence enrich=true
 ///   | prevalence enrich=true window=24h
 ///
 /// Enrichment mode (positional shorthand):
 ///   | prevalence src_ip
-///   | prevalence src_ip threshold=rare
 ///   | prevalence src_ip, dest_ip
+///   | prevalence src_ip | where is_rare=true   (rarity filter after enrichment)
 pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = tag_no_case("prevalence").parse(input)?;
     let (input, _) = multispace1(input)?;
@@ -369,7 +372,7 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
         ));
     }
 
-    // Positional enrichment shorthand: prevalence field1, field2 [threshold=rare|uncommon|common]
+    // Positional enrichment shorthand: prevalence field1, field2 [window=…]
     // Parse comma-separated field names
     let (remaining, fields) =
         separated_list0(delimited(multispace0, char(','), multispace0), field_name).parse(input)?;
@@ -381,23 +384,40 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
         )));
     }
 
-    // Parse optional threshold=rare|uncommon|common (accepted but ignored for now)
-    let mut remaining = remaining;
-    if let Ok((next, _)) = preceded::<_, _, nom::error::Error<&str>, _, _>(
+    // NAN-4372: a prevalence FILTER name is never an artifact field. A bare
+    // `prevalence domain_first_seen` (or one whose comparison failed to parse,
+    // e.g. `domain_first_seen > yesterday`) used to fall through to this
+    // enrichment shorthand, which decorated nothing and returned every row.
+    // Fail at the name; `convert_error` explains the filter syntax.
+    for field in &fields {
+        if is_prevalence_filter_field_name(field) {
+            let at = input
+                .find(field.as_str())
+                .map_or(input, |offset| &input[offset..]);
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                at,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+    }
+
+    // NAN-4372: `threshold=rare|uncommon|common` used to be accepted and
+    // ignored, so the stage that read as a rarity filter returned every row.
+    // Refuse it at the keyword; `convert_error` names the supported filter.
+    let remaining = if let Ok((_, _)) = preceded::<_, _, nom::error::Error<&str>, _, _>(
         multispace1,
-        preceded(
-            tag_no_case("threshold="),
-            alt((
-                tag_no_case("rare"),
-                tag_no_case("uncommon"),
-                tag_no_case("common"),
-            )),
-        ),
+        tag_no_case("threshold="),
     )
     .parse(remaining)
     {
-        remaining = next;
-    }
+        let at = remaining.trim_start();
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            at,
+            nom::error::ErrorKind::Verify,
+        )));
+    } else {
+        remaining
+    };
 
     // Parse optional window parameter
     let (remaining, time_window) =
@@ -412,6 +432,25 @@ pub(super) fn prevalence_command(input: &str) -> ParseResult<'_, Command> {
             enrich: true,
         },
     ))
+}
+
+/// Every name [`prevalence_field`] accepts as a filter condition's field.
+pub(crate) const PREVALENCE_FILTER_FIELD_NAMES: &[&str] = &[
+    "prevalence_file_hash",
+    "prevalence_process_hash",
+    "prevalence_dest_domain",
+    "hash_prevalence",
+    "domain_prevalence",
+    "hash_first_seen",
+    "domain_first_seen",
+];
+
+/// Whether `name` is a prevalence filter field (case-insensitive), i.e. it
+/// needs `<op> <threshold>` and can never be a positional artifact field.
+pub(crate) fn is_prevalence_filter_field_name(name: &str) -> bool {
+    PREVALENCE_FILTER_FIELD_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
 /// Parse a single prevalence condition: field operator threshold
@@ -435,6 +474,22 @@ fn prevalence_condition(input: &str) -> ParseResult<'_, PrevalenceCondition> {
 /// Parse prevalence field name
 fn prevalence_field(input: &str) -> ParseResult<'_, PrevalenceField> {
     alt((
+        // NAN-4288 (F15): the nPL reference writes the condition with the
+        // prevalence column names (`prevalence prevalence_file_hash < 5`),
+        // which were a parse error. File and process hashes are both hash
+        // artifacts; there is no IP rarity filter, so `prevalence_dest_ip`
+        // stays unsupported here (use `enrich=true | where`).
+        value(
+            PrevalenceField::HashPrevalence,
+            alt((
+                tag_no_case("prevalence_file_hash"),
+                tag_no_case("prevalence_process_hash"),
+            )),
+        ),
+        value(
+            PrevalenceField::DomainPrevalence,
+            tag_no_case("prevalence_dest_domain"),
+        ),
         value(
             PrevalenceField::HashPrevalence,
             tag_no_case("hash_prevalence"),

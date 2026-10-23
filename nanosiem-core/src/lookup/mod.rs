@@ -29,5 +29,5 @@ pub use service::{LookupError, LookupService};
 pub use types::{
     BatchLookupQuery, BatchLookupResult, ColumnTypeOverride, LookupColumn, LookupHistoryEntry,
     LookupHistoryKind, LookupQuery, LookupResult, LookupRowsPage, LookupTable, LookupTableCreator,
-    LookupUsage, NewLookupTable, LOOKUP_TABLE_PREFIX, MAX_LOOKUP_TABLE_ROWS,
+    LookupUsage, NewLookupTable, LOOKUP_TABLE_PREFIX, MAX_BATCH_LOOKUP_KEYS, MAX_LOOKUP_TABLE_ROWS,
 };

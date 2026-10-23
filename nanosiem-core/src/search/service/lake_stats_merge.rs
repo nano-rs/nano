@@ -19,6 +19,19 @@
 //! | `latest(timestamp)`, `max(timestamp)`   | `max(timestamp)`         | max (chronological)       |
 //! | `first(f)`                           | `argMin(f, timestamp)`      | oldest slice's non-null   |
 //! | `last(f)`                            | `argMax(f, timestamp)`      | newest slice's non-null   |
+//! | `sum(n)` (NAN-4313)                  | `sum(n)`                    | sum of non-null partials  |
+//! | `min(n)` / `max(n)` of a numeric `n` | `min(n)` / `max(n)`         | numeric min / max         |
+//! | `avg(n)`                             | `sum(n)`, `count(n)`        | Σsum / Σcount             |
+//!
+//! NAN-4313: an empty slice of an ungrouped `stats` returns its one row with
+//! count 0 and every other state NULL (NAN-4291), and a grouped slice has no
+//! row for a group it did not see, so every merge skips NULL partials. A sum
+//! of integer partials is exact (i128); `avg` is the merged sum over the
+//! merged non-null count, which is what ClickHouse's `avg` computes over the
+//! whole window. `min`/`max` merge numerically only on fields the schema
+//! types as numeric (below). Percentiles and medians have no exact merge from
+//! partials and keep the rejection, which the search handler escalates to a
+//! durable job where the tenant has one.
 //!
 //! `first`/`last` need no per-field companion timestamp: bisected slices are
 //! disjoint in event time, so every event of a newer slice is strictly newer
@@ -31,12 +44,13 @@
 //! event time can only occur inside one slice, where the engine resolves it
 //! exactly as the unsliced query would.
 //!
-//! `min`/`max` merge only on the physical event-time column: the worker's
-//! JSON cannot distinguish a quoted UInt64 from a digit String, so merging
-//! them for an arbitrary field could order `"10"` and `"9"` differently from
-//! ClickHouse. Everything else (`avg`, `dc`, `values`, percentiles,
-//! conditional or expression aggregations, a row transform before `stats`)
-//! keeps the existing single-request behaviour.
+//! `min`/`max` merge chronologically on the physical event-time column and
+//! numerically on a schema-numeric field. The worker's JSON cannot
+//! distinguish a quoted UInt64 from a digit String, so on any other field
+//! merging could order `"10"` and `"9"` differently from ClickHouse.
+//! Everything else (`dc`, `values`, percentiles, conditional or expression
+//! aggregations, a row transform before `stats`) keeps the existing
+//! single-request behaviour.
 //!
 //! The path is taken ONLY after the worker rejects the unsliced request with
 //! a scan-budget error, so every query that succeeds today is unchanged.
@@ -48,7 +62,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 
 use super::core_search::{is_lake_scan_budget_rejection, LakeSliceRetries};
-use crate::query::{AggFunc, Command, Query};
+use crate::query::{AggFunc, Command, PrettyPrint, Query};
 use crate::search::types::TimeRangeInput;
 use crate::search::SearchError;
 
@@ -58,7 +72,7 @@ const EVENT_TIME_FIELD: &str = "timestamp";
 const SLICE_CONCURRENCY: usize = 2;
 
 /// How one aggregation's per-slice cells combine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LakeSliceMerge {
     /// `count()` — sum.
     Count,
@@ -70,6 +84,15 @@ pub(super) enum LakeSliceMerge {
     First,
     /// `last(f)` — the newest slice's non-null value.
     Last,
+    /// `sum(n)` — the sum of the non-null partials (NAN-4313).
+    Sum,
+    /// `min(n)` of a numeric field — the least non-null partial.
+    Min,
+    /// `max(n)` of a numeric field — the greatest non-null partial.
+    Max,
+    /// `avg(n)` — each slice sends `sum(n)` and `count(n)` under these
+    /// private aliases; the merge is Σsum / Σcount (null when Σcount is 0).
+    Avg { sum: String, count: String },
 }
 
 /// A `stats` pipeline that can run as disjoint time slices and merge exactly.
@@ -84,17 +107,28 @@ pub(super) struct LakeMergeableStatsPlan {
     pub post_commands: Vec<Command>,
 }
 
-fn merge_rule(aggregation: &crate::query::Aggregation) -> Option<LakeSliceMerge> {
+fn merge_rule(
+    aggregation: &crate::query::Aggregation,
+    index: usize,
+    numeric: &dyn Fn(&str) -> bool,
+) -> Option<LakeSliceMerge> {
     if aggregation.condition.is_some() || aggregation.field_expr.is_some() {
         return None;
     }
     let field = aggregation.field.as_deref();
     match (aggregation.func, field) {
+        (AggFunc::Sum, Some(_)) => Some(LakeSliceMerge::Sum),
+        (AggFunc::Avg, Some(_)) => Some(LakeSliceMerge::Avg {
+            sum: format!("__nano_avg_sum_{index}"),
+            count: format!("__nano_avg_count_{index}"),
+        }),
         (AggFunc::Count, None) => Some(LakeSliceMerge::Count),
         (AggFunc::Earliest | AggFunc::Min, Some(EVENT_TIME_FIELD | "time")) => {
             Some(LakeSliceMerge::Earliest)
         }
         (AggFunc::Latest | AggFunc::Max, Some(EVENT_TIME_FIELD | "time")) => Some(LakeSliceMerge::Latest),
+        (AggFunc::Min, Some(field)) if numeric(field) => Some(LakeSliceMerge::Min),
+        (AggFunc::Max, Some(field)) if numeric(field) => Some(LakeSliceMerge::Max),
         (AggFunc::First, Some(_)) => Some(LakeSliceMerge::First),
         (AggFunc::Last, Some(_)) => Some(LakeSliceMerge::Last),
         _ => None,
@@ -107,7 +141,10 @@ fn merge_rule(aggregation: &crate::query::Aggregation) -> Option<LakeSliceMerge>
 /// before `stats` could rewrite the event-time column that `first`/`last`
 /// order by. The suffix is limited to the bounded row/ordering commands the
 /// count path already applies in Rust.
-pub(super) fn lake_mergeable_stats_plan(query: &Query) -> Option<LakeMergeableStatsPlan> {
+pub(super) fn lake_mergeable_stats_plan(
+    query: &Query,
+    numeric: &dyn Fn(&str) -> bool,
+) -> Option<LakeMergeableStatsPlan> {
     let Query::Piped { source, command } = query else {
         return None;
     };
@@ -122,14 +159,18 @@ pub(super) fn lake_mergeable_stats_plan(query: &Query) -> Option<LakeMergeableSt
         if aggregations.is_empty() {
             return None;
         }
+        let group_by_spec = group_by;
         let group_by = group_by.clone().unwrap_or_default();
         let mut seen: HashSet<String> = group_by.iter().cloned().collect();
         if seen.len() != group_by.len() {
             return None;
         }
         let mut merged = Vec::with_capacity(aggregations.len());
-        for aggregation in aggregations {
-            let rule = merge_rule(aggregation)?;
+        // What each slice computes: the query's own aggregations, with an
+        // `avg` replaced by its sum and non-null count partials.
+        let mut slice_aggregations = Vec::with_capacity(aggregations.len());
+        for (index, aggregation) in aggregations.iter().enumerate() {
+            let rule = merge_rule(aggregation, index, numeric)?;
             let alias = aggregation.output_alias();
             // A duplicate alias (or one shadowing a group key) would fold two
             // states into one JSON column; the worker's own output is then
@@ -137,10 +178,33 @@ pub(super) fn lake_mergeable_stats_plan(query: &Query) -> Option<LakeMergeableSt
             if !seen.insert(alias.clone()) {
                 return None;
             }
+            if let LakeSliceMerge::Avg { sum, count } = &rule {
+                if !seen.insert(sum.clone()) || !seen.insert(count.clone()) {
+                    return None;
+                }
+                slice_aggregations.push(crate::query::Aggregation::with_alias(
+                    AggFunc::Sum,
+                    aggregation.field.clone(),
+                    sum.clone(),
+                ));
+                slice_aggregations.push(crate::query::Aggregation::with_alias(
+                    AggFunc::Count,
+                    aggregation.field.clone(),
+                    count.clone(),
+                ));
+            } else {
+                slice_aggregations.push(aggregation.clone());
+            }
             merged.push((alias, rule));
         }
         return Some(LakeMergeableStatsPlan {
-            aggregate_query: query.clone(),
+            aggregate_query: Query::Piped {
+                source: source.clone(),
+                command: Command::Stats {
+                    aggregations: slice_aggregations,
+                    group_by: group_by_spec.clone(),
+                },
+            },
             group_by,
             aggregations: merged,
             post_commands: Vec::new(),
@@ -162,7 +226,7 @@ pub(super) fn lake_mergeable_stats_plan(query: &Query) -> Option<LakeMergeableSt
     if !supported_suffix {
         return None;
     }
-    let mut plan = lake_mergeable_stats_plan(source)?;
+    let mut plan = lake_mergeable_stats_plan(source, numeric)?;
     plan.post_commands.push(command.clone());
     Some(plan)
 }
@@ -193,6 +257,95 @@ fn parse_count(value: Option<&serde_json::Value>) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// One numeric partial: integers stay exact (a UInt64 / Int64 sum arrives
+/// as a JSON number or a quoted string), anything else is a float.
+#[derive(Debug, Clone, Copy)]
+enum Partial {
+    Int(i128),
+    Float(f64),
+}
+
+impl Partial {
+    fn as_f64(self) -> f64 {
+        match self {
+            Partial::Int(value) => value as f64,
+            Partial::Float(value) => value,
+        }
+    }
+
+    fn compare(&self, other: &Partial) -> std::cmp::Ordering {
+        match (self, other) {
+            (Partial::Int(left), Partial::Int(right)) => left.cmp(right),
+            (left, right) => left
+                .as_f64()
+                .partial_cmp(&right.as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        }
+    }
+}
+
+fn parse_partial(value: &serde_json::Value, alias: &str) -> Result<Partial, SearchError> {
+    let parsed = match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| number.as_u64().map(i128::from))
+            .map(Partial::Int)
+            .or_else(|| number.as_f64().map(Partial::Float)),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            text.parse::<i128>()
+                .map(Partial::Int)
+                .ok()
+                .or_else(|| text.parse::<f64>().ok().map(Partial::Float))
+        }
+        _ => None,
+    };
+    parsed.ok_or_else(|| malformed(format!("{alias} partial {value} is not numeric")))
+}
+
+/// `cell + incoming` for two sum partials (`cell` may be null: nothing yet).
+/// The result keeps the worker's spelling: quoted if either partial was.
+fn add_partials(
+    cell: &serde_json::Value,
+    incoming: &serde_json::Value,
+    alias: &str,
+) -> Result<serde_json::Value, SearchError> {
+    if cell.is_null() {
+        parse_partial(incoming, alias)?;
+        return Ok(incoming.clone());
+    }
+    let quoted = cell.is_string() || incoming.is_string();
+    let total = match (parse_partial(cell, alias)?, parse_partial(incoming, alias)?) {
+        (Partial::Int(left), Partial::Int(right)) => Partial::Int(
+            left.checked_add(right)
+                .ok_or_else(|| malformed(format!("{alias} overflowed")))?,
+        ),
+        (left, right) => Partial::Float(left.as_f64() + right.as_f64()),
+    };
+    Ok(match total {
+        Partial::Int(value) if quoted => serde_json::Value::String(value.to_string()),
+        Partial::Int(value) => i64::try_from(value)
+            .map(serde_json::Value::from)
+            .or_else(|_| u64::try_from(value).map(serde_json::Value::from))
+            .unwrap_or_else(|_| serde_json::Value::String(value.to_string())),
+        Partial::Float(value) if quoted => serde_json::Value::String(value.to_string()),
+        Partial::Float(value) => serde_json::json!(value),
+    })
+}
+
+/// The merged `[Σsum, Σcount]` of an `avg` as ClickHouse's Float64 average;
+/// null when no slice saw a value.
+fn average(state: &serde_json::Value) -> serde_json::Value {
+    let count = parse_count(state.get(1)).unwrap_or(0);
+    match state.get(0) {
+        Some(sum) if count > 0 && !sum.is_null() => parse_partial(sum, "avg")
+            .map(|sum| serde_json::json!(sum.as_f64() / count as f64))
+            .unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    }
 }
 
 fn malformed(message: String) -> SearchError {
@@ -243,6 +396,8 @@ pub(super) fn merge_lake_stats_slices(
                     .iter()
                     .map(|(_, rule)| match rule {
                         LakeSliceMerge::Count => serde_json::Value::from(0_u64),
+                        // [Σsum, Σcount] until the final division.
+                        LakeSliceMerge::Avg { .. } => serde_json::json!([null, 0_u64]),
                         _ => serde_json::Value::Null,
                     })
                     .collect(),
@@ -251,6 +406,46 @@ pub(super) fn merge_lake_stats_slices(
         for ((alias, rule), cell) in plan.aggregations.iter().zip(entry.1.iter_mut()) {
             let incoming = object.get(alias).unwrap_or(&serde_json::Value::Null);
             match rule {
+                LakeSliceMerge::Sum => {
+                    if !incoming.is_null() {
+                        *cell = add_partials(cell, incoming, alias)?;
+                    }
+                }
+                LakeSliceMerge::Min | LakeSliceMerge::Max => {
+                    if incoming.is_null() {
+                        continue;
+                    }
+                    let candidate = parse_partial(incoming, alias)?;
+                    let replace = cell.is_null() || {
+                        let current = parse_partial(cell, alias)?;
+                        let order = candidate.compare(&current);
+                        if *rule == LakeSliceMerge::Min {
+                            order == std::cmp::Ordering::Less
+                        } else {
+                            order == std::cmp::Ordering::Greater
+                        }
+                    };
+                    if replace {
+                        *cell = incoming.clone();
+                    }
+                }
+                LakeSliceMerge::Avg { sum, count } => {
+                    let partial_sum = object.get(sum).unwrap_or(&serde_json::Value::Null);
+                    let partial_count = parse_count(object.get(count))
+                        .ok_or_else(|| malformed(format!("worker omitted numeric {count}")))?;
+                    if partial_count == 0 {
+                        continue;
+                    }
+                    if partial_sum.is_null() {
+                        return Err(malformed(format!("{sum} is null over {partial_count} values")));
+                    }
+                    let total_sum = add_partials(&cell[0], partial_sum, sum)?;
+                    let total_count = parse_count(Some(&cell[1]))
+                        .unwrap_or(0)
+                        .checked_add(partial_count)
+                        .ok_or_else(|| malformed(format!("{count} overflowed UInt64")))?;
+                    *cell = serde_json::json!([total_sum, total_count]);
+                }
                 LakeSliceMerge::Count => {
                     let add = parse_count(Some(incoming))
                         .ok_or_else(|| malformed(format!("worker omitted numeric {alias}")))?;
@@ -301,12 +496,39 @@ pub(super) fn merge_lake_stats_slices(
             for (field, value) in plan.group_by.iter().zip(groups) {
                 row.insert(field.clone(), value);
             }
-            for ((alias, _), value) in plan.aggregations.iter().zip(cells) {
+            for ((alias, rule), value) in plan.aggregations.iter().zip(cells) {
+                let value = match rule {
+                    LakeSliceMerge::Avg { .. } => average(&value),
+                    _ => value,
+                };
                 row.insert(alias.clone(), value);
             }
             serde_json::Value::Object(row)
         })
         .collect())
+}
+
+/// NAN-4313 native-test seam: the statement each budget slice of `query`
+/// runs (`None` when it is not slice-mergeable). The lake worker's native
+/// tests run it through the real compiler and engine per slice and merge the
+/// rows with [`merge_sliced_stats`], the same plan and merge the search
+/// service uses.
+#[doc(hidden)]
+pub fn sliced_stats_statement(query: &str, numeric: &dyn Fn(&str) -> bool) -> Option<String> {
+    let parsed = crate::query::parse_query(query).ok()?;
+    lake_mergeable_stats_plan(&parsed, numeric).map(|plan| plan.aggregate_query.pretty_print())
+}
+
+/// NAN-4313 native-test seam: [`merge_lake_stats_slices`] for `query`.
+#[doc(hidden)]
+pub fn merge_sliced_stats(
+    query: &str,
+    numeric: &dyn Fn(&str) -> bool,
+    slices: Vec<(TimeRangeInput, Vec<serde_json::Value>)>,
+) -> Option<Result<Vec<serde_json::Value>, SearchError>> {
+    let parsed = crate::query::parse_query(query).ok()?;
+    let plan = lake_mergeable_stats_plan(&parsed, numeric)?;
+    Some(merge_lake_stats_slices(&plan, slices, usize::MAX))
 }
 
 /// Run a scan-budget-rejected stats query as bisected time slices.
@@ -391,7 +613,7 @@ mod tests {
 
     #[test]
     fn identity_sync_query_has_an_exact_slice_merge_plan() {
-        let plan = lake_mergeable_stats_plan(&parse_query(IDENTITY_QUERY).unwrap())
+        let plan = lake_mergeable_stats_plan(&parse_query(IDENTITY_QUERY).unwrap(), &|_| false)
             .expect("identity sync stats must be sliceable");
         assert_eq!(plan.group_by, vec!["user".to_string()]);
         assert_eq!(
@@ -415,8 +637,7 @@ mod tests {
         );
         // The last-sign-in overlay query is sliceable too.
         assert!(lake_mergeable_stats_plan(
-            &parse_query("user=* auth_result=success | stats latest(timestamp) as last_sign_in by user | head 50000").unwrap()
-        )
+            &parse_query("user=* auth_result=success | stats latest(timestamp) as last_sign_in by user | head 50000").unwrap(), &|_| false)
         .is_some());
     }
 
@@ -429,7 +650,7 @@ mod tests {
         let settings =
             crate::enterprise_shared_identity_sync::TenantIdentitySyncSettings::default();
         let observed =
-            lake_mergeable_stats_plan(&parse_query(&settings.observed_users_query()).unwrap())
+            lake_mergeable_stats_plan(&parse_query(&settings.observed_users_query()).unwrap(), &|_| false)
                 .expect("observed-users query must be slice-mergeable");
         assert_eq!(
             observed.aggregations.len(),
@@ -437,9 +658,9 @@ mod tests {
             "count + earliest + latest + four OCSF identity attributes"
         );
         assert_eq!(observed.group_by, vec!["user.name".to_string()]);
-        assert!(lake_mergeable_stats_plan(&parse_query(&settings.observed_principals_query(true)).unwrap()).is_some());
+        assert!(lake_mergeable_stats_plan(&parse_query(&settings.observed_principals_query(true)).unwrap(), &|_| false).is_some());
         assert!(
-            lake_mergeable_stats_plan(&parse_query(&settings.last_sign_in_query()).unwrap())
+            lake_mergeable_stats_plan(&parse_query(&settings.last_sign_in_query()).unwrap(), &|_| false)
                 .is_some()
         );
     }
@@ -447,31 +668,77 @@ mod tests {
     #[test]
     fn non_mergeable_stats_never_take_the_slice_path() {
         for query in [
-            // avg/dc/values have no exact slice-merge state here.
-            "user=* | stats avg(bytes_in) by user",
+            // dc/values have no exact slice-merge state here, nor do
+            // percentiles or medians (no exact merge from partials).
             "user=* | stats dc(src_ip) by user",
+            "user=* | stats perc95(bytes_in) as p by user",
+            "user=* | stats median(bytes_in) as m",
             "user=* | stats values(src_ip) by user",
-            // min/max on a non-time column: the worker's JSON cannot say whether
-            // "10" < "9" is a String or a UInt64 comparison.
+            // min/max on a column the schema does not type numeric: the
+            // worker's JSON cannot say whether "10" < "9" is a String or a
+            // UInt64 comparison.
             "user=* | stats min(bytes_in) as b by user",
             // Conditional / expression aggregations.
             "user=* | stats count(eval(auth_result=\"success\")) as ok by user",
             // Duplicate output aliases would collapse two states into one column.
-            "user=* | stats last(user_domain), last(user_identity_email) by user",
+            "user=* | stats last(user_domain) as l, last(user_identity_email) as l by user",
             // A row transform before stats could rewrite `timestamp`.
             "user=* | eval timestamp=0 | stats latest(timestamp) as l by user",
             // Not a stats pipeline at all.
             "user=* | head 10",
         ] {
             assert!(
-                lake_mergeable_stats_plan(&parse_query(query).unwrap()).is_none(),
+                lake_mergeable_stats_plan(&parse_query(query).unwrap(), &|_| false).is_none(),
                 "{query} must not be treated as slice-mergeable"
             );
         }
     }
 
+    /// NAN-4313: sum / avg / numeric min / max merge exactly and skip the
+    /// null partials of empty slices; quoted UInt64 partials stay quoted
+    /// and exact past f64 precision; min/max of a non-numeric field are
+    /// not merged (digit strings would compare numerically).
+    #[test]
+    fn numeric_partials_merge_exactly_and_skip_empty_slices() {
+        let numeric = |field: &str| field == "bytes";
+        let plan = lake_mergeable_stats_plan(
+            &parse_query("* | stats count, sum(bytes) as s, avg(bytes) as a, min(bytes) as lo, max(bytes) as hi").unwrap(),
+            &numeric,
+        )
+        .unwrap();
+        let statement = plan.aggregate_query.pretty_print();
+        assert!(statement.contains("sum(bytes) as __nano_avg_sum_2") && statement.contains("count(bytes) as __nano_avg_count_2"),
+            "{statement}");
+        assert!(!statement.contains("avg("), "{statement}");
+        let empty = json!({"count": "0", "s": null, "__nano_avg_sum_2": null, "__nano_avg_count_2": "0", "lo": null, "hi": null});
+        let big = 9_007_199_254_740_993_u64; // 2^53 + 1: not exact as f64
+        let slices = vec![
+            (range("2026-09-01T00:00:00Z", "2026-09-01T00:59:59Z"),
+             vec![json!({"count": "2", "s": big.to_string(), "__nano_avg_sum_2": 30, "__nano_avg_count_2": "2", "lo": 10, "hi": 20})]),
+            (range("2026-09-01T01:00:00Z", "2026-09-01T01:59:59Z"), vec![empty.clone()]),
+            (range("2026-09-01T02:00:00Z", "2026-09-01T02:59:59Z"), vec![empty]),
+            (range("2026-09-01T03:00:00Z", "2026-09-01T03:59:59Z"),
+             vec![json!({"count": "1", "s": "7", "__nano_avg_sum_2": 15, "__nano_avg_count_2": "1", "lo": 15, "hi": 15})]),
+        ];
+        let merged = merge_lake_stats_slices(&plan, slices, 10).unwrap();
+        assert_eq!(merged, vec![json!({"count": 3, "s": (big + 7).to_string(), "a": 15.0, "lo": 10, "hi": 20})]);
+
+        // All slices empty: count 0, every other state null.
+        let none = json!({"count": "0", "s": null, "__nano_avg_sum_2": null, "__nano_avg_count_2": "0", "lo": null, "hi": null});
+        let merged = merge_lake_stats_slices(
+            &plan,
+            vec![(range("2026-09-01T00:00:00Z", "2026-09-01T00:59:59Z"), vec![none.clone()]),
+                 (range("2026-09-01T01:00:00Z", "2026-09-01T01:59:59Z"), vec![none])],
+            10,
+        )
+        .unwrap();
+        assert_eq!(merged, vec![json!({"count": 0, "s": null, "a": null, "lo": null, "hi": null})]);
+
+        assert!(lake_mergeable_stats_plan(&parse_query("* | stats min(user) as u").unwrap(), &numeric).is_none());
+    }
+
     fn identity_plan() -> LakeMergeableStatsPlan {
-        lake_mergeable_stats_plan(&parse_query(IDENTITY_QUERY).unwrap()).unwrap()
+        lake_mergeable_stats_plan(&parse_query(IDENTITY_QUERY).unwrap(), &|_| false).unwrap()
     }
 
     fn by_user(rows: Vec<Value>) -> BTreeMap<String, Value> {
@@ -539,8 +806,7 @@ mod tests {
         // `first` the oldest-ordered, and equal earliest/latest timestamps
         // keep the older slice's cell. Identical ranges keep input order.
         let plan = lake_mergeable_stats_plan(
-            &parse_query("user=* | stats first(user_domain) as f, last(user_domain) as l, latest(timestamp) as ts by user").unwrap(),
-        )
+            &parse_query("user=* | stats first(user_domain) as f, last(user_domain) as l, latest(timestamp) as ts by user").unwrap(), &|_| false)
         .unwrap();
         let a = range("2026-09-01T00:00:00Z", "2026-09-01T12:00:00Z");
         let b = range("2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z");
@@ -603,7 +869,8 @@ mod tests {
         let mut groups: BTreeMap<&str, Vec<&Event>> = BTreeMap::new();
         for event in events
             .iter()
-            .filter(|e| e.ts >= range.start && e.ts <= range.end)
+            // The worker's half-open source bound (NAN-4280).
+            .filter(|e| e.ts >= range.start && e.ts < range.end)
         {
             groups.entry(event.user).or_default().push(event);
         }
@@ -659,8 +926,8 @@ mod tests {
                 email: None,
             });
         }
-        // dave: one event on each side of the first bisection point (the
-        // left slice ends 1 µs before the right one starts).
+        // dave: one event on each side of the first bisection point, and
+        // one exactly on it (NAN-4280: it belongs to the right slice only).
         for ts in [
             base + Duration::days(15) - Duration::microseconds(1),
             base + Duration::days(15),
@@ -700,7 +967,7 @@ mod tests {
         let estimate = |range: &TimeRangeInput| {
             events
                 .iter()
-                .filter(|e| e.ts >= range.start && e.ts <= range.end)
+                .filter(|e| e.ts >= range.start && e.ts < range.end)
                 .count() as u64
                 * BYTES_PER_EVENT
         };
@@ -737,13 +1004,14 @@ mod tests {
             calls.iter().all(|(path, _)| path != "0"),
             "the rejected full range is not re-sent"
         );
-        // Slices tile the window exactly: disjoint, gap-free, inclusive.
+        // Slices tile the window exactly: disjoint, gap-free, half-open
+        // (NAN-4280: adjacent slices share their boundary).
         let mut ranges: Vec<_> = slices.iter().map(|(r, _)| r.clone()).collect();
         ranges.sort_by_key(|r| r.start);
         assert_eq!(ranges.first().unwrap().start, full.start);
         assert_eq!(ranges.last().unwrap().end, full.end);
         for pair in ranges.windows(2) {
-            assert_eq!(pair[0].end + Duration::microseconds(1), pair[1].start);
+            assert_eq!(pair[0].end, pair[1].start);
         }
         let merged = by_user(merge_lake_stats_slices(&plan, slices, 1_000).unwrap());
         let mut expected = by_user(aggregate(&events, &full));

@@ -55,7 +55,7 @@ pub struct LeanPrevalenceExportQuery {
     pub max_prevalence: Option<u64>,
     /// `csv` (default) or `json`: the download format.
     pub format: Option<String>,
-    /// Accepted for API compatibility: a lean export is always queued.
+    /// Accepted for API compatibility: an export is always queued.
     pub queue: Option<bool>,
 }
 
@@ -147,7 +147,7 @@ fn threshold() -> u64 {
     nanosiem_core::search::lake_cell::LAKE_CELL_PREVALENCE_RARITY_THRESHOLD
 }
 
-/// Queue a complete Prevalence export on the caller's lean cell.
+/// Queue a complete Prevalence export on the caller's lake cell.
 ///
 /// Requires `prevalence:export` and `search:execute` (the result is a search
 /// job the caller downloads). Always answers 202: poll
@@ -164,7 +164,7 @@ fn threshold() -> u64 {
         (status = 400, description = "Invalid window, type or format", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Missing prevalence:export or search:execute, or the tenant has no prevalence component", body = ErrorResponse),
-        (status = 503, description = "The tenant's lean-cell job lane or retention identity is unavailable", body = ErrorResponse),
+        (status = 503, description = "The tenant's lake cell job lane or retention identity is unavailable", body = ErrorResponse),
     )
 )]
 pub async fn lean_prevalence_export(
@@ -217,7 +217,7 @@ pub async fn lean_prevalence_export(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Missing prevalence:view or search:execute, or the tenant has no prevalence component", body = ErrorResponse),
         (status = 404, description = "The named job is not this caller's rare list", body = ErrorResponse),
-        (status = 503, description = "The tenant's lean-cell job lane, result storage or retention identity is unavailable", body = ErrorResponse),
+        (status = 503, description = "The tenant's lake cell job lane, result storage or retention identity is unavailable", body = ErrorResponse),
     )
 )]
 pub async fn lean_rare_artifacts(

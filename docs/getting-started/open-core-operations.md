@@ -152,7 +152,7 @@ normal volume tooling if re-ingesting is not an option.
 | `8080` | Vector HTTP ingest | `VECTOR_AUTH_TOKEN` (Bearer) | Blank token fails closed |
 | `8088` | Vector HEC | `VECTOR_AUTH_TOKEN` | |
 | `6000` | Vector native | **none** (trusts forwarder) | `127.0.0.1` unless `NANO_VECTOR_NATIVE_BIND_ADDRESS` is set |
-| `4317` / `4318` | OpenTelemetry (raw) | **none** | `127.0.0.1` unless `NANO_OTLP_BIND_ADDRESS` is set; remote OTLP/HTTP uses nginx `/otlp` with the token |
+| `4317` / `4318` | OpenTelemetry (raw) | Internal only | Not published; remote OTLP/HTTP uses nginx `/otlp` with an active source-bound credential |
 | `24224` | Fluent Forward | — no source by default | `127.0.0.1` unless `NANO_FLUENT_BIND_ADDRESS` is set |
 
 The lake object store, catalog and query worker bind to `127.0.0.1` only.

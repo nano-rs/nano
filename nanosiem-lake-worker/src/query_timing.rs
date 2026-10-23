@@ -15,6 +15,10 @@ pub struct Phases {
     pub request_id: String,
     #[serde(skip)]
     pub execution_seconds: u64,
+    /// NAN-4154: when the request started (its interactive deadline is
+    /// `started + execution_seconds`).
+    #[serde(skip)]
+    pub started: Option<Instant>,
     pub plan_ms: f64,
     pub tail_manifest_ms: f64,
     pub tail_objects: usize,
@@ -29,6 +33,12 @@ pub struct Phases {
     #[serde(skip)]
     pub(crate) derivative_depth: usize,
     pub chdb_ms: f64,
+    /// NAN-4177: start of each native statement still running for this
+    /// request. A request cancelled at its deadline (a lane retry still in
+    /// chDB) used to log `chdb_ms` without that statement: ~0.3 s for a
+    /// 45 s escalated query. The phase record adds their elapsed time.
+    #[serde(skip)]
+    pub(crate) native_inflight: Vec<Instant>,
     /// Native stream initialization includes SQL analysis and Parquet setup;
     /// the pinned C ABI cannot split these into independent timers.
     pub native_init_ms: f64,
@@ -40,6 +50,9 @@ pub struct Phases {
     /// First fetch per statement, also included in native_fetch_ms.
     pub native_first_fetch_ms: f64,
     pub native_statements: usize,
+    /// NAN-4174: the most threads any statement of the request was granted
+    /// by the process thread budget (0: no budgeted statement).
+    pub threads_granted: u64,
     /// Statements using a lane connection already used by an earlier statement.
     pub native_session_reused: usize,
     pub native_fetch_calls: usize,
@@ -60,12 +73,29 @@ pub struct Phases {
     pub entity_count_native_parts: usize,
     pub entity_count_index_hours: usize,
     pub entity_count_native_hours: usize,
+    /// NAN-4298: typed `count_aggregate` requests answered by the entity
+    /// counts instead of the rollups.
+    pub entity_count_aggregate_routes: usize,
     pub entity_count_fallback_reasons: std::collections::BTreeSet<crate::part_query::entity_count::Reason>,
     /// NAN-3392: wall time of the selection's sub-stages, summed over every
     /// part selection of the request: uid/entity sidecars, token indexes,
     /// and the data-file footer/bloom probe (fan-out wall, not CPU).
     pub select_sidecar_ms: f64,
     pub select_token_ms: f64,
+    /// NAN-4164: select_token split into leasing the token files and
+    /// judging them, and the token-cache work behind it (process deltas;
+    /// concurrent requests share them).
+    pub select_token_lease_ms: f64,
+    pub select_token_evidence_ms: f64,
+    /// NAN-4164: the token seed's estimate (density), lease plus evidence.
+    pub density_token_ms: f64,
+    pub token_probes: u64,
+    pub token_probe_excluded: u64,
+    pub token_probe_ms: f64,
+    pub token_decodes: u64,
+    pub token_decode_bytes: u64,
+    pub token_read_ms: f64,
+    pub token_decode_ms: f64,
     pub select_bloom_ms: f64,
     /// NAN-3392: per-(file, hint) footer/bloom evidence cache lookups.
     pub evidence_cache_hits: usize,
@@ -237,6 +267,9 @@ pub struct Funnel {
     pub entity_sidecar_pruned_files: usize,
     pub infile_pruned_files: usize,
     pub resident_infile_files: usize,
+    /// NAN-4190: files answered (and pruned) by the window entity index.
+    pub entity_index_files: usize,
+    pub entity_index_pruned_files: usize,
     pub fetched_files: usize,
     pub row_groups: usize,
     pub kept_row_groups: usize,
@@ -378,6 +411,20 @@ impl Drop for SelectCpu<'_> {
     }
 }
 
+impl Phases {
+    /// A native statement started at `started` returned (NAN-4177).
+    pub(crate) fn native_finished(&mut self, started: Instant) {
+        if let Some(index) = self.native_inflight.iter().position(|at| *at == started) {
+            self.native_inflight.swap_remove(index);
+        }
+    }
+
+    /// Milliseconds the still-running native statements have spent so far.
+    pub(crate) fn native_inflight_ms(&self) -> f64 {
+        self.native_inflight.iter().map(|at| at.elapsed().as_secs_f64() * 1000.0).sum()
+    }
+}
+
 pub(crate) fn process_cpu_ms() -> Option<f64> {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -421,15 +468,26 @@ impl Drop for RequestGuard {
             native_first_fetch_ms = p.native_first_fetch_ms,
             native_session_reused = p.native_session_reused,
             native_statements = p.native_statements, native_fetch_calls = p.native_fetch_calls,
+            threads_granted = p.threads_granted,
             sql_prepare_ms = p.sql_prepare_ms, file_prepare_ms = p.file_prepare_ms,
+            // NAN-4154: the part of file_prepare_ms spent queued for a heavy
+            // cold-read slot or waiting out a saturated cache.
+            cold_queue_ms = p.cold_queue_ms,
             file_verify_ms = p.file_verify_ms,
             footer_read_ms = p.footer_read_ms, decode_ms = p.decode_ms,
-            chdb_ms = p.chdb_ms, lane_wait_ms = p.lane_wait_ms, encode_ms = p.encode_ms, cpu_ms,
+            // NAN-4177: including statements still running at a cancel.
+            chdb_ms = p.chdb_ms + p.native_inflight_ms(), chdb_inflight_ms = p.native_inflight_ms(),
+            lane_wait_ms = p.lane_wait_ms, encode_ms = p.encode_ms, cpu_ms,
             select_cpu_ms = p.select_cpu_ms, select_cpu_scope = "request_threads_sync_sections",
             entity_count_index_ms = p.entity_count_index_ms, entity_count_native_ms = p.entity_count_native_ms,
             entity_count_index_parts = p.entity_count_index_parts, entity_count_native_parts = p.entity_count_native_parts,
             entity_count_index_hours = p.entity_count_index_hours, entity_count_native_hours = p.entity_count_native_hours,
             select_sidecar_ms = p.select_sidecar_ms, select_token_ms = p.select_token_ms,
+            select_token_lease_ms = p.select_token_lease_ms, select_token_evidence_ms = p.select_token_evidence_ms,
+            density_token_ms = p.density_token_ms,
+            token_probes = p.token_probes, token_probe_excluded = p.token_probe_excluded, token_probe_ms = p.token_probe_ms,
+            token_decodes = p.token_decodes, token_decode_bytes = p.token_decode_bytes,
+            token_read_ms = p.token_read_ms, token_decode_ms = p.token_decode_ms,
             select_bloom_ms = p.select_bloom_ms,
             evidence_cache_hits = p.evidence_cache_hits, evidence_cache_misses = p.evidence_cache_misses,
             cpu_scope = "process", tail_open_scope = "included_in_chdb",
@@ -451,6 +509,8 @@ impl Drop for RequestGuard {
             funnel_entity_sidecar_pruned_files = p.funnel.entity_sidecar_pruned_files,
             funnel_infile_pruned_files = p.funnel.infile_pruned_files,
             funnel_resident_infile_files = p.funnel.resident_infile_files,
+            funnel_entity_index_files = p.funnel.entity_index_files,
+            funnel_entity_index_pruned_files = p.funnel.entity_index_pruned_files,
             funnel_fetched_files = p.funnel.fetched_files,
             funnel_row_groups = p.funnel.row_groups, funnel_kept_row_groups = p.funnel.kept_row_groups,
             funnel_candidate_blocks = p.funnel.candidate_blocks, funnel_fine_runs = p.funnel.fine_runs,
@@ -473,6 +533,23 @@ impl Drop for RequestGuard {
             "interactive query phases"
         );
     }
+}
+
+/// NAN-4154: how much earlier than its interactive execution budget a
+/// request stops waiting for cache capacity. The search service's own lake
+/// timeout sits below the cell's budget (live: cancelled at ~45 s of 55 s);
+/// stopping first lets the read fail retryably (503: the search service
+/// promotes it to a durable job, NAN-3644) and drop its leases, instead of
+/// sleeping on them until the caller hangs up.
+pub const DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// NAN-4154: what is left of the current interactive request's budget minus
+/// [`DEADLINE_MARGIN`]; `None` outside a request.
+pub fn time_left() -> Option<std::time::Duration> {
+    let phases = current()?;
+    let phases = phases.lock().unwrap_or_else(|e| e.into_inner());
+    let deadline = phases.started? + std::time::Duration::from_secs(phases.execution_seconds);
+    Some(deadline.saturating_duration_since(Instant::now()).saturating_sub(DEADLINE_MARGIN))
 }
 
 /// A process-stable tier budget: SQL and plan hashes do not vary per request.
@@ -505,6 +582,7 @@ pub async fn measure<T, E>(
     let phases = Arc::new(Mutex::new(Phases {
         request_id: request_id.chars().take(128).collect(),
         execution_seconds: interactive_execution_seconds(),
+        started: Some(Instant::now()),
         cold_scan: cold_scan.clone(),
         ..Phases::default()
     }));
@@ -684,7 +762,10 @@ mod tests {
         for (index, record) in records.iter().enumerate() {
             let fields = record["fields"].as_object().unwrap();
             let funnel = fields.iter().filter(|(key, _)| key.starts_with("funnel_")).collect::<Vec<_>>();
-            assert_eq!(funnel.len(), if index == 0 { 35 } else { 33 }, "{funnel:?}");
+            // NAN-4304: 35 since NAN-4190 added the window entity index's
+            // `entity_index_files` / `entity_index_pruned_files`.
+            assert_eq!(funnel.len(), if index == 0 { 37 } else { 35 }, "{funnel:?}");
+            assert!(fields.contains_key("funnel_entity_index_files") && fields.contains_key("funnel_entity_index_pruned_files"));
             for (key, value) in funnel {
                 assert!(value.is_number() || value.is_boolean() || value.is_null(), "{key}={value}");
             }
@@ -771,5 +852,22 @@ mod tests {
         }
         tokio::join!(request(7), request(19));
         assert!(current().is_none());
+    }
+
+    /// NAN-4177: a statement still in chDB at a cancel counts toward chdb_ms.
+    #[test]
+    fn inflight_native_statements_count_until_they_return() {
+        let mut phases = Phases::default();
+        let first = Instant::now() - std::time::Duration::from_millis(40);
+        let second = Instant::now();
+        phases.native_inflight.push(first);
+        phases.native_inflight.push(second);
+        assert!(phases.native_inflight_ms() >= 40.0);
+        phases.native_finished(first);
+        assert_eq!(phases.native_inflight, vec![second]);
+        phases.native_finished(first);
+        assert_eq!(phases.native_inflight.len(), 1, "an unknown statement changes nothing");
+        phases.native_finished(second);
+        assert_eq!(phases.native_inflight_ms(), 0.0);
     }
 }

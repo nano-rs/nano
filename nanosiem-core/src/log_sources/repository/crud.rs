@@ -273,10 +273,10 @@ impl LogSourceRepository {
                 name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values, dispatch_source_config_id,
-                lifecycle_status
+                lifecycle_status, extension_vrl, extension_enabled
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                COALESCE($17, 'active'))
+                COALESCE($17, 'active'), $18, $19)
             RETURNING id, name, description, namespace, timezone, source_type,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
@@ -308,6 +308,9 @@ impl LogSourceRepository {
         .bind(&new.dispatch_source_config_id)
         // NAN-1920: None → COALESCE defaults to 'active' in the VALUES clause.
         .bind(&new.lifecycle_status)
+        // NAN-4372: the extension is accepted at create (blank → none).
+        .bind(new.extension())
+        .bind(new.extension_is_enabled())
         .fetch_one(&self.pool)
         .await?;
 

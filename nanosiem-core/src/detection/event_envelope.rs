@@ -57,6 +57,44 @@ pub fn normalize_match_event(event: &mut Value) {
     );
 }
 
+/// Normalize a batch with the rule's declared risk subject. A final `table`
+/// often drops `risk_entity` while retaining the aliased entity column; row
+/// heuristics alone cannot recover that declaration. Parse once per batch,
+/// and use the last explicit entity (later risk pipes inherit it).
+/// Missing/null subjects retain the ordinary envelope fallback.
+pub fn normalize_match_events_for_query(events: &mut [Value], query: &str) {
+    let parsed = crate::query::parse_query(query).ok();
+    let entity_field = parsed.as_ref().and_then(|query| {
+        let mut node = query;
+        while let crate::query::Query::Piped { source, command } = node {
+            if let crate::query::Command::Risk { entity_field: Some(field), .. } = command {
+                return Some(field.as_str());
+            }
+            node = source;
+        }
+        None
+    });
+    for event in events {
+        normalize_match_event(event);
+        let Some(obj) = event.as_object_mut() else { continue };
+        if let Some(entity) = entity_field.and_then(|field| value_field(obj, field))
+            .and_then(subject_value)
+        {
+            let ty = entity_type_from_value(&entity);
+            obj.insert(MATCH_ENTITY.into(), Value::String(entity));
+            obj.insert(MATCH_ENTITY_TYPE.into(), Value::String(ty.into()));
+        }
+    }
+}
+
+fn subject_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) if !s.trim().is_empty() && s != "unknown" => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Kind {
     Raw,
@@ -225,6 +263,13 @@ fn pick_label(obj: &Map<String, Value>, kind: Kind) -> Option<String> {
 /// segment, say) stays a frontend concern — this is the identifier a pivot
 /// query has to filter on.
 fn pick_entity(obj: &Map<String, Value>) -> Option<(String, String)> {
+    // Both risk executors resolve arbitrary entity columns into risk_entity.
+    // Prefer that declared subject to an unrelated actor present on a raw row.
+    if let Some(entity) = obj.get("risk_entity").and_then(subject_value) {
+        let ty = entity_type_from_value(&entity).to_string();
+        return Some((entity, ty));
+    }
+
     if let Some(entity) = str_field(obj, "entity") {
         let declared = str_field(obj, "entity_type")
             .map(|t| t.trim().to_ascii_lowercase())

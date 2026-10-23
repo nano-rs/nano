@@ -53,6 +53,7 @@ import {
   comparatorSymbol,
   formatMetricValue,
   monitorScope,
+  monitorLabelText,
   parseMonitorAlert,
   type MonitorAlertView,
   type MonitorKind,
@@ -73,6 +74,8 @@ interface Monitor {
   name: string;
   kind?: MonitorKind; // undefined only for a stray detection row
   kindLabel: string; // 'Metric monitor' | 'SLO' | 'Synthetic check'
+  labels: string;
+  evaluatedAt?: string;
   scope: string; // metric (with agg) for metric/slo, target URL for synthetic
   /** Big breach figure — the actual value / observed status. */
   breachPrimary: string;
@@ -140,6 +143,8 @@ function toMonitor(a: Alert): Monitor {
     kind: mv?.kind,
     kindLabel: mv ? MONITOR_KIND_LABEL[mv.kind] : 'Monitor',
     scope: mv ? monitorScope(mv) : a.rule_id ?? '—',
+    labels: mv ? monitorLabelText(mv) : '',
+    evaluatedAt: mv?.evaluatedAt,
     breachPrimary: figures.primary,
     breachSecondary: figures.secondary,
     status: STATUS_OF[a.status],
@@ -252,7 +257,7 @@ export function AlertsMonitors() {
     (m: Monitor) => {
       if (kindFilter !== 'all' && m.kind !== kindFilter) return false;
       if (sevFilter !== 'all' && normalizeSeverity(m.sev) !== sevFilter) return false;
-      if (q && !`${m.name} ${m.scope}`.toLowerCase().includes(q)) return false;
+      if (q && !`${m.name} ${m.scope} ${m.labels}`.toLowerCase().includes(q)) return false;
       return true;
     },
     [kindFilter, sevFilter, q],
@@ -284,7 +289,6 @@ export function AlertsMonitors() {
         await runner(id);
         toast({ title: `${label} monitor alert` });
       } catch (err) {
-        // eslint-disable-next-line no-console
         console.error(`${label} failed for ${id}:`, err);
         toast({ title: `${label} failed`, variant: 'destructive' });
       } finally {
@@ -429,6 +433,8 @@ export function AlertsMonitors() {
                   </span>
                   <div className="min-w-0 flex-1">
                     <div className="text-[13px] text-fg font-medium leading-tight truncate">{m.name}</div>
+                    {m.labels && <div className="font-mono text-[10.5px] text-fg-2 truncate mt-1" title={m.labels}>{m.labels}</div>}
+                    {m.evaluatedAt && <div className="font-mono text-[10px] text-fg-3 mt-1">Last seen {new Date(m.evaluatedAt).toLocaleString()}</div>}
                     <div className="flex items-center gap-2 mt-1 text-[10.5px] text-fg-3">
                       <span className={cn('font-mono uppercase tracking-wider', SEV_TONE[m.sev])}>{m.sev}</span>
                       <span className="text-fg-4">·</span>
@@ -520,6 +526,7 @@ export function AlertsMonitors() {
               </span>
               <div className="min-w-0">
                 <div className="text-[12px] text-fg truncate">{m.name}</div>
+                {m.labels && <div className="font-mono text-[10.5px] text-fg-2 truncate" title={m.labels}>{m.labels}</div>}
                 <div className={cn('text-[10px]', st.text)}>
                   {st.label}
                   {m.for !== '—' && ` · ${m.for}`}

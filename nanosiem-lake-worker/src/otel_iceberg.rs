@@ -1012,20 +1012,37 @@ pub fn plan_recent_traces(
     Ok(OtelNativeQueryPlan { sql, params })
 }
 
-/// Distinct metric names for the Metrics explorer. Search caches this bounded
-/// inventory; a future Iceberg maintenance rollup can replace the raw distinct
-/// scan without changing this typed contract.
+/// Hard ceiling on a metric-inventory scan, whatever the table's general query
+/// budget: the inventory feeds an interactive dropdown (NAN-4098).
+pub const METRIC_NAMES_MAX_EXECUTION_SECONDS: u64 = 30;
+
+/// Metric names seen in `[start, end)` with each name's latest sample, for the
+/// Metrics explorer catalog (`otel_metric_catalog`).
+///
+/// NAN-4098: always time-bounded. The unbounded `SELECT DISTINCT metric_name`
+/// read every retained hour partition (~59 s on the ops tenant); the event-time
+/// predicate prunes to the window's hour partitions. Returns at most 10001
+/// rows so the caller can tell a full inventory from a capped one.
 pub fn plan_metric_names(
     table: &OtelQuerySource,
     tenant_id: &str,
     service_name: Option<&str>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
 ) -> Result<OtelNativeQueryPlan> {
     validate_tenant_id(tenant_id)?;
     if service_name.is_some_and(invalid_query_text) {
         bail!("metric inventory service_name is invalid");
     }
+    if let Err(error) = crate::otel_metric_catalog::validate_direct_window(start, end) {
+        bail!(error);
+    }
     let (source, mut params) = trusted_otel_source(table)?;
-    params.push(("otel_tenant_id".to_string(), tenant_id.to_string()));
+    params.extend([
+        ("otel_tenant_id".to_string(), tenant_id.to_string()),
+        ("otel_start".to_string(), start.to_rfc3339()),
+        ("otel_end".to_string(), end.to_rfc3339()),
+    ]);
     let service_filter = if let Some(service_name) = service_name.filter(|value| !value.is_empty())
     {
         params.push(("otel_service_name".to_string(), service_name.to_string()));
@@ -1034,12 +1051,17 @@ pub fn plan_metric_names(
         ""
     };
     let sql = format!(
-        "SELECT DISTINCT metric_name FROM {source} \
-         WHERE tenant_uid = {{otel_tenant_id:String}}{service_filter} \
-         ORDER BY metric_name ASC LIMIT 10000 SETTINGS max_threads={}, \
-         max_execution_time={}, max_bytes_to_read={}, max_memory_usage={}, \
-         max_result_rows=10000, result_overflow_mode='throw'",
-        table.threads, table.max_execution_seconds, table.max_query_bytes, table.max_memory_bytes,
+        "SELECT metric_name, toUInt32(toUnixTimestamp(max(metrics.timestamp))) AS last_seen_unix \
+         FROM {source} AS metrics WHERE tenant_uid = {{otel_tenant_id:String}} \
+         AND metrics.timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
+         AND metrics.timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC')\
+         {service_filter} GROUP BY metric_name ORDER BY metric_name ASC LIMIT 10001 \
+         SETTINGS max_threads={}, max_execution_time={}, max_bytes_to_read={}, \
+         max_memory_usage={}, max_result_rows=10001, result_overflow_mode='throw'",
+        table.threads,
+        table.max_execution_seconds.min(METRIC_NAMES_MAX_EXECUTION_SECONDS),
+        table.max_query_bytes,
+        table.max_memory_bytes,
     );
     Ok(OtelNativeQueryPlan { sql, params })
 }
@@ -1147,6 +1169,7 @@ pub fn plan_infra_hosts(
     let host_group = "if(JSONExtractString(resource_attributes_json, 'host.group') != '', \
                       JSONExtractString(resource_attributes_json, 'host.group'), service_name)";
     let mut filters = String::new();
+    let mut group_filter = String::new();
     if let Some(query) = query.filter(|value| !value.is_empty()) {
         params.push(("otel_host_query".to_string(), query.to_string()));
         filters.push_str(&format!(
@@ -1155,7 +1178,7 @@ pub fn plan_infra_hosts(
     }
     if let Some(group) = group.filter(|value| !value.is_empty()) {
         params.push(("otel_host_group".to_string(), group.to_string()));
-        filters.push_str(&format!(" AND {host_group} = {{otel_host_group:String}}"));
+        group_filter = " HAVING host_group = {otel_host_group:String}".to_string();
     }
     if let Some(environment) = environment.filter(|value| !value.is_empty()) {
         params.push(("otel_environment".to_string(), environment.to_string()));
@@ -1164,20 +1187,59 @@ pub fn plan_infra_hosts(
              {otel_environment:String}",
         );
     }
-    let sql = format!(
-        "SELECT {host} AS host, any({host_group}) AS host_group, \
-         argMaxIf(value, timestamp, metric_name = 'system.cpu.utilization') AS cpu_util, \
-         argMaxIf(value, timestamp, metric_name = 'system.memory.utilization') AS mem_util, \
-         argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m') AS load_1m, \
-         argMaxIf(value, timestamp, metric_name = 'system.network.io') AS net_io, \
-         countIf(metric_name = 'system.cpu.utilization') AS cpu_n, \
-         countIf(metric_name = 'system.memory.utilization') AS mem_n, \
-         countIf(metric_name = 'system.cpu.load_average.1m') AS load_n, \
-         countIf(metric_name = 'system.network.io') AS net_n \
-         FROM {source} AS metrics WHERE tenant_uid = {{otel_tenant_id:String}} \
+    // NAN-4028: resource identity and scrape timestamp stay attached to the
+    // query-time interface sum. Every read remains tenant/time fenced.
+    let node_source = format!(
+        "WITH infra_raw AS (SELECT tenant_uid, resource_attributes_json, attributes_json, \
+         service_name, timestamp, metric_name, value FROM {source} AS metrics \
+         WHERE tenant_uid = {{otel_tenant_id:String}} \
          AND metrics.timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
          AND metrics.timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC') \
-         AND {host} != ''{filters} GROUP BY host ORDER BY host ASC LIMIT 10001 \
+         AND metric_name IN ('system.cpu.utilization', 'system.memory.utilization', 'system.cpu.load_average.1m', 'system.network.io', 'system.cpu.usage', 'system.cpu.logical.count', 'system.memory.usage', 'system.network.io.total', 'k8s.pod.restarts', 'nano.infra.health', 'node_memory_MemAvailable_bytes', 'node_memory_MemTotal_bytes', 'node_load1', 'node_network_receive_bytes_total', 'node_network_transmit_bytes_total') AND {host} != ''{filters}), \
+         infra_samples AS (SELECT tenant_uid, resource_attributes_json, service_name, timestamp, \
+         metric_name, value FROM infra_raw UNION ALL \
+         SELECT tenant_uid, resource_attributes_json, service_name, timestamp, \
+         'nano.node.network.io.total', sum(value) FROM infra_raw \
+         WHERE metric_name IN ('node_network_receive_bytes_total', 'node_network_transmit_bytes_total') \
+         AND JSONExtractString(attributes_json, 'device') != '' \
+         AND NOT match(JSONExtractString(attributes_json, 'device'), '^(lo|veth|cali|cni|docker|flannel)') \
+         GROUP BY tenant_uid, resource_attributes_json, service_name, timestamp) "
+    );
+    let sql = format!(
+        "{node_source}SELECT {host} AS host, \
+         argMaxIf({host_group}, timestamp, JSONExtractString(resource_attributes_json, 'host.group') != '') AS host_group, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'nano.infra.kind'), timestamp, JSONExtractString(resource_attributes_json, 'nano.infra.kind') != '') AS kind, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'k8s.node.name'), timestamp, JSONExtractString(resource_attributes_json, 'k8s.node.name') != '') AS node_name, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'k8s.pod.name'), timestamp, JSONExtractString(resource_attributes_json, 'k8s.pod.name') != '') AS pod_name, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'k8s.namespace.name'), timestamp, JSONExtractString(resource_attributes_json, 'k8s.namespace.name') != '') AS namespace, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'k8s.workload.name'), timestamp, JSONExtractString(resource_attributes_json, 'k8s.workload.name') != '') AS workload, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'k8s.pod.phase'), timestamp, JSONExtractString(resource_attributes_json, 'k8s.pod.phase') != '') AS phase, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'nano.cluster'), timestamp, JSONExtractString(resource_attributes_json, 'nano.cluster') != '') AS cluster, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'cloud.region'), timestamp, JSONExtractString(resource_attributes_json, 'cloud.region') != '') AS region, \
+         argMaxIf(JSONExtractString(resource_attributes_json, 'host.type'), timestamp, JSONExtractString(resource_attributes_json, 'host.type') != '') AS instance_type, \
+         argMaxIf(value, timestamp, metric_name = 'system.cpu.usage') AS cpu_cores, \
+         countIf(metric_name = 'system.cpu.usage') AS cpu_cores_n, \
+         argMaxIf(value, timestamp, metric_name = 'system.cpu.logical.count') AS cpu_count, \
+         countIf(metric_name = 'system.cpu.logical.count') AS cpu_count_n, \
+         argMaxIf(value, timestamp, metric_name = 'system.memory.usage') AS mem_bytes, \
+         countIf(metric_name = 'system.memory.usage') AS mem_bytes_n, \
+         argMaxIf(value, timestamp, metric_name = 'k8s.pod.restarts') AS restarts, \
+         countIf(metric_name = 'k8s.pod.restarts') AS restarts_n, \
+         argMaxIf(value, timestamp, metric_name = 'nano.infra.health') AS health, \
+         countIf(metric_name = 'nano.infra.health') AS health_n, \
+         if(countIf(metric_name IN ('system.network.io.total', 'system.network.io')) > 0, if(countIf(metric_name = 'system.network.io.total') >= 2 AND argMaxIf(value, timestamp, metric_name = 'system.network.io.total') >= argMinIf(value, timestamp, metric_name = 'system.network.io.total'), (argMaxIf(value, timestamp, metric_name = 'system.network.io.total') - argMinIf(value, timestamp, metric_name = 'system.network.io.total')) / nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = 'system.network.io.total'), maxIf(timestamp, metric_name = 'system.network.io.total')) / 1000.0, 0), NULL), if(countIf(metric_name = 'nano.node.network.io.total') >= 2 AND argMaxIf(value, timestamp, metric_name = 'nano.node.network.io.total') >= argMinIf(value, timestamp, metric_name = 'nano.node.network.io.total'), (argMaxIf(value, timestamp, metric_name = 'nano.node.network.io.total') - argMinIf(value, timestamp, metric_name = 'nano.node.network.io.total')) / nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = 'nano.node.network.io.total'), maxIf(timestamp, metric_name = 'nano.node.network.io.total')) / 1000.0, 0), NULL)) AS net_rate, \
+         argMaxIf(value, timestamp, metric_name = 'system.cpu.utilization') AS cpu_util, \
+         if(countIf(metric_name = 'system.memory.utilization') > 0, argMaxIf(value, timestamp, metric_name = 'system.memory.utilization'), if(countIf(metric_name = 'node_memory_MemAvailable_bytes') > 0 AND argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes') > 0, 1 - argMaxIf(value, timestamp, metric_name = 'node_memory_MemAvailable_bytes') / nullIf(argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes'), 0), NULL)) AS mem_util, \
+         if(countIf(metric_name = 'system.cpu.load_average.1m') > 0, argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m'), argMaxIf(value, timestamp, metric_name = 'node_load1')) AS load_1m, \
+         argMaxIf(value, timestamp, metric_name = 'system.network.io') AS net_io, \
+         countIf(metric_name = 'system.cpu.utilization') AS cpu_n, \
+         if(countIf(metric_name = 'system.memory.utilization') > 0, countIf(metric_name = 'system.memory.utilization'), if(countIf(metric_name = 'node_memory_MemAvailable_bytes') > 0 AND argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes') > 0, 1, 0)) AS mem_n, \
+         (countIf(metric_name = 'system.cpu.load_average.1m') + countIf(metric_name = 'node_load1')) AS load_n, \
+         countIf(metric_name = 'system.network.io') AS net_n \
+         FROM infra_samples AS metrics WHERE tenant_uid = {{otel_tenant_id:String}} \
+         AND metrics.timestamp >= parseDateTime64BestEffort({{otel_start:String}}, 6, 'UTC') \
+         AND metrics.timestamp < parseDateTime64BestEffort({{otel_end:String}}, 6, 'UTC') \
+         AND metric_name IN ('system.cpu.utilization', 'system.memory.utilization', 'system.cpu.load_average.1m', 'system.network.io', 'system.cpu.usage', 'system.cpu.logical.count', 'system.memory.usage', 'system.network.io.total', 'k8s.pod.restarts', 'nano.infra.health', 'node_memory_MemAvailable_bytes', 'node_memory_MemTotal_bytes', 'node_load1', 'nano.node.network.io.total') AND {host} != ''{filters} GROUP BY host{group_filter} ORDER BY host ASC LIMIT 10001 \
          SETTINGS max_threads={}, max_execution_time={}, max_bytes_to_read={}, \
          max_memory_usage={}, max_result_rows=10001, result_overflow_mode='throw'",
         table.threads, table.max_execution_seconds, table.max_query_bytes, table.max_memory_bytes,
@@ -1947,10 +2009,17 @@ pub fn plan_slo_compute(
 }
 
 fn json_tag_lookup(key_parameter: &str) -> String {
-    format!(
+    let direct = format!(
         "if(JSONHas(attributes_json, {{{key_parameter}:String}}), \
          JSONExtractString(attributes_json, {{{key_parameter}:String}}), \
          JSONExtractString(resource_attributes_json, {{{key_parameter}:String}}))"
+    );
+    // Prometheus instance is optional after OTLP conversion. Keep a real
+    // instance when present; otherwise use the resource's stable node identity.
+    format!(
+        "if({{{key_parameter}:String}} = 'instance' AND ({direct}) = '', \
+        coalesce(nullIf(JSONExtractString(resource_attributes_json, 'host.name'), ''), \
+        JSONExtractString(resource_attributes_json, 'k8s.node.name')), {direct})"
     )
 }
 
@@ -2803,6 +2872,20 @@ mod tests {
     }
 
     #[test]
+    fn native_metrics_accept_unknown_start_time() {
+        for kind in ["gauge", "sum", "histogram"] {
+            let mut event = metric();
+            event["type"] = json!(kind);
+            event["startTimeUnixNano"] = json!("0");
+            let row = normalize_otel_row(OtelDataset::Metrics, "tenant-a", &event).unwrap();
+            assert_eq!(row.row["metric_type"], kind);
+            assert_eq!(row.row["aggregation_temporality"], 2);
+        }
+        assert!(METRIC_VALUE_DELTA.contains("value >= nano_prev_value"));
+        assert!(!METRIC_VALUE_DELTA.contains("start_time"));
+    }
+
+    #[test]
     fn metric_normalization_preserves_histogram_and_temporality() {
         let row = normalize_otel_row(OtelDataset::Metrics, "tenant-a", &metric()).unwrap();
         assert_eq!(row.row["metric_name"], "http.server.duration");
@@ -2957,6 +3040,33 @@ mod tests {
         assert!(plan.sql.contains("LIMIT 10001"));
         assert!(plan.sql.contains("{otel_filter_value_0:String}"));
         assert!(!plan.sql.contains("OR 1=1"));
+    }
+
+    #[test]
+    fn instance_scalar_uses_resource_identity_and_event_time_bounds() {
+        let (start, end) = metric_window();
+        let plan = plan_metric_scalar_v2(
+            &table(),
+            "tenant-a",
+            "node_pressure_cpu_waiting_seconds_total",
+            None,
+            start,
+            end,
+            MetricAggregate::Rate,
+            Some("instance"),
+            &[],
+        )
+        .unwrap();
+        assert!(plan.sql.contains("{otel_group_key:String} = 'instance'"));
+        assert!(plan.sql.contains("'host.name'"));
+        assert!(plan.sql.contains("'k8s.node.name'"));
+        assert!(plan
+            .sql
+            .contains("metrics.timestamp >= parseDateTime64BestEffort({otel_start:String}"));
+        assert!(plan
+            .sql
+            .contains("metrics.timestamp < parseDateTime64BestEffort({otel_end:String}"));
+        assert!(plan.sql.contains("GROUP BY series_key"));
     }
 
     fn metric_window() -> (DateTime<Utc>, DateTime<Utc>) {
@@ -3173,12 +3283,56 @@ mod tests {
 
     #[test]
     fn metric_inventory_keeps_service_out_of_sql() {
-        let plan = plan_metric_names(&table(), "tenant-a", Some("checkout")).unwrap();
-        assert!(plan.sql.contains("SELECT DISTINCT metric_name"));
+        let end = DateTime::parse_from_rfc3339("2026-08-12T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let start = end - chrono::Duration::hours(1);
+        let plan = plan_metric_names(&table(), "tenant-a", Some("checkout"), start, end).unwrap();
+        assert!(plan.sql.contains("GROUP BY metric_name"));
         assert!(plan
             .sql
             .contains("service_name = {otel_service_name:String}"));
         assert!(!plan.sql.contains("checkout"));
+    }
+
+    /// NAN-4098: the inventory is always bounded in time, rows, and runtime.
+    #[test]
+    fn metric_inventory_is_time_bounded_and_capped() {
+        let end = DateTime::parse_from_rfc3339("2026-08-12T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let start = end - chrono::Duration::hours(24);
+        let plan = plan_metric_names(&table(), "tenant-a", None, start, end).unwrap();
+        assert!(plan
+            .sql
+            .contains("metrics.timestamp >= parseDateTime64BestEffort({otel_start:String}, 6, 'UTC')"));
+        assert!(plan
+            .sql
+            .contains("metrics.timestamp < parseDateTime64BestEffort({otel_end:String}, 6, 'UTC')"));
+        assert!(plan.sql.contains("LIMIT 10001"));
+        assert!(plan.sql.contains("max_result_rows=10001"));
+        assert!(!plan.sql.contains("DISTINCT"));
+        assert!(!plan.sql.contains("service_name ="));
+        let budget = format!("max_execution_time={}", METRIC_NAMES_MAX_EXECUTION_SECONDS);
+        assert!(
+            plan.sql.contains(&budget) || table().max_execution_seconds < METRIC_NAMES_MAX_EXECUTION_SECONDS,
+            "{}",
+            plan.sql
+        );
+        assert!(plan.params.iter().any(|(k, v)| k == "otel_start" && v == &start.to_rfc3339()));
+        assert!(plan.params.iter().any(|(k, v)| k == "otel_end" && v == &end.to_rfc3339()));
+
+        // Empty, inverted, and over-wide windows are refused.
+        assert!(plan_metric_names(&table(), "tenant-a", None, end, end).is_err());
+        assert!(plan_metric_names(&table(), "tenant-a", None, end, start).is_err());
+        assert!(plan_metric_names(
+            &table(),
+            "tenant-a",
+            None,
+            end - chrono::Duration::days(8),
+            end
+        )
+        .is_err());
     }
 
     #[test]
@@ -3378,4 +3532,160 @@ mod tests {
             "s3://nano-lake/warehouse/tenant-a/otel_spans/",
         ));
     }
+
+    /// Train/native lane: exercise BOTH SQL builders against the same golden
+    /// inputs, including zero-valued OTel precedence and tenant/time fences.
+    #[test]
+    #[ignore = "requires a digest-verified native chDB library"]
+    fn infra_hosts_node_exporter_and_otel_golden() {
+        use crate::native::NativeChdb;
+        use nanosiem_core::query::{InfraHostsFilters, infra_hosts_sql};
+        use std::io::Write;
+
+        let runtime = NativeChdb::load_verified(
+            std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
+            &std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap(),
+        )
+        .unwrap();
+        std::mem::forget(runtime.clone());
+        let connection = runtime.connect(&["--"]).unwrap();
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        let mut point =
+            |tenant: &str, host: &str, name: &str, value: f64, second: u32, device: &str| {
+                let resource = json!({"host.name": host});
+                let attributes = json!({"device": device});
+                writeln!(
+                    fixture,
+                    "{}",
+                    json!({
+                        "tenant_uid": tenant, "resource_attributes": resource,
+                        "resource_attributes_json": resource.to_string(), "attributes": attributes,
+                        "attributes_json": attributes.to_string(), "service_name": "node-exporter",
+                        "timestamp": format!("2026-08-12 00:{:02}:{:02}", second / 60, second % 60),
+                        "metric_name": name, "value": value,
+                    })
+                )
+                .unwrap();
+            };
+        for (host, available, total) in [
+            ("node", 25., 100.),
+            ("mixed", 25., 100.),
+            ("zero-total", 25., 0.),
+        ] {
+            point(
+                "tenant-a",
+                host,
+                "node_memory_MemAvailable_bytes",
+                available,
+                0,
+                "",
+            );
+            point("tenant-a", host, "node_memory_MemTotal_bytes", total, 0, "");
+            point("tenant-a", host, "node_load1", 2.5, 0, "");
+        }
+        for (second, rx, tx) in [(0, 100., 50.), (60, 160., 110.)] {
+            point(
+                "tenant-a",
+                "node",
+                "node_network_receive_bytes_total",
+                rx,
+                second,
+                "eth0",
+            );
+            point(
+                "tenant-a",
+                "node",
+                "node_network_transmit_bytes_total",
+                tx,
+                second,
+                "eth0",
+            );
+            for device in ["lo", "veth0", "cali0", "cni0", "docker0", "flannel0"] {
+                point(
+                    "tenant-a",
+                    "node",
+                    "node_network_receive_bytes_total",
+                    rx * 1000.,
+                    second,
+                    device,
+                );
+            }
+            point(
+                "tenant-a",
+                "otel",
+                "system.network.io.total",
+                rx,
+                second,
+                "",
+            );
+        }
+        point("tenant-a", "otel", "system.memory.utilization", 0.4, 0, "");
+        point("tenant-a", "otel", "system.cpu.load_average.1m", 4., 0, "");
+        point("tenant-a", "mixed", "system.memory.utilization", 0., 0, "");
+        point("tenant-a", "mixed", "system.cpu.load_average.1m", 0., 0, "");
+        point("tenant-a", "mixed", "system.network.io", 7., 0, "");
+        point("tenant-b", "node", "node_load1", 999., 600, "");
+        point(
+            "tenant-a",
+            "missing-total",
+            "node_memory_MemAvailable_bytes",
+            25.,
+            0,
+            "",
+        );
+        drop(point);
+        fixture.flush().unwrap();
+        let schema = "tenant_uid String, resource_attributes Map(String, String), resource_attributes_json String, attributes Map(String, String), attributes_json String, service_name String, timestamp DateTime64(6, 'UTC'), metric_name String, value Float64";
+        let input = format!("file({{infra_fixture:String}}, JSONEachRow, '{schema}')");
+        let input = input.replace("'UTC'", "\\'UTC\\'");
+        let start = DateTime::parse_from_rfc3339("2026-08-12T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = start + chrono::Duration::hours(1);
+        let range = nanosiem_core::query::TimeRange { start, end };
+        // The core builder reads a tenant-bound logical table; the lake builder
+        // must itself fence the shared physical table (including tenant-b above).
+        let core = infra_hosts_sql(&range, &InfraHostsFilters::default(), false).replace(
+            "nanosiem.otel_metrics",
+            &format!("(SELECT * FROM {input} WHERE tenant_uid = 'tenant-a')"),
+        );
+        let source = table();
+        let (trusted, _) = trusted_otel_source(&source).unwrap();
+        let mut lake = plan_infra_hosts(&source, "tenant-a", start, end, None, None, None).unwrap();
+        lake.sql = lake.sql.replace(&trusted, &input);
+        let golden: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/infra-hosts-node-exporter-golden.json"
+        ))
+        .unwrap();
+        for (label, sql, mut params) in [("core", core, vec![]), ("lake", lake.sql, lake.params)] {
+            params.push((
+                "infra_fixture".into(),
+                fixture.path().to_str().unwrap().to_string(),
+            ));
+            let bindings = params
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>();
+            let output = connection
+                .query_with_params(&sql, "JSONEachRow", &bindings)
+                .unwrap();
+            let rows: Vec<Value> = String::from_utf8(output.data)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let projection: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "host": row["host"], "mem_util": row["mem_util"], "mem_n": row["mem_n"],
+                        "load_1m": row["load_1m"], "net_rate": row["net_rate"], "net_io": row["net_io"],
+                    })
+                })
+                .collect();
+            assert_eq!(Value::Array(projection), golden, "{label}");
+        }
+    }
+
+
 }

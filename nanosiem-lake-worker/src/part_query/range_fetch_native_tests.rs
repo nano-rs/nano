@@ -235,8 +235,7 @@ async fn ranged_search_matches_whole_files_and_fetches_a_fraction() {
         // Entity pivots keep whole files (and their in-file bloom pruning).
         ("src_endpoint.ip=\"10.0.3.17\" | stats count by src_endpoint.hostname", false, false),
         ("actor.user.name=user7 | stats count by api.operation", false, false),
-        // Geo/ASN: masked endpoints read their roots, enrichments and every
-        // scalar leaf the owner-denial probe reads.
+        // Geo/ASN: plain endpoint leaves (NAN-4168: no read-time masks).
         ("* | stats count by src_endpoint.location.country", false, false),
         ("api.operation=ListRoles | stats count by src_endpoint.location.country, dst_endpoint.autonomous_system.number", false, true),
         ("* | stats count by src_endpoint.ip | sort -count | head 5", false, false),

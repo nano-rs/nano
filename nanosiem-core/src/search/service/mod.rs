@@ -66,6 +66,7 @@ pub(super) use super::jobs;
 
 mod ai_pipe_deadline;
 mod asset;
+pub mod background_request;
 pub use asset::{DimensionFirst, EntityActivityBucket};
 pub mod asset_dossier;
 mod baseline;
@@ -85,6 +86,8 @@ pub use lake_cloud::CloudDossierAccumulator;
 mod lake_identity;
 mod lake_host_identity;
 mod lake_stats_merge;
+#[doc(hidden)]
+pub use lake_stats_merge::{merge_sliced_stats, sliced_stats_statement};
 
 /// NAN-1506: row cap for the bulk field-stats scan (shared by the standalone
 /// `/api/search/field-stats` companion and the inline parallel companion in
@@ -106,7 +109,7 @@ pub(super) const AGGREGATE_OUTPUT_CAP: usize = 1_000_000;
 mod enterprise_shared_views;
 mod histogram;
 pub use histogram::SearchHistogramResult;
-mod ioc_lookup_resolve;
+pub(crate) mod ioc_lookup_resolve;
 mod lake_views;
 mod lake_view_cache;
 pub(crate) use lake_views::lake_product_cursor as lake_product_cursor_for_row;
@@ -120,11 +123,14 @@ mod output_column_guard;
 mod prevalence_join;
 mod prevalence_processing;
 mod retro;
+pub use retro::LakeRetroHuntScan;
+pub(crate) use retro::split_ip_port as retro_split_ip_port;
 mod sql_execution;
 pub use sql_execution::RawSqlAuditAccess;
 /// NAN-2564: the shared detection runtime classifies scan-budget refusals.
 pub use core_search::is_lake_scan_budget_rejection;
-pub use core_search::{is_durable_lane_post_processing_refusal, DURABLE_LANE_POST_PROCESSING_REFUSAL};
+pub use core_search::lake_count_rollup_answers;
+pub use core_search::{is_durable_lane_post_processing_refusal, DURABLE_LANE_POST_PROCESSING_REFUSAL, LAKE_LOOKUP_ALTERNATIVE};
 mod streaming;
 mod tree_view;
 pub(crate) use tree_view::{derived_parent_label_field, TREE_PREVALENCE_FIELDS};
@@ -617,122 +623,77 @@ fn convert_parse_error(parse_error: ParseError) -> SearchError {
     }
 }
 
-// Static regex for time modifiers - compiled once at startup
-// Pattern to match earliest=-24h, earliest=-1d, latest=now, etc.
-// Group 1: modifier (earliest/latest)
-// Group 2: number (optional, for -24, -7, etc.)
-// Group 3: unit (optional, for h, d, m, etc.)
-// Group 4: "now" (optional, alternative to number+unit)
-static TIME_MODIFIER_PATTERN: once_cell::sync::Lazy<regex::Regex> =
-    once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"(?i)\b(earliest|latest)=(?:(-?\d+)([smhdwMy])|(now))\b").unwrap()
-    });
+/// Use the parser's quote- and subsearch-aware scanner on every execution path.
+fn extract_time_bounds(query: &str) -> Result<(String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>), SearchError> {
+    extract_time_bounds_at(query, chrono::Utc::now())
+}
 
-/// Extract and parse time modifiers (earliest/latest) from the query
-/// Returns the cleaned query and optional time offset in seconds
-///
-/// NAN-3377: comments are stripped FIRST, with the parser's own
-/// `strip_comments` (quote-aware, so `url="http://x"` survives). The tidy-up
-/// below flattens newlines, and a `//` comment ends at a newline: flattening
-/// first turned `base\n// note\n| where x=1` into one line whose comment
-/// swallowed the `| where`. Stripping first also means an `earliest=` written
-/// inside a comment no longer sets the search range — exactly what the parser
-/// sees, since it strips comments before anything else.
-fn extract_time_modifiers(query: &str) -> (String, Option<i64>, Option<i64>) {
-    tracing::debug!(
-        "extract_time_modifiers called with query: {}",
-        crate::inputlookup::storage_policy::redact_url_credentials(query)
-    );
-
+fn extract_time_bounds_at(query: &str, now: chrono::DateTime<chrono::Utc>) -> Result<(String, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>), SearchError> {
     let without_comments = crate::query::strip_comments(query);
-    let query = without_comments.as_str();
-
-    let time_pattern = &*TIME_MODIFIER_PATTERN;
-
-    let mut earliest_offset: Option<i64> = None;
-    let mut latest_offset: Option<i64> = None;
-    // NAN-3337: a modifier inside a `[...]` subsearch never sets the OUTER
-    // range. It stays in the query text, where `parse_query` rejects it.
-    let depths = crate::query::subsearch_depths(query);
-    // `x.latest=-1h` is a field filter, as in the parser's scan.
-    let top_level = |m: &regex::Match<'_>| {
-        depths.get(m.start()).copied().unwrap_or(0) == 0
-            && (m.start() == 0 || query.as_bytes()[m.start() - 1] != b'.')
-    };
-
-    for cap in time_pattern.captures_iter(query) {
-        if !cap.get(0).is_some_and(|m| top_level(&m)) {
-            continue;
-        }
-        let modifier = cap
-            .get(1)
-            .map(|m| m.as_str().to_lowercase())
-            .unwrap_or_default();
-
-        // Check if it's "now" (group 4)
-        if cap.get(4).is_some() {
-            tracing::debug!("Time modifier: {}=now", modifier);
-            if modifier == "latest" {
-                latest_offset = Some(0); // now = 0 offset
-            }
-            continue;
-        }
-
-        // Otherwise it's number+unit (groups 2 and 3)
-        let value_str = cap.get(2).map(|m| m.as_str()).unwrap_or("0");
-        let unit = cap.get(3).map(|m| m.as_str()).unwrap_or("");
-
-        let value: i64 = value_str.parse().unwrap_or(0);
-
-        // Convert to seconds
-        let seconds = match unit {
-            "s" => value,
-            "m" => value * 60,
-            "h" => value * 3600,
-            "d" => value * 86400,
-            "w" => value * 604800,
-            "M" => value * 2592000,  // ~30 days
-            "y" => value * 31536000, // ~365 days
-            _ => value,
-        };
-
-        tracing::debug!(
-            "Time modifier: {}={}{} -> {} seconds",
-            modifier,
-            value,
-            unit,
-            seconds
-        );
-
-        if modifier == "earliest" {
-            earliest_offset = Some(seconds);
-        } else if modifier == "latest" {
-            latest_offset = Some(seconds);
+    let (cleaned, tokens, _) = crate::query::split_time_modifiers(&without_comments);
+    let mut earliest = None;
+    let mut latest = None;
+    for token in tokens {
+        let offset = crate::query::time_modifiers::resolve(&token, now)
+            .map_err(SearchError::SqlValidationError)?;
+        if token.get(..9).is_some_and(|s| s.eq_ignore_ascii_case("earliest=")) {
+            earliest = Some(offset);
+        } else {
+            latest = Some(offset);
         }
     }
-
-    // Remove the time modifiers from the query
-    let cleaned = time_pattern
-        .replace_all(query, |cap: &regex::Captures<'_>| {
-            let whole = cap.get(0).expect("match");
-            if top_level(&whole) {
-                String::new()
-            } else {
-                whole.as_str().to_string()
-            }
-        })
-        .to_string();
-    // Clean up any double spaces
     let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if earliest.is_some() || latest.is_some() {
+        // The query can carry a signed `inputlookup url=` (NAN-3109); its
+        // credentials never reach a trace (NAN-4304).
+        tracing::debug!(
+            query = %crate::inputlookup::storage_policy::redact_url_credentials(&cleaned),
+            ?earliest,
+            ?latest,
+            "Cleaned query: in-query time modifiers applied"
+        );
+    }
+    Ok((cleaned, earliest, latest))
+}
 
-    tracing::debug!(
-        "Cleaned query: {}, earliest: {:?}, latest: {:?}",
-        crate::inputlookup::storage_policy::redact_url_credentials(&cleaned),
-        earliest_offset,
-        latest_offset
-    );
+/// Apply in-query `earliest=` / `latest=` to the requested window
+/// (NAN-4288 F16), SPL style: they replace the time picker, and `earliest=`
+/// without `latest=` searches up to now. A range they leave empty is a clear
+/// 400 naming the tokens, instead of the lake compiler's "start must be
+/// earlier than end".
+fn apply_time_bounds(
+    range: &TimeRangeInput,
+    earliest: Option<chrono::DateTime<chrono::Utc>>,
+    latest: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<TimeRangeInput, SearchError> {
+    // `earliest=` overrides only the start and `latest=` only the end. The
+    // caller's other bound always stands: scheduled and catch-up detection
+    // windows are contiguous [start, end), so moving an end to "now" would
+    // overlap the next window and duplicate alerts.
+    let mut adjusted = range.clone();
+    if let Some(start) = earliest {
+        adjusted.start = start;
+    }
+    if let Some(end) = latest {
+        adjusted.end = end;
+    }
+    if (earliest.is_some() || latest.is_some()) && adjusted.start >= adjusted.end {
+        return Err(SearchError::SqlValidationError(format!(
+            "earliest=/latest= in the query select an empty time range ({} to {}). earliest= \
+             replaces the start and latest= the end of the selected time range; adjust the \
+             time range or remove the tokens",
+            adjusted.start.to_rfc3339(),
+            adjusted.end.to_rfc3339(),
+        )));
+    }
+    Ok(adjusted)
+}
 
-    (cleaned, earliest_offset, latest_offset)
+#[cfg(test)]
+fn extract_time_modifiers(query: &str) -> Result<(String, Option<i64>, Option<i64>), SearchError> {
+    let now = chrono::Utc::now();
+    let (query, earliest, latest) = extract_time_bounds_at(query, now)?;
+    Ok((query, earliest.map(|t| (t - now).num_seconds()), latest.map(|t| (t - now).num_seconds())))
 }
 
 /// Convert an AST time window to the prevalence-service time window.
@@ -2520,7 +2481,7 @@ mod tests {
     #[test]
     fn subsearch_time_modifiers_never_set_the_outer_range_nan3337() {
         let query = "class_uid=3002 | stats count as main | append [search class_uid=3002 earliest=-3h latest=-2h | stats count as sub]";
-        let (cleaned, earliest, latest) = extract_time_modifiers(query);
+        let (cleaned, earliest, latest) = extract_time_modifiers(query).unwrap();
         assert_eq!((earliest, latest), (None, None), "outer range took the subsearch's modifiers");
         assert!(cleaned.contains("earliest=-3h") && cleaned.contains("latest=-2h"), "{cleaned}");
         let err = parse_query(&cleaned).expect_err("subsearch modifiers must be rejected");
@@ -2528,7 +2489,7 @@ mod tests {
 
         // Outer modifiers still apply next to a plain subsearch.
         let (cleaned, earliest, _) =
-            extract_time_modifiers("a earliest=-1h | append [search b | stats count]");
+            extract_time_modifiers("a earliest=-1h | append [search b | stats count]").unwrap();
         assert_eq!(earliest, Some(-3600));
         assert!(parse_query(&cleaned).is_ok(), "{cleaned}");
         // Word boundaries and escapes: neither of these is a modifier.
@@ -2536,59 +2497,157 @@ mod tests {
             "a | append [search b is_latest=true | stats count]",
             "a | append [search b x.earliest=-1h | stats count]",
         ] {
-            let (cleaned, earliest, latest) = extract_time_modifiers(query);
+            let (cleaned, earliest, latest) = extract_time_modifiers(query).unwrap();
             assert_eq!((earliest, latest), (None, None), "{query}");
             assert!(parse_query(&cleaned).is_ok(), "{query} must parse");
         }
-        let (_, earliest, _) = extract_time_modifiers(r"a \[ earliest=-1h");
+        let (_, earliest, _) = extract_time_modifiers(r"a \[ earliest=-1h").unwrap();
         assert_eq!(earliest, Some(-3600), "an escaped bracket opens no subsearch");
         assert!(crate::query::subsearch_depths(r"a \[ b").iter().all(|d| *d == 0));
         // A whole-query `[search …]` wrapper is not a subsearch.
-        let (_, earliest, _) = extract_time_modifiers("[search a earliest=-1h]");
+        let (_, earliest, _) = extract_time_modifiers("[search a earliest=-1h]").unwrap();
         assert_eq!(earliest, Some(-3600));
+    }
+
+    #[test]
+    fn launch_snap_query_shape() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 17, 21, 35, 42).unwrap();
+        for value in ["-7d@d", "@d"] {
+            let query = format!("sourcetype=windows_event earliest={value} | stats count");
+            let (cleaned, earliest, _) = extract_time_bounds_at(&query, now).unwrap();
+            assert_eq!(cleaned, "sourcetype=windows_event | stats count");
+            let expected = if value == "@d" { 17 } else { 10 };
+            assert_eq!(earliest.unwrap(),
+                chrono::Utc.with_ymd_and_hms(2026, 10, expected, 0, 0, 0).unwrap());
+        }
+        assert!(extract_time_modifiers("error earliest=-7d@invalid").is_err());
+        let (cleaned, earliest, _) = extract_time_modifiers(r#"message="earliest=-7d@invalid""#).unwrap();
+        assert!(earliest.is_none());
+        assert!(cleaned.contains("earliest="));
+    }
+
+    /// NAN-4288 (F16): `earliest=` overrides only the start, `latest=` only
+    /// the end, and a range they leave empty is a named 400, not a compile
+    /// error.
+    #[test]
+    fn query_time_bounds_override_one_side_or_fail_clearly() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 20, 22, 0, 0).unwrap();
+        let picker = TimeRangeInput::new(
+            chrono::Utc.with_ymd_and_hms(2026, 10, 19, 0, 0, 0).unwrap(),
+            chrono::Utc.with_ymd_and_hms(2026, 10, 19, 1, 0, 0).unwrap(),
+        );
+        // The explorer's repro: a past picker window plus `earliest=-1h` (or
+        // `-1d`) starts after the picker's end, a clear 400 naming the tokens.
+        for token in ["earliest=-1h", "earliest=-1d"] {
+            let query = format!("metadata.log_source=apache_access {token} | stats count");
+            let (_, earliest, latest) = extract_time_bounds_at(&query, now).unwrap();
+            let error = apply_time_bounds(&picker, earliest, latest).unwrap_err();
+            assert!(
+                matches!(&error, SearchError::SqlValidationError(m) if m.contains("earliest=/latest=")),
+                "{token}: {error}"
+            );
+        }
+        // `earliest=` alone moves only the start; the caller's end stands.
+        let (_, earliest, latest) = extract_time_bounds_at("x earliest=-3d", now).unwrap();
+        let range = apply_time_bounds(&picker, earliest, latest).unwrap();
+        assert_eq!((range.start, range.end), (now - chrono::Duration::days(3), picker.end));
+        // `latest=` alone moves only the end.
+        let (_, earliest, latest) = extract_time_bounds_at("x latest=-1d", now).unwrap();
+        let range = apply_time_bounds(&picker, earliest, latest).unwrap();
+        assert_eq!((range.start, range.end), (picker.start, now - chrono::Duration::days(1)));
+        // No tokens: the picker is untouched.
+        let range = apply_time_bounds(&picker, None, None).unwrap();
+        assert_eq!((range.start, range.end), (picker.start, picker.end));
+        // An inverted pair names the tokens.
+        let (_, earliest, latest) = extract_time_bounds_at("x earliest=-1h latest=-2h", now).unwrap();
+        let error = apply_time_bounds(&picker, earliest, latest).unwrap_err();
+        assert!(matches!(&error, SearchError::SqlValidationError(m) if m.contains("earliest=/latest=")), "{error}");
+    }
+
+    /// NAN-4288 review: detection windows stay contiguous. Scheduled and
+    /// catch-up runs reach `apply_time_bounds` through
+    /// `DetectionService::evaluate_window` -> `SearchService::search`; a run
+    /// that executes late (catch-up) must still end at its own window end so
+    /// it never overlaps the next window, with or without an `earliest=`
+    /// token in the rule.
+    #[test]
+    fn detection_catch_up_windows_keep_their_end() {
+        use chrono::TimeZone;
+        // The engine is three hours behind; the three backlog windows run now.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 20, 22, 0, 0).unwrap();
+        let base = now - chrono::Duration::hours(3);
+        let windows: Vec<TimeRangeInput> = (0..3)
+            .map(|i| {
+                TimeRangeInput::new(
+                    base + chrono::Duration::hours(i),
+                    base + chrono::Duration::hours(i + 1),
+                )
+            })
+            .collect();
+        for rule in ["process.name=cmd.exe", "process.name=cmd.exe earliest=-4h"] {
+            let (_, earliest, latest) = extract_time_bounds_at(rule, now).unwrap();
+            let ranges: Vec<TimeRangeInput> = windows
+                .iter()
+                .map(|w| apply_time_bounds(w, earliest, latest).unwrap())
+                .collect();
+            for (range, window) in ranges.iter().zip(&windows) {
+                assert_eq!(range.end, window.end, "{rule}: a window end moved");
+                assert!(range.end < now || window.end == now, "{rule}: end moved to now");
+            }
+            if earliest.is_none() {
+                for (range, window) in ranges.iter().zip(&windows) {
+                    assert_eq!(range.start, window.start, "{rule}: start moved");
+                }
+                for pair in ranges.windows(2) {
+                    assert_eq!(pair[0].end, pair[1].start, "{rule}: windows not contiguous");
+                }
+            }
+        }
     }
 
     #[test]
     fn test_extract_time_modifiers() {
         // Test earliest with hours
         let (cleaned, earliest, latest) =
-            extract_time_modifiers("source_type=squid_proxy earliest=-24h");
+            extract_time_modifiers("source_type=squid_proxy earliest=-24h").unwrap();
         assert_eq!(cleaned, "source_type=squid_proxy");
         assert_eq!(earliest, Some(-24 * 3600)); // -24 hours in seconds
         assert_eq!(latest, None);
 
         // Test earliest with days
         let (cleaned, earliest, latest) =
-            extract_time_modifiers("source_type=test earliest=-7d | stats count");
+            extract_time_modifiers("source_type=test earliest=-7d | stats count").unwrap();
         assert_eq!(cleaned, "source_type=test | stats count");
         assert_eq!(earliest, Some(-7 * 86400)); // -7 days in seconds
         assert_eq!(latest, None);
 
         // Test latest=now (with fixed regex pattern)
         let (cleaned, earliest, latest) =
-            extract_time_modifiers("source_type=test earliest=-1h latest=now");
+            extract_time_modifiers("source_type=test earliest=-1h latest=now").unwrap();
         assert_eq!(cleaned, "source_type=test");
         assert_eq!(earliest, Some(-1 * 3600)); // -1 hour in seconds
         assert_eq!(latest, Some(0)); // now = 0 offset
 
         // Test no time modifiers
-        let (cleaned, earliest, latest) = extract_time_modifiers("source_type=test | stats count");
+        let (cleaned, earliest, latest) = extract_time_modifiers("source_type=test | stats count").unwrap();
         assert_eq!(cleaned, "source_type=test | stats count");
         assert_eq!(earliest, None);
         assert_eq!(latest, None);
 
         // Test with minutes
-        let (cleaned, earliest, _) = extract_time_modifiers("error earliest=-30m");
+        let (cleaned, earliest, _) = extract_time_modifiers("error earliest=-30m").unwrap();
         assert_eq!(cleaned, "error");
         assert_eq!(earliest, Some(-30 * 60)); // -30 minutes in seconds
 
         // Test with weeks
-        let (cleaned, earliest, _) = extract_time_modifiers("error earliest=-2w");
+        let (cleaned, earliest, _) = extract_time_modifiers("error earliest=-2w").unwrap();
         assert_eq!(cleaned, "error");
         assert_eq!(earliest, Some(-2 * 604800)); // -2 weeks in seconds
 
         // Test just latest=now
-        let (cleaned, earliest, latest) = extract_time_modifiers("source_type=test latest=now");
+        let (cleaned, earliest, latest) = extract_time_modifiers("source_type=test latest=now").unwrap();
         assert_eq!(cleaned, "source_type=test");
         assert_eq!(earliest, None);
         assert_eq!(latest, Some(0));
@@ -2599,7 +2658,7 @@ mod tests {
         // A `//` comment on its own line used to swallow every later line:
         // the whitespace tidy flattened newlines before the parser's comment
         // stripper (which ends `//` at a newline) ever saw the query.
-        let (cleaned, earliest, latest) = extract_time_modifiers("base\n// note\n| where x=1");
+        let (cleaned, earliest, latest) = extract_time_modifiers("base\n// note\n| where x=1").unwrap();
         assert_eq!(cleaned, "base | where x=1");
         assert_eq!((earliest, latest), (None, None));
         assert_eq!(
@@ -2608,13 +2667,13 @@ mod tests {
         );
 
         // A leading comment line used to leave an empty query (400).
-        let (cleaned, _, _) = extract_time_modifiers("// c\nbase");
+        let (cleaned, _, _) = extract_time_modifiers("// c\nbase").unwrap();
         assert_eq!(cleaned, "base");
         assert_eq!(parse_query(&cleaned).unwrap(), parse_query("base").unwrap());
 
         // Time modifiers are still extracted around a comment line.
         let (cleaned, earliest, latest) =
-            extract_time_modifiers("earliest=-2h base\n// c\n| head 5");
+            extract_time_modifiers("earliest=-2h base\n// c\n| head 5").unwrap();
         assert_eq!(cleaned, "base | head 5");
         assert_eq!((earliest, latest), (Some(-2 * 3600), None));
 
@@ -2625,19 +2684,19 @@ mod tests {
             "base /* one\ntwo */\n| where x=1",
             "base // trailing\n| where x=1",
         ] {
-            let (cleaned, _, _) = extract_time_modifiers(query);
+            let (cleaned, _, _) = extract_time_modifiers(query).unwrap();
             assert_eq!(cleaned, "base | where x=1", "{query:?}");
         }
 
         // An `earliest=` written inside a comment is commentary, not the range
         // (the parser never sees it either).
         let (cleaned, earliest, _) =
-            extract_time_modifiers("base // earliest=-30d was too slow\n| head 5");
+            extract_time_modifiers("base // earliest=-30d was too slow\n| head 5").unwrap();
         assert_eq!(cleaned, "base | head 5");
         assert_eq!(earliest, None);
 
         // `//` inside a quoted value is not a comment.
-        let (cleaned, _, _) = extract_time_modifiers("url=\"http://x/y\"\n// note\n| head 5");
+        let (cleaned, _, _) = extract_time_modifiers("url=\"http://x/y\"\n// note\n| head 5").unwrap();
         assert_eq!(cleaned, "url=\"http://x/y\" | head 5");
     }
 
@@ -2653,7 +2712,7 @@ mod tests {
             "error earliest=-12h latest=now",
         )
         .unwrap();
-        let (_cleaned, earliest, latest) = extract_time_modifiers(&enforced);
+        let (_cleaned, earliest, latest) = extract_time_modifiers(&enforced).unwrap();
         assert_eq!(
             earliest,
             Some(-12 * 3600),
@@ -2804,7 +2863,7 @@ mod nan3080_detection_prevalence_timeout_tests {
 
 #[cfg(test)]
 mod signed_url_trace_tests {
-    use super::extract_time_modifiers;
+    use super::{extract_time_bounds_at, extract_time_modifiers};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -2830,13 +2889,17 @@ mod signed_url_trace_tests {
             .with_writer(move || capture.clone())
             .finish();
         let query = "| inputlookup url=\"https://storage.googleapis.com/bucket/x?sig=TEST_CREDENTIAL\" earliest=-1h";
+        // NAN-4304: the production extractor every search path calls (the
+        // `extract_time_modifiers` shim is test-only).
         tracing::subscriber::with_default(subscriber, || {
-            let (cleaned, earliest, _) = extract_time_modifiers(query);
+            let now = chrono::Utc::now();
+            let (cleaned, earliest, _) = extract_time_bounds_at(query, now).unwrap();
             assert!(
                 cleaned.contains("sig=TEST_CREDENTIAL"),
                 "execution retains credentials"
             );
-            assert_eq!(earliest, Some(-3600));
+            assert_eq!(earliest, Some(now - chrono::Duration::hours(1)));
+            assert_eq!(extract_time_modifiers(query).unwrap().1, Some(-3600));
         });
         let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
         assert!(

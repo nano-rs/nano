@@ -388,8 +388,8 @@ ok "nano-jobs carries nano-api's runtime environment (except listener-only: $API
 
 # ----------------------------------------------------------------------------
 # 12. Unauthenticated ingest ports bind to loopback by default (NAN-3322).
-#     Vector native :6000, raw OTLP :4317/:4318 and Fluent :24224 check no
-#     token; publishing them on every interface is opt-in via NANO_*_BIND_ADDRESS.
+#     Vector native :6000 and Fluent :24224 are loopback by default. Raw OTLP
+#     has no host publication, even when the obsolete bind override is set.
 # ----------------------------------------------------------------------------
 lean_config_json=$(env -u NANO_VECTOR_NATIVE_BIND_ADDRESS -u NANO_OTLP_BIND_ADDRESS -u NANO_FLUENT_BIND_ADDRESS \
   POSTGRES_PASSWORD=x JWT_SECRET=x NANOSIEM_ENCRYPTION_KEY=x VECTOR_AUTH_TOKEN=x \
@@ -406,6 +406,10 @@ reexposed=$(NANO_VECTOR_NATIVE_BIND_ADDRESS=0.0.0.0 NANO_FLUENT_BIND_ADDRESS=0.0
   COMPOSE_PROFILES=lean docker compose -f "$COMPOSE" config --format json 2>/dev/null \
   | jq -r '[.services[].ports // [] | .[] | select((.target == 6000 or .target == 24224) and .host_ip == "0.0.0.0")] | length')
 [[ "$reexposed" == "2" ]] || fail "NANO_VECTOR_NATIVE_BIND_ADDRESS / NANO_FLUENT_BIND_ADDRESS do not re-expose :6000 / :24224"
-ok "unauthenticated ingest ports (:6000, :4317/:4318, :24224) bind 127.0.0.1 unless NANO_*_BIND_ADDRESS is set"
+otlp_exposed=$(NANO_OTLP_BIND_ADDRESS=0.0.0.0 POSTGRES_PASSWORD=x JWT_SECRET=x NANOSIEM_ENCRYPTION_KEY=x VECTOR_AUTH_TOKEN=x \
+  COMPOSE_PROFILES=lean docker compose -f "$COMPOSE" config --format json 2>/dev/null \
+  | jq -r '[.services[].ports // [] | .[] | select(.target == 4317 or .target == 4318)] | length')
+[[ "$otlp_exposed" == "0" ]] || fail "raw OTLP must not bypass credential authentication"
+ok "raw OTLP stays internal; native/Fluent ports default to loopback"
 
 printf '\n\033[32mAll open-source stack checks passed.\033[0m\n'

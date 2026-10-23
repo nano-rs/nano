@@ -302,6 +302,13 @@ pub struct CellConfig {
     /// false (query[T] builds in-process, as before).
     #[serde(default)]
     pub product_state_role: bool,
+    /// `tenzir_landing` (NAN-4137, cell feature `lean_tenzir_landing_v1`):
+    /// run `landing[T]`, the hosted OCSF bucket-drop converter, for every
+    /// tenant placed with `landing: true` on the cell that writes for it.
+    /// Its status rides the status push as the tenant's `landing` entry.
+    /// Default false: no landing role, a byte-identical status push.
+    #[serde(default)]
+    pub tenzir_landing: bool,
     /// `detect.runs_rules` (cell feature `detect_runs_rules_v1`): detect[T]
     /// runs its tenant's rule searches in its own engine, under its own
     /// budget, and the router sends every `/v1/tenants/{t}/detect/...`
@@ -757,6 +764,12 @@ pub struct TenantPlacement {
     /// watches the backlog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest_hold_until: Option<u64>,
+    /// NAN-4137 (cell feature `lean_tenzir_landing_v1`): the tenant has at
+    /// least one active OCSF bucket-drop (Tenzir) source, so the cell keeps
+    /// landing[T] running for it (on a cell with `tenzir_landing`). Absent:
+    /// false. Placement refuses unknown fields: render it only for that feature.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub landing: bool,
 }
 
 /// product[T]'s fixed budget (NAN-3148): never placed, never shared with
@@ -767,6 +780,16 @@ fn product_budget() -> RoleBudget {
         limit_millicores: crate::budget::PRODUCT_LIMIT_MILLICORES,
         request_memory_bytes: crate::budget::PRODUCT_REQUEST_MEMORY_BYTES,
         limit_memory_bytes: crate::budget::PRODUCT_LIMIT_MEMORY_BYTES,
+    }
+}
+
+/// landing[T]'s fixed budget (NAN-4137).
+fn landing_budget() -> RoleBudget {
+    RoleBudget {
+        request_millicores: crate::budget::LANDING_REQUEST_MILLICORES,
+        limit_millicores: crate::budget::LANDING_LIMIT_MILLICORES,
+        request_memory_bytes: crate::budget::LANDING_REQUEST_MEMORY_BYTES,
+        limit_memory_bytes: crate::budget::LANDING_LIMIT_MEMORY_BYTES,
     }
 }
 
@@ -795,6 +818,7 @@ impl TenantPlacement {
                 request_memory_bytes: crate::budget::MAINTENANCE_REQUEST_MEMORY_BYTES,
                 limit_memory_bytes: crate::budget::MAINTENANCE_LIMIT_MEMORY_BYTES },
             Role::Product => product_budget(),
+            Role::Landing => landing_budget(),
         }
     }
 
@@ -817,7 +841,7 @@ impl TenantPlacement {
             detect_request_memory_bytes: None, detect_limit_memory_bytes: None,
             query_request_millicores: None, query_limit_millicores: None,
             query_request_memory_bytes: None, query_limit_memory_bytes: None, ingest_hold_eps: None,
-            ingest_hold_until: None }
+            ingest_hold_until: None, landing: false }
     }
 
     pub fn role_budget(&self, role: crate::contract::Role) -> Option<RoleBudget> {
@@ -834,6 +858,8 @@ impl TenantPlacement {
                 limit_memory_bytes: crate::budget::MAINTENANCE_LIMIT_MEMORY_BYTES }),
             // Fixed, never placed: the product-state builder (NAN-3148).
             Role::Product => return Some(product_budget()),
+            // Fixed, never placed: the landing converter (NAN-4137).
+            Role::Landing => return Some(landing_budget()),
         };
         match values {
             (Some(request_millicores), Some(limit_millicores), Some(request_memory_bytes), Some(limit_memory_bytes)) =>

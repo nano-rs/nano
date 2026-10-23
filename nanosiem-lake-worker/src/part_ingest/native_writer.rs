@@ -62,11 +62,38 @@ pub fn owner_origin(signing_url: &str) -> Result<String> {
         && url.query().is_none() && url.fragment().is_none(), "invalid pinned owner origin");
     Ok(url.origin().ascii_serialization())
 }
+/// A journaled authorization has no successful PUT evidence. Never retry
+/// this identity or claim it was registered; its enclosing unpublished part
+/// must be rebuilt under a fresh identity instead.
+#[derive(Debug, thiserror::Error)]
+#[error("native PUT outcome unresolved; owner recovery required")]
+pub struct NativePutUnresolved {
+    pub key: String,
+}
+
 /// The owner answered a native writer call with a non-success status.
 #[derive(Debug, thiserror::Error)]
 #[error("native writer owner refused HTTP {status}")]
 pub struct OwnerRefused {
     pub status: u16,
+}
+
+/// NAN-4336: the owner's answer when NanoSIEM refused a writer reservation
+/// itself (control `r2_writers.reserve` HTTP 400, e.g. a `max_event_time`
+/// more than 5 min past control's clock): `422 writer_reservation_refused`,
+/// `retryable: false`. A replay of the same request reaches the same verdict.
+pub const OWNER_RESERVATION_REFUSED_STATUS: u16 = 422;
+
+impl OwnerRefused {
+    /// NAN-4336: a permanent refusal of this object's reservation.
+    pub fn is_reservation_refused(&self) -> bool {
+        self.status == OWNER_RESERVATION_REFUSED_STATUS
+    }
+}
+
+/// NAN-4336: does `error` carry the owner's permanent reservation refusal?
+pub fn reservation_refused(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<OwnerRefused>().is_some_and(OwnerRefused::is_reservation_refused))
 }
 
 /// NAN-3723: how long one native writer call keeps retrying an owner that
@@ -95,7 +122,24 @@ pub(crate) fn owner_unavailable_delay(attempt: u32, elapsed: Duration, window: D
     (elapsed + delay <= window).then_some(delay)
 }
 
+#[derive(Default)]
+struct WriterCounters {
+    replay_started: std::sync::atomic::AtomicU64,
+    replay_completed: std::sync::atomic::AtomicU64,
+    authorize_started: std::sync::atomic::AtomicU64,
+    authorize_completed: std::sync::atomic::AtomicU64,
+    complete_started: std::sync::atomic::AtomicU64,
+    complete_completed: std::sync::atomic::AtomicU64,
+    put_started: std::sync::atomic::AtomicU64,
+    put_completed: std::sync::atomic::AtomicU64,
+}
 pub struct NativePartWriter {
+    counters: WriterCounters,
+    /// Shared by authorize, complete, journal replay and retries. Starts at
+    /// twenty native RPC/s under the smallest control allowance (3072/min); scales
+    /// with assignment EPS. No burst after an idle gap.
+    next_owner_call: tokio::sync::Mutex<tokio::time::Instant>,
+    owner_call_interval: Duration,
     origin: String, tenant: String, cell: String, bucket: String,
     permission: RwLock<WritePermission>, tls: OwnerTlsClient, dir: PathBuf, archive: PathBuf,
     /// Writes hold this shared, so independent objects upload concurrently
@@ -150,12 +194,37 @@ impl NativePartWriter {
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
                 std::fs::File::open(path)?.sync_all()?;
             } }
-        Ok(Self { origin: origin.trim_end_matches('/').into(), tenant: tenant.into(), cell: cell.into(),
+        Ok(Self { counters: WriterCounters::default(), next_owner_call: tokio::sync::Mutex::new(tokio::time::Instant::now()), owner_call_interval: Duration::from_millis(50), origin: origin.trim_end_matches('/').into(), tenant: tenant.into(), cell: cell.into(),
             bucket: bucket.into(), permission: RwLock::new(permission),
             tls: OwnerTlsClient::new(origin, ca, Duration::from_secs(30))?, dir, archive, gate: Default::default(),
             keys: Default::default(), needs_replay: std::sync::atomic::AtomicBool::new(true),
             unavailable_retry_window: OWNER_UNAVAILABLE_RETRY_WINDOW })
     }
+    /// Match the existing owner admission envelope without changing contract
+    /// EPS. Reserve 21.875% for signing/control traffic and retries elsewhere.
+    /// Higher-volume tenants retain their proportionally larger budget.
+    pub fn with_ingest_eps(mut self, eps: f64) -> Result<Self> {
+        ensure!(eps.is_finite() && (0.0..=1_000_000.0).contains(&eps), "invalid native writer EPS");
+        let requests_per_minute = ((eps * 60.0 / 500.0).ceil() * 8.0).max(3072.0);
+        // Authorize performs reserve+verify; complete performs complete+register.
+        // Pace both as two control calls conservatively: reserve/verify/complete
+        // charge the tenant bucket; registration charges the shared global bucket.
+        self.owner_call_interval = Duration::from_secs_f64(120.0 / (requests_per_minute * (2400.0 / 3072.0)));
+        Ok(self)
+    }
+    /// Process-local attempts and successful replies. Retried HTTP requests
+    /// count separately; counters include failures and never reset on a tick.
+    pub fn diagnostics(&self) -> Value {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.counters;
+        json!({"replay_started_total": c.replay_started.load(Relaxed), "replay_completed_total": c.replay_completed.load(Relaxed),
+            "authorize_started_total": c.authorize_started.load(Relaxed), "authorize_completed_total": c.authorize_completed.load(Relaxed),
+            "complete_started_total": c.complete_started.load(Relaxed), "complete_completed_total": c.complete_completed.load(Relaxed),
+            "put_started_total": c.put_started.load(Relaxed), "put_completed_total": c.put_completed.load(Relaxed)})
+    }
+    pub(crate) fn put_started(&self) { self.counters.put_started.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    pub(crate) fn put_completed(&self) { self.counters.put_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+
     pub fn check_store_binding(&self, prefix: &str, location: &super::s3_store::S3Location) -> Result<()> {
         ensure!(prefix == format!("lake/parts/v1/tenant={}/", self.tenant) && location.bucket == self.bucket && location.prefix.is_empty(), "native store binding differs");
         Ok(())
@@ -231,7 +300,17 @@ impl NativePartWriter {
             }
         }
     }
+    async fn pace_owner_call(&self) {
+        let mut next = self.next_owner_call.lock().await;
+        tokio::time::sleep_until(*next).await;
+        *next = tokio::time::Instant::now() + self.owner_call_interval;
+    }
     async fn post_once(&self, route: &str, body: &Value) -> Result<Value> {
+        self.pace_owner_call().await;
+        let (started, completed) = if route.ends_with(":authorize") {
+            (&self.counters.authorize_started, &self.counters.authorize_completed)
+        } else { (&self.counters.complete_started, &self.counters.complete_completed) };
+        started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let token = { let permission = self.permission.read().expect("write permission");
             permission.validate(&self.tenant, &self.cell)?; zeroize::Zeroizing::new(permission.token.clone()) };
         let bearer = zeroize::Zeroizing::new(format!("Bearer {}", token.as_str()));
@@ -248,7 +327,9 @@ impl NativePartWriter {
             ensure!(bytes.len() + chunk.len() <= 65536, "native writer owner response exceeds cap");
             bytes.extend_from_slice(&chunk);
         }
-        Ok(serde_json::from_slice(&bytes)?)
+        let value = serde_json::from_slice(&bytes)?;
+        completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(value)
     }
     fn save(&self, path: &Path, intent: &Intent) -> Result<()> {
         use std::io::Write;
@@ -315,6 +396,7 @@ impl NativePartWriter {
         replayed
     }
     pub(crate) async fn replay_pending_locked(&self) -> Result<()> {
+        self.counters.replay_started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::time::timeout(Duration::from_secs(60), async {
             self.permission.read().expect("write permission").validate(&self.tenant, &self.cell)?;
             let mut count = 0usize;
@@ -341,8 +423,10 @@ impl NativePartWriter {
                     "native receipt replay binding differs");
                 self.complete_intent(&path, intent).await?;
             }
-            Ok(())
-        }).await.context("native receipt replay time cap exceeded")?
+            Ok::<(), anyhow::Error>(())
+        }).await.context("native receipt replay time cap exceeded")??;
+        self.counters.replay_completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
     pub async fn begin(&self, key: &str, sha: &str, bytes: u64, hints: &WriteHints) -> Result<Option<NativeAttempt>> {
         let tenant_key = { self.permission.read().expect("write permission").tenant_key.clone() };
@@ -372,7 +456,9 @@ impl NativePartWriter {
         if let Some(intent) = Self::load(&path)? {
             ensure!(intent.request == request, "native pending request differs");
             if intent.registered.is_some() { self.archive_registered(&path, &intent)?; return Ok(None); }
-            ensure!(intent.object.is_some(), "native PUT outcome unresolved; owner recovery required");
+            if intent.object.is_none() {
+                return Err(NativePutUnresolved { key: key.to_string() }.into());
+            }
             self.complete_intent(&path, intent).await?;
             return Ok(None);
         }
@@ -557,7 +643,33 @@ pub(crate) mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "bounded by the window");
         // 0 ms, then +250 ms; +500 ms would pass the 300 ms window.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(writer.diagnostics()["authorize_started_total"], 2);
+        assert_eq!(writer.diagnostics()["authorize_completed_total"], 0);
         assert_eq!(std::fs::read_dir(dir.path().join("native-writer-receipts/pending")).unwrap().count(), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn native_pacing_scales_with_existing_eps_without_inflating_it() {
+        let (writer, _dir, _, task) = unavailable_owner(0, Duration::from_secs(10)).await;
+        assert_eq!(writer.owner_call_interval, Duration::from_millis(50));
+        let writer = writer.with_ingest_eps(15_500.0).unwrap();
+        let admitted_rpm = 120.0 / writer.owner_call_interval.as_secs_f64();
+        assert!(admitted_rpm > 11_600.0 && admitted_rpm < 11_630.0);
+        assert!(writer.with_ingest_eps(f64::NAN).is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn owner_calls_share_a_paced_budget_without_idle_bursts() {
+        let (writer, _dir, _, task) = unavailable_owner(0, Duration::from_secs(10)).await;
+        let started = tokio::time::Instant::now();
+        futures::future::join_all((0..9).map(|_| writer.pace_owner_call())).await;
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let started = tokio::time::Instant::now();
+        futures::future::join_all((0..3).map(|_| writer.pace_owner_call())).await;
+        assert!(started.elapsed() >= Duration::from_millis(100), "idle time never accumulates burst tokens");
         task.abort();
     }
 
@@ -601,6 +713,12 @@ pub(crate) mod tests {
         writer.replay_pending().await.unwrap();
         assert_eq!(a.load(Ordering::SeqCst), 1);
         assert_eq!(c.load(Ordering::SeqCst), 2);
+        let counters = writer.diagnostics();
+        assert_eq!(counters["replay_started_total"], 2);
+        assert_eq!(counters["replay_completed_total"], 2);
+        assert_eq!(counters["authorize_started_total"], 0);
+        assert_eq!(counters["complete_started_total"], 1);
+        assert_eq!(counters["complete_completed_total"], 1);
         task.abort();
     }
 
@@ -667,7 +785,8 @@ pub(crate) mod tests {
         let (writer, _dir, a, c, task) = fixture(false).await;
         let sha = "c".repeat(64);
         assert!(writer.begin("tenant/parts/object", &sha, 7, &hints()).await.unwrap().is_some());
-        assert!(writer.begin("tenant/parts/object", &sha, 7, &hints()).await.err().unwrap().to_string().contains("unresolved"));
+        let error = writer.begin("tenant/parts/object", &sha, 7, &hints()).await.err().unwrap();
+        assert_eq!(error.downcast_ref::<NativePutUnresolved>().unwrap().key, "tenant/parts/object");
         assert_eq!(a.load(Ordering::SeqCst), 1);
         writer.replay_pending().await.unwrap();
         assert_eq!(c.load(Ordering::SeqCst), 0);

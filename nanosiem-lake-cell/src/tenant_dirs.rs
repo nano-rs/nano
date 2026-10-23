@@ -468,6 +468,10 @@ pub fn tenant_tree(tenant: &str, ids: &TenantIds) -> DirSpec {
     // parts (NAN-2916). Query shares the gid but Landlock mounts it read-only.
     let mut root = DirSpec::new(tenant, euid, ids.gid, 0o750).child(DirSpec::new("parts", ids.ingest_uid, ids.gid, 0o2770));
     for role in Role::ALL {
+        // NAN-4137: no landing uid, no landing dir (landing[T] cannot run).
+        if role == Role::Landing && ids.landing_uid.is_none() {
+            continue;
+        }
         let uid = ids.uid(role);
         let mut dir = DirSpec::new(role.as_str(), uid, ids.gid, 0o700).child(DirSpec::new("tmp", uid, ids.gid, 0o700));
         if role == Role::Product {
@@ -492,7 +496,7 @@ pub fn ensure_tenant_tree(tenants_dir: &Path, tenant: &str, ids: &TenantIds) -> 
 /// id in `foreign`: the other tenants' ids (NAN-3875). The supervisor
 /// always calls this one.
 pub fn ensure_tenant_tree_guarded(tenants_dir: &Path, tenant: &str, ids: &TenantIds, foreign: &BTreeSet<u32>) -> io::Result<()> {
-    if [ids.ingest_uid, ids.query_uid, ids.detect_uid, ids.gid].iter().any(|u| foreign.contains(u)) {
+    if ids.uids().iter().chain([&ids.gid]).any(|u| foreign.contains(u)) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("tenant {tenant}: its own ids overlap another tenant's")));
     }
     let spec = tenant_tree(tenant, ids);
@@ -752,7 +756,7 @@ mod tests {
 
     fn own_ids() -> TenantIds {
         let (u, g) = euid_egid();
-        TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, gid: g }
+        TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, landing_uid: Some(u), gid: g }
     }
 
     #[test]
@@ -809,7 +813,7 @@ mod tests {
         // The plain test user owns t1's tree; mark our ids as another
         // tenant's (with t2 getting distinct ids): the walk must refuse t1
         // as t2 and change nothing.
-        let other = TenantIds { slot: 1, ingest_uid: ids.ingest_uid + 2, query_uid: ids.ingest_uid + 3, detect_uid: ids.detect_uid + 1, gid: ids.gid + 2 };
+        let other = TenantIds { slot: 1, ingest_uid: ids.ingest_uid + 2, query_uid: ids.ingest_uid + 3, detect_uid: ids.detect_uid + 1, landing_uid: ids.landing_uid.map(|u| u + 1), gid: ids.gid + 2 };
         let foreign: BTreeSet<u32> = [ids.ingest_uid, ids.gid].into_iter().collect();
         let before = meta(&d.path().join("t1/parts"));
         let e = ensure_tenant_tree_guarded(d.path(), "t1", &other, &foreign).unwrap_err();
@@ -984,7 +988,7 @@ mod tests {
     const CELL_CAPS: u64 = 0x2000e9;
 
     fn live_ids() -> TenantIds {
-        TenantIds { slot: 0, ingest_uid: 20000, query_uid: 20001, detect_uid: 60000, gid: 20000 }
+        TenantIds { slot: 0, ingest_uid: 20000, query_uid: 20001, detect_uid: 60000, landing_uid: Some(62767), gid: 20000 }
     }
 
     /// Drop this thread's effective, permitted and inheritable sets to

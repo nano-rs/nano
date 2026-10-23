@@ -26,7 +26,7 @@ use nanosiem_lake_worker::otel_handoff::{
 use nanosiem_lake_worker::otel_lean::{
     compact_mirror, expire_handoff_objects, lean_dataset_location, lean_tenant_bucket,
     load_lean_scan_state, prune_drained_markers, recover_compaction, recover_drain_journal, LeanOtelHandoffLedger, LeanOtelR2Source,
-    PostgresOtelDrainPresence,
+    HandoffExpiryPacer, PostgresOtelDrainPresence,
 };
 use nanosiem_lake_worker::iceberg::{CatalogConfig, catalog_session_expired, table_ident};
 use nanosiem_lake_worker::native::NativeChdb;
@@ -39,6 +39,10 @@ use nanosiem_lake_worker::otel_iceberg::{
     plan_service_endpoints, plan_service_exemplars, plan_service_red, plan_services_overview,
     plan_services_sparkline, plan_slo_compute, plan_synthetic_history, plan_synthetic_summary,
     plan_trace_by_id, publish_otel_rows,
+};
+use nanosiem_lake_worker::otel_metric_catalog::{
+    COLD_LOOKBACK, MAX_CATALOG_KEYS, MAX_CATALOG_NAMES, MetricNameCatalog, ScanWindow,
+    validate_direct_window,
 };
 use nanosiem_lake_worker::planner::{ObjectStoreCredentials, TenantQueryConfig};
 use serde::{Deserialize, Serialize};
@@ -140,6 +144,7 @@ struct AppState {
     local_store: Option<Arc<nanosiem_lake_worker::otel_local::LocalOtelStore>>,
     /// Hosted-shared: the drain, for the committed-table pins it refreshes.
     hosted_drain: Option<Arc<OtelHandoffDrain>>,
+    metric_catalogs: MetricCatalogs,
 }
 
 #[derive(Debug, Serialize)]
@@ -282,13 +287,29 @@ struct RecentTracesResponse {
 struct MetricNamesQuery {
     #[serde(default)]
     service_name: Option<String>,
+    /// Explicit window (both or neither). Omitted: the cached catalog.
+    #[serde(default)]
+    start: Option<DateTime<Utc>>,
+    #[serde(default)]
+    end: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
 struct MetricNamesResponse {
     names: Vec<Value>,
     count: usize,
+    /// NAN-4098: start of the window the names cover (end is "now").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_start: Option<DateTime<Utc>>,
+    /// NAN-4098: true while the catalog covers less than its full 24 h
+    /// (cold start, backfill pending) or the inventory hit its row cap.
+    partial: bool,
 }
+
+/// NAN-4098: per-service-filter metric-name catalogs ("" = all services).
+/// Each entry has its own lock so one slow scan never blocks another filter;
+/// concurrent requests for the same filter wait on the one in-flight scan.
+type MetricCatalogs = Arc<Mutex<HashMap<String, Arc<Mutex<MetricNameCatalog>>>>>;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -551,6 +572,7 @@ async fn main() -> Result<()> {
             .map(|lean| Arc::new(lean.mirror_dir.clone())),
         hosted_drain,
         local_store,
+        metric_catalogs: MetricCatalogs::default(),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -903,6 +925,31 @@ async fn query_metric_names(
     Query(request): Query<MetricNamesQuery>,
 ) -> ApiResult<Json<MetricNamesResponse>> {
     authorize(&headers, &state.query_token)?;
+    let service = request
+        .service_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let explicit = match (request.start, request.end) {
+        (Some(start), Some(end)) => Some(ScanWindow { start, end }),
+        (None, None) => None,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_METRIC_QUERY",
+                anyhow::anyhow!("metric inventory start and end go together"),
+            ));
+        }
+    };
+    if let Some(window) = explicit {
+        validate_direct_window(window.start, window.end).map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "INVALID_METRIC_QUERY",
+                anyhow::anyhow!(error),
+            )
+        })?;
+    }
     let Some(table) = current_query_table(&state, OtelDataset::Metrics)
         .await
         .map_err(|error| {
@@ -917,15 +964,127 @@ async fn query_metric_names(
         return Ok(Json(MetricNamesResponse {
             names: Vec::new(),
             count: 0,
+            window_start: None,
+            partial: false,
         }));
     };
-    let plan = plan_metric_names(&table, &state.tenant_id, request.service_name.as_deref())
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, "INVALID_METRIC_QUERY", error))?;
-    let names = execute_json_plan(&state, plan).await?;
-    Ok(Json(MetricNamesResponse {
+
+    // An explicit window is a direct, uncached, bounded inventory.
+    if let Some(window) = explicit {
+        let rows = scan_metric_names(&state, &table, service.as_deref(), window).await?;
+        let capped = rows.len() > MAX_CATALOG_NAMES;
+        let mut names: Vec<String> = rows.into_iter().map(|(name, _)| name).collect();
+        names.truncate(MAX_CATALOG_NAMES);
+        return Ok(Json(metric_names_response(names, Some(window.start), capped)));
+    }
+
+    let key = service.clone().unwrap_or_default();
+    let entry = {
+        let mut catalogs = state.metric_catalogs.lock().await;
+        match catalogs.get(&key) {
+            Some(entry) => Some(entry.clone()),
+            None if catalogs.len() < MAX_CATALOG_KEYS => {
+                let entry = Arc::new(Mutex::new(MetricNameCatalog::default()));
+                catalogs.insert(key.clone(), entry.clone());
+                Some(entry)
+            }
+            None => None,
+        }
+    };
+    let Some(entry) = entry else {
+        // Too many distinct service filters cached: answer this one from a
+        // bounded cold-lookback scan without caching it.
+        let now = Utc::now();
+        let window = ScanWindow {
+            start: now - COLD_LOOKBACK,
+            end: now,
+        };
+        let rows = scan_metric_names(&state, &table, service.as_deref(), window).await?;
+        let mut names: Vec<String> = rows.into_iter().map(|(name, _)| name).collect();
+        names.truncate(MAX_CATALOG_NAMES);
+        return Ok(Json(metric_names_response(names, Some(window.start), true)));
+    };
+
+    let mut catalog = entry.lock().await;
+    let now = Utc::now();
+    if let Some(window) = catalog.refresh_window(now) {
+        match scan_metric_names(&state, &table, service.as_deref(), window).await {
+            Ok(rows) => catalog.apply_scan(window, rows, now),
+            // Stale-but-serving: a warm catalog answers through a failed
+            // incremental scan; only a cold one surfaces the error.
+            Err(error) if catalog.names(now).is_empty() => return Err(error),
+            Err(_) => tracing::warn!(
+                service = %key,
+                "metric catalog refresh failed; serving the previous catalog"
+            ),
+        }
+    }
+    if let Some(window) = catalog.claim_backfill(now) {
+        let state = state.clone();
+        let entry = entry.clone();
+        let table = table.clone();
+        tokio::spawn(async move {
+            let result = scan_metric_names(&state, &table, service.as_deref(), window).await;
+            let mut catalog = entry.lock().await;
+            let now = Utc::now();
+            match result {
+                Ok(rows) => {
+                    catalog.apply_scan(window, rows, now);
+                    catalog.finish_backfill(true, now);
+                }
+                Err(_) => {
+                    tracing::warn!("metric catalog 24 h backfill failed; retrying later");
+                    catalog.finish_backfill(false, now);
+                }
+            }
+        });
+    }
+    let names = catalog.names(now);
+    let partial = catalog.is_partial() || names.len() >= MAX_CATALOG_NAMES;
+    let window_start = catalog.window_start(now);
+    Ok(Json(metric_names_response(names, Some(window_start), partial)))
+}
+
+fn metric_names_response(
+    names: Vec<String>,
+    window_start: Option<DateTime<Utc>>,
+    partial: bool,
+) -> MetricNamesResponse {
+    let names: Vec<Value> = names
+        .into_iter()
+        .map(|name| serde_json::json!({ "metric_name": name }))
+        .collect();
+    MetricNamesResponse {
         count: names.len(),
         names,
-    }))
+        window_start,
+        partial,
+    }
+}
+
+/// One bounded inventory scan: `(metric_name, last_seen)` rows.
+async fn scan_metric_names(
+    state: &AppState,
+    table: &OtelQuerySource,
+    service: Option<&str>,
+    window: ScanWindow,
+) -> ApiResult<Vec<(String, DateTime<Utc>)>> {
+    let plan = plan_metric_names(table, &state.tenant_id, service, window.start, window.end)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, "INVALID_METRIC_QUERY", error))?;
+    let rows = execute_json_plan(state, plan).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = json_string(row, "metric_name");
+            if name.is_empty() {
+                return None;
+            }
+            let seen = json_optional_number(row, "last_seen_unix")
+                .and_then(|secs| DateTime::from_timestamp(secs as i64, 0))
+                .unwrap_or(window.end);
+            Some((name, seen))
+        })
+        .collect())
 }
 
 async fn query_metric_tags(
@@ -1314,17 +1473,54 @@ async fn query_infra_hosts(
     let mut hosts = rows
         .iter()
         .map(|row| {
-            let cpu_pct = json_number(row, "cpu_util") * 100.0;
-            let mem_pct = json_number(row, "mem_util") * 100.0;
-            let status = host_status(cpu_pct, mem_pct);
+            let host = json_string(row, "host");
             let group = json_string(row, "host_group");
+            let kind = json_string(row, "kind");
+            let cpu_reported = json_number(row, "cpu_n") > 0.0
+                || (json_number(row, "cpu_count") > 0.0 && json_number(row, "cpu_cores_n") > 0.0);
+            let cpu_pct = if json_number(row, "cpu_n") > 0.0 {
+                json_number(row, "cpu_util") * 100.0
+            } else if json_number(row, "cpu_count") > 0.0 && json_number(row, "cpu_cores_n") > 0.0 {
+                json_number(row, "cpu_cores") / json_number(row, "cpu_count") * 100.0
+            } else {
+                0.0
+            };
+            let mem_pct = json_number(row, "mem_util") * 100.0;
+            let utilization_status = host_status(cpu_pct, mem_pct);
+            let status = if json_number(row, "health_n") > 0.0 {
+                let health = json_number(row, "health");
+                if health >= 2.0 || utilization_status == "bad" {
+                    "bad"
+                } else if health >= 1.0 || utilization_status == "warn" {
+                    "warn"
+                } else {
+                    "good"
+                }
+            } else if cpu_reported || json_number(row, "mem_n") > 0.0 {
+                utilization_status
+            } else {
+                "unknown"
+            };
             let value = serde_json::json!({
-                "host": json_string(row, "host"),
-                "group": if group.is_empty() { Value::Null } else { Value::String(group) },
-                "cpu_pct": gauge_value(row, "cpu_n", cpu_pct),
+                "host": host,
+                "group": if group.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(group) },
+                "cpu_pct": if cpu_reported { serde_json::json!(cpu_pct) } else { serde_json::Value::Null },
                 "mem_pct": gauge_value(row, "mem_n", mem_pct),
                 "load": gauge_value(row, "load_n", json_number(row, "load_1m")),
-                "net_bytes_per_sec": gauge_value(row, "net_n", json_number(row, "net_io")),
+                "net_bytes_per_sec": row.get("net_rate").filter(|value| !value.is_null()).cloned()
+                    .unwrap_or_else(|| gauge_value(row, "net_n", json_number(row, "net_io"))),
+                "kind": kind,
+                "node_name": json_string(row, "node_name"),
+                "pod_name": json_string(row, "pod_name"),
+                "namespace": json_string(row, "namespace"),
+                "workload": json_string(row, "workload"),
+                "phase": json_string(row, "phase"),
+                "cluster": json_string(row, "cluster"),
+                "region": json_string(row, "region"),
+                "instance_type": json_string(row, "instance_type"),
+                "cpu_cores": gauge_value(row, "cpu_cores_n", json_number(row, "cpu_cores")),
+                "mem_bytes": gauge_value(row, "mem_bytes_n", json_number(row, "mem_bytes")),
+                "restarts": gauge_value(row, "restarts_n", json_number(row, "restarts")),
                 "status": status,
             });
             (status, value)
@@ -1360,7 +1556,9 @@ async fn query_rum(
     Query(request): Query<RumQuery>,
 ) -> ApiResult<Json<Value>> {
     authorize(&headers, &state.query_token)?;
-    let Some(metrics) = current_query_table(&state, OtelDataset::Metrics)
+    // Each signal is optional: browser metrics can arrive before the first
+    // pageview span, and pageviews can arrive without web-vitals metrics.
+    let metrics = current_query_table(&state, OtelDataset::Metrics)
         .await
         .map_err(|error| {
             api_error(
@@ -1368,19 +1566,8 @@ async fn query_rum(
                 "OTEL_TABLE_UNAVAILABLE",
                 error,
             )
-        })?
-    else {
-        // No table yet == no telemetry yet. Answer empty, not 503.
-        return Ok(Json(serde_json::json!({
-            "web_vitals": [],
-            "page_views": [],
-            "page_views_series": [],
-            "js_errors": [],
-            "top_pages": [],
-            "recent_errors": [],
-        })));
-    };
-    let Some(spans) = current_query_table(&state, OtelDataset::Spans)
+        })?;
+    let spans = current_query_table(&state, OtelDataset::Spans)
         .await
         .map_err(|error| {
             api_error(
@@ -1388,58 +1575,61 @@ async fn query_rum(
                 "OTEL_TABLE_UNAVAILABLE",
                 error,
             )
-        })?
-    else {
-        // No table yet == no telemetry yet. Answer empty, not 503.
-        return Ok(Json(serde_json::json!({
-            "web_vitals": [],
-            "page_views": [],
-            "page_views_series": [],
-            "js_errors": [],
-            "top_pages": [],
-            "recent_errors": [],
-        })));
-    };
-    let vitals = plan_rum_vitals(
-        &metrics,
-        &state.tenant_id,
-        request.start,
-        request.end,
-        request.env.as_deref(),
-    );
-    let series = plan_rum_series(
-        &spans,
-        &state.tenant_id,
-        request.start,
-        request.end,
-        request.step_seconds,
-        request.page.as_deref(),
-        request.browser.as_deref(),
-        request.env.as_deref(),
-    );
-    let top_pages = plan_rum_top_pages(
-        &spans,
-        &state.tenant_id,
-        request.start,
-        request.end,
-        request.page.as_deref(),
-        request.browser.as_deref(),
-        request.env.as_deref(),
-    );
-    let recent_errors = plan_rum_recent_errors(
-        &spans,
-        &state.tenant_id,
-        request.start,
-        request.end,
-        request.page.as_deref(),
-        request.browser.as_deref(),
-        request.env.as_deref(),
-    );
+        })?;
     let map_plan_error = |error| api_error(StatusCode::BAD_REQUEST, "INVALID_RUM_QUERY", error);
-    let vital_rows = execute_json_plan(&state, vitals.map_err(map_plan_error)?).await?;
-    let series_rows = execute_json_plan(&state, series.map_err(map_plan_error)?).await?;
-    let top_rows = execute_json_plan(&state, top_pages.map_err(map_plan_error)?).await?;
-    let error_rows = execute_json_plan(&state, recent_errors.map_err(map_plan_error)?).await?;
+    let vital_rows = if let Some(metrics) = metrics.as_ref() {
+        execute_json_plan(
+            &state,
+            plan_rum_vitals(
+                metrics,
+                &state.tenant_id,
+                request.start,
+                request.end,
+                request.env.as_deref(),
+            )
+            .map_err(map_plan_error)?,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let (series_rows, top_rows, error_rows) = if let Some(spans) = spans.as_ref() {
+        let series = plan_rum_series(
+            spans,
+            &state.tenant_id,
+            request.start,
+            request.end,
+            request.step_seconds,
+            request.page.as_deref(),
+            request.browser.as_deref(),
+            request.env.as_deref(),
+        );
+        let top = plan_rum_top_pages(
+            spans,
+            &state.tenant_id,
+            request.start,
+            request.end,
+            request.page.as_deref(),
+            request.browser.as_deref(),
+            request.env.as_deref(),
+        );
+        let errors = plan_rum_recent_errors(
+            spans,
+            &state.tenant_id,
+            request.start,
+            request.end,
+            request.page.as_deref(),
+            request.browser.as_deref(),
+            request.env.as_deref(),
+        );
+        (
+            execute_json_plan(&state, series.map_err(map_plan_error)?).await?,
+            execute_json_plan(&state, top.map_err(map_plan_error)?).await?,
+            execute_json_plan(&state, errors.map_err(map_plan_error)?).await?,
+        )
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     if series_rows.len() > 100_000 {
         return Err(api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1447,6 +1637,20 @@ async fn query_rum(
             anyhow::anyhow!("RUM series exceeds its interactive result bound"),
         ));
     }
+    Ok(Json(rum_response(
+        &vital_rows,
+        &series_rows,
+        &top_rows,
+        &error_rows,
+    )))
+}
+
+fn rum_response(
+    vital_rows: &[Value],
+    series_rows: &[Value],
+    top_rows: &[Value],
+    error_rows: &[Value],
+) -> Value {
     let web_vitals = if let Some(row) = vital_rows.first() {
         serde_json::json!({
             "lcp_ms": counted_number(row, "lcp_n", "lcp_ms"),
@@ -1459,7 +1663,7 @@ async fn query_rum(
     let mut page_views = 0_i64;
     let mut js_errors = 0_i64;
     let mut page_views_series = Vec::with_capacity(series_rows.len());
-    for row in &series_rows {
+    for row in series_rows {
         let views = json_number(row, "views");
         page_views += views as i64;
         js_errors += json_number(row, "js_errors") as i64;
@@ -1491,14 +1695,14 @@ async fn query_rum(
             })
         })
         .collect::<Vec<_>>();
-    Ok(Json(serde_json::json!({
+    serde_json::json!({
         "web_vitals": web_vitals,
         "page_views": page_views,
         "page_views_series": page_views_series,
         "js_errors": js_errors,
         "top_pages": top_pages,
         "recent_errors": recent_errors,
-    })))
+    })
 }
 
 async fn query_metrics(
@@ -2479,6 +2683,9 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
         let mut last_maintenance = std::time::Instant::now() - maintenance_interval;
         let mut last_reload = std::time::Instant::now();
         let mut warned_no_policy = false;
+        // NAN-4084: the handoff retention pass lists R2; it runs every
+        // HANDOFF_EXPIRY_INTERVAL (sooner while behind), not every maintenance pass.
+        let mut expiry_pacer = HandoffExpiryPacer::default();
         // NAN-3290: a backlogged dataset is drained again on the next loop
         // iteration instead of after `drain_interval` (catch-up after an
         // empty-mirror restart); reload and maintenance timers are still
@@ -2497,7 +2704,9 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
                 if !pacer.due(dataset, std::time::Instant::now()) {
                     continue;
                 }
-                let backlogged = match drain.drain_once(dataset).await {
+                // NAN-4084: (backlogged, found anything new). A cycle that
+                // found nothing, or failed, backs this dataset off.
+                let (backlogged, found) = match drain.drain_once(dataset).await {
                     Ok(report) => {
                         if unavailable {
                             tracing::info!("lean OTLP handoff drain recovered");
@@ -2506,19 +2715,20 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
                         if report.objects_drained > 0 || report.objects_rejected > 0 {
                             tracing::info!(dataset = dataset.as_str(), ?report, "drained lean OTLP handoff objects");
                         }
-                        report.backlogged
+                        let found = report.objects_pending > 0 || report.objects_drained > 0 || report.objects_rejected > 0;
+                        (report.backlogged, found)
                     }
                     Err(error) if !unavailable => {
                         tracing::error!(dataset = dataset.as_str(), error = %error_chain(&error), "lean OTLP handoff drain failed; retrying");
                         unavailable = true;
-                        false
+                        (false, false)
                     }
                     Err(error) => {
                         tracing::debug!(dataset = dataset.as_str(), error = %error, "lean OTLP handoff drain still failing");
-                        false
+                        (false, false)
                     }
                 };
-                pacer.record(dataset, std::time::Instant::now(), backlogged);
+                pacer.record(dataset, std::time::Instant::now(), backlogged, found);
             }
             if last_maintenance.elapsed() >= maintenance_interval {
                 last_maintenance = std::time::Instant::now();
@@ -2537,6 +2747,8 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
                     max_age_hours = max_age_hours.min(i64::from(purge.retention_days) * 24);
                 }
                 let floor_hour = i64::from(current_hour) - max_age_hours;
+                let expiry_due = expiry_pacer.due(std::time::Instant::now());
+                let mut expiry_behind = false;
                 for dataset in [OtelDataset::Spans, OtelDataset::Metrics] {
                     let compacted = tokio::task::block_in_place(|| compact_mirror(&mirror, dataset, current_hour));
                     match compacted {
@@ -2551,9 +2763,13 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
                             tracing::warn!(dataset = dataset.as_str(), error = %error_chain(&error), "lean OTLP drain marker prune failed");
                         }
                     }
+                    if !expiry_due {
+                        continue;
+                    }
                     match purge.as_ref() {
                         Some(purge) => match expire_handoff_objects(source.as_ref(), tenant, dataset, purge, now, expiry_batch).await {
                             Ok(report) if report.deleted > 0 || report.held => {
+                                expiry_behind |= report.deleted >= expiry_batch;
                                 tracing::info!(dataset = dataset.as_str(), ?report, "lean OTLP handoff retention pass");
                             }
                             Ok(_) => {}
@@ -2565,6 +2781,9 @@ async fn spawn_lean_drain(args: &Arguments, lean: &LeanArguments) -> Result<Arc<
                         }
                         None => {}
                     }
+                }
+                if expiry_due {
+                    expiry_pacer.record(std::time::Instant::now(), expiry_behind);
                 }
             }
             pause_drain_loop(&pacer).await;
@@ -2711,6 +2930,28 @@ mod tests {
         assert_eq!(body["services"], json!([]));
         assert_eq!(body["total"], json!(0));
         assert_eq!(body["has_more"], json!(false));
+    }
+
+    #[test]
+    fn rum_preserves_partial_signals_and_empty_contract() {
+        let empty = rum_response(&[], &[], &[], &[]);
+        assert_eq!(empty["page_views"], json!(0));
+        assert_eq!(empty["js_errors"], json!(0));
+        assert_eq!(
+            empty["web_vitals"],
+            json!({"lcp_ms": null, "inp_ms": null, "cls": null})
+        );
+        let metrics_only = rum_response(&[json!({"lcp_n": 1, "lcp_ms": 1200})], &[], &[], &[]);
+        assert_eq!(metrics_only["web_vitals"]["lcp_ms"], json!(1200.0));
+        let spans_only = rum_response(
+            &[],
+            &[json!({"bucket": "2026-10-16 12:00:00", "views": 3, "js_errors": 1})],
+            &[],
+            &[],
+        );
+        assert_eq!(spans_only["page_views"], json!(3));
+        assert_eq!(spans_only["js_errors"], json!(1));
+        assert!(spans_only["web_vitals"]["lcp_ms"].is_null());
     }
 
     #[test]

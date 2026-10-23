@@ -1083,3 +1083,36 @@ fn sort_compare(
         cmp
     }
 }
+
+#[cfg(test)]
+mod risk_match_envelope_tests {
+
+    #[test]
+    fn risk_eval_alias_survives_table_projection_in_match_envelope() {
+        use crate::query::parse_query;
+        use super::apply_post_prevalence_commands;
+        use crate::detection::normalize_match_events_for_query;
+        use serde_json::json;
+
+        // The ops rule keeps its eval alias in table, but drops risk_entity.
+        for alias in ["account", "subject_alias", "arbitrary_column"] {
+            let query = format!("* | eval {alias}=coalesce(user.uid, actor.user.uid) | risk score=60 entity={alias} | table {alias}, risk_score");
+            let ast = parse_query(&query).unwrap();
+            let mut commands = Vec::new();
+            let mut node = &ast;
+            while let crate::query::Query::Piped { source, command } = node {
+                commands.push(command.clone());
+                node = source;
+            }
+            commands.reverse();
+            let mut rows = apply_post_prevalence_commands(
+                vec![json!({"actor.user.uid": "usr_example"})], &commands,
+            ).unwrap().results;
+            assert!(rows[0].get("risk_entity").is_none());
+            normalize_match_events_for_query(&mut rows, &query);
+            assert_eq!(rows[0]["_match_entity"], "usr_example");
+            assert_eq!(rows[0]["_match_entity_type"], "user");
+        }
+    }
+
+}

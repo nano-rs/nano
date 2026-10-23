@@ -347,8 +347,7 @@ impl PartQueryEngine {
                 Err(error) => return Err(error),
             };
             batches += 1;
-            let scalar = self.scalar_plan(&selection, compiled).await?;
-            let plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || plan_logs(&selection, compiled, None))?;
+            let plan = plan_logs(&selection, compiled, None)?;
             if let Some(budget) = fence.scan_budget.filter(|budget| plan.budget.estimated_scan_bytes > *budget) {
                 return Err(PartQueryError::Budget(format!(
                     "batch scan of {} bytes exceeds its budget of {budget}", plan.budget.estimated_scan_bytes)));
@@ -375,9 +374,12 @@ impl PartQueryEngine {
                 Ok(meta) if meta.len() == 0 => std::fs::remove_file(&path).map_err(internal)?,
                 Ok(meta) => {
                     spill_bytes = spill_bytes.saturating_add(meta.len());
-                    let (cache, bytes) = (cache.clone(), meta.len());
-                    match tokio::task::spawn_blocking(move || cache.reserve_scratch(bytes)).await.map_err(internal)? {
+                    // NAN-4138: a saturated cache is waited out (bounded),
+                    // not reported as a scan too large to stage.
+                    match cache.reserve_scratch_waiting(meta.len()).await {
                         Ok(reservation) => reserved.push(reservation),
+                        // Still saturated after the wait: transient, retryable.
+                        Err(error) if error.retryable() && meta.len() <= cache.max_bytes() => return Err(PartQueryError::Unavailable(error.to_string())),
                         Err(error) => {
                             tracing::warn!(%error, spill_bytes, "batched cold read: the cache cannot hold the spooled rows");
                             return Err(PartQueryError::ColdScanTooLarge { needed_bytes: planned_bytes.max(spill_bytes), ceiling_bytes: ceiling, background_bytes: 0 });

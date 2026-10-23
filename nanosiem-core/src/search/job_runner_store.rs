@@ -97,6 +97,16 @@ pub trait DurableJobRunnerStore: Send + Sync + std::fmt::Debug {
     async fn release_claim(&self, _claim: &RunnerClaim) -> Result<bool, DurableJobStoreError> {
         Err(DurableJobStoreError::Unsupported)
     }
+    /// NAN-4290: claim the oldest queued job of the small-job lane only
+    /// ([`super::jobs::small_job_lane`]), never a larger one ahead of it.
+    /// Stores without lanes report `Unsupported`.
+    async fn claim_small(
+        &self,
+        _owner: &str,
+        _lease: Duration,
+    ) -> Result<Option<RunnerClaim>, DurableJobStoreError> {
+        Err(DurableJobStoreError::Unsupported)
+    }
 }
 
 /// Existing open-core/dedicated stores retain their implementation and defaults.

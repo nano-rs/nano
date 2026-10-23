@@ -498,6 +498,10 @@ pub struct LakeCellRouteSource {
     /// NAN-3867: tenants whose cell runs the lean erasure executor
     /// (`erasure-executors.json`, a sibling of `routes.json`).
     erasure_executors: RwLock<Arc<LakeCellErasureExecutors>>,
+    /// NAN-4149: true once a routes map has been ACCEPTED (parsed) at least
+    /// once in this process (always true for a fixed map). Until then an empty
+    /// route map means "not loaded yet", not "no tenant is placed".
+    loaded: std::sync::atomic::AtomicBool,
 }
 
 impl LakeCellRouteSource {
@@ -541,6 +545,7 @@ impl LakeCellRouteSource {
             current: RwLock::new(Arc::new(LakeCellRoutes::default())),
             string_route_warned: Mutex::new(HashSet::new()),
             erasure_executors: RwLock::new(Arc::new(LakeCellErasureExecutors::default())),
+            loaded: std::sync::atomic::AtomicBool::new(false),
         };
         source.reload();
         source
@@ -559,7 +564,18 @@ impl LakeCellRouteSource {
             current: RwLock::new(Arc::new(routes)),
             string_route_warned: Mutex::new(HashSet::new()),
             erasure_executors: RwLock::new(Arc::new(LakeCellErasureExecutors::default())),
+            loaded: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// NAN-4149: whether a routes map has been accepted at least once (a
+    /// fixed map always has). Re-checks a due reload first, so a map that
+    /// arrives after boot is seen without waiting for another caller.
+    pub fn has_loaded(&self) -> bool {
+        if !self.loaded.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.current();
+        }
+        self.loaded.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A fixed route map plus fixed erasure-executor declarations (tests).
@@ -663,6 +679,7 @@ impl LakeCellRouteSource {
                 );
                 *self.current.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Arc::new(routes);
+                self.loaded.store(true, std::sync::atomic::Ordering::Release);
             }
             Err(error) => {
                 tracing::error!(

@@ -293,6 +293,8 @@ pub struct AppState {
     /// It is never backed by the API control pool.
     #[cfg(feature = "enterprise")]
     pub tenant_ai_rls_runtime: Option<Arc<TenantAiRlsRuntime>>,
+    #[cfg(feature = "enterprise")]
+    pub soar_service: Option<Arc<nanosiem_enterprise::soar::service::SoarService>>,
     /// Bounded tenant-signed Cases/Notebooks data plane. This is derived only
     /// from the startup-attested shared RLS runtime and remains absent in every
     /// dedicated/open-core profile. The shared router fails closed when it is
@@ -1134,6 +1136,7 @@ impl nanosiem_enterprise::handlers::enterprise_shared_cases_extras::EnterpriseSh
 impl nanosiem_enterprise::handlers::enterprise_shared_playbooks::EnterpriseSharedPlaybooksAppState for AppState {
     fn playbook_repository_egress_enabled(&self) -> bool { self.config.egress_jobs_enabled() }
     fn playbook_execution_search_resolver(&self) -> Option<Arc<TenantSearchRuntimeResolver>> { self.tenant_search_runtime_resolver.clone() }
+    fn playbook_soar_service(&self) -> Option<Arc<nanosiem_enterprise::soar::service::SoarService>> { self.soar_service.clone() }
 }
 #[cfg(feature = "enterprise")]
 impl nanosiem_enterprise::handlers::enterprise_shared_marketplace::EnterpriseSharedMarketplaceAppState for AppState {
@@ -1296,4 +1299,9 @@ impl nanosiem_enterprise::handlers::notebooks::NotebooksAppState for AppState {
     fn create_data_access_layer(&self) -> nanosiem_enterprise::melod::data_access::DataAccessLayer {
         AppState::create_data_access_layer(self)
     }
+}
+
+#[cfg(feature = "enterprise")]
+impl nanosiem_enterprise::handlers::soar::SoarAppState for AppState {
+    fn soar_service(&self)->Option<Arc<nanosiem_enterprise::soar::service::SoarService>> { self.soar_service.clone() }
 }

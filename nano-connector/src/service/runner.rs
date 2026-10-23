@@ -460,11 +460,22 @@ impl Runner {
     fn close(&self, claim: &ClaimedFeed, mut rec: RunRecord, spec: Option<&ConnectorSpec>, error: Option<String>) -> RunRecord {
         let now = Utc::now();
         rec.finished_at = now;
+        // NAN-3660: the ingress refused the feed's credential. Record the
+        // refusal itself (not the engine's wrapper) so the operator sees
+        // "credential_revoked: ... rotate the feed credential".
+        let mut credential_refused = false;
         if let Some(e) = error {
             if rec.status == RunStatus::Success {
                 rec.status = RunStatus::Failed;
             }
             rec.errors = 1;
+            let e = match crate::service::hec::credential_refusal_in(&e) {
+                Some(refusal) if rec.status == RunStatus::Failed => {
+                    credential_refused = true;
+                    refusal.to_string()
+                }
+                _ => e,
+            };
             rec.error = Some(truncate(&e, 1000));
         }
         let schedule = effective_schedule(claim.feed.schedule.as_deref(), spec.and_then(|s| s.schedule.as_deref()));
@@ -474,6 +485,11 @@ impl Runner {
         });
         rec.next_run_at = if rec.ok() {
             regular
+        } else if credential_refused {
+            // Not a transient failure: retrying each batch cannot help until
+            // the credential is rotated (which makes the feed due at once).
+            // Never re-enroll here: a tenant's revoke stays in force.
+            (now + ChronoDuration::seconds(crate::service::hec::CREDENTIAL_REFUSED_RETRY_SECS)).max(regular)
         } else if rec.deferred {
             let jitter = 1.0 + rand::random::<f64>();
             let d = self.cfg.poll_interval.mul_f64(jitter);

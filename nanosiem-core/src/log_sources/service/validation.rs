@@ -224,6 +224,63 @@ pub(crate) fn diagnostic_from_warning(message: &str) -> VrlDiagnostic {
     }
 }
 
+/// A sample that never reached the parser (or whose run errored as a whole).
+pub(crate) fn failed_sample(sample_log: &str, error: String) -> ParserTestResult {
+    ParserTestResult {
+        input: truncate(sample_log, 200),
+        success: false,
+        output: None,
+        error: Some(error),
+        extracted_field_count: 0,
+        schema_validation: None,
+    }
+}
+
+/// Run the parser (+ optional extension) chain over many raw samples with a
+/// single compile (NAN-2385), each sample shaped as the source's delivery
+/// path shapes it (NAN-4372). Results are index-aligned with `sample_logs`.
+/// Shared by the self-hosted deploy gate and the hosted rollout preflight.
+pub(crate) async fn run_sample_chain_batch(
+    validator: &crate::parsers::VrlValidator,
+    parser_vrl: &str,
+    extension_vrl: Option<&str>,
+    sample_logs: &[String],
+    validate_ocsf: bool,
+    delivery: crate::parsers::ingest_shaping::SampleDelivery,
+) -> Vec<ParserTestResult> {
+    // NAN-4372: production shaping (see `test_vrl_chain`). A shaping
+    // failure is the shipped config's fault, not a sample's, so it
+    // fails every sample with the same error.
+    let inputs: Vec<String> = match sample_logs
+        .iter()
+        .map(|sample_log| delivery.input(sample_log))
+        .collect::<Result<_, _>>()
+    {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            return sample_logs
+                .iter()
+                .map(|sample_log| failed_sample(sample_log, format!("Sample shaping error: {error}")))
+                .collect()
+        }
+    };
+    let stages: Vec<&str> = match extension_vrl {
+        Some(ext) if !ext.trim().is_empty() => vec![parser_vrl, ext],
+        _ => vec![parser_vrl],
+    };
+    match validator.test_vrl_chain_batch(&stages, &inputs).await {
+        Ok(results) => sample_logs
+            .iter()
+            .zip(results)
+            .map(|(sample_log, result)| parser_test_result(sample_log, result, validate_ocsf))
+            .collect(),
+        Err(e) => sample_logs
+            .iter()
+            .map(|sample_log| failed_sample(sample_log, format!("VRL execution error: {e}")))
+            .collect(),
+    }
+}
+
 impl LogSourceService {
     /// Persist a receipt for the current stored parser after the interactive
     /// test endpoint successfully validates one raw sample. If the caller was
@@ -413,7 +470,17 @@ impl LogSourceService {
         // twice at that), which for a 1k-line OCSF parser pushed a deploy past
         // the UI's request timeout.
         for (index, result) in self
-            .test_vrl_chain_batch(&log_source.parser_vrl, extension_vrl, samples, true)
+            .test_vrl_chain_batch(
+                &log_source.parser_vrl,
+                extension_vrl,
+                samples,
+                true,
+                // NAN-4372: a dedicated ingest token is accepted by both the
+                // HTTP and HEC listeners (and the built-in collectors push
+                // over HEC), so its delivery path is unknown: `.message`
+                // (`SampleDelivery::for_source_paths` with no protocol).
+                crate::parsers::ingest_shaping::SampleDelivery::Message,
+            )
             .await
             .into_iter()
             .enumerate()
@@ -475,7 +542,8 @@ impl LogSourceService {
 
     /// Test VRL against a sample log
     pub async fn test_vrl(&self, vrl_code: &str, sample_log: &str) -> ParserTestResult {
-        self.test_vrl_chain(vrl_code, None, sample_log, false).await
+        self.test_vrl_chain(vrl_code, None, sample_log, false, Default::default())
+            .await
     }
 
     /// Test a parser VRL plus an optional extension overlay (NAN-874) against a
@@ -488,11 +556,15 @@ impl LogSourceService {
         extension_vrl: Option<&str>,
         sample_log: &str,
         validate_ocsf: bool,
+        delivery: crate::parsers::ingest_shaping::SampleDelivery,
     ) -> ParserTestResult {
-        let input_json = serde_json::json!({
-            "message": sample_log
-        });
-        let input_str = serde_json::to_string(&input_json).unwrap_or_default();
+        // NAN-4372: the sample is shaped as the source's delivery path
+        // shapes a line: the HTTP front door's `parse_content` merge, or
+        // `{"message": ...}` for HEC, pull and fetch sources.
+        let input_str = match delivery.input(sample_log) {
+            Ok(input) => input,
+            Err(error) => return failed_sample(sample_log, format!("Sample shaping error: {error}")),
+        };
 
         // Pick the right validator method to avoid the chain wrapper's empty-stage
         // bookkeeping when no extension is in play.
@@ -526,36 +598,17 @@ impl LogSourceService {
         extension_vrl: Option<&str>,
         sample_logs: &[String],
         validate_ocsf: bool,
+        delivery: crate::parsers::ingest_shaping::SampleDelivery,
     ) -> Vec<ParserTestResult> {
-        let inputs: Vec<String> = sample_logs
-            .iter()
-            .map(|sample_log| {
-                serde_json::to_string(&serde_json::json!({ "message": sample_log }))
-                    .unwrap_or_default()
-            })
-            .collect();
-        let stages: Vec<&str> = match extension_vrl {
-            Some(ext) if !ext.trim().is_empty() => vec![parser_vrl, ext],
-            _ => vec![parser_vrl],
-        };
-        match self.vrl_validator.test_vrl_chain_batch(&stages, &inputs).await {
-            Ok(results) => sample_logs
-                .iter()
-                .zip(results)
-                .map(|(sample_log, result)| parser_test_result(sample_log, result, validate_ocsf))
-                .collect(),
-            Err(e) => sample_logs
-                .iter()
-                .map(|sample_log| ParserTestResult {
-                    input: truncate(sample_log, 200),
-                    success: false,
-                    output: None,
-                    error: Some(format!("VRL execution error: {}", e)),
-                    extracted_field_count: 0,
-                    schema_validation: None,
-                })
-                .collect(),
-        }
+        run_sample_chain_batch(
+            &self.vrl_validator,
+            parser_vrl,
+            extension_vrl,
+            sample_logs,
+            validate_ocsf,
+            delivery,
+        )
+        .await
     }
 
     /// Test VRL against real events from ClickHouse, comparing current vs new parse.

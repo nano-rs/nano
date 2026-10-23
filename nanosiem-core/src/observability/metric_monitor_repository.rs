@@ -148,7 +148,14 @@ impl MetricMonitorRepository {
     /// All ENABLED monitors — the runner's evaluation set. (The runner applies
     /// its own due-time gate against `eval_interval_secs`; this just trims the
     /// disabled rows in SQL.)
+    #[tracing::instrument(name = "db.postgresql.monitors.list_enabled", skip_all)]
     pub async fn list_enabled(&self) -> Result<Vec<MetricMonitor>, MetricMonitorRepositoryError> {
+        use tracing::Instrument;
+        let mut connection = self.pool.acquire()
+            .instrument(tracing::info_span!("db.postgresql.connection.acquire")).await?;
+        let mut tx = sqlx::Connection::begin(&mut *connection).await?;
+        super::metric_alert_lifecycle::repair_default_grouping(&mut tx, None).await?;
+        tx.commit().await?;
         let rows = sqlx::query(
             r#"
             SELECT id, name, metric_name, agg, service_name, group_by, filters,
@@ -159,7 +166,8 @@ impl MetricMonitorRepository {
             ORDER BY id ASC
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
+        .instrument(tracing::info_span!("db.postgresql.execute"))
         .await?;
 
         rows.iter().map(Self::row_to_monitor).collect()

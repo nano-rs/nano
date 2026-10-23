@@ -20,6 +20,7 @@ pub use nanosiem_api_lib::AuditExt;
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::agent_enrichment;
 pub mod alerts;
+pub mod browser_telemetry;
 pub mod api_keys;
 pub mod audit;
 // Air-gapped deployment import handlers (NAN-1201) — enterprise only.
@@ -27,6 +28,9 @@ pub mod audit;
 pub mod airgap;
 pub mod auth;
 mod auth_challenge_audit;
+/// NAN-4152: public claim of a per-tenant demo session (hosted builds only).
+#[cfg(feature = "enterprise")]
+pub mod shared_demo_claim;
 pub mod capabilities;
 // Cases + queues + queue-routing-rules + case-grouping settings handlers —
 // lifted to the enterprise crate in NAN-752 (Phase 2 of the open-core split).

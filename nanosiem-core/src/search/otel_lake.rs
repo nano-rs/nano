@@ -222,6 +222,7 @@ impl OtelLakeEvaluator {
         }))
     }
 
+    #[tracing::instrument(name = "db.lake.metric_scalar", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn metric_scalar(
         &self,
         query: &MetricQuery<'_>,
@@ -258,11 +259,11 @@ impl OtelLakeEvaluator {
                 response.status()
             ));
         }
-        Ok(response
-            .json::<MetricScalarResponse>()
-            .await
-            .map_err(|error| error.to_string())?
-            .series
+        let bytes = response.bytes().await.map_err(|error| error.to_string())?;
+        tracing::Span::current().record("db.response.bytes", bytes.len() as u64);
+        let scalar: MetricScalarResponse = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        tracing::Span::current().record("db.response.rows", scalar.series.len() as u64);
+        Ok(scalar.series
             .into_iter()
             .map(|series| {
                 let value = if series.row_count == 0 {

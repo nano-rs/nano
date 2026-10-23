@@ -727,13 +727,8 @@ services:
       - "${NANO_VECTOR_NATIVE_BIND_ADDRESS:-127.0.0.1}:6000:6000"
       # Splunk HEC
       - "8088:8088"
-      # OpenTelemetry: Vector's OTLP source has no authentication, so it
-      # listens on loopback only. Remote OTLP/HTTP goes through nginx at
-      # <base>/otlp with the ingest token. Set NANO_OTLP_BIND_ADDRESS=0.0.0.0
-      # only on a network where unauthenticated OTLP (including gRPC) is
-      # acceptable.
-      - "${NANO_OTLP_BIND_ADDRESS:-127.0.0.1}:4317:4317"
-      - "${NANO_OTLP_BIND_ADDRESS:-127.0.0.1}:4318:4318"
+      # OTLP HTTP/gRPC have no native credential gate. Do not publish either
+      # port, even on loopback: remote OTLP uses the authenticated /otlp edge.
       # Fluent Forward (no source by default; unauthenticated if you add one):
       # loopback only unless NANO_FLUENT_BIND_ADDRESS is set (NAN-3322).
       - "${NANO_FLUENT_BIND_ADDRESS:-127.0.0.1}:24224:24224"

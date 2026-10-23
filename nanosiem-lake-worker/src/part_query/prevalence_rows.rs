@@ -93,16 +93,15 @@ pub(super) fn shape(
     tenant: &str,
     artifacts: &[(String, String)],
     deny: &[String],
-    authority: &str,
 ) -> [u8; 32] {
     let deny = deny
         .iter()
         .map(|source| source.trim().to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     let mut hash = Sha256::new();
-    hash.update(b"nano.part-prevalence.v1\0");
+    hash.update(b"nano.part-prevalence.v2\0");
     hash.update(
-        serde_json::to_vec(&(tenant, artifacts, deny, authority))
+        serde_json::to_vec(&(tenant, artifacts, deny))
             .expect("prevalence shape serializes"),
     );
     hash.finalize().into()
@@ -281,27 +280,22 @@ mod tests {
     #[test]
     fn shapes_bind_tenant_artifacts_and_normalized_source_scope() {
         let artifacts = vec![("domain".into(), "example.test".into())];
-        let base = shape("tenant-a", &artifacts, &["HIDDEN".into()], "auth");
+        let base = shape("tenant-a", &artifacts, &["HIDDEN".into()]);
         assert_eq!(
             base,
-            shape("tenant-a", &artifacts, &[" hidden ".into()], "auth")
+            shape("tenant-a", &artifacts, &[" hidden ".into()])
         );
         assert_ne!(
             base,
-            shape("tenant-a", &artifacts, &["hidden".into()], "changed-auth")
+            shape("tenant-b", &artifacts, &["hidden".into()])
         );
-        assert_ne!(
-            base,
-            shape("tenant-b", &artifacts, &["hidden".into()], "auth")
-        );
-        assert_ne!(base, shape("tenant-a", &artifacts, &[], "auth"));
+        assert_ne!(base, shape("tenant-a", &artifacts, &[]));
         assert_ne!(
             base,
             shape(
                 "tenant-a",
                 &[("ip".into(), "10.0.0.1".into())],
                 &["hidden".into()],
-                "auth"
             )
         );
     }

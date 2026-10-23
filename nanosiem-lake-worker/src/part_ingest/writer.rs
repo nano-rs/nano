@@ -891,6 +891,70 @@ pub(crate) fn part_hints(record: &ProvenanceRecord) -> WriteHints {
     }
 }
 
+/// Identify only the unpublished event hour owning a native unresolved PUT.
+/// Derive keys from trusted finished records, never from the error's tenant
+/// or path. Other hours can retain their already registered immutable files.
+pub(super) fn unresolved_publication_hour(finished: &[FinishedPart], error: &anyhow::Error) -> Result<Option<i32>> {
+    let Some(unresolved) = error.downcast_ref::<super::native_writer::NativePutUnresolved>() else {
+        return Ok(None);
+    };
+    for part in finished {
+        let record = &part.record;
+        let keys = PartKeys::new(&record.tenant_id, record.level, record.event_hour, &record.part_id)?;
+        let matches_file = record.files.all().iter().any(|(name, _, _)| keys.file(name) == unresolved.key);
+        let matches_pending = SignPayload::for_record(record)?.record_ref
+            .is_some_and(|reference| reference.key == unresolved.key);
+        if matches_file || keys.provenance() == unresolved.key || matches_pending {
+            return Ok(Some(record.event_hour));
+        }
+    }
+    anyhow::bail!("unresolved native publication does not belong to finished output")
+}
+
+// Retry only classified transient publication failures. Native writes journal
+// their identity and replay unresolved intents before another PUT, so retrying
+// this same immutable key never starts an unrelated publication.
+fn publication_retryable(error: &anyhow::Error) -> bool {
+    #[cfg(feature = "enterprise")]
+    if let Some(failure) = error.downcast_ref::<crate::enterprise_shared_writer_retry::WriterPlaneFailure>() {
+        return failure.class == crate::enterprise_shared_writer_retry::WriterFailureClass::Retryable;
+    }
+    if let Some(refused) = error.downcast_ref::<super::native_writer::OwnerRefused>() {
+        return refused.status == 429 || (500..600).contains(&refused.status);
+    }
+    error.downcast_ref::<super::r2_put::TransientPutError>().is_some()
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_timeout() || e.is_connect() || e.is_body() || e.is_request())
+}
+
+async fn retry_publication<T, F, Fut>(mut write: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    for attempt in 0..4_u32 {
+        match write().await {
+            Err(error) if attempt < 3 && publication_retryable(&error) => {
+                // Bounded to three backoffs (1.75 seconds total). Never print
+                // provider bodies, credentials, or signed storage locations.
+                tracing::warn!(attempt = attempt + 1, "retrying transient immutable part publication");
+                tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+async fn put_publication_bytes(store: &dyn ObjectStore, key: &str, bytes: &[u8], hints: &WriteHints, compacting: bool) -> Result<()> {
+    retry_publication(|| async {
+        if !super::merge_quota::remote_transfer(compacting, bytes.len() as u64,
+            store.put_if_absent_with(key, bytes, hints)).await? {
+            ensure!(store.get(key).await?.as_deref() == Some(bytes), "existing publication content differs");
+        }
+        Ok(())
+    }).await
+}
+
 /// Upload a finished part's files (conditional creates). Not yet live.
 pub async fn upload_part_files(store: &dyn ObjectStore, finished: &FinishedPart) -> Result<()> {
     upload_part_files_with_quota(store, finished, false).await
@@ -916,37 +980,78 @@ fn part_file_uploads<'a>(store: &'a dyn ObjectStore, finished: &'a FinishedPart,
         let key = keys.file(name);
         uploads.push(async move {
             let path = finished.dir.join(name);
-            ensure!(
-                super::merge_quota::remote_transfer(compacting, bytes, store.put_file_if_absent_with(&key, &path, sha, bytes, &hints)).await?,
-                "part file {name} already exists"
-            );
+            retry_publication(|| async {
+                if !super::merge_quota::remote_transfer(compacting, bytes,
+                    store.put_file_if_absent_with(&key, &path, sha, bytes, &hints)).await? {
+                    // Verify an immutable collision using a spill file, keeping
+                    // memory bounded even for a maximum-size Parquet object.
+                    let existing = tempfile::NamedTempFile::new_in(&finished.dir)?;
+                    ensure!(store.get_to_file(&key, existing.path()).await?, "existing part file disappeared");
+                    let mut file = File::open(existing.path())?;
+                    use sha2::Digest;
+                    let mut digest = sha2::Sha256::new();
+                    use std::io::Read;
+                    let mut buffer = [0_u8; 64 * 1024];
+                    loop {
+                        let count = file.read(&mut buffer)?;
+                        if count == 0 { break; }
+                        digest.update(&buffer[..count]);
+                    }
+                    ensure!(file.metadata()?.len() == bytes && hex::encode(digest.finalize()) == sha,
+                        "existing part file content differs");
+                }
+                Ok(())
+            }).await?;
+            if !compacting {
+                // A many-hour foreground flush may publish thousands of files
+                // before its single Add can commit. Real completed uploads
+                // defer the soft watchdog; its hard bound still applies.
+                super::stall_watchdog::note_progress();
+            }
             Ok(())
         });
     }
     Ok(uploads)
 }
 
-/// Owner-registered writes in flight at once per publish. Each costs ~0.6 s
-/// of owner authorize/complete plus the PUT; one at a time, a part's eight
-/// files took ~8 s and capped ingest catch-up (the load-test tenant, 2026-10-06).
-pub const PUBLISH_CONCURRENCY: usize = 8;
+/// Owner-registered writes in flight at once per publish. Wide-history
+/// catch-up needs enough independent files to hide authorize/PUT/complete
+/// latency. NativePartWriter separately paces owner RPCs across publications
+/// (including retries), so a larger window cannot bypass the owner budget.
+pub const PUBLISH_CONCURRENCY: usize = 32;
 
-/// Run `writes` up to [`PUBLISH_CONCURRENCY`] at a time and wait for EVERY
-/// one before reporting the first error. Never drop an in-flight write: a
+/// Run `writes` up to [`PUBLISH_CONCURRENCY`] at a time. After observing an
+/// error, start no more queued writes and settle every in-flight write before
+/// reporting that error. Never drop an in-flight write: a
 /// native write cancelled between authorize and PUT leaves an unresolved
 /// intent that refuses a retry of its key.
 async fn settle_all<T, F: std::future::Future<Output = Result<T>>>(writes: Vec<F>) -> Result<Vec<T>> {
     use futures::{FutureExt, StreamExt};
-    let mut indexed = Vec::with_capacity(writes.len());
-    for (index, write) in writes.into_iter().enumerate() {
-        indexed.push(write.map(move |result| (index, result)));
+    let mut queued = writes.into_iter().enumerate()
+        .map(|(index, write)| write.map(move |result| (index, result)));
+    let mut running = futures::stream::FuturesUnordered::new();
+    for write in queued.by_ref().take(PUBLISH_CONCURRENCY) {
+        running.push(write);
     }
-    let mut results = futures::stream::iter(indexed)
-        .buffer_unordered(PUBLISH_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+    let mut results = Vec::new();
+    let mut failure = None;
+    while let Some((index, result)) = running.next().await {
+        match result {
+            Ok(value) => results.push((index, value)),
+            Err(error) if failure.is_none() => failure = Some(error),
+            Err(_) => {},
+        }
+        if failure.is_none() {
+            if let Some(write) = queued.next() {
+                running.push(write);
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
     results.sort_by_key(|(index, _)| *index);
-    results.into_iter().map(|(_, result)| result).collect()
+    Ok(results.into_iter().map(|(_, value)| value).collect())
 }
 
 /// Upload, owner-sign (≤16 parts and ≤ `SIGN_REQUEST_BUDGET_BYTES` per call),
@@ -1020,10 +1125,7 @@ async fn publish_parts_with_quota(
     for (part, payload) in finished.iter().zip(&payloads) {
         let Some(reference) = payload.record_ref.as_ref() else { continue };
         staged.push(async move {
-            ensure!(
-                super::merge_quota::remote_transfer(compacting, payload.canonical.len() as u64, store.put_if_absent_with(&reference.key, &payload.canonical, &part_hints(&part.record))).await?,
-                "pending provenance already exists"
-            );
+            put_publication_bytes(store, &reference.key, &payload.canonical, &part_hints(&part.record), compacting).await?;
             Ok(())
         });
     }
@@ -1055,10 +1157,7 @@ async fn publish_parts_with_quota(
             refs.push(PartRef::from_record(&part.record, &sha256_hex(&bytes), true));
             let (key, hints) = (keys.provenance(), part_hints(&part.record));
             puts.push(async move {
-                ensure!(
-                    super::merge_quota::remote_transfer(compacting, bytes.len() as u64, store.put_if_absent_with(&key, &bytes, &hints)).await?,
-                    "part provenance already exists"
-                );
+                put_publication_bytes(store, &key, &bytes, &hints, compacting).await?;
                 Ok(())
             });
         }
@@ -1102,10 +1201,7 @@ async fn publish_parts_with_quota(
         refs.push(PartRef::from_record(&part.record, &sha256_hex(&bytes), true));
         let (key, hints) = (keys.provenance(), part_hints(&part.record));
         puts.push(async move {
-            ensure!(
-                super::merge_quota::remote_transfer(compacting, bytes.len() as u64, store.put_if_absent_with(&key, &bytes, &hints)).await?,
-                "part provenance already exists"
-            );
+            put_publication_bytes(store, &key, &bytes, &hints, compacting).await?;
             Ok(())
         });
     }
@@ -1119,6 +1215,97 @@ async fn publish_parts_with_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn publication_retry_is_bounded_and_only_transient() {
+        let mut attempts = 0;
+        let result = retry_publication(|| {
+            attempts += 1;
+            let attempt = attempts;
+            async move {
+                if attempt < 3 {
+                    Err(super::super::native_writer::OwnerRefused { status: 503 }.into())
+                } else { Ok(()) }
+            }
+        }).await;
+        assert!(result.is_ok());
+        assert_eq!(attempts, 3);
+        let mut attempts = 0;
+        let result: Result<()> = retry_publication(|| {
+            attempts += 1;
+            async { Err(super::super::native_writer::OwnerRefused { status: 413 }.into()) }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        let mut attempts = 0;
+        let result: Result<()> = retry_publication(|| {
+            attempts += 1;
+            async { Err(super::super::native_writer::OwnerRefused { status: 429 }.into()) }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 4);
+    }
+
+    #[tokio::test]
+    async fn publication_same_finished_part_can_resume_without_new_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = batch(8, 1_000);
+        let mut writer = PartWriter::create(dir.path(), draft(rows.schema(), Level::L0, sources()), PartialSource::FromRows, 1, 1_000).unwrap();
+        writer.write(&rows).unwrap();
+        let finished = writer.finish().unwrap();
+        let store = crate::parts::part_log::LocalObjectStore::new(dir.path().join("store")).unwrap();
+        let signer = signer(1);
+        let first = publish_parts(&store, &signer, &signer.trusted(), std::slice::from_ref(&finished)).await.unwrap();
+        let resumed = publish_parts(&store, &signer, &signer.trusted(), std::slice::from_ref(&finished)).await.unwrap();
+        assert_eq!(first[0].part_id, resumed[0].part_id);
+        assert_eq!(first[0].provenance_sha256, resumed[0].provenance_sha256);
+        assert_eq!(first[0].rows, 8);
+        let keys = PartKeys::new(&finished.record.tenant_id, finished.record.level,
+            finished.record.event_hour, &finished.record.part_id).unwrap();
+        let name = finished.record.files.all()[0].0;
+        // Simulate corruption of an immutable remote file. A matching key
+        // alone must never be treated as a successfully resumed upload.
+        let remote = dir.path().join("store").join(keys.file(name));
+        // LocalObjectStore hard-links uploads: detach the remote name before
+        // corrupting it so the immutable local source remains unchanged.
+        std::fs::remove_file(&remote).unwrap();
+        std::fs::write(remote, b"corrupt").unwrap();
+        let error = publish_parts(&store, &signer, &signer.trusted(), std::slice::from_ref(&finished)).await.unwrap_err();
+        assert!(error.to_string().contains("existing part file content differs"));
+    }
+
+    #[test]
+    fn unresolved_publication_maps_only_owned_immutable_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = batch(8, 1_000);
+        let mut writer = PartWriter::create(dir.path(), draft(rows.schema(), Level::L0, sources()), PartialSource::FromRows, 1, 1_000).unwrap();
+        writer.write(&rows).unwrap();
+        let mut finished = writer.finish().unwrap();
+        let keys = PartKeys::new(TENANT, finished.record.level, finished.record.event_hour, &finished.record.part_id).unwrap();
+        // Inflate writer metadata only, to force canonical signing by reference.
+        finished.record.writer.build = "x".repeat(100_000);
+        let pending = SignPayload::for_record(&finished.record).unwrap().record_ref.unwrap().key;
+        for key in [keys.file(finished.record.files.all()[0].0), keys.provenance(), pending] {
+            let error = super::super::native_writer::NativePutUnresolved { key }.into();
+            assert_eq!(unresolved_publication_hour(std::slice::from_ref(&finished), &error).unwrap(), Some(finished.record.event_hour));
+        }
+        for key in [keys.file("unowned"), keys.provenance().replace(TENANT, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")] {
+            let error = super::super::native_writer::NativePutUnresolved { key }.into();
+            assert!(unresolved_publication_hour(std::slice::from_ref(&finished), &error).is_err());
+        }
+        assert_eq!(unresolved_publication_hour(std::slice::from_ref(&finished), &anyhow::anyhow!("other failure")).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn publication_existing_bytes_must_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::parts::part_log::LocalObjectStore::new(dir.path()).unwrap();
+        let hints = WriteHints { class: WriterClass::LakePart, event_hour: 0, min_time_ms: 0, max_time_ms: 1 };
+        put_publication_bytes(&store, "immutable", b"signed", &hints, false).await.unwrap();
+        put_publication_bytes(&store, "immutable", b"signed", &hints, false).await.unwrap();
+        assert!(put_publication_bytes(&store, "immutable", b"different", &hints, false).await.is_err());
+    }
+
     use crate::part_ingest::merge::{merge_parts, MergeInput};
     use crate::part_ingest::schema::{decode, infer_schema};
     use crate::parts::provenance::tests::{signer, TENANT};
@@ -1863,6 +2050,11 @@ mod tests {
             for file in &part.record.files.data {
                 let blooms: Vec<Option<String>> = serde_json::from_slice(&std::fs::read(part.dir.join(&file.uid_blooms.as_ref().unwrap().name)).unwrap()).unwrap();
                 let mask = crate::part_query::prune::uid_summary_mask(Some(&blooms), file.row_groups as usize, &hints).unwrap();
+                // NAN-4292: the reader's positioned probe answers the same
+                // over the writer's sidecar.
+                let uid = file.uid_blooms.as_ref().unwrap();
+                let probed = crate::part_query::uid_probe::UidLayouts::default().mask(&part.dir.join(&uid.name), &uid.sha256, file.row_groups as usize, &hints);
+                assert_eq!(probed.as_ref(), Some(&mask));
                 let groups = mask.iter().enumerate().filter_map(|(index, keep)| keep.then_some(index)).collect::<Vec<_>>();
                 if groups.is_empty() { continue; }
                 fetched_parts += 1;
@@ -2638,15 +2830,16 @@ mod tests {
     }
 
     /// Catch-up throughput: publish writes run PUBLISH_CONCURRENCY at a time,
-    /// keep input order, and a failure is reported only after every other
-    /// in-flight write settled (none is cancelled mid-flight).
+    /// keep input order, and a failure stops the queued backlog while every
+    /// already-started write settles (none is cancelled mid-flight).
     #[tokio::test]
     async fn settle_all_runs_writes_concurrently_and_never_cancels_on_failure() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let (live, peak, done) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let writes = (0..24_usize).map(|i| {
-            let (live, peak, done) = (live.clone(), peak.clone(), done.clone());
+        let (live, peak, done, started) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let writes = (0..PUBLISH_CONCURRENCY * 3).map(|i| {
+            let (live, peak, done, started) = (live.clone(), peak.clone(), done.clone(), started.clone());
             async move {
+                started.fetch_add(1, Ordering::SeqCst);
                 let now = live.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 tokio::time::sleep(std::time::Duration::from_millis(if i == 0 { 1 } else { 30 })).await;
@@ -2657,7 +2850,9 @@ mod tests {
             }
         }).collect::<Vec<_>>();
         assert!(settle_all(writes).await.unwrap_err().to_string().contains("first write fails"));
-        assert_eq!(done.load(Ordering::SeqCst), 23, "no write is dropped after the failure");
+        assert_eq!(started.load(Ordering::SeqCst), PUBLISH_CONCURRENCY, "queued writes never start after the first failure");
+        assert_eq!(done.load(Ordering::SeqCst), PUBLISH_CONCURRENCY - 1, "every delayed in-flight write finishes after the failure");
+        assert_eq!(live.load(Ordering::SeqCst), 0, "no in-flight write was cancelled");
         assert_eq!(peak.load(Ordering::SeqCst), PUBLISH_CONCURRENCY);
         let ordered = settle_all((0..12_u64).map(|i| async move {
             tokio::time::sleep(std::time::Duration::from_millis(12 - i)).await;

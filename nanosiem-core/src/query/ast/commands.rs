@@ -61,7 +61,8 @@ pub enum Command {
     },
     /// head command: limit to first N results
     Head { count: usize },
-    /// tail command: limit to last N results
+    /// tail command: the last N results of the current order, listed from the
+    /// end (newest-first default: the oldest N, oldest first)
     Tail { count: usize },
     /// timechart command: time-based aggregation
     Timechart {
@@ -311,7 +312,9 @@ pub enum Command {
         artifact_fields: Vec<String>,
         /// Filter conditions (can have multiple, all must be satisfied)
         conditions: Vec<PrevalenceCondition>,
-        /// Time window for prevalence calculation
+        /// Time window for the host counts. `*_first_seen` conditions always
+        /// compare the first sighting in the 30d prevalence data, whatever
+        /// this window is (NAN-4372).
         time_window: Option<PrevalenceTimeWindow>,
         /// Whether to enrich results with prevalence data (enrichment mode)
         enrich: bool,

@@ -38,14 +38,14 @@ pub struct AssetDossier {
     /// envelope and was admitted to the isolated durable query lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_job: Option<crate::search::AsyncSearchResponse>,
-    /// present while a lean dossier is still being built. The
+    /// present while a progressive dossier is still being built. The
     /// sections cover `covered_start..covered_end` so far; the client renders
     /// them and asks again after `retry_after_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<ProductViewProgress>,
 }
 
-/// how far a progressively built lean product view has got.
+/// how far a progressively built lake product view has got.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, Default, PartialEq, Eq)]
 pub struct ProductViewProgress {
     /// True once every section is final; the client stops polling.

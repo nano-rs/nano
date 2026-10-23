@@ -231,23 +231,12 @@ fn table_view_user_hunt_reads_minimal_uniform_roots() {
 
 // Frozen compiler output, including the 25 display fields that the earlier
 // three-field SELECT-* benchmark omitted. Compare all returned values, not
-// merely IDs, so moving the authorization boundary cannot expose enrichment.
+// merely IDs. NAN-4168: stamped values read as stored, expired or not.
 #[tokio::test]
 #[ignore = "requires a digest-verified native chDB library"]
-async fn nan2523_compiler_leaf_page_preserves_rows_and_masks() {
+async fn nan2523_compiler_leaf_page_preserves_rows_and_stamped_values() {
     use sha2::Digest;
-    use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference, read::ReadAuthorization};
-    let tenant_id = uuid::Uuid::from_u128(1);
-    let now = "2026-09-21T14:15:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap();
-    let revisions = [("ipinfo_lite", 1), ("threatfox", 1), ("threatfox", 2),
-        ("tor_exit_nodes", 1), ("tor_exit_nodes", 2)].map(|(feed, revision)| AuthorizedRevision {
-        tenant_id, evaluated_at: now, valid_until: now + chrono::Duration::days(1),
-        reference: RevisionReference { feed_id: feed.into(), feed_revision: revision,
-            tier: "included".into(), grant_revision: 1, entitlement_revision: 1 },
-        class: FeedClass::Baseline, digest: "a".repeat(64), mapping_revision: 1, deny_epoch: 0,
-    });
-    let authority = ReadAuthorization::from_resolved(tenant_id, now, &revisions);
-    nanosiem_lake_worker::enrichment_read::scope(authority.clone(), async move {
+    async move {
     let runtime = NativeChdb::load_verified(
         std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
         &std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap(),
@@ -258,7 +247,6 @@ async fn nan2523_compiler_leaf_page_preserves_rows_and_masks() {
     let artifact_dir = std::env::var("NAN2523_ARTIFACT_DIR").ok().map(std::path::PathBuf::from);
     if let Some(path) = &artifact_dir {
         std::fs::create_dir_all(path).unwrap();
-        std::fs::write(path.join("permission.sql"), authority.tuple_permission_sql("__nano_e")).unwrap();
     }
     let fixture: Value = serde_json::from_str(include_str!("fixtures/nan2469-live-tail-read-schema.json")).unwrap();
     let schema = fixture["read_schema"].as_str().unwrap();
@@ -404,13 +392,9 @@ async fn nan2523_compiler_leaf_page_preserves_rows_and_masks() {
                     assert_eq!(rows.len(), 101); // executor keeps one lookahead row
                     assert_eq!(&rows, expected.as_ref().unwrap(), "{scope}");
                     if scope == "combined" {
-                        assert!(rows.iter().any(|r| r["src_endpoint.location.country"].is_null()));
-                        assert!(rows.iter().any(|r| r["src_endpoint.location.country"] == "US"));
                         for row in &rows {
-                            let id: usize = row["metadata.uid"].as_str().unwrap().strip_prefix("event-").unwrap().parse().unwrap();
-                            let country = if id % 4 == 0 { Value::Null } else { json!("US") };
-                            assert_eq!(row["src_endpoint.location.country"], country);
-                            assert_eq!(row["dst_endpoint.location.country"], country);
+                            assert_eq!(row["src_endpoint.location.country"], "US");
+                            assert_eq!(row["dst_endpoint.location.country"], "US");
                             assert!(!row["src_endpoint.autonomous_system.number"].is_null());
                         }
                     }
@@ -451,5 +435,5 @@ async fn nan2523_compiler_leaf_page_preserves_rows_and_masks() {
         if tail.objects.len() >= 20 { assert!(after_ms < serial_ms * 0.65, "sparse scan must be sub-linear versus serial statement opens"); }
     }
     if artifact_dir.is_some() { eprintln!("NAN-2523 retained fixtures: {}", dir.keep().display()); }
-    }).await;
+    }.await;
 }

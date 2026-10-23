@@ -49,6 +49,8 @@ fn log_source_named(name: &str, match_values: Vec<String>) -> NewLogSource {
         sampling_ratio: None,
         sampling_exclude_condition: None,
         lifecycle_status: None,
+        extension_vrl: None,
+        extension_enabled: None,
     }
 }
 

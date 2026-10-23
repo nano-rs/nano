@@ -214,15 +214,15 @@ async fn reads_scale_with_the_window_and_the_lookback_only_checks_window_values(
     let newest_day = spans.incident_start - Duration::days(1);
     for (query, range, _, _) in &checks[..2] {
         assert_eq!(range.start, newest_day);
-        assert!(range.end < spans.incident_start, "{range:?}");
+        assert_eq!(range.end, spans.incident_start, "half-open: shares the incident start {range:?}");
         assert!(!in_list_values(query).is_empty());
     }
     assert_eq!(in_list_values(&checks[2].0), vec![ip(7)]);
     assert_eq!(checks[2].1.start, spans.new_start);
-    assert!(checks[2].1.end < newest_day);
+    assert_eq!(checks[2].1.end, newest_day, "half-open: shares the newest day start");
     for (query, range, _, _) in &checks {
         assert!(
-            range.start >= spans.new_start && range.end < spans.incident_start,
+            range.start >= spans.new_start && range.end <= spans.incident_start,
             "{range:?}"
         );
         assert!(in_list_values(query).len() <= LAKE_BASELINE_IN_BATCH_VALUES);

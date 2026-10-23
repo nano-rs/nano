@@ -445,7 +445,7 @@ pub(crate) mod tests {
         rows: HashMap<String, Vec<HashMap<String, serde_json::Value>>>,
     }
 
-    fn make_table(name: &str, columns: Vec<LookupColumn>, pk: Option<&str>) -> LookupTable {
+    pub(crate) fn make_table(name: &str, columns: Vec<LookupColumn>, pk: Option<&str>) -> LookupTable {
         LookupTable {
             id: uuid::Uuid::now_v7(),
             name: name.to_string(),
@@ -581,16 +581,44 @@ pub(crate) mod tests {
         ) -> Result<Option<HashMap<String, serde_json::Value>>, LookupRepositoryError> {
             unimplemented!()
         }
+        /// Mirrors the tenant lookup store: a batch over
+        /// `MAX_BATCH_LOOKUP_KEYS` keys is refused as invalid input (NAN-4287).
         async fn lookup_batch(
             &self,
-            _: &str,
-            _: &str,
-            _: &[serde_json::Value],
-            _: Option<&[String]>,
+            table_name: &str,
+            key_field: &str,
+            key_values: &[serde_json::Value],
+            output_fields: Option<&[String]>,
             _: bool,
         ) -> Result<HashMap<String, HashMap<String, serde_json::Value>>, LookupRepositoryError>
         {
-            unimplemented!()
+            if key_values.len() > crate::lookup::MAX_BATCH_LOOKUP_KEYS {
+                return Err(LookupRepositoryError::InvalidColumnName(format!(
+                    "at most {} key values per batch lookup",
+                    crate::lookup::MAX_BATCH_LOOKUP_KEYS
+                )));
+            }
+            let text = |value: &serde_json::Value| match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let wanted: std::collections::HashSet<String> = key_values.iter().map(text).collect();
+            let mut matches = HashMap::new();
+            for row in self.rows.get(table_name).into_iter().flatten() {
+                let Some(key) = row.get(key_field).map(text) else { continue };
+                if !wanted.contains(&key) {
+                    continue;
+                }
+                let projected = row
+                    .iter()
+                    .filter(|(column, _)| {
+                        output_fields.is_none_or(|fields| fields.iter().any(|f| f == *column))
+                    })
+                    .map(|(column, value)| (column.clone(), value.clone()))
+                    .collect();
+                matches.insert(key, projected);
+            }
+            Ok(matches)
         }
         async fn sample_rows(
             &self,

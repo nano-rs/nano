@@ -144,6 +144,7 @@ struct Issued {
 /// A segment acknowledged without rows: what the chain and accounting need.
 #[derive(Debug, Clone)]
 struct Skip {
+    operator: bool,
     key: String,
     sha256: String,
     length: u64,
@@ -180,6 +181,8 @@ struct State {
     overflow_objects: u64,
     ended: bool,
     stats: PullStats,
+    backlog_skip: Option<super::backlog::BacklogSkipPlan>,
+    recovery_checked: u64,
 }
 
 /// Pull outcomes since open (NAN-2964): an empty edge log, a DO pull slot
@@ -347,6 +350,9 @@ impl<T: EdgeLogTransport> EdgeLogSource<T> {
             through = lease.committed_through;
             chain = lease.committed_chain.clone();
         }
+        if let Some(plan) = &lease.backlog_skip {
+            plan.validate(tenant_id, chrono::Utc::now().timestamp_millis())?;
+        }
         let source = Self {
             transport,
             tenant_id: tenant_id.to_string(),
@@ -367,6 +373,8 @@ impl<T: EdgeLogTransport> EdgeLogSource<T> {
                 overflow_objects: lease.overflow_objects,
                 ended: false,
                 stats: PullStats::default(),
+                backlog_skip: lease.backlog_skip,
+                recovery_checked: through,
             }),
         };
         let status = source.status_locked(&*source.state.lock().await);
@@ -435,6 +443,20 @@ impl<T: EdgeLogTransport> EdgeLogSource<T> {
                 }
             }
         }
+        let recovery = state.backlog_skip.clone();
+        if let Some(plan) = recovery {
+            let candidates = state.pulled.iter().filter(|(seq, _)| **seq > state.recovery_checked && plan.includes(**seq))
+                .filter_map(|(seq, segment)| super::backlog::old_segment_rows(&segment.bytes, plan.cutoff_ms).map(|rows| (*seq, rows)))
+                .collect::<Vec<_>>();
+            for (seq, rows) in candidates {
+                let segment = state.pulled.remove(&seq).expect("selected recovery segment");
+                state.by_key.remove(&segment.key);
+                state.buffered_bytes = state.buffered_bytes.saturating_sub(segment.length);
+                state.skipped.insert(seq, Skip { operator: true, key: segment.key, sha256: segment.sha256, length: segment.length,
+                    chain: segment.chain, received_at_ms: segment.received_at_ms, rows, rows_rejected: rows, rows_duplicate: 0 });
+            }
+        }
+        state.recovery_checked = state.last_pulled;
         self.log_status_locked(&mut state);
         Ok(state
             .pulled
@@ -576,6 +598,7 @@ impl<T: EdgeLogTransport> EdgeLogSource<T> {
             state.by_key.remove(&segment.key);
             state.buffered_bytes = state.buffered_bytes.saturating_sub(segment.length);
             state.skipped.insert(seq, Skip {
+                operator: false,
                 key: segment.key,
                 sha256: segment.sha256,
                 length: segment.length,
@@ -602,19 +625,24 @@ impl<T: EdgeLogTransport> EdgeLogSource<T> {
             return None;
         }
         let mut seq = state.through;
-        let (mut bytes, mut oldest, mut last) = (0_u64, i64::MAX, None);
+        let (mut bytes, mut oldest, mut last, mut rows, mut operator) = (0_u64, i64::MAX, None, 0_u64, false);
         while let Some(skip) = state.skipped.get(&(seq + 1)) {
             seq += 1;
             bytes = bytes.saturating_add(skip.length);
+            rows = rows.saturating_add(skip.rows);
+            operator |= skip.operator;
             oldest = oldest.min(skip.received_at_ms);
             last = Some(skip);
         }
         let last = last?;
-        let due = bytes >= self.config.skip_floor_bytes || now_ms.saturating_sub(oldest) >= self.config.skip_floor_age_ms;
+        let due = operator || bytes >= self.config.skip_floor_bytes || now_ms.saturating_sub(oldest) >= self.config.skip_floor_age_ms;
         due.then(|| EdgePointRequest {
             through_seq: seq,
             through_chain: last.chain.clone(),
-            reason: "edge segments consumed without rows".to_string(),
+            reason: match state.backlog_skip.as_ref().filter(|_| operator) {
+                Some(plan) => format!("operator backlog plan={} range={}-{} bytes={} rows={}", plan.plan_hash, state.through + 1, seq, bytes, rows),
+                None => "edge segments consumed without rows".to_string(),
+            },
         })
     }
 

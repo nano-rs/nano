@@ -585,6 +585,7 @@ pub struct IngestPrevalence {
     /// NAN-3811: point reads finished by apply-chunk read tasks, ever (this
     /// writer). The ingest loop's stall clock restarts while it advances.
     chunk_reads_done: Arc<std::sync::atomic::AtomicU64>,
+    durable_commits: u64,
     /// NAN-3849: the granted store under `db`, for in-place credential
     /// refreshes; `None` for a local state.
     owner: Option<Arc<OwnerStore>>,
@@ -1054,6 +1055,7 @@ impl IngestPrevalence {
             rarity_threshold: crate::prevalence::DEFAULT_RARITY_THRESHOLD,
             chunk_reads: None,
             chunk_reads_done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            durable_commits: 0,
             owner: None,
             #[cfg(test)]
             crash_after_writes: None,
@@ -1128,6 +1130,22 @@ impl IngestPrevalence {
     /// count, so the state is complete at `head`.
     pub async fn initialize_at(&mut self, seq: u64, entry_sha256: &str) -> Result<()> {
         self.initialize_rebuild(&EntryRef { seq, sha256: entry_sha256, rebuild: true, parts: 0 }, &[]).await
+    }
+
+    /// Checkpoint a verified span with no non-empty Adds. The caller checks
+    /// the signed log chain; rows do not change, but its durable cursor must
+    /// advance so long merge-only spans cannot replay forever after a cut.
+    pub(crate) async fn checkpoint_scanned(&mut self, seq: u64, sha256: &str) -> Result<()> {
+        let cursor = self.applied().await?.context("prevalence state has no replay cursor")?;
+        ensure!(cursor.is_complete() && seq > cursor.seq && crate::parts::is_sha256_hex(sha256),
+            "invalid prevalence scan checkpoint");
+        let next = Applied {
+            seq, entry_sha256: sha256.to_owned(), rebuild: false,
+            parts: 0, next_part: 0, next_chunk: 0, part_sha256: None,
+        };
+        let mut writes = WriteBatch::new();
+        writes.put(APPLIED_KEY, serde_json::to_vec(&next)?);
+        self.commit(writes, true).await
     }
 
     /// The part list an interrupted rebuild resumes.
@@ -1763,6 +1781,11 @@ impl IngestPrevalence {
     /// writer). Advances while a slow chunk is still reading, so the ingest
     /// loop can tell a store that answers slowly from one that does not
     /// answer at all.
+    /// Completed WAL durability barriers, never in-memory cache growth.
+    pub(crate) fn watchdog_progress(&self) -> u64 {
+        self.chunk_reads_done().saturating_add(self.durable_commits)
+    }
+
     pub fn chunk_reads_done(&self) -> u64 {
         self.chunk_reads_done.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1864,6 +1887,7 @@ impl IngestPrevalence {
     /// a restart then resumes exactly where this step stopped).
     pub async fn make_durable(&mut self) -> Result<()> {
         self.db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await?;
+        self.durable_commits = self.durable_commits.saturating_add(1);
         self.last_flush = std::time::Instant::now();
         self.wal_flushes_since_l0 = self.wal_flushes_since_l0.saturating_add(1);
         Ok(())
@@ -1877,6 +1901,7 @@ impl IngestPrevalence {
             self.db
                 .flush_with_options(FlushOptions { flush_type: FlushType::Wal })
                 .await?;
+            self.durable_commits = self.durable_commits.saturating_add(1);
             self.last_flush = std::time::Instant::now();
             self.wal_flushes_since_l0 = self.wal_flushes_since_l0.saturating_add(1);
         }
@@ -2681,6 +2706,59 @@ mod tests {
         assert_eq!(stamped(&batched, "1.2.0.5").await, (entries as u64, json!(entries)), "a recurring key counts every entry once");
         // Replaying the batch after it landed is refused (it is behind the cursor).
         assert!(batched.apply_entries_batch(TENANT_A, &batch).await.is_err());
+    }
+
+    /// Seven-hour Add backlog shaped like a large tenant's, including planning, cold reads,
+    /// durable owner commits and foreground time (not just key-read speed).
+    /// Six 10k-row partials fit the production row cap. Measure their real
+    /// fold's distinct reads, then charge each read wave 100 ms and each
+    /// durable commit 450 ms while new Adds arrive every 20 s.
+    #[tokio::test]
+    async fn seven_hour_add_backlog_cost_converges_with_foreground_service() {
+        let temp = tempfile::tempdir().unwrap();
+        let entries = 6;
+        let mut batch = Vec::new();
+        for n in 0..entries {
+            let rows = (0..10_000).map(|k| {
+                let mut value = row(&["host"], 10);
+                // 9k recurring artifacts, 1k new per flush.
+                let artifact = if k < 9_000 { k } else { 9_000 + n * 1_000 + k - 9_000 };
+                value.key.2 = format!("artifact-{artifact:05}");
+                value
+            }).collect::<Vec<_>>();
+            let path = temp.path().join(format!("backlog-{n}.parquet"));
+            write_sorted(rows, &path).unwrap();
+            batch.push(BatchEntry { seq: n as u64 + 1, sha256: format!("{:064x}", n + 1),
+                parts: vec![(format!("p{n}"), path, 10 * DAY_US)] });
+        }
+        let mut state = IngestPrevalence::open_shared(TENANT_A, Arc::new(InMemory::new())).await.unwrap();
+        state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+        let applied = state.apply_entries_batch(TENANT_A, &batch).await.unwrap();
+        assert_eq!(applied.rows, 60_000);
+        assert!(applied.rows <= CATCH_UP_BATCH_ROWS);
+        assert_eq!(state.chunk_reads_done(), 15_000);
+        assert_eq!(state.applied().await.unwrap().unwrap().seq, 6);
+        // Include all 33 planned log GETs even though only six Adds fit.
+        let scan = super::super::ingest::PREVALENCE_CATCH_UP_SCAN as f64 + 1.0;
+        let lanes = super::super::ingest::PREVALENCE_CATCH_UP_FETCHES as f64;
+        let prepare_s = (scan / lanes).ceil() * 0.1 + (12.0 / lanes).ceil() * 0.1;
+        let reads_s = (state.chunk_reads_done() as f64 / APPLY_READS as f64).ceil() * 0.1;
+        // CPU allowance for decode/fold/encode + durable owner commit.
+        let work_s = prepare_s + reads_s + 0.5 + 0.45;
+        let foreground_per_step_s = 1.0;
+        // A read task survives the 5s wait; each slice yields to foreground.
+        let slices = (work_s / 5.0).ceil();
+        let batch_s = work_s + slices * foreground_per_step_s;
+        let (mut backlog, mut elapsed, mut foreground_calls) = (7.0 * 3_600.0 / 20.0, 0.0, 0.0);
+        while backlog >= entries as f64 && elapsed < 3_600.0 {
+            backlog += batch_s / 20.0 - entries as f64;
+            elapsed += batch_s;
+            foreground_calls += slices;
+        }
+        assert!(backlog < entries as f64, "backlog failed to drain: {backlog} after {elapsed}s");
+        assert!(elapsed < 3_600.0, "seven-hour backlog must drain within an hour at the modeled costs");
+        assert!(foreground_calls >= elapsed / 6.0, "foreground served at least once each bounded slice");
+        state.close().await.unwrap();
     }
 
     /// NAN-3849: tenant-a's backlog x fold cost, modeled on its measured numbers

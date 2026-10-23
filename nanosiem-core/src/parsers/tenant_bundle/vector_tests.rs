@@ -139,3 +139,128 @@ pub fn render(cases: &[(&GeneratedSource, &[String])]) -> Option<String> {
         &toml::to_string(&root).expect("a table of strings always serializes"),
     ))
 }
+
+/// Keep each source's exact transforms and their upstream dependencies. Tests
+/// inject at the same entry point and assert at the same outputs as the combined
+/// config. Downstream consumers cannot affect these assertions. The combined
+/// validate and platform tests still exercise the complete wiring.
+pub fn source_configs(
+    tree: &super::archive::BundleTree,
+    cases: &[(&GeneratedSource, &[String])],
+) -> Result<Vec<String>, super::TenantBundleError> {
+    use std::collections::BTreeSet;
+    if cases.iter().all(|(_, samples)| samples.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let error = |message: String| super::TenantBundleError::Input(message);
+    let mut config = toml::Table::new();
+    let mut interpolations = Vec::new();
+    let interpolation = regex::Regex::new(r"\$\$|\$\{[^}\n]+\}|\$[A-Za-z_][A-Za-z0-9_]*").unwrap();
+    let bare =
+        regex::Regex::new(r"(?m)(=\s*)(NANO_SHARD_INTERPOLATION_[0-9]+_)(\s*(?:#.*)?$)").unwrap();
+    for (path, bytes) in &tree.files {
+        // Match the runtime's three config dirs, without loading backups or
+        // both copies of the source configs.
+        let parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        if !matches!(parent, "" | "sources/parsers" | "sources/configs") {
+            continue;
+        }
+        if [".json", ".yaml", ".yml"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
+        {
+            return Err(error(format!("unsupported shard config format: {path}")));
+        }
+        if !path.ends_with(".toml") {
+            continue;
+        }
+        let text = std::str::from_utf8(bytes).map_err(|e| error(e.to_string()))?;
+        // Preserve Vector's pre-TOML interpolation, including typed unquoted
+        // values. Never evaluate environment variables inside the builder.
+        if text.contains("NANO_SHARD_INTERPOLATION_") {
+            return Err(error(
+                "reserved shard interpolation marker in config".into(),
+            ));
+        }
+        let masked = interpolation.replace_all(text, |caps: &regex::Captures<'_>| {
+            if &caps[0] == "$$" {
+                return "$$".to_string();
+            }
+            let token = format!("NANO_SHARD_INTERPOLATION_{}_", interpolations.len());
+            interpolations.push((token.clone(), caps[0].to_string()));
+            token
+        });
+        let masked = bare.replace_all(&masked, "${1}\"${2}RAW\"${3}");
+        let parsed: toml::Table =
+            toml::from_str(&masked).map_err(|e| error(format!("{path}: {e}")))?;
+        for (key, value) in parsed {
+            if key == "tests" || key == "sinks" {
+                continue;
+            }
+            if let Some(existing) = config.get_mut(&key) {
+                let dest = existing
+                    .as_table_mut()
+                    .ok_or_else(|| error(format!("duplicate {key}")))?;
+                let items = value
+                    .as_table()
+                    .ok_or_else(|| error(format!("duplicate {key}")))?;
+                for (name, item) in items {
+                    if dest.insert(name.clone(), item.clone()).is_some() {
+                        return Err(error(format!("duplicate {key}.{name}")));
+                    }
+                }
+            } else {
+                config.insert(key, value);
+            }
+        }
+    }
+    let transforms = config
+        .get("transforms")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| error("missing transforms".into()))?;
+    let mut configs = Vec::new();
+    for (source, samples) in cases {
+        let Some(tests) = render(&[(source, samples)]) else {
+            continue;
+        };
+        let mut keep: BTreeSet<String> = source.components.iter().cloned().collect();
+        let mut pending: Vec<String> = keep.iter().cloned().collect();
+        while let Some(name) = pending.pop() {
+            let transform = transforms
+                .get(&name)
+                .ok_or_else(|| error(format!("missing transform {name}")))?;
+            if let Some(inputs) = transform.get("inputs").and_then(toml::Value::as_array) {
+                for input in inputs.iter().filter_map(toml::Value::as_str) {
+                    let upstream = input.split('.').next().unwrap_or(input);
+                    // Wildcard wiring needs explicit dependency expansion before
+                    // it can be safely sharded. Refuse rather than omit a gate.
+                    if upstream.contains(['*', '?', '[']) {
+                        return Err(error(format!("cannot shard wildcard input {input}")));
+                    }
+                    if transforms.contains_key(upstream) && keep.insert(upstream.into()) {
+                        pending.push(upstream.into());
+                    }
+                }
+            }
+        }
+        let mut shard = config.clone();
+        shard
+            .get_mut("transforms")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .retain(|name, _| keep.contains(name));
+        let mut rendered = toml::to_string(&shard).map_err(|e| error(e.to_string()))?;
+        for (token, original) in &interpolations {
+            // Bare typed values were quoted only to let the TOML parser read
+            // them; string interpolation stays inside its original quotes.
+            rendered = rendered.replace(&format!("\\\"{token}RAW\\\""), original);
+            rendered = rendered.replace(&format!("\"{token}RAW\""), original);
+            rendered = rendered.replace(token, original);
+        }
+        rendered.push_str("\n");
+        rendered.push_str(&tests);
+        configs.push(rendered);
+    }
+    Ok(configs)
+}

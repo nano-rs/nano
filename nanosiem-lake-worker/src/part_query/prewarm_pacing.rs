@@ -11,8 +11,8 @@
 //! drove the cache's per-hit bit-rot sample to re-hash the whole window every
 //! few minutes inside the 4 GiB query role.
 //!
-//! - [`PrewarmLedger`]: digests a pass already leased (and, with enrichments,
-//!   proved); later passes skip them unless the owner proof went stale.
+//! - [`PrewarmLedger`]: digests a pass already leased; later passes skip
+//!   them.
 //! - [`PrewarmPacer`]: at most one incremental pass per
 //!   [`PREWARM_MIN_INTERVAL_ENV`] (default 60 s); arrivals inside the
 //!   interval coalesce into one trailing pass.
@@ -54,20 +54,19 @@ fn parse_min_interval(value: Option<&str>) -> Duration {
 }
 
 /// Data/sidecar digests an earlier prewarm pass of this process already
-/// leased (and proved, when the schema has enrichments).
+/// leased.
 #[derive(Debug, Default)]
 pub struct PrewarmLedger {
     done: Mutex<HashSet<String>>,
 }
 
 impl PrewarmLedger {
-    /// Must a pass touch `sha256`? Yes when no earlier pass finished it, or
-    /// when its owner proof is no longer fresh (`proof_fresh` false).
-    pub fn needs(&self, sha256: &str, proof_fresh: bool) -> bool {
-        !proof_fresh || !self.done.lock().unwrap_or_else(|e| e.into_inner()).contains(sha256)
+    /// Must a pass touch `sha256`? Yes when no earlier pass finished it.
+    pub fn needs(&self, sha256: &str) -> bool {
+        !self.done.lock().unwrap_or_else(|e| e.into_inner()).contains(sha256)
     }
 
-    /// A pass leased (and proved) these digests.
+    /// A pass leased these digests.
     pub fn record<'a>(&self, digests: impl IntoIterator<Item = &'a str>) {
         self.done.lock().unwrap_or_else(|e| e.into_inner()).extend(digests.into_iter().map(str::to_owned));
     }
@@ -185,13 +184,12 @@ mod tests {
     #[test]
     fn ledger_skips_done_digests_until_their_proof_goes_stale() {
         let ledger = PrewarmLedger::default();
-        assert!(ledger.needs("a", true), "never prewarmed");
+        assert!(ledger.needs("a"), "never prewarmed");
         ledger.record(["a", "b"]);
-        assert!(!ledger.needs("a", true), "leased and proved by an earlier pass");
-        assert!(ledger.needs("a", false), "an expired owner proof is re-proved");
+        assert!(!ledger.needs("a"), "leased by an earlier pass");
         ledger.retain_live(&HashSet::from(["b"]));
-        assert!(ledger.needs("a", true), "superseded digests are forgotten");
-        assert!(!ledger.needs("b", true));
+        assert!(ledger.needs("a"), "superseded digests are forgotten");
+        assert!(!ledger.needs("b"));
         assert_eq!(ledger.len(), 1);
     }
 

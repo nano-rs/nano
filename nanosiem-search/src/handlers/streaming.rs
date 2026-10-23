@@ -34,7 +34,7 @@ impl Drop for StreamSearchTask { fn drop(&mut self) { self.0.abort(); } }
 ///
 /// SSE event types:
 /// - `started`: Search execution started (includes job_id, query_id, is_streaming flag)
-/// - `progress`: Rows scanned progress update; on a lean cell, `phase: "cold_scan"`
+/// - `progress`: Rows scanned progress update; on a lake cell, `phase: "cold_scan"`
 ///   with `cold_bytes_read` / `cold_bytes_total` / `queued` while it fetches
 ///   uncached data or waits for the reader's heavy cold-read slot
 /// - `rows`: A batch of result rows
@@ -44,7 +44,7 @@ impl Drop for StreamSearchTask { fn drop(&mut self) { self.0.abort(); } }
 /// - `completed`: Search finished successfully
 /// - `error`: Search failed
 ///
-/// `x-nano-follow: true` keeps a lean cell log event stream open and emits
+/// `x-nano-follow: true` keeps a lake cell log event stream open and emits
 /// events committed in later part-log heads. Disconnect or DELETE by request ID
 /// ends it. Follow streams bypass the result cache. The first head delivers one
 /// page (the request's limit, at most 500); later heads re-read only a short

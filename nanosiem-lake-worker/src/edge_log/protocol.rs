@@ -46,6 +46,8 @@ pub struct Lease {
     pub purge_seq: Option<u64>,
     #[serde(default)]
     pub purge_chain: Option<String>,
+    #[serde(default)]
+    pub backlog_skip: Option<super::backlog::BacklogSkipPlan>,
 }
 
 /// One verified edge segment: the exact bytes the Container's Vector sink PUT.

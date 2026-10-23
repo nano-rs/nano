@@ -224,10 +224,6 @@ fn window(hour: DateTime<Utc>) -> (String, String) {
     ((hour - Duration::hours(1)).to_rfc3339(), (hour + Duration::hours(11)).to_rfc3339())
 }
 
-fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(TENANT.parse().unwrap(), Utc::now(), &[])
-}
-
 async fn rows(engine: &PartQueryEngine, query: &str, hour: DateTime<Utc>, limit: usize) -> Vec<Value> {
     let (start, end) = window(hour);
     let request = BroadNplRequest {
@@ -251,7 +247,7 @@ async fn rows(engine: &PartQueryEngine, query: &str, hour: DateTime<Utc>, limit:
         deny_source_types: Default::default(),
     };
     let answer = crate::query_timing::measure("nan3566", async {
-        Ok::<_, ()>(crate::enrichment_read::scope(granted(), engine.broad_npl(&request)).await)
+        Ok::<_, ()>(engine.broad_npl(&request).await)
     })
     .await
     .unwrap()
@@ -338,7 +334,7 @@ async fn a_one_row_source_in_a_multi_file_hour_part_reaches_every_field_list_rou
         group_by_source: false,
     };
     let counted = crate::query_timing::measure("nan3566-count", async {
-        Ok::<_, ()>(crate::enrichment_read::scope(granted(), super::super::partials::count_aggregate(&engine, &request)).await)
+        Ok::<_, ()>(super::super::partials::count_aggregate(&engine, &request).await)
     })
     .await
     .unwrap()
@@ -393,7 +389,7 @@ async fn a_source_type_in_list_count_from_the_rollup_matches_the_raw_scan() {
         }))
         .unwrap();
         let counted = crate::query_timing::measure("nan3780-count", async {
-            Ok::<_, ()>(crate::enrichment_read::scope(granted(), super::super::partials::count_aggregate(&engine, &request)).await)
+            Ok::<_, ()>(super::super::partials::count_aggregate(&engine, &request).await)
         })
         .await
         .unwrap()

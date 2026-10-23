@@ -419,11 +419,15 @@ impl AlertRepository {
     ///
     /// Parameterized; `source_id` is the producer's identifier text (the SLO id
     /// for `kind = "slo"`).
+    #[tracing::instrument(name = "db.postgresql.alerts.latest_for_source", skip_all)]
     pub async fn latest_alert_at_for_source(
         &self,
         kind: &str,
         source_id: &str,
     ) -> Result<Option<DateTime<Utc>>, AlertRepositoryError> {
+        use tracing::Instrument;
+        let mut connection = self.pool.acquire()
+            .instrument(tracing::info_span!("db.postgresql.connection.acquire")).await?;
         let created_at: Option<DateTime<Utc>> = sqlx::query_scalar(
             r#"
             SELECT created_at
@@ -435,7 +439,8 @@ impl AlertRepository {
         )
         .bind(kind)
         .bind(source_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
+        .instrument(tracing::info_span!("db.postgresql.execute"))
         .await?;
 
         Ok(created_at)

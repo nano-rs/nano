@@ -519,6 +519,36 @@ pub async fn execute(
     report
 }
 
+/// NAN-4162: one sanctioned task's retained inventory across its bounded
+/// passes. A listing retains up to `budget` eligible keys (refused keys are
+/// never selected); each pass plans at most `max_requests` of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InventoryBudget {
+    pub deleted: usize,
+    pub budget: usize,
+}
+
+impl InventoryBudget {
+    /// Requests the next pass may plan, or `None` once the budget is spent.
+    /// An empty candidate set still runs (the pass also publishes the index).
+    pub(crate) fn next_pass(&self, max_requests: usize) -> Option<usize> {
+        (self.deleted < self.budget).then(|| max_requests.min(self.budget - self.deleted))
+    }
+
+    /// Fold one pass in: receipted keys and keys refused (within their TTL)
+    /// leave `objects`. Whether the task should run another pass at once:
+    /// only when the candidate set shrank, so the loop cannot spin.
+    pub(crate) fn after_pass(
+        &mut self, objects: &mut Vec<ListedPartObject>, receipted: &[String],
+        refused: &RefusedKeys, now_ms: i64, report: &PassReport,
+    ) -> bool {
+        let before = objects.len();
+        self.deleted += receipted.len();
+        objects.retain(|object| !receipted.iter().any(|key| key == &object.key) && !refused.is_refused(&object.key, now_ms));
+        report.paused_reason.is_none() && objects.len() < before && !objects.is_empty() && self.next_pass(1).is_some()
+    }
+}
+
 pub(crate) async fn execute_local(
     authority: &dyn LakePartDeleteAuthority, requests: &[LakePartDeleteRequest],
 ) -> PassReport {
@@ -1548,4 +1578,93 @@ mod tests {
         assert!(!report.backoff && report.deleted == 1);
         assert_eq!(state.next_pass_delay(base), base, "a clean pass resets the back-off");
     }
+
+    /// NAN-4162 (a large tenant, 10-13..10-18): 332 unauthorizable keys sorted first
+    /// and filled most of every 512-key selection, so each task deleted 180
+    /// while ingest superseded more. Refused keys never take a selection slot
+    /// once known, one listing feeds several bounded passes, and the backlog
+    /// drains within backlog / per-task budget tasks.
+    #[tokio::test(start_paused = true)]
+    async fn refused_keys_never_hold_the_selection_and_the_backlog_drains_in_bounded_tasks() {
+        use crate::lake_part_gc::planner::{GcPolicy, InventorySelection};
+        const PARTS: u64 = 240;
+        const REFUSED: usize = 60;
+        const MAX: usize = 8;
+        let mut chain = Chain::new();
+        for n in 1..=PARTS {
+            chain.add(n, T0 + n as i64);
+        }
+        for group in 0..PARTS / 10 {
+            chain.push(LogOp::Merge {
+                output: crate::lake_part_gc::planner::tests::part_ref(10_000 + group, Level::Minute),
+                supersedes: (1..=10).map(|k| id(group * 10 + k)).collect(),
+            }, T0 + 10_000 + group as i64);
+        }
+        let reader = ChainReader { chain, checkpoint: None };
+        let mut listing: Vec<ListedPartObject> = (1..=PARTS).map(|n| ListedPartObject {
+            key: key(n, Level::L0, "data-00000.parquet"), strong_etag: "\"e\"".into(), content_length: 3, uploaded_at_ms: T0,
+        }).collect();
+        listing.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut authority = FakeAuthority::capable();
+        for object in &listing[..REFUSED] {
+            authority.refusals.insert(object.key.clone(), (404, OBJECT_NOT_FOUND));
+        }
+        let index = FakeIndex::new(Vec::new());
+        let mut state = LakePartGcState::genesis();
+        let now = T0 + 20_000 + 2 * 3_600_000;
+        let policy = GcPolicy { max_requests: MAX, ..GcPolicy::default() };
+        let per_task = MAX * crate::part_ingest::part_gc_cell::PASSES_PER_INVENTORY;
+        // Fold the view (a pass over no objects) before the first selection.
+        run_pass(&authority, &index, &reader, PassInput {
+            tenant_id: "tenant1", tenant_uuid: TENANT_UUID, state: &mut state, objects: &[], now_ms: now, receipted: None, policy,
+        }).await;
+        // Backlog x per-task cost: every key (deletable or not yet known
+        // refused) costs one slot, at most `per_task` per task.
+        let bound = PARTS as usize / per_task + 1;
+        let mut tasks = 0;
+        loop {
+            let live = crate::lake_part_gc::live_part_keys(TENANT_UUID, &mut state.view, &reader).await.unwrap();
+            let mut objects: Vec<_> = {
+                let selection = InventorySelection::new("tenant1", TENANT_UUID, &state.view, &live, now, policy).unwrap()
+                    .excluding(&state.refused_keys)
+                    .retaining(per_task);
+                assert_eq!(selection.limit(), per_task);
+                listing.iter().filter(|object| selection.eligible(object)).take(selection.limit()).cloned().collect()
+            };
+            if objects.is_empty() {
+                break;
+            }
+            tasks += 1;
+            assert!(tasks <= bound, "backlog did not drain within {bound} tasks");
+            let mut budget = InventoryBudget { deleted: 0, budget: per_task };
+            while let Some(requests) = budget.next_pass(MAX) {
+                let reported = index.deleted.lock().unwrap().iter().flatten().count();
+                let report = run_pass(&authority, &index, &reader, PassInput {
+                    tenant_id: "tenant1", tenant_uuid: TENANT_UUID, state: &mut state, objects: &objects, now_ms: now,
+                    receipted: None, policy: GcPolicy { max_requests: requests, ..policy },
+                }).await;
+                assert!(report.planned as usize <= MAX, "{report:?}");
+                let receipted: Vec<String> = index.deleted.lock().unwrap().iter().flatten().skip(reported)
+                    .map(|deleted| deleted.key.clone()).collect();
+                listing.retain(|object| !receipted.contains(&object.key));
+                if !budget.after_pass(&mut objects, &receipted, &state.refused_keys, now, &report) {
+                    break;
+                }
+            }
+        }
+        // Everything deletable is gone; only the unauthorizable keys remain,
+        // and each reached the owner exactly once.
+        assert_eq!(listing.len(), REFUSED);
+        for object in &listing {
+            let asked = authority.calls().iter().filter(|call| **call == format!("authorize {}", object.key)).count();
+            assert_eq!(asked, 1, "{}", object.key);
+        }
+        // Before NAN-4162 a selection of `MAX` kept refused keys at its head:
+        // with every refused key known, the old selection still offered
+        // them first, and a pass planned nothing deletable.
+        let live = crate::lake_part_gc::live_part_keys(TENANT_UUID, &mut state.view, &reader).await.unwrap();
+        let old = InventorySelection::new("tenant1", TENANT_UUID, &state.view, &live, now, policy).unwrap();
+        assert!(listing.iter().take(MAX).all(|object| old.eligible(object)));
+    }
+
 }

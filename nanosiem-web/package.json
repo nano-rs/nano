@@ -1,7 +1,7 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "scripts": {
     "test:user-visible-text": "vitest run src/user-visible-text.test.ts",
@@ -43,6 +43,8 @@
     "test:theme-parity": "node --test src/lib/theme-parity.test.ts",
     "test:toast-tokens": "node --test src/lib/toast-tokens.test.ts",
     "test:refresh-session": "node --test src/lib/refresh-coordinator.test.ts src/lib/refresh-takeover.test.ts src/lib/session-credentials.test.ts src/lib/authenticated-fetch.test.ts src/lib/request-credentials.test.ts && node --import tsx --test src/lib/api/search-refresh.test.ts",
+    "test:tenant-path-alias": "tsx --test src/lib/tenant-path-alias.test.ts",
+    "test:shared-demo": "tsx --test src/lib/shared-demo.test.ts && vitest run src/components/DemoBanner.test.tsx src/enterprise/pages/DemoClaim.test.tsx",
     "test:raw-fetch-credentials": "node --test src/lib/raw-fetch-credentials.test.ts",
     "test:csv-safe": "node --test src/lib/csv-safe.test.ts src/lib/search-csv.test.ts src/lib/audit-csv.test.ts"
   },

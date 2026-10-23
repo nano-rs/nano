@@ -16,6 +16,14 @@
 //!
 //! Timeouts: connect, TLS handshake, response headers, the gap between two
 //! body frames (slowloris), and the whole exchange.
+//!
+//! Egress proxy (NAN-4369): with a [`crate::egress_proxy::ProxyDialer`] the
+//! TCP leg is a CONNECT tunnel through the platform egress proxy, which
+//! authorizes the exact host for the run's [`EgressGrant`]. Every check above
+//! still runs in process first (allowlist, deny list, resolve-and-refuse
+//! non-public answers); the proxy re-resolves and enforces its own private
+//! range deny. TLS (SNI and certificate name = the host) runs inside the
+//! tunnel, so the proxy never sees request headers or vendor credentials.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -43,10 +51,19 @@ pub enum BrokerError {
     DnsBlocked { host: String, ip: IpAddr },
     #[error("connect to {0} failed: {1}")]
     Connect(SocketAddr, String),
+    /// The egress proxy did not open a tunnel; nothing reached the vendor.
+    #[error("{0}; the request was not sent")]
+    EgressProxy(crate::egress_proxy::ProxyRefusal),
     #[error("TLS with {0} failed: {1}")]
     Tls(String, String),
     #[error("HTTP exchange failed: {0}")]
     Http(String),
+    /// The transport attests that it refused before invoking request IO.
+    #[error("request not sent: {0}")]
+    NotSent(&'static str),
+    /// Retryable admission pressure, before invoking request IO.
+    #[error("request deferred before send: {0}")]
+    Deferred(&'static str),
     #[error("timed out: {0}")]
     Timeout(&'static str),
     #[error("response body exceeds {0} bytes")]
@@ -76,19 +93,53 @@ impl Resolver for SystemResolver {
     }
 }
 
-/// TCP connect to the pinned address. Tests map pinned public addresses onto a
-/// local mock; production connects directly.
+/// What a run's egress is authorized for, carried to the dialer. One broker
+/// serves one run, so the grant is fixed for the broker's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EgressGrant {
+    pub tenant: uuid::Uuid,
+    pub connection: uuid::Uuid,
+    pub revision: i64,
+    pub purpose: GrantPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantPurpose {
+    /// A native SOAR vendor call.
+    Soar,
+}
+
+impl GrantPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Soar => "soar",
+        }
+    }
+}
+
+/// One new connection: the policy-checked host, the pinned address it
+/// resolved to, and the run's grant (absent outside granted runs).
+#[derive(Debug, Clone, Copy)]
+pub struct DialTarget<'a> {
+    pub host: &'a str,
+    pub addr: SocketAddr,
+    pub grant: Option<&'a EgressGrant>,
+}
+
+/// TCP connect for one new connection. Production connects directly to the
+/// pinned address or tunnels through the egress proxy; tests map pinned
+/// public addresses onto a local mock.
 #[async_trait::async_trait]
 pub trait Dialer: Send + Sync {
-    async fn dial(&self, addr: SocketAddr) -> std::io::Result<TcpStream>;
+    async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream>;
 }
 
 pub struct DirectDialer;
 
 #[async_trait::async_trait]
 impl Dialer for DirectDialer {
-    async fn dial(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
-        TcpStream::connect(addr).await
+    async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream> {
+        TcpStream::connect(target.addr).await
     }
 }
 
@@ -117,6 +168,9 @@ impl ClientIdentity {
 pub struct BrokerConfig {
     pub resolver: Arc<dyn Resolver>,
     pub dialer: Arc<dyn Dialer>,
+    /// The run's egress grant, passed to the dialer (NAN-4369). Set per run
+    /// by the caller that owns the tenant connection; never shared.
+    pub egress_grant: Option<EgressGrant>,
     /// Extra trust anchors (tests). Production trusts webpki roots only.
     pub extra_roots: Vec<CertificateDer<'static>>,
     /// TCP connect, and separately the TLS handshake.
@@ -145,6 +199,7 @@ impl Default for BrokerConfig {
         Self {
             resolver: Arc::new(SystemResolver),
             dialer: Arc::new(DirectDialer),
+            egress_grant: None,
             extra_roots: Vec::new(),
             connect_timeout: Duration::from_secs(10),
             response_timeout: Duration::from_secs(60),
@@ -312,10 +367,14 @@ impl Broker {
 
     async fn dial(&self, host: &str, addr: SocketAddr) -> Result<IdleConn, BrokerError> {
         self.dial_log.lock().expect("dial log").push((host.to_string(), addr));
-        let tcp = tokio::time::timeout(self.cfg.connect_timeout, self.cfg.dialer.dial(addr))
+        let target = DialTarget { host, addr, grant: self.cfg.egress_grant.as_ref() };
+        let tcp = tokio::time::timeout(self.cfg.connect_timeout, self.cfg.dialer.dial(target))
             .await
             .map_err(|_| BrokerError::Timeout("connect"))?
-            .map_err(|e| BrokerError::Connect(addr, e.to_string()))?;
+            .map_err(|e| match crate::egress_proxy::ProxyRefusal::from_io(&e) {
+                Some(refusal) => BrokerError::EgressProxy(refusal),
+                None => BrokerError::Connect(addr, e.to_string()),
+            })?;
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|e| BrokerError::Tls(host.to_string(), e.to_string()))?;
         let tls = tokio::time::timeout(

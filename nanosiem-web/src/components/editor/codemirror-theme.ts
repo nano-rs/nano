@@ -5,7 +5,7 @@
  * Maps existing CSS variables to CodeMirror styling
  */
 import { EditorView } from '@codemirror/view';
-import { Extension } from '@codemirror/state';
+import type { Extension } from '@codemirror/state';
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
 import { tags } from '@lezer/highlight';
 

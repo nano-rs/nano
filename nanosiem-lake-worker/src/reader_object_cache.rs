@@ -26,7 +26,7 @@ use crate::hot_tail_cache::{parse_s3_uri, shared_r2_operator, valid_sha256};
 use anyhow::Context as _;
 use fs2::FileExt;
 use futures::future::{BoxFuture, FutureExt, Shared};
-use futures::TryStreamExt;
+use futures::{StreamExt as _, TryStreamExt};
 use opendal::Operator;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -226,7 +226,54 @@ const HOT_WINDOW_FENCE_SLAB_BYTES: u64 = 16 * 1024 * 1024;
 /// it queues for a heavy slot; it is no longer a refusal.
 const DEFAULT_QUERY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_FETCH_CONCURRENCY: usize = 16;
+
+/// NAN-4277: how many of `fetch_concurrency` download slots background
+/// downloads (durable jobs, hot-window hydration) may hold at once: all but a
+/// quarter (at least one) kept for interactive reads; 16 → 12.
+///
+/// All downloads used to share one FIFO queue. On a large hosted tenant (2026-10-20)
+/// a 30 d durable `stats` job queued one 1,561-object / 33.9 GB lease, and for
+/// the 8.5 min it took every interactive cold read waited behind it: 395-byte
+/// objects took 21 s, a 1 h `| head 50` spent 45 s in file preparation and was
+/// escalated at the request deadline. The total stays `fetch_concurrency`
+/// (same R2 requests and bandwidth); only the order changes.
+fn background_fetch_slots(fetch_concurrency: usize) -> usize {
+    if fetch_concurrency <= 1 {
+        return fetch_concurrency;
+    }
+    fetch_concurrency - (fetch_concurrency / 4).max(1)
+}
+
+/// NAN-4290: how many of one lease's `misses` downloads it submits at once.
+///
+/// An interactive lease submits every miss (its downloads take the free
+/// slots first, NAN-4277). A background lease (a durable job's, or hot-window
+/// hydration's) keeps at most [`background_fetch_slots`] submitted and adds
+/// the next as one lands. The background slots are FIFO: a 30 d job used to
+/// queue its whole 1,561-object lease at once, and a 1 h job's few objects,
+/// also a background read, then waited behind all of them. Bounded per lease,
+/// concurrent jobs' downloads interleave: the small job waits for at most one
+/// round of the big lease's downloads. A single lease still fills every
+/// background slot, so its throughput, R2 requests and bytes are unchanged.
+fn lease_outstanding_fetches(fetch_concurrency: usize, misses: usize) -> usize {
+    let background = HYDRATE_RATE.try_with(|_| ()).is_ok() || DURABLE_JOB_COLD_BYTES.try_with(|_| ()).is_ok();
+    let bound = if background { background_fetch_slots(fetch_concurrency) } else { misses };
+    bound.max(1)
+}
 const DEFAULT_FETCH_DEADLINE: Duration = Duration::from_secs(30);
+/// NAN-4138: how long a foreground lease waits for cache or hot-window
+/// volume capacity before it gives up with `Saturated`. Saturation is
+/// transient (leases end; the volume accountant re-walks every 30 s and sees
+/// evictions; hourly merges release their scratch), so a read waits it out
+/// instead of failing the search (NAN-3644: never refuse cold reads). The
+/// wait stages nothing: no reservation, temp file or buffer is held while it
+/// sleeps, so it cannot grow memory or the volume. The request's own
+/// deadline and cancellation still end it sooner.
+pub const SATURATION_WAIT_INTERACTIVE: Duration = Duration::from_secs(120);
+/// NAN-4138: a durable job's saturation wait (it has no interactive caller).
+pub const SATURATION_WAIT_DURABLE: Duration = Duration::from_secs(600);
+const SATURATION_BACKOFF_FIRST: Duration = Duration::from_millis(100);
+const SATURATION_BACKOFF_MAX: Duration = Duration::from_secs(2);
 /// One in this many trusted hits is re-hashed to catch silent bit-rot.
 const REHASH_SAMPLE: u64 = 64;
 /// NAN-3403: an object this process hashed less than this long ago is not
@@ -342,6 +389,14 @@ const TEMP_PREFIX: &str = ".fetch-";
 const DOWNLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const OBJECT_MODE: u32 = 0o444;
 
+const SATURATED_TEXT: &str = "reader cache is saturated by leased or protected objects";
+
+/// NAN-4138: whether stringified error text is a [`ReaderCacheError::Saturated`]
+/// (transient: callers map it to a retryable 503, never a 500).
+pub fn text_is_saturation(text: &str) -> bool {
+    text.contains(SATURATED_TEXT)
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ReaderCacheError {
     #[error("reader cache configuration is invalid: {0}")]
@@ -358,7 +413,7 @@ pub enum ReaderCacheError {
          this reader can stage at once"
     )]
     ScanTooLarge { required_bytes: u64, ceiling_bytes: u64, background_bytes: u64 },
-    #[error("reader cache is saturated by leased or protected objects; {needed_bytes} bytes could not be admitted")]
+    #[error("{SATURATED_TEXT}; {needed_bytes} bytes could not be admitted")]
     Saturated { needed_bytes: u64 },
     #[error("cold object fetch exceeded its deadline")]
     FetchTimeout,
@@ -690,6 +745,10 @@ struct State {
     live: HashMap<String, usize>,
     inflight: HashMap<String, FetchFuture>,
     background_rates: HashMap<String, Arc<HydratePacing>>,
+    /// NAN-4277: in-flight background downloads (a durable job's or the
+    /// hot window's) still allowed to wait for a background download slot.
+    /// A foreground read that needs the same object promotes it.
+    background_lanes: HashMap<String, Arc<tokio::sync::Notify>>,
     /// Bytes of downloads in flight in this process.
     reserved: u64,
     /// Sampled bit-rot re-hashes deferred off the lease path (digests).
@@ -739,9 +798,18 @@ struct Inner {
     key_prefix: String,
     objects: PathBuf,
     pins: PathBuf,
+    /// NAN-4222: `reads/<sha256>.bin`, one stable hard link per verified
+    /// object that native readers open (see [`ReaderCacheLease::pinned_path`]).
+    reads: PathBuf,
     lock_path: PathBuf,
     source: Arc<dyn ReaderObjectSource>,
     permits: tokio::sync::Semaphore,
+    /// NAN-4277: the share of `permits` that background downloads (durable
+    /// jobs, hot-window hydration) may hold at once, see
+    /// [`background_fetch_slots`]. A background download takes one of these
+    /// before one of `permits`, so the rest of `permits` always stays free
+    /// for interactive reads.
+    background_permits: tokio::sync::Semaphore,
     /// NAN-3644: the heavy cold-read slots (see
     /// [`READER_COLD_HEAVY_CONCURRENCY_ENV`]); `heavy_slots` is their count.
     heavy: Arc<tokio::sync::Semaphore>,
@@ -753,6 +821,9 @@ struct Inner {
     fence_slab_bytes: AtomicU64,
     /// A background scrub of `State::scrub` is running.
     scrubbing: std::sync::atomic::AtomicBool,
+    /// NAN-4138: test override of the saturation wait, in ms
+    /// (`u64::MAX`: the interactive/durable defaults).
+    saturation_wait_ms: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -915,6 +986,51 @@ impl ReaderObjectCache {
         if DURABLE_JOB_COLD_BYTES.try_with(|_| ()).is_ok() { self.durable_cold_ceiling() } else { self.interactive_cold_ceiling() }
     }
 
+    /// NAN-4138: how long the current foreground read waits out saturation.
+    /// NAN-4154: an interactive request waits at most until its own deadline
+    /// ([`crate::query_timing::time_left`]): past it the read fails
+    /// retryably, its leases drop with the request, and the search service
+    /// promotes the query to a durable job (which waits up to
+    /// [`SATURATION_WAIT_DURABLE`]). On a large hosted tenant a 120 s interactive
+    /// wait outlived the caller's ~45 s timeout and sat on its leases.
+    fn saturation_wait(&self) -> Duration {
+        let durable = DURABLE_JOB_COLD_BYTES.try_with(|_| ()).is_ok();
+        let wait = match self.inner.saturation_wait_ms.load(Ordering::Relaxed) {
+            u64::MAX if durable => SATURATION_WAIT_DURABLE,
+            u64::MAX => SATURATION_WAIT_INTERACTIVE,
+            ms => Duration::from_millis(ms),
+        };
+        match crate::query_timing::time_left() {
+            Some(left) if !durable => wait.min(left),
+            _ => wait,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_saturation_wait(&self, wait: Duration) {
+        self.inner.saturation_wait_ms.store(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX - 1), Ordering::Relaxed);
+    }
+
+    /// NAN-4138: [`Self::reserve_scratch`] that waits out a saturated cache
+    /// (bounded, like a foreground lease) instead of refusing the read.
+    pub async fn reserve_scratch_waiting(&self, bytes: u64) -> Result<ScratchReservation, ReaderCacheError> {
+        // More than the whole cache never fits: no wait.
+        let budget = if bytes > self.inner.settings.max_bytes { Duration::ZERO } else { self.saturation_wait() };
+        let mut wait = SaturationWait::new(budget);
+        loop {
+            let inner = self.inner.clone();
+            match blocking(move || inner.reserve(bytes)).await {
+                Ok(reservation) => return Ok(ScratchReservation { _reservation: reservation }),
+                Err(error @ ReaderCacheError::Saturated { .. }) => {
+                    if !wait.wait(&self.inner.tenant_id, bytes).await {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// NAN-3644: the heavy slot for one read, waiting in the queue if every
     /// slot is held. Inside a request (`query_timing::measure`) the slot is
     /// the request's: its later selections reuse it and it is released when
@@ -1001,8 +1117,10 @@ impl ReaderObjectCache {
         };
         bind_marker(&directory, &objects, &expected)?;
         let pins = directory.join("pins");
+        let reads = directory.join("reads");
         std::fs::create_dir_all(&objects)?;
         std::fs::create_dir_all(&pins)?;
+        std::fs::create_dir_all(&reads)?;
         // NAN-3644: batched cold reads spool here for one request's life; a
         // spool left by a process that died mid-request is never read again.
         match std::fs::remove_dir_all(directory.join(COLD_BATCH_SCRATCH)) {
@@ -1014,6 +1132,7 @@ impl ReaderObjectCache {
         let heavy_slots = cold_heavy_concurrency_from_env();
         let inner = Arc::new(Inner {
             permits: tokio::sync::Semaphore::new(settings.fetch_concurrency),
+            background_permits: tokio::sync::Semaphore::new(background_fetch_slots(settings.fetch_concurrency)),
             heavy: Arc::new(tokio::sync::Semaphore::new(heavy_slots)),
             heavy_slots: std::sync::atomic::AtomicUsize::new(heavy_slots),
             settings,
@@ -1022,6 +1141,7 @@ impl ReaderObjectCache {
             key_prefix: key_prefix.to_string(),
             objects,
             pins,
+            reads,
             lock_path: directory.join(".lock"),
             source,
             state: Mutex::default(),
@@ -1029,10 +1149,12 @@ impl ReaderObjectCache {
             hot_capacity: Mutex::new(None),
             fence_slab_bytes: AtomicU64::new(HOT_WINDOW_FENCE_SLAB_BYTES),
             scrubbing: std::sync::atomic::AtomicBool::new(false),
+            saturation_wait_ms: AtomicU64::new(u64::MAX),
         });
         inner.with_global_lock(|| {
             inner.sweep_temporaries()?;
             inner.reclaim_stale_pins()?;
+            inner.sweep_read_links()?;
             let mut state = inner.state();
             inner.refresh_index(&mut state, true)
         })?;
@@ -1195,7 +1317,8 @@ impl ReaderObjectCache {
         }
         // The fetch deadline starts once the read is admitted, not while it
         // waits for a heavy slot.
-        let deadline = tokio::time::Instant::now() + fetch_deadline(self.inner.settings.fetch_deadline, objects.iter().fold(0_u64, |bytes, object| bytes.saturating_add(object.size_bytes)));
+        let lease_deadline = fetch_deadline(self.inner.settings.fetch_deadline, objects.iter().fold(0_u64, |bytes, object| bytes.saturating_add(object.size_bytes)));
+        let mut deadline = tokio::time::Instant::now() + lease_deadline;
         // A shared budget is drawn when the fetch starts and refunded if the
         // lease fails: `spent` counts only bytes a lease actually delivered.
         // The draw re-checks the ceiling atomically: a sibling lease of the
@@ -1223,28 +1346,53 @@ impl ReaderObjectCache {
         let miss_count = misses.len();
         // A second round only runs if another process evicted a fresh object
         // between its admission and our link.
-        for _round in 0..2 {
+        // NAN-4138: a foreground read that finds the cache (or the hot-window
+        // volume) saturated waits for capacity, bounded, instead of failing
+        // the search. Background hydration still defers at once: its pass
+        // retries later and must not hold capacity hostage.
+        let mut saturation = foreground.then(|| SaturationWait::new(self.saturation_wait()));
+        let mut rounds = 0;
+        while rounds < 2 {
             if misses.is_empty() {
                 break;
             }
+            let charge = &progress_charge;
+            let largest = misses.iter().map(|object| object.size_bytes).max().unwrap_or(0);
+            let inner = &self.inner;
+            // Collected first: a stream holding the mapping closure is not
+            // `Send` for every lifetime, which spawned searches require.
             let fetches: Vec<_> = misses
                 .iter()
-                .map(|object| (self.inner.fetch_shared(object), object.size_bytes))
+                .map(|object| async move {
+                    inner.fetch_shared(object).await.map_err(|error| error.duplicate())?;
+                    charge.read(object.size_bytes);
+                    Ok::<_, ReaderCacheError>(())
+                })
                 .collect();
-            let charge = &progress_charge;
-            let largest = fetches.iter().map(|(_, bytes)| *bytes).max().unwrap_or(0);
-            let read = futures::future::try_join_all(fetches.into_iter().map(|(fetch, bytes)| async move {
-                fetch.await.map_err(|error| error.duplicate())?;
-                charge.read(bytes);
-                Ok::<_, ReaderCacheError>(())
-            }));
+            let read = futures::stream::iter(fetches)
+            .buffer_unordered(lease_outstanding_fetches(inner.settings.fetch_concurrency, misses.len()))
+            .try_collect::<Vec<()>>();
             // NAN-3714: the lease deadline is extended while objects keep
             // arriving (each extension: one more object's own deadline); it
             // cuts only a lease that stopped progressing. A large cold read
             // on a link slower than the sizing floor degrades to slower,
             // never to an error.
             let stall = fetch_deadline(self.inner.settings.fetch_deadline, largest);
-            wait_while_progressing(read, deadline, stall, || charge.read.load(Ordering::Relaxed)).await??;
+            match wait_while_progressing(read, deadline, stall, || charge.read.load(Ordering::Relaxed)).await? {
+                Ok(_) => rounds += 1,
+                Err(error @ ReaderCacheError::Saturated { needed_bytes }) => {
+                    let Some(wait) = saturation.as_mut() else { return Err(error) };
+                    // Pin what did land; only the rest waits. Nothing is
+                    // staged while waiting (the failed fetches dropped their
+                    // reservations and temp files).
+                    if !wait.wait(&self.inner.tenant_id, needed_bytes).await {
+                        return Err(error);
+                    }
+                    // Waiting is not a stalled transfer.
+                    deadline = tokio::time::Instant::now() + lease_deadline;
+                }
+                Err(error) => return Err(error),
+            }
             let inner = self.inner.clone();
             let directory = lease.directory.clone();
             misses = blocking(move || inner.link_present(misses, &directory)).await?;
@@ -1310,6 +1458,7 @@ impl ReaderObjectCache {
                     continue;
                 }
                 std::fs::remove_file(path)?;
+                inner.drop_read_link(&digest, &pinned)?;
                 state.entries.remove(&digest);
                 inner.counters.evictions.fetch_add(1, Ordering::Relaxed);
             }
@@ -1344,6 +1493,7 @@ impl ReaderObjectCache {
                     Err(error) => return Err(error.into()),
                 }
                 std::fs::remove_file(path)?;
+                inner.drop_read_link(&digest, &pinned)?;
                 state.entries.remove(&digest);
                 inner.counters.evictions.fetch_add(1, Ordering::Relaxed);
                 objects += 1;
@@ -1575,6 +1725,86 @@ impl Inner {
                 }
                 Err(error) if error.kind() == fs2::lock_contended_error().kind() => {}
                 Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_path(&self, sha256: &str) -> PathBuf {
+        self.reads.join(format!("{sha256}.bin"))
+    }
+
+    /// NAN-4222: point `reads/<sha256>.bin` at the inode `pin` (a lease's
+    /// private hard link of the verified object). chDB keys its Parquet
+    /// metadata cache by path, so a stable read path lets every statement
+    /// after the first reuse the parsed footer; the per-lease pin path missed
+    /// on every statement. An existing link to another inode is replaced
+    /// only when no lease pins that inode, so a selected read is never
+    /// redirected; otherwise this lease reads through its private pin. Must
+    /// run under the global lock. Best effort: a failure leaves the private
+    /// path in use.
+    fn ensure_read_link(&self, sha256: &str, pin: &Path, pinned: &mut Option<BTreeSet<(u64, u64)>>) {
+        let read = self.read_path(sha256);
+        let linked = (|| -> Result<(), ReaderCacheError> {
+            let target = std::fs::symlink_metadata(pin)?;
+            match std::fs::symlink_metadata(&read) {
+                Ok(current) if (current.dev(), current.ino()) == (target.dev(), target.ino()) => return Ok(()),
+                Ok(current) => {
+                    let pinned = match pinned {
+                        Some(pinned) => pinned,
+                        None => pinned.insert(self.pinned_inodes()?),
+                    };
+                    if pinned.contains(&(current.dev(), current.ino())) {
+                        return Ok(());
+                    }
+                    std::fs::remove_file(&read)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            std::fs::hard_link(pin, &read)?;
+            Ok(())
+        })();
+        if let Err(error) = linked {
+            tracing::debug!(%error, sha256, "reader cache stable read link not updated; using the lease pin path");
+        }
+    }
+
+    /// Remove `reads/<sha256>.bin` unless a lease pins its inode. Must run
+    /// under the global lock, after the canonical object is removed.
+    fn drop_read_link(&self, sha256: &str, pinned: &BTreeSet<(u64, u64)>) -> Result<(), ReaderCacheError> {
+        let read = self.read_path(sha256);
+        match std::fs::symlink_metadata(&read) {
+            Ok(current) if !pinned.contains(&(current.dev(), current.ino())) => match std::fs::remove_file(&read) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            },
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Remove read links whose canonical object is gone or replaced and whose
+    /// inode no lease pins (crashes, integrity evictions, other processes),
+    /// so no stale link keeps disk space. Must run under the global lock.
+    fn sweep_read_links(&self) -> Result<(), ReaderCacheError> {
+        let pinned = self.pinned_inodes()?;
+        for entry in std::fs::read_dir(&self.reads)? {
+            let path = entry?.path();
+            let canonical = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".bin"))
+                .filter(|name| valid_sha256(name))
+                .map(|sha256| self.object_path(sha256));
+            let Ok(current) = std::fs::symlink_metadata(&path) else { continue };
+            let live = canonical
+                .and_then(|canonical| std::fs::symlink_metadata(canonical).ok())
+                .is_some_and(|object| (object.dev(), object.ino()) == (current.dev(), current.ino()));
+            if !live && !pinned.contains(&(current.dev(), current.ino())) {
+                let _ = std::fs::remove_file(&path);
             }
         }
         Ok(())
@@ -1866,12 +2096,15 @@ impl Inner {
         }
         self.with_global_lock(|| {
             let mut missing = Vec::new();
+            let mut pinned = None;
             for object in objects {
                 let source = self.object_path(&object.sha256);
                 let destination = directory.join(format!("{}.bin", object.sha256));
                 match std::fs::hard_link(&source, &destination) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Ok(()) => self.ensure_read_link(&object.sha256, &destination, &mut pinned),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        self.ensure_read_link(&object.sha256, &destination, &mut pinned)
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         self.state().entries.remove(&object.sha256);
                         missing.push(object);
@@ -1886,10 +2119,17 @@ impl Inner {
     /// Join the in-flight fetch for this digest, or start one. The fetch runs
     /// as its own task so a caller hitting its deadline does not waste it.
     fn fetch_shared(self: &Arc<Self>, object: &ReaderObjectRef) -> FetchFuture {
+        let hydrating = HYDRATE_RATE.try_with(|_| ()).is_ok();
+        // NAN-4277: a read inside neither a durable job nor hydration is an
+        // interactive (foreground) read.
+        let foreground = !hydrating && DURABLE_JOB_COLD_BYTES.try_with(|_| ()).is_err();
         let mut state = self.state();
         if let Some(fetch) = state.inflight.get(&object.sha256) {
-            if HYDRATE_RATE.try_with(|_| ()).is_err() {
+            if !hydrating {
                 if let Some(rate) = state.background_rates.get(&object.sha256) { rate.rate.store(0, Ordering::Relaxed); rate.foreground.notify_one(); }
+            }
+            if foreground {
+                if let Some(lane) = state.background_lanes.get(&object.sha256) { lane.notify_one(); }
             }
             return fetch.clone();
         }
@@ -1897,9 +2137,11 @@ impl Inner {
         let owned = object.clone();
         let rate = HYDRATE_RATE.try_with(Arc::clone).ok();
         if let Some(rate) = &rate { state.background_rates.insert(object.sha256.clone(), rate.clone()); }
+        let lane = (!foreground).then(|| Arc::new(tokio::sync::Notify::new()));
+        if let Some(lane) = &lane { state.background_lanes.insert(object.sha256.clone(), lane.clone()); }
         let task = tokio::spawn(async move {
             let work = async {
-            let outcome = std::panic::AssertUnwindSafe(inner.fetch_object(&owned))
+            let outcome = std::panic::AssertUnwindSafe(inner.fetch_object(&owned, lane))
                 .catch_unwind()
                 .await
                 .unwrap_or_else(|_| {
@@ -1911,6 +2153,7 @@ impl Inner {
                 let mut state = inner.state();
                 state.inflight.remove(&owned.sha256);
                 state.background_rates.remove(&owned.sha256);
+                state.background_lanes.remove(&owned.sha256);
             }
             outcome.map_err(Arc::new)
             };
@@ -1929,7 +2172,13 @@ impl Inner {
         fetch
     }
 
-    async fn fetch_object(self: &Arc<Self>, object: &ReaderObjectRef) -> Result<(), ReaderCacheError> {
+    /// `background`: the promotion signal of a background download (see
+    /// [`background_fetch_slots`]); `None` for an interactive read.
+    async fn fetch_object(
+        self: &Arc<Self>,
+        object: &ReaderObjectRef,
+        background: Option<Arc<tokio::sync::Notify>>,
+    ) -> Result<(), ReaderCacheError> {
         // NAN-3714: the deadline cuts a stalled transfer, not the wait for a
         // download slot. Started before the permit, every object queued behind
         // a large lease's first `fetch_concurrency` downloads timed out in the
@@ -1938,6 +2187,19 @@ impl Inner {
         // deadline" (HTTP 500) while every transfer was still progressing.
         // A queued object waits on other transfers, each bounded by this same
         // deadline once it holds its slot.
+        // NAN-4277: a background download first takes a background slot, so
+        // background work never holds every download slot. Promoted (a
+        // foreground read needs this object) it stops waiting for one.
+        let _background = match background {
+            Some(promoted) => tokio::select! {
+                biased;
+                () = promoted.notified() => None,
+                permit = self.background_permits.acquire() => Some(permit.map_err(|_| {
+                    ReaderCacheError::Unavailable("reader cache closed".to_string())
+                })?),
+            },
+            None => None,
+        };
         let _permit = self
             .permits
             .acquire()
@@ -2118,6 +2380,7 @@ impl Inner {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error.into()),
                 }
+                self.drop_read_link(&sha256, &pinned)?;
                 state.entries.remove(&sha256);
                 self.counters.evictions.fetch_add(1, Ordering::Relaxed);
                 used = state.stored_bytes();
@@ -2249,6 +2512,42 @@ impl Drop for BudgetCharge<'_> {
         if !self.committed {
             self.budget.refund(self.bytes);
         }
+    }
+}
+
+/// NAN-4138: one read's bounded wait for cache capacity. Each `wait` sleeps
+/// a backoff (100 ms doubling to 2 s) while the budget lasts; it holds
+/// nothing while asleep, and dropping the future (cancellation) ends it.
+struct SaturationWait {
+    started: Option<tokio::time::Instant>,
+    budget: Duration,
+    backoff: Duration,
+    waits: u32,
+}
+
+impl SaturationWait {
+    fn new(budget: Duration) -> Self {
+        Self { started: None, budget, backoff: SATURATION_BACKOFF_FIRST, waits: 0 }
+    }
+
+    /// Sleep before the next attempt; false once the budget is spent.
+    async fn wait(&mut self, tenant_id: &str, needed_bytes: u64) -> bool {
+        let started = *self.started.get_or_insert_with(tokio::time::Instant::now);
+        let Some(left) = self.budget.checked_sub(started.elapsed()).filter(|left| !left.is_zero()) else {
+            tracing::warn!(tenant_id, needed_bytes, waited_ms = started.elapsed().as_millis() as u64, waits = self.waits,
+                "reader_cache_saturated: capacity did not free up within the wait; giving up");
+            return false;
+        };
+        if self.waits == 0 {
+            tracing::info!(tenant_id, needed_bytes, budget_ms = self.budget.as_millis() as u64,
+                "reader_cache_saturated: waiting for capacity instead of failing the read");
+        }
+        self.waits += 1;
+        let sleep = self.backoff.min(left);
+        self.backoff = (self.backoff * 2).min(SATURATION_BACKOFF_MAX);
+        tokio::time::sleep(sleep).await;
+        crate::query_timing::record(|p| p.cold_queue_ms += sleep.as_secs_f64() * 1000.0);
+        true
     }
 }
 
@@ -2384,10 +2683,20 @@ impl ReaderCacheLease {
         self.ensure_ms
     }
 
-    /// Statement-private hard link. Canonical replacement or retirement cannot
-    /// redirect an already selected read to a different inode.
+    /// The path a reader opens for `sha256`: the stable `reads/<sha256>.bin`
+    /// when it is the very inode this lease pins (NAN-4222: chDB's Parquet
+    /// metadata cache is keyed by path, so a stable path reuses the parsed
+    /// footer across statements), else the statement-private hard link.
+    /// Either way canonical replacement or retirement cannot redirect an
+    /// already selected read to a different inode: a read link is only ever
+    /// replaced while no lease pins its inode, and this lease pins it.
     pub fn pinned_path(&self, sha256: &str) -> PathBuf {
-        self.directory.join(format!("{sha256}.bin"))
+        let private = self.directory.join(format!("{sha256}.bin"));
+        let read = self.inner.read_path(sha256);
+        match (std::fs::symlink_metadata(&private), std::fs::symlink_metadata(&read)) {
+            (Ok(pin), Ok(stable)) if (pin.dev(), pin.ino()) == (stable.dev(), stable.ino()) => read,
+            _ => private,
+        }
     }
 
     /// Canonical object paths, de-duplicated, in request order.
@@ -2736,6 +3045,37 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(lease.pinned_path(&foreground.sha256)).unwrap().len(), 100);
     }
 
+    /// NAN-4154: query leases under pressure take every evictable non-hot
+    /// object (plain LRU) before any hot-window object; hot parts go only
+    /// when nothing else is evictable.
+    #[tokio::test]
+    async fn lease_pressure_evicts_every_cold_object_before_any_hot_one() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 1_000, &source);
+        let hot = ["h1", "h2", "h3", "h4"].map(|name| source.put(name, 100));
+        let cold = ["c1", "c2", "c3", "c4"].map(|name| source.put(name, 100));
+        for object in hot.iter().chain(cold.iter()) {
+            drop(cache.ensure_local(std::slice::from_ref(object)).await.unwrap());
+        }
+        cache.set_hot(hot.iter().enumerate().map(|(end, object)| (object.sha256.clone(), end as i64)).collect());
+        // A 7-day query leases four new objects at once: 1,200 bytes wanted
+        // of a 1,000-byte cache holding 800, all four cold objects evictable.
+        let wanted = ["q1", "q2", "q3", "q4"].map(|name| source.put(name, 100));
+        let lease = cache.ensure_local(&wanted).await.unwrap();
+        for object in &hot {
+            assert!(cache.object_path(&object.sha256).exists(), "a hot-window object was evicted while cold ones were evictable");
+        }
+        assert!(cold.iter().filter(|object| cache.object_path(&object.sha256).exists()).count() <= 2);
+        // Still leased, more pressure: the remaining cold objects go first,
+        // then (nothing else evictable) the oldest hot object.
+        let more = ["q5", "q6", "q7"].map(|name| source.put(name, 100));
+        let _more = cache.ensure_local(&more).await.unwrap();
+        assert!(cold.iter().all(|object| !cache.object_path(&object.sha256).exists()));
+        assert!(!cache.object_path(&hot[0].sha256).exists(), "oldest hot goes only once nothing else is evictable");
+        assert!(cache.object_path(&hot[3].sha256).exists());
+        drop(lease);
+    }
+
     #[tokio::test]
     async fn hot_window_volume_pressure_shrinks_warm_cache_oldest_first() {
         let (root, source) = fixture();
@@ -2762,8 +3102,45 @@ pub(crate) mod tests {
         cache.trim_pressure().await.unwrap();
         assert!(cache.object_path(&new.sha256).exists());
         let next = source.put("next", 8192);
+        cache.set_saturation_wait(Duration::from_millis(200));
         assert!(cache.ensure_local(std::slice::from_ref(&next)).await.is_err());
         drop(lease);
+    }
+
+    /// NAN-4138, the live failure: an hourly merge's scratch fills the
+    /// hot-window volume and a search's object cannot be admitted. The read
+    /// waits; when the scratch goes (merge committed), it completes. The
+    /// volume never passes its target while it waits or after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn search_waits_out_merge_scratch_volume_pressure() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 1 << 20, &source);
+        let held = source.put("held", 8192);
+        let lease = cache.ensure_local(std::slice::from_ref(&held)).await.unwrap();
+        let usage = nanosiem_lake_cell::volume_usage::directory_bytes(root.path()).unwrap();
+        let limit = usage + 16384;
+        cache.set_hot_capacity(crate::local_hot_window::Settings {
+            root: root.path().to_path_buf(), hours: 72, bytes_per_second: 0,
+            reserve_bytes: Some(0), max_bytes: limit, schedule: Default::default(), persistent: false,
+        });
+        let scratch = root.path().join("merge-scratch");
+        std::fs::write(&scratch, vec![0; 16384]).unwrap();
+        cache.set_saturation_wait(Duration::from_secs(30));
+        let wanted = source.put("wanted", 8192);
+        let waiting = tokio::spawn({
+            let (cache, wanted) = (cache.clone(), wanted.clone());
+            async move { cache.ensure_local(std::slice::from_ref(&wanted)).await }
+        });
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished(), "the search waits out the pressure");
+            assert!(nanosiem_lake_cell::volume_usage::directory_bytes(root.path()).unwrap() <= limit + 4096);
+        }
+        std::fs::remove_file(&scratch).unwrap();
+        let wanted_lease = tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap().unwrap();
+        assert!(wanted_lease.pinned_path(&wanted.sha256).exists());
+        assert!(lease.pinned_path(&held.sha256).exists(), "the held object was never evicted");
+        assert!(nanosiem_lake_cell::volume_usage::directory_bytes(root.path()).unwrap() <= limit);
     }
 
     /// NAN-3139: in the jailed query process the volume accountant was
@@ -2938,6 +3315,8 @@ pub(crate) mod tests {
             root: root.path().to_path_buf(), hours: 72, bytes_per_second: 0,
             reserve_bytes: Some(0), max_bytes: limit, schedule: Default::default(), persistent: false,
         });
+        // The scratch never shrinks here: the bounded wait gives up.
+        cache.set_saturation_wait(Duration::from_millis(200));
         assert!(cache.ensure_local(std::slice::from_ref(&object)).await.is_err());
         assert!(!cache.object_path(&object.sha256).exists());
         assert!(nanosiem_lake_cell::volume_usage::directory_bytes(root.path()).unwrap() <= limit);
@@ -3502,6 +3881,175 @@ pub(crate) mod tests {
         assert_eq!(next.unwrap().unwrap().fetched_bytes(), 300);
     }
 
+    /// NAN-4277: a source whose `slow-*` objects block until the gate opens
+    /// (counting the downloads that started); every other object is served
+    /// at once.
+    struct GatedSource {
+        inner: Arc<FakeSource>,
+        gate: tokio::sync::Semaphore,
+        started: AtomicUsize,
+        /// NAN-4290: each slow download consumes one gate permit, so a test
+        /// can let exactly `n` of them finish.
+        consume: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ReaderObjectSource for GatedSource {
+        async fn stream_object(
+            &self,
+            object: &ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            if object.source_uri.contains("/slow-") {
+                self.started.fetch_add(1, Ordering::SeqCst);
+                let permit = self.gate.acquire().await?;
+                if self.consume { permit.forget() }
+            }
+            self.inner.stream_object(object, sink).await
+        }
+    }
+
+    fn gated_cache(root: &Path) -> (ReaderObjectCache, Arc<GatedSource>) {
+        gated_cache_with(root, false)
+    }
+
+    fn gated_cache_with(root: &Path, consume: bool) -> (ReaderObjectCache, Arc<GatedSource>) {
+        let source = Arc::new(GatedSource {
+            inner: Arc::new(FakeSource::default()),
+            gate: tokio::sync::Semaphore::new(0),
+            started: AtomicUsize::new(0),
+            consume,
+        });
+        // The production constructor and settings shape: 4 download slots,
+        // so background downloads may hold 3.
+        let cache = ReaderObjectCache::open(settings(root, 1 << 20), "t1", BUCKET, PREFIX, source.clone()).unwrap();
+        (cache, source)
+    }
+
+    async fn until_started(source: &GatedSource, count: usize) {
+        for _ in 0..500 {
+            if source.started.load(Ordering::SeqCst) >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("only {} slow downloads started", source.started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn background_downloads_keep_a_quarter_of_the_slots_for_interactive_reads() {
+        assert_eq!(background_fetch_slots(DEFAULT_FETCH_CONCURRENCY), 12);
+        assert_eq!(background_fetch_slots(4), 3);
+        assert_eq!(background_fetch_slots(2), 1);
+        // One slot cannot be split: background work keeps it.
+        assert_eq!(background_fetch_slots(1), 1);
+    }
+
+    // NAN-4277 (a large hosted tenant, 2026-10-20): a durable job's large cold lease
+    // used to fill the one FIFO download queue, so a 1 h interactive search
+    // needing a few cold objects waited for the whole lease (45 s deadline).
+    #[tokio::test]
+    async fn a_durable_lease_never_holds_every_download_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, source) = gated_cache(root.path());
+        let durable_objects: Vec<_> = (0..8).map(|i| source.inner.put(&format!("slow-{i}"), 100)).collect();
+        let durable = tokio::spawn({
+            let cache = cache.clone();
+            async move { with_durable_job_cold_budget(1 << 20, cache.ensure_local(&durable_objects)).await }
+        });
+        until_started(&source, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(source.started.load(Ordering::SeqCst), 3, "background downloads hold 3 of 4 slots");
+        // An interactive read is admitted at once on the free slot.
+        let interactive = source.inner.put("fresh", 100);
+        let lease = tokio::time::timeout(Duration::from_secs(5), cache.ensure_local(std::slice::from_ref(&interactive)))
+            .await
+            .expect("an interactive read must not queue behind a durable lease")
+            .unwrap();
+        assert_eq!(lease.fetched_bytes(), 100);
+        // The durable lease still completes once its transfers progress.
+        source.gate.add_permits(64);
+        let lease = tokio::time::timeout(Duration::from_secs(5), durable).await.unwrap().unwrap().unwrap();
+        assert_eq!(lease.fetched_bytes(), 800);
+    }
+
+    // NAN-4277: an interactive read that needs an object a durable lease has
+    // queued (a 30 d scan covers the last hour too) promotes that download
+    // instead of waiting for the durable lease to reach it.
+    #[tokio::test]
+    async fn an_interactive_read_promotes_a_queued_durable_download() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, source) = gated_cache(root.path());
+        let shared = source.inner.put("recent", 100);
+        let mut durable_objects: Vec<_> = (0..4).map(|i| source.inner.put(&format!("slow-{i}"), 100)).collect();
+        durable_objects.push(shared.clone());
+        let durable = tokio::spawn({
+            let cache = cache.clone();
+            async move { with_durable_job_cold_budget(1 << 20, cache.ensure_local(&durable_objects)).await }
+        });
+        until_started(&source, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(source.inner.reads(), 0, "the shared object is still queued behind the durable lease");
+        let lease = tokio::time::timeout(Duration::from_secs(5), cache.ensure_local(std::slice::from_ref(&shared)))
+            .await
+            .expect("the interactive read must promote the queued durable download")
+            .unwrap();
+        assert_eq!(lease.fetched_bytes(), 100);
+        assert_eq!(source.inner.reads(), 1, "one download serves both leases");
+        source.gate.add_permits(64);
+        let lease = tokio::time::timeout(Duration::from_secs(5), durable).await.unwrap().unwrap().unwrap();
+        assert_eq!(lease.fetched_bytes(), 500);
+    }
+
+    // NAN-4290: a 30 d aggregate and a 1 h listing run as durable jobs at the
+    // same time (the small-job lane). Both leases are background reads. The
+    // 30 d lease used to submit all of its downloads at once, so the 1 h
+    // lease's objects queued behind every one of them. Now a background lease
+    // keeps at most the background share submitted: the 1 h lease waits for
+    // one round of the 30 d lease's downloads, not for the whole lease.
+    #[tokio::test]
+    async fn a_small_durable_lease_waits_one_round_not_the_whole_large_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let (cache, source) = gated_cache_with(root.path(), true);
+        let large_objects: Vec<_> = (0..64).map(|i| source.inner.put(&format!("slow-{i}"), 100)).collect();
+        let large = tokio::spawn({
+            let cache = cache.clone();
+            async move { with_durable_job_cold_budget(1 << 30, cache.ensure_local(&large_objects)).await }
+        });
+        until_started(&source, 3).await;
+        let small_objects: Vec<_> = (0..2).map(|i| source.inner.put(&format!("recent-{i}"), 100)).collect();
+        let small = tokio::spawn({
+            let cache = cache.clone();
+            async move { with_durable_job_cold_budget(1 << 30, cache.ensure_local(&small_objects)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Exactly one round of the large lease's downloads finishes.
+        source.gate.add_permits(3);
+        let lease = tokio::time::timeout(Duration::from_secs(5), small)
+            .await
+            .expect("the small lease must not wait for the whole large lease")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.fetched_bytes(), 200);
+        assert!(!large.is_finished(), "the large lease is still downloading");
+        let started = source.started.load(Ordering::SeqCst);
+        assert!(started <= 9, "the large lease never had more than the background share in flight ({started} started)");
+        // The large lease still completes, every object fetched once.
+        source.gate.add_permits(64);
+        let lease = tokio::time::timeout(Duration::from_secs(10), large).await.unwrap().unwrap().unwrap();
+        assert_eq!(lease.fetched_bytes(), 6_400);
+        assert_eq!(source.started.load(Ordering::SeqCst), 64);
+    }
+
+    #[test]
+    fn only_background_leases_bound_their_submitted_downloads() {
+        // Interactive: every miss at once (its downloads take the free slots).
+        assert_eq!(lease_outstanding_fetches(16, 1_561), 1_561);
+        assert_eq!(lease_outstanding_fetches(16, 0), 1);
+        let durable = DURABLE_JOB_COLD_BYTES.sync_scope(1, || lease_outstanding_fetches(16, 1_561));
+        assert_eq!(durable, background_fetch_slots(16));
+    }
+
     #[tokio::test]
     async fn cold_set_over_the_ceiling_is_refused_before_any_read() {
         let (root, source) = fixture();
@@ -3571,13 +4119,253 @@ pub(crate) mod tests {
         let cache = open(root.path(), 200, &source);
         let [a, b, c] = ["a", "b", "c"].map(|name| source.put(name, 100));
         let lease = cache.ensure_local(&[a.clone(), b.clone()]).await.unwrap();
+        // NAN-4138: a held lease outlasting the bounded wait still ends in
+        // a retryable `Saturated`, never in evicting a leased object.
+        cache.set_saturation_wait(Duration::from_millis(300));
+        let started = Instant::now();
         let error = cache.ensure_local(std::slice::from_ref(&c)).await.unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(300), "the read waited before giving up");
         assert!(matches!(error, ReaderCacheError::Saturated { needed_bytes: 100 }), "{error}");
         assert!(error.retryable());
         assert!(lease.paths().iter().all(|path| path.exists()));
         drop(lease);
         cache.ensure_local(&[c]).await.unwrap();
         assert_eq!(cache.stats().evictions, 1);
+    }
+
+    /// NAN-4154: a request blocked on saturation stops waiting at its own
+    /// deadline (not the 120 s interactive wait): the read fails retryably
+    /// (503, promoted to a durable job by the search service) and the
+    /// request holds 0 leases from then on, its partial lease included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_saturated_read_past_its_deadline_escalates_holding_no_leases() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 300, &source);
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|name| source.put(name, 100));
+        // Another query holds two thirds of the cache.
+        let other = cache.ensure_local(&[a.clone(), b.clone()]).await.unwrap();
+        assert_eq!(pin_dirs(root.path()), 1);
+        let started = Instant::now();
+        let error = crate::query_timing::measure("nan4154-deadline", async {
+            // ~1 s of interactive budget left after the margin.
+            crate::query_timing::record(|p| p.execution_seconds = crate::query_timing::DEADLINE_MARGIN.as_secs() + 1);
+            // c lands (a partial lease); d waits for capacity that never frees.
+            let partial = cache.ensure_local(std::slice::from_ref(&c)).await.unwrap();
+            let blocked = cache.ensure_local(std::slice::from_ref(&d)).await;
+            drop(partial);
+            blocked.map(drop)
+        })
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10), "waited {:?}, past the request deadline", started.elapsed());
+        assert!(started.elapsed() >= Duration::from_millis(500), "it waited for capacity first");
+        assert!(matches!(error, ReaderCacheError::Saturated { .. }), "{error}");
+        assert!(error.retryable(), "retryable: the search service escalates it");
+        assert_eq!(pin_dirs(root.path()), 1, "only the other query's lease is held");
+        assert_eq!(temporaries(root.path()), 0);
+        // Outside a request (a durable job, background work) the configured wait applies.
+        assert_eq!(crate::query_timing::time_left(), None);
+        drop(other);
+    }
+
+    /// NAN-4138: no files under `pins/` (every lease released).
+    fn pin_dirs(root: &Path) -> usize {
+        std::fs::read_dir(tenant_directory(root, "t1").join("pins")).unwrap().count()
+    }
+
+    fn temporaries(root: &Path) -> usize {
+        std::fs::read_dir(tenant_directory(root, "t1").join("objects")).unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name().to_string_lossy().starts_with(TEMP_PREFIX))
+            .count()
+    }
+
+    /// NAN-4138 (lean-internal, 10-19): hourly merges and wide reads filled
+    /// the hot-window volume and searches failed with 500 "reader cache is
+    /// saturated". A foreground read now waits for capacity: it succeeds
+    /// once a lease ends, and stages nothing (no reservation, no temp file,
+    /// no fetch) while it waits, so the wait cannot grow memory or disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_foreground_read_waits_for_capacity_then_succeeds() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 200, &source);
+        cache.set_saturation_wait(Duration::from_secs(30));
+        let [a, b, c] = ["a", "b", "c"].map(|name| source.put(name, 100));
+        let lease = cache.ensure_local(&[a.clone(), b.clone()]).await.unwrap();
+        let reads_before = source.reads();
+        let waiting = tokio::spawn({
+            let (cache, c) = (cache.clone(), c.clone());
+            async move { cache.ensure_local(std::slice::from_ref(&c)).await }
+        });
+        let mut peak_stored = 0;
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!waiting.is_finished(), "a saturated read waits, it does not fail");
+            let stats = cache.stats();
+            peak_stored = peak_stored.max(stats.stored_bytes);
+            assert_eq!(cache.inner.state().reserved, 0, "nothing reserved while waiting");
+            assert_eq!(temporaries(root.path()), 0, "no partial download while waiting");
+        }
+        assert!(peak_stored <= 200, "the cache stayed within its budget: {peak_stored}");
+        assert_eq!(source.reads(), reads_before, "the waiting read fetched nothing");
+        assert!(lease.paths().iter().all(|path| path.exists()), "leased objects were not evicted");
+        drop(lease);
+        let lease = tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap().unwrap();
+        assert!(lease.pinned_path(&c.sha256).exists());
+        assert!(cache.stats().stored_bytes <= 200);
+        drop(lease);
+        assert_eq!(pin_dirs(root.path()), 0);
+    }
+
+    /// NAN-4138: background hydration still defers at once (its pass
+    /// retries), so it never queues behind searches for capacity.
+    #[tokio::test]
+    async fn saturated_background_hydration_defers_without_waiting() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 200, &source);
+        cache.set_saturation_wait(Duration::from_secs(30));
+        let [a, b, c] = ["a", "b", "c"].map(|name| source.put(name, 100));
+        let _lease = cache.ensure_local(&[a, b]).await.unwrap();
+        let started = Instant::now();
+        let error = background_hydrate(0, cache.ensure_local(std::slice::from_ref(&c))).await.unwrap_err();
+        assert!(matches!(error, ReaderCacheError::Saturated { .. }), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// NAN-4138: a cancelled read (request deadline, client gone) releases
+    /// everything it held: its pins, its in-process holds, and, once the
+    /// detached download ends, its capacity reservation. Covers a read
+    /// cancelled mid-download and one cancelled while waiting on saturation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reads_release_leases_holds_and_reservations() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 300, &source);
+        cache.set_saturation_wait(Duration::from_secs(30));
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|name| source.put(name, 100));
+        // Cancelled mid-download.
+        drop(cache.ensure_local(std::slice::from_ref(&a)).await.unwrap());
+        source.delay_ms.store(400, Ordering::SeqCst);
+        let cancelled = tokio::time::timeout(Duration::from_millis(50), cache.ensure_local(&[a.clone(), b.clone()])).await;
+        assert!(cancelled.is_err(), "the read was cancelled mid-download");
+        assert_eq!(pin_dirs(root.path()), 0, "the cancelled lease's pins are gone");
+        assert!(cache.inner.state().holds.is_empty(), "no in-process holds remain");
+        assert!(cache.inner.state().live.is_empty());
+        // The detached download finishes (or fails) and returns its bytes.
+        for _ in 0..100 {
+            if cache.inner.state().inflight.is_empty() { break }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(cache.inner.state().reserved, 0, "the download's reservation was released");
+        source.delay_ms.store(0, Ordering::SeqCst);
+        // Cancelled while waiting for capacity.
+        let lease = cache.ensure_local(&[b.clone(), c.clone(), a.clone()]).await.unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_millis(300), cache.ensure_local(std::slice::from_ref(&d))).await;
+        assert!(cancelled.is_err(), "the read was still waiting for capacity");
+        assert_eq!(pin_dirs(root.path()), 1, "only the live lease remains pinned");
+        assert!(cache.inner.state().holds.is_empty());
+        assert_eq!(cache.inner.state().reserved, 0);
+        drop(lease);
+        assert_eq!(pin_dirs(root.path()), 0);
+        // Everything released: the cache is fully usable again.
+        let lease = cache.ensure_local(std::slice::from_ref(&d)).await.unwrap();
+        assert!(lease.pinned_path(&d.sha256).exists());
+    }
+
+    /// NAN-4138: a batched cold read's spool reservation waits out
+    /// saturation too, and a spool larger than the whole cache is refused at
+    /// once (permanent, not transient).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scratch_reservation_waits_for_capacity() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 200, &source);
+        cache.set_saturation_wait(Duration::from_secs(30));
+        let [a, b] = ["a", "b"].map(|name| source.put(name, 100));
+        let lease = cache.ensure_local(&[a, b]).await.unwrap();
+        let waiting = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.reserve_scratch_waiting(100).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        drop(lease);
+        let reservation = tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap().unwrap();
+        assert_eq!(cache.inner.state().reserved, 100);
+        drop(reservation);
+        let started = Instant::now();
+        assert!(matches!(cache.reserve_scratch_waiting(201).await, Err(ReaderCacheError::Saturated { .. })));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// NAN-4222: every lease of one verified object hands native readers the
+    /// same path (chDB caches parsed Parquet footers by path), the very inode
+    /// the lease pins; eviction removes the link with the object.
+    #[tokio::test]
+    async fn leases_share_a_stable_read_path_on_the_pinned_inode() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 400, &source);
+        let other = open(root.path(), 400, &source);
+        let object = source.put("stable", 100);
+        let first = cache.ensure_local(std::slice::from_ref(&object)).await.unwrap();
+        let second = other.ensure_local(std::slice::from_ref(&object)).await.unwrap();
+        let path = first.pinned_path(&object.sha256);
+        assert_eq!(path, second.pinned_path(&object.sha256), "one path across leases and processes");
+        assert!(path.starts_with(tenant_directory(root.path(), "t1").join("reads")), "{}", path.display());
+        let inode = |path: &Path| { let m = std::fs::metadata(path).unwrap(); (m.dev(), m.ino()) };
+        assert_eq!(inode(&path), inode(&cache.object_path(&object.sha256)));
+        drop((first, second));
+        let third = cache.ensure_local(std::slice::from_ref(&object)).await.unwrap();
+        assert_eq!(third.pinned_path(&object.sha256), path, "the path outlives the leases that made it");
+        drop(third);
+        assert!(other.evict_unleased(vec![object.sha256.clone()]).await.unwrap().is_empty());
+        assert!(!path.exists(), "eviction removes the read link with the object");
+    }
+
+    /// NAN-4222: a read link is never moved off an inode a live lease still
+    /// pins; a lease of the replacement inode reads through its private pin
+    /// until then, and the next lease after release relinks.
+    #[tokio::test]
+    async fn read_link_is_not_redirected_while_its_inode_is_pinned() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 400, &source);
+        let object = source.put("replaced", 100);
+        let old = cache.ensure_local(std::slice::from_ref(&object)).await.unwrap();
+        let read = old.pinned_path(&object.sha256);
+        let inode = |path: &Path| { let m = std::fs::metadata(path).unwrap(); (m.dev(), m.ino()) };
+        let old_inode = inode(&read);
+        // Replace the canonical object with a fresh inode of the same bytes
+        // (an integrity re-fetch, or another process's re-admission).
+        let canonical = cache.object_path(&object.sha256);
+        let bytes = std::fs::read(&canonical).unwrap();
+        std::fs::remove_file(&canonical).unwrap();
+        cache.inner.state().entries.remove(&object.sha256);
+        let staged = canonical.with_extension("staged");
+        std::fs::write(&staged, &bytes).unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(OBJECT_MODE)).unwrap();
+        std::fs::rename(&staged, &canonical).unwrap();
+        let new = cache.ensure_local(std::slice::from_ref(&object)).await.unwrap();
+        let path = new.pinned_path(&object.sha256);
+        assert_ne!(path, read, "the pinned read link keeps its inode");
+        assert_eq!(inode(&read), old_inode);
+        assert_eq!(inode(&path), inode(&canonical));
+        assert_eq!(old.pinned_path(&object.sha256), read);
+        drop((old, new));
+        let next = cache.ensure_local(std::slice::from_ref(&object)).await.unwrap();
+        assert_eq!(next.pinned_path(&object.sha256), read, "relinked once the old inode is free");
+        assert_eq!(inode(&read), inode(&canonical));
+    }
+
+    /// NAN-4222: a read link whose object is gone and whose inode no lease
+    /// pins is swept at open, so it cannot hold disk space.
+    #[tokio::test]
+    async fn stale_read_links_are_swept_at_open() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 400, &source);
+        let object = source.put("orphan", 100);
+        let read = cache.ensure_local(std::slice::from_ref(&object)).await.unwrap().pinned_path(&object.sha256);
+        std::fs::remove_file(cache.object_path(&object.sha256)).unwrap();
+        assert!(read.exists());
+        drop(cache);
+        let _reopened = open(root.path(), 400, &source);
+        assert!(!read.exists());
     }
 
     #[tokio::test]
@@ -3642,8 +4430,13 @@ pub(crate) mod tests {
         drop(other.ensure_local(std::slice::from_ref(&a)).await.unwrap());
         assert_ne!(std::fs::metadata(&canonical).unwrap().ino(), std::fs::metadata(&pinned).unwrap().ino());
         assert_eq!(std::fs::read(&pinned).unwrap(), expected);
+        // NAN-4222: the selected path is the stable read link; it stays on the
+        // old inode while this lease pins it and moves to the re-fetch after.
+        assert_eq!(pinned, cache.inner.read_path(&a.sha256));
         drop(lease);
-        assert!(!pinned.exists());
+        let next = cache.ensure_local(std::slice::from_ref(&a)).await.unwrap();
+        assert_eq!(next.pinned_path(&a.sha256), pinned);
+        assert_eq!(std::fs::metadata(&canonical).unwrap().ino(), std::fs::metadata(&pinned).unwrap().ino());
     }
 
     #[tokio::test]
@@ -3658,6 +4451,7 @@ pub(crate) mod tests {
         assert!(object_path(root.path(), "t1", &a.sha256).exists());
         assert!(!object_path(root.path(), "t1", &b.sha256).exists());
         cache.set_protected([a.sha256.clone(), c.sha256.clone()]);
+        cache.set_saturation_wait(Duration::ZERO);
         let error = cache.ensure_local(&[b]).await.unwrap_err();
         assert!(matches!(error, ReaderCacheError::Saturated { .. }), "{error}");
     }

@@ -564,6 +564,15 @@ pub struct CgroupTree {
     /// for and unresolvable; surfaced as the `io_max_unresolved` signal.
     io_max_unresolved: Option<String>,
     cpu_max_burst: bool,
+    /// NAN-4316: serialises tenant cgroup creation, initialisation and
+    /// removal. Two roles of a new tenant spawn at once; the one that does
+    /// not create the cgroup must not return (and attach its process) before
+    /// the creator has written the initial `memory.high` / `cpu.max`.
+    init: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Test only: the creator pauses after `mkdir`, widening the window a
+    /// concurrent role would attach in without [`Self::init`].
+    #[cfg(test)]
+    pause_after_create: Option<std::time::Duration>,
 }
 
 /// `st_dev` → (major, minor), glibc's `gnu_dev_major` / `gnu_dev_minor`.
@@ -626,6 +635,21 @@ pub fn init_memory_min(min_bytes: u64, cell_memory_bytes: u64) -> u64 {
 
 fn write(path: &Path, value: &str) -> io::Result<()> {
     std::fs::write(path, value).map_err(|e| io::Error::new(e.kind(), format!("write {}: {e}", path.display())))
+}
+
+/// `mkdir` for a cgroup another spawn of the same tenant may be creating
+/// at the same moment: returns whether this call created it. NAN-4314: a
+/// birth starts ingest[T] and query[T] together, each under its own role
+/// lock; both saw the tenant cgroup absent and the slower `mkdir` failed
+/// with EEXIST ("spawn failed: cgroup: File exists"). An existing
+/// directory is the cgroup we want; any other error (or a non-directory
+/// in its place) still fails.
+fn create_dir_if_absent(dir: &Path) -> io::Result<bool> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(false),
+        Err(e) => Err(io::Error::new(e.kind(), format!("mkdir {}: {e}", dir.display()))),
+    }
 }
 
 pub(crate) fn read_kv(path: &Path, key: &str) -> Option<u64> {
@@ -779,7 +803,9 @@ impl CgroupTree {
                 let _ = write(&target.join("cgroup.procs"), pid);
             }
         }
-        let tree = Self { slots: Default::default(), root, rel_root, controllers, io_max, io_max_unresolved: None, cpu_max_burst };
+        let tree = Self { slots: Default::default(), root, rel_root, controllers, io_max, io_max_unresolved: None, cpu_max_burst, init: Default::default(),
+            #[cfg(test)]
+            pause_after_create: None };
         tree.enable_controllers(&tree.root)?;
         for d in ["warm", "tenants"] {
             let p = tree.root.join(d);
@@ -990,10 +1016,18 @@ impl CgroupTree {
             _ => {}
         }
         self.register(t, slot);
+        // The whole create-and-initialise is one step for every caller: a
+        // concurrent role spawn of the same tenant waits here until the
+        // creator is done, so no process attaches under the parent's limits.
+        let _init = self.init.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = self.tenant_dir(t);
-        let fresh = !dir.exists();
-        if fresh {
-            std::fs::create_dir(&dir)?;
+        // Only the spawn that created it initialises the controller-owned
+        // files below (the watchdog retunes them at runtime; a later ensure
+        // must not reset them); a concurrent role spawn reuses it.
+        let fresh = create_dir_if_absent(&dir)?;
+        #[cfg(test)]
+        if let Some(pause) = self.pause_after_create.filter(|_| fresh) {
+            std::thread::sleep(pause);
         }
         // Order: raise max before high before low, so no intermediate state
         // has low > high or high > max rejected or OOMing.
@@ -1034,9 +1068,7 @@ impl CgroupTree {
         self.enable_controllers(&dir)?;
         for role in Role::ALL {
             let leaf = dir.join(role.as_str());
-            if !leaf.exists() {
-                std::fs::create_dir(&leaf)?;
-            }
+            create_dir_if_absent(&leaf)?;
             // Kill the whole role process on OOM, never leave it half-dead.
             let _ = write(&leaf.join("memory.oom.group"), "1");
             let _ = write(&leaf.join("memory.swap.max"), "0");
@@ -1117,6 +1149,7 @@ impl CgroupTree {
 
     /// Remove the tenant's cgroup if no process is left in it.
     pub fn remove_tenant_if_empty(&self, t: &TenantId) -> io::Result<bool> {
+        let _init = self.init.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = self.tenant_dir(t);
         if !dir.exists() {
             return Ok(true);
@@ -1764,5 +1797,72 @@ mod tests {
         }
         assert_eq!(tree.remove_limbo().unwrap(), 0);
         assert!(!d.path().join("limbo").exists());
+    }
+
+    /// NAN-4314: a birth starts every resident role of a tenant at once,
+    /// each under its own role lock, and each runs `ensure_tenant` on the
+    /// shared tree. All of them must succeed on the first try: none may
+    /// fail with EEXIST because another role created the tenant cgroup (or
+    /// a role leaf) between its existence check and its `mkdir`.
+    #[test]
+    fn concurrent_role_spawns_of_a_new_tenant_all_create_its_cgroup() {
+        let d = fake_root("cpu io memory pids\n");
+        let mut tree = CgroupTree::adopt_root(d.path().to_path_buf(), "/".into(), vec![], true).unwrap();
+        tree.pause_after_create = Some(std::time::Duration::from_millis(5));
+        let limits = limits_for_io();
+        for n in 0..64u32 {
+            let t = TenantId::new(&format!("tenant{n}")).unwrap();
+            let barrier = std::sync::Barrier::new(Role::ALL.len());
+            let dir = d.path().join(format!("tenants/s{n}"));
+            // NAN-4316: what each role saw of the tenant limits at the moment
+            // it attached (`place`), right after its `ensure_tenant` returned.
+            let results: Vec<io::Result<(Option<String>, Option<String>)>> = std::thread::scope(|s| {
+                let handles: Vec<_> = Role::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(i, role)| {
+                        let (tree, t, barrier, limits, dir) = (&tree, &t, &barrier, &limits, &dir);
+                        s.spawn(move || {
+                            barrier.wait();
+                            tree.ensure_tenant(t, n, limits)?;
+                            let seen = (std::fs::read_to_string(dir.join("memory.high")).ok(),
+                                std::fs::read_to_string(dir.join("cpu.max")).ok());
+                            tree.place(1000 + i as u32, t, *role)?;
+                            Ok(seen)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let cpu_max = rd(&dir.join("cpu.max"));
+            for r in &results {
+                let seen = r.as_ref().unwrap_or_else(|e| panic!("tenant{n}: a concurrent role spawn failed: {e}"));
+                assert_eq!(seen.0.as_deref(), Some(limits.memory_hard_bytes.to_string().as_str()),
+                    "tenant{n}: a role attached before memory.high was initialised");
+                assert_eq!(seen.1.as_deref(), Some(cpu_max.as_str()), "tenant{n}: a role attached before cpu.max was initialised");
+            }
+            for role in Role::ALL {
+                assert!(dir.join(role.as_str()).is_dir(), "tenant{n}: {} leaf", role.as_str());
+            }
+            // The creator initialised the controller-owned files exactly as a
+            // lone spawn does.
+            assert_eq!(rd(&dir.join("memory.high")), limits.memory_hard_bytes.to_string());
+        }
+    }
+
+    /// NAN-4314: an existing cgroup directory is reused (not created); a
+    /// non-directory in its place, or a missing parent, is still an error.
+    #[test]
+    fn create_dir_if_absent_reuses_only_a_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("s0");
+        assert!(create_dir_if_absent(&dir).unwrap(), "first call creates");
+        assert!(!create_dir_if_absent(&dir).unwrap(), "second call reuses");
+        let file = d.path().join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let e = create_dir_if_absent(&file).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert!(e.to_string().contains("mkdir"), "{e}");
+        assert_eq!(create_dir_if_absent(&d.path().join("gone/s1")).unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 }

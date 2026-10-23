@@ -202,3 +202,91 @@ fn hec_bytes_codec_preserves_string_and_object_payloads() {
         assert_eq!(metadata["source_type"], "okta");
     }
 }
+
+/// NAN-3646: `.message` is never left empty for a HEC payload. Covers a
+/// string event, an object event (as the bytes codec delivers it, as an
+/// unflattened `.event`, and spread over the root by a Vector without the
+/// bytes codec), a non-string `.message`, and an envelope with no event.
+#[test]
+fn hec_normalize_message_for_string_object_and_missing_events() {
+    let program = transform_source(HEC, "hec_normalize");
+    let normalize = |log: Value| kept(run(&program, log, Some((TOKEN, "okta")))).0;
+    let as_json = |event: &Value| -> Value {
+        serde_json::from_str(event["message"].as_str().expect("message is a string")).unwrap()
+    };
+
+    // String event: unchanged.
+    let log = crate::parsers::tenant_bundle::bronze_row_contract::splunk_hec_log(
+        &json!({"event": "raw line", "sourcetype": "okta"}),
+    )
+    .unwrap();
+    assert_eq!(normalize(log)["message"], "raw line");
+    assert_eq!(normalize(json!({"event": "raw line", "splunk_sourcetype": "okta"}))["message"], "raw line");
+
+    // Object event with an explicit `message`: that message wins.
+    let event = normalize(json!({"event": {"message": "m", "user": "a"}, "splunk_sourcetype": "okta"}));
+    assert_eq!(event["message"], "m");
+
+    // Object event still nested under `.event`: serialized whole.
+    let payload = json!({"user": "alice", "action": "login", "nested": {"id": 7}});
+    let event = normalize(json!({"event": payload, "splunk_sourcetype": "okta"}));
+    assert_eq!(as_json(&event), payload);
+
+    // Object event spread over the root (no bytes codec): rebuilt from the
+    // root without the HEC envelope, deterministically (key-sorted).
+    let spread = json!({
+        "user": "alice", "action": "login", "nested": {"id": 7},
+        "splunk_sourcetype": "okta", "splunk_source": "s", "splunk_index": "main",
+        "splunk_channel": "c", "host": "fwd-1", "source_type": "splunk_hec",
+        "timestamp": "2026-10-18T00:00:00Z",
+    });
+    let event = normalize(spread.clone());
+    assert_eq!(as_json(&event), payload);
+    assert_eq!(
+        event["message"],
+        r#"{"action":"login","nested":{"id":7},"user":"alice"}"#,
+        "key-sorted, byte-stable serialization"
+    );
+    assert_eq!(normalize(spread)["message"], event["message"]);
+    // An empty `.message` alongside spread fields is treated the same way.
+    let event = normalize(json!({"message": "", "user": "alice", "splunk_sourcetype": "okta"}));
+    assert_eq!(as_json(&event), json!({"user": "alice"}));
+
+    // A non-string `.message` is serialized, never dropped.
+    let event = normalize(json!({"message": {"user": "alice"}, "splunk_sourcetype": "okta"}));
+    assert_eq!(as_json(&event), json!({"user": "alice"}));
+
+    // Missing event: only envelope fields, so the message stays empty.
+    let event = normalize(json!({"splunk_sourcetype": "okta", "host": "fwd-1"}));
+    assert_eq!(event["message"], "");
+    assert_eq!(event["source_type"], "okta");
+}
+
+#[test]
+fn otlp_logs_use_edge_identity_and_bound_route() {
+    let program = transform_source(
+        include_str!("../../../config/vector/03-otlp-source.toml"),
+        "otlp_logs_prep",
+    );
+    let (event, metadata) = kept(run(
+        &program,
+        json!({
+            "message": "hello", "x-nano-credential-id": TOKEN,
+            "x-nano-source-route": "otlp_log",
+            "attributes": {"x-nano-credential-id": "forged", "source_type": "forged"}
+        }),
+        None,
+    ));
+    assert_eq!(event["auth_status"], "authenticated");
+    assert_eq!(event["source_type"], "otlp_log");
+    assert_eq!(metadata["nano_credential_id"], TOKEN);
+    assert_eq!(metadata["source_type"], "otlp_log");
+    assert!(event.get("x-nano-credential-id").is_none());
+    let (_, metadata) = kept(run(
+        &program,
+        json!({"message": "internal",
+        "attributes": {"x-nano-credential-id": "forged"}}),
+        None,
+    ));
+    assert!(metadata.get("nano_credential_id").is_none());
+}

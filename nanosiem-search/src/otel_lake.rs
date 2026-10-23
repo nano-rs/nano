@@ -163,9 +163,17 @@ struct RecentTracesResponse {
     traces: Vec<Value>,
 }
 
+/// The lake's metric-name catalog answer (NAN-4098: time-bounded, cached
+/// per tenant in the lake process).
 #[derive(Debug, Deserialize)]
-struct MetricNamesResponse {
-    names: Vec<Value>,
+pub struct LakeMetricNames {
+    pub names: Vec<Value>,
+    /// Start of the window the names cover; absent from older lake images.
+    #[serde(default)]
+    pub window_start: Option<chrono::DateTime<chrono::Utc>>,
+    /// True while the catalog covers less than its full window.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,7 +408,7 @@ impl OtelLakeClient {
     pub async fn metric_names(
         &self,
         service_name: Option<&str>,
-    ) -> Result<Vec<Value>, OtelLakeClientError> {
+    ) -> Result<LakeMetricNames, OtelLakeClientError> {
         let mut url = self.base_url.clone();
         url.set_path("v1/otel/metrics/names");
         if let Some(service_name) = service_name.filter(|value| !value.is_empty()) {
@@ -411,7 +419,7 @@ impl OtelLakeClient {
         if !response.status().is_success() {
             return Err(OtelLakeClientError::Status(response.status()));
         }
-        Ok(response.json::<MetricNamesResponse>().await?.names)
+        Ok(response.json::<LakeMetricNames>().await?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -794,5 +802,29 @@ mod tests {
         source.reload();
         assert_eq!(clients.client(tenant).unwrap().token, "b".repeat(48));
         assert!(clients.client(uuid::Uuid::now_v7()).is_none());
+    }
+
+    /// NAN-4098: the lake's catalog answer carries its coverage; an older lake
+    /// image's `{names, count}` still decodes (full, unbounded semantics).
+    #[test]
+    fn lake_metric_names_decodes_new_and_old_shapes() {
+        let new: LakeMetricNames = serde_json::from_value(serde_json::json!({
+            "names": [{"metric_name": "a"}],
+            "count": 1,
+            "window_start": "2026-10-17T23:00:00Z",
+            "partial": true
+        }))
+        .unwrap();
+        assert_eq!(new.names.len(), 1);
+        assert!(new.partial);
+        assert!(new.window_start.is_some());
+
+        let old: LakeMetricNames = serde_json::from_value(serde_json::json!({
+            "names": [{"metric_name": "a"}],
+            "count": 1
+        }))
+        .unwrap();
+        assert!(!old.partial);
+        assert!(old.window_start.is_none());
     }
 }

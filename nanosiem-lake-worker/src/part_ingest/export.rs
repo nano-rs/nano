@@ -221,7 +221,7 @@ fn make_manifest(state: &ExportState, tenant_id: &str, pending: &[(ExportHour, V
 }
 
 // Publish complete files, fsync contents and directory before advancing state.
-fn atomic_write(path: &Path, bytes: &[u8], immutable: bool) -> Result<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8], immutable: bool) -> Result<()> {
     let parent = path.parent().ok_or_else(|| anyhow::anyhow!("export path has no parent"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;

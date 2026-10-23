@@ -24,6 +24,11 @@
 //!
 //! Function bodies (`CREATE FUNCTION ... AS $$ ... $$`) are skipped: they run
 //! later as their caller, not as the migrator.
+//!
+//! NAN-4265: `scripts/check-core-migration-owner-window.py` is a port of this
+//! scan that `scripts/build-publish-control.sh` runs on every control build,
+//! because core 373 failed this test and still reached a live control migrate
+//! while CI tests were on hold. Change both together.
 
 use regex::Regex;
 use std::collections::BTreeSet;
@@ -33,6 +38,13 @@ use std::path::{Path, PathBuf};
 /// immutable; 340 / 350 / 352 used the ownership-skip pattern. 354 and 357
 /// were the first two to break the rule and are retired by NAN-3782.
 const FIRST_CHECKED_VERSION: u64 = 354;
+
+/// NAN-4340: enterprise migrations are scanned from the first one applied in
+/// no region. 9014400 created triggers on the owner-held alerts / cases /
+/// case_workflow_events outside the window and failed FP-T75 with
+/// "permission denied for table alerts". Never lower this floor: older
+/// enterprise migrations are applied and immutable.
+const FIRST_CHECKED_ENTERPRISE_VERSION: u64 = 9_014_400;
 
 fn migrations_dir(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../migrations").join(name)
@@ -202,7 +214,7 @@ fn all_files() -> (Vec<(u64, String, String)>, BTreeSet<String>) {
 #[test]
 fn registry_scan_finds_the_known_owner_held_tables() {
     let (_, registered) = all_files();
-    for table in ["cloud_credentials", "parser_repositories", "rule_repositories", "connector_feeds"] {
+    for table in ["cloud_credentials", "parser_repositories", "rule_repositories", "connector_feeds", "retro_hunt_rule_state"] {
         assert!(registered.contains(table), "registry scan lost {table}");
     }
     assert!(registered.len() > 100, "registry scan found only {} tables", registered.len());
@@ -228,6 +240,32 @@ fn core_migrations_alter_registered_tables_only_inside_the_owner_window() {
          when nano_shared.rls_role_contract is enabled; see 360):\n  {}",
         failures.join("\n  ")
     );
+}
+
+#[test]
+fn unapplied_enterprise_migrations_alter_registered_tables_only_inside_the_owner_window() {
+    let (_, registered) = all_files();
+    let mut failures = Vec::new();
+    let enterprise = sql_files(&migrations_dir("postgres-enterprise"));
+    for (version, name, sql) in &enterprise {
+        if *version < FIRST_CHECKED_ENTERPRISE_VERSION {
+            continue;
+        }
+        for (head, table) in violations(sql, &registered) {
+            failures.push(format!("{name}: {head} {table}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "enterprise migrations run owner-only DDL on RLS-registered tables outside the \
+         managed-owner bootstrap window (wrap it in a DO block that opens \
+         begin/end_managed_owner_bootstrap, as 9014700 does):\n  {}",
+        failures.join("\n  ")
+    );
+    // The shipped 9014400 trigger statement that failed FP-T75 is caught.
+    let shipped_9014400 = "CREATE TRIGGER soar_alert_committed AFTER INSERT ON public.alerts \
+        FOR EACH ROW EXECUTE FUNCTION nano_shared.enqueue_soar_source_event();";
+    assert_eq!(violations(shipped_9014400, &registered), vec![("create trigger".to_string(), "alerts".to_string())]);
 }
 
 /// The two bodies NAN-3782 retired must be caught, and their replacements pass.
@@ -271,12 +309,39 @@ CREATE TRIGGER t BEFORE INSERT ON public.rule_repositories FOR EACH ROW EXECUTE 
 ALTER TABLE public.cloud_credentials ADD COLUMN y INT;";
     assert!(violations(created_here, &registered).is_empty());
 
+    // NAN-4265: the 373 body #7238 shipped (hosted roll: "must be owner of
+    // table retro_hunt_rule_state").
+    let shipped_373 = "ALTER TABLE retro_hunt_rule_state
+    ADD COLUMN IF NOT EXISTS platform_revisions JSONB;";
+    assert_eq!(
+        violations(shipped_373, &registered),
+        vec![("alter table".to_owned(), "retro_hunt_rule_state".to_owned())]
+    );
+
     for file in [
+        "352_connector_feed_pending_delete.sql",
         "360_cloud_credentials_azure_event_hubs.sql",
         "361_first_party_ocsf_content_defaults.sql",
         "367_first_party_content_follows_main.sql",
+        "373_retro_hunt_platform_revisions.sql",
     ] {
         let sql = std::fs::read_to_string(migrations_dir("postgres").join(file)).unwrap();
         assert!(violations(&sql, &registered).is_empty(), "{file}");
     }
+}
+
+/// NAN-4265: core 373 skips an owner-held retro_hunt_rule_state and defers to
+/// enterprise 9014295, which must apply the SAME body inside the window.
+#[test]
+fn retro_hunt_platform_revisions_twin_bodies_match() {
+    let body = |dir: &str, file: &str| {
+        let sql = std::fs::read_to_string(migrations_dir(dir).join(file)).unwrap();
+        let (begin, end) = ("-- BEGIN retro_hunt_platform_revisions body", "-- END retro_hunt_platform_revisions body");
+        let start = sql.find(begin).unwrap_or_else(|| panic!("{file}: no body start marker")) + begin.len();
+        let stop = sql.find(end).unwrap_or_else(|| panic!("{file}: no body end marker"));
+        sql[start..stop].to_owned()
+    };
+    let core = body("postgres", "373_retro_hunt_platform_revisions.sql");
+    assert!(core.contains("ADD COLUMN IF NOT EXISTS platform_revisions JSONB"), "{core}");
+    assert_eq!(core, body("postgres-enterprise", "9014295_retro_hunt_platform_revisions.sql"));
 }

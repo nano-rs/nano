@@ -55,7 +55,7 @@ export function fmtPct(v: number | null | undefined): string {
 }
 
 /** Design health tone (the mock uses `danger`, the backend wire uses `bad`). */
-export type DesignHealth = 'good' | 'warn' | 'danger';
+export type DesignHealth = 'good' | 'warn' | 'danger' | 'neutral';
 
 /** Translate the backend `ServiceHealth` wire value to the design tone. */
 export function toDesignHealth(h: ServiceHealth): DesignHealth {
@@ -73,6 +73,7 @@ interface HealthTone {
 
 /** health → tailwind tone classes (1:1 with the design's HEALTH table). */
 export const HEALTH: Record<DesignHealth, HealthTone> = {
+  neutral: { dot: 'bg-fg-3', text: 'text-fg-3', bg: 'bg-foreground/5 border-border', label: 'No latency objective', sev: 3 },
   danger: { dot: 'bg-danger', text: 'text-danger', bg: 'bg-danger/12 border-danger/30', label: 'Critical', sev: 0 },
   warn: { dot: 'bg-warn', text: 'text-warn', bg: 'bg-warn/12 border-warn/30', label: 'Degraded', sev: 1 },
   good: { dot: 'bg-good', text: 'text-good', bg: 'bg-good/10 border-good/30', label: 'Healthy', sev: 2 },

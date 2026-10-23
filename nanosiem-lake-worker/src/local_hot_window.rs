@@ -325,6 +325,23 @@ pub fn configured_max_bytes(value: Option<&str>) -> Result<u64> {
     Ok(DEFAULT_MAX_BYTES)
 }
 
+/// NAN-4154: the size of the filesystem holding `root` (statvfs blocks).
+pub fn filesystem_total(root: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(root.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: path is NUL-terminated and stat points to writable storage.
+    ensure!(
+        unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } == 0,
+        "statvfs {}: {}",
+        root.display(),
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: successful statvfs initialized stat.
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_blocks.saturating_mul(stat.f_frsize))
+}
+
 /// Leave a eighth of this filesystem for ingest/merge scratch by default.
 /// Only currently available blocks plus our existing residency are claimable.
 pub fn capacity(root: &Path, reserve: Option<u64>, resident: u64) -> Result<u64> {

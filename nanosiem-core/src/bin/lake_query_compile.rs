@@ -10,13 +10,16 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use nanosiem_core::query::{
-    ClickHouseSqlGenerator, Command, Comparator, Query, QueryOptions, RhsSyntax, SearchExpr,
-    TimeRange, Value,
+    ClickHouseSqlGenerator, Command, Query, QueryOptions, SearchExpr,
+    TimeRange,
     parse_query, validate_query_fields_with_profile,
 };
 use nanosiem_core::schema::{
     FieldResolution, FieldType, OcsfProfile, RiskProfile, SchemaId, SchemaProfile, profile_for_id,
 };
+use nanosiem_core::search::lake_candidate_hints::{CandidateHint, candidate_hints};
+#[cfg(test)]
+use nanosiem_core::search::lake_candidate_hints::source_search_expression;
 use nanosiem_core::search::query_processing::{
     apply_auto_sort, apply_profile_product_semantics, contains_lake_post_processing_anywhere,
     query_has_nested_scan,
@@ -103,491 +106,6 @@ struct CompileResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     projected_scan_columns: Vec<String>,
     sql: String,
-}
-
-/// A compiler-proven safe superset lookup for the immutable serving sidecars.
-///
-/// This is deliberately only a hint. The worker always runs the complete
-/// compiled query against the candidate blocks, so the sidecar never becomes
-/// an event truth source and cannot introduce false-positive results.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum CandidateHint {
-    Entity { source_path: String, value: String },
-    SourceFamily { value: String },
-    /// NAN-3188: `class_uid = value`, emitted only as a top-level-AND
-    /// conjunct (never inside OR / NOT). It lets the worker skip a whole
-    /// source/class family file whose signed class is another value.
-    Class { value: i64 },
-    Keyword { mode: &'static str, value: String },
-    Any { alternatives: Vec<CandidateHint> },
-}
-
-const ENTITY_SIDECAR_PATHS: &[&str] = &[
-    "src_endpoint.ip",
-    "dst_endpoint.ip",
-    "src_endpoint.mac",
-    "dst_endpoint.mac",
-    "src_endpoint.hostname",
-    "dst_endpoint.hostname",
-    "device.hostname",
-    "user.name",
-    "user.uid",
-    "actor.user.name",
-    "actor.user.uid",
-    "process.name",
-    "process.uid",
-    "actor.process.name",
-    "actor.process.uid",
-    "file.hashes.value",
-    "process.file.hashes.value",
-    "url.hostname",
-    "query.hostname",
-    "url.url_string",
-    "answers.rdata",
-    "email.from",
-    "email.to",
-    "vulnerabilities.cve.uid",
-    "resources.ip",
-    "resources.hostname",
-    "resources.device.hostname",
-    "resources.user.name",
-    "resources.user.uid",
-    "resources.uid",
-    "evidences.query.hostname",
-    "evidences.url.url_string",
-    "trace.uid",
-    "trace.span.uid",
-    "unmapped.trace_id",
-    "unmapped.span_id",
-    "metadata.uid",
-    "enrichments.value",
-    // NAN-3694: asset-pivot identities (worker `IDENTITY_PATHS` blooms). An
-    // OR prunes only when every leg is hinted, so one unhinted `device.ip`
-    // leg turned the whole IP pivot into a full scan.
-    "device.ip",
-    "device.uid",
-    "user.email_addr",
-    "actor.user.email_addr",
-    "actor.process.user.name",
-];
-
-// The contract lives in `nanosiem_core::search::keyword_sidecar` so the lake
-// worker that builds the index asserts against the same list. See that module
-// for why a hinted-but-unindexed path is a silent zero-result, not a missed
-// optimization.
-use nanosiem_core::search::keyword_sidecar::KEYWORD_SIDECAR_PATHS;
-
-const MAX_CANDIDATE_HINTS: usize = 8;
-
-fn source_search_expression(query: &Query) -> &SearchExpr {
-    match query {
-        Query::Search(expression) => expression,
-        Query::Piped { source, .. } => source_search_expression(source),
-    }
-}
-
-fn exact_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value.clone()),
-        Value::Ip(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-/// Return one literal token that every match of `pattern` must contain.
-///
-/// This deliberately accepts fewer regexes than ClickHouse can execute. A
-/// missed optimization only causes a bounded source scan; an invented guard
-/// could hide events, so alternations intersect their guarantees and optional
-/// repetitions contribute nothing.
-fn mandatory_regex_token(pattern: &str) -> Option<String> {
-    use regex_syntax::hir::{Hir, HirKind};
-
-    fn tokens(value: &[u8]) -> BTreeSet<String> {
-        let Ok(value) = std::str::from_utf8(value) else {
-            return BTreeSet::new();
-        };
-        value
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|token| token.chars().count() >= 3)
-            .map(str::to_lowercase)
-            .collect()
-    }
-
-    fn required(hir: &Hir) -> BTreeSet<String> {
-        match hir.kind() {
-            HirKind::Literal(literal) => tokens(&literal.0),
-            HirKind::Capture(capture) => required(&capture.sub),
-            HirKind::Repetition(repetition) if repetition.min > 0 => required(&repetition.sub),
-            HirKind::Concat(expressions) => expressions
-                .iter()
-                .flat_map(required)
-                .collect::<BTreeSet<_>>(),
-            HirKind::Alternation(expressions) => {
-                let mut expressions = expressions.iter();
-                let Some(first) = expressions.next() else {
-                    return BTreeSet::new();
-                };
-                expressions.fold(required(first), |common, expression| {
-                    common
-                        .intersection(&required(expression))
-                        .cloned()
-                        .collect()
-                })
-            }
-            HirKind::Empty | HirKind::Class(_) | HirKind::Look(_) | HirKind::Repetition(_) => {
-                BTreeSet::new()
-            }
-        }
-    }
-
-    // Nano executes positive regexes case-insensitively. Removing only the
-    // leading global flag preserves the language while keeping literals as
-    // literals in regex-syntax's HIR instead of expanded character classes.
-    let pattern = pattern.strip_prefix("(?i)").unwrap_or(pattern);
-    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
-    required(&hir)
-        .into_iter()
-        .max_by_key(|token| token.chars().count())
-}
-
-/// The entity-sidecar columns an `=` filter on `field` compares, or `None`
-/// when that comparison is not an exact match of sidecar-indexed columns.
-///
-/// A canonical sidecar path is itself. NAN-3162: a product alias resolves the
-/// way the SQL generator resolves it -- `host` / `src_ip` / `dest_host` to
-/// their one explicit column, and a class-split alias (`user`, `src_host`,
-/// `process_name`) to BOTH of its columns, because it lowers to
-/// `if(a != '', a, b) = v`: every matching row holds `v` in `a` or in `b`, so
-/// the union of the two exact lookups is a superset. Anything else (JSON
-/// paths, computed columns, a split with an unindexed side) yields no hint,
-/// which is always sound.
-fn entity_sidecar_paths(field: &str, profile: &dyn SchemaProfile) -> Option<Vec<&'static str>> {
-    let indexed = |path: &str| ENTITY_SIDECAR_PATHS.iter().copied().find(|known| *known == path);
-    if let Some(path) = indexed(field) {
-        return Some(vec![path]);
-    }
-    if profile.source_computed_column(field).is_some() {
-        return None;
-    }
-    if let Some((primary, fallback)) = profile.class_split_source_fields(field) {
-        return Some(vec![indexed(primary)?, indexed(fallback)?]);
-    }
-    match profile.resolve(field) {
-        FieldResolution::ExplicitColumn(column) => indexed(&column).map(|path| vec![path]),
-        _ => None,
-    }
-}
-
-/// `metadata.log_source` itself, or an alias the profile resolves to exactly
-/// that column (`source_type`, `sourcetype`). NAN-3221: `source_type=audit`
-/// compiled to the same `lower("metadata.log_source") = 'audit'` predicate
-/// but carried no source-family hint, so no file was pruned by its signed
-/// family and a 24 h page scanned every file (a 502 after 60 s).
-fn is_log_source_field(field: &str, profile: &dyn SchemaProfile) -> bool {
-    field == "metadata.log_source"
-        || (profile.source_computed_column(field).is_none()
-            && matches!(profile.resolve(field), FieldResolution::ExplicitColumn(column) if column == "metadata.log_source"))
-}
-
-fn candidate_hint_for_expression(
-    expression: &SearchExpr,
-    profile: &dyn SchemaProfile,
-) -> Option<CandidateHint> {
-    match expression {
-        SearchExpr::FieldFilter {
-            field,
-            op: Comparator::Eq,
-            value,
-            rhs,
-        } if is_log_source_field(field, profile)
-            && (*rhs == RhsSyntax::Literal
-                || (*rhs == RhsSyntax::Bareword
-                    && exact_text(value).is_some_and(|text| !profile.is_known_field(&text))))
-            && exact_text(value).is_some_and(|text| !text.is_empty() && !text.contains(['*', '?'])) =>
-        {
-            Some(CandidateHint::SourceFamily {
-                value: exact_text(value).expect("guarded above"),
-            })
-        }
-        SearchExpr::Keyword(value) if !value.trim().is_empty() && value.trim() != "*" => {
-            // A wildcard keyword (`svch*`, `*svchost*`, `c?d`) compiles to a
-            // substring `iLike`, not `hasAllTokens`: its pieces may be PARTIAL
-            // tokens. `token` mode would make the generation keyword sidecar
-            // require the whole token `svch` and prune every `svchost` row;
-            // `contains` expands pieces through the fragment lane (or falls
-            // back), and part-index pruning keeps only interior tokens for both
-            // modes (NAN-3032/NAN-3034).
-            let mode = if value.contains(['*', '?']) { "contains" } else { "token" };
-            Some(CandidateHint::Keyword {
-                mode,
-                value: value.clone(),
-            })
-        }
-        // NAN-2380: a BAREWORD right-hand side may be a column reference
-        // (`src_endpoint.ip = dest_endpoint.ip`), and a sidecar candidate hint
-        // built from a column NAME would prune to the files containing that
-        // text — i.e. none — turning a field-to-field hunt into a silent
-        // zero-result. NAN-3162: so ask the generator's own classifier. A
-        // bareword it reads as a VALUE (`host=web1.corp.local`, `user=alice`)
-        // compiles to exactly the SQL of its quoted spelling and gets exactly
-        // its hint; a column reference or an ambiguous token gets none.
-        SearchExpr::FieldFilter {
-            field,
-            op,
-            value,
-            rhs,
-        }
-            if *op == Comparator::Eq
-                && nanosiem_core::query::rhs_compiles_as_value(profile, field, op, value, *rhs)
-                && entity_sidecar_paths(field, profile).is_some()
-                && exact_text(value).is_some()
-                // NAN-2361: a dotless literal on a host-entity field does NOT
-                // compile to exact equality -- the SQL generator expands it to
-                // `= v OR startsWith(col, 'v.')` so short names match FQDNs.
-                // An exact-value entity hint is then NARROWER than the
-                // predicate it accompanies, and candidates PRUNE the source, so
-                // every object holding only the FQDN was discarded before the
-                // SQL could accept it: `device.hostname="ws-fin-011"` returned
-                // ZERO on promoted data while the identical query worked on the
-                // hot tail (which carries no entity sidecar to prune with).
-                // Emitting no hint is always sound -- it only costs pruning.
-                && !nanosiem_core::query::hostname_equality_expands(
-                    profile,
-                    field,
-                    &exact_text(value).expect("guarded above"),
-                ) =>
-        {
-            let text = exact_text(value).expect("guarded above");
-            let paths = entity_sidecar_paths(field, profile).expect("guarded above");
-            // These Eq literals lower to empty/notEmpty, iLike, or IP range
-            // predicates, so an exact-value hint could discard matching rows.
-            let is_ip = |path: &str| {
-                profile.entity_type(path) == Some(nanosiem_core::schema::EntityType::Ip)
-                    || profile.field_type(path) == Some(nanosiem_core::schema::FieldType::IpAddress)
-                    || path.ends_with(".ip")
-            };
-            if text.is_empty()
-                || text.contains(['*', '?'])
-                || (text.contains('/') && (is_ip(field) || paths.iter().any(|path| is_ip(path))))
-            {
-                return None;
-            }
-            let mut hints = paths
-                .into_iter()
-                .map(|path| CandidateHint::Entity {
-                    source_path: path.to_string(),
-                    value: text.clone(),
-                })
-                .collect::<Vec<_>>();
-            Some(if hints.len() == 1 {
-                hints.pop().expect("one hint")
-            } else {
-                CandidateHint::Any { alternatives: hints }
-            })
-        }
-        SearchExpr::FieldFilter {
-            field,
-            op,
-            value,
-            rhs,
-        }
-            if nanosiem_core::query::rhs_compiles_as_value(profile, field, op, value, *rhs)
-                && matches!(
-                op,
-                Comparator::Eq
-                    | Comparator::Contains
-                    | Comparator::StartsWith
-                    | Comparator::EndsWith
-            ) && KEYWORD_SIDECAR_PATHS.contains(&field.as_str())
-                && matches!(value, Value::String(text) if !text.trim().is_empty()) =>
-        {
-            Some(CandidateHint::Keyword {
-                mode: "contains",
-                value: exact_text(value).expect("guarded above"),
-            })
-        }
-        SearchExpr::FieldFilter { field, op, value, .. }
-            if *op == Comparator::Regex
-                && KEYWORD_SIDECAR_PATHS.contains(&field.as_str())
-                && matches!(value, Value::Regex(pattern) if mandatory_regex_token(pattern).is_some()) =>
-        {
-            let Value::Regex(pattern) = value else {
-                unreachable!("guarded above")
-            };
-            Some(CandidateHint::Keyword {
-                mode: "regex_guard",
-                value: mandatory_regex_token(pattern).expect("guarded above"),
-            })
-        }
-        _ => None,
-    }
-}
-
-/// NAN-3188: the class a positive `class_uid = <integer>` filter requires,
-/// or `None`. Only the exact canonical field (after alias resolution) and an
-/// integral literal qualify: a quoted literal must be the canonical decimal
-/// spelling so it compares equal to the number. This is consulted only for
-/// mandatory AND conjuncts, never under OR or NOT: a file of another class
-/// can still hold rows matching another OR branch.
-fn class_hint_for_expression(expression: &SearchExpr, profile: &dyn SchemaProfile) -> Option<CandidateHint> {
-    let SearchExpr::FieldFilter { field, op: Comparator::Eq, value, rhs } = expression else {
-        return None;
-    };
-    if profile.canonicalize(field).as_ref() != "class_uid"
-        || !nanosiem_core::query::rhs_compiles_as_value(profile, field, &Comparator::Eq, value, *rhs)
-    {
-        return None;
-    }
-    let class = match value {
-        Value::Number(number) if number.is_finite() && number.fract() == 0.0 && number.abs() < 9.0e15 => *number as i64,
-        Value::String(text) => {
-            let parsed = text.parse::<i64>().ok()?;
-            (parsed.to_string() == *text).then_some(parsed)?
-        }
-        _ => return None,
-    };
-    Some(CandidateHint::Class { value: class })
-}
-
-// An OR can prune only when EVERY branch has a safe lookup. Keep the union
-// explicit in the wire contract; the worker must never intersect its children.
-fn disjunctive_hint(expression: &SearchExpr, profile: &dyn SchemaProfile) -> Option<CandidateHint> {
-    fn collect(expression: &SearchExpr, profile: &dyn SchemaProfile, out: &mut Vec<CandidateHint>) -> Option<()> {
-        if out.len() >= MAX_CANDIDATE_HINTS { return None; }
-        match expression {
-            SearchExpr::Or(left, right) => { collect(left, profile, out)?; collect(right, profile, out)?; }
-            SearchExpr::Group(inner) => collect(inner, profile, out)?,
-            // A class-split alias (`user=alice`) is itself a union; inside an
-            // OR it contributes its alternatives, never a nested union.
-            other => match candidate_hint_for_expression(other, profile)? {
-                CandidateHint::Any { alternatives } => out.extend(alternatives),
-                hint => out.push(hint),
-            },
-        }
-        Some(())
-    }
-    let mut alternatives = Vec::new();
-    collect(expression, profile, &mut alternatives)?;
-    if alternatives.len() > MAX_CANDIDATE_HINTS {
-        return None;
-    }
-    Some(CandidateHint::Any { alternatives })
-}
-
-/// Collect only predicates that are mandatory for every matching row.
-///
-/// A child of an `AND` remains a safe candidate superset: the complete query
-/// is always rechecked against the selected blocks. `OR` requires a complete union of safe branch lookups; `NOT` stays opaque.
-/// Selecting only one OR child could discard matching rows. Grouping is transparent. Keeping this proof in the compiler means
-/// the worker never has to interpret analyst query syntax.
-fn collect_conjunctive_hints(
-    expression: &SearchExpr,
-    profile: &dyn SchemaProfile,
-    hints: &mut Vec<CandidateHint>,
-) {
-    let probes = hints.iter().map(|hint| match hint {
-        CandidateHint::Any { alternatives } => alternatives.len(),
-        _ => 1,
-    }).sum::<usize>();
-    if probes >= MAX_CANDIDATE_HINTS { return; }
-    match expression {
-        SearchExpr::And(left, right) => {
-            collect_conjunctive_hints(left, profile, hints);
-            collect_conjunctive_hints(right, profile, hints);
-        }
-        SearchExpr::Group(inner) => collect_conjunctive_hints(inner, profile, hints),
-        SearchExpr::Or(_, _) => {
-            if let Some(CandidateHint::Any { alternatives }) = disjunctive_hint(expression, profile) {
-                // Preserve the existing total probe bound across AND groups.
-                // A union that does not fit must be dropped in its entirety.
-                if probes + alternatives.len() <= MAX_CANDIDATE_HINTS {
-                    hints.push(CandidateHint::Any { alternatives });
-                }
-            }
-        }
-        expression => {
-            // NAN-3188: a mandatory class equality is a whole-file class
-            // hint. Its arm is reached only through AND / Group, never OR or
-            // NOT, which are handled (or left opaque) above.
-            if let Some(hint) = class_hint_for_expression(expression, profile) {
-                if probes < MAX_CANDIDATE_HINTS && !hints.contains(&hint) {
-                    hints.push(hint);
-                }
-                return;
-            }
-            if let Some(hint) = candidate_hint_for_expression(expression, profile) {
-                let cost = match &hint {
-                    CandidateHint::Any { alternatives } => alternatives.len(),
-                    _ => 1,
-                };
-                if probes + cost <= MAX_CANDIDATE_HINTS && !hints.contains(&hint) {
-                    hints.push(hint);
-                }
-            }
-        }
-    }
-}
-
-fn candidate_hints(
-    query: &Query,
-    dataset: &str,
-    profile: &dyn SchemaProfile,
-) -> Vec<CandidateHint> {
-    // NAN-2961: every scan of a correlation query (join / append / IN
-    // subsearch) binds the SAME candidate part set. Hints from the outer
-    // search alone would drop the parts only a subsearch matches, so a
-    // correlation query reads the full time-bounded part set.
-    if dataset != "logs" || query_has_nested_scan(query) {
-        return Vec::new();
-    }
-    let mut hints = Vec::new();
-    collect_conjunctive_hints(source_search_expression(query), profile, &mut hints);
-    collect_source_family_where_hints(query, profile, &mut hints);
-    hints
-}
-
-/// A post-search `where` may be moved to file selection only while every
-/// preceding command preserves the original log-source column and row set.
-/// In particular, `head`, aggregation, and an eval that replaces log_source
-/// make the pushdown unsound.
-fn collect_source_family_where_hints(
-    query: &Query,
-    profile: &dyn SchemaProfile,
-    hints: &mut Vec<CandidateHint>,
-) -> bool {
-    match query {
-        Query::Search(_) => true,
-        Query::Piped { source, command } => {
-            if !collect_source_family_where_hints(source, profile, hints) {
-                return false;
-            }
-            match command {
-                Command::Eval { assignments } => assignments
-                    .iter()
-                    .all(|assignment| assignment.field != "metadata.log_source"),
-                Command::Where { condition } => {
-                    let mut candidates = Vec::new();
-                    collect_conjunctive_hints(condition, profile, &mut candidates);
-                    for candidate in candidates {
-                        let source_only = match &candidate {
-                            CandidateHint::SourceFamily { .. } => true,
-                            CandidateHint::Any { alternatives } => alternatives.iter().all(
-                                |alternative| matches!(alternative, CandidateHint::SourceFamily { .. }),
-                            ),
-                            _ => false,
-                        };
-                        if source_only && hints.len() < MAX_CANDIDATE_HINTS {
-                            hints.push(candidate);
-                        }
-                    }
-                    true
-                }
-                _ => false,
-            }
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -899,8 +417,10 @@ fn compile(request: CompileRequest) -> Result<CompileResponse> {
     };
     apply_profile_product_semantics(&mut query, profile.as_ref());
     if dataset == "logs" && contains_lake_post_processing_anywhere(&query) {
+        // NAN-4287: a 400 the analyst can act on, naming the supported shape.
         bail!(
-            "lake compiler cannot execute Nano-side lookup, prevalence, inputlookup, identity, or AI stages"
+            "lake compiler cannot execute Nano-side lookup, prevalence, inputlookup, identity, or AI stages here. {}",
+            nanosiem_core::search::service::LAKE_LOOKUP_ALTERNATIVE
         );
     }
     let field_errors = validate_query_fields_with_profile(&query, Some(profile.as_ref()));
@@ -972,7 +492,9 @@ fn compile(request: CompileRequest) -> Result<CompileResponse> {
     // progressively (the worker bounds that sort; see the builder's docs).
     let mut generator = ClickHouseSqlGenerator::with_table(source_placeholder)
         .with_profile(profile.clone())
-        .with_uid_tiebreak_any_window(true);
+        .with_uid_tiebreak_any_window(true)
+        // NAN-4164: multi-token bare keywords match as an adjacent term.
+        .with_keyword_term_adjacency(true);
     if internal_distinct_state {
         // SearchService merges these exact, bounded values states across
         // scan-budgeted slices. The normal user-facing values() cap of 100
@@ -1208,6 +730,9 @@ fn is_newest_first_event_projection(query: &Query) -> bool {
                     Command::Table { .. }
                         | Command::Fields { .. }
                         | Command::Head { .. }
+                        // NAN-4236: a row filter keeps the newest-first
+                        // order and is exact per disjoint time chunk.
+                        | Command::Where { .. }
                         | Command::Rename { .. }
                         | Command::Fillnull { .. }
                         | Command::Eval { .. }
@@ -1388,6 +913,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn launch_auth_enum_queries_compile_to_ids() {
+        for field in ["auth_result", "status_id"] {
+            for label in ["failure", "Failure", "FAILURE"] {
+                let output = compile(request(&format!("class_name=Authentication {field}={label} | stats count"))).unwrap();
+                assert!(output.sql.contains("status_id"), "{}", output.sql);
+                assert!(!output.sql.to_lowercase().contains("'failure'"), "{}", output.sql);
+                assert!(output.sql.contains("= 2"), "{}", output.sql);
+            }
+            for suffix in ["=not_an_outcome", " IN (failure, not_an_outcome)"] {
+                assert!(compile(request(&format!("{field}{suffix} | stats count"))).is_err());
+            }
+            assert!(compile(request(&format!("{field} IN (failure, success) | stats count"))).unwrap().sql.contains("IN (2, 1)"));
+            assert!(compile(request(&format!("{field}!=Failure | stats count"))).unwrap().sql.contains("!= 2"));
+        }
+        let disposition = compile(request("disposition_id=Blocked | stats count")).unwrap();
+        assert!(disposition.sql.contains("= 2"), "{}", disposition.sql);
+        assert!(compile(request("unresolvable_auth_alias=failure | stats count")).is_err());
+        let file = compile(request("class_uid=1001 file_action=create | stats count")).unwrap();
+        assert!(file.sql.contains("activity_name"), "{}", file.sql);
+    }
+
+    #[test]
+    fn launch_protocol_queries_use_iana_ids_and_declare_fallback_columns() {
+        for field in ["protocol", "protocol_name", "connection_info.protocol_name", "connection_info.protocol_num"] {
+            for label in ["tcp", "TCP", "Tcp"] {
+                let output = compile(request(&format!("class_name=\"Network Activity\" {field}={label} | stats count"))).unwrap();
+                assert!(output.sql.contains("connection_info.protocol_num"), "{}", output.sql);
+                assert!(output.sql.contains("= 6"), "{}", output.sql);
+                if field != "connection_info.protocol_num" {
+                    assert!(output.sql.contains("connection_info.protocol_name"), "{}", output.sql);
+                }
+                assert!(output.required_columns.iter().any(|c| c.name == "connection_info.protocol_num"));
+            }
+            assert!(compile(request(&format!("{field}=not_a_protocol | stats count"))).is_err());
+            let output = compile(request(&format!("{field} IN (tcp, udp) | stats count"))).unwrap();
+            assert!(output.sql.contains("connection_info.protocol_num"), "{}", output.sql);
+        }
+    }
+
     /// NAN-3059: `event_type=<label>` compares the class-scoped enum's label
     /// column (`lower(activity_name) = …`). A projected plan such as the
     /// documented process tree must declare that column, or stage 0 fails on
@@ -1479,7 +1044,8 @@ mod tests {
         }
     }
 
-    /// NAN-2994: the whole gen1 k6 realistic corpus (94 queries, also driven
+    /// NAN-2994: the whole gen1 k6 realistic corpus (94 queries plus the 14
+    /// NAN-4164 keyword-class queries, also driven
     /// by `benchmarks/k6/lean_gate_search.js`) passes BOTH lean validation
     /// hops: the Search front door, whose cell-tenant profile has no snapshot
     /// inventory, and query[T]'s compile against a stored lake schema (the
@@ -1497,7 +1063,7 @@ mod tests {
             .flat_map(|domain| domain["queries"].as_array().unwrap())
             .map(|query| query["query"].as_str().unwrap())
             .collect();
-        assert_eq!(queries.len(), 94);
+        assert_eq!(queries.len(), 108);
         assert!(queries
             .iter()
             .any(|query| query.contains("metadata.event_code")));
@@ -1575,6 +1141,32 @@ mod tests {
     /// NAN-3188: a mandatory `class_uid = N` becomes a whole-file class
     /// hint; under OR or NOT it must not (another branch / the complement
     /// can match rows of any class).
+    /// NAN-4291 (F6): an ungrouped `stats` over no rows is one row with count
+    /// 0 and every other aggregate null, not its type default (1970 for
+    /// `max(time)`, `''` for `values`, 0 / NaN for `sum` / `avg`). Counts and
+    /// distinct counts stay 0. Grouped stats over no rows have no rows, so
+    /// their aggregates are unchanged.
+    #[test]
+    fn ungrouped_aggregates_are_null_over_no_rows() {
+        let compiled = compile(request(
+            "* | stats count, dc(actor.user.name) as users, max(time) as mt, \
+             values(actor.user.name) as v, avg(dst_endpoint.port) as a, sum(eval(dst_endpoint.port=443)) as tls",
+        ))
+        .unwrap();
+        for wrapped in ["max(", "arrayStringConcat(", "avg(", "sumIf("] {
+            assert!(
+                compiled.sql.contains(&format!("if(count() = 0, NULL, {wrapped}")),
+                "{wrapped} is null over no rows: {}",
+                compiled.sql
+            );
+        }
+        assert!(compiled.sql.contains("count() AS `count`") || compiled.sql.contains("count() AS count"), "{}", compiled.sql);
+        assert!(!compiled.sql.contains("NULL, uniqExact("), "{}", compiled.sql);
+
+        let grouped = compile(request("* | stats count, max(time) as mt by actor.user.name")).unwrap();
+        assert!(!grouped.sql.contains("if(count() = 0"), "{}", grouped.sql);
+    }
+
     #[test]
     fn class_uid_equality_under_and_is_a_class_hint_only() {
         let classes = |query: &str| {
@@ -1604,14 +1196,22 @@ mod tests {
             "class_uid!=4001",
             "class_uid>4000",
             r#"class_uid="04001""#,
-            r#"class_uid="4001x""#,
             "class_uid=4001.5",
             "class_uid IN (4001, 1001)",
-            // A post-search where is not a search-term conjunct.
-            "dst_endpoint.port=445 | where class_uid=4001",
+            // A where after a row-changing command is no candidate superset.
+            "dst_endpoint.port=445 | head 10 | where class_uid=4001",
         ] {
             assert!(classes(query).is_empty(), "{query}");
         }
+        // NAN-3341 (#7013) made a non-numeric label on a numeric OCSF field a
+        // loud compile error (it silently matched nothing before), so this
+        // case no longer compiles at all, let alone hints a class.
+        // NAN-4155 (#7215) made a where over raw events hint like its
+        // search-term spelling (same or narrower predicate), so a class where
+        // is a class hint too.
+        assert_eq!(classes("dst_endpoint.port=445 | where class_uid=4001"), class(4001));
+        let label = compile(request(r#"class_uid="4001x""#)).unwrap_err();
+        assert!(format!("{label:#}").contains("Cannot resolve label '4001x'"), "{label:#}");
         let output = compile(request("class_uid=4001 dst_endpoint.port=445")).unwrap();
         assert!(output.sql.contains("4001"), "the SQL still filters rows: {}", output.sql);
         let wire = serde_json::to_value(&output.candidate_hints).unwrap();
@@ -2515,9 +2115,21 @@ mod tests {
 
     #[test]
     fn row_preserving_ocsf_projection_retains_newest_first_proof() {
-        // NAN-3060: these compile to an UNORDERED outer `SELECT … LIMIT n`,
-        // so they never claim a cursor-continuable newest-first order (cursor
-        // pages over them repeated and skipped rows).
+        // NAN-3060: a shape that compiles to an UNORDERED outer `SELECT …
+        // LIMIT n` never claims a cursor-continuable newest-first order
+        // (cursor pages over them repeated and skipped rows).
+        for query in [
+            "* | table time, src_endpoint.ip | where isnotnull(src_endpoint.ip)",
+            "* | table time, metadata.uid | rename metadata.uid AS u",
+            "* | sort time",
+        ] {
+            let output = compile(request(query)).expect("projection should compile");
+            assert!(!ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
+            assert!(!output.newest_first_event_rows, "{query}: {}", output.sql);
+        }
+        // NAN-4263: a projection only picks columns. It now ends in the
+        // event cursor order itself (ordered by the source key it reads), so
+        // it keeps the proof; `sort -time` restates the implicit order.
         for query in [
             "* | table time, src_endpoint.ip, process.cmd_line",
             "* | fields time, metadata.uid",
@@ -2526,17 +2138,18 @@ mod tests {
             "* | table time, metadata.uid | sort -time",
         ] {
             let output = compile(request(query)).expect("projection should compile");
-            assert!(!ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
-            assert!(!output.newest_first_event_rows, "{query}: {}", output.sql);
+            assert!(ends_in_event_cursor_order(&output.sql) && output.newest_first_event_rows, "{query}: {}", output.sql);
         }
         for query in ["*", "* | eval x=1", "* | sort -time | head 50", "* | head 5"] {
             let output = compile(request(query)).expect("event query should compile");
             assert!(ends_in_event_cursor_order(&output.sql) && output.newest_first_event_rows, "{query}: {}", output.sql);
         }
 
+        // NAN-4236: a row filter keeps the newest-first order (like a search
+        // term) and is exact per disjoint time chunk, so it pages too.
         let filtered = compile(request("* | where isnotnull(src_endpoint.ip)"))
             .expect("filtered event query should compile");
-        assert!(!filtered.newest_first_event_rows);
+        assert!(filtered.newest_first_event_rows && ends_in_event_cursor_order(&filtered.sql), "{}", filtered.sql);
 
         let headed = compile(request(
             r#"metadata.log_source="windows_sysmon" | head 3"#,
@@ -2595,6 +2208,197 @@ mod tests {
         assert_eq!(trailing_newest_first_limit(&plain.sql), Some(100));
     }
 
+    /// NAN-4278 (searchfuzz F4/F8): an explicit order survives to the end of
+    /// the statement, and `tail N` / `reverse` invert the order the rows are
+    /// actually in. Before, `sort -x | head N` was re-sorted newest-first by
+    /// the implicit outer order, and `tail N` took the NEWEST N rows.
+    #[test]
+    fn explicit_orders_end_the_statement_and_tail_inverts_the_current_order() {
+        let final_statement = |sql: &str| sql.rsplit_once("\nSELECT ").map(|(_, last)| last.to_string()).unwrap();
+        const OLDEST_FIRST: &str = "ORDER BY time ASC NULLS FIRST, \"metadata.uid\" ASC NULLS FIRST";
+        const BY_LENGTH: &str = "ORDER BY \"http_response.length\" DESC, time DESC, \"metadata.uid\" DESC";
+        // Default newest-first listing: `tail N` is the oldest N, oldest first.
+        for query in ["* | tail 5", "* | tail 5 | table time, metadata.uid", "* | tail 5 | fields time, metadata.uid"] {
+            let output = compile(request(query)).unwrap();
+            assert!(output.sql.contains(&format!("  SELECT * FROM stage_0\n  {OLDEST_FIRST}\n  LIMIT 5\n")), "{query}: {}", output.sql);
+            assert!(!final_statement(&output.sql).contains("DESC"), "{query}: {}", output.sql);
+            assert!(!output.newest_first_event_rows, "{query}");
+        }
+        // `sort x | head/where` ends in the user's order, never the time cursor.
+        for query in [
+            "* | sort -http_response.length | head 20",
+            "* | sort -http_response.length | where severity_id=1 | head 20",
+            "* | sort -http_response.length",
+        ] {
+            let output = compile(request(query)).unwrap();
+            assert!(final_statement(&output.sql).contains(&format!("{BY_LENGTH} LIMIT ")), "{query}: {}", output.sql);
+            assert!(!output.newest_first_event_rows, "{query}");
+        }
+        // A projection after the sorted head keeps the head's order (no re-sort).
+        for query in [
+            "* | sort -http_response.length | head 20 | table http_response.length, time",
+            "* | sort -http_response.length | head 20 | fields http_response.length, time",
+        ] {
+            let output = compile(request(query)).unwrap();
+            assert!(!final_statement(&output.sql).contains("ORDER BY"), "{query}: {}", output.sql);
+            assert!(output.sql.contains(&format!("  SELECT * FROM stage_0\n  {BY_LENGTH}\n)")), "{query}: {}", output.sql);
+        }
+        // `sort x | tail N`: the last N of the sort, last first.
+        let output = compile(request("* | sort -http_response.length | tail 3")).unwrap();
+        assert!(output.sql.contains("ORDER BY \"http_response.length\" ASC NULLS FIRST, time ASC NULLS FIRST, \"metadata.uid\" ASC NULLS FIRST\n  LIMIT 3"), "{}", output.sql);
+        // `reverse` then `head`: the oldest rows, oldest first, to the end.
+        let output = compile(request("* | reverse | head 3")).unwrap();
+        assert!(final_statement(&output.sql).contains(&format!("{OLDEST_FIRST} LIMIT ")), "{}", output.sql);
+        // `tail` twice is the identity order again (NULL placement included).
+        let output = compile(request("* | tail 9 | tail 3")).unwrap();
+        assert!(output.sql.contains("ORDER BY time DESC NULLS LAST, \"metadata.uid\" DESC NULLS LAST\n  LIMIT 3"), "{}", output.sql);
+        // After an aggregation the sort keys are the group's: `tail` inverts them.
+        let output = compile(request("* | stats count by device.hostname | sort -count | tail 2")).unwrap();
+        assert!(output.sql.contains("ORDER BY count ASC NULLS FIRST, \"device.hostname\" DESC NULLS FIRST\n  LIMIT 2"), "{}", output.sql);
+        // Default listings and #7371 / #7343 shapes are unchanged.
+        for query in ["* | head 5", "* | table time, metadata.uid | head 5", "* | sort -time | head 5"] {
+            let output = compile(request(query)).unwrap();
+            assert!(output.newest_first_event_rows && ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
+        }
+    }
+
+    /// NAN-4284 (searchfuzz F19-F21) through the lake compile entry point:
+    /// a join narrows its subsearch to the main side's keys BEFORE the cap
+    /// and reads unmatched rows as NULL; `IN [… | fields f]` and
+    /// `time_diff(t1, t2)` compile.
+    #[test]
+    fn joins_cap_after_the_key_semi_join_and_read_misses_as_null() {
+        let join = "metadata.log_source=apache_access | head 20 | join type=left src_endpoint.ip \
+                    [search metadata.log_source=apache_access | stats count as total by src_endpoint.ip]";
+        let sql = compile(request(join)).unwrap().sql;
+        // The keys are the head's own (a totally ordered head re-reads the
+        // same rows), and the cap follows the narrowing.
+        assert!(sql.contains("AND \"src_endpoint.ip\" IN (SELECT \"src_endpoint.ip\" FROM stage_1)\n    LIMIT 1 BY \"src_endpoint.ip\"\n    LIMIT 10000\n"), "{sql}");
+        assert!(!sql.contains("GROUP BY \"src_endpoint.ip\")) LIMIT"), "the subsearch body is uncapped: {sql}");
+        assert!(sql.ends_with("join_use_nulls=1"), "{sql}");
+        let inner = compile(request("metadata.log_source=apache_access | join src_endpoint.ip \
+            [search metadata.log_source=apache_access | stats count as total by src_endpoint.ip]")).unwrap().sql;
+        assert!(inner.contains("IN (SELECT \"src_endpoint.ip\" FROM stage_0)\n    LIMIT 1 BY \"src_endpoint.ip\"\n    LIMIT 10000"), "{inner}");
+        let fields = compile(request("* src_endpoint.ip IN [search http_response.code=500 | fields src_endpoint.ip] | stats count")).unwrap().sql;
+        let returned = compile(request("* src_endpoint.ip IN [search http_response.code=500 | return src_endpoint.ip] | stats count")).unwrap().sql;
+        assert_eq!(fields, returned);
+        let gap = compile(request("* | head 5 | eval gap=time_diff(time, time)")).unwrap().sql;
+        assert!(gap.contains("dateDiff('second', time, time) AS gap"), "{gap}");
+    }
+
+    /// NAN-4236: a newest-first `head N` behind a row filter or ahead of a
+    /// projection ends in the event cursor order with the head as its
+    /// trailing limit, so the worker walks it newest-first and stops at N
+    /// rows instead of ranking the whole window. A projection with no head
+    /// pages the same way (NAN-4263).
+    #[test]
+    fn filtered_and_projected_heads_page_newest_first() {
+        for query in [
+            "device.hostname=\"h\" | where severity_id=1 | head 7",
+            "device.hostname=\"h\" | table metadata.uid, device.hostname | head 7",
+            "device.hostname=\"h\" | head 7 | table metadata.uid",
+            "device.hostname=\"h\" | fields metadata.uid | head 7",
+            "device.hostname=\"h\" | where severity_id=1 | table metadata.uid | head 7",
+        ] {
+            let output = compile(request(query)).unwrap();
+            assert!(output.newest_first_event_rows, "{query}: {}", output.sql);
+            assert_eq!(trailing_newest_first_limit(&output.sql), Some(7), "{query}: {}", output.sql);
+            assert!(ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
+        }
+        let output = compile(request("device.hostname=\"h\" | table metadata.uid | head 7")).unwrap();
+        assert!(output.sql.contains("\nSELECT \"metadata.uid\" FROM stage_1 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 7"), "{}", output.sql);
+        // An alias that reuses an order key would reorder by the alias.
+        let output = compile(request("device.hostname=\"h\" | table device.hostname as time | head 7")).unwrap();
+        assert!(!output.newest_first_event_rows, "{}", output.sql);
+        // NAN-4263: a projection with no head is the newest events too
+        // (the search service pulls `head N` out and sends the limit).
+        for query in ["device.hostname=\"h\" | table metadata.uid"] {
+            let output = compile(request(query)).unwrap();
+            assert!(output.newest_first_event_rows && ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
+        }
+    }
+
+    /// NAN-4263 (FP T67): a bare `*` with `head N` and a projection, in
+    /// either order, is the N newest events newest first, paged newest-first
+    /// chunk by chunk -- exactly like `* | head N`. The lake search service
+    /// pulls the head out of row-preserving pipelines (`lake_head_page_plan`)
+    /// and sends `* | table …` with limit N; query[T] compiles with limit
+    /// offset + limit + 1. That projection compiled to an unordered `SELECT
+    /// … FROM stage_1 LIMIT 201` without the newest-first proof, so the
+    /// worker read the whole 7 d window (2291 files) and returned whichever
+    /// 200 rows it produced first (10:00Z and 2 days back, not 20:17Z).
+    #[test]
+    fn bare_star_projection_heads_page_newest_first_in_either_order() {
+        let compile_with = |query: &str, limit: usize| {
+            let mut request = request(query);
+            request.end = "2026-08-14T00:00:00Z".to_string();
+            request.limit = limit;
+            compile(request).unwrap_or_else(|error| panic!("{query}: {error}"))
+        };
+        // As sent to query[T] by the search service (head pulled out).
+        for query in [
+            "* | table time, metadata.uid",
+            "* | table time, device.hostname, metadata.log_source",
+            "* | fields time, metadata.uid",
+            "* | fields - message",
+            "* | rename device.hostname AS host",
+            "* | eval x=1 | table time, x",
+            "* | sort -time | table time, metadata.uid",
+            "* | sort -_time | table time, metadata.uid",
+            "* | table time, metadata.uid | sort -_time",
+        ] {
+            let output = compile_with(query, 201);
+            assert!(output.newest_first_event_rows, "{query}: {}", output.sql);
+            assert!(ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
+            assert!(output.sql.trim_end().contains(" LIMIT 201 SETTINGS "), "{query}: {}", output.sql);
+            assert!(!output.sql.contains(" _time "), "{query}: {}", output.sql);
+        }
+        // As typed (a direct query[T] caller, the head kept), both orders.
+        for query in [
+            "* | head 200 | table time, metadata.uid",
+            "* | table time, metadata.uid | head 200",
+            "* | head 200 | fields time, metadata.uid",
+            "* | fields time, metadata.uid | head 200",
+            "* | head 200 | rename device.hostname AS host",
+            "* | rename device.hostname AS host | head 200",
+            "* | head 200 | eval x=1",
+            "* | eval x=1 | head 200",
+            "* | sort -_time | head 200 | table time, metadata.uid",
+            "* | sort -_time | table time, metadata.uid | head 200",
+            "* | table time, metadata.uid | sort -_time | head 200",
+        ] {
+            let output = compile_with(query, 201);
+            assert!(output.newest_first_event_rows, "{query}: {}", output.sql);
+            assert_eq!(trailing_newest_first_limit(&output.sql), Some(200), "{query}: {}", output.sql);
+            assert!(ends_in_event_cursor_order(&output.sql), "{query}: {}", output.sql);
+        }
+        let output = compile_with("* | table time, metadata.uid", 201);
+        assert!(
+            output.sql.contains("\nSELECT time, \"metadata.uid\" FROM stage_0 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 201 "),
+            "{}", output.sql
+        );
+        // Order-changing stages keep their own order and never claim the
+        // newest-first event order.
+        for query in [
+            "* | sort device.hostname | table device.hostname | head 5",
+            "* | sort time | table time, metadata.uid | head 5",
+            "* | stats count by device.hostname | head 5",
+            "* | dedup device.hostname | table device.hostname | head 5",
+            "* | top 5 device.hostname",
+            "* | sort -_time | dedup device.hostname | head 5",
+        ] {
+            let output = compile_with(query, 201);
+            assert!(!output.newest_first_event_rows, "{query}: {}", output.sql);
+        }
+        // An explicit sort ahead of an order-sensitive stage is kept (only
+        // its `_time` now names the time column).
+        let output = compile_with("* | sort -_time | dedup device.hostname | head 5", 201);
+        assert!(output.sql.contains("ORDER BY time DESC"), "{}", output.sql);
+        // A rename onto an order key would order by the renamed value.
+        let output = compile_with("* | rename device.hostname AS time | head 5", 201);
+        assert!(!output.newest_first_event_rows, "{}", output.sql);
+    }
+
     #[test]
     fn internal_distinct_merge_state_is_not_truncated_to_user_values_cap() {
         let output = compile(request(
@@ -2645,8 +2449,17 @@ mod tests {
             }]
         );
 
+        // NAN-4186: an alternation without a common literal guards each
+        // branch; every match holds one of them.
+        let branches = compile(request("message=/(rundll32|powershell)/ | head 20")).unwrap();
+        assert_eq!(
+            branches.candidate_hints,
+            vec![CandidateHint::Any { alternatives: ["rundll32", "powershell"].into_iter()
+                .map(|value| CandidateHint::Keyword { mode: "regex_guard", value: value.to_string() }).collect() }]
+        );
+
         for query in [
-            "message=/(rundll32|powershell)/ | head 20",
+            "message=/(rundll32|ab)/ | head 20",
             "message=/(admin)?.*/ | head 20",
             "message=/.*/ | head 20",
             "message!=/rundll3[0-9].*/ | head 20",
@@ -2808,12 +2621,12 @@ mod tests {
         assert!(
             output
                 .sql
-                .contains("has(\"enrichments.type\", 'threat_intelligence')")
+                .contains("arrayExists(x -> lower(toString(x)) = 'threat_intelligence', \"enrichments.type\")")
         );
         assert!(
             output
                 .sql
-                .contains("has(\"enrichments.provider\", 'tenant_feed')")
+                .contains("arrayExists(x -> lower(toString(x)) = 'tenant_feed', \"enrichments.provider\")")
         );
         assert!(output.sql.contains("\"enrichments.data.confidence\""));
         assert!(!output.sql.contains("ioc_src_ip_threat_type"));
@@ -3193,6 +3006,59 @@ mod tests {
 
         let limited = compile(request(r#"* | head 10 | where metadata.log_source=windows_sysmon | stats count by device.hostname"#)).unwrap();
         assert!(limited.candidate_hints.is_empty());
+
+        let renamed_source = compile(request(r#"* | eval metadata.log_source="x" | where metadata.log_source=windows_sysmon | stats count()"#)).unwrap();
+        assert!(renamed_source.candidate_hints.is_empty(), "{:?}", renamed_source.candidate_hints);
+    }
+
+    /// NAN-4155: `* | where <entity>=v` must plan like `<entity>=v`: the same
+    /// sidecar pruning hints and the same narrow scan columns. It used to
+    /// carry no entity hint and declare `message`/`raw_data` (from the bare
+    /// `*`), so a 7 d `* | where device.hostname=…` read raw_data from every
+    /// part (k6 parity 10-19: 504 after 345 s vs 27 s for the filter form).
+    #[test]
+    fn where_after_bare_star_plans_like_the_filter_form() {
+        for predicate in [
+            r#"device.hostname="ws-hr-132.corp.local""#,
+            r#"process.file.hashes.value="0faafb1b35275f3912da163319c87e224985b26b36e662f813897f22445e187e""#,
+            r#"src_endpoint.ip="10.1.7.226""#,
+            r#"user.name="svc_dc""#,
+            r#"class_uid=4001"#,
+        ] {
+            let filter = compile(CompileRequest { query: format!("{predicate} | stats count() as n"), ..request("") }).unwrap();
+            let piped = compile(CompileRequest { query: format!("* | where {predicate} | stats count() as n"), ..request("") }).unwrap();
+            assert!(!filter.candidate_hints.is_empty(), "{predicate}");
+            assert_eq!(piped.candidate_hints, filter.candidate_hints, "{predicate}");
+            assert_eq!(piped.projected_scan_columns, filter.projected_scan_columns, "{predicate}");
+            assert!(!piped.projected_scan_columns.iter().any(|c| c == "raw_data" || c == "message"), "{predicate}");
+            assert!(!piped.required_columns.iter().any(|c| c.name == "raw_data"), "{predicate}");
+        }
+
+        // `* | stats count()` reads no body column either.
+        let count = compile(request("* | stats count() as n")).unwrap();
+        assert!(!count.projected_scan_columns.iter().any(|c| c == "raw_data" || c == "message"), "{:?}", count.projected_scan_columns);
+        assert!(!count.required_columns.iter().any(|c| c.name == "raw_data"));
+    }
+
+    #[test]
+    fn where_entity_hint_requires_row_and_field_preservation() {
+        let host = |query: &str| compile(request(query)).unwrap().candidate_hints.iter().any(|hint| matches!(hint,
+            CandidateHint::Entity { source_path, value } if source_path == "device.hostname" && value == "h1.corp.local"));
+        assert!(host(r#"* | where device.hostname="h1.corp.local" | head 10"#));
+        assert!(host(r#"* | eval x=1 | where device.hostname="h1.corp.local" | stats count()"#));
+        // An eval that rewrites the hinted field (directly or via its alias)
+        // makes the stored value irrelevant; rows must not be pruned by it.
+        assert!(!host(r#"* | eval device.hostname="h1.corp.local" | where device.hostname="h1.corp.local" | stats count()"#));
+        assert!(!host(r#"* | eval host="h1.corp.local" | where device.hostname="h1.corp.local" | stats count()"#));
+        // A row-changing command before the where stops the pushdown.
+        assert!(!host(r#"* | head 10 | where device.hostname="h1.corp.local""#));
+        assert!(!host(r#"* | stats count() by device.hostname | where device.hostname="h1.corp.local""#));
+        // NAN-4186: a field predicate's substring guard may come from a
+        // where; a bare where keyword (whose semantics differ) never does.
+        let keyword = compile(request(r#"* | where message="svchost" | stats count()"#)).unwrap();
+        assert_eq!(keyword.candidate_hints, vec![CandidateHint::Keyword { mode: "contains", value: "svchost".to_string() }]);
+        let bare = compile(request(r#"* | where svchost | stats count()"#)).unwrap();
+        assert!(!bare.candidate_hints.iter().any(|hint| matches!(hint, CandidateHint::Keyword { .. })));
     }
 
     #[test]
@@ -3311,5 +3177,851 @@ mod tests {
 
         let output = compile(request("* | fields - src_endpoint.*")).unwrap();
         assert!(output.sql.contains("EXCEPT (") && output.sql.contains("\"src_endpoint.ip\""), "{}", output.sql);
+    }
+
+    /// The stage-1 `| where` predicate of a compiled lake query.
+    fn where_stage(sql: &str) -> String {
+        sql.lines()
+            .filter(|line| line.trim_start().starts_with("WHERE ") && !line.contains("time "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// NAN-4276 (F1): `| where <String column> <op> <number>` was emitted with a
+    /// bare numeric literal (`"metadata.event_code" = 7`), which chDB refuses
+    /// ("No supertype for types String, UInt8"). Through the production
+    /// compile: equality/IN compare the literal as text, exactly like the
+    /// search term, ranges compare the column's numeric value, and numeric
+    /// columns and computed outputs keep their numeric compare.
+    #[test]
+    fn where_numeric_literal_is_typed_against_string_columns() {
+        let base = "metadata.log_source=windows_sysmon";
+        let term = compile(request(&format!("{base} metadata.event_code=7 | stats count"))).unwrap();
+        assert!(term.sql.contains(r#""metadata.event_code" = '7'"#), "{}", term.sql);
+        for (pipe, expected) in [
+            ("where metadata.event_code=7", r#"lower("metadata.event_code") = '7'"#),
+            ("where metadata.event_code==7", r#"lower("metadata.event_code") = '7'"#),
+            ("where metadata.event_code!=7", r#"lower(toString("metadata.event_code")) != '7'"#),
+            ("where metadata.event_code>4000", r#"toFloat64OrNull(toString("metadata.event_code")) > 4000"#),
+            ("where metadata.event_code<=4000", r#"toFloat64OrNull(toString("metadata.event_code")) <= 4000"#),
+            ("where metadata.event_code IN (1, 7)", r#"IN ('1', '7')"#),
+            ("where metadata.event_code NOT IN (1, \"7\")", r#"lower("metadata.event_code") NOT IN ('1', '7')"#),
+            ("where metadata.event_code=7 OR metadata.event_code=1", r#"lower("metadata.event_code") = '1'"#),
+            ("where user=7", "= '7'"),
+        ] {
+            let query = format!("{base} | {pipe} | stats count");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            let stage = where_stage(&output.sql);
+            assert!(stage.contains(expected), "{query}: {stage}\n{}", output.sql);
+            assert!(!stage.contains("= 7") && !stage.contains("(1, 7)"), "{query}: {stage}");
+        }
+        // Numeric columns and computed numbers stay numeric.
+        for (pipe, expected) in [
+            ("where class_uid=1007", "class_uid = 1007"),
+            ("where severity_id>=3", "severity_id >= 3"),
+            ("where src_endpoint.port=443", r#""src_endpoint.port" = 443"#),
+            ("where process.pid > 4 AND metadata.event_code=7", r#""process.pid" > 4"#),
+            ("stats count by metadata.event_code | where count > 10", "count > 10"),
+            ("stats count as total by metadata.event_code | where total=10", "total = 10"),
+            ("eval n=len(message) | where n=7", "n = 7"),
+        ] {
+            let query = format!("{base} | {pipe}");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            let stage = where_stage(&output.sql);
+            assert!(stage.contains(expected), "{query}: {stage}\n{}", output.sql);
+            assert!(!stage.contains("toFloat64OrNull") || pipe.contains("event_code"), "{query}: {stage}");
+        }
+    }
+
+    /// NAN-4276 follow-up: a stats by-field that passes a String column
+    /// through, and an eval output of a String expression, are String in
+    /// the stages after them, so `| where <name>=7` types the literal as
+    /// text (it was `= 7`, a chDB String/UInt8 400). A numeric eval output
+    /// and an aggregation output stay numeric.
+    #[test]
+    fn where_after_by_field_and_string_eval_types_numeric_literals_as_text() {
+        let base = "metadata.log_source=windows_sysmon";
+        for (pipe, expected) in [
+            ("stats count by metadata.event_code | where metadata.event_code=7", r#"lower(toString("metadata.event_code")) = '7'"#),
+            ("stats count by metadata.event_code | where metadata.event_code IN (1, 7)", "IN ('1', '7')"),
+            ("timechart span=1h count by metadata.event_code | where metadata.event_code=7", r#"lower("metadata.event_code") = '7'"#),
+            ("eval x=metadata.event_code | where x=7", "lower(toString(x)) = '7'"),
+            ("eval x=lower(metadata.event_code) | where x>4000", "toFloat64OrNull(toString(x)) > 4000"),
+            ("eval x=metadata.event_code | stats count by x | where x=7", "lower(toString(x)) = '7'"),
+        ] {
+            let query = format!("{base} | {pipe}");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            let stage = where_stage(&output.sql);
+            assert!(stage.contains(expected), "{query}: {stage}\n{}", output.sql);
+        }
+        for (pipe, expected) in [
+            ("eval x=len(message) | where x=7", "x = 7"),
+            ("eval x=metadata.event_code | eval x=len(message) | where x=7", "x = 7"),
+            ("stats count by metadata.event_code | where count > 10", "count > 10"),
+            ("stats count by severity_id | where severity_id=3", "severity_id = 3"),
+        ] {
+            let query = format!("{base} | {pipe}");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            let stage = where_stage(&output.sql);
+            assert!(stage.contains(expected), "{query}: {stage}\n{}", output.sql);
+        }
+    }
+
+    /// NAN-4280: the source time bound is half-open `[start, end)` as one
+    /// plain conjunction in the single WHERE (partition/min-max pruning and
+    /// move-to-PREWHERE unchanged), so adjacent windows never count an event
+    /// on their shared boundary twice.
+    #[test]
+    fn source_time_bound_is_half_open() {
+        for query in ["* | stats count", "powershell | timechart span=5m count() as count", "metadata.log_source=windows_sysmon | head 10"] {
+            let output = compile(request(query)).unwrap();
+            assert!(
+                output.sql.contains("WHERE time >= '2026-08-07 00:00:00.000000' AND time < '2026-08-08 00:00:00.000000'"),
+                "{query}: {}",
+                output.sql
+            );
+            assert!(!output.sql.contains("BETWEEN"), "{query}: {}", output.sql);
+            assert!(!output.sql.contains("PREWHERE"), "{query}: {}", output.sql);
+        }
+        // The user predicate stays parenthesized behind the bound, so an OR
+        // in it can never escape the window.
+        let output = compile(request("user=a OR user=b | stats count")).unwrap();
+        assert!(output.sql.contains("time < '2026-08-08 00:00:00.000000'\n  AND ("), "{}", output.sql);
+    }
+
+    /// NAN-4276: a search-term range on a String column compares numerically.
+    /// It used to quote the number and compare text (`'500' > '4000'`).
+    #[test]
+    fn search_term_numeric_range_on_string_column_is_numeric() {
+        let output = compile(request("metadata.event_code>4000 | stats count")).unwrap();
+        assert!(
+            output.sql.contains(r#"toFloat64OrNull(toString("metadata.event_code")) > 4000"#),
+            "{}",
+            output.sql
+        );
+        let numeric = compile(request("severity_id>3 | stats count")).unwrap();
+        assert!(numeric.sql.contains("severity_id > 3"), "{}", numeric.sql);
+    }
+
+    /// NAN-4285: a CIDR inside `IN (...)` / `NOT IN (...)` on an IP field is
+    /// network membership (as `ip=10.0.0.0/8` is), in search terms and in
+    /// `| where`; exact addresses keep the prunable IN-list. The list used to
+    /// compile to `ip IN ('10.0.0.0/8')`, a string compare that matched nothing.
+    #[test]
+    fn cidr_in_lists_compile_to_network_membership() {
+        let range = |cidr: &str| format!("isIPAddressInRange(toString(\"dst_endpoint.ip\"), '{cidr}')");
+        for prefix in ["", "* | where "] {
+            let all = compile(request(&format!(
+                "{prefix}dst_endpoint.ip IN (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) | stats count"
+            ))).unwrap().sql;
+            for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] {
+                assert!(all.contains(&range(cidr)), "{prefix}: {all}");
+            }
+            assert!(!all.contains("IN ('10.0.0.0/8'") && !all.contains("'10.0.0.0/8', '172"), "{prefix}: {all}");
+            assert!(all.contains("isIPv4String(toString(\"dst_endpoint.ip\"))"), "guarded against non-IP values: {all}");
+
+            let mixed = compile(request(&format!("{prefix}dst_endpoint.ip IN (10.0.0.0/8, 8.8.8.8) | stats count"))).unwrap().sql;
+            assert!(mixed.contains(&range("10.0.0.0/8")), "{prefix}: {mixed}");
+            assert!(mixed.contains("IN ('8.8.8.8')") && !mixed.contains("IN ('10.0.0.0/8'") && !mixed.contains("'8.8.8.8', '10."), "{prefix}: {mixed}");
+            assert!(mixed.contains(" OR ifNull((isIPv4String"), "exact list OR the ranges: {mixed}");
+
+            let negated = compile(request(&format!("{prefix}dst_endpoint.ip NOT IN (10.0.0.0/8, 8.8.8.8) | stats count"))).unwrap().sql;
+            assert!(negated.contains(&range("10.0.0.0/8")) && negated.contains("NOT ifNull(("), "{prefix}: {negated}");
+            assert!(negated.contains("length(toString("), "NOT IN needs the field present: {negated}");
+            assert!(!negated.contains("NOT IN ('10.0.0.0/8'"), "{prefix}: {negated}");
+
+            let v6 = compile(request(&format!(r#"{prefix}dst_endpoint.ip IN ("fe80::/10", "2001:db8::1") | stats count"#))).unwrap().sql;
+            assert!(v6.contains(&range("fe80::/10")) && v6.contains("IN ('2001:db8::1')"), "{prefix}: {v6}");
+
+            for bad in ["10.0.0.0/33", "fe80::/129", "10.0.0/8x", "host/8"] {
+                assert!(compile(request(&format!("{prefix}dst_endpoint.ip IN (\"{bad}\", 8.8.8.8) | stats count"))).is_err(), "{prefix}{bad}");
+            }
+        }
+        // The OCSF alias of a UDM IP field resolves the same way.
+        let alias = compile(request("src_ip NOT IN (10.0.0.0/8, 192.168.0.0/16) | stats count")).unwrap().sql;
+        assert!(alias.contains("isIPAddressInRange(toString(\"src_endpoint.ip\"), '10.0.0.0/8')"), "{alias}");
+        // `| where ip=cidr` matches the search-term form.
+        let eq = compile(request(r#"* | where dst_endpoint.ip="10.0.0.0/8" | stats count"#)).unwrap().sql;
+        assert!(eq.contains(&range("10.0.0.0/8")), "{eq}");
+        let ne = compile(request(r#"* | where dst_endpoint.ip!="10.0.0.0/8" | stats count"#)).unwrap().sql;
+        assert!(ne.contains(&range("10.0.0.0/8")) && ne.contains("NOT ifNull(("), "{ne}");
+        // After an aggregation the by-field is still an IP column.
+        let by = compile(request("* | stats count by dst_endpoint.ip | where dst_endpoint.ip IN (10.0.0.0/8)")).unwrap().sql;
+        assert!(by.contains("isIPAddressInRange(toString("), "{by}");
+        // A slash in a non-IP field stays a plain string value.
+        let path = compile(request(r#"http_request.url.path IN ("/a/b", "/c") | stats count"#)).unwrap().sql;
+        assert!(path.contains("'/a/b', '/c'") && !path.contains("isIPAddressInRange"), "{path}");
+        // CIDR lists name no exact entity, so they must not prune candidates.
+        let hinted = compile(request("dst_endpoint.ip IN (10.0.0.0/8, 8.8.8.8) | stats count")).unwrap();
+        assert!(hinted.candidate_hints.is_empty(), "{:?}", hinted.candidate_hints);
+    }
+
+    /// NAN-4279 searchfuzz F9–F13, through the lake's production compile
+    /// entry point. Each query is also compiled from its pretty-printed form,
+    /// which is what the front door sends the worker.
+    fn compile_both_ways(input: CompileRequest) -> CompileResponse {
+        use nanosiem_core::query::PrettyPrint;
+        let printed = parse_query(&input.query).unwrap().pretty_print();
+        let direct = compile(CompileRequest { query: input.query.clone(), ..clone_request(&input) })
+            .unwrap_or_else(|error| panic!("{}: {error:#}", input.query));
+        let reprinted = compile(CompileRequest { query: printed.clone(), ..input })
+            .unwrap_or_else(|error| panic!("{printed}: {error:#}"));
+        assert_eq!(direct.sql, reprinted.sql, "printed form {printed} compiled differently");
+        direct
+    }
+
+    fn clone_request(input: &CompileRequest) -> CompileRequest {
+        CompileRequest {
+            query: input.query.clone(),
+            unmapped_field_types: input.unmapped_field_types.clone(),
+            snapshot_field_types: input.snapshot_field_types.clone(),
+            lowercased_fields: input.lowercased_fields.clone(),
+            dataset: input.dataset.clone(),
+            start: input.start.clone(),
+            end: input.end.clone(),
+            event_contract: input.event_contract.clone(),
+            ..request("")
+        }
+    }
+
+    #[test]
+    fn nan4279_earliest_latest_pick_by_event_time_not_value() {
+        for query in [
+            "metadata.log_source=apache_access | stats earliest(http_response.length) as e, latest(http_response.length) as l",
+            "metadata.log_source=apache_access | stats earliest(http_response.length) as e, latest(http_response.length) as l by http_request.http_method",
+            "metadata.log_source=apache_access | timechart span=1h earliest(http_response.length) as e",
+        ] {
+            let sql = compile_both_ways(request(query)).sql;
+            assert!(
+                sql.contains("argMin(\"http_response.length\", (time, toString(\"http_response.length\")))"),
+                "{query}: {sql}"
+            );
+            assert!(!sql.contains("min(\"http_response.length\")"), "{query}: {sql}");
+            if query.contains("latest(") {
+                assert!(
+                    sql.contains("argMax(\"http_response.length\", (time, toString(\"http_response.length\")))"),
+                    "{query}: {sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nan4279_same_function_aggregates_get_unique_display_names() {
+        let output = compile_both_ways(request(
+            "metadata.log_source=windows_sysmon | stats dc(device.hostname), dc(actor.user.name), dc(actor.process.name)",
+        ));
+        for name in ["dc(device.hostname)", "dc(actor.user.name)", "dc(actor.process.name)"] {
+            assert!(output.sql.contains(&format!("AS \"{name}\"")), "{name}: {}", output.sql);
+        }
+        assert!(!output.sql.contains("AS dc"), "{}", output.sql);
+        for column in &output.required_columns {
+            assert!(!column.name.contains('('), "display name leaked as a column: {}", column.name);
+        }
+        // Mixed families and repeats stay unique; a lone aggregate keeps its
+        // short name, so existing `| where dc > N` pipelines are unchanged.
+        let mixed = compile_both_ways(request(
+            "* | stats count, count(actor.user.name), avg(traffic.bytes_in), avg(traffic.bytes_out), dc(src_endpoint.ip), dc(src_endpoint.ip), max(time) by device.hostname",
+        ))
+        .sql;
+        for name in ["count(actor.user.name)", "avg(traffic.bytes_in)", "avg(traffic.bytes_out)", "dc(src_endpoint.ip)", "dc(src_endpoint.ip)_2"] {
+            assert!(mixed.contains(&format!("AS \"{name}\"")), "{name}: {mixed}");
+        }
+        assert!(mixed.contains("count() AS count") && mixed.contains("AS max"), "{mixed}");
+        let single = compile_both_ways(request("* | stats dc(src_endpoint.ip) by device.hostname | where dc > 5")).sql;
+        assert!(single.contains("AS dc"), "{single}");
+    }
+
+    #[test]
+    fn nan4279_any_documented_percentile_shorthand_parses() {
+        for (query, level) in [
+            ("* | stats perc99(http_response.length) as v", "0.99"),
+            ("* | stats perc50(http_response.length) as v", "0.5"),
+            ("* | stats p90(http_response.length) as v", "0.9"),
+            ("* | stats perc95(http_response.length) as v", "0.95"),
+            ("* | stats p99(http_response.length) as v", "0.99"),
+        ] {
+            let sql = compile_both_ways(request(query)).sql;
+            assert!(sql.contains(&format!("quantile({level})(\"http_response.length\")")), "{query}: {sql}");
+        }
+        assert!(parse_query("* | stats perc101(http_response.length) as v").is_err());
+        let both = compile_both_ways(request(
+            "* | stats perc90(http_response.length), perc99(http_response.length)",
+        ))
+        .sql;
+        assert!(both.contains("AS \"perc90(http_response.length)\"") && both.contains("AS \"perc99(http_response.length)\""), "{both}");
+    }
+
+    #[test]
+    fn nan4279_dedup_keeps_the_first_row_in_newest_first_order() {
+        let newest = compile_both_ways(request("metadata.log_source=apache_access | dedup http_request.http_method")).sql;
+        let oldest = compile_both_ways(request("metadata.log_source=apache_access | dedup http_request.http_method keepfirst=false")).sql;
+        let keeplast = compile_both_ways(request("metadata.log_source=apache_access | dedup http_request.http_method keeplast=true")).sql;
+        assert_eq!(oldest, keeplast);
+        assert_ne!(newest, oldest, "keepfirst=false must change the survivor");
+        let keeps = |sql: &str, newest: bool| {
+            if sql.contains("(time) FROM") {
+                sql.contains(if newest { "max(time) FROM" } else { "min(time) FROM" })
+            } else {
+                sql.contains("time DESC\n  LIMIT 1 BY") == newest
+            }
+        };
+        assert!(keeps(&newest, true), "{newest}");
+        assert!(keeps(&oldest, false), "{oldest}");
+        // A non-base source takes the sort shape; the same rule holds.
+        let staged = compile_both_ways(request("metadata.log_source=apache_access | where http_response.code=200 | dedup http_request.http_method")).sql;
+        assert!(staged.contains("ORDER BY \"http_request.http_method\", time DESC\n  LIMIT 1 BY"), "{staged}");
+    }
+
+    #[test]
+    fn nan4279_object_roots_project_exclude_and_expand_their_leaves() {
+        let mut snapshot = BTreeMap::new();
+        for leaf in ["http_request.http_method", "http_request.url.hostname", "http_request.user_agent"] {
+            snapshot.insert(leaf.to_string(), FieldType::String);
+        }
+        for leaf in ["enrichments.name", "enrichments.value", "enrichments.provider", "enrichments.data.country_name"] {
+            snapshot.insert(leaf.to_string(), FieldType::Array);
+        }
+        let with_snapshot = |query: &str| {
+            let mut input = request(query);
+            input.snapshot_field_types = snapshot.clone();
+            input
+        };
+
+        let table = compile_both_ways(with_snapshot("* | table http_request, src_endpoint.ip"));
+        for leaf in ["http_request.http_method", "http_request.url.hostname", "http_request.user_agent", "src_endpoint.ip"] {
+            assert!(table.sql.contains(&format!("\"{leaf}\"")), "{leaf}: {}", table.sql);
+            assert!(table.required_columns.iter().any(|column| column.name == leaf), "{leaf} not declared");
+        }
+        assert!(!table.sql.contains("\"http_request\""), "{}", table.sql);
+
+        let excluded = compile_both_ways(with_snapshot("* | fields - raw_data, enrichments"));
+        assert!(excluded.sql.contains("EXCEPT ("), "{}", excluded.sql);
+        assert!(excluded.sql.contains("raw_data"), "{}", excluded.sql);
+        for leaf in ["enrichments.name", "enrichments.value", "enrichments.data.country_name"] {
+            assert!(excluded.sql.contains(&format!("\"{leaf}\"")), "{leaf}: {}", excluded.sql);
+        }
+        // Every excluded leaf must exist in the projected view, or EXCEPT
+        // refuses it: the worker supplies a declared leaf the parts lack as a
+        // typed NULL.
+        let excepted = excluded.sql.split("EXCEPT (").nth(1).unwrap().split(')').next().unwrap();
+        for leaf in excepted.split(", ").map(|leaf| leaf.trim_matches('"')).filter(|leaf| leaf.starts_with("enrichments.")) {
+            assert!(
+                excluded.required_columns.iter().any(|column| column.name == leaf),
+                "{leaf} excluded but not declared: {:?}",
+                excluded.required_columns
+            );
+        }
+
+        let expanded = compile_both_ways(with_snapshot("* | mvexpand enrichments | table enrichments.name, enrichments.value"));
+        // One ARRAY JOIN zips every leaf array (separate arrayJoins would
+        // multiply them), and every joined leaf is declared to the worker.
+        let joined = expanded.sql.split("ARRAY JOIN ").nth(1).unwrap().split(" LIMIT").next().unwrap();
+        assert_eq!(expanded.sql.matches("ARRAY JOIN").count(), 1, "{}", expanded.sql);
+        assert!(!expanded.sql.contains("arrayJoin("), "{}", expanded.sql);
+        for leaf in ["enrichments.name", "enrichments.value", "enrichments.provider", "enrichments.data.country_name"] {
+            assert!(joined.contains(&format!("\"{leaf}\"")), "{leaf}: {}", expanded.sql);
+        }
+        for leaf in joined.split(", ").map(|leaf| leaf.trim_matches('"')) {
+            assert!(expanded.required_columns.iter().any(|column| column.name == leaf), "{leaf} not declared");
+        }
+        assert!(!expanded.sql.contains("ext.enrichments"), "{}", expanded.sql);
+
+        // The front door validates without the snapshot inventory.
+        let profile = OcsfProfile::lake_1_9();
+        for query in ["* | table http_request, src_endpoint.ip", "* | fields - raw_data, enrichments", "* | mvexpand enrichments"] {
+            let mut parsed = parse_query(query).unwrap();
+            apply_profile_product_semantics(&mut parsed, &profile);
+            let errors = validate_query_fields_with_profile(&parsed, Some(&profile));
+            assert!(errors.is_empty(), "{query}: {errors:?}");
+        }
+        // A pipeline column that shares an object's name is left alone.
+        let derived = compile(with_snapshot("* | stats count as device by src_endpoint.ip | table device, src_endpoint.ip")).unwrap();
+        assert!(derived.sql.contains("device") && !derived.sql.contains("\"device."), "{}", derived.sql);
+        // A misspelt root is still an unknown field.
+        assert!(compile(with_snapshot("* | table http_requestt")).is_err());
+    }
+
+    /// NAN-4288 (F15): the documented `prevalence <prevalence column> <op> N`
+    /// form parses (it was "Unexpected token '<'"). The lake compiler then
+    /// refuses it as a Nano-side stage, which the front door runs.
+    #[test]
+    fn nan4288_documented_prevalence_filter_parses() {
+        use nanosiem_core::query::{PrevalenceField, PrevalenceThreshold};
+        for (query, field) in [
+            ("metadata.log_source=windows_sysmon metadata.event_code=1 | prevalence prevalence_process_hash < 5 window=24h | stats count", PrevalenceField::HashPrevalence),
+            ("* | prevalence prevalence_file_hash < 5 window=24h", PrevalenceField::HashPrevalence),
+            ("* | prevalence prevalence_dest_domain <= 3", PrevalenceField::DomainPrevalence),
+        ] {
+            let parsed = parse_query(query).unwrap_or_else(|error| panic!("{query}: {error}"));
+            let mut found = None;
+            let mut cursor = &parsed;
+            while let Query::Piped { source, command } = cursor {
+                if let Command::Prevalence { conditions, .. } = command {
+                    found = conditions.first().cloned();
+                }
+                cursor = source;
+            }
+            let condition = found.unwrap_or_else(|| panic!("{query}: no prevalence condition"));
+            assert_eq!(condition.field, field, "{query}");
+            assert!(matches!(condition.threshold, PrevalenceThreshold::Count(_)), "{query}");
+            let error = compile(request(query)).unwrap_err().to_string();
+            assert!(error.contains("prevalence"), "{query}: {error}");
+            assert!(!error.contains("invalid nPL query"), "{query}: {error}");
+        }
+    }
+
+    /// NAN-4288 (F17): a quoted Windows path reaches the worker as a term
+    /// regex whose backslashes match the JSON-escaped raw text.
+    #[test]
+    fn nan4288_backslash_phrase_matches_escaped_raw_text() {
+        let output = compile(request(r#""C:\Windows\System32\svchost.exe" | stats count by metadata.log_source"#)).unwrap();
+        assert!(output.sql.contains(r"\\\\+"), "{}", output.sql);
+    }
+
+    /// NAN-4283 (searchfuzz F22): `arr=v` on an array-valued OCSF leaf means
+    /// "any element equals v", case-insensitively, whether `v` is bare or
+    /// quoted. It used to emit `has(arr, '<lowered>')`, a case-sensitive match
+    /// against display-case elements (`SeImpersonatePrivilege`, `Hostname`,
+    /// `T1110`), so it silently returned 0.
+    #[test]
+    fn nan4283_every_advertised_array_leaf_compares_bare_and_quoted_the_same() {
+        let profile = OcsfProfile::lake_1_9();
+        let arrays: Vec<&str> = profile
+            .fields()
+            .iter()
+            .filter(|field| profile.field_type(field.name) == Some(FieldType::Array))
+            .map(|field| field.name)
+            .collect();
+        assert!(arrays.len() >= 60, "array leaves: {arrays:?}");
+        for field in arrays {
+            if profile.is_lowercased_at_ingest(field) {
+                continue; // raw has(): nan4283_lowercased_at_ingest_array_keeps_raw_has
+            }
+            let bare = compile(request(&format!("{field}=MixedCase | stats count")))
+                .unwrap_or_else(|e| panic!("{field} bare: {e:#}"));
+            let quoted = compile(request(&format!("{field}=\"MixedCase\" | stats count")))
+                .unwrap_or_else(|e| panic!("{field} quoted: {e:#}"));
+            assert_eq!(bare.sql, quoted.sql, "{field}");
+            assert!(
+                bare.sql.contains(&format!(
+                    "arrayExists(x -> lower(toString(x)) = 'mixedcase', {})",
+                    if field.contains('.') { format!("\"{field}\"") } else { field.to_string() }
+                )),
+                "{field}: {}",
+                bare.sql
+            );
+            assert!(!bare.sql.contains("has(\""), "{field}: {}", bare.sql);
+        }
+    }
+
+    /// Arrays the profile marks lowercased at ingest keep the raw `has()`
+    /// compare (`email.to` is in the OCSF lowercased-at-ingest set).
+    #[test]
+    fn nan4283_lowercased_at_ingest_array_keeps_raw_has() {
+        let output = compile(request("email.to=Victim@Example.com | stats count")).unwrap();
+        assert!(output.sql.contains("has(\"email.to\", 'victim@example.com')"), "{}", output.sql);
+    }
+
+    /// Review of #7396: a 7-30d hash hunt must keep its file pruning. Pruning
+    /// keys on the candidate hints (entity sidecars, part blooms), which come
+    /// from the parsed query, not the SQL predicate. The hash hunt still emits
+    /// its `file.hashes.value` entity hint, and the predicate is the
+    /// case-insensitive element test.
+    #[test]
+    fn nan4283_hash_hunt_keeps_its_pruning_hint() {
+        let sha = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+        let output = compile(request(&format!("file.hashes.value={sha} | stats count"))).unwrap();
+        assert!(
+            output.candidate_hints.iter().any(|hint| matches!(
+                hint,
+                CandidateHint::Entity { source_path, value }
+                    if source_path == "file.hashes.value" && value.eq_ignore_ascii_case(sha)
+            )),
+            "{:?}",
+            output.candidate_hints
+        );
+        let lowered = sha.to_ascii_lowercase();
+        assert!(
+            output.sql.contains(&format!("arrayExists(x -> lower(toString(x)) = '{lowered}', \"file.hashes.value\")")),
+            "{}",
+            output.sql
+        );
+    }
+
+    /// The F22 repros: search terms and `| where`, bare and quoted, for
+    /// string-enum arrays, object-array leaves and IP/bool/number leaves.
+    #[test]
+    fn nan4283_array_equality_repros_are_any_element_case_insensitive() {
+        let member = |field: &str, needle: &str| {
+            let column = if field.contains('.') { format!("\"{field}\"") } else { field.to_string() };
+            format!("arrayExists(x -> lower(toString(x)) = '{needle}', {column})")
+        };
+        let compile_typed = |query: String, typed: &[&str]| {
+            let mut input = request(&query);
+            for field in typed {
+                input.snapshot_field_types.insert((*field).into(), FieldType::Array);
+            }
+            compile(input).unwrap_or_else(|e| panic!("{query}: {e:#}"))
+        };
+        for (field, value, needle) in [
+            ("privileges", "SeImpersonatePrivilege", "seimpersonateprivilege"),
+            ("observables.type", "Hostname", "hostname"),
+            ("finding_info.attacks.technique.uid", "T1110", "t1110"),
+            ("observables.value", "10.1.5.40", "10.1.5.40"),
+            ("evidences.src_endpoint.ip", "10.1.1.68", "10.1.1.68"),
+            ("evidences.device.hostname", "LT-Support-015", "lt-support-015"),
+            ("enrichments.data.is_rare", "true", "true"),
+            ("enrichments.data.host_count", "3", "3"),
+        ] {
+            let typed = [field];
+            let predicate = member(field, needle);
+            for query in [
+                format!("{field}={value} | stats count"),
+                format!("{field}=\"{value}\" | stats count"),
+                format!("* | where {field}={value} | stats count"),
+                format!("* | where {field}=\"{value}\" | stats count"),
+            ] {
+                let output = compile_typed(query.clone(), &typed);
+                assert!(output.sql.contains(&predicate), "{query}: {}", output.sql);
+                assert!(!output.sql.contains(&format!("NOT {predicate}")), "{query}");
+            }
+            let negated = compile_typed(format!("{field}!={value} | stats count"), &typed);
+            assert!(negated.sql.contains(&format!("NOT {predicate}")), "{}", negated.sql);
+        }
+    }
+
+    /// NAN-4283 (searchfuzz F24): a URL value is never a comment, so the rest
+    /// of the query, including the pipeline, survives.
+    #[test]
+    fn nan4283_url_value_is_not_a_comment() {
+        let output = compile(request(
+            "http_request.url.url_string=https://stackoverflow.com/robots.txt | stats count",
+        ))
+        .unwrap();
+        assert!(output.sql.contains("https://stackoverflow.com/robots.txt"), "{}", output.sql);
+        assert!(output.sql.contains("count()"), "{}", output.sql);
+        let wildcard = compile(request("http_request.url.url_string=https://x.example/* | stats count")).unwrap();
+        assert!(wildcard.sql.contains("https://x.example/%"), "{}", wildcard.sql);
+        // Documented comments still strip.
+        let commented = compile(request("// header\nhttp_request.url.url_string=\"a\" /* note */ | stats count // tail")).unwrap();
+        assert!(!commented.sql.contains("header") && !commented.sql.contains("note"), "{}", commented.sql);
+    }
+
+    /// NAN-4289 (searchfuzz F26): a pasted allow-list of a few hundred
+    /// `NOT field=v` terms compiled to one parenthesis level per AND node and
+    /// hit ClickHouse's `Maximum parse depth (1000) exceeded` (Code 306) at
+    /// about 250 terms. AND chains are flat now, like OR chains (NAN-3276), so
+    /// the predicate's nesting is constant in the number of terms, in search
+    /// terms and in `| where`.
+    #[test]
+    fn nan4289_long_conjunctions_compile_flat() {
+        let max_depth = |sql: &str| {
+            let (mut depth, mut max) = (0i32, 0i32);
+            for c in sql.chars() {
+                match c {
+                    '(' => { depth += 1; max = max.max(depth); }
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+            }
+            max
+        };
+        let terms = |n: usize, prefix: &str| {
+            (0..n).map(|i| format!("{prefix}http_request.url.path=\"/zz{i}\"")).collect::<Vec<_>>().join(" ")
+        };
+        let few = compile(request(&format!("metadata.log_source=apache_access {} | stats count", terms(10, "NOT ")))).unwrap();
+        for n in [250, 400, 1000] {
+            for query in [
+                format!("metadata.log_source=apache_access {} | stats count", terms(n, "NOT ")),
+                format!("metadata.log_source=apache_access {} | stats count", terms(n, "")),
+                format!("metadata.log_source=apache_access | where {} | stats count",
+                    (0..n).map(|i| format!("http_request.url.path!=\"/zz{i}\"")).collect::<Vec<_>>().join(" AND ")),
+            ] {
+                let output = compile(request(&query)).unwrap_or_else(|e| panic!("{n}: {e:#}"));
+                assert!(
+                    max_depth(&output.sql) <= max_depth(&few.sql) + 2,
+                    "{n} terms nest {} deep vs {} for 10",
+                    max_depth(&output.sql),
+                    max_depth(&few.sql)
+                );
+                assert!(output.sql.contains(&format!("/zz{}", n - 1)));
+            }
+        }
+    }
+
+    /// NAN-4286 (F28): a bare RHS naming a field, or a column the pipeline
+    /// computed upstream, is a column reference in `| where`; it used to be
+    /// the literal text (`= 'http_response.code'`, `= 'c'`, always 0 rows)
+    /// or, for `>`/`<`, a column stage_0 never projected (chDB Code 47).
+    #[test]
+    fn nan4286_where_compares_two_fields() {
+        let base = "metadata.log_source=apache_access";
+        for (pipe, expected) in [
+            (
+                "where http_response.code=http_response.code",
+                r#""http_response.code" = "http_response.code""#,
+            ),
+            (
+                "where http_response.code > http_request.length",
+                r#""http_response.code" > "http_request.length""#,
+            ),
+            (
+                "where src_endpoint.ip=dst_endpoint.ip",
+                r#"lower("src_endpoint.ip") = lower("dst_endpoint.ip")"#,
+            ),
+            (
+                "eval c=404 | where http_response.code=c",
+                r#"lower(toString("http_response.code")) = lower(toString(c))"#,
+            ),
+            (
+                "eval c=404 | where c=http_response.code",
+                r#"lower(toString(c)) = lower(toString("http_response.code"))"#,
+            ),
+            ("eval c=404 | where http_response.code > c", r#""http_response.code" > c"#),
+        ] {
+            let query = format!("{base} | {pipe} | stats count");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            assert!(output.sql.contains(expected), "{query}: {}", output.sql);
+            // Every column the comparison reads is projected by stage_0.
+            let stage_0 = output.sql.split("stage_1 AS").next().unwrap();
+            for column in ["\"dst_endpoint.ip\"", "\"http_request.length\""] {
+                if pipe.contains(column.trim_matches('"')) {
+                    assert!(stage_0.contains(column), "{query}: {stage_0}");
+                    assert!(
+                        output.required_columns.iter().any(|c| format!("\"{}\"", c.name) == column),
+                        "{query}: required_columns lacks {column}"
+                    );
+                }
+            }
+        }
+        // A quoted RHS is still the literal text.
+        let quoted = compile(request(&format!(
+            "{base} | eval c=404 | where http_response.code=\"c\" | stats count"
+        )))
+        .unwrap();
+        assert!(!quoted.sql.contains("toString(c)"), "{}", quoted.sql);
+    }
+
+    /// NAN-4286 (F29): arithmetic or a literal on the LEFT of a `where`
+    /// comparison, with or without spaces, was "Unexpected token".
+    #[test]
+    fn nan4286_where_expressions_on_either_side() {
+        for (pipe, expected) in [
+            (
+                "where http_response.code-http_request.length=0",
+                r#"(toFloat64OrNull(toString("http_response.code")) - toFloat64OrNull(toString("http_request.length"))) = 0"#,
+            ),
+            (
+                "where http_response.code+http_request.length>1000",
+                r#"(toFloat64OrNull(toString("http_response.code")) + toFloat64OrNull(toString("http_request.length"))) > 1000"#,
+            ),
+            (
+                "where 1000 < http_response.code + http_request.length",
+                r#"1000 < (toFloat64OrNull(toString("http_response.code")) + toFloat64OrNull(toString("http_request.length")))"#,
+            ),
+            ("where 404 = http_response.code", r#"404 = "http_response.code""#),
+            ("eval c=404 | where c-http_response.code=0", r#"(c - toFloat64OrNull(toString("http_response.code"))) = 0"#),
+        ] {
+            let query = format!("metadata.log_source=apache_access | {pipe} | stats count");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            assert!(output.sql.contains(expected), "{query}: {}", output.sql);
+        }
+        // A hyphenated bare keyword is still a keyword.
+        let keyword = compile(request("metadata.log_source=apache_access | where foo-bar | stats count")).unwrap();
+        assert!(keyword.sql.contains("[Ff][Oo][Oo]\\\\-[Bb][Aa][Rr]"), "{}", keyword.sql);
+    }
+
+    /// NAN-4310: the searchfuzz post-aggregation shapes (`stats … by`,
+    /// `where <alias> > N`, `sort -<alias>`, `head`) compile, and every source
+    /// column stage_0 reads is a declared required column, so the planner
+    /// binds it (a part without the OCSF `count` leaf gets a typed NULL).
+    /// An undeclared bare `count` would read as the aggregate function
+    /// (Code 215). The alias filter runs after the aggregation, on its output.
+    #[test]
+    fn nan4310_aggregate_alias_where_sort_head_shapes() {
+        for (query, alias_filter) in [
+            ("* | stats count by metadata.log_source | where count > 5", "WHERE count > 5"),
+            ("* | stats count by metadata.log_source | where count>5 | sort -count | head 10", "WHERE count > 5"),
+            ("* | stats count by metadata.log_source | sort -count | head 3", "ORDER BY count DESC"),
+            ("* | stats count | where count > 5", "WHERE count > 5"),
+            ("* | stats count as n by metadata.log_source | where n > 5 | sort -n", "WHERE n > 5"),
+            ("* | stats dc(src_endpoint.ip) as hosts by metadata.log_source | where hosts > 1", "WHERE hosts > 1"),
+            ("* | stats dc(src_endpoint.ip) by metadata.log_source | where dc_src_endpoint.ip > 1", "> 1"),
+            (
+                "* | stats sum(http_request.length) as bytes, count by src_endpoint.ip | where bytes > 100 AND count > 1 | sort -bytes | head 5",
+                "WHERE (bytes > 100 AND count > 1)",
+            ),
+            ("* | top limit=5 metadata.log_source | where count > 1", "WHERE count > 1"),
+        ] {
+            let output = compile(request(query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            let (stage_0, rest) = output.sql.split_once("stage_1 AS").expect("staged plan");
+            let select = stage_0
+                .split_once("SELECT ")
+                .and_then(|(_, tail)| tail.split_once(" FROM __nano_lake_source__"))
+                .map(|(columns, _)| columns)
+                .unwrap_or_else(|| panic!("{query}: {stage_0}"));
+            for column in select.split(", ") {
+                let name = column.trim().trim_matches('"');
+                assert!(
+                    output.required_columns.iter().any(|c| c.name == name),
+                    "{query}: stage_0 reads undeclared {name}: {}",
+                    output.sql
+                );
+            }
+            assert!(rest.contains(alias_filter), "{query}: {}", output.sql);
+            assert!(!stage_0.contains(alias_filter), "{query}: {}", output.sql);
+        }
+    }
+
+    /// NAN-4303: `+` with a string operand concatenates (`"a"+"b"` was
+    /// chDB Code 43 Float64 + String); number + number stays a numeric add,
+    /// and an untyped stage alias keeps the numeric add.
+    #[test]
+    fn nan4303_plus_concatenates_strings_and_adds_numbers() {
+        for (pipe, expected) in [
+            (r#"eval s="a"+"b""#, "concat(toString('a'), toString('b')) AS s"),
+            (
+                r#"eval s=metadata.log_source + "_x""#,
+                r#"concat(toString("metadata.log_source"), toString('_x')) AS s"#,
+            ),
+            (
+                r#"eval s="code " + http_response.code"#,
+                r#"concat(toString('code '), toString("http_response.code")) AS s"#,
+            ),
+            (r#"eval s=1 + 2 + "x""#, "concat(toString((1 + 2)), toString('x')) AS s"),
+            (
+                r#"rex field=metadata.log_source "(?<w>[a-z]+)_" | eval s=w + "!""#,
+                "concat(toString(w), toString('!')) AS s",
+            ),
+            (
+                r#"where src_endpoint.ip + ":" + http_response.code = "10.0.0.1:404""#,
+                r#"concat(toString(concat(toString("src_endpoint.ip"), toString(':'))), toString("http_response.code"))"#,
+            ),
+            // Number + number, and an untyped alias + number: numeric add.
+            (
+                "eval s=http_response.code + 1",
+                r#"(toFloat64OrNull(toString("http_response.code")) + 1) AS s"#,
+            ),
+            (
+                "eval s=http_response.code + http_request.length",
+                r#"(toFloat64OrNull(toString("http_response.code")) + toFloat64OrNull(toString("http_request.length"))) AS s"#,
+            ),
+            ("eval s=http_response.code | eval t=s + 1", "(coalesce(toFloat64OrNull(toString(s))"),
+        ] {
+            let query = format!("metadata.log_source=apache_access | {pipe} | stats count");
+            let output = compile(request(&query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            assert!(output.sql.contains(expected), "{query}: {}", output.sql);
+        }
+        let numeric = compile(request(
+            "metadata.log_source=apache_access | eval s=http_response.code + 1 | stats count",
+        ))
+        .unwrap();
+        assert!(!numeric.sql.contains("concat("), "{}", numeric.sql);
+    }
+
+    /// NAN-4286 (F30): time literals compare as instants in both the search
+    /// term and `| where` (RFC3339 was Code 53, minute precision Code 41, an
+    /// epoch silently 0 rows), and `relative_time()` honours the modifier
+    /// grammar instead of `DateTime64 + '-1h'` (Code 43).
+    #[test]
+    fn nan4286_time_literals_and_relative_time() {
+        let at = "toDateTime64('2026-10-20 22:30:00.000', 3, 'UTC')";
+        for query in [
+            "* | where time > \"2026-10-20T22:30:00Z\" | stats count",
+            "* | where time > \"2026-10-20T23:30:00+01:00\" | stats count",
+            "* | where time > \"2026-10-20 22:30\" | stats count",
+            "* | where time > \"2026-10-20 22:30:00.000\" | stats count",
+            "* time>\"2026-10-20T22:30:00Z\" | stats count",
+        ] {
+            let output = compile(request(query)).unwrap_or_else(|e| panic!("{query}: {e:#}"));
+            assert!(output.sql.contains(&format!("time > {at}")), "{query}: {}", output.sql);
+        }
+        let epoch = compile(request("* | where time > 1792535400 | stats count")).unwrap();
+        assert!(epoch.sql.contains("time > toDateTime64(1792535400, 3, 'UTC')"), "{}", epoch.sql);
+        let error = compile(request("* | where time > \"yesterday\" | stats count")).unwrap_err();
+        assert!(format!("{error:#}").contains("write a time as RFC3339"), "{error:#}");
+
+        let relative = compile(request(
+            "* | where time > relative_time(now(), \"-1h\") | eval d=relative_time(time, \"-1d@d\") | stats count by d",
+        ))
+        .unwrap();
+        assert!(relative.sql.contains("addHours(toDateTime64(now(), 3, 'UTC'), -1)"), "{}", relative.sql);
+        assert!(
+            relative.sql.contains("toDateTime64(toStartOfDay(addDays(toDateTime64(time, 3, 'UTC'), -1)), 3, 'UTC')"),
+            "{}",
+            relative.sql
+        );
+        assert!(compile(request("* | eval d=relative_time(time, \"-1x\") | stats count by d")).is_err());
+        let parsed = compile(request(
+            "* | eval p=strptime(\"2026-10-20 22:30\", \"%Y-%m-%d %H:%M\") | where time > p | stats count",
+        ))
+        .unwrap();
+        assert!(parsed.sql.contains("parseDateTimeOrNull("), "{}", parsed.sql);
+    }
+
+    /// NAN-4295 (F22, second half): `stats … by <array>` groups by each
+    /// element (SPL multivalue `by`), never by the whole array, and drops
+    /// NULL elements (the `[null]` groups of repeated-object leaves).
+    #[test]
+    fn nan4295_stats_by_array_field_groups_by_element() {
+        let mut input = request("* | stats count by privileges, evidences.src_endpoint.hostname");
+        input.snapshot_field_types.insert("privileges".into(), FieldType::Array);
+        input.snapshot_field_types.insert("evidences.src_endpoint.hostname".into(), FieldType::Array);
+        let sql = compile(input).unwrap().sql;
+        assert!(sql.contains("arrayJoin(arrayFilter(x -> x IS NOT NULL, privileges)) AS _mv_privileges"), "{sql}");
+        assert!(
+            sql.contains(
+                "arrayJoin(arrayFilter(x -> x IS NOT NULL, \"evidences.src_endpoint.hostname\")) AS \"_mv_evidences.src_endpoint.hostname\""
+            ),
+            "{sql}"
+        );
+        // ClickHouse's analyzer rejects a repeated arrayJoin in GROUP BY
+        // (Code 43); the group key is the per-element alias, named back to
+        // the field (first, in by-clause order) outside the aggregation.
+        let group_by = &sql[sql.find("GROUP BY").expect("GROUP BY")..];
+        assert!(!group_by.contains("arrayJoin"), "{sql}");
+        assert!(group_by.contains("_mv_privileges"), "{sql}");
+        assert!(
+            sql.contains(
+                "SELECT _mv_privileges AS privileges, \"_mv_evidences.src_endpoint.hostname\" AS \"evidences.src_endpoint.hostname\", * EXCEPT("
+            ),
+            "{sql}"
+        );
+
+        // A search filter on the same array is evaluated on the array column
+        // (the element alias must not shadow it in the WHERE).
+        let mut input = request("privileges=SeDebugPrivilege | stats count by privileges");
+        input.snapshot_field_types.insert("privileges".into(), FieldType::Array);
+        let sql = compile(input).unwrap().sql;
+        assert!(sql.contains("arrayExists(x -> lower(toString(x)) = 'sedebugprivilege', privileges)"), "{sql}");
+        assert!(sql.contains("AS _mv_privileges"), "{sql}");
+
+        // Downstream, the by-field is a scalar per row: `where` compares it
+        // directly instead of as array membership.
+        let mut input = request("* | stats count by privileges | where privileges=\"Admin\"");
+        input.snapshot_field_types.insert("privileges".into(), FieldType::Array);
+        let sql = compile(input).unwrap().sql;
+        let tail = &sql[sql.find("GROUP BY").expect("GROUP BY")..];
+        assert!(!tail.contains("arrayExists"), "{sql}");
+        assert!(!tail.contains("has("), "{sql}");
+
+        // A non-string repeated leaf splits the same way.
+        let sql = compile(request("* | stats count by module.file.signatures.algorithm_id")).unwrap().sql;
+        assert!(
+            sql.contains("arrayJoin(arrayFilter(x -> x IS NOT NULL, \"module.file.signatures.algorithm_id\"))"),
+            "{sql}"
+        );
+
+        // After `mvexpand` the column already holds one element per row.
+        let mut input = request("* | mvexpand privileges | stats count by privileges");
+        input.snapshot_field_types.insert("privileges".into(), FieldType::Array);
+        let sql = compile(input).unwrap().sql;
+        assert!(sql.contains("arrayJoin(privileges) AS privileges"), "{sql}");
+        assert!(!sql.contains("_mv_privileges") && !sql.contains("arrayFilter"), "{sql}");
+
+        // A scalar by-field is unchanged.
+        let sql = compile(request("* | stats count by src_endpoint.ip")).unwrap().sql;
+        assert!(!sql.contains("arrayJoin"), "{sql}");
     }
 }

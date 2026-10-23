@@ -142,6 +142,7 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         handlers::auth::AuthApiDoc::openapi(),
         handlers::mfa::MfaApiDoc::openapi(),
         handlers::users::UsersApiDoc::openapi(),
+        handlers::browser_telemetry::BrowserTelemetryApiDoc::openapi(),
         handlers::groups::GroupsApiDoc::openapi(),
         handlers::roles::RolesApiDoc::openapi(),
         handlers::api_keys::ApiKeysApiDoc::openapi(),
@@ -233,6 +234,8 @@ fn sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         // OIDC / SSO — open-core split (NAN-745). Gated alongside the
         // handler module; the open spec omits these paths entirely.
         sub_docs.push(handlers::oidc::OidcApiDoc::openapi());
+        // NAN-4152: public per-tenant demo claim (enterprise_shared).
+        sub_docs.push(handlers::shared_demo_claim::SharedDemoClaimApiDoc::openapi());
         // Air-gapped bundle import (NAN-1201) — enterprise only.
         sub_docs.push(handlers::airgap::parsers::AirgapParsersApiDoc::openapi());
         sub_docs.push(handlers::airgap::enrichment::AirgapEnrichmentApiDoc::openapi());
@@ -267,6 +270,9 @@ fn shared_sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         nanosiem_enterprise::handlers::enterprise_shared_settings::EnterpriseSharedSettingsApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_sources::EnterpriseSharedSourcesApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_enrichment::EnterpriseSharedEnrichmentApiDoc::openapi(),
+        nanosiem_enterprise::handlers::soar::SoarApiDoc::openapi(),
+        // NAN-4369: the egress proxy's SOAR check (internal, helper bearer).
+        nanosiem_enterprise::soar::egress::SoarEgressApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_melod::EnterpriseSharedMelodApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_cases_extras::EnterpriseSharedCasesExtrasApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_hunting::EnterpriseSharedHuntingApiDoc::openapi(),
@@ -283,6 +289,8 @@ fn shared_sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         nanosiem_enterprise::handlers::enterprise_shared_search_extras::EnterpriseSharedSearchExtrasApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_iam_extras::EnterpriseSharedIamExtrasApiDoc::openapi(),
         nanosiem_enterprise::handlers::shared_r2_owner_observation::R2OwnerObservationApiDoc::openapi(),
+        // NAN-4152: public web path alias resolver (enterprise_shared only).
+        nanosiem_enterprise::handlers::shared_tenant_path_alias::SharedTenantPathAliasPublicApiDoc::openapi(),
     ]
 }
 
@@ -377,6 +385,33 @@ pub async fn shared_root_docs_fence(
     next.run(request).await
 }
 
+/// Operations whose own annotation declares human-session security only.
+///
+/// Read from handler docs whose `security(...)` is maintained per operation and
+/// pinned by contract tests (SOAR: settings PUT and approval decisions refuse
+/// API keys). Many older handlers declare `bearer_auth` alone while accepting
+/// keys, so this is deliberately not applied to every merged document.
+fn human_session_only_operations() -> std::collections::BTreeSet<(String, &'static str)> {
+    #[allow(unused_mut)]
+    let mut docs: Vec<utoipa::openapi::OpenApi> = Vec::new();
+    #[cfg(feature = "enterprise")]
+    docs.push(nanosiem_enterprise::handlers::soar::SoarApiDoc::openapi());
+    let mut found = std::collections::BTreeSet::new();
+    for doc in docs {
+        let doc = serde_json::to_value(doc).expect("serialize OpenAPI");
+        let Some(paths) = doc["paths"].as_object() else { continue };
+        for (path, item) in paths {
+            for method in ["get", "post", "put", "patch", "delete", "head", "options", "trace"] {
+                let Some(security) = item[method]["security"].as_array() else { continue };
+                if !security.iter().any(|scheme| scheme.get("api_key").is_some()) {
+                    found.insert((path.clone(), method));
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Public, static tenant API contract. No tenant records or credentials are
 /// read to render documentation. Runtime auth still decides permissions.
 fn shared_openapi_template() -> &'static serde_json::Value {
@@ -384,6 +419,7 @@ fn shared_openapi_template() -> &'static serde_json::Value {
     SPEC.get_or_init(|| {
         use axum::http::Method;
         let mut spec = serde_json::to_value(build_shared_openapi()).expect("serialize OpenAPI");
+        let human_only = human_session_only_operations();
         let paths = spec["paths"].as_object_mut().expect("OpenAPI paths");
         paths.retain(|path, item| {
             if !path.starts_with("/api/") { return false; }
@@ -409,7 +445,10 @@ fn shared_openapi_template() -> &'static serde_json::Value {
                 } else {
                     crate::middleware::auth::shared_documented_operation(&method, &probe)
                 };
-                if !allowed { ops.remove(name); }
+                // This document offers only X-API-Key. An operation that refuses
+                // keys (human session only) cannot be called from it, and
+                // advertising it with api_key would be false (NAN-4375).
+                if !allowed || human_only.contains(&(path.clone(), name)) { ops.remove(name); }
                 else if let Some(operation) = ops.get_mut(name) {
                     operation.as_object_mut().expect("OpenAPI operation").remove("servers");
                     operation["security"] = serde_json::json!([{ "api_key": [] }]);
@@ -711,6 +750,42 @@ mod tests {
         check(serde_json::to_value(super::build_shared_openapi()).unwrap());
     }
 
+    /// NAN-4282: API prose (descriptions, summaries, titles) never names the
+    /// internal code name "lean"; identifiers (paths, operation ids, enum
+    /// values, `lean_*` fields) are not prose and stay.
+    #[test]
+    fn openapi_prose_does_not_use_the_internal_code_name() {
+        fn walk(value: &serde_json::Value, path: &str, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, value) in map {
+                        let here = format!("{path}/{key}");
+                        match (key.as_str(), value) {
+                            ("description" | "summary" | "title", serde_json::Value::String(text)) => {
+                                for mention in nanosiem_core::branding::code_name_mentions(text) {
+                                    found.push(format!("{here}: {mention}"));
+                                }
+                            }
+                            _ => walk(value, &here, found),
+                        }
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() { walk(value, &format!("{path}/{index}"), found); }
+                }
+                _ => {}
+            }
+        }
+        let check = |spec: serde_json::Value| {
+            let mut found = Vec::new();
+            walk(&spec, "", &mut found);
+            assert!(found.is_empty(), "OpenAPI prose uses the internal code name:\n{}", found.join("\n"));
+        };
+        check(serde_json::to_value(super::build_openapi()).unwrap());
+        #[cfg(feature = "enterprise")]
+        check(super::shared_openapi_template().clone());
+    }
+
     use super::*;
     use utoipa::openapi::path::HttpMethod;
 
@@ -908,6 +983,7 @@ mod tests {
             ("/api/marketplace/collectors/{slug}", "delete"),
             ("/api/marketplace/collectors/{slug}/install", "post"),
             ("/api/marketplace/collectors/{slug}/feeds/{feed_id}/reset-checkpoint", "post"),
+            ("/api/marketplace/collectors/{slug}/feeds/{feed_id}/rotate-credential", "post"),
             ("/api/marketplace/collectors/{slug}/credentials", "put"),
             ("/api/marketplace/collectors/{slug}/components", "get"),
             ("/api/marketplace/collectors/{slug}/components/{component}", "put"),
@@ -1058,7 +1134,8 @@ mod tests {
         // NAN-2879 adds lake-part-deletes:attest and lake-part-log:index;
         // NAN-2942 adds provisioning-outbox:expedite;
         // NAN-2980 adds hec-sources:credentials.
-        assert_eq!(private["paths"].as_object().unwrap().len(), 28);
+        // SOAR owner status and signed delivery remain private-only.
+        assert_eq!(private["paths"].as_object().unwrap().len(), 30);
         assert!(private["paths"]["/internal/v1/enterprise-shared/hec-sources:credentials"]["post"].is_object());
         assert!(!build_openapi().paths.paths.contains_key("/internal/v1/enterprise-shared/hec-sources:credentials"),
             "hec-sources:credentials must stay off the public spec");
@@ -1127,7 +1204,7 @@ mod tests {
         // reject, are counted here too; so are NAN-2879's two lake-part
         // paths, which this count had missed, and NAN-2942's
         // provisioning-outbox:expedite, and NAN-2980's hec-sources:credentials).
-        assert_eq!(private["paths"].as_object().unwrap().len(), 28);
+        assert_eq!(private["paths"].as_object().unwrap().len(), 30);
         let path = "/internal/v1/enterprise-shared/hec-sources:enroll";
         assert_eq!(private["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/HecSourceEnrollRequest");
@@ -1150,6 +1227,38 @@ mod tests {
         let path = "/internal/v1/enterprise-shared/automation-keys:issue";
         assert!(paths.contains_key(path));
         assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn tenant_path_alias_op_is_private_and_resolver_is_public() {
+        use nanosiem_enterprise::handlers::shared_tenant_path_alias::EnterpriseSharedTenantPathAliasApiDoc;
+        // NAN-4152: tenant-path-alias:set for nano-main; never in the customer
+        // spec. The public resolver is.
+        let private = serde_json::to_value(EnterpriseSharedTenantPathAliasApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 1);
+        let path = "/internal/v1/enterprise-shared/tenant-path-alias:set";
+        assert!(paths.contains_key(path));
+        let customer = build_openapi();
+        assert!(!customer.paths.paths.contains_key(path));
+        assert!(customer.paths.paths.contains_key("/api/auth/shared/tenant-path-alias/{alias}"));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn landing_source_ops_are_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_landing_sources::EnterpriseSharedLandingSourcesApiDoc;
+        // NAN-4136: landing-sources:* for nano-main's bucket drop UI and the
+        // destroy job; never in the customer spec.
+        let private = serde_json::to_value(EnterpriseSharedLandingSourcesApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 5);
+        for action in ["read", "issue", "rotate", "revoke", "revoke-all"] {
+            let path = format!("/internal/v1/enterprise-shared/landing-sources:{action}");
+            assert!(paths.contains_key(&path), "{path}");
+            assert!(!build_openapi().paths.paths.contains_key(&path), "{path}");
+        }
     }
 
     #[cfg(feature = "enterprise")]
@@ -1179,6 +1288,23 @@ mod tests {
         let path = "/internal/v1/enterprise-shared/tenant-ai-allowance:set";
         assert!(paths.contains_key(path));
         assert!(!build_openapi().paths.paths.contains_key(path));
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn tenant_demo_ops_are_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_demo_sessions::EnterpriseSharedTenantDemoApiDoc;
+        // NAN-4152: tenant-demo:set + demo-session:create for nano-main; never
+        // in the customer spec. The public claim is.
+        let private = serde_json::to_value(EnterpriseSharedTenantDemoApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.len(), 2);
+        let public = build_openapi();
+        for path in ["/internal/v1/enterprise-shared/tenant-demo:set", "/internal/v1/enterprise-shared/demo-session:create"] {
+            assert!(paths.contains_key(path), "{path}");
+            assert!(!public.paths.paths.contains_key(path), "{path}");
+        }
+        assert!(public.paths.paths.contains_key("/api/auth/shared/demo/claim"));
     }
 
     #[cfg(feature = "enterprise")]
@@ -1245,6 +1371,23 @@ mod tests {
         }
         assert!(spec["paths"]["/v1/ip-context/batch"].is_null());
         assert!(spec["paths"]["/v1/ip-context/stats"].is_null());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn egress_expected_op_is_documented_only_on_private_listener() {
+        use nanosiem_enterprise::handlers::shared_egress_expected::EnterpriseSharedEgressExpectedApiDoc;
+        // NAN-4371: nano-main's leader refresh reads egress-expected:read; it
+        // must never leak into the customer spec, and its destination carries
+        // exactly tenant_id / purpose / host.
+        let private = serde_json::to_value(EnterpriseSharedEgressExpectedApiDoc::openapi()).unwrap();
+        let paths = private["paths"].as_object().unwrap();
+        assert_eq!(paths.keys().collect::<Vec<_>>(), ["/internal/v1/enterprise-shared/egress-expected:read"]);
+        let public = build_openapi();
+        assert!(!public.paths.paths.contains_key("/internal/v1/enterprise-shared/egress-expected:read"));
+        let properties = private["components"]["schemas"]["EnterpriseSharedEgressExpectedDestination"]["properties"]
+            .as_object().unwrap();
+        assert_eq!(properties.keys().collect::<Vec<_>>(), ["host", "purpose", "tenant_id"]);
     }
 
     #[cfg(feature = "enterprise")]
@@ -1686,17 +1829,114 @@ mod tests {
         // NAN-3882 adds the ENTERPRISE IOC list viewer:
         //   /api/ioc-lists/{list_id}/indicators (GET). Open is unchanged.
         // NAN-3904 adds four shared OIDC admin paths; NAN-3910 adds two IOC upload paths.
-        let min_paths = 666;
+        // NAN-3660 adds the hosted feed ingest-credential rotation:
+        //   /api/marketplace/collectors/{slug}/feeds/{feed_id}/rotate-credential (POST).
+        // NAN-4152 adds the shared /api/auth/shared/tenant-path-alias/{alias} (GET).
+        // NAN-4152 adds the public demo claim /api/auth/shared/demo/claim (POST).
+        let min_paths = 670;
         #[cfg(not(feature = "enterprise"))]
         // NAN-3577: floor matches the regenerated default-feature published spec.
         // NAN-3806: +1 (/api/ingest-tokens/{credential_id}/bind); NAN-3807: +2 (landing sources);
         // NAN-3812: +1 (/api/me/field-usage).
-        let min_paths = 480;
+        let min_paths = 481;
+
+        // Keep the SOAR increment separate so the baseline follows main.
+        // M2: ten paths; M3c: nine; tenant settings: one (enterprise only);
+        // NAN-4369: the internal egress check, one.
+        // NAN-4380: tenant-bound agent query receipts, one.
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 22;
 
         assert!(
             path_count >= min_paths,
             "Expected at least {min_paths} paths, got {path_count}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn soar_contract_has_protected_operations_and_write_only_credentials() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let paths: Vec<_> = spec["paths"].as_object().unwrap().iter()
+            .filter(|(path, _)| path.starts_with("/api/soar/")).collect();
+        assert_eq!(paths.len(), 20);
+        let mut ids = std::collections::BTreeSet::new();
+        for (_, path) in paths {
+            for method in ["get", "post", "put", "delete"] {
+                if let Some(operation) = path.get(method) {
+                    assert!(!operation["security"].as_array().unwrap().is_empty());
+                    let id = operation["operationId"].as_str().unwrap();
+                    assert!(id.starts_with("soar_"));
+                    assert!(ids.insert(id));
+                }
+            }
+        }
+        assert_eq!(ids.len(), 28);
+        let schemas = &spec["components"]["schemas"];
+        for request in ["SoarCreateConnection", "SoarUpdateConnection"] {
+            assert_eq!(schemas[request]["properties"]["credentials"]["writeOnly"], true);
+        }
+        let connection = schemas["SoarConnection"]["properties"].as_object().unwrap();
+        for secret in ["credentials", "credentials_encrypted", "credentials_nonce"] {
+            assert!(!connection.contains_key(secret));
+        }
+        let parameters = spec["paths"]["/api/soar/runs"]["get"]["parameters"].as_array().unwrap();
+        assert!(parameters.iter().all(|p| p["in"] == "query"));
+        for decision in ["approve", "reject"] {
+            let path = format!("/api/soar/approvals/{{id}}/{decision}");
+            assert_eq!(spec["paths"][&path]["post"]["security"], serde_json::json!([{"bearer_auth": []}]));
+        }
+        assert_eq!(spec["paths"]["/api/soar/runs/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/SoarRunDetail");
+        for schema in ["CreateFlow", "UpdateFlow", "ValidateFlow", "RunFlow", "DecideApproval"] {
+            assert_eq!(schemas[schema]["additionalProperties"], false, "{schema}");
+        }
+        for schema in ["SoarFlow", "SoarFlows", "FlowValidation", "SoarRunDetail", "SoarStepExecution", "SoarApproval", "SoarApprovals"] {
+            assert!(schemas[schema].is_object(), "{schema}");
+        }
+        assert!(schemas["RequestAuthority"].is_null());
+        assert!(schemas["SoarFlows"]["properties"]["event_overflow_count"].is_object());
+        assert!(schemas["SoarFlows"]["properties"]["last_event_overflow_at"].is_object());
+        assert_eq!(spec["paths"]["/api/playbooks/{id}/run"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/EnterpriseSharedGovernedRunPlaybookResponse");
+        let bridge = schemas["EnterpriseSharedGovernedRunPlaybookResponse"].to_string();
+        assert!(bridge.contains("soar_run_id") && bridge.contains("soar_status"));
+        let approval_parameters = spec["paths"]["/api/soar/approvals"]["get"]["parameters"].as_array().unwrap();
+        assert!(approval_parameters.iter().all(|p| p["in"] == "query"));
+        // NAN-4375: run-detail paging is a query string, not path segments.
+        let run_parameters = spec["paths"]["/api/soar/runs/{id}"]["get"]["parameters"].as_array().unwrap();
+        for name in ["steps_limit", "steps_offset", "approvals_limit", "approvals_offset"] {
+            let parameter = run_parameters.iter().find(|p| p["name"] == name).expect(name);
+            assert_eq!(parameter["in"], "query", "{name}");
+            assert_ne!(parameter["required"], true, "{name}");
+        }
+        let id = run_parameters.iter().find(|p| p["name"] == "id").unwrap();
+        assert_eq!(id["in"], "path");
+        assert_eq!(spec["paths"]["/api/soar/settings"]["put"]["security"], serde_json::json!([{"bearer_auth": []}]));
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
+    fn tenant_doc_omits_soar_operations_that_refuse_api_keys() {
+        // The tenant document authenticates only with X-API-Key. Settings PUT and
+        // approval decisions accept a human session only (NAN-4375).
+        let human_only = human_session_only_operations();
+        for (path, method) in [
+            ("/api/soar/settings", "put"),
+            ("/api/soar/approvals/{id}/approve", "post"),
+            ("/api/soar/approvals/{id}/reject", "post"),
+        ] {
+            assert!(human_only.contains(&(path.to_string(), method)), "{method} {path}");
+        }
+        assert_eq!(human_only.len(), 3, "{human_only:?}");
+        let spec = tenant_openapi("buddytenant");
+        for (path, method) in human_only {
+            assert!(spec["paths"][&path][method].is_null(), "tenant doc advertises {method} {path} with api_key");
+        }
+        // Key-capable SOAR operations stay, on the key scheme.
+        for (path, method) in [("/api/soar/settings", "get"), ("/api/soar/approvals", "get"), ("/api/soar/runs/{id}", "get")] {
+            let operation = &spec["paths"][path][method];
+            assert!(operation.is_object(), "missing tenant {method} {path}");
+            assert_eq!(operation["security"], serde_json::json!([{ "api_key": [] }]), "{method} {path}");
+        }
     }
 
     #[test]

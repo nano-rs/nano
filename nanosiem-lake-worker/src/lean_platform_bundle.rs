@@ -696,37 +696,108 @@ impl PlatformBundle {
     ) -> Result<Vec<GrantedIoc<'a>>> {
         let mut out = Vec::new();
         for row in self.lookup_ioc(value)? {
-            if row
-                .data
-                .get("effective_valid_until")
-                .and_then(Value::as_i64)
-                .is_some_and(|until| until <= now.timestamp())
-            {
+            if let Some(granted) = self.live_granted_row(policy, row, now)? {
+                out.push(granted);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The one grant/revision/expiry gate for a platform IOC row: `None` when
+    /// the row is expired or its feed is not granted at the bundle's revision.
+    /// Shared by [`Self::granted_ioc_rows`] (stamping + point lookup) and
+    /// [`Self::granted_feed_rows`] (retro-hunt delta enumeration), so the retro
+    /// hunt can never hunt an indicator ingest would not have matched.
+    fn live_granted_row<'a>(
+        &self,
+        policy: &'a TenantPlatformPolicy,
+        row: IocSnapshotInput,
+        now: DateTime<Utc>,
+    ) -> Result<Option<GrantedIoc<'a>>> {
+        if row
+            .data
+            .get("effective_valid_until")
+            .and_then(Value::as_i64)
+            .is_some_and(|until| until <= now.timestamp())
+        {
+            return Ok(None);
+        }
+        if let Some(expiry) = row.data.get("indicator_expires_at").and_then(Value::as_str) {
+            let expiry =
+                DateTime::parse_from_rfc3339(expiry).context("invalid platform IOC expiry")?;
+            if expiry <= now {
+                return Ok(None);
+            }
+        }
+        let Some(grant) = self.grant(policy, &row.source_id, now) else {
+            return Ok(None);
+        };
+        if self.revisions.get(&row.source_id) != Some(&grant.feed_revision) {
+            return Ok(None);
+        }
+        let mut source_until = self.valid_until.get(&row.source_id).copied();
+        if let Some(record_until) = row
+            .data
+            .get("effective_valid_until")
+            .and_then(Value::as_i64)
+            .and_then(|s| DateTime::from_timestamp(s, 0))
+        {
+            source_until = Some(source_until.map_or(record_until, |v| v.min(record_until)));
+        }
+        Ok(Some(GrantedIoc { row, grant, source_until }))
+    }
+
+    /// The bundle's revision of each exact-match IOC feed `policy` grants now
+    /// (NAN-4169). A retro hunt compares this with the revisions it last
+    /// processed: only a changed feed is enumerated.
+    pub fn granted_ioc_feed_revisions(
+        &self,
+        policy: &TenantPlatformPolicy,
+        now: DateTime<Utc>,
+    ) -> Result<BTreeMap<String, i64>> {
+        Ok(self
+            .granted_ioc_feeds(policy, now)?
+            .into_iter()
+            .filter_map(|feed| self.revisions.get(&feed).map(|revision| (feed, *revision)))
+            .collect())
+    }
+
+    /// Every live row of the granted IOC `feeds` (NAN-4169 retro delta), through
+    /// the same gate as ingest stamping. One linear pass over the IOC section;
+    /// refuses (rather than truncates) past `max_rows`, so a caller never
+    /// mistakes a partial feed for the whole revision.
+    pub fn granted_feed_rows(
+        &self,
+        policy: &TenantPlatformPolicy,
+        feeds: &std::collections::BTreeSet<String>,
+        now: DateTime<Utc>,
+        max_rows: usize,
+    ) -> Result<Vec<IocSnapshotInput>> {
+        ensure!(
+            policy.bundle_sha256 == self.digest,
+            "platform policy and bundle differ"
+        );
+        let mut out = Vec::new();
+        if feeds.is_empty() {
+            return Ok(out);
+        }
+        let bytes = &self.map[self.ioc_start..self.ioc_end];
+        for line in bytes.split(|b| *b == b'\n') {
+            if line.is_empty() {
                 continue;
             }
-            if let Some(expiry) = row.data.get("indicator_expires_at").and_then(Value::as_str) {
-                let expiry =
-                    DateTime::parse_from_rfc3339(expiry).context("invalid platform IOC expiry")?;
-                if expiry <= now {
-                    continue;
-                }
-            }
-            let Some(grant) = self.grant(policy, &row.source_id, now) else {
-                continue;
-            };
-            if self.revisions.get(&row.source_id) != Some(&grant.feed_revision) {
+            let tab = line
+                .iter()
+                .position(|b| *b == b'\t')
+                .context("invalid IOC row")?;
+            let row: IocSnapshotInput = serde_json::from_slice(&line[tab + 1..])?;
+            if !feeds.contains(&row.source_id) || NON_IOC_FEEDS.contains(&row.source_id.as_str()) {
                 continue;
             }
-            let mut source_until = self.valid_until.get(&row.source_id).copied();
-            if let Some(record_until) = row
-                .data
-                .get("effective_valid_until")
-                .and_then(Value::as_i64)
-                .and_then(|s| DateTime::from_timestamp(s, 0))
-            {
-                source_until = Some(source_until.map_or(record_until, |v| v.min(record_until)));
+            if let Some(granted) = self.live_granted_row(policy, row, now)? {
+                ensure!(out.len() < max_rows, "platform IOC feed exceeds the retro enumeration bound");
+                out.push(granted.row);
             }
-            out.push(GrantedIoc { row, grant, source_until });
         }
         Ok(out)
     }
@@ -998,69 +1069,6 @@ fn stamp_record(
     Ok(
         json!({"name":field,"value":value,"provider":format!("platform/{feed}"),"type":kind,"data":data}),
     )
-}
-
-/// Apply fresh tenant rights to a row read from a signed part. This same
-/// operation is available to query[T] after its route lands.
-pub fn mask_event(
-    event: &mut Value,
-    policy: &TenantPlatformPolicy,
-    now: DateTime<Utc>,
-) -> Result<()> {
-    let object = event.as_object_mut().context("OCSF event must be object")?;
-    let Some(Value::Array(records)) = object.get_mut("enrichments") else {
-        return Ok(());
-    };
-    let mut revoked = Vec::new();
-    records.retain(|record| {
-        let Some(feed) = record
-            .get("provider")
-            .and_then(Value::as_str)
-            .and_then(|v| v.strip_prefix("platform/"))
-        else {
-            return true;
-        };
-        let data = &record["data"];
-        let allowed = policy.grant(feed, now).is_some_and(|grant| {
-            data["feed_revision_id"].as_i64() == Some(grant.feed_revision)
-                && data["valid_until"]
-                    .as_str()
-                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                    .is_some_and(|t| t > now)
-                && match &grant.premium {
-                    Some(right) => {
-                        data["premium"]["entitlement_revision"].as_i64()
-                            == Some(right.entitlement_revision)
-                            && data["premium"]["grant_revision"].as_i64()
-                                == Some(right.grant_revision)
-                            && data["premium"]["tier"].as_str() == Some(right.tier.as_str())
-                    }
-                    None => data["premium"].is_null(),
-                }
-        });
-        if !allowed {
-            if let Some(fields) = data["owned_fields"].as_array() {
-                revoked.extend(fields.iter().filter_map(Value::as_str).map(str::to_string));
-            }
-        }
-        allowed
-    });
-    for field in revoked {
-        let mut parts = field.split('.');
-        if let (Some(endpoint), Some(child), Some(leaf)) =
-            (parts.next(), parts.next(), parts.next())
-        {
-            if let Some(map) = object
-                .get_mut(endpoint)
-                .and_then(Value::as_object_mut)
-                .and_then(|e| e.get_mut(child))
-                .and_then(Value::as_object_mut)
-            {
-                map.remove(leaf);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Where a cell process finds the node-shared platform bundle.
@@ -1429,29 +1437,15 @@ mod tests {
         let mut producer = json!({"src_endpoint":{"ip":"8.8.8.8",
             "autonomous_system":{"name":"Producer network"}, "location":{"continent":"Producer continent"}}});
         bundle.stamp(producer.as_object_mut().unwrap(), &policy, Utc::now()).unwrap();
-        let mut revoked = policy;
-        revoked.grants.clear();
-        mask_event(&mut producer, &revoked, Utc::now()).unwrap();
         assert_eq!(producer["src_endpoint"]["autonomous_system"]["name"], "Producer network");
         assert_eq!(producer["src_endpoint"]["location"]["continent"], "Producer continent");
-        assert!(producer["src_endpoint"]["autonomous_system"].get("number").is_none());
-
     }
 
     #[tokio::test]
     #[ignore = "requires a digest-verified native chDB library"]
-    async fn all_lite_attributes_native_search_table_stats_and_revocation() {
-        use nanosiem_core::platform_enrichment::{AuthorizedRevision, RevisionReference, read::ReadAuthorization};
+    async fn all_lite_attributes_native_search_table_and_stats() {
         let dir = tempfile::tempdir().unwrap();
         let (_, policy, path) = lite_part_fixture(dir.path());
-        let now = Utc::now();
-        let auth = ReadAuthorization::from_resolved(policy.tenant_id, now, &[AuthorizedRevision {
-            tenant_id: policy.tenant_id, evaluated_at: now,
-            valid_until: policy.grants["ipinfo_lite"].valid_until,
-            reference: RevisionReference { feed_id:"ipinfo_lite".into(), feed_revision:1,
-                tier:"included".into(), grant_revision:1, entitlement_revision:1 },
-            class: FeedClass::Baseline, digest:"a".repeat(64), mapping_revision:1, deny_epoch:0,
-        }]);
         let runtime = crate::native::NativeChdb::load_verified(
             std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
             &std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap()).unwrap();
@@ -1489,9 +1483,9 @@ mod tests {
                     "query_sha256":"a".repeat(64),"start":"2026-10-01T00:00:00Z",
                     "end":"2026-10-02T00:00:00Z","limit":100,"table_view":true,
                     "required_columns":[{"name":leaf,"field_type":"string"}],"sql":sql})).unwrap();
-                let plan = crate::enrichment_read::scope(auth.clone(), async {
+                let plan = async {
                     plan_broad_log_query(&config, &manifest, &compiled).unwrap()
-                }).await;
+                }.await;
                 assert!(!plan.schema_defaults.contains(&leaf));
                 let params = plan.params.iter().map(|(k,v)| (k.as_str(),v.as_str())).collect::<Vec<_>>();
                 let result = c.query_with_params(&plan.sql, "JSONEachRow", &params).unwrap();
@@ -1499,32 +1493,188 @@ mod tests {
             }
         }
 
-        let projection = ["src_endpoint", "dst_endpoint", "enrichments"].iter()
-            .map(|root| format!("{} AS {root}", crate::enrichment_read::root_expression(root, &auth)))
-            .collect::<Vec<_>>().join(", ");
-        let result = c.query_with_params(&format!("SELECT {projection} FROM {source}"), "JSONEachRow", &[]).unwrap();
+        // NAN-4168: stamped roots are plain columns, read as stored.
+        let result = c.query_with_params(&format!("SELECT src_endpoint, dst_endpoint, enrichments FROM {source}"), "JSONEachRow", &[]).unwrap();
         assert_lite_attributes(&serde_json::from_slice::<Value>(&result.data).unwrap());
-        for endpoint in ["src_endpoint", "dst_endpoint"] {
-            let leaf = format!("{endpoint}.autonomous_system.name");
-            let expression = crate::enrichment_read::leaf_expression(&leaf, &auth);
-            for sql in [format!("SELECT {expression} AS name FROM {source}"),
-                format!("SELECT {expression} AS name, count() AS count FROM {source} GROUP BY name")] {
-                let result = c.query_with_params(&sql, "JSONEachRow", &[]).unwrap();
-                let row: Value = serde_json::from_slice(&result.data).unwrap();
-                assert_eq!(row["name"], "Fixture network");
-            }
-            let denied = ReadAuthorization::unknown(policy.tenant_id, now);
-            let expression = crate::enrichment_read::leaf_expression(&leaf, &denied);
-            let result = c.query_with_params(&format!("SELECT {expression} AS name FROM {source}"), "JSONEachRow", &[]).unwrap();
-            assert!(serde_json::from_slice::<Value>(&result.data).unwrap()["name"].is_null());
+    }
+
+    /// NAN-4168 (ingest-only enrichment): Tor, ThreatFox and geo stamps
+    /// written under feed revision 1 stay visible to a 7-day read (the
+    /// search and scheduled-detection path: the same planner) after the
+    /// feeds refresh to revision 2 and after every stamp's `valid_until`
+    /// has passed. The plan carries no read authority at all.
+    #[tokio::test]
+    #[ignore = "requires a digest-verified native chDB library"]
+    async fn stamps_stay_visible_to_a_7d_read_after_feed_refresh_and_stamp_expiry() {
+        use crate::part_ingest::schema::{decode, infer_schema};
+        use crate::planner::{CompiledQuery, TenantQueryConfig, ObjectStoreCredentials,
+            SnapshotCache, SnapshotCacheObject, SourceManifest, plan_broad_log_query};
+        use std::collections::BTreeSet;
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = Uuid::new_v4();
+        let iocs = [("threatfox", "8.8.8.8"), ("tor_exit_nodes", "8.8.8.8")].map(|(source, value)| IocSnapshotInput {
+            ioc_value: value.into(), ioc_type: "ip".into(), source_id: source.into(),
+            threat_type: "malware".into(), ..Default::default()
+        });
+        // Stamp one event per revision, an hour apart, under short grants.
+        let stamped_at: DateTime<Utc> = "2026-10-01T12:00:00Z".parse().unwrap();
+        let mut events = Vec::new();
+        for revision in [1_i64, 2] {
+            let path = dir.path().join(format!("platform-{revision}.bundle"));
+            let digest = PlatformBundle::publish(&path, Some(&mmdb_bytes()), &iocs, BTreeMap::from([
+                ("ipinfo_lite".into(), revision), ("threatfox".into(), revision), ("tor_exit_nodes".into(), revision),
+            ])).unwrap();
+            let now = stamped_at + chrono::Duration::hours(revision);
+            let grant = PlatformGrant { feed_revision: revision, valid_until: now + chrono::Duration::minutes(5), premium: None };
+            let policy = TenantPlatformPolicy { tenant_id: tenant, revision: revision as u64, bundle_sha256: digest.clone(),
+                grants: ["ipinfo_lite", "threatfox", "tor_exit_nodes"].into_iter().map(|feed| (feed.to_string(), grant.clone())).collect() };
+            let mut event = json!({"time": now.to_rfc3339(), "metadata": {"uid": format!("uid-{revision}")},
+                "src_endpoint": {"ip": "8.8.8.8"}});
+            PlatformBundle::open(&path, &digest).unwrap().stamp(event.as_object_mut().unwrap(), &policy, now).unwrap();
+            let providers = event["enrichments"].as_array().unwrap().iter()
+                .map(|stamp| stamp["provider"].as_str().unwrap().to_string()).collect::<BTreeSet<_>>();
+            assert_eq!(providers, BTreeSet::from(["platform/ipinfo_lite".to_string(),
+                "platform/threatfox".to_string(), "platform/tor_exit_nodes".to_string()]), "{event}");
+            events.push(event);
         }
-        let denied = crate::enrichment_read::root_expression("enrichments", &ReadAuthorization::unknown(policy.tenant_id, now));
-        let result = c.query_with_params(&format!("SELECT {denied} AS enrichments FROM {source}"), "JSONEachRow", &[]).unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&result.data).unwrap()["enrichments"], json!([]));
+        let refs = events.iter().collect::<Vec<_>>();
+        let schema = Arc::new(infer_schema(&refs).unwrap());
+        let batch = decode(schema.clone(), &refs).unwrap();
+        let path = dir.path().join("part.parquet");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let runtime = crate::native::NativeChdb::load_verified(
+            std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
+            &std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap()).unwrap();
+        std::mem::forget(runtime.clone());
+        let c = runtime.connect(&[]).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&path).unwrap()).unwrap();
+        let types = crate::generation::schema_leaf_types(reader.schema());
+        let read_schema = crate::iceberg::clickhouse_read_schema(reader.schema()).unwrap();
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        let object = "s3://test/events/part.parquet";
+        let config = TenantQueryConfig {
+            tenant_id: tenant.to_string(), source: "https://object.test/test/events".into(),
+            iceberg_metadata_file_path: "metadata/test.json".into(), max_query_bytes: 10_000_000,
+            max_memory_bytes: 1_000_000_000, max_execution_seconds: 30, threads: 1,
+            credentials: ObjectStoreCredentials::DefaultChain,
+            snapshot_cache: Some(SnapshotCache { source_spec: path.to_str().unwrap().into(),
+                objects: BTreeMap::from([(object.into(), SnapshotCacheObject {
+                    version_id: "v1".into(), bytes, path: path.clone() })]), bytes,
+                read_schema: Some(read_schema), bootstrap: false }),
+        };
+        let manifest: SourceManifest = serde_json::from_value(json!({"tenant_id": tenant.to_string(),
+            "objects": [{"event_object_key": object, "event_object_version": "v1",
+                "event_object_bytes": bytes, "rows": 2, "available_paths": types.keys().collect::<Vec<_>>(),
+                "field_types": types}]})).unwrap();
+        // A 7-day lookback read six days after the last stamp expired.
+        let end = stamped_at + chrono::Duration::days(6);
+        let run = |sql: &str, required: Value| {
+            let compiled: CompiledQuery = serde_json::from_value(json!({"schema_version": 1,
+                "profile": "ocsf", "dataset": "logs", "source_placeholder": "__nano_lake_source__",
+                "query_sha256": "a".repeat(64), "start": (end - chrono::Duration::days(7)).to_rfc3339(),
+                "end": end.to_rfc3339(), "limit": 100, "table_view": false,
+                "required_columns": required, "sql": sql})).unwrap();
+            let plan = plan_broad_log_query(&config, &manifest, &compiled).unwrap();
+            assert!(plan.params.iter().all(|(name, _)| !name.contains("authority")), "{:?}", plan.params);
+            assert!(!plan.sql.contains("owned_fields") && !plan.sql.contains("valid_until"), "{}", plan.sql);
+            let params = plan.params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>();
+            let result = c.query_with_params(&plan.sql, "JSONEachRow", &params).unwrap();
+            String::from_utf8_lossy(&result.data).lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>()
+        };
+        // Geo: a detection-style stats by country over both revisions.
+        let rows = run("SELECT `src_endpoint.location.country` AS country, count() AS count FROM __nano_lake_source__ GROUP BY country",
+            json!([{"name": "src_endpoint.location.country", "field_type": "string"}]));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["country"], "US");
+        assert_eq!(rows[0]["count"].as_u64().or_else(|| rows[0]["count"].as_str().and_then(|s| s.parse().ok())), Some(2));
+        // Tor and ThreatFox: every stamp of both revisions, as stored.
+        let rows = run("SELECT `enrichments` AS enrichments FROM __nano_lake_source__",
+            json!([{"name": "enrichments", "field_type": "array"}]));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let mut seen = BTreeSet::new();
+        for row in &rows {
+            for stamp in row["enrichments"].as_array().unwrap() {
+                let until: DateTime<Utc> = stamp["data"]["valid_until"].as_str().unwrap().parse().unwrap();
+                assert!(until < end, "{stamp}");
+                seen.insert((stamp["provider"].as_str().unwrap().to_string(), stamp["data"]["feed_revision_id"].as_i64().unwrap()));
+            }
+        }
+        for provider in ["platform/ipinfo_lite", "platform/threatfox", "platform/tor_exit_nodes"] {
+            for revision in [1, 2] {
+                assert!(seen.contains(&(provider.to_string(), revision)), "{provider} r{revision}: {seen:?}");
+            }
+        }
+    }
+
+    /// NAN-4167: ThreatFox keys ~85% of its IP indicators as `ip:port`; lean
+    /// ingest looked up bare IPs only, so they never matched.
+    #[test]
+    fn threatfox_ip_port_indicator_matches_the_endpoint_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("platform.bundle");
+        let indicator = |value: &str, kind: &str| IocSnapshotInput {
+            ioc_value: value.into(),
+            ioc_type: kind.into(),
+            source_id: "threatfox".into(),
+            threat_type: "botnet_cc".into(),
+            ..Default::default()
+        };
+        let digest = PlatformBundle::publish(
+            &path,
+            None,
+            &[indicator("159.65.136.5:7713", "ip:port"), indicator("39.105.125.235", "ip")],
+            BTreeMap::from([("threatfox".into(), 110)]),
+        )
+        .unwrap();
+        let bundle = PlatformBundle::open(&path, &digest).unwrap();
+        let now = Utc::now();
+        let policy = TenantPlatformPolicy {
+            tenant_id: Uuid::new_v4(),
+            revision: 1,
+            bundle_sha256: digest,
+            grants: BTreeMap::from([("threatfox".into(), PlatformGrant {
+                feed_revision: 110,
+                valid_until: now + chrono::Duration::hours(1),
+                premium: None,
+            })]),
+        };
+        let stamped = |event: Value| {
+            let mut event = event;
+            bundle.stamp(event.as_object_mut().unwrap(), &policy, now).unwrap();
+            event.get("enrichments").cloned().unwrap_or(json!([]))
+        };
+        let hit = stamped(json!({"src_endpoint":{"ip":"10.0.0.5","port":51000},
+            "dst_endpoint":{"ip":"159.65.136.5","port":7713}}));
+        assert_eq!(hit.as_array().unwrap().len(), 1, "{hit}");
+        assert_eq!(hit[0]["provider"], "platform/threatfox");
+        assert_eq!(hit[0]["name"], "dst_endpoint.ip");
+        assert_eq!(hit[0]["value"], "159.65.136.5:7713");
+        assert_eq!(hit[0]["data"]["matched_field"], "dst_endpoint.ip");
+        // Another port, no port, or the port on the other endpoint: no match.
+        for miss in [
+            json!({"dst_endpoint":{"ip":"159.65.136.5","port":443}}),
+            json!({"dst_endpoint":{"ip":"159.65.136.5"}}),
+            json!({"src_endpoint":{"ip":"10.0.0.5","port":7713},"dst_endpoint":{"ip":"159.65.136.5"}}),
+        ] {
+            assert!(stamped(miss.clone()).as_array().unwrap().is_empty(), "{miss}");
+        }
+        // Source side matches too; bare-IP indicators still match with a port.
+        let src = stamped(json!({"src_endpoint":{"ip":"159.65.136.5","port":7713}}));
+        assert_eq!(src[0]["name"], "src_endpoint.ip");
+        let bare = stamped(json!({"dst_endpoint":{"ip":"39.105.125.235","port":7443}}));
+        assert_eq!(bare.as_array().unwrap().len(), 1);
+        assert_eq!(bare[0]["value"], "39.105.125.235");
+        // On-demand lookup accepts the socket form as well.
+        assert_eq!(bundle.lookup_indicator(&policy, "159.65.136.5:7713", now).unwrap().len(), 1);
     }
 
     #[test]
-    fn one_mmap_stamps_geo_ioc_and_masks_revocation_expiry_and_other_tenant() {
+    fn one_mmap_stamps_geo_ioc_per_tenant_and_revocation_only_stops_new_stamps() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("platform.bundle");
         let mmdb = mmdb_bytes();
@@ -1584,32 +1734,33 @@ mod tests {
         );
         assert_eq!(a_event["enrichments"].as_array().unwrap().len(), 2);
         assert!(a_event["dst_endpoint"].get("location").is_none());
-        let mut unchanged_feed = a_event.clone();
-        let mut rotated_bundle = a.clone();
-        rotated_bundle.bundle_sha256 = "0".repeat(64);
-        mask_event(&mut unchanged_feed, &rotated_bundle, now).unwrap();
-        assert_eq!(unchanged_feed["enrichments"].as_array().unwrap().len(), 2);
         let mut b_event = json!({"src_endpoint":{"ip":"8.8.8.8"}});
         bundle
             .stamp(b_event.as_object_mut().unwrap(), &b, now)
             .unwrap();
         assert_eq!(b_event["enrichments"].as_array().unwrap().len(), 1);
+        // NAN-4168: a revoked grant stops new stamping; the stamped event
+        // keeps every value (there is no read-time mask to apply).
+        let stamped = a_event.clone();
         let mut revoked = a.clone();
         revoked.grants.clear();
-        mask_event(&mut a_event, &revoked, now).unwrap();
-        assert!(a_event["enrichments"].as_array().unwrap().is_empty());
-        assert!(a_event["src_endpoint"]["location"].get("country").is_none());
-        assert!(a_event["src_endpoint"]["autonomous_system"]
-            .get("number")
-            .is_none());
-        mask_event(&mut b_event, &b, now + chrono::Duration::minutes(6)).unwrap();
-        assert!(b_event["enrichments"].as_array().unwrap().is_empty());
+        let mut fresh = json!({"src_endpoint":{"ip":"8.8.8.8"}});
+        bundle.stamp(fresh.as_object_mut().unwrap(), &revoked, now).unwrap();
+        assert!(fresh.get("enrichments").map_or(true, |e| e.as_array().unwrap().is_empty()), "{fresh}");
+        assert!(fresh["src_endpoint"].get("location").is_none(), "{fresh}");
+        assert_eq!(a_event, stamped);
+        assert_eq!(a_event["src_endpoint"]["location"]["country"], "US");
+        // An expired grant also stops new stamping only.
+        let mut late = json!({"src_endpoint":{"ip":"8.8.8.8"}});
+        bundle.stamp(late.as_object_mut().unwrap(), &b, now + chrono::Duration::minutes(6)).unwrap();
+        assert!(late.get("enrichments").map_or(true, |e| e.as_array().unwrap().is_empty()), "{late}");
+        assert_eq!(b_event["enrichments"].as_array().unwrap().len(), 1);
         let restarted = PlatformBundle::open(&path, &digest).unwrap();
         assert_eq!(restarted.lookup_ioc("8.8.8.8").unwrap().len(), 1);
     }
 
     #[test]
-    fn premium_feed_requires_tenant_grant_and_current_entitlement_to_read() {
+    fn premium_feed_stamps_only_under_a_tenant_grant_and_stamps_stay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("platform.bundle");
         let digest = PlatformBundle::publish(
@@ -1652,17 +1803,13 @@ mod tests {
             event["enrichments"][0]["data"]["premium"]["entitlement_revision"],
             7
         );
+        let stamped = event.clone();
         let mut revoked = policy.clone();
-        revoked
-            .grants
-            .get_mut("spur")
-            .unwrap()
-            .premium
-            .as_mut()
-            .unwrap()
-            .entitlement_revision = 8;
-        mask_event(&mut event, &revoked, now).unwrap();
-        assert!(event["enrichments"].as_array().unwrap().is_empty());
+        revoked.grants.clear();
+        let mut fresh = json!({"url":{"hostname":"bad.example"}});
+        bundle.stamp(fresh.as_object_mut().unwrap(), &revoked, now).unwrap();
+        assert!(fresh.get("enrichments").map_or(true, |e| e.as_array().unwrap().is_empty()), "{fresh}");
+        assert_eq!(event, stamped);
     }
 
     #[test]

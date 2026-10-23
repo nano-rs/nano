@@ -160,8 +160,33 @@ if exists(.event) {
     del(.event)
 }
 
-if !exists(.message) {
-    .message = ""
+# NAN-3646: a sender that posts a structured (object) event can reach this
+# point with no `.message`: a Vector without the bytes codec (or an older
+# fork) spreads the object over the log root instead. Every parser reads
+# `.message`, so an empty one becomes an unparsed row the lake refuses
+# (`raw_data_missing`). Rebuild the payload from the root minus the HEC
+# envelope and pipeline fields. VRL objects are key-sorted, so the JSON is
+# deterministic (a redelivered batch serializes byte-identically). A
+# non-string `.message` (an object or number) is serialized the same way.
+if !exists(.message) || .message == null || .message == "" {
+    hec_envelope_keys = ["message", "auth_status", "source_type", "claimed_source_type",
+                         "sourcetype", "splunk_sourcetype", "splunk_source", "splunk_index",
+                         "splunk_channel", "host",
+                         "timestamp", "metadata", "content_format", "routing_timestamp",
+                         "ingest_time", "_inserted_at"]
+    hec_payload = {}
+    for_each(object!(.)) -> |key, value| {
+        if !includes(hec_envelope_keys, key) && value != null {
+            hec_payload = set!(hec_payload, [key], value)
+        }
+    }
+    if length(hec_payload) > 0 {
+        .message = encode_json(hec_payload)
+    } else {
+        .message = ""
+    }
+} else if !is_string(.message) {
+    .message = encode_json(.message)
 }
 
 .content_format = "splunk_hec"

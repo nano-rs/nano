@@ -472,7 +472,7 @@ export function Prevalence() {
       if (artifact.artifact_type.startsWith('hash')) field = 'file_hash';
       else if (artifact.artifact_type.startsWith('ip_address')) field = 'dest_ip';
       else field = 'dest_host';
-      navigate(`/search?q=${encodeURIComponent(`${field}="${artifact.artifact}"`)}`);
+      navigate(`/search#q=${encodeURIComponent(`${field}="${artifact.artifact}"`)}`);
     },
     [navigate],
   );

@@ -41,22 +41,23 @@ fn assert_tiles(span: &TimeRange, pieces: &[TimeRange]) {
     oldest_first.reverse();
     assert_eq!(oldest_first.first().unwrap().0, micros(span).0);
     assert_eq!(oldest_first.last().unwrap().1, micros(span).1);
+    // NAN-4280: half-open pieces share each boundary (gap-free, no overlap).
     for pair in oldest_first.windows(2) {
-        assert_eq!(pair[0].1 + 1, pair[1].0, "{pieces:?}");
-        assert!(pair[0].0 <= pair[0].1);
+        assert_eq!(pair[0].1, pair[1].0, "{pieces:?}");
+        assert!(pair[0].0 < pair[0].1);
     }
 }
 
 #[test]
 fn the_lookback_is_read_newest_day_first_then_the_remainder() {
-    let end = Utc.with_ymd_and_hms(2026, 10, 7, 19, 0, 0).unwrap() - Duration::microseconds(1);
-    let lookback = TimeRange::new(end - Duration::days(7) + Duration::microseconds(1), end);
+    let end = Utc.with_ymd_and_hms(2026, 10, 7, 19, 0, 0).unwrap();
+    let lookback = TimeRange::new(end - Duration::days(7), end);
     let spans = lake_baseline_lookback_spans(&lookback);
     assert_eq!(spans.len(), 2);
     assert_tiles(&lookback, &spans);
     assert_eq!(spans[0].end, end);
     assert_eq!(
-        micros(&spans[0]).1 - micros(&spans[0]).0 + 1,
+        micros(&spans[0]).1 - micros(&spans[0]).0,
         86_400_000_000
     );
 
@@ -219,10 +220,7 @@ async fn a_7d_lookback_over_the_cold_budget_is_split_never_refused() {
         })
         .map(|(_, range, _)| range.clone())
         .collect::<Vec<_>>();
-    let lookback = TimeRange::new(
-        spans.new_start,
-        spans.incident_start - Duration::microseconds(1),
-    );
+    let lookback = TimeRange::new(spans.new_start, spans.incident_start);
     let mut sorted = accepted.clone();
     sorted.sort_by_key(|range| std::cmp::Reverse(range.start));
     assert_tiles(&lookback, &sorted);

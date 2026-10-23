@@ -113,6 +113,38 @@ impl IngestTokenService {
         Ok(self.repo.settings(self.tenant_id).await?)
     }
 
+    /// OTLP requires a credential bound to an enabled push source. Logs use
+    /// that source's parser; traces/metrics retain their native signal types.
+    /// No positive cache: revocation and the install switch apply on the next request.
+    pub async fn authenticate_otlp(
+        &self,
+        token: &str,
+    ) -> Result<Option<super::BindableSourceCredential>, IngestTokenServiceError> {
+        if token.is_empty() || token.len() > 4096 {
+            return Ok(None);
+        }
+        let hash = sha256_hex(token);
+        if self
+            .install_token
+            .as_deref()
+            .is_some_and(|install| sha256_hex(install) == hash)
+        {
+            let settings = self.settings().await?;
+            if settings.install_token_enabled {
+                if let Some(source) = self.install_token_source(&settings).await? {
+                    if source.enabled {
+                        return Ok(Some(super::BindableSourceCredential {
+                            id: INSTALL_CREDENTIAL_ID,
+                            route: source.route_key,
+                        }));
+                    }
+                }
+            }
+            return Ok(None);
+        }
+        Ok(self.repo.otlp_credential(self.tenant_id, &hash).await?)
+    }
+
     /// Whether an install token is configured (`VECTOR_AUTH_TOKEN` non-blank).
     pub fn install_token_configured(&self) -> bool {
         self.install_token.is_some()
@@ -141,7 +173,7 @@ impl IngestTokenService {
     ) -> Result<BindableSource, IngestTokenServiceError> {
         self.repo.bindable_source(source_id).await?.ok_or_else(|| {
             IngestTokenServiceError::InvalidSource(
-                "Source not found, or it cannot receive pushed events (OTLP and pulled sources take no ingest token)"
+                "Source not found, or it cannot receive pushed events (pulled sources take no ingest token)"
                     .into(),
             )
         })

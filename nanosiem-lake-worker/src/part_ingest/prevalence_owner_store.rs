@@ -488,9 +488,9 @@ impl OwnerStore {
         //   SlateDB's sequenced protocol refreshes and advances;
         // - absent: nothing landed; drop the record and create afresh. If
         //   the owner still holds a pending row for the old request it
-        //   refuses (the key stays blocked, never quarantined); if it never
-        //   authorized it (cell30: the owner crashed first), the create
-        //   simply succeeds.
+        //   refuses, except for abandoned maintenance compactions creates
+        //   recovered by 9013910. No key is quarantined. If the owner never
+        //   authorized it (cell30: it crashed first), the create succeeds.
         if journal_path.exists() {
             let bytes = std::fs::read(&journal_path).map_err(|e| error(e.to_string()))?;
             let saved: PendingMutation =
@@ -580,24 +580,57 @@ impl OwnerStore {
         };
         let envelope = serde_json::to_vec(&request).map_err(|e| error(e.to_string()))?;
         let envelope = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(envelope);
-        let body = reqwest::Body::wrap_stream(futures::stream::iter(
-            payload.into_iter().map(Ok::<_, std::io::Error>),
-        ));
-        // No refresh loop reaches a store inside SlateDB: re-check the CA
-        // bundle here so a CA rotation needs no restart.
-        self.tls.reload_ca_if_due(OWNER_CA_RECHECK, "prevalence owner");
-        let response = self
-            .tls
-            .client()
-            .post(&self.access.url)
-            .bearer_auth(self.bearer())
-            .header("x-nano-owner-request", envelope)
-            .header("content-type", "application/octet-stream")
-            .header(reqwest::header::CONTENT_LENGTH, length)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| error(e.to_string()))?;
+        // Keep the request ID and bytes fixed while an owner reservation is
+        // contested. A 409 is not proof that the conditional create landed.
+        // In particular, never invent AlreadyExists for an absent numbered
+        // compactions file: SlateDB would refresh the same version forever.
+        let mut conflict_backoff = std::time::Duration::from_millis(100);
+        let response = loop {
+            let body = reqwest::Body::wrap_stream(futures::stream::iter(
+                payload.clone().into_iter().map(Ok::<_, std::io::Error>),
+            ));
+            self.tls.reload_ca_if_due(OWNER_CA_RECHECK, "prevalence owner");
+            let response = self
+                .tls
+                .client()
+                .post(&self.access.url)
+                .bearer_auth(self.bearer())
+                .header("x-nano-owner-request", &envelope)
+                .header("content-type", "application/octet-stream")
+                .header(reqwest::header::CONTENT_LENGTH, length)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| error(e.to_string()))?;
+            if response.status() != reqwest::StatusCode::CONFLICT
+                || self.writer_class != WriterClass::Maintenance
+            {
+                break response;
+            }
+            drop(response);
+            match slatedb::object_store::ObjectStoreExt::head(&self.reads(), path).await {
+                Ok(_) => {
+                    // Another conditional writer won. Let SlateDB re-read
+                    // its sequenced state and converge (or fence this writer).
+                    return Err(slatedb::object_store::Error::AlreadyExists {
+                        path: path.to_string(),
+                        source: std::io::Error::other("owner conflict: object now exists").into(),
+                    });
+                }
+                Err(slatedb::object_store::Error::NotFound { .. }) => {}
+                Err(other) => return Err(other),
+            }
+            // The owner's conditional-create reservation recovery allows a
+            // fresh current maintenance request to replace an abandoned
+            // compactions reservation. Retry in place while that migration
+            // rolls out or another request is still completing. This future
+            // remains cancellable; the role's credential refresh runs beside
+            // it and can refresh the bearer without reopening the compactor.
+            tracing::warn!(key_family, backoff_ms = conflict_backoff.as_millis() as u64,
+                "prevalence owner conflict on absent object; re-reading and retrying");
+            tokio::time::sleep(conflict_backoff).await;
+            conflict_backoff = (conflict_backoff * 2).min(std::time::Duration::from_secs(5));
+        };
         if response.status() != reqwest::StatusCode::OK {
             if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
                 // SlateDB's numbered manifest/compactions protocol must see
@@ -802,6 +835,9 @@ mod tests {
         if state.failure.load(Ordering::SeqCst) == 1 {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
+        if state.failure.load(Ordering::SeqCst) == 4 {
+            return Err(StatusCode::CONFLICT);
+        }
         if state.failure.load(Ordering::SeqCst) == 3 {
             // The owner's authorize refusal (e.g. authorize_stale_epoch).
             return Err(StatusCode::FORBIDDEN);
@@ -992,6 +1028,52 @@ mod tests {
             .delete(&Path::from("db/wal/00000000000000000002.sst"))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn maintenance_owner_conflict_rereads_and_retries_without_stopping() {
+        let (objects, access, fixture, tmp) = setup(4).await;
+        let mut owner = access.owner;
+        owner.bearer = "maintenance-token".into();
+        let store = OwnerStore::new_maintenance(objects.clone(), MaintenanceAccess {
+            read: access.read, owner, owner_ca_file: None,
+        }, tmp.path()).unwrap();
+        let path = Path::from("db/compactions/00000000000000000001.compactions");
+        let write = store.put_opts(&path, b"new state".to_vec().into(), PutMode::Create.into());
+        tokio::pin!(write);
+        // Repeated 409 + absent HEAD must stay in this call, preserving the
+        // journal/request ID, instead of stopping SlateDB's compactor.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut write => panic!("contested write returned before owner recovery: {result:?}"),
+                _ = async {
+                    while fixture.requests.lock().unwrap().len() < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        }).await.expect("owner did not receive repeated contested requests");
+        fixture.failure.store(0, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut write).await.unwrap().unwrap();
+        let requests = fixture.requests.lock().unwrap();
+        assert!(requests.iter().all(|id| *id == requests[0]));
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn maintenance_owner_conflict_with_present_object_refreshes_instead_of_overwriting() {
+        let (objects, access, fixture, tmp) = setup(4).await;
+        let mut owner = access.owner;
+        owner.bearer = "maintenance-token".into();
+        let store = OwnerStore::new_maintenance(objects.clone(), MaintenanceAccess {
+            read: access.read, owner, owner_ca_file: None,
+        }, tmp.path()).unwrap();
+        let path = Path::from("db/compactions/00000000000000000001.compactions");
+        objects.put(&path, b"winner".to_vec().into()).await.unwrap();
+        let result = store.put_opts(&path, b"loser".to_vec().into(), PutMode::Create.into()).await;
+        assert!(matches!(result, Err(slatedb::object_store::Error::AlreadyExists { .. })));
+        assert_eq!(objects.get(&path).await.unwrap().bytes().await.unwrap().as_ref(), b"winner");
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1415,17 +1497,22 @@ mod tests {
 
     #[tokio::test]
     async fn standalone_maintenance_compacts_real_ingest_l0_and_reopens() {
-        run_standalone_maintenance_compaction(false).await;
+        run_standalone_maintenance_compaction(false, false).await;
     }
 
     /// Run by the disposable PG18 harness with tenant-specific logins.
     #[tokio::test]
     #[ignore]
     async fn standalone_maintenance_compaction_with_real_pg_owner() {
-        run_standalone_maintenance_compaction(true).await;
+        run_standalone_maintenance_compaction(true, false).await;
     }
 
-    async fn run_standalone_maintenance_compaction(expect_pg: bool) {
+    #[tokio::test]
+    async fn standalone_maintenance_compactor_survives_owner_conflicts_and_resumes() {
+        run_standalone_maintenance_compaction(false, true).await;
+    }
+
+    async fn run_standalone_maintenance_compaction(expect_pg: bool, conflict: bool) {
         use slatedb::admin::AdminBuilder;
         use tokio_util::sync::CancellationToken;
 
@@ -1504,6 +1591,10 @@ mod tests {
             .await
             .is_err());
 
+        if conflict {
+            fixture.failure.store(4, Ordering::SeqCst);
+        }
+        let requests_before = fixture.requests.lock().unwrap().len();
         let admin = AdminBuilder::new("db", maintenance).build();
         let cancel = CancellationToken::new();
         let options = slatedb::config::CompactorOptions {
@@ -1525,6 +1616,19 @@ mod tests {
                 .run_compactor_with_options(worker_cancel, options)
                 .await
         });
+        if conflict {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if fixture.requests.lock().unwrap().len() >= requests_before + 3 {
+                        break;
+                    }
+                    assert!(!worker.is_finished(), "409 stopped the real SlateDB compactor");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.expect("compactor did not retry owner conflicts");
+            assert!(!worker.is_finished(), "409 stopped the real SlateDB compactor");
+            fixture.failure.store(0, Ordering::SeqCst);
+        }
         for n in 0..24u32 {
             let artifact = format!("192.0.2.{n}");
             let key = crate::part_ingest::prevalence::key("ip", &artifact);

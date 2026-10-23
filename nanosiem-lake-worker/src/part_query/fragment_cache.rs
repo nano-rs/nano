@@ -25,8 +25,8 @@ mod tests {
     }
 
     #[test]
-    fn normalization_binds_kind_cursor_schema_and_authority() {
-        let sql = "SELECT time FROM __nano_lake_source__ WHERE time BETWEEN '2026-10-01 16:00:00.000000' AND '2026-10-01 17:00:00.000000' AND message='2026-10-01 16:00:00.000000'";
+    fn normalization_binds_kind_cursor_and_schema() {
+        let sql = "SELECT time FROM __nano_lake_source__ WHERE time >= '2026-10-01 16:00:00.000000' AND time < '2026-10-01 17:00:00.000000' AND message='2026-10-01 16:00:00.000000'";
         let a: CompiledQuery = serde_json::from_value(serde_json::json!({
             "schema_version":1,"profile":"ocsf","dataset":"logs","source_placeholder":"__nano_lake_source__",
             "query_sha256":"a","start":"2026-10-01T16:00:00Z","end":"2026-10-01T17:00:00Z","limit":101,
@@ -35,22 +35,30 @@ mod tests {
         let mut b = a.clone();
         b.end = "2026-10-01T18:00:00Z".into();
         b.sql = sql.replace("17:00:00.000000", "18:00:00.000000");
-        let key = Context::new(&a, None, "auth").identity;
-        assert_eq!(key, Context::new(&b, None, "auth").identity);
+        let key = Context::new(&a, None).identity;
+        assert_eq!(key, Context::new(&b, None).identity);
         assert!(normalized_sql(&a).contains("message='2026-10-01 16:00:00.000000'"));
-        assert_ne!(
-            key,
-            Context::new(&a, Some(("time", "uid")), "auth").identity
+        // NAN-4280: the compiler's half-open bound is recognized (the fast
+        // path engages), and the retired inclusive form is not.
+        assert!(normalized_sql(&a).contains("WHERE __nano_part_window__ AND message="), "{}", normalized_sql(&a));
+        let mut inclusive = a.clone();
+        inclusive.sql = sql.replace(
+            "time >= '2026-10-01 16:00:00.000000' AND time < '2026-10-01 17:00:00.000000'",
+            "time BETWEEN '2026-10-01 16:00:00.000000' AND '2026-10-01 17:00:00.000000'",
         );
-        assert_ne!(key, Context::new(&a, None, "changed").identity);
+        assert_eq!(normalized_sql(&inclusive), inclusive.sql);
         assert_ne!(
             key,
-            Context::for_statement("histogram", &a, None, "auth").identity
+            Context::new(&a, Some(("time", "uid"))).identity
+        );
+        assert_ne!(
+            key,
+            Context::for_statement("histogram", &a, None).identity
         );
         b.required_columns =
             serde_json::from_value(serde_json::json!([{"name":"x","field_type":"string"}]))
                 .unwrap();
-        assert_ne!(key, Context::new(&b, None, "auth").identity);
+        assert_ne!(key, Context::new(&b, None).identity);
     }
 
     #[test]
@@ -103,7 +111,7 @@ mod tests {
 }
 
 /// Conservative identity: compiler SQL, typed missing-column defaults,
-/// projection, cursor and authority. Only the compiler-owned source time
+/// projection and cursor. Only the compiler-owned source time
 /// bounds are normalized; edge windows remain in the per-part key.
 #[derive(Clone)]
 pub(super) struct Context {
@@ -111,33 +119,37 @@ pub(super) struct Context {
 }
 
 impl Context {
-    pub fn new(query: &CompiledQuery, cursor: Option<(&str, &str)>, authority: &str) -> Self {
-        Self::for_statement("locator", query, cursor, authority)
+    pub fn new(query: &CompiledQuery, cursor: Option<(&str, &str)>) -> Self {
+        Self::for_statement("locator", query, cursor)
     }
 
     pub fn for_statement(
         kind: &str,
         query: &CompiledQuery,
         cursor: Option<(&str, &str)>,
-        authority: &str,
     ) -> Self {
         let normalized = normalized_sql(query);
         let mut hash = Sha256::new();
         hash.update(format!(
-            "fragment-v1\0{kind}\0{}\0{:?}\0{:?}\0{}\0{:?}\0{}",
+            "fragment-v2\0{kind}\0{}\0{:?}\0{:?}\0{}\0{:?}",
             normalized,
             query.required_columns,
             query.projected_scan_columns,
             query.limit,
             cursor,
-            authority
         ));
         Self {
             identity: hash.finalize().into(),
         }
     }
 
-    pub fn key(&self, tenant: &str, part: &PartRef, from: i64, to: i64) -> [u8; 32] {
+    /// The cache key of one part's answer over `[from, last]`, both
+    /// INCLUSIVE µs (NAN-4280: a caller holding a half-open compiled window
+    /// passes `end - 1`). The window is clamped to the part, so windows that
+    /// cover the same rows of it share the answer: clamping an exclusive end
+    /// would map `[a, T)` and `[a, T + 5)` over a part ending at `T` to one
+    /// key although only the second holds the row at `T`.
+    pub fn key(&self, tenant: &str, part: &PartRef, from: i64, last: i64) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(self.identity);
         // Length-delimited identity fields prevent concatenation ambiguity.
@@ -151,7 +163,7 @@ impl Context {
             hash.update(field.as_bytes());
         }
         hash.update(from.max(part.min_time_us).to_le_bytes());
-        hash.update(to.min(part.max_time_us).to_le_bytes());
+        hash.update(last.min(part.max_time_us).to_le_bytes());
         hash.finalize().into()
     }
 }
@@ -171,8 +183,12 @@ fn normalized_sql(query: &CompiledQuery) -> String {
     };
     static WINDOW: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let pattern = WINDOW.get_or_init(|| {
-        regex::Regex::new(r"FROM __nano_lake_source__\s+WHERE time BETWEEN '([^']+)' AND '([^']+)'")
-            .expect("static window regex")
+        // NAN-4280: built from the compiler's own half-open bound text.
+        regex::Regex::new(&format!(
+            r"FROM __nano_lake_source__\s+WHERE {}",
+            nanosiem_core::sql_hygiene::half_open_time_bound_pattern("time", "[^']+")
+        ))
+        .expect("static window regex")
     });
     let Some(captures) = pattern.captures(&query.sql) else {
         return query.sql.clone();

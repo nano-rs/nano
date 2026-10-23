@@ -337,9 +337,13 @@ export class SearchApi {
    * List distinct tag keys for a metric, or distinct values for one key
    * (NAN-1540). GET /api/search/metrics/tags?metric_name=&key=.
    */
-  async listMetricTags(metricName: string, key?: string): Promise<MetricTagsResponse> {
+  async listMetricTags(metricName: string, key?: string, timeRange?: TimeRange): Promise<MetricTagsResponse> {
     const params = new URLSearchParams({ metric_name: metricName });
     if (key) params.set('key', key);
+    if (timeRange) {
+      params.set('start', timeRange.start);
+      params.set('end', timeRange.end);
+    }
     return this.request(`/api/search/metrics/tags?${params.toString()}`);
   }
 

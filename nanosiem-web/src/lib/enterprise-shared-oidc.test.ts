@@ -190,6 +190,16 @@ test('repeat login discovers minimal tenant labels and starts the same exact cal
   assert.equal(harness.requests[1].init?.credentials, 'include');
 });
 
+test('repeat SSO preserves the search window within the verified tenant root', async () => {
+  const path = '/search?q=error&start=2026-10-17T12%3A00%3A00Z&end=2026-10-17T13%3A00%3A00Z';
+  const harness = dependencies([
+    json(entry()), json(callback()), json(refreshed()), json(user()), json(bootstrap()),
+  ]);
+  await startEnterpriseSharedOidcLogin('tenant-a', 'entra-workforce', harness.deps, path);
+  const result = await completeEnterpriseSharedOidc(new URLSearchParams({ code: 'code', state: 'state' }), harness.deps);
+  assert.equal(result.destination, '/t/tenant-a' + path);
+});
+
 test('the uniform 401 from provider discovery means "no SSO", not a failure', async () => {
   // Anti-enumeration: the server answers 401 for an unknown tenant and for a
   // known tenant with no provider alike. The login page must treat it as an
@@ -532,4 +542,29 @@ test('dedicated login stays unchanged while shared tenant login uses only the te
   assert.match(sharedPage, /window\.history\.replaceState/);
   assert.match(sharedPage, /window\.location\.hash/);
   assert.doesNotMatch(sharedPage, /localStorage|setAccessToken|getAccessToken/);
+});
+
+for (const [code, message] of [
+  ['sso_membership_unknown', 'Group membership could not be verified. Ask your administrator to check directory access.'],
+  ['sso_group_not_allowed', 'Your account is not in a group allowed to access this tenant'],
+  ['unknown_code', 'Single sign-on failed. Please try again.'],
+]) {
+  test(`callback admission copy is allowlisted: ${code}`, async () => {
+    const harness = dependencies([json(entry()), json({ error: code, message: 'private upstream details' }, 403)]);
+    await begin(harness.deps);
+    await assert.rejects(completeEnterpriseSharedOidc(
+      new URLSearchParams({ code: 'authorization-code', state: 'server-state' }), harness.deps,
+    ), { message });
+    assert.equal(harness.requests.length, 2);
+    assert.equal(harness.storage.values.size, 0);
+  });
+}
+
+test('SSO return paths cannot escape the verified tenant through redirects or dot segments', async () => {
+  for (const path of ['//evil.example/search', '/../../t/other/search', '/%2e%2e/%2e%2e/t/other/search']) {
+    const harness = dependencies([json(entry()), json(callback()), json(refreshed()), json(user()), json(bootstrap())]);
+    await startEnterpriseSharedOidcLogin('tenant-a', 'entra-workforce', harness.deps, path);
+    const result = await completeEnterpriseSharedOidc(new URLSearchParams({ code: 'code', state: 'state' }), harness.deps);
+    assert.equal(result.destination, '/t/tenant-a');
+  }
 });

@@ -3,17 +3,15 @@
 //! Exact `broad_npl` result reuse over immutable parts.
 //!
 //! A `logs` answer is a function of the request (query, window, page,
-//! cursor, deny set), the verified parts that overlap its window, the read
-//! schema the compiler typed it against, and the platform enrichment read
-//! authority. Parts never change after they are added: a merge, late data,
+//! cursor, deny set), the verified parts that overlap its window, and the
+//! read schema the compiler typed it against (enrichment is fixed at ingest,
+//! NAN-4168). Parts never change after they are added: a merge, late data,
 //! retention or an erasure retires parts and adds new ones, which changes the
-//! overlapping set. So an answer keyed on all four is the answer a fresh run
+//! overlapping set. So an answer keyed on all three is the answer a fresh run
 //! would compute, without the gen1 serving-generation pin the search result
 //! cache requires (lean cells have none, so that cache never admitted them).
 //!
-//! Bounds: entries live [`TTL`] (the only drift is a platform enrichment
-//! stamp expiring inside it, the same class of staleness the search result
-//! cache accepts for 300 s), an entry is at most [`MAX_ENTRY_BYTES`] of JSON,
+//! Bounds: entries live [`TTL`], an entry is at most [`MAX_ENTRY_BYTES`] of JSON,
 //! and the cache holds at most [`MAX_TOTAL_BYTES`].
 //!
 //! NAN-3809: a *settled* answer lives [`SETTLED_TTL`]. Settled means the
@@ -21,9 +19,8 @@
 //! ([`nanosiem_core::search::settled_reuse`]), the query reads nothing but
 //! the window's events, and the answer is complete and non-empty. The key is
 //! unchanged, so a late part, a merge, an erasure, a schema change, a new
-//! query image, a different deny set or a changed enrichment read authority
-//! (whose identity includes every right's `valid_until`) still misses. Every
-//! hit re-resolves the current authority to build its key.
+//! query image or a different deny set still misses. Enrichment is fixed at
+//! ingest (NAN-4168), so no enrichment authority is part of the key.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -72,18 +69,15 @@ pub fn key(
     request: &BroadNplRequest,
     parts: &[PartRef],
     schema_fingerprint: Option<&str>,
-    authority_identity: &str,
     execution_identity: &str,
 ) -> [u8; 32] {
     let mut identity = request.clone();
     identity.request_id = String::new();
     let mut hasher = Sha256::new();
-    hasher.update(b"nano.part-query-result.v2\0");
+    hasher.update(b"nano.part-query-result.v3\0");
     hasher.update(serde_json::to_vec(&identity).expect("request serializes"));
     hasher.update(b"\0schema\0");
     hasher.update(schema_fingerprint.unwrap_or("-").as_bytes());
-    hasher.update(b"\0authority\0");
-    hasher.update(authority_identity.as_bytes());
     hasher.update(b"\0execution\0");
     hasher.update(execution_identity.as_bytes());
     let mut parts = parts.iter().map(|part| (part.part_id.to_string(), &part.provenance_sha256, &part.merkle_root)).collect::<Vec<_>>();
@@ -100,15 +94,12 @@ pub fn key(
 }
 
 /// NAN-3809: the data identity of a window, independent of any one request:
-/// the overlapping parts, the read schema, the enrichment read authority and
-/// the query artifacts. A durable job records it next to its result pages;
+/// the overlapping parts, the read schema and the query artifacts. A durable job records it next to its result pages;
 /// the job is re-served only while the current identity is the same.
-pub fn window_identity(parts: &[PartRef], schema_fingerprint: Option<&str>, authority_identity: &str, execution_identity: &str) -> String {
+pub fn window_identity(parts: &[PartRef], schema_fingerprint: Option<&str>, execution_identity: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"nano.part-query-window.v1\0schema\0");
+    hasher.update(b"nano.part-query-window.v2\0schema\0");
     hasher.update(schema_fingerprint.unwrap_or("-").as_bytes());
-    hasher.update(b"\0authority\0");
-    hasher.update(authority_identity.as_bytes());
     hasher.update(b"\0execution\0");
     hasher.update(execution_identity.as_bytes());
     let mut parts = parts.iter().map(|part| (part.part_id.to_string(), &part.provenance_sha256, &part.merkle_root)).collect::<Vec<_>>();
@@ -201,20 +192,19 @@ mod tests {
         let a = request("powershell");
         let mut b = a.clone();
         b.request_id = "r2".into();
-        assert_eq!(key(&a, &[], Some("s"), "auth", "compiler/native/config-v1"), key(&b, &[], Some("s"), "auth", "compiler/native/config-v1"));
-        assert_ne!(key(&a, &[], Some("s"), "auth", "compiler/native/config-v1"), key(&request("cmd"), &[], Some("s"), "auth", "compiler/native/config-v1"));
-        assert_ne!(key(&a, &[], Some("s"), "auth", "compiler/native/config-v1"), key(&a, &[], Some("s2"), "auth", "compiler/native/config-v1"));
-        assert_ne!(key(&a, &[], Some("s"), "auth", "compiler/native/config-v1"), key(&a, &[], Some("s"), "other", "compiler/native/config-v1"));
-        assert_ne!(key(&a, &[], Some("s"), "auth", "compiler-v1"), key(&a, &[], Some("s"), "auth", "compiler-v2"));
+        assert_eq!(key(&a, &[], Some("s"), "compiler/native/config-v1"), key(&b, &[], Some("s"), "compiler/native/config-v1"));
+        assert_ne!(key(&a, &[], Some("s"), "compiler/native/config-v1"), key(&request("cmd"), &[], Some("s"), "compiler/native/config-v1"));
+        assert_ne!(key(&a, &[], Some("s"), "compiler/native/config-v1"), key(&a, &[], Some("s2"), "compiler/native/config-v1"));
+        assert_ne!(key(&a, &[], Some("s"), "compiler-v1"), key(&a, &[], Some("s"), "compiler-v2"));
         let mut other_tenant = a.clone();
         other_tenant.tenant_id = "other-tenant".into();
-        assert_ne!(key(&a, &[], Some("s"), "auth", "config"), key(&other_tenant, &[], Some("s"), "auth", "config"));
+        assert_ne!(key(&a, &[], Some("s"), "config"), key(&other_tenant, &[], Some("s"), "config"));
         let mut denied = a.clone();
         denied.deny_source_types.insert("windows_sysmon".into());
-        assert_ne!(key(&a, &[], Some("s"), "auth", "config"), key(&denied, &[], Some("s"), "auth", "config"));
+        assert_ne!(key(&a, &[], Some("s"), "config"), key(&denied, &[], Some("s"), "config"));
         let mut paged = a.clone();
         paged.offset = 100;
-        assert_ne!(key(&a, &[], Some("s"), "auth", "compiler/native/config-v1"), key(&paged, &[], Some("s"), "auth", "compiler/native/config-v1"));
+        assert_ne!(key(&a, &[], Some("s"), "compiler/native/config-v1"), key(&paged, &[], Some("s"), "compiler/native/config-v1"));
     }
 
     #[test]
@@ -255,7 +245,7 @@ mod tests {
     #[test]
     fn hits_are_rebound_to_the_caller_and_bounded() {
         let cache = ResultCache::default();
-        let k = key(&request("x"), &[], None, "a", "compiler/native/config-v1");
+        let k = key(&request("x"), &[], None, "compiler/native/config-v1");
         cache.insert(k, &json!({"ok": true, "request_id": "r1", "wall_seconds": 3.0, "result": {"rows": [1], "query_result_cache_hit": false}}));
         let hit = cache.get(&k, "r9").unwrap();
         assert_eq!(hit["request_id"], "r9");
@@ -263,7 +253,7 @@ mod tests {
         assert_eq!(hit["result"]["rows"], json!([1]));
         assert!(cache.get(&[0; 32], "r9").is_none());
         let huge = json!({"result": {"rows": ["x".repeat(MAX_ENTRY_BYTES)]}});
-        let big = key(&request("big"), &[], None, "a", "compiler/native/config-v1");
+        let big = key(&request("big"), &[], None, "compiler/native/config-v1");
         cache.insert(big, &huge);
         assert!(cache.get(&big, "r").is_none());
     }
@@ -315,12 +305,12 @@ mod tests {
         let parts = [part(1), part(2)];
         let fresh = fresh_answer(3);
         assert!(settled_answer(&request, end_us(&request), &fresh, now_utc()));
-        let k = key(&request, &parts, Some("s"), "auth", "config");
+        let k = key(&request, &parts, Some("s"), "config");
         let stored = Instant::now();
         cache.insert_at(k, &fresh, SETTLED_TTL, stored);
         let mut again = request.clone();
         again.request_id = "second-tab".into();
-        let hit = cache.get_at(&key(&again, &parts, Some("s"), "auth", "config"), "second-tab", later(stored)).expect("settled hit");
+        let hit = cache.get_at(&key(&again, &parts, Some("s"), "config"), "second-tab", later(stored)).expect("settled hit");
         assert_eq!(hit["result"]["result_rows"], fresh["result"]["result_rows"]);
         assert_eq!(hit["result"]["rows"], fresh["result"]["rows"]);
         assert_eq!(hit["result"]["query_result_cache_hit"], true);
@@ -328,22 +318,21 @@ mod tests {
     }
 
     #[test]
-    fn a_deny_set_authority_or_generation_change_misses_a_settled_entry() {
+    fn a_deny_set_or_generation_change_misses_a_settled_entry() {
         let cache = ResultCache::default();
         let request = request("powershell");
         let parts = [part(1), part(2)];
         let stored = Instant::now();
-        cache.insert_at(key(&request, &parts, Some("s"), "auth", "config"), &fresh_answer(3), SETTLED_TTL, stored);
+        cache.insert_at(key(&request, &parts, Some("s"), "config"), &fresh_answer(3), SETTLED_TTL, stored);
         let at = later(stored);
         let mut denied = request.clone();
         denied.deny_source_types.insert("windows_sysmon".into());
-        assert!(cache.get_at(&key(&denied, &parts, Some("s"), "auth", "config"), "r", at).is_none(), "deny set");
-        assert!(cache.get_at(&key(&request, &parts, Some("s"), "revoked-grant", "config"), "r", at).is_none(), "authority");
+        assert!(cache.get_at(&key(&denied, &parts, Some("s"), "config"), "r", at).is_none(), "deny set");
         // A late part, a merge or an erasure changes the overlapping part set.
-        assert!(cache.get_at(&key(&request, &[part(1), part(2), part(3)], Some("s"), "auth", "config"), "r", at).is_none(), "late part");
-        assert!(cache.get_at(&key(&request, &[part(4)], Some("s"), "auth", "config"), "r", at).is_none(), "merge");
-        assert!(cache.get_at(&key(&request, &parts, Some("s2"), "auth", "config"), "r", at).is_none(), "schema");
-        assert!(cache.get_at(&key(&request, &parts, Some("s"), "auth", "config"), "r", at).is_some());
+        assert!(cache.get_at(&key(&request, &[part(1), part(2), part(3)], Some("s"), "config"), "r", at).is_none(), "late part");
+        assert!(cache.get_at(&key(&request, &[part(4)], Some("s"), "config"), "r", at).is_none(), "merge");
+        assert!(cache.get_at(&key(&request, &parts, Some("s2"), "config"), "r", at).is_none(), "schema");
+        assert!(cache.get_at(&key(&request, &parts, Some("s"), "config"), "r", at).is_some());
     }
 
     #[test]
@@ -373,7 +362,7 @@ mod tests {
 
         // Such answers keep the plain 60 s tier: gone once it passes.
         let cache = ResultCache::default();
-        let k = key(&relative, &[part(1)], Some("s"), "auth", "config");
+        let k = key(&relative, &[part(1)], Some("s"), "config");
         let stored = Instant::now();
         cache.insert_at(k, &fresh_answer(3), TTL, stored);
         assert!(cache.get_at(&k, "r", stored).is_some());
@@ -381,13 +370,12 @@ mod tests {
     }
 
     #[test]
-    fn window_identity_binds_parts_schema_authority_and_artifacts() {
-        let base = window_identity(&[part(1), part(2)], Some("s"), "auth", "c/n");
-        assert_eq!(base, window_identity(&[part(2), part(1)], Some("s"), "auth", "c/n"), "order-free");
-        assert_ne!(base, window_identity(&[part(1), part(2), part(3)], Some("s"), "auth", "c/n"));
-        assert_ne!(base, window_identity(&[part(1)], Some("s"), "auth", "c/n"));
-        assert_ne!(base, window_identity(&[part(1), part(2)], Some("s2"), "auth", "c/n"));
-        assert_ne!(base, window_identity(&[part(1), part(2)], Some("s"), "auth2", "c/n"));
-        assert_ne!(base, window_identity(&[part(1), part(2)], Some("s"), "auth", "c2/n"));
+    fn window_identity_binds_parts_schema_and_artifacts() {
+        let base = window_identity(&[part(1), part(2)], Some("s"), "c/n");
+        assert_eq!(base, window_identity(&[part(2), part(1)], Some("s"), "c/n"), "order-free");
+        assert_ne!(base, window_identity(&[part(1), part(2), part(3)], Some("s"), "c/n"));
+        assert_ne!(base, window_identity(&[part(1)], Some("s"), "c/n"));
+        assert_ne!(base, window_identity(&[part(1), part(2)], Some("s2"), "c/n"));
+        assert_ne!(base, window_identity(&[part(1), part(2)], Some("s"), "c2/n"));
     }
 }

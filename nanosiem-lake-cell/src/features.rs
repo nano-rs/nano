@@ -205,6 +205,15 @@ pub const CELL_FEATURES: &[&str] = &[
     // snapshots under `<tenant>/product`, and query[T] only reads them
     // (product state never runs on query's CPU quota). Default off.
     "lean_product_state_role_v1",
+    // NAN-4137: `tenzir_landing` in cell.json plus `landing: true` on a
+    // placed tenant: the supervisor keeps `landing[T]` (role `landing`,
+    // served by the ingest binary, its own uid) running on the writer cell.
+    // It exchanges for role=landing (accepts [landing_reader]: read/delete
+    // on the tenant's landing prefixes only, plus the landing-ledger and
+    // edge-log producer tokens), leases files from the landing ledger DO and
+    // appends bronze to the edge log. Its counters ride the status push as
+    // `tenants[].landing`. TZCELL NANO-MAIN-NEEDS.md is the platform contract.
+    "lean_tenzir_landing_v1",
     // NAN-3243: the image ships `/usr/local/bin/lake_otel_ingest` with its
     // lean mode (`NANO_OTEL_LAKE_MODE=lean`): one per-tenant Deployment, never
     // a cell child, that drains the tenant Worker's `otel-handoff-v1/` OTLP
@@ -319,6 +328,15 @@ pub const CELL_FEATURES: &[&str] = &[
     // reporting this. No cell config key. The worker side is pinned by
     // `part_ingest::lean_erasure` tests (`cell_feature_lean_erasure_v1_is_backed`).
     "lean_erasure_v1",
+    // NAN-4290: query[T] runs a second durable job lane for small jobs (a
+    // search over at most a day, `nanosiem_core::search::small_job_lane`): its
+    // own read-write chDB connection at one interactive lane's memory, holding
+    // an interactive admission slot, so a 1 h listing never waits for a 30 d
+    // aggregate on the general job lane. The tenant's `lake_job_runner` may
+    // then run `--small-lane-slots 1`; the platform renders that flag only for
+    // images reporting this. No cell config key. The worker side is pinned by
+    // `part_query` tests (`cell_feature_lean_job_small_lane_v1_is_backed`).
+    "lean_job_small_lane_v1",
 ];
 
 /// The label value: names joined with commas.
@@ -489,7 +507,7 @@ mod tests {
                 let Ok(d) = tempfile::tempdir() else { return false };
                 // SAFETY: geteuid/getegid never fail.
                 let (u, g) = unsafe { (libc::geteuid(), libc::getegid()) };
-                let ids = crate::uidmap::TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, gid: g };
+                let ids = crate::uidmap::TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, landing_uid: Some(u), gid: g };
                 let tree = |t: &str| crate::tenant_dirs::ensure_tenant_tree(d.path(), t, &ids);
                 let mode = |p: &str| std::fs::symlink_metadata(d.path().join(p)).map(|m| m.permissions().mode() & 0o7777).ok();
                 let built = tree("t").is_ok() && mode("t/parts") == Some(0o2770) && mode("t/query/tmp") == Some(0o700);
@@ -512,7 +530,7 @@ mod tests {
                 let Ok(d) = tempfile::tempdir() else { return false };
                 // SAFETY: geteuid/getegid never fail.
                 let (u, g) = unsafe { (libc::geteuid(), libc::getegid()) };
-                let ids = crate::uidmap::TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, gid: g };
+                let ids = crate::uidmap::TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, landing_uid: Some(u), gid: g };
                 let trees = [a, b].iter().all(|t| crate::tenant_dirs::ensure_tenant_tree(d.path(), t, &ids).is_ok())
                     && std::fs::write(d.path().join(b).join("query/tmp/x"), b"12345").is_ok()
                     && std::os::unix::fs::symlink(d.path().join(a), d.path().join(b).join("parts/to-a")).is_ok();
@@ -525,7 +543,7 @@ mod tests {
                     && l.record(&tid(b), crate::tenant_dirs::PurgeBytes { tmp_bytes: 5, ..Default::default() }, chrono::Utc::now(), 3);
                 let snap = StatusSnapshot { cell_id: "c".into(), placement_revision: 2,
                     placed: vec![(tid(a), TenantState::Idle)], draining: vec![], purged: l.purged.clone().into_iter().collect(),
-                    ingest: Default::default() };
+                    ingest: Default::default(), landing: Default::default() };
                 let v = serde_json::json!({"cell_id": "c", "placement_revision": 2,
                     "tenants": [{"tenant_id": a, "state": "idle"}],
                     "purged": [{"tenant_id": b, "reason": "drain", "verified": true, "at": l.purged[&tid(b)].at,
@@ -685,6 +703,23 @@ mod tests {
                     && placed.effective_role_budget(Role::Product).request_millicores
                         < placed.effective_role_budget(Role::Query).request_millicores
             }),
+            ("lean_tenzir_landing_v1", || {
+                use crate::contract::Role;
+                let t = crate::contract::TenantId::new("t").unwrap();
+                let mut placed = crate::config::TenantPlacement::legacy(t, 300.0);
+                let on = cfg(serde_json::json!({"tenzir_landing": true}));
+                let off_by_default = !cfg(serde_json::json!({})).tenzir_landing
+                    && !crate::supervisor::landing_wanted(true, Some(&placed));
+                placed.landing = true;
+                on.tenzir_landing && off_by_default
+                    && crate::supervisor::landing_wanted(true, Some(&placed))
+                    && !crate::supervisor::landing_wanted(false, Some(&placed))
+                    && Role::parse("landing") == Some(Role::Landing)
+                    && Role::ALL.contains(&Role::Landing)
+                    && Role::Landing.credential_role() == Role::Landing
+                    && !crate::supervisor::idle_reapable(Role::Landing, Some(&placed))
+                    && placed.effective_role_budget(Role::Landing).limit_memory_bytes == crate::budget::LANDING_LIMIT_MEMORY_BYTES
+            }),
             ("lean_otel_drain_v1", || {
                 // The drain is reached directly by search, never through the
                 // cell router: no tenant route class opens to an `otel` path.
@@ -735,7 +770,7 @@ mod tests {
                 let snap = StatusSnapshot { cell_id: "c".into(), placement_revision: 2,
                     placed: vec![(tid(a), TenantState::Running)], draining: vec![tid(b)], purged: vec![],
                     // A counter keyed to a draining tenant is never reported.
-                    ingest: [(tid(a), c), (tid(b), c)].into_iter().collect() };
+                    ingest: [(tid(a), c), (tid(b), c)].into_iter().collect(), landing: Default::default() };
                 let v = serde_json::to_value(snap.full_body()).unwrap();
                 let off = StatusSnapshot { ingest: Default::default(), ..snap.clone() };
                 let hb = serde_json::from_value::<crate::contract::Heartbeat>(serde_json::json!({"busy": false, "rows_committed_total": 7}));
@@ -867,6 +902,9 @@ mod tests {
             // Ingest-only (exchange field + executor); the cell forwards
             // nothing and renders no key for it.
             ("lean_erasure_v1", || !CELL_FEATURES.is_empty()),
+            // Query-only (a job lane inside query[T] and a runner flag); the
+            // cell forwards nothing and renders no key for it.
+            ("lean_job_small_lane_v1", || !CELL_FEATURES.is_empty()),
         ]
     }
 

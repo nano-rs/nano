@@ -58,7 +58,7 @@ use sha2::{Digest, Sha256};
 use super::credentials::{is_credential_stale, CredentialStale, QueryCredentialSwap, R2ReadAuthority};
 use super::job_results::{JobResultStorageUnavailable, JobResultStore};
 use super::detections::{CommitRequest, DetectionGate, GateRefused, PlanRequest, ResetRequest};
-use super::engine::{BroadNplRequest, EngineSettings, FetchLogRequest, PartQueryEngine, PartQueryError};
+use super::engine::{BroadNplRequest, EngineSettings, FetchLogRequest, JobLane, PartQueryEngine, PartQueryError};
 use super::fetch::{parts_key_prefix, PartFetcher, R2ReadStore};
 use super::log_view::PartLogView;
 use super::{jobs, partials, risk};
@@ -390,6 +390,7 @@ fn exchange_role(role: Role) -> Result<&'static str> {
         Role::Product => Ok(Role::Query.as_str()),
         Role::Ingest => bail!("lake_part_query does not exchange as ingest"),
         Role::Maintenance => bail!("lake_part_query does not exchange as maintenance"),
+        Role::Landing => bail!("lake_part_query does not exchange as landing"),
     }
 }
 
@@ -421,6 +422,7 @@ pub fn role_credential_set(role: Role) -> Result<(&'static [&'static str], &'sta
         Role::Product => Ok((&["lake_part_read"], &["enrichment_reader"])),
         Role::Ingest => bail!("lake_part_query does not exchange as ingest"),
         Role::Maintenance => bail!("lake_part_query does not exchange as maintenance"),
+        Role::Landing => bail!("lake_part_query does not exchange as landing"),
     }
 }
 
@@ -885,6 +887,10 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
         source,
     )?;
     if let Some(settings) = &hot_settings { cache.set_hot_capacity(settings.clone()); }
+    // NAN-4174: the lane memo lives beside the reader cache on a persistent
+    // (A/B) hot volume, so a roll keeps it; otherwise in the state dir.
+    let lane_memo_dir = hot_settings.as_ref().filter(|settings| settings.persistent)
+        .map_or_else(|| options.state_dir.clone(), |settings| settings.root.clone());
     // NAN-3644: the env knob wins over the boot document.
     if std::env::var_os(crate::reader_object_cache::READER_COLD_HEAVY_CONCURRENCY_ENV).is_none() {
         if let Some(slots) = boot.engine.cache_heavy_concurrency {
@@ -920,17 +926,29 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
             large_lanes = super::lanes::large_lane_connections(classes.large_bytes, routing_v2), routing_v2, "query lanes by size");
     }
     let threads = u64::from(nanosiem_lake_cell::budget::query_threads(options.cpu_millis));
+    // NAN-4174: query[T]'s statements share one thread pool sized to the
+    // role quota (interactive first; see `thread_budget`). The point lane is
+    // outside it (one row group per statement). Roles without size classes
+    // (detect, product) keep their planned threads.
+    let thread_budget = classes.is_some().then(|| crate::thread_budget::ThreadBudget::new(threads));
+    let budgeted = |executor: NativeExecutor| match &thread_budget {
+        Some(pool) => executor.with_thread_budget(pool.clone()),
+        None => executor,
+    };
+    if let Some(pool) = &thread_budget {
+        tracing::info!(threads = pool.total(), "query thread budget");
+    }
     let read_lanes = classes.map_or(budget.concurrency, |classes| classes.small_lanes);
-    let executor = NativeExecutor::start_with_server_memory_limit(runtime.clone(), read_lanes, "parts", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
-        .with_result_limit(budget.result_bytes);
+    let executor = budgeted(NativeExecutor::start_with_server_memory_limit(runtime.clone(), read_lanes, "parts", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
+        .with_result_limit(budget.result_bytes));
     let large = match &classes {
         Some(classes) => Some((
             // NAN-3393: two statements at half the large memory each when
             // half is still a large lane (the 4 GiB role: 2 x 768 MiB); a
             // statement that outgrows half takes both (see `lanes::LargeLane`).
-            NativeExecutor::start_with_server_memory_limit(runtime.clone(), super::lanes::large_lane_connections(classes.large_bytes, routing_v2),
+            budgeted(NativeExecutor::start_with_server_memory_limit(runtime.clone(), super::lanes::large_lane_connections(classes.large_bytes, routing_v2),
                 "parts-large", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
-                .with_result_limit(budget.result_bytes),
+                .with_result_limit(budget.result_bytes)),
             classes.large_bytes,
         )),
         None => None,
@@ -939,7 +957,14 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     // waits behind a scan; its statements read one row group.
     let point = NativeExecutor::start_with_server_memory_limit(runtime.clone(), 1, "parts-point", ExecutorMode::ReadOnly, Some(budget.server_bytes))?
         .with_result_limit(budget.result_bytes);
-    let writer = NativeExecutor::start_with_server_memory_limit(runtime, 1, "parts-rw", ExecutorMode::ReadWrite, Some(budget.server_bytes))?;
+    // NAN-4290: query[T]'s small-job lane (its own read-write connection; a
+    // job on it runs at one interactive lane's memory and holds an
+    // interactive slot). Roles without size classes run no jobs.
+    let small_job_writer = match &classes {
+        Some(_) => Some(budgeted(NativeExecutor::start_with_server_memory_limit(runtime.clone(), 1, "parts-rw-small", ExecutorMode::ReadWrite, Some(budget.server_bytes))?)),
+        None => None,
+    };
+    let writer = budgeted(NativeExecutor::start_with_server_memory_limit(runtime, 1, "parts-rw", ExecutorMode::ReadWrite, Some(budget.server_bytes))?);
     phases.lap("executors_start");
     let settings = EngineSettings {
         tenant_id: tenant_id.clone(),
@@ -958,8 +983,12 @@ pub async fn open_engine_timed(options: &OpenOptions, phases: &mut StartupPhases
     if let Some((large, large_bytes)) = large {
         engine = engine.with_large_lane(super::lanes::LargeLane::with_routing(large, large_bytes, routing_v2));
     }
+    if let Some(small_job_writer) = small_job_writer {
+        engine = engine.with_small_job_writer(small_job_writer);
+    }
     let engine = engine
-        .with_state_dir(&options.state_dir);
+        .with_state_dir(&options.state_dir)
+        .with_lane_memo_dir(&lane_memo_dir);
     let gate = DetectionGate::new(Some(options.state_dir.clone()), head)?;
     gate.seed(live_ranges);
     phases.lap("engine_and_gate");
@@ -1286,6 +1315,9 @@ struct IdentityEntityBatchHttpRequest {
 }
 
 struct JobRecord {
+    /// NAN-4290: the job lane it was admitted to (in memory only: a restart
+    /// fails every running record, see `load_job_records`).
+    lane: JobLane,
     status: &'static str,
     cancelled: Arc<AtomicBool>,
     result: Option<crate::job::ResultArtifactRef>,
@@ -1332,6 +1364,7 @@ fn load_job_records(state_dir: &std::path::Path, tenant_id: &str) -> Result<BTre
             _ => bail!("invalid persisted job status"),
         };
         if records.insert(key, JobRecord {
+            lane: JobLane::General,
             status,
             cancelled: Arc::new(AtomicBool::new(status == "cancelled")),
             result: if status == "completed" { record.result } else { None },
@@ -1400,6 +1433,7 @@ impl QueryService {
             .route("/v1/ioc/lookup", post(ioc_lookup))
             .route("/v1/ioc/indicator-sets", post(ioc_indicator_sets))
             .route("/v1/ioc/source-records", post(ioc_source_records))
+            .route("/v1/ioc/platform-records", post(ioc_platform_records))
             .route("/v1/identity/directory/users", post(identity_directory_list))
             .route("/v1/identity/directory/lookup", post(identity_directory_lookup))
             .route("/v1/identity/directory/stats", post(identity_directory_stats))
@@ -1577,7 +1611,7 @@ impl QueryService {
     }
 
     /// Startup prewarm: prove every already-live cell-local data file
-    /// (owner-denial proofs, in-place SHA-256) before the process reports
+    /// (in-place SHA-256) before the process reports
     /// ready. Optional remote residency stays within the cache budget.
     pub fn spawn_prewarm(self: Arc<Self>) {
         if self.engine.fetcher().hot_settings.is_some() {
@@ -1587,7 +1621,7 @@ impl QueryService {
         }
     }
 
-    /// product[T] (NAN-3148): serves no search, so no owner-proof prewarm.
+    /// product[T] (NAN-3148): serves no search, so no prewarm.
     pub fn mark_ready_without_prewarm(&self) {
         self.readiness.mark_ready();
     }
@@ -1621,10 +1655,9 @@ impl QueryService {
         self.spawn_incremental_prewarm();
     }
 
-    /// Prove files of parts that arrived since, in the background. Readiness
-    /// is NOT withdrawn (NAN-2984): a query over a part the prewarm has not
-    /// reached yet proves its own few files (`scalar_plan` →
-    /// `owner_proofs_for`, and anything unproven keeps every mask), so
+    /// Verify files of parts that arrived since, in the background.
+    /// Readiness is NOT withdrawn (NAN-2984): a query over a part the
+    /// prewarm has not reached yet fetches and verifies its own files, so
     /// results are unchanged. Withdrawing readiness on every new part turned
     /// each L0 flush (and merge) into a 503 window that search retried
     /// through, adding latency right when fresh data arrived.
@@ -1658,32 +1691,26 @@ impl QueryService {
         tokio::spawn(async move {
             let _guard = self.prewarm_lock.lock().await;
             let started = Instant::now();
-            let tenant = self.engine.settings().tenant_id.clone();
             let engine = &self.engine;
             let mut retry = Duration::from_secs(1);
             loop {
                 if !self.readiness.is_current(ticket) {
                     break;
                 }
-                match crate::enrichment_read::execute(
-                    || crate::enrichment_read::resolve(&tenant),
-                    async {
-                        // NAN-3720: a pass no readiness waits on is
-                        // background work and yields to searches.
-                        let warmed = if gate_readiness {
-                            engine.prewarm_owner_proofs(self.prewarm_hours).await?
-                        } else {
-                            engine.prewarm_owner_proofs_in_background(self.prewarm_hours).await?
-                        };
-                        Ok::<_, PartQueryError>(warmed)
-                    },
-                ).await {
-                    Ok(Ok(_)) => {
+                // NAN-3720: a pass no readiness waits on is background work
+                // and yields to searches.
+                let warmed = if gate_readiness {
+                    engine.prewarm_parts(self.prewarm_hours).await
+                } else {
+                    engine.prewarm_parts_in_background(self.prewarm_hours).await
+                };
+                match warmed {
+                    Ok(_) => {
                         self.prewarm_wall_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
                         self.readiness.complete(ticket);
                         self.clone().spawn_product_state();
-                        // Even explicitly gated owner-proof startup leaves
-                        // optional evidence warming until searches are ready.
+                        // Even explicitly gated startup leaves optional
+                        // evidence warming until searches are ready.
                         if gate_readiness {
                             if engine.prewarm_selection_evidence().await.is_err() {
                                 tracing::warn!("optional selection evidence prewarm failed; queries resolve misses");
@@ -1695,8 +1722,7 @@ impl QueryService {
                         }
                         break;
                     }
-                    Ok(Err(error)) => tracing::warn!(error = %error, "query prewarm failed; retrying before readiness"),
-                    Err(_) => tracing::warn!("query prewarm lacks enrichment read authority; retrying before readiness"),
+                    Err(error) => tracing::warn!(error = %error, "query prewarm failed; retrying before readiness"),
                 }
                 tokio::time::sleep(retry).await;
                 retry = (retry * 2).min(Duration::from_secs(30));
@@ -1784,9 +1810,41 @@ impl QueryService {
                         }
                         if report.remaining > 0 { super::identity::BACKFILL_BUSY_POLL } else { super::identity::BACKFILL_INTERVAL }
                     }
+                    // NAN-4316: nothing to backfill before the new tenant's genesis.
+                    Err(PartQueryError::NoSchemaYet) => {
+                        tracing::debug!("identity observation backfill: part log has no schema yet");
+                        super::identity::BACKFILL_INTERVAL
+                    }
                     Err(error) => {
                         tracing::warn!(error = %error, "identity observation backfill pass failed; retrying next interval");
                         super::identity::BACKFILL_INTERVAL
+                    }
+                };
+            }
+        });
+    }
+
+    /// NAN-4190: keep the window entity index current. Each pass starts
+    /// only while every query slot is free and no durable job runs (see
+    /// [`super::entity_index::merge_once`]); passes poll again soon while
+    /// resident files remain outside the index.
+    pub fn spawn_entity_index(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut wait = super::entity_index::BUSY_POLL;
+            loop {
+                tokio::time::sleep(wait).await;
+                let pass = async {
+                    // The background log refresher keeps the view current:
+                    // no extra part-log read per pass.
+                    self.engine.refresh_for_request().await?;
+                    super::entity_index::merge_once(&self.engine, &self.state_dir, chrono::Utc::now().timestamp_micros()).await
+                };
+                wait = match pass.await {
+                    Ok(report) if report.built && report.tail >= super::entity_index::MAX_TAIL_FILES => super::entity_index::BUSY_POLL,
+                    Ok(_) => super::entity_index::INTERVAL,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "window entity index pass failed; selections use per-file evidence");
+                        super::entity_index::INTERVAL
                     }
                 };
             }
@@ -1797,9 +1855,17 @@ impl QueryService {
         Ok(self.engine.admit(self.admission_deadline()).await?)
     }
 
-    /// A durable job's own admission (NAN-3077; see `PartQueryEngine::admit_job`).
-    async fn admit_job(&self) -> std::result::Result<super::engine::AdmissionSlot, ApiError> {
-        Ok(self.engine.admit_job(self.admission_deadline()).await?)
+    /// A durable job's own admission (NAN-3077, NAN-4290; see
+    /// `PartQueryEngine::admit_job_lane`). Lanes that stay busy past the
+    /// admission deadline answer 429 `job_busy`: the attempt never started,
+    /// so the runner hands it back uncharged.
+    async fn admit_job_lane(&self, small: bool) -> std::result::Result<(JobLane, super::engine::AdmissionSlot), ApiError> {
+        match self.engine.admit_job_lane(small, self.admission_deadline()).await {
+            Err(PartQueryError::ConcurrencyBudget(message)) => {
+                Err(ApiError(StatusCode::TOO_MANY_REQUESTS, message, "job_busy", None))
+            }
+            other => Ok(other?),
+        }
     }
 
     /// [`Self::admit`] for a request of `class` (NAN-3077).
@@ -1863,7 +1929,11 @@ async fn query(State(state): State<AppState>, headers: axum::http::HeaderMap, Js
         QueryRequest::FetchLog(request) => (request.request_id.clone(), true),
         QueryRequest::FieldNames { request_id } => (request_id.clone(), false),
     };
-    let class = super::engine::RequestClass::of(&request_id, fetch_log);
+    // NAN-4174: a wide-window search never takes the slots kept for short ones.
+    let class = match &request {
+        QueryRequest::BroadNpl(request) => super::engine::RequestClass::of_window(&request_id, false, &request.start, &request.end),
+        _ => super::engine::RequestClass::of(&request_id, fetch_log),
+    };
     // NAN-3715: a slow real search is kept for probe replay (never rows).
     let captured = match &request {
         QueryRequest::BroadNpl(request) => Some(request.clone()),
@@ -1898,6 +1968,7 @@ async fn query(State(state): State<AppState>, headers: axum::http::HeaderMap, Js
 }
 
 /// `/v1/query`'s measured work, by route.
+#[tracing::instrument(name = "cell.query", skip_all)]
 async fn answer_query(service: &Arc<QueryService>, engine: &PartQueryEngine, request: QueryRequest) -> std::result::Result<Value, ApiError> {
     service.refresh().await?;
     service.require_ready()?;
@@ -2153,17 +2224,16 @@ async fn cached_broad_npl_pinned(service: &QueryService, request: &BroadNplReque
     }
     let (parts, _, _, _) = engine.snapshot(from_us, to_us).await?;
     let (_, schema) = engine.head_and_schema_fingerprint().await;
-    let authority = crate::enrichment_read::resolve(&request.tenant_id).await.cache_identity();
     let config = format!("{}\0{}\0{:?}", service.compiler_sha256, service.native_artifact_sha256, engine.settings());
     let head = engine.head().await;
-    let key = super::result_cache::key(request, &parts, schema.as_deref(), &authority, &config);
+    let key = super::result_cache::key(request, &parts, schema.as_deref(), &config);
     if let Some(hit) = service.results.get(&key, &request.request_id) {
         return Ok(hit);
     }
     let answer = engine.broad_npl(request).await?;
     // A vanished-part retry can use a newer scope. Never store that answer
-    // under the original part set, or across an enrichment-authority change.
-    if head == engine.latest_head().await && authority == crate::enrichment_read::resolve(&request.tenant_id).await.cache_identity() {
+    // under the original part set.
+    if head == engine.latest_head().await {
         // NAN-3809: a settled, complete answer outlives the 60 s tier, so a
         // pasted absolute-range URL is answered without a second scan.
         if super::result_cache::settled_answer(request, to_us, &answer, chrono::Utc::now()) {
@@ -2295,6 +2365,32 @@ async fn ioc_indicator_sets(State(state): State<AppState>, Json(request): Json<c
     Ok(Json(result))
 }
 
+/// NAN-4169: the retro hunt's platform feed delta — the tenant's granted
+/// platform IOC feeds whose revision moved past what the hunt processed.
+async fn ioc_platform_records(State(state): State<AppState>, Json(request): Json<crate::lean_ioc_query::PlatformRecordsRequest>) -> ApiResult {
+    use crate::lean_ioc_query::PlatformIocs;
+    state.service.require_ready()?;
+    let _inflight = state.service.begin();
+    let tenant = state.service.engine().settings().tenant_id.parse().map_err(|_|
+        ApiError(StatusCode::SERVICE_UNAVAILABLE, "process tenant is invalid".into(), "not_ready", None))?;
+    // A changed feed is a linear pass over the bundle's IOC section: keep it
+    // off the request executor.
+    let result = tokio::task::spawn_blocking(move || {
+        let view = crate::enrichment_read::platform_ioc_view(tenant).map_err(|error| {
+            tracing::warn!(%error, tenant_id = %tenant, "platform IOC feeds unavailable for retro delta");
+        });
+        let platform = match &view {
+            Ok(Some((bundle, policy))) => PlatformIocs::Granted { bundle: bundle.as_ref(), policy },
+            Ok(None) => PlatformIocs::NotConfigured,
+            Err(()) => PlatformIocs::Unavailable,
+        };
+        crate::lean_ioc_query::platform_records(tenant, platform, request)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("platform record enumeration failed: {error}"))??;
+    Ok(Json(result))
+}
+
 async fn ioc_source_records(State(state): State<AppState>, Json(request): Json<crate::lean_ioc_query::SourceRequest>) -> ApiResult {
     state.service.require_ready()?;
     let _inflight = state.service.begin();
@@ -2406,8 +2502,11 @@ async fn job_search(State(state): State<AppState>, headers: axum::http::HeaderMa
     state.service.require_job_state()?;
     state.service.require_ready()?;
     spec.validate().map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string(), "invalid_request", None))?;
-    // Held until the job finishes (the handler awaits it).
-    let _slot = state.service.admit_job().await?;
+    // NAN-4290: a small job (a search over at most a day) takes the small
+    // job lane, so it never waits for a long job on the general lane. The
+    // slot moves into the job's thread below: held until the job finishes,
+    // even when the runner's request is dropped first.
+    let (lane, slot) = state.service.admit_job_lane(jobs::small_job_spec(&spec)).await?;
     state.service.refresh().await?;
     state.service.require_ready()?;
     let key = job_key(&JobControlRequest {
@@ -2426,13 +2525,13 @@ async fn job_search(State(state): State<AppState>, headers: axum::http::HeaderMa
         if records.contains_key(&key) {
             return Err(ApiError(StatusCode::CONFLICT, "search job attempt already exists".into(), "duplicate_job", None));
         }
-        if records.values().any(|record| matches!(record.status, "running" | "cancel_requested")) {
-            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "query process already has a running search job".into(), "job_busy", None));
+        if records.values().any(|record| record.lane == lane && matches!(record.status, "running" | "cancel_requested")) {
+            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "query process already has a running search job on this lane".into(), "job_busy", None));
         }
         if records.len() >= 1_024 {
             records.retain(|_, record| matches!(record.status, "running" | "cancel_requested"));
         }
-        records.insert(key.clone(), JobRecord { status: "running", cancelled: cancelled.clone(), result: None });
+        records.insert(key.clone(), JobRecord { lane, status: "running", cancelled: cancelled.clone(), result: None });
         if let Err(error) = persist_job_records(&state.service.state_dir, &spec.tenant_id, &records) {
             records.remove(&key);
             return Err(ApiError::from(error));
@@ -2445,13 +2544,14 @@ async fn job_search(State(state): State<AppState>, headers: axum::http::HeaderMa
     let handle = tokio::runtime::Handle::current();
     let response_key = key.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let _inflight = service.begin();
         // NAN-3272: a durable job reads under its own resource-class scan
         // budget, not the interactive cold-fetch budget whose refusal says
         // "run it as a background job".
         let outcome = handle.block_on(crate::reader_object_cache::with_durable_job_cold_budget(
             spec.scan_budget_bytes,
-            jobs::run_job(service.engine(), &spec, &results, &pin, &cancelled),
+            jobs::run_job_on(service.engine(), lane, &spec, &results, &pin, &cancelled),
         ));
         // NAN-3272: a lane-wait timeout committed nothing; drop the attempt's
         // record so the runner may re-send this same fenced attempt after a
@@ -2689,9 +2789,9 @@ async fn job_page(State(state): State<AppState>, Json(request): Json<ResultPageR
 /// identical settled search? Yes only when the reuse marker the job wrote
 /// next to its result names this tenant, job and result, the window is still
 /// settled, and the window's current data identity (refreshed part set, read
-/// schema, query artifacts, enrichment read authority) equals the one the
-/// job read. Search re-checks ownership, deny set and caller authority; the
-/// result pages re-check retention and enrichment authority when read.
+/// schema, query artifacts) equals the one the job read. Search re-checks
+/// ownership, deny set and caller authority; the result pages re-check
+/// retention when read.
 async fn job_reuse_check(State(state): State<AppState>, Json(request): Json<ReuseCheckRequest>) -> ApiResult {
     state.service.require_job_state()?;
     if request.tenant_id != state.service.engine().settings().tenant_id {
@@ -2716,7 +2816,7 @@ async fn job_reuse_check(State(state): State<AppState>, Json(request): Json<Reus
     let pin = jobs::PartJobPin::at_head(
         head, schema_fingerprint.as_deref(), &state.service.compiler_sha256, &state.service.native_artifact_sha256,
     )?;
-    let current = jobs::window_reuse_identity(state.service.engine(), &pin, &request.tenant_id, marker.from_us, marker.to_us)
+    let current = jobs::window_reuse_identity(state.service.engine(), &pin, marker.from_us, marker.to_us)
         .await
         .map_err(ApiError::from)?;
     let reusable = marker.admits(&request.tenant_id, &request.job_id, &request.manifest_sha256, &current, chrono::Utc::now());
@@ -2897,7 +2997,7 @@ mod contract_tests {
     use super::{job_key, job_page_record_allows, resolve_detect_bootstrap, load_identity_snapshot, load_job_records, persist_job_records,
         request_cell_job_cancel, result_attempt_id, validate_enrichment_credential,
         validate_query_credential, EngineBoot, ExchangedCredential, JobControlRequest, JobRecord,
-        LayeredStore, QueryBootstrap, QueryIdentitySnapshotBoot, Role, BOOTSTRAP_FORMAT};
+        JobLane, LayeredStore, QueryBootstrap, QueryIdentitySnapshotBoot, Role, BOOTSTRAP_FORMAT};
     use super::PrewarmReadiness;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2979,7 +3079,7 @@ mod contract_tests {
     #[test]
     fn cell_cancel_flag_is_observed_by_the_running_executor() {
         let cancelled = Arc::new(AtomicBool::new(false));
-        let mut record = JobRecord { status: "running", cancelled: cancelled.clone(), result: None };
+        let mut record = JobRecord { lane: JobLane::General, status: "running", cancelled: cancelled.clone(), result: None };
         assert!(request_cell_job_cancel(&mut record));
         assert!(cancelled.load(Ordering::Acquire));
         assert_eq!(record.status, "cancel_requested");
@@ -3333,7 +3433,7 @@ mod contract_tests {
         let tenant = "b464ceb9-28a6-4249-8e29-3489627ac5f6";
         let mut jobs = BTreeMap::new();
         jobs.insert(("completed".into(), "attempt-1".into()), JobRecord {
-            status: "completed", cancelled: Arc::new(AtomicBool::new(false)),
+            lane: JobLane::General, status: "completed", cancelled: Arc::new(AtomicBool::new(false)),
             result: Some(crate::job::ResultArtifactRef {
                 manifest_uri: "file:///tenant/result/manifest.json".into(),
                 manifest_sha256: "a".repeat(64), rows: 2, parts: 1,
@@ -3341,10 +3441,10 @@ mod contract_tests {
             }),
         });
         jobs.insert(("running".into(), "attempt-2".into()), JobRecord {
-            status: "running", cancelled: Arc::new(AtomicBool::new(false)), result: None,
+            lane: JobLane::General, status: "running", cancelled: Arc::new(AtomicBool::new(false)), result: None,
         });
         jobs.insert(("cancel".into(), "attempt-3".into()), JobRecord {
-            status: "cancel_requested", cancelled: Arc::new(AtomicBool::new(true)), result: None,
+            lane: JobLane::General, status: "cancel_requested", cancelled: Arc::new(AtomicBool::new(true)), result: None,
         });
         persist_job_records(state.path(), tenant, &jobs).unwrap();
         let recovered = load_job_records(state.path(), tenant).unwrap();
@@ -3368,11 +3468,11 @@ mod contract_tests {
         let cancelled = ("job".to_string(), "cancelled".to_string());
         let mut records = BTreeMap::new();
         records.insert(completed.clone(), JobRecord {
-            status: "completed", cancelled: Arc::new(AtomicBool::new(false)),
+            lane: JobLane::General, status: "completed", cancelled: Arc::new(AtomicBool::new(false)),
             result: Some(reference.clone()),
         });
         records.insert(cancelled.clone(), JobRecord {
-            status: "cancelled", cancelled: Arc::new(AtomicBool::new(true)), result: None,
+            lane: JobLane::General, status: "cancelled", cancelled: Arc::new(AtomicBool::new(true)), result: None,
         });
         persist_job_records(state.path(), tenant, &records).unwrap();
         let recovered = load_job_records(state.path(), tenant).unwrap();
@@ -3474,6 +3574,10 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
             credential_refresh_at_risk: self.credentials.get().is_some_and(|credentials| credentials.refresher.at_risk()),
             identity_directory: None,
             selection_evidence_cache: Some(self.engine().selection_evidence_status()),
+            writer_lease_epoch: None,
+            writer_ready: false,
+            landing: None,
+            ingest_diagnostics: None,
         }
     }
 

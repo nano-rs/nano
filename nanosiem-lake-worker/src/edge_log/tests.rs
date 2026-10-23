@@ -78,6 +78,7 @@ impl EdgeLogTransport for FakeEdge {
         let chain_at = |seq: u64| if seq == 0 { Some(edge_log_genesis(TENANT)) } else { log.segments.get(seq as usize - 1).map(|s| s.chain.clone()) };
         let committed = log.committed;
         Ok(Lease {
+            backlog_skip: None,
             kind: "ok".into(), epoch: log.epoch, committed_through: committed,
             committed_chain: chain_at(committed).unwrap(), last_part_id: None, head: log.segments.len() as u64,
             floor_seq: 0, floor_chain: edge_log_genesis(TENANT), mode: log.mode.clone(),
@@ -658,4 +659,90 @@ async fn status_tells_an_empty_log_from_a_busy_or_withholding_do() {
     let status = source.status().await;
     assert_eq!((status.head, status.last_pulled, status.empty_behind_head_streak), (3, 0, STALL_STREAK));
     assert!(status.stall().unwrap().contains("head"));
+}
+
+// Recovery uses real Parquet, the real source's signed-range accounting, and
+// an otherwise faithful DO transport. The operator deliberately includes a
+// mixed segment to prove runtime revalidation keeps it even in a bad plan.
+#[derive(Clone)]
+struct RecoveryEdge(FakeEdge, super::backlog::BacklogSkipPlan);
+#[async_trait]
+impl EdgeLogTransport for RecoveryEdge {
+    async fn lease(&self, id: &str, at: Option<u64>) -> Result<Lease> {
+        let mut lease = self.0.lease(id, at).await?;
+        if lease.committed_through == 0 { lease.committed_chain = edge_log_genesis(super::backlog::OPS_TENANT); }
+        if at == Some(0) { lease.at_chain = Some(edge_log_genesis(super::backlog::OPS_TENANT)); }
+        lease.backlog_skip = Some(self.1.clone());
+        Ok(lease)
+    }
+    async fn pull(&self, epoch: u64, after: u64, bytes: u64, count: u32) -> Result<PullOutcome> {
+        self.0.pull(epoch, after, bytes, count).await
+    }
+    async fn commit(&self, request: &CommitRequest) -> Result<CommitOutcome> { self.0.commit(request).await }
+}
+
+fn recovery_fixture() -> RecoveryEdge {
+    use super::backlog::{BacklogSkipPlan, BacklogSummary, OPS_TENANT};
+    let cutoff = chrono::Utc::now().timestamp_millis() - 3_600_000;
+    let edge = FakeEdge::default();
+    for (i, times) in [vec![Some(1)], vec![Some(1), Some(cutoff)], vec![Some(1)], vec![None], vec![Some(1)]].into_iter().enumerate() {
+        edge.append(&format!("bronze-v2/shard=0/tenant_id={OPS_TENANT}/k{}.parquet", i + 1), &super::backlog::tests::parquet(times));
+    }
+    edge.set(|log| {
+        let mut previous = edge_log_genesis(OPS_TENANT);
+        for segment in &mut log.segments {
+            segment.prev_chain = previous;
+            segment.chain = edge_log_next_chain(&segment.prev_chain, segment.seq, &segment.key, &segment.sha256, segment.length);
+            previous = segment.chain.clone();
+        }
+    });
+    let mut plan = BacklogSkipPlan { version: 1, tenant_uuid: OPS_TENANT.into(), cutoff_ms: cutoff, first_seq: 1, through_seq: 4,
+        summary: BacklogSummary { segments: 3, bytes: 0, rows: 4, kept: 1, ranges: vec![[1, 3]], manifest_sha256: "a".repeat(64) },
+        plan_hash: String::new(), at: cutoff + 3_600_000 };
+    plan.plan_hash = plan.canonical_hash().unwrap();
+    RecoveryEdge(edge, plan)
+}
+
+#[tokio::test]
+async fn backlog_recovery_preserves_mixed_unknown_unplanned_and_commits_only_after_durable_range() {
+    use super::backlog::OPS_TENANT;
+    let edge = recovery_fixture();
+    let source = EdgeLogSource::open(edge.clone(), OPS_TENANT, "ingest", None, EdgeLogSourceConfig::default()).await.unwrap();
+    let pending = source.pending(10).await.unwrap();
+    assert_eq!(pending.iter().map(|n| n.seq).collect::<Vec<_>>(), vec![2, 4, 5]);
+    assert_eq!(edge.0.committed(), 0);
+    let floor = source.floor_due(0).await.unwrap();
+    assert_eq!(floor.through_seq, 1, "retained sequence2 is a hard barrier");
+    assert!(floor.reason.contains(&edge.1.plan_hash));
+    assert!(floor.reason.contains("rows=1"));
+    // Crash before EdgeFloor append: everything is replayed and no DO ACK.
+    drop(source);
+    let restarted = EdgeLogSource::open(edge.clone(), OPS_TENANT, "restart", None, EdgeLogSourceConfig::default()).await.unwrap();
+    let pending = restarted.pending(10).await.unwrap();
+    assert_eq!(pending.iter().map(|n| n.seq).collect::<Vec<_>>(), vec![2, 4, 5]);
+    let floor = restarted.floor_due(0).await.unwrap();
+    assert_eq!(edge.0.committed(), 0);
+    restarted.floor_appended(&floor).await.unwrap(); // simulate durable EdgeFloor
+    assert_eq!(edge.0.committed(), 1);
+    let sources = pending[..2].iter().map(source_of).collect::<Vec<_>>();
+    let range = restarted.range_for_flush(&sources, 0, 0).await.unwrap().unwrap();
+    range.validate(OPS_TENANT, &sources).unwrap();
+    assert_eq!((range.first_seq, range.through_seq), (2, 4));
+    assert_eq!(range.skipped.iter().map(|s| (s.seq, s.rows, s.rows_rejected)).collect::<Vec<_>>(), vec![(3, 1, 1)]);
+    assert_eq!(edge.0.committed(), 1, "range issuance must not acknowledge");
+    // Crash after durable Add but before DO ACK; reopen reconciles that
+    // exact chain point rather than publishing the retained rows twice.
+    let point = EdgePoint { log: format!("edgelog:{OPS_TENANT}"), through_seq: 4, through_chain: range.through_chain };
+    drop(restarted);
+    let final_source = EdgeLogSource::open(edge.clone(), OPS_TENANT, "after-add", Some(&point), EdgeLogSourceConfig::default()).await.unwrap();
+    assert_eq!(edge.0.committed(), 4);
+    assert_eq!(final_source.pending(10).await.unwrap().iter().map(|n| n.seq).collect::<Vec<_>>(), vec![5]);
+}
+
+#[tokio::test]
+async fn backlog_recovery_rejects_cross_tenant_and_modified_plan() {
+    let edge = recovery_fixture();
+    assert!(EdgeLogSource::open(edge.clone(), TENANT, "wrong", None, EdgeLogSourceConfig::default()).await.is_err());
+    let mut tampered = edge.clone(); tampered.1.cutoff_ms -= 1;
+    assert!(EdgeLogSource::open(tampered, super::backlog::OPS_TENANT, "bad-hash", None, EdgeLogSourceConfig::default()).await.is_err());
 }

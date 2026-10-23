@@ -45,7 +45,7 @@ export function SearchQueryInput({
   queryMode,
   onSearch,
   onAiSearch,
-  aiMode,
+  aiMode: aiModeProp,
   searchHistory = [],
   historyEnabled,
   onToggleHistoryEnabled,
@@ -56,6 +56,13 @@ export function SearchQueryInput({
   timeRange,
   isOcsf = false,
 }: SearchQueryInputProps) {
+  // NAN-4131: `onAiSearch` is passed only when pivt can actually serve the
+  // request (`capabilities.melod` + connected provider). Open core has no AI,
+  // and an unknown capability must not advertise it either, so every AI
+  // affordance here (NL hint, NATURAL LANGUAGE badge, "translate & run")
+  // keys off that prop (fail closed).
+  const aiAvailable = !!onAiSearch;
+  const aiMode = aiAvailable && !!aiModeProp;
   const editorRef = useRef<SearchQueryEditorRef>(null);
   const historyDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -191,7 +198,7 @@ export function SearchQueryInput({
     : 'SELECT … FROM logs';
 
   // Show hint when focused and not dismissed (and no dropdowns open)
-  const showNlHint = isFocused && !nlHintDismissed && !showHistorySuggestions && !aiMode;
+  const showNlHint = aiAvailable && isFocused && !nlHintDismissed && !showHistorySuggestions && !aiMode;
 
   // Retro hunts scan every event in the selected time range (no narrow-window
   // shortcut), so surface that the moment a `| retro` command is typed — it tells
@@ -294,7 +301,8 @@ export function SearchQueryInput({
 
   return (
     <div className="flex-1 flex flex-col">
-      {/* Natural language hint - slides in above input */}
+      {/* Natural language hint - slides in above input (AI builds only) */}
+      {aiAvailable && (
       <div className={`overflow-hidden transition-all duration-300 ease-out ${
         showNlHint ? 'max-h-8 opacity-100 mb-1.5' : 'max-h-0 opacity-0 mb-0'
       }`}>
@@ -311,6 +319,7 @@ export function SearchQueryInput({
           </button>
         </div>
       </div>
+      )}
 
       <div className="relative">
         <div className={`search-console-input-shell relative border rounded-md min-h-[34px] resize-y overflow-hidden transition-colors duration-300 ease-out ${

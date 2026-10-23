@@ -655,7 +655,16 @@ struct PendingCredential {
     request_id: Option<Uuid>,
     reveal_key: Option<(Vec<u8>, String)>,
     waited_secs: i64,
+    /// NAN-3660: the credential a rotation is replacing. It stays valid until
+    /// the new one is stored on the feed, the new request fails, or
+    /// [`ROTATION_GRACE_SECS`] pass; then it is revoked.
+    previous_credential: Option<Uuid>,
 }
+
+#[cfg(feature = "enterprise")]
+/// NAN-3660: the longest a rotation keeps the previous credential valid
+/// while its replacement is still pending.
+pub const ROTATION_GRACE_SECS: i64 = 3600;
 
 #[cfg(feature = "enterprise")]
 /// What one feed's issuance step concluded.
@@ -708,7 +717,7 @@ impl PgFeedStore {
         } else { String::new() };
         let hec = if self.sink_column { "sink = 'hec'" } else { "TRUE" };
         let rows = sqlx::query(&format!(
-            "SELECT id, name, source_slug, created_by, ingest_credential_request_id,
+            "SELECT id, name, source_slug, created_by, ingest_credential_request_id, ingest_credential_id,
                     ingest_reveal_key_encrypted, ingest_reveal_key_nonce,
                     COALESCE(EXTRACT(EPOCH FROM now() - ingest_credential_requested_at)::bigint, 0) AS waited_secs
                FROM public.connector_feeds feed
@@ -734,6 +743,7 @@ impl PgFeedStore {
                 request_id: r.try_get("ingest_credential_request_id").map_err(db)?,
                 reveal_key: ct.zip(nonce),
                 waited_secs: r.try_get("waited_secs").map_err(db)?,
+                previous_credential: r.try_get("ingest_credential_id").map_err(db)?,
             };
             let step = {
                 let mut sp = sqlx::Connection::begin(&mut *tx).await.map_err(db)?;
@@ -763,9 +773,21 @@ impl PgFeedStore {
                         serde_json::json!({ "request_id": request_id, "source_slug": feed.source_slug,
                             "requested_by": slot.actor_id, "delegated_by": feed.installer }));
                 }
-                CredentialStep::Waiting => pass.waiting += 1,
+                CredentialStep::Waiting => {
+                    pass.waiting += 1;
+                    // NAN-3660: bound the rotation overlap.
+                    if let Some(previous) = feed.previous_credential.filter(|_| feed.waited_secs > ROTATION_GRACE_SECS) {
+                        self.retire_previous(&mut tx, slot, &feed, previous, "rotation grace period passed").await?;
+                    }
+                }
                 CredentialStep::Issued { request_id, credential_id } => {
                     pass.issued += 1;
+                    // NAN-3660: the replacement is stored; end the overlap.
+                    if let Some(previous) = feed.previous_credential.filter(|p| Some(*p) != credential_id) {
+                        self.revoke_orphan(&mut tx, slot, previous, "nano-connector: feed credential rotated").await;
+                        credential_audit("connector_feed_credential_retired", slot.tenant_id, feed.feed_id,
+                            serde_json::json!({ "credential_id": previous, "replaced_by": credential_id, "reason": "rotated" }));
+                    }
                     credential_audit("connector_feed_credential_issued", slot.tenant_id, feed.feed_id,
                         serde_json::json!({ "request_id": request_id, "credential_id": credential_id, "source_slug": feed.source_slug,
                             "requested_by": slot.actor_id, "delegated_by": feed.installer }));
@@ -773,7 +795,11 @@ impl PgFeedStore {
                 CredentialStep::Failed { code, retry_secs, restart, revoke } => {
                     pass.failed += 1;
                     if let Some(credential_id) = revoke {
-                        self.revoke_orphan(&mut tx, slot, credential_id).await;
+                        self.revoke_orphan(&mut tx, slot, credential_id, "nano-connector: issued feed credential could not be stored").await;
+                    }
+                    // NAN-3660: a failed replacement ends the rotation overlap.
+                    if let Some(previous) = feed.previous_credential.filter(|_| restart) {
+                        self.retire_previous(&mut tx, slot, &feed, previous, "replacement request failed").await?;
                     }
                     let code: String = code.chars().take(1000).collect();
                     sqlx::query(
@@ -959,11 +985,36 @@ impl PgFeedStore {
         Ok(CredentialStep::Issued { request_id, credential_id: reveal.credential_id })
     }
 
+    /// NAN-3660: revoke the credential a rotation replaced and forget it.
+    async fn retire_previous(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        slot: &TenantSlot,
+        feed: &PendingCredential,
+        previous: Uuid,
+        why: &str,
+    ) -> Result<(), StoreError> {
+        self.revoke_orphan(tx, slot, previous, &format!("nano-connector: feed credential rotated ({why})")).await;
+        sqlx::query(
+            "UPDATE public.connector_feeds SET ingest_credential_id = NULL, updated_at = now()
+              WHERE tenant_id = $1 AND id = $2 AND ingest_token_encrypted IS NULL AND ingest_credential_id = $3",
+        )
+        .bind(slot.tenant_id)
+        .bind(feed.feed_id)
+        .bind(previous)
+        .execute(&mut **tx)
+        .await
+        .map_err(db)?;
+        credential_audit("connector_feed_credential_retired", slot.tenant_id, feed.feed_id,
+            serde_json::json!({ "credential_id": previous, "reason": why }));
+        Ok(())
+    }
+
     /// Best-effort: revoke an issued credential no feed will ever hold.
-    async fn revoke_orphan(&self, tx: &mut Transaction<'_, Postgres>, slot: &TenantSlot, credential_id: Uuid) {
+    async fn revoke_orphan(&self, tx: &mut Transaction<'_, Postgres>, slot: &TenantSlot, credential_id: Uuid, reason: &str) {
         use nanosiem_core::enterprise_shared_sources::{RevokeIngestCredentialInput, revoke_ingest_credential_row};
         let Ok(mut sp) = sqlx::Connection::begin(&mut **tx).await else { return };
-        let input = RevokeIngestCredentialInput { reason: "nano-connector: issued feed credential could not be stored".into() };
+        let input = RevokeIngestCredentialInput { reason: reason.chars().take(200).collect() };
         match revoke_ingest_credential_row(&mut sp, slot.tenant_id, slot.actor_id, credential_id, &input).await {
             Ok(_) => {
                 let _ = sp.commit().await;

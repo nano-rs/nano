@@ -5,7 +5,8 @@
 // scan that hands back a continuation cursor). The total comes from the list
 // summary, never from a COUNT per keystroke.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Search } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
@@ -13,10 +14,15 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { IocExpiryChange, IocListSummary, IocMatchMode, IocType } from '@/lib/api/ioc-lists';
+import type { RetroListRow } from '@/lib/api/types';
+import { fetchRetroPage } from '@/components/search/retro/useRetro';
+import { RETRO_IOC_WINDOW_DAYS, lastDaysRange, retroListQuery, retroSearchUrl } from '@/components/search/retro/links';
 import { cn } from '@/lib/utils';
 import { ExpirySelect, NO_EXPIRY, expiryInstant, type ExpiryValue } from './IocExpirySelect';
 
 const PAGE_SIZE = 100;
+/** Indicators one hit count covers (one retro campaign page). */
+const HITS_MAX = 500;
 const TYPES: IocType[] = ['ip', 'domain', 'hash', 'url', 'email'];
 
 function useDebounced<T>(value: T, ms: number): T {
@@ -60,6 +66,7 @@ export function IocListViewer({ list }: { list: IocListSummary }) {
 
   const rows = entries.data?.pages.flatMap((p) => p.indicators) ?? [];
   const last = entries.data?.pages[entries.data.pages.length - 1];
+  const hits = useIndicatorHits(rows.map((r) => r.value));
   const filtered = Boolean(q || type || (hideExpired && list.expired_count));
 
   return (
@@ -102,6 +109,21 @@ export function IocListViewer({ list }: { list: IocListSummary }) {
           {list.expired_count ? <span className="tabular-nums">({list.expired_count.toLocaleString()})</span> : null}
         </label>
         <span className="flex-1" />
+        <button
+          type="button"
+          onClick={hits.run}
+          disabled={hits.loading || rows.length === 0}
+          title={`Count log events matching the shown indicators over the last ${RETRO_IOC_WINDOW_DAYS} days (ingest and retro matches). Runs only when clicked.`}
+          className="h-[22px] px-2 rounded border border-border text-[10.5px] font-mono text-muted-foreground hover:text-foreground disabled:opacity-50 flex items-center gap-1"
+        >
+          {hits.loading && <LoadingIcon className="w-3 h-3" strokeWidth={1.5} />}
+          {hits.counts ? 'recount hits' : `count hits (${RETRO_IOC_WINDOW_DAYS}d)`}
+        </button>
+        {hits.error && (
+          <span className="text-[10.5px] font-mono text-destructive truncate max-w-[220px]" title={hits.error}>
+            {hits.error}
+          </span>
+        )}
         <span className="text-[10.5px] font-mono text-muted-foreground tabular-nums">
           {filtered ? `${rows.length.toLocaleString()}${entries.hasNextPage ? '+' : ''} shown` : `${rows.length.toLocaleString()} of ${list.indicator_count.toLocaleString()}`}
         </span>
@@ -112,6 +134,7 @@ export function IocListViewer({ list }: { list: IocListSummary }) {
           <span className="flex-1">value</span>
           <span className="w-[56px]">type</span>
           <span className="w-[40px] text-right">risk</span>
+          <span className="w-[64px] text-right" title={`log events matching the indicator over the last ${RETRO_IOC_WINDOW_DAYS} days`}>hits {RETRO_IOC_WINDOW_DAYS}d</span>
           <span className="w-[180px]">tags</span>
           <span className="w-[120px]">expires</span>
           <span className="w-[120px]">added</span>
@@ -142,6 +165,7 @@ export function IocListViewer({ list }: { list: IocListSummary }) {
                 <span className={cn('flex-1 min-w-0 font-mono text-foreground truncate', row.expired && 'line-through')} title={row.note ?? undefined}>{row.value}</span>
                 <span className="w-[56px] font-mono text-muted-foreground">{row.ioc_type}</span>
                 <span className="w-[40px] text-right font-mono tabular-nums text-foreground/80">{row.risk_score}</span>
+                <HitCount value={row.value} counts={hits.counts} />
                 <span className="w-[180px] font-mono text-[10.5px] text-muted-foreground truncate">{row.tags.join(', ') || '—'}</span>
                 <span className={cn('w-[120px] font-mono text-[10.5px] tabular-nums', row.expired ? 'text-destructive' : 'text-muted-foreground')}>
                   {shortDate(row.expires_at)}
@@ -176,6 +200,73 @@ export function IocListViewer({ list }: { list: IocListSummary }) {
       )}
       <ListExpiry list={list} />
     </div>
+  );
+}
+
+interface IndicatorHits {
+  /** Lowercased indicator -> matching events over the window; `null` until counted. */
+  counts: Map<string, number> | null;
+  loading: boolean;
+  error: string | null;
+  run: () => void;
+}
+
+/**
+ * NAN-4169: per-indicator hit counts over the retro IOC window, through the
+ * existing retro campaign view (`ioc in [..] | retro`): one list rollup for the
+ * shown indicators. On request only — it is a background retro job on lean
+ * tenants, never queued just by opening the list.
+ */
+function useIndicatorHits(values: string[]): IndicatorHits {
+  const [counts, setCounts] = useState<Map<string, number> | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const key = values.join('\n');
+  const current = useRef(key);
+  useEffect(() => {
+    current.current = key;
+    setCounts(null);
+    setError(null);
+  }, [key]);
+  const run = () => {
+    const shown = values.slice(0, HITS_MAX);
+    if (shown.length === 0) return;
+    const runKey = key;
+    setLoading(true);
+    setError(null);
+    fetchRetroPage(
+      { query: retroListQuery(shown), axis: 'indicator', offset: 0, limit: HITS_MAX },
+      lastDaysRange(),
+    )
+      .then((response) => {
+        // The shown rows changed while counting: drop the stale result.
+        if (current.current !== runKey) return;
+        const next = new Map<string, number>(shown.map((v) => [v.toLowerCase(), 0]));
+        for (const row of (response.rows ?? []) as RetroListRow[]) next.set(row.value.toLowerCase(), row.hits);
+        setCounts(next);
+      })
+      .catch((err) => current.current === runKey && setError(err instanceof Error ? err.message : 'Hit count failed'))
+      .finally(() => setLoading(false));
+  };
+  return { counts, loading, error, run };
+}
+
+function HitCount({ value, counts }: { value: string; counts: Map<string, number> | null }) {
+  const count = counts?.get(value.toLowerCase());
+  if (count === undefined) {
+    return <span className="w-[64px] text-right font-mono text-[10.5px] text-muted-foreground">—</span>;
+  }
+  if (count === 0) {
+    return <span className="w-[64px] text-right font-mono tabular-nums text-muted-foreground">0</span>;
+  }
+  return (
+    <Link
+      to={retroSearchUrl(value)}
+      title="Open in the retro view"
+      className="w-[64px] text-right font-mono tabular-nums text-primary hover:underline"
+    >
+      {count.toLocaleString()}
+    </Link>
   );
 }
 

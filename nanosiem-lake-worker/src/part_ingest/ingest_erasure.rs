@@ -38,6 +38,7 @@ const MAX_DEFERRAL_MS: i64 = 30 * 60_000;
 /// The executor's state on the ingestor.
 #[derive(Default)]
 pub(crate) struct ErasureExec {
+    catalog_completion: Option<(uuid::Uuid, u64)>,
     slot: Option<ErasureLedgerSlot>,
     executor_node: String,
     /// The ledger and the credential URL it was built from.
@@ -209,7 +210,7 @@ impl<'a> Ingestor<'a> {
             match phase {
                 LeanPhase::Scan | LeanPhase::Tail => self.start_erasure_step(now_ms, lag_ms).await?,
                 LeanPhase::Prevalence => self.erase_prevalence(now_ms).await?,
-                LeanPhase::Done => self.complete_erasure()?,
+                LeanPhase::Done => self.complete_erasure(now_ms).await?,
             }
         }
         if let Some(write) = self.erasure.write.take() {
@@ -492,10 +493,22 @@ impl<'a> Ingestor<'a> {
         }
         // Not an IP subject (prevalence keys IPs only), or prevalence is not
         // configured for this tenant (no state exists to hold the address).
-        self.complete_erasure()
+        self.complete_erasure(now_ms).await
     }
 
-    fn complete_erasure(&mut self) -> Result<()> {
+    async fn complete_erasure(&mut self, now_ms: i64) -> Result<()> {
+        if self.cfg.catalog.is_some() {
+            self.tick_catalog(now_ms).await;
+            let order = self.erasure.order.as_ref().context("order")?;
+            // Capture one convergence head, including deletions performed by
+            // earlier orders/processes. New ingest must not keep moving this
+            // fence, and a clean order must not skip a stale catalog.
+            if self.erasure.catalog_completion.is_none_or(|(id, _)| id != order.order_id) {
+                self.erasure.catalog_completion = Some((order.order_id, self.log.live().head().map_or(0, |h| h.0)));
+            }
+            let required = self.erasure.catalog_completion.context("catalog completion fence")?.1;
+            if self.catalog_applied_seq.is_none_or(|seq| seq < required) || self.cfg.catalog.as_ref().is_some_and(|catalog| catalog.recovery_required()) { return Ok(()); }
+        }
         let order = self.erasure.order.as_mut().context("order")?;
         order.progress.phase = LeanPhase::Done;
         tracing::info!(tenant = %self.cfg.tenant_id, order = %order.order_id, sweeps = order.progress.sweeps,

@@ -258,6 +258,20 @@ pub struct TenantEntry {
     /// for placed tenants; absent otherwise, so the body is byte-identical.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ingest: Option<IngestCounters>,
+    /// NAN-4137 (`lean_tenzir_landing_v1`): the tenant's live landing[T]
+    /// counters. Only on a `tenzir_landing` cell, only while landing[T]
+    /// runs; absent otherwise, so every other body is byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub landing: Option<LandingCounters>,
+}
+
+/// One landing[T] process life's counters (`epoch_ms` = its spawn time):
+/// the platform diffs successive samples like [`IngestCounters`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingCounters {
+    pub epoch_ms: u64,
+    pub status: crate::contract::LandingStatus,
 }
 
 /// One ingest process life's committed rows (`epoch_ms` = its spawn time).
@@ -304,6 +318,8 @@ pub struct StatusSnapshot {
     pub purged: Vec<(TenantId, PurgeRecord)>,
     /// NAN-3522: placed tenants' ingest counters (empty unless enabled).
     pub ingest: BTreeMap<TenantId, IngestCounters>,
+    /// NAN-4137: placed tenants' landing counters (empty unless enabled).
+    pub landing: BTreeMap<TenantId, LandingCounters>,
 }
 
 /// The platform's tenant ids are lowercase UUIDs; anything else (dev or
@@ -316,12 +332,12 @@ pub fn platform_tenant_id(t: &TenantId) -> bool {
 
 impl StatusSnapshot {
     pub fn tenants(&self, with_draining: bool) -> Vec<TenantEntry> {
-        let placed = self.placed.iter().map(|(t, s)| (t, *s, self.ingest.get(t).copied()));
-        let draining = self.draining.iter().filter(|_| with_draining).map(|t| (t, TenantState::Draining, None));
+        let placed = self.placed.iter().map(|(t, s)| (t, *s, self.ingest.get(t).copied(), self.landing.get(t).cloned()));
+        let draining = self.draining.iter().filter(|_| with_draining).map(|t| (t, TenantState::Draining, None, None));
         let all: Vec<TenantEntry> = placed
             .chain(draining)
-            .filter(|(t, _, _)| platform_tenant_id(t))
-            .map(|(t, state, ingest)| TenantEntry { tenant_id: t.as_str().to_owned(), state, ingest })
+            .filter(|(t, _, _, _)| platform_tenant_id(t))
+            .map(|(t, state, ingest, landing)| TenantEntry { tenant_id: t.as_str().to_owned(), state, ingest, landing })
             .collect();
         if all.len() > MAX_TENANTS {
             tracing::warn!(tenants = all.len(), "more tenants than one status push holds; reporting the first {MAX_TENANTS}");
@@ -391,6 +407,7 @@ impl StatusSource for LedgerSource {
             draining: l.pending.keys().cloned().collect(),
             purged: l.purged.into_iter().collect(),
             ingest: BTreeMap::new(),
+            landing: BTreeMap::new(),
         }
     }
     fn purges_settled(&self, tenants: &[TenantId]) {
@@ -674,6 +691,7 @@ mod tests {
             draining: vec![t(C)],
             purged: l.purged.clone().into_iter().collect(),
             ingest: BTreeMap::new(),
+            landing: BTreeMap::new(),
         };
         let body = snap.body(snap.tenants(true), snap.purges().into_iter().map(|(_, p)| p).collect());
         let v = serde_json::to_value(&body).unwrap();
@@ -701,7 +719,7 @@ mod tests {
                 reason: PurgeReason::Drain, verified: true, at: "2026-09-28T00:00:00.000Z".into(),
                 bytes: PurgeBytes::default(), recorded_ms: 1000 - i as u64 }))
             .collect();
-        let snap = StatusSnapshot { cell_id: "c".into(), placement_revision: 1, placed, draining: vec![], purged, ingest: BTreeMap::new() };
+        let snap = StatusSnapshot { cell_id: "c".into(), placement_revision: 1, placed, draining: vec![], purged, ingest: BTreeMap::new(), landing: BTreeMap::new() };
         assert_eq!(snap.tenants(true).len(), MAX_TENANTS);
         let p = snap.purges();
         assert_eq!(p.len(), MAX_PURGED);

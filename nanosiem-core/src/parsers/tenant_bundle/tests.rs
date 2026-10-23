@@ -1421,3 +1421,190 @@ fn a_pre_nan3197_sampled_bundle_still_strips() {
     let verified = overlay::verify_against_base(&base, &candidate).unwrap();
     assert!(verified.tenants[0].sampled && !verified.tenants[0].ocsf_sampled);
 }
+
+#[test]
+fn source_test_configs_preserve_cases_and_exact_transform_dependencies() {
+    let mut first = source("first", GOOD_VRL);
+    first.samples = vec![
+        "GET /$HOME/NANO_SHARD_INTERPOLATION_0_".into(),
+        "invalid".into(),
+    ];
+    let outcome = build::generate(&inputs(
+        vec![first, source("second", GOOD_VRL)],
+        BuildPurpose::Rollout,
+        None,
+    ));
+    assert!(outcome.ok(), "{:?}", outcome.report.failure);
+    let combined: toml::Table = outcome.tests_toml.as_ref().unwrap().parse().unwrap();
+    let tree = archive::unpack(outcome.bundle.as_ref().unwrap()).unwrap();
+    assert_eq!(outcome.source_test_configs.len(), 2);
+    let mut actual_cases = Vec::new();
+    for text in &outcome.source_test_configs {
+        // The runtime substitutes these typed defaults before parsing TOML.
+        let typed =
+            regex::Regex::new(r"(?m)(=\s*)\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}\n]+)\}").unwrap();
+        let concrete = typed.replace_all(text, "${1}${2}");
+        let shard: toml::Table = concrete.parse().unwrap();
+        assert!(text.contains("${VECTOR_RATE_LIMIT_PER_CLIENT_EPS:-500000}"));
+        let transforms = shard["transforms"].as_table().unwrap();
+        let tests = shard["tests"].as_array().unwrap();
+        actual_cases.extend(tests.iter().cloned());
+        let name = tests[0]["name"].as_str().unwrap();
+        let (own, other) = if name.contains("first") {
+            ("first", "second")
+        } else {
+            ("second", "first")
+        };
+        assert!(transforms.contains_key(&format!("tenant__{own}_parse")));
+        assert!(!transforms
+            .keys()
+            .any(|key| key.starts_with(&format!("tenant__{other}_"))));
+        for (component, transform) in transforms {
+            let original = tree
+                .files
+                .iter()
+                .filter(|(path, _)| {
+                    matches!(
+                        path.rsplit_once('/').map(|(p, _)| p).unwrap_or(""),
+                        "" | "sources/parsers" | "sources/configs"
+                    )
+                })
+                .filter_map(|(_, bytes)| std::str::from_utf8(bytes).ok())
+                .filter_map(|text| {
+                    typed
+                        .replace_all(text, "${1}${2}")
+                        .parse::<toml::Table>()
+                        .ok()
+                })
+                .find_map(|doc| doc.get("transforms")?.get(component).cloned());
+            assert_eq!(Some(transform), original.as_ref(), "changed {component}");
+            for input in transform.get("inputs").unwrap().as_array().unwrap() {
+                let upstream = input.as_str().unwrap().split('.').next().unwrap();
+                assert!(
+                    transforms.contains_key(upstream)
+                        || shard
+                            .get("sources")
+                            .and_then(|sources| sources.get(upstream))
+                            .is_some(),
+                    "missing {upstream}"
+                );
+            }
+        }
+    }
+    assert_eq!(actual_cases, *combined["tests"].as_array().unwrap());
+}
+
+/// Run on the train with the pinned Vector fork; no local core test build needed.
+#[test]
+#[ignore = "requires Docker and NANO_PIPE_VECTOR_TEST_IMAGE; memory-capped Vector integration"]
+fn source_test_configs_vector_equivalence() {
+    let image = std::env::var("NANO_PIPE_VECTOR_TEST_IMAGE").expect("pin Vector image");
+    let vrl = format!("assert!(.message == \"GET /index.html\")\n{GOOD_VRL}")
+        .replace("parts[0] ?? \"GET\"", "parts[0]")
+        .replace("parts[1] ?? \"/\"", "parts[1]");
+    for bad in [None, Some("first"), Some("second")] {
+        let mut sources = vec![source("first", &vrl), source("second", &vrl)];
+        if let Some(bad) = bad {
+            sources.iter_mut().find(|s| s.slug == bad).unwrap().samples = vec!["bad sample".into()];
+        }
+        let outcome = build::generate(&inputs(sources, BuildPurpose::Rollout, None));
+        assert!(outcome.ok(), "{:?}", outcome.report.failure);
+        let tree = archive::unpack(outcome.bundle.as_ref().unwrap()).unwrap();
+        let temp = tempfile::tempdir_in(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target"),
+        ).unwrap();
+        for (path, bytes) in &tree.files {
+            let dest = temp.path().join(path);
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, bytes).unwrap();
+        }
+        std::fs::write(temp.path().join("tests.toml"), outcome.tests_toml.unwrap()).unwrap();
+        for (index, shard) in outcome.source_test_configs.iter().enumerate() {
+            std::fs::write(
+                temp.path().join(format!("shard-{index}.toml.disabled")),
+                shard,
+            )
+            .unwrap();
+        }
+        let run = |args: &[&str]| {
+            let mut command = std::process::Command::new("docker");
+            command
+                .args([
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--memory",
+                    "2g",
+                    "--cpus",
+                    "2",
+                    "--ulimit",
+                    "core=0",
+                    "--entrypoint",
+                    "/usr/bin/vector",
+                    "-v",
+                ])
+                .arg(format!("{}:/fixtures:ro", temp.path().display()));
+            for (key, value) in &outcome.env {
+                command.args(["-e", &format!("{key}={value}")]);
+            }
+            command
+                .arg(&image)
+                .args(["--dangerously-allow-env-var-interpolation", "test"])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let combined = run(&[
+            "--config-dir",
+            "/fixtures",
+            "--config-dir",
+            "/fixtures/sources/parsers",
+            "--config-dir",
+            "/fixtures/sources/configs",
+        ]);
+        assert_eq!(
+            combined.status.success(),
+            bad.is_none(),
+            "combined: {:?}\n{}\n{}",
+            combined.status,
+            String::from_utf8_lossy(&combined.stdout),
+            String::from_utf8_lossy(&combined.stderr)
+        );
+        for (index, slug) in ["first", "second"].iter().enumerate() {
+            let shard = run(&[
+                "--config-toml",
+                &format!("/fixtures/shard-{index}.toml.disabled"),
+            ]);
+            assert_eq!(
+                shard.status.success(),
+                bad != Some(*slug),
+                "{slug}: {:?}\n{}\n{}",
+                shard.status,
+                String::from_utf8_lossy(&shard.stdout),
+                String::from_utf8_lossy(&shard.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn source_test_configs_only_include_changed_sources_with_samples() {
+    let mut request = inputs(
+        vec![source("first", GOOD_VRL), source("second", GOOD_VRL)],
+        BuildPurpose::Rollout,
+        None,
+    );
+    let mut json: serde_json::Value = serde_json::from_slice(&request.build_json).unwrap();
+    json["changed_sources"] = serde_json::json!(["second"]);
+    request.build_json = serde_json::to_vec(&json).unwrap();
+    let outcome = build::generate(&request);
+    assert!(outcome.ok(), "{:?}", outcome.report.failure);
+    assert_eq!(outcome.source_test_configs.len(), 1);
+    let text = &outcome.source_test_configs[0];
+    assert!(text.contains("tenant second sample 1"));
+    assert!(!text.contains("[transforms.tenant__first_"));
+    let empty = build::generate(&inputs(Vec::new(), BuildPurpose::Rollout, None));
+    assert!(empty.ok(), "{:?}", empty.report.failure);
+    assert!(empty.source_test_configs.is_empty());
+}

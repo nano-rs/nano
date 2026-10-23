@@ -281,17 +281,40 @@ FIELDS THAT DO NOT EXIST (NEVER USE THESE):
 - http_status - USE http_status_code INSTEAD"#
 }
 
+/// Scope-first nPL guidance shared by every pivt / meloD prompt that writes
+/// queries (NAN-4173). A bare `*` search on a shared SIEM scans every source
+/// and slows every other analyst's queries; on lean, bare `*` over 4h with
+/// stats/eval/where/timechart becomes a durable background job (NAN-4163).
+macro_rules! npl_scope_first_text {
+    () => {
+        "SCOPE FIRST (required for every generated nPL query):
+- Start every query with a source (`metadata.log_source=\"...\"`), class (`class_uid=...`), entity (`device.hostname=...`, `actor.user.name=...`, `src_endpoint.ip=...`, a hash) or keyword term before any `|` command.
+- Never emit a bare `*` search (`* | stats ...`, `* | timechart ...`) unless the user explicitly asks for all events. If `*` is truly required, keep the time window at or below 4h: bare `*` over 4h with stats/eval/where/timechart runs as a slow background job.
+- Exception: the inventory count `* | stats count by metadata.log_source` (also by `source_type` or `class_uid`, or `* | timechart span=1h count` with a span that is a whole multiple of 5m) is served from rollups and is cheap at any window. `dc`/`sum`, other group-by fields or an `eval` first still need a scan.
+- Plain listing (`* | head N`) stays interactive but should still be scoped when possible."
+    };
+}
+
+/// Scope-first nPL guidance block for AI prompts (NAN-4173). Append this to
+/// any system / task prompt that asks a model to write nPL.
+pub const NPL_SCOPE_FIRST_GUIDANCE: &str = npl_scope_first_text!();
+
 /// Get a compact query syntax reference for AI prompts
 ///
 /// Returns query syntax rules that should be included in prompts that generate queries.
 pub fn get_query_syntax_reference() -> &'static str {
-    r#"IMPORTANT - Query Syntax Rules:
+    concat!(
+        r#"IMPORTANT - Query Syntax Rules:
 - Use piped syntax: search_terms | command1 | command2
 - Field filters: field=value, field>5, field<10, field!="value"
 - Boolean: term1 AND term2, term1 OR term2, NOT term
 - Stats: | stats count, sum(field), avg(field) by group_field
 - Sort: | sort -field (descending) or | sort field (ascending)
-- Time modifiers: earliest=-24h, earliest=-7d, latest=now (optional, overrides UI time picker)"#
+- Time modifiers: earliest=-24h, earliest=-7d, latest=now (optional, overrides UI time picker)
+
+"#,
+        npl_scope_first_text!()
+    )
 }
 
 /// Format category name for display
@@ -367,5 +390,21 @@ mod tests {
 
         // Should still contain field names
         assert!(context.contains("`src_ip`"));
+    }
+}
+
+#[cfg(test)]
+mod scope_first_tests {
+    use super::*;
+
+    /// NAN-4173: the shared scope-first block names source, class and entity
+    /// scoping, the bare-`*` ban and the 4h background-job threshold, and the
+    /// compact syntax reference used by notebook prompts carries it.
+    #[test]
+    fn scope_first_guidance_is_shared_and_complete() {
+        for needle in ["metadata.log_source=", "class_uid=", "device.hostname=", "bare `*`", "4h"] {
+            assert!(NPL_SCOPE_FIRST_GUIDANCE.contains(needle), "missing {needle}");
+        }
+        assert!(get_query_syntax_reference().ends_with(NPL_SCOPE_FIRST_GUIDANCE));
     }
 }

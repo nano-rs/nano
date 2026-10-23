@@ -632,7 +632,8 @@ mod tests {
                 OtelServicesSort::Name,
             )
             .unwrap(),
-            plan_metric_names(&source(OtelDataset::Metrics), &tenant.to_string(), None).unwrap(),
+            plan_metric_names(&source(OtelDataset::Metrics), &tenant.to_string(), None, start, end)
+                .unwrap(),
         ];
         for plan in plans {
             let result = executor.execute_sql(plan.sql, plan.params).await.unwrap();

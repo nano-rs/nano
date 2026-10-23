@@ -32,6 +32,7 @@ export function TelemetryUnavailable({ telemetry, subject }: TelemetryUnavailabl
       <div className="text-[11px] text-fg-4 mt-1 max-w-[340px]">
         {telemetry?.detail ?? DEFAULT_DETAIL}
       </div>
+      <TelemetrySetupHint />
       {telemetry?.reason && (
         <div className="font-mono text-[10.5px] text-fg-4 mt-2">{telemetry.reason}</div>
       )}
@@ -48,11 +49,21 @@ export function TelemetryUnavailableNotice({
     <div className="flex items-center gap-2 h-7 px-2.5 mb-2.5 border border-border rounded-md text-[11px] text-fg-3">
       <Radio className="w-[13px] h-[13px] text-fg-4 shrink-0" strokeWidth={1.5} />
       <span className="truncate">
-        {subject} are saved but not evaluated — telemetry is not ingested on this deployment.
+        {subject}: {telemetry?.detail ?? DEFAULT_DETAIL}
       </span>
       {telemetry?.reason && (
         <span className="ml-auto font-mono text-[10.5px] text-fg-4 shrink-0">{telemetry.reason}</span>
       )}
+    </div>
+  );
+}
+
+/** Setup help is also shown when a live drain has no rows for a signal. */
+export function TelemetrySetupHint() {
+  return (
+    <div className="mt-2 text-[11px] text-fg-4">
+      Check the selected range and filters. If your exporter is running, check its delivery errors and queued data.
+      {' '}<a href="https://nano.rs/docs/integrations/otlp#observability-pages" target="_blank" rel="noopener noreferrer" className="text-brand hover:underline">Set up OpenTelemetry</a>
     </div>
   );
 }

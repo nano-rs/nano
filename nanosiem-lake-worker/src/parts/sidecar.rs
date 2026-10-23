@@ -28,6 +28,254 @@ pub const TOKEN_INDEX_VERSION_V3: u32 = 3;
 pub const TOKEN_INDEX_MAGIC_V4: &[u8; 8] = b"NANOTKI4";
 pub const TOKEN_INDEX_VERSION_V4: u32 = 4;
 pub const TRIGRAM_FILTER_BYTES: usize = 32 * 1024;
+/// v5 (NAN-4164) adds, per v4 group, a bloom of adjacent token pairs
+/// ([`adjacent_pairs`]), so a bare keyword that splits into several tokens
+/// (`10.1.4.20`, `ws-fin-095`, `"failed password"`) prunes on its pairs
+/// instead of on pieces that occur in nearly every row. Same file name and
+/// signed record entry. Readers of v5 went live before any writer emitted
+/// it; the writer is on by default ([`pairs_enabled`]).
+pub const TOKEN_INDEX_MAGIC_V5: &[u8; 8] = b"NANOTKI5";
+pub const TOKEN_INDEX_VERSION_V5: u32 = 5;
+pub const PAIR_ENABLE_ENV: &str = "NANO_LAKE_PAIR_INDEX";
+/// v6 (NAN-4217): the v5 layout, unchanged, whose token bloom and block
+/// index ALSO hold every IP address of the text as one whole token
+/// ([`address_tokens`]: `48.170.34.111`, `fe80::1`). A bare IP splits into
+/// number tokens (48, 170, 34, 111) found in nearly every row group, so on
+/// v4/v5 it prunes little; its whole-address token is as rare as the IP.
+/// Only the magic differs, so a v6 file never answers an address question
+/// for a reader that does not know the version: an older reader refuses
+/// the magic, keeps every group and scans (correct, slower). Writer behind
+/// [`ip_tokens_enabled`] (default off): readers roll first.
+pub const TOKEN_INDEX_MAGIC_V6: &[u8; 8] = b"NANOTKI6";
+pub const TOKEN_INDEX_VERSION_V6: u32 = 6;
+pub const IP_TOKEN_ENABLE_ENV: &str = "NANO_LAKE_IP_TOKEN_INDEX";
+/// Pair bloom size cap per group ([`pair_filter_bytes`]). A full large-tenant group
+/// (~650k distinct pairs) lands at the cap with a per-pair false-positive
+/// rate of ~6%, and a needle needs ALL of its pairs, so a three-pair IP
+/// needle passes a non-matching group ~0.02% of the time.
+pub const PAIR_FILTER_MAX_BYTES: usize = 512 * 1024;
+/// Distinct pair hashes remembered per group (8 bytes each) before the
+/// group's pair bloom is stored saturated (matches everything).
+const PAIR_DISTINCT_CAP: usize = 2_000_000;
+
+/// Pair bloom bytes for `pairs` distinct pairs: the power of two at or
+/// BELOW the 1% size (the token bloom rounds up; at up to 2x the false
+/// positives per pair, a small group's pair bloom stays near its token
+/// bloom instead of doubling past it), between 32 bytes and the cap.
+pub fn pair_filter_bytes(pairs: usize) -> usize {
+    let bits = -8.0 * pairs as f64 / (1.0 - TOKEN_FPP.powf(1.0 / 8.0)).ln();
+    let bytes = (bits / 8.0) as usize;
+    let floor = if bytes.is_power_of_two() { bytes } else { bytes.next_power_of_two() / 2 };
+    floor.clamp(32, PAIR_FILTER_MAX_BYTES)
+}
+
+/// On wherever the v4 writer is on (token counts and trigrams). Readers of
+/// v5 shipped first (#7262); exact "0" is the kill switch back to v4.
+pub fn pairs_enabled() -> bool {
+    pairs_enabled_from(std::env::var(PAIR_ENABLE_ENV).ok().as_deref())
+}
+
+fn pairs_enabled_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// NAN-4217: emit whole-address tokens (v6) where the v5 writer is on and
+/// `NANO_LAKE_IP_TOKEN_INDEX` is exactly "1". Off by default until every
+/// reader understands v6.
+pub fn ip_tokens_enabled() -> bool {
+    ip_tokens_enabled_from(std::env::var(IP_TOKEN_ENABLE_ENV).ok().as_deref())
+}
+
+fn ip_tokens_enabled_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// An IPv4 octet as the address token writes it: 1-3 ASCII digits, at most
+/// 255 (leading zeros are kept literally, `010` is its own spelling).
+fn ipv4_octet(piece: &[u8]) -> bool {
+    (1..=3).contains(&piece.len())
+        && piece.iter().all(u8::is_ascii_digit)
+        && piece.iter().fold(0_u32, |n, b| n * 10 + u32::from(b - b'0')) <= 255
+}
+
+/// `text` is exactly `a.b.c.d` of [`ipv4_octet`]s.
+fn is_ipv4_address(text: &[u8]) -> bool {
+    let mut octets = 0;
+    for piece in text.split(|b| *b == b'.') {
+        if !ipv4_octet(piece) {
+            return false;
+        }
+        octets += 1;
+    }
+    octets == 4
+}
+
+/// `text` (ASCII hex digits and `:` only) parses as an IPv6 address.
+fn is_ipv6_address(text: &[u8]) -> bool {
+    text.iter().filter(|b| **b == b':').count() >= 2
+        && std::str::from_utf8(text).is_ok_and(|text| text.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// IPv6 candidates: runs of ASCII hex digits and `:`. A run that holds
+/// neither `::` nor seven colons cannot contain an address, so timestamps
+/// (`10:34:48`) and MACs (`00:1a:2b:3c:4d:5e`) cost one scan of the run.
+fn is_hex_or_colon(b: u8) -> bool {
+    b.is_ascii_hexdigit() || b == b':'
+}
+
+/// NAN-4217: the whole-address tokens of `text` (v6), lowercased, shared by
+/// ingest. A bare IP needle is matched by the lake term regex: the needle's
+/// characters in order, ASCII case folded, with no ASCII alphanumeric (and
+/// no non-ASCII character) touching an alphanumeric end. So in any value it
+/// matches, the needle occurs as a substring whose edges are:
+///
+/// - IPv4 `a.b.c.d`: each octet is a WHOLE maximal run of ASCII digits (its
+///   neighbours are `.` inside the needle, non-digits at the ends). Every
+///   four consecutive digit runs joined by single dots, each an
+///   [`ipv4_octet`], are therefore emitted: `1.48.170.34.111` yields
+///   `1.48.170.34` and `48.170.34.111`.
+/// - IPv6: a substring of one maximal run of hex digits and colons that
+///   starts at the run start, after a `:` or on a `:`, and ends likewise.
+///   Every such substring that parses as an IPv6 address is emitted
+///   (`fe80::1` yields `fe80::1`, `::1`, `fe80::` ...; bounded by the run
+///   length, at most 45 bytes per address).
+///
+/// Superset by construction: an emitted token may be an occurrence the term
+/// regex then rejects (`x48.170.34.111`), never the reverse.
+pub fn address_tokens(text: &str, mut emit: impl FnMut(&str)) {
+    let bytes = text.as_bytes();
+    // IPv4: walk maximal digit runs, remembering the last three that were
+    // joined to their successor by exactly one '.'.
+    let mut chain: [(usize, usize); 4] = [(0, 0); 4];
+    let mut chained = 0_usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && bytes[at].is_ascii_digit() {
+            at += 1;
+        }
+        let joined = chained > 0 && start >= 1 && bytes[start - 1] == b'.' && chain[(chained - 1) % 4].1 + 1 == start;
+        if !joined {
+            chained = 0;
+        }
+        if ipv4_octet(&bytes[start..at]) {
+            chain[chained % 4] = (start, at);
+            chained += 1;
+            if chained >= 4 {
+                let first = chain[(chained - 4) % 4].0;
+                // ASCII digits and dots: always valid UTF-8 boundaries.
+                emit(&text[first..at]);
+            }
+        } else {
+            chained = 0;
+        }
+    }
+    // IPv6: maximal runs of hex digits and colons.
+    let mut lowered = String::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !is_hex_or_colon(bytes[at]) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && is_hex_or_colon(bytes[at]) {
+            at += 1;
+        }
+        let run = &bytes[start..at];
+        let colons = run.iter().filter(|b| **b == b':').count();
+        if colons < 2 || (colons < 7 && !run.windows(2).any(|w| w == b"::")) {
+            continue;
+        }
+        let edge_start = |i: usize| i == 0 || run[i - 1] == b':' || run[i] == b':';
+        let edge_end = |j: usize| j == run.len() || run[j] == b':' || run[j - 1] == b':';
+        // Prefix counts of colons and of `::` starts, so a window is parsed
+        // only when it can be an address: seven colons and no `::`, or one
+        // `::` and at most eight colons (`::2:3:4:5:6:7:8`). Long colon runs (certificate
+        // fingerprints `AB:CD:...`) then cost a few parses per start, not
+        // one per (start, end) pair.
+        let mut colons_before = Vec::with_capacity(run.len() + 1);
+        let mut doubles_before = Vec::with_capacity(run.len() + 1);
+        let (mut c, mut d) = (0_usize, 0_usize);
+        for k in 0..run.len() {
+            colons_before.push(c);
+            doubles_before.push(d);
+            c += usize::from(run[k] == b':');
+            d += usize::from(run[k] == b':' && run.get(k + 1) == Some(&b':'));
+        }
+        colons_before.push(c);
+        doubles_before.push(d);
+        for i in (0..run.len()).filter(|i| edge_start(*i)) {
+            // An address is at most 39 hex/colon bytes (`ffff:...` x8).
+            for j in (i + 2..=run.len().min(i + 39)).filter(|j| edge_end(*j)) {
+                let colons = colons_before[j] - colons_before[i];
+                // `::` pairs starting inside the window (the last byte's
+                // pair would reach past it).
+                let doubles = doubles_before[j - 1] - doubles_before[i];
+                if colons > 8 {
+                    break;
+                }
+                if !((doubles == 0 && colons == 7) || doubles == 1) {
+                    continue;
+                }
+                let candidate = &run[i..j];
+                if is_ipv6_address(candidate) {
+                    lowered.clear();
+                    lowered.extend(candidate.iter().map(|b| b.to_ascii_lowercase() as char));
+                    emit(&lowered);
+                }
+            }
+        }
+    }
+}
+
+/// NAN-4217: the whole-address token a bare keyword `value` requires in any
+/// row it matches, or `None` when it is not exactly one IPv4 (four
+/// [`ipv4_octet`]s) or IPv6 address (hex digits and colons only; an
+/// embedded dotted IPv4 tail is left to the other evidence). See
+/// [`address_tokens`] for why every matching value holds it.
+pub fn address_needle(value: &str) -> Option<String> {
+    let trimmed = value.trim().as_bytes();
+    if is_ipv4_address(trimmed) || (trimmed.iter().all(|b| is_hex_or_colon(*b)) && is_ipv6_address(trimmed)) {
+        return Some(trimmed.iter().map(|b| b.to_ascii_lowercase() as char).collect());
+    }
+    None
+}
+
+/// The bloom key of adjacent tokens `a`, `b` (already lowercased).
+pub fn pair_key(a: &str, b: &str) -> [u8; 8] {
+    let mut hasher = twox_hash::XxHash64::with_seed(0x4e41_4e4f_5041_4952);
+    std::hash::Hasher::write(&mut hasher, a.as_bytes());
+    std::hash::Hasher::write(&mut hasher, &[0x1f]);
+    std::hash::Hasher::write(&mut hasher, b.as_bytes());
+    std::hash::Hasher::finish(&hasher).to_le_bytes()
+}
+
+/// Adjacent token pairs of `text` under [`tokenize`]: two tokens with only
+/// separators between them. A piece over [`TOKEN_MAX_BYTES`] is not a token
+/// and breaks adjacency on both sides. Shared by ingest and query.
+pub fn adjacent_pairs(text: &str, mut emit: impl FnMut(&str, &str)) {
+    let mut previous: Option<std::borrow::Cow<'_, str>> = None;
+    for piece in text.split(|c: char| !c.is_alphanumeric()) {
+        if piece.is_empty() {
+            continue;
+        }
+        let token: std::borrow::Cow<'_, str> =
+            if piece.chars().all(|c| !c.is_uppercase()) { piece.into() } else { piece.to_lowercase().into() };
+        if token.len() > TOKEN_MAX_BYTES {
+            previous = None;
+            continue;
+        }
+        if let Some(previous) = &previous {
+            emit(previous, &token);
+        }
+        previous = Some(token);
+    }
+}
 pub const TRIGRAM_ENABLE_ENV: &str = "NANO_LAKE_TRIGRAM_INDEX";
 
 pub fn trigrams_enabled() -> bool {
@@ -86,6 +334,10 @@ pub struct TokenGroupBuilder {
     blocks: Option<BlockBuilder>,
     counts: Option<CountBuilder>,
     trigrams: Option<Sbbf>,
+    pairs: Option<HashSet<u64>>,
+    pairs_overflow: bool,
+    /// v6: whole-address tokens join the token bloom and block index.
+    addresses: bool,
 }
 
 impl TokenGroupBuilder {
@@ -114,9 +366,27 @@ impl TokenGroupBuilder {
         builder
     }
 
+    /// A v5 builder: v4 plus the adjacent-pair bloom.
+    pub fn with_pairs(block_rows: u32) -> Self {
+        let mut builder = Self::with_trigrams(block_rows);
+        builder.pairs = Some(HashSet::new());
+        builder
+    }
+
+    /// A v6 builder: v5 whose token bloom and block index also hold every
+    /// whole IP address of the text ([`address_tokens`]).
+    pub fn with_addresses(block_rows: u32) -> Self {
+        let mut builder = Self::with_pairs(block_rows);
+        builder.addresses = true;
+        builder
+    }
+
     /// The v2/v3 builder the writers use for `block_rows` (`None`: v1).
     pub fn for_writer(block_rows: Option<u32>) -> Self {
         match block_rows {
+            Some(block_rows) if super::token_counts::enabled() && trigrams_enabled() && pairs_enabled() && ip_tokens_enabled() =>
+                Self::with_addresses(block_rows),
+            Some(block_rows) if super::token_counts::enabled() && trigrams_enabled() && pairs_enabled() => Self::with_pairs(block_rows),
             Some(block_rows) if super::token_counts::enabled() && trigrams_enabled() => Self::with_trigrams(block_rows),
             Some(block_rows) if super::token_counts::enabled() => Self::with_blocks_and_counts(block_rows),
             Some(block_rows) => Self::with_blocks(block_rows),
@@ -166,7 +436,26 @@ impl TokenGroupBuilder {
                 ascii_trigrams(&folded, |gram| filter.insert(gram.as_slice()));
             }
         }
-        tokenize(text, |token| {
+        if let Some(pairs) = &mut self.pairs {
+            let overflow = &mut self.pairs_overflow;
+            let mut add = |a: &str, b: &str| {
+                if pairs.len() < PAIR_DISTINCT_CAP {
+                    pairs.insert(u64::from_le_bytes(pair_key(a, b)));
+                } else {
+                    *overflow = true;
+                }
+            };
+            adjacent_pairs(text, &mut add);
+            // The keyword SQL matches case-insensitively under RE2 simple
+            // folding, where long-s and the Kelvin sign equal ASCII s/k
+            // (`to_lowercase` maps only the Kelvin sign). Index the folded
+            // spelling too, as the trigram bloom does.
+            if !text.is_ascii() {
+                let folded = text.to_lowercase().replace('ſ', "s");
+                adjacent_pairs(&folded, &mut add);
+            }
+        }
+        let mut add = |token: &str| {
             if let Some(blocks) = &mut self.blocks {
                 blocks.add_token(token);
             }
@@ -177,7 +466,13 @@ impl TokenGroupBuilder {
             } else {
                 self.overflow = true;
             }
-        });
+        };
+        tokenize(text, &mut add);
+        // A whole address holds `.`/`:`, which no split token does, so it
+        // never collides with one.
+        if self.addresses {
+            address_tokens(text, &mut add);
+        }
     }
 
     /// Finish into (rows, distinct tokens, bitset bytes[, block index]).
@@ -195,8 +490,22 @@ impl TokenGroupBuilder {
         if let Some(counts) = &counts {
             ensure!(u64::from(counts.rows) == self.rows, "token counts do not cover the group's rows");
         }
+        let pairs = match self.pairs {
+            None => None,
+            Some(_) if self.pairs_overflow => Some(PairBloom { pairs: 0, bitset: vec![0xff; 32] }),
+            Some(pairs) if pairs.is_empty() => Some(PairBloom { pairs: 0, bitset: Vec::new() }),
+            Some(pairs) => {
+                let mut filter = Sbbf::new_with_num_of_bytes(pair_filter_bytes(pairs.len()));
+                for pair in &pairs {
+                    filter.insert(pair.to_le_bytes().as_slice());
+                }
+                let mut bitset = Vec::new();
+                filter.write_bitset(&mut bitset)?;
+                Some(PairBloom { pairs: pairs.len() as u64, bitset })
+            }
+        };
         if self.tokens.is_empty() {
-            return Ok(TokenGroup { rows: self.rows, tokens: 0, bitset: Vec::new(), saturated: false, blocks, counts, trigrams });
+            return Ok(TokenGroup { rows: self.rows, tokens: 0, bitset: Vec::new(), saturated: false, blocks, counts, trigrams, pairs, addresses: self.addresses });
         }
         let distinct = self.tokens.len() as u64;
         let mut filter = Sbbf::new_with_ndv_fpp(distinct.max(64), TOKEN_FPP)?;
@@ -211,7 +520,7 @@ impl TokenGroupBuilder {
         if saturated {
             bitset = vec![0xff; 32];
         }
-        Ok(TokenGroup { rows: self.rows, tokens: distinct, bitset, saturated, blocks, counts, trigrams })
+        Ok(TokenGroup { rows: self.rows, tokens: distinct, bitset, saturated, blocks, counts, trigrams, pairs, addresses: self.addresses })
     }
 }
 
@@ -228,6 +537,31 @@ pub struct TokenGroup {
     pub counts: Option<TokenCounts>,
     /// v4 only, bounded candidate bloom; never exact count evidence.
     pub trigrams: Option<Vec<u8>>,
+    /// v5 only: the adjacent-pair bloom.
+    pub pairs: Option<PairBloom>,
+    /// v6: the token bloom and block index also hold every whole address
+    /// ([`address_tokens`]), so an address needle may require its token.
+    pub addresses: bool,
+}
+
+/// One group's adjacent-pair bloom (v5). Empty = the group holds no pair;
+/// a saturated (all-ones, 32-byte) bloom matches every pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairBloom {
+    /// Distinct pairs inserted (0 when saturated).
+    pub pairs: u64,
+    pub bitset: Vec<u8>,
+}
+
+impl PairBloom {
+    /// May every pair be adjacent somewhere in this group?
+    pub fn may_contain_all(&self, pairs: &[[u8; 8]]) -> bool {
+        if self.bitset.is_empty() {
+            return pairs.is_empty();
+        }
+        let filter = Sbbf::new(&self.bitset);
+        pairs.iter().all(|pair| filter.check(pair.as_slice()))
+    }
 }
 
 impl TokenGroup {
@@ -237,6 +571,7 @@ impl TokenGroup {
                 + blocks.common.resident_bytes() + blocks.fine.resident_bytes())
             + self.counts.as_ref().map_or(0, TokenCounts::resident_bytes)
             + self.trigrams.as_ref().map_or(0, Vec::capacity)
+            + self.pairs.as_ref().map_or(0, |pairs| pairs.bitset.capacity())
     }
 
     /// May every token be present in this group?
@@ -261,6 +596,12 @@ pub fn encode_token_index(groups: &[TokenGroup]) -> Result<Vec<u8>> {
     let with_trigrams = groups.iter().filter(|group| group.trigrams.is_some()).count();
     ensure!(with_trigrams == 0 || (with_trigrams == groups.len() && v3), "token groups mix v3 and v4");
     let v4 = with_trigrams > 0;
+    let with_pairs = groups.iter().filter(|group| group.pairs.is_some()).count();
+    ensure!(with_pairs == 0 || (with_pairs == groups.len() && v4), "token groups mix v4 and v5");
+    let v5 = with_pairs > 0;
+    let with_addresses = groups.iter().filter(|group| group.addresses).count();
+    ensure!(with_addresses == 0 || (with_addresses == groups.len() && v5), "token groups mix v5 and v6");
+    let v6 = with_addresses > 0;
     let block_rows = groups.first().and_then(|group| group.blocks.as_ref()).map(|blocks| blocks.block_rows);
     ensure!(
         groups.iter().all(|group| group.blocks.as_ref().map(|blocks| blocks.block_rows) == block_rows),
@@ -271,6 +612,14 @@ pub fn encode_token_index(groups: &[TokenGroup]) -> Result<Vec<u8>> {
         None => {
             out.extend_from_slice(TOKEN_INDEX_MAGIC);
             out.extend_from_slice(&TOKEN_INDEX_VERSION.to_le_bytes());
+        }
+        Some(_) if v6 => {
+            out.extend_from_slice(TOKEN_INDEX_MAGIC_V6);
+            out.extend_from_slice(&TOKEN_INDEX_VERSION_V6.to_le_bytes());
+        }
+        Some(_) if v5 => {
+            out.extend_from_slice(TOKEN_INDEX_MAGIC_V5);
+            out.extend_from_slice(&TOKEN_INDEX_VERSION_V5.to_le_bytes());
         }
         Some(_) if v4 => {
             out.extend_from_slice(TOKEN_INDEX_MAGIC_V4);
@@ -308,6 +657,12 @@ pub fn encode_token_index(groups: &[TokenGroup]) -> Result<Vec<u8>> {
         if let Some(grams) = &group.trigrams {
             ensure!(grams.len() == TRIGRAM_FILTER_BYTES, "invalid trigram bloom size");
             out.extend_from_slice(grams);
+        }
+        if let Some(pairs) = &group.pairs {
+            ensure!(pairs.bitset.len() % 32 == 0 && pairs.bitset.len() <= PAIR_FILTER_MAX_BYTES, "invalid pair bloom size");
+            out.extend_from_slice(&pairs.pairs.to_le_bytes());
+            out.extend_from_slice(&u32::try_from(pairs.bitset.len())?.to_le_bytes());
+            out.extend_from_slice(&pairs.bitset);
         }
     }
     let digest = Sha256::digest(&out);
@@ -348,6 +703,8 @@ fn decode_token_index_body(body: &[u8]) -> Result<Vec<TokenGroup>> {
         magic if magic == TOKEN_INDEX_MAGIC_V2 => TOKEN_INDEX_VERSION_V2,
         magic if magic == TOKEN_INDEX_MAGIC_V3 => TOKEN_INDEX_VERSION_V3,
         magic if magic == TOKEN_INDEX_MAGIC_V4 => TOKEN_INDEX_VERSION_V4,
+        magic if magic == TOKEN_INDEX_MAGIC_V5 => TOKEN_INDEX_VERSION_V5,
+        magic if magic == TOKEN_INDEX_MAGIC_V6 => TOKEN_INDEX_VERSION_V6,
         _ => bail!("token index magic is wrong"),
     };
     if cursor.u32()? != version {
@@ -382,8 +739,19 @@ fn decode_token_index_body(body: &[u8]) -> Result<Vec<TokenGroup>> {
             None => None,
         };
         let counts = if v3 { Some(TokenCounts::decode(&mut cursor, rows)?) } else { None };
-        let trigrams = if version == TOKEN_INDEX_VERSION_V4 { Some(cursor.take(TRIGRAM_FILTER_BYTES)?.to_vec()) } else { None };
-        out.push(TokenGroup { rows, tokens, bitset, saturated, blocks, counts, trigrams });
+        let trigrams = if version >= TOKEN_INDEX_VERSION_V4 { Some(cursor.take(TRIGRAM_FILTER_BYTES)?.to_vec()) } else { None };
+        let pairs = if version >= TOKEN_INDEX_VERSION_V5 {
+            let pairs = cursor.u64()?;
+            let len = cursor.u32()? as usize;
+            if len % 32 != 0 || len > PAIR_FILTER_MAX_BYTES {
+                bail!("pair filter length is invalid");
+            }
+            Some(PairBloom { pairs, bitset: cursor.take(len)?.to_vec() })
+        } else {
+            None
+        };
+        let addresses = version >= TOKEN_INDEX_VERSION_V6;
+        out.push(TokenGroup { rows, tokens, bitset, saturated, blocks, counts, trigrams, pairs, addresses });
     }
     if cursor.at != body.len() {
         bail!("token index has trailing bytes");
@@ -556,6 +924,230 @@ mod tests {
         let mut unknown = bytes;
         unknown[7] = b'9';
         assert!(decode_leased_token_index(&unknown).is_err());
+    }
+
+    /// NAN-4164 follow-up: the pair writer is on unless exactly "0".
+    #[test]
+    fn pair_index_is_on_unless_killed() {
+        assert!(pairs_enabled_from(None));
+        assert!(pairs_enabled_from(Some("1")));
+        assert!(pairs_enabled_from(Some("")));
+        assert!(!pairs_enabled_from(Some("0")));
+    }
+
+    /// NAN-4164: v5 carries an adjacent-pair bloom per group; pairs break
+    /// at over-long pieces, fold like the trigram bloom, and round-trip.
+    #[test]
+    fn v5_pair_bloom_round_trips_and_answers_adjacency() {
+        let mut seen = Vec::new();
+        adjacent_pairs("src=10.1.4.20, Failed  password", |a, b| seen.push(format!("{a} {b}")));
+        assert_eq!(seen, ["src 10", "10 1", "1 4", "4 20", "20 failed", "failed password"]);
+        let long = "x".repeat(TOKEN_MAX_BYTES + 1);
+        seen.clear();
+        adjacent_pairs(&format!("a {long} b c"), |a, b| seen.push(format!("{a} {b}")));
+        assert_eq!(seen, ["b c"]);
+
+        let mut builder = TokenGroupBuilder::with_pairs(4);
+        builder.add_row_at(0);
+        builder.add_text("src=10.1.4.20 at 2026-10-01T04:20:00");
+        builder.add_text("ſysmon-x \u{212A}erberos.y");
+        builder.add_row_at(1);
+        builder.add_text("Computer: WS-FIN-095.corp");
+        let group = builder.finish().unwrap();
+        let bloom = group.pairs.clone().unwrap();
+        assert!(bloom.pairs > 0 && !bloom.bitset.is_empty() && bloom.bitset.len() <= PAIR_FILTER_MAX_BYTES);
+        let has = |a: &str, b: &str| bloom.may_contain_all(&[pair_key(a, b)]);
+        for (a, b) in [("10", "1"), ("1", "4"), ("4", "20"), ("ws", "fin"), ("fin", "095"), ("sysmon", "x"), ("kerberos", "y")] {
+            assert!(has(a, b), "{a} {b}");
+        }
+        // Pieces present, never adjacent in this order (bloom false
+        // positives are possible in general, not at these sizes).
+        assert!(!has("20", "10") || !has("095", "fin") || !has("1", "10"));
+
+        let bytes = encode_token_index(&[group.clone()]).unwrap();
+        assert!(bytes.starts_with(TOKEN_INDEX_MAGIC_V5));
+        assert_eq!(decode_token_index(&bytes).unwrap(), vec![group.clone()]);
+        assert_eq!(decode_leased_token_index(&bytes).unwrap(), vec![group.clone()]);
+        let mut v4 = group.clone();
+        v4.pairs = None;
+        assert!(encode_token_index(&[group.clone(), v4.clone()]).is_err(), "v4 and v5 groups never mix");
+        assert!(encode_token_index(&[v4]).unwrap().starts_with(TOKEN_INDEX_MAGIC_V4));
+        assert!(decode_leased_token_index(&bytes[..bytes.len() - 40]).is_err());
+
+        assert_eq!(pair_filter_bytes(1), 32);
+        assert_eq!(pair_filter_bytes(231_292), 256 * 1024, "a 14k-row large-tenant group");
+        assert_eq!(pair_filter_bytes(647_194), PAIR_FILTER_MAX_BYTES, "a full large-tenant group");
+        assert_eq!(pair_filter_bytes(50_000_000), PAIR_FILTER_MAX_BYTES);
+
+        let empty = TokenGroupBuilder::with_pairs(4).finish().unwrap();
+        assert_eq!(empty.pairs, Some(PairBloom { pairs: 0, bitset: Vec::new() }));
+        assert!(!empty.pairs.as_ref().unwrap().may_contain_all(&[pair_key("a", "b")]));
+        assert!(empty.pairs.as_ref().unwrap().may_contain_all(&[]));
+    }
+
+    fn addresses_of(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        address_tokens(text, |t| out.push(t.to_string()));
+        out
+    }
+
+    /// NAN-4217: whole-address tokens: every dotted window of four octets,
+    /// IPv6 substrings on colon edges, lowercased; near misses yield nothing
+    /// that a different needle could take for its own.
+    #[test]
+    fn address_tokens_cover_dotted_windows_and_ipv6() {
+        assert_eq!(addresses_of("src=48.170.34.111:443 dst=48.170.34.11"), ["48.170.34.111", "48.170.34.11"]);
+        assert_eq!(addresses_of("148.170.34.1119 1.48.170.34.111.5"), ["1.48.170.34", "48.170.34.111", "170.34.111.5"]);
+        assert_eq!(addresses_of("256.1.1.1 1..2.3.4 1.2.3 01.002.3.4"), ["01.002.3.4"]);
+        assert_eq!(addresses_of("v1.2.3.4-beta x10.0.0.5y"), ["1.2.3.4", "10.0.0.5"], "superset: letters do not block");
+        assert!(addresses_of("2026-10-20T10:34:48.123Z 00:1a:2b:3c:4d:5e").is_empty());
+        let v6 = addresses_of("from FE80::1%eth0 to 2001:db8:0:0:0:0:0:1.");
+        for want in ["fe80::1", "fe80::", "::1", "2001:db8:0:0:0:0:0:1"] {
+            assert!(v6.iter().any(|t| t == want), "{want} in {v6:?}");
+        }
+        assert!(v6.iter().all(|t| t.parse::<std::net::Ipv6Addr>().is_ok() && *t == t.to_ascii_lowercase()));
+        // A long colon run (certificate fingerprint) holds 8-group windows.
+        let fingerprint = (0..32).map(|i| format!("{:02X}", i * 7 % 256)).collect::<Vec<_>>().join(":");
+        let windows = addresses_of(&fingerprint);
+        assert_eq!(windows.len(), 32 - 7, "{windows:?}");
+        assert_eq!(windows[0], "00:07:0e:15:1c:23:2a:31");
+
+        assert_eq!(address_needle(" 48.170.34.111 ").as_deref(), Some("48.170.34.111"));
+        assert_eq!(address_needle("FE80::1").as_deref(), Some("fe80::1"));
+        assert!(addresses_of("x ::2:3:4:5:6:7:8 y").iter().any(|t| t == "::2:3:4:5:6:7:8"));
+        assert!(addresses_of("1:2:3:4:5:6:7:: z").iter().any(|t| t == "1:2:3:4:5:6:7::"));
+        for not in ["48.170.34", "48.170.34.1119", "256.0.0.1", "10.0.0.5:443", "fe80::1%eth0", "::ffff:1.2.3.4", "host-1", "a:b"] {
+            assert_eq!(address_needle(not), None, "{not}");
+        }
+    }
+
+    /// NAN-4217: no false negatives. For every haystack built from address
+    /// fragments, separators, letters and non-ASCII characters, a needle the
+    /// lake term regex matches (its characters, ASCII case-insensitive, with
+    /// no ASCII alphanumeric or non-ASCII character touching an alphanumeric
+    /// end) is among the haystack's address tokens.
+    #[test]
+    fn address_tokens_hold_every_term_match() {
+        fn term_matches(haystack: &str, needle: &str) -> bool {
+            let (hay, needle) = (haystack.to_ascii_lowercase(), needle.to_ascii_lowercase());
+            let token_char = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || !c.is_ascii());
+            hay.match_indices(&needle).any(|(at, _)| {
+                let starts = needle.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+                let ends = needle.chars().last().is_some_and(|c| c.is_ascii_alphanumeric());
+                (!starts || !token_char(hay[..at].chars().last()))
+                    && (!ends || !token_char(hay[at + needle.len()..].chars().next()))
+            })
+        }
+        const FRAGMENTS: [&str; 21] = [
+            "48.170.34.111", "148.170.34.1119", "48.170.34.11", "1.", ".5", ".", ":", "::", "1", "x", " ", "é",
+            "FE80::1", "fe80:0:0:0:0:0:0:1", "::1", "2001:DB8::", "a", "0", "10.0.0.5", "-", "::2:3:4:5:6:7:8",
+        ];
+        const NEEDLES: [&str; 11] = [
+            "48.170.34.111", "48.170.34.11", "1.48.170.34", "170.34.111.5", "10.0.0.5", "fe80::1", "2001:db8::", "1::1",
+            "fe80::", "0.0.5.1", "::2:3:4:5:6:7:8",
+        ];
+        let mut haystacks = Vec::new();
+        for a in FRAGMENTS {
+            for b in FRAGMENTS {
+                for c in FRAGMENTS {
+                    haystacks.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        let mut matched = 0;
+        for haystack in &haystacks {
+            let tokens = addresses_of(haystack);
+            for needle in NEEDLES {
+                let address = address_needle(needle).expect("an address needle");
+                if term_matches(haystack, needle) {
+                    matched += 1;
+                    assert!(tokens.contains(&address), "{needle:?} matches {haystack:?} but tokens are {tokens:?}");
+                }
+            }
+        }
+        assert!(matched > 1_000, "{matched}");
+    }
+
+    /// NAN-4217: v6 = the v5 layout with address tokens in the token bloom
+    /// and block index; never mixed with v5; off by default.
+    #[test]
+    fn v6_round_trips_and_holds_addresses() {
+        assert!(!ip_tokens_enabled_from(None));
+        assert!(!ip_tokens_enabled_from(Some("0")));
+        assert!(!ip_tokens_enabled_from(Some("")));
+        assert!(ip_tokens_enabled_from(Some("1")));
+
+        let mut builder = TokenGroupBuilder::with_addresses(4);
+        builder.add_row_at(0);
+        builder.add_text("src=48.170.34.111 dst=FE80::1");
+        builder.add_row_at(1);
+        builder.add_text("148.170.34.1119 48.170.34.11");
+        let group = builder.finish().unwrap();
+        assert!(group.addresses);
+        assert!(group.may_contain_all(&["48.170.34.111".into(), "fe80::1".into(), "48".into(), "170".into()]));
+        let blocks = group.blocks.as_ref().unwrap();
+        assert_eq!(blocks.blocks_with_all(&["48.170.34.111".into()]), Some(vec![true]));
+
+        let bytes = encode_token_index(&[group.clone()]).unwrap();
+        assert!(bytes.starts_with(TOKEN_INDEX_MAGIC_V6));
+        assert_eq!(decode_token_index(&bytes).unwrap(), vec![group.clone()]);
+        assert_eq!(decode_leased_token_index(&bytes).unwrap(), vec![group.clone()]);
+        let mut v5 = group.clone();
+        v5.addresses = false;
+        assert!(encode_token_index(&[group.clone(), v5.clone()]).is_err(), "v5 and v6 groups never mix");
+        let v5_bytes = encode_token_index(&[v5]).unwrap();
+        assert!(v5_bytes.starts_with(TOKEN_INDEX_MAGIC_V5));
+        assert!(!decode_token_index(&v5_bytes).unwrap()[0].addresses);
+        // Same layout: only the magic and version differ.
+        assert_eq!(bytes[12..bytes.len() - 32], v5_bytes[12..v5_bytes.len() - 32]);
+    }
+
+    /// NAN-4164/NAN-4217 sizing probe: `tokens.nti` bytes (and builder
+    /// time) of v4 vs v5 vs v6 over a JSONL
+    /// sample of body fields (one object per row, as `* | table <body
+    /// fields>` returns them), in 65,536-row groups.
+    /// `NANO_PAIR_SAMPLE=rows.jsonl cargo test -p nanosiem-lake-worker --lib
+    /// v5_size_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs NANO_PAIR_SAMPLE"]
+    fn v5_size_probe() {
+        let path = std::env::var("NANO_PAIR_SAMPLE").expect("NANO_PAIR_SAMPLE");
+        let rows = std::fs::read_to_string(path).unwrap().lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(line).ok())
+            .collect::<Vec<_>>();
+        for chunk in rows.chunks(65_536) {
+            let (mut v4, mut v5, mut v6) =
+                (TokenGroupBuilder::with_trigrams(1_024), TokenGroupBuilder::with_pairs(1_024), TokenGroupBuilder::with_addresses(1_024));
+            let feed = |builder: &mut TokenGroupBuilder| {
+                for (i, row) in chunk.iter().enumerate() {
+                    builder.add_row_at(i as i64 * 15_000);
+                    for (field, value) in row {
+                        let Some(text) = value.as_str() else { continue };
+                        builder.add_text(text);
+                        if field == "message" || field == "raw_data" {
+                            builder.add_body(text);
+                        }
+                    }
+                }
+            };
+            let started = std::time::Instant::now();
+            feed(&mut v4);
+            let v4_ms = started.elapsed().as_secs_f64() * 1e3;
+            let started = std::time::Instant::now();
+            feed(&mut v5);
+            let v5_ms = started.elapsed().as_secs_f64() * 1e3;
+            let started = std::time::Instant::now();
+            feed(&mut v6);
+            let v6_ms = started.elapsed().as_secs_f64() * 1e3;
+            let (v4, v5, v6) = (v4.finish().unwrap(), v5.finish().unwrap(), v6.finish().unwrap());
+            let pairs = v5.pairs.clone().unwrap();
+            println!(
+                "rows={} tokens={} token_bloom={} pairs={} pair_bloom={} v4_bytes={} v5_bytes={} v6_tokens={} v6_token_bloom={} v6_bytes={} feed_ms v4={v4_ms:.0} v5={v5_ms:.0} v6={v6_ms:.0}",
+                chunk.len(), v4.tokens, v4.bitset.len(), pairs.pairs, pairs.bitset.len(),
+                encode_token_index(std::slice::from_ref(&v4)).unwrap().len(), encode_token_index(std::slice::from_ref(&v5)).unwrap().len(),
+                v6.tokens, v6.bitset.len(), encode_token_index(std::slice::from_ref(&v6)).unwrap().len(),
+            );
+        }
     }
 
     #[test]

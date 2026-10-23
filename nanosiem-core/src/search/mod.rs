@@ -24,6 +24,7 @@ pub mod job_coordinator_config;
 #[cfg(feature = "enterprise")]
 pub mod hosted_producer_reload;
 mod in_flight_jobs;
+mod recent_reuse_jobs;
 pub mod job_control_store;
 pub mod job_coordinator_transport;
 pub mod job_envelope;
@@ -31,6 +32,7 @@ pub mod job_runner_store;
 pub mod job_signing;
 pub mod jobs;
 pub mod keyword_sidecar;
+pub mod lake_candidate_hints;
 mod lake;
 pub mod lake_cell;
 pub mod lake_debug;
@@ -75,9 +77,12 @@ pub use jobs::{
     SearchJobProgress, SearchJobRegistry, SearchJobResultPage, SearchJobResultRef,
     SearchJobResultSummary, SearchJobStatus, SearchJobStatusResponse, SearchJobStore,
     SearchJobSummary, MAX_DURABLE_POST_PAGE_ROWS, MAX_DURABLE_POST_QUERY_BYTES,
+    search_job_error_code, QUERY_TOO_LARGE_ERROR_CODE, QUERY_TOO_LARGE_MEMORY_MESSAGE,
+    QUERY_TOO_LARGE_SCAN_MESSAGE, QUERY_TOO_LARGE_TIME_MESSAGE, small_job_lane,
+    SMALL_JOB_MAX_WINDOW_MS,
 };
 pub use lake::{
-    lake_rollup_field_is_enrichment_sensitive, LAKE_COUNT_ROLLUP_FIELDS,
+    LAKE_COUNT_ROLLUP_FIELDS,
     LakeBackend, LakeDetectionPlan, LakeDetectionRerunWindow, LakeIdentityObservation, LakeIdentityResolution,
     OwnedLakeBackend, EVENT_SCAN_SOURCE_PREFIX,
     SharedLakeOtelIngestAssignment, SharedLakeWorkerAssignment, SharedLakeWorkerRegistry,
@@ -110,7 +115,7 @@ pub use service::cloud_overview::{
     CloudOverviewTimelineLane, CloudOverviewTimelineMarker,
 };
 pub use service::{
-    run_lake_baseline, CloudDossierAccumulator, LakeAssetCardRead, LakeAssetCards, LakeBaselineOutcome, LakeBaselinePlan,
+    run_lake_baseline, CloudDossierAccumulator, LakeAssetCardRead, LakeRetroHuntScan, LakeAssetCards, LakeBaselineOutcome, LakeBaselinePlan,
     LAKE_BASELINE_BUDGET_EXHAUSTED,
     FieldStatsResult, FieldValuesResult, LakeCellDetectHeadProbe, LakeCellDetectionCommitter, RawSqlAuditAccess, SearchHistogramResult, SearchService,
 };

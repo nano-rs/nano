@@ -115,7 +115,7 @@ export function QuickPivotIntake() {
   const submit = () => {
     if (!trimmed) return;
     const q = buildQuery(kind, trimmed, strictOcsf);
-    navigate(`/search?q=${encodeURIComponent(q)}&run=true`);
+    navigate(`/search#q=${encodeURIComponent(q)}&run=true`);
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {

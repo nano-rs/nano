@@ -19,6 +19,8 @@ mod parser;
 mod pretty_print;
 pub mod source_alias;
 mod time_bins;
+pub(crate) mod time_modifiers;
+pub(crate) use parser::split_time_modifiers;
 mod sql_gen;
 pub mod validation;
 
@@ -88,7 +90,7 @@ pub use clickhouse_sql_gen::otel::{
     valid_tag_key, MetricAgg, MetricQuery, MetricTagFilter,
 };
 pub(crate) use parser::{extract_time_modifier_tokens, strip_comments, subsearch_depths};
-pub use parser::{parse_query, ParseError};
+pub use parser::{comment_may_start_after, parse_query, ParseError};
 pub(crate) use pretty_print::npl_quoted_literal;
 pub use pretty_print::PrettyPrint;
 pub use sql_gen::{SqlGenError, TimeRange};

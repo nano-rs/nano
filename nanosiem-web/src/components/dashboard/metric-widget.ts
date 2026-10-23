@@ -67,11 +67,14 @@ export interface AddMetricToDashboardArgs {
  * Persist a metric query as an `obs_metric` widget. Returns the dashboard id the
  * widget landed on, so callers can navigate to `/dashboards/<id>`.
  */
-export async function addMetricToDashboard(args: AddMetricToDashboardArgs): Promise<string> {
+export async function addMetricToDashboard(
+  args: AddMetricToDashboardArgs,
+  client: Pick<typeof api, 'getDashboard' | 'updateDashboard' | 'createDashboard'> = api,
+): Promise<string> {
   const panel = buildMetricPanelConfig(args.title, args.metricConfig);
 
   if (args.dashboardId) {
-    const full: Dashboard = await api.getDashboard(args.dashboardId);
+    const full: Dashboard = await client.getDashboard(args.dashboardId);
     const existingPanels: PanelConfig[] = Array.isArray(full.panels) ? full.panels : [];
     const existingLayout = full.layout || { columns: 12, rowHeight: 80, items: [] };
     const existingItems: LayoutItem[] = Array.isArray(existingLayout.items)
@@ -87,7 +90,7 @@ export async function addMetricToDashboard(args: AddMetricToDashboardArgs): Prom
       autoRun: existingLayout.autoRun,
     };
 
-    await api.updateDashboard(args.dashboardId, {
+    await client.updateDashboard(args.dashboardId, {
       panels: [...existingPanels, panel],
       layout: updatedLayout,
     });
@@ -100,7 +103,7 @@ export async function addMetricToDashboard(args: AddMetricToDashboardArgs): Prom
     rowHeight: 80,
     items: [{ i: panel.id, x: 0, y: 0, w: 6, h: 4, minW: 2, minH: 2 }],
   };
-  const created = await api.createDashboard({
+  const created = await client.createDashboard({
     name,
     description: 'Created from the metrics explorer',
     layout,

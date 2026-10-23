@@ -1426,6 +1426,13 @@ impl FindingLogger {
             .unwrap_or_default();
         let projection = finding_ocsf::evidences(&sample);
         finding_ocsf::evidence_observables(&mut observables, &projection.evidences);
+        // NAN-4169: a retro IOC match (an auto retro-hunt hit: the indicator
+        // was learned after the event was ingested) is a searchable signal of
+        // its own. The rule query marker survives sample redaction.
+        let retro_ioc = get_str("rule_query").starts_with("retro-hunt:")
+            || sample
+                .iter()
+                .any(|event| event.get("retro_ioc").and_then(serde_json::Value::as_bool) == Some(true));
 
         let time_ms = timestamp.timestamp_millis();
         let first_seen = metadata.get("first_seen_time").and_then(serde_json::Value::as_i64);
@@ -1439,7 +1446,7 @@ impl FindingLogger {
         let mut finding_info = json!({
             "title": rule_name,
             "uid": event_uid,
-            "types": [signal_type],
+            "types": if retro_ioc { json!([signal_type, "retro_ioc"]) } else { json!([signal_type]) },
             "data_sources": data_sources,
             "attacks": attacks,
             "analytic": {
@@ -1464,6 +1471,10 @@ impl FindingLogger {
             "raw_risk_score": cloned("raw_risk_score", json!(0)),
             "matched_events_redacted": cloned("matched_events_redacted", json!(false)),
         });
+        if retro_ioc {
+            unmapped["retro"] = json!(true);
+            unmapped["retro_ioc"] = json!(true);
+        }
         if include_clickhouse_compat {
             // ClickHouse readers (risk SQL, tuning, nPL bare-field aliases)
             // extract these from the stored `unmapped` spill.
@@ -1674,6 +1685,29 @@ mod ocsf_finding_tests {
         // product provenance (so OCSF consumers attribute it to nano)
         assert_eq!(event["metadata"]["product"]["name"], "nano");
         assert_eq!(event["metadata"]["version"], "1.9.0");
+    }
+
+    /// NAN-4169: a retro-hunt hit is flagged on the finding itself, so
+    /// `finding_info.types="retro_ioc"` / `unmapped.retro_ioc=true` find it
+    /// even when the matched-event sample is redacted.
+    #[test]
+    fn retro_hunt_findings_carry_the_retro_ioc_flag() {
+        let ts = DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").unwrap().with_timezone(&Utc);
+        let mut metadata = sample_metadata();
+        metadata["rule_query"] = json!("retro-hunt: new IOCs from all feeds over last 5d");
+        metadata["risk_entity"] = json!("198.51.100.9:443");
+        metadata["risk_entity_field"] = json!("indicator");
+        let event = FindingLogger::build_ocsf_finding_event(&metadata, "retro", ts);
+        assert_eq!(event["finding_info"]["types"], json!(["detection_match", "retro_ioc"]));
+        assert_eq!(event["unmapped"]["retro_ioc"], true);
+        assert_eq!(event["unmapped"]["retro"], true);
+        let mut sampled = sample_metadata();
+        sampled["matched_events_sample"] = json!([{"indicator": "evil.example", "retro_ioc": true}]);
+        let event = FindingLogger::build_ocsf_finding_event(&sampled, "retro", ts);
+        assert_eq!(event["unmapped"]["retro_ioc"], true);
+        let plain = FindingLogger::build_ocsf_finding_event(&sample_metadata(), "plain", ts);
+        assert_eq!(plain["finding_info"]["types"], json!(["detection_match"]));
+        assert!(plain["unmapped"].get("retro_ioc").is_none());
     }
 
     #[test]

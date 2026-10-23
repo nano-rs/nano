@@ -222,7 +222,7 @@ async fn zero_activity_for_an_entity_with_lookback_events_still_evaluates_dimens
     assert!(presence[0].0.contains("device.hostname=\"ws-it-083\""));
     assert!(!presence[0].0.contains("dst_endpoint"));
     assert!(presence[0].0.ends_with("| head 1"));
-    assert!(presence[0].1.end < spans.coverage_end());
+    assert_eq!(presence[0].1.end, spans.coverage_end(), "half-open: the newest span ends at coverage end");
     assert!(presence[0].1.start >= spans.coverage_end() - Duration::days(1));
 }
 

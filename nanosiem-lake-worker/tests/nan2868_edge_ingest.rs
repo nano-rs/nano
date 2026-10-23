@@ -124,6 +124,7 @@ impl EdgeLogTransport for FakeDo {
         s.epoch += 1;
         let chain_at = |seq: u64| if seq == 0 { Some(edge_log_genesis(TENANT)) } else { s.segments.get(seq as usize - 1).map(|x| x.chain.clone()) };
         Ok(Lease {
+            backlog_skip: None,
             kind: "ok".into(), epoch: s.epoch, committed_through: s.committed, committed_chain: chain_at(s.committed).unwrap(),
             last_part_id: None, head: s.segments.len() as u64, floor_seq: 0, floor_chain: edge_log_genesis(TENANT),
             mode: "do".into(), overflow_objects: 0, at_chain: at.and_then(chain_at), purge_seq: None, purge_chain: None,
@@ -342,7 +343,7 @@ async fn purging_a_consumer_with_unuploaded_parts_loses_nothing_and_duplicates_n
     std::fs::create_dir(&tenants).unwrap();
     // SAFETY: geteuid/getegid never fail.
     let (u, g) = unsafe { (libc::geteuid(), libc::getegid()) };
-    let ids = TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, gid: g };
+    let ids = TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, landing_uid: Some(u), gid: g };
     let work = tenants.join(TENANT).join("ingest");
 
     // 1. Cell A: pulls, builds part drafts, the upload fails. Removed, drained, purged.
@@ -600,4 +601,128 @@ async fn a_backlog_past_the_flush_object_cap_drains_in_bounded_flushes() {
     assert_eq!(adds, vec![MAX_FLUSH_OBJECTS, total - MAX_FLUSH_OBJECTS], "the object cap cut the first flush");
     assert_eq!(adds.iter().sum::<usize>(), total);
     assert_eq!(live_uids(&parts).await.len(), total);
+}
+
+/// `metadata.uid` of every row of a bronze segment, in order.
+fn bronze_uids(bytes: &[u8]) -> Vec<String> {
+    use arrow_array::cast::AsArray;
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let events = batch.column_by_name("_nano_bronze_event").unwrap().as_string::<i32>();
+        for event in events.iter() {
+            let event: Value = serde_json::from_str(event.unwrap()).unwrap();
+            out.push(event["metadata"]["uid"].as_str().unwrap().to_string());
+        }
+    }
+    out
+}
+
+/// One hosted landing upload, through the production path: `convert_file`
+/// (the shared landing conversion running Vector's own lake storage stage),
+/// `split_segments` + `segment_key` exactly as `EdgeAppend::emit` produces
+/// them into the tenant edge log, then ingest[T] over that log.
+fn land_hosted(fake: &FakeDo, file: &[u8], landed_at_s: i64) -> Vec<String> {
+    use nanosiem_lake_worker::landing::{convert_file, FileFormat, LandingSource};
+    use nanosiem_lake_worker::landing_hosted::{segment_key, split_segments, MAX_SEGMENT_BYTES};
+    let stage = nanosiem_core::parsers::landing_ocsf::LandingOcsfStage::new(1).unwrap();
+    let source = LandingSource {
+        source_id: uuid::Uuid::parse_str("0b8f6c1e-3c55-4a8e-9d3e-2f7c1a4b5d60").unwrap(),
+        route_key: "tenzir_sysmon".into(),
+        credential_id: uuid::Uuid::parse_str("1b84f015-b560-433b-8bb6-ed4e39f48334").unwrap(),
+        active: true,
+    };
+    let now = chrono::Utc::now();
+    let converted = convert_file(file, FileFormat::Ndjson { gzip: false }, &stage, TENANT, &source, now).unwrap();
+    assert_eq!(converted.rows_refused, 0, "{:?}", converted.first_refusal);
+    let mut uids = Vec::new();
+    let mut index = 0;
+    for (_, body, rows) in &converted.objects {
+        for (bytes, _) in split_segments(body, *rows, MAX_SEGMENT_BYTES).unwrap() {
+            let key = segment_key(TENANT, &converted.content_sha256, index, Some(landed_at_s * 1_000), now);
+            index += 1;
+            uids.extend(bronze_uids(&bytes));
+            fake.append(&key, bytes);
+        }
+    }
+    uids
+}
+
+/// NAN-4322: the landing ledger refuses a same-key re-PUT, but the same file
+/// re-uploaded under a NEW object key is a new landed file and is converted
+/// again (its landing counters count it again). Its rows must not become
+/// searchable twice: rows keep the sender's `metadata.uid`, rows without one
+/// (or with a minted random UUIDv4) derive it from `sha256(file):ordinal`,
+/// so the re-upload carries the same uids and ingest[T]'s uid window drops
+/// it, whether the same consumer or a respawned one ingests the copy.
+#[tokio::test(flavor = "current_thread")]
+async fn the_same_landed_file_under_a_new_key_adds_zero_searchable_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let parts = LocalObjectStore::new(dir.path().join("parts")).unwrap();
+    let fake = FakeDo::default();
+    let mut rows = Vec::new();
+    for i in 0..40 {
+        let mut row = event("placeholder", DAY0_S + 3_000 + (i as i64 % 30), i);
+        let metadata = row["metadata"].as_object_mut().unwrap();
+        match i % 4 {
+            // The sender's own event id (Tenzir `metadata.uid` from the source).
+            0 => { metadata.insert("uid".into(), json!(format!("tenzir:wks-01:{i}"))); }
+            // A random UUIDv4 the sender minted (not in raw_data): replaced.
+            1 => { metadata.insert("uid".into(), json!(uuid::Uuid::new_v4().to_string())); }
+            // No uid at all.
+            _ => { metadata.remove("uid"); }
+        }
+        // Tenzir rows carry no lake stamps; the stage sets them.
+        metadata.remove("tenant_uid");
+        metadata.remove("log_source");
+        if let Some(raw) = row.get_mut("raw_data") {
+            *raw = json!(format!("raw event {i}"));
+        }
+        rows.push(row);
+    }
+    // Two identical lines at different ordinals stay two real events.
+    rows[39] = rows[38].clone();
+    let mut file = Vec::new();
+    for row in &rows {
+        serde_json::to_writer(&mut file, row).unwrap();
+        file.push(b'\n');
+    }
+
+    let first = land_hosted(&fake, &file, DAY0_S + 3_050);
+    assert_eq!(first.len(), 40);
+    assert_eq!(first.iter().collect::<HashSet<_>>().len(), 40, "every ordinal keeps its own uid");
+    run_ingest(&fake, &parts, &dir.path().join("w1"), (DAY0_S + 3_100) * 1_000, 3).await.unwrap();
+    assert_eq!(live_uids(&parts).await.len(), 40);
+
+    // The sender PUTs the same bytes under a new key a minute later: the
+    // ledger leases it as a new file, the converter accepts 40 rows again.
+    let second = land_hosted(&fake, &file, DAY0_S + 3_110);
+    assert_eq!(second, first, "a re-upload derives the same uids");
+    run_ingest(&fake, &parts, &dir.path().join("w1"), (DAY0_S + 3_200) * 1_000, 3).await.unwrap();
+    assert_eq!(fake.committed(), 2);
+    assert_eq!(live_uids(&parts).await.len(), 40, "the re-upload adds zero searchable rows");
+
+    // Again an hour later, ingested by a respawned consumer (fresh work dir):
+    // the hour is re-hydrated from its live parts.
+    land_hosted(&fake, &file, DAY0_S + 6_700);
+    run_ingest(&fake, &parts, &dir.path().join("w2"), (DAY0_S + 6_800) * 1_000, 3).await.unwrap();
+    assert_eq!(fake.committed(), 3);
+    let uids = live_uids(&parts).await;
+    assert_eq!(uids.len(), 40, "a respawned consumer drops the re-upload too");
+    assert_eq!(uids.iter().collect::<HashSet<_>>(), first.iter().collect::<HashSet<_>>());
+
+    // Control: a file that differs by one byte is other content. Only the
+    // sender-uid rows (every 4th) are the same events; the 30 rows whose uid
+    // the lake derived from the file are new rows, so the zero above is the
+    // uid window's doing, not an artefact of the harness.
+    let mut other = file.clone();
+    other.push(b'\n');
+    let third = land_hosted(&fake, &other, DAY0_S + 6_900);
+    assert_eq!(third.iter().filter(|uid| first.contains(uid)).count(), 10);
+    run_ingest(&fake, &parts, &dir.path().join("w2"), (DAY0_S + 7_000) * 1_000, 3).await.unwrap();
+    assert_eq!(live_uids(&parts).await.len(), 70);
 }

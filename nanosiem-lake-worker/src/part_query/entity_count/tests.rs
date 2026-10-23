@@ -6,7 +6,7 @@ fn compiled(predicate: &str) -> CompiledQuery {
         "source_placeholder":"__nano_lake_source__","query_sha256":"fixture",
         "start":"1970-01-01T00:00:00Z","end":"1970-01-01T03:00:00Z","limit":101,
         "table_view":false,"required_columns":[],
-        "sql":format!("WITH stage_0 AS (\n SELECT time, \"user.name\" FROM __nano_lake_source__\n WHERE time BETWEEN '1970-01-01 00:00:00.000000' AND '1970-01-01 03:00:00.000000'\n AND {predicate}\n),\nstage_1 AS (\n SELECT count() AS count\n FROM stage_0\n)\nSELECT * FROM stage_1 LIMIT 101 SETTINGS max_threads=2")
+        "sql":format!("WITH stage_0 AS (\n SELECT time, \"user.name\" FROM __nano_lake_source__\n WHERE time >= '1970-01-01 00:00:00.000000' AND time < '1970-01-01 03:00:00.000000'\n AND {predicate}\n),\nstage_1 AS (\n SELECT count() AS count\n FROM stage_0\n)\nSELECT * FROM stage_1 LIMIT 101 SETTINGS max_threads=2")
     })).unwrap()
 }
 
@@ -267,4 +267,61 @@ fn entity_count_signed_source_inventory_is_conservative_for_mixed_and_legacy_fil
     assert!(!sources_allowed(&record, &denied));
     record.files.data[1].log_sources = None;
     assert!(!sources_allowed(&record, &denied));
+}
+
+/// NAN-4280: the shape captures the compiler's half-open source bound
+/// verbatim (each native leg splices its fence in front of exactly that
+/// text), and the retired inclusive `BETWEEN` form is never recognized, so a
+/// mismatch can only decline the index path, never double-count.
+#[test]
+fn entity_count_shape_captures_the_half_open_window_clause() {
+    let predicate = r#"lower("user.name") = 'alice'"#;
+    let captured = shape(&compiled(predicate)).expect("shape");
+    assert_eq!(
+        captured.window_clause,
+        nanosiem_core::sql_hygiene::half_open_time_bound("time", "1970-01-01 00:00:00.000000", "1970-01-01 03:00:00.000000")
+    );
+    let mut inclusive = compiled(predicate);
+    inclusive.sql = inclusive.sql.replace(&captured.window_clause, "time BETWEEN '1970-01-01 00:00:00.000000' AND '1970-01-01 03:00:00.000000'");
+    assert!(shape(&inclusive).is_none());
+}
+
+/// NAN-4298: only the ungrouped, unbucketed, unfiltered single-value
+/// equality count on an entity-count field becomes the entity-count nPL, and
+/// only for values that need no escaping.
+#[test]
+fn typed_count_npl_is_only_the_entity_equality_count() {
+    let request = |field: &str, kind: &str, values: &[&str], extra: Value| -> crate::count_aggregate::CountAggregateRequest {
+        let mut body = json!({"request_id":"r","tenant_id":"t","group_field":field,"group_results":false,
+            "predicate":{"kind":kind,"values":values},"count_alias":"count","start":"2026-10-01T00:00:00Z",
+            "end":"2026-10-02T00:00:00Z","max_groups":10});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    assert_eq!(
+        count_aggregate_npl(&request("src_endpoint.ip", "eq", &["10.0.0.1"], json!({}))).as_deref(),
+        Some(r#"src_endpoint.ip="10.0.0.1" | stats count() as nano_entity_count"#)
+    );
+    assert_eq!(
+        count_aggregate_npl(&request("user.name", "eq", &["Alice"], json!({"deny_source_types":["audit"]}))).as_deref(),
+        Some(r#"user.name="Alice" | stats count() as nano_entity_count"#)
+    );
+    for refused in [
+        request("process.name", "eq", &["cmd.exe"], json!({})),
+        request("src_endpoint.ip", "in", &["10.0.0.1"], json!({})),
+        request("src_endpoint.ip", "eq", &["10.0.0.1", "10.0.0.2"], json!({})),
+        request("src_endpoint.ip", "eq", &["10.0.0.1"], json!({"group_results":true})),
+        request("src_endpoint.ip", "eq", &["10.0.0.1"], json!({"group_by_source":true})),
+        request("src_endpoint.ip", "eq", &["10.0.0.1"], json!({"bucket_span_us":300_000_000})),
+        request("src_endpoint.ip", "eq", &["10.0.0.1"], json!({"source_filter":"apache_access"})),
+        request("user.name", "eq", &["a\"b"], json!({})),
+        request("user.name", "eq", &["a\\b"], json!({})),
+        request("user.name", "eq", &["adm*"], json!({})),
+        request("user.name", "eq", &["a?"], json!({})),
+        request("user.name", "eq", &["é"], json!({})),
+        request("user.name", "eq", &["a\nb"], json!({})),
+        request("user.name", "eq", &[""], json!({})),
+    ] {
+        assert_eq!(count_aggregate_npl(&refused), None, "{refused:?}");
+    }
 }

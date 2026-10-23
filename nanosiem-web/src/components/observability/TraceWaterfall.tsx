@@ -49,7 +49,7 @@ function buildTraceLogsHref(traceId: string, traceStartMs: number, durMs: number
     params.set('start', new Date(startMs).toISOString());
     params.set('end', new Date(endMs).toISOString());
   }
-  return `/search?${params.toString()}`;
+  return `/search#${params.toString()}`;
 }
 
 // Span-kind → short tag tone (mirrors the design's SPAN_KIND_TONE).

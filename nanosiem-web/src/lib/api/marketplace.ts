@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import type { InventoryItem } from './marketplace-inventory';
-import type { HostedCollector, HostedCollectorFeed, HostedCollectorInstall, HostedCollectorRotation } from '@/enterprise/api/hosted-collectors';
+import type { HostedCollector, HostedCollectorFeed, HostedCollectorInstall, HostedCollectorRotation, HostedFeedCredentialRotation, HostedFeedCredentialRotationResult } from '@/enterprise/api/hosted-collectors';
 
 /**
  * Marketplace API client
@@ -326,6 +326,12 @@ export class MarketplaceApi {
   rotateHostedCollectorCredentials(slug: string, input: HostedCollectorRotation): Promise<{ message: string; feeds: string[] }> {
     return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/credentials`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+    });
+  }
+  /** NAN-3660: re-issue one feed's ingest credential (no reinstall; the checkpoint is kept). */
+  rotateHostedFeedCredential(slug: string, feedId: string, input: HostedFeedCredentialRotation): Promise<HostedFeedCredentialRotationResult> {
+    return this.request(`/api/marketplace/collectors/${encodeURIComponent(slug)}/feeds/${encodeURIComponent(feedId)}/rotate-credential`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
     });
   }
   enableHostedCollector(slug: string, enabled: boolean): Promise<{ message: string }> {

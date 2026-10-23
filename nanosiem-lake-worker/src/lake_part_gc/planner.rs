@@ -310,7 +310,12 @@ pub struct InventorySelection<'a> {
     live_keys: &'a BTreeSet<String>,
     now_ms: i64,
     policy: GcPolicy,
+    refused: Option<&'a super::executor::RefusedKeys>,
+    retain: Option<usize>,
 }
+
+/// Most eligible objects one task retains ([`InventorySelection::retaining`]).
+pub const MAX_SELECTION_RETAINED: usize = 4 * 512;
 
 impl<'a> InventorySelection<'a> {
     pub(crate) fn new(
@@ -318,12 +323,31 @@ impl<'a> InventorySelection<'a> {
         live_keys: &'a BTreeSet<String>, now_ms: i64, policy: GcPolicy,
     ) -> Result<Self> {
         policy.validate()?;
-        Ok(Self { tenant_id, tenant_uuid, view, live_keys, now_ms, policy })
+        Ok(Self { tenant_id, tenant_uuid, view, live_keys, now_ms, policy, refused: None, retain: None })
     }
 
-    pub(crate) fn limit(&self) -> usize { self.policy.max_requests.min(512) }
+    /// NAN-4162: keys the executor would skip as refused (within their TTL)
+    /// are not candidates. Unauthorizable keys (no writer receipt, 24 h) sort
+    /// first and used to fill most of every bounded selection, capping a large tenant's
+    /// GC at 180 deletes per task while ingest superseded far more.
+    pub(crate) fn excluding(mut self, refused: &'a super::executor::RefusedKeys) -> Self {
+        self.refused = Some(refused);
+        self
+    }
+
+    /// NAN-4162: retain up to `count` eligible objects (at most
+    /// [`MAX_SELECTION_RETAINED`]) so one listing feeds several bounded passes.
+    pub(crate) fn retaining(mut self, count: usize) -> Self {
+        self.retain = Some(count.clamp(1, MAX_SELECTION_RETAINED));
+        self
+    }
+
+    pub(crate) fn limit(&self) -> usize { self.retain.unwrap_or_else(|| self.policy.max_requests.min(512)) }
 
     pub(crate) fn eligible(&self, object: &ListedPartObject) -> bool {
+        if self.refused.is_some_and(|refused| refused.is_refused(&object.key, self.now_ms)) {
+            return false;
+        }
         eligible_request(self.tenant_id, self.tenant_uuid, self.view, self.live_keys,
             object, self.now_ms, &self.policy).is_ok()
     }

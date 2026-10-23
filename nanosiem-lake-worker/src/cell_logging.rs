@@ -9,7 +9,7 @@
 //! silent for its whole life (NAN-2964). Output is JSON, one object per line,
 //! like every other child line the supervisor forwards.
 
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// The filter a cell child runs with: `rust_log` when it parses, else `info`.
 pub fn child_env_filter(rust_log: Option<&str>) -> EnvFilter {
@@ -22,7 +22,13 @@ pub fn child_env_filter(rust_log: Option<&str>) -> EnvFilter {
 /// Install the JSON subscriber for a cell child (call once, after the jail).
 pub fn init_child_tracing() {
     let rust_log = std::env::var("RUST_LOG").ok();
-    tracing_subscriber::fmt().with_env_filter(child_env_filter(rust_log.as_deref())).json().init();
+    let service =
+        std::env::var("NANO_OTLP_TRACE_SERVICE").unwrap_or_else(|_| "nano-lake-worker".into());
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().json())
+        .with(nanosiem_core::telemetry::OtlpTraceLayer::from_env(&service))
+        .with(child_env_filter(rust_log.as_deref()))
+        .init();
 }
 
 #[cfg(test)]

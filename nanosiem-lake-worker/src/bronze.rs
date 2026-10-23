@@ -34,6 +34,83 @@ pub const MAX_BRONZE_FILES: usize = 500;
 pub const MAX_BRONZE_ROWS: usize = 250_000;
 pub const MAX_BRONZE_BYTES: u64 = 1_073_741_824;
 
+/// NAN-4336: how far past its ingest time an event's `time` may be. The
+/// control writer authority refuses a reservation whose `max_event_time`
+/// is more than 5 min past its own clock (`r2_writers.reserve`, HTTP 400), so
+/// one future-dated row used to hold its whole object, and every later
+/// object of the tenant behind it, until wall-clock time caught up. Equal to
+/// that guard on purpose: a row admission keeps can always be reserved.
+pub const MAX_FUTURE_EVENT_SKEW_MS: i64 = 5 * 60 * 1_000;
+/// NAN-4336: the `metadata.labels` entry of a row whose `time` was clamped
+/// to its ingest time (OCSF 1.9 `metadata.labels`: "the list of labels
+/// attached to the event"). Searchable as `metadata.labels = "time_clamped"`.
+pub const TIME_CLAMPED_LABEL: &str = "time_clamped";
+
+/// NAN-4336: clamp a future-dated event to its ingest time.
+///
+/// An event whose `time` is more than [`MAX_FUTURE_EVENT_SKEW_MS`] after
+/// `ingest_ms` gets `time = ingest_ms` (epoch ms), keeps what the source
+/// sent in OCSF `metadata.original_time` (a source-supplied value there is
+/// left as is, otherwise the original `time` as RFC 3339 UTC), and is marked
+/// with [`TIME_CLAMPED_LABEL`] in `metadata.labels`. Returns whether it
+/// clamped.
+///
+/// A future `time` is never left in place: an absent (or null) `metadata`
+/// is created for the original and the label; a `metadata` that is not an
+/// object (admission refuses that row as invalid OCSF anyway) cannot hold
+/// them, so only `time` is clamped and the row is still counted. An event
+/// without a readable `time` has no future time to clamp.
+pub fn clamp_future_event_time(event: &mut Value, ingest_ms: i64) -> bool {
+    let Some(time_ms) = crate::iceberg::ocsf_time_millis(event.get("time")) else { return false };
+    if time_ms <= ingest_ms.saturating_add(MAX_FUTURE_EVENT_SKEW_MS) || ingest_ms <= 0 {
+        return false;
+    }
+    let Some(fields) = event.as_object_mut() else { return false };
+    fields.insert("time".to_string(), Value::from(ingest_ms));
+    let metadata = fields.entry("metadata").or_insert(Value::Null);
+    if metadata.is_null() {
+        *metadata = Value::Object(serde_json::Map::new());
+    }
+    let Value::Object(metadata) = metadata else { return true };
+    if !metadata.get("original_time").and_then(Value::as_str).is_some_and(|original| !original.is_empty()) {
+        let original = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(time_ms)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_else(|| time_ms.to_string());
+        metadata.insert("original_time".to_string(), Value::from(original));
+    }
+    match metadata.get_mut("labels") {
+        Some(Value::Array(labels)) => {
+            if !labels.iter().any(|label| label.as_str() == Some(TIME_CLAMPED_LABEL)) {
+                labels.push(Value::from(TIME_CLAMPED_LABEL));
+            }
+        }
+        // A non-array `labels` already fails OCSF validation: leave it, so
+        // the row is refused with its real cause.
+        Some(_) => {}
+        None => {
+            metadata.insert("labels".to_string(), Value::from(vec![TIME_CLAMPED_LABEL]));
+        }
+    }
+    true
+}
+
+/// NAN-4336: the ingest time a row is clamped to: its own
+/// `metadata.processed_time` (stamped by the tenant's Vector lake sink or the
+/// landing stage when the row was parsed, so a crash replay of the same
+/// object clamps identically), capped by `ceiling_ms` (when its object
+/// reached the tenant's edge log, else admission's clock).
+fn row_ingest_ms(event: &Value, ceiling_ms: i64) -> i64 {
+    event
+        .pointer("/metadata/processed_time")
+        .and_then(|value| crate::iceberg::ocsf_time_millis(Some(value)))
+        .filter(|processed| *processed > 0)
+        .map_or(ceiling_ms, |processed| processed.min(ceiling_ms))
+}
+
+/// NAN-4336: rows admission clamped to their ingest time, per counter
+/// source slug ([`SourceKey`]).
+pub type ClampedSources = BTreeMap<String, u64>;
+
 #[derive(Debug, Error)]
 pub enum BronzeAdmissionError {
     #[error("Vector bronze replay identity {event_uid} has conflicting event data")]
@@ -76,6 +153,9 @@ pub struct BronzeAdmission {
     pub enrichment: IngestEnrichmentMetrics,
     pub files: Vec<BronzeFileAdmission>,
     pub batch: NormalizedEventBatch,
+    /// NAN-4336: rows whose `time` was more than [`MAX_FUTURE_EVENT_SKEW_MS`]
+    /// past their ingest time and was clamped to it, per source slug.
+    pub time_clamped: ClampedSources,
     /// Pre-enrichment semantic identities keyed by Vector's stable OCSF UID.
     ///
     /// This is deliberately captured before IOC, IP context, IPinfo, or
@@ -135,6 +215,8 @@ pub struct BronzeFileAdmission {
 struct AdmittedEvent {
     event_uid: String,
     digest: [u8; 32],
+    /// NAN-4336: `time` was clamped to the row's ingest time.
+    time_clamped: bool,
     time_ms: i64,
     event_hour: i32,
     row: EventRow,
@@ -229,12 +311,42 @@ pub fn bronze_file_row_count(path: &Path) -> Result<u64> {
     Ok(rows)
 }
 
+/// Uncompressed bytes of a bronze object's rows, from its Parquet footer
+/// alone (NAN-4319). Admission's memory grows with the decoded events, not
+/// the compressed object: a highly compressible 1 MB edge segment carried
+/// 50k rows. Errors read as unknown (0) to the caller.
+pub fn bronze_file_decoded_bytes(path: &Path) -> Result<u64> {
+    validate_source_file(path)?;
+    let reader = parquet::file::reader::SerializedFileReader::new(File::open(path)?)?;
+    let metadata = parquet::file::reader::FileReader::metadata(&reader);
+    Ok(metadata.row_groups().iter().map(|group| u64::try_from(group.total_byte_size()).unwrap_or(0)).sum())
+}
+
 pub fn admit_bronze_files_with_enrichment(
     paths: &[PathBuf],
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
 ) -> Result<BronzeAdmission> {
-    admit_bronze_files_inner(paths, tenant_id, enricher, None)
+    admit_bronze_files_inner(paths, tenant_id, enricher, None, &IngestTimes::now())
+}
+
+/// NAN-4336: the ingest time ceiling of each admitted file: when its object
+/// reached the tenant (the edge log's receipt time), else `now_ms`. A row is
+/// clamped against `min(metadata.processed_time, ceiling)`.
+#[derive(Debug, Clone, Default)]
+pub struct IngestTimes {
+    pub received_ms: BTreeMap<PathBuf, i64>,
+    pub now_ms: i64,
+}
+
+impl IngestTimes {
+    pub fn now() -> Self {
+        Self { received_ms: BTreeMap::new(), now_ms: chrono::Utc::now().timestamp_millis() }
+    }
+
+    fn ceiling(&self, path: &Path) -> i64 {
+        self.received_ms.get(path).copied().filter(|ms| *ms > 0).map_or(self.now_ms, |ms| ms.min(self.now_ms))
+    }
 }
 
 /// Rows of one source file that admission refused: `(rows, first refusal)`.
@@ -329,8 +441,20 @@ pub fn admit_bronze_files_attributing(
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
 ) -> Result<(BronzeAdmission, RefusedRows, RefusedSources)> {
+    admit_bronze_files_received(paths, tenant_id, enricher, &IngestTimes::now())
+}
+
+/// [`admit_bronze_files_attributing`] clamping future-dated rows against
+/// each file's ingest time ([`IngestTimes`], NAN-4336). Part ingest admits
+/// through this.
+pub fn admit_bronze_files_received(
+    paths: &[PathBuf],
+    tenant_id: &str,
+    enricher: &BronzeIngestEnricher,
+    times: &IngestTimes,
+) -> Result<(BronzeAdmission, RefusedRows, RefusedSources)> {
     let mut salvage = Salvage::default();
-    let admission = admit_bronze_files_inner(paths, tenant_id, enricher, Some(&mut salvage))?;
+    let admission = admit_bronze_files_inner(paths, tenant_id, enricher, Some(&mut salvage), times)?;
     Ok((admission, salvage.rows, salvage.sources))
 }
 
@@ -339,6 +463,7 @@ fn admit_bronze_files_inner(
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
     mut refused: Option<&mut Salvage>,
+    times: &IngestTimes,
 ) -> Result<BronzeAdmission> {
     if paths.is_empty() || paths.len() > MAX_BRONZE_FILES {
         bail!("bronze admission requires one to {MAX_BRONZE_FILES} files");
@@ -355,6 +480,7 @@ fn admit_bronze_files_inner(
     let mut enrichment = enricher.initial_metrics();
     let mut timings = AdmissionTimings::default();
     let mut identities = AdmittedIdentities::new();
+    let mut time_clamped = ClampedSources::new();
     #[cfg(all(feature = "enterprise", target_os = "linux"))]
     let _platform_batch_budget = if enricher.platform.is_some() {
         Some(
@@ -414,6 +540,7 @@ fn admit_bronze_files_inner(
             .with_batch_size(group_rows)
             .build()?;
         let before = source_rows;
+        let ceiling_ms = times.ceiling(path);
         for batch in reader {
             let batch = batch?;
             source_rows = source_rows
@@ -478,6 +605,7 @@ fn admit_bronze_files_inner(
                     return (Err(BronzeAdmissionError::ConflictingReplay { event_uid }.into()), attribution);
                 }
                 let admitted = admit_event(event, tenant_id, enricher, object_pins.get(path).map(String::as_str),
+                    Some(ceiling_ms),
                     #[cfg(all(feature = "enterprise", target_os = "linux"))]
                     claims[index].clone());
                 (admitted, attribution)
@@ -499,6 +627,9 @@ fn admit_bronze_files_inner(
                     }
                     (Err(error), _) => return Err(error),
                 };
+                if admitted.time_clamped {
+                    *time_clamped.entry(SourceKey::of(&admitted.row.ocsf_event).source_slug).or_default() += 1;
+                }
                 merge_admission_timings(&mut timings, &admitted.timings);
                 merge_enrichment_metrics(&mut enrichment, &admitted.enrichment);
                 insert_admitted_event(&mut identities, admitted)?;
@@ -618,6 +749,7 @@ fn admit_bronze_files_inner(
         enrichment,
         files,
         batch: NormalizedEventBatch::from_admitted(tenant_id, normalized)?,
+        time_clamped,
         source_identity_digests,
     })
 }
@@ -756,7 +888,7 @@ fn admit_event_without_pin(
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
 ) -> Result<AdmittedEvent> {
-    admit_event(event, tenant_id, enricher, None,
+    admit_event(event, tenant_id, enricher, None, None,
         #[cfg(all(feature = "enterprise", target_os = "linux"))]
         None)
 }
@@ -770,6 +902,7 @@ fn admit_event(
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
     object: Option<&str>,
+    ingest_ceiling_ms: Option<i64>,
     #[cfg(all(feature = "enterprise", target_os = "linux"))]
     prepared: Option<crate::platform_stamping::Claim>,
 ) -> Result<AdmittedEvent> {
@@ -786,6 +919,18 @@ fn admit_event(
     // IP-context, IPinfo and prevalence assignments may legitimately rotate
     // between two deliveries of the same Vector event.
     let digest = source_identity_digest(&event)?;
+    // NAN-4336: clamp a future-dated row to its ingest time, after the
+    // source identity is fixed (the identity stays what the source sent, so
+    // a redelivery is still the same event) and before decoration and
+    // normalization (so the part, its event hour and the reservation's
+    // max_event_time all see the clamped time).
+    let time_clamped = match ingest_ceiling_ms {
+        Some(ceiling) => {
+            let ingest_ms = row_ingest_ms(&event, ceiling);
+            clamp_future_event_time(&mut event, ingest_ms)
+        }
+        None => false,
+    };
     #[cfg(all(feature = "enterprise", target_os = "linux"))]
     let mut platform = enricher
         .platform
@@ -878,6 +1023,7 @@ fn admit_event(
     Ok(AdmittedEvent {
         event_uid,
         digest,
+        time_clamped,
         time_ms,
         event_hour,
         row: normalized,
@@ -2143,5 +2289,83 @@ mod tests {
         assert_eq!(admitted.batch.len(), 1);
         assert_eq!(admitted.batch.rows()[0].event_uid, "source-2");
         assert_eq!(admitted.source_identity_digests().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod nan4336_clamp_tests {
+    use super::*;
+    use serde_json::json;
+
+    const INGEST: i64 = 1_792_602_464_000; // 2026-10-21T17:07:44Z
+
+    #[test]
+    fn clamps_only_past_the_skew_and_keeps_the_original() {
+        // At the skew boundary: untouched.
+        let mut at = json!({"time": INGEST + MAX_FUTURE_EVENT_SKEW_MS, "metadata": {"uid": "a"}});
+        assert!(!clamp_future_event_time(&mut at, INGEST));
+        assert_eq!(at, json!({"time": INGEST + MAX_FUTURE_EVENT_SKEW_MS, "metadata": {"uid": "a"}}));
+        // 14 h ahead (RFC 3339, as the bronze `time` column decodes).
+        let mut future = json!({"time": "2026-10-22T07:07:44.250Z", "metadata": {"uid": "a", "labels": ["x"]}});
+        assert!(clamp_future_event_time(&mut future, INGEST));
+        assert_eq!(future, json!({"time": INGEST, "metadata": {"uid": "a", "labels": ["x", TIME_CLAMPED_LABEL],
+            "original_time": "2026-10-22T07:07:44.250Z"}}));
+        // Idempotent: a clamped row is never clamped again.
+        let once = future.clone();
+        assert!(!clamp_future_event_time(&mut future, INGEST));
+        assert_eq!(future, once);
+        // A source-supplied original_time is the source's: kept.
+        let mut supplied = json!({"time": INGEST + 3_600_000, "metadata": {"original_time": "Oct 22 03:07:44"}});
+        assert!(clamp_future_event_time(&mut supplied, INGEST));
+        assert_eq!(supplied["metadata"]["original_time"], "Oct 22 03:07:44");
+        assert_eq!(supplied["metadata"]["labels"], json!([TIME_CLAMPED_LABEL]));
+        // Unreadable time: nothing to clamp.
+        let mut broken = json!({"time": "soon", "metadata": {}});
+        assert!(!clamp_future_event_time(&mut broken, INGEST));
+        assert_eq!(broken, json!({"time": "soon", "metadata": {}}));
+    }
+
+    #[test]
+    fn a_future_time_is_never_left_in_place_whatever_metadata_looks_like() {
+        let future = "2026-10-22T07:07:44.000Z";
+        let marked = json!({"original_time": future, "labels": [TIME_CLAMPED_LABEL]});
+        // No metadata, or a null one: created for the original and the label.
+        for mut row in [json!({"time": future}), json!({"time": future, "metadata": null})] {
+            assert!(clamp_future_event_time(&mut row, INGEST));
+            assert_eq!(row, json!({"time": INGEST, "metadata": marked}));
+        }
+        // A non-object metadata cannot hold them: time is still clamped and
+        // the row counted (admission refuses it as invalid OCSF).
+        let mut row = json!({"time": future, "metadata": 1});
+        assert!(clamp_future_event_time(&mut row, INGEST));
+        assert_eq!(row, json!({"time": INGEST, "metadata": 1}));
+        // A non-array labels is left as is (its own refusal), time clamped.
+        let mut row = json!({"time": future, "metadata": {"labels": "x"}});
+        assert!(clamp_future_event_time(&mut row, INGEST));
+        assert_eq!(row, json!({"time": INGEST, "metadata": {"labels": "x", "original_time": future}}));
+    }
+
+    #[test]
+    fn a_row_clamps_to_its_processed_time_capped_by_receipt() {
+        let row = json!({"metadata": {"processed_time": INGEST - 1_000}});
+        assert_eq!(row_ingest_ms(&row, INGEST), INGEST - 1_000);
+        assert_eq!(row_ingest_ms(&row, INGEST - 5_000), INGEST - 5_000, "never later than the receipt");
+        assert_eq!(row_ingest_ms(&json!({"metadata": {}}), INGEST), INGEST);
+        assert_eq!(row_ingest_ms(&json!({"metadata": {"processed_time": 0}}), INGEST), INGEST);
+    }
+
+    #[test]
+    fn a_clamped_row_passes_strict_ocsf_admission() {
+        let mut event = json!({
+            "activity_id": 1, "category_uid": 3, "class_uid": 3002, "severity_id": 1, "type_uid": 300201,
+            "time": INGEST + 14 * 3_600_000, "raw_data": "r", "raw_data_size": 1,
+            "user": {"name": "alice"}, "dst_endpoint": {"ip": "192.168.1.1"},
+            "metadata": {"uid": "u1", "log_source": "hec", "version": "1.9.0", "tenant_uid": "tenant-a",
+                "product": {"name": "fixture", "vendor_name": "nano"}},
+        });
+        assert!(clamp_future_event_time(&mut event, INGEST));
+        let admitted = admit_event_without_pin(event, "tenant-a", &BronzeIngestEnricher::disabled()).unwrap();
+        assert_eq!(admitted.time_ms, INGEST);
+        assert_eq!(admitted.row.ocsf_event["metadata"]["labels"], json!([TIME_CLAMPED_LABEL]));
     }
 }

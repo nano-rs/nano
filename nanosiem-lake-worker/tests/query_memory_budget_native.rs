@@ -762,7 +762,7 @@ async fn streamed_paged_read_executes_the_query_once() {
     let start = (now - chrono::Duration::hours(1)).to_rfc3339();
     let end = (now + chrono::Duration::minutes(1)).to_rfc3339();
     let statements = || { let s = service.engine().executor().status(); s.completed + s.failed };
-    // Warm every per-process memo (owner proofs, membership, schema).
+    // Warm every per-process memo (file proofs, membership, schema).
     assert_eq!(paged_read(&service, "*", &start, &end, 500, 500).await.0, 200);
 
     let before = statements();

@@ -12,6 +12,7 @@
 //! spans and there is no background recompute job.
 
 pub mod eval;
+pub mod metric_alert_lifecycle;
 pub mod metric_monitor_repository;
 pub mod slo_repository;
 pub mod synthetic_check_repository;

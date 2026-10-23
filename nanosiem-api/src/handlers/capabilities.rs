@@ -643,6 +643,7 @@ mod tests {
             landing_page: None,
             deployment_mode: "enterprise_shared".to_string(),
             active_tenant: None,
+            demo: None,
         };
         let bootstrap = serde_json::to_value(identity).unwrap();
         let auth_me = serde_json::to_value(current_user).unwrap();

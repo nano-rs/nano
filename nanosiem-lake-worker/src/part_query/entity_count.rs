@@ -23,6 +23,9 @@ struct Shape {
     lowered: BTreeSet<String>,
     alias: String,
     denied: BTreeSet<String>,
+    /// NAN-4280: the compiled source time bound, verbatim, so each native
+    /// leg can splice its disjoint fence in front of exactly that text.
+    window_clause: String,
 }
 
 fn shape(compiled: &CompiledQuery) -> Option<Shape> {
@@ -30,27 +33,32 @@ fn shape(compiled: &CompiledQuery) -> Option<Shape> {
         return None;
     }
     static SQL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let sql = SQL.get_or_init(|| regex::Regex::new(concat!(
+    // NAN-4280: the window clause is built from the compiler's own bound
+    // text (`time >= 'a' AND time < 'b'`), so the two cannot drift apart.
+    let sql = SQL.get_or_init(|| regex::Regex::new(&[
         r#"(?s)^WITH stage_0 AS \(\s*SELECT [^\n()]* FROM __nano_lake_source__\s*"#,
-        r#"WHERE time BETWEEN '([0-9: .-]+)' AND '([0-9: .-]+)'\s*AND (.*?)\s*"#,
+        &format!(
+            r#"WHERE ({})\s*AND (.*?)\s*"#,
+            nanosiem_core::sql_hygiene::half_open_time_bound_pattern("time", "[0-9: .-]+")
+        ),
         r#"\),\s*stage_1 AS \(\s*SELECT count\(\) AS ([A-Za-z_][A-Za-z0-9_]*)\s*FROM stage_0\s*\)\s*"#,
         r#"SELECT \* FROM stage_1 LIMIT ([0-9]+)(?: SETTINGS [^;\n]*)?\s*$"#,
-    )).expect("static count shape"));
+    ].concat()).expect("static count shape"));
     let captures = sql.captures(&compiled.sql)?;
     let time = |text: &str| {
         chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
             .ok()
             .map(|t| t.and_utc().timestamp_micros())
     };
-    if (time(&captures[1])?, time(&captures[2])?)
-        != super::engine::compiled_window_us(compiled).ok()?
+    if (time(&captures[2])?, time(&captures[3])?)
+        != super::engine::compiled_bound_us(compiled).ok()?
     {
         return None;
     }
-    if captures[5].parse::<usize>().ok()? == 0 {
+    if captures[6].parse::<usize>().ok()? == 0 {
         return None;
     }
-    let mut predicate = captures[3].trim();
+    let mut predicate = captures[4].trim();
     let mut depth = 0_i32;
     let mut expect_leg = true;
     let mut pivot = Vec::new();
@@ -98,9 +106,6 @@ fn shape(compiled: &CompiledQuery) -> Option<Shape> {
             return None;
         }
         let path = found[2].to_string();
-        if crate::enrichment_read::sensitive(&path) {
-            return None;
-        }
         let raw_path = super::prune::INGEST_LOWERCASED_BLOOM_PATHS.contains(&path.as_str());
         if !lower && !raw_path {
             return None;
@@ -149,8 +154,9 @@ fn shape(compiled: &CompiledQuery) -> Option<Shape> {
         kind,
         pivot,
         lowered,
-        alias: captures[4].into(),
+        alias: captures[5].into(),
         denied,
+        window_clause: captures[1].to_string(),
     })
 }
 
@@ -331,6 +337,123 @@ pub(super) async fn run(
     request: &BroadNplRequest,
     compiled: &CompiledQuery,
 ) -> QueryResult<Option<Run>> {
+    run_bounded(engine, request, compiled, None).await
+}
+
+/// NAN-4298: interior parts without count evidence the typed count route
+/// accepts before it leaves the answer to the rollups. Fresh minute parts of
+/// the newest hour may not carry evidence yet; a window reaching back before
+/// the writer (or a cell without it) has many more and is cheaper from the
+/// rollups than from a native scan of every uncovered part.
+const COUNT_AGGREGATE_MAX_UNCOVERED_PARTS: usize = 16;
+
+/// NAN-4298: an ungrouped, unbucketed single-value equality count on an
+/// entity-count field (`src_endpoint.ip=v | stats count`), answered from the
+/// signed hourly entity counts like the same nPL through `broad_npl`.
+///
+/// The count rollups answer this shape too, but their per-part memo is keyed
+/// by the value, so every new value re-reads every rollup partial of the
+/// window (3–4.5 s warm, 16 s cold over 7 d on a large tenant; the index answers in
+/// ~1.2–1.6 s). `None` (shape, coverage, budget) leaves the request to the
+/// rollups, unchanged. The answer is a `count_aggregate` fragment.
+pub(super) async fn count_aggregate(
+    engine: &PartQueryEngine,
+    request: &crate::count_aggregate::CountAggregateRequest,
+) -> QueryResult<Option<crate::native::NativeQueryOutput>> {
+    let Some(query) = count_aggregate_npl(request) else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    // The count route's wire `end` is inclusive; nPL windows are half-open
+    // (NAN-4280), so the nPL ends 1 µs after it.
+    let Ok(window) = request.window() else {
+        return Ok(None);
+    };
+    let Some(end) = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(window.end_exclusive_us)
+        .map(|end| end.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+    else {
+        return Ok(None);
+    };
+    let npl = BroadNplRequest {
+        request_id: request.request_id.clone(),
+        tenant_id: request.tenant_id.clone(),
+        dataset: "logs".into(),
+        query,
+        start: request.start.clone(),
+        end,
+        limit: 1,
+        offset: 0,
+        table_view: false,
+        use_cache: false,
+        cursor_time: None,
+        cursor_event_uid: None,
+        anchor_us: None,
+        decay: None,
+        clear_boundaries: Default::default(),
+        minimum_clear_revision: None,
+        watch_weights: Default::default(),
+        deny_source_types: request.deny_source_types.clone(),
+    };
+    // The index is optional evidence: any failure on the way (field types,
+    // compile, a shape the matcher does not recognize, a native leg error)
+    // leaves the request to the rollups rather than failing it.
+    let Ok(field_types) = engine.field_types().await else {
+        return Ok(None);
+    };
+    let Ok(compiled) = engine.compile(&npl, field_types).await else {
+        return Ok(None);
+    };
+    let Ok(Some(run)) = run_bounded(engine, &npl, &compiled, Some(COUNT_AGGREGATE_MAX_UNCOVERED_PARTS)).await else {
+        return Ok(None);
+    };
+    let Some(events) = run.rows.first().and_then(|row| count(std::slice::from_ref(row), COUNT_AGGREGATE_ALIAS)) else {
+        return Ok(None);
+    };
+    crate::query_timing::record(|p| p.entity_count_aggregate_routes += 1);
+    Ok(Some(crate::native::NativeQueryOutput {
+        data: format!("{}\n", json!({"value": Value::Null, "events": events})).into_bytes(),
+        elapsed: started.elapsed(),
+        storage_rows_read: run.storage_rows,
+        storage_bytes_read: run.storage_bytes,
+    }))
+}
+
+const COUNT_AGGREGATE_ALIAS: &str = "nano_entity_count";
+
+/// The nPL a typed count request means, when it is the one shape the entity
+/// counts answer and its value needs no escaping (no quote, backslash,
+/// wildcard or control character; ASCII; bounded). The field must be both a
+/// count-rollup field (the request was planned for the rollups) and an entity
+/// count field.
+fn count_aggregate_npl(request: &crate::count_aggregate::CountAggregateRequest) -> Option<String> {
+    if request.grouped() || request.bucket_span_us.is_some() || request.source_filter.is_some() {
+        return None;
+    }
+    let predicate = request.predicate.as_ref()?;
+    let [value] = predicate.values.as_slice() else { return None };
+    if !matches!(predicate.kind, crate::planner::CountPredicateKind::Eq) {
+        return None;
+    }
+    let field = request.group_field.as_str();
+    if !KINDS.iter().any(|paths| paths.contains(&field)) {
+        return None;
+    }
+    if value.is_empty()
+        || !value.is_ascii()
+        || value.len() > crate::parts::entity_counts::MAX_VALUE_BYTES
+        || value.chars().any(|c| c.is_ascii_control() || matches!(c, '"' | '\\' | '*' | '?'))
+    {
+        return None;
+    }
+    Some(format!("{field}=\"{value}\" | stats count() as {COUNT_AGGREGATE_ALIAS}"))
+}
+
+async fn run_bounded(
+    engine: &PartQueryEngine,
+    request: &BroadNplRequest,
+    compiled: &CompiledQuery,
+    max_uncovered: Option<usize>,
+) -> QueryResult<Option<Run>> {
     if request.cursor_time.is_some() || request.cursor_event_uid.is_some() {
         reason(Reason::Cursor);
         return Ok(None);
@@ -347,6 +470,8 @@ pub(super) async fn run(
             .iter()
             .map(|s| s.trim().to_ascii_lowercase()),
     );
+    // NAN-4280: inclusive µs `[from, to]`, the rows the half-open compiled
+    // bound admits; the index split and the native legs work in these.
     let (from, to) = super::engine::compiled_window_us(compiled)?;
     let Some((interior, boundaries)) = split(from, to) else {
         reason(Reason::Window);
@@ -417,6 +542,15 @@ pub(super) async fn run(
         .filter(|p| !covered.contains(&p.part_id))
         .map(|p| p.part_id.clone())
         .collect::<BTreeSet<_>>();
+    // Only interior parts count: the boundary hours are native either way.
+    let interior_uncovered = parts
+        .iter()
+        .filter(|p| p.max_time_us >= interior.0 && p.min_time_us < interior.1 && !covered.contains(&p.part_id))
+        .count();
+    if max_uncovered.is_some_and(|max| interior_uncovered > max) {
+        reason(Reason::Uncovered);
+        return Ok(None);
+    }
     let all = parts
         .iter()
         .map(|p| p.part_id.clone())
@@ -459,11 +593,13 @@ pub(super) async fn run(
         // Keep the original compiled predicate and aggregate; only add the
         // disjoint time fence to its source WHERE. Selection alone is pruning.
         let mut leg = compiled.clone();
-        leg.sql = leg.sql.replacen("WHERE time BETWEEN", &format!("WHERE time >= fromUnixTimestamp64Micro({a}) AND time <= fromUnixTimestamp64Micro({b}) AND time BETWEEN"), 1);
-        let scalar = engine.scalar_plan(&selection, &leg).await?;
-        let plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || {
-            plan_logs(&selection, &leg, None)
-        })?;
+        let anchor = format!("WHERE {}", shape.window_clause);
+        if !leg.sql.contains(&anchor) {
+            // The fence must apply, or the leg would re-count indexed hours.
+            return Err(super::engine::internal_text("entity count leg has no source time bound".into()));
+        }
+        leg.sql = leg.sql.replacen(&anchor, &format!("WHERE time >= fromUnixTimestamp64Micro({a}) AND time <= fromUnixTimestamp64Micro({b}) AND {}", shape.window_clause), 1);
+        let plan = plan_logs(&selection, &leg, None)?;
         let output = engine.execute(plan).await?;
         engine_seconds += output.elapsed.as_secs_f64();
         storage_rows += output.storage_rows_read;

@@ -88,13 +88,7 @@ async fn run() -> Result<()> {
     #[cfg(feature = "enterprise")]
     {
         tracing::info!("Applying enterprise PostgreSQL overlay migrations");
-        let mut overlay_migrator = sqlx::migrate!("../migrations/postgres-enterprise");
-        // ignore_missing(true) so the overlay's validator tolerates the
-        // open history's applied rows that already sit in _sqlx_migrations.
-        // Matches the same call in nanosiem-api/src/state/constructors.rs.
-        overlay_migrator.set_ignore_missing(true);
-        overlay_migrator
-            .run(pg_pool)
+        nanosiem_enterprise::postgres_migrations::run(pg_pool)
             .await
             .context("running enterprise PostgreSQL overlay migrations")?;
     }

@@ -20,6 +20,12 @@ pub enum IngestTokenRepositoryError {
     DuplicateName(String),
 }
 
+/// Verified sender identity passed from the OTLP edge to Vector.
+pub struct BindableSourceCredential {
+    pub id: Uuid,
+    pub route: String,
+}
+
 pub struct IngestTokenRepository {
     pool: PgPool,
 }
@@ -258,6 +264,39 @@ impl IngestTokenRepository {
             return Ok(None);
         }
         self.get(tenant_id, id).await
+    }
+
+    /// Authenticate an OTLP sender against current database state, without a
+    /// positive cache. Disabled/deleted sources and revoked/unbound tokens fail
+    /// closed. The hash is never logged or returned.
+    pub async fn otlp_credential(
+        &self,
+        tenant_id: Uuid,
+        hash: &str,
+    ) -> Result<Option<BindableSourceCredential>, IngestTokenRepositoryError> {
+        let row = sqlx::query(
+            "SELECT t.id, ls.name, ls.source_type, ls.match_values FROM ingest_tokens t
+             JOIN log_sources ls ON ls.id = t.source_id
+             WHERE t.tenant_id = $1 AND t.token_sha256 = $2
+               AND t.revoked_at IS NULL AND ls.enabled",
+        )
+        .bind(tenant_id)
+        .bind(hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let transport: String = row.try_get("source_type")?;
+        if !is_push_capable(&transport) {
+            return Ok(None);
+        }
+        let name: String = row.try_get("name")?;
+        let values: Option<Vec<String>> = row.try_get("match_values")?;
+        Ok(Some(BindableSourceCredential {
+            id: row.try_get("id")?,
+            route: route_key(values.as_deref(), &name),
+        }))
     }
 
     /// The tokens Vector's file lists: active and bound to a source that can
@@ -522,11 +561,11 @@ mod tests {
             .unwrap();
         let repo = IngestTokenRepository::new(pool.clone());
 
-        // OTLP never takes a token; the push source does.
+        // OTLP and routed log sources both accept source-bound credentials.
         let sources = repo.bindable_sources().await.unwrap();
-        assert_eq!(sources.len(), 1);
+        assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].route_key, "apache_access");
-        assert!(repo.bindable_source(OTLP).await.unwrap().is_none());
+        assert_eq!(repo.bindable_source(OTLP).await.unwrap().unwrap().route_key, "otlp_log");
 
         let a = super::super::generate_token();
         let created = repo
@@ -664,6 +703,107 @@ mod tests {
         assert!(!listed.contains(&c.sha256_hex));
         assert!(!listed.contains(&c.value));
 
+        drop_schema(&pool, &schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
+    async fn otlp_authentication_lifecycle() {
+        let Some((pool, schema)) = pool_with("").await else {
+            return;
+        };
+        sqlx::raw_sql(&source(
+            OTLP,
+            "OTLP logs",
+            "otlp",
+            "ARRAY['otlp_log']",
+            true,
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repo = IngestTokenRepository::new(pool.clone());
+        let secret = super::super::generate_token();
+        let token = repo
+            .create(
+                T1,
+                "otlp sender",
+                &secret.prefix,
+                &secret.sha256_hex,
+                OTLP,
+                None,
+            )
+            .await
+            .unwrap();
+        let service = super::super::IngestTokenService::with_paths(
+            pool.clone(),
+            T1,
+            std::path::PathBuf::from("/unused"),
+            String::new(),
+            Some("synthetic-install".into()),
+        );
+        assert!(service.authenticate_otlp("wrong").await.unwrap().is_none());
+        assert!(repo
+            .otlp_credential(T2, &secret.sha256_hex)
+            .await
+            .unwrap()
+            .is_none());
+        let authenticated = service
+            .authenticate_otlp(&secret.value)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authenticated.id, token.credential_id);
+        assert_eq!(authenticated.route, "otlp_log");
+        assert!(service
+            .authenticate_otlp("synthetic-install")
+            .await
+            .unwrap()
+            .is_none());
+        repo.bind_install_token(T1, None, OTLP, None).await.unwrap();
+        assert_eq!(
+            service
+                .authenticate_otlp("synthetic-install")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            super::super::INSTALL_CREDENTIAL_ID
+        );
+        repo.set_install_token_enabled(T1, false, None)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate_otlp("synthetic-install")
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("UPDATE log_sources SET enabled = false WHERE id = $1")
+            .bind(OTLP)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate_otlp(&secret.value)
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("UPDATE log_sources SET enabled = true WHERE id = $1")
+            .bind(OTLP)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate_otlp(&secret.value)
+            .await
+            .unwrap()
+            .is_some());
+        repo.revoke(T1, token.credential_id, None).await.unwrap();
+        assert!(service
+            .authenticate_otlp(&secret.value)
+            .await
+            .unwrap()
+            .is_none());
         drop_schema(&pool, &schema).await;
     }
 

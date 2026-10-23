@@ -68,6 +68,24 @@ impl AppState {
                 handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
                 tracing::info!("Enterprise-shared shadow investigation runtime started");
             }
+            // NAN-4232: startup-attest the native executor only in the jobs
+            // process. Every admitted run retains its original tenant/actor;
+            // per-run leases provide distribution across jobs instances.
+            if self.config.egress_jobs_enabled() {
+                if let Some(service) = self.soar_service.as_ref() {
+                    match nanosiem_enterprise::soar_shared_runtime::SoarSharedRuntime::connect_startup(
+                        self.pool.clone(), service.clone(),
+                    ).await {
+                        Ok(runtime) => {
+                            handles.push(Arc::new(runtime).start_with_shutdown(self.shutdown_token()));
+                            tracing::info!("Enterprise-shared SOAR executor started");
+                        }
+                        Err(_) => {
+                            tracing::error!("Enterprise-shared SOAR executor unavailable; runs remain queued");
+                        }
+                    }
+                }
+            }
             if let Some(runtime) = self.tenant_alert_triage_runtime.as_ref() {
                 handles.push(runtime.clone().start_with_shutdown(self.shutdown_token()));
                 tracing::info!("Enterprise-shared alert triage runtime started");
@@ -1136,14 +1154,6 @@ impl AppState {
             nanosiem_core::webhooks::WebhookRepository::new(self.pool.clone()),
         );
 
-        // Per-(monitor, series) durable re-arm window: a persistent breach raises
-        // at most one alert per this window (O14; mirrors the SLO scheduler's
-        // durable re-arm). Defaults to 1h.
-        let rearm_secs: u64 = std::env::var("METRIC_MONITOR_REARM_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(3600);
-
         tokio::spawn(async move {
             let repo = nanosiem_core::observability::MetricMonitorRepository::new(pool.clone());
             // Last-evaluation instant per monitor id (in-memory due-time gate).
@@ -1187,7 +1197,6 @@ impl AppState {
                         &search_service,
                         &pool,
                         &monitor,
-                        rearm_secs,
                         &webhook_service,
                     );
                     match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
@@ -1228,16 +1237,13 @@ impl AppState {
     /// (`None` when the window had no data — never a fabricated 0.0). A `None`
     /// series is skipped: no comparison, no alert.
     ///
-    /// Re-arm (O14): each breaching series is gated by the durable
-    /// [`AlertRepository::latest_alert_at_for_source`] check keyed by
-    /// `(monitor, series)` with a `rearm_secs` window, so a persistent breach
-    /// raises at most one alert per series per window instead of one per eval
-    /// interval (mirrors the SLO scheduler's durable re-arm).
+    /// A persistent breach updates one open incident per series. Known healthy
+    /// samples close it; missing data preserves it. Only openings notify.
+    #[tracing::instrument(name = "scheduler.metric_monitor", skip_all)]
     async fn evaluate_one_metric_monitor(
         search_service: &nanosiem_core::SearchService,
         pool: &sqlx::PgPool,
         monitor: &nanosiem_core::observability::MetricMonitor,
-        rearm_secs: u64,
         webhook_service: &nanosiem_core::webhooks::WebhookService,
     ) -> anyhow::Result<()> {
         use nanosiem_core::query::{MetricAgg, MetricQuery, MetricTagFilter, TimeRange};
@@ -1256,6 +1262,11 @@ impl AppState {
             })
             .collect();
 
+        // Dedicated evaluation is serialized before taking its timestamp and
+        // querying samples, so a slow pass cannot race a later healthy window.
+        let mut tx = pool.begin().await?;
+        nanosiem_core::observability::metric_alert_lifecycle::reconcile(&mut tx, None, monitor.id)
+            .await?;
         let now = chrono::Utc::now();
         let begin = now - chrono::Duration::seconds(monitor.window_secs.max(1) as i64);
         let time_range = TimeRange::new(begin, now);
@@ -1281,128 +1292,58 @@ impl AppState {
             .await
             .map_err(|e| anyhow::anyhow!("metric query failed: {e}"))?;
 
-        // NAN-1541: raise through the UNIFIED alert spine.
-        let alert_repo = nanosiem_core::db::repository::AlertRepository::new(pool.clone());
-
+        if monitor.group_by.is_some()
+            && results
+                .iter()
+                .any(|(key, value)| !key.is_empty() && value.is_some())
+        {
+            nanosiem_core::observability::metric_alert_lifecycle::retire_unlabelled(
+                &mut tx, None, monitor.id, now,
+            )
+            .await?;
+        }
+        let mut notifications = Vec::new();
         for (series_key, value) in results {
-            // O13: a `None` scalar is no-data — neither a breach nor a
-            // comparison. Skip it rather than fabricate a 0.0 that would
-            // false-fire `lt`/`lte` monitors when the metric stops reporting.
-            let value = match value {
-                Some(v) => v,
-                None => continue,
-            };
-
-            if !nanosiem_core::observability::eval::metric_breach(monitor, Some(value)) {
+            let Some(value) = value.filter(|v| {
+                v.is_finite() && (monitor.group_by.is_none() || !series_key.is_empty())
+            }) else {
                 continue;
-            }
-
-            // Durable, time-based re-arm keyed by (monitor, series) — O14.
-            // Without this a persistent breach raises one High alert per series
-            // every eval interval (an alert storm). The authority is the
-            // persisted `alerts` table (survives jobs restart / leader
-            // failover), keyed via the per-series `source_id`; mirrors the SLO
-            // scheduler's re-arm gate.
-            let source_id = metric_monitor_source_id(monitor.id, &series_key);
-            match alert_repo
-                .latest_alert_at_for_source("metric_monitor", &source_id)
-                .await
-            {
-                Ok(Some(last_created)) => {
-                    if slo_alert_within_rearm(last_created, chrono::Utc::now(), rearm_secs) {
-                        // Within the re-arm window — this series already alerted
-                        // recently; skip to avoid a storm.
-                        continue;
-                    }
-                }
-                Ok(None) => {
-                    // No prior alert for this (monitor, series) — proceed to raise.
-                }
-                Err(e) => {
-                    // Re-arm lookup failed: skip raising this series rather than
-                    // risk a storm without the durable guard (mirrors the SLO
-                    // scheduler). The evaluation itself still succeeded, so the
-                    // due gate advances and the next due tick re-checks.
-                    tracing::warn!(
-                        monitor = %monitor.name,
-                        series = %series_key,
-                        error = %e,
-                        "Metric-monitor: re-arm lookup failed; skipping series this tick"
-                    );
-                    continue;
-                }
-            }
-
-            // Entity for webhook context (NAN-1741 A1): which series breached.
-            // Un-grouped monitors have an empty series key, so fall back to the
-            // monitor's service scope. Computed before `payload` so the move of
-            // `series_key` into the JSON below can't race it.
-            let webhook_entity = if series_key.is_empty() {
-                monitor.service_name.clone()
-            } else {
-                Some(series_key.clone())
             };
-
-            // Breach payload — captured in the alert's matched_events so the
-            // console can render which monitor/series/value tripped.
-            let payload = nanosiem_core::observability::eval::metric_payload(monitor, &series_key, value, now);
-
-            // Metric-monitor alerts are not tied to a detection rule, so
-            // `rule_id` is NULL (the FK is nullable) and the per-series key
-            // (monitor id + series) rides in `source_id`. High severity by
-            // default. No event-hash dedup — the durable re-arm gate above is
-            // the dedup boundary.
-            match alert_repo
-                .create_alert(nanosiem_core::db::repository::AlertInsert {
-                    kind: "metric_monitor",
-                    rule_id: None,
-                    source_id: Some(source_id),
-                    severity: &nanosiem_core::Severity::High,
-                    matched_events: &payload,
-                    event_hash: None,
-                    // A13 (NAN-1752): metric-monitor alerts have no match count.
-                    match_count: None,
-                })
-                .await
+            let source = metric_monitor_source_id(monitor.id, &series_key);
+            let payload = nanosiem_core::observability::eval::metric_payload(
+                monitor,
+                &series_key,
+                value,
+                now,
+            );
+            let breaching = nanosiem_core::observability::eval::metric_breach(monitor, Some(value));
+            if let Some(id) = nanosiem_core::observability::metric_alert_lifecycle::observe(
+                &mut tx, None, &source, breaching, &payload, now,
+            )
+            .await?
             {
-                Ok(alert) => {
-                    tracing::info!(
-                        monitor = %monitor.name,
-                        series = %series_key,
-                        value,
-                        threshold = monitor.threshold,
-                        comparator = monitor.comparator.as_str(),
-                        "Metric-monitor breach — alert raised"
-                    );
-
-                    // NAN-1741 A1: forward to obs_alert-subscribed webhooks.
-                    // kind "metric_monitor" maps to the obs_alert stream
-                    // (migration 217); mirrors the synthetic runner's fire shape.
-                    // Fire only after the row is durably created (never on error).
-                    let severity_str =
-                        format!("{:?}", nanosiem_core::Severity::High).to_lowercase();
-                    webhook_service
-                        .fire_alert(
-                            alert.id,
-                            "metric_monitor",
-                            None,
-                            &monitor.name,
-                            &severity_str,
-                            webhook_entity,
-                            &payload,
-                            alert.created_at,
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        monitor = %monitor.name,
-                        series = %series_key,
-                        error = %e,
-                        "Metric-monitor: failed to raise alert"
-                    );
-                }
+                let entity = if series_key.is_empty() {
+                    monitor.service_name.clone()
+                } else {
+                    Some(series_key)
+                };
+                notifications.push((id, entity, payload));
             }
+        }
+        tx.commit().await?;
+        for (id, entity, payload) in notifications {
+            webhook_service
+                .fire_alert(
+                    id,
+                    "metric_monitor",
+                    None,
+                    &monitor.name,
+                    "high",
+                    entity,
+                    &payload,
+                    now,
+                )
+                .await;
         }
 
         Ok(())
@@ -1656,15 +1597,7 @@ impl AppState {
     }
 }
 
-/// O14: durable per-series re-arm key for metric-monitor alerts.
-///
-/// Encodes `(monitor id, series key)` into the alert's `source_id` text so the
-/// durable [`AlertRepository::latest_alert_at_for_source`] lookup can re-arm per
-/// series (a monitor with `group_by` raises independent alerts per series). The
-/// monitor id is a hyphenated UUID (never contains `:`), so the first `:` cleanly
-/// separates the fixed prefix from the verbatim series key — the mapping is
-/// injective, which is all the durable lookup needs (it never parses the key
-/// back). A no-`group_by` monitor yields `""` as the series key → `"<id>:"`.
+/// Stable identity for the incident belonging to a monitor and series.
 fn metric_monitor_source_id(monitor_id: uuid::Uuid, series_key: &str) -> String {
     nanosiem_core::observability::eval::metric_monitor_source_id(monitor_id, series_key)
 }

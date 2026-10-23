@@ -2,6 +2,7 @@
 
 //! HTTP recovery policy for idempotent reads from a tenant-pinned lake worker.
 
+use crate::telemetry::http::{send_observed, execute_observed};
 use reqwest::{RequestBuilder, Response, StatusCode};
 use std::future::Future;
 use std::time::{Duration, Instant};
@@ -9,6 +10,11 @@ use std::time::{Duration, Instant};
 const DEFAULT_RECOVERY_WINDOW: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// NAN-4304: a deadline-bound replay is sent only while at least this much
+/// (or a quarter of a shorter deadline) is left after its delay. A replay
+/// with less time left cannot finish, and its timeout would replace the
+/// cell's real answer.
+const MIN_REPLAY_WINDOW: Duration = Duration::from_millis(500);
 
 /// NAN-3270: response header carrying a lake worker error's `reason`
 /// (the same value as the JSON body's), readable without the body.
@@ -79,9 +85,12 @@ async fn send_idempotent_with_recovery_policy(
     let retry_until = deadline.map_or(recovery_window, |d| d.min(recovery_window));
     let mut retry_delay = INITIAL_RETRY_DELAY;
     let mut replay = false;
+    // The last transient answer the worker gave. A replay that the deadline
+    // cuts short returns this, not its own timeout (NAN-4304).
+    let mut last_answer: Option<Response> = None;
     loop {
         let Some(mut attempt) = request.try_clone() else {
-            return request.send().await;
+            return send_observed(request).await;
         };
         if let Some(deadline) = deadline {
             // The attempt itself ends at the request deadline.
@@ -94,26 +103,44 @@ async fn send_idempotent_with_recovery_policy(
             // cell pod that is rolling away.
             let (_, built) = attempt.build_split();
             match built {
-                Ok(built) => fresh_connection_client().execute(built).await,
+                Ok(built) => execute_observed(fresh_connection_client(), built).await,
                 Err(error) => Err(error),
             }
         } else {
-            attempt.send().await
+            send_observed(attempt).await
         };
         replay = true;
+        let delay = jittered(retry_delay);
+        // Within a deadline, a replay must still have a usable window after
+        // its delay; without one the transport stops at the next answer.
+        let replay_fits = |elapsed: Duration| match deadline {
+            Some(deadline) => elapsed + delay + MIN_REPLAY_WINDOW.min(deadline / 4) < deadline,
+            None => true,
+        };
         match sent {
             Ok(response) => {
+                let elapsed = started.elapsed();
                 if !is_transient_lake_response(&response)
-                    || started.elapsed() >= retry_until
+                    || elapsed >= retry_until
+                    || !replay_fits(elapsed)
                 {
                     return Ok(response);
                 }
+                last_answer = Some(response);
             }
             Err(error) => {
+                let elapsed = started.elapsed();
                 if !is_transient_lake_transport_error(&error)
-                    || started.elapsed() >= retry_until
+                    || elapsed >= retry_until
+                    || !replay_fits(elapsed)
                 {
-                    return Err(error);
+                    // A deadline that cut a replay short keeps the worker's
+                    // own earlier answer (its status and reason) for the
+                    // caller instead of a bare timeout.
+                    return match last_answer {
+                        Some(answer) if deadline.is_some() && error.is_timeout() => Ok(answer),
+                        _ => Err(error),
+                    };
                 }
             }
         }
@@ -122,7 +149,7 @@ async fn send_idempotent_with_recovery_policy(
         if remaining.is_zero() {
             continue;
         }
-        tokio::time::sleep(jittered(retry_delay).min(remaining)).await;
+        tokio::time::sleep(delay.min(remaining)).await;
         retry_delay = retry_delay.saturating_mul(2).min(MAX_RETRY_DELAY);
     }
 }
@@ -271,6 +298,48 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert!(response.text().await.unwrap().contains("query_budget_exhausted"));
+    }
+
+    /// NAN-4304: a worker that stays transient (503, not a budget refusal)
+    /// through the whole request deadline answers the caller with its own
+    /// 503 and reason, inside the deadline: never a timeout from a replay
+    /// sent with no time left.
+    #[tokio::test]
+    async fn persistent_503_within_a_deadline_returns_the_workers_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = attempts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                server_attempts.fetch_add(1, Ordering::Relaxed);
+                let body = r#"{"ok":false,"reason":"part_data_unavailable","error":"parts"}"#;
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\n{LAKE_REASON_HEADER}: part_data_unavailable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let deadline = Duration::from_millis(1_500);
+        let started = Instant::now();
+        let response = send_idempotent_with_recovery_policy(
+            reqwest::Client::new().get(format!("http://{address}/v1/query")),
+            DEFAULT_RECOVERY_WINDOW,
+            Some(deadline),
+        )
+        .await
+        .expect("the worker's 503, not a deadline timeout");
+        server.abort();
+
+        assert!(started.elapsed() < deadline, "{:?}", started.elapsed());
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(attempts.load(Ordering::Relaxed) > 1, "a bare 503 is still replayed");
+        assert!(response.text().await.unwrap().contains("part_data_unavailable"));
     }
 
     #[tokio::test]

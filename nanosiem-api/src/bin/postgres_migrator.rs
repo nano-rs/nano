@@ -77,16 +77,17 @@ async fn run() -> Result<()> {
 
     #[cfg(feature = "enterprise")]
     {
-        // Re-expand the embedded overlay through 9000195 (per-tenant rotation
-        // health scope). `sqlx::migrate!` embeds the SQL at COMPILE time, so a
-        // new migration file is invisible to an already-built binary -- this
-        // comment is the call site that has to be touched for the rebuild, as
-        // 9000193 and 9000194 each did. build.rs also tracks the migration
-        // directory for future additions.
-        let mut overlay_migrator = sqlx::migrate!("../migrations/postgres-enterprise");
-        overlay_migrator.set_ignore_missing(true);
-        overlay_migrator
-            .run(&pool)
+        // NAN-4328: CONCURRENTLY prebuild for 9014330 on a populated control
+        // DB, in this same migrate step (autocommit, before the migration
+        // transaction); a no-op once 9014330 is applied.
+        let receipt = nanosiem_core::enterprise_shared_writer_jti_prebuild::run(&pool)
+            .await
+            .context("NAN-4328 writer JTI retention index prebuild")?;
+        tracing::info!(
+            receipt = %serde_json::to_string(&receipt).unwrap_or_default(),
+            "writer JTI retention index prebuild"
+        );
+        nanosiem_enterprise::postgres_migrations::run(&pool)
             .await
             .context("running enterprise PostgreSQL overlay migrations")?;
     }

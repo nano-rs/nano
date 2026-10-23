@@ -12,6 +12,11 @@
 //! The summary is a pure function over rows so the dedicated handler, the
 //! enterprise-shared (lean) handler and the runtimes' health signal all agree.
 
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -169,8 +174,24 @@ fn percentile(sorted: &[i64], pct: usize) -> i64 {
 /// passes `None`.
 pub fn record_schedule_lag(summary: &ScheduleLagSummary, tenant: Option<Uuid>) {
     let tenant_label = tenant.map(|t| t.to_string()).unwrap_or_else(|| "dedicated".into());
-    metrics::gauge!("nanosiem_detection_schedule_lag_max_seconds", "tenant" => tenant_label.clone())
-        .set(summary.max_lag_secs as f64);
+    // NAN-4031: identify the rule behind a max-lag page. Clear the previous
+    // labelled series when the worst rule changes (or recovers), so a stale
+    // failure cannot remain the maximum forever. Existing consumers can
+    // continue aggregating the same metric name by tenant.
+    static WORST_GAUGES: OnceLock<Mutex<HashMap<String, metrics::Gauge>>> = OnceLock::new();
+    let mut previous = WORST_GAUGES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(gauge) = previous.remove(&tenant_label) {
+        gauge.set(0.0);
+    }
+    let rule_id = summary.worst.first().map(|rule| rule.rule_id.clone()).unwrap_or_default();
+    let gauge = metrics::gauge!("nanosiem_detection_schedule_lag_max_seconds",
+        "tenant" => tenant_label.clone(), "rule_id" => rule_id);
+    gauge.set(summary.max_lag_secs as f64);
+    previous.insert(tenant_label.clone(), gauge);
+    drop(previous);
     metrics::gauge!("nanosiem_detection_schedule_lag_p95_seconds", "tenant" => tenant_label.clone())
         .set(summary.p95_lag_secs as f64);
     metrics::gauge!("nanosiem_detection_rules_behind_schedule", "tenant" => tenant_label.clone())

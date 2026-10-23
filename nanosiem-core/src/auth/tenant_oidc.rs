@@ -327,6 +327,8 @@ pub enum TenantOidcError {
     IdentityNotInvited,
     #[error("your account is not in a group allowed to access this tenant")]
     GroupNotAllowed,
+    #[error("group membership could not be verified")]
+    GroupMembershipUnknown,
     #[error("tenant OIDC lookup unavailable — failing closed")]
     Unavailable,
     #[error("tenant OIDC credential could not be decrypted")]
@@ -919,14 +921,16 @@ impl TenantOidcRepository {
             if authorization.access_policy.google_delegated_admin.is_none() {
                 return Ok(());
             }
-            let credential = self.decrypt_provider_secret(encrypted)?;
+            let credential = self
+                .decrypt_provider_secret(encrypted)
+                .map_err(|_| TenantOidcError::GroupMembershipUnknown)?;
             identity.groups = super::google_workspace_groups(
                 &authorization.access_policy,
                 &credential,
                 &identity.email,
             )
             .await
-            .map_err(|_| TenantOidcError::Unavailable)?;
+            .map_err(|_| TenantOidcError::GroupMembershipUnknown)?;
         }
         Ok(())
     }

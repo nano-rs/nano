@@ -416,7 +416,7 @@ impl Default for MetricAgg {
 /// (`ClickHouseSqlGenerator::metric_rate_expr` in `aggregation.rs`) and hardcodes
 /// the `otel_metrics` `timestamp` time column and `value` measurement column —
 /// this dataset always carries both. Cross-series contamination within a single
-/// grouping is the same accepted limitation as the nPL rate path (O15).
+/// grouping remains a limitation of the nPL rate path (O15); metrics-v2 rates partition full series first (NAN-4031).
 const METRIC_CUMULATIVE_WINDOW_DELTA_EXPR: &str = "arraySum(arrayMap(d -> if(d > 0, d, 0), arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value)))))))";
 
 /// Temporality-aware `sum` for the metrics dataset (NAN-1734, O26 consumer half).
@@ -453,6 +453,44 @@ fn metric_rate_expr() -> String {
     format!(
         "{} / greatest(dateDiff('second', min(timestamp), max(timestamp)), 1)",
         metric_sum_expr()
+    )
+}
+
+/// NAN-4031: difference each complete metric series before summing rates into the requested attribute group.
+/// Canonical attribute ordering keeps equivalent maps in the same series even when an SDK reorders its tags.
+/// Hashing canonical maps avoids grouping by variable-length arrays (200k-point benchmark: ~25–31%
+/// over the former unpartitioned path, accepted in favor of replica/reset correctness).
+fn grouped_metric_rate_sql(
+    table: &str,
+    series_select: &str,
+    filter: &str,
+    time_range: &TimeRange,
+    step_secs: Option<u64>,
+) -> String {
+    let value_expr = metric_rate_expr();
+    let (bucket_select, group_keys, count_select, limit) = match step_secs {
+        Some(step) => (
+            format!(", toStartOfInterval(timestamp, toIntervalSecond({step})) AS bucket"),
+            "series_key, bucket",
+            "",
+            200000,
+        ),
+        None => (
+            String::new(),
+            "series_key",
+            ", sum(row_count) AS row_count",
+            100000,
+        ),
+    };
+    format!(
+        "SELECT {group_keys}, sum(v) AS v{count_select}\n\
+         FROM (SELECT {series_select}{bucket_select}, {value_expr} AS v, count() AS row_count\n\
+         FROM {table}\n\
+         WHERE timestamp BETWEEN '{start}' AND '{end}' AND ({filter})\n\
+         GROUP BY {group_keys}, cityHash64(metric_name, service_name, mapSort(attributes), mapSort(resource_attributes)))\n\
+         GROUP BY {group_keys} ORDER BY {group_keys} ASC LIMIT {limit}",
+        start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+        end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
     )
 }
 
@@ -552,10 +590,18 @@ fn tag_lookup_expr(key: &str) -> String {
     // `if(has(map,k), map[k], fallback)` — map[absent] yields '' for
     // Map(_,String), but be explicit so a real empty-string value and an absent
     // key are both handled and the fallback to resource is unambiguous.
-    format!(
+    let direct = format!(
         "if(has(attributes, '{k}'), attributes['{k}'], \
          if(has(resource_attributes, '{k}'), resource_attributes['{k}'], ''))"
-    )
+    );
+    if key == "instance" {
+        format!(
+            "if(({direct}) = '', if(resource_attributes['host.name'] != '', \
+            resource_attributes['host.name'], resource_attributes['k8s.node.name']), {direct})"
+        )
+    } else {
+        direct
+    }
 }
 
 /// Validate a tag/attribute key for use as a `group_by` or filter key
@@ -622,6 +668,10 @@ pub fn metric_timeseries_v2_sql(
         _ => ("'' AS series_key".to_string(), "bucket"),
     };
 
+    if query.agg == MetricAgg::Rate {
+        return grouped_metric_rate_sql(&table, &series_select, &filter, time_range, Some(step));
+    }
+
     format!(
         "SELECT {series_select},\n       \
                 toStartOfInterval(timestamp, toIntervalSecond({step})) AS bucket,\n       \
@@ -686,6 +736,10 @@ pub fn metric_scalar_sql(
         // No group_by → a single scalar row; emit a constant key for shape parity.
         _ => ("'' AS series_key".to_string(), String::new()),
     };
+
+    if query.agg == MetricAgg::Rate {
+        return grouped_metric_rate_sql(&table, &series_select, &filter, time_range, None);
+    }
 
     format!(
         "SELECT {series_select},\n       \
@@ -1333,6 +1387,9 @@ pub struct InfraHostsFilters<'a> {
 }
 
 /// SQL for the Infra host inventory (`GET /api/search/infra/hosts`).
+/// NAN-4028: when system.* series are absent, raw node-exporter memory/load
+/// gauges and per-scrape interface-counter sums supply the same columns.
+/// Existing OTel readings, including zero, always take precedence.
 ///
 /// One row per host over `[time_range]` on `timestamp` (partition-pruned),
 /// reading from `otel_metrics`. Host identity is
@@ -1364,6 +1421,7 @@ pub fn infra_hosts_sql(
     // lowercased (for `q`) / escaped. host.group / deployment.environment are
     // exact matches; `q` is a case-insensitive substring on the host name.
     let mut extra = String::new();
+    let mut group_filter = String::new();
     if let Some(q) = filters.q {
         if !q.is_empty() {
             extra.push_str(&format!(
@@ -1374,10 +1432,7 @@ pub fn infra_hosts_sql(
     }
     if let Some(group) = filters.group {
         if !group.is_empty() {
-            extra.push_str(&format!(
-                "\n  AND resource_attributes['host.group'] = '{}'",
-                escape_string(group)
-            ));
+            group_filter.push_str(&format!("\nHAVING host_group = '{}'", escape_string(group)));
         }
     }
     if let Some(env) = filters.env {
@@ -1389,21 +1444,57 @@ pub fn infra_hosts_sql(
         }
     }
 
+    // NAN-4028: aggregate node-exporter interfaces per scrape at query time.
+    // Bound both UNION branches before aggregation; keep customer OTel series.
+    let node_source = format!(
+        "WITH infra_raw AS (SELECT resource_attributes, attributes, timestamp, metric_name, value \
+         FROM {table} WHERE timestamp BETWEEN '{start}' AND '{end}' \
+         AND metric_name IN ('system.cpu.utilization', 'system.memory.utilization', 'system.cpu.load_average.1m', 'system.network.io', 'system.cpu.usage', 'system.cpu.logical.count', 'system.memory.usage', 'system.network.io.total', 'k8s.pod.restarts', 'nano.infra.health', 'node_memory_MemAvailable_bytes', 'node_memory_MemTotal_bytes', 'node_load1', 'node_network_receive_bytes_total', 'node_network_transmit_bytes_total') AND resource_attributes['host.name'] != ''{extra}), \
+         infra_samples AS (SELECT resource_attributes, timestamp, metric_name, value FROM infra_raw \
+         UNION ALL SELECT resource_attributes, timestamp, 'nano.node.network.io.total', \
+         sum(value) FROM infra_raw \
+         WHERE metric_name IN ('node_network_receive_bytes_total', 'node_network_transmit_bytes_total') \
+         AND attributes['device'] != '' AND NOT match(attributes['device'], '^(lo|veth|cali|cni|docker|flannel)') \
+         GROUP BY resource_attributes, timestamp) ",
+        start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+        end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
+    );
+
     format!(
-        "SELECT resource_attributes['host.name'] AS host,\n       \
-                any(if(resource_attributes['host.group'] != '', resource_attributes['host.group'], service_name)) AS host_group,\n       \
+        "{node_source}SELECT resource_attributes['host.name'] AS host,\n       \
+                argMaxIf(resource_attributes['host.group'], timestamp, resource_attributes['host.group'] != '') AS host_group,\n       \
+                argMaxIf(resource_attributes['nano.infra.kind'], timestamp, resource_attributes['nano.infra.kind'] != '') AS kind,\n       \
+                argMaxIf(resource_attributes['k8s.node.name'], timestamp, resource_attributes['k8s.node.name'] != '') AS node_name,\n       \
+                argMaxIf(resource_attributes['k8s.pod.name'], timestamp, resource_attributes['k8s.pod.name'] != '') AS pod_name,\n       \
+                argMaxIf(resource_attributes['k8s.namespace.name'], timestamp, resource_attributes['k8s.namespace.name'] != '') AS namespace,\n       \
+                argMaxIf(resource_attributes['k8s.workload.name'], timestamp, resource_attributes['k8s.workload.name'] != '') AS workload,\n       \
+                argMaxIf(resource_attributes['k8s.pod.phase'], timestamp, resource_attributes['k8s.pod.phase'] != '') AS phase,\n       \
+                argMaxIf(resource_attributes['nano.cluster'], timestamp, resource_attributes['nano.cluster'] != '') AS cluster,\n       \
+                argMaxIf(resource_attributes['cloud.region'], timestamp, resource_attributes['cloud.region'] != '') AS region,\n       \
+                argMaxIf(resource_attributes['host.type'], timestamp, resource_attributes['host.type'] != '') AS instance_type,\n       \
+                argMaxIf(value, timestamp, metric_name = 'system.cpu.usage') AS cpu_cores,\n       \
+                countIf(metric_name = 'system.cpu.usage') AS cpu_cores_n,\n       \
+                argMaxIf(value, timestamp, metric_name = 'system.cpu.logical.count') AS cpu_count,\n       \
+                countIf(metric_name = 'system.cpu.logical.count') AS cpu_count_n,\n       \
+                argMaxIf(value, timestamp, metric_name = 'system.memory.usage') AS mem_bytes,\n       \
+                countIf(metric_name = 'system.memory.usage') AS mem_bytes_n,\n       \
+                argMaxIf(value, timestamp, metric_name = 'k8s.pod.restarts') AS restarts,\n       \
+                countIf(metric_name = 'k8s.pod.restarts') AS restarts_n,\n       \
+                argMaxIf(value, timestamp, metric_name = 'nano.infra.health') AS health,\n       \
+                countIf(metric_name = 'nano.infra.health') AS health_n,\n       \
+                if(countIf(metric_name IN ('system.network.io.total', 'system.network.io')) > 0, if(countIf(metric_name = 'system.network.io.total') >= 2 AND argMaxIf(value, timestamp, metric_name = 'system.network.io.total') >= argMinIf(value, timestamp, metric_name = 'system.network.io.total'), (argMaxIf(value, timestamp, metric_name = 'system.network.io.total') - argMinIf(value, timestamp, metric_name = 'system.network.io.total')) / nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = 'system.network.io.total'), maxIf(timestamp, metric_name = 'system.network.io.total')) / 1000.0, 0), NULL), if(countIf(metric_name = 'nano.node.network.io.total') >= 2 AND argMaxIf(value, timestamp, metric_name = 'nano.node.network.io.total') >= argMinIf(value, timestamp, metric_name = 'nano.node.network.io.total'), (argMaxIf(value, timestamp, metric_name = 'nano.node.network.io.total') - argMinIf(value, timestamp, metric_name = 'nano.node.network.io.total')) / nullIf(dateDiff('millisecond', minIf(timestamp, metric_name = 'nano.node.network.io.total'), maxIf(timestamp, metric_name = 'nano.node.network.io.total')) / 1000.0, 0), NULL)) AS net_rate,\n       \
                 argMaxIf(value, timestamp, metric_name = 'system.cpu.utilization') AS cpu_util,\n       \
-                argMaxIf(value, timestamp, metric_name = 'system.memory.utilization') AS mem_util,\n       \
-                argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m') AS load_1m,\n       \
+                if(countIf(metric_name = 'system.memory.utilization') > 0, argMaxIf(value, timestamp, metric_name = 'system.memory.utilization'), if(countIf(metric_name = 'node_memory_MemAvailable_bytes') > 0 AND argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes') > 0, 1 - argMaxIf(value, timestamp, metric_name = 'node_memory_MemAvailable_bytes') / nullIf(argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes'), 0), NULL)) AS mem_util,\n       \
+                if(countIf(metric_name = 'system.cpu.load_average.1m') > 0, argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m'), argMaxIf(value, timestamp, metric_name = 'node_load1')) AS load_1m,\n       \
                 argMaxIf(value, timestamp, metric_name = 'system.network.io') AS net_io,\n       \
                 countIf(metric_name = 'system.cpu.utilization') AS cpu_n,\n       \
-                countIf(metric_name = 'system.memory.utilization') AS mem_n,\n       \
-                countIf(metric_name = 'system.cpu.load_average.1m') AS load_n,\n       \
+                if(countIf(metric_name = 'system.memory.utilization') > 0, countIf(metric_name = 'system.memory.utilization'), if(countIf(metric_name = 'node_memory_MemAvailable_bytes') > 0 AND argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes') > 0, 1, 0)) AS mem_n,\n       \
+                (countIf(metric_name = 'system.cpu.load_average.1m') + countIf(metric_name = 'node_load1')) AS load_n,\n       \
                 countIf(metric_name = 'system.network.io') AS net_n\n\
-         FROM {table}\n\
+         FROM infra_samples AS {table_ref}\n\
          WHERE {table_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
-           AND resource_attributes['host.name'] != ''{extra}\n\
-         GROUP BY host\n\
+           AND metric_name IN ('system.cpu.utilization', 'system.memory.utilization', 'system.cpu.load_average.1m', 'system.network.io', 'system.cpu.usage', 'system.cpu.logical.count', 'system.memory.usage', 'system.network.io.total', 'k8s.pod.restarts', 'nano.infra.health', 'node_memory_MemAvailable_bytes', 'node_memory_MemTotal_bytes', 'node_load1', 'nano.node.network.io.total') AND resource_attributes['host.name'] != ''{extra}\n\
+         GROUP BY host{group_filter}\n\
          ORDER BY host ASC\n\
          LIMIT 10000",
         start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),

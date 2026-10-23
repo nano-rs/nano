@@ -496,7 +496,8 @@ async fn server_main() -> Result<()> {
     let app = create_router(state.clone())
         .layer(prometheus_layer)
         .merge(app_metrics.metrics_router())
-        .merge(nanosiem_api::hosted_config_router());
+        .merge(nanosiem_api::hosted_config_router())
+        .merge(nanosiem_api::soar_egress_router(&state));
 
     let wait_for_shutdown = async {
         match nanosiem_core::shutdown::wait_for_shutdown_signal().await {

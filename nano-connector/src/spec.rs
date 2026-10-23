@@ -473,6 +473,10 @@ pub enum Method {
     #[default]
     Get,
     Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
 }
 
 /// Request body: set exactly one of `form` or `json`.

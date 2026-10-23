@@ -40,5 +40,5 @@
     "time",
     "user.name"
   ],
-  "sql": "WITH stage_0 AS (\n  SELECT \"actor.user.name\", message, \"metadata.log_source\", \"metadata.uid\", time, \"user.name\" FROM __nano_lake_source__\n  WHERE time BETWEEN '2026-09-21 13:15:00.000000' AND '2026-09-21 14:15:00.000000'\n  AND (((lower(\"actor.user.name\") = 'jsmith' OR lower(\"user.name\") = 'jsmith')))\n),\nstage_1 AS (\n  SELECT toStartOfInterval(time, INTERVAL 2 MINUTE) AS time_bucket, count() AS count\n  FROM stage_0\n  GROUP BY time_bucket\n  ORDER BY time_bucket\n)\nSELECT * FROM stage_1 LIMIT 100 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=1, optimize_aggregation_in_order=1"
+  "sql": "WITH stage_0 AS (\n  SELECT \"actor.user.name\", message, \"metadata.log_source\", \"metadata.uid\", time, \"user.name\" FROM __nano_lake_source__\n  WHERE time >= '2026-09-21 13:15:00.000000' AND time < '2026-09-21 14:15:00.000000'\n  AND (((lower(\"actor.user.name\") = 'jsmith' OR lower(\"user.name\") = 'jsmith')))\n),\nstage_1 AS (\n  SELECT toStartOfInterval(time, INTERVAL 2 MINUTE) AS time_bucket, count() AS count\n  FROM stage_0\n  GROUP BY time_bucket\n  ORDER BY time_bucket\n)\nSELECT * FROM stage_1 LIMIT 100 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=1, optimize_aggregation_in_order=1"
 }

@@ -51,7 +51,7 @@ const PATHS: &[(&str, &str)] = &[
 
 const DNS_OVER_HTTPS_WHERES: &str = r#"WITH stage_0 AS (
   SELECT * FROM __nano_lake_source__
-  WHERE time BETWEEN '2026-09-28 00:00:00.000000' AND '2026-09-29 00:00:00.000000'
+  WHERE time >= '2026-09-28 00:00:00.000000' AND time < '2026-09-29 00:00:00.000000'
   AND (class_uid = 4002)
 ),
 stage_1 AS (
@@ -297,7 +297,7 @@ const ENRICHED_PATHS: &[(&str, &str)] = &[
 ///  | where is_private_ip(src_endpoint.ip) AND is_private_ip(dst_endpoint.ip)`.
 const RDP_LATERAL_MOVEMENT: &str = r#"WITH stage_0 AS (
   SELECT * FROM __nano_lake_source__
-  WHERE time BETWEEN '2026-09-28 00:00:00.000000' AND '2026-09-29 00:00:00.000000'
+  WHERE time >= '2026-09-28 00:00:00.000000' AND time < '2026-09-29 00:00:00.000000'
   AND ((class_uid = 4001 AND "dst_endpoint.port" = 3389))
 ),
 stage_1 AS (
@@ -414,4 +414,128 @@ async fn rdp_lateral_movement_runs_on_native_enriched_ocsf_parts() {
     assert_eq!(rows[1]["src_endpoint"]["hostname"], "ws-1");
     assert_eq!(rows[1]["dst_endpoint"]["port"], 3389);
     assert_eq!(rows[1]["enrichments"].as_array().map(Vec::len), Some(2));
+}
+
+/// NAN-4310: post-aggregation `| where` / `sort` / `head` on an aggregate
+/// alias over parts that carry no `count` column. The compiler's stage_0
+/// projects the OCSF base-event `count` leaf (a known physical column) and
+/// declares it in `required_columns`; the planner binds it as a typed NULL,
+/// and `stats`' own `count() AS count` shadows it downstream. A bare source
+/// binding without that default reads `count` as the aggregate function
+/// (chDB Code 215), so this pins the planner contract on the real native
+/// path. The SQL is `lake_query_compile`'s output for each query.
+#[tokio::test]
+#[ignore = "requires a digest-verified native chDB library"]
+async fn aggregate_alias_where_sort_head_run_on_parts_without_a_count_column() {
+    let fixture = fixture();
+    let cases: &[(&str, &str, &[(&str, &str)], Value)] = &[
+        (
+            "* | stats count by dst_endpoint.ip | where count > 1 | sort -count | head 5",
+            r#"WITH stage_0 AS (
+  SELECT count, "dst_endpoint.ip", message, "metadata.log_source", "metadata.uid", time FROM __nano_lake_source__
+  WHERE time >= '2026-09-28 00:00:00.000000' AND time < '2026-09-29 00:00:00.000000'
+  AND (1)
+),
+stage_1 AS (
+  SELECT "dst_endpoint.ip" AS "dst_endpoint.ip", count() AS count
+  FROM stage_0
+  GROUP BY "dst_endpoint.ip"
+),
+stage_2 AS (
+  SELECT * FROM stage_1
+  WHERE count > 1
+),
+stage_3 AS (
+  SELECT * FROM stage_2
+  ORDER BY count DESC, "dst_endpoint.ip" ASC
+),
+stage_4 AS (
+  SELECT * FROM stage_3
+  LIMIT 5
+)
+SELECT * FROM stage_4 LIMIT 10000 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"#,
+            &[("count", "string"), ("dst_endpoint.ip", "string"), ("message", "string"), ("metadata.log_source", "string"), ("metadata.uid", "string"), ("time", "timestamp")],
+            json!([{"count": 2, "dst_endpoint.ip": "1.1.1.1"}]),
+        ),
+        (
+            "* | stats count by metadata.log_source | sort -count | head 1",
+            r#"WITH stage_0 AS (
+  SELECT count, message, "metadata.log_source", "metadata.uid", time FROM __nano_lake_source__
+  WHERE time >= '2026-09-28 00:00:00.000000' AND time < '2026-09-29 00:00:00.000000'
+  AND (1)
+),
+stage_1 AS (
+  SELECT "metadata.log_source" AS "metadata.log_source", count() AS count
+  FROM stage_0
+  GROUP BY "metadata.log_source"
+),
+stage_2 AS (
+  SELECT * FROM stage_1
+  ORDER BY count DESC, "metadata.log_source" ASC
+),
+stage_3 AS (
+  SELECT * FROM stage_2
+  LIMIT 1
+)
+SELECT * FROM stage_3 LIMIT 10000 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"#,
+            &[("count", "string"), ("message", "string"), ("metadata.log_source", "string"), ("metadata.uid", "string"), ("time", "timestamp")],
+            json!([{"count": 3, "metadata.log_source": "proxy"}]),
+        ),
+        (
+            "* | stats dc(src_endpoint.ip) as hosts, count by dst_endpoint.ip | where hosts > 1 AND count > 1",
+            r#"WITH stage_0 AS (
+  SELECT count, "dst_endpoint.ip", message, "metadata.log_source", "metadata.uid", "src_endpoint.ip", time FROM __nano_lake_source__
+  WHERE time >= '2026-09-28 00:00:00.000000' AND time < '2026-09-29 00:00:00.000000'
+  AND (1)
+),
+stage_1 AS (
+  SELECT "dst_endpoint.ip" AS "dst_endpoint.ip", uniqExact("src_endpoint.ip") AS hosts, count() AS count
+  FROM stage_0
+  GROUP BY "dst_endpoint.ip"
+),
+stage_2 AS (
+  SELECT * FROM stage_1
+  ORDER BY count DESC, "dst_endpoint.ip" ASC
+),
+stage_3 AS (
+  SELECT * FROM stage_2
+  WHERE (hosts > 1 AND count > 1)
+)
+SELECT * FROM stage_3 LIMIT 10000 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"#,
+            &[("count", "string"), ("dst_endpoint.ip", "string"), ("message", "string"), ("metadata.log_source", "string"), ("metadata.uid", "string"), ("src_endpoint.ip", "string"), ("time", "timestamp")],
+            json!([{"count": 2, "dst_endpoint.ip": "1.1.1.1", "hosts": 2}]),
+        ),
+        (
+            "* | stats count | where count > 2",
+            r#"WITH stage_0 AS (
+  SELECT count, message, "metadata.log_source", "metadata.uid", time FROM __nano_lake_source__
+  WHERE time >= '2026-09-28 00:00:00.000000' AND time < '2026-09-29 00:00:00.000000'
+  AND (1)
+),
+stage_1 AS (
+  SELECT count() AS count
+  FROM stage_0
+),
+stage_2 AS (
+  SELECT * FROM stage_1
+  WHERE count > 2
+)
+SELECT * FROM stage_2 LIMIT 10000 SETTINGS max_threads=16, max_execution_time=300, optimize_read_in_order=0, optimize_aggregation_in_order=0"#,
+            &[("count", "string"), ("message", "string"), ("metadata.log_source", "string"), ("metadata.uid", "string"), ("time", "timestamp")],
+            json!([{"count": 3}]),
+        ),
+    ];
+    for (query, sql, required, expected) in cases {
+        let compiled: CompiledQuery = serde_json::from_value(json!({
+            "schema_version":1,"profile":"ocsf","dataset":"logs",
+            "source_placeholder":"__nano_lake_source__","query_sha256":"a".repeat(64),
+            "start":"2026-09-28T00:00:00Z","end":"2026-09-29T00:00:00Z",
+            "limit":10000,"table_view":true,"newest_first_event_rows":false,
+            "required_columns": required.iter().map(|(name, field_type)| json!({"name":name,"field_type":field_type})).collect::<Vec<_>>(),
+            "sql": sql,
+        }))
+        .unwrap();
+        let rows = run(&fixture, &compiled).await;
+        assert_eq!(Value::Array(rows), *expected, "{query}");
+    }
 }

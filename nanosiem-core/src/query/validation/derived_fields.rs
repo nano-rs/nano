@@ -235,6 +235,12 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             for sb in split_by {
                 fields.insert(sb.to_lowercase());
             }
+            // NAN-4289 (F25): a split timechart pivots into one column per
+            // series VALUE (`GET`, `POST`, `OTHER`), known only at runtime.
+            // Later commands may address them (`| where GET > 7000`).
+            if !split_by.is_empty() {
+                fields.insert(DYNAMIC_PIPELINE_SCHEMA.to_string());
+            }
             for agg in aggregations {
                 fields.insert(get_aggregation_output_name(agg));
                 insert_agg_reference_alias(agg, fields);

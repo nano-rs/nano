@@ -8,6 +8,7 @@
 pub mod attack_names;
 pub mod data_sources;
 pub(crate) mod mapping;
+pub use mapping::{mitre_mapping_unchanged, validate_mitre_mapping_for_write};
 mod repository;
 mod sync;
 mod types;

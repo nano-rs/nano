@@ -1,20 +1,69 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Short-lived CONNECT capabilities. Tokens deliberately have no Debug representation.
+//!
+//! One HMAC construction, domain-separated by purpose (NAN-4369). Each purpose
+//! signs a distinct message prefix AND is deployed with its own key, so an
+//! inputlookup token can never authorize a SOAR tunnel or the reverse.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use uuid::Uuid;
 
-pub fn sign(key: &[u8], tenant: Uuid, host: &str, exp: i64) -> Option<String> {
-    if key.len() < 32 || tenant.is_nil() {
-        return None;
+/// What a CONNECT capability is for. Every field of the purpose is signed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EgressPurpose {
+    /// Shared inputlookup URL fetches: `v1|tenant|host|exp` (unchanged wire form).
+    InputLookup,
+    /// A native SOAR vendor call for one tenant connection at one revision:
+    /// `soar-v1|tenant|connection|revision|host|exp`.
+    Soar { connection: Uuid, revision: i64 },
+}
+
+impl EgressPurpose {
+    fn message(self, tenant: Uuid, host: &str, exp: i64) -> Option<String> {
+        match self {
+            Self::InputLookup => Some(format!("v1|{tenant}|{host}|{exp}")),
+            Self::Soar { connection, revision } if !connection.is_nil() && revision >= 0 => Some(
+                format!("soar-v1|{tenant}|{connection}|{revision}|{host}|{exp}"),
+            ),
+            Self::Soar { .. } => None,
+        }
     }
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
-    mac.update(format!("v1|{tenant}|{host}|{exp}").as_bytes());
-    Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+pub fn sign(key: &[u8], tenant: Uuid, host: &str, exp: i64) -> Option<String> {
+    sign_for(key, EgressPurpose::InputLookup, tenant, host, exp)
 }
 
 pub fn verify(key: &[u8], tenant: Uuid, host: &str, token: &str, exp: i64, now: i64) -> bool {
+    verify_for(key, EgressPurpose::InputLookup, tenant, host, token, exp, now)
+}
+
+pub fn sign_for(
+    key: &[u8],
+    purpose: EgressPurpose,
+    tenant: Uuid,
+    host: &str,
+    exp: i64,
+) -> Option<String> {
+    if key.len() < 32 || tenant.is_nil() {
+        return None;
+    }
+    let message = purpose.message(tenant, host, exp)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).ok()?;
+    mac.update(message.as_bytes());
+    Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+pub fn verify_for(
+    key: &[u8],
+    purpose: EgressPurpose,
+    tenant: Uuid,
+    host: &str,
+    token: &str,
+    exp: i64,
+    now: i64,
+) -> bool {
     if key.len() < 32
         || tenant.is_nil()
         || exp <= now
@@ -25,13 +74,16 @@ pub fn verify(key: &[u8], tenant: Uuid, host: &str, token: &str, exp: i64, now: 
     {
         return false;
     }
+    let Some(message) = purpose.message(tenant, host, exp) else {
+        return false;
+    };
     let Ok(bytes) = URL_SAFE_NO_PAD.decode(token) else {
         return false;
     };
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(key) else {
         return false;
     };
-    mac.update(format!("v1|{tenant}|{host}|{exp}").as_bytes());
+    mac.update(message.as_bytes());
     mac.verify_slice(&bytes).is_ok()
 }
 
@@ -121,5 +173,35 @@ mod tests {
         ));
         assert!(service_token_matches(&key, &key));
         assert!(!service_token_matches(&key, &[43; 32]));
+    }
+
+    #[test]
+    fn soar_capability_binds_connection_revision_and_is_domain_separated() {
+        let key = [42; 32];
+        let tenant = Uuid::new_v4();
+        let connection = Uuid::new_v4();
+        let soar = EgressPurpose::Soar { connection, revision: 3 };
+        let token = sign_for(&key, soar, tenant, "acme.okta.com", 1060).unwrap();
+        assert!(verify_for(&key, soar, tenant, "acme.okta.com", &token, 1060, 1000));
+        // Another revision, connection, tenant or host: denied.
+        for other in [
+            EgressPurpose::Soar { connection, revision: 4 },
+            EgressPurpose::Soar { connection: Uuid::new_v4(), revision: 3 },
+        ] {
+            assert!(!verify_for(&key, other, tenant, "acme.okta.com", &token, 1060, 1000));
+        }
+        assert!(!verify_for(&key, soar, Uuid::new_v4(), "acme.okta.com", &token, 1060, 1000));
+        assert!(!verify_for(&key, soar, tenant, "evil.okta.com", &token, 1060, 1000));
+        // Expired, or too far in the future: denied.
+        assert!(!verify_for(&key, soar, tenant, "acme.okta.com", &token, 1060, 1060));
+        assert!(!verify_for(&key, soar, tenant, "acme.okta.com", &token, 1060, 999));
+        // Domain separation: neither purpose's token verifies as the other,
+        // even under the same key.
+        assert!(!verify(&key, tenant, "acme.okta.com", &token, 1060, 1000));
+        let lookup = sign(&key, tenant, "acme.okta.com", 1060).unwrap();
+        assert!(!verify_for(&key, soar, tenant, "acme.okta.com", &lookup, 1060, 1000));
+        // A nil connection or a negative revision never signs.
+        assert!(sign_for(&key, EgressPurpose::Soar { connection: Uuid::nil(), revision: 1 }, tenant, "acme.okta.com", 1060).is_none());
+        assert!(sign_for(&key, EgressPurpose::Soar { connection, revision: -1 }, tenant, "acme.okta.com", 1060).is_none());
     }
 }

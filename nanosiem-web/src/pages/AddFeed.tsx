@@ -87,6 +87,7 @@ import { IngestEndpointCard } from '@/components/add-data/IngestEndpointCard';
 import { IssueCredentialPanel } from '@/components/add-data/IssueCredentialPanel';
 import { INGEST_CREDENTIALS_PATH } from '@/components/add-data/LogSourcesTabs';
 import { Checkbox } from '@/components/ui/checkbox';
+import { useCapabilities } from '@/hooks/use-capabilities';
 
 // ------------------------------------------------------------------
 // Constants — lifted verbatim from design-ref/shadcn/add-feed-view.jsx
@@ -1338,6 +1339,8 @@ function AddFeedHero({
   /** Hosted-shared tenants: "Add data", and the tenant's ingest host in place of the transport. */
   shared?: { hostname?: string };
 }) {
+  // NAN-4132: pivt copy only where AI exists (open core has none; unknown = none).
+  const aiAvailable = useCapabilities().capabilities.melod === true;
   return (
     <div className="shrink-0 border-b border-border bg-card/40 px-5 py-4 flex items-start gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-primary/30 bg-primary/[0.08] flex items-center justify-center shrink-0">
@@ -1352,8 +1355,8 @@ function AddFeedHero({
         </div>
         <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
           {shared
-            ? 'Pick how data arrives and which source it is, then issue a credential for your ingest endpoint. For a source nano does not parse yet, build a custom parser first; pivt drafts it from your samples.'
-            : 'Define a feed identifier, parse incoming events with VRL, and route them to a repository. pivt will draft the parser from your samples — review, validate, and deploy in one place.'}
+            ? `Pick how data arrives and which source it is, then issue a credential for your ingest endpoint. For a source nano does not parse yet, build a custom parser first${aiAvailable ? '; pivt drafts it from your samples.' : '.'}`
+            : `Define a feed identifier, parse incoming events with VRL, and route them to a repository. ${aiAvailable ? 'pivt will draft the parser from your samples — review, validate, and deploy in one place.' : 'Write the parser against your samples, then validate and deploy in one place.'}`}
         </div>
       </div>
       <div className="hidden md:flex items-center gap-3 shrink-0">
@@ -2945,7 +2948,7 @@ type VrlPanelProps = {
   draftSaved: boolean;
 };
 
-function VrlPanel(props: VrlPanelProps) {
+export function VrlPanel(props: VrlPanelProps) {
   const {
     vrl,
     setVrl,
@@ -2968,6 +2971,11 @@ function VrlPanel(props: VrlPanelProps) {
     applyPivtSuggestion,
     draftSaved,
   } = props;
+  // NAN-4132: the pivt tab, chat and "Generate with pivt" exist only when AI
+  // does (`capabilities.melod`). Open core has no AI; an unknown capability is
+  // treated as none (fail closed) and a stale 'ai' pane falls back to Diagnostics.
+  const aiAvailable = useCapabilities().capabilities.melod === true;
+  const activePane = !aiAvailable && sidePane === 'ai' ? 'diag' : sidePane;
 
   const [sidePaneCollapsed, setSidePaneCollapsedState] = useState<boolean>(
     () => typeof window !== 'undefined' && localStorage.getItem('add-feed-side-pane-collapsed') === '1',
@@ -2981,7 +2989,7 @@ function VrlPanel(props: VrlPanelProps) {
     }
   };
 
-  const tabs: Array<{
+  const allTabs: Array<{
     id: 'diag' | 'tests' | 'ai';
     label: string;
     icon: typeof AlertTriangle;
@@ -3008,6 +3016,7 @@ function VrlPanel(props: VrlPanelProps) {
     },
     { id: 'ai', label: 'pivt', icon: Sparkles, count: null, tone: null },
   ];
+  const tabs = aiAvailable ? allTabs : allTabs.filter((t) => t.id !== 'ai');
 
   return (
     <div className="rounded-md border border-border overflow-hidden flex flex-col h-[calc(100vh-320px)]">
@@ -3016,19 +3025,21 @@ function VrlPanel(props: VrlPanelProps) {
         <Code className="w-3 h-3 text-muted-foreground" />
         <span className="text-[11px] font-mono text-foreground">{feedId || 'parser'}.vrl</span>
         <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/60">
-          {vrl.trim() ? 'VRL · pivt-drafted' : 'VRL · empty'}
+          {vrl.trim() ? (aiAvailable ? 'VRL · pivt-drafted' : 'VRL') : 'VRL · empty'}
         </span>
         <div className="flex-1" />
-        <Button
-          variant={vrl.trim() ? 'outline' : 'default'}
-          size="sm"
-          className="h-6 gap-1 text-[10.5px]"
-          onClick={onRegenerate}
-          disabled={genState === 'streaming'}
-        >
-          <Sparkles className="w-3 h-3" />
-          {genState === 'streaming' ? 'Generating…' : vrl.trim() ? 'Regenerate' : 'Generate with pivt'}
-        </Button>
+        {aiAvailable && (
+          <Button
+            variant={vrl.trim() ? 'outline' : 'default'}
+            size="sm"
+            className="h-6 gap-1 text-[10.5px]"
+            onClick={onRegenerate}
+            disabled={genState === 'streaming'}
+          >
+            <Sparkles className="w-3 h-3" />
+            {genState === 'streaming' ? 'Generating…' : vrl.trim() ? 'Regenerate' : 'Generate with pivt'}
+          </Button>
+        )}
         <Button variant="outline" size="sm" className="h-6 gap-1 text-[10.5px]" onClick={() => void onValidate()} disabled={isValidating || !vrl.trim()}>
           <Check className="w-3 h-3" />
           {isValidating ? 'Validating…' : 'Validate'}
@@ -3059,7 +3070,7 @@ function VrlPanel(props: VrlPanelProps) {
         )}
       >
         <div className="min-h-0 min-w-0 bg-background">
-          <VrlEditor value={vrl} onChange={setVrl} placeholder="# Generated VRL will appear here" />
+          <VrlEditor value={vrl} onChange={setVrl} placeholder={aiAvailable ? '# Generated VRL will appear here' : '# Write VRL here'} />
         </div>
         <div className="flex flex-col min-h-0 bg-card/40 overflow-hidden">
           {sidePaneCollapsed ? (
@@ -3084,7 +3095,7 @@ function VrlPanel(props: VrlPanelProps) {
                   title={t.label}
                   className={cn(
                     'w-7 h-7 rounded-md flex items-center justify-center transition-colors',
-                    sidePane === t.id ? 'bg-muted' : 'hover:bg-muted/60',
+                    activePane === t.id ? 'bg-muted' : 'hover:bg-muted/60',
                   )}
                 >
                   <t.icon
@@ -3109,15 +3120,15 @@ function VrlPanel(props: VrlPanelProps) {
                     onClick={() => setSidePane(t.id)}
                     className={cn(
                       'h-7 px-2 rounded text-[10.5px] flex items-center gap-1.5 transition-colors whitespace-nowrap',
-                      sidePane === t.id ? 'text-foreground bg-muted' : 'text-muted-foreground hover:text-foreground/80',
+                      activePane === t.id ? 'text-foreground bg-muted' : 'text-muted-foreground hover:text-foreground/80',
                     )}
                   >
                     <t.icon
                       className={cn(
                         'w-3 h-3 shrink-0',
-                        sidePane === t.id && t.tone === 'good' && 'text-emerald-500',
-                        sidePane === t.id && t.tone === 'warn' && 'text-amber-500',
-                        sidePane === t.id && t.tone === 'danger' && 'text-destructive',
+                        activePane === t.id && t.tone === 'good' && 'text-emerald-500',
+                        activePane === t.id && t.tone === 'warn' && 'text-amber-500',
+                        activePane === t.id && t.tone === 'danger' && 'text-destructive',
                       )}
                     />
                     <span>{t.label}</span>
@@ -3146,9 +3157,9 @@ function VrlPanel(props: VrlPanelProps) {
                   <ChevronRight className="w-3 h-3" />
                 </button>
               </div>
-              {sidePane === 'diag' && <DiagPane diagnostics={validation.diagnostics} valid={validation.syntaxValid} />}
-              {sidePane === 'tests' && <TestsPane tests={tests} />}
-              {sidePane === 'ai' && (
+              {activePane === 'diag' && <DiagPane diagnostics={validation.diagnostics} valid={validation.syntaxValid} />}
+              {activePane === 'tests' && <TestsPane tests={tests} />}
+              {activePane === 'ai' && (
                 <AiPane
                   message={pivtMessage}
                   setMessage={setPivtMessage}

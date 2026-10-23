@@ -255,7 +255,7 @@ class ApiClient {
       (req) => this._search.queryMetrics(req),
       // NAN-1540: multi-series metrics + tag discovery.
       (req, cacheOpts) => this._search.queryMetricsV2(req, cacheOpts),
-      (metricName, key) => this._search.listMetricTags(metricName, key)
+      (metricName, key, timeRange) => this._search.listMetricTags(metricName, key, timeRange)
     );
     this._detections = new DetectionsApi(this.request.bind(this));
     this.sourceOnboarding = new SourceOnboardingApi(this.request.bind(this), this.requestRaw.bind(this));

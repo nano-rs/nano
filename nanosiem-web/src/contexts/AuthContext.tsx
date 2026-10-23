@@ -51,6 +51,12 @@ import {
   tenantSlugForAuthContinuation,
   verifyServerAuthIdentity,
 } from '../lib/tenant-auth-shell';
+import {
+  isDemoIdentity,
+  sharedDemoClaimBody,
+  SHARED_DEMO_CLAIM_PATH,
+  type SharedDemoState,
+} from '../lib/shared-demo';
 
 // ============================================================================
 // Types
@@ -79,6 +85,14 @@ export interface User {
   isApiKey?: boolean;
   deployment_mode: DeploymentMode;
   active_tenant?: ActiveTenant;
+  /** NAN-4152: present only for a live demo analyst on the shared runtime. */
+  demo?: SharedDemoState;
+}
+
+/** The login / claim success body (`AuthResponse`). */
+interface AuthSuccessResponse {
+  user: User;
+  tokens: { access_token: string; refresh_token: string; expires_in: number };
 }
 
 /**
@@ -108,6 +122,12 @@ export interface AuthContextType extends AuthState {
   login: (email: string, password: string, tenantSlug?: string) => Promise<void>;
   loginAsDemo: (displayName?: string) => Promise<void>;
   claimDemoToken: (token: string) => Promise<void>;
+  /**
+   * NAN-4152: claim a shared demo link for the CANONICAL tenant slug. Same
+   * session establishment as a shared login (cookies + in-memory bearer).
+   * Rejects with the server's status/code (401 `invalid_demo_link`).
+   */
+  claimSharedDemo: (tenantSlug: string, token: string) => Promise<void>;
   loginWithOidc: (providerSlug: string, currentPath?: string) => Promise<void>;
   handleOidcCallback: (
     providerSlug: string,
@@ -560,6 +580,28 @@ export function AuthProvider({ children }: AuthProviderProps) {
     };
   }, [anonymousState, authenticatedState, refreshAuth, handleAuthFailure]);
 
+  // A successful AuthResponse (login or shared demo claim): bearer in memory,
+  // identity verified through /me against the selector, session broadcast.
+  const establishSession = useCallback(async (
+    authResponse: AuthSuccessResponse,
+    selectedTenant: string | undefined,
+  ): Promise<void> => {
+    setAccessToken(authResponse.tokens.access_token, authResponse.tokens.expires_in);
+    const userInfo = await apiRequest<User>(
+      '/api/auth/me', {}, authResponse.tokens.access_token,
+    );
+
+    const nextState = authenticatedState(userInfo, selectedTenant);
+    setState(nextState);
+    broadcastSessionReplacement(
+      refreshScopeKey(nextState.tenantRuntime.scope),
+      authenticatedCookieSlot(nextState),
+    );
+    setPendingTenantSlug(null);
+
+    scheduleTokenRefresh(authResponse.tokens.expires_in);
+  }, [authenticatedState, scheduleTokenRefresh]);
+
   // Login with email and password (may return MFA challenge)
   const login = useCallback(async (
     email: string,
@@ -602,24 +644,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         }
 
         // Normal login success
-        const authResponse = response as unknown as {
-          user: User;
-          tokens: { access_token: string; refresh_token: string; expires_in: number };
-        };
-        setAccessToken(authResponse.tokens.access_token, authResponse.tokens.expires_in);
-        const userInfo = await apiRequest<User>(
-          '/api/auth/me', {}, authResponse.tokens.access_token,
-        );
-
-        const nextState = authenticatedState(userInfo, selectedTenant);
-        setState(nextState);
-        broadcastSessionReplacement(
-          refreshScopeKey(nextState.tenantRuntime.scope),
-          authenticatedCookieSlot(nextState),
-        );
-        setPendingTenantSlug(null);
-
-        scheduleTokenRefresh(authResponse.tokens.expires_in);
+        await establishSession(response as unknown as AuthSuccessResponse, selectedTenant);
       }, {
         requireCoordination: selectedTenant !== undefined,
         cookieSlot: selectedTenant === undefined ? ORIGIN_COOKIE_SLOT : tenantCookieSlot(selectedTenant),
@@ -637,7 +662,29 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }));
       throw error;
     }
-  }, [authenticatedState, scheduleTokenRefresh]);
+  }, [establishSession]);
+
+  // NAN-4152: claim a shared demo link. The answer is a login AuthResponse
+  // (+ the tenant's session cookies), so the session is established exactly
+  // as a successful shared login: same cookie-mutation lock, same /me
+  // verification against the canonical slug, same refresh scheduling.
+  const claimSharedDemo = useCallback(async (tenantSlug: string, token: string): Promise<void> => {
+    const body = sharedDemoClaimBody(tenantSlug, token);
+    setState(prev => ({ ...prev, isLoading: true, error: null }));
+    try {
+      await withBrowserCookieMutationLock(async () => {
+        const response = await apiRequest<AuthSuccessResponse>(SHARED_DEMO_CLAIM_PATH, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+        await establishSession(response, body.tenant_slug);
+      }, { requireCoordination: true, cookieSlot: tenantCookieSlot(body.tenant_slug) });
+    } catch (error) {
+      clearAccessToken();
+      setState(prev => ({ ...prev, isLoading: false, error: null }));
+      throw error;
+    }
+  }, [establishSession]);
 
   // Verify MFA challenge (TOTP code or backup code)
   const verifyMfa = useCallback(async (code: string): Promise<void> => {
@@ -1063,7 +1110,8 @@ export function AuthProvider({ children }: AuthProviderProps) {
     setState(anonymousState());
   }, [anonymousState]);
 
-  const isDemoUser = state.user?.roles?.includes('demo_analyst') ?? false;
+  // Saturn demo role, or a live shared demo session (`demo.active` on /me).
+  const isDemoUser = isDemoIdentity(state.user);
 
   const value: AuthContextType = {
     ...state,
@@ -1072,6 +1120,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     login,
     loginAsDemo,
     claimDemoToken,
+    claimSharedDemo,
     loginWithOidc,
     handleOidcCallback,
     acceptSharedOidcSession,

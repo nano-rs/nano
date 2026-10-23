@@ -89,6 +89,9 @@ impl LakePartDeleteGrant {
 /// itself; the pass plans from the verified log and control re-attests.
 #[async_trait]
 pub trait SanctionedPartGc: Send + Sync {
+    fn attach_catalog(&self, _catalog: Arc<super::iceberg_export::lifecycle::TenantCatalog>) -> Result<()> {
+        anyhow::bail!("sanctioned GC has no catalog receipt guard")
+    }
     async fn run_pass(&self, now_ms: i64) -> Result<PassReport>;
 
     /// Schedule work; background starts/busy acknowledgements carry no report.
@@ -128,6 +131,9 @@ pub enum PartGcDecision {
 /// Consulted before any lake-part delete. `Err` is a closed gate.
 #[async_trait]
 pub trait PartGcAuthority: Send + Sync {
+    fn attach_catalog(&self, _catalog: Arc<super::iceberg_export::lifecycle::TenantCatalog>) -> Result<()> {
+        anyhow::bail!("GC authority has no catalog receipt guard")
+    }
     async fn decision(&self, now_ms: i64) -> Result<PartGcDecision>;
 
     /// Completion is observable even after the route or grant is withdrawn.
@@ -188,6 +194,10 @@ impl ExchangedGrantAuthority {
 
 #[async_trait]
 impl PartGcAuthority for ExchangedGrantAuthority {
+    fn attach_catalog(&self, catalog: Arc<super::iceberg_export::lifecycle::TenantCatalog>) -> Result<()> {
+        catalog.validate_tenant(&self.tenant)?;
+        self.sanctioned.as_ref().context("sanctioned GC missing")?.attach_catalog(catalog)
+    }
     async fn poll_report(&self, now_ms: i64) -> Option<Result<PassReport>> {
         match &self.sanctioned {
             Some(pass) => pass.poll_report(now_ms).await,

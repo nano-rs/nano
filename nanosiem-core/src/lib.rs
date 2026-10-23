@@ -88,6 +88,12 @@ pub mod enterprise_shared_region_rls_key;
 /// NAN-3512: per-tenant monthly AI allowance (`tenant-ai-allowance:set`).
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_tenant_ai_allowance;
+/// NAN-4152: per-tenant web path alias (`tenant-path-alias:set`).
+#[cfg(feature = "enterprise")]
+pub mod enterprise_shared_tenant_path_alias;
+/// NAN-4152: per-tenant demo mode (`tenant-demo:set`, `demo-session:create`).
+#[cfg(feature = "enterprise")]
+pub mod enterprise_shared_demo;
 /// NAN-3825: tenant member management from the private control plane
 /// (`tenant-members:list` / `tenant-members:manage`, MSSP partners).
 #[cfg(feature = "enterprise")]
@@ -95,6 +101,9 @@ pub mod enterprise_shared_operator_members;
 /// NAN-3843: operator-issued tenant automation keys (`automation-keys:issue`).
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_operator_automation_keys;
+/// NAN-4136: hosted Tenzir bucket drop (landing) source keys (`landing-sources:*`).
+#[cfg(feature = "enterprise")]
+pub mod enterprise_shared_landing_sources;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_risk_publisher;
 #[cfg(feature = "enterprise")]
@@ -107,6 +116,9 @@ pub mod enterprise_shared_runtime_assignments;
 pub mod enterprise_shared_assignment_generation;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_lake_pipeline_alerts;
+/// NAN-4371: `egress-expected:read`, the region's expected egress sources (9014950).
+#[cfg(feature = "enterprise")]
+pub mod enterprise_shared_egress_expected;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_lean_audit_delivery;
 /// NAN-3762: lean per-tenant enrichment coverage snapshot (marketplace hero).
@@ -727,6 +739,8 @@ pub use upload::{
 
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_tenant_purge_prebuild;
+#[cfg(feature = "enterprise")]
+pub mod enterprise_shared_writer_jti_prebuild;
 #[cfg(feature = "enterprise")]
 pub mod enterprise_shared_uid_capability_issuer;
 #[cfg(feature = "enterprise")]

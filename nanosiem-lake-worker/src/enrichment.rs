@@ -1119,9 +1119,23 @@ const URL_STRING_PATHS: [&str; 2] = ["url.url_string", "http_request.url.url_str
 
 fn candidates(event: &Map<String, Value>, prevalence_only: bool) -> Vec<(String, String)> {
     let mut values = Vec::new();
-    for path in ["src_endpoint.ip", "dst_endpoint.ip"] {
+    for (path, port_path) in [
+        ("src_endpoint.ip", "src_endpoint.port"),
+        ("dst_endpoint.ip", "dst_endpoint.port"),
+    ] {
         if let Some(value) = string_at(event, path) {
-            values.push((path.to_string(), normalize_indicator(value)));
+            let ip = normalize_indicator(value);
+            // NAN-4167: most ThreatFox IP indicators are `ip:port`, keyed
+            // exactly so in the platform bundle. Add the endpoint's own
+            // socket as an IOC-only candidate (prevalence indexes bare IPs),
+            // matching the gen1 stamper (`platform_stamping/free.rs`). The
+            // path stays the IP's, so readers attribute it to that endpoint.
+            if !prevalence_only {
+                if let Some(socket) = endpoint_socket(&ip, value_at(event, port_path)) {
+                    values.push((path.to_string(), socket));
+                }
+            }
+            values.push((path.to_string(), ip));
         }
     }
     for path in [
@@ -1150,6 +1164,20 @@ fn candidates(event: &Map<String, Value>, prevalence_only: bool) -> Vec<(String,
     values.sort();
     values.dedup();
     values
+}
+
+/// `ip:port` (`[v6]:port` for IPv6, as `SocketAddr` prints it) for an
+/// endpoint with a valid IP and a port in 1..=65535. OCSF `port` is an
+/// integer; a numeric string from a loose parser is accepted too.
+fn endpoint_socket(ip: &str, port: Option<&Value>) -> Option<String> {
+    let port = match port? {
+        Value::Number(n) => n.as_u64()?,
+        Value::String(s) => s.trim().parse::<u64>().ok()?,
+        _ => return None,
+    };
+    let port = u16::try_from(port).ok().filter(|p| *p > 0)?;
+    let ip: std::net::IpAddr = ip.parse().ok()?;
+    Some(std::net::SocketAddr::new(ip, port).to_string())
 }
 
 pub(crate) fn value_at<'a>(event: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
@@ -1484,6 +1512,42 @@ mod tests {
         assert!(prevalence_artifact_candidates(url_event).iter().all(|(path, _)| !path.ends_with("url_string")));
         assert!(ioc.contains(&("email.from".to_string(), "mail.example".to_string())));
         assert!(ioc.contains(&("dst_endpoint.hostname".to_string(), "dst.example".to_string())));
+    }
+
+    /// NAN-4167: each endpoint's own `ip:port` is an IOC candidate (ThreatFox
+    /// keys most IP indicators that way), never a prevalence artifact.
+    #[test]
+    fn endpoint_ip_port_is_an_ioc_only_candidate() {
+        let event = json!({
+            "src_endpoint": {"ip": "10.0.0.5", "port": 51000},
+            "dst_endpoint": {"ip": "159.65.136.5", "port": 7713}
+        });
+        let event = event.as_object().unwrap();
+        let ioc = artifact_candidates(event);
+        assert!(ioc.contains(&("dst_endpoint.ip".to_string(), "159.65.136.5:7713".to_string())));
+        assert!(ioc.contains(&("dst_endpoint.ip".to_string(), "159.65.136.5".to_string())));
+        assert!(ioc.contains(&("src_endpoint.ip".to_string(), "10.0.0.5:51000".to_string())));
+        assert!(!ioc.contains(&("dst_endpoint.ip".to_string(), "159.65.136.5:51000".to_string())),
+            "a port pairs only with its own endpoint");
+        assert!(prevalence_artifact_candidates(event).iter().all(|(_, v)| !v.contains(':')));
+
+        for (endpoint, expected) in [
+            (json!({"ip": "2001:DB8::1", "port": 443}), Some("[2001:db8::1]:443")),
+            (json!({"ip": "1.2.3.4", "port": "8080"}), Some("1.2.3.4:8080")),
+            (json!({"ip": "1.2.3.4", "port": 0}), None),
+            (json!({"ip": "1.2.3.4", "port": 70000}), None),
+            (json!({"ip": "1.2.3.4", "port": -1}), None),
+            (json!({"ip": "1.2.3.4"}), None),
+            (json!({"ip": "not-an-ip", "port": 443}), None),
+        ] {
+            let event = json!({"dst_endpoint": endpoint.clone()});
+            let sockets: Vec<_> = artifact_candidates(event.as_object().unwrap())
+                .into_iter()
+                .map(|(_, v)| v)
+                .filter(|v| *v != endpoint["ip"].as_str().unwrap().to_ascii_lowercase())
+                .collect();
+            assert_eq!(sockets, expected.into_iter().map(str::to_string).collect::<Vec<_>>(), "{endpoint}");
+        }
     }
 
     /// NAN-3038: the stamp names its source by list name, keeps the source

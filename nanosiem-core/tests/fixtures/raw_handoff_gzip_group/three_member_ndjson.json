@@ -1,0 +1,20 @@
+{
+  "//": "NAN-4111: a grouped gzip NDJSON raw-handoff v2 delivery body (3 members + 2 one-newline members). The hosted-ingest test asserts the receipt object sends exactly delivery_base64; nanosiem-core/tests/raw_handoff_gzip_group_decode.rs decodes it with the Vector fork decoder (flate2 MultiGzDecoder).",
+  "members": [
+    {
+      "gzip_base64": "H4sIAAAAAAACA6tWylWyMqzlqgbRRrUAQDPWZg8AAAA=",
+      "open_line": true
+    },
+    {
+      "gzip_base64": "H4sIAAAAAAACA6tWylWyMq7lAgBTt64ACAAAAA==",
+      "open_line": false
+    },
+    {
+      "gzip_base64": "H4sIAAAAAAACA6tWylWyMqkFAOu1nO4HAAAA",
+      "open_line": true
+    }
+  ],
+  "gzip_newline_member_base64": "H4sIAAAAAAAA/+MCAJMG1zIBAAAA",
+  "delivery_base64": "H4sIAAAAAAACA6tWylWyMqzlqgbRRrUAQDPWZg8AAAAfiwgAAAAAAAD/4wIAkwbXMgEAAAAfiwgAAAAAAAIDq1bKVbIyruUCAFO3rgAIAAAAH4sIAAAAAAACA6tWylWyMqkFAOu1nO4HAAAAH4sIAAAAAAAA/+MCAJMG1zIBAAAA",
+  "decoded": "{\"m\":1}\n{\"m\":2}\n{\"m\":3}\n{\"m\":4}\n"
+}

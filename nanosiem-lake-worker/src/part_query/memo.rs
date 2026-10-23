@@ -5,8 +5,7 @@
 //! `query[T]` exits when idle, so everything it proved about immutable part
 //! files would otherwise be re-proved on every restart: the in-place SHA-256
 //! of every cell-local data file a query touches (≈10 CPU-s per 7 days of a
-//! 300 eps tenant) and the location/ASN owner-denial probe (≈40 CPU-s per
-//! 7 days). Both are kept as small JSON files in the process's own state dir,
+//! 300 eps tenant). It is kept as a small JSON file in the process's own state dir,
 //! written atomically (temporary file + rename). A lost or corrupt file only
 //! costs the re-proof: loading never fails the process.
 

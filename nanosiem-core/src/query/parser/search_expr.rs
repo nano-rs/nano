@@ -250,9 +250,9 @@ fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
 /// index-aware variant; only the previously mis-split predicates change.
 fn unparenthesized_arithmetic_or_leaf(input: &str) -> ParseResult<'_, SearchExpr> {
     let leaf = primary_leaf_expr(input);
-    let arithmetic = eval_predicate_expression(input).ok().filter(|(_, e)| {
-        eval_contains_arithmetic(e) && eval_is_boolean(e)
-    });
+    let predicate = eval_predicate_expression(input)
+        .ok()
+        .filter(|(_, e)| eval_is_boolean(e));
     // The leaf must have stopped AT an arithmetic operator; a `-term` after a
     // filter stays what it was (a separate term), never a subtraction.
     let stopped_at_operator = |rest: &str| {
@@ -264,13 +264,27 @@ fn unparenthesized_arithmetic_or_leaf(input: &str) -> ParseResult<'_, SearchExpr
             _ => false,
         }
     };
-    match (leaf, arithmetic) {
-        (Ok((leaf_rest, _)), Some((rest, expression)))
-            if rest.len() < leaf_rest.len() && stopped_at_operator(leaf_rest) =>
+    // NAN-4286 (F29): written without spaces (`a-b=0`, `c+d>10`) the bare
+    // keyword grammar swallowed `a-b` as ONE term, and with a literal or an
+    // expression on the left (`1000 < a + b`) it took `1000` as a keyword;
+    // either way it then stopped AT the comparator, a syntax error. A keyword
+    // is never followed by a comparator, so the eval reading of the whole
+    // comparison only ever replaces an error.
+    let keyword_stopped_at_comparator = |leaf: &SearchExpr, rest: &str| {
+        matches!(leaf, SearchExpr::Keyword(_))
+            && rest.trim_start().starts_with(['=', '!', '<', '>'])
+    };
+    match (leaf, predicate) {
+        (Ok((leaf_rest, leaf_expr)), Some((rest, expression)))
+            if rest.len() < leaf_rest.len()
+                && ((eval_contains_arithmetic(&expression) && stopped_at_operator(leaf_rest))
+                    || keyword_stopped_at_comparator(&leaf_expr, leaf_rest)) =>
         {
             Ok((rest, SearchExpr::EvalPredicate(expression)))
         }
-        (Err(_), Some((rest, expression))) => Ok((rest, SearchExpr::EvalPredicate(expression))),
+        (Err(_), Some((rest, expression))) if eval_contains_arithmetic(&expression) => {
+            Ok((rest, SearchExpr::EvalPredicate(expression)))
+        }
         (leaf, _) => leaf,
     }
 }

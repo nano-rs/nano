@@ -8,9 +8,8 @@
     target_os = "linux"
 ))]
 //! NAN-2499: actual compiler/planner, a 24h generation and forty hydrated tail objects.
-//! Requires the same verified chDB/compiler environment as stored_enrichment_native.
+//! Requires a verified chDB library and NANO_LAKE_COMPILER.
 use nanosiem_lake_worker::{
-    enrichment_read,
     generation::HotTailManifest,
     native::{NativeChdb, NativeConnection, NativeQueryOutput},
     planner::{
@@ -51,7 +50,7 @@ fn generate(c: &NativeConnection, path: &Path, rows: u64, offset: u64) {
     }
     // Two base objects each span 24h; forty tail objects span successive windows.
     // Ordered timestamps, 3:1 proxy/sysmon mix. Varied endpoints,
-    // nested structs and stamps force the production mask, unlike flat microbenchmarks.
+    // nested structs and stamps, unlike flat microbenchmarks.
     let sql = format!(
         r#"INSERT INTO FUNCTION file({{path:String}}, Parquet)
     SELECT event.time AS time, event.action_id AS action_id, event.metadata AS metadata, event.traffic AS traffic, event.src_endpoint AS src_endpoint, event.process AS process, event.enrichments AS enrichments FROM (SELECT CAST(tuple(fromUnixTimestamp64Micro(1786060800000000 + toInt64(if({offset} < 2*{rows}, number*86400000000/{rows}, (number+{offset})*86400000000/{total}))),
@@ -153,8 +152,6 @@ fn stats_scan_scales_with_bytes_and_preserves_rows() {
         serde_json::from_value(json!({"tenant_id":tenant_id,"objects":objects})).unwrap();
     let mut tail: HotTailManifest = serde_json::from_value(json!({"schema_version":4,"tenant_id":tenant_id,"table":"logs","base_snapshot_id":1,"head_snapshot_id":2,"head_metadata_location":"s3://fixture/table/metadata/00002.metadata.json","iceberg_metadata_file_path":"metadata/00002.metadata.json","read_schema":SCHEMA,"available_paths":fields.keys().collect::<Vec<_>>(),"objects":tail_objects})).unwrap();
     tail.local_paths = local_paths;
-    let authority = enrichment_read::current();
-    let old_ip = enrichment_read::root_expression("src_endpoint", &authority);
     let mut results = vec![];
     for hours in [1, 6, 24] {
         let compiled = compile(hours, &fields);
@@ -171,60 +168,31 @@ fn stats_scan_scales_with_bytes_and_preserves_rows() {
             serde_json::to_vec(&plan.params).unwrap(),
         )
         .unwrap();
-        // Frozen pre-fix projection, preserving the identical compiler and scan settings.
-        let old_leaf = format!("tupleElement({old_ip}, 'ip') AS `src_endpoint.ip`");
         let new_leaf = "`src_endpoint`.`ip` AS `src_endpoint.ip`";
         assert!(
             plan.sql.contains(new_leaf),
             "producer IP must use the native leaf"
         );
-        let before = plan.sql.replace(new_leaf, &old_leaf);
-        let after = plan.sql.clone();
-        std::fs::write(dir.join(format!("{hours}h-before.sql")), &before).unwrap();
-        std::fs::write(dir.join(format!("{hours}h-after.sql")), &after).unwrap();
-        // The old expression is deliberately expensive. Execute it once for
-        // the correctness oracle; sample the production path after a warmup.
-        let baseline = run(&c, &before, &plan.params);
+        std::fs::write(dir.join(format!("{hours}h.sql")), &plan.sql).unwrap();
+        // One warmup establishes the rows; sample the next three.
+        let baseline = run(&c, &plan.sql, &plan.params);
         assert!(!baseline.data.is_empty());
-        let mut times_after = vec![];
+        let mut times = vec![];
         let mut bytes = 0;
         let mut read_rows = 0;
-        for repetition in 0..4 {
-            let b = run(&c, &after, &plan.params);
-            assert_eq!(baseline.data, b.data, "byte-equivalent rows at {hours}h");
-            if repetition > 0 {
-                times_after.push(b.elapsed.as_secs_f64());
-            }
+        for _ in 0..3 {
+            let b = run(&c, &plan.sql, &plan.params);
+            assert_eq!(baseline.data, b.data, "stable rows at {hours}h");
+            times.push(b.elapsed.as_secs_f64());
             bytes = b.storage_bytes_read;
             read_rows = b.storage_rows_read;
         }
-        times_after.sort_by(f64::total_cmp);
-        let before_bytes = baseline.storage_bytes_read;
+        times.sort_by(f64::total_cmp);
         println!(
-            "NAN2499 {hours}h before={:.6} after={:.6} read_bytes={bytes} before_read_bytes={before_bytes} read_rows={read_rows} estimated_bytes={}",
-            baseline.elapsed.as_secs_f64(), times_after[1], plan.budget.estimated_scan_bytes
+            "NAN2499 {hours}h elapsed={:.6} read_bytes={bytes} read_rows={read_rows} estimated_bytes={}",
+            times[1], plan.budget.estimated_scan_bytes
         );
-        results.push((times_after[1], bytes));
-        for (label, sql) in [("before", &before), ("after", &after)] {
-            for explain in ["PIPELINE", "indexes=1"] {
-                let out = c
-                    .query_with_params(
-                        &format!("EXPLAIN {explain} {sql}"),
-                        "TSVRaw",
-                        &plan
-                            .params
-                            .iter()
-                            .map(|(k, v)| (k.as_str(), v.as_str()))
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap();
-                std::fs::write(
-                    dir.join(format!("{hours}h-{label}-{explain}.txt")),
-                    out.data,
-                )
-                .unwrap();
-            }
-        }
+        results.push((times[1], bytes));
     }
     assert!(
         results[2].0 / results[1].0 <= 2.0 * results[2].1 as f64 / results[1].1 as f64,

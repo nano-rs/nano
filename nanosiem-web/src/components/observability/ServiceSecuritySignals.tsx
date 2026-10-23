@@ -15,16 +15,18 @@
 // "no detections" line, NOT a heavy empty panel).
 //
 // Each signal links into the SIEM search scoped to its matched entity so an
-// analyst lands on the underlying logs (mirrors InfraTab's /search?q= pattern).
+// analyst lands on the underlying logs (mirrors InfraTab's /search#q= pattern).
 
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ShieldAlert, ChevronRight } from 'lucide-react';
+import { useDetections } from '@/hooks/use-api';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { ServiceSecuritySignalsResponse, ServiceSecuritySignal } from '@/lib/api/observability';
 import type { TimeRange } from '@/lib/api/types';
+import { matchSearchUrl } from '@/components/matches/search-window';
 import { nplQuotedBody } from '@/lib/npl-quote';
 
 // How many of the sampled signals to render inline. The backend already caps
@@ -57,7 +59,7 @@ function sevTone(sev: string | null): SevTone {
  * names (src_ip/dest_ip/src_host/dest_host/hostname) would 400 every
  * drill-down — OR'd OCSF halves never rescue it.
  */
-function searchHref(s: ServiceSecuritySignal): string {
+export function searchHref(s: ServiceSecuritySignal, lookbackMinutes?: number): string {
   let q: string | null = null;
   if (s.matched_entity && s.matched_entity_type === 'ip') {
     const ip = nplQuotedBody(s.matched_entity);
@@ -66,7 +68,7 @@ function searchHref(s: ServiceSecuritySignal): string {
     const h = nplQuotedBody(s.matched_entity);
     q = `device.hostname="${h}"`;
   }
-  return q ? `/search?q=${encodeURIComponent(q)}` : '/alerts';
+  return q ? matchSearchUrl(q, { events: [], detectedAt: parseUTCTimestamp(s.ts) }, lookbackMinutes) : '/alerts';
 }
 
 function fmtTs(ts: string): string {
@@ -91,6 +93,7 @@ export interface ServiceSecuritySignalsProps {
 export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecuritySignalsProps) {
   const [data, setData] = useState<ServiceSecuritySignalsResponse | null>(null);
   const [errored, setErrored] = useState(false);
+  const { data: rules, loading: rulesLoading, error: rulesError } = useDetections({ includeArchived: true }, { skip: !data?.signal_total });
 
   useEffect(() => {
     let cancelled = false;
@@ -156,7 +159,11 @@ export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecurit
       {shown.map((s, i) => (
         <Link
           key={`${s.ts}-${s.rule_name}-${i}`}
-          to={searchHref(s)}
+          to={searchHref(s, rules?.find((rule) => rule.name === s.rule_name)?.lookback_minutes)}
+          aria-disabled={rulesLoading || (!rules && !rulesError)}
+          onClick={(event) => {
+            if (rulesLoading || (!rules && !rulesError)) event.preventDefault();
+          }}
           className="group flex items-center gap-2.5 px-3.5 py-2 border-b border-danger/10 last:border-b-0 hover:bg-danger/10"
         >
           <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', sevTone(s.severity).dot)} />

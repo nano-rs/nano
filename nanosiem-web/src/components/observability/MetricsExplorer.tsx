@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+
 /**
  * MetricsExplorer (NAN-1540)
  *
@@ -25,6 +27,7 @@ import {
   LineChart,
   ListOrdered,
   Plus,
+  RotateCw,
   Sigma,
   X,
 } from 'lucide-react';
@@ -43,6 +46,7 @@ import {
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import type {
   MetricAgg,
   MetricFilter,
@@ -94,8 +98,29 @@ function vizToWidgetViz(mode: MetricVizMode): MetricWidgetViz {
   return 'timeseries';
 }
 
+/**
+ * Where the metric-name catalog stands (NAN-4098). The picker always accepts a
+ * typed metric name, so a slow or failed catalog never leaves it unusable, and
+ * every empty list says why it is empty.
+ */
+export type MetricCatalogStatus =
+  | { status: 'loading' }
+  | { status: 'error'; message: string; onRetry?: () => void }
+  | { status: 'ready'; partial?: boolean };
+
+const READY_CATALOG: MetricCatalogStatus = { status: 'ready' };
+
+/** Most names the picker renders at once; typing narrows the rest. */
+const PICKER_RENDER_CAP = 200;
+
+type LoadState = 'loading' | 'error' | 'ready';
+
 export interface MetricsExplorerProps {
   metricNames: string[];
+  /** Catalog state for the picker; defaults to ready. */
+  catalog?: MetricCatalogStatus;
+  /** When set, the panel shows a remove control (multi-panel Metrics tab). */
+  onRemove?: () => void;
   apiTimeRange: TimeRange;
   /** Preselect this metric on mount (e.g. `| metric <name>`); ignored if absent. */
   initialMetric?: string;
@@ -114,17 +139,18 @@ export interface MetricsExplorerProps {
 
 export function MetricsExplorer({
   metricNames,
+  catalog = READY_CATALOG,
+  onRemove,
   apiTimeRange,
   initialMetric,
   initialService,
   onMonitorCreated,
 }: MetricsExplorerProps) {
   // --- query state ---
-  const [metric, setMetric] = useState(
-    initialMetric && metricNames.includes(initialMetric)
-      ? initialMetric
-      : (metricNames[0] ?? '')
-  );
+  // A requested metric (`| metric <name>`) is honored even when the catalog
+  // has not loaded or does not list it: the catalog is a convenience, not a
+  // gate (NAN-4098).
+  const [metric, setMetric] = useState(initialMetric || (metricNames[0] ?? ''));
   const [agg, setAgg] = useState<MetricAgg>('avg');
   const [groupBy, setGroupBy] = useState<string>(NO_GROUP);
   const [filters, setFilters] = useState<MetricFilter[]>([]);
@@ -134,8 +160,16 @@ export function MetricsExplorer({
   const [stepSecs, setStepSecs] = useState(60);
   const [viz, setViz] = useState<MetricVizMode>('timeseries');
 
+  // The catalog arrives independently of the explorer and monitor results.
+  useEffect(() => {
+    if (!metric && metricNames.length > 0) {
+      setMetric(initialMetric || metricNames[0]);
+    }
+  }, [metric, metricNames, initialMetric]);
+
   // --- tag discovery ---
   const [tagKeys, setTagKeys] = useState<string[]>([]);
+  const [tagState, setTagState] = useState<LoadState>('ready');
 
   // --- result ---
   const [series, setSeries] = useState<MetricSeries[]>([]);
@@ -159,27 +193,38 @@ export function MetricsExplorer({
 
   const { start, end } = apiTimeRange;
 
-  // Load tag keys when the metric changes (resets group/filter selection).
+  // Reset selections only for a different metric, not a different time window.
+  useEffect(() => {
+    setGroupBy(NO_GROUP);
+    setFilters([]);
+  }, [metric]);
+
+  // Discover tags over the same explicit window as the chart.
   useEffect(() => {
     if (!metric) {
       setTagKeys([]);
+      setTagState('ready');
       return;
     }
     let cancelled = false;
+    setTagKeys([]);
+    setTagState('loading');
     api.observability
-      .listMetricTags(metric)
+      .listMetricTags(metric, undefined, { start, end })
       .then((r) => {
-        if (!cancelled) setTagKeys(r.tag_keys ?? []);
+        if (cancelled) return;
+        setTagKeys(r.tag_keys ?? []);
+        setTagState('ready');
       })
       .catch(() => {
-        if (!cancelled) setTagKeys([]);
+        if (cancelled) return;
+        setTagKeys([]);
+        setTagState('error');
       });
-    setGroupBy(NO_GROUP);
-    setFilters([]);
     return () => {
       cancelled = true;
     };
-  }, [metric]);
+  }, [metric, start, end]);
 
   // Fetch the series whenever any query input or the time range changes.
   useEffect(() => {
@@ -252,7 +297,12 @@ export function MetricsExplorer({
       {/* ---- query builder row ---- */}
       <div className="px-3 py-2 border-b border-border flex items-center gap-2 flex-wrap">
         {/* metric */}
-        <MetricPicker metric={metric} metricNames={metricNames} onChange={setMetric} />
+        <MetricPicker
+          metric={metric}
+          metricNames={metricNames}
+          catalog={catalog}
+          onChange={setMetric}
+        />
 
         {/* aggregation */}
         <DropdownMenu>
@@ -292,7 +342,15 @@ export function MetricsExplorer({
               <span className="font-mono text-[11px] text-fg-3">(none)</span>
             </DropdownMenuItem>
             {tagKeys.length === 0 && (
-              <div className="px-2 py-1.5 text-[11px] text-fg-4">No tags on this metric.</div>
+              <div className="px-2 py-1.5 text-[11px] text-fg-4">
+                {!metric
+                  ? 'Pick a metric first.'
+                  : tagState === 'loading'
+                    ? 'Loading tags…'
+                    : tagState === 'error'
+                      ? 'Could not load tags for this metric.'
+                      : 'No tags on this metric in this range.'}
+              </div>
             )}
             {tagKeys.map((k) => (
               <DropdownMenuItem key={k} onClick={() => setGroupBy(k)}>
@@ -326,12 +384,25 @@ export function MetricsExplorer({
         {loading && <LoadingIcon className="w-3.5 h-3.5 text-fg-4" />}
         <span className="flex-1" />
         <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={loading} />
+        {onRemove && (
+          <button
+            type="button"
+            onClick={onRemove}
+            className="text-fg-4 hover:text-destructive w-6 h-6 flex items-center justify-center rounded"
+            aria-label="Remove panel"
+            title="Remove panel"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        )}
       </div>
 
       {/* ---- filters row ---- */}
       <FiltersRow
         metric={metric}
         tagKeys={tagKeys}
+        tagState={tagState}
+        apiTimeRange={apiTimeRange}
         filters={filters}
         onChange={setFilters}
         service={service}
@@ -391,11 +462,18 @@ export function MetricsExplorer({
           </div>
         ) : !metric ? (
           <div className="flex items-center justify-center h-[220px] text-[12px] text-fg-3">
-            Pick a metric to chart.
+            {catalog.status === 'loading'
+              ? 'Loading the metric catalog… or type a metric name in the picker.'
+              : 'Pick or type a metric to chart.'}
           </div>
         ) : loading && series.length === 0 ? (
           <div className="flex items-center justify-center h-[220px]">
             <LoadingIcon className="w-5 h-5 text-fg-4" />
+          </div>
+        ) : series.length === 0 || series.every((s) => s.points.length === 0) ? (
+          <div className="py-12 text-center text-[12px] text-fg-3">
+            No samples for this metric in the selected range and filters. A catalog entry can outlive its latest samples.
+            <TelemetrySetupHint />
           </div>
         ) : (
           <MetricViz mode={viz} series={series} metricName={metric} height={240} />
@@ -446,19 +524,51 @@ export function MetricsExplorer({
 }
 
 // ---------------------------------------------------------------------------
-// Metric-name picker (searchable-ish dropdown)
+// Metric-name picker: type to filter the catalog, or chart any typed name.
 // ---------------------------------------------------------------------------
 function MetricPicker({
   metric,
   metricNames,
+  catalog,
   onChange,
 }: {
   metric: string;
   metricNames: string[];
+  catalog: MetricCatalogStatus;
   onChange: (m: string) => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  const typed = text.trim();
+  const matches = useMemo(() => {
+    const needle = typed.toLowerCase();
+    return needle ? metricNames.filter((m) => m.toLowerCase().includes(needle)) : metricNames;
+  }, [metricNames, typed]);
+  const shown = matches.slice(0, PICKER_RENDER_CAP);
+  const canUseTyped = typed !== '' && !metricNames.includes(typed);
+
+  const choose = (m: string) => {
+    onChange(m);
+    setText('');
+    setOpen(false);
+  };
+
+  let emptyNote: string | null = null;
+  if (shown.length === 0) {
+    if (catalog.status === 'loading') emptyNote = null;
+    else if (catalog.status === 'error') emptyNote = 'Metric catalog unavailable. Type a metric name above.';
+    else if (typed) emptyNote = 'No catalog match. Press Enter to chart the typed name.';
+    else emptyNote = 'No metrics in the catalog window. Type a metric name above.';
+  }
+
   return (
-    <DropdownMenu>
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setText('');
+      }}
+    >
       <DropdownMenuTrigger asChild>
         <button
           type="button"
@@ -470,14 +580,61 @@ function MetricPicker({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent className="w-[320px] max-h-[360px] overflow-y-auto">
-        {metricNames.length === 0 && (
-          <div className="px-2 py-1.5 text-[11px] text-fg-3">No metrics ingested.</div>
+        <div className="p-1.5 border-b border-border">
+          <Input
+            autoFocus
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              // Keep the menu's typeahead from stealing keystrokes.
+              e.stopPropagation();
+              if (e.key === 'Enter' && typed) {
+                e.preventDefault();
+                choose(typed);
+              }
+            }}
+            placeholder="Filter or type a metric name"
+            aria-label="Metric name"
+            className="h-7 font-mono text-[11px]"
+          />
+        </div>
+        {catalog.status === 'loading' && (
+          <div role="status" className="px-2 py-1.5 flex items-center gap-1.5 text-[11px] text-fg-3">
+            <LoadingIcon className="w-3 h-3" /> Loading metric catalog…
+          </div>
         )}
-        {metricNames.map((m) => (
-          <DropdownMenuItem key={m} onClick={() => onChange(m)}>
+        {catalog.status === 'error' && (
+          <div role="alert" className="px-2 py-1.5 flex items-center gap-1.5 text-[11px] text-destructive">
+            <AlertCircle className="w-3 h-3 shrink-0" />
+            <span className="truncate">{catalog.message}</span>
+            {catalog.onRetry && (
+              <button
+                type="button"
+                onClick={catalog.onRetry}
+                className="ml-auto inline-flex items-center gap-1 text-fg-2 hover:text-primary"
+              >
+                <RotateCw className="w-3 h-3" /> Retry
+              </button>
+            )}
+          </div>
+        )}
+        {canUseTyped && (
+          <DropdownMenuItem onClick={() => choose(typed)}>
+            <span className="text-[11px] text-fg-3 shrink-0">Use</span>
+            <span className="font-mono text-[11px] truncate">{typed}</span>
+          </DropdownMenuItem>
+        )}
+        {emptyNote && <div className="px-2 py-1.5 text-[11px] text-fg-3">{emptyNote}</div>}
+        {shown.map((m) => (
+          <DropdownMenuItem key={m} onClick={() => choose(m)}>
             <span className="font-mono text-[11px] truncate">{m}</span>
           </DropdownMenuItem>
         ))}
+        {matches.length > shown.length && (
+          <div className="px-2 py-1.5 font-mono text-[10.5px] text-fg-4">
+            +{matches.length - shown.length} more · type to narrow
+          </div>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -489,6 +646,8 @@ function MetricPicker({
 function FiltersRow({
   metric,
   tagKeys,
+  tagState,
+  apiTimeRange,
   filters,
   onChange,
   service,
@@ -496,6 +655,8 @@ function FiltersRow({
 }: {
   metric: string;
   tagKeys: string[];
+  tagState: LoadState;
+  apiTimeRange: TimeRange;
   filters: MetricFilter[];
   onChange: (next: MetricFilter[]) => void;
   /** Active `service_name` scope (promoted column, NAN-1564); '' ⇒ unscoped. */
@@ -505,19 +666,41 @@ function FiltersRow({
   const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [pendingValues, setPendingValues] = useState<string[]>([]);
   const [valuesLoading, setValuesLoading] = useState(false);
+  const [valuesError, setValuesError] = useState(false);
+  const valuesRequest = useRef(0);
+  const { start, end } = apiTimeRange;
+  useEffect(() => {
+    setPendingKey(null);
+    setPendingValues([]);
+    setValuesLoading(false);
+    return () => {
+      valuesRequest.current += 1;
+    };
+  }, [metric, start, end]);
 
   const loadValues = useCallback(
     (key: string) => {
+      const request = ++valuesRequest.current;
       setPendingKey(key);
       setPendingValues([]);
       setValuesLoading(true);
+      setValuesError(false);
       api.observability
-        .listMetricTags(metric, key)
-        .then((r) => setPendingValues(r.tag_values ?? []))
-        .catch(() => setPendingValues([]))
-        .finally(() => setValuesLoading(false));
+        .listMetricTags(metric, key, { start, end })
+        .then((r) => {
+          if (request === valuesRequest.current) setPendingValues(r.tag_values ?? []);
+        })
+        .catch(() => {
+          if (request === valuesRequest.current) {
+            setPendingValues([]);
+            setValuesError(true);
+          }
+        })
+        .finally(() => {
+          if (request === valuesRequest.current) setValuesLoading(false);
+        });
     },
-    [metric]
+    [metric, start, end]
   );
 
   const addFilter = (key: string, value: string) => {
@@ -572,6 +755,17 @@ function FiltersRow({
           <button
             type="button"
             disabled={tagKeys.length === 0}
+            title={
+              tagKeys.length > 0
+                ? undefined
+                : !metric
+                  ? 'Pick a metric first'
+                  : tagState === 'loading'
+                    ? 'Loading tags…'
+                    : tagState === 'error'
+                      ? 'Could not load tags for this metric'
+                      : 'No tags on this metric in this range'
+            }
             className="inline-flex items-center gap-1 h-6 px-1.5 rounded-md border border-dashed border-border-2 text-[10.5px] text-fg-3 hover:text-primary hover:border-primary/40 transition-colors disabled:opacity-40"
           >
             <Plus className="w-3 h-3" /> filter
@@ -602,7 +796,9 @@ function FiltersRow({
                 {valuesLoading && <LoadingIcon className="w-3 h-3" />}
               </div>
               {!valuesLoading && pendingValues.length === 0 && (
-                <div className="px-2 py-1.5 text-[11px] text-fg-4">No values.</div>
+                <div className="px-2 py-1.5 text-[11px] text-fg-4">
+                  {valuesError ? 'Could not load values.' : 'No values in this range.'}
+                </div>
               )}
               {pendingValues.map((v) => (
                 <DropdownMenuItem key={v} onClick={() => addFilter(pendingKey, v)}>

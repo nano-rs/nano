@@ -269,7 +269,7 @@ fn logs_query_with_risk_in_subsearch_scopes_derived_source_to_the_bracket() {
 
     assert!(sql.contains("FROM logs"), "{sql}");
     assert!(
-        sql.contains("timestamp BETWEEN"),
+        sql.contains("timestamp >= "),
         "outer logs bound must remain: {sql}"
     );
     assert!(
@@ -294,7 +294,7 @@ fn logs_query_with_risk_join_scopes_derived_source_to_the_subsearch() {
     );
 
     assert!(
-        sql.contains("timestamp BETWEEN"),
+        sql.contains("timestamp >= "),
         "outer logs bound must remain: {sql}"
     );
     // The multi-stage subsearch generator re-indents nested SQL, so compare the
@@ -363,17 +363,17 @@ fn non_risk_datasets_are_byte_identical_with_and_without_risk_config() {
 
 #[test]
 fn logs_time_bound_predicate_is_byte_identical_form() {
-    // The refactored helper must emit the exact historical bound text.
+    // NAN-4280: the helper emits the half-open [start, end) bound.
     let gen = ClickHouseSqlGenerator::new();
     let tr = time_range();
     assert_eq!(
         gen.time_bound_predicate("timestamp", &tr),
-        "timestamp BETWEEN '2026-07-10 00:00:00.000000' AND '2026-07-10 12:00:00.000000'"
+        "timestamp >= '2026-07-10 00:00:00.000000' AND timestamp < '2026-07-10 12:00:00.000000'"
     );
     let sql = generate(&gen, "error | head 100");
     assert!(
         sql.contains(
-            "WHERE timestamp BETWEEN '2026-07-10 00:00:00.000000' AND '2026-07-10 12:00:00.000000' AND ("
+            "WHERE timestamp >= '2026-07-10 00:00:00.000000' AND timestamp < '2026-07-10 12:00:00.000000' AND ("
         ),
         "{sql}"
     );

@@ -109,10 +109,25 @@ fn check_chain_len(input: &str, len: usize) -> Result<(), nom::Err<nom::error::E
     Ok(())
 }
 
+/// NAN-4283: whether a `//` or `/*` whose first slash follows `prev` starts a
+/// comment. Only a slash pair at a token boundary does: start of input,
+/// whitespace, or a pipeline/grouping delimiter. Inside an unquoted value
+/// (`url=https://host/path`, `path=/var/*`) the pair is part of the value. Treating
+/// it as a comment silently dropped the rest of the query, including every
+/// `| command`. Every nPL comment stripper must share this rule.
+pub fn comment_may_start_after(prev: Option<char>) -> bool {
+    match prev {
+        None => true,
+        Some(c) => c.is_whitespace() || matches!(c, '|' | '(' | ')' | '[' | ']' | ','),
+    }
+}
+
 /// Strip comments from query input
 /// Handles:
 /// - Single-line comments: // comment (to end of line)
 /// - Block comments: /* comment */
+///
+/// Both forms start only at a token boundary ([`comment_may_start_after`]).
 pub(crate) fn strip_comments(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -140,7 +155,7 @@ pub(crate) fn strip_comments(input: &str) -> String {
         }
 
         // Check for comments
-        if c == '/' {
+        if c == '/' && comment_may_start_after(result.chars().next_back()) {
             match chars.peek() {
                 Some(&'/') => {
                     // Single-line comment: skip to end of line
@@ -269,7 +284,7 @@ pub(crate) fn extract_time_modifier_tokens(input: &str) -> Vec<String> {
 /// Modifiers inside a `[...]` subsearch are NOT stripped: they are returned
 /// in the third element and left in place, and `parse_query` rejects them
 /// (NAN-3337).
-fn split_time_modifiers(input: &str) -> (String, Vec<String>, Vec<String>) {
+pub(crate) fn split_time_modifiers(input: &str) -> (String, Vec<String>, Vec<String>) {
     let mut result = String::with_capacity(input.len());
     let mut tokens = Vec::new();
     let mut nested = Vec::new();
@@ -421,6 +436,15 @@ fn parse_query_inner(input: &str) -> Result<Query, ParseError> {
             suggestions: vec![],
             full_query: Some(input.to_string()),
         });
+    }
+    for token in extract_time_modifier_tokens(&normalized) {
+        if let Err(message) = super::time_modifiers::resolve(&token, chrono::Utc::now()) {
+            return Err(ParseError {
+                message, position: 0, line: 1, column: 1, token: Some(token),
+                context_before: None, expected: vec![], suggestions: vec![],
+                full_query: Some(input.to_string()),
+            });
+        }
     }
     let normalized = strip_time_modifiers(&normalized);
     let normalized = normalized.trim();

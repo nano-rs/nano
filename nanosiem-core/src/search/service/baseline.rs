@@ -647,17 +647,22 @@ fn lake_baseline_micros_range(start: i64, end: i64) -> TimeRange {
 }
 
 /// `span` cut into `pieces` contiguous, disjoint ranges, NEWEST FIRST.
+/// NAN-4280: ranges are half-open `[start, end)`, so adjacent pieces share
+/// their boundary and an event on it is read by exactly one piece.
 fn lake_baseline_span_pieces(span: &TimeRange, pieces: u64) -> Vec<TimeRange> {
     let (start, end) = lake_baseline_span_micros(span);
-    let length = end.saturating_sub(start).saturating_add(1).max(1);
+    if end <= start {
+        return vec![span.clone()];
+    }
+    let length = end - start;
     let pieces = (pieces.max(1) as i64).min(length);
     let step = (length + pieces - 1) / pieces;
     let mut out = Vec::new();
     let mut piece_start = start;
-    while piece_start <= end {
-        let piece_end = piece_start.saturating_add(step - 1).min(end);
+    while piece_start < end {
+        let piece_end = piece_start.saturating_add(step).min(end);
         out.push(lake_baseline_micros_range(piece_start, piece_end));
-        piece_start = piece_end + 1;
+        piece_start = piece_end;
     }
     out.reverse();
     out
@@ -667,15 +672,16 @@ fn lake_baseline_span_pieces(span: &TimeRange, pieces: u64) -> Vec<TimeRange> {
 /// the remainder as one span. A span the cold-read budget refuses is split
 /// (see [`lake_baseline_refusal`]), so the warm case costs two reads per
 /// batch and a cold 7d lookback degrades into budget-sized day pieces.
+/// NAN-4280: half-open spans sharing `newest_start`.
 fn lake_baseline_lookback_spans(lookback: &TimeRange) -> Vec<TimeRange> {
     let (start, end) = lake_baseline_span_micros(lookback);
-    if end - start < LAKE_BASELINE_FIRST_SPAN_MICROS {
+    if end - start <= LAKE_BASELINE_FIRST_SPAN_MICROS {
         return vec![lookback.clone()];
     }
-    let newest_start = end - LAKE_BASELINE_FIRST_SPAN_MICROS + 1;
+    let newest_start = end - LAKE_BASELINE_FIRST_SPAN_MICROS;
     vec![
         lake_baseline_micros_range(newest_start, end),
-        lake_baseline_micros_range(start, newest_start - 1),
+        lake_baseline_micros_range(start, newest_start),
     ]
 }
 
@@ -1270,7 +1276,8 @@ where
     // over the same lookback, newest first, before claiming it.
     let mut activity_uncounted = false;
     if summary.coverage.is_blind() {
-        let presence_end = spans.coverage_end() - chrono::Duration::microseconds(1);
+        // NAN-4280: half-open, so the presence read ends AT the coverage end.
+        let presence_end = spans.coverage_end();
         let probe = if presence_end > spans.new_start {
             reader
                 .spans(
@@ -1357,10 +1364,8 @@ where
     if !summary.coverage.is_blind() {
         // NAN-3256 (b)/(c), per dimension, all dimensions at once under the
         // shared in-flight bound; see `LakeBaselineReader::lookback`.
-        let lookback_range = TimeRange::new(
-            spans.new_start,
-            spans.incident_start - chrono::Duration::microseconds(1),
-        );
+        // NAN-4280: half-open `[new_start, incident_start)`.
+        let lookback_range = TimeRange::new(spans.new_start, spans.incident_start);
         let mut windows = Vec::with_capacity(selected.len());
         for (index, result) in window_reads.into_iter().enumerate() {
             // NAN-3277: a failed window read skips its dimension (reported,
@@ -1699,7 +1704,7 @@ impl SearchService {
         scope: &ScopeSet,
         authority: Option<&crate::search::DurableSearchJobAuthority>,
     ) -> Result<Option<String>, SearchError> {
-        let (cleaned, earliest, latest) = extract_time_modifiers(&request.query);
+        let (cleaned, earliest, latest) = extract_time_bounds(&request.query)?;
         let Ok(parsed) = parse_query(&cleaned) else {
             return Ok(None);
         };
@@ -1721,10 +1726,10 @@ impl SearchService {
         let now = chrono::Utc::now();
         let mut incident = TimeRange::new(request.time_range.start, request.time_range.end);
         if let Some(offset) = earliest {
-            incident.start = now + chrono::Duration::seconds(offset);
+            incident.start = offset;
         }
         if let Some(offset) = latest {
-            incident.end = now + chrono::Duration::seconds(offset);
+            incident.end = offset;
         }
         let incident = self
             .retention_bound_input_range(&TimeRangeInput::new(incident.start, incident.end), now)?

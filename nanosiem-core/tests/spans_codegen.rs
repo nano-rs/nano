@@ -39,9 +39,9 @@ fn spans_target_table_and_time_column() {
     let sql = spans_sql("error");
     assert!(sql.contains("FROM otel_spans"), "{sql}");
     // Time-bound + default order use the spans clock `start_time`, never `timestamp`.
-    assert!(sql.contains("start_time BETWEEN"), "{sql}");
+    assert!(sql.contains("start_time >= "), "{sql}");
     assert!(sql.contains("ORDER BY start_time DESC"), "{sql}");
-    assert!(!sql.contains("timestamp BETWEEN"), "spans must not bound on timestamp: {sql}");
+    assert!(!sql.contains("timestamp >= "), "spans must not bound on timestamp: {sql}");
 }
 
 // --- Acceptance: bare keyword ---------------------------------------------
@@ -212,7 +212,7 @@ fn logs_dataset_is_byte_identical_default() {
     let kw = logs_sql("error");
     assert!(kw.contains("hasAllTokens(lower(message), 'error')"), "{kw}");
     assert!(kw.contains("FROM logs"), "{kw}");
-    assert!(kw.contains("timestamp BETWEEN"), "{kw}");
+    assert!(kw.contains("timestamp >= "), "{kw}");
     assert!(kw.contains("action AS event_type"), "{kw}");
 
     // And a spans-only construct does not leak into the logs path: `service_name`

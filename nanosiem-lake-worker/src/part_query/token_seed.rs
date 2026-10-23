@@ -94,6 +94,24 @@ pub async fn estimate(
     if !applies(hints) || end_us <= start_us {
         return Ok(None);
     }
+    // NAN-4164: the seed's own token work, beside select_token's.
+    let (started, before) = (std::time::Instant::now(), engine.token_cache().stats());
+    let estimate = estimate_inner(engine, hints, start_us, end_us, target).await;
+    let work = engine.token_cache().stats() - before;
+    crate::query_timing::record(|p| {
+        p.density_token_ms += started.elapsed().as_secs_f64() * 1000.0;
+        super::engine::record_token_work(p, work);
+    });
+    estimate
+}
+
+async fn estimate_inner(
+    engine: &PartQueryEngine,
+    hints: &[CandidateHint],
+    start_us: i64,
+    end_us: i64,
+    target: u64,
+) -> QueryResult<Option<TokenEstimate>> {
     let (parts, ..) = engine.snapshot(start_us, end_us).await?;
     let records = engine
         .fetcher()
@@ -146,6 +164,22 @@ pub async fn estimate(
             .ensure_files(&wanted)
             .await
             .map_err(map_fetch_error)?;
+        // NAN-4164: judge the batch on the blocking pool first,
+        // `TOKEN_PROBE_CONCURRENCY` files at a time (the selection's fan-out);
+        // the walk below then reads the cached evidence. One file at a time
+        // on a runtime worker, a cold 7 d seed took 2.3 s for 508 files.
+        let items = batch
+            .iter()
+            .filter_map(|(part, index, .., groups)| {
+                let local = tokens.path(&part.part_id, PartFile::Tokens(*index))?;
+                Some((local.path.clone(), local.sha256.clone(), *groups))
+            })
+            .collect::<Vec<_>>();
+        let (cache, shared): (_, std::sync::Arc<[CandidateHint]>) = (engine.token_cache_arc(), hints.into());
+        super::select_evidence::blocking_map_with(items, super::select_evidence::token_probe_concurrency(), move |(path, sha256, groups)| {
+            drop(cache.evidence(&path, &sha256, groups, &shared));
+        })
+        .await;
         for (part, index, min_us, max_us, rows, groups) in batch {
             let Some(local) = tokens.path(&part.part_id, PartFile::Tokens(*index)) else {
                 // No index: what is known stops here.

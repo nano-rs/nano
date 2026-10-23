@@ -15,7 +15,7 @@ export class SessionExpiredError extends Error {
  * access-token cookie on the pooled host and is refused. */
 export function allowsAnonymousRequest(endpoint: string): boolean {
   const path = endpoint.split('?')[0];
-  return /^\/api\/auth\/(login|refresh|logout|methods|password\/reset-request|password\/reset|mfa\/(verify|setup|verify-setup|challenge))$/.test(path)
+  return /^\/api\/auth\/(login|refresh|logout|methods|password\/reset-request|password\/reset|mfa\/(verify|setup|verify-setup|challenge)|shared\/demo\/claim)$/.test(path)
     || /^\/api\/auth\/(shared\/)?oidc\/(providers|[^/]+\/(authorize|callback))$/.test(path)
     || /^\/api\/(capabilities|setup(?:\/.*)?|demo\/session(?:\/[^/]+\/claim)?)$/.test(path)
     || /^\/api\/search\/shared\/[^/]+$/.test(path);

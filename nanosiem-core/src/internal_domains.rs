@@ -477,7 +477,7 @@ pub fn is_public_suffix(suffix: &str) -> bool {
 }
 
 /// Whether the saved list reached the components that read it outside the
-/// API (the lean ingest workers on shared; the ClickHouse prevalence filter on
+/// API (the lake ingest workers on shared; the ClickHouse prevalence filter on
 /// dedicated).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]

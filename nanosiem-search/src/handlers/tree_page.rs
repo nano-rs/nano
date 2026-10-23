@@ -240,7 +240,7 @@ pub async fn get_tree_page(
                 .as_str()
                 .unwrap_or("failed")
                 .into(),
-            error: status.error,
+            error: status.error.map(|error| nanosiem_core::branding::without_internal_code_name(&error).into_owned()),
             preview: false,
             nodes: vec![],
             config: Value::Null,

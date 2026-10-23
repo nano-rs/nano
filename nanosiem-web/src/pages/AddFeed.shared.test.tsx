@@ -34,6 +34,7 @@ vi.mock('@/contexts/AuthContext', () => ({
     hasPermission: () => true,
   }),
 }));
+vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: {} }) }));
 vi.mock('@/hooks/use-toast', () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock('@/enterprise/hooks/use-melod-job', () => ({ useMelodJob: () => ({ start: vi.fn(), loading: false }) }));
 vi.mock('@/components/editor/VrlEditor', () => ({ VrlEditor: () => null }));
@@ -211,6 +212,8 @@ describe('AddFeed → Add data (NAN-2593)', () => {
     mocks.mode = 'dedicated';
     renderAddFeed();
     expect(screen.getByText('Add a new feed')).toBeTruthy();
+    // NAN-4132: no AI capability → the hero copy does not promise pivt drafting.
+    expect(screen.queryByText(/pivt/)).toBeNull();
     expect(screen.getByText('Ingestion source')).toBeTruthy();
     expect(await screen.findByText('HTTP ingest')).toBeTruthy();
     expect(mocks.getIngestEndpoint).not.toHaveBeenCalled();

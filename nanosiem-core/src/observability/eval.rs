@@ -12,6 +12,25 @@ pub fn within_rearm(last: DateTime<Utc>, now: DateTime<Utc>, seconds: u64) -> bo
     elapsed < 0 || (elapsed as u64) < seconds
 }
 
+/// Fill only absent filtered counter series in groups whose base metric is
+/// present. Existing NULL rates (e.g. one sample) and dead services stay unknown.
+pub fn fill_missing_counter_rates(
+    rows: Vec<(String, Option<f64>)>,
+    filtered_counts: Vec<(String, Option<f64>)>,
+    base_counts: Vec<(String, Option<f64>)>,
+) -> Vec<(String, Option<f64>)> {
+    let observed: std::collections::HashSet<_> = filtered_counts.into_iter()
+        .filter(|(_, n)| n.is_some_and(|n| n.is_finite() && n > 0.0))
+        .map(|(key, _)| key).collect();
+    let mut result: std::collections::BTreeMap<_, _> = rows.into_iter().collect();
+    for (key, count) in base_counts {
+        if count.is_some_and(|n| n.is_finite() && n > 0.0) && !observed.contains(&key) {
+            result.insert(key, Some(0.0));
+        }
+    }
+    result.into_iter().collect()
+}
+
 pub fn metric_breach(monitor: &MetricMonitor, value: Option<f64>) -> bool {
     value.is_some_and(|v| v.is_finite() && monitor.comparator.breached(v, monitor.threshold))
 }
@@ -22,7 +41,20 @@ pub fn metric_payload(
     value: f64,
     now: DateTime<Utc>,
 ) -> serde_json::Value {
+    let mut labels = serde_json::Map::new();
+    for filter in &monitor.filters {
+        labels.insert(
+            filter.key.clone(),
+            serde_json::Value::String(filter.value.clone()),
+        );
+    }
+    if let Some(group) = &monitor.group_by {
+        if !series.is_empty() {
+            labels.insert(group.clone(), serde_json::Value::String(series.to_owned()));
+        }
+    }
     serde_json::json!([{
+        "labels": labels,
         "monitor_id": monitor.id.to_string(), "monitor_name": monitor.name,
         "metric_name": monitor.metric_name, "agg": monitor.agg,
         "service_name": monitor.service_name, "group_by": monitor.group_by,
@@ -79,6 +111,24 @@ pub fn slo_payload(
 mod tests {
     use super::*;
     #[test]
+    fn sparse_counter_rate_golden() {
+        let rows = vec![("active".into(), Some(2.0)), ("one-sample".into(), None),
+            ("absent".into(), None)];
+        let filtered = vec![("active".into(), Some(5.0)), ("one-sample".into(), Some(1.0)),
+            ("absent".into(), Some(0.0))];
+        let base = vec![("active".into(), Some(9.0)), ("one-sample".into(), Some(9.0)),
+            ("absent".into(), Some(9.0)), ("new-group".into(), Some(2.0)),
+            ("dead".into(), Some(0.0)), ("unknown".into(), None)];
+        assert_eq!(fill_missing_counter_rates(rows, filtered, base), vec![
+            ("absent".into(), Some(0.0)), ("active".into(), Some(2.0)),
+            ("new-group".into(), Some(0.0)), ("one-sample".into(), None)]);
+        assert_eq!(fill_missing_counter_rates(vec![("".into(), None)], vec![],
+            vec![("".into(), Some(0.0))]), vec![("".into(), None)]);
+        assert_eq!(fill_missing_counter_rates(vec![], vec![],
+            vec![("".into(), Some(3.0))]), vec![("".into(), Some(0.0))]);
+    }
+
+    #[test]
     fn no_data_and_partial_never_breach() {
         assert_eq!(slo_evaluation(0.99, 0.0, true, false).status, "no_data");
         assert_eq!(slo_evaluation(0.99, 0.0, false, true).status, "partial");
@@ -119,6 +169,14 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
+        monitor.group_by = Some("instance".into());
+        monitor.filters.push(super::super::MonitorTagFilter {
+            key: "mountpoint".into(),
+            value: "/".into(),
+        });
+        let payload = metric_payload(&monitor, "node-a", 9.0, now);
+        assert_eq!(payload[0]["labels"]["instance"], "node-a");
+        assert_eq!(payload[0]["labels"]["mountpoint"], "/");
         for (comparator, low, equal, high) in [
             (Gt, false, false, true),
             (Gte, false, true, true),
@@ -133,5 +191,55 @@ mod tests {
             assert!(!metric_breach(&monitor, Some(f64::NAN)));
             assert!(!metric_breach(&monitor, Some(f64::INFINITY)));
         }
+    }
+}
+
+/// Conservative free-space fraction within a monitor window. Missing or invalid
+/// capacity is no-data, never a fabricated zero/free-space incident.
+pub fn filesystem_ratios(
+    available: Vec<(String, Option<f64>)>,
+    capacity: Vec<(String, Option<f64>)>,
+) -> Vec<(String, Option<f64>)> {
+    let capacity: std::collections::HashMap<_, _> = capacity.into_iter().collect();
+    available
+        .into_iter()
+        .map(|(key, value)| {
+            let ratio = value
+                .zip(capacity.get(&key).copied().flatten())
+                .filter(|(free, size)| {
+                    free.is_finite()
+                        && size.is_finite()
+                        && *free >= 0.0
+                        && *size > 0.0
+                        && free <= size
+                })
+                .map(|(free, size)| free / size);
+            (key, ratio)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod filesystem_tests {
+    use super::filesystem_ratios;
+    #[test]
+    fn ratios_match_nodes_and_require_fresh_positive_capacity() {
+        let rows = filesystem_ratios(
+            vec![
+                ("small".into(), Some(6.38)),
+                ("large".into(), Some(6.38)),
+                ("missing".into(), Some(1.0)),
+                ("zero".into(), Some(1.0)),
+            ],
+            vec![
+                ("large".into(), Some(100.0)),
+                ("small".into(), Some(40.0)),
+                ("zero".into(), Some(0.0)),
+            ],
+        );
+        assert!((rows[0].1.unwrap() - 0.1595).abs() < 1e-9);
+        assert!(rows[1].1.unwrap() < 0.1);
+        assert_eq!(rows[2].1, None);
+        assert_eq!(rows[3].1, None);
     }
 }

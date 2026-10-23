@@ -214,6 +214,12 @@ export interface NavItem {
   hideOnShared?: boolean;
   /** Hosted shared-lake pipeline management has a tenant runtime contract. */
   sharedOnly?: boolean;
+  /**
+   * Hide from demo analysts (Saturn role or a live shared demo session,
+   * NAN-4152): the surface is refused by the demo guard even though a demo
+   * permission happens to match (same rule as the settings `demoHidden`).
+   */
+  demoHidden?: boolean;
 }
 
 /**
@@ -292,7 +298,7 @@ const settingsNavigation: NavItem[] = [
   { name: 'Risk Scoring', href: '/settings/risk', icon: TrendingUp, permissions: 'risk:configure', capability: 'risk' },
   { name: 'Storage', href: '/settings/storage', icon: Database, permissions: 'settings:retention' },
   { name: 'Search', href: '/settings/search', icon: Gauge, permissions: 'settings:system' },
-  { name: 'AI', href: '/settings/ai', icon: Bot, permissions: ['settings:ai', 'settings:ai_providers', 'settings:agent_models'], capability: 'melod' },
+  { name: 'AI', href: '/settings/ai', icon: Bot, permissions: ['settings:ai', 'settings:ai_providers', 'settings:agent_models'], capability: 'melod', demoHidden: true },
   { name: 'Webhooks', href: '/settings/webhooks', icon: Webhook, permissions: 'settings:webhooks' },
   { name: 'GDPR', href: '/settings/gdpr', icon: ShieldCheck, permissions: 'gdpr:anonymize' },
   { name: 'Access Control', href: '/settings/access-control', icon: LucideShield, permissions: ['users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view'] },
@@ -650,6 +656,7 @@ function MainAppShell({ children }: AppLayoutProps) {
       // Build-time capability gate — open-core builds drop enterprise items.
       if (item.capability && !capabilities[item.capability]) return false;
       if (!visibleOnEdition(item, sharedTenant)) return false;
+      if (item.demoHidden && isDemoUser) return false;
 
       // No permission required - always show
       if (!item.permissions) return true;
@@ -660,7 +667,7 @@ function MainAppShell({ children }: AppLayoutProps) {
       }
       return hasPermission(item.permissions);
     });
-  }, [hasPermission, hasAnyPermission, capabilities, sharedTenant]);
+  }, [hasPermission, hasAnyPermission, capabilities, sharedTenant, isDemoUser]);
 
   // Filtered navigation arrays based on user permissions
   const filteredNavigation = useMemo(() => {

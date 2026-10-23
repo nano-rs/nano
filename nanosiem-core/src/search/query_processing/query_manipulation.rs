@@ -15,7 +15,8 @@ use crate::search::field_utils::{is_post_processing_field, normalize_field_alias
 
 /// Resolve schema-dependent product semantics without creating field aliases.
 /// Explicit field names remain untouched and must validate against the active
-/// profile. Only named presets and omitted defaults are translated.
+/// profile. Only named presets, omitted defaults and OCSF object roots in
+/// `table` / `fields` (`http_request` → `http_request.*`) are translated.
 pub fn apply_profile_product_semantics(
     query: &mut Query,
     profile: &dyn crate::schema::SchemaProfile,
@@ -27,6 +28,32 @@ pub fn apply_profile_product_semantics(
 
     if !profile.uses_strict_canonical_fields() {
         return;
+    }
+
+    // NAN-4279 (F13): an OCSF object root in `table` / `fields` names every
+    // leaf beneath it. The lake view has only the dotted leaves, so the root
+    // becomes the `<root>.*` wildcard the projection already expands. Only
+    // over event rows: after stats/eval/rename a name like `device` may be a
+    // pipeline column, never an OCSF object.
+    let as_root_wildcard = |name: &mut String| {
+        if !profile.object_root_leaves(name).is_empty() {
+            name.push_str(".*");
+        }
+    };
+    let over_event_rows = carries_event_fields_only(source);
+    match command {
+        _ if !over_event_rows => {}
+        Command::Table { fields } => {
+            for field in fields.iter_mut().filter(|field| field.alias.is_none()) {
+                as_root_wildcard(&mut field.name);
+            }
+            return;
+        }
+        Command::Fields { fields, .. } => {
+            fields.iter_mut().for_each(as_root_wildcard);
+            return;
+        }
+        _ => {}
     }
 
     if let Command::ResolveIdentity {
@@ -67,6 +94,27 @@ pub fn apply_profile_product_semantics(
             *prevalence_field = Some("http_request.url.hostname".to_string());
         }
         None => {}
+    }
+}
+
+/// Whether every column `query` outputs is a stored event field: the search
+/// itself and commands that only filter, order, project or expand event rows.
+fn carries_event_fields_only(query: &Query) -> bool {
+    match query {
+        Query::Search(_) => true,
+        Query::Piped { source, command } => {
+            (matches!(
+                command,
+                Command::Where { .. }
+                    | Command::Sort { .. }
+                    | Command::Head { .. }
+                    | Command::Tail { .. }
+                    | Command::Dedup { .. }
+                    | Command::Fields { .. }
+                    | Command::Mvexpand { .. }
+            ) || matches!(command, Command::Table { fields } if fields.iter().all(|f| f.alias.is_none())))
+                && carries_event_fields_only(source)
+        }
     }
 }
 

@@ -614,12 +614,12 @@ export NANOSIEM_ANTHROPIC_NATIVE="${NANOSIEM_ANTHROPIC_NATIVE:-1}"
 #   parked until we have a reason to re-evaluate. Set to `1` to opt in.
 export NANOSIEM_PARSER_TOOL_LOOP="${NANOSIEM_PARSER_TOOL_LOOP:-0}"
 
-# Docs RAG (product-doc retrieval for AI chat) — reaches the internet, so SKIP
-# in air-gap. docs_rag.rs no-ops gracefully when DOCS_RAG_URL is unset.
-if [ "$AIRGAP_MODE" != "true" ]; then
-    export DOCS_RAG_URL="${DOCS_RAG_URL:-https://siem-rag.nano.rs}"
-    export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-nsiem-docs-ca25fd841aa2213987887249055be498}"
-fi
+# Docs search (NAN-4103): pivt grounds product answers on the nano-docs-public
+# AI Search instance via the docs-search Worker. DOCS_SEARCH_TOKEN is the
+# Worker caller token (NOT a Cloudflare token); it has no default, so docs
+# grounding stays off locally unless you export it. Off under AIRGAP_MODE.
+export DOCS_SEARCH_URL="${DOCS_SEARCH_URL:-https://docs-search.nano.rs}"
+export DOCS_SEARCH_TOKEN="${DOCS_SEARCH_TOKEN:-}"
 
 # Log directory
 LOG_DIR="./logs"
@@ -1476,8 +1476,8 @@ CLOUDFLARE_AI_GATEWAY_URL="$CLOUDFLARE_AI_GATEWAY_URL" \
 CF_AIG_AUTH_TOKEN="$CF_AIG_AUTH_TOKEN" \
 NANOSIEM_ANTHROPIC_NATIVE="$NANOSIEM_ANTHROPIC_NATIVE" \
 NANOSIEM_PARSER_TOOL_LOOP="$NANOSIEM_PARSER_TOOL_LOOP" \
-DOCS_RAG_URL="$DOCS_RAG_URL" \
-DOCS_RAG_TOKEN="$DOCS_RAG_TOKEN" \
+DOCS_SEARCH_URL="$DOCS_SEARCH_URL" \
+DOCS_SEARCH_TOKEN="$DOCS_SEARCH_TOKEN" \
 DISK_PRESSURE_CHECK_INTERVAL_SECS="$DISK_PRESSURE_CHECK_INTERVAL_SECS" \
 DISK_PRESSURE_HIGH_WATERMARK="$DISK_PRESSURE_HIGH_WATERMARK" \
 DISK_PRESSURE_LOW_WATERMARK="$DISK_PRESSURE_LOW_WATERMARK" \

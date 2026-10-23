@@ -164,9 +164,7 @@ impl DetectionService {
         // the rule-editor test drawer renders aggregate-row labels the same
         // way the matches list does (NAN-830).
         let mut sample_events = response.results;
-        for ev in &mut sample_events {
-            crate::detection::normalize_match_event(ev);
-        }
+        crate::detection::normalize_match_events_for_query(&mut sample_events, &rule.query);
         // Audit D35: the sample is capped at `max_events_per_alert` for display.
         // While it isn't capped, its length IS the exact post-processing match
         // count — correct even for `| where count > N` threshold rules that
@@ -424,13 +422,10 @@ impl DetectionService {
                         bucket_start,
                         count,
                     });
-                    for mut row in rows {
+                    for row in rows {
                         if sample_events.len() >= max_samples {
                             break;
                         }
-                        // NAN-831: canonical envelope so the test drawer
-                        // renders aggregate-row labels uniformly.
-                        crate::detection::normalize_match_event(&mut row);
                         sample_events.push(row);
                     }
                 }
@@ -450,6 +445,9 @@ impl DetectionService {
                 }
             }
         }
+
+        // Normalize the capped sample as one batch: parse the risk declaration once.
+        crate::detection::normalize_match_events_for_query(&mut sample_events, query);
 
         // FuturesUnordered yields in completion order — sort chronologically
         // so the sparkline renders in time order regardless of how queries
@@ -686,9 +684,7 @@ impl DetectionService {
 
         // NAN-831: canonical envelope (see analyze_rule_historical above).
         let mut sample_events = response.results;
-        for ev in &mut sample_events {
-            crate::detection::normalize_match_event(ev);
-        }
+        crate::detection::normalize_match_events_for_query(&mut sample_events, query);
         // Audit D35: the sample is capped at `max_events_per_alert` for display.
         // While it isn't capped, its length IS the exact post-processing match
         // count — correct even for `| where count > N` threshold rules that

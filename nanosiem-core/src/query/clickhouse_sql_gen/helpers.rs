@@ -889,17 +889,17 @@ pub(crate) fn anchored_guard_token(literal_lower: &str) -> Option<&str> {
 /// `raw_data` is NULL, so a leg here can evaluate to NULL. That is harmless for a
 /// positive search (NULL filters like false, and `NULL OR true` is true) but not
 /// under negation — see [`null_safe_not`], which every `NOT` goes through.
-pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str]) -> String {
+pub(crate) fn bare_keyword_predicate(kw: &str, cols: &[&str], term_adjacency: bool) -> String {
     debug_assert!(
         !cols.is_empty(),
         "keyword_search_columns() must never be empty"
     );
     match cols {
-        [col] => bare_keyword_predicate_for_column(kw, col),
+        [col] => bare_keyword_predicate_for_column(kw, col, term_adjacency),
         _ => {
             let folded = cols
                 .iter()
-                .map(|col| bare_keyword_predicate_for_column(kw, col))
+                .map(|col| bare_keyword_predicate_for_column(kw, col, term_adjacency))
                 .collect::<Vec<_>>()
                 .join(" OR ");
             // Parenthesized: the caller splices this into a larger AND-chain, and
@@ -940,7 +940,7 @@ pub(crate) fn null_safe_not(inner_sql: &str) -> String {
 /// The single-column predicate. Every arm below must stay index-compatible: the
 /// emitted expression is matched by ClickHouse against the text index BY
 /// EXPRESSION, so `lower(<col>)` here must mirror the DDL exactly.
-fn bare_keyword_predicate_for_column(kw: &str, col: &str) -> String {
+fn bare_keyword_predicate_for_column(kw: &str, col: &str, term_adjacency: bool) -> String {
     let lowered = kw.to_lowercase();
 
     // Explicit wildcards (`cmd*`, `*cmd`, `c?d`, `**`) are partial-match intent →
@@ -964,7 +964,154 @@ fn bare_keyword_predicate_for_column(kw: &str, col: &str) -> String {
         return format!("lower({col}) iLike '%{}%'", escape_like_pattern(&escaped));
     }
 
-    format!("hasAllTokens(lower({col}), '{}')", escaped)
+    // NAN-4164: an ASCII multi-token needle is the exact term regex alone.
+    // It implies the token test (see `keyword_term_regex_ascii_exact`), and
+    // `hasAllTokens(lower(col), …)` copies and tokenizes every value: on a
+    // 2.1M-row raw_data scan on a large tenant, the token-guarded form cost 0.6-0.8 s
+    // over a 0.3 s read floor, the regex alone 0.1 s, same rows.
+    if term_adjacency {
+        if let Some(term) = keyword_term_regex_ascii_exact(&lowered) {
+            return format!("match({col}, '{}')", escape_regex_pattern(&term));
+        }
+    }
+    let tokens = format!("hasAllTokens(lower({col}), '{}')", escaped);
+    match term_adjacency.then(|| keyword_term_regex(&lowered)).flatten() {
+        Some(term) => format!("({tokens} AND match({col}, '{}'))", escape_regex_pattern(&term)),
+        None => tokens,
+    }
+}
+
+/// NAN-4288 (F17): a backslash in a phrase matches a RUN of backslashes.
+///
+/// Raw text keeps a JSON event's escaping, so Sysmon stores
+/// `C:\\Windows\\System32\\svchost.exe` with doubled backslashes, while
+/// analysts paste the path as it displays, with single ones. The phrase then
+/// never matched (0 rows against 78,126 for the field compare). Backslashes
+/// are token separators, so the token prefilter is unchanged.
+const ESCAPED_BACKSLASH_RUN: &str = r"\\+";
+
+/// NAN-4164: the adjacency regex of a bare keyword that ClickHouse splits
+/// into two or more tokens; `None` for a single-token needle (token search
+/// is already exact for it).
+///
+/// Token-AND alone lets the pieces match anywhere in the event, which is
+/// wrong for exactly the needles analysts type most: on the live lean tenant
+/// `"10.1.4.20"` matched 13,766 events in an hour where 646 hold the IP
+/// (`10`, `1`, `4` and `20` occur in nearly every timestamp), and
+/// `"failed password"` matched 2,207 events where none holds the phrase.
+/// The needle is matched as a TERM instead: the characters in order, with a
+/// token boundary on each end. The regex requires the needle's characters in
+/// order (case-insensitive, a run of whitespace matching any whitespace run)
+/// and, where the needle starts/ends with an alphanumeric, an ASCII
+/// non-alphanumeric neighbour: the ClickHouse token boundary, where every
+/// non-ASCII byte is a token character. The lake's adjacent-pair index
+/// (NAN-4164 v5 `tokens.nti`) relies on that edge: a matching needle's pieces
+/// are then whole, adjacent index tokens. So `10.1.4.20` no longer
+/// matches `110.1.4.201`, and `ws-fin-095` no longer matches
+/// `ws-fin-0951`. Every match still satisfies `hasAllTokens`, which stays in
+/// front as the cheap prefilter and the token-index hint.
+pub(crate) fn keyword_term_regex(lowered: &str) -> Option<String> {
+    let mut pieces = 0;
+    let mut in_token = false;
+    for byte in lowered.bytes() {
+        let token_byte = byte.is_ascii_alphanumeric() || byte >= 0x80;
+        if token_byte && !in_token {
+            pieces += 1;
+        }
+        in_token = token_byte;
+    }
+    if pieces < 2 {
+        return None;
+    }
+    let is_alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let trimmed = lowered.trim();
+    let mut regex = String::from("(?i)");
+    if is_alnum(trimmed.chars().next()) {
+        regex.push_str(r"(?:^|[^a-z0-9\x{80}-\x{10FFFF}])");
+    }
+    let mut literal = String::new();
+    let mut in_space = false;
+    for c in trimmed.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                regex.push_str(&regex::escape(&literal));
+                literal.clear();
+                regex.push_str(r"\s+");
+            }
+            in_space = true;
+        } else if c == '\\' {
+            // NAN-4288 (F17): see `ESCAPED_BACKSLASH_RUN`.
+            in_space = false;
+            regex.push_str(&regex::escape(&literal));
+            literal.clear();
+            regex.push_str(ESCAPED_BACKSLASH_RUN);
+        } else {
+            in_space = false;
+            literal.push(c);
+        }
+    }
+    regex.push_str(&regex::escape(&literal));
+    if is_alnum(trimmed.chars().last()) {
+        regex.push_str(r"(?:$|[^a-z0-9\x{80}-\x{10FFFF}])");
+    }
+    Some(regex)
+}
+
+/// NAN-4164: [`keyword_term_regex`] for an ASCII needle, folding case with
+/// ASCII classes (`[Ff]`) instead of `(?i)`, so a match is EXACTLY
+/// `hasAllTokens(lower(col), needle) AND match(col, keyword_term_regex)`:
+///
+/// - `lower` and the token searcher fold ASCII only, while RE2's `(?i)` also
+///   folds `ſ` to `s` and the Kelvin sign to `k`; ASCII classes fold exactly
+///   what `lower` folds, so the regex alone never accepts a value the token
+///   test rejects for case;
+/// - every needle piece (an ASCII alphanumeric run, which is what
+///   `splitByNonAlpha` makes of an ASCII needle) is matched whole: its
+///   neighbours are the needle's own separators (matched literally, or `\s+`
+///   for whitespace) or, at an alphanumeric end, the boundary class
+///   `[^A-Za-z0-9\x{80}-\x{10FFFF}]` (a non-token ASCII byte) or the value's
+///   edge. So every piece is a token of the value, which is the token test.
+///
+/// `None` for a non-ASCII needle (its edges and folding need the token test)
+/// and for a single-token needle (token search is already exact).
+pub(crate) fn keyword_term_regex_ascii_exact(lowered: &str) -> Option<String> {
+    if !lowered.is_ascii() {
+        return None;
+    }
+    keyword_term_regex(lowered)?;
+    let trimmed = lowered.trim();
+    let starts = trimmed.chars().next().is_some_and(|c| c.is_ascii_alphanumeric());
+    let ends = trimmed.chars().last().is_some_and(|c| c.is_ascii_alphanumeric());
+    const EDGE: &str = r"[^A-Za-z0-9\x{80}-\x{10FFFF}]";
+    let mut regex = String::new();
+    if starts {
+        regex.push_str(&format!("(?:^|{EDGE})"));
+    }
+    let mut in_space = false;
+    for c in trimmed.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                regex.push_str(r"\s+");
+            }
+            in_space = true;
+            continue;
+        }
+        in_space = false;
+        if c == '\\' {
+            regex.push_str(ESCAPED_BACKSLASH_RUN);
+        } else if c.is_ascii_alphabetic() {
+            regex.push('[');
+            regex.push(c.to_ascii_uppercase());
+            regex.push(c.to_ascii_lowercase());
+            regex.push(']');
+        } else {
+            regex.push_str(&regex::escape(&c.to_string()));
+        }
+    }
+    if ends {
+        regex.push_str(&format!("(?:$|{EDGE})"));
+    }
+    Some(regex)
 }
 
 /// A bare keyword carrying `*`/`?` (NAN-3041): Splunk TERM semantics.
@@ -1680,6 +1827,24 @@ pub(crate) fn is_reserved_word(word: &str) -> bool {
 mod inline_tests {
     use super::*;
 
+    /// NAN-4288 (F17): a pasted Windows path matches raw text that keeps the
+    /// JSON escaping (doubled backslashes) as well as unescaped text, and
+    /// still requires the backslash.
+    #[test]
+    fn phrase_backslash_matches_json_escaped_raw_text() {
+        let needle = r"c:\windows\system32\svchost.exe";
+        for regex in [
+            keyword_term_regex_ascii_exact(needle).unwrap(),
+            keyword_term_regex(needle).unwrap(),
+        ] {
+            let re = regex::Regex::new(&regex).unwrap();
+            assert!(re.is_match(r#"{"Image":"C:\\Windows\\System32\\svchost.exe"}"#), "{regex}");
+            assert!(re.is_match(r"Image: C:\Windows\System32\svchost.exe"), "{regex}");
+            assert!(!re.is_match(r"C:/Windows/System32/svchost.exe"), "{regex}");
+            assert!(!re.is_match(r"C:\Windows\System32\svchost.exe2"), "{regex}");
+        }
+    }
+
     #[test]
     fn extract_named_groups_handles_both_pcre_forms() {
         // NAN-1340: `(?P<name>…)` (re2/Python/Splunk-PCRE) must be recognized, not
@@ -2186,5 +2351,120 @@ mod inline_tests {
         // No alphanumeric content → no guard.
         assert_eq!(anchored_guard_token("***"), None);
         assert_eq!(anchored_guard_token(""), None);
+    }
+
+    /// NAN-4164: a multi-token bare keyword is matched as a term (characters
+    /// in order, token boundary on each end); a single token stays token-only.
+    #[test]
+    fn keyword_term_regex_pins_compound_needles() {
+        assert_eq!(keyword_term_regex("sysmon"), None);
+        assert_eq!(keyword_term_regex("-sysmon-"), None);
+        assert_eq!(keyword_term_regex(""), None);
+        assert_eq!(
+            keyword_term_regex("10.1.4.20").as_deref(),
+            Some(r"(?i)(?:^|[^a-z0-9\x{80}-\x{10FFFF}])10\.1\.4\.20(?:$|[^a-z0-9\x{80}-\x{10FFFF}])")
+        );
+        assert_eq!(
+            keyword_term_regex("failed  password").as_deref(),
+            Some(r"(?i)(?:^|[^a-z0-9\x{80}-\x{10FFFF}])failed\s+password(?:$|[^a-z0-9\x{80}-\x{10FFFF}])")
+        );
+        assert_eq!(
+            keyword_term_regex("c:\\windows\\").as_deref(),
+            // NAN-4288: each backslash matches a JSON-escaped run.
+            Some(r"(?i)(?:^|[^a-z0-9\x{80}-\x{10FFFF}])c:\\+windows\\+")
+        );
+
+        let matches = |needle: &str, text: &str| {
+            regex::Regex::new(&keyword_term_regex(needle).unwrap()).unwrap().is_match(text)
+        };
+        assert!(matches("10.1.4.20", "src=10.1.4.20 dst=1.1.1.1"));
+        assert!(matches("10.1.4.20", "10.1.4.20"));
+        assert!(!matches("10.1.4.20", "src=110.1.4.201"));
+        // A non-ASCII neighbour is a token character to ClickHouse and to
+        // the lake token index, so it is not a term boundary either.
+        assert!(!matches("10.1.4.20", "src=é10.1.4.20"));
+        assert!(!matches("10.1.4.20", "10.1.4.20ü"));
+        assert!(!matches("10.1.4.20", "→10.1.4.20←"));
+        assert!(!matches("10.1.4.20", "2026-10-01T04:20:00 host 10.1.9.4"));
+        assert!(matches("ws-fin-095", "Computer: WS-FIN-095.corp"));
+        assert!(!matches("ws-fin-095", "ws-fin-0951"));
+        assert!(matches("failed password", "sshd: Failed\tpassword for root"));
+        assert!(!matches("failed password", "password failed"));
+        assert!(!matches("failed password", "failedpassword"));
+    }
+
+    #[test]
+    fn bare_keyword_predicate_adds_term_match_only_when_enabled() {
+        let cols = ["message"];
+        assert_eq!(
+            bare_keyword_predicate("10.1.4.20", &cols, false),
+            "hasAllTokens(lower(message), '10.1.4.20')"
+        );
+        assert_eq!(
+            bare_keyword_predicate("10.1.4.20", &cols, true),
+            r"match(message, '(?:^|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])10\\.1\\.4\\.20(?:$|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])')"
+        );
+        assert_eq!(
+            bare_keyword_predicate("Sysmon", &cols, true),
+            "hasAllTokens(lower(message), 'sysmon')"
+        );
+        assert_eq!(
+            bare_keyword_predicate("o'brien x", &cols, true),
+            r"match(message, '(?:^|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])[Oo]''[Bb][Rr][Ii][Ee][Nn]\\s+[Xx](?:$|[^A-Za-z0-9\\x{80}-\\x{10FFFF}])')"
+        );
+        // A non-ASCII needle keeps the token test in front of the term regex.
+        assert_eq!(
+            bare_keyword_predicate("straße x", &cols, true),
+            r"(hasAllTokens(lower(message), 'straße x') AND match(message, '(?i)(?:^|[^a-z0-9\\x{80}-\\x{10FFFF}])straße\\s+x(?:$|[^a-z0-9\\x{80}-\\x{10FFFF}])'))"
+        );
+    }
+
+    /// NAN-4164: for an ASCII needle the exact term regex alone accepts
+    /// exactly what `hasAllTokens(lower(col), needle) AND match(col, (?i)
+    /// term)` accepts, including the values where RE2's Unicode case
+    /// folding (`ſ`, the Kelvin sign) or a non-ASCII neighbour would differ.
+    #[test]
+    fn ascii_exact_term_regex_equals_tokens_and_term_regex() {
+        // ClickHouse `splitByNonAlpha` over ASCII-lowered text: ASCII
+        // alphanumerics and every non-ASCII character are token characters.
+        fn tokens(text: &str) -> Vec<String> {
+            text.to_ascii_lowercase()
+                .split(|c: char| c.is_ascii() && !c.is_ascii_alphanumeric())
+                .filter(|piece| !piece.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+        const FRAGMENTS: [&str; 22] = [
+            "10.1.4.20", "110.1.4.201", "FAILED", "failed", "Password", "paſsword", "\u{212A}ey", "Key", " ", "\t",
+            ".", "-", "é", "→", "WS-FIN-095", "ws-fin-0951", "C:\\WINDOWS\\", "x", "Y", "-X Y", "ü10", "20ü",
+        ];
+        const NEEDLES: [&str; 8] =
+            ["10.1.4.20", "failed password", "ws-fin-095", "c:\\windows\\", "-x y", "key x", "failed\tpassword", "4.20"];
+        let mut haystacks = vec![String::new()];
+        for a in FRAGMENTS {
+            haystacks.push(a.to_string());
+            for b in FRAGMENTS {
+                haystacks.push(format!("{a}{b}"));
+                for c in FRAGMENTS {
+                    haystacks.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+        for needle in NEEDLES {
+            let lowered = needle.to_lowercase();
+            let exact = regex::Regex::new(&keyword_term_regex_ascii_exact(&lowered).unwrap()).unwrap();
+            let term = regex::Regex::new(&keyword_term_regex(&lowered).unwrap()).unwrap();
+            let wanted = tokens(&lowered);
+            let mut matched = 0;
+            for haystack in &haystacks {
+                let have = tokens(haystack);
+                let old = wanted.iter().all(|token| have.contains(token)) && term.is_match(haystack);
+                assert_eq!(exact.is_match(haystack), old, "{needle:?} over {haystack:?}");
+                matched += usize::from(old);
+            }
+            assert!(matched > 0, "{needle:?} must match some haystack");
+        }
+        assert_eq!(keyword_term_regex_ascii_exact("straße x"), None);
+        assert_eq!(keyword_term_regex_ascii_exact("sysmon"), None);
     }
 }

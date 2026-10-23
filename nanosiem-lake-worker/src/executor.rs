@@ -146,6 +146,21 @@ pub fn read_lane_sql(sql: &str) -> String {
     with_setting(&sql, READ_LANE_FILE_METHOD)
 }
 
+/// NAN-4174: `sql` under its thread grant (unchanged without one), and the
+/// largest grant of the request in its timing record.
+fn grant_sql(
+    grant: Option<&crate::thread_budget::ThreadGrant>,
+    sql: String,
+    timing: Option<&Arc<Mutex<crate::query_timing::Phases>>>,
+) -> String {
+    let Some(grant) = grant else { return sql };
+    if let Some(timing) = timing {
+        let mut phases = timing.lock().unwrap_or_else(|e| e.into_inner());
+        phases.threads_granted = phases.threads_granted.max(grant.threads());
+    }
+    grant.apply(&sql)
+}
+
 /// Append one `name=value` setting the same way as [`with_read_only_setting`].
 pub fn with_setting(sql: &str, setting: &str) -> String {
     let trimmed = sql.trim_end();
@@ -186,6 +201,8 @@ struct Job {
     admitted_at: Instant,
     deadline: Instant,
     started: oneshot::Sender<Instant>,
+    /// NAN-4174: whom the statement serves (its thread grant's class).
+    priority: crate::thread_budget::Priority,
 }
 
 /// One streamed statement's lane job (see [`NativeExecutor::execute_streaming`]).
@@ -200,6 +217,8 @@ struct StreamJob {
     clock: Option<Arc<StatementClock>>,
     deadline: Instant,
     started: oneshot::Sender<Instant>,
+    /// NAN-4174: whom the statement serves (its thread grant's class).
+    priority: crate::thread_budget::Priority,
 }
 
 enum StreamItem {
@@ -273,6 +292,9 @@ pub struct NativeExecutor {
     server_memory_limit_bytes: Option<u64>,
     result_limit_bytes: Option<u64>,
     streaming: bool,
+    /// NAN-4174: the process thread budget every statement on this pool
+    /// takes a grant from when its lane starts it (unset: threads as written).
+    thread_budget: Arc<std::sync::OnceLock<Arc<crate::thread_budget::ThreadBudget>>>,
     /// NAN-3391: keeps the process-wide chDB DNS cache refresher running
     /// while this executor (or a clone) is alive.
     #[allow(dead_code)] // held for its Drop, never read
@@ -404,6 +426,7 @@ impl NativeExecutor {
         let connection_args: Arc<[String]> =
             executor_connection_args(server_memory_limit_bytes).into();
         let streaming = runtime.supports_streaming();
+        let thread_budget: Arc<std::sync::OnceLock<Arc<crate::thread_budget::ThreadBudget>>> = Arc::default();
         for index in 0..connection_count {
             senders.push(start_connection(
                 runtime.clone(),
@@ -412,6 +435,7 @@ impl NativeExecutor {
                 lanes[index].clone(),
                 mode,
                 connection_args.clone(),
+                thread_budget.clone(),
             )?);
         }
         // NAN-3391: embedded chDB never refreshes its DNS cache; see native_dns.
@@ -431,6 +455,7 @@ impl NativeExecutor {
             server_memory_limit_bytes,
             result_limit_bytes: None,
             streaming,
+            thread_budget,
             dns_refresher,
         })
     }
@@ -450,6 +475,18 @@ impl NativeExecutor {
     pub fn with_result_limit(mut self, bytes: u64) -> Self {
         self.result_limit_bytes = Some(bytes);
         self
+    }
+
+    /// NAN-4174: take every statement's threads from `budget` (see
+    /// [`crate::thread_budget`]). Set once; a second budget is ignored.
+    pub fn with_thread_budget(self, budget: Arc<crate::thread_budget::ThreadBudget>) -> Self {
+        let _ = self.thread_budget.set(budget);
+        self
+    }
+
+    /// The thread budget set by [`Self::with_thread_budget`].
+    pub fn thread_budget(&self) -> Option<&Arc<crate::thread_budget::ThreadBudget>> {
+        self.thread_budget.get()
     }
 
     /// Whether [`Self::execute_streaming`] is available (the chDB artifact
@@ -645,6 +682,7 @@ impl NativeExecutor {
         self.lanes[index].queued.fetch_add(1, Ordering::Relaxed);
         permit.send(Command::Stream(StreamJob {
             query_id, request_id, budget, sql, params: plan.params, chunks, timing, clock, deadline, started,
+            priority: crate::thread_budget::Priority::current(),
         }));
         match tokio::time::timeout_at(deadline.into(), start_receiver).await {
             Ok(Ok(started_at)) => wait.finished_at = Some(started_at),
@@ -734,6 +772,7 @@ impl NativeExecutor {
             admitted_at,
             deadline,
             started,
+            priority: crate::thread_budget::Priority::current(),
         }));
         match tokio::time::timeout_at(deadline.into(), start_receiver).await {
             Ok(Ok(started_at)) => wait.finished_at = Some(started_at),
@@ -995,6 +1034,7 @@ fn start_connection(
     status: Arc<LaneStatus>,
     mode: ExecutorMode,
     connection_args: Arc<[String]>,
+    thread_budget: Arc<std::sync::OnceLock<Arc<crate::thread_budget::ThreadBudget>>>,
 ) -> Result<mpsc::Sender<Command>, ExecutorError> {
     let (sender, mut receiver) = mpsc::channel::<Command>(EXECUTOR_QUEUE_DEPTH);
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
@@ -1064,6 +1104,9 @@ fn start_connection(
                             ExecutorMode::ReadOnly => read_lane_sql(&job.sql),
                             ExecutorMode::ReadWrite => job.sql.clone(),
                         };
+                        // NAN-4174: threads by what runs now, held to the end.
+                        let grant = thread_budget.get().map(|budget| budget.grant(job.priority));
+                        let sql = grant_sql(grant.as_ref(), sql, job.timing.as_ref());
                         if let Some(timing) = &job.timing {
                             timing.lock().unwrap_or_else(|e| e.into_inner()).sql_prepare_ms += prepare_started.elapsed().as_secs_f64() * 1000.0;
                         }
@@ -1072,7 +1115,13 @@ fn start_connection(
                         }
                         session_used = true;
                         let native_started = Instant::now();
+                        if let Some(timing) = &job.timing {
+                            timing.lock().unwrap_or_else(|e| e.into_inner()).native_inflight.push(native_started);
+                        }
                         let result = connection.query_with_params(&sql, "JSONEachRow", &params);
+                        if let Some(timing) = &job.timing {
+                            timing.lock().unwrap_or_else(|e| e.into_inner()).native_finished(native_started);
+                        }
                         if let Some(clock) = &job.clock {
                             StatementClock::add(&clock.native_us, native_started.elapsed());
                         }
@@ -1145,6 +1194,9 @@ fn start_connection(
                             ExecutorMode::ReadOnly => read_lane_sql(&job.sql),
                             ExecutorMode::ReadWrite => job.sql.clone(),
                         };
+                        // NAN-4174: threads by what runs now, held to the end.
+                        let grant = thread_budget.get().map(|budget| budget.grant(job.priority));
+                        let sql = grant_sql(grant.as_ref(), sql, job.timing.as_ref());
                         if let Some(timing) = &job.timing {
                             timing.lock().unwrap_or_else(|e| e.into_inner()).sql_prepare_ms += prepare_started.elapsed().as_secs_f64() * 1000.0;
                         }
@@ -1153,6 +1205,9 @@ fn start_connection(
                         }
                         session_used = true;
                         let native_started = Instant::now();
+                        if let Some(timing) = &job.timing {
+                            timing.lock().unwrap_or_else(|e| e.into_inner()).native_inflight.push(native_started);
+                        }
                         // `clean`: the statement ran to its end and the reader
                         // took every block. Anything else (an error, or a reader
                         // that went away mid-result) reopens the connection, as
@@ -1214,8 +1269,9 @@ fn start_connection(
                             }
                         };
                         if let Some(timing) = job.timing {
-                            timing.lock().unwrap_or_else(|e| e.into_inner()).chdb_ms +=
-                                native_started.elapsed().as_secs_f64() * 1000.0;
+                            let mut phases = timing.lock().unwrap_or_else(|e| e.into_inner());
+                            phases.chdb_ms += native_started.elapsed().as_secs_f64() * 1000.0;
+                            phases.native_finished(native_started);
                         }
                         if let Some(clock) = &job.clock {
                             StatementClock::add(&clock.native_us, native_started.elapsed());
@@ -1600,6 +1656,7 @@ mod tests {
             server_memory_limit_bytes: None,
             result_limit_bytes: None,
             streaming: false,
+            thread_budget: Arc::default(),
             dns_refresher: None,
         }
     }

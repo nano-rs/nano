@@ -98,10 +98,31 @@ pub trait CheckpointStore: Send + Sync {
     async fn save(&self, stream: &str, state: &Value) -> Result<(), String>;
 }
 
+/// Server-derived request semantics, independent of URL or credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestPurpose {
+    Authentication,
+    Read,
+    VendorMutation,
+    /// Callers without semantic evidence must retain conservative behavior.
+    Unknown,
+}
+
 /// An exchange: the broker in production, a recording in preview.
 #[async_trait::async_trait]
 pub trait Transport: Send + Sync {
     async fn send_once(&self, req: &OutboundRequest, hosts: &HostPolicy, caps: BodyCaps) -> Result<InboundResponse, BrokerError>;
+    /// Existing transports keep their behavior; authority wrappers can retain
+    /// the purpose through admission until actual IO starts.
+    async fn send_once_with_purpose(
+        &self,
+        req: &OutboundRequest,
+        hosts: &HostPolicy,
+        caps: BodyCaps,
+        _purpose: RequestPurpose,
+    ) -> Result<InboundResponse, BrokerError> {
+        self.send_once(req, hosts, caps).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -275,7 +296,7 @@ pub fn compile(spec: &ConnectorSpec, ceilings: &Limits) -> Result<Compiled, Engi
         return Err(bad("enrichments have exactly one stream".into()));
     }
     check_identity(spec)?;
-    let auth: Arc<dyn AuthPlugin> = Arc::from(auth::build(&spec.auth.kind, &spec.auth.params)?);
+    let mut auth = auth::build(&spec.auth.kind, &spec.auth.params)?;
     let check_req = |r: &RequestTemplate| -> Result<(), EngineError> {
         template::references(&r.url)?;
         for (k, v) in &r.query {
@@ -351,7 +372,8 @@ pub fn compile(spec: &ConnectorSpec, ceilings: &Limits) -> Result<Compiled, Engi
         max_checkpoint_bytes: l.max_checkpoint_bytes.min(c.max_checkpoint_bytes),
         max_identity_memberships: l.max_identity_memberships.min(c.max_identity_memberships),
     };
-    Ok(Compiled { spec: spec.clone(), auth, limits })
+    auth.set_request_limit(limits.max_requests);
+    Ok(Compiled { spec: spec.clone(), auth: Arc::from(auth), limits })
 }
 
 /// `kind: identity` walks whole directories (a 500k-user Okta org is ~2,500
@@ -576,6 +598,7 @@ impl Run {
             // Outside a sequence (discovery, item rendering): a stream
             // activated by this run.
             initial_cursor: Some(point_forward::fmt_rfc3339(point_forward::initial_cursor(self.started))),
+            ..Default::default()
         }
     }
 
@@ -597,7 +620,7 @@ impl Run {
             }
         }
         let platform = self.pull_broker.as_ref().map(|p| p.token.as_str());
-        let set = Arc::new(SecretSet::new(self.creds.values().chain(derived.iter().map(String::as_str)).chain(platform)));
+        let set = Arc::new(SecretSet::with_derived(self.creds.values(), derived.iter().map(String::as_str).chain(platform)));
         *cache = Some((derived.len(), set.clone()));
         set
     }
@@ -683,7 +706,13 @@ impl Run {
             let resp = loop {
                 if req.url.host_str() == Some(origin_host.as_str()) {
                     let cx = AuthContext { creds: &self.creds, fetch: self, scope, now: self.now(), feed_id: self.feed_id.as_deref() };
-                    self.compiled.auth.apply(&mut req, &cx).await?;
+                    self.compiled.auth.apply(&mut req, &cx).await.map_err(|e| match e {
+                        AuthError::RateLimited => EngineError::Upstream {
+                            status: 429,
+                            body: "session login rate limited".into(),
+                        },
+                        e => EngineError::Auth(e),
+                    })?;
                 }
                 let r = match self.transport.send_once(&req, &self.hosts, self.caps()).await {
                     Ok(r) => r,
@@ -729,7 +758,7 @@ impl Run {
             };
             let resp = self.redact(resp)?;
             match resp.status {
-                401 if !refreshed && self.compiled.auth.invalidate() => {
+                401 if !refreshed && self.compiled.auth.invalidate(&req).await => {
                     refreshed = true;
                     continue;
                 }
@@ -927,6 +956,27 @@ impl Run {
 
 #[async_trait::async_trait]
 impl TokenFetch for Run {
+    async fn session_login(&self, request: &OutboundRequest) -> Result<InboundResponse, String> {
+        if self
+            .secrets()
+            .contains_decoded(request.url.as_str().as_bytes())
+        {
+            return Err("login URL would expose a credential".into());
+        }
+        if self.requests.fetch_add(1, Ordering::SeqCst) >= self.compiled.limits.max_requests {
+            return Err("request cap reached".into());
+        }
+        self.pace(None).await;
+        self.transport
+            .send_once_with_purpose(
+                request,
+                &self.hosts,
+                self.caps(),
+                RequestPurpose::Authentication,
+            )
+            .await
+            .map_err(|_| "session exchange failed".into())
+    }
     async fn post_form(&self, url: &str, form: &[(String, String)]) -> Result<(u16, Vec<u8>), String> {
         let url = url::Url::parse(url).map_err(|e| e.to_string())?;
         let encoded = {
@@ -1039,6 +1089,10 @@ fn method(m: Method) -> http::Method {
     match m {
         Method::Get => http::Method::GET,
         Method::Post => http::Method::POST,
+        Method::Put => http::Method::PUT,
+        Method::Patch => http::Method::PATCH,
+        Method::Delete => http::Method::DELETE,
+        Method::Head => http::Method::HEAD,
     }
 }
 

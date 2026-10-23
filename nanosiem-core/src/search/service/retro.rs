@@ -215,6 +215,85 @@ const LAKE_RETRO_ASSET_FIELDS: &[&str] = &[
 
 const LAKE_RETRO_USER_FIELDS: &[&str] = &["user.name", "actor.user.name"];
 
+/// NAN-4169: extra columns a scheduled retro hunt reads per matching row: the
+/// ingest stamps (`enrichments.value`, to skip events ingest already matched)
+/// and the endpoint ports (`ip:port` indicators).
+const LAKE_RETRO_HUNT_EXTRA_FIELDS: &[&str] = &[
+    "enrichments.type",
+    "enrichments.value",
+    "src_endpoint.port",
+    "dst_endpoint.port",
+];
+
+/// NAN-4169: how a scheduled retro hunt (an auto retro-hunt rule run) differs
+/// from an interactive `| retro`: `ip:port` indicators are scanned by their IP
+/// and matched on the same endpoint's port, and an event ingest already
+/// stamped with the indicator is not counted (it was matched at ingest).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LakeRetroHuntOptions {
+    /// Values the `ioc in [...]` scan filters on: plain indicators plus the
+    /// bare IP of every `ip:port` indicator.
+    pub scan_values: Vec<String>,
+    /// Lowercased IP -> (`ip:port` indicator, port).
+    pub ip_ports: std::collections::HashMap<String, Vec<(String, String)>>,
+}
+
+impl LakeRetroHuntOptions {
+    /// Split `indicators` (lowercased) into scan values and `ip:port` legs.
+    pub(crate) fn for_indicators(indicators: &[String]) -> Self {
+        let mut options = Self::default();
+        let mut scan = std::collections::BTreeSet::new();
+        for indicator in indicators {
+            let value = indicator.trim().to_lowercase();
+            match split_ip_port(&value) {
+                Some((ip, port)) => {
+                    scan.insert(ip.clone());
+                    options.ip_ports.entry(ip).or_default().push((value, port));
+                }
+                None => {
+                    scan.insert(value);
+                }
+            }
+        }
+        options.scan_values = scan.into_iter().collect();
+        options
+    }
+
+    /// `ip:port` indicators the row matches through this endpoint IP column:
+    /// the same endpoint's port must equal the indicator's port.
+    fn ip_port_matches(&self, row: &serde_json::Value, observable: &str, ip: &str) -> Vec<String> {
+        let Some(legs) = self.ip_ports.get(ip) else {
+            return Vec::new();
+        };
+        let Some(port_path) = lake_retro_endpoint_port_path(observable) else {
+            return Vec::new();
+        };
+        let ports = lake_retro_values(row, port_path);
+        legs.iter()
+            .filter(|(_, port)| ports.iter().any(|value| value.trim() == port))
+            .map(|(indicator, _)| indicator.clone())
+            .collect()
+    }
+}
+
+/// The port column on the same endpoint as an IP observable. The lean scan
+/// reports IP observables under their aliases (`src_ip` / `dest_ip`, NAN-4169
+/// native test) and the canonical paths (`*_endpoint.ip`) elsewhere; the
+/// port is always read from the canonical endpoint column the hunt requests.
+fn lake_retro_endpoint_port_path(observable: &str) -> Option<&'static str> {
+    match observable {
+        "src_ip" | "src_endpoint.ip" => Some("src_endpoint.port"),
+        "dest_ip" | "dst_ip" | "dst_endpoint.ip" => Some("dst_endpoint.port"),
+        _ => None,
+    }
+}
+
+/// `ip:port` (`[v6]:port` for IPv6) -> (lowercased ip, port).
+pub(crate) fn split_ip_port(value: &str) -> Option<(String, String)> {
+    let address: std::net::SocketAddr = value.trim().parse().ok()?;
+    Some((address.ip().to_string().to_lowercase(), address.port().to_string()))
+}
+
 #[derive(Default)]
 struct LakeRetroIndicatorAccum {
     hits: u64,
@@ -230,6 +309,310 @@ struct LakeRetroPivotAccum {
     indicators: std::collections::HashSet<String>,
     first_seen: Option<String>,
     last_seen: Option<String>,
+}
+
+/// The `ioc=` / `ioc in [...]` filter a lake retro scan runs on.
+fn lake_retro_ioc_expr(scan_values: &[String]) -> Result<String, SearchError> {
+    let literal_list = scan_values
+        .iter()
+        .map(|value| {
+            serde_json::to_string(value).map_err(|error| {
+                SearchError::SqlValidationError(format!(
+                    "failed to encode retro indicator: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(",");
+    Ok(if scan_values.len() == 1 {
+        format!("ioc={literal_list}")
+    } else {
+        format!("ioc in [{literal_list}]")
+    })
+}
+
+/// The event-level lake retro scan (`List`/`Pivot`, and the multi-slice
+/// `Summary`): the matching events' identity, user and observable columns,
+/// plus the ingest stamps and endpoint ports for a scheduled hunt.
+fn lake_retro_scan_query(
+    ioc_expr: &str,
+    observables: &[ResolvedObservable],
+    hunt: bool,
+) -> String {
+    let mut fields = vec!["time", "metadata.uid"];
+    fields.extend_from_slice(LAKE_RETRO_ASSET_FIELDS);
+    fields.extend_from_slice(LAKE_RETRO_USER_FIELDS);
+    fields.extend(observables.iter().map(|observable| observable.logical));
+    if hunt {
+        fields.extend_from_slice(LAKE_RETRO_HUNT_EXTRA_FIELDS);
+    }
+    fields.sort_unstable();
+    fields.dedup();
+    format!("{ioc_expr} | table {}", fields.join(","))
+}
+
+/// Per-indicator and per-pivot accumulation over the scanned events: the one
+/// fold shared by the interactive `| retro` and the scheduled retro hunt.
+struct LakeRetroFold {
+    indicator_set: std::collections::HashSet<String>,
+    accumulators: std::collections::BTreeMap<String, LakeRetroIndicatorAccum>,
+    pivots: std::collections::BTreeMap<String, LakeRetroPivotAccum>,
+}
+
+impl LakeRetroFold {
+    fn new(indicators: &[String]) -> Self {
+        Self {
+            indicator_set: indicators
+                .iter()
+                .map(|value| value.trim().to_lowercase())
+                .collect(),
+            accumulators: indicators
+                .iter()
+                .map(|value| (value.to_lowercase(), LakeRetroIndicatorAccum::default()))
+                .collect(),
+            pivots: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The indicators one scanned event matches, each with the observable
+    /// fields it matched through. A scheduled hunt also matches `ip:port`
+    /// indicators on the same endpoint's port, and drops an indicator the
+    /// event was already stamped with at ingest (NAN-4169).
+    fn event_matches(
+        &self,
+        row: &serde_json::Value,
+        observables: &[ResolvedObservable],
+        hunt: Option<&LakeRetroHuntOptions>,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut event_matches: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for observable in observables {
+            for value in lake_retro_values(row, observable.logical) {
+                let normalized = value.trim().to_lowercase();
+                if self.indicator_set.contains(&normalized) {
+                    event_matches
+                        .entry(normalized.clone())
+                        .or_default()
+                        .insert(observable.logical.to_string());
+                }
+                if let Some(hunt) = hunt {
+                    for indicator in hunt.ip_port_matches(row, observable.logical, &normalized) {
+                        event_matches
+                            .entry(indicator)
+                            .or_default()
+                            .insert(observable.logical.to_string());
+                    }
+                }
+            }
+        }
+        // NAN-4169: an event ingest already stamped with the indicator was
+        // matched at ingest; the retro hunt never re-reports it.
+        if hunt.is_some() && !event_matches.is_empty() {
+            let stamped = lake_retro_ioc_stamps(row);
+            event_matches.retain(|indicator, _| !stamped.contains(indicator));
+        }
+        event_matches
+    }
+
+    fn add_row(
+        &mut self,
+        row: &serde_json::Value,
+        axis: RetroAxis,
+        observables: &[ResolvedObservable],
+        hunt: Option<&LakeRetroHuntOptions>,
+    ) {
+        let timestamp = lake_retro_first_value(row, "time");
+        let host = LAKE_RETRO_ASSET_FIELDS
+            .iter()
+            .find_map(|path| lake_retro_first_value(row, path));
+        let pivot_entity = match axis {
+            RetroAxis::User => LAKE_RETRO_USER_FIELDS
+                .iter()
+                .find_map(|path| lake_retro_first_value(row, path)),
+            _ => host.clone(),
+        };
+        for (indicator, matched_fields) in self.event_matches(row, observables, hunt) {
+            let Some(accumulator) = self.accumulators.get_mut(&indicator) else {
+                continue;
+            };
+            accumulator.hits = accumulator.hits.saturating_add(1);
+            for field in matched_fields {
+                *accumulator.fields.entry(field).or_default() += 1;
+            }
+            if let Some(host) = host.as_ref().filter(|value| !value.is_empty()) {
+                accumulator.hosts.insert(host.clone());
+                *accumulator.entity_hits.entry(host.clone()).or_default() += 1;
+            }
+            lake_retro_update_bounds(
+                &mut accumulator.first_seen,
+                &mut accumulator.last_seen,
+                timestamp.as_deref(),
+            );
+            if let Some(entity) = pivot_entity.as_ref().filter(|value| !value.is_empty()) {
+                let pivot = self.pivots.entry(entity.clone()).or_default();
+                pivot.indicators.insert(indicator.clone());
+                lake_retro_update_bounds(
+                    &mut pivot.first_seen,
+                    &mut pivot.last_seen,
+                    timestamp.as_deref(),
+                );
+            }
+        }
+    }
+
+    /// The `List` submode rows (rarest first) and the no-hit indicators.
+    fn into_list_rows(
+        self,
+        indicators: &[String],
+        total_hosts: u64,
+    ) -> (Vec<RetroListRow>, Vec<String>) {
+        let accumulators = self.accumulators;
+        let no_hits = indicators
+            .iter()
+            .filter(|value| {
+                accumulators
+                    .get(&value.to_lowercase())
+                    .is_none_or(|accumulator| accumulator.hits == 0)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rows = accumulators
+            .into_iter()
+            .filter(|(_, accumulator)| accumulator.hits > 0)
+            .map(|(value, accumulator)| {
+                let hosts = accumulator.hosts.len() as u64;
+                let field = accumulator
+                    .fields
+                    .into_iter()
+                    .max_by(|left, right| {
+                        left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0))
+                    })
+                    .map(|(field, _)| field)
+                    .unwrap_or_default();
+                RetroListRow {
+                    indicator_type: classify_indicator(&value).to_string(),
+                    value,
+                    hits: accumulator.hits,
+                    hosts,
+                    total_hosts,
+                    first_seen: accumulator.first_seen,
+                    last_seen: accumulator.last_seen,
+                    field,
+                    verdict: lake_retro_verdict(hosts, total_hosts).to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            left.hosts
+                .cmp(&right.hosts)
+                .then_with(|| left.hits.cmp(&right.hits))
+                .then_with(|| left.value.cmp(&right.value))
+        });
+        (rows, no_hits)
+    }
+}
+
+/// The indicator values ingest stamped on an event as threat-intel matches
+/// (`enrichments[]` entries of type `threat_intelligence`), lowercased.
+/// Every other entry is ignored: the ingest `prevalence` / `reputation`
+/// stamp carries the event's own observed artifact as its `value`, so
+/// treating any `enrichments.value` as an IOC match would drop every
+/// retro hit (NAN-4169, caught by the native retro hunt test).
+fn lake_retro_ioc_stamps(row: &serde_json::Value) -> std::collections::HashSet<String> {
+    fn column<'a>(row: &'a serde_json::Value, path: &str) -> Vec<&'a serde_json::Value> {
+        let value = row.get(path).or_else(|| {
+            path.split('.').try_fold(row, |current, segment| current.get(segment))
+        });
+        match value {
+            Some(serde_json::Value::Array(values)) => values.iter().collect(),
+            Some(serde_json::Value::Null) | None => Vec::new(),
+            Some(value) => vec![value],
+        }
+    }
+    let types = column(row, "enrichments.type");
+    let values = column(row, "enrichments.value");
+    if types.len() != values.len() {
+        // Unpaired columns cannot be attributed: stamp nothing (a possible
+        // duplicate alert beats a silently dropped retro hit).
+        return std::collections::HashSet::new();
+    }
+    types
+        .into_iter()
+        .zip(values)
+        .filter(|(kind, _)| {
+            kind.as_str()
+                .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("threat_intelligence"))
+        })
+        .filter_map(|(_, value)| value.as_str())
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+impl From<RetroListRow> for RetroHuntHit {
+    fn from(row: RetroListRow) -> Self {
+        RetroHuntHit {
+            value: row.value,
+            indicator_type: row.indicator_type,
+            field: row.field,
+            hits: row.hits,
+            hosts: row.hosts,
+            total_hosts: row.total_hosts,
+            first_seen: row.first_seen,
+            last_seen: row.last_seen,
+            verdict: row.verdict,
+        }
+    }
+}
+
+/// NAN-4169: one scheduled retro hunt's lake scan for an indicator group,
+/// exactly as [`SearchService::retro_hunt_over_indicators`] runs it on a
+/// lean tenant: the same scan query, event matching (`ip:port` legs, ingest
+/// stamp dedupe) and per-indicator fold. Exposed so native tests can run the
+/// production scan through a real worker engine over real parts.
+pub struct LakeRetroHuntScan {
+    /// The nPL statement the tenant's worker executes over the lookback.
+    pub query: String,
+    indicators: Vec<String>,
+    observables: Vec<ResolvedObservable>,
+    hunt: LakeRetroHuntOptions,
+}
+
+impl LakeRetroHuntScan {
+    pub fn new(
+        profile: &dyn crate::schema::SchemaProfile,
+        indicators: &[String],
+    ) -> Result<Self, SearchError> {
+        if indicators.is_empty() {
+            return Err(SearchError::SqlValidationError(
+                "retro resolved no indicators".to_string(),
+            ));
+        }
+        let hunt = LakeRetroHuntOptions::for_indicators(indicators);
+        let observables = scope_observables(&resolve_ioc_observables(profile), &hunt.scan_values);
+        let query = lake_retro_scan_query(&lake_retro_ioc_expr(&hunt.scan_values)?, &observables, true);
+        Ok(Self { query, indicators: indicators.to_vec(), observables, hunt })
+    }
+
+    /// Fold the scanned rows into the hunt's hits (indicators with no
+    /// surviving match are absent).
+    pub fn hits<'a>(
+        &self,
+        rows: impl IntoIterator<Item = &'a serde_json::Value>,
+        total_hosts: u64,
+    ) -> Vec<RetroHuntHit> {
+        let mut fold = LakeRetroFold::new(&self.indicators);
+        for row in rows {
+            fold.add_row(row, RetroAxis::Indicator, &self.observables, Some(&self.hunt));
+        }
+        fold.into_list_rows(&self.indicators, total_hosts)
+            .0
+            .into_iter()
+            .map(RetroHuntHit::from)
+            .collect()
+    }
 }
 
 /// Retro submode, derived from the parsed `ioc` term + axis.
@@ -702,7 +1085,7 @@ impl SearchService {
         self.require_dedicated_retention_surface("retro companion queries")?;
         req.time_range.validate()?;
 
-        let (cleaned_query, _earliest, _latest) = super::extract_time_modifiers(&req.query);
+        let (cleaned_query, _earliest, _latest) = super::extract_time_bounds(&req.query)?;
         let query = parse_query(&cleaned_query).map_err(super::convert_parse_error)?;
 
         let mut plan = extract_retro_plan(&query).ok_or_else(|| {
@@ -739,7 +1122,7 @@ impl SearchService {
 
         if self.backend() == crate::search::config::SearchBackend::Lake {
             return self
-                .build_lake_retro_view(&plan, &indicators, &range, scope, &req)
+                .build_lake_retro_view(&plan, &indicators, &range, scope, &req, None)
                 .await;
         }
 
@@ -829,7 +1212,7 @@ impl SearchService {
             return Ok(None);
         }
         req.time_range.validate()?;
-        let (cleaned_query, _earliest, _latest) = super::extract_time_modifiers(&req.query);
+        let (cleaned_query, _earliest, _latest) = super::extract_time_bounds(&req.query)?;
         let query = parse_query(&cleaned_query).map_err(super::convert_parse_error)?;
         let mut plan = extract_retro_plan(&query).ok_or_else(|| {
             SearchError::SqlValidationError(
@@ -941,6 +1324,7 @@ impl SearchService {
         range: &TimeRange,
         scope: &ScopeSet,
         request: &RetroRequest,
+        hunt: Option<&LakeRetroHuntOptions>,
     ) -> Result<RetroResponse, SearchError> {
         if indicators.is_empty() {
             return Err(SearchError::SqlValidationError(
@@ -948,23 +1332,11 @@ impl SearchService {
             ));
         }
 
-        let observables = scope_observables(&self.retro_observables(), indicators);
-        let literal_list = indicators
-            .iter()
-            .map(|value| {
-                serde_json::to_string(value).map_err(|error| {
-                    SearchError::SqlValidationError(format!(
-                        "failed to encode retro indicator: {error}"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(",");
-        let ioc_expr = if indicators.len() == 1 {
-            format!("ioc={}", literal_list)
-        } else {
-            format!("ioc in [{literal_list}]")
-        };
+        // NAN-4169: a scheduled hunt scans by the bare IP of an `ip:port`
+        // indicator (the indexed observable) and matches the port per row.
+        let scan_values: &[String] = hunt.map_or(indicators, |hunt| hunt.scan_values.as_slice());
+        let observables = scope_observables(&self.retro_observables(), scan_values);
+        let ioc_expr = lake_retro_ioc_expr(scan_values)?;
 
         // A single-indicator retro is the common interactive case. Aggregate
         // it in chDB instead of materializing every matching event in the
@@ -1175,23 +1547,8 @@ impl SearchService {
             });
         }
 
-        let mut fields = vec!["time", "metadata.uid"];
-        fields.extend_from_slice(LAKE_RETRO_ASSET_FIELDS);
-        fields.extend_from_slice(LAKE_RETRO_USER_FIELDS);
-        fields.extend(observables.iter().map(|observable| observable.logical));
-        fields.sort_unstable();
-        fields.dedup();
-        let scan_query = format!("{ioc_expr} | table {}", fields.join(","));
-        let indicator_set = indicators
-            .iter()
-            .map(|value| value.trim().to_lowercase())
-            .collect::<std::collections::HashSet<_>>();
-        let mut accumulators = indicators
-            .iter()
-            .map(|value| (value.to_lowercase(), LakeRetroIndicatorAccum::default()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut pivots: std::collections::BTreeMap<String, LakeRetroPivotAccum> =
-            std::collections::BTreeMap::new();
+        let scan_query = lake_retro_scan_query(&ioc_expr, &observables, hunt.is_some());
+        let mut fold = LakeRetroFold::new(indicators);
 
         let mut pending = vec![range.clone()];
         let mut completed_slices = 0_usize;
@@ -1216,68 +1573,15 @@ impl SearchService {
                     return Err(SearchError::ResourceExhausted("result".to_string()));
                 }
                 let newer_start = slice.start + chrono::Duration::microseconds(width_us / 2);
-                pending.push(TimeRange::new(
-                    slice.start,
-                    newer_start - chrono::Duration::microseconds(1),
-                ));
+                // NAN-4280: half-open slices share `newer_start`.
+                pending.push(TimeRange::new(slice.start, newer_start));
                 pending.push(TimeRange::new(newer_start, slice.end));
                 continue;
             }
             completed_slices += 1;
 
             for row in &response.results {
-                let timestamp = lake_retro_first_value(row, "time");
-                let host = LAKE_RETRO_ASSET_FIELDS
-                    .iter()
-                    .find_map(|path| lake_retro_first_value(row, path));
-                let pivot_entity = match plan.axis {
-                    RetroAxis::User => LAKE_RETRO_USER_FIELDS
-                        .iter()
-                        .find_map(|path| lake_retro_first_value(row, path)),
-                    _ => host.clone(),
-                };
-                let mut event_matches: std::collections::BTreeMap<
-                    String,
-                    std::collections::BTreeSet<String>,
-                > = std::collections::BTreeMap::new();
-                for observable in &observables {
-                    for value in lake_retro_values(row, observable.logical) {
-                        let normalized = value.trim().to_lowercase();
-                        if indicator_set.contains(&normalized) {
-                            event_matches
-                                .entry(normalized)
-                                .or_default()
-                                .insert(observable.logical.to_string());
-                        }
-                    }
-                }
-                for (indicator, matched_fields) in event_matches {
-                    let Some(accumulator) = accumulators.get_mut(&indicator) else {
-                        continue;
-                    };
-                    accumulator.hits = accumulator.hits.saturating_add(1);
-                    for field in matched_fields {
-                        *accumulator.fields.entry(field).or_default() += 1;
-                    }
-                    if let Some(host) = host.as_ref().filter(|value| !value.is_empty()) {
-                        accumulator.hosts.insert(host.clone());
-                        *accumulator.entity_hits.entry(host.clone()).or_default() += 1;
-                    }
-                    lake_retro_update_bounds(
-                        &mut accumulator.first_seen,
-                        &mut accumulator.last_seen,
-                        timestamp.as_deref(),
-                    );
-                    if let Some(entity) = pivot_entity.as_ref().filter(|value| !value.is_empty()) {
-                        let pivot = pivots.entry(entity.clone()).or_default();
-                        pivot.indicators.insert(indicator.clone());
-                        lake_retro_update_bounds(
-                            &mut pivot.first_seen,
-                            &mut pivot.last_seen,
-                            timestamp.as_deref(),
-                        );
-                    }
-                }
+                fold.add_row(row, plan.axis, &observables, hunt);
             }
         }
 
@@ -1288,7 +1592,8 @@ impl SearchService {
         match plan.submode {
             RetroSubmode::Summary => {
                 let value = indicators.first().cloned().unwrap_or_default();
-                let accumulator = accumulators
+                let accumulator = fold
+                    .accumulators
                     .remove(&value.to_lowercase())
                     .unwrap_or_default();
                 let distinct_hosts = accumulator.hosts.len() as u64;
@@ -1353,47 +1658,7 @@ impl SearchService {
                 })
             }
             RetroSubmode::List => {
-                let no_hits = indicators
-                    .iter()
-                    .filter(|value| {
-                        accumulators
-                            .get(&value.to_lowercase())
-                            .is_none_or(|accumulator| accumulator.hits == 0)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut rows = accumulators
-                    .into_iter()
-                    .filter(|(_, accumulator)| accumulator.hits > 0)
-                    .map(|(value, accumulator)| {
-                        let hosts = accumulator.hosts.len() as u64;
-                        let field = accumulator
-                            .fields
-                            .into_iter()
-                            .max_by(|left, right| {
-                                left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0))
-                            })
-                            .map(|(field, _)| field)
-                            .unwrap_or_default();
-                        RetroListRow {
-                            indicator_type: classify_indicator(&value).to_string(),
-                            value,
-                            hits: accumulator.hits,
-                            hosts,
-                            total_hosts,
-                            first_seen: accumulator.first_seen,
-                            last_seen: accumulator.last_seen,
-                            field,
-                            verdict: lake_retro_verdict(hosts, total_hosts).to_string(),
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                rows.sort_by(|left, right| {
-                    left.hosts
-                        .cmp(&right.hosts)
-                        .then_with(|| left.hits.cmp(&right.hits))
-                        .then_with(|| left.value.cmp(&right.value))
-                });
+                let (rows, no_hits) = fold.into_list_rows(indicators, total_hosts);
                 let total = rows.len();
                 let page = rows.into_iter().skip(offset).take(limit).collect();
                 Ok(RetroResponse {
@@ -1412,7 +1677,8 @@ impl SearchService {
                 })
             }
             RetroSubmode::Pivot => {
-                let verdict_by_indicator = accumulators
+                let verdict_by_indicator = fold
+                    .accumulators
                     .iter()
                     .map(|(value, accumulator)| {
                         (
@@ -1427,7 +1693,8 @@ impl SearchService {
                         )
                     })
                     .collect::<std::collections::HashMap<_, _>>();
-                let mut rows = pivots
+                let mut rows = fold
+                    .pivots
                     .into_iter()
                     .map(|(id, pivot)| {
                         let mut indicators = pivot.indicators.into_iter().collect::<Vec<_>>();
@@ -2117,6 +2384,7 @@ impl SearchService {
                     enrichment_name: record.enrichment_name,
                     confidence: record.confidence.max(0) as u32,
                     fetched_at_ms: record.published_at_ms,
+                    feed_revision: None,
                 })
                 .collect());
         }
@@ -2141,8 +2409,45 @@ impl SearchService {
                 enrichment_name: r.enrichment_name,
                 confidence: r.confidence,
                 fetched_at_ms: r.fetched_at_ms,
+                feed_revision: None,
             })
             .collect())
+    }
+
+    /// NAN-4169: the tenant's granted platform IOC feeds (ThreatFox, Tor exit
+    /// nodes...) whose revision moved past `known`, with the rows of each
+    /// changed feed — the platform half of a retro-hunt delta. Lake only: the
+    /// legacy ClickHouse backend has no platform bundle (its feeds land in
+    /// `custom_enrichment_results`, which the keyset candidates already read),
+    /// and a worker without platform mounts (open core) returns no feeds.
+    pub async fn retro_hunt_platform_delta(
+        &self,
+        known: &std::collections::BTreeMap<String, i64>,
+        artifact_types: &[String],
+    ) -> Result<Vec<crate::enrichment::ioc::LakePlatformFeedDelta>, SearchError> {
+        let shared = self.shared_retro_feed_client("retro platform feed delta")?;
+        if shared.is_none() {
+            self.require_dedicated_retention_surface("retro platform feed delta")?;
+        }
+        if shared.is_none() && self.backend() != crate::search::config::SearchBackend::Lake {
+            return Ok(Vec::new());
+        }
+        let process_client;
+        let client = match shared {
+            Some(client) => client,
+            None => {
+                process_client = required_lake_ioc_client()?;
+                &process_client
+            }
+        };
+        client
+            .platform_records(
+                known,
+                artifact_types,
+                crate::enrichment::ioc::MAX_PLATFORM_DELTA_RECORDS,
+            )
+            .await
+            .map_err(|error| SearchError::ServiceUnavailable(error.to_string()))
     }
 
     /// Count distinct candidate indicators still remaining after `cursor` — the
@@ -2229,6 +2534,7 @@ impl SearchService {
                     limit: Some(500),
                     sort: None,
                 };
+                let hunt = LakeRetroHuntOptions::for_indicators(chunk);
                 let response = self
                     .build_lake_retro_view(
                         &plan,
@@ -2236,21 +2542,10 @@ impl SearchService {
                         &range,
                         &ScopeSet::unrestricted(),
                         &request,
+                        Some(&hunt),
                     )
                     .await?;
-                hits.extend(response.rows.unwrap_or_default().into_iter().map(|row| {
-                    RetroHuntHit {
-                        value: row.value,
-                        indicator_type: row.indicator_type,
-                        field: row.field,
-                        hits: row.hits,
-                        hosts: row.hosts,
-                        total_hosts: row.total_hosts,
-                        first_seen: row.first_seen,
-                        last_seen: row.last_seen,
-                        verdict: row.verdict,
-                    }
-                }));
+                hits.extend(response.rows.unwrap_or_default().into_iter().map(RetroHuntHit::from));
             }
             return Ok(hits);
         }
@@ -3492,5 +3787,47 @@ mod tests {
         // The literal closes only at the very end — the quote after `drop` is
         // doubled, so no premature `'drop'|` breakout appears.
         assert!(!sql.contains("'drop'|"), "unescaped breakout in: {sql}");
+    }
+
+    /// NAN-4169: a scheduled hunt scans an `ip:port` indicator by its IP and
+    /// matches only the same endpoint's port.
+    #[test]
+    fn hunt_options_scan_ip_port_by_ip_and_match_the_endpoint_port() {
+        let hunt = LakeRetroHuntOptions::for_indicators(&[
+            "198.51.100.9:443".to_string(),
+            "Evil.Example".to_string(),
+            "[2001:db8::1]:8443".to_string(),
+        ]);
+        assert_eq!(hunt.scan_values, ["198.51.100.9", "2001:db8::1", "evil.example"]);
+        let row = serde_json::json!({
+            "dst_endpoint.ip": "198.51.100.9", "dst_endpoint.port": 443,
+            "src_endpoint.ip": "10.0.0.5", "src_endpoint.port": "51515",
+        });
+        assert_eq!(hunt.ip_port_matches(&row, "dst_endpoint.ip", "198.51.100.9"), ["198.51.100.9:443"]);
+        let other_port = serde_json::json!({"dst_endpoint.ip": "198.51.100.9", "dst_endpoint.port": 80});
+        assert!(hunt.ip_port_matches(&other_port, "dst_endpoint.ip", "198.51.100.9").is_empty());
+        // The port must be on the SAME endpoint as the IP.
+        let crossed = serde_json::json!({"src_endpoint.ip": "198.51.100.9", "dst_endpoint.port": 443});
+        assert!(hunt.ip_port_matches(&crossed, "src_endpoint.ip", "198.51.100.9").is_empty());
+        // The lean scan names IP observables by alias (`dest_ip`).
+        assert_eq!(hunt.ip_port_matches(&row, "dest_ip", "198.51.100.9"), ["198.51.100.9:443"]);
+        assert!(hunt.ip_port_matches(&other_port, "dest_ip", "198.51.100.9").is_empty());
+        assert_eq!(split_ip_port("not-an-endpoint"), None);
+    }
+
+    /// NAN-4169: only `threat_intelligence` stamps dedupe a retro hit; the
+    /// ingest prevalence stamp carries the observed artifact as its value.
+    #[test]
+    fn hunt_options_dedupe_only_threat_intel_stamps() {
+        let row = serde_json::json!({
+            "enrichments.type": ["reputation", "threat_intelligence"],
+            "enrichments.value": ["198.51.100.7", "203.0.113.50"],
+        });
+        let stamps = lake_retro_ioc_stamps(&row);
+        assert!(stamps.contains("203.0.113.50"));
+        assert!(!stamps.contains("198.51.100.7"));
+        let unpaired = serde_json::json!({"enrichments.type": ["threat_intelligence"], "enrichments.value": []});
+        assert!(lake_retro_ioc_stamps(&unpaired).is_empty());
+        assert!(lake_retro_ioc_stamps(&serde_json::json!({})).is_empty());
     }
 }

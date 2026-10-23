@@ -5,8 +5,9 @@
 //! `NANO_LAKE_COMPACTION_LAYOUT` or NAN-3437 `NANO_LAKE_CLASS_FAMILIES`, real
 //! compiler, planner, chDB). The hinted
 //! query must prune whole source/class files and return exactly the rows of
-//! its `| where class_uid = N` form, which carries no class hint and so
-//! prunes nothing.
+//! an unhinted form (`| eval c = class_uid + 0 | where c = N`), which prunes
+//! nothing. Since NAN-4155 the `| where class_uid = N` form carries the same
+//! class hint, so it must prune like the search form and return those rows.
 //!
 //! ```sh
 //! export NANO_CHDB_LIBRARY_PATH=... NANO_CHDB_LIBRARY_SHA256=... NANO_LAKE_COMPILER=...
@@ -315,14 +316,6 @@ fn request(query: &str, hour: DateTime<Utc>, table_view: bool) -> BroadNplReques
     }
 }
 
-fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(
-        TENANT.parse().unwrap(),
-        Utc::now(),
-        &[],
-    )
-}
-
 /// Rows and the request's selection funnel.
 async fn run(
     engine: &PartQueryEngine,
@@ -333,7 +326,7 @@ async fn run(
     engine.clear_locator_cache();
     let request = request(query, hour, table_view);
     crate::query_timing::measure("nan3188", async {
-        let answer = crate::enrichment_read::scope(granted(), engine.broad_npl(&request))
+        let answer = engine.broad_npl(&request)
             .await
             .unwrap_or_else(|error| panic!("{query}: {error}"));
         let funnel = crate::query_timing::current()
@@ -407,7 +400,19 @@ async fn class_uid_pruning_over_a_clustered_hour(env: &str, value: &str) {
     // Event rows: identical uids, and exactly the fixture truth.
     let (hinted, hinted_funnel) =
         run(&engine, "class_uid=4001 dst_endpoint.port=445", hour, true).await;
+    // NAN-4159: the unhinted ground truth. A `where` on a computed eval
+    // output carries no class hint, so nothing is pruned (NAN-4186 pushes
+    // hints through a plain alias such as `eval c=class_uid`, so the alias
+    // is computed: `class_uid+0`).
     let (plain, plain_funnel) = run(
+        &engine,
+        "dst_endpoint.port=445 | eval c=class_uid+0 | where c=4001",
+        hour,
+        true,
+    )
+    .await;
+    // NAN-4155: `| where class_uid=N` pushes the class hint down.
+    let (piped, piped_funnel) = run(
         &engine,
         "dst_endpoint.port=445 | where class_uid=4001",
         hour,
@@ -416,18 +421,25 @@ async fn class_uid_pruning_over_a_clustered_hour(env: &str, value: &str) {
     .await;
     assert_eq!(sorted_uids(&hinted), truth, "hinted rows equal truth");
     assert_eq!(sorted_uids(&plain), truth, "unhinted rows equal truth");
+    assert_eq!(sorted_uids(&piped), truth, "where-form rows equal truth");
     assert!(
         hinted_funnel.source_family_pruned_files > 0,
         "the class hint pruned no file: is the hour part class-clustered? {hinted_funnel:?}"
     );
     assert_eq!(
         plain_funnel.source_family_pruned_files, 0,
-        "the where form carries no class hint"
+        "the eval/where form carries no class hint"
+    );
+    // The funnel sums every selection of the walk, and the two forms walk
+    // different chunk counts, so only "it prunes" is comparable.
+    assert!(
+        piped_funnel.source_family_pruned_files > 0,
+        "the where form carries the class hint (NAN-4155): {piped_funnel:?}"
     );
 
     // The NAN-3188 aggregate shape.
     let (hinted, hinted_funnel) = run(&engine, "(class_uid=4001 activity_id=1) dst_endpoint.port=445 | stats count() as n by src_endpoint.hostname", hour, false).await;
-    let (plain, _) = run(&engine, "dst_endpoint.port=445 | where class_uid=4001 AND activity_id=1 | stats count() as n by src_endpoint.hostname", hour, false).await;
+    let (plain, _) = run(&engine, "dst_endpoint.port=445 | eval c=class_uid+0 | where c=4001 AND activity_id=1 | stats count() as n by src_endpoint.hostname", hour, false).await;
     assert!(!hinted.is_empty());
     assert_eq!(
         sorted_rows(&hinted),
@@ -455,4 +467,37 @@ async fn class_uid_pruning_over_a_clustered_hour(env: &str, value: &str) {
     );
     eprintln!("nan3188 class prune ({env}={value}): hinted funnel {hinted_funnel:?}");
     std::env::remove_var(env);
+}
+
+/// NAN-4292: an event-id lookup over the class-families hour prunes files
+/// by uid sidecar through the engine's positioned probe and still returns
+/// exactly the one row, cold (layouts built) and warm (layouts cached).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn uid_lookup_prunes_files_by_sidecar_and_returns_the_row() {
+    std::env::set_var(crate::part_ingest::merge::CLASS_FAMILIES_ENV, "1");
+    std::env::set_var("NANO_LAKE_UID_SIDECAR_WRITE", "1");
+    let root = tempfile::tempdir().unwrap();
+    let hour = (Utc::now() - Duration::hours(8))
+        .duration_trunc(Duration::hours(1))
+        .unwrap();
+    ingest_and_seal(root.path(), hour).await;
+    let engine = engine(root.path()).await;
+    for i in [0, 4_001, ROWS - 1] {
+        let uid = format!("uid-{i:08}");
+        for pass in ["cold", "warm"] {
+            let (rows, funnel) = run(&engine, &format!("metadata.uid={uid}"), hour, true).await;
+            assert_eq!(sorted_uids(&rows), vec![uid.clone()], "{uid} {pass}");
+            assert!(funnel.uid_pruned_files > 0, "the uid sidecars pruned no file ({uid} {pass}): {funnel:?}");
+        }
+        let (rows, _) = run(&engine, &format!("metadata.uid={uid} | stats count() as n"), hour, false).await;
+        let n = rows[0]["n"].as_u64().or_else(|| rows[0]["n"].as_str().and_then(|n| n.parse().ok()));
+        assert_eq!(n, Some(1), "{uid}: {rows:?}");
+    }
+    // An absent id prunes every file and returns nothing.
+    let (rows, funnel) = run(&engine, "metadata.uid=uid-absent", hour, true).await;
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(funnel.uid_pruned_files > 0, "{funnel:?}");
+    std::env::remove_var("NANO_LAKE_UID_SIDECAR_WRITE");
+    std::env::remove_var(crate::part_ingest::merge::CLASS_FAMILIES_ENV);
 }

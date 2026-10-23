@@ -170,7 +170,8 @@ impl HostPolicy {
             let host = if raw.contains("{{") {
                 let v = template::render_str(raw, scope)
                     .map_err(|e| PolicyError::BadRule(e.to_string()))?;
-                let v = v.trim().trim_end_matches('.').to_ascii_lowercase();
+                let v = template::config_host(&v).map_err(|e| PolicyError::BadRule(e.to_string()))?;
+                let v = v.trim_end_matches('.').to_ascii_lowercase();
                 if r.host_suffixes.is_empty() {
                     return Err(PolicyError::BadRule(format!(
                         "templated host {raw} needs host_suffixes"

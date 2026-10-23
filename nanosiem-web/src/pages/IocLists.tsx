@@ -6,7 +6,8 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ChevronRight, Info, Plus, Trash2, Upload, Send } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { ArrowUpRight, ChevronRight, History, Info, Plus, Trash2, Upload, Send } from 'lucide-react';
 import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -23,6 +24,7 @@ import {
 } from '@/lib/api/ioc-lists';
 import { cn } from '@/lib/utils';
 import { IocListViewer } from './IocListViewer';
+import { RETRO_IOC_WINDOW_DAYS } from '@/components/search/retro/links';
 import { ExpirySelect, NO_EXPIRY, expiryInstant, type ExpiryValue } from './IocExpirySelect';
 
 const QUERY_KEY = ['ioc-lists'];
@@ -142,6 +144,7 @@ export function IocLists() {
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-6 space-y-3">
+        <RetroIocHuntStrip />
         {upload && (
           <UploadPanel
             target={upload.list}
@@ -509,3 +512,62 @@ function UploadPanel({
 }
 
 export default IocLists;
+
+/**
+ * NAN-4169: the retro IOC hunt for this tenant. When a feed refresh or a list
+ * publish adds indicators, an auto retro-hunt rule matches just the new ones
+ * against the last few days of logs; hits land in the alert queue as `retro`
+ * matches. Shows the tenant's rule, or offers to set it up (it then follows the
+ * normal staging → live → alerting lifecycle on the rule page).
+ */
+function RetroIocHuntStrip() {
+  const rules = useQuery({
+    queryKey: ['detections', 'retro-hunt'],
+    queryFn: () => api.listDetections(),
+    select: (all) => all.filter((rule) => rule.kind === 'retro_hunt' && !rule.archived),
+    retry: false,
+    staleTime: 60_000,
+  });
+  if (rules.isLoading || rules.isError) return null;
+  const rule = rules.data?.[0];
+  return (
+    <div
+      className="rounded-lg border border-border bg-card h-[32px] px-4 flex items-center gap-2 text-[11.5px]"
+      data-testid="retro-ioc-hunt"
+    >
+      <History className="w-[13px] h-[13px] text-muted-foreground shrink-0" strokeWidth={1.5} />
+      <span className="text-foreground">Retro IOC hunt</span>
+      {rule ? (
+        <>
+          <span className="font-mono text-[10.5px] text-muted-foreground truncate">{rule.name}</span>
+          <span className="font-mono text-[10.5px] px-1 rounded border border-border text-muted-foreground">{rule.mode}</span>
+          <span className="text-[10.5px] text-muted-foreground truncate">
+            new indicators are matched against past logs; hits are tagged retro
+          </span>
+          <span className="flex-1" />
+          <Link
+            to={`/rules/retro-hunt/${rule.id}`}
+            className="h-[22px] px-2 rounded border border-border text-[10.5px] font-mono text-muted-foreground hover:text-foreground flex items-center gap-1"
+          >
+            runs
+            <ArrowUpRight className="w-3 h-3" strokeWidth={1.5} />
+          </Link>
+        </>
+      ) : (
+        <>
+          <span className="text-[10.5px] text-muted-foreground truncate">
+            off: indicators added by a list publish or feed refresh are only matched on new events
+          </span>
+          <span className="flex-1" />
+          <Link
+            to="/rules/retro-hunt/new?preset=ioc"
+            className="h-[22px] px-2 rounded border border-border text-[10.5px] font-mono text-muted-foreground hover:text-foreground flex items-center gap-1"
+          >
+            set up · last {RETRO_IOC_WINDOW_DAYS}d
+            <ArrowUpRight className="w-3 h-3" strokeWidth={1.5} />
+          </Link>
+        </>
+      )}
+    </div>
+  );
+}

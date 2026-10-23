@@ -88,7 +88,7 @@ pub struct AssetEventsResponse {
     /// usable while this task runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub durable_job: Option<nanosiem_core::search::AsyncSearchResponse>,
-    /// present on a lean summary still being built; while
+    /// present on a progressive summary still being built; while
     /// `complete` is false the counts cover `covered_start..` so far and the
     /// client asks again after `retry_after_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1138,7 +1138,7 @@ pub struct AssetArtifactsResponse {
     /// count. Mirrors `artifacts_truncated` on /api/prevalence/query-artifacts.
     #[serde(default)]
     pub artifacts_truncated: bool,
-    /// present on a lean summary still being built; poll again
+    /// present on a progressive summary still being built; poll again
     /// after `retry_after_ms` while `complete` is false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<nanosiem_core::search::ProductViewProgress>,

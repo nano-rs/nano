@@ -403,6 +403,11 @@ fn collect_fields_from_search_expr(
     profile: &dyn crate::schema::SchemaProfile,
 ) {
     match expr {
+        // NAN-4155: the match-all `*` (and an empty keyword) compiles to
+        // `AND (1)` and reads no body column. Declaring `message`/`raw_data`
+        // for it made every `* | …` lake pipeline fetch the widest column of
+        // every part in its window.
+        SearchExpr::Keyword(value) if value.trim().is_empty() || value.trim() == "*" => {}
         SearchExpr::Keyword(_) => {
             // A bare keyword is evaluated across every profile-defined keyword
             // column. `message` is a core field, but OCSF also searches
@@ -414,8 +419,24 @@ fn collect_fields_from_search_expr(
                 fields.insert(canon_collect(column, profile));
             }
         }
-        SearchExpr::FieldFilter { field, .. } => {
+        SearchExpr::FieldFilter { field, value, rhs, .. } => {
             fields.insert(canon_collect(field, profile));
+            // NAN-4286: a bare RHS that codegen may read as a column
+            // (`| where src_endpoint.ip = dst_endpoint.ip`, `a > b`) must be
+            // projected by stage_0 too, or the later stage fails with Code 47
+            // ("Unknown identifier dst_endpoint.ip in scope stage_1").
+            // Projecting a column the filter ends up reading as a literal
+            // costs bytes only, never correctness.
+            if let (crate::query::RhsSyntax::Bareword, crate::query::Value::String(name)) =
+                (rhs, value)
+            {
+                if profile.is_known_field(name)
+                    && (super::search_expr::is_dotted_schema_path(name)
+                        || profile.uses_strict_canonical_fields())
+                {
+                    fields.insert(canon_collect(name, profile));
+                }
+            }
         }
         SearchExpr::FunctionFilter { function, .. } => {
             // Collect fields from function arguments
@@ -482,7 +503,7 @@ fn collect_in_subsearch_fields(
         Query::Search(expr) => collect_fields_from_search_expr(expr, fields, profile),
         Query::Piped { source, command } => {
             collect_in_subsearch_fields(source, fields, profile);
-            if let Command::Return { fields: returned, .. } = command {
+            if let Some(returned) = super::search_expr::in_subsearch_return_fields(command) {
                 for field in returned {
                     fields.insert(canon_collect(field, profile));
                 }
@@ -754,7 +775,14 @@ fn collect_fields_from_command(
         }
         Command::Mvexpand { field, .. } => {
             *needs_all = true;
-            fields.insert(canon_collect(field, profile));
+            // NAN-4279 (F13): an OCSF object root reads its leaf arrays, never
+            // a JSON-tail column of the root's name.
+            let leaves = profile.object_root_leaves(field);
+            if leaves.is_empty() {
+                fields.insert(canon_collect(field, profile));
+            } else {
+                fields.extend(leaves);
+            }
         }
         Command::Return {
             fields: return_fields,

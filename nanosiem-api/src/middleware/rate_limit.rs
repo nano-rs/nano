@@ -381,6 +381,48 @@ pub async fn login_rate_limit_middleware(
     }
 }
 
+/// NAN-4152: the public web path alias resolver
+/// (`GET /api/auth/shared/tenant-path-alias/{alias}`).
+///
+/// The SPA calls it once per `/t/<segment>` page load, so it gets its OWN
+/// per-IP bucket (`tenant_path_alias_ip`, same window as login, 5x the login
+/// cap): ordinary page loads must never spend the login budget, and a burst of
+/// reloads behind one NAT must not lock users out of signing in.
+pub async fn tenant_path_alias_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
+    let ip = extract_client_ip(&req);
+
+    match state
+        .check(
+            "tenant_path_alias_ip",
+            &ip,
+            state.config.login_window_seconds,
+            state.config.login_max_requests.saturating_mul(5),
+        )
+        .await
+    {
+        Ok(_) => next.run(req).await,
+        Err(retry_after) => {
+            tracing::warn!(ip = %ip, "Tenant path alias rate limit exceeded");
+            let error = RateLimitError {
+                error: "Too many requests. Please try again later.".to_string(),
+                retry_after_seconds: retry_after,
+            };
+            let body = serde_json::to_string(&error)
+                .unwrap_or_else(|_| r#"{"error":"Too many requests"}"#.to_string());
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("Content-Type", "application/json")
+                .header("Retry-After", retry_after.to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+}
+
 /// Middleware for rate limiting MFA setup + verify-setup attempts.
 ///
 /// Separate bucket from `login_ip` so a busy login window doesn't exhaust

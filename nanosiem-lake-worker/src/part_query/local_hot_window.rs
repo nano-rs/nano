@@ -56,9 +56,18 @@ fn plan_files(record: &ProvenanceRecord) -> Vec<(PartFile, &str, u64)> {
 /// data file is resident, NAN-3165), it is never answered from the data file,
 /// and as a non-hot object it was evicted first: a cold 24 h hash pivot on a
 /// settled cell missed 121 of 167 objects and spent 2.3 s in fetches.
+///
+/// NAN-4154: the entity sidecars (locators, then blooms) too. A pivot on a
+/// value the in-file blooms cannot answer (any mixed-case hostname or user,
+/// `prune::needs_folded_blooms`) reads them for every file in range even when
+/// the data is local, and as non-hot objects they went first under lease
+/// pressure: on a large hosted tenant a 7 d hostname pivot missed 845 sidecars
+/// (~1 MB each) and spent 30 s in select_sidecar against a warm window.
 fn resident_files(record: &ProvenanceRecord) -> Vec<(PartFile, &str, u64)> {
     (0..record.files.data.len())
-        .flat_map(|index| [PartFile::Data(index), PartFile::Tokens(index)])
+        .flat_map(|index| {
+            [PartFile::Data(index), PartFile::Tokens(index), PartFile::EntityLocators(index), PartFile::Entities(index)]
+        })
         .chain(RESIDENT_PARTIALS.iter().map(|kind| PartFile::Partial(*kind)))
         .filter_map(|file| {
             super::fetch::file_digest(record, file).map(|(_, digest, bytes)| (file, digest, bytes))
@@ -98,6 +107,30 @@ fn hydration_jobs(
 pub(super) type BeforeWarm<'a> =
     dyn Fn(Vec<crate::parts::part_log::PartRef>) -> futures::future::BoxFuture<'a, ()> + Send + Sync + 'a;
 
+/// NAN-4164: how long the before-warm token-layout load may run. It runs
+/// beside the count-rollup plan memo (~22 s on a large tenant) and reads only section
+/// headers, so it adds at most this to the warm gate (whose own bound is
+/// `WARM_GATE_TIMEOUT`, 900 s); what it leaves continues in the background
+/// after Ready.
+pub const TOKEN_WARM_BEFORE_READY: Duration = Duration::from_secs(60);
+/// NAN-4164: token files whose layout loads at once (blocking threads):
+/// enough to hide network-volume latency, little CPU.
+pub const TOKEN_WARM_FAN_OUT: usize = 8;
+
+/// NAN-4164: what one token-layout load did.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TokenWarm {
+    /// Token files whose group layout is now held.
+    pub files: usize,
+    /// Resident bytes of those layouts.
+    pub bytes: u64,
+    /// Local files not loaded (deadline, or a search arrived).
+    pub left: usize,
+    /// Token files not local (never fetched for this).
+    pub remote: usize,
+    pub seconds: f64,
+}
+
 /// Bytes a part occupies in the hot window: admission, budget and progress
 /// all count the same set of objects, so "window warm" means rollups too.
 fn resident_bytes(record: &ProvenanceRecord) -> u64 {
@@ -130,8 +163,112 @@ impl PartQueryEngine {
         .await
     }
 
-    fn before_warm_hook<'a>(&'a self) -> impl Fn(Vec<crate::parts::part_log::PartRef>) -> futures::future::BoxFuture<'a, ()> + Send + Sync + 'a {
-        move |parts| Box::pin(self.prewarm_plan_memo(parts))
+    /// What a hydration pass runs once right before it latches warm (the
+    /// pod reports Ready after it): the count-rollup plan memo and, beside
+    /// it, the token-index warm of the hot window (NAN-4164).
+    pub(crate) fn before_warm_hook<'a>(&'a self) -> impl Fn(Vec<crate::parts::part_log::PartRef>) -> futures::future::BoxFuture<'a, ()> + Send + Sync + 'a {
+        move |parts| {
+            Box::pin(async move {
+                let deadline = Instant::now() + TOKEN_WARM_BEFORE_READY;
+                let (_, warmed) = futures::join!(
+                    self.prewarm_plan_memo(parts.clone()),
+                    self.warm_token_indexes(&parts, Some(deadline), false)
+                );
+                match warmed {
+                    Ok(warm) => tracing::info!(
+                        files = warm.files, bytes = warm.bytes, left = warm.left, remote = warm.remote,
+                        seconds = warm.seconds, "token index layouts loaded before warm"
+                    ),
+                    Err(error) => tracing::warn!(%error, "token index layouts not loaded before warm; the first queries read them"),
+                }
+            })
+        }
+    }
+
+    /// NAN-4164: the background continuation of the before-warm token warm
+    /// (files its deadline left, and parts that arrived since). Hot-window
+    /// cells after the warm latch only, and only while no search runs.
+    pub(crate) async fn warm_token_indexes_in_background(&self) {
+        let Some(settings) = &self.fetcher().hot_settings else { return };
+        if !self.fetcher().hot_window_gate().is_some_and(|gate| gate.warm()) {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp_micros();
+        let from = now.saturating_sub(i64::try_from(settings.hours).unwrap_or(i64::MAX).saturating_mul(3_600_000_000));
+        let parts = match self.snapshot(from, now).await {
+            Ok((parts, ..)) => parts,
+            // NAN-4316: a new tenant before its genesis has no layouts to load.
+            Err(super::engine::PartQueryError::NoSchemaYet) => return tracing::debug!("background token-layout load: no schema yet"),
+            Err(error) => return tracing::warn!(%error, "background token-layout load skipped"),
+        };
+        match self.warm_token_indexes(&parts, None, true).await {
+            Ok(warm) if warm.files > 0 => tracing::info!(
+                files = warm.files, bytes = warm.bytes, left = warm.left, seconds = warm.seconds, "token index layouts loaded in the background"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "background token-layout load failed; queries read them"),
+        }
+    }
+
+    /// NAN-4164: load the group layout ([`super::token_probe::GroupLayout`])
+    /// of the token index of every data file of `parts` that is already
+    /// local (hot window or cell ingest; never an R2 read) into the token
+    /// cache, newest part first, so the first bare-keyword search after a
+    /// roll reads only bloom blocks. Stops at `deadline`, and in the
+    /// `background` once a search is in flight; held layouts are skipped.
+    /// Bounded: [`TOKEN_WARM_FAN_OUT`] files in flight, section headers
+    /// only, and the token cache's own layout bound (~50 bytes a group).
+    pub(crate) async fn warm_token_indexes(&self, parts: &[crate::parts::part_log::PartRef], deadline: Option<Instant>, background: bool) -> QueryResult<TokenWarm> {
+        let started = Instant::now();
+        let mut parts = parts.to_vec();
+        if let Some(settings) = &self.fetcher().hot_settings {
+            let now = chrono::Utc::now().timestamp_micros();
+            let cutoff = now.saturating_sub(i64::try_from(settings.hours).unwrap_or(i64::MAX).saturating_mul(3_600_000_000));
+            parts.retain(|part| part.max_time_us >= cutoff);
+        }
+        parts.sort_by_key(|part| std::cmp::Reverse((part.max_time_us, part.part_id.clone())));
+        let records = self.fetcher().records(&parts).await.map_err(map_fetch_error)?;
+        let mut warm = TokenWarm::default();
+        let mut pending = Vec::new();
+        for (part, record) in parts.iter().zip(&records) {
+            for (index, data) in record.files.data.iter().enumerate() {
+                let Some((_, digest, _)) = super::fetch::file_digest(record, PartFile::Tokens(index)) else { continue };
+                if self.token_cache().has_layout(digest) {
+                    continue;
+                }
+                if !self.fetcher().file_is_local(part, record, PartFile::Tokens(index)).await.map_err(map_fetch_error)? {
+                    warm.remote += 1;
+                    continue;
+                }
+                pending.push((part.clone(), index, data.row_groups as usize, digest.to_string()));
+            }
+        }
+        let mut at = 0;
+        while at < pending.len() {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                || (background && !self.evidence_idle())
+            {
+                break;
+            }
+            let batch = &pending[at..(at + TOKEN_WARM_FAN_OUT).min(pending.len())];
+            at += batch.len();
+            let wanted = batch.iter().map(|(part, index, ..)| (part.clone(), PartFile::Tokens(*index))).collect::<Vec<_>>();
+            let leased = self.fetcher().ensure_files(&wanted).await.map_err(map_fetch_error)?;
+            let reads = batch.iter().filter_map(|(part, index, groups, digest)| {
+                let path = leased.path(&part.part_id, PartFile::Tokens(*index))?.path.clone();
+                let (groups, digest, cache) = (*groups, digest.clone(), self.token_cache_arc());
+                Some(tokio::task::spawn_blocking(move || cache.layout(&path, &digest, groups).map(|layout| layout.len())))
+            });
+            for read in futures::future::join_all(reads).await {
+                let Ok(Some(groups)) = read else { continue };
+                warm.files += 1;
+                warm.bytes += (groups * super::token_probe::GroupLayout::BYTES) as u64;
+            }
+            drop(leased);
+        }
+        warm.left = pending.len() - at;
+        warm.seconds = started.elapsed().as_secs_f64();
+        Ok(warm)
     }
 
     /// NAN-3714: the count-rollup source summaries (what `* | stats count`,
@@ -167,6 +304,28 @@ async fn hydrate(
     pass_started: Instant,
 ) -> QueryResult<()> {
     hydrate_with(fetcher, tenant, parts, inflight, pass_started, &|_| Box::pin(async {})).await
+}
+
+/// NAN-4154: hours from now back to the oldest selected part's start,
+/// capped at the window (zero when nothing is selected).
+fn selected_span_hours<T>(selected: &[(i64, u64, (crate::parts::part_log::PartRef, T))], now: i64, hours: u64) -> f64 {
+    selected
+        .iter()
+        .map(|(_, _, (part, _))| part.min_time_us)
+        .min()
+        .map_or(0.0, |oldest| (now.saturating_sub(oldest).max(0) as f64 / 3_600_000_000.0).min(hours as f64))
+}
+
+/// NAN-4154: a pass skips a failed download and goes on; this many failures
+/// in a row (with no success between) stop it until the next pass.
+const MAX_FAILED_IN_A_ROW: usize = 8;
+
+/// NAN-4154: why one hydration download failed.
+struct Deferral {
+    /// The cache had no room (leased or protected objects): nothing else
+    /// fits this pass either.
+    saturated: bool,
+    error: String,
 }
 
 async fn hydrate_with(
@@ -442,13 +601,13 @@ async fn hydrate_with(
         hit: bool,
         lookup_seconds: f64,
         fetch_seconds: f64,
-        result: Result<(), String>,
+        result: Result<(), Deferral>,
     }
     let (targets_ref, bucket_ref, warm_ref) = (&targets, &bucket, &warm_flag);
     let fetches = futures::stream::iter(jobs.into_iter().map(|(index, file)| async move {
         let (part, record) = targets_ref[index];
-        // Residency is for data files, their token indexes and the
-        // RESIDENT_PARTIALS. Entity/UID blooms, locators, ranges and the
+        // Residency is for data files, their token indexes, entity
+        // sidecars and the RESIDENT_PARTIALS. UID blooms, ranges and the
         // other partials are fetched by the query paths that read them.
         let (_, digest, size) = super::fetch::file_digest(record, file).expect("selected file");
         let object = crate::reader_object_cache::ReaderObjectRef {
@@ -485,7 +644,13 @@ async fn hydrate_with(
         )
         .await
         .map(drop)
-        .map_err(|error| error.to_string());
+        .map_err(|error| Deferral {
+            saturated: error.chain().any(|cause| matches!(
+                cause.downcast_ref::<crate::reader_object_cache::ReaderCacheError>(),
+                Some(crate::reader_object_cache::ReaderCacheError::Saturated { .. })
+            )),
+            error: error.to_string(),
+        });
         Ok(Outcome {
             index, size, hit, lookup_seconds,
             fetch_seconds: fetch_started.elapsed().as_secs_f64(),
@@ -495,6 +660,15 @@ async fn hydrate_with(
     .buffered(pass_concurrency);
     tokio::pin!(fetches);
     let mut completed_prefix = 0_usize;
+    // NAN-4154: a pass that stops early (a deferred object, or a rerun before
+    // latching warm) counts only the prefix it finished; that is not a shrink.
+    let mut stopped_early = false;
+    // NAN-4154: any download deferred this pass (skipped or stopping it).
+    let mut deferred_any = false;
+    // NAN-4154: failures in a row. One is skipped; a run of them is an
+    // outage (object storage down), where waiting out every object's
+    // deadline would hold the pass for hours instead of retrying next pass.
+    let mut failed_in_a_row = 0_usize;
     loop {
         // Parts whose every object is resident, in selection order.
         while completed_prefix < selected.len() && remaining[completed_prefix] == 0 {
@@ -536,6 +710,7 @@ async fn hydrate_with(
                     "local hot-window warm hours resident; rediscovering once before reporting warm"
                 );
                 fetcher.request_hot_rerun();
+                stopped_early = true;
                 break;
             }
             before_warm(plan_parts.clone()).await;
@@ -568,10 +743,17 @@ async fn hydrate_with(
         let outcome = outcome?;
         if outcome.index >= selected.len() {
             // NAN-3714: a plan-only partial, outside the window's coverage.
-            if let Err(error) = outcome.result {
-                tracing::warn!(%error, "plan partial deferred");
-                break;
+            if let Err(deferral) = outcome.result {
+                deferred_any = true;
+                tracing::warn!(error = %deferral.error, saturated = deferral.saturated, "plan partial deferred");
+                failed_in_a_row += 1;
+                if deferral.saturated || failed_in_a_row >= MAX_FAILED_IN_A_ROW {
+                    stopped_early = true;
+                    break;
+                }
+                continue;
             }
+            failed_in_a_row = 0;
             remaining[outcome.index] -= 1;
             continue;
         }
@@ -581,21 +763,53 @@ async fn hydrate_with(
         } else {
             coverage.cache_miss_objects += 1;
             coverage.fetch_seconds += outcome.fetch_seconds;
-            if let Err(error) = outcome.result {
+            if let Err(deferral) = outcome.result {
                 coverage.deferred_objects += 1;
-                tracing::warn!(%error, "hot-window object deferred");
-                break;
+                deferred_any = true;
+                tracing::warn!(error = %deferral.error, saturated = deferral.saturated, "hot-window object deferred");
+                // NAN-4154: a saturated cache admits nothing more this pass
+                // (the next pass retries once leases end). Any other failure
+                // (a fetch past its deadline) skips this object only: the
+                // pass used to stop at it and restart from the newest hour,
+                // so under load it never reached the older hours again.
+                failed_in_a_row += 1;
+                if deferral.saturated || failed_in_a_row >= MAX_FAILED_IN_A_ROW {
+                    stopped_early = true;
+                    break;
+                }
+                continue;
             }
             coverage.hydrate_bytes += outcome.size;
         }
+        failed_in_a_row = 0;
         coverage.local_bytes += outcome.size;
         remaining[outcome.index] -= 1;
     }
     coverage.update_progress(started.elapsed().as_secs_f64());
-    if coverage.effective_hours < previous_hours {
+    if stopped_early || deferred_any {
+        // NAN-4154: a deferral is not an eviction. The pass recounts from
+        // zero and its prefix stops at the first unfinished part, short of
+        // what earlier passes made resident,
+        // so keep the recorded coverage, bounded by what this pass still
+        // selects (a capacity shrink is real and shows here).
+        let finished_hours = coverage.effective_hours;
+        coverage.effective_hours = finished_hours.max(previous_hours.min(selected_span_hours(&selected, now, settings.hours)));
+        tracing::info!(
+            covered_hours = coverage.effective_hours,
+            finished_prefix_hours = finished_hours,
+            previous_hours,
+            selected_parts = coverage.selected_parts,
+            bytes_target = coverage.selected_bytes,
+            stopped_early,
+            deferred_objects = coverage.deferred_objects,
+            "local hot-window pass did not finish its window (deferred download or rerun); recorded coverage kept, next pass resumes"
+        );
+    } else if coverage.effective_hours < previous_hours {
         tracing::info!(
             covered_hours = coverage.effective_hours,
             previous_hours,
+            bytes_target = coverage.selected_bytes,
+            capacity_bytes = coverage.capacity_bytes,
             "local hot-window shrunk under volume pressure"
         );
     }
@@ -625,6 +839,10 @@ fn pass_now_us() -> i64 {
     }
     chrono::Utc::now().timestamp_micros()
 }
+
+#[cfg(test)]
+#[path = "token_warm_native_tests.rs"]
+mod token_warm_native;
 
 #[cfg(test)]
 mod tests {
@@ -882,7 +1100,13 @@ mod tests {
                 })
                 .sum();
             assert_eq!(sidecar_bytes, in_window.len() as u64 * (2 * 4 + 32) * 1024);
-            let live_bytes = data_bytes + sidecar_bytes;
+            // NAN-4154: and the entity sidecars (locators, blooms) of each file.
+            let entity_bytes: u64 = in_window
+                .iter()
+                .flat_map(|p| inventories.iter().find(|(i, _)| i.part_id == p.part_id).unwrap().1.files.data.iter())
+                .map(|d| d.entity_locators.as_ref().map_or(0, |f| f.bytes) + d.entity_blooms.as_ref().map_or(0, |f| f.bytes))
+                .sum();
+            let live_bytes = data_bytes + sidecar_bytes + entity_bytes;
             let before_bytes: u64 = inventories
                 .iter()
                 .filter(|(p, _)| {
@@ -976,7 +1200,9 @@ mod tests {
                 assert_eq!(coverage.selected_parts, in_window.len());
                 assert_eq!(coverage.selected_bytes, live_bytes, "bytes_target includes rollups");
                 assert_eq!(coverage.local_bytes, live_bytes, "bytes_resident includes rollups");
-                assert_eq!(coverage.cache_miss_objects as usize, 4 * in_window.len());
+                // Data, token index, rollup, entity ranges and (NAN-4154)
+                // the entity locator and bloom sidecars of every part.
+                assert_eq!(coverage.cache_miss_objects as usize, 6 * in_window.len());
                 assert_eq!(coverage.buckets[2].total_bytes, live_bytes);
             }
             // NAN-3180 acceptance: the rollup read path of a stats step, and
@@ -1020,6 +1246,8 @@ mod tests {
                     let resident = matches!(
                         name,
                         "data-00000.parquet" | "tokens-00000.nti" | "partial-rollup.parquet" | "partial-entityranges.parquet"
+                            // NAN-4154: the entity sidecars.
+                            | "locators-00000.json" | "entities-00000.json"
                     );
                     // NAN-3714: a live part older than the window keeps its
                     // plan partials (only) resident.
@@ -1086,6 +1314,17 @@ mod tests {
         hours: i64,
         part_bytes: usize,
     ) -> (Arc<LocalObjectStore>, std::path::PathBuf, LocalPartSigner, Vec<PartRef>) {
+        slow_fixture_with(root, hours, part_bytes, false).await
+    }
+
+    /// `entity_sidecars`: every data file also carries an entity locator and
+    /// an entity bloom sidecar (~1/16 of the data bytes each).
+    async fn slow_fixture_with(
+        root: &std::path::Path,
+        hours: i64,
+        part_bytes: usize,
+        entity_sidecars: bool,
+    ) -> (Arc<LocalObjectStore>, std::path::PathBuf, LocalPartSigner, Vec<PartRef>) {
         let source = root.join("objects");
         let store = Arc::new(LocalObjectStore::new(&source).unwrap());
         let signer = signer(9);
@@ -1136,6 +1375,23 @@ mod tests {
                 bytes: tokens.len() as u64,
                 sha256: sha256_hex(&tokens),
             };
+            if entity_sidecars {
+                for (name, fill) in [("locators-00000.json", 0xe1_u8), ("entities-00000.json", 0xe2_u8)] {
+                    let mut sidecar = vec![fill; (part_bytes / 16).max(16)];
+                    sidecar[..8].copy_from_slice(&serial.to_le_bytes());
+                    store.put(&keys.file(name), &sidecar).await.unwrap();
+                    let digest = crate::parts::provenance::FileDigest {
+                        name: name.into(),
+                        bytes: sidecar.len() as u64,
+                        sha256: sha256_hex(&sidecar),
+                    };
+                    if name.starts_with("locators-") {
+                        record.files.data[0].entity_locators = Some(digest);
+                    } else {
+                        record.files.data[0].entity_blooms = Some(digest);
+                    }
+                }
+            }
             let signature = signer
                 .sign(TENANT, std::slice::from_ref(&record))
                 .await
@@ -1331,6 +1587,332 @@ mod tests {
         let expired = stuck(0);
         assert_eq!(expired.hot_window_gate(), Some(crate::local_hot_window::WarmGate::TimedOut));
         assert!(expired.hot_window_gate().unwrap().warm());
+    }
+
+    /// R2 stand-in that fails one part's objects (a fetch past its deadline,
+    /// an unreadable object): not a saturated cache.
+    struct FailingSource {
+        inner: StoreObjectSource,
+        failing: String,
+    }
+    #[async_trait::async_trait]
+    impl crate::reader_object_cache::ReaderObjectSource for FailingSource {
+        async fn stream_object(
+            &self,
+            object: &crate::reader_object_cache::ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            anyhow::ensure!(!object.source_uri.contains(&self.failing), "object storage unavailable");
+            self.inner.stream_object(object, sink).await
+        }
+    }
+
+    /// NAN-4154: a download that fails for any reason but a saturated cache
+    /// skips that object; the pass hydrates every other part. It used to stop
+    /// at the first failure and restart from the newest hour next pass, so on
+    /// a large hosted tenant under query load it never got past the newest hours
+    /// again (a 41 GiB 7-day window stuck at 4-5 h for 30+ minutes).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_download_skips_one_object_not_the_rest_of_the_window() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, source, signer, live) = slow_fixture(root.path(), 6, 64 * 1024).await;
+        let newest = live.iter().max_by_key(|part| part.max_time_us).unwrap().part_id.to_string();
+        let cache_root = root.path().join("skip");
+        let cache = ReaderObjectCache::open(
+            ReaderObjectCacheSettings {
+                root: cache_root.clone(),
+                max_bytes: 256 << 20,
+                query_max_bytes: 1 << 20,
+                fetch_concurrency: 4,
+                fetch_deadline: Duration::from_secs(5),
+            },
+            TENANT,
+            "lab",
+            &parts_key_prefix(TENANT).unwrap(),
+            Arc::new(FailingSource { inner: StoreObjectSource::local("lab", store.clone(), source.clone()), failing: newest }),
+        )
+        .unwrap();
+        let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap()
+            .with_hot_window(Some(crate::local_hot_window::Settings {
+                root: cache_root,
+                hours: 48,
+                bytes_per_second: 64 << 20,
+                reserve_bytes: Some(0),
+                max_bytes: 1 << 30,
+                schedule: crate::local_hot_window::Schedule { concurrency: 1, ..Default::default() },
+                persistent: false,
+            }));
+        hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+        let coverage = fetcher.hot_coverage.lock().unwrap().clone();
+        // The newest part (data + token index) failed; the five older ones are local.
+        assert_eq!(coverage.deferred_objects, 2, "{coverage:?}");
+        assert_eq!(fetcher.cache().stats().objects, 2 * (live.len() - 1), "{coverage:?}");
+        assert!(!coverage.warm, "a deferred part keeps the window short of warm");
+    }
+
+    /// NAN-4154: hostname/user pivots whose value the in-file blooms cannot
+    /// answer read the entity sidecars of every file in range even when the
+    /// data is local. They are part of the hot window: hydrated with their
+    /// part, counted in its bytes, and soft-pinned like the data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entity_sidecars_of_every_window_part_are_resident() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, source, signer, live) = slow_fixture_with(root.path(), 6, 64 * 1024, true).await;
+        let cache_root = root.path().join("sidecars");
+        let cache = ReaderObjectCache::open(
+            ReaderObjectCacheSettings {
+                root: cache_root.clone(),
+                max_bytes: 256 << 20,
+                query_max_bytes: 1 << 20,
+                fetch_concurrency: 4,
+                fetch_deadline: Duration::from_secs(5),
+            },
+            TENANT,
+            "lab",
+            &parts_key_prefix(TENANT).unwrap(),
+            Arc::new(StoreObjectSource::local("lab", store.clone(), source.clone())),
+        )
+        .unwrap();
+        let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap()
+            .with_hot_window(Some(crate::local_hot_window::Settings {
+                root: cache_root,
+                hours: 48,
+                bytes_per_second: 64 << 20,
+                reserve_bytes: Some(0),
+                max_bytes: 1 << 30,
+                schedule: crate::local_hot_window::Schedule { concurrency: 1, ..Default::default() },
+                persistent: false,
+            }));
+        hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+        let coverage = fetcher.hot_coverage.lock().unwrap().clone();
+        assert!(coverage.warm, "{coverage:?}");
+        let records = fetcher.records(&live).await.unwrap();
+        let mut sidecar_bytes = 0;
+        for (part, record) in live.iter().zip(&records) {
+            for file in [PartFile::EntityLocators(0), PartFile::Entities(0)] {
+                let (_, digest, bytes) = super::super::fetch::file_digest(record, file).unwrap();
+                let object = crate::reader_object_cache::ReaderObjectRef {
+                    range: None,
+                    source_uri: fetcher.file_uri(part, record, file).unwrap(),
+                    sha256: digest.to_string(),
+                    size_bytes: bytes,
+                };
+                assert!(fetcher.cache().is_local(&object).await.unwrap(), "{file:?} of {} not resident", part.part_id);
+                sidecar_bytes += bytes;
+            }
+            assert!(resident_bytes(record) >= record.files.data[0].bytes + record.files.data[0].tokens.bytes + 2 * (64 * 1024 / 16));
+        }
+        // Data, token index and both sidecars of every part.
+        assert_eq!(fetcher.cache().stats().objects, 4 * live.len(), "{coverage:?}");
+        assert!(coverage.local_bytes >= sidecar_bytes, "{coverage:?}");
+    }
+
+    /// Object storage that is down: every fetch fails and is counted.
+    struct DownSource {
+        attempts: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl crate::reader_object_cache::ReaderObjectSource for DownSource {
+        async fn stream_object(
+            &self,
+            _object: &crate::reader_object_cache::ReaderObjectRef,
+            _sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            self.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("cold object fetch exceeded its deadline")
+        }
+    }
+
+    /// NAN-4154: skipping a failed download must not turn an object-storage
+    /// outage into one fetch deadline per object of the window (hours per
+    /// pass on a 2000-object 7-day window). A run of failures stops the pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_outage_stops_the_pass_after_a_run_of_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, _source, signer, live) = slow_fixture(root.path(), 12, 16 * 1024).await;
+        let cache_root = root.path().join("down");
+        let down = Arc::new(DownSource { attempts: AtomicU64::new(0) });
+        let cache = ReaderObjectCache::open(
+            ReaderObjectCacheSettings {
+                root: cache_root.clone(),
+                max_bytes: 256 << 20,
+                query_max_bytes: 1 << 20,
+                fetch_concurrency: 4,
+                fetch_deadline: Duration::from_secs(5),
+            },
+            TENANT,
+            "lab",
+            &parts_key_prefix(TENANT).unwrap(),
+            down.clone(),
+        )
+        .unwrap();
+        let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap()
+            .with_hot_window(Some(crate::local_hot_window::Settings {
+                root: cache_root,
+                hours: 48,
+                bytes_per_second: 64 << 20,
+                reserve_bytes: Some(0),
+                max_bytes: 1 << 30,
+                schedule: crate::local_hot_window::Schedule { concurrency: 1, ..Default::default() },
+                persistent: false,
+            }));
+        hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+        let attempts = down.attempts.load(std::sync::atomic::Ordering::Relaxed) as usize;
+        let coverage = fetcher.hot_coverage.lock().unwrap().clone();
+        assert!(attempts >= MAX_FAILED_IN_A_ROW, "{attempts} {coverage:?}");
+        assert!(attempts < 2 * live.len(), "the pass tried all {attempts} objects through an outage");
+        assert!(!coverage.warm);
+    }
+
+    /// R2 stand-in that fails one part's objects only while `failing` is set.
+    struct SwitchedSource {
+        inner: StoreObjectSource,
+        part: String,
+        failing: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::reader_object_cache::ReaderObjectSource for SwitchedSource {
+        async fn stream_object(
+            &self,
+            object: &crate::reader_object_cache::ReaderObjectRef,
+            sink: &mut (dyn for<'b> FnMut(&'b [u8]) -> anyhow::Result<()> + Send),
+        ) -> anyhow::Result<()> {
+            let failing = self.failing.load(std::sync::atomic::Ordering::Relaxed);
+            anyhow::ensure!(!(failing && object.source_uri.contains(&self.part)), "cold object fetch exceeded its deadline");
+            self.inner.stream_object(object, sink).await
+        }
+    }
+
+    /// NAN-4154: on a large hosted tenant every pass that deferred one download
+    /// recorded the window as 0 h ("shrunk under volume pressure") although
+    /// 44 GB stayed resident. A deferral mid-pass keeps the recorded coverage;
+    /// the deferred part is fetched by the next pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferral_mid_pass_keeps_the_recorded_coverage() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, source, signer, live) = slow_fixture(root.path(), 6, 64 * 1024).await;
+        let newest = live.iter().max_by_key(|part| part.max_time_us).unwrap().clone();
+        let cache_root = root.path().join("kept");
+        let switched = Arc::new(SwitchedSource {
+            inner: StoreObjectSource::local("lab", store.clone(), source.clone()),
+            part: newest.part_id.to_string(),
+            failing: false.into(),
+        });
+        let cache = ReaderObjectCache::open(
+            ReaderObjectCacheSettings {
+                root: cache_root.clone(),
+                max_bytes: 256 << 20,
+                query_max_bytes: 1 << 20,
+                fetch_concurrency: 4,
+                fetch_deadline: Duration::from_secs(5),
+            },
+            TENANT,
+            "lab",
+            &parts_key_prefix(TENANT).unwrap(),
+            switched.clone(),
+        )
+        .unwrap();
+        let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap()
+            .with_hot_window(Some(crate::local_hot_window::Settings {
+                root: cache_root,
+                hours: 48,
+                bytes_per_second: 64 << 20,
+                reserve_bytes: Some(0),
+                max_bytes: 1 << 30,
+                schedule: crate::local_hot_window::Schedule { concurrency: 1, ..Default::default() },
+                persistent: false,
+            }));
+        let pass = || async {
+            hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+            fetcher.hot_coverage.lock().unwrap().clone()
+        };
+        let warm = pass().await;
+        assert!(warm.warm && warm.effective_hours > 5.0, "{warm:?}");
+
+        // The newest part's objects are replaced (a merge) and its download fails.
+        let record = fetcher.record(&newest).await.unwrap();
+        let digests = record.files.all().iter().map(|(_, digest, _)| digest.to_string()).collect::<Vec<_>>();
+        fetcher.cache().evict_unleased(digests).await.unwrap();
+        switched.failing.store(true, std::sync::atomic::Ordering::Relaxed);
+        let deferred = pass().await;
+        assert_eq!(deferred.deferred_objects, 2, "{deferred:?}");
+        assert_eq!(deferred.effective_hours, warm.effective_hours, "a deferral is not a shrink: {deferred:?}");
+        // The five older parts were looked up, not fetched again.
+        assert_eq!((deferred.cache_hit_objects, deferred.cache_miss_objects), (10, 2), "{deferred:?}");
+
+        switched.failing.store(false, std::sync::atomic::Ordering::Relaxed);
+        let healed = pass().await;
+        assert!(healed.warm, "{healed:?}");
+        assert_eq!(healed.effective_hours, warm.effective_hours);
+        assert_eq!(healed.cache_miss_objects, 2, "only the deferred part is fetched: {healed:?}");
+    }
+
+    /// NAN-4154: a pass stopped by a saturated cache admits nothing more and
+    /// the next pass resumes: what earlier passes admitted is a local lookup
+    /// (never downloaded again) and only the missing objects are fetched, so
+    /// repeated stops still converge to the whole window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturation_stops_resume_and_converge_to_the_whole_window() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, source, signer, live) = slow_fixture(root.path(), 6, 64 * 1024).await;
+        let cache_root = root.path().join("saturated");
+        let max_bytes = 64_u64 << 20;
+        let cache = ReaderObjectCache::open(
+            ReaderObjectCacheSettings {
+                root: cache_root.clone(),
+                max_bytes,
+                query_max_bytes: 1 << 20,
+                fetch_concurrency: 4,
+                fetch_deadline: Duration::from_secs(5),
+            },
+            TENANT,
+            "lab",
+            &parts_key_prefix(TENANT).unwrap(),
+            Arc::new(StoreObjectSource::local("lab", store.clone(), source.clone())),
+        )
+        .unwrap();
+        cache.set_saturation_wait(Duration::from_millis(20));
+        let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap()
+            .with_hot_window(Some(crate::local_hot_window::Settings {
+                root: cache_root,
+                hours: 48,
+                bytes_per_second: 64 << 20,
+                reserve_bytes: Some(0),
+                max_bytes: 1 << 30,
+                schedule: crate::local_hot_window::Schedule { concurrency: 1, ..Default::default() },
+                persistent: false,
+            }));
+        let pass = || async {
+            hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(1), Instant::now()).await.unwrap();
+            fetcher.hot_coverage.lock().unwrap().clone()
+        };
+        let objects = 2 * live.len();
+
+        // Leased scratch fills the cache: the first download is refused and
+        // the pass stops there.
+        let blocker = fetcher.cache().reserve_scratch(max_bytes - 1024).unwrap();
+        let stopped = pass().await;
+        assert_eq!((stopped.deferred_objects, fetcher.cache().stats().objects), (1, 0), "{stopped:?}");
+        assert!(!stopped.warm);
+        drop(blocker);
+
+        // Room again: the next pass fetches every missing object once.
+        let resumed = pass().await;
+        assert!(resumed.warm, "{resumed:?}");
+        assert_eq!(resumed.cache_miss_objects as usize, objects, "{resumed:?}");
+        assert_eq!(fetcher.cache().stats().objects, objects);
+
+        // A stop after that never re-downloads what is resident.
+        let blocker = fetcher.cache().reserve_scratch(max_bytes - fetcher.cache().stats().stored_bytes - 1024).unwrap();
+        let settled = pass().await;
+        drop(blocker);
+        assert!(settled.warm, "{settled:?}");
+        assert_eq!((settled.cache_hit_objects as usize, settled.cache_miss_objects), (objects, 0), "{settled:?}");
     }
 
     /// NAN-3180: one hourly part with a data file, its token index, and the
@@ -2000,23 +2582,29 @@ mod tests {
         let key = crate::hot_tail_cache::parse_s3_uri(&missing.source_uri).unwrap().1.to_string();
         let body = store.get(&key).await.unwrap().unwrap();
         store.delete(&key).await.unwrap();
+        slow.order.lock().unwrap().clear();
+        // NAN-4154: the pass skips the missing object and continues, so the
+        // first pass already fetches in warm-up order: plan metadata, the
+        // edge, then the rest.
+        let mut order = Vec::new();
         for _ in 0..2 {
             hydrate_with(&fetcher, TENANT, live_parts(&store, &signer).await, &AtomicU64::new(0), Instant::now(), &hook)
                 .await
                 .unwrap();
             fetcher.take_hot_rerun();
+            if order.is_empty() {
+                order = slow.order.lock().unwrap().clone();
+            }
         }
         assert!(!fetcher.hot_coverage.lock().unwrap().warm_resident, "a missing 30 d rollup holds warm");
         assert_eq!(fetcher.hot_window_gate(), Some(WarmGate::Hydrating));
         assert!(hooked.lock().unwrap().is_empty());
         store.put(&key, &body).await.unwrap();
-        slow.order.lock().unwrap().clear();
 
-        // First complete pass: plan metadata and the edge, then a rediscovery.
+        // First complete pass: the missing plan metadata, then a rediscovery.
         hydrate_with(&fetcher, TENANT, live_parts(&store, &signer).await, &AtomicU64::new(0), Instant::now(), &hook)
             .await
             .unwrap();
-        let order = slow.order.lock().unwrap().clone();
         let partials = order.iter().take_while(|uri| uri.contains("/partial-")).count();
         assert!(order[partials..].iter().all(|uri| !uri.contains("/partial-")), "partials first: {order:?}");
         for age in [0, 1, 5, 23, 24, 100, 400] {

@@ -19,9 +19,10 @@ use crate::auth::tenant::TrustedTenantContext;
 
 /// Every independently gated product/runtime surface in a shared tenant.
 ///
-/// A plan revision contains an explicit row for every variant. Adding a new
-/// component therefore makes older incomplete manifests fail closed until a
-/// new reviewed plan revision declares it enabled or disabled.
+/// Legacy components are mandatory in every plan. Newly introduced SOAR is
+/// recognized during reader rollout, but its absence denies only SOAR so old
+/// immutable plans continue authorizing their established features. New
+/// reviewed revisions explicitly enable or disable SOAR after reader readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantComponent {
@@ -48,8 +49,11 @@ pub enum TenantComponent {
     Incidents,
     ObservabilityConvergence,
     Sso,
+    Soar,
 }
 
+/// Mandatory legacy manifest shared with the existing provisioning contract.
+/// Additive components are recognized separately until their reviewed rollout.
 pub const TENANT_COMPONENTS: [TenantComponent; 23] = [
     TenantComponent::Api,
     TenantComponent::Ingest,
@@ -75,6 +79,8 @@ pub const TENANT_COMPONENTS: [TenantComponent; 23] = [
     TenantComponent::ObservabilityConvergence,
     TenantComponent::Sso,
 ];
+
+pub const OPTIONAL_TENANT_COMPONENTS: [TenantComponent; 1] = [TenantComponent::Soar];
 
 impl TenantComponent {
     pub const fn as_str(self) -> &'static str {
@@ -102,6 +108,7 @@ impl TenantComponent {
             Self::Incidents => "incidents",
             Self::ObservabilityConvergence => "observability_convergence",
             Self::Sso => "sso",
+            Self::Soar => "soar",
         }
     }
 }
@@ -118,6 +125,7 @@ impl FromStr for TenantComponent {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         TENANT_COMPONENTS
             .iter()
+            .chain(OPTIONAL_TENANT_COMPONENTS.iter())
             .copied()
             .find(|component| component.as_str() == value)
             .ok_or_else(|| TenantEntitlementError::InvalidContract {
@@ -396,6 +404,8 @@ fn build_snapshot(
         }
     }
 
+    // Additive reader rollout: old immutable manifests predate SOAR. Absence
+    // denies only SOAR; all legacy components remain mandatory and strict.
     for required in TENANT_COMPONENTS {
         if !components.contains_key(&required) {
             return Err(TenantEntitlementError::InvalidContract {
@@ -442,10 +452,11 @@ mod tests {
     fn component_names_are_unique_and_round_trip() {
         let names = TENANT_COMPONENTS
             .into_iter()
+            .chain(OPTIONAL_TENANT_COMPONENTS)
             .map(TenantComponent::as_str)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(names.len(), TENANT_COMPONENTS.len());
-        for component in TENANT_COMPONENTS {
+        assert_eq!(names.len(), TENANT_COMPONENTS.len() + OPTIONAL_TENANT_COMPONENTS.len());
+        for component in TENANT_COMPONENTS.into_iter().chain(OPTIONAL_TENANT_COMPONENTS) {
             assert_eq!(
                 component.as_str().parse::<TenantComponent>().unwrap(),
                 component
@@ -490,5 +501,36 @@ mod tests {
             snapshot.require_component(&tenant_a, TenantComponent::Search),
             Err(TenantEntitlementError::ComponentDisabled { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod optional_component_tests {
+    use super::*;
+    fn rows(tenant:Uuid)->Vec<EntitlementRow>{
+        TENANT_COMPONENTS.into_iter().map(|c|EntitlementRow{
+            tenant_id:tenant,tenant_status:"active".into(),plan_code:"lean".into(),plan_revision:1,plan_state:"active".into(),assignment_revision:1,
+            retention_revision:1,retention_option_revision:1,retention_days:30,irreversible_event_time_floor:DateTime::UNIX_EPOCH,
+            assignment_state:"active".into(),effective_at:DateTime::UNIX_EPOCH,expires_at:None,limits:serde_json::json!({"api_access":"full","retention_days":30}),
+            component_code:c.as_str().into(),component_enabled:true,component_configuration:serde_json::json!({})
+        }).collect()
+    }
+    #[test]
+    fn reader_rollout_keeps_old_manifests_valid_and_soar_closed(){
+        let t=TrustedTenantContext{tenant_id:Uuid::new_v4(),tenant_slug:"old-plan".into()};
+        let snapshot=build_snapshot(&t,rows(t.tenant_id),Utc::now()).unwrap();
+        assert!(snapshot.require_component(&t,TenantComponent::Search).is_ok());
+        assert!(snapshot.require_component(&t,TenantComponent::Soar).is_err());
+        for enabled in [false,true]{
+            let mut r=rows(t.tenant_id);let mut extra=rows(t.tenant_id).pop().unwrap();extra.component_code="soar".into();extra.component_enabled=enabled;r.push(extra);
+            let snapshot=build_snapshot(&t,r,Utc::now()).unwrap();assert_eq!(snapshot.require_component(&t,TenantComponent::Soar).is_ok(),enabled);
+        }
+    }
+    #[test]
+    fn additive_reader_still_rejects_unknown_malformed_and_missing_legacy_components(){
+        let t=TrustedTenantContext{tenant_id:Uuid::new_v4(),tenant_slug:"strict-plan".into()};
+        let mut r=rows(t.tenant_id);r.pop();assert!(build_snapshot(&t,r,Utc::now()).is_err());
+        let mut r=rows(t.tenant_id);r[0].component_code="unrecognized".into();assert!(build_snapshot(&t,r,Utc::now()).is_err());
+        let mut r=rows(t.tenant_id);r[0].component_configuration=serde_json::json!([]);assert!(build_snapshot(&t,r,Utc::now()).is_err());
     }
 }

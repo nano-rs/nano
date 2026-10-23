@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use nanosiem_lake_worker::bronze::admit_bronze_files;
 use nanosiem_lake_worker::enrichment::{write_ioc_snapshot, BronzeIngestEnricher, IocSnapshot, IocSnapshotInput};
-use nanosiem_lake_worker::lean_platform_bundle::{mask_event, PlatformBundle, PlatformGrant, TenantPlatformPolicy};
+use nanosiem_lake_worker::lean_platform_bundle::{PlatformBundle, PlatformGrant, TenantPlatformPolicy};
 use nanosiem_lake_worker::part_ingest::dedup::read_time_uids;
 use nanosiem_lake_worker::part_ingest::discovery::NoticeHandle;
 use nanosiem_lake_worker::part_ingest::ingest::seed_schema;
@@ -375,7 +375,7 @@ async fn tenant_ioc_match_is_written_into_signed_l0_with_revision() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn platform_geo_asn_and_ioc_are_in_signed_part_then_masked_on_revocation() {
+async fn platform_geo_asn_and_ioc_are_in_signed_part() {
     let fx = fixture(1, 1);
     let (key, at) = &fx.objects[0];
     let mut source = event("platform-geo", DAY0_S + 61, 1);
@@ -397,7 +397,7 @@ async fn platform_geo_asn_and_ioc_are_in_signed_part_then_masked_on_revocation()
     };
     let mut ingestor = Ingestor::open(
         config(&fx.root), &fx.parts, &fx.sources, &fx.spool, &fx.signer, trusted(),
-        BronzeIngestEnricher::disabled().with_lean_platform(bundle, policy.clone()),
+        BronzeIngestEnricher::disabled().with_lean_platform(bundle, policy),
         &seed_schema(), DAY0_S * 1_000,
     ).await.unwrap();
     let started = std::time::Instant::now();
@@ -417,7 +417,7 @@ async fn platform_geo_asn_and_ioc_are_in_signed_part_then_masked_on_revocation()
     let batch = reader.next().unwrap().unwrap();
     let mut json = arrow_json::LineDelimitedWriter::new(Vec::new());
     json.write(&batch).unwrap(); json.finish().unwrap();
-    let mut row: Value = serde_json::from_slice(&json.into_inner()).unwrap();
+    let row: Value = serde_json::from_slice(&json.into_inner()).unwrap();
     assert_eq!(row["src_endpoint"]["location"]["country"], "US");
     assert_eq!(row["src_endpoint"]["autonomous_system"]["number"], 64500);
     assert_eq!(row["src_endpoint"]["autonomous_system"]["name"], "Fixture network");
@@ -429,24 +429,17 @@ async fn platform_geo_asn_and_ioc_are_in_signed_part_then_masked_on_revocation()
     assert_eq!(geo["data"]["as_domain"], "fixture.example");
     assert!(row["enrichments"].as_array().unwrap().iter().any(|e| e["provider"] == "platform/threatfox"));
     assert!(row["enrichments"].as_array().unwrap().iter().any(|e| e["provider"] == "platform/ipinfo_lite"));
-    let mut revoked = policy;
-    revoked.grants.clear();
-    mask_event(&mut row, &revoked, chrono::Utc::now()).unwrap();
-    // Revocation masks every platform entry; the tenant's own ingest-time
-    // prevalence stamp (NAN-2915) is not platform data and stays.
-    let left = row["enrichments"].as_array().unwrap();
-    assert!(left.iter().all(|e| !e["provider"].as_str().unwrap_or("").starts_with("platform/")));
-    assert!(left.iter().all(|e| e["name"] == "prevalence" && e["provider"] == "nano"));
-    assert!(row["src_endpoint"]["location"].get("country").is_none());
-    assert!(row["src_endpoint"]["autonomous_system"].get("number").is_none());
 }
 
 /// Run the same admitted row through the signed log, verified part fetcher,
 /// native compiler and production broad_npl planning path. The policy file is
 /// replaced between requests, as it is by the cell's control plane.
+/// NAN-4168: enrichment is enforced at ingest only. A revoked or expired
+/// grant and a feed revision refresh change what new rows get stamped with;
+/// rows already stamped read back unchanged.
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256 and NANO_LAKE_COMPILER"]
-async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
+async fn signed_platform_part_stays_visible_to_native_query_after_policy_revoke() {
     use nanosiem_lake_worker::executor::{ExecutorMode, NativeExecutor};
     use nanosiem_lake_worker::native::NativeChdb;
     use nanosiem_lake_worker::part_query::engine::{BroadNplRequest, EngineSettings, PartQueryEngine};
@@ -601,7 +594,6 @@ async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
         deny_source_types: BTreeSet::new(),
     };
     let query = |q: &str| request(q);
-    std::env::set_var("NANO_LAKE_PLATFORM_POLICY_FILE", &policy_path);
     let visible = engine.broad_npl(&query("enriched_src_country_code=US | stats count")).await.unwrap();
     assert_eq!(visible["result"]["rows"][0]["count"], 1, "{visible}");
     let names = engine.broad_npl(&query("* | stats count by src_endpoint.autonomous_system.name")).await.unwrap();
@@ -632,20 +624,20 @@ async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
     policy.revision += 1;
     policy.grants.clear();
     std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
-    let masked = engine.broad_npl(&query("enriched_src_country_code=US | stats count")).await.unwrap();
-    assert_eq!(masked["result"]["rows"][0]["count"], 0, "{masked}");
-    let masked_ioc = engine.broad_npl(&query("ioc_src_ip_threat_type=malware | stats count")).await.unwrap();
-    assert_eq!(masked_ioc["result"]["rows"][0]["count"], 0, "{masked_ioc}");
-    let masked_stamps = engine.broad_npl(&query("* | table enrichments.provider, enrichments.data.threat_type")).await.unwrap();
-    let masked_text = masked_stamps["result"]["rows"].to_string();
-    assert!(!masked_text.contains("platform/spur") && masked_text.contains("tenant-a-feed"), "{masked_stamps}");
+    let revoked = engine.broad_npl(&query("enriched_src_country_code=US | stats count")).await.unwrap();
+    assert_eq!(revoked["result"]["rows"][0]["count"], 1, "{revoked}");
+    let revoked_ioc = engine.broad_npl(&query("ioc_src_ip_threat_type=malware | stats count")).await.unwrap();
+    assert_eq!(revoked_ioc["result"]["rows"][0]["count"], 1, "{revoked_ioc}");
+    let revoked_stamps = engine.broad_npl(&query("* | table enrichments.provider, enrichments.data.threat_type")).await.unwrap();
+    let revoked_text = revoked_stamps["result"]["rows"].to_string();
+    assert!(revoked_text.contains("platform/spur") && revoked_text.contains("tenant-a-feed"), "{revoked_stamps}");
     policy.revision += 1;
     policy.grants.insert("ipinfo_lite".into(), PlatformGrant {
         feed_revision: 1, valid_until: now - chrono::Duration::seconds(1), premium: None,
     });
     std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
     let expired = engine.broad_npl(&query("enriched_src_country_code=US | stats count")).await.unwrap();
-    assert_eq!(expired["result"]["rows"][0]["count"], 0, "{expired}");
+    assert_eq!(expired["result"]["rows"][0]["count"], 1, "{expired}");
 
     // Tenant B ingests the same platform feed bytes under a different grant.
     // It receives geo/ASN but no threatfox match, and its query process has a
@@ -712,7 +704,6 @@ async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
         max_query_bytes: 128 << 20, max_memory_bytes: 1 << 30,
         max_execution_seconds: 30, threads: 1,
     }, store_b, view_b, fetcher_b, executor_b).unwrap();
-    std::env::set_var("NANO_LAKE_PLATFORM_POLICY_FILE", &policy_b_path);
     let mut request_b = request("enriched_src_country_code=US | stats count");
     request_b.tenant_id = TENANT_B.into();
     let geo_b = engine_b.broad_npl(&request_b).await.unwrap();
@@ -783,7 +774,6 @@ async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
     rotation_row["src_endpoint"]["ip"] = json!("8.8.8.8");
     write_bronze(&fx.root.join("sources").join(rotation_key), &[rotation_row]);
     fx.spool.deliver(&notice(rotation_key, rotation_time)).unwrap();
-    std::env::set_var("NANO_LAKE_PLATFORM_POLICY_FILE", &policy_path);
     let rotation_accepted = Instant::now();
     loop {
         engine.refresh().await.unwrap();
@@ -797,10 +787,10 @@ async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
     }
     let rotated_ioc = engine.broad_npl(&query("ioc_src_ip_threat_type=malware-rotated | stats count")).await.unwrap();
     assert_eq!(rotated_ioc["result"]["rows"][0]["count"], 1, "{rotated_ioc}");
-    std::env::set_var("NANO_LAKE_PLATFORM_POLICY_FILE", &policy_b_path);
-    let wrong_policy = engine.broad_npl(&query("enriched_src_country_code=US | stats count")).await.unwrap();
-    assert_eq!(wrong_policy["result"]["rows"][0]["count"], 0, "A accepted B's policy: {wrong_policy}");
-    std::env::set_var("NANO_LAKE_PLATFORM_POLICY_FILE", &policy_path);
+    // The row stamped under threatfox revision 2 keeps its verdict after the
+    // feed refreshed to revision 3.
+    let refreshed_ioc = engine.broad_npl(&query("ioc_src_ip_threat_type=malware | stats count")).await.unwrap();
+    assert_eq!(refreshed_ioc["result"]["rows"][0]["count"], 1, "{refreshed_ioc}");
     assert!(changed_at.elapsed() >= Duration::from_secs(30), "refresh interval was not exercised");
     eprintln!("nan2918 scheduled source refresh wall_ms={} accepted-to-query-visible_ms={}",
         changed_at.elapsed().as_millis(), rotation_accepted.elapsed().as_millis());
@@ -1008,7 +998,6 @@ async fn signed_platform_part_is_masked_by_native_query_after_policy_revoke() {
         assert!(running.0.try_wait().unwrap().is_none(), "persistent ingest binary exited during soak");
         eprintln!("nan2918-soak complete offered={} duration_ms={}", queried_rows, soak_started.elapsed().as_millis());
     }
-    std::env::remove_var("NANO_LAKE_PLATFORM_POLICY_FILE");
 }
 
 fn test_mmdb_bytes() -> Vec<u8> {
@@ -2359,6 +2348,270 @@ async fn a_failing_sign_holds_the_buffer_and_the_retry_commits_exactly_once() {
     let _ = flaky.key_id();
 }
 
+/// A deterministic native-owner latency/fault model. Every immutable upload
+/// pays reserve/verify/PUT/HEAD/complete/register latency; every 200th call
+/// refuses transiently. Control calls share the native writer's paced budget.
+/// The production retry must retry that file rather than restart the flush.
+struct SlowTransientParts {
+    inner: LocalObjectStore,
+    delay_ms: u64,
+    next_owner_call: tokio::sync::Mutex<tokio::time::Instant>,
+    calls: AtomicUsize,
+    faults: AtomicUsize,
+    creates: AtomicUsize,
+}
+
+#[async_trait]
+impl ObjectStore for SlowTransientParts {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> { self.inner.get(key).await }
+    async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        for stage in 0..6 {
+            if matches!(stage, 0 | 1 | 4 | 5) {
+                let mut next = self.next_owner_call.lock().await;
+                tokio::time::sleep_until(*next).await;
+                *next = tokio::time::Instant::now() + std::time::Duration::from_millis(25);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call % 200 == 0 && !key.contains("/log/") {
+                self.faults.fetch_add(1, Ordering::SeqCst);
+                return Err(nanosiem_lake_worker::part_ingest::native_writer::OwnerRefused { status: 503 }.into());
+            }
+        }
+        let created = self.inner.put_if_absent(key, bytes).await?;
+        if created { self.creates.fetch_add(1, Ordering::SeqCst); }
+        Ok(created)
+    }
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> { self.inner.put(key, bytes).await }
+    async fn delete(&self, key: &str) -> Result<()> { self.inner.delete(key).await }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> { self.inner.list(prefix).await }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn five_hundred_event_hours_with_slow_transient_owner_commit_within_watchdog() {
+    wide_transient_owner_regression(50).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn five_hundred_event_hours_with_400ms_paced_owner_commit_within_watchdog() {
+    wide_transient_owner_regression(400).await;
+}
+
+async fn wide_transient_owner_regression(delay_ms: u64) {
+    let fx = fixture(4, 125);
+    for (object, (key, at)) in fx.objects.iter().enumerate() {
+        let events = (0..125).map(|row| {
+            let index = object * 125 + row;
+            event(&format!("wide-owner-{index}"), DAY0_S - (500 - index as i64) * 3_600 + 60, index)
+        }).collect::<Vec<_>>();
+        write_bronze(&fx.root.join("sources").join(key), &events);
+        fx.spool.deliver(&notice(key, *at)).unwrap();
+    }
+    let store: &'static SlowTransientParts = Box::leak(Box::new(SlowTransientParts {
+        inner: LocalObjectStore::new(fx.root.join("parts")).unwrap(),
+        delay_ms, next_owner_call: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        calls: AtomicUsize::new(0), faults: AtomicUsize::new(0), creates: AtomicUsize::new(0),
+    }));
+    let owner: &'static LocalPartSigner = Box::leak(Box::new(signer()));
+    let mut cfg = config(&fx.root);
+    cfg.max_objects_per_admission = 4;
+    cfg.prevalence_enabled = false;
+    let mut clock = (DAY0_S + 2_500) * 1_000;
+    let queue = OrderingQueue {
+        spool: &fx.spool, parts: &fx.parts, sources: &fx.sources,
+        issued: std::sync::atomic::AtomicBool::new(false),
+        keys: std::sync::Mutex::new(BTreeMap::new()), ranges: AtomicUsize::new(0), acked: AtomicUsize::new(0),
+    };
+    let mut ingestor = Ingestor::open(cfg, store, &fx.sources, &queue, owner, trusted(),
+        BronzeIngestEnricher::disabled(), &seed_schema(), clock).await.unwrap();
+    ingestor.set_background_store(store);
+    ingestor.set_background_signer(owner);
+    let started = std::time::Instant::now();
+    tokio::time::timeout(std::time::Duration::from_secs(900), async {
+        for attempt in 0..12 {
+            let (report, _) = ingestor.tick_ingest(clock).await.unwrap();
+            if attempt == 0 {
+                assert_eq!(report.flushed_parts, 500, "wide buffers seal before the age interval elapses");
+            }
+            ingestor.flush_now(clock + 1).await.unwrap();
+            clock += 11_000;
+            if fx.spool.pending(1).await.unwrap().is_empty() { break; }
+        }
+    }).await.expect("500 historical hours must commit inside the edge stall watchdog");
+    let elapsed = started.elapsed();
+    assert!(fx.spool.pending(1).await.unwrap().is_empty(), "every source notice drained");
+    let set = live(&fx).await;
+    assert_eq!(set.parts().map(|part| part.event_hour).collect::<HashSet<_>>().len(), 500);
+    let part_files = set.parts().map(|part| {
+        let keys = PartKeys::new(TENANT, part.level, part.event_hour, &part.part_id).unwrap();
+        std::fs::read_dir(fx.root.join("parts").join(keys.provenance()).parent().unwrap()).unwrap().count()
+    }).sum::<usize>();
+    assert_exactly_once(&live_rows(&fx).await, 500);
+    assert_eq!(queue.acked.load(Ordering::SeqCst), 4, "each source notice acknowledged once");
+    let log_keys = nanosiem_lake_worker::parts::format::LogKeys::new(TENANT).unwrap();
+    let mut consumed = HashSet::new();
+    let mut adds = 0;
+    for seq in 1..=set.head().unwrap().0 {
+        let bytes = fx.parts.get(&log_keys.entry(seq)).await.unwrap().unwrap();
+        let entry = nanosiem_lake_worker::parts::part_log::LogEntry::parse_bytes(&bytes, TENANT).unwrap();
+        if let nanosiem_lake_worker::parts::part_log::LogOp::Add { consumed: sources, .. } = entry.op {
+            adds += 1;
+            for source in sources {
+                assert!(consumed.insert((source.key, source.version, source.sha256)),
+                    "a source must be consumed by exactly one Add");
+            }
+        }
+    }
+    assert_eq!(consumed.len(), 4);
+    assert_eq!(adds, queue.ranges.load(Ordering::SeqCst), "one Add per issued flush range");
+    assert!(store.faults.load(Ordering::SeqCst) > 0, "transient failures were exercised");
+    assert_eq!(load_log(&fx.parts, TENANT_B).await.unwrap().parts().count(), 0,
+        "wide history and retries remain fenced to their tenant");
+    eprintln!("wide-owner regression: event_hours=500 parts={} part_files={} simulated_calls={} transient_faults={} creates={} latency_ms_per_call={} watchdog_s=900 commit_ms={}",
+        set.parts().count(), part_files, store.calls.load(Ordering::SeqCst), store.faults.load(Ordering::SeqCst),
+        store.creates.load(Ordering::SeqCst), delay_ms, elapsed.as_millis());
+}
+
+/// An unknown native PUT permanently closes only that immutable identity.
+struct UnknownNativePut {
+    inner: LocalObjectStore,
+    hour_prefix: String,
+    blocked_key: std::sync::Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl ObjectStore for UnknownNativePut {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> { self.inner.get(key).await }
+    async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        let blocked = {
+            let mut blocked = self.blocked_key.lock().unwrap();
+            if blocked.is_none() && key.starts_with(&self.hour_prefix) && key.ends_with("data-00000.parquet") {
+                *blocked = Some(key.to_string());
+            }
+            blocked.as_deref() == Some(key)
+        };
+        if blocked {
+            return Err(nanosiem_lake_worker::part_ingest::native_writer::NativePutUnresolved { key: key.to_string() }.into());
+        }
+        self.inner.put_if_absent(key, bytes).await
+    }
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> { self.inner.put(key, bytes).await }
+    async fn delete(&self, key: &str) -> Result<()> { self.inner.delete(key).await }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> { self.inner.list(prefix).await }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unresolved_native_put_rebuilds_only_its_hour_and_keeps_completed_other_parts() {
+    let fx = fixture(1, 4);
+    let (key, at) = &fx.objects[0];
+    let events = (0..4).map(|hour| event(&format!("unknown-put-{hour}"), DAY0_S + hour as i64 * 3_600 + 60, hour)).collect::<Vec<_>>();
+    write_bronze(&fx.root.join("sources").join(key), &events);
+    fx.spool.deliver(&notice(key, *at)).unwrap();
+    let failed_hour = event_hour_of((DAY0_S + 3 * 3_600) * 1_000_000);
+    let keys = PartKeys::new(TENANT, Level::L0, failed_hour, &nanosiem_lake_worker::parts::format::PartId::new(1).unwrap()).unwrap();
+    let key = keys.provenance();
+    let hour_prefix = format!("{}/", Path::new(&key).parent().unwrap().parent().unwrap().display());
+    let store: &'static UnknownNativePut = Box::leak(Box::new(UnknownNativePut {
+        inner: LocalObjectStore::new(fx.root.join("parts")).unwrap(), hour_prefix,
+        blocked_key: std::sync::Mutex::new(None),
+    }));
+    let owner: &'static LocalPartSigner = Box::leak(Box::new(signer()));
+    let mut cfg = config(&fx.root);
+    cfg.prevalence_enabled = false;
+    let clock = (DAY0_S + 4 * 3_600) * 1_000;
+    let mut ingestor = Ingestor::open(cfg, store, &fx.sources, &fx.spool, owner, trusted(),
+        BronzeIngestEnricher::disabled(), &seed_schema(), clock).await.unwrap();
+    ingestor.set_background_store(store);
+    ingestor.set_background_signer(owner);
+    ingestor.tick_ingest(clock).await.unwrap();
+    assert!(ingestor.flush_now(clock + 11_001).await.is_err(), "unknown PUT fails closed");
+    assert_eq!(fx.spool.pending(2).await.unwrap().len(), 1);
+    assert_eq!(live(&fx).await.parts().count(), 0);
+    let remote_before = store.list(&format!("lake/parts/v1/tenant={TENANT}/")).await.unwrap();
+    let kept_data = remote_before.into_iter().filter(|key| key.ends_with("data-00000.parquet")
+        && !key.starts_with(&store.hour_prefix)).collect::<HashSet<_>>();
+    assert_eq!(kept_data.len(), 3, "other hours completed before the unresolved PUT");
+    ingestor.flush_now(clock + 11_002).await.unwrap();
+    assert!(fx.spool.pending(1).await.unwrap().is_empty());
+    let set = live(&fx).await;
+    let live_data = set.parts().map(|part| PartKeys::new(TENANT, part.level, part.event_hour, &part.part_id).unwrap().data(0)).collect::<HashSet<_>>();
+    assert!(kept_data.is_subset(&live_data), "successful hours keep the same part ids");
+    assert!(!live_data.contains(store.blocked_key.lock().unwrap().as_ref().unwrap()), "unknown identity is never reused");
+    assert_eq!(set.parts().count(), 4);
+    assert_exactly_once(&live_rows(&fx).await, 4);
+    assert_eq!(load_log(&fx.parts, TENANT_B).await.unwrap().parts().count(), 0);
+}
+
+/// Historical rows fan out into many L0s in one background flush. A failed
+/// publication must leave every notice pending until a successful retry's Add.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn many_hour_background_publication_failure_retries_without_acking_or_losing_rows() {
+    let fx = fixture(4, 12);
+    for (object, (key, at)) in fx.objects.iter().enumerate() {
+        let events = (0..12).map(|row| {
+            let index = object * 12 + row;
+            event(&format!("many-hour-{index}"), DAY0_S - (48 - index as i64) * 3_600 + 60, index)
+        }).collect::<Vec<_>>();
+        write_bronze(&fx.root.join("sources").join(key), &events);
+        fx.spool.deliver(&notice(key, *at)).unwrap();
+    }
+    let store: &'static LocalObjectStore = Box::leak(Box::new(LocalObjectStore::new(fx.root.join("parts")).unwrap()));
+    let owner: &'static FlakySigner = Box::leak(Box::new(FlakySigner {
+        inner: signer(), fail: AtomicUsize::new(1),
+    }));
+    let mut cfg = config(&fx.root);
+    cfg.max_objects_per_admission = 1;
+    cfg.prevalence_enabled = false;
+    cfg.commit_when_ready = false; // Maintenance must not retry the failed flight.
+    cfg.cache_max_bytes = 1;
+    let mut clock = (DAY0_S + 2_500) * 1_000;
+    let mut ingestor = Ingestor::open(cfg, store, &fx.sources, &fx.spool, owner, trusted(),
+        BronzeIngestEnricher::disabled(), &seed_schema(), clock).await.unwrap();
+    ingestor.set_background_store(store);
+    ingestor.set_background_signer(owner);
+    ingestor.tick_ingest(clock).await.unwrap();
+    clock += 11_000;
+    ingestor.tick_ingest(clock).await.unwrap();
+    assert_eq!(ingestor.health().flushes_pipelined_total, 1, "the first 24 hours publish in the background");
+    let failure = tokio::time::timeout(std::time::Duration::from_secs(120), ingestor.flush_now(clock + 1))
+        .await.expect("publication failure must surface within the step budget").unwrap_err();
+    assert!(failure.to_string().contains("pipelined flush build/publish"));
+    assert_eq!(owner.fail.load(Ordering::SeqCst), 0, "the owner refusal was exercised");
+    assert_eq!(fx.spool.pending(8).await.unwrap().len(), 4, "no notice is acknowledged before publication succeeds");
+    assert_eq!(live(&fx).await.parts().count(), 0, "failed publication has no committed Add");
+    let prefix = format!("lake/parts/v1/tenant={TENANT}/");
+    let uploaded_before_retry = store.list(&prefix).await.unwrap().into_iter()
+        .filter(|key| key.ends_with(".parquet")).collect::<HashSet<_>>();
+    assert!(!uploaded_before_retry.is_empty(), "files completed before signing failed");
+    let local_parts = fx.root.join("work/parts");
+    let retained_dirs = std::fs::read_dir(&local_parts).unwrap().flatten()
+        .filter(|entry| entry.file_type().unwrap().is_dir()).map(|entry| entry.path()).collect::<Vec<_>>();
+    assert!(!retained_dirs.is_empty());
+    clock += 60_001;
+    ingestor.tick_maintain(clock, &[], &mut Default::default()).await.unwrap();
+    assert_eq!(live(&fx).await.parts().count(), 0, "maintenance does not retry the failed flight");
+    assert!(retained_dirs.iter().all(|path| path.is_dir()),
+        "cache eviction must preserve immutable output held by a failed flight");
+    tokio::time::timeout(std::time::Duration::from_secs(120), ingestor.flush_now(clock + 2))
+        .await.expect("publication retry must finish").unwrap();
+    assert_eq!(fx.spool.pending(8).await.unwrap().len(), 2);
+    let uploaded_after_retry = store.list(&prefix).await.unwrap().into_iter()
+        .filter(|key| key.ends_with(".parquet")).collect::<HashSet<_>>();
+    assert_eq!(uploaded_before_retry, uploaded_after_retry,
+        "retry keeps completed immutable files under the same part ids");
+    for _ in 0..3 {
+        clock += 11_000;
+        ingestor.tick_ingest(clock).await.unwrap();
+    }
+    ingestor.flush_now(clock + 1).await.unwrap();
+    assert!(fx.spool.pending(1).await.unwrap().is_empty());
+    let set = live(&fx).await;
+    assert_eq!(set.parts().map(|part| part.event_hour).collect::<HashSet<_>>().len(), 48);
+    assert_exactly_once(&live_rows(&fx).await, 48);
+    assert_eq!(load_log(&fx.parts, TENANT_B).await.unwrap().parts().count(), 0,
+        "the retry never creates parts for another tenant");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_tiny_cache_budget_evicts_and_merges_still_refetch_verified_parts() {
     let fx = fixture(120, 6);
@@ -3368,10 +3621,10 @@ mod part_gc_gate {
                     plane: plane.clone(),
                 })),
                 lister: lister.unwrap_or_else(|| Arc::new(StoreLister(store))),
+                state_dir: Some(fx.root.join("gc-state")),
+                worker_http: Some(worker_http),
             })
             .unwrap()
-            .with_state_dir(&fx.root.join("gc-state"))
-            .with_worker_http_client(worker_http)
             // Wall-clock tests delete hundreds of keys; production paces
             // authorizes at 240/min (covered by the executor's paused-clock test).
             .with_authorizes_per_minute(1_000_000);
@@ -3451,13 +3704,14 @@ mod part_gc_gate {
                 xml.push_str("</ListBucketResult>");
                 ([(axum::http::header::CONTENT_TYPE, "application/xml")], xml).into_response()
             }
-            struct S3Lister(Arc<S3ObjectStore>);
+            struct S3Lister(Arc<S3ObjectStore>, Arc<AtomicUsize>);
             #[async_trait]
             impl PartObjectLister for S3Lister {
                 fn inventory_scope(&self) -> Option<String> {
                     Some(self.0.inventory_scope())
                 }
                 async fn list_part_objects(&self, prefix: &str) -> Result<Vec<ListedPartObject>> {
+                    self.1.fetch_add(1, Ordering::SeqCst);
                     self.0.list_with_metadata(prefix).await
                 }
             }
@@ -3512,7 +3766,8 @@ mod part_gc_gate {
                 session_token: None,
             };
             let s3 = Arc::new(S3ObjectStore::new(&location).unwrap());
-            let lister = S3Lister(s3.clone());
+            let listing_tasks = Arc::new(AtomicUsize::new(0));
+            let lister = S3Lister(s3.clone(), listing_tasks.clone());
             let h = harness_with_inputs(&fx, None, Some(Arc::new(lister))).await;
             h.plane.lock().unwrap().first_attest_delay = true;
             // Exchange policy enables legal 200 reads/s from genesis and on every refresh.
@@ -3690,9 +3945,9 @@ mod part_gc_gate {
                 "arrivals must continue throughout the slow listing"
             );
             assert_eq!(
-                starts.load(Ordering::SeqCst),
-                if adversarial { 1 } else { 3 },
-                "one full listing per distinct owned task"
+                listing_tasks.load(Ordering::SeqCst),
+                3,
+                "one full listing per distinct owned task (credential refresh may retry the first HTTP page)"
             );
             assert!(
                 calls.load(Ordering::SeqCst) <= pages * 3 + refreshes + 3,
@@ -5236,7 +5491,7 @@ impl NoticeQueue for OrderingQueue<'_> {
         anyhow::ensure!(self.issued.swap(false, Ordering::SeqCst), "an ack without an issued range");
         let live = load_log(self.parts, TENANT).await?;
         for handle in handles {
-            let key = self.keys.lock().unwrap().get(&handle.0).cloned().expect("acked handle was pending");
+            let key = self.keys.lock().unwrap().remove(&handle.0).expect("each handle is acknowledged only once");
             let bytes = self.sources.get(&key).await?.expect("source object");
             let source = nanosiem_lake_worker::parts::part_log::SourceRef { key, version: "1".into(), sha256: sha256_hex(&bytes) };
             anyhow::ensure!(live.consumed(&source), "an ack before its add committed: {}", source.key);
@@ -5953,4 +6208,131 @@ async fn the_first_flush_after_a_cold_start_never_waits_on_the_prevalence_rebuil
     drop(ingestor);
     let objects = fx.objects.len() as u64;
     assert_eq!(dest_ip_prevalence(&fx, &store, now + 1_000).await, (objects, objects));
+}
+
+/// NAN-4168, production query path: rows stamped by the real ingest binary
+/// (platform bundle + tenant policy) are served by query[T] exactly as the
+/// `lake_part_query` binary wires it: a `QueryBootstrap` document,
+/// `server::open_engine`, `QueryService::new`, its background prewarm, and the HTTP
+/// `/v1/query` route (axum router over a socket). A search projecting endpoint
+/// fields plus country returns the stored stamps, and a stats by country
+/// counts them, after the policy grants are revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256 and NANO_LAKE_COMPILER"]
+async fn platform_stamps_return_through_the_query_service_route() {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::rt::TokioIo;
+    use nanosiem_lake_worker::part_query::server::{open_engine, OpenOptions, QueryBootstrap, QueryService};
+    use std::time::Duration;
+
+    let fx = fixture(1, 1);
+    let (key, _at) = &fx.objects[0];
+    let event_time_s = chrono::Utc::now().timestamp() - 10;
+    let mut source = event("service-platform", event_time_s, 1);
+    source["src_endpoint"]["ip"] = json!("8.8.8.8");
+    source["dst_endpoint"]["ip"] = json!("9.9.9.9");
+    write_bronze(&fx.root.join("sources").join(key), &[source]);
+    let bundle_path = fx.root.join("platform.bundle");
+    let digest = PlatformBundle::publish(&bundle_path, Some(&test_mmdb_bytes()), &[
+        IocSnapshotInput { ioc_value: "8.8.8.8".into(), ioc_type: "ip".into(), source_id: "threatfox".into(),
+            threat_type: "malware".into(), ..Default::default() },
+        IocSnapshotInput { ioc_value: "8.8.8.8".into(), ioc_type: "ip".into(), source_id: "tor_exit_nodes".into(),
+            threat_type: "tor".into(), ..Default::default() },
+    ], BTreeMap::from([("ipinfo_lite".into(), 1), ("threatfox".into(), 2), ("tor_exit_nodes".into(), 2)])).unwrap();
+    let now = chrono::Utc::now();
+    let grant = |feed_revision| PlatformGrant { feed_revision, valid_until: now + chrono::Duration::minutes(5), premium: None };
+    let mut policy = TenantPlatformPolicy {
+        tenant_id: TENANT.parse().unwrap(), revision: 1, bundle_sha256: digest.clone(),
+        grants: BTreeMap::from([("ipinfo_lite".into(), grant(1)), ("threatfox".into(), grant(2)), ("tor_exit_nodes".into(), grant(2))]),
+    };
+    let policy_path = fx.root.join("policy.json");
+    std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let signing_key = fx.root.join("signing-key.hex");
+    std::fs::write(&signing_key, hex::encode([11; 32])).unwrap();
+    fx.spool.deliver(&notice(key, event_time_s)).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_lake_part_ingest"))
+        .args(["run", "--tenant-id", TENANT, "--signer-key-id", SIGNER_KEY_ID,
+            "--signing-key-file", signing_key.to_str().unwrap(),
+            "--parts-dir", fx.root.join("parts").to_str().unwrap(),
+            "--sources-dir", fx.root.join("sources").to_str().unwrap(),
+            "--spool-dir", fx.root.join("spool").to_str().unwrap(),
+            "--work-dir", fx.root.join("work").to_str().unwrap(),
+            "--platform-bundle-file", bundle_path.to_str().unwrap(),
+            "--platform-policy-file", policy_path.to_str().unwrap(),
+            "--tick-ms", "100", "--flush-ms", "1000", "--exit-when-idle"])
+        .output().unwrap();
+    assert!(output.status.success(), "ingest exit: {}", String::from_utf8_lossy(&output.stderr));
+    // Revoke every grant: stamps already written must still be served.
+    policy.revision += 1;
+    policy.grants.clear();
+    std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+
+    // The query[T] bootstrap document (lab form: local parts, no R2).
+    let state = tempfile::tempdir().unwrap();
+    let bootstrap: QueryBootstrap = serde_json::from_value(json!({
+        "format": "nano.query-bootstrap.v1", "tenant_id": TENANT, "bucket": "nan4168-service",
+        "trusted_signer_keys": [{"key_id": SIGNER_KEY_ID,
+            "public_key_hex": hex::encode(self::key().verifying_key().to_bytes())}],
+        "engine": {
+            "chdb_library": std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
+            "chdb_sha256": std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap(),
+            "compiler": std::env::var("NANO_LAKE_COMPILER").unwrap(),
+            "cache_bytes": 256u64 << 20, "cache_query_bytes": 128u64 << 20, "prewarm_hours": 24,
+        },
+    })).unwrap();
+    let options = OpenOptions {
+        bootstrap, r2: None, parts_dir: Some(fx.root.join("parts")), state_dir: state.path().to_path_buf(),
+        memory_cap_bytes: 4 << 30, size_classes: true, cpu_millis: 2000,
+    };
+    let (engine, gate) = open_engine(&options).await.unwrap();
+    let service = QueryService::new(engine, gate, state.path().to_path_buf(), "compiler".into(),
+        options.bootstrap.engine.chdb_sha256.clone(), None, options.bootstrap.engine.prewarm_hours, None);
+    // The query role's default (no readiness-gating prewarm).
+    service.clone().start_ready_with_background_prewarm();
+
+    let call = |method: &'static str, uri: &'static str, body: Option<Value>| {
+        let service = service.clone();
+        async move {
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            tokio::spawn(service.serve_stream(server));
+            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client)).await.unwrap();
+            tokio::spawn(connection);
+            let request = hyper::Request::builder().method(method).uri(uri)
+                .header("host", "cell").header("content-type", "application/json")
+                .body(Full::new(Bytes::from(body.map_or_else(String::new, |b| b.to_string())))).unwrap();
+            let response = sender.send_request(request).await.unwrap();
+            let status = response.status().as_u16();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null))
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let search = |query: &str| json!({
+        "route": "broad_npl", "request_id": uuid::Uuid::new_v4().to_string(), "tenant_id": TENANT,
+        "dataset": "logs", "query": query,
+        "start": chrono::DateTime::from_timestamp(event_time_s - 7 * 86_400, 0).unwrap().to_rfc3339(),
+        "end": chrono::DateTime::from_timestamp(event_time_s + 300, 0).unwrap().to_rfc3339(),
+        "limit": 10, "table_view": false,
+    });
+    let (status, rows) = loop {
+        let (status, body) = call("POST", "/v1/query", Some(search(
+            "* | table src_endpoint.ip, dst_endpoint.ip, src_endpoint.location.country, src_endpoint.autonomous_system.number, enrichments.provider, enrichments.data.feed_revision_id"))).await;
+        if status == 200 || Instant::now() > deadline { break (status, body); }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    assert_eq!(status, 200, "{rows}");
+    let row = &rows["result"]["rows"][0];
+    assert_eq!(row["src_endpoint.ip"], "8.8.8.8", "{rows}");
+    assert_eq!(row["dst_endpoint.ip"], "9.9.9.9", "{rows}");
+    assert_eq!(row["src_endpoint.location.country"], "US", "{rows}");
+    assert_eq!(row["src_endpoint.autonomous_system.number"], 64500, "{rows}");
+    let providers = row["enrichments.provider"].to_string();
+    for provider in ["platform/ipinfo_lite", "platform/threatfox", "platform/tor_exit_nodes"] {
+        assert!(providers.contains(provider), "{provider}: {rows}");
+    }
+    let (status, stats) = call("POST", "/v1/query", Some(search("* | stats count by src_endpoint.location.country"))).await;
+    assert_eq!(status, 200, "{stats}");
+    assert_eq!(stats["result"]["rows"][0]["src_endpoint.location.country"], "US", "{stats}");
+    assert_eq!(stats["result"]["rows"][0]["count"], 1, "{stats}");
 }

@@ -30,10 +30,11 @@ import { cn } from '@/lib/utils';
 import { MatchesHero } from '@/components/matches/MatchesHero';
 import { MatchesList } from '@/components/matches/MatchesList';
 import { MatchesDetail } from '@/components/matches/MatchesDetail';
+import { matchSearchUrl } from '@/components/matches/search-window';
 import { LogicTab } from '@/components/matches/LogicTab';
 import { buildMatchView, buildActivity28, type MatchView } from '@/components/matches/helpers';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
-import { nplQuotedBody } from '@/lib/npl-quote';
+import { ruleMatchSearchQuery } from '@/components/matches/search-query';
 
 type TabId = 'matches' | 'logic';
 
@@ -146,45 +147,8 @@ export function Matches() {
 
   const handleOpenInSearch = useCallback((view: MatchView) => {
     if (!apiRule) return;
-    const raw = (view.entity.raw || view.entity.label || '').trim();
-    if (!raw) return;
-    const escaped = nplQuotedBody(raw);
-    // Use only the source-filter stage of the rule's pipeline (everything
-    // before the first `|`). Appending `| search "..."` after a stats step
-    // breaks at compile time because `search` lowers to `WHERE message LIKE …`,
-    // and `message` no longer exists post-aggregation. Drop the aggregation
-    // entirely when pivoting to raw events — the analyst wants the underlying
-    // activity for the entity, not a re-run of the rule's stats.
-    const baseFilter = apiRule.query.split('|')[0].trim();
-    const ocsf = schema === 'ocsf';
-    let entityFilter: string;
-    switch (view.entity.type) {
-      case 'user':
-      case 'role':
-      case 'service':
-        entityFilter = ocsf
-          ? raw.startsWith('arn:')
-            ? `(actor.user.uid="${escaped}" OR actor.user.name="${escaped}")`
-            : `(actor.user.name="${escaped}" OR actor.user.uid="${escaped}" OR user.name="${escaped}" OR user.uid="${escaped}")`
-          : raw.startsWith('arn:')
-            ? `user_identity.arn="${escaped}"`
-            : `user="${escaped}"`;
-        break;
-      case 'host':
-        entityFilter = ocsf
-          ? `(device.hostname="${escaped}" OR src_endpoint.hostname="${escaped}" OR dst_endpoint.hostname="${escaped}")`
-          : `(src_host="${escaped}" OR dest_host="${escaped}" OR hostname="${escaped}")`;
-        break;
-      case 'ip':
-        entityFilter = ocsf
-          ? `(src_endpoint.ip="${escaped}" OR dst_endpoint.ip="${escaped}")`
-          : `(src_ip="${escaped}" OR dest_ip="${escaped}")`;
-        break;
-      default:
-        entityFilter = `"${escaped}"`;
-    }
-    const q = baseFilter ? `${baseFilter} ${entityFilter}` : entityFilter;
-    navigate(`/search?q=${encodeURIComponent(q)}`);
+    const q = ruleMatchSearchQuery(apiRule.query, view.events, view.entity, schema === 'ocsf');
+    navigate(matchSearchUrl(q, view, apiRule.lookback_minutes));
   }, [apiRule, navigate, schema]);
 
   if (ruleLoading) {
@@ -299,11 +263,13 @@ export function Matches() {
               linkedAlertId={linkedAlert?.id}
               linkedAlertTitle={linkedAlert?.rule_name}
               onOpenInSearch={handleOpenInSearch}
+              onRunRuleQuery={(view) => navigate(matchSearchUrl(apiRule.query, view, apiRule.lookback_minutes))}
               ruleId={apiRule?.id}
+              ruleName={apiRule.name}
             />
           </div>
         ) : (
-          <LogicTab rule={apiRule} />
+          <LogicTab rule={apiRule} match={selected} />
         )}
       </div>
     </div>

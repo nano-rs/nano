@@ -33,6 +33,10 @@
 //!   lookup reads the merged identity file. The background build stays
 //!   process-level: `identity_merged_index=1` on a process with the index
 //!   off finds no merged file and reads every source, as off does.
+//! - `entity_index` (`NANO_LAKE_ENTITY_INDEX`, NAN-4190): whether a selection
+//!   reads the window entity index. The build is process-level, as for the
+//!   identity index: `entity_index=1` on a process without one changes
+//!   nothing.
 //!
 //! - `payload_threads=N` (`NANO_LAKE_PAYLOAD_MAX_THREADS`, NAN-3411) and
 //!   `payload_block_rows=N` (`NANO_LAKE_PAYLOAD_BLOCK_ROWS`): the full-event
@@ -78,6 +82,8 @@ pub struct Overrides {
     pub flat_filter_leaves: Option<bool>,
     pub lane_routing_v2: Option<bool>,
     pub identity_merged_index: Option<bool>,
+    /// NAN-4190: read the window entity index.
+    pub entity_index: Option<bool>,
     /// NAN-3411: payload statement reader threads (unclamped; see module docs).
     pub payload_threads: Option<u64>,
     /// NAN-3411: payload statement block rows (unclamped; see module docs).
@@ -140,7 +146,7 @@ const fn flag_knob(name: &'static str, env: Option<&'static str>, what: &'static
 }
 
 /// NAN-3715: every engine knob the SQL probe may override for one call. The
-/// first five are the [`HEADER`] switches (carried in [`Overrides`]); the
+/// first six are the [`HEADER`] switches (carried in [`Overrides`]); the
 /// rest are read through [`probe_flag`] / [`probe_count`] at their single
 /// call site and fall back to the process value outside a probe.
 pub const PROBE_KNOBS: &[Knob] = &[
@@ -149,6 +155,7 @@ pub const PROBE_KNOBS: &[Knob] = &[
     flag_knob("identity_merged_index", Some("NANO_LAKE_IDENTITY_MERGED_INDEX"), "read the merged identity index"),
     Knob { name: "payload_threads", env: Some("NANO_LAKE_PAYLOAD_MAX_THREADS"), kind: KnobKind::Count { min: 1, max: 64 }, what: "payload statement reader threads (planner clamps)" },
     Knob { name: "payload_block_rows", env: Some("NANO_LAKE_PAYLOAD_BLOCK_ROWS"), kind: KnobKind::Count { min: 1, max: 65_536 }, what: "payload statement block rows (planner clamps)" },
+    flag_knob("entity_index", Some("NANO_LAKE_ENTITY_INDEX"), "read the window entity index (exact entity row runs)"),
     flag_knob("range_fetch", Some("NANO_LAKE_SEARCH_RANGE_FETCH"), "sparse column-range fetch of data files"),
     Knob { name: "range_narrow_denominator", env: None, kind: KnobKind::Count { min: 1, max: 64 }, what: "a ranged read is used when its chunks are <= 1/N of the file (default 2)" },
     flag_knob("two_pass", Some("NANO_LAKE_TWO_PASS"), "two-pass row queries (narrow locate, then payload)"),
@@ -170,7 +177,9 @@ pub const PROBE_KNOBS: &[Knob] = &[
     flag_knob("prune_tokens", None, "per-file token indexes"),
     flag_knob("prune_blooms", None, "data-file footer stats / in-file bloom row-group pruning"),
     flag_knob("fine_runs", None, "v2 block runs in place of whole row groups"),
-    Knob { name: "evidence_probe_concurrency", env: None, kind: KnobKind::Count { min: 1, max: 32 }, what: "files probed at once for footer/bloom/token evidence (default 8)" },
+    flag_knob("keyword_counts", None, "single-keyword counts, histograms and by-source counts from v3 token counts (off: scan)"),
+    Knob { name: "evidence_probe_concurrency", env: None, kind: KnobKind::Count { min: 1, max: 32 }, what: "files probed at once for footer/bloom/entity evidence (default 8)" },
+    Knob { name: "token_probe_concurrency", env: None, kind: KnobKind::Count { min: 1, max: 128 }, what: "token-index files probed at once in select and the token seed (default 32)" },
 ];
 
 /// NAN-3715: process-level settings a probe cannot override (named in its
@@ -246,6 +255,7 @@ pub fn parse(text: &str) -> Parsed {
             "flat_filter_leaves" => &mut parsed.overrides.flat_filter_leaves,
             "lane_routing_v2" => &mut parsed.overrides.lane_routing_v2,
             "identity_merged_index" => &mut parsed.overrides.identity_merged_index,
+            "entity_index" => &mut parsed.overrides.entity_index,
             _ => {
                 parsed.invalid += 1;
                 continue;
@@ -344,6 +354,11 @@ pub fn identity_merged_index(process: bool) -> bool {
     current().identity_merged_index.unwrap_or(process)
 }
 
+/// Effective `NANO_LAKE_ENTITY_INDEX` given the process value (NAN-4190).
+pub fn entity_index(process: bool) -> bool {
+    current().entity_index.unwrap_or(process)
+}
+
 /// This request's `payload_threads` / `payload_block_rows`, else the
 /// process values (unclamped; the planner clamps).
 pub fn payload_read(process_threads: Option<u64>, process_block_rows: Option<u64>) -> (Option<u64>, Option<u64>) {
@@ -372,6 +387,7 @@ pub fn evidence() -> Option<Value> {
         "flat_filter_leaves": switch(crate::planner::flat_filter_leaves_env(), overrides.flat_filter_leaves),
         "lane_routing_v2": switch(crate::part_query::lanes::lane_routing_v2_enabled(), overrides.lane_routing_v2),
         "identity_merged_index": switch(crate::part_query::identity_merged::enabled(), overrides.identity_merged_index),
+        "entity_index": switch(crate::part_query::entity_index::enabled(), overrides.entity_index),
         // Effective before the tenant's thread budget (the plan may lower it).
         "payload_threads": knob(env_threads, overrides.payload_threads, threads),
         "payload_block_rows": knob(env_rows, overrides.payload_block_rows, rows),

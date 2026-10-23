@@ -41,7 +41,7 @@ All code is in `src/`:
 | Asset | Where it lives | Must never |
 |---|---|---|
 | Tenant credentials (API keys, OAuth client secrets, SA private keys, mTLS keys) | `RunInput.credentials`, host process memory, one run only | reach VRL, an event, a checkpoint, an error message, preview output, a log, or a request to a host other than through the auth plugin |
-| Derived secrets (OAuth access tokens) | `TokenCache` per run | same as above (they are added to the redaction set) |
+| Derived secrets (OAuth/session tokens, composite headers, request signatures) | `TokenCache` per run | same as above (they are added to the redaction set) |
 | Platform secrets (pod env, mounted files, service tokens) | host process env and filesystem | be readable by a connector, VRL included |
 | Cursors and checkpoints (`state`, window watermark, seen uids) | `CheckpointStore` (PG, service lane) | grow without bound; be read or written across tenants |
 | Tenant event data | sink | go to a host outside the spec allowlist, or be mixed across tenants |
@@ -398,3 +398,40 @@ tenant parser VRL in the API process. The same deep-nesting input that
 crashes the VRL compiler above (about 700 levels in an 8 MiB stack, less on
 a 2 MiB tokio worker) should abort `nanosiem-api`. That was not tested here;
 it is tracked separately.
+
+
+## Declarative session and signing auth
+
+Session login uses the existing policy-checked transport and Authentication
+request purpose in both collector and native sequence paths. Credentials enter
+only the plugin-created POST body. Login redirects are refused. The selected
+JSON string or cookie value is bounded, header-safe, at least six bytes, and
+registered for redaction before a vendor request. Both old and refreshed
+session values remain in the redaction set. Both JSON-token and cookie headers
+are restricted to the login origin; cookies also require a declared
+segment-aligned path prefix. All logins and refresh attempts consume normal
+caps, timeouts and request budgets, including collector request pacing. Login
+429s surface as rate limiting without forwarding the login response body.
+Cache invalidation compares the rejected request's token under the fetch lock,
+so a late 401 cannot evict a newer token minted by another fan-out task. A single
+explicit 401 permits one refresh; 403, 5xx, transport errors and ambiguous
+writes do not. Native connection contexts separate caches by tenant/connection,
+auth config and execution mode/recording; collectors construct fresh plugins
+per run. Contexts must never be shared with another credential set.
+
+Composite auth reads two named credentials and registers the composed value as
+a derived secret. HMAC validates every output header (including timestamp and
+key ID), rejects collisions/routing headers, and expands canonical fields only
+once over the actual request bytes. Keyed crypto stays in the trusted host.
+SHA256 is the default; legacy SHA1 requires explicit selection. Canonical
+messages are bounded at 8 MiB. Signature history is bounded by the compiled
+request cap (after identity defaults and platform ceilings), retaining early
+signatures for reflection redaction throughout the run. Signing beyond the
+history cap fails closed rather than evicting an older signature. Session token
+history is capped at 1,024 per auth context, which then refuses a further login
+until the host constructs a new context. Existing short-credential and other redaction limits above still apply.
+
+Tests use the real engine/broker against a local TLS mock plus native pack
+admission/execution with strict replay. Credential and session values are
+created only in memory for synthetic protocol tests. No vendor responses or
+credential-bearing fixtures are shipped.

@@ -2088,6 +2088,71 @@ async fn nan3168_long_windows_are_deferred_between_their_rebuilds() {
     assert!(logs.contains("cpu_scope=\"process\" threads=1"), "{logs}");
 }
 
+/// NAN-4154: once every window is rebuilt, the publisher removes the maintained states and day
+/// histories no window used within the grace (superseded inventories: a large
+/// hosted tenant kept 32 GiB of them on the hot volume the 7-day hot window shares) and
+/// keeps every file the published windows are built from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn nan4154_rebuilt_windows_remove_superseded_prevalence_states() {
+    let _serial = serial();
+    use super::super::product_publish::{read_manifest, write_manifest, Cadence, Cycle};
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let _fixture = engine_with_detail_fixture(root.path(), now, 71, true, false, false, true).await;
+    let product_dir = root.path().join("product");
+    std::fs::create_dir_all(product_dir.join("demand")).unwrap();
+    let states = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(dir).unwrap().flatten().map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("prevalence-state-v2-") || name.starts_with("prevalence-history-v2-"))
+            .collect()
+    };
+    let behind = |product_dir: &std::path::Path| {
+        let mut manifest = read_manifest(product_dir).unwrap();
+        let older = manifest.log_head.map(|head| head.saturating_sub(1));
+        manifest.log_head = older;
+        for entry in manifest.windows.values_mut() { entry.log_head = older; }
+        write_manifest(product_dir, &manifest).unwrap();
+    };
+
+    let mut publisher = nan3168_publisher(root.path(), &product_dir).await;
+    publisher.set_cadence(Cadence::every_cycle());
+    assert_eq!(publisher.cycle().await, Cycle::Built);
+    let first = publisher.manifest().clone();
+    let used = states(&product_dir);
+    assert!(used.iter().any(|name| name.starts_with("prevalence-state-v2-")), "{used:?}");
+    assert!(used.iter().any(|name| name.starts_with("prevalence-history-v2-")), "{used:?}");
+
+    // Superseded inventories of earlier cycles: never named again, last used a day ago.
+    let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+    let planted = ["prevalence-state-v2-", "prevalence-history-v2-"].map(|prefix| {
+        let path = product_dir.join(format!("{prefix}{}.parquet", "f".repeat(64)));
+        std::fs::write(&path, b"superseded").unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(day_ago).unwrap();
+        path
+    });
+
+    // A new process that rebuilt only the short windows has not walked the
+    // long windows' inputs: nothing is swept.
+    drop(publisher);
+    behind(&product_dir);
+    let mut publisher = nan3168_publisher(root.path(), &product_dir).await;
+    assert_eq!(publisher.cycle().await, Cycle::Built);
+    assert!(planted.iter().all(|path| path.exists()), "not every window rebuilt in this process: nothing swept");
+
+    // Every window rebuilt: the superseded files go, every used one stays.
+    drop(publisher);
+    behind(&product_dir);
+    let mut publisher = nan3168_publisher(root.path(), &product_dir).await;
+    publisher.set_cadence(Cadence::every_cycle());
+    assert_eq!(publisher.cycle().await, Cycle::Built);
+    assert!(planted.iter().all(|path| !path.exists()), "superseded states removed");
+    let after = states(&product_dir);
+    assert!(used.is_subset(&after), "a used state was removed: {:?}", used.difference(&after).collect::<Vec<_>>());
+    assert!(publisher.manifest().complete());
+    assert_eq!(publisher.manifest().windows.len(), first.windows.len());
+}
+
 /// NAN-3926: a real publication after an empty startup bypasses the long-window
 /// cadence once; the consumer immediately sees the first artifacts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3001,4 +3066,107 @@ async fn nan3766_publisher_publishes_first_and_partial_details() {
     assert!(coverage["scanned_start"].as_str().unwrap() > coverage["window_start"].as_str().unwrap());
     let hosts = answer["result"]["top_hosts"].as_array().unwrap();
     assert!(!hosts.is_empty() && hosts[0]["count"].as_u64().unwrap() < ROWS as u64, "{hosts:?}");
+}
+
+/// NAN-4290, native and through the production HTTP path (`/v1/jobs/search`,
+/// the boot's lanes: a general read-write connection and the small-job
+/// lane's own): a 1 h listing finishes promptly while a 30 d aggregate holds
+/// the general job lane. On a large hosted tenant (2026-10-20) the same 1 h
+/// `| head 50` waited 9.5 min behind a 30 d `stats` job.
+///
+/// The general connection first runs an 8 s statement (the long aggregate's
+/// work); the 30 d job is admitted to the general lane and queues behind it.
+/// The 1 h job is then submitted: it takes the small lane and returns its
+/// committed result while both are still running. The 30 d job completes
+/// after.
+#[cfg(feature = "enterprise")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn nan4290_a_1h_listing_finishes_while_a_30d_aggregate_holds_the_general_lane() {
+    let _serial = serial();
+    use super::super::{detections::DetectionGate, engine::JobLane, server::QueryService};
+    use nanosiem_lake_cell::tenant_token::{JOB_AUTH_HEADER, JOB_AUTH_LEGACY};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let _fixture = engine(root.path(), now).await;
+    // The boot's small-job lane: its own read-write connection (server.rs
+    // `open_engine_timed`, "parts-rw-small").
+    let runtime = NativeChdb::load_verified(
+        std::env::var("NANO_CHDB_LIBRARY_PATH").unwrap(),
+        &std::env::var("NANO_CHDB_LIBRARY_SHA256").unwrap(),
+    ).unwrap();
+    let small_writer = NativeExecutor::start_with_server_memory_limit(runtime, 1, "parts-rw-small", ExecutorMode::ReadWrite, Some(3 << 29)).unwrap();
+    let engine = reopen_engine_at(root.path(), "http-jobs").await.with_small_job_writer(small_writer);
+    let service = QueryService::new(engine, DetectionGate::new(None, 0).unwrap(), root.path().join("http-jobs"),
+        "b".repeat(64), "c".repeat(64), None, 24, None);
+    service.mark_ready_without_prewarm();
+    let results = JobResultStore::new(TENANT, None);
+    results.install(Some(results.operator_for(&serde_json::from_value::<R2Credentials>(json!({
+        "endpoint": fake_r2().await, "region": "auto", "access_key_id": "k", "secret_access_key": "s",
+    })).unwrap()).unwrap()));
+    service.attach_job_results(results.clone()).unwrap();
+    let (head, schema) = service.engine().head_and_schema_fingerprint().await;
+    let pin = PartJobPin::at_head(head, schema.as_deref(), &"b".repeat(64), &"c".repeat(64)).unwrap();
+
+    let post = |service: Arc<QueryService>, spec: LakeQueryJobSpec| async move {
+        let body = serde_json::to_string(&spec).unwrap();
+        let (mut client, server) = tokio::net::UnixStream::pair().unwrap();
+        let task = tokio::spawn(service.serve_stream(server));
+        client.write_all(format!("POST /v1/jobs/search HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{JOB_AUTH_HEADER}: {JOB_AUTH_LEGACY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (header, body) = response.split_once("\r\n\r\n").unwrap();
+        (header.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap(), body.to_string())
+    };
+    let job = |id: &str, query: &str, start: DateTime<Utc>| {
+        let mut job = spec(&pin, &format!("{id}-attempt"), DurableLakeTask::SearchNplV1, query, start, now + Duration::minutes(1), None);
+        job.job_id = id.into();
+        job.fence_token = format!("{id}:1:1:{}", "f".repeat(36));
+        job
+    };
+    let aggregate = job("nan4290-30d", "* | stats count by class_uid", now - Duration::days(30));
+    let listing = job("nan4290-1h", "* | head 50", now - Duration::hours(1));
+    assert!(!super::super::jobs::small_job_spec(&aggregate), "a 30 d search is a general-lane job");
+    assert!(super::super::jobs::small_job_spec(&listing), "a 1 h search is a small-lane job");
+
+    // The long aggregate's work occupies the general lane's one connection.
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(8);
+    let general = service.engine().job_writer(JobLane::General).unwrap().clone();
+    let held = tokio::spawn(async move {
+        general.execute_sql(format!(
+            "SELECT sum(sleepEachRow(1)) FROM numbers({}) SETTINGS max_block_size = 1, function_sleep_max_microseconds_per_block = 0",
+            HOLD.as_secs()), vec![]).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let started = std::time::Instant::now();
+    let long = tokio::spawn(post(service.clone(), aggregate));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!long.is_finished(), "the 30 d job is still queued behind the general lane's work");
+
+    // The 1 h listing: admitted to the small lane, committed, answered.
+    let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(6), post(service.clone(), listing.clone()))
+        .await.expect("the 1 h listing must not wait for the 30 d job");
+    let listing_ms = started.elapsed().as_millis();
+    assert_eq!(status, 200, "{body}");
+    assert!(!long.is_finished(), "the 1 h listing finished while the 30 d job still ran");
+    assert!(!held.is_finished(), "the general lane was still busy when the listing finished");
+    let reference: crate::job::ResultArtifactRef = serde_json::from_value(serde_json::from_str::<Value>(&body).unwrap()["result"].clone()).unwrap();
+    let page = result_page(&results, &reference, "nan4290-1h", TENANT, 0).await.unwrap();
+    assert_eq!(page["rows"].as_array().unwrap().len(), 50, "the listing's committed page");
+
+    // The 30 d aggregate then completes on the general lane.
+    held.await.unwrap().expect("the held statement ends");
+    let (status, body) = long.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let aggregate_ms = started.elapsed().as_millis();
+    let reference: crate::job::ResultArtifactRef = serde_json::from_value(serde_json::from_str::<Value>(&body).unwrap()["result"].clone()).unwrap();
+    let page = result_page(&results, &reference, "nan4290-30d", TENANT, 0).await.unwrap();
+    let total: u64 = page["rows"].as_array().unwrap().iter().map(|row| row["count"].as_u64()
+        .or_else(|| row["count"].as_str().and_then(|count| count.parse().ok())).expect("count")).sum();
+    assert_eq!(total, ROWS as u64, "the 30 d aggregate counts every fixture event");
+    assert!(aggregate_ms >= listing_ms + 1_000);
+    println!("NAN4290 listing_1h_ms={listing_ms} aggregate_30d_ms={aggregate_ms} hold_s={}", HOLD.as_secs());
 }

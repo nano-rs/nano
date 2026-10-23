@@ -48,7 +48,7 @@ pub use tenant_query::{TenantAuditFacet, TenantAuditPage, TenantAuditQueryError,
 pub use actions::*;
 pub use context::ClientContext;
 pub use ocsf_mapping::{AuditAuthProtocol, AuditSubject, IamAction, OcsfAuditClass};
-pub use emitter::{append_dedicated_audit_in_transaction, append_tenant_audit_in_transaction, AuditEmitError, AuditEmitter};
+pub use emitter::{append_dedicated_audit_in_transaction, append_tenant_audit_batch_in_transaction, append_tenant_audit_in_transaction, AuditEmitError, AuditEmitter};
 #[cfg(feature = "enterprise")]
 pub(crate) use emitter::mirror_automation_key_audit_in_transaction;
 pub use query::{AuditQueryError, AuditQueryService, ClickHouseAuditEntry, ClickHouseAuditQuery};
@@ -143,6 +143,9 @@ pub enum AuditSource {
     /// promoting a lead into a case, and writing or revoking the tenant-wide
     /// dismissal memory. All four decide what the SOC does and does not see.
     Hunt,
+    /// SOAR response-automation events (flows, runs, approvals, settings).
+    /// Vendor-connection credential events stay under `Credentials`.
+    Soar,
 }
 
 impl std::fmt::Display for AuditSource {
@@ -186,6 +189,7 @@ impl std::fmt::Display for AuditSource {
             Self::SourceScope => write!(f, "source_scope"),
             Self::Artifact => write!(f, "artifact"),
             Self::Hunt => write!(f, "hunt"),
+            Self::Soar => write!(f, "soar"),
         }
     }
 }

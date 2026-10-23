@@ -140,6 +140,11 @@ fn ids(body: &str) -> Vec<String> {
 }
 
 async fn start_hec(seq: Arc<AtomicU64>, script: Arc<dyn Fn(usize) -> Act + Send + Sync>) -> Hec {
+    start_hec_auth(seq, Arc::new(move |n, _: &str| script(n))).await
+}
+
+/// [`start_hec`] whose script also sees the request's `Authorization`.
+async fn start_hec_auth(seq: Arc<AtomicU64>, script: Arc<dyn Fn(usize, &str) -> Act + Send + Sync>) -> Hec {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let log: Arc<Mutex<Vec<HecReq>>> = Arc::new(Mutex::new(vec![]));
@@ -158,12 +163,13 @@ async fn start_hec(seq: Arc<AtomicU64>, script: Arc<dyn Fn(usize) -> Act + Send 
                         assert_eq!(req.uri().path(), "/services/collector/event");
                         let body = String::from_utf8(req.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
                         let n = count.fetch_add(1, Ordering::SeqCst);
+                        let act = script(n, &auth);
                         let idx = {
                             let mut l = log.lock().unwrap();
                             l.push(HecReq { auth, key, body, ack_seq: None });
                             l.len() - 1
                         };
-                        let resp = match script(n) {
+                        let resp = match act {
                             Act::Ok => {
                                 let s = seq.fetch_add(1, Ordering::SeqCst);
                                 log.lock().unwrap()[idx].ack_seq = Some(s);
@@ -418,6 +424,68 @@ async fn ingress_refusal_fails_the_run_keeps_the_cursor_and_backs_off() {
     assert!(f.store.next_run_at(f.feed_id).unwrap() > Utc::now() + chrono::Duration::seconds(20), "failure backs off");
     let runs = f.store.runs();
     assert_eq!(runs.len(), 1);
+}
+
+/// NAN-3660 acceptance (mock): the tenant revokes the feed's credential
+/// mid-run → the run fails with `credential_revoked`, the cursor holds and
+/// the feed stops posting (backs off an hour, never re-enrolls on its own)
+/// → the rotate operation installs a new credential → the feed resumes from
+/// its checkpoint: every event delivered, no gap, no duplicate.
+#[tokio::test]
+async fn revoked_credential_stops_the_feed_until_rotation_then_resumes_without_gap() {
+    const NEW_TOKEN: &str = "feed-ingest-token-rotated-9876543210";
+    let seq = Arc::new(AtomicU64::new(0));
+    let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = revoked.clone();
+    // The old token is accepted for the first POST, then revoked; the new
+    // token is always accepted.
+    let hec = start_hec_auth(
+        seq.clone(),
+        Arc::new(move |n, auth: &str| {
+            if auth == format!("Splunk {NEW_TOKEN}") {
+                return Act::Ok;
+            }
+            if n >= 1 {
+                gate.store(true, Ordering::SeqCst);
+            }
+            if gate.load(Ordering::SeqCst) { Act::Status(401) } else { Act::Ok }
+        }),
+    )
+    .await;
+    let f = fixture(hec.port, seq).await;
+    let r = runner(&f, "runner-a");
+    r.tick().await.unwrap();
+    let rec = r.drain().await.remove(0);
+    assert_eq!(rec.status, RunStatus::Failed);
+    let error = rec.error.as_deref().unwrap();
+    assert!(error.starts_with("credential_revoked: "), "the refusal itself, not the engine wrapper: {error}");
+    assert!(error.ends_with("rotate the feed credential"), "{error}");
+    assert!(revoked.load(Ordering::SeqCst));
+    let next = f.store.next_run_at(f.feed_id).unwrap();
+    assert!(next > Utc::now() + chrono::Duration::minutes(55), "backs off ~1 h, not per batch: {next}");
+    let committed_before = f.store.checkpoint(f.feed_id, "system_log").and_then(|c| c.pointer("/window/seen").cloned()).unwrap();
+    assert_eq!(committed_before.as_object().unwrap().len(), PAGE, "the acked page stays committed");
+
+    // Not due: another tick posts nothing (no hot loop, no re-enroll).
+    let posts = hec.reqs().len();
+    r.tick().await.unwrap();
+    assert!(r.drain().await.is_empty());
+    assert_eq!(hec.reqs().len(), posts);
+
+    // Rotate: the new credential is stored, the lease fenced, the feed due.
+    f.store.rotate_ingest_token(f.feed_id, Secret::new(NEW_TOKEN));
+    r.tick().await.unwrap();
+    let rec = r.drain().await.remove(0);
+    assert_eq!(rec.status, RunStatus::Success, "{:?}", rec.error);
+    let after: Vec<HecReq> = hec.reqs().into_iter().skip(posts).collect();
+    assert!(!after.is_empty() && after.iter().all(|r| r.auth == format!("Splunk {NEW_TOKEN}")));
+
+    // Every event exactly once across both credentials: no gap, no duplicate.
+    let delivered: Vec<String> = hec.acked().into_iter().flat_map(|(_, ids)| ids).collect();
+    let unique: BTreeSet<String> = delivered.iter().cloned().collect();
+    assert_eq!(unique, all_uuids(&f), "no gap");
+    assert_eq!(delivered.len(), unique.len(), "no duplicate");
+    assert_commits_follow_acks(&f, &hec);
 }
 
 #[tokio::test]

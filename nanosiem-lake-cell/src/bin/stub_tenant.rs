@@ -62,6 +62,36 @@ struct Writer {
     tenant: String,
     consumer: String,
     state: tokio::sync::Mutex<WriterState>,
+    /// NAN-4052 (`pg_lease=1` and an assigned writer lease): model the
+    /// Postgres cell writer lease on the fake store, as ingest[T] does.
+    pg_lease: Option<PgLease>,
+}
+
+/// The ingest[T] side of the cell writer lease: acquire before the edge-log
+/// lease (held elsewhere: exit standby), renew by CAS every TTL/4, commit
+/// only before `sent + TTL - TTL/5`, exit standby on loss, release on drain.
+struct PgLease {
+    holder: String,
+    ttl_ms: u64,
+    epoch: AtomicU64,
+    valid_until: Mutex<std::time::Instant>,
+}
+
+impl PgLease {
+    fn deadline(&self, sent: std::time::Instant) -> std::time::Instant {
+        sent + Duration::from_millis(self.ttl_ms - self.ttl_ms / 5)
+    }
+
+    fn standby(&self, why: &str) -> ! {
+        eprintln!("stub ingest {}: writer lease {why}; standing by", self.holder);
+        std::process::exit(nanosiem_lake_cell::contract::WRITER_STANDBY_EXIT_CODE)
+    }
+
+    fn check(&self) {
+        if std::time::Instant::now() >= *self.valid_until.lock().unwrap() {
+            self.standby("deadline passed");
+        }
+    }
 }
 
 #[derive(Default)]
@@ -119,6 +149,9 @@ impl Writer {
         if st.buffer.is_empty() {
             return Ok(());
         }
+        if let Some(pg) = &self.pg_lease {
+            pg.check();
+        }
         let v = store_post(&self.store, &format!("/{}/commit", self.tenant),
             json!({"epoch": st.epoch, "from": st.committed, "events": st.buffer, "consumer": self.consumer})).await?;
         match v["kind"].as_str() {
@@ -132,7 +165,36 @@ impl Writer {
         }
     }
 
+    async fn acquire_pg_lease(self: &Arc<Self>) {
+        let Some(pg) = &self.pg_lease else { return };
+        let sent = std::time::Instant::now();
+        let v = match store_post(&self.store, &format!("/{}/wlease_acquire", self.tenant), json!({"holder": pg.holder, "ttl_ms": pg.ttl_ms})).await {
+            Ok(v) => v,
+            Err(e) => pg.standby(&format!("store unreachable: {e}")),
+        };
+        if v["acquired"] != true {
+            pg.standby(&format!("held by {}", v["holder"]));
+        }
+        pg.epoch.store(v["epoch"].as_u64().unwrap_or(0), Ordering::SeqCst);
+        *pg.valid_until.lock().unwrap() = pg.deadline(sent);
+        let me = self.clone();
+        tokio::spawn(async move {
+            let pg = me.pg_lease.as_ref().unwrap();
+            loop {
+                tokio::time::sleep(Duration::from_millis(pg.ttl_ms / 4)).await;
+                let sent = std::time::Instant::now();
+                let body = json!({"holder": pg.holder, "epoch": pg.epoch.load(Ordering::SeqCst), "ttl_ms": pg.ttl_ms});
+                match store_post(&me.store, &format!("/{}/wlease_renew", me.tenant), body).await {
+                    Ok(v) if v["renewed"] == true => *pg.valid_until.lock().unwrap() = pg.deadline(sent),
+                    Ok(_) => pg.standby("taken by another pod generation"),
+                    Err(_) => pg.check(),
+                }
+            }
+        });
+    }
+
     async fn run(self: Arc<Self>) {
+        self.acquire_pg_lease().await;
         while let Err(e) = self.lease().await {
             eprintln!("stub ingest: lease: {e}");
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -162,6 +224,11 @@ impl Writer {
         st.stopped = true;
         if let Err(e) = self.commit(&mut st).await {
             eprintln!("stub ingest: flush on shutdown: {e}");
+        }
+        if let Some(pg) = &self.pg_lease {
+            *pg.valid_until.lock().unwrap() = std::time::Instant::now();
+            let body = json!({"holder": pg.holder, "epoch": pg.epoch.load(Ordering::SeqCst)});
+            let _ = store_post(&self.store, &format!("/{}/wlease_release", self.tenant), body).await;
         }
     }
 }
@@ -573,6 +640,9 @@ impl TenantService for Stub {
             last_progress_unix_ms: self.last_progress.load(Ordering::Relaxed),
             queue_depth: 0,
             detail: None,
+            // Ingest start-up (and the cell writer lease, if modelled) is done.
+            writer_ready: self.a.role == Role::Ingest
+                && self.writer.as_ref().is_none_or(|w| w.pg_lease.as_ref().is_none_or(|pg| pg.epoch.load(Ordering::SeqCst) > 0)),
             ..Heartbeat::default()
         }
     }
@@ -594,6 +664,15 @@ fn main() -> anyhow::Result<()> {
                 tenant: a.tenant.to_string(),
                 consumer: format!("{}/{}", opts.get("cell").cloned().unwrap_or_default(), std::process::id()),
                 state: tokio::sync::Mutex::new(WriterState::default()),
+                pg_lease: match (&a.writer_lease, opts.get("pg_lease").map(String::as_str)) {
+                    (Some(lease), Some("1")) => Some(PgLease {
+                        holder: lease.holder.clone(),
+                        ttl_ms: lease.ttl_ms,
+                        epoch: AtomicU64::new(0),
+                        valid_until: Mutex::new(std::time::Instant::now()),
+                    }),
+                    _ => None,
+                },
             })),
             _ => None,
         };

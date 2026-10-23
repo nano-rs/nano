@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+
 // SlosTab (NAN-1536) — service-level objectives with error-budget cards.
 //
 // Ported from the design handoff (obs-alerts.jsx · SLOView + obs-charts2.jsx ·
@@ -114,6 +116,12 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
 
   return (
     <div className="flex flex-col gap-3.5">
+      {slos.some((s) => s.status === 'no_data' || s.status === 'partial') && (
+        <div className="border border-border px-3 py-2 text-[11px] text-fg-3">
+          No data means no matching service spans were evaluated. Partial means the full SLO window is not covered yet.
+          <TelemetrySetupHint />
+        </div>
+      )}
       {/* header / meta row */}
       <div className="flex items-center gap-2">
         <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-fg-3">

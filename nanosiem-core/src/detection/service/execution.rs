@@ -619,15 +619,16 @@ impl DetectionService {
             return;
         };
 
-        match self
-            .evaluate_window(
+        match crate::search::service::background_request::with_detection_request_ids(
+            self.evaluate_window(
                 &companion,
                 time_range.clone(),
                 rule.dataset.clone(),
                 // Scheduled/real-time SYSTEM execution — unrestricted (NAN-2047).
                 &crate::auth::ScopeSet::unrestricted(),
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(rows) => {
                 let stamp = match classify_companion_rows_with_field(&rows, source_field) {
@@ -769,15 +770,18 @@ impl DetectionService {
         // Run the rule's query against this window. Shared with the historical
         // tester so test ≡ prod by construction. (`time_range` is kept for the
         // NAN-1800 source_type companion in the alerting branch below.)
-        let mut results = self
-            .evaluate_window(
+        // NAN-4193: scheduled windows send `detect-` request ids so the lake
+        // cell's thread budget runs them as background work.
+        let mut results = crate::search::service::background_request::with_detection_request_ids(
+            self.evaluate_window(
                 &rule.query,
                 time_range.clone(),
                 rule.dataset.clone(),
                 // Scheduled/real-time SYSTEM execution — unrestricted (NAN-2047).
                 &crate::auth::ScopeSet::unrestricted(),
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         // Dedup namespace: Live bake-in and Alerting record/filter separately so
         // a rule promoted Live→Alerting isn't suppressed by bake-in records (D17).

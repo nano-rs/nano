@@ -91,6 +91,7 @@ impl HttpEdgeLogClient {
         let response = self
             .http
             .post(self.url(action)?)
+            .header("x-nano-edge-backlog-skip-version", "1")
             .bearer_auth(bearer.as_str())
             .json(&body)
             .send()
@@ -107,6 +108,25 @@ impl HttpEdgeLogClient {
             bytes.extend_from_slice(&chunk);
         }
         Ok((status, bytes))
+    }
+}
+
+impl HttpEdgeLogClient {
+    /// NAN-4338: `POST /edge-log/v1/quarantine`. 200 is recorded (moved,
+    /// already moved, or not a landing segment); 400 / 404 / 405 is a Worker
+    /// without the route or a tenant without a landing ledger (drop the
+    /// report); anything else is an error to retry.
+    pub async fn report_quarantine(
+        &self,
+        report: &crate::part_ingest::quarantine_ledger::QuarantineReport,
+    ) -> Result<crate::part_ingest::quarantine_ledger::ReportOutcome> {
+        use crate::part_ingest::quarantine_ledger::ReportOutcome;
+        let (status, _) = self.post("quarantine", serde_json::to_value(report)?).await?;
+        match status.as_u16() {
+            200 => Ok(ReportOutcome::Recorded),
+            400 | 404 | 405 => Ok(ReportOutcome::Unsupported),
+            _ => Err(refused("quarantine", status)),
+        }
     }
 }
 

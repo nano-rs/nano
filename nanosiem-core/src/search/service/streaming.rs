@@ -544,8 +544,19 @@ impl SearchService {
         }
 
         // Extract time modifiers and parse query
-        let (cleaned_query, earliest_offset, latest_offset) =
-            extract_time_modifiers(&request.query);
+        let (cleaned_query, earliest_offset, latest_offset) = match extract_time_bounds(&request.query) {
+            Ok(bounds) => bounds,
+            Err(error) => {
+                send_event!(SearchStreamEvent::Error {
+                    code: "VALIDATION_ERROR".to_string(),
+                    message: error.to_string(),
+                });
+                if let Some(ref request_id) = request.request_id {
+                    self.query_tracker.unregister(request_id);
+                }
+                return;
+            }
+        };
 
         // NAN-1799: gate the streaming path's query text with the caller's
         // source-scope deny-set BEFORE the parse below — chunk SQL, the count
@@ -570,13 +581,23 @@ impl SearchService {
                 return;
             }
         };
-        let mut adjusted_time_range = request.time_range.clone();
-        if let Some(offset_secs) = earliest_offset {
-            adjusted_time_range.start = chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-        }
-        if let Some(offset_secs) = latest_offset {
-            adjusted_time_range.end = chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-        }
+        let mut adjusted_time_range = match apply_time_bounds(
+            &request.time_range,
+            earliest_offset,
+            latest_offset,
+        ) {
+            Ok(range) => range,
+            Err(error) => {
+                send_event!(SearchStreamEvent::Error {
+                    code: "VALIDATION_ERROR".to_string(),
+                    message: error.to_string(),
+                });
+                if let Some(ref request_id) = request.request_id {
+                    self.query_tracker.unregister(request_id);
+                }
+                return;
+            }
+        };
 
         let mut query = match parse_query(&cleaned_query) {
             Ok(q) => q,

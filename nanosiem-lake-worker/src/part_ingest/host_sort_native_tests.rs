@@ -267,14 +267,10 @@ fn request(query: &str, start: DateTime<Utc>, end: DateTime<Utc>, limit: usize, 
     }
 }
 
-fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(TENANT.parse().unwrap(), Utc::now(), &[])
-}
-
 async fn run(engine: &PartQueryEngine, request: &BroadNplRequest) -> (Vec<Value>, crate::query_timing::Funnel) {
     engine.clear_locator_cache();
     crate::query_timing::measure("nan3412", async {
-        let answer = crate::enrichment_read::scope(granted(), engine.broad_npl(request))
+        let answer = engine.broad_npl(request)
             .await
             .unwrap_or_else(|error| panic!("{}: {error}", request.query));
         let funnel = crate::query_timing::current().expect("request scope").lock().unwrap().funnel.clone();

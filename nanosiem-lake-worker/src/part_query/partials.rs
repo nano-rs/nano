@@ -61,11 +61,16 @@ async fn count_aggregate_pinned(engine: &PartQueryEngine, request: &CountAggrega
         .ok_or_else(|| invalid("exact count rollup does not cover the requested field"))?;
     request.validate_shape().map_err(|error| invalid(error.to_string()))?;
     let window = request.window().map_err(|error| invalid(error.to_string()))?;
-    let tenant = request.tenant_id.clone();
     let work = async {
         let mut outputs = Vec::new();
-        let rollup_eligible = window.full_start_us < window.full_end_us
-            && !crate::enrichment_read::sensitive(&request.group_field);
+        // NAN-4298: an entity-field equality count from the signed hourly
+        // entity counts; any other shape, or a window they do not cover,
+        // keeps the rollup route below.
+        if let Some(output) = super::entity_count::count_aggregate(engine, request).await? {
+            outputs.push(output);
+            return Ok::<_, PartQueryError>(outputs);
+        }
+        let rollup_eligible = window.full_start_us < window.full_end_us;
         let native_ranges = if rollup_eligible {
             let (parts, _, _, _) = engine.snapshot(window.full_start_us, window.full_end_us - 1).await?;
             outputs.push(rollup_fragment(engine, request, &parts, window.full_start_us, window.full_end_us).await?);
@@ -109,9 +114,7 @@ async fn count_aggregate_pinned(engine: &PartQueryEngine, request: &CountAggrega
         }
         Ok::<_, PartQueryError>(outputs)
     };
-    let outputs = crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), work)
-        .await
-        .map_err(|_| PartQueryError::Unavailable("enrichment read authority is unavailable".to_string()))??;
+    let outputs = work.await?;
     let merged = merge_outputs(request, outputs).map_err(|error| match error {
         crate::count_aggregate::CountAggregateError::Invalid(message) => invalid(message),
         crate::count_aggregate::CountAggregateError::Internal(message) => internal(message),
@@ -141,12 +144,42 @@ async fn count_aggregate_pinned(engine: &PartQueryEngine, request: &CountAggrega
     }))
 }
 
+/// NAN-4293: parts per per-part rollup statement. One statement over all of
+/// a 7 d window's ~250 cold parts took ~6 s (~20–48 CPU-s) on a large tenant, longer
+/// than the segments refresh's per-read deadline; 32 parts is ~0.7 s, and
+/// every finished chunk is memoized before the next one starts.
+const ROLLUP_MEMO_CHUNK_PARTS: usize = 32;
+
+/// Why a chunk of the per-part rollup did not answer.
+enum ChunkError {
+    /// The answer is too wide for the per-part shape: the caller answers
+    /// from the merged rollup plan instead.
+    TooWide(String),
+    Fail(PartQueryError),
+}
+
+/// Run `run` over `items` a chunk of `chunk` at a time, handing each
+/// finished chunk's answer to `keep` before the next chunk starts. A caller
+/// that is cancelled (its future dropped) or fails part-way has kept every
+/// chunk that finished.
+async fn by_chunks<T: Clone, R, E, F, Fut>(items: &[T], chunk: usize, mut run: F, mut keep: impl FnMut(R)) -> Result<(), E>
+where
+    F: FnMut(Vec<T>) -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    for items in items.chunks(chunk.max(1)) {
+        keep(run(items.to_vec()).await?);
+    }
+    Ok(())
+}
+
 /// The whole-bucket fragment of a count over `parts` from their rollup
 /// partials, served per part from [`super::rollup_rows`] (NAN-3093): only
-/// parts without a memoized answer are read, in one statement that keeps
-/// every file's rows apart, and the window and span are applied in memory.
-/// If that per-part statement outgrows its result or memory budget, the
-/// merged single-statement plan answers instead.
+/// parts without a memoized answer are read, in statements of at most
+/// [`ROLLUP_MEMO_CHUNK_PARTS`] parts that keep every file's rows apart (each
+/// chunk memoized as it finishes, NAN-4293), and the window and span are
+/// applied in memory. If a per-part statement outgrows its result or memory
+/// budget, the merged single-statement plan answers instead.
 async fn rollup_fragment(
     engine: &PartQueryEngine,
     request: &CountAggregateRequest,
@@ -198,50 +231,73 @@ async fn rollup_fragment(
             // one cannot be served from partials; fail rather than undercount.
             return Err(internal("a live part has no rollup partial"));
         }
-        let first = local.iter().map(|partial| partial.min_bucket_start_us).min().expect("pending is not empty");
-        let last = local.iter().map(|partial| partial.max_bucket_start_us).max().expect("pending is not empty");
-        let rollup = CountRollup::from_local_partials(local);
         let selection_tenant = engine.limits_tenant();
-        let plans = rollup
-            .plan_by_part_with_source_groups(
-                &selection_tenant,
-                &request.group_field,
-                request.group_results,
-                request.group_by_source,
-                request.predicate.as_ref(),
-                first,
-                last + COUNT_ROLLUP_BUCKET_US,
-                request.source_filter.as_deref(),
-                &request.deny_source_types,
-            )
-            .map_err(|error| invalid(error.to_string()))?;
-        let mut fresh: std::collections::BTreeMap<crate::parts::format::PartId, Vec<rollup_rows::RollupRow>> =
-            pending.iter().map(|part| (part.part_id.clone(), Vec::new())).collect();
-        for plan in plans {
-            let output = match engine.run_sql(plan.sql, plan.params).await {
-                Ok(output) => output,
-                // Only an answer too wide for the per-part shape falls back;
-                // a deadline, a shed lane or any other fault is the caller's.
-                Err(error) if !per_part_answer_too_wide(&error) => return Err(internal(error.to_string())),
-                Err(error) => {
-                    tracing::warn!(error = %error, "per-part count rollup failed; answering from the merged rollup plan");
-                    drop(partials);
-                    return merged_rollup_fragment(engine, request, parts, full_start_us, full_end_us).await;
+        // NAN-4293: plan, run and memoize the pending parts a bounded chunk
+        // at a time. A read cancelled at its caller's deadline (the segments
+        // refresh gives each read 6 s) keeps every chunk it finished, so the
+        // next retry starts where it stopped instead of re-reading every part.
+        let chunked = by_chunks(&local, ROLLUP_MEMO_CHUNK_PARTS, |chunk| {
+            let (by_path, selection_tenant) = (&by_path, &selection_tenant);
+            async move {
+                let first = chunk.iter().map(|partial| partial.min_bucket_start_us).min().expect("chunks are not empty");
+                let last = chunk.iter().map(|partial| partial.max_bucket_start_us).max().expect("chunks are not empty");
+                let plans = CountRollup::from_local_partials(chunk.clone())
+                    .plan_by_part_with_source_groups(
+                        selection_tenant,
+                        &request.group_field,
+                        request.group_results,
+                        request.group_by_source,
+                        request.predicate.as_ref(),
+                        first,
+                        last + COUNT_ROLLUP_BUCKET_US,
+                        request.source_filter.as_deref(),
+                        &request.deny_source_types,
+                    )
+                    .map_err(|error| ChunkError::Fail(invalid(error.to_string())))?;
+                let mut fresh = std::collections::BTreeMap::<crate::parts::format::PartId, Vec<rollup_rows::RollupRow>>::new();
+                for partial in &chunk {
+                    let part = by_path.get(&partial.path.to_string_lossy().to_string())
+                        .ok_or_else(|| ChunkError::Fail(internal("a leased rollup partial has no part")))?;
+                    fresh.insert(part.clone(), Vec::new());
                 }
-            };
-            storage_rows_read = storage_rows_read.saturating_add(output.storage_rows_read);
-            storage_bytes_read = storage_bytes_read.saturating_add(output.storage_bytes_read);
-            for line in output.data.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
-                let (path, row) = rollup_rows::decode(line).ok_or_else(|| internal("per-part count rollup row is malformed"))?;
-                let part = by_path.get(&path).ok_or_else(|| internal("per-part count rollup named an unleased file"))?;
-                fresh.get_mut(part).expect("every leased part is pending").push(row);
+                let (mut rows_read, mut bytes_read) = (0_u64, 0_u64);
+                for plan in plans {
+                    let output = match engine.run_sql(plan.sql, plan.params).await {
+                        Ok(output) => output,
+                        // Only an answer too wide for the per-part shape falls
+                        // back; a deadline, a shed lane or any other fault is
+                        // the caller's.
+                        Err(error) if !per_part_answer_too_wide(&error) => return Err(ChunkError::Fail(internal(error.to_string()))),
+                        Err(error) => return Err(ChunkError::TooWide(error.to_string())),
+                    };
+                    rows_read = rows_read.saturating_add(output.storage_rows_read);
+                    bytes_read = bytes_read.saturating_add(output.storage_bytes_read);
+                    for line in output.data.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+                        let (path, row) = rollup_rows::decode(line).ok_or_else(|| ChunkError::Fail(internal("per-part count rollup row is malformed")))?;
+                        let rows = by_path.get(&path).and_then(|part| fresh.get_mut(part))
+                            .ok_or_else(|| ChunkError::Fail(internal("per-part count rollup named a file outside its chunk")))?;
+                        rows.push(row);
+                    }
+                }
+                Ok((fresh, rows_read, bytes_read))
             }
-        }
+        }, |(fresh, rows_read, bytes_read)| {
+            storage_rows_read = storage_rows_read.saturating_add(rows_read);
+            storage_bytes_read = storage_bytes_read.saturating_add(bytes_read);
+            for (part, rows) in fresh {
+                let rows = Arc::new(rows);
+                memo.insert(key.clone(), part, rows.clone());
+                answers.push(rows);
+            }
+        }).await;
         drop(partials);
-        for (part, rows) in fresh {
-            let rows = Arc::new(rows);
-            memo.insert(key.clone(), part, rows.clone());
-            answers.push(rows);
+        match chunked {
+            Ok(()) => {}
+            Err(ChunkError::Fail(error)) => return Err(error),
+            Err(ChunkError::TooWide(error)) => {
+                tracing::warn!(error = %error, "per-part count rollup failed; answering from the merged rollup plan");
+                return merged_rollup_fragment(engine, request, parts, full_start_us, full_end_us).await;
+            }
         }
     }
     let _fold_timer = crate::query_timing::timer(crate::query_timing::Phase::RollupFold);
@@ -841,6 +897,118 @@ const STEP_PREFIX: &str = ".prevalence-step-";
 /// State files of the pre-NAN-3279 format (no `bucket`): never read again.
 const LEGACY_PREFIXES: [&str; 3] = ["prevalence-state-v1-", "prevalence-window-v1-", "prevalence-history-v1-"];
 
+/// NAN-4154: how long a maintained state or day history survives a complete
+/// product cycle that did not use it.
+///
+/// Both are content-addressed by their part inventory, so every merge,
+/// arrival or retirement writes a new name and the old one is never read
+/// again. [`sweep_state_dir`] keeps them a month by age, which kept every
+/// superseded version: a large hosted tenant held 1,111 state files (17 GiB) and
+/// 580 day histories (14.8 GiB) after five days, growing ~6 GiB a day, on the
+/// hot volume the 7-day hot window shares. Only ~4.9 GiB had been used in
+/// the last day. The volume target was exceeded, the hot window evicted its
+/// oldest parts, and 7-day searches fetched them back from R2.
+///
+/// A complete cycle (every window rebuilt) touches every state and history
+/// file a published window is built from (`touch_product_state` on reuse,
+/// the manifest's own files every tick). A file it left untouched for this
+/// long is superseded. Six hours spans several hour rolls (each one rebuilds
+/// the stable prefix and walks its day blocks) and a demand-built window's
+/// reuse. A quiet tenant runs no cycle, so its files are never swept while
+/// it is quiet. Removing a file still needed is a rebuild, never a wrong
+/// answer: it is rebuilt from its inputs under the same name.
+pub(super) const SUPERSEDED_STATE_GRACE: std::time::Duration = std::time::Duration::from_secs(6 * 3_600);
+
+/// NAN-4154: remove the maintained prevalence states and day histories in
+/// `state` last used before `used_before` (see [`SUPERSEDED_STATE_GRACE`]).
+/// Temporaries, fold steps, windows and product files are left to
+/// [`sweep_state_dir`] and [`prune_product_state`]. Returns the files removed
+/// and the bytes freed (a name whose inode is still linked elsewhere frees
+/// nothing).
+pub(super) fn sweep_superseded_states(state: &std::path::Path, used_before: std::time::SystemTime) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(state) else { return (0, 0) };
+    let (mut files, mut bytes) = (0_u64, 0_u64);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(STATE_PREFIX) || name.starts_with(HISTORY_STATE_PREFIX)) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        if !metadata.is_file() || !metadata.modified().is_ok_and(|at| at < used_before) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            files += 1;
+            if metadata.nlink() <= 1 {
+                bytes += metadata.len();
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// NAN-4154: maintained prevalence states and day histories may use at most
+/// this fraction (1/N) of the volume product[T]'s dir lives on. They share it
+/// with the 7-day hot window (the A/B hot volume, NAN-3799), so their growth
+/// is capacity taken from search.
+pub(super) const STATE_BUDGET_DIVISOR: u64 = 8;
+/// NAN-4154: a state or history used this recently is never removed for budget.
+pub(super) const STATE_BUDGET_FLOOR: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// NAN-4154: bound the maintained states and day histories to `budget_bytes`,
+/// removing the least recently used first, never one used at or after
+/// `keep_after`. A file another name links (a published window) frees no
+/// bytes and is not counted twice. Returns (files removed, bytes freed,
+/// bytes left). A removed state is rebuilt under the same content address
+/// the next time a window needs it: this costs build time, never answers.
+pub(super) fn enforce_state_budget(
+    state: &std::path::Path,
+    budget_bytes: u64,
+    keep_after: std::time::SystemTime,
+) -> (u64, u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(state) else { return (0, 0, 0) };
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates = Vec::new();
+    let mut total = 0_u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(STATE_PREFIX) || name.starts_with(HISTORY_STATE_PREFIX)) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else { continue };
+        if !metadata.is_file() || !seen.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        total += metadata.len();
+        let Ok(modified) = metadata.modified() else { continue };
+        if modified < keep_after {
+            candidates.push((modified, entry.path(), metadata.len(), metadata.nlink()));
+        }
+    }
+    let (mut files, mut freed) = (0_u64, 0_u64);
+    if total <= budget_bytes {
+        return (0, 0, total);
+    }
+    candidates.sort();
+    for (_, path, bytes, links) in candidates {
+        if total <= budget_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            files += 1;
+            if links <= 1 {
+                freed += bytes;
+                total -= bytes;
+            }
+        }
+    }
+    (files, freed, total)
+}
+
 /// Retain daily aggregates and day blocks across quiet periods so a new
 /// arrival only rebuilds its day. A month bounds reuse to the supported
 /// product window.
@@ -1132,8 +1300,6 @@ async fn prevalence_lookup_memoized(
             &engine.settings().tenant_id,
             batch,
             deny_source_types,
-            &crate::enrichment_read::current_for_tenant(&engine.settings().tenant_id)
-                .cache_identity(),
         );
         let mut summaries = Vec::new();
         let mut pending = Vec::new();
@@ -2698,5 +2864,135 @@ mod nan3802_cursor_tests {
             let cursor = PrevalenceExplorerCursor { last_seen: bad.into(), ..legacy.clone() };
             assert!(validated_explorer_cursor(&cursor).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod nan4154_superseded_state_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn file(dir: &std::path::Path, name: &str, bytes: usize, age: Duration) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![7_u8; bytes]).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+        path
+    }
+
+    /// NAN-4154 PR2: over budget, the least recently used states and
+    /// histories go first until it fits; nothing used since `keep_after`,
+    /// no other family, and no bytes a published window still links count
+    /// as freed.
+    #[test]
+    fn the_state_budget_removes_least_recently_used_first_and_keeps_recent_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = Duration::from_secs(3_600);
+        let digest = |n: u8| format!("{:064x}", n);
+        let oldest = file(dir.path(), &format!("{STATE_PREFIX}{}.parquet", digest(1)), 400, 5 * hour);
+        let older = file(dir.path(), &format!("{HISTORY_STATE_PREFIX}{}.parquet", digest(2)), 300, 4 * hour);
+        let newer = file(dir.path(), &format!("{STATE_PREFIX}{}.parquet", digest(3)), 200, 3 * hour);
+        let recent = file(dir.path(), &format!("{HISTORY_STATE_PREFIX}{}.parquet", digest(4)), 500, Duration::from_secs(60));
+        let window = file(dir.path(), &format!("{WINDOW_STATE_PREFIX}{}.parquet", digest(5)), 5_000, 9 * hour);
+        let keep_after = SystemTime::now() - STATE_BUDGET_FLOOR;
+
+        // Within budget: nothing goes.
+        assert_eq!(enforce_state_budget(dir.path(), 1_400, keep_after), (0, 0, 1_400));
+        // 1,400 over 800: the two least recently used go (700), then it fits.
+        assert_eq!(enforce_state_budget(dir.path(), 800, keep_after), (2, 700, 700));
+        assert!(!oldest.exists() && !older.exists());
+        assert!(newer.exists() && recent.exists() && window.exists());
+        // Recent use is never removed, even when that leaves it over budget.
+        assert_eq!(enforce_state_budget(dir.path(), 100, keep_after), (1, 200, 500));
+        assert!(recent.exists() && window.exists());
+    }
+
+    /// Superseded states and day histories (unused for longer than the grace
+    /// at a complete cycle) go; everything a cycle used, and every other
+    /// family the existing sweeps own, stays.
+    #[test]
+    fn only_states_and_histories_unused_since_the_cutoff_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = Duration::from_secs(3_600);
+        let digest = |n: u8| format!("{:064x}", n);
+        let stale_state = file(dir.path(), &format!("{STATE_PREFIX}{}.parquet", digest(1)), 100, 7 * hour);
+        let stale_history = file(dir.path(), &format!("{HISTORY_STATE_PREFIX}{}.parquet", digest(2)), 50, 30 * hour);
+        let used_state = file(dir.path(), &format!("{STATE_PREFIX}{}.parquet", digest(3)), 10, Duration::ZERO);
+        let used_history = file(dir.path(), &format!("{HISTORY_STATE_PREFIX}{}.parquet", digest(4)), 10, hour);
+        // Other families keep their own retention, however old.
+        let others = [
+            file(dir.path(), &format!("{WINDOW_STATE_PREFIX}{}.parquet", digest(5)), 10, 30 * hour),
+            file(dir.path(), &format!("product-history-v2-{}.state", digest(6)), 10, 30 * hour),
+            file(dir.path(), ".prevalence-state-0123.parquet", 10, 30 * hour),
+            file(dir.path(), &format!("{STEP_PREFIX}x-2-000.parquet"), 10, 30 * hour),
+            file(dir.path(), "product-manifest.json", 10, 30 * hour),
+        ];
+        // A state linked into a published window frees no bytes when unlinked.
+        let linked = file(dir.path(), &format!("{STATE_PREFIX}{}.parquet", digest(7)), 1_000, 8 * hour);
+        let window_link = dir.path().join(format!("{WINDOW_STATE_PREFIX}{}.parquet", digest(8)));
+        std::fs::hard_link(&linked, &window_link).unwrap();
+
+        let cutoff = SystemTime::now() - SUPERSEDED_STATE_GRACE;
+        let (files, bytes) = sweep_superseded_states(dir.path(), cutoff);
+        assert_eq!((files, bytes), (3, 150));
+        for gone in [&stale_state, &stale_history, &linked] {
+            assert!(!gone.exists(), "{} is superseded", gone.display());
+        }
+        for kept in [&used_state, &used_history, &window_link].into_iter().chain(others.iter()) {
+            assert!(kept.exists(), "{} must stay", kept.display());
+        }
+        // Idempotent; a missing directory is not an error.
+        assert_eq!(sweep_superseded_states(dir.path(), cutoff), (0, 0));
+        assert_eq!(sweep_superseded_states(&dir.path().join("absent"), cutoff), (0, 0));
+    }
+
+    #[test]
+    fn the_grace_spans_several_hour_rolls() {
+        assert!(SUPERSEDED_STATE_GRACE >= Duration::from_secs(3 * 3_600));
+        assert!(SUPERSEDED_STATE_GRACE < Duration::from_secs(86_400));
+    }
+}
+
+#[cfg(test)]
+mod nan4293_tests {
+    use super::*;
+
+    /// Every chunk is kept, in order, and a statement never spans more than
+    /// one chunk of parts.
+    #[tokio::test]
+    async fn every_chunk_is_kept_in_order() {
+        let items = (0..70).collect::<Vec<u32>>();
+        let mut kept = Vec::new();
+        let result: Result<(), ()> = by_chunks(&items, ROLLUP_MEMO_CHUNK_PARTS, |chunk| async move { Ok(chunk) }, |chunk| kept.push(chunk)).await;
+        assert!(result.is_ok());
+        assert_eq!(kept.iter().map(Vec::len).collect::<Vec<_>>(), [32, 32, 6]);
+        assert_eq!(kept.concat(), items);
+    }
+
+    /// A failure part-way keeps the chunks that finished before it.
+    #[tokio::test]
+    async fn a_failed_chunk_keeps_the_chunks_before_it() {
+        let items = (0..10).collect::<Vec<u32>>();
+        let mut kept = Vec::new();
+        let result = by_chunks(&items, 3, |chunk| async move { if chunk[0] == 6 { Err("too wide") } else { Ok(chunk) } }, |chunk| kept.push(chunk)).await;
+        assert_eq!(result, Err("too wide"));
+        assert_eq!(kept, [vec![0, 1, 2], vec![3, 4, 5]]);
+    }
+
+    /// The segments refresh shape: the caller's deadline drops the read
+    /// while a later chunk is still running, and the finished chunks are
+    /// already kept (memoized), so the next read resumes after them.
+    #[tokio::test]
+    async fn a_cancelled_read_keeps_its_finished_chunks() {
+        let items = (0..10).collect::<Vec<u32>>();
+        let kept = std::sync::Mutex::new(Vec::new());
+        let read = by_chunks(&items, 4, |chunk| async move {
+            if chunk[0] >= 4 {
+                std::future::pending::<()>().await;
+            }
+            Ok::<_, ()>(chunk)
+        }, |chunk| kept.lock().unwrap().push(chunk));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), read).await.is_err(), "the read is cancelled");
+        assert_eq!(*kept.lock().unwrap(), [vec![0, 1, 2, 3]]);
     }
 }

@@ -167,6 +167,13 @@ pub struct ControlChannel {
 }
 
 impl ControlChannel {
+    /// The child end of a control `SOCK_SEQPACKET` pair, already past the
+    /// handshake ([`Bootstrapped::into_async`] does this for a spawned child;
+    /// harnesses that play the supervisor use it directly).
+    pub fn from_fd(fd: OwnedFd) -> std::io::Result<Self> {
+        Ok(Self { sock: Arc::new(AsyncSeqpacket::new(fd)?) })
+    }
+
     pub async fn next_event(&self) -> std::io::Result<Event> {
         loop {
             let Some((msg, mut fds)) = self.sock.recv_json::<ToChild>().await? else {

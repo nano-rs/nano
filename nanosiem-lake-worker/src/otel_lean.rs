@@ -1146,6 +1146,34 @@ pub struct ExpiryReport {
     pub held: bool,
 }
 
+/// NAN-4084: how often the handoff retention pass runs. Each pass lists
+/// every dataset's handoff prefix (R2 Class A), and retention is
+/// receipt-hour granular, so a 60 s cadence bought nothing over 10 min.
+pub const HANDOFF_EXPIRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// NAN-4084: when the lean drain loop runs [`expire_handoff_objects`]: every
+/// [`HANDOFF_EXPIRY_INTERVAL`], or at the next maintenance pass while the
+/// last one was behind (a dataset's pass deleted a full batch).
+#[derive(Debug, Clone, Default)]
+pub struct HandoffExpiryPacer {
+    last: Option<std::time::Instant>,
+    behind: bool,
+}
+
+impl HandoffExpiryPacer {
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        self.behind
+            || self
+                .last
+                .is_none_or(|at| now.saturating_duration_since(at) >= HANDOFF_EXPIRY_INTERVAL)
+    }
+
+    pub fn record(&mut self, now: std::time::Instant, behind: bool) {
+        self.last = Some(now);
+        self.behind = behind;
+    }
+}
+
 /// Delete handoff objects of one dataset whose receipt hour is older than the
 /// retention window (at most `limit` per pass, oldest first).
 ///
@@ -1822,6 +1850,45 @@ mod tests {
         assert_eq!(*presence.beats.lock().unwrap(), vec![(0, 0)]);
     }
 
+    /// NAN-4084: the drain loop backs off on `objects_pending == 0`, so a
+    /// cycle must report every undrained object it found, and none once the
+    /// objects it drained are only acknowledged keys still in R2.
+    #[tokio::test]
+    async fn a_cycle_reports_pending_objects_only_while_any_are_undrained() {
+        let mirror = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeR2::default());
+        let presence = Arc::new(MemoryPresence::default());
+        let drain = lean_drain(mirror.path(), store.clone(), presence);
+        let reports = drain_until_idle(&drain, OtelDataset::Spans).await;
+        assert!(reports.iter().all(|report| report.objects_pending == 0), "nothing landed: {reports:?}");
+        land_spans(&store, Utc::now(), "nan4084", 3);
+        let found = drain.drain_once(OtelDataset::Spans).await.unwrap();
+        assert_eq!((found.objects_pending, found.objects_drained), (1, 1));
+        let reports = drain_until_idle(&drain, OtelDataset::Spans).await;
+        let last = reports.last().unwrap();
+        assert_eq!(last.objects_pending, 0, "the drained key is still listed but not pending");
+        assert!(last.objects_seen >= 1, "the acknowledged key stays in R2: {last:?}");
+    }
+
+    #[test]
+    fn the_handoff_expiry_runs_every_ten_minutes_and_sooner_only_while_behind() {
+        assert_eq!(HANDOFF_EXPIRY_INTERVAL, std::time::Duration::from_secs(600));
+        let start = std::time::Instant::now();
+        let mut pacer = HandoffExpiryPacer::default();
+        assert!(pacer.due(start), "the first maintenance pass expires");
+        pacer.record(start, false);
+        let minute = std::time::Duration::from_secs(60);
+        for pass in 1..10 {
+            assert!(!pacer.due(start + minute * pass), "maintenance pass {pass} skips the listing");
+        }
+        assert!(pacer.due(start + HANDOFF_EXPIRY_INTERVAL));
+        // A full batch: the next maintenance pass continues instead of waiting 10 min.
+        pacer.record(start + HANDOFF_EXPIRY_INTERVAL, true);
+        assert!(pacer.due(start + HANDOFF_EXPIRY_INTERVAL + minute));
+        pacer.record(start + HANDOFF_EXPIRY_INTERVAL + minute, false);
+        assert!(!pacer.due(start + HANDOFF_EXPIRY_INTERVAL + minute * 2));
+    }
+
     #[tokio::test]
     async fn compaction_folds_each_closed_hour_into_one_file_without_losing_rows() {
         let mirror = tempfile::tempdir().unwrap();
@@ -2161,7 +2228,7 @@ mod tests {
         );
 
         let metrics = source(OtelDataset::Metrics);
-        let plan = plan_metric_names(&metrics, &tenant_id, None).unwrap();
+        let plan = plan_metric_names(&metrics, &tenant_id, None, start, end).unwrap();
         let names = rows(
             executor
                 .execute_sql(plan.sql, plan.params)

@@ -364,9 +364,11 @@ impl R2PartStore {
         for (name, value) in headers.iter().filter(|(name, _)| name != "host") {
             request = request.header(name.as_str(), value.as_str());
         }
+        if let Some(writer) = native_writer { writer.put_started(); }
         let response = request.body(body).send().await?;
         match response.status().as_u16() {
             200 => {
+                if let Some(writer) = native_writer { writer.put_completed(); }
                 if let (Some(writer), Some(attempt)) = (native_writer, native_attempt) {
                     let etag = response.headers().get(reqwest::header::ETAG).context("native PUT has no ETag")?.to_str()?;
                     writer.finish(attempt, etag).await?;
@@ -510,6 +512,11 @@ impl ObjectStore for R2PartStore {
         bail!("the R2 part store never overwrites ({key})")
     }
 
+    async fn modified_ms(&self, key: &str) -> Result<Option<i64>> {
+        self.check_key(key)?;
+        self.reader_for(key).modified_ms(key).await
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         self.check_key(key)?;
         self.reader_for(key).delete(key).await
@@ -519,6 +526,11 @@ impl ObjectStore for R2PartStore {
         // Fence lists to this tenant's prefix like every other access.
         self.check_key(&format!("{prefix}__list_probe__"))?;
         self.reader_for(prefix).list(prefix).await
+    }
+
+    async fn list_page(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        self.check_key(&format!("{prefix}__list_probe__"))?;
+        self.reader_for(prefix).list_page(prefix, start_after, limit).await
     }
 }
 

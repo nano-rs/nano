@@ -119,6 +119,17 @@ fn use_fine_runs(fine_runs: usize, fine: (u64, usize), coarse: (u64, usize)) -> 
     fine_beats_coarse(fine, coarse, crate::planner::fence_set_enabled())
 }
 
+/// NAN-4211: whether the fine selection's rendered row fence and time guard
+/// fit one statement. Exact runs over many one-row-group files (the window
+/// entity index on a busy host over 7d: ~3,000 runs in ~2,500 files) fence
+/// every file, where the coarse selection reads those files whole with no
+/// fence; past the budget the statement outgrew chDB's `max_query_size` and
+/// the query failed. Declining keeps the coarse selection (same rows).
+fn fine_fence_fits(fine_selection: &[CandidateBlock], objects: &[ManifestObject]) -> bool {
+    let rows = objects.iter().map(|object| (object.event_object_key.as_str(), object.rows)).collect::<BTreeMap<_, _>>();
+    planner::candidate_fence_sql_bytes(fine_selection, &|key| rows.get(key).copied()) <= planner::MAX_FENCE_SQL_BYTES
+}
+
 /// `rows × (decode + fence)` for each selection; a selection without terms
 /// is read unfenced. The set fence costs [`SET_FENCE_TERMS`] per row, the OR
 /// fence one term per block (NAN-3179).
@@ -159,6 +170,11 @@ pub enum PartQueryError {
     ConcurrencyBudget(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// NAN-4316: the tenant's part log has no `genesis` yet. A new tenant's
+    /// ingest writes it when it first opens the log, so a query process
+    /// started at birth sees this for a few seconds: retryable, not a fault.
+    #[error("tenant part log has no schema yet")]
+    NoSchemaYet,
 }
 
 impl PartQueryError {
@@ -168,7 +184,7 @@ impl PartQueryError {
             Self::Budget(_) => 413,
             Self::ColdScanTooLarge { .. } => 422,
             Self::QueryFailed(_) => 422,
-            Self::Unavailable(_) | Self::MemoryBudget(_) => 503,
+            Self::Unavailable(_) | Self::MemoryBudget(_) | Self::NoSchemaYet => 503,
             Self::ConcurrencyBudget(_) => 429,
             Self::Internal(_) => 500,
         }
@@ -185,8 +201,20 @@ impl PartQueryError {
             // escalates it to a durable job.
             Self::MemoryBudget(_) | Self::ConcurrencyBudget(_) => QUERY_BUDGET_EXHAUSTED,
             Self::Internal(_) => "internal",
+            Self::NoSchemaYet => "no_schema",
         }
     }
+}
+
+/// NAN-4290: the durable job lanes of one query process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobLane {
+    /// One job at a time on the read-write lane, at the large lane's memory
+    /// (NAN-3077): every job may run here.
+    General,
+    /// One small job at a time on its own read-write connection: a 1 h
+    /// listing never waits for a 30 d aggregate on the general lane.
+    Small,
 }
 
 /// One admitted request's native-work slot. Every release returns freed
@@ -235,6 +263,10 @@ pub enum RequestClass {
     /// most `slots - 1` at once, so a primary always finds a slot free of
     /// companions.
     Companion,
+    /// NAN-4174: a primary over a wide window (more than
+    /// [`WIDE_WINDOW_HOURS`]): at most `slots - SHORT_RESERVED_SLOTS` at
+    /// once, so short-window primaries always find a slot.
+    Wide,
 }
 
 impl RequestClass {
@@ -246,6 +278,15 @@ impl RequestClass {
             Self::Companion
         } else {
             Self::Primary
+        }
+    }
+
+    /// [`Self::of`] for a request over `[start, end]`: a primary over a
+    /// wide window is [`Self::Wide`].
+    pub fn of_window(request_id: &str, fetch_log: bool, start: &str, end: &str) -> Self {
+        match Self::of(request_id, fetch_log) {
+            Self::Primary if wide_window(start, end) => Self::Wide,
+            class => class,
         }
     }
 }
@@ -262,6 +303,39 @@ const MAX_IDENTITY_COVERAGE_MEMO: usize = 65_536;
 /// primaries simply share it).
 pub(crate) fn companion_permits(slots: usize) -> usize {
     slots.saturating_sub(1).max(1)
+}
+
+/// NAN-4174: admission slots kept for short-window primaries: a wide
+/// primary (window over [`WIDE_WINDOW_HOURS`]) never takes the last ones, so
+/// a 1 h / 24 h or single-source search never waits behind 7 d aggregates
+/// for a slot (a Chronicle-style simple/complex split).
+pub const SHORT_RESERVED_SLOTS: usize = 2;
+/// NAN-4174: a primary over more hours than this is wide.
+pub const WIDE_WINDOW_HOURS: i64 = 24;
+
+/// Wide-gate permits for `slots` admission slots (at least one).
+pub(crate) fn wide_permits(slots: usize) -> usize {
+    slots.saturating_sub(SHORT_RESERVED_SLOTS).max(1)
+}
+
+/// NAN-4174: whether a `[start, end]` (RFC 3339) request window is wide.
+/// An unparsable window is not: the request fails later, never here.
+pub fn wide_window(start: &str, end: &str) -> bool {
+    match (chrono::DateTime::parse_from_rfc3339(start), chrono::DateTime::parse_from_rfc3339(end)) {
+        (Ok(start), Ok(end)) => (end - start).num_hours() > WIDE_WINDOW_HOURS,
+        _ => false,
+    }
+}
+
+/// NAN-4164: add a token-cache work delta to a request's phases.
+pub(super) fn record_token_work(p: &mut crate::query_timing::Phases, work: super::token_cache::TokenCacheStats) {
+    p.token_probes += work.probes;
+    p.token_probe_excluded += work.probe_excluded;
+    p.token_probe_ms += work.probe_ns as f64 / 1e6;
+    p.token_decodes += work.decodes;
+    p.token_decode_bytes += work.decode_bytes;
+    p.token_read_ms += work.read_ns as f64 / 1e6;
+    p.token_decode_ms += work.decode_ns as f64 / 1e6;
 }
 
 /// A permit only when all `slots` are free (NAN-3077 background work).
@@ -316,7 +390,7 @@ pub(crate) const BACKGROUND_IDLE_WAIT: Duration = Duration::from_secs(30);
 /// ([`idle_permit`]) and it never joins the semaphore's FIFO queue: a queued
 /// background waiter would be served before a request that arrived after
 /// it, so an interactive search waited behind a whole background batch (an
-/// incremental owner-proof prewarm after every merge commit). It polls
+/// incremental prewarm after every merge commit). It polls
 /// every `poll` and gives up (`None`) after `wait` or once admission closes.
 pub(crate) async fn wait_idle_permit(
     admission: &Arc<tokio::sync::Semaphore>,
@@ -346,6 +420,15 @@ pub const DETECT_ADMISSION_DEADLINE: Duration = Duration::from_secs(60);
 
 pub type QueryResult<T> = std::result::Result<T, PartQueryError>;
 
+/// The read schema at the view's head; [`PartQueryError::NoSchemaYet`] while
+/// the log has no `genesis` (NAN-4316), any other failure `Internal`.
+fn read_schema(view: &mut PartLogView) -> QueryResult<Arc<arrow_schema::Schema>> {
+    if view.schema_fingerprint().is_none() {
+        return Err(PartQueryError::NoSchemaYet);
+    }
+    view.read_schema().map_err(internal)
+}
+
 pub(super) fn internal(error: impl std::fmt::Display) -> PartQueryError {
     internal_text(error.to_string())
 }
@@ -354,6 +437,10 @@ pub(super) fn internal(error: impl std::fmt::Display) -> PartQueryError {
 /// being refreshed (NAN-3017), so it is a retryable 503, never a 500.
 pub(crate) fn internal_text(text: String) -> PartQueryError {
     if super::credentials::text_is_credential_stale(&text) {
+        PartQueryError::Unavailable(text)
+    } else if crate::reader_object_cache::text_is_saturation(&text) {
+        // NAN-4138: a saturated reader cache that reached here through a
+        // stringly error path is transient (503, retryable), not a 500.
         PartQueryError::Unavailable(text)
     } else if super::memory_budget::is_budget_refusal(&text) {
         // A budget refusal that reached here through a stringly error path.
@@ -514,6 +601,10 @@ pub struct SelectionEvidence {
     /// from the data file's own Parquet blooms instead of decoding the
     /// locator / bloom sidecars.
     pub resident_infile_files: usize,
+    /// NAN-4190: files answered by the window entity index, and those it
+    /// proved hold no matching row (pruned before any sidecar or footer).
+    pub entity_index_files: usize,
+    pub entity_index_pruned_files: usize,
     /// NAN-3165: leased data files dropped because no row group survived
     /// their own evidence (in-file blooms, membership, tokens).
     pub infile_pruned_files: usize,
@@ -559,6 +650,8 @@ fn record_selection_funnel(evidence: &SelectionEvidence) {
         f.entity_sidecar_pruned_files += evidence.entity_sidecar_pruned_files;
         f.infile_pruned_files += evidence.infile_pruned_files;
         f.resident_infile_files += evidence.resident_infile_files;
+        f.entity_index_files += evidence.entity_index_files;
+        f.entity_index_pruned_files += evidence.entity_index_pruned_files;
         f.fetched_files += evidence.fetched_files;
         f.row_groups += evidence.row_groups;
         f.kept_row_groups += evidence.kept_row_groups;
@@ -580,26 +673,6 @@ fn hint_counts(hints: &[CandidateHint]) -> (usize, usize) {
             (keywords + k, entities + e)
         }
     })
-}
-
-/// NAN-3800: the per-file split of mixed owner proofs (`proofs[i]` proves
-/// `objects[i]`; [`PartQueryEngine::owner_proofs_for`] keeps that order and
-/// the caller checked both lengths match). `None` when no file is clean:
-/// there is nothing to read unmasked.
-fn scalar_split(
-    objects: &[(PathBuf, String)],
-    proofs: &[OwnerProofState],
-) -> Option<Arc<crate::enrichment_read::ScalarSplit>> {
-    let clean = objects.iter().zip(proofs)
-        .filter(|(_, proof)| proof.clean)
-        .map(|((path, _), _)| path.clone())
-        .collect::<BTreeSet<_>>();
-    if clean.is_empty() {
-        return None;
-    }
-    let unclean_null_leaves = proofs.iter().filter(|proof| !proof.clean)
-        .fold(ALL_SCALAR_LEAVES, |mask, proof| mask & proof.null_leaves);
-    Some(Arc::new(crate::enrichment_read::ScalarSplit { clean, unclean_null_leaves }))
 }
 
 /// NAN-3165: resident data files take entity evidence from their in-file
@@ -624,6 +697,33 @@ fn payload_at_instants() -> bool {
 fn density_over_selective() -> bool {
     crate::perf_overrides::probe_flag("density_over_selective",
         std::env::var("NANO_LAKE_DENSITY_OVER_SELECTIVE").map_or(true, |value| value != "0"))
+}
+
+/// NAN-4157: the inputs of the progressive walk's whole-window preselect.
+#[derive(Debug, Clone, Copy, Default)]
+struct WindowPreselect {
+    /// The one-shot multi-path hash window (read whole anyway).
+    whole_hash_window: bool,
+    /// The density estimate found the value too dense for blooms.
+    dense: bool,
+    /// The density estimate fills the page inside a newer first chunk.
+    density_fills_first_chunk: bool,
+    /// [`density_over_selective`].
+    density_over_selective: bool,
+    /// A keyword token keeps few row groups of the window.
+    token_preselect: bool,
+    /// An entity pivot (host, IP, user, process, hash).
+    uses_entities: bool,
+}
+
+/// NAN-4157: whether the progressive walk selects the whole window once
+/// before its first chunk. The preselect only pays off when it may be read
+/// whole (a few row groups); when the density estimate fills the page in a
+/// newer first chunk and overrides a selective read, it would just lease
+/// every surviving file of the window to cut chunks from.
+fn window_preselect(inputs: WindowPreselect) -> bool {
+    let candidate = !inputs.whole_hash_window && !inputs.dense && (inputs.token_preselect || inputs.uses_entities);
+    candidate && !(inputs.density_fills_first_chunk && inputs.density_over_selective)
 }
 
 /// The verified local source of one query. Holding it holds the leases.
@@ -749,13 +849,9 @@ pub struct PartQueryEngine {
     /// catch-up done inside a query would hide new data from the gate and a
     /// due detection could be skipped.
     advances: std::sync::Mutex<Vec<(u64, Advance)>>,
-    /// `(data file sha256, authority identity)` → `(clean, expires_us)`:
-    /// whether the file holds no denied platform stamp owning a location/ASN
-    /// leaf (see `enrichment_read::owner_denial_probe_sql`).
-    owner_proofs: std::sync::Mutex<std::collections::HashMap<(String, String), OwnerProofState>>,
-    /// Where `owner_proofs` survives idle exit (`None`: process lifetime).
-    owner_proofs_memo: Option<PathBuf>,
-    /// A background owner-proof prewarm is running.
+    /// The process's own state dir (`None`: no persistent state).
+    state_dir: Option<PathBuf>,
+    /// A part prewarm is running.
     prewarming: std::sync::atomic::AtomicBool,
     evidence_prewarm: std::sync::Mutex<Value>,
     evidence_ready_at: std::sync::OnceLock<Instant>,
@@ -764,6 +860,8 @@ pub struct PartQueryEngine {
     // NAN-3392: shared with the blocking-pool evidence probes.
     file_metadata: Arc<prune::FileMetadataCache>,
     token_cache: Arc<super::token_cache::TokenCache>,
+    /// NAN-4292: verified uid sidecar layouts for event-id lookups.
+    uid_layouts: Arc<super::uid_probe::UidLayouts>,
     /// NAN-3392: per-(file, hint) footer/bloom evidence across queries.
     evidence_cache: Arc<super::select_evidence::EvidenceCache>,
     entity_cache: super::entity_cache::EntityCache,
@@ -779,6 +877,8 @@ pub struct PartQueryEngine {
     identity_coverage: std::sync::Mutex<std::collections::HashMap<crate::parts::format::PartId, Option<i64>>>,
     /// NAN-3399: this process's merged identity observation index.
     identity_merged: super::identity_merged::MergedSlot,
+    /// NAN-4190: this process's window entity index.
+    entity_index: super::entity_index::Slot,
     /// NAN-3093: per-part count-rollup answers (see [`super::rollup_rows`]).
     rollup_rows: super::rollup_rows::RollupRowsMemo,
     prevalence_rows: super::prevalence_rows::PrevalenceRowsMemo,
@@ -799,8 +899,14 @@ pub struct PartQueryEngine {
     point_admission: Arc<tokio::sync::Semaphore>,
     /// NAN-3077: companions hold one of these beside their slot.
     companion_gate: Arc<tokio::sync::Semaphore>,
+    /// NAN-4174: wide-window primaries hold one of these beside their slot.
+    wide_gate: Arc<tokio::sync::Semaphore>,
     /// NAN-3077: durable jobs (one at a time, on the read-write lane).
     job_admission: Arc<tokio::sync::Semaphore>,
+    /// NAN-4290: the small-job lane: its own read-write connection and one
+    /// permit (see [`JobLane::Small`]). `None`: every job takes the general lane.
+    small_job_writer: Option<NativeExecutor>,
+    small_job_admission: Arc<tokio::sync::Semaphore>,
     /// Native-work slots (see [`super::memory_budget`]): one per read lane.
     pub(super) admission: Arc<tokio::sync::Semaphore>,
     /// NAN-3148: published product state (product[T] publishes, query[T]
@@ -817,7 +923,6 @@ struct LocatorKey {
     end: String,
     end_inclusive: bool,
     cursor: Option<(String, String)>,
-    authority: String,
 }
 
 const MAX_LOCATOR_RESULTS: usize = 256;
@@ -841,7 +946,7 @@ fn locator_selection_identity(manifest: &SourceManifest, candidates: Option<&[Ca
 }
 
 fn locator_entry_bytes(key: &LocatorKey, hits: &LocatorHits) -> usize {
-    key.selection_identity.len() + key.sql.len() + key.start.len() + key.end.len() + key.authority.len()
+    key.selection_identity.len() + key.sql.len() + key.start.len() + key.end.len()
         + key.cursor.as_ref().map_or(0, |(time, uid)| time.len() + uid.len())
         + hits.times.iter().map(|time| time.len() + std::mem::size_of::<String>()).sum::<usize>()
 }
@@ -971,10 +1076,11 @@ fn background_refresh_delay(base: Duration, previous: Duration, changed: bool) -
     }
 }
 
-/// File name of the persisted owner-denial proof memo.
-const OWNER_PROOFS_MEMO: &str = "owner-proofs.v2.json";
+/// File name of the owner-denial proof memo earlier releases persisted in
+/// the state dir; removed on start (NAN-4168: no read-time enrichment masks).
+const LEGACY_OWNER_PROOFS_MEMO: &str = "owner-proofs.v2.json";
 
-/// Data files per background owner-proof batch.
+/// Data files per prewarm batch.
 const PREWARM_BATCH_FILES: usize = 16;
 
 /// Remote (R2-only) data files of parts this close to the newest data are
@@ -1006,25 +1112,6 @@ fn prewarm_batches<T>(candidates: Vec<(T, u64, bool)>) -> Vec<(Vec<T>, bool)> {
     batches
 }
 
-/// Every bit of `SCALAR_MASKED_LEAVES`.
-const ALL_SCALAR_LEAVES: u16 = (1 << 10) - 1;
-
-/// What the owner-denial probe proved about one data file for one authority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OwnerProofState {
-    /// No denied platform stamp owns a location/ASN leaf in any row.
-    pub clean: bool,
-    /// The proof holds until the earliest owning stamp expires.
-    pub expires_us: i64,
-    /// Leaves whose every non-null value is owned by a denied stamp.
-    pub null_leaves: u16,
-}
-
-/// One persisted owner-denial proof: `(file sha256, authority identity,
-/// proof)`. A proof is content-addressed and authority-keyed, so it stays
-/// valid until `expires_us` whatever process computed it.
-type OwnerProof = (String, String, OwnerProofState);
-
 impl PartQueryEngine {
     pub fn new(
         settings: EngineSettings,
@@ -1038,10 +1125,12 @@ impl PartQueryEngine {
         }
         let slots = executor.connection_count().max(1);
         let fragments = super::fragment_cache::FragmentCache::new(settings.max_memory_bytes);
-        Ok(Self { settings, fragments, store, view: tokio::sync::Mutex::new(view), fetcher, executor, writer: None, advances: Default::default(), owner_proofs: Default::default(), owner_proofs_memo: None, prewarming: Default::default(), evidence_prewarm: Default::default(), evidence_ready_at: Default::default(), prewarmed: Default::default(), file_metadata: Default::default(), token_cache: Default::default(), evidence_cache: Default::default(), entity_cache: Default::default(), entity_count_memo: Default::default(), locator_cache: Default::default(), membership_memo: Default::default(), identity_coverage: Default::default(), identity_merged: Default::default(), rollup_rows: Default::default(), prevalence_rows: Default::default(), caught_up_at: Default::default(), background_log_refresh: Default::default(),
+        Ok(Self { settings, fragments, store, view: tokio::sync::Mutex::new(view), fetcher, executor, writer: None, advances: Default::default(), state_dir: None, prewarming: Default::default(), evidence_prewarm: Default::default(), evidence_ready_at: Default::default(), prewarmed: Default::default(), file_metadata: Default::default(), token_cache: Default::default(), uid_layouts: Default::default(), evidence_cache: Default::default(), entity_cache: Default::default(), entity_count_memo: Default::default(), locator_cache: Default::default(), membership_memo: Default::default(), identity_coverage: Default::default(), identity_merged: Default::default(), entity_index: Default::default(), rollup_rows: Default::default(), prevalence_rows: Default::default(), caught_up_at: Default::default(), background_log_refresh: Default::default(),
             point: None, large: None, lane_memo: Default::default(), point_admission: Arc::new(tokio::sync::Semaphore::new(POINT_PERMITS)),
             companion_gate: Arc::new(tokio::sync::Semaphore::new(companion_permits(slots))),
+            wide_gate: Arc::new(tokio::sync::Semaphore::new(wide_permits(slots))),
             job_admission: Arc::new(tokio::sync::Semaphore::new(1)),
+            small_job_writer: None, small_job_admission: Arc::new(tokio::sync::Semaphore::new(1)),
             admission: Arc::new(tokio::sync::Semaphore::new(slots)), product: Default::default() })
     }
 
@@ -1074,6 +1163,22 @@ impl PartQueryEngine {
                 }
             }
             RequestClass::Point | RequestClass::Primary => self.admit(deadline).await,
+            RequestClass::Wide => {
+                let started = Instant::now();
+                let gate = match tokio::time::timeout(deadline, self.wide_gate.clone().acquire_owned()).await {
+                    Ok(Ok(gate)) => gate,
+                    Ok(Err(_)) => return Err(PartQueryError::Unavailable("query admission is closed".into())),
+                    Err(_) => {
+                        return Err(PartQueryError::ConcurrencyBudget(format!(
+                            "long-window searches stayed at their limit for {} s; retry later or run it as a search job",
+                            deadline.as_secs()
+                        )))
+                    }
+                };
+                let mut slot = self.admit(deadline.saturating_sub(started.elapsed())).await?;
+                slot.gate = Some(gate);
+                Ok(slot)
+            }
             RequestClass::Companion => {
                 let started = Instant::now();
                 let gate = match tokio::time::timeout(deadline, self.companion_gate.clone().acquire_owned()).await {
@@ -1128,6 +1233,63 @@ impl PartQueryEngine {
         }
     }
 
+    /// NAN-4290: admit one durable job to a lane. A `small` job (see
+    /// [`nanosiem_core::search::small_job_lane`]) takes the small-job lane,
+    /// or the general lane when only that one is free; any other job takes
+    /// the general lane ([`Self::admit_job`]). A small-lane job also holds an
+    /// interactive admission slot: its statements run at one interactive
+    /// lane's memory ([`Self::job_lane_memory_bytes`]), inside the memory and
+    /// CPU (thread budget) the interactive lanes are carved from, so the
+    /// tenant's query budget is unchanged.
+    pub async fn admit_job_lane(&self, small: bool, deadline: Duration) -> QueryResult<(JobLane, AdmissionSlot)> {
+        if !small || self.small_job_writer.is_none() {
+            return Ok((JobLane::General, self.admit_job(deadline).await?));
+        }
+        let started = Instant::now();
+        let gate = match self.small_job_admission.clone().try_acquire_owned() {
+            Ok(gate) => gate,
+            Err(_) => {
+                if let Ok(permit) = self.job_admission.clone().try_acquire_owned() {
+                    return Ok((JobLane::General, AdmissionSlot { permit: Some(permit), slots: 1, gate: None }));
+                }
+                match tokio::time::timeout(deadline, self.small_job_admission.clone().acquire_owned()).await {
+                    Ok(Ok(gate)) => gate,
+                    Ok(Err(_)) => return Err(PartQueryError::Unavailable("query admission is closed".into())),
+                    Err(_) => return Err(PartQueryError::ConcurrencyBudget(format!(
+                        "both search job lanes stayed busy for {} s; retry after it",
+                        deadline.as_secs()
+                    ))),
+                }
+            }
+        };
+        let mut slot = self.admit(deadline.saturating_sub(started.elapsed())).await?;
+        slot.gate = Some(gate);
+        Ok((JobLane::Small, slot))
+    }
+
+    /// NAN-4290: attach the small-job lane's read-write connection.
+    pub fn with_small_job_writer(mut self, writer: NativeExecutor) -> Self {
+        self.small_job_writer = Some(writer);
+        self
+    }
+
+    /// The read-write connection a job admitted to `lane` executes on.
+    pub fn job_writer(&self, lane: JobLane) -> Option<&NativeExecutor> {
+        match lane {
+            JobLane::General => self.writer.as_ref(),
+            JobLane::Small => self.small_job_writer.as_ref(),
+        }
+    }
+
+    /// A job statement's memory cap on `lane`: the general lane's is
+    /// [`Self::job_memory_bytes`], the small lane's one interactive lane's.
+    pub fn job_lane_memory_bytes(&self, lane: JobLane) -> u64 {
+        match lane {
+            JobLane::General => self.job_memory_bytes(),
+            JobLane::Small => self.settings.max_memory_bytes,
+        }
+    }
+
     /// Attach the large lane (NAN-3077 size classes) with its memory
     /// (`large_bytes`, split across its connections, see
     /// [`super::lanes::LargeLane`]).
@@ -1145,6 +1307,7 @@ impl PartQueryEngine {
             // (`QueryMemoryBudget::result_bytes`) is unchanged.
             self.admission.add_permits(1);
             self.companion_gate.add_permits(1);
+            self.wide_gate.add_permits(1);
         }
         self.large = Some(large);
         self
@@ -1219,6 +1382,11 @@ impl PartQueryEngine {
         &self.identity_merged
     }
 
+    /// NAN-4190: the window entity index slot.
+    pub(crate) fn entity_index(&self) -> &super::entity_index::Slot {
+        &self.entity_index
+    }
+
     /// Memoized identity coverage of `part` (see `identity_coverage`).
     pub(crate) fn identity_coverage(&self, part: &crate::parts::format::PartId) -> Option<Option<i64>> {
         self.identity_coverage.lock().expect("identity coverage").get(part).copied()
@@ -1240,28 +1408,26 @@ impl PartQueryEngine {
         self.executor.connection_count().max(1) + usize::from(self.large.is_some())
     }
 
-    /// Keep owner-denial proofs across restarts in `dir` (the process's own
-    /// state dir); expired proofs are dropped on load.
+    /// Use `dir` (the process's own state dir) for persistent state. The
+    /// owner-denial proof memo of earlier releases is removed (NAN-4168).
     pub fn with_state_dir(mut self, dir: &std::path::Path) -> Self {
-        let path = dir.join(OWNER_PROOFS_MEMO);
-        let now_us = chrono::Utc::now().timestamp_micros();
-        if let Some(proofs) = super::memo::load::<Vec<OwnerProof>>(&path) {
-            let mut map = self.owner_proofs.lock().expect("owner proofs");
-            for (sha, identity, proof) in proofs.into_iter().take(super::memo::MAX_ENTRIES) {
-                if proof.expires_us > now_us {
-                    map.insert((sha, identity), proof);
-                }
-            }
-        }
-        self.owner_proofs_memo = Some(path);
+        let _ = std::fs::remove_file(dir.join(LEGACY_OWNER_PROOFS_MEMO));
+        self.state_dir = Some(dir.to_path_buf());
+        self
+    }
+
+    /// NAN-4174: keep the lane memo (see [`super::lanes::LaneMemo`]) in
+    /// `dir`: the persistent hot volume when query[T] has one (it survives a
+    /// pod roll), else the state dir (it survives idle exit).
+    pub fn with_lane_memo_dir(self, dir: &std::path::Path) -> Self {
+        self.lane_memo.persist_at(dir.join(super::lanes::LANE_MEMO_FILE));
         self
     }
 
     /// Reuse the query process's local identity derivation directory. Engines
     /// without persistent state use signed part partials only.
     pub(super) fn identity_state_dir(&self) -> &std::path::Path {
-        self.owner_proofs_memo.as_deref().and_then(std::path::Path::parent)
-            .unwrap_or_else(|| std::path::Path::new("/dev/null"))
+        self.state_dir.as_deref().unwrap_or_else(|| std::path::Path::new("/dev/null"))
     }
 
     /// NAN-3148: how this process relates to published product state (set
@@ -1313,6 +1479,10 @@ impl PartQueryEngine {
 
     pub fn fetcher(&self) -> &PartFetcher {
         &self.fetcher
+    }
+
+    pub(super) fn token_cache_arc(&self) -> Arc<super::token_cache::TokenCache> {
+        self.token_cache.clone()
     }
 
     pub(super) fn token_cache(&self) -> &super::token_cache::TokenCache {
@@ -1444,7 +1614,7 @@ impl PartQueryEngine {
         if !fresh {
             self.catch_up_locked(&mut view).await?;
         }
-        let schema = view.read_schema().map_err(internal)?;
+        let schema = read_schema(&mut view)?;
         Ok((view.parts_overlapping(from_us, to_us), schema, view.head().map(|(seq, _)| seq), view.live().parts().count()))
     }
 
@@ -1472,7 +1642,7 @@ impl PartQueryEngine {
         let pin = PinnedDiscovery {
             engine: self as *const Self as usize,
             parts: view.parts_overlapping(i64::MIN, i64::MAX),
-            schema: view.read_schema().map_err(internal)?,
+            schema: read_schema(&mut view)?,
             head: view.head(),
             fingerprint: view.schema_fingerprint().map(str::to_owned),
             live_parts: view.live().parts().count(),
@@ -1488,7 +1658,7 @@ impl PartQueryEngine {
             (pin.engine == self as *const Self as usize).then(|| crate::generation::schema_leaf_types(&pin.schema))
         }) { return Ok(types); }
         let mut view = self.view.lock().await;
-        let schema = view.read_schema().map_err(internal)?;
+        let schema = read_schema(&mut view)?;
         Ok(crate::generation::schema_leaf_types(&schema))
     }
 
@@ -1637,6 +1807,55 @@ impl PartQueryEngine {
         evidence.time_files = candidates_files.len();
         // NAN-3392: select sub-phase walls (sidecar / token / footer-bloom).
         let sidecar_started = Instant::now();
+        // NAN-4190: the window entity index answers the entity hints of the
+        // files it covers (exact group masks and row runs with exact times)
+        // before any sidecar or footer is read; uncovered files keep the
+        // per-file evidence path below.
+        let mut index_fine: BTreeMap<(String, usize), prune::FineBlocks> = BTreeMap::new();
+        let mut index_answered: BTreeSet<(String, usize)> = BTreeSet::new();
+        let mut index_hints: Option<Arc<[CandidateHint]>> = None;
+        if let Some(index) = prune_sidecars.then(|| self.entity_index.for_query()).flatten().filter(|index| index.answers(hints)) {
+            let record_of = parts.iter().zip(&records).map(|(part, record)| (part.part_id.clone(), record)).collect::<BTreeMap<_, _>>();
+            let files = candidates_files.iter().map(|(part, index)| {
+                let data = &record_of[&part.part_id].files.data[*index];
+                (super::entity_index::SourceKey { part: part.part_id.clone(), index: *index, sha256: data.sha256.clone() }, data.row_groups as usize, data.rows)
+            }).collect::<Vec<_>>();
+            let (lookup_index, lookup_hints) = (index.clone(), hints.to_vec());
+            let (mut found, cpu) = super::select_evidence::blocking_map(vec![()], move |()| lookup_index.evidence(&lookup_hints, &files)).await;
+            select_cpu_ms += cpu;
+            // A failed task or an unreadable index file keeps every file on the per-file path.
+            if let Some(Some(Some(found))) = found.pop() {
+                let (mut covered, mut pruned) = (BTreeSet::new(), BTreeSet::new());
+                let mut kept = Vec::with_capacity(candidates_files.len());
+                for ((part, file), answer) in std::mem::take(&mut candidates_files).into_iter().zip(found) {
+                    let Some(answer) = answer else {
+                        kept.push((part, file));
+                        continue;
+                    };
+                    evidence.entity_index_files += 1;
+                    covered.insert((part.part_id.clone(), file));
+                    if !answer.mask.iter().any(|keep| *keep) {
+                        evidence.entity_index_pruned_files += 1;
+                        pruned.insert((part.part_id.clone(), file));
+                        continue;
+                    }
+                    let key = (part.part_id.to_string(), file);
+                    if answer.answered {
+                        index_answered.insert(key.clone());
+                    }
+                    if answer.fine.iter().any(Option::is_some) {
+                        index_fine.insert(key.clone(), answer.fine);
+                    }
+                    entity_masks.insert(key, answer.mask);
+                    kept.push((part, file));
+                }
+                candidates_files = kept;
+                sidecar_files.retain(|(part, file, _)| !covered.contains(&(part.part_id.clone(), *file)));
+                uid_wanted.retain(|(part, file)| !matches!(file, PartFile::Uids(file) if pruned.contains(&(part.part_id.clone(), *file))));
+                super::entity_index::fit_run_budget(&mut index_fine, MAX_CANDIDATE_BLOCKS * 3 / 4);
+                index_hints = Some(index.strip_answered(if prune_blooms { hints } else { &[] }).into());
+            }
+        }
         // NAN-3165: a data file already local answers entity evidence from
         // its own Parquet blooms in the data stage (a pread of the hinted
         // field's filter per row group), so its sidecars are not leased or
@@ -1652,11 +1871,23 @@ impl PartQueryEngine {
         entity_wanted.extend(sidecar_files.into_iter().map(|(part, _, file)| (part, file)));
         if uid_lookup {
             let uids = self.fetcher.ensure_files(&uid_wanted).await.map_err(map_fetch_error)?;
+            // NAN-4292: one positioned read per group against a cached
+            // layout (not a full JSON + hex decode through the metadata
+            // cache), fanned out like the token probes.
+            let items = candidates_files.iter().map(|(part, index)| {
+                let groups = uids.records[&part.part_id].files.data[*index].row_groups as usize;
+                let local = uids.path(&part.part_id, PartFile::Uids(*index)).map(|local| (local.path.clone(), local.sha256.clone()));
+                (local, groups)
+            }).collect::<Vec<_>>();
+            let (layouts, uid_hints) = (self.uid_layouts.clone(), Arc::<[CandidateHint]>::from(hints));
+            let (masks, cpu) = super::select_evidence::blocking_map_with(items, super::select_evidence::token_probe_concurrency(), move |(local, groups)| {
+                local.and_then(|(path, sha256)| layouts.mask(&path, &sha256, groups, &uid_hints))
+            }).await;
+            select_cpu_ms += cpu;
+            let mut masks = masks.into_iter();
             candidates_files.retain(|(part, index)| {
-                let Some(local) = uids.path(&part.part_id, PartFile::Uids(*index)) else { return true };
-                let blooms = self.fetcher.metadata_bytes(local).and_then(|bytes| serde_json::from_slice::<Vec<Option<String>>>(&bytes).ok());
-                let record = &uids.records[&part.part_id];
-                let Some(mask) = prune::uid_summary_mask(blooms.as_deref(), record.files.data[*index].row_groups as usize, hints) else { return true };
+                // A failed blocking task or unknown file keeps every group.
+                let Some(mask) = masks.next().flatten().flatten() else { return true };
                 if !mask.iter().any(|keep| *keep) {
                     evidence.uid_pruned_files += 1;
                     return false;
@@ -1751,6 +1982,8 @@ impl PartQueryEngine {
         if prune_tokens && prune::uses_tokens(hints) && !candidates_files.is_empty() {
             let wanted = candidates_files.iter().map(|(part, index)| (part.clone(), PartFile::Tokens(*index))).collect::<Vec<_>>();
             let tokens = self.fetcher.ensure_files(&wanted).await.map_err(map_fetch_error)?;
+            let lease_ms = token_started.elapsed().as_secs_f64() * 1000.0;
+            let token_stats = self.token_cache.stats();
             survivors.clear();
             let record_of = parts.iter().zip(&records).map(|(part, record)| (part.part_id.clone(), record.clone())).collect::<BTreeMap<_, _>>();
             // NAN-3392: first-time token evidence (read + decode) runs on
@@ -1765,7 +1998,8 @@ impl PartQueryEngine {
                     (local, groups)
                 }).collect::<Vec<_>>();
                 let (cache, hints) = (self.token_cache.clone(), shared_hints.clone());
-                let (results, cpu) = super::select_evidence::blocking_map(items, move |(local, groups)| {
+                // NAN-4164: I/O-bound, so a deeper fan-out than footers.
+                let (results, cpu) = super::select_evidence::blocking_map_with(items, super::select_evidence::token_probe_concurrency(), move |(local, groups)| {
                     // Leased files: the fetcher verified them against the
                     // signed record, so the trailer is not re-hashed.
                     local.map_or((None, None), |(path, sha256)| cache.evidence(&path, &sha256, groups, &hints))
@@ -1773,64 +2007,93 @@ impl PartQueryEngine {
                 select_cpu_ms += cpu;
                 fanned_out = Some(results.into_iter());
             }
-            let cpu = crate::query_timing::select_cpu(Some(&mut select_cpu_ms));
-            for (part, index) in &candidates_files {
-                let token_file = tokens.path(&part.part_id, PartFile::Tokens(*index));
-                let groups = record_of[&part.part_id].files.data[*index].row_groups as usize;
-                let (mask, fine) = match counting.as_mut() {
-                    // A failed blocking task keeps every group (unknown).
-                    None => fanned_out.as_mut().and_then(Iterator::next).flatten().unwrap_or((None, None)),
-                    Some((plan, tally)) => match token_file.and_then(|local| self.token_cache.get(&local.path, &local.sha256)) {
-                        None => (None, None),
-                        Some(decoded) => {
-                            let (mut mask, mut fine) = prune::token_evidence_of(&decoded, groups, hints);
-                            if let Some(mask) = mask.as_mut().filter(|mask| mask.len() == decoded.len()) {
-                                for (group, tokens) in decoded.iter().enumerate() {
-                                    // Exact counts replace the group's scan; an
-                                    // unreadable table just leaves it scanned.
-                                    let counted = tally.count_group(&format!("{}/{index}", part.part_id), plan, tokens).unwrap_or_else(|error| {
-                                        tracing::warn!(part = %part.part_id, file = index, group, error = %error, "token counts unreadable; scanning the group");
-                                        false
-                                    });
-                                    if counted {
-                                        mask[group] = false;
-                                        if let Some(runs) = fine.as_mut().and_then(|fine| fine.get_mut(group)) {
-                                            *runs = Some(Vec::new());
+            // NAN-4311: a counting selection tallies sequentially, but reads
+            // and decodes its token files on the blocking pool first, one
+            // chunk at a time (a day of a common token is hundreds of whole
+            // files, far over the decoded cache; a chunk bounds what is held).
+            let chunk_files = if counting.is_some() { super::select_evidence::token_probe_concurrency().max(1) } else { candidates_files.len().max(1) };
+            for chunk in candidates_files.chunks(chunk_files) {
+                let mut decoded_for_counting = None;
+                if counting.is_some() {
+                    let items = chunk.iter().map(|(part, index)| {
+                        tokens.path(&part.part_id, PartFile::Tokens(*index)).map(|local| (local.path.clone(), local.sha256.clone()))
+                    }).collect::<Vec<_>>();
+                    let cache = self.token_cache.clone();
+                    let (results, cpu) = super::select_evidence::blocking_map_with(items, super::select_evidence::token_probe_concurrency(), move |local| {
+                        local.and_then(|(path, sha256)| cache.get(&path, &sha256))
+                    }).await;
+                    select_cpu_ms += cpu;
+                    decoded_for_counting = Some(results.into_iter().map(Option::flatten));
+                }
+                let cpu = crate::query_timing::select_cpu(Some(&mut select_cpu_ms));
+                for (part, index) in chunk {
+                    let token_file = tokens.path(&part.part_id, PartFile::Tokens(*index));
+                    let groups = record_of[&part.part_id].files.data[*index].row_groups as usize;
+                    let (mask, fine) = match counting.as_mut() {
+                        // A failed blocking task keeps every group (unknown).
+                        None => fanned_out.as_mut().and_then(Iterator::next).flatten().unwrap_or((None, None)),
+                        Some((plan, tally)) => match decoded_for_counting.as_mut().and_then(Iterator::next).flatten() {
+                            None => (None, None),
+                            Some(decoded) => {
+                                let (mut mask, mut fine) = prune::token_evidence_of(&decoded, groups, hints);
+                                // NAN-4311: the file's one signed source family, if any.
+                                let source = record_of[&part.part_id].files.data[*index].log_sources.as_deref()
+                                    .and_then(|sources| match sources { [source] => Some(source.as_str()), _ => None });
+                                if let Some(mask) = mask.as_mut().filter(|mask| mask.len() == decoded.len()) {
+                                    for (group, tokens) in decoded.iter().enumerate() {
+                                        // Exact counts replace the group's scan; an
+                                        // unreadable table just leaves it scanned.
+                                        let counted = tally.count_group(&format!("{}/{index}", part.part_id), source, plan, tokens).unwrap_or_else(|error| {
+                                            tracing::warn!(part = %part.part_id, file = index, group, error = %error, "token counts unreadable; scanning the group");
+                                            false
+                                        });
+                                        if counted {
+                                            mask[group] = false;
+                                            if let Some(runs) = fine.as_mut().and_then(|fine| fine.get_mut(group)) {
+                                                *runs = Some(Vec::new());
+                                            }
                                         }
                                     }
                                 }
+                                (mask, fine)
                             }
-                            (mask, fine)
-                        }
-                    },
-                };
-                match mask {
-                    Some(mask) if !mask.iter().any(|keep| *keep) => evidence.token_pruned_files += 1,
-                    Some(mask) => {
-                        token_masks.insert((part.part_id.to_string(), *index), mask);
-                        if let Some(fine) = fine {
-                            fine_blocks.insert((part.part_id.to_string(), *index), fine);
-                        }
-                        if combine_hints {
-                            if let Some(local) = token_file {
-                                combined_token_files.insert((part.part_id.to_string(), *index), super::select_evidence::TokenFile { path: local.path.clone(), sha256: local.sha256.clone() });
+                        },
+                    };
+                    match mask {
+                        Some(mask) if !mask.iter().any(|keep| *keep) => evidence.token_pruned_files += 1,
+                        Some(mask) => {
+                            token_masks.insert((part.part_id.to_string(), *index), mask);
+                            if let Some(fine) = fine {
+                                fine_blocks.insert((part.part_id.to_string(), *index), fine);
                             }
-                        }
-                        survivors.push((part.clone(), *index));
-                    }
-                    None => {
-                        if combine_hints {
-                            if let Some(local) = token_file {
-                                combined_token_files.insert((part.part_id.to_string(), *index), super::select_evidence::TokenFile { path: local.path.clone(), sha256: local.sha256.clone() });
+                            if combine_hints {
+                                if let Some(local) = token_file {
+                                    combined_token_files.insert((part.part_id.to_string(), *index), super::select_evidence::TokenFile { path: local.path.clone(), sha256: local.sha256.clone() });
+                                }
                             }
+                            survivors.push((part.clone(), *index));
                         }
-                        survivors.push((part.clone(), *index));
+                        None => {
+                            if combine_hints {
+                                if let Some(local) = token_file {
+                                    combined_token_files.insert((part.part_id.to_string(), *index), super::select_evidence::TokenFile { path: local.path.clone(), sha256: local.sha256.clone() });
+                                }
+                            }
+                            survivors.push((part.clone(), *index));
+                        }
                     }
                 }
+                drop(cpu);
             }
-            drop(cpu);
             record_lease(&mut evidence, &tokens);
             leases.push(tokens);
+            let work = self.token_cache.stats() - token_stats;
+            let total_ms = token_started.elapsed().as_secs_f64() * 1000.0;
+            crate::query_timing::record(|p| {
+                p.select_token_lease_ms += lease_ms;
+                p.select_token_evidence_ms += total_ms - lease_ms;
+                record_token_work(p, work);
+            });
         }
         let token_ms = token_started.elapsed().as_secs_f64() * 1000.0;
         crate::query_timing::record(|p| {
@@ -1922,17 +2185,21 @@ impl PartQueryEngine {
             tokens: self.token_cache.clone(),
         };
         let cache_footer = survivors.len() <= prune::MAX_OPEN_FOOTERS;
-        let probe_of = |part: &PartRef, local: &super::fetch::LocalFile, tokens: Option<super::select_evidence::TokenFile>| super::select_evidence::Probe {
+        // NAN-4190: a file whose indexed hints the window entity index
+        // answered exactly reads no bloom for them.
+        let probe_hints = |part: &PartRef, index: usize| index_answered.contains(&(part.part_id.to_string(), index)).then(|| index_hints.clone()).flatten();
+        let probe_of = |part: &PartRef, local: &super::fetch::LocalFile, tokens: Option<super::select_evidence::TokenFile>, hints: Option<Arc<[CandidateHint]>>| super::select_evidence::Probe {
             path: local.path.clone(),
             // A sparse file's footer summary is keyed apart from the whole
             // file's: its rewritten footer carries no bloom references.
             file_key: summary_key(local),
             tokens,
             buckets: membership.and_then(|membership| membership.part(&part.part_id).flatten()).cloned(),
+            hints,
         };
         let probes = survivors.iter().map(|(part, index)| {
             let tokens = combined_token_files.get(&(part.part_id.to_string(), *index)).cloned();
-            data.path(&part.part_id, PartFile::Data(*index)).map(|local| probe_of(part, local, tokens))
+            data.path(&part.part_id, PartFile::Data(*index)).map(|local| probe_of(part, local, tokens, probe_hints(part, *index)))
         }).collect::<Vec<_>>();
         let (probed, cpu) = super::select_evidence::probe_all(&evidence_caches, probes, footer_hints.clone(), combine_hints, cache_footer).await;
         select_cpu_ms += cpu;
@@ -1950,7 +2217,7 @@ impl PartQueryEngine {
             let key = self.fetcher.file_uri(part, record, PartFile::Data(*index)).map_err(internal)?;
             let key_for_mask = (part.part_id.to_string(), *index);
             let token_mask = token_masks.remove(&key_for_mask);
-            let (mut footer, stats) = probed.next().unwrap_or_default();
+            let (mut footer, stats, mut file_summary) = probed.next().unwrap_or_default();
             probe_stats.absorb(stats);
             if footer.is_none() {
                 // Re-resolve the same signed object once, retaining the new
@@ -1960,11 +2227,12 @@ impl PartQueryEngine {
                 local = retry.path(&part.part_id, PartFile::Data(*index))
                     .ok_or_else(|| internal("retry data file was not leased"))?.clone();
                 let tokens = combined_token_files.get(&key_for_mask).cloned();
-                let (mut again, cpu) = super::select_evidence::probe_all(&evidence_caches, vec![Some(probe_of(part, &local, tokens))], footer_hints.clone(), combine_hints, cache_footer).await;
+                let (mut again, cpu) = super::select_evidence::probe_all(&evidence_caches, vec![Some(probe_of(part, &local, tokens, probe_hints(part, *index)))], footer_hints.clone(), combine_hints, cache_footer).await;
                 select_cpu_ms += cpu;
-                let (retried, stats) = again.pop().unwrap_or_default();
+                let (retried, stats, summary) = again.pop().unwrap_or_default();
                 probe_stats.absorb(stats);
                 footer = retried;
+                file_summary = summary;
                 leases.push(retry);
             }
             let (combined_mask, membership_mask, ranges, group_times) = footer
@@ -1985,7 +2253,7 @@ impl PartQueryEngine {
             }
             // Runs are group-relative; an index whose groups disagree with
             // the verified footer is ignored (row groups only).
-            let fine = fine_blocks.remove(&key_for_mask).filter(|fine| {
+            let fine = super::entity_index::and_fine(fine_blocks.remove(&key_for_mask), index_fine.remove(&key_for_mask)).filter(|fine| {
                 fine.len() == ranges.len()
                     && fine.iter().zip(&ranges).all(|(runs, (start, end))| {
                         runs.as_ref().is_none_or(|runs| runs.iter().all(|(s, e, _)| s < e && *e <= end - start))
@@ -2073,7 +2341,8 @@ impl PartQueryEngine {
             // unkept groups are skipped only through the time guard (exact
             // group stats), and a selection that is not handed to the scan
             // (no fence) reads every group: keep that charge aside.
-            let (column_compressed_bytes, whole_leaves) = self.file_metadata.summary(&local.path, &summary_key(&local))
+            let (column_compressed_bytes, whole_leaves) = file_summary.clone()
+                .or_else(|| self.file_metadata.summary(&local.path, &summary_key(&local)))
                 .map(|summary| summary.kept_and_whole_leaf_bytes(mask.as_deref().filter(|_| group_times.is_some())))
                 .unwrap_or_default();
             if let Some(whole) = whole_leaves {
@@ -2097,7 +2366,9 @@ impl PartQueryEngine {
         // pruned, or too many blocks) whole files with no fence term.
         let scan_rows = |blocks: &[CandidateBlock]| blocks.iter().map(|block| block.row_end - block.row_start).sum::<u64>();
         let coarse_terms = if pruned_any && blocks.len() <= MAX_CANDIDATE_BLOCKS { blocks.len() } else { 0 };
-        let use_fine = allow_fine_runs && use_fine_runs(fine_runs, (scan_rows(&fine_selection), fine_selection.len()), (scan_rows(&blocks), coarse_terms));
+        let use_fine = allow_fine_runs
+            && use_fine_runs(fine_runs, (scan_rows(&fine_selection), fine_selection.len()), (scan_rows(&blocks), coarse_terms))
+            && fine_fence_fits(&fine_selection, &objects);
         if fine_runs > 0 && !use_fine {
             evidence.fine_declined_runs = fine_runs;
         }
@@ -2177,159 +2448,31 @@ impl PartQueryEngine {
         })
     }
 
-    /// What can be proven about this selection's location/ASN leaves under
-    /// the current authority (see [`crate::enrichment_read::ScalarPlan`]):
-    /// - `elided` when every data file holds no denied platform stamp owning
-    ///   one of those leaves (the masks are then the identity);
-    /// - `null_leaves` when, in every file, every non-null value of a leaf is
-    ///   owned by a denied stamp (the masked leaf is NULL on every row, e.g.
-    ///   after a right was revoked).
-    ///
-    /// Results are unchanged either way. Proofs are memoized per (file,
-    /// authority) until the earliest owning stamp expires, and persisted.
-    pub async fn scalar_plan(&self, selection: &Selection, compiled: &CompiledQuery) -> QueryResult<crate::enrichment_read::ScalarPlan> {
-        use crate::enrichment_read::ScalarPlan;
-        // Only worth proving when the query reads a location/ASN leaf.
-        if !compiled.required_columns.iter().any(|column| crate::enrichment_read::scalar_masked_leaf(&column.name)) {
-            return Ok(ScalarPlan::default());
-        }
-        let Some(cache) = selection.tenant.snapshot_cache.as_ref() else { return Ok(ScalarPlan::default()) };
-        if cache.objects.is_empty() || !selection.field_types.keys().any(|path| path.starts_with("enrichments")) {
-            tracing::debug!(objects = cache.objects.len(), "owner-denial probe skipped: no objects or no enrichments");
-            return Ok(ScalarPlan::default());
-        }
-        let objects = cache.objects.values().map(|object| (object.path.clone(), object.version_id.clone())).collect::<Vec<_>>();
-        let proofs = self.owner_proofs_for(&objects, &cache.read_schema.clone().ok_or_else(|| internal("selection has no read schema"))?, &selection.field_types).await?;
-        if proofs.len() != objects.len() {
-            // Every file must be proven; anything else keeps every mask.
-            return Ok(ScalarPlan::default());
-        }
-        let elided = proofs.iter().all(|proof| proof.clean);
-        if elided {
-            return Ok(ScalarPlan { elided: true, ..ScalarPlan::default() });
-        }
-        let null_leaves = proofs.iter().fold(ALL_SCALAR_LEAVES, |mask, proof| mask & proof.null_leaves);
-        Ok(ScalarPlan { elided: false, null_leaves, split: scalar_split(&objects, &proofs) })
-    }
-
-    /// Owner-denial proofs for `objects` (`(local path, sha256)`), probing
-    /// the ones not memoized for the current authority.
-    async fn owner_proofs_for(&self, objects: &[(PathBuf, String)], read_schema: &str, field_types: &BTreeMap<String, String>) -> QueryResult<Vec<OwnerProofState>> {
-        let authority = crate::enrichment_read::current();
-        let identity = authority.cache_identity();
-        let now_us = chrono::Utc::now().timestamp_micros();
-        let mut known = BTreeMap::new();
-        let mut unknown = Vec::new();
-        {
-            let proofs = self.owner_proofs.lock().expect("owner proofs");
-            for (path, sha) in objects {
-                match proofs.get(&(sha.clone(), identity.clone())) {
-                    Some(proof) if proof.expires_us > now_us => {
-                        known.insert(sha.clone(), *proof);
-                    }
-                    _ => unknown.push((path.clone(), sha.clone())),
-                }
-            }
-        }
-        if !unknown.is_empty() {
-            let sql = format!(
-                "{} SETTINGS max_threads={}, max_execution_time={}, max_memory_usage={}, use_query_cache=0",
-                crate::enrichment_read::owner_denial_probe_sql_for_fields(&authority, field_types.keys().map(String::as_str)),
-                self.settings.threads,
-                crate::query_timing::execution_seconds(self.settings.max_execution_seconds),
-                self.settings.max_memory_bytes
-            );
-            // A batch over the memory budget is probed in halves (the probe
-            // reads every file's `enrichments`), down to one file.
-            let mut rows = Vec::new();
-            let mut pending = vec![&unknown[..]];
-            while let Some(chunk) = pending.pop() {
-                let mut paths = chunk.iter().map(|(path, _)| path.to_string_lossy().to_string()).collect::<Vec<_>>();
-                let spec = planner::local_path_spec(&mut paths).map_err(map_plan_error)?;
-                match self.execute_sql(sql.clone(), vec![("probe_source".to_string(), spec), ("probe_schema".to_string(), read_schema.to_string())]).await {
-                    Ok(chunk_rows) => rows.extend(chunk_rows),
-                    Err(PartQueryError::MemoryBudget(error)) if chunk.len() > 1 => {
-                        tracing::warn!(files = chunk.len(), error = %error, "owner-denial probe over the memory budget; splitting the batch");
-                        let (first, second) = chunk.split_at(chunk.len() / 2);
-                        pending.push(second);
-                        pending.push(first);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            let by_path = unknown.iter().map(|(path, sha)| (path.to_string_lossy().to_string(), sha.clone())).collect::<BTreeMap<_, _>>();
-            let number = |value: &Value| value.as_i64().or_else(|| value.as_str().and_then(|v| v.parse().ok()));
-            for row in rows {
-                let Some(sha) = row["path"].as_str().and_then(|path| by_path.get(path)) else { continue };
-                // A missing/unparseable count is "not proven".
-                let denied = number(&row["denied"]).unwrap_or(i64::MAX);
-                let expires_us = number(&row["expires_us"]).unwrap_or(0);
-                let null_leaves = (0..crate::enrichment_read::SCALAR_MASKED_LEAVES.len())
-                    .filter(|index| number(&row[format!("keep_{index}").as_str()]) == Some(0))
-                    .fold(0_u16, |mask, index| mask | (1 << index));
-                known.insert(sha.clone(), OwnerProofState { clean: denied == 0 && expires_us > now_us, expires_us, null_leaves });
-            }
-            // A file the probe returned no row for is empty: nothing to mask.
-            for sha in by_path.values() {
-                known.entry(sha.clone()).or_insert(OwnerProofState { clean: true, expires_us: i64::MAX, null_leaves: ALL_SCALAR_LEAVES });
-            }
-            let persisted = {
-                let mut proofs = self.owner_proofs.lock().expect("owner proofs");
-                for (_, sha) in &unknown {
-                    if let Some(proof) = known.get(sha) {
-                        proofs.insert((sha.clone(), identity.clone()), *proof);
-                    }
-                }
-                if proofs.len() > super::memo::MAX_ENTRIES {
-                    proofs.retain(|_, proof| proof.expires_us > now_us);
-                    if proofs.len() > super::memo::MAX_ENTRIES {
-                        proofs.clear();
-                    }
-                }
-                self.owner_proofs_memo.as_ref().map(|path| {
-                    (path.clone(), proofs.iter().map(|((sha, identity), proof)| (sha.clone(), identity.clone(), *proof)).collect::<Vec<OwnerProof>>())
-                })
-            };
-            if let Some((path, proofs)) = persisted {
-                super::memo::store(&path, &proofs);
-            }
-            tracing::debug!(files = by_path.len(), "owner-denial probe");
-        }
-        Ok(objects.iter().filter_map(|(_, sha)| known.get(sha).copied()).collect())
-    }
-
-    /// NAN-3403: is `sha256`'s owner proof for `identity` memoized and
-    /// unexpired at `now_us`? (A prewarm pass skips such files.)
-    fn owner_proof_fresh(&self, sha256: &str, identity: &str, now_us: i64) -> bool {
-        self.owner_proofs.lock().expect("owner proofs")
-            .get(&(sha256.to_string(), identity.to_string()))
-            .is_some_and(|proof| proof.expires_us > now_us)
-    }
-
     pub(super) async fn hot_live_parts(&self) -> Vec<PartRef> {
         self.view.lock().await.live().parts().cloned().collect()
     }
 
-    /// Prove new data files ahead of queries (on part arrival and at start),
-    /// under the authority of the calling scope, so no interactive query
-    /// pays the first-sight probe. Best effort: errors are logged.
+    /// Verify and cache new part files ahead of queries (on part arrival and
+    /// at start), so no interactive query pays the first-sight fetch. Best
+    /// effort: errors are logged.
     ///
-    /// Required cell-local proofs retain their verification fence. Optional
+    /// Required cell-local files retain their verification fence. Optional
     /// remote sidecars/data are warmed newest-first within a total byte budget.
     /// One prewarm runs at a time.
-    pub async fn prewarm_owner_proofs(&self, recent_hours: u64) -> QueryResult<usize> {
-        self.prewarm_owner_proofs_with(recent_hours, false).await
+    pub async fn prewarm_parts(&self, recent_hours: u64) -> QueryResult<usize> {
+        self.prewarm_parts_with(recent_hours, false).await
     }
 
-    /// [`Self::prewarm_owner_proofs`] as background work (NAN-3720): the
+    /// [`Self::prewarm_parts`] as background work (NAN-3720): the
     /// incremental pass after arrivals and merges, which no readiness waits
-    /// on. Its native statements start only while the engine is idle
-    /// ([`wait_idle_permit`]); when searches keep it busy the pass stops and
-    /// the files it did not reach are proved by the queries that read them
-    /// (as for any part a pass has not reached yet, NAN-2984).
-    pub async fn prewarm_owner_proofs_in_background(&self, recent_hours: u64) -> QueryResult<usize> {
+    /// on. Its optional native statements (source summaries) start only while
+    /// the engine is idle.
+    pub async fn prewarm_parts_in_background(&self, recent_hours: u64) -> QueryResult<usize> {
+        // NAN-4164: token-index layouts the before-warm pass left (its
+        // deadline) or that arrived since; idle engine only.
+        self.warm_token_indexes_in_background().await;
         self.prewarm_selection_evidence().await?;
-        self.prewarm_owner_proofs_with(recent_hours, true).await
+        self.prewarm_parts_with(recent_hours, true).await
     }
 
     pub fn selection_evidence_status(&self) -> Value {
@@ -2346,7 +2489,7 @@ impl PartQueryEngine {
         self.evidence_prewarm.lock().unwrap_or_else(|e| e.into_inner())["state"] == "yielded"
     }
 
-    /// Optional seven-day evidence work, independent of owner-proof freshness
+    /// Optional seven-day evidence work, independent of prewarm progress
     /// and file-residency ledgers. Searches always resolve their own misses.
     pub(crate) async fn prewarm_selection_evidence(&self) -> QueryResult<()> {
         // Observe readiness conservatively: the first pass after the hot gate
@@ -2461,7 +2604,7 @@ impl PartQueryEngine {
         Ok(())
     }
 
-    fn evidence_idle(&self) -> bool {
+    pub(super) fn evidence_idle(&self) -> bool {
         evidence_lanes_idle(&self.admission, self.admission_slots(), &self.point_admission, &self.job_admission)
     }
 
@@ -2471,7 +2614,7 @@ impl PartQueryEngine {
         wait_idle_permit(&self.admission, self.admission_slots(), BACKGROUND_IDLE_POLL, BACKGROUND_IDLE_WAIT).await
     }
 
-    async fn prewarm_owner_proofs_with(&self, recent_hours: u64, background: bool) -> QueryResult<usize> {
+    async fn prewarm_parts_with(&self, recent_hours: u64, background: bool) -> QueryResult<usize> {
         if self.prewarming.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(PartQueryError::Unavailable("part prewarm is already running".to_string()));
         }
@@ -2481,7 +2624,15 @@ impl PartQueryEngine {
         }
         let _reset = Reset(&self.prewarming);
         let result = async {
-            let (parts, schema, _, _) = self.snapshot(i64::MIN, i64::MAX).await?;
+            let (parts, _, _, _) = match self.snapshot(i64::MIN, i64::MAX).await {
+                // NAN-4316: a tenant born moments ago (no ingest genesis
+                // yet) has nothing to warm; its parts are fetched as they come.
+                Err(PartQueryError::NoSchemaYet) => {
+                    tracing::debug!("part log has no schema yet (new tenant); nothing to prewarm");
+                    return Ok(0);
+                }
+                other => other?,
+            };
             let newest = parts.iter().map(|part| part.max_time_us).max().unwrap_or(0);
             let from_us = newest.saturating_sub(i64::try_from(recent_hours).unwrap_or(i64::MAX).saturating_mul(3_600_000_000));
             let mut newest_first = parts.clone();
@@ -2493,7 +2644,7 @@ impl PartQueryEngine {
             // any skipped object; readiness does not promise whole-set residency.
             let records = self.fetcher.records(&parts).await.map_err(map_fetch_error)?;
             // In hot-window mode the hydrator owns background residency.
-            // Keep mandatory local owner proofs, but leave remote data and all
+            // Keep mandatory local verification, but leave remote data and all
             // sidecars to queries so prewarm cannot bypass the event window.
             let mut remaining = if self.fetcher.hot_settings.is_some() {
                 0
@@ -2508,13 +2659,7 @@ impl PartQueryEngine {
                     .collect::<std::collections::HashSet<_>>();
                 self.prewarmed.retain_live(&live);
             }
-            let field_types = crate::generation::schema_leaf_types(&schema);
-            let probe_owners = field_types.keys().any(|path| path.starts_with("enrichments"));
-            let identity = crate::enrichment_read::current().cache_identity();
-            let pass_now_us = chrono::Utc::now().timestamp_micros();
-            let needs = |sha256: &str, proved: bool| {
-                !throttle || self.prewarmed.needs(sha256, !proved || self.owner_proof_fresh(sha256, &identity, pass_now_us))
-            };
+            let needs = |sha256: &str| !throttle || self.prewarmed.needs(sha256);
             let mut skipped = 0_usize;
             let mut by_id = records.iter().zip(&parts).map(|(record, part)| (&part.part_id, record)).collect::<std::collections::BTreeMap<_, _>>();
             for part in recent_parts.iter().chain(&older_parts) {
@@ -2523,7 +2668,7 @@ impl PartQueryEngine {
                     .chain(record.files.partials.iter().map(|partial| PartFile::Partial(partial.kind)));
                 for file in sidecars {
                     let Some((_, digest, bytes)) = super::fetch::file_digest(record, file) else { continue };
-                    if !needs(digest, false) { skipped += 1; continue }
+                    if !needs(digest) { skipped += 1; continue }
                     if !take_prewarm_budget(&mut remaining, bytes) { continue }
                     match self.fetcher.ensure_files(&[(part.clone(), file)]).await {
                         Ok(_) => {
@@ -2566,7 +2711,7 @@ impl PartQueryEngine {
                     if !part.overlaps(cutoff, now) { continue; }
                 }
                 for index in 0..record.files.data.len() {
-                    if !needs(&record.files.data[index].sha256, probe_owners) { skipped += 1; continue }
+                    if !needs(&record.files.data[index].sha256) { skipped += 1; continue }
                     let local = self.fetcher.local_file_path(part, record, PartFile::Data(index)).is_some();
                     let bytes = record.files.data[index].bytes;
                     let remote = part.max_time_us >= remote_from_us && remote_bytes.saturating_add(bytes) <= remote_budget;
@@ -2577,55 +2722,15 @@ impl PartQueryEngine {
                 }
             }
             let wanted = candidates.len();
-            let batches = prewarm_batches(candidates);
-            if !probe_owners {
-                for (batch, local) in &batches {
-                    match self.fetcher.ensure_files(batch).await {
-                        Ok(leased) => if throttle { self.prewarmed.record(leased.files.iter().map(|file| file.sha256.as_str())) },
-                        Err(error) if !local => tracing::warn!(error = %format!("{error:#}"), "recent remote part data prewarm failed; queries fetch it"),
-                        Err(error) => return Err(map_fetch_error(error)),
-                    }
-                }
-                return Ok(wanted);
-            }
-            let read_schema = crate::iceberg::clickhouse_read_schema(&schema).map_err(internal)?;
-            let mut proven = 0;
-            // Newest first (what queries touch first), in bounded batches so
-            // progress is persisted as it goes.
-            for (index, (batch, is_local)) in batches.iter().enumerate() {
-                let local = match self.fetcher.ensure_files(batch).await {
-                    Ok(local) => local,
-                    // A remote copy is an optimization: never let it hold
-                    // readiness (a query fetches the file itself).
-                    Err(error) if !is_local => {
-                        tracing::warn!(error = %format!("{error:#}"), "recent remote part data prewarm failed; queries fetch it");
-                        continue;
-                    }
+            for (batch, local) in &prewarm_batches(candidates) {
+                match self.fetcher.ensure_files(batch).await {
+                    Ok(leased) => if throttle { self.prewarmed.record(leased.files.iter().map(|file| file.sha256.as_str())) },
+                    Err(error) if !local => tracing::warn!(error = %format!("{error:#}"), "recent remote part data prewarm failed; queries fetch it"),
                     Err(error) => return Err(map_fetch_error(error)),
-                };
-                let objects = local.files.iter().map(|file| (file.path.clone(), file.sha256.clone())).collect::<Vec<_>>();
-                // Prewarm takes a native-work slot like a request, so it never
-                // runs on top of a full set of admitted queries. In the
-                // background it also never queues for one (NAN-3720): it
-                // waits for an idle engine and yields the pass to searches.
-                let _slot = if background {
-                    match self.background_slot().await {
-                        Some(slot) => slot,
-                        None => {
-                            tracing::info!(proven, remaining_batches = batches.len() - index,
-                                "background part prewarm yielded to searches; the next pass resumes it");
-                            break;
-                        }
-                    }
-                } else {
-                    self.admission.clone().acquire_owned().await
-                        .map_err(|_| PartQueryError::Unavailable("query admission is closed".into()))?
-                };
-                proven += self.owner_proofs_for(&objects, &read_schema, &field_types).await?.len();
-                if throttle { self.prewarmed.record(objects.iter().map(|(_, sha256)| sha256.as_str())); }
+                }
             }
             tracing::info!(recent_parts = recent_parts.len(), all_parts = parts.len(), skipped_files = skipped, "part sidecars prewarmed");
-            Ok::<usize, PartQueryError>(proven)
+            Ok::<usize, PartQueryError>(wanted)
         }
         .await;
         match &result {
@@ -2872,7 +2977,6 @@ impl PartQueryEngine {
         if request.dataset != "logs" {
             return Err(PartQueryError::Invalid("the part engine serves dataset logs; risk goes to /v1/risk".to_string()));
         }
-        let tenant = request.tenant_id.clone();
         let work = async {
             let started = Instant::now();
             let field_types = self.field_types().await?;
@@ -2915,12 +3019,7 @@ impl PartQueryEngine {
             };
             Ok((compiled, run))
         };
-        let (compiled, mut run) = crate::enrichment_read::execute(
-            || crate::enrichment_read::resolve(&tenant),
-            work,
-        )
-        .await
-        .map_err(|_| PartQueryError::Unavailable("enrichment read authority is unavailable".to_string()))??;
+        let (compiled, mut run) = work.await?;
         let continuation = run.continuation.take();
         let mut decoded = run.rows;
         let group_total = stats_page_total(compiled.stats_page, request.offset, &mut decoded)?;
@@ -2946,6 +3045,11 @@ impl PartQueryEngine {
                 "log_refresh_ms": p.log_refresh_ms,
                 "select_cpu_ms": p.select_cpu_ms,
                 "select_sidecar_ms": p.select_sidecar_ms, "select_token_ms": p.select_token_ms,
+                "select_token_lease_ms": p.select_token_lease_ms, "select_token_evidence_ms": p.select_token_evidence_ms,
+                "density_token_ms": p.density_token_ms,
+                "token_probes": p.token_probes, "token_probe_excluded": p.token_probe_excluded, "token_probe_ms": p.token_probe_ms,
+                "token_decodes": p.token_decodes, "token_decode_bytes": p.token_decode_bytes,
+                "token_read_ms": p.token_read_ms, "token_decode_ms": p.token_decode_ms,
                 "select_bloom_ms": p.select_bloom_ms,
                 "entity_count_index_ms": p.entity_count_index_ms, "entity_count_native_ms": p.entity_count_native_ms,
                 "entity_count_index_parts": p.entity_count_index_parts, "entity_count_native_parts": p.entity_count_native_parts,
@@ -2998,7 +3102,6 @@ impl PartQueryEngine {
         &self, request: &BroadNplRequest, compiled: &CompiledQuery, field_types: &BTreeMap<String, String>,
         cursor: Option<(&str, &str)>, compile_s: f64,
     ) -> QueryResult<Run> {
-        let tenant = request.tenant_id.clone();
         let mut phases = vec![("compile", compile_s)];
         let mut clock = Instant::now();
         let mut lap = |name: &'static str, phases: &mut Vec<(&str, f64)>| {
@@ -3023,10 +3126,7 @@ impl PartQueryEngine {
         if progressive {
             let context = (super::fragment_cache::enabled() && super::result_cache::cacheable(request))
                 .then(|| planner::page_locator(compiled)).flatten()
-                .filter(|locator| locator.projected_scan_columns.iter().all(|path|
-                    !crate::enrichment_read::sensitive(path) && path != "src_endpoint" && path != "dst_endpoint"))
-                .map(|locator| super::fragment_cache::Context::new(&locator, cursor,
-                    &crate::enrichment_read::current_for_tenant(&tenant).cache_identity()));
+                .map(|locator| super::fragment_cache::Context::new(&locator, cursor));
             let mut run = super::fragment_cache::CONTEXT.scope(context,
                 self.progressive(compiled, cursor, membership.as_ref(), if compiled.stats_page { 0 } else { request.offset })).await?;
             run.planner["result_cache"] = serde_json::to_value(self.fragments.counters()).map_err(internal)?;
@@ -3035,9 +3135,7 @@ impl PartQueryEngine {
             run.planner["membership_s"] = json!(phases[1].1);
             return Ok(run);
         }
-        if cursor.is_none() && super::fragment_cache::enabled() && super::result_cache::cacheable(request)
-            && compiled.projected_scan_columns.iter().all(|path|
-                !crate::enrichment_read::sensitive(path) && path != "src_endpoint" && path != "dst_endpoint") {
+        if cursor.is_none() && super::fragment_cache::enabled() && super::result_cache::cacheable(request) {
             if let Some(run) = Box::pin(self.fragment_aggregate(compiled, from_us, to_us, membership.as_ref())).await? {
                 crate::query_timing::record(|p| p.funnel.fragment_aggregate = true);
                 return Ok(run);
@@ -3045,7 +3143,7 @@ impl PartQueryEngine {
         }
         // A single-keyword histogram is answered from v3 token counts
         // where they cover whole row groups; the rest is scanned.
-        let count_plan = if cursor.is_none() { keyword_count::plan(compiled, (from_us, to_us)) } else { None };
+        let count_plan = if cursor.is_none() && keyword_count::enabled() { keyword_count::plan(compiled, compiled_bound_us(compiled)?) } else { None };
         let mut tally = keyword_count::Tally::default();
         crate::query_timing::record(|p| p.funnel.counting = count_plan.is_some());
         let selection = match self
@@ -3067,19 +3165,11 @@ impl PartQueryEngine {
         };
         lap("select", &mut phases);
         // NAN-3155: a filtered/sorted/limited row page reads its predicate and
-        // order leaves first, then only the result rows' full width. Its
-        // masks then run on the page rows only, so the owner probe (a scan
-        // of every selected file, only ever a mask-elision) is skipped.
+        // order leaves first, then only the result rows' full width.
         let two_pass = count_plan.is_none().then(|| super::two_pass::plan(compiled)).flatten();
         crate::query_timing::record(|p| p.funnel.two_pass = two_pass.is_some());
-        let scalar = if two_pass.is_some() {
-            crate::enrichment_read::ScalarPlan::default()
-        } else {
-            self.scalar_plan(&selection, compiled).await?
-        };
-        lap("owner_probe", &mut phases);
         if let Some(two) = two_pass {
-            if let Some(two_run) = Box::pin(self.run_two_pass(&selection, &two, scalar.clone(), None, cursor)).await? {
+            if let Some(two_run) = Box::pin(self.run_two_pass(&selection, &two, None, cursor)).await? {
                 lap("execute", &mut phases);
                 return Ok(Run {
                     rows: two_run.rows,
@@ -3093,27 +3183,47 @@ impl PartQueryEngine {
                     planner: {
                         let mut planner = serde_json::to_value(&selection.evidence).map_err(internal)?;
                         planner["two_pass"] = json!({"statements": two_run.statements, "narrow_rows": two_run.narrow_rows});
-                        planner["scalar_masks_elided"] = json!(scalar.elided);
-                        planner["scalar_null_leaves"] = json!(scalar.null_leaves);
-                        planner["scalar_split_clean_files"] = json!(scalar.split.as_ref().map(|split| split.clean.len()));
                         planner["phases_s"] = json!(phases.iter().map(|(name, seconds)| json!({"phase": name, "s": seconds})).collect::<Vec<_>>());
                         planner
                     },
                 });
             }
         }
-        let plan = crate::enrichment_read::plan_with_scalar_plan(scalar.clone(), || plan_logs(&selection, compiled, cursor))?;
-        let (rows, engine_seconds, storage_rows, storage_bytes) = if count_plan.is_some() && selection.manifest.objects.is_empty() {
+        let mut plan = plan_logs(&selection, compiled, cursor)?;
+        let (mut rows, mut engine_seconds, mut storage_rows, mut storage_bytes) = if count_plan.is_some() && selection.manifest.objects.is_empty() {
             // Everything was counted: nothing is left to scan.
             (Vec::new(), 0.0, 0, 0)
         } else {
             let output = self.execute(plan.clone()).await?;
             (decode_rows(&output.data)?, output.elapsed.as_secs_f64(), output.storage_rows_read, output.storage_bytes_read)
         };
-        let rows = match &count_plan {
-            Some(count_plan) => keyword_count::merge(count_plan, rows, &tally).map_err(|error| internal(format!("{error:#}")))?,
-            None => rows,
-        };
+        let mut selection = selection;
+        if let Some(count_plan) = &count_plan {
+            match keyword_count::merge(count_plan, rows, &tally).map_err(|error| internal(format!("{error:#}")))? {
+                keyword_count::Merged::Rows(merged) => rows = merged,
+                keyword_count::Merged::Rescan => {
+                    // NAN-4311: the scan's page cut groups the merge needs
+                    // (more sources than the page): the plain statement
+                    // over the whole selection, without the counts.
+                    tracing::info!("keyword count groups overflowed the page; rescanning without the counts");
+                    crate::query_timing::record(|p| p.funnel.counting = false);
+                    selection = match self.select_with(from_us, to_us, &compiled.candidate_hints, membership.as_ref()).await {
+                        Ok(selection) => selection,
+                        // As above: over the cold ceiling, read in batches.
+                        Err(PartQueryError::ColdScanTooLarge { needed_bytes, .. }) if super::cold_batches::not_batchable(compiled).is_none() => {
+                            return Box::pin(self.run_cold_batched(compiled, (from_us, to_us), membership.as_ref(), needed_bytes)).await;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    plan = plan_logs(&selection, compiled, cursor)?;
+                    let output = self.execute(plan.clone()).await?;
+                    rows = decode_rows(&output.data)?;
+                    engine_seconds += output.elapsed.as_secs_f64();
+                    storage_rows += output.storage_rows_read;
+                    storage_bytes += output.storage_bytes_read;
+                }
+            }
+        }
         lap("execute", &mut phases);
         Ok(Run {
             rows,
@@ -3126,9 +3236,6 @@ impl PartQueryEngine {
             continuation: None,
             planner: {
                 let mut planner = serde_json::to_value(&selection.evidence).map_err(internal)?;
-                planner["scalar_masks_elided"] = json!(scalar.elided);
-                planner["scalar_null_leaves"] = json!(scalar.null_leaves);
-                planner["scalar_split_clean_files"] = json!(scalar.split.as_ref().map(|split| split.clean.len()));
                 planner["phases_s"] = json!(phases.iter().map(|(name, seconds)| json!({"phase": name, "s": seconds})).collect::<Vec<_>>());
                 planner
             },
@@ -3152,7 +3259,6 @@ impl PartQueryEngine {
             hints.push(CandidateHint::SourceFamily { value: source.clone() });
         }
         let started = Instant::now();
-        let tenant = request.tenant_id.clone();
         let work = async {
             let (parts, _, _, _) = self.snapshot(from_us, to_us).await?;
             let mut evidence = SelectionEvidence { time_parts: parts.len(), ..Default::default() };
@@ -3200,9 +3306,7 @@ impl PartQueryEngine {
             }
             Ok::<_, PartQueryError>((rows, evidence, storage_rows, storage_bytes))
         };
-        let (rows, planner, storage_rows, storage_bytes) = crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), work)
-            .await
-            .map_err(|_| PartQueryError::Unavailable("enrichment read authority is unavailable".to_string()))??;
+        let (rows, planner, storage_rows, storage_bytes) = work.await?;
         Ok(json!({
             "ok": true,
             "schema_version": 1,
@@ -3448,7 +3552,6 @@ impl PartQueryEngine {
         if request.dataset != "logs" || request.offset != 0 || request.cursor_time.is_some() || page_rows == 0 {
             return Err(PartQueryError::Invalid("a streamed read is a first page of dataset logs with a positive page size".to_string()));
         }
-        let tenant = request.tenant_id.clone();
         let work = async {
             let field_types = self.field_types().await?;
             let compiled = self.compile(request, field_types.clone()).await?;
@@ -3485,8 +3588,7 @@ impl PartQueryEngine {
             let (from_us, to_us) = compiled_window_us(&compiled)?;
             let membership = self.membership(&request.query, &field_types, from_us, to_us).await?;
             let selection = self.select_with(from_us, to_us, &compiled.candidate_hints, membership.as_ref()).await?;
-            let scalar = self.scalar_plan(&selection, &compiled).await?;
-            let mut plan = crate::enrichment_read::plan_with_scalar_plan(scalar.clone(), || plan_logs(&selection, &compiled, None))?;
+            let mut plan = plan_logs(&selection, &compiled, None)?;
             if let Some(sql) = threshold_first(&plan.sql) {
                 plan.sql = sql;
             }
@@ -3496,7 +3598,6 @@ impl PartQueryEngine {
             let defaults = serde_json::to_value(&plan.schema_defaults).map_err(internal)?;
             let mut planner = serde_json::to_value(&selection.evidence).map_err(internal)?;
             planner["kind"] = json!("streamed_pages");
-            planner["scalar_masks_elided"] = json!(scalar.elided);
             let total = request.limit;
             let mut pending: VecDeque<Value> = VecDeque::new();
             let mut matched = 0_usize;
@@ -3547,7 +3648,7 @@ impl PartQueryEngine {
                     carry = tail;
                     while pending.len() >= page_rows {
                         let page: Vec<Value> = pending.drain(..page_rows).collect();
-                        if !deliver(self, emit, emitted, &mut outcome, page, &tenant, &envelope, &planner, &budget, &defaults).await? {
+                        if !deliver(self, emit, emitted, &mut outcome, page, &envelope, &planner, &budget, &defaults).await? {
                             // Dropping the stream cancels the statement.
                             return Ok(outcome);
                         }
@@ -3571,19 +3672,16 @@ impl PartQueryEngine {
             outcome.has_more = matched > total;
             if !pending.is_empty() || !*emitted {
                 let page: Vec<Value> = pending.drain(..).collect();
-                deliver(self, emit, emitted, &mut outcome, page, &tenant, &envelope, &planner, &budget, &defaults).await?;
+                deliver(self, emit, emitted, &mut outcome, page, &envelope, &planner, &budget, &defaults).await?;
             }
             Ok::<_, PartQueryError>(outcome)
         };
-        crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), work)
-            .await
-            .map_err(|_| PartQueryError::Unavailable("enrichment read authority is unavailable".to_string()))?
+        work.await
     }
 }
 
 /// Hand one page to the caller of a streamed read: the envelope first,
-/// plain pages after. Every page re-checks the enrichment read authority
-/// (a revocation mid-read stops the read before its next row is released).
+/// plain pages after.
 #[allow(clippy::too_many_arguments)]
 async fn deliver<F, Fut, E>(
     engine: &PartQueryEngine,
@@ -3591,7 +3689,6 @@ async fn deliver<F, Fut, E>(
     emitted: &mut bool,
     outcome: &mut PagedOutcome,
     page: Vec<Value>,
-    tenant: &str,
     envelope: &E,
     planner: &Value,
     budget: &Value,
@@ -3602,9 +3699,6 @@ where
     Fut: std::future::Future<Output = bool> + Send,
     E: Fn(Vec<Value>, bool, Value, Value, Value, Value) -> Value,
 {
-    crate::enrichment_read::validate_return(tenant)
-        .await
-        .map_err(|error| PartQueryError::Unavailable(format!("{error:#}")))?;
     let rows = page.len();
     let line = if *emitted {
         PagedLine::Page(page)
@@ -3992,7 +4086,25 @@ impl PartQueryEngine {
                 Err(error) => tracing::warn!(reason = error.reason(), "token density unavailable; default progressive seeds"),
             }
         }
-        if !whole_hash_window && !skip_preselect && (token_preselect || prune::uses_entities(&compiled.candidate_hints)) {
+        // NAN-4157: when the density estimate fills the page inside a newer
+        // first chunk, the preselect can never be read whole (see
+        // `read_whole` below), so it would only cut chunks out of a lease
+        // of every surviving file in the window. Cold, that lease is the
+        // whole window's token indexes and data files (168 h hash pivot: 355
+        // files / 9.3 GB) before chunk 1 runs. Each chunk selects its own
+        // files instead.
+        let preselect_window = window_preselect(WindowPreselect {
+            whole_hash_window,
+            dense: skip_preselect,
+            density_fills_first_chunk,
+            density_over_selective: density_over_selective(),
+            token_preselect,
+            uses_entities: prune::uses_entities(&compiled.candidate_hints),
+        });
+        if !preselect_window && density_fills_first_chunk && !skip_preselect && !whole_hash_window {
+            preselect = json!({"skipped": "density_first_chunk"});
+        }
+        if preselect_window {
             let (from_us, to_us) = (start.timestamp_micros(), execution_end.timestamp_micros());
             let preselect_started = Instant::now();
             // NAN-3644: a window over the cold ceiling walks its chunks
@@ -4051,14 +4163,11 @@ impl PartQueryEngine {
         let (mut attempts, mut executed, mut splits, mut fetched_files, mut source_family_pruned_files) =
             (0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
         let (mut select_s, mut locate_s, mut plan_s, mut execute_s) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-        let mut owner_probe_s = 0.0_f64;
         let mut payload_files = 0_usize;
         let mut payload_narrowed_files = 0_usize;
         // Files in the full-width statements' source (what chDB opens).
         let mut payload_source_files = 0_usize;
         let mut payload_candidate_blocks = 0_usize;
-        // Masks of a two-pass page run on its rows only (see run_compiled).
-        let owner_probe_skipped_for_page = planner::table_view_masks_after_top_k(compiled) || two_pass.is_some();
         // After each walked chunk the older remainder is re-tiled from the
         // density seen so far (see [`progressive::reseed`]).
         let (window_start_us, walk_end_us) = (start.timestamp_micros(), execution_end.timestamp_micros());
@@ -4204,21 +4313,9 @@ impl PartQueryEngine {
             }
             let selection = at_instants.as_ref().unwrap_or(&selection);
             let fence = SourceTimeFence { start: &chunk.start, end: &chunk.end, end_inclusive: chunk.end_inclusive, exact_times: exact_times.as_deref() };
-            let phase_start = Instant::now();
-            let compiled_ref = query;
-            // The probe is only a mask-elision optimization. For producer-only
-            // top-K pages, masks already run on the bounded page; probing every
-            // file first adds a cold full scan and lane wait to first results.
-            // Default ScalarPlan keeps all authorization masks in place.
-            let scalar = if owner_probe_skipped_for_page {
-                crate::enrichment_read::ScalarPlan::default()
-            } else {
-                self.scalar_plan(&selection, compiled_ref).await?
-            };
-            owner_probe_s += phase_start.elapsed().as_secs_f64();
             if let Some(two) = chunk_two_pass {
                 let phase_start = Instant::now();
-                if let Some(two_run) = Box::pin(self.run_two_pass(&selection, two, scalar.clone(), Some(fence), chunk_cursor)).await? {
+                if let Some(two_run) = Box::pin(self.run_two_pass(&selection, two, Some(fence), chunk_cursor)).await? {
                     execute_s += phase_start.elapsed().as_secs_f64();
                     decoded_bytes = decoded_bytes.saturating_add(two_run.payload_bytes);
                     let mut rows = two_run.rows;
@@ -4268,7 +4365,7 @@ impl PartQueryEngine {
                 }
             }
             let phase_start = Instant::now();
-            let planned = crate::enrichment_read::plan_with_scalar_plan(scalar.clone(), || match chunk_cursor {
+            let planned = match chunk_cursor {
                 Some((time, event_uid)) => planner::plan_broad_log_query_with_candidates_tail_time_and_cursor(
                     &selection.tenant,
                     &selection.manifest,
@@ -4286,7 +4383,7 @@ impl PartQueryEngine {
                     None,
                     Some(fence),
                 ),
-            });
+            };
             let plan = match planned {
                 Ok(plan) => plan,
                 Err(planner::QueryPlanError::BudgetRejected { .. }) => {
@@ -4427,8 +4524,6 @@ impl PartQueryEngine {
             "select_s": select_s,
             "locate_s": locate_s,
             "plan_s": plan_s,
-            "owner_probe_s": owner_probe_s,
-            "owner_probe_skipped_for_page": owner_probe_skipped_for_page,
             "execute_s": execute_s,
             "exact_recheck": true,
         });
@@ -4453,8 +4548,7 @@ impl PartQueryEngine {
         let (parts, _, _, _) = self.snapshot(from, to).await?;
         // Preserve native empty-relation validation, schemas and metadata.
         if parts.is_empty() || parts.len() > 4096 { return Ok(None); }
-        let context = super::fragment_cache::Context::for_statement(shape.kind, compiled, None,
-            &crate::enrichment_read::current_for_tenant(&self.settings.tenant_id).cache_identity());
+        let context = super::fragment_cache::Context::for_statement(shape.kind, compiled, None);
         let mut run = Run { rows: Vec::new(), engine_seconds: 0.0, storage_rows: 0, storage_bytes: 0,
             temporary_aliases: BTreeSet::new(), schema_defaults: Vec::new(), budget: json!({}), planner: json!({}), continuation: None };
         let mut partials = Vec::new();
@@ -4462,20 +4556,48 @@ impl PartQueryEngine {
         let mut selected_bytes = 0_u64;
         let mut statements = 0;
         let mut range_fetch = super::range_fetch::FetchEvidence::default();
+        // NAN-4164: a single-keyword count or histogram answers each part's
+        // whole-window row groups from its v3 token counts (as the unpartial
+        // path does); only the rest of the part is scanned. Without this the
+        // result cache bypassed the counts and every part of a common token
+        // (`sysmon | stats count`, the search histogram) was scanned.
+        let count_plan = if keyword_count::enabled() { keyword_count::plan(compiled, compiled_bound_us(compiled)?) } else { None };
+        let (mut counted_groups, mut counted_rows, mut counted_parts) = (0_usize, 0_u64, 0_usize);
+        crate::query_timing::record(|p| p.funnel.counting = count_plan.is_some());
         for part in &parts {
             let key = context.key(&self.settings.tenant_id, part, from, to);
             let bytes = if let Some(bytes) = self.fragments.get_partial(&key) { bytes } else {
-                let selection = self.select_part(from, to, &compiled.candidate_hints, membership, None, Some(&part.part_id)).await?;
+                let mut tally = keyword_count::Tally::default();
+                let selection = self.select_part(from, to, &compiled.candidate_hints, membership, count_plan.as_ref().map(|plan| (plan, &mut tally)), Some(&part.part_id)).await?;
                 range_fetch.absorb(&selection.evidence.range);
                 selected_bytes = selected_bytes.saturating_add(selection.manifest.objects.iter().map(|object| object.event_object_bytes).sum::<u64>());
                 if selected_bytes > self.settings.max_query_bytes { return Ok(None); }
                 let plan = plan_logs(&selection, compiled, None)?;
-                let output = self.execute(plan.clone()).await?;
-                run.engine_seconds += output.elapsed.as_secs_f64();
-                run.storage_rows += output.storage_rows_read;
-                run.storage_bytes += output.storage_bytes_read;
-                statements += 1;
-                let rows = decode_rows(&output.data)?;
+                let rows = if count_plan.is_some() && selection.manifest.objects.is_empty() {
+                    // Every group was counted (or none can match): no scan.
+                    Vec::new()
+                } else {
+                    let output = self.execute(plan.clone()).await?;
+                    run.engine_seconds += output.elapsed.as_secs_f64();
+                    run.storage_rows += output.storage_rows_read;
+                    run.storage_bytes += output.storage_bytes_read;
+                    statements += 1;
+                    decode_rows(&output.data)?
+                };
+                let rows = match &count_plan {
+                    Some(count_plan) => {
+                        counted_groups += tally.groups();
+                        counted_rows += tally.rows();
+                        counted_parts += usize::from(tally.groups() > 0);
+                        match keyword_count::merge(count_plan, rows, &tally).map_err(|error| internal(format!("{error:#}")))? {
+                            keyword_count::Merged::Rows(rows) => rows,
+                            // Only the grouped plan rescans, and its shape
+                            // is never a fragment aggregate: the plain path.
+                            keyword_count::Merged::Rescan => return Ok(None),
+                        }
+                    }
+                    None => rows,
+                };
                 let partial = json!({"rows":rows,"schema_defaults":plan.schema_defaults,"budget":plan.budget});
                 let bytes = serde_json::to_vec(&partial).map_err(internal)?.into_boxed_slice();
                 self.fragments.insert_partial(key, part.part_id.clone(), bytes.clone());
@@ -4494,6 +4616,7 @@ impl PartQueryEngine {
         let counters = serde_json::to_value(self.fragments.counters()).map_err(internal)?;
         super::debug::result_cache(counters.clone());
         run.planner = json!({"kind":shape.kind,"result_cache":counters,"successful_native_statements":statements,
+            "keyword_counts":{"applies":count_plan.is_some(),"groups":counted_groups,"rows":counted_rows,"parts":counted_parts},
             "partial_bytes":decoded_bytes,"parts":parts.len(),
             "range_files":range_fetch.range_files,"resident_files":range_fetch.resident_files,
             "range_fetched_bytes":range_fetch.range_fetched_bytes,"whole_fetched_bytes":range_fetch.whole_fetched_bytes,
@@ -4524,7 +4647,11 @@ impl PartQueryEngine {
         let Some(context) = context.filter(|_| !selection._leases.is_empty()) else { return self.locate_chunk(selection, locator, fence, cursor).await };
         if locator.limit > planner::MAX_EXACT_FENCE_TIMES { return Ok(None); }
         let from = rfc3339_us(fence.start)?;
-        let to = rfc3339_us(fence.end)? - i64::from(!fence.end_inclusive);
+        // NAN-4280: a fence inclusive at the window end still admits only
+        // what the half-open compiled bound does, so the key's last instant
+        // is the compiled last µs, never the end itself (two windows ending
+        // 1µs apart would otherwise share a key over a part ending there).
+        let to = (rfc3339_us(fence.end)? - i64::from(!fence.end_inclusive)).min(compiled_window_us(locator)?.1);
         let mut merged = Located { statements: 0, times: Vec::new(), cache_hit: true, engine_seconds: 0.0, storage_rows: 0, storage_bytes: 0 };
         let mut times = BTreeSet::new();
         for part in &selection.parts {
@@ -4594,7 +4721,6 @@ impl PartQueryEngine {
             end: fence.end.to_owned(),
             end_inclusive: fence.end_inclusive,
             cursor: cursor.map(|(time, uid)| (time.to_owned(), uid.to_owned())),
-            authority: crate::enrichment_read::current_for_tenant(&self.settings.tenant_id).cache_identity(),
         };
         // NAN-3715: a probe neither reads nor writes the locator cache (its
         // timing must include the locate statement; its knobs may differ).
@@ -4709,13 +4835,12 @@ impl PartQueryEngine {
         &self,
         selection: &Selection,
         two: &super::two_pass::TwoPass,
-        scalar: crate::enrichment_read::ScalarPlan, // the narrow pass's (the payload probes its own files)
         fence: Option<SourceTimeFence<'_>>,
         cursor: Option<(&str, &str)>,
     ) -> QueryResult<Option<TwoPassRun>> {
         use super::two_pass::{self, RowId};
         let narrow = if cursor.is_some() { &two.narrow_cursor } else { &two.narrow };
-        let planned = crate::enrichment_read::plan_with_scalar_plan(scalar.clone(), || Self::plan_fenced(selection, narrow, fence, cursor));
+        let planned = Self::plan_fenced(selection, narrow, fence, cursor);
         let plan = match planned {
             Ok(plan) => plan,
             Err(planner::QueryPlanError::BudgetRejected { .. }) => return Ok(None),
@@ -4777,13 +4902,11 @@ impl PartQueryEngine {
             Some(fence) => (fence.start.to_string(), fence.end.to_string(), fence.end_inclusive),
             None => (two.payload.start.clone(), two.payload.end.clone(), true),
         };
-        // The payload reads (and owner-probes) only the files holding its
-        // rows; its masks then run on those rows only.
+        // The payload reads only the files holding its rows.
         let payload_selection = selection.only_paths(&ids.iter().map(|id| id.path.clone()).collect())?;
         if payload_selection.manifest.objects.is_empty() {
             return Ok(None);
         }
-        let scalar = self.scalar_plan(&payload_selection, &two.payload).await?;
         let selection = &payload_selection;
         let mut seen = BTreeSet::new();
         let mut rows = Vec::new();
@@ -4791,7 +4914,7 @@ impl PartQueryEngine {
             let batch_times = batch.iter().map(|(time, _)| time.to_string()).collect::<Vec<_>>();
             let batch_ids = batch.iter().flat_map(|(_, ids)| ids.iter().cloned()).collect::<Vec<_>>();
             let payload_fence = SourceTimeFence { start: &start, end: &end, end_inclusive, exact_times: Some(&batch_times) };
-            let planned = crate::enrichment_read::plan_with_scalar_plan(scalar.clone(), || Self::plan_fenced(selection, &two.payload, Some(payload_fence), cursor));
+            let planned = Self::plan_fenced(selection, &two.payload, Some(payload_fence), cursor);
             let mut plan = match planned {
                 Ok(plan) => plan,
                 Err(planner::QueryPlanError::BudgetRejected { .. }) => return Ok(None),
@@ -4948,8 +5071,20 @@ pub fn rfc3339_us(value: &str) -> QueryResult<i64> {
         .map_err(|_| PartQueryError::Invalid(format!("{value} is not an RFC3339 timestamp")))
 }
 
-/// The compiled query's inclusive event-time window.
+/// The compiled query's event-time window as INCLUSIVE µs `(first, last)`.
+///
+/// NAN-4280: the compiled bound is half-open (`time >= start AND time <
+/// end`), so the last instant it admits is `end - 1µs`. Every consumer
+/// (part selection, membership, fragment-cache keys, coverage checks) works
+/// in inclusive µs; the conversion happens here, once.
 pub fn compiled_window_us(compiled: &CompiledQuery) -> QueryResult<(i64, i64)> {
+    let (first, end) = (rfc3339_us(&compiled.start)?, rfc3339_us(&compiled.end)?);
+    Ok((first, end.saturating_sub(1)))
+}
+
+/// The compiled bound's own literals, `[start, end)` µs, for the fast-path
+/// recognizers that match them against the SQL text.
+pub fn compiled_bound_us(compiled: &CompiledQuery) -> QueryResult<(i64, i64)> {
     Ok((rfc3339_us(&compiled.start)?, rfc3339_us(&compiled.end)?))
 }
 
@@ -5032,6 +5167,38 @@ async fn run_compiler(path: &std::path::Path, request: &CompilerRequest<'_>, tim
 #[path = "compiler_spawn_bench.rs"]
 mod compiler_spawn_bench;
 
+#[cfg(test)]
+mod nan4157_window_preselect_tests {
+    use super::*;
+
+    fn pivot() -> WindowPreselect {
+        WindowPreselect { uses_entities: true, density_over_selective: true, ..Default::default() }
+    }
+
+    /// NAN-4157: a 168 h hash pivot whose density estimate fills the page
+    /// in the newest chunk never leases the whole window before chunk 1.
+    #[test]
+    fn density_filled_first_chunk_skips_the_whole_window_preselect() {
+        assert!(!window_preselect(WindowPreselect { density_fills_first_chunk: true, ..pivot() }));
+        assert!(!window_preselect(WindowPreselect { density_fills_first_chunk: true, token_preselect: true, ..pivot() }));
+    }
+
+    #[test]
+    fn other_pivots_keep_their_preselect_decision() {
+        // A sparse pivot (page not filled in chunk 1) may still be read whole.
+        assert!(window_preselect(pivot()));
+        // The NAN-3169 override off: a selective preselect may be read whole.
+        assert!(window_preselect(WindowPreselect { density_fills_first_chunk: true, density_over_selective: false, ..pivot() }));
+        // A token-selective keyword walk.
+        assert!(window_preselect(WindowPreselect { token_preselect: true, uses_entities: false, ..pivot() }));
+        // Dense values and the one-shot hash window never preselect.
+        assert!(!window_preselect(WindowPreselect { dense: true, ..pivot() }));
+        assert!(!window_preselect(WindowPreselect { whole_hash_window: true, ..pivot() }));
+        // No index hint: nothing to preselect with.
+        assert!(!window_preselect(WindowPreselect { uses_entities: false, ..pivot() }));
+    }
+}
+
 /// NAN-3720: interactive searches win over background native work. A slot
 /// model with the engine's admission semaphore and virtual time, so the
 /// latency bound is exact rather than a flaky wall-clock measurement.
@@ -5044,7 +5211,7 @@ mod nan3720_background_yield_tests {
 
     const SLOTS: usize = 2;
     const SEARCH: Duration = Duration::from_secs(1);
-    /// One owner-proof batch of an incremental prewarm (statement time).
+    /// One batch of an incremental prewarm (statement time).
     const BATCH: Duration = Duration::from_secs(5);
 
     /// A search admitted like `PartQueryEngine::admit`, doing `work`: its
@@ -5172,6 +5339,33 @@ mod nan3171_fine_run_tests {
     /// NAN-3179: the set fence costs the same per row for any block count,
     /// so fewer rows win unless the saving is under the fence's own cost
     /// against an unfenced read.
+    /// NAN-4211: exact runs spread over thousands of files are declined (the
+    /// coarse selection reads them whole); a few files keep their fine runs.
+    #[test]
+    fn fine_fence_declined_when_it_would_outgrow_the_statement() {
+        let t0 = 1_790_640_000_000_000_i64;
+        let selection = |files: u64| {
+            let key = |file: u64| format!("s3://bucket/table/data/2026/10/{file:05}-0123456789abcdef.parquet");
+            let objects = (0..files)
+                .map(|file| ManifestObject { event_object_key: key(file), event_object_version: "v".into(), event_object_bytes: 900,
+                    rows: 100_000, available_paths: vec!["time".into()].into(), field_types: BTreeMap::new(),
+                    column_compressed_bytes: BTreeMap::new() })
+                .collect::<Vec<_>>();
+            let blocks = (0..files)
+                .flat_map(|file| (0..3_u64).map(move |run| (file, run)))
+                .map(|(file, run)| CandidateBlock { event_object_key: key(file), event_object_bytes: 900,
+                    row_start: run * 4_096, row_end: run * 4_096 + 1_024, max_time_ms: None,
+                    time_range_us: Some((t0 + (file * 3 + run) as i64 * 60_000_000, t0 + (file * 3 + run) as i64 * 60_000_000 + 2_000_000)) })
+                .collect::<Vec<_>>();
+            (blocks, objects)
+        };
+        let (blocks, objects) = selection(40);
+        assert!(fine_fence_fits(&blocks, &objects));
+        let (blocks, objects) = selection(1_365);
+        assert!(blocks.len() <= MAX_CANDIDATE_BLOCKS);
+        assert!(!fine_fence_fits(&blocks, &objects));
+    }
+
     #[test]
     fn set_fence_costs_runs_by_rows_not_terms() {
         assert!(fine_beats_coarse((164 * 1_024, 164), (118 * 8_192, 61), true));
@@ -5219,6 +5413,15 @@ mod admission_class_tests {
         assert_eq!(RequestClass::of("0192-aaaa-hist", false), RequestClass::Companion);
         assert_eq!(RequestClass::of("0192-aaaa-hist-rollup", false), RequestClass::Companion);
         assert_eq!(RequestClass::of("0192-aaaa", false), RequestClass::Primary);
+        // NAN-4174: a primary over more than 24 h is wide; companions and
+        // point lookups keep their class; a bad window is not wide.
+        let (day, week) = (("2026-10-18T00:00:00Z", "2026-10-19T00:00:00Z"), ("2026-10-12T00:00:00Z", "2026-10-19T00:00:00Z"));
+        assert_eq!(RequestClass::of_window("0192-aaaa", false, day.0, day.1), RequestClass::Primary);
+        assert_eq!(RequestClass::of_window("0192-aaaa", false, week.0, week.1), RequestClass::Wide);
+        assert_eq!(RequestClass::of_window("0192-aaaa-hist", false, week.0, week.1), RequestClass::Companion);
+        assert_eq!(RequestClass::of_window("0192-aaaa", true, week.0, week.1), RequestClass::Point);
+        assert_eq!(RequestClass::of_window("0192-aaaa", false, "x", week.1), RequestClass::Primary);
+        assert_eq!((wide_permits(7), wide_permits(2), wide_permits(1)), (5, 1, 1));
         assert_eq!(companion_permits(1), 1);
         assert_eq!(companion_permits(2), 1);
         assert_eq!(companion_permits(4), 3);
@@ -5236,6 +5439,19 @@ mod admission_class_tests {
         let primary = slots.clone().try_acquire_owned();
         assert!(primary.is_ok(), "a primary is not shut out by companions");
         drop((first_gate, first_slot));
+    }
+
+    /// NAN-4174: on the 7-slot query role, five wide (7 d) searches running
+    /// leave two slots that only short-window searches can take.
+    #[tokio::test]
+    async fn wide_searches_never_take_the_slots_kept_for_short_ones() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(7));
+        let gate = Arc::new(tokio::sync::Semaphore::new(wide_permits(7)));
+        let wide = (0..5).map(|_| (gate.clone().try_acquire_owned().unwrap(), slots.clone().try_acquire_owned().unwrap())).collect::<Vec<_>>();
+        assert!(gate.clone().try_acquire_owned().is_err(), "a sixth wide search waits on the gate");
+        let short = (0..2).map(|_| slots.clone().try_acquire_owned()).collect::<Vec<_>>();
+        assert!(short.iter().all(Result::is_ok), "short searches still get a slot at once");
+        drop((wide, short));
     }
 }
 
@@ -5421,7 +5637,7 @@ mod budget_error_tests {
 
     #[test]
     fn streamed_statement_finds_its_threshold_on_time_first() {
-        let sql = "WITH stage_0 AS (SELECT * FROM (SELECT *, tupleElement(`metadata`, 'uid') AS __nano_path_1 FROM src) WHERE time BETWEEN 'a' AND 'b') \
+        let sql = "WITH stage_0 AS (SELECT * FROM (SELECT *, tupleElement(`metadata`, 'uid') AS __nano_path_1 FROM src) WHERE time >= 'a' AND time < 'b') \
                    SELECT * FROM stage_0 ORDER BY time DESC, __nano_path_1 DESC LIMIT 20001 SETTINGS max_threads=3, readonly=2";
         let rewritten = threshold_first(sql).unwrap();
         assert!(rewritten.starts_with("WITH __nano_rows AS (WITH stage_0 AS ("), "{rewritten}");
@@ -5834,7 +6050,6 @@ mod future_size_tests {
             ("progressive", ret(|| { let e: &PartQueryEngine = unreachable!(); let c: &CompiledQuery = unreachable!(); e.progressive(c, None, None, 0) })),
             ("fragment_aggregate", ret(|| { let e: &PartQueryEngine = unreachable!(); let c: &CompiledQuery = unreachable!(); e.fragment_aggregate(c, 0, 0, None) })),
             ("select_counting", ret(|| { let e: &PartQueryEngine = unreachable!(); e.select_counting(0, 0, &[], None, None) })),
-            ("scalar_plan", ret(|| { let e: &PartQueryEngine = unreachable!(); let s: &Selection = unreachable!(); let c: &CompiledQuery = unreachable!(); e.scalar_plan(s, c) })),
             ("execute", ret(|| { let e: &PartQueryEngine = unreachable!(); let p: NativeQueryPlan = unreachable!(); e.execute(p) })),
             ("fetch_log", ret(|| { let e: &PartQueryEngine = unreachable!(); let r: &FetchLogRequest = unreachable!(); e.fetch_log(r) })),
             ("refresh", ret(|| { let e: &PartQueryEngine = unreachable!(); e.refresh() })),
@@ -5854,6 +6069,10 @@ mod future_size_tests {
 #[cfg(test)]
 #[path = "lean_query_native_tests.rs"]
 pub(crate) mod lean_query_native;
+
+#[cfg(all(test, feature = "enterprise"))]
+#[path = "retro_hunt_native_tests.rs"]
+mod retro_hunt_native;
 
 #[cfg(test)]
 #[path = "class_prune_native_tests.rs"]
@@ -6409,5 +6628,36 @@ mod background_refresh_tests {
         drop(target);
         tokio::time::sleep(BACKGROUND_REFRESH_PERIOD * 2).await;
         assert!(task.is_finished(), "the refresher exits once its service is gone");
+    }
+}
+
+#[cfg(test)]
+mod no_schema_yet_tests {
+    use super::*;
+    use crate::parts::part_log::{LocalObjectStore, PartLogWriter};
+    use crate::parts::provenance::tests::TENANT;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    /// NAN-4316: a query process started at a tenant's birth opens its part
+    /// log before ingest wrote the `genesis`. The engine's schema read says
+    /// so as a typed, retryable `NoSchemaYet` (503 `no_schema`, which the
+    /// prewarm, identity backfill and token-layout loops treat as a quiet
+    /// no-op), never an `Internal` 500; once the genesis lands it reads.
+    #[tokio::test]
+    async fn an_empty_log_is_no_schema_yet_until_ingest_writes_its_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        let mut view = PartLogView::open(&store, TENANT, super::super::log_view::tests::trusted()).await.unwrap();
+        let error = read_schema(&mut view).unwrap_err();
+        assert!(matches!(error, PartQueryError::NoSchemaYet), "{error}");
+        assert_eq!((error.status(), error.reason()), (503, "no_schema"));
+
+        let schema = Schema::new(vec![
+            Field::new("time", DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())), false),
+            Field::new("message", DataType::Utf8, true),
+        ]);
+        PartLogWriter::open(&store, TENANT, 1, &schema, 1_790_330_500_000).await.unwrap();
+        view.catch_up(&store).await.unwrap();
+        assert_eq!(read_schema(&mut view).unwrap().fields().len(), 2);
     }
 }

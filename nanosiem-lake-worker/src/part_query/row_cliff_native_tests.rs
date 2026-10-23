@@ -151,18 +151,6 @@ async fn engine_with_result_limit(root: &std::path::Path, result_limit: u64) -> 
     }, store, view, fetcher, small).unwrap().with_writer(writer).with_large(large, 3 << 29).with_state_dir(&state)
 }
 
-fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference};
-    let tenant: uuid::Uuid = TENANT.parse().unwrap();
-    let now = Utc::now();
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(tenant, now, &[AuthorizedRevision {
-        tenant_id: tenant,
-        reference: RevisionReference { feed_id: "ipinfo_lite".into(), feed_revision: 2, tier: "included".into(), grant_revision: 1, entitlement_revision: 1 },
-        class: FeedClass::Baseline, digest: "0".repeat(64), mapping_revision: 1, deny_epoch: 0,
-        valid_until: now + Duration::days(30), evaluated_at: now,
-    }])
-}
-
 fn request(now: DateTime<Utc>, limit: usize, offset: usize, table_view: bool) -> BroadNplRequest {
     BroadNplRequest {
         request_id: "nan3265".into(), tenant_id: TENANT.into(), dataset: "logs".into(),
@@ -195,8 +183,7 @@ async fn deep_full_row_pages_walk_and_equal_the_materialized_page() {
     for table_view in [false, true] {
         for (limit, offset) in [(200, 0), (750, 0), (999, 0), (1_000, 0), (200, 800), (2_000, 0), (5_000, 0), (200, 4_500), (8_000, 1_000)] {
             let started = std::time::Instant::now();
-            let answer = crate::query_timing::measure("nan3265", Box::pin(crate::enrichment_read::scope(granted(),
-                engine.broad_npl(&request(now, limit, offset, table_view))))).await
+            let answer = crate::query_timing::measure("nan3265", Box::pin(engine.broad_npl(&request(now, limit, offset, table_view)))).await
                 .unwrap_or_else(|error| panic!("limit {limit} offset {offset} (table_view={table_view}): {error}"));
             let wall = started.elapsed().as_secs_f64();
             let rows = answer["result"]["rows"].as_array().unwrap_or_else(|| panic!("no rows in {answer}"));
@@ -233,7 +220,7 @@ async fn byte_cut_pages_continue_to_the_materialized_page() {
     let run = |request: BroadNplRequest| {
         let engine = &engine;
         async move {
-            crate::query_timing::measure("nan3270", Box::pin(crate::enrichment_read::scope(granted(), engine.broad_npl(&request)))).await
+            crate::query_timing::measure("nan3270", Box::pin(engine.broad_npl(&request))).await
                 .unwrap_or_else(|error| panic!("limit {} offset {}: {error}", request.limit, request.offset))
         }
     };

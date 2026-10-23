@@ -96,13 +96,41 @@ pub fn job_matches_reuse_request(job: &SearchJob, request: &SearchRequest, canon
         && job_is_this_request(job, request, canonical_query, caller)
 }
 
-/// NAN-3883: a queued or running durable job that is computing exactly this
+/// NAN-4277: where a request looks for an in-flight durable job to follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachPoint {
+    /// A new request, before any work. It follows only a job a runner has
+    /// already claimed (`Running`). A job still `Queued` behind another
+    /// tenant job has not started, so the request runs interactively first:
+    /// a retry after a deadline escalation gets its own attempt instead of
+    /// being pinned to the queue (a large hosted tenant, 2026-10-20: a 1 h
+    /// `| head 50` stayed queued 9.5 min behind a 30 d scan and every retry
+    /// followed it). If that attempt is slow too, its own escalation
+    /// attaches at [`AttachPoint::Submission`].
+    NewRequest,
+    /// The request is about to submit the same durable job (deadline
+    /// escalation, bare `*` long-window route): a queued or running twin is
+    /// followed instead of queueing a second copy.
+    Submission,
+}
+
+/// NAN-3883: an in-flight durable job that is computing exactly this
 /// caller's request. A reload, a reopened tab or a history entry of a search
 /// that escalated attaches to it instead of starting the same scan again.
 /// Nothing settles here: the job answers the identical absolute window.
-pub fn job_matches_attach_request(job: &SearchJob, request: &SearchRequest, canonical_query: &str, caller: &ReuseCaller<'_>) -> bool {
-    matches!(job.status, SearchJobStatus::Queued | SearchJobStatus::Running)
-        && job_is_this_request(job, request, canonical_query, caller)
+/// NAN-4277: a `Queued` job is followed only at [`AttachPoint::Submission`].
+pub fn job_matches_attach_request(
+    job: &SearchJob,
+    request: &SearchRequest,
+    canonical_query: &str,
+    caller: &ReuseCaller<'_>,
+    point: AttachPoint,
+) -> bool {
+    let in_flight = match point {
+        AttachPoint::NewRequest => job.status == SearchJobStatus::Running,
+        AttachPoint::Submission => matches!(job.status, SearchJobStatus::Queued | SearchJobStatus::Running),
+    };
+    in_flight && job_is_this_request(job, request, canonical_query, caller)
 }
 
 /// The same plain durable search, by the same user, under the same scope and
@@ -269,30 +297,34 @@ mod tests {
         let mut running = finished_job(&deny);
         running.status = SearchJobStatus::Running;
         running.result_ref = None;
-        assert!(job_matches_attach_request(&running, &request, "class_uid = 4001", &caller));
+        assert!(job_matches_attach_request(&running, &request, "class_uid = 4001", &caller, AttachPoint::Submission));
         let mut queued = running.clone();
         queued.status = SearchJobStatus::Queued;
-        assert!(job_matches_attach_request(&queued, &request, "class_uid = 4001", &caller));
+        assert!(job_matches_attach_request(&queued, &request, "class_uid = 4001", &caller, AttachPoint::Submission));
+        // NAN-4277: a new request follows only a claimed job; a queued one
+        // has not started, so the request gets its own interactive attempt.
+        assert!(job_matches_attach_request(&running, &request, "class_uid = 4001", &caller, AttachPoint::NewRequest));
+        assert!(!job_matches_attach_request(&queued, &request, "class_uid = 4001", &caller, AttachPoint::NewRequest));
         // A relative window that ends now attaches too: nothing is settled.
         let mut live = request.clone();
         live.time_range.end = Utc::now();
         let mut live_job = running.clone();
         live_job.request.time_range.end = live.time_range.end;
-        assert!(job_matches_attach_request(&live_job, &live, "class_uid = 4001", &caller));
+        assert!(job_matches_attach_request(&live_job, &live, "class_uid = 4001", &caller, AttachPoint::Submission));
 
         let done = finished_job(&deny);
-        assert!(!job_matches_attach_request(&done, &request, "class_uid = 4001", &caller));
+        assert!(!job_matches_attach_request(&done, &request, "class_uid = 4001", &caller, AttachPoint::Submission));
         let mut failed = running.clone();
         failed.status = SearchJobStatus::Failed;
-        assert!(!job_matches_attach_request(&failed, &request, "class_uid = 4001", &caller));
+        assert!(!job_matches_attach_request(&failed, &request, "class_uid = 4001", &caller, AttachPoint::Submission));
         let wider = BTreeSet::new();
         assert!(!job_matches_attach_request(&running, &request, "class_uid = 4001",
-            &ReuseCaller { user_id: caller.user_id, deny: &wider, authority: caller.authority }));
+            &ReuseCaller { user_id: caller.user_id, deny: &wider, authority: caller.authority }, AttachPoint::Submission));
         assert!(!job_matches_attach_request(&running, &request, "class_uid = 4001",
-            &ReuseCaller { user_id: uuid::Uuid::from_u128(9), deny: &deny, authority: Some(&current) }));
-        assert!(!job_matches_attach_request(&running, &request, "class_uid = 4002", &caller));
+            &ReuseCaller { user_id: uuid::Uuid::from_u128(9), deny: &deny, authority: Some(&current) }, AttachPoint::Submission));
+        assert!(!job_matches_attach_request(&running, &request, "class_uid = 4002", &caller, AttachPoint::Submission));
         let mut shifted = request.clone();
         shifted.time_range.start = shifted.time_range.start - Duration::seconds(1);
-        assert!(!job_matches_attach_request(&running, &shifted, "class_uid = 4001", &caller));
+        assert!(!job_matches_attach_request(&running, &shifted, "class_uid = 4001", &caller, AttachPoint::Submission));
     }
 }

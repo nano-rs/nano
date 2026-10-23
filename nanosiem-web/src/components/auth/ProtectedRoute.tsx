@@ -54,7 +54,7 @@ export function ProtectedRoute({
 
   // Redirect to login if not authenticated
   if (!isAuthenticated) {
-    return <Navigate to={loginPath} state={{ from: location.pathname }} replace />;
+    return <Navigate to={loginPath} state={{ from: location.pathname + location.search + location.hash }} replace />;
   }
 
   // Check permissions

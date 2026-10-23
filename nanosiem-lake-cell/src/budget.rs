@@ -44,6 +44,15 @@ pub const PRODUCT_REQUEST_MILLICORES: u32 = 100;
 pub const PRODUCT_LIMIT_MILLICORES: u32 = 1_000;
 pub const PRODUCT_REQUEST_MEMORY_BYTES: u64 = 512 * MIB;
 pub const PRODUCT_LIMIT_MEMORY_BYTES: u64 = 3 * GIB;
+/// landing[T] (NAN-4137, `lean_tenzir_landing_v1`): one landed file at a
+/// time, at most 256 MiB on the store and 1 GiB decoded (`landing::MAX_*`),
+/// converted row by row. Fixed, never placed; its ceilings are added to the
+/// tenant's like product[T]'s, so a large file can never squeeze ingest or
+/// query.
+pub const LANDING_REQUEST_MILLICORES: u32 = 100;
+pub const LANDING_LIMIT_MILLICORES: u32 = 1_000;
+pub const LANDING_REQUEST_MEMORY_BYTES: u64 = 256 * MIB;
+pub const LANDING_LIMIT_MEMORY_BYTES: u64 = 3 * GIB;
 pub const QUERY_PLACEMENT_REQUEST_MILLICORES: u32 = 250;
 /// The chDB thread count a query process opens with, from its role CPU
 /// limit (fixed for the life of the process; NAN-3177).

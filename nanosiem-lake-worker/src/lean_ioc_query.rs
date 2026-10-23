@@ -292,6 +292,129 @@ pub async fn source_records(
     }))
 }
 
+/// NAN-4169: a retro hunt's request for the platform IOC feeds it has not
+/// processed yet. `known` maps feed id to the revision the hunt last finished.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformRecordsRequest {
+    pub request_id: String,
+    pub tenant_id: String,
+    pub snapshot_id: String,
+    #[serde(default)]
+    pub known: std::collections::BTreeMap<String, i64>,
+    #[serde(default)]
+    pub artifact_types: Vec<String>,
+    pub max_records: usize,
+}
+
+/// Upper bound on platform rows one retro delta request may enumerate.
+pub const MAX_PLATFORM_RECORDS: usize = 500_000;
+
+/// The coarse retro artifact type of a platform IOC row (`ip`, `ip:port`,
+/// `domain`, `url`, `hash`), or `None` for a type retro does not hunt.
+pub fn platform_retro_type(ioc_type: &str) -> Option<&'static str> {
+    let t = ioc_type.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "ip" | "ipv4" | "ipv6" | "ip_address" | "ip-dst" | "ip-src" => Some("ip"),
+        "ip:port" | "ip_port" => Some("ip:port"),
+        "domain" | "hostname" | "fqdn" => Some("domain"),
+        "url" | "uri" => Some("url"),
+        _ if t.contains("hash") || matches!(t.as_str(), "md5" | "sha1" | "sha256") => Some("hash"),
+        _ => None,
+    }
+}
+
+/// NAN-4169: the granted platform IOC feeds (ThreatFox, Tor exit nodes...)
+/// whose bundle revision differs from the caller's `known` revision, with
+/// every live row of each changed feed. Unchanged feeds come back with their
+/// revision and no rows, so an idle feed costs one policy read. Only feeds
+/// this process tenant's own policy grants, through the ingest gate
+/// ([`PlatformBundle::granted_feed_rows`]); never another tenant's.
+pub fn platform_records(
+    tenant: Uuid,
+    platform: PlatformIocs<'_>,
+    request: PlatformRecordsRequest,
+) -> Result<Value> {
+    binding(
+        tenant,
+        &request.request_id,
+        &request.tenant_id,
+        &request.snapshot_id,
+    )?;
+    ensure!(
+        (1..=MAX_PLATFORM_RECORDS).contains(&request.max_records)
+            && request.known.len() <= 64
+            && request.artifact_types.len() <= 16,
+        "invalid platform record request bounds"
+    );
+    let wanted_types: BTreeSet<&'static str> = request
+        .artifact_types
+        .iter()
+        .filter_map(|t| platform_retro_type(t))
+        .collect();
+    let (bundle, policy) = match platform {
+        PlatformIocs::NotConfigured => {
+            return Ok(json!({
+                "ok": true, "schema_version": 1, "request_id": request.request_id,
+                "tenant_id": request.tenant_id, "snapshot_id": request.snapshot_id,
+                "platform_status": "not_configured", "feeds": []
+            }))
+        }
+        PlatformIocs::Unavailable => {
+            anyhow::bail!("platform IOC feeds are unavailable for this tenant now")
+        }
+        PlatformIocs::Granted { bundle, policy } => (bundle, policy),
+    };
+    ensure!(
+        policy.tenant_id == tenant,
+        "platform policy tenant differs from process tenant"
+    );
+    let now = chrono::Utc::now();
+    let revisions = bundle.granted_ioc_feed_revisions(policy, now)?;
+    let changed: BTreeSet<String> = revisions
+        .iter()
+        .filter(|(feed, revision)| request.known.get(*feed) != Some(*revision))
+        .map(|(feed, _)| feed.clone())
+        .collect();
+    let rows = bundle.granted_feed_rows(policy, &changed, now, request.max_records)?;
+    let mut by_feed: std::collections::BTreeMap<String, Vec<Value>> = std::collections::BTreeMap::new();
+    for row in rows {
+        let Some(kind) = platform_retro_type(&row.ioc_type) else { continue };
+        // `ip:port` rows are hunted under the `ip` filter too.
+        let type_matches = wanted_types.is_empty()
+            || wanted_types.contains(&kind)
+            || (kind == "ip:port" && wanted_types.contains(&"ip"));
+        let value = row.ioc_value.trim().to_ascii_lowercase();
+        if !type_matches || value.is_empty() || value.len() > 4096 {
+            continue;
+        }
+        by_feed.entry(row.source_id.clone()).or_default().push(json!({
+            "value": value, "key_type": kind,
+            "confidence": row.confidence_level.clamp(0, 100),
+            "tags": row.tags,
+        }));
+    }
+    let feeds: Vec<Value> = revisions
+        .iter()
+        .map(|(feed, revision)| {
+            let is_changed = changed.contains(feed);
+            json!({
+                "feed": feed,
+                "display_name": platform_feed_display_name(feed),
+                "revision": revision,
+                "changed": is_changed,
+                "records": if is_changed { by_feed.remove(feed).unwrap_or_default() } else { Vec::new() },
+            })
+        })
+        .collect();
+    Ok(json!({
+        "ok": true, "schema_version": 1, "request_id": request.request_id,
+        "tenant_id": request.tenant_id, "snapshot_id": request.snapshot_id,
+        "platform_status": "ok", "platform_bundle_sha256": bundle.digest(),
+        "feeds": feeds
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,5 +724,89 @@ mod tests {
             .unwrap();
         assert_eq!(records["count"], 1);
         assert_eq!(records["records"][0]["value"], "8.8.8.8");
+    }
+
+    /// NAN-4169: the retro delta enumerates only the platform feeds this
+    /// tenant's own policy grants, only when their bundle revision moved past
+    /// the caller's `known` revision, and types `ip:port` rows apart.
+    #[test]
+    fn platform_records_return_changed_granted_feeds_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let bundle_path = dir.path().join("bundle.nanpfb");
+        let mut port = platform_row("threatfox", "198.51.100.9:443");
+        port.ioc_type = "ip:port".into();
+        let digest = PlatformBundle::publish(
+            &bundle_path,
+            None,
+            &[
+                platform_row("threatfox", "198.51.100.7"),
+                port,
+                platform_row("tor_exit_nodes", "203.0.113.5"),
+            ],
+            std::collections::BTreeMap::from([
+                ("threatfox".to_string(), 3),
+                ("tor_exit_nodes".to_string(), 4),
+            ]),
+        )
+        .unwrap();
+        let bundle = PlatformBundle::open(&bundle_path, &digest).unwrap();
+        let a_policy = policy(a, &digest, &[("threatfox", 3, 60), ("tor_exit_nodes", 4, 60)]);
+        let request = |tenant: Uuid, known: &[(&str, i64)]| PlatformRecordsRequest {
+            request_id: "retro1".into(),
+            tenant_id: tenant.to_string(),
+            snapshot_id: format!("ioc-{tenant}-current"),
+            known: known.iter().map(|(f, r)| (f.to_string(), *r)).collect(),
+            artifact_types: vec![],
+            max_records: 1_000,
+        };
+        let feeds = |answer: &Value| -> Vec<(String, bool, Vec<(String, String)>)> {
+            answer["feeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| {
+                    let rows = f["records"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| (r["value"].as_str().unwrap().to_string(), r["key_type"].as_str().unwrap().to_string()))
+                        .collect();
+                    (f["feed"].as_str().unwrap().to_string(), f["changed"].as_bool().unwrap(), rows)
+                })
+                .collect()
+        };
+        // First sight: both granted feeds are changed and fully enumerated.
+        let first = platform_records(a, granted(&bundle, &a_policy), request(a, &[])).unwrap();
+        assert_eq!(
+            feeds(&first),
+            vec![
+                ("threatfox".into(), true, vec![
+                    ("198.51.100.7".into(), "ip".into()),
+                    ("198.51.100.9:443".into(), "ip:port".into()),
+                ]),
+                ("tor_exit_nodes".into(), true, vec![("203.0.113.5".into(), "ip".into())]),
+            ]
+        );
+        // Already processed revisions are reported without rows.
+        let idle = platform_records(a, granted(&bundle, &a_policy), request(a, &[("threatfox", 3), ("tor_exit_nodes", 4)])).unwrap();
+        assert!(feeds(&idle).iter().all(|(_, changed, rows)| !changed && rows.is_empty()));
+        let moved = platform_records(a, granted(&bundle, &a_policy), request(a, &[("threatfox", 2), ("tor_exit_nodes", 4)])).unwrap();
+        assert_eq!(feeds(&moved)[0].1, true);
+        assert_eq!(feeds(&moved)[0].2.len(), 2);
+        // Tenant B is granted Tor only: ThreatFox is never enumerated for it.
+        let b_policy = policy(b, &digest, &[("tor_exit_nodes", 4, 60)]);
+        let b_answer = platform_records(b, granted(&bundle, &b_policy), request(b, &[])).unwrap();
+        assert_eq!(feeds(&b_answer).iter().map(|f| f.0.clone()).collect::<Vec<_>>(), ["tor_exit_nodes"]);
+        // Another tenant's request on B's process is refused by the binding.
+        assert!(platform_records(b, granted(&bundle, &b_policy), request(a, &[])).is_err());
+        // No platform mounts (open core): nothing to hunt, not an error.
+        let open = platform_records(a, PlatformIocs::NotConfigured, request(a, &[])).unwrap();
+        assert_eq!(open["platform_status"], "not_configured");
+        // The enumeration bound refuses instead of truncating a feed.
+        let mut small = request(a, &[]);
+        small.max_records = 1;
+        assert!(platform_records(a, granted(&bundle, &a_policy), small).is_err());
     }
 }

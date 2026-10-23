@@ -75,6 +75,24 @@ pub fn hosted_config_router() -> Router {
     )
 }
 
+/// `POST /internal/soar/egress-check` (NAN-4369): the egress proxy's SOAR
+/// helper asks which exact host a tenant connection may reach. Merged
+/// OUTSIDE the auth and IP layers like `hosted_config_router`; it carries its
+/// own helper bearer, and the gateway proxies only `/api/*`.
+#[cfg(feature = "enterprise")]
+pub fn soar_egress_router(state: &AppState) -> Router {
+    let resolver = state
+        .config
+        .deployment_mode
+        .is_enterprise_shared()
+        .then(|| nanosiem_core::auth::TenantMembershipResolver::new(state.pool.clone()));
+    nanosiem_enterprise::soar::egress::router(state.soar_service.clone(), resolver)
+}
+#[cfg(not(feature = "enterprise"))]
+pub fn soar_egress_router(_state: &AppState) -> Router {
+    Router::new()
+}
+
 /// Capabilities `nanosiem-api` and `nanosiem-jobs` report to
 /// `--print-features` (NAN-3531 N2a). Only the enterprise build carries the
 /// live hosted producer reload.
@@ -141,6 +159,9 @@ pub fn create_router(state: AppState) -> Router {
     #[cfg(feature = "enterprise")]
     let auth_state=auth_state.with_shared_authorization_audit(
         state.tenant_ai_rls_runtime.as_ref().map(|runtime|runtime.tenant_authorization_audit()));
+    #[cfg(feature = "enterprise")]
+    let auth_state = auth_state.with_shared_demo(
+        state.tenant_ai_rls_runtime.as_ref().map(|runtime| runtime.demo_runtime()));
 
     // Rate-limited login route
     let login_route = Router::new()
@@ -374,6 +395,7 @@ pub fn create_router(state: AppState) -> Router {
 
     // Build the router
     let mut app = Router::new()
+        .route_if(!shared_product, "/api/internal/otlp-auth", get(handlers::ingest_tokens::authenticate_otlp))
         // Health check (public - minimal info only)
         .route("/health", get(handlers::health_check))
         .route("/ready", get(handlers::ready_check))
@@ -714,6 +736,7 @@ pub fn create_router(state: AppState) -> Router {
             .merge(eh::enterprise_shared_settings::enterprise_shared_settings_routes::<AppState>())
             .merge(eh::enterprise_shared_sources::enterprise_shared_sources_routes::<AppState>())
             .merge(eh::enterprise_shared_enrichment::enterprise_shared_enrichment_routes::<AppState>())
+            .merge(eh::soar::routes::<AppState>())
             .merge(eh::enterprise_shared_melod::enterprise_shared_melod_routes::<AppState>())
             .merge(eh::enterprise_shared_cases_extras::enterprise_shared_cases_extras_routes::<AppState>())
             .merge(eh::enterprise_shared_hunting::enterprise_shared_hunting_routes::<AppState>())
@@ -831,6 +854,31 @@ pub fn create_router(state: AppState) -> Router {
                     login_rate_limit_middleware,
                 ))
                 .layer(DefaultBodyLimit::max(8 * 1024));
+            // NAN-4152: public web path alias resolver (`/t/<alias>` ->
+            // canonical slug). Per-IP limited like SSO discovery, but on its
+            // own bucket: page loads never spend the login budget.
+            let shared_tenant_path_alias_route = Router::new()
+                .route(
+                    "/api/auth/shared/tenant-path-alias/{alias}",
+                    get(nanosiem_enterprise::handlers::shared_tenant_path_alias::resolve_shared_tenant_path_alias::<AppState>),
+                )
+                .layer(axum_middleware::from_fn_with_state(
+                    (*rate_limit_state).clone(),
+                    crate::middleware::rate_limit::tenant_path_alias_rate_limit_middleware,
+                ))
+                .layer(DefaultBodyLimit::max(1024));
+            // NAN-4152: public demo-link claim; rate-limited like the
+            // public OIDC login routes.
+            let shared_demo_claim_route = Router::new()
+                .route(
+                    nanosiem_core::enterprise_shared_demo::DEMO_CLAIM_PATH,
+                    post(handlers::shared_demo_claim::claim_shared_demo),
+                )
+                .layer(axum_middleware::from_fn_with_state(
+                    (*rate_limit_state).clone(),
+                    login_rate_limit_middleware,
+                ))
+                .layer(DefaultBodyLimit::max(8 * 1024));
             let shared_membership_acceptance_route =
                 Router::new()
                     .route(
@@ -876,8 +924,10 @@ pub fn create_router(state: AppState) -> Router {
                 ))
                 .layer(DefaultBodyLimit::max(8 * 1024));
             app = app
+                .merge(shared_demo_claim_route)
                 .merge(shared_activation_route)
                 .merge(shared_oidc_login_routes)
+                .merge(shared_tenant_path_alias_route)
                 .merge(shared_oidc_routes)
                 .merge(shared_membership_acceptance_route)
                 .merge(shared_oidc_admin_routes);
@@ -3198,6 +3248,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/system-health/events/{id}/deliveries",
             get(handlers::system_health_events::list_health_deliveries),
         )
+        .route("/api/observability/browser", post(handlers::browser_telemetry::pageview).layer(axum::extract::DefaultBodyLimit::max(1024)))
         // Observability console SLOs (NAN-1536) — PG-backed definitions,
         // attainment computed on read from otel_spans.
         .route_if(!shared_product, 

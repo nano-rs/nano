@@ -57,6 +57,8 @@ pub(crate) fn shared_documented_operation(_method: &axum::http::Method, _path: &
 /// Public endpoints that don't require authentication.
 /// All entries are matched exactly (no prefix matching).
 const PUBLIC_ENDPOINTS: &[&str] = &[
+    // Authenticates the ingestion credential itself, without a user session.
+    "/api/internal/otlp-auth",
     "/health",
     // Kubernetes readiness probe (HA8, NAN-1777). Probes are unauthenticated;
     // without this the auth middleware 401s /ready before the handler's
@@ -233,12 +235,21 @@ pub struct AuthState {
     pub shared_automation_key_service: Option<Arc<TenantAutomationKeyService>>,
     #[cfg(feature = "enterprise")]
     pub shared_authorization_audit: Option<nanosiem_core::audit::TenantAuthorizationAudit>,
+    /// NAN-4152: per-tenant demo principal reads. A `demo_analyst` principal
+    /// is refused (503) when this is absent: the guard fails closed.
+    #[cfg(feature = "enterprise")]
+    pub shared_demo: Option<nanosiem_core::enterprise_shared_demo::DemoRuntime>,
 }
 
 impl AuthState {
     #[cfg(feature = "enterprise")]
     pub fn with_shared_authorization_audit(mut self, audit: Option<nanosiem_core::audit::TenantAuthorizationAudit>) -> Self {
         self.shared_authorization_audit=audit;self
+    }
+    #[cfg(feature = "enterprise")]
+    pub fn with_shared_demo(mut self, demo: Option<nanosiem_core::enterprise_shared_demo::DemoRuntime>) -> Self {
+        self.shared_demo = demo;
+        self
     }
     /// Create a new auth state
     pub fn new(
@@ -263,6 +274,8 @@ impl AuthState {
             shared_automation_key_service: None,
             #[cfg(feature = "enterprise")]
             shared_authorization_audit: None,
+            #[cfg(feature = "enterprise")]
+            shared_demo: None,
         }
     }
 
@@ -289,6 +302,8 @@ impl AuthState {
             shared_automation_key_service: None,
             #[cfg(feature = "enterprise")]
             shared_authorization_audit: None,
+            #[cfg(feature = "enterprise")]
+            shared_demo: None,
         }
     }
 
@@ -314,6 +329,8 @@ impl AuthState {
             shared_automation_key_service: None,
             #[cfg(feature = "enterprise")]
             shared_authorization_audit: None,
+            #[cfg(feature = "enterprise")]
+            shared_demo: None,
         }
     }
 

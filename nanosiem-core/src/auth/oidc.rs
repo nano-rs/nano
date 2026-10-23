@@ -199,6 +199,31 @@ impl IdTokenClaims {
     }
 }
 
+/// Shared membership boundary for hosted and dedicated sign-in. Call only after
+/// token validation and Entra overage resolution; Google membership is supplied
+/// separately by the delegated Directory lookup, never by an ID-token claim.
+pub fn groups_from_validated_claims(
+    claims: &IdTokenClaims,
+    group_claim: Option<&str>,
+) -> Result<Vec<String>, OidcError> {
+    if claims.iss == "https://accounts.google.com" {
+        return Ok(vec![]);
+    }
+    if claims.has_group_overage() {
+        return Err(OidcError::GroupMembershipUnknown);
+    }
+    if claims.entra_tenant().is_some() {
+        return Ok(claims.groups.clone());
+    }
+    match group_claim {
+        Some("groups") => Ok(claims.groups.clone()),
+        Some("roles") => Ok(claims.roles.clone()),
+        Some(_) => Err(OidcError::InvalidConfig("Unsupported groups claim".into())),
+        None if !claims.groups.is_empty() => Ok(claims.groups.clone()),
+        None => Ok(claims.roles.clone()),
+    }
+}
+
 /// Resolve overage only through a fixed Microsoft Graph endpoint. Never use
 /// `_claim_sources`, which would disclose a bearer credential to an arbitrary URL.
 pub async fn resolve_entra_groups(
@@ -845,23 +870,7 @@ impl OidcService {
             })
             .unwrap_or_else(|| email.split('@').next().unwrap_or(&email).to_string());
 
-        // Extract groups based on provider's group claim configuration
-        let groups = if claims.entra_tenant().is_some() {
-            claims.groups.clone()
-        } else if let Some(ref group_claim) = provider.group_claim {
-            match group_claim.as_str() {
-                "groups" => claims.groups.clone(),
-                "roles" => claims.roles.clone(),
-                _ => claims.groups.clone(), // Default to groups
-            }
-        } else {
-            // Try both groups and roles
-            if !claims.groups.is_empty() {
-                claims.groups.clone()
-            } else {
-                claims.roles.clone()
-            }
-        };
+        let groups = groups_from_validated_claims(claims, provider.group_claim.as_deref())?;
 
         Ok(OidcUser {
             subject: claims.sub.clone(),
@@ -1195,5 +1204,52 @@ mod entra_group_tests {
         )
         .await
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod membership_boundary_tests {
+    use super::*;
+    #[test]
+    fn shared_claim_boundary_respects_membership_source() {
+        for (issuer, extra, claim, expected) in [
+            (
+                "https://example.okta.com",
+                serde_json::json!({}),
+                Some("groups"),
+                vec!["allowed"],
+            ),
+            (
+                "https://login.microsoftonline.com/11111111-1111-4111-8111-111111111111/v2.0",
+                serde_json::json!({"tid":"11111111-1111-4111-8111-111111111111"}),
+                Some("roles"),
+                vec!["allowed"],
+            ),
+            (
+                "https://accounts.google.com",
+                serde_json::json!({}),
+                Some("groups"),
+                vec![],
+            ),
+        ] {
+            let mut value = serde_json::json!({"iss":issuer,"sub":"subject","aud":"client","iat":1,"exp":2,"groups":["allowed"],"roles":["untrusted-role"]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let claims: IdTokenClaims = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                groups_from_validated_claims(&claims, claim).unwrap(),
+                expected
+            );
+            if issuer != "https://accounts.google.com" {
+                let mut unresolved = claims.clone();
+                unresolved.hasgroups = Some(true);
+                assert!(matches!(
+                    groups_from_validated_claims(&unresolved, claim),
+                    Err(OidcError::GroupMembershipUnknown)
+                ));
+            }
+        }
     }
 }

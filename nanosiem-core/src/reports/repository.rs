@@ -456,11 +456,6 @@ impl ReportRepository {
             .bind(&artifact.content)
             .execute(&mut *tx)
             .await?;
-            #[cfg(feature="enterprise")]
-            sqlx::query("UPDATE report_run_artifacts SET platform_read_fence=$2 WHERE id=$1")
-                .bind(artifact_id)
-                .bind(artifact.platform_read_fence.as_ref().map(|f|serde_json::to_value(f).expect("bounded result fence")))
-                .execute(&mut *tx).await?;
         }
 
         sqlx::query(
@@ -666,37 +661,12 @@ impl ReportRepository {
         })
     }
 
-    #[cfg(feature="enterprise")]
-    async fn validate_enrichment_fence(&self, fence: &crate::platform_enrichment::read::ReadFence) -> Result<(),ReportRepositoryError> {
-        // Dedicated report rows use a compatibility tenant, while the event
-        // worker can have a different server-assigned tenant. Never infer its
-        // authority from the report row or from the downloadable fence itself.
-        let tenant = std::env::var("NANO_LAKE_TENANT_ID")
-            .map(|value| value.parse().unwrap_or(Uuid::nil()))
-            .unwrap_or(COMPATIBILITY_TENANT_ID);
-        let current = crate::platform_enrichment::read::resolve_from_environment(tenant).await;
-        if fence.tenant_id != tenant || fence.authority_sha256 != current.cache_identity()
-            || fence.valid_until.is_some_and(|until| until <= chrono::Utc::now()) {
-            return Err(ReportRepositoryError::InvalidData("report enrichment authorization expired or changed".into()));
-        }
-        Ok(())
-    }
-
     /// Fetch artifact bytes only after callers have authorized against
     /// [`Self::get_artifact_scope`].
     pub async fn get_artifact_bytes(
         &self,
         artifact_id: Uuid,
     ) -> Result<ReportArtifactContent, ReportRepositoryError> {
-        #[cfg(feature="enterprise")]
-        let fence = {
-            let value: Option<serde_json::Value> = sqlx::query_scalar("SELECT NULLIF(to_jsonb(a)->'platform_read_fence','null'::jsonb) FROM report_run_artifacts a WHERE id=$1")
-                .bind(artifact_id).fetch_optional(&self.pool).await?.flatten();
-            value.map(serde_json::from_value::<crate::platform_enrichment::read::ReadFence>).transpose()
-                .map_err(|_|ReportRepositoryError::InvalidData("invalid enrichment result fence".into()))?
-        };
-        #[cfg(feature="enterprise")]
-        if let Some(fence) = &fence { self.validate_enrichment_fence(fence).await?; }
         let row = sqlx::query_as::<_, ArtifactBytesRow>(
             r#"
             SELECT filename, content_type, content
@@ -708,8 +678,6 @@ impl ReportRepository {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(ReportRepositoryError::ArtifactNotFound(artifact_id))?;
-        #[cfg(feature="enterprise")]
-        if let Some(fence) = &fence { self.validate_enrichment_fence(fence).await?; }
         Ok(ReportArtifactContent {
             filename: row.filename,
             content_type: row.content_type,

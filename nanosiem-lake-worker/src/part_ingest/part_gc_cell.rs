@@ -142,9 +142,16 @@ const INDEX_LAG_WARN: Duration = Duration::from_secs(60 * 60);
 struct Inventory {
     fence: InventoryFence,
     objects: Vec<ListedPartObject>,
-    deleted: usize,
+    /// NAN-4162: deletes made and allowed across this inventory's passes.
+    budget: crate::lake_part_gc::executor::InventoryBudget,
     checkpoint: Arc<tokio::sync::Mutex<Option<Option<CheckpointClaim>>>>,
 }
+
+/// NAN-4162: bounded passes (each at most `max_requests`) one listing feeds.
+/// Paced by the executor's authorize pacer (240/min), so a full task of
+/// 4 x 512 takes about 8.5 min, inside one pass interval and well inside the
+/// inventory lifetime.
+pub const PASSES_PER_INVENTORY: usize = 4;
 
 /// Format tag of the persisted view.
 pub const VIEW_FORMAT: &str = "nano.lake-part-gc-view.v1";
@@ -655,10 +662,18 @@ pub struct CellPartGcWiring {
     pub owner_ca_file: Option<std::path::PathBuf>,
     pub reader: Arc<dyn PartLogReader>,
     pub lister: Arc<dyn PartObjectLister>,
+    /// Persist the folded view under this dir and resume from it (producer
+    /// parts: its sibling `parts`). Unguarded constructor only; the guarded
+    /// one takes its state and view dirs as arguments.
+    pub state_dir: Option<std::path::PathBuf>,
+    /// Worker HTTP client override (tests and private-CA Workers only);
+    /// `None` uses the platform roots, HTTPS only.
+    pub worker_http: Option<reqwest::Client>,
 }
 
 struct Shared {
     tenant_uuid: String,
+    catalog: RwLock<Option<Arc<super::iceberg_export::lifecycle::TenantCatalog>>>,
     owner_tls: OwnerTlsClient,
     authorize_url: Url,
     index_url: Url,
@@ -693,6 +708,11 @@ struct Shared {
     /// NAN-3810: the ingest log writer's receipted appends; the index sync's
     /// `receipted_through` watermark.
     receipted_appends: Arc<crate::lake_part_gc::index::ReceiptedAppends>,
+    /// NAN-4188: index publications the follower started (one per receipted
+    /// append, coalesced to [`FOLLOW_MIN_GAP_MS`]).
+    follower_publications: AtomicU64,
+    /// NAN-4188: catch-up stops on control's NL009 (`lake_part_index_incomplete`).
+    index_incomplete_total: AtomicU64,
 }
 
 /// What the GC progress line reports (NAN-3459). Process-local.
@@ -749,6 +769,10 @@ struct Runner {
     /// NAN-3459: the last task ended at its lifetime while still catching
     /// up; start the next one at the next poll, not the next 10-min schedule.
     resume_now: bool,
+    /// NAN-4188: the receipted log seq the follower last published for.
+    follow_through: Option<u64>,
+    /// NAN-4188: earliest start of the next follower publication (unix ms).
+    next_follow_ms: i64,
 }
 
 /// The sanctioned pass a lean cell wires into its delete gate.
@@ -761,7 +785,7 @@ pub struct CellSanctionedPartGc {
 
 impl CellSanctionedPartGc {
     pub fn new(wiring: CellPartGcWiring) -> Result<Self> {
-        Self::new_inner(wiring, None)
+        Self::new_inner(wiring, None, None)
     }
 
     /// The only unwrapped reader is built here over the exact guarded store.
@@ -772,6 +796,7 @@ impl CellSanctionedPartGc {
         store: Arc<R2PartStore>,
         trusted: crate::parts::provenance::TenantKeySet,
         state_dir: &Path,
+        view_dir: Option<&Path>,
     ) -> Result<Self> {
         let reader = crate::lake_part_gc::StorePartLogReader::new(store.clone(), tenant_uuid, trusted)?.gc_private();
         Self::new_inner(CellPartGcWiring {
@@ -780,20 +805,37 @@ impl CellSanctionedPartGc {
             owner_ca_file,
             reader: Arc::new(reader),
             lister: Arc::new(R2PartLister(store.clone())),
-        }, Some((&store, state_dir)))
+            state_dir: None,
+            worker_http: None,
+        }, Some((&store, state_dir)), view_dir)
     }
 
-    fn new_inner(wiring: CellPartGcWiring, store: Option<(&R2PartStore, &Path)>) -> Result<Self> {
+    /// NAN-4194: `view_dir` is taken here, not by a builder, because the
+    /// guarded constructor hands the R2 store a weak reference to `Shared`;
+    /// after that `Arc::get_mut` fails (it panicked every ingest role on T57).
+    /// NAN-4195: every option of `Shared` is likewise set here, before it is
+    /// shared; `tests/shared_state_builders_static_contract.rs` refuses a
+    /// production `Arc::get_mut(..).expect(..)` builder.
+    fn new_inner(wiring: CellPartGcWiring, store: Option<(&R2PartStore, &Path)>, view_dir: Option<&Path>) -> Result<Self> {
         ensure!(uuid::Uuid::parse_str(&wiring.tenant_uuid).is_ok(), "part GC tenant must be a uuid");
         let base = Url::parse(&wiring.owner_url).context("part_signing.url")?;
         let owner_tls = OwnerTlsClient::new(&wiring.owner_url, wiring.owner_ca_file.as_deref(), OWNER_TIMEOUT)?;
-        let worker_http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(WORKER_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .https_only(true)
-            .build()
-            .context("build retention authority client")?;
+        let worker_http = match wiring.worker_http {
+            Some(client) => client,
+            None => reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(WORKER_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .https_only(true)
+                .build()
+                .context("build retention authority client")?,
+        };
+        // Guarded: the R2 state dir (view on `view_dir` when given).
+        // Unguarded: the wiring's state dir, if any.
+        let view_state: Option<(&Path, &Path)> = match store {
+            Some((_, path)) => Some((view_dir.unwrap_or(path), path)),
+            None => wiring.state_dir.as_deref().map(|path| (path, path)),
+        };
         let pacer = Arc::new(ReadPacer::new(DEFAULT_LOG_READS_PER_SECOND));
         let reader = if store.is_some() {
             wiring.reader
@@ -802,6 +844,7 @@ impl CellSanctionedPartGc {
         };
         let shared = Arc::new(Shared {
             tenant_uuid: wiring.tenant_uuid,
+            catalog: RwLock::new(None),
             owner_tls,
             authorize_url: base.join(AUTHORIZE_PATH)?,
             index_url: base.join(INDEX_PATH)?,
@@ -809,9 +852,9 @@ impl CellSanctionedPartGc {
             reader,
             pacer,
             lister: wiring.lister,
-            views: store.map(|(_, path)| ViewStore::new(path)),
-            producer_parts: store
-                .and_then(|(_, path)| path.parent().map(|parent| parent.join("parts"))),
+            views: view_state.map(|(view, _)| ViewStore::new(view)),
+            producer_parts: view_state
+                .and_then(|(_, state)| state.parent().map(|parent| parent.join("parts"))),
             route: RwLock::new(None),
             route_epoch: AtomicU64::new(0),
             enabled: AtomicBool::new(false),
@@ -825,6 +868,8 @@ impl CellSanctionedPartGc {
             view_complete: AtomicBool::new(false),
             publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             index_only_indexed: AtomicU64::new(0),
+            follower_publications: AtomicU64::new(0),
+            index_incomplete_total: AtomicU64::new(0),
             receipted_appends: Arc::default(),
         });
         if let Some((store, _)) = store {
@@ -866,11 +911,20 @@ impl CellSanctionedPartGc {
         })
     }
 
-    /// Persist the folded view under `state_dir` and resume from it.
-    pub fn with_state_dir(mut self, state_dir: &Path) -> Self {
+    /// NAN-4183: keep the folded view and the refused-key markers in `dir`
+    /// (`<dir>/lake-part-gc/`) instead of the state dir. Tests only, on the
+    /// unguarded constructor: production passes the view dir to
+    /// [`Self::new_guarded`] (NAN-4194; `get_mut` fails once the R2 guard
+    /// holds its weak reference).
+    #[cfg(test)]
+    pub(crate) fn with_view_dir(mut self, dir: &Path) -> Self {
         let shared = Arc::get_mut(&mut self.shared).expect("not shared yet");
-        shared.views = Some(ViewStore::new(state_dir));
-        shared.producer_parts = state_dir.parent().map(|parent| parent.join("parts"));
+        let every = shared.views.as_ref().map(|views| views.save_every_ms.load(Ordering::Relaxed));
+        let views = ViewStore::new(dir);
+        if let Some(every) = every {
+            views.save_every_ms.store(every, Ordering::Relaxed);
+        }
+        shared.views = Some(views);
         self
     }
 
@@ -898,13 +952,6 @@ impl CellSanctionedPartGc {
     /// The pass's own runtime (tests).
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
         self.runtime.handle()
-    }
-
-    /// Replace the Worker HTTP client (tests and private-CA Workers only;
-    /// production uses the platform roots, HTTPS only).
-    pub fn with_worker_http_client(mut self, client: reqwest::Client) -> Self {
-        Arc::get_mut(&mut self.shared).expect("not shared yet").worker_http = client;
-        self
     }
 
     /// Override the owner authorize pace (tests; default
@@ -1096,7 +1143,10 @@ async fn run_one(
         };
         let selection = crate::lake_part_gc::planner::InventorySelection::new(
             &route.tenant_slug, &shared.tenant_uuid, &state.view, &live_keys, now_ms, route.policy,
-        )?;
+        )?
+        .excluding(&state.refused_keys)
+        .retaining(route.policy.max_requests.saturating_mul(PASSES_PER_INVENTORY));
+        let budget = selection.limit();
         let mut objects =
             tokio::time::timeout(LISTING_TIMEOUT, shared.lister.list_selected_part_objects(&prefix, &selection))
                 .await
@@ -1116,7 +1166,7 @@ async fn run_one(
         *inventory = Some(Inventory {
             fence,
             objects,
-            deleted: 0,
+            budget: crate::lake_part_gc::executor::InventoryBudget { deleted: 0, budget },
             checkpoint: Arc::new(tokio::sync::Mutex::new(None)),
         });
         // Arrivals during pagination are folded before any planning. Keep the
@@ -1134,9 +1184,10 @@ async fn run_one(
             }
         }
     }
-    if inventory.as_ref().expect("inventory initialized").deleted >= route.policy.max_requests {
+    let saved = inventory.as_ref().expect("inventory initialized");
+    let Some(pass_requests) = saved.budget.next_pass(route.policy.max_requests) else {
         return Ok(PassReport::default());
-    }
+    };
     let objects = &inventory.as_ref().expect("inventory initialized").objects;
     let fence = inventory
         .as_ref()
@@ -1147,6 +1198,7 @@ async fn run_one(
         shared: shared.clone(),
         fence: fence.clone(),
         receipted: std::sync::Mutex::new(Vec::new()),
+        catalog_pass: Default::default(),
     };
     let reader = CompleteViewReader {
         shared: shared.clone(),
@@ -1173,10 +1225,7 @@ async fn run_one(
             now_ms,
             receipted: Some(&shared.receipted_appends),
             policy: GcPolicy {
-                max_requests: route
-                    .policy
-                    .max_requests
-                    .saturating_sub(inventory.as_ref().expect("inventory initialized").deleted),
+                max_requests: pass_requests,
                 ..route.policy
             },
         },
@@ -1194,12 +1243,13 @@ async fn run_one(
         .receipted
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !receipted.is_empty() {
+    {
+        // NAN-4162: deleted and refused keys leave the inventory; with budget
+        // and candidates left the task runs the next bounded pass at once.
         let saved = inventory.as_mut().expect("inventory initialized");
-        saved.deleted += receipted.len();
-        saved
-            .objects
-            .retain(|object| !receipted.iter().any(|key| key == &object.key));
+        if saved.budget.after_pass(&mut saved.objects, &receipted, &state.refused_keys, now_ms, &report) {
+            report.paused_reason = Some(INVENTORY_CONTINUES.into());
+        }
     }
     if reader.advanced.load(Ordering::SeqCst) {
         // The executor stopped before planning. Resume new arrivals through
@@ -1211,6 +1261,10 @@ async fn run_one(
 }
 
 const LOG_UNVERIFIABLE: &str = "log_unverifiable";
+/// NAN-4162: a pass shrank the inventory and it has budget and candidates
+/// left; the task runs the next bounded pass at once. Internal only: never a
+/// reported pause.
+pub(crate) const INVENTORY_CONTINUES: &str = "inventory_continues";
 /// A fold read was fenced by a successful credential exchange (the
 /// `suspend_requests` → `update` window). Expected on every refresh while a
 /// fold is in flight; retried exactly like an unverifiable log, logged quietly.
@@ -1660,6 +1714,26 @@ fn index_only_due(runner: &Runner, now_ms: i64, view_complete: bool) -> bool {
         && (runner.task.is_none() || !view_complete)
 }
 
+/// NAN-4188: control refuses every delete (NL009) from the moment an ingest
+/// flush reserves the next log entry until that entry is indexed. The index
+/// used to move only at a pass's preparation or an NL009 re-sync, so a busy tenant's
+/// gate was closed 56% of the time (index lag p50 8.9 s, p90 198 s after the
+/// receipt). The follower publishes as soon as this process's own writer has
+/// a receipted append above what it last published: beside a running pass
+/// too (they share `publish_lock`; a busy lock just skips). Coalesced to one
+/// start per [`FOLLOW_MIN_GAP_MS`], and it keeps the index-only failure
+/// back-off. Control load: about one extra status read per log entry; the
+/// push itself replaces the one the pass would have made.
+fn follow_due(runner: &Runner, now_ms: i64, receipted_through: Option<u64>) -> bool {
+    runner.armed
+        && runner.index_task.is_none()
+        && now_ms >= runner.next_follow_ms
+        && receipted_through.is_some_and(|seq| runner.follow_through.is_none_or(|through| seq > through))
+}
+
+/// NAN-4188: least time between two follower publications.
+const FOLLOW_MIN_GAP_MS: i64 = 2_000;
+
 /// Jittered `INDEX_ONLY_INTERVAL * 2^failures`, capped.
 fn index_only_delay(failures: u32) -> Duration {
     jittered(INDEX_ONLY_INTERVAL.saturating_mul(1_u32 << failures.min(16)).min(INDEX_ONLY_MAX_INTERVAL))
@@ -1726,7 +1800,7 @@ async fn run_index_only(shared: Arc<Shared>) -> Result<PassReport> {
     // restart: the state dir is on an ephemeral volume) or still folding
     // publishes within a minute instead of after a full genesis fold.
     let fence = InventoryFence::capture(&shared)?;
-    let seams = Seams { shared: shared.clone(), fence: fence.clone(), receipted: std::sync::Mutex::new(Vec::new()) };
+    let seams = Seams { shared: shared.clone(), fence: fence.clone(), receipted: std::sync::Mutex::new(Vec::new()), catalog_pass: Default::default() };
     let reader = FencedLogReader { shared: shared.clone(), fence };
     let mut report = PassReport::default();
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1866,7 +1940,7 @@ async fn run_catch_up(
             report.backoff = true;
         }
         let settle_delay = settling_retry(&mut report, &mut settling);
-        last_paused = report.paused_reason.clone();
+        last_paused = report.paused_reason.clone().filter(|reason| reason != INVENTORY_CONTINUES);
         if report.deleted > 0 {
             // NAN-3495: steady deletes under live ingest meet a 409 index
             // incomplete every few seconds; only a run of them without
@@ -1891,6 +1965,7 @@ async fn run_catch_up(
             Some("lake_part_index_incomplete") if index_incomplete < MAX_INDEX_INCOMPLETE_RETRIES => {
                 failures = 0;
                 index_incomplete += 1;
+                shared.index_incomplete_total.fetch_add(1, Ordering::Relaxed);
                 let delay = index_incomplete_retry_delay(index_incomplete);
                 tracing::debug!(
                     retry = index_incomplete,
@@ -1901,6 +1976,12 @@ async fn run_catch_up(
             }
             Some(INVENTORY_STALE) => {
                 inventory = None;
+                tokio::time::sleep(CATCH_UP_YIELD).await;
+            }
+            Some(INVENTORY_CONTINUES) => {
+                // Only after the candidate set shrank (deleted or newly
+                // refused keys left it), so this cannot spin.
+                failures = 0;
                 tokio::time::sleep(CATCH_UP_YIELD).await;
             }
             Some(reason @ (LOG_UNVERIFIABLE | CREDENTIAL_REFRESH)) if failures < MAX_CATCH_UP_RETRIES => {
@@ -2014,15 +2095,18 @@ fn report_progress(shared: &Shared, view_head: Option<u64>, report: &PassReport)
         return;
     }
     let (deleted_total, indexed_total) = (progress.deleted_total, progress.indexed_total);
-    let paused = report.paused_reason.as_deref().unwrap_or("");
+    let follower_publications = shared.follower_publications.load(Ordering::Relaxed);
+    let index_incomplete_total = shared.index_incomplete_total.load(Ordering::Relaxed);
+    let paused = report.paused_reason.as_deref().filter(|reason| *reason != INVENTORY_CONTINUES).unwrap_or("");
     let ProgressLine { index_head_seq, lag_entries, lag_seconds, behind_seconds, lagging } = line;
     if lagging {
         tracing::warn!(index_head_seq = ?index_head_seq, log_head_seq = ?view_head, lag_entries, lag_seconds = ?lag_seconds,
-            behind_seconds, deleted_total, indexed_total, paused,
+            behind_seconds, deleted_total, indexed_total, follower_publications, index_incomplete_total, paused,
             "lake-part GC index lags the part log by more than 1 h; deletes wait for it");
     } else {
         tracing::info!(index_head_seq = ?index_head_seq, log_head_seq = ?view_head, lag_entries, lag_seconds = ?lag_seconds,
-            behind_seconds, deleted_total, indexed_total, paused, "lake-part GC progress");
+            behind_seconds, deleted_total, indexed_total, follower_publications, index_incomplete_total, paused,
+            "lake-part GC progress");
     }
 }
 
@@ -2087,6 +2171,11 @@ async fn collect_index(runner: &mut Runner, now_ms: i64) {
     };
     runner.index_failures = if failed { runner.index_failures.saturating_add(1) } else { 0 };
     runner.next_index_ms = runner.next_index_ms.max(now_ms.saturating_add(index_only_delay(runner.index_failures).as_millis() as i64));
+    if failed {
+        // NAN-4188: a refused or failed publication (e.g. control's 503 on
+        // lock contention) backs the follower off with the index-only cadence.
+        runner.next_follow_ms = runner.next_follow_ms.max(runner.next_index_ms);
+    }
 }
 
 impl CellSanctionedPartGc {
@@ -2097,8 +2186,19 @@ impl CellSanctionedPartGc {
     /// 6 h) or a cold view (~25 min on the load-test tenant) froze it.
     fn spawn_index_only_if_idle(&self, runner: &mut Runner, now_ms: i64) {
         let view_complete = self.shared.view_complete.load(Ordering::SeqCst);
-        if runner.armed && index_only_due(runner, now_ms, view_complete) && self.shared.current().is_ok() {
-            runner.next_index_ms = now_ms.saturating_add(index_only_delay(runner.index_failures).as_millis() as i64);
+        let receipted_through = self.shared.receipted_appends.receipted_through(now_ms);
+        let scheduled = runner.armed && index_only_due(runner, now_ms, view_complete);
+        let follow = !scheduled && follow_due(runner, now_ms, receipted_through);
+        if (scheduled || follow) && self.shared.current().is_ok() {
+            if scheduled {
+                runner.next_index_ms = now_ms.saturating_add(index_only_delay(runner.index_failures).as_millis() as i64);
+            } else {
+                self.shared.follower_publications.fetch_add(1, Ordering::Relaxed);
+            }
+            if receipted_through.is_some() {
+                runner.follow_through = receipted_through;
+            }
+            runner.next_follow_ms = now_ms.saturating_add(FOLLOW_MIN_GAP_MS);
             runner.index_task = Some(self.runtime.handle().spawn(run_index_only(self.shared.clone())));
         }
     }
@@ -2170,6 +2270,13 @@ impl Shared {
 
 #[async_trait]
 impl SanctionedPartGc for CellSanctionedPartGc {
+    fn attach_catalog(&self, catalog: Arc<super::iceberg_export::lifecycle::TenantCatalog>) -> Result<()> {
+        catalog.validate_tenant(&self.shared.tenant_uuid)?;
+        let mut slot = self.shared.catalog.write().map_err(|_| anyhow::anyhow!("catalog GC guard poisoned"))?;
+        ensure!(slot.as_ref().is_none_or(|current| Arc::ptr_eq(current, &catalog)), "catalog GC custody cannot be replaced");
+        *slot = Some(catalog);
+        Ok(())
+    }
     /// Collect the previous pass's result and start the next one in the
     /// background. While a pass is in flight, an empty report.
     async fn run_pass(&self, now_ms: i64) -> Result<PassReport> {
@@ -2228,9 +2335,16 @@ struct Seams {
     shared: Arc<Shared>,
     fence: InventoryFence,
     receipted: std::sync::Mutex<Vec<String>>,
+    catalog_pass: crate::part_ingest::iceberg_export::lifecycle::CatalogGcPass,
 }
 
 impl Seams {
+    async fn catalog_receipt(&self, permit: &LakePartDeletePermit) -> Result<()> {
+        let catalog = self.shared.catalog.read().map_err(|_| anyhow::anyhow!("catalog GC guard poisoned"))?.clone();
+        if let Some(catalog) = catalog { catalog.guard_delete_in_pass(permit, &self.catalog_pass).await?; }
+        Ok(())
+    }
+
     async fn owner_post<T: Serialize + Sync, R: DeserializeOwned>(&self, url: &Url, body: &T, limit: usize) -> Result<R> {
         let route = self.fence.wait_current(&self.shared).await?;
         ensure!(route.owner_expires_at - BEARER_SKEW > (self.shared.now)(), "owner delete bearer expired");
@@ -2334,10 +2448,12 @@ impl LakePartDeleteAuthority for Seams {
     }
 
     async fn prepare(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeletePermit> {
+        self.catalog_receipt(permit).await?;
         self.worker_post(WORKER_PREPARE_PATH, permit).await
     }
 
     async fn retire(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeleteReceipt> {
+        self.catalog_receipt(permit).await?;
         let receipt: LakePartDeleteReceipt = self.worker_post(WORKER_RETIRE_PATH, permit).await?;
         if receipt.verify(permit).is_ok() {
             self.receipted
@@ -2507,9 +2623,10 @@ mod tests {
                 owner_ca_file: None,
                 reader,
                 lister: Arc::new(NoObjects),
+                state_dir: Some(state_dir.to_path_buf()),
+                worker_http: None,
             })
             .unwrap()
-            .with_state_dir(state_dir)
             // Every slice persists (the restart tests count re-reads).
             .with_view_save_interval(Duration::ZERO)
             .with_log_reads_per_second(0);
@@ -2828,6 +2945,42 @@ mod tests {
             assert!(restarted.reads() <= 13, "resumed with {} reads", restarted.reads());
         }
 
+        /// NAN-4183: the cell's state dir is per-pod ephemeral, so a view kept
+        /// there is gone after a roll and the log refolds from seq 0. With the
+        /// view on a dir that survives the pod (the persistent hot volume), a
+        /// pod with a FRESH state dir resumes within a couple of reads.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_rolled_pod_with_a_fresh_state_dir_resumes_the_view_from_the_hot_volume() {
+            let hot = tempfile::tempdir().unwrap();
+            let entries = VIEW_PERSIST_EVERY * 2 + 10;
+            let first_pod = tempfile::tempdir().unwrap();
+            let first = pass(chain(entries), first_pod.path(), Duration::ZERO).with_view_dir(hot.path());
+            for at in 0..10 {
+                first.run_pass_now(T0 + at).await.unwrap();
+                if first.state.lock().await.view.head_seq() == Some(entries - 1) { break; }
+            }
+            assert_eq!(first.state.lock().await.view.head_seq(), Some(entries - 1));
+            assert!(hot.path().join("lake-part-gc/view.json").exists(), "the view is on the hot volume");
+            assert!(!first_pod.path().join("lake-part-gc/view.json").exists(), "not in the ephemeral state dir");
+            drop(first);
+            drop(first_pod);
+
+            // The roll: a new pod, a fresh state dir, the same hot volume.
+            let second_pod = tempfile::tempdir().unwrap();
+            let rolled = pass(chain(entries + 5), second_pod.path(), Duration::ZERO).with_view_dir(hot.path());
+            rolled.run_pass_now(T0 + 20).await.unwrap();
+            assert_eq!(rolled.state.lock().await.view.head_seq(), Some(entries + 4));
+            assert!(rolled.reads() <= 8, "resumed with {} reads (head re-verify + 5 new + probe)", rolled.reads());
+            drop(rolled);
+
+            // Without the hot volume (today's cell) the same roll refolds from seq 0.
+            let third_pod = tempfile::tempdir().unwrap();
+            let refold = pass(chain(entries + 5), third_pod.path(), Duration::ZERO);
+            refold.run_pass_now(T0 + 30).await.unwrap();
+            assert_eq!(refold.reads(), VIEW_PERSIST_EVERY, "a fresh state dir starts at genesis");
+            assert_eq!(refold.state.lock().await.view.head_seq(), Some(VIEW_PERSIST_EVERY - 1));
+        }
+
         #[tokio::test(flavor = "current_thread")]
         async fn a_bounded_pass_persists_and_restart_continues_the_backlog() {
             let dir = tempfile::tempdir().unwrap();
@@ -3075,6 +3228,7 @@ mod tests {
                         deadline: tokio::time::Instant::now() + INVENTORY_LIFETIME,
                     },
                     receipted: std::sync::Mutex::new(Vec::new()),
+                    catalog_pass: Default::default(),
                         };
                 assert!(seams.worker_supports_lake_part_delete().await.is_err());
                 assert!(gc.run_pass_now(T0).await.is_err());
@@ -3559,6 +3713,39 @@ mod tests {
         }
     }
 
+    /// NAN-4188: the index follower's due rule and failure back-off.
+    #[tokio::test]
+    async fn follower_publishes_each_new_receipted_append_once_coalesced_and_backs_off() {
+        let armed = || Runner { armed: true, ..Runner::default() };
+        assert!(!follow_due(&Runner::default(), 1_000, Some(5)), "never before the delete gate armed the runner");
+        assert!(!follow_due(&armed(), 1_000, None), "nothing receipted (or still settling)");
+        assert!(follow_due(&armed(), 1_000, Some(5)));
+        let followed = Runner { follow_through: Some(5), ..armed() };
+        assert!(!follow_due(&followed, 1_000, Some(5)), "published for this append already");
+        assert!(follow_due(&followed, 1_000, Some(6)));
+        let coalescing = Runner { follow_through: Some(5), next_follow_ms: 3_000, ..armed() };
+        assert!(!follow_due(&coalescing, 2_999, Some(9)));
+        assert!(follow_due(&coalescing, 3_000, Some(9)));
+        let publishing = Runner { index_task: Some(tokio::spawn(async { Ok(PassReport::default()) })), ..armed() };
+        assert!(!follow_due(&publishing, 1_000, Some(9)), "one publisher at a time");
+        // A beside-the-pass task is allowed (unlike scheduled index-only).
+        let pass = Runner { task: Some(tokio::spawn(async { Ok(PassReport::default()) })), ..armed() };
+        assert!(follow_due(&pass, 1_000, Some(9)));
+        assert!(!index_only_due(&pass, 1_000, true));
+        // A refused publication (control 503 on lock contention) backs the
+        // follower off with the index-only cadence, not every 2 s.
+        let refused = tokio::spawn(async {
+            Ok(PassReport { paused_reason: Some("lake_part_index_unavailable".into()), backoff: true, ..PassReport::default() })
+        });
+        while !refused.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut runner = Runner { index_task: Some(refused), ..armed() };
+        collect_index(&mut runner, 1_000).await;
+        assert!(runner.next_follow_ms >= 61_000, "{}", runner.next_follow_ms);
+        assert!(!follow_due(&runner, 2_000, Some(9)));
+    }
+
     /// NAN-3495: an index-only task's result never resets or extends the pass
     /// back-off, and is not reported as a pass.
     #[tokio::test]
@@ -3637,4 +3824,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "part_gc_transport_tests.rs"]
-mod transport_tests;
+pub(crate) mod transport_tests;

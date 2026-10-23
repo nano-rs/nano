@@ -182,7 +182,11 @@ impl SearchService {
         dataset: Option<&str>,
         scope: &ScopeSet,
     ) -> Result<String, SearchError> {
-        // Validate time range
+        let (cleaned_query, earliest, latest) = extract_time_bounds(query)?;
+        let mut requested_time_range = time_range.clone();
+        if let Some(start) = earliest { requested_time_range.start = start; }
+        if let Some(end) = latest { requested_time_range.end = end; }
+        let time_range = &requested_time_range;
         time_range.validate()?;
         let Some(retention_time_range) =
             self.retention_bound_input_range(time_range, chrono::Utc::now())?
@@ -200,23 +204,13 @@ impl SearchService {
                 crate::query::Dataset::Logs | crate::query::Dataset::Risk
             )
         {
-            let (cleaned_query, earliest_offset, latest_offset) = extract_time_modifiers(query);
             let cleaned_query = enforce_explain_source_scope(
                 &cleaned_query,
                 query_dataset,
                 self.lake_query.mode,
                 scope,
             )?;
-            let mut adjusted_time_range = time_range.clone();
-            if let Some(offset_secs) = earliest_offset {
-                adjusted_time_range.start =
-                    chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-            }
-            if let Some(offset_secs) = latest_offset {
-                adjusted_time_range.end =
-                    chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-            }
-            adjusted_time_range.validate()?;
+            let adjusted_time_range = time_range.clone();
             let request_id = format!("lake-explain-{}", uuid::Uuid::now_v7());
             let request = SearchRequest {
                 query: cleaned_query,
@@ -247,9 +241,6 @@ impl SearchService {
         // executed path — without this, "Inspect SQL" validates against and
         // renders the logs table for a spans/metrics query (misleading FROM logs).
         let query_profile = self.dataset_profile(dataset);
-
-        // Extract time modifiers and clean the query
-        let (cleaned_query, _, _) = extract_time_modifiers(query);
 
         // NAN-1799: same injection point as `search()` — before the parse, so
         // every explain branch below (prevalence pushdown included) renders

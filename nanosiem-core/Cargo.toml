@@ -35,7 +35,7 @@ reqwest = { version = "0.13", features = ["json", "form", "gzip", "stream", "que
 # Standard OTLP/HTTP protobuf encoding for the existing synthetic runner's
 # internal Vector export. This matches the already-pinned log-blaster OTLP
 # transport; it is not a separate telemetry engine or service.
-opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "metrics", "with-serde"] }
+opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "metrics", "trace", "with-serde"] }
 prost = "0.13"
 url = "2.5"
 flate2 = "1.0"
@@ -149,6 +149,7 @@ path = "src/bin/nano_parser_bundle_build.rs"
 
 
 # Hosted-shared RLS activation helper (NAN-3861): enterprise builds only.
+
 
 
 

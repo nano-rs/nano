@@ -93,9 +93,9 @@ fn dataset_generator_retargets_table_and_time_column() {
     let q = parse_query("error").unwrap();
     let sql = g.generate(&q, &tr).unwrap();
     assert!(sql.contains("FROM otel_spans"), "{sql}");
-    assert!(sql.contains("WHERE start_time BETWEEN"), "{sql}");
+    assert!(sql.contains("WHERE start_time >= "), "{sql}");
     assert!(sql.contains("ORDER BY start_time DESC"), "{sql}");
-    assert!(!sql.contains("timestamp BETWEEN"), "{sql}");
+    assert!(!sql.contains("timestamp >= "), "{sql}");
 
     // rate() on spans uses the dataset time column too.
     let r = g
@@ -128,7 +128,7 @@ fn logs_dataset_is_byte_identical_default() {
         "Dataset::Logs must be byte-identical to the default"
     );
     assert!(base.contains("FROM logs"), "{base}");
-    assert!(base.contains("timestamp BETWEEN"), "{base}");
+    assert!(base.contains("timestamp >= "), "{base}");
 }
 
 #[test]
@@ -394,12 +394,61 @@ fn metric_rate_agg_uses_window_in_scalar() {
     assert!(!sql.contains("max(value) - min(value)"), "{sql}");
     assert!(sql.contains("AS v"), "{sql}");
     assert!(sql.contains("count() AS row_count"), "{sql}");
-    // No group_by → no GROUP BY clause (single scalar row).
-    assert!(!sql.contains("GROUP BY"), "{sql}");
+    // No group_by still partitions replicas before returning one scalar row.
+    assert!(sql.contains("GROUP BY series_key, cityHash64"), "{sql}");
     // O26/NAN-1734: temporality-gated — cumulative branch delta-decodes, the
     // DELTA/UNSPECIFIED branch raw-sums the increments; both over the window.
     assert!(sql.contains("if(max(aggregation_temporality) = 2"), "{sql}");
     assert!(sql.contains("sum(value)) / greatest(dateDiff"), "{sql}");
+}
+
+#[test]
+fn grouped_rates_difference_each_series_before_attribute_aggregation() {
+    for name in [
+        "requests_total",
+        "nanosiem_vector_component_sent_events_total",
+        "nanosiem_vector_component_discarded_events_total",
+        "nanosiem_vector_component_errors_total",
+    ] {
+        let query = MetricQuery {
+            metric_name: name,
+            service_name: None,
+            agg: MetricAgg::Rate,
+            group_by: Some("deployment.environment"),
+            filters: &[],
+            step_secs: 60,
+        };
+        let sql = metric_scalar_sql(&query, &day_range(), false);
+        assert!(
+            sql.starts_with("SELECT series_key, sum(v) AS v, sum(row_count) AS row_count"),
+            "{sql}"
+        );
+        assert!(sql.contains("FROM (SELECT"), "{sql}");
+        assert!(
+            sql.contains("GROUP BY series_key, cityHash64(metric_name, service_name"),
+            "{sql}"
+        );
+        assert!(sql.contains("arrayDifference"), "{sql}");
+        assert!(sql.contains(&format!("metric_name = '{name}'")), "{sql}");
+        assert!(sql.contains("mapSort(attributes), mapSort(resource_attributes)"));
+        let timeseries = metric_timeseries_v2_sql(&query, &day_range(), false);
+        assert!(timeseries.contains("SELECT series_key, bucket, sum(v) AS v"));
+        assert!(timeseries
+            .contains("GROUP BY series_key, bucket, cityHash64(metric_name, service_name"));
+    }
+    // Why grouping before differencing matters: two idle replicas at different absolute totals generate false
+    // positive deltas if their samples are interleaved. Each replica alone has zero change.
+    let positive_deltas = |values: &[f64]| {
+        values
+            .windows(2)
+            .map(|p| (p[1] - p[0]).max(0.0))
+            .sum::<f64>()
+    };
+    assert_eq!(positive_deltas(&[10.0, 100.0, 10.0, 100.0]), 180.0);
+    assert_eq!(
+        positive_deltas(&[10.0, 10.0]) + positive_deltas(&[100.0, 100.0]),
+        0.0
+    );
 }
 
 #[test]
@@ -653,13 +702,13 @@ fn infra_hosts_latest_per_host_metric() {
     );
     assert!(
         sql.contains(
-            "argMaxIf(value, timestamp, metric_name = 'system.memory.utilization') AS mem_util"
+            "1 - argMaxIf(value, timestamp, metric_name = 'node_memory_MemAvailable_bytes') / nullIf(argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes'), 0)"
         ),
         "{sql}"
     );
     assert!(
         sql.contains(
-            "argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m') AS load_1m"
+            "argMaxIf(value, timestamp, metric_name = 'node_load1')) AS load_1m"
         ),
         "{sql}"
     );
@@ -848,10 +897,7 @@ fn infra_hosts_q_group_env_pushdown() {
         sql.contains("AND lower(resource_attributes['host.name']) LIKE '%web-01%'"),
         "{sql}"
     );
-    assert!(
-        sql.contains("AND resource_attributes['host.group'] = 'frontend'"),
-        "{sql}"
-    );
+    assert!(sql.contains("HAVING host_group = 'frontend'"), "{sql}");
     assert!(
         sql.contains("AND resource_attributes['deployment.environment'] = 'prod'''"),
         "{sql}"
@@ -1121,10 +1167,10 @@ fn cross_dataset_in_spans_to_logs() {
     let sql = g.generate(&q, &xds_range()).unwrap();
     // Outer reads spans on start_time.
     assert!(sql.contains("FROM otel_spans"), "{sql}");
-    assert!(sql.contains("WHERE start_time BETWEEN"), "{sql}");
+    assert!(sql.contains("WHERE start_time >= "), "{sql}");
     // The IN subquery hits the LOGS table on the LOGS time column.
     assert!(sql.contains("IN (SELECT DISTINCT"), "{sql}");
-    assert!(sql.contains("FROM logs WHERE timestamp BETWEEN"), "{sql}");
+    assert!(sql.contains("FROM logs WHERE timestamp >= "), "{sql}");
 }
 
 /// NAN-1567: a logs subsearch from a SPANS outer must resolve its WHERE
@@ -1167,7 +1213,7 @@ fn cross_dataset_in_logs_to_spans() {
     assert!(sql.contains("FROM logs"), "{sql}");
     // Subquery hits otel_spans on start_time.
     assert!(
-        sql.contains("FROM otel_spans WHERE start_time BETWEEN"),
+        sql.contains("FROM otel_spans WHERE start_time >= "),
         "{sql}"
     );
 }
@@ -1183,8 +1229,8 @@ fn cross_dataset_join_logs_to_spans_partial_merge() {
     let sql = g.generate(&q, &xds_range()).unwrap();
     // The join subsearch reads otel_spans on start_time.
     assert!(
-        sql.contains("FROM otel_spans\n    WHERE start_time BETWEEN")
-            || sql.contains("FROM otel_spans WHERE start_time BETWEEN"),
+        sql.contains("FROM otel_spans\n    WHERE start_time >= ")
+            || sql.contains("FROM otel_spans WHERE start_time >= "),
         "subsearch must hit otel_spans/start_time:\n{sql}"
     );
     // Non-logs subsearch → partial_merge.
@@ -1328,5 +1374,51 @@ fn cross_dataset_in_both_numeric_keeps_bare_form() {
     if let Ok(q) = q {
         let sql = g.generate(&q, &xds_range()).unwrap();
         assert!(!sql.contains("lower(value)"), "{sql}");
+    }
+}
+
+#[test]
+fn instance_grouping_falls_back_to_otel_node_identity() {
+    let expression = tag_lookup_expr("instance");
+    assert!(expression.contains("attributes['instance']"));
+    assert!(expression.contains("resource_attributes['host.name']"));
+    assert!(expression.contains("resource_attributes['k8s.node.name']"));
+    assert!(!tag_lookup_expr("mountpoint").contains("host.name"));
+}
+
+#[test]
+fn infra_inventory_joins_metadata_after_aggregation_and_bounds_counter_rates() {
+    let sql = infra_hosts_sql(
+        &day_range(),
+        &InfraHostsFilters {
+            group: Some("cluster/region/pool"),
+            ..Default::default()
+        },
+        false,
+    );
+    assert!(sql.contains("AS cpu_cores"));
+    assert!(sql.contains("AS cpu_count"));
+    assert!(sql.contains("AS restarts"));
+    assert!(sql.contains("AS instance_type"));
+    assert!(sql.contains("AS health_n"));
+    assert!(sql.contains("system.network.io.total"));
+    assert!(sql.contains("nullIf(dateDiff('millisecond'"));
+    assert!(sql.find("HAVING host_group").unwrap() > sql.find("GROUP BY host").unwrap());
+    assert!(!sql.contains("AND resource_attributes['host.group']"));
+
+}
+
+#[test]
+fn infra_hosts_node_fallback_is_bounded_and_preserves_otel_precedence() {
+    for clustered in [false, true] {
+        let sql = infra_hosts_sql(&day_range(), &InfraHostsFilters::default(), clustered);
+        assert!(sql.contains("if(countIf(metric_name = 'system.memory.utilization') > 0"));
+        assert!(sql.contains("if(countIf(metric_name = 'system.cpu.load_average.1m') > 0"));
+        assert!(sql.contains("nullIf(argMaxIf(value, timestamp, metric_name = 'node_memory_MemTotal_bytes'), 0)"));
+        assert!(sql.contains("GROUP BY resource_attributes, timestamp"));
+        assert!(sql.contains("^(lo|veth|cali|cni|docker|flannel)"));
+        let union = sql.find("UNION ALL").unwrap();
+        assert!(sql[..union].contains("WHERE timestamp BETWEEN '2024-01-01"));
+        assert!(sql.contains("'nano.node.network.io.total'"));
     }
 }

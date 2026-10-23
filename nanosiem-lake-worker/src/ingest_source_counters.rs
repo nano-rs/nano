@@ -358,7 +358,7 @@ pub const CREDENTIAL_ID_FIELD: &str = crate::iceberg::METADATA_CREDENTIAL_ID;
 
 /// `metadata.nano_credential_id` as a canonical lowercase UUID, or `None`.
 /// Anything else is unattributed, never a new counter bucket per value.
-fn credential_id(event: &Value) -> Option<String> {
+pub(crate) fn credential_id(event: &Value) -> Option<String> {
     let text = event
         .get("metadata")
         .and_then(|m| m.get(CREDENTIAL_ID_FIELD))

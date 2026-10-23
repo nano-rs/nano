@@ -310,7 +310,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
       return;
     }
     if (canSearch) {
-      navigate(`/search?q=${encodeURIComponent(text)}`);
+      navigate(`/search#q=${encodeURIComponent(text)}`);
     }
   };
 

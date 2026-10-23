@@ -498,7 +498,7 @@
           "use_case": "Full single-host cross-source chronological sweep (auth->process->network)",
           "tier": "ir",
           "mitre": "T1071 Application Layer Protocol",
-          "query": "* | eval corpus_process_name=coalesce(nullif(process.name,\"\"),actor.process.name), corpus_command_line=coalesce(nullif(process.cmd_line,\"\"),actor.process.cmd_line), corpus_user=coalesce(nullif(user.name,\"\"),actor.user.name) | where device.hostname=\"ws-exec-087.corp.local\" (class_uid=1007 activity_id=1) OR (class_uid=4001 activity_id=1) OR metadata.event_code=\"4624\" OR metadata.event_code=\"4625\" OR metadata.event_code=\"4672\" | table time,metadata.log_source,metadata.event_code,corpus_user,corpus_process_name,corpus_command_line,dst_endpoint.ip | sort time | head 60",
+          "query": "* | eval corpus_process_name=coalesce(nullif(process.name,\"\"),actor.process.name), corpus_command_line=coalesce(nullif(process.cmd_line,\"\"),actor.process.cmd_line), corpus_user=coalesce(nullif(user.name,\"\"),actor.user.name) | where device.hostname=\"ws-exec-087.corp.local\" ((class_uid=1007 activity_id=1) OR (class_uid=4001 activity_id=1) OR metadata.event_code=\"4624\" OR metadata.event_code=\"4625\" OR metadata.event_code=\"4672\") | table time,metadata.log_source,metadata.event_code,corpus_user,corpus_process_name,corpus_command_line,dst_endpoint.ip | sort time | head 60",
           "window": "24h",
           "exec_ms": 115,
           "rows": 60,
@@ -1023,6 +1023,124 @@
           "catches": "Hosts with heavy multi-tool recon volume over 24h - scopes which machines an intruder enumerated from.",
           "exec_ms": 178,
           "rows": 0
+        }
+      ]
+    },
+    {
+      "domain": "Bare keyword search (NAN-4164)",
+      "key": "keyword",
+      "queries": [
+        {
+          "use_case": "Keyword: rare file hash",
+          "tier": "ir",
+          "query_class": "keyword",
+          "query": "e6d69d6c68205c0d5e0098b4230f42ad60bbb95e1bc47a474bf3a38d16f99a73",
+          "window": "24h",
+          "catches": "Every event carrying an IOC hash, wherever it sits in the event - the first pivot on a threat-intel hit."
+        },
+        {
+          "use_case": "Keyword: rare file hash, upper case",
+          "tier": "ir",
+          "query_class": "keyword",
+          "query": "E6D69D6C68205C0D5E0098B4230F42AD60BBB95E1BC47A474BF3A38D16F99A73",
+          "window": "24h",
+          "catches": "Same hunt as pasted from a vendor report: keyword search is case-insensitive."
+        },
+        {
+          "use_case": "Keyword: dotted IP as a term",
+          "tier": "hunt",
+          "query_class": "keyword",
+          "query": "\"10.1.4.20\"",
+          "window": "24h",
+          "catches": "Every event mentioning an internal IP, matched as a whole term (not 10, 1, 4 and 20 anywhere in the event)."
+        },
+        {
+          "use_case": "Keyword: rare external IP",
+          "tier": "hunt",
+          "query_class": "keyword",
+          "query": "48.170.34.111",
+          "window": "24h",
+          "catches": "An external IP from an alert, across every source; the needle's pieces occur in almost every timestamp."
+        },
+        {
+          "use_case": "Keyword: hostname",
+          "tier": "triage",
+          "query_class": "keyword",
+          "query": "ws-fin-095",
+          "window": "24h",
+          "catches": "All activity for one workstation name, in any field."
+        },
+        {
+          "use_case": "Keyword: user name",
+          "tier": "triage",
+          "query_class": "keyword",
+          "query": "dthomas",
+          "window": "24h",
+          "catches": "All activity for one account, in any field."
+        },
+        {
+          "use_case": "Keyword: correlation uuid",
+          "tier": "ir",
+          "query_class": "keyword",
+          "query": "01a1561e-357a-7263-914a-6a5b80535d0a",
+          "window": "24h",
+          "catches": "Every event of one request or session id."
+        },
+        {
+          "use_case": "Keyword: absent token",
+          "tier": "hunt",
+          "query_class": "keyword",
+          "query": "zzqxnotatoken",
+          "window": "24h",
+          "catches": "A token that is in no event: must prune every file."
+        },
+        {
+          "use_case": "Keyword: common source name",
+          "tier": "triage",
+          "query_class": "keyword",
+          "query": "sysmon",
+          "window": "24h",
+          "catches": "A common token, first page only."
+        },
+        {
+          "use_case": "Keyword: phrase",
+          "tier": "hunt",
+          "query_class": "keyword",
+          "query": "\"failed password\"",
+          "window": "24h",
+          "catches": "An auth-failure phrase as typed by an analyst, matched in order."
+        },
+        {
+          "use_case": "Keyword: event-log phrase",
+          "tier": "triage",
+          "query_class": "keyword",
+          "query": "\"Audit Failure\"",
+          "window": "24h",
+          "catches": "Windows audit failures by phrase."
+        },
+        {
+          "use_case": "Keyword: wildcard substring",
+          "tier": "hunt",
+          "query_class": "keyword",
+          "query": "*svchost*",
+          "window": "24h",
+          "catches": "Substring keyword search over every body field."
+        },
+        {
+          "use_case": "Keyword: mixed case",
+          "tier": "triage",
+          "query_class": "keyword",
+          "query": "PowerShell",
+          "window": "24h",
+          "catches": "Mixed-case keyword equals its lower-case form."
+        },
+        {
+          "use_case": "Keyword: count of a common token",
+          "tier": "triage",
+          "query_class": "keyword",
+          "query": "sysmon | stats count",
+          "window": "24h",
+          "catches": "Volume of a keyword over the window, answered from token counts."
         }
       ]
     }

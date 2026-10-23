@@ -28,7 +28,11 @@ fn widened_span(span: Duration, range: &TimeRange) -> Result<Duration, SearchErr
     }
     let start = range.start.timestamp();
     let end = range.end.timestamp();
-    if end.div_euclid(seconds) - start.div_euclid(seconds) + 1 <= MAX_BUCKETS {
+    // NAN-4276: count the buckets the half-open window actually fills (the
+    // same `last_bucket_start` the fill uses). `floor(end) + 1` counted one
+    // extra bucket on aligned ends, so 24 h at 1m (exactly 1,440 buckets)
+    // was widened to 5m.
+    if bucket_count(range, seconds) <= MAX_BUCKETS {
         return Ok(span);
     }
     let minimum = ((end - start) / (MAX_BUCKETS - 1) + 1).max(seconds);
@@ -233,6 +237,29 @@ fn series_name(
     }
 }
 
+/// NAN-4276: start of the last bucket the window covers. The window end is
+/// EXCLUSIVE (the search range is `[start, end)`), so a range ending exactly on
+/// a span boundary (22:00..23:00 at 5m) has no 23:00 bucket. The old
+/// `floor(end)` fill emitted that bucket as a synthetic trailing zero (13
+/// buckets for a 12-bucket hour). A sub-second end (23:00:00.5) still covers
+/// part of the 23:00 bucket, so it stays.
+fn last_bucket_start(range: &TimeRange, seconds: i64) -> i64 {
+    let end = range.end.timestamp();
+    let last_covered_second = if range.end.timestamp_subsec_nanos() == 0 {
+        end - 1
+    } else {
+        end
+    };
+    last_covered_second.div_euclid(seconds) * seconds
+}
+
+/// Buckets of width `seconds` the half-open `range` fills (at least one).
+fn bucket_count(range: &TimeRange, seconds: i64) -> i64 {
+    let first = range.start.timestamp().div_euclid(seconds) * seconds;
+    let last = last_bucket_start(range, seconds).max(first);
+    (last - first) / seconds + 1
+}
+
 fn pivot(
     rows: &[serde_json::Value],
     other: &[serde_json::Value],
@@ -286,7 +313,7 @@ fn pivot(
         columns.extend(aggregations.iter().map(Aggregation::output_alias));
     }
     let start = range.start.timestamp().div_euclid(seconds) * seconds;
-    let end = range.end.timestamp().div_euclid(seconds) * seconds;
+    let end = last_bucket_start(range, seconds).max(start);
     for ts in (start..=end).step_by(seconds as usize) {
         buckets.entry(ts).or_default();
     }
@@ -309,6 +336,51 @@ fn pivot(
             serde_json::Value::Object(row)
         })
         .collect())
+}
+
+/// NAN-4289 (searchfuzz F25): split `… | timechart … by f | <tail>` when the
+/// tail addresses a PIVOT column (`| where GET > 7000`, `| fields time_bucket, GET`).
+///
+/// The SQL form of a split timechart is long-form (`time_bucket, f, count`); the
+/// pivot into one column per series happens in [`SearchService::complete_timechart`],
+/// which only ran when the timechart was the last command. A tail that names a
+/// series therefore reached the compiler and was refused as an unknown field.
+///
+/// Only a tail that references a name the long-form rows do NOT carry is
+/// diverted, and only when every tail command runs in memory. A tail that reads
+/// the long-form columns (`| where f="GET"`, `| head 100`) keeps its existing
+/// SQL shape and results.
+pub(super) fn split_pivot_tail(query: &Query) -> Option<(&Query, &Command, Vec<Command>)> {
+    let mut tail = Vec::new();
+    let mut current = query;
+    let (source, chart) = loop {
+        let Query::Piped { source, command } = current else {
+            return None;
+        };
+        match command {
+            Command::Timechart { split_by, .. } if !split_by.is_empty() => break (source.as_ref(), command),
+            _ => {
+                tail.push(command.clone());
+                current = source;
+            }
+        }
+    };
+    if tail.is_empty() {
+        return None;
+    }
+    tail.reverse();
+    if !tail.iter().all(crate::search::processing::post_processing::is_supported_post_processing_command) {
+        return None;
+    }
+    let long_form = crate::query::collect_derived_fields(current);
+    let printed = std::iter::once("*".to_string())
+        .chain(tail.iter().map(|command| command.pretty_print()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let addresses_pivot = crate::search::field_usage::extract_query_fields(&printed)
+        .iter()
+        .any(|field| !long_form.contains(&field.to_lowercase()));
+    addresses_pivot.then_some((source, chart, tail))
 }
 
 const RANK_ALIAS: &str = "__nano_timechart_rank";
@@ -435,8 +507,7 @@ fn single_pass_eligible(aggregations: &[Aggregation], fields: &[String]) -> bool
 
 fn single_pass_row_cap(span: Duration, range: &TimeRange) -> usize {
     let seconds = (span.as_secs() as i64).max(1);
-    let buckets =
-        range.end.timestamp().div_euclid(seconds) - range.start.timestamp().div_euclid(seconds) + 1;
+    let buckets = bucket_count(range, seconds);
     (buckets.max(1) as usize)
         .saturating_mul(SINGLE_PASS_SERIES_PER_BUCKET)
         .min(SINGLE_PASS_MAX_ROWS)
@@ -795,7 +866,13 @@ mod tests {
         let start = chrono::DateTime::parse_from_rfc3339("2026-10-01T11:20:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let range = TimeRange::new(start, start + chrono::Duration::days(1));
+        // NAN-4276: exactly a day at 1m is 1,440 buckets and is NOT widened;
+        // one minute more is.
+        let day = TimeRange::new(start, start + chrono::Duration::days(1));
+        assert_eq!(widened_span(Duration::from_secs(60), &day).unwrap().as_secs(), 60);
+        assert_eq!(bucket_count(&day, 60), 1_440);
+        let range = TimeRange::new(start, start + chrono::Duration::days(1) + chrono::Duration::minutes(1));
+        assert_eq!(bucket_count(&range, 60), 1_441);
         let span = widened_span(Duration::from_secs(60), &range).unwrap();
         assert_eq!(span.as_secs(), 300);
         let rows = vec![
@@ -826,6 +903,64 @@ mod tests {
             107
         );
     }
+    /// NAN-4276: the window end is exclusive. `* | timechart span=5m count`
+    /// over 22:00..23:00 is 12 buckets, not 13 with a synthetic 23:00 zero.
+    #[test]
+    fn fill_stops_before_an_exclusive_end_boundary() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let count = [Aggregation::new(AggFunc::Count, None)];
+        let rows = vec![
+            serde_json::json!({"time_bucket":"2026-10-20 22:00:00","count":5}),
+            serde_json::json!({"time_bucket":"2026-10-20 22:55:00","count":3}),
+        ];
+        let span = Duration::from_secs(300);
+        let hour = TimeRange::new(at("2026-10-20T22:00:00Z"), at("2026-10-20T23:00:00Z"));
+        let chart = pivot(&rows, &[], &[], &count, span, &hour).unwrap();
+        assert_eq!(chart.len(), 12);
+        assert_eq!(chart[0]["time_bucket"], "2026-10-20T22:00:00+00:00");
+        assert_eq!(chart[11]["time_bucket"], "2026-10-20T22:55:00+00:00");
+        assert_eq!(chart[11]["count"], 3);
+        // Split charts take the same fill (61 -> 60 rows at 1m).
+        let split = pivot(
+            &[serde_json::json!({"time_bucket":"2026-10-20 22:00:00","src":"a","count":1})],
+            &[],
+            &["src".into()],
+            &count,
+            Duration::from_secs(60),
+            &hour,
+        )
+        .unwrap();
+        assert_eq!(split.len(), 60);
+        assert_eq!(
+            split.last().unwrap()["time_bucket"],
+            "2026-10-20T22:59:00+00:00"
+        );
+        // An end inside a bucket still covers part of it.
+        let ragged = TimeRange::new(
+            at("2026-10-20T22:00:00Z"),
+            at("2026-10-20T23:00:00Z") + chrono::Duration::milliseconds(500),
+        );
+        let chart = pivot(&rows, &[], &[], &count, span, &ragged).unwrap();
+        assert_eq!(chart.len(), 13);
+        let unaligned = TimeRange::new(at("2026-10-20T22:02:00Z"), at("2026-10-20T23:02:00Z"));
+        let chart = pivot(&rows, &[], &[], &count, span, &unaligned).unwrap();
+        assert_eq!(chart.len(), 13);
+        assert_eq!(chart[12]["time_bucket"], "2026-10-20T23:00:00+00:00");
+        // A real row in the end bucket is never dropped (the SQL time bound
+        // is inclusive, so an event at exactly `end` is counted).
+        let edge = vec![serde_json::json!({"time_bucket":"2026-10-20 23:00:00","count":1})];
+        let chart = pivot(&edge, &[], &[], &count, span, &hour).unwrap();
+        assert_eq!(chart.len(), 13);
+        assert_eq!(chart[12]["count"], 1);
+        // A window shorter than one span still yields its bucket.
+        let tiny = TimeRange::new(at("2026-10-20T22:00:00Z"), at("2026-10-20T22:00:01Z"));
+        assert_eq!(pivot(&[], &[], &[], &count, span, &tiny).unwrap().len(), 1);
+    }
+
     #[test]
     fn generated_queries_roundtrip_and_reuse_stats_pages() {
         let parsed =

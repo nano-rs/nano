@@ -59,6 +59,25 @@ fn source(i: usize) -> &'static str {
     ["aws_cloudtrail", "windows_sysmon", "conduit_proxy"][i % 3]
 }
 
+/// NAN-4159: the digest of event rows over every column except `raw_data`.
+/// A bareword search declares the keyword body columns, so its table-view
+/// rows carry `raw_data`; since NAN-4155 a bare `* | where …` reference does
+/// not (list rows never carry `raw_data`; the inspector's full-event fetch
+/// does). Every other column, and the row set and order, must be identical.
+fn list_digest(rows: &[Value]) -> String {
+    let rows = rows
+        .iter()
+        .map(|row| {
+            let mut row = row.clone();
+            if let Some(object) = row.as_object_mut() {
+                object.remove("raw_data");
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    digest(&rows)
+}
+
 fn event(i: usize, time: &str) -> Value {
     let source = source(i);
     let hash = hash_of(i);
@@ -268,8 +287,8 @@ async fn rare_hash_bareword_prunes_to_its_files_in_every_shape() {
             "{query} vs | where"
         );
         assert_eq!(
-            digest(&rows),
-            digest(&reference_rows),
+            list_digest(&rows),
+            list_digest(&reference_rows),
             "{query}: rows hash-identical to | where"
         );
         assert_eq!(
@@ -297,8 +316,8 @@ async fn rare_hash_bareword_prunes_to_its_files_in_every_shape() {
         "page 2: truth"
     );
     assert_eq!(
-        digest(&rows_of(&page)),
-        digest(&rows_of(&reference_page)),
+        list_digest(&rows_of(&page)),
+        list_digest(&rows_of(&reference_page)),
         "page 2 vs | where"
     );
     assert_eq!(
@@ -327,8 +346,8 @@ async fn rare_hash_bareword_prunes_to_its_files_in_every_shape() {
     )
     .await;
     assert_eq!(
-        digest(&rows_of(&answer)),
-        digest(&rows_of(&reference)),
+        list_digest(&rows_of(&answer)),
+        list_digest(&rows_of(&reference)),
         "{sparse} vs | where"
     );
     assert!(statements(&answer) <= 2, "{sparse}: {}", answer["planner"]);
@@ -539,10 +558,6 @@ async fn realistic_day_bareword_shapes() {
         minimum_clear_revision: None,
         deny_source_types: Default::default(),
     };
-    let authority = || {
-        let tenant: uuid::Uuid = LAB_TENANT.parse().unwrap();
-        nanosiem_core::platform_enrichment::read::ReadAuthorization::unknown(tenant, Utc::now())
-    };
     let queries = std::env::var("NAN3170_QUERIES").unwrap_or_else(|_| {
         [
             "1000003 | head 100",
@@ -560,10 +575,7 @@ async fn realistic_day_bareword_shapes() {
             let cpu = crate::query_timing::process_cpu_ms().unwrap_or(0.0);
             let answer = crate::query_timing::measure(
                 "nan3170-lab",
-                Box::pin(crate::enrichment_read::scope(
-                    authority(),
-                    engine.broad_npl(&request(query)),
-                )),
+                Box::pin(engine.broad_npl(&request(query))),
             )
             .await
             .unwrap_or_else(|error| panic!("{query}: {error}"));

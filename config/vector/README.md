@@ -117,6 +117,31 @@ Ingestion -> Credentials shows the snippet.
 
 Needs `ghcr.io/nano-rs/vector` 0.59.0-nano.7 or later (`valid_tokens_file`).
 
+## Open-core OTLP credentials
+
+The nginx `/otlp/v1/{logs,traces,metrics}` edge authenticates each request via
+`GET /api/internal/otlp-auth`. The API hashes the presented credential and checks
+current tenant-scoped database state. There is no positive cache or static
+install-token fallback: revocation, source disable/delete, and the install switch
+apply to the next request. Database failure closes the edge. In-flight requests
+already authenticated may finish.
+
+Use a credential bound to the enabled **OpenTelemetry Logs (OCSF)** source
+(`otlp_log`) for the built-in parser. All enabled push sources are bindable,
+including `otlp`/`opentelemetry`; logs use the bound route exactly like HEC/HTTP.
+Metrics/traces share the sender credential's lifecycle, but retain native signal
+types rather than passing through the log parser. All three carry the credential
+ID; native signal JSON carries it at `metadata.nano_credential_id`.
+
+Raw Vector OTLP ports are internal only, with no host publication (including
+gRPC). The internal network is a trusted service boundary. Exporters outside it
+must use the authenticated HTTP edge. nginx replaces both reserved identity
+headers and strips Authorization before forwarding. Vector's fixed legacy OTLP
+decoder confines body/attributes to nested fields, so payloads cannot replace
+those root header fields. Keep `log_namespace = false` and
+`use_otlp_decoding = false` with this header mapping. Internal service traffic
+without edge headers has no named credential attribution.
+
 ## Environment Variables
 
 - `VECTOR_AUTH_TOKEN` - Install token: accepted only once bound to a source; keys the platform pull credential (default: `nanosiem-default-token`)

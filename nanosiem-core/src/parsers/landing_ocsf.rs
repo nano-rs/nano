@@ -312,6 +312,37 @@ mod tests {
         assert_eq!(row.partition, again.partition);
     }
 
+    /// NAN-4320: a detection bound to a landing source matches the rows that
+    /// source lands. The shared runtime pins every scan of a rule to its
+    /// bound route slug on `metadata.log_source` (`pin_detection_query`) and
+    /// filters on nothing Vector-only: a landed row (stamped
+    /// `ingress_transport = landing_bucket`) is selected by its route key.
+    #[test]
+    fn a_rule_bound_to_the_landing_source_matches_landed_rows() {
+        use crate::query::{parse_query, Query, SearchExpr};
+        use crate::search::evaluate_condition_on_json;
+        use crate::search::query_processing::{pin_detection_query, LAKE_SOURCE_FIELD};
+        fn base(query: &Query) -> &SearchExpr {
+            match query {
+                Query::Search(expression) => expression,
+                Query::Piped { source, .. } => base(source),
+            }
+        }
+        let matches = |rule: &str, bound: &str, row: &Value| {
+            let pinned = pin_detection_query(rule, bound, LAKE_SOURCE_FIELD).unwrap();
+            evaluate_condition_on_json(base(&parse_query(&pinned.query).unwrap()), row)
+        };
+        let stage = LandingOcsfStage::new(1).unwrap();
+        let landed = event_of(&stage.prepare(sysmon(None), &ctx(None)).unwrap());
+        assert_eq!(landed["metadata"]["ingress_transport"], LANDING_INGRESS_TRANSPORT);
+        // The rule names its landing source, or names none and is pinned to it.
+        assert!(matches(r#"metadata.log_source="tenzir_sysmon" AND class_uid=1007"#, "tenzir_sysmon", &landed));
+        assert!(matches("class_uid=1007 AND device.hostname=\"wks-01\"", "tenzir_sysmon", &landed));
+        assert!(!matches("class_uid=3002", "tenzir_sysmon", &landed), "the rule body still decides");
+        // Bound to another source, the landed row is out of scope.
+        assert!(!matches("class_uid=1007", "apache_access", &landed));
+    }
+
     #[test]
     fn an_empty_tenant_is_dropped_like_vector_drops_it() {
         let stage = LandingOcsfStage::new(1).unwrap();

@@ -339,11 +339,16 @@ pub(crate) fn field_name_with_wildcard(input: &str) -> ParseResult<'_, String> {
 }
 
 /// Parse comparison operator (excludes regex which uses /pattern/ syntax)
+///
+/// NAN-4276: `==` is equality, as the nPL reference documents for eval/where
+/// (`| where actor.process.name=="svchost.exe"` was a syntax error). It is
+/// tried before `=` so the second `=` is never read as part of the value.
 pub(crate) fn comparator(input: &str) -> ParseResult<'_, Comparator> {
     alt((
         value(Comparator::Ne, tag("!=")),
         value(Comparator::Gte, tag(">=")),
         value(Comparator::Lte, tag("<=")),
+        value(Comparator::Eq, tag("==")),
         value(Comparator::Eq, tag("=")),
         value(Comparator::Gt, tag(">")),
         value(Comparator::Lt, tag("<")),

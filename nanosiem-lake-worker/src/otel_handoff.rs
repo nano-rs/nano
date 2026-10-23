@@ -866,6 +866,10 @@ pub struct DrainCycleReport {
     pub sweep: bool,
     /// NAN-3886 (lean): `list` / `list_receipt_hours` calls this cycle made.
     pub list_calls: usize,
+    /// NAN-4084: undrained objects this cycle found, whether or not it
+    /// drained them. Zero means the cycle found nothing new; the drain loop
+    /// then backs off (see [`DrainPacer`]).
+    pub objects_pending: usize,
 }
 
 /// NAN-3359: the first receipt hour a NORMAL (non-full-scan) cycle lists.
@@ -1028,22 +1032,41 @@ enum FetchedHandoff {
     Accepted(DrainedHandoffBatch, Vec<OtelLakeRow>),
 }
 
+/// NAN-4084: the longest a dataset's drain interval grows while its cycles
+/// find nothing new. Every cycle lists R2 (Class A, $4.50/M): two datasets
+/// every 10 s was ~17.3k ListObjects per tenant per day at any traffic level.
+/// After idle, a newly landed object waits at most this long to be drained.
+pub const DRAIN_IDLE_INTERVAL_CAP: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Pacing of the drain loop (NAN-3290 catch-up mode). Each dataset is drained
 /// when its interval has elapsed OR its last cycle was backlogged; the loop
 /// sleeps only while no dataset is backlogged. Both datasets are visited every
 /// loop iteration, so a backlogged dataset never starves the other one, and
 /// the caller's maintenance / credential-reload timers are checked every
 /// iteration too.
+///
+/// NAN-4084 idle backoff: a cycle that found nothing new (or failed) doubles
+/// that dataset's interval, up to [`DRAIN_IDLE_INTERVAL_CAP`] (or the base
+/// interval when that is larger); a cycle that found anything resets it to the
+/// base interval.
 #[derive(Debug, Clone)]
 pub struct DrainPacer {
     interval: std::time::Duration,
+    cap: std::time::Duration,
+    current: [std::time::Duration; 2],
     next_due: [std::time::Instant; 2],
     backlogged: [bool; 2],
 }
 
 impl DrainPacer {
     pub fn new(interval: std::time::Duration, now: std::time::Instant) -> Self {
-        Self { interval, next_due: [now; 2], backlogged: [false; 2] }
+        Self {
+            interval,
+            cap: interval.max(DRAIN_IDLE_INTERVAL_CAP),
+            current: [interval; 2],
+            next_due: [now; 2],
+            backlogged: [false; 2],
+        }
     }
 
     fn slot(dataset: OtelDataset) -> usize {
@@ -1059,12 +1082,23 @@ impl DrainPacer {
         self.backlogged[slot] || now >= self.next_due[slot]
     }
 
-    /// Record one cycle's outcome (`backlogged = false` for a failed cycle,
-    /// so a failing drain backs off at the normal interval).
-    pub fn record(&mut self, dataset: OtelDataset, now: std::time::Instant, backlogged: bool) {
+    /// Record one cycle's outcome. `found`: the cycle found at least one
+    /// undrained object. A failed cycle is `backlogged = false, found =
+    /// false`, so a failing drain backs off like an idle one.
+    pub fn record(&mut self, dataset: OtelDataset, now: std::time::Instant, backlogged: bool, found: bool) {
         let slot = Self::slot(dataset);
         self.backlogged[slot] = backlogged;
-        self.next_due[slot] = now + self.interval;
+        self.current[slot] = if backlogged || found {
+            self.interval
+        } else {
+            self.current[slot].saturating_mul(2).min(self.cap)
+        };
+        self.next_due[slot] = now + self.current[slot];
+    }
+
+    /// The interval `dataset` waits after its last cycle (NAN-4084).
+    pub fn current_interval(&self, dataset: OtelDataset) -> std::time::Duration {
+        self.current[Self::slot(dataset)]
     }
 
     /// True while any dataset is catching up.
@@ -1347,6 +1381,7 @@ impl OtelHandoffDrain {
             .pending_newest_first(dataset, &candidates, &hours, self.binding.max_objects)
             .await?;
         let pending_count = pending.len();
+        report.objects_pending = pending_count;
         let fold = self.drain_pending(dataset, pending, &pending_hours, &mut report).await?;
         let oldest_retry_hour = fold.retries.iter().map(|index| pending_hours[*index]).min();
         report.backlogged = (saturated || fold.examined < pending_count) && fold.acknowledged;
@@ -1570,6 +1605,7 @@ impl OtelHandoffDrain {
         }
 
         let pending_count = pending.len();
+        report.objects_pending = pending_count;
         let fold = self.drain_pending(dataset, pending, &pending_hours, &mut report).await?;
 
         // The live window moves the watermark exactly as on gen1 (NAN-3359).
@@ -2945,7 +2981,9 @@ mod tests {
     async fn mirror_hydrates_from_the_ledger_with_exact_reads() {
         let first_mirror = tempfile::tempdir().unwrap();
         let (drain, store, sink, ledger) = harness(Some(first_mirror.path().to_path_buf()));
-        let start = 1_789_600_000_000_000_000_u64;
+        // Relative to now: hydration skips event hours older than the mirror's
+        // 31-day age floor, so a fixed date silently ages out of the test.
+        let start = u64::try_from(Utc::now().timestamp_nanos_opt().unwrap()).unwrap();
         land_handoff(&store, OtelDataset::Spans, ndjson(&[span_envelope(&"3".repeat(32), &"d".repeat(16), start)])).await;
         drain.drain_once(OtelDataset::Spans).await.unwrap();
         assert_eq!(sink.requests.lock().unwrap().len(), 1);
@@ -3549,15 +3587,48 @@ mod tests {
         let start = std::time::Instant::now();
         let mut pacer = DrainPacer::new(interval, start);
         assert!(pacer.due(OtelDataset::Spans, start) && pacer.due(OtelDataset::Metrics, start));
-        pacer.record(OtelDataset::Spans, start, true);
-        pacer.record(OtelDataset::Metrics, start, false);
+        pacer.record(OtelDataset::Spans, start, true, true);
+        pacer.record(OtelDataset::Metrics, start, false, true);
         assert!(pacer.catching_up());
         assert_eq!(pacer.pause(start), std::time::Duration::ZERO);
         assert!(pacer.due(OtelDataset::Spans, start), "backlogged: immediately due");
         assert!(!pacer.due(OtelDataset::Metrics, start), "idle: waits its interval");
         assert!(pacer.due(OtelDataset::Metrics, start + interval), "still drained on its interval");
-        pacer.record(OtelDataset::Spans, start, false);
+        pacer.record(OtelDataset::Spans, start, false, true);
         assert_eq!(pacer.pause(start), interval);
         assert_eq!(pacer.pause(start + interval * 2), std::time::Duration::ZERO);
+    }
+
+    /// NAN-4084: idle cycles double a dataset's interval up to the cap; any
+    /// found object (or a backlog) resets it, per dataset.
+    #[test]
+    fn the_pacer_backs_an_idle_dataset_off_to_the_cap_and_resets_on_any_object() {
+        let interval = std::time::Duration::from_secs(10);
+        let secs = std::time::Duration::from_secs;
+        let mut now = std::time::Instant::now();
+        let mut pacer = DrainPacer::new(interval, now);
+        let mut waits = Vec::new();
+        for _ in 0..6 {
+            pacer.record(OtelDataset::Spans, now, false, false);
+            waits.push(pacer.current_interval(OtelDataset::Spans));
+            assert!(!pacer.due(OtelDataset::Spans, now + pacer.current_interval(OtelDataset::Spans) - secs(1)));
+            now += pacer.current_interval(OtelDataset::Spans);
+            assert!(pacer.due(OtelDataset::Spans, now));
+        }
+        assert_eq!(waits, [secs(20), secs(40), secs(80), secs(120), secs(120), secs(120)]);
+        assert_eq!(DRAIN_IDLE_INTERVAL_CAP, secs(120));
+        assert_eq!(pacer.current_interval(OtelDataset::Metrics), interval, "the other dataset keeps its own pace");
+        pacer.record(OtelDataset::Spans, now, false, true);
+        assert_eq!(pacer.current_interval(OtelDataset::Spans), interval, "a found object resets to the base");
+        pacer.record(OtelDataset::Spans, now, false, false);
+        pacer.record(OtelDataset::Spans, now, true, false);
+        assert_eq!(pacer.current_interval(OtelDataset::Spans), interval, "a backlog resets to the base");
+        assert_eq!(pacer.pause(now), std::time::Duration::ZERO);
+        // A base above the cap is never shortened.
+        let mut slow = DrainPacer::new(secs(300), now);
+        slow.record(OtelDataset::Metrics, now, false, false);
+        assert_eq!(slow.current_interval(OtelDataset::Metrics), secs(300));
+        // Idle steady state: 2 datasets x 86_400 / 120 = 1_440 lists a day (was 17_280 at 10 s).
+        assert_eq!(2 * 86_400 / DRAIN_IDLE_INTERVAL_CAP.as_secs(), 1_440);
     }
 }

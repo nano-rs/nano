@@ -888,6 +888,9 @@ impl MarketplaceRepository {
     pub async fn list_repos_for_auto_sync(
         &self,
     ) -> Result<Vec<EnrichmentMarketplaceRepo>, MarketplaceError> {
+        use tracing::Instrument;
+        let mut connection = self.pool.acquire()
+            .instrument(tracing::info_span!("db.postgresql.connection.acquire")).await?;
         let repos = sqlx::query_as::<_, EnrichmentMarketplaceRepo>(
             r#"
             SELECT
@@ -922,7 +925,8 @@ impl MarketplaceRepository {
             ORDER BY r.last_synced_at NULLS FIRST
             "#,
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *connection)
+        .instrument(tracing::info_span!("db.postgresql.execute"))
         .await?;
 
         Ok(repos)

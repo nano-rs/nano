@@ -87,6 +87,7 @@ for_each(tags) -> |k, v| {
 }
 
 event = {
+    "metadata": { "nano_credential_id": %nano_credential_id },
     "name": to_string(.name) ?? "",
     "unit": to_string(.unit) ?? "",
     "timeUnixNano": nanos,
@@ -182,6 +183,14 @@ for_each(points) -> |_i, point| {
 # Vector 0.57 parses typed numeric TOML before environment interpolation, so the
 # numeric limits below are concrete deployment defaults. A deployment renderer
 # may materialize different numeric values for larger tenants.
+#
+# NAN-4189: batches flush every 5 s, not every 1 s. On hosted lean every batch
+# is one `otel-handoff-v1/` object: 1 R2 PUT, 2 HEAD + 1 GET in the drain, and a
+# writer-DO lease + record (~6 SQLite rows). At 1 s the internal ops tenant
+# wrote ~4.7k objects/h (~$1.4/day of Cloudflare); 5 s coalesces bursts to ~2k/h.
+# The ceiling is the ACK path: end-to-end acknowledgements hold the OTLP
+# response until this sink delivers, the hosted direct ACK cap is 15 s, and the
+# common OTel SDK export timeout is 10 s, so 5 s leaves room for the PUT.
 [sinks.otlp_lake_spans]
 type = "http"
 inputs = ["otlp_lake_spans_envelope"]
@@ -199,7 +208,7 @@ when_full = "block"
 [sinks.otlp_lake_spans.batch]
 max_bytes = 5242880
 max_events = 5000
-timeout_secs = 1
+timeout_secs = 5
 
 [sinks.otlp_lake_spans.request]
 concurrency = "adaptive"
@@ -231,7 +240,7 @@ when_full = "block"
 [sinks.otlp_lake_metrics.batch]
 max_bytes = 5242880
 max_events = 5000
-timeout_secs = 1
+timeout_secs = 5
 
 [sinks.otlp_lake_metrics.request]
 concurrency = "adaptive"

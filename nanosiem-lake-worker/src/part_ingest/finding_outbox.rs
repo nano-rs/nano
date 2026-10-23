@@ -14,6 +14,7 @@ use std::sync::Arc;
 use sqlx::Row;
 
 use super::finding_append::{FindingAppendRequest, FindingAppendTransport};
+use super::finding_attempts::{attempted_receipts, AttemptCache};
 use super::ingest::FINDING_IO_CONCURRENCY;
 use super::schema::{additive_merge, decode, infer_schema};
 use super::writer::{publish_parts, sort_by_time_uid, PartDraft, PartWriter, PartialSource};
@@ -177,8 +178,9 @@ const REPLAY_PROGRESS_EVERY: u64 = 5_000;
 
 /// The pre-existing receipts that may have been committed and so need the
 /// log proof. Ingest writes an attempt marker before every `Add` that
-/// consumes a receipt, and its completion marker proves historical `Add`s
-/// were indexed. With that index present, a receipt without a marker was
+/// consumes receipts (one per append since NAN-4181,
+/// [`super::finding_attempts`]), and its completion marker proves historical
+/// `Add`s were indexed. With that index present, a receipt without a marker was
 /// never offered to the log: it is republished directly, with no scan. A
 /// receipt left by a failed attempt (missing R2 grant, expired owner bearer,
 /// old cell or writer epoch) is the ordinary case, not crash replay.
@@ -186,6 +188,16 @@ pub async fn receipts_needing_log_proof(
     store: &dyn ObjectStore,
     tenant_id: &str,
     preexisting: &[SourceRef],
+) -> Result<Vec<SourceRef>> {
+    receipts_needing_log_proof_cached(store, tenant_id, preexisting, &AttemptCache::default()).await
+}
+
+/// [`receipts_needing_log_proof`] reusing marker bodies already read.
+pub async fn receipts_needing_log_proof_cached(
+    store: &dyn ObjectStore,
+    tenant_id: &str,
+    preexisting: &[SourceRef],
+    attempts: &AttemptCache,
 ) -> Result<Vec<SourceRef>> {
     if preexisting.is_empty() {
         return Ok(Vec::new());
@@ -198,23 +210,11 @@ pub async fn receipts_needing_log_proof(
         // No index yet (ingest never opened this log): only the scan is proof.
         None => return Ok(preexisting.to_vec()),
     }
-    use futures::{StreamExt, TryStreamExt};
-    let markers = futures::stream::iter(preexisting.iter())
-        .map(|source| async move {
-            let key = super::ingest::finding_attempt_key(tenant_id, source)?;
-            Ok::<_, anyhow::Error>((source, store.get(&key).await?))
-        })
-        .buffered(FINDING_IO_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    let mut attempted = Vec::new();
-    for (source, marker) in markers {
-        if let Some(bytes) = marker {
-            ensure!(bytes == serde_json::to_vec(source)?, "finding attempt marker differs");
-            attempted.push(source.clone());
-        }
-    }
-    Ok(attempted)
+    let marked = attempted_receipts(store, tenant_id, preexisting, attempts).await?;
+    Ok(preexisting.iter()
+        .filter(|source| marked.contains(&(source.key.clone(), source.sha256.clone(), source.version.clone())))
+        .cloned()
+        .collect())
 }
 
 /// What one drain pass saw and did. Logged by the caller every pass.
@@ -314,6 +314,8 @@ pub struct DrainLogCache {
     tenant_id: Option<String>,
     loaded_seq: u64,
     next_prune_ms: i64,
+    /// NAN-4181: attempt marker bodies already read (immutable).
+    attempts: AttemptCache,
 }
 
 impl DrainLogCache {
@@ -590,7 +592,10 @@ async fn publish_claimed(
     // republished directly; only a receipt ingest attempted (crash between
     // intent and ack) scans immutable log evidence before republish or ack.
     pass.preexisting_receipts = preexisting.len();
-    let attempted = receipts_needing_log_proof(store, tenant_id, &preexisting).await?;
+    if cache.tenant_id.as_deref().is_some_and(|cached| cached != tenant_id) {
+        cache.attempts = AttemptCache::default();
+    }
+    let attempted = receipts_needing_log_proof_cached(store, tenant_id, &preexisting, &cache.attempts).await?;
     pass.replay_checked = attempted.len();
     let committed = if attempted.is_empty() {
         BTreeMap::new()
@@ -612,7 +617,10 @@ async fn publish_claimed(
         min_time_ms: now_ms,
         max_time_ms: now_ms,
     };
-    futures::stream::iter(fresh.iter())
+    // NAN-4181: a receipt an earlier pass stored is not PUT again (a
+    // conditional PUT answering 412 is still a billed Class A request).
+    let stored = preexisting.iter().map(|source| source.key.as_str()).collect::<std::collections::BTreeSet<_>>();
+    futures::stream::iter(fresh.iter().filter(|row| !stored.contains(row.source.key.as_str())))
         .map(|row| {
             let hints = &hints;
             async move {

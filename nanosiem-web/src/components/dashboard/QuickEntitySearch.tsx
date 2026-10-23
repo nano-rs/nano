@@ -98,7 +98,7 @@ export function QuickEntitySearch() {
     }
 
     // Navigate to search with the query
-    navigate(`/search?q=${encodeURIComponent(searchQuery)}`);
+    navigate(`/search#q=${encodeURIComponent(searchQuery)}`);
   };
 
   return (

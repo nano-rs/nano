@@ -8,6 +8,7 @@ import { useAuth, type User } from '@/contexts/AuthContext';
 import {
   beginEnterpriseSharedOidc,
   completeEnterpriseSharedOidc,
+  SsoAdmissionError,
   type SharedOidcBrowserDependencies,
 } from '@/lib/enterprise-shared-oidc';
 import { browserTenantRuntime } from '@/lib/tenant-runtime';
@@ -145,7 +146,7 @@ export function EnterpriseSharedOidcCallback() {
         // Full load: the destination is under the tenant prefix.
         window.location.assign(result.destination);
       })
-      .catch(() => setError(UNIFORM_ERROR));
+      .catch((error: unknown) => setError(error instanceof SsoAdmissionError ? error.message : UNIFORM_ERROR));
   }, [acceptSharedOidcSession, discardFailedSharedOidcSession]);
 
   return <SharedOidcStatus error={error} />;

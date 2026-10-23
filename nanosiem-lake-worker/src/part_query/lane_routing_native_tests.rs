@@ -261,7 +261,7 @@ const SMALL: u64 = super::SMALL_QUERY_BYTES;
 
 fn wide_shape() -> crate::planner::ReaderShape {
     // message + raw_data over the fixture's 96 row groups, a 7 d window.
-    crate::planner::ReaderShape { wide_columns: 2, row_groups: 96, window_class: 8, columns_key: 0x3393 }
+    crate::planner::ReaderShape { wide_columns: 2, row_groups: 96, window_class: 8, columns_key: 0x3393, string_group_by: false }
 }
 
 /// Item 2 (and the parity the bounds owe): today's small-lane statement

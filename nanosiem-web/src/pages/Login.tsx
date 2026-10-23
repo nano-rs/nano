@@ -545,12 +545,13 @@ export function Login({ tenantSlug }: { tenantSlug?: string } = {}) {
     pushLines(makeLine('sys', `→ launching SSO handoff · ${slug}`));
     try {
       if (tenantSlug === undefined) {
-        await loginWithOidc(slug, location.pathname);
+        await loginWithOidc(slug, safeReturnPath((location.state as { from?: string })?.from));
       } else {
         const authorizeUrl = await startEnterpriseSharedOidcLogin(
           tenantSlug,
           slug,
           sharedOidcDependencies(),
+          safeReturnPath((location.state as { from?: string })?.from),
         );
         window.location.assign(authorizeUrl);
       }

@@ -781,21 +781,6 @@ impl ReportService {
     }
 
     async fn produce_dashboard(
-        &self, def: &ReportDefinition, scope: &ScopeSet, dashboard: &Dashboard,
-        requires_search_sql: bool,
-    ) -> Result<ExecutionOutput, ReportError> {
-        let (result, fence) = crate::platform_enrichment::read::capture_result_fence(
-            self.produce_dashboard_inner(def,scope,dashboard,requires_search_sql)
-        ).await;
-        let mut output = result?;
-        if self.search_service.backend() == crate::search::SearchBackend::Lake && fence.is_none() {
-            return Err(ReportError::Execution("lake report authorization fence unavailable".into()));
-        }
-        for artifact in &mut output.artifacts { artifact.platform_read_fence = fence.clone(); }
-        Ok(output)
-    }
-
-    async fn produce_dashboard_inner(
         &self,
         def: &ReportDefinition,
         scope: &ScopeSet,
@@ -849,7 +834,6 @@ impl ReportService {
 
         let base = artifact_basename(&def.name, now);
         let artifacts = vec![RenderedArtifact {
-                platform_read_fence: None,
             kind: "html".into(),
             filename: format!("{base}.html"),
             content_type: "text/html; charset=utf-8".into(),
@@ -1295,21 +1279,6 @@ pub async fn source_types_for_result_with(
 /// into an INCOMPLETE manifest as belt-and-braces (an incomplete manifest
 /// already denies every restricted requester at download).
 pub async fn produce_search_report(
-    search_service: &SearchService, def: &ReportDefinition, scope: &ScopeSet,
-    restricted_registry: BTreeSet<String>,
-) -> Result<ExecutionOutput, ReportError> {
-    let (result, fence) = crate::platform_enrichment::read::capture_result_fence(
-        produce_search_report_inner(search_service,def,scope,restricted_registry)
-    ).await;
-    let mut output = result?;
-    if search_service.backend() == crate::search::SearchBackend::Lake && fence.is_none() {
-        return Err(ReportError::Execution("lake report authorization fence unavailable".into()));
-    }
-    for artifact in &mut output.artifacts { artifact.platform_read_fence = fence.clone(); }
-    Ok(output)
-}
-
-async fn produce_search_report_inner(
     search_service: &SearchService,
     def: &ReportDefinition,
     scope: &ScopeSet,
@@ -1376,14 +1345,12 @@ async fn produce_search_report_inner(
     let base = artifact_basename(&def.name, now);
     let artifacts = vec![
         RenderedArtifact {
-                platform_read_fence: None,
             kind: "csv".into(),
             filename: format!("{base}.csv"),
             content_type: "text/csv; charset=utf-8".into(),
             content: csv_bytes,
         },
         RenderedArtifact {
-                platform_read_fence: None,
             kind: "html".into(),
             filename: format!("{base}.html"),
             content_type: "text/html; charset=utf-8".into(),

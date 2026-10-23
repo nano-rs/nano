@@ -90,6 +90,15 @@ export function hasValue(value: unknown, fieldName?: string): boolean {
  * @param query The search query to strip comments from
  * @returns The query with comments removed
  */
+// NAN-4283: a `//` or `/*` starts a comment only at a token boundary (start,
+// whitespace, or a pipeline/grouping delimiter). Inside an unquoted value such
+// as `url=https://host/x` it is part of the value. Mirrors the server's
+// `comment_may_start_after` so the UI never sends a truncated query.
+function commentMayStartAfter(result: string): boolean {
+  if (result.length === 0) return true;
+  return /[\s|()[\],]/.test(result[result.length - 1]);
+}
+
 export function stripComments(query: string): string {
   let result = '';
   let i = 0;
@@ -136,7 +145,7 @@ export function stripComments(query: string): string {
     }
     
     // Skip single-line comments (// ...) when not in quote or regex
-    if (!inQuote && !inRegex && c === '/' && next === '/') {
+    if (!inQuote && !inRegex && c === '/' && next === '/' && commentMayStartAfter(result)) {
       // Skip until end of line
       while (i < query.length && query[i] !== '\n') {
         i++;
@@ -145,7 +154,7 @@ export function stripComments(query: string): string {
     }
     
     // Skip multi-line comments (/* ... */) when not in quote or regex
-    if (!inQuote && !inRegex && c === '/' && next === '*') {
+    if (!inQuote && !inRegex && c === '/' && next === '*' && commentMayStartAfter(result)) {
       i += 2; // Skip /*
       // Find closing */
       while (i < query.length - 1) {

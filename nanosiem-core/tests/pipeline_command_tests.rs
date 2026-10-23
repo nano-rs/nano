@@ -439,8 +439,8 @@ fn eval_len_function() {
 fn dedup_single_field() {
     let sql = npl("* | dedup src_ip");
     assert!(
-        sql.contains("min(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
-        "dedup should restrict candidates to each key's oldest row, got:\n{sql}"
+        sql.contains("max(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
+        "dedup should restrict candidates to each key's newest row (NAN-4279), got:\n{sql}"
     );
     assert!(
         sql.contains("LIMIT 1 BY src_ip"),
@@ -460,9 +460,9 @@ fn dedup_single_field() {
 fn dedup_multiple_fields() {
     let sql = npl("* | dedup src_ip, dest_ip");
     assert!(
-        sql.contains("min(timestamp) FROM stage_0")
+        sql.contains("max(timestamp) FROM stage_0")
             && sql.contains("GROUP BY src_ip, dest_ip"),
-        "dedup should restrict candidates to each key's oldest row, got:\n{sql}"
+        "dedup should restrict candidates to each key's newest row (NAN-4279), got:\n{sql}"
     );
     assert!(
         sql.contains("LIMIT 1 BY src_ip, dest_ip"),
@@ -1245,7 +1245,7 @@ fn eventstats_estdc_uses_uniq_combined64() {
     // absence of the window — since checking only the former would pass on a
     // reverted implementation.
     assert!(
-        sql.contains("uniqCombined64(src_ip)") && sql.contains("mapFromArrays"),
+        sql.contains("uniqCombined64(src_ip)") && sql.contains("groupArrayIf(__nano_k"),
         "eventstats estdc should be a uniqCombined64 map attach (NAN-1642); got: {sql}"
     );
     assert!(
@@ -1305,7 +1305,7 @@ fn dc_emission_stays_uniq_exact_everywhere() {
     // BY ...)` would satisfy both lines above while restoring exactly the
     // whole-partition window NAN-1642 removed. Pin the shape here too.
     assert!(
-        eventstats.contains("mapFromArrays"),
+        eventstats.contains("groupArrayIf(__nano_k"),
         "grouped eventstats dc must use the map attach (NAN-1642); got: {eventstats}"
     );
     assert!(
@@ -1371,7 +1371,7 @@ fn eventstats_after_head_scans_its_source_once() {
          scalar (one evaluation via the scalar cache); got:\n{sql}"
     );
     assert!(
-        sql.matches(closure.as_str()).count() == 2 && sql.contains("mapFromArrays"),
+        sql.matches(closure.as_str()).count() == 2 && sql.contains("groupArrayIf(__nano_k"),
         "constants AND rows must both read the id-closure (`{closure}`); got:\n{sql}"
     );
     assert!(
@@ -1433,7 +1433,7 @@ fn eventstats_snapshot_carries_every_aggregate_slot() {
         "toFloat64(count())",
         "toFloat64(uniqExact(src_ip))",
         "toFloat64(avg(bytes_out))",
-        "argMin(\"user\", timestamp)",
+        "argMin(\"user\", (timestamp, toString(\"user\")))",
     ] {
         assert!(
             sql.contains(fragment),
@@ -1460,7 +1460,7 @@ fn eventstats_after_stable_stages_keeps_bounded_map_attach() {
     ] {
         let sql = npl(query);
         assert!(
-            sql.contains("mapFromArrays") && !sql.contains("OVER (PARTITION BY"),
+            sql.contains("groupArrayIf(__nano_k") && !sql.contains("OVER (PARTITION BY"),
             "`{query}` must keep the bounded map attach (NAN-1642); got:\n{sql}"
         );
     }
@@ -1480,7 +1480,7 @@ fn eventstats_after_every_subset_selector_takes_the_snapshot_shape() {
         let sql = npl(query);
         assert!(
             sql.contains("WHERE id IN (SELECT arrayJoin((SELECT groupArray(id) FROM ")
-                && sql.contains("mapFromArrays"),
+                && sql.contains("groupArrayIf(__nano_k"),
             "`{query}` must take the id-closure shape; got:\n{sql}"
         );
         assert!(
@@ -1505,7 +1505,7 @@ fn eventstats_after_non_selector_unstable_stages_falls_back_to_window() {
     ] {
         let sql = npl(query);
         assert!(
-            !sql.contains("mapFromArrays") && !sql.contains("groupArray(id)"),
+            !sql.contains("groupArrayIf(__nano_k") && !sql.contains("groupArray(id)"),
             "`{query}` has no identity-preserving selector suffix — neither \
              the map attach nor the id-closure may be used; got:\n{sql}"
         );
@@ -1556,7 +1556,7 @@ fn eventstats_window_fallback_keeps_every_aggregate_and_alias() {
          min(bytes_out) OVER (PARTITION BY dest_ip)) AS r",
         "groupUniqArray(100)(toString(src_ip)) OVER (PARTITION BY dest_ip)",
         "(topK(1)(src_ip) OVER (PARTITION BY dest_ip))[1] AS m",
-        "argMin(src_ip, timestamp) OVER (PARTITION BY dest_ip) AS el",
+        "argMin(src_ip, (timestamp, toString(src_ip))) OVER (PARTITION BY dest_ip) AS el",
     ] {
         assert!(
             sql.contains(fragment),
@@ -1573,7 +1573,7 @@ fn anomaly_after_head_scans_its_source_once() {
     for (query, expected) in [
         ("* | head 100 | anomaly bytes_out by dest_ip", "__nano_stats"),
         ("* | head 100 | anomaly bytes_out", "__nano_stats"),
-        ("* | head 100 | anomaly bytes_out by dest_ip method=mad", "__nano_med[__nano_k]"),
+        ("* | head 100 | anomaly bytes_out by dest_ip method=mad", "transform(__nano_k, __nano_med.1"),
     ] {
         let sql = npl(query);
         assert!(
@@ -1597,7 +1597,7 @@ fn anomaly_after_head_scans_its_source_once() {
     ] {
         let sql = npl(query);
         assert!(
-            !sql.contains("mapFromArrays") && !sql.contains("__nano_stats") && !sql.contains("__nano_med"),
+            !sql.contains("groupArrayIf(__nano_k") && !sql.contains("__nano_stats") && !sql.contains("__nano_med"),
             "`{query}` must not compute anomaly constants from a second scan; got:\n{sql}"
         );
         assert!(
@@ -1627,12 +1627,12 @@ fn subsearch_eventstats_follows_the_same_stability_rule() {
     // the subsearch LIMIT, which is applied to the finished body).
     let stable = npl("* | join user [search error | eventstats avg(bytes_out) by user]");
     assert!(
-        stable.contains("mapFromArrays") && !stable.contains("OVER (PARTITION BY"),
+        stable.contains("groupArrayIf(__nano_k") && !stable.contains("OVER (PARTITION BY"),
         "eventstats over a stable subsearch body must keep the map attach; got:\n{stable}"
     );
     let unstable = npl("* | join user [search error | head 100 | eventstats avg(bytes_out) by user]");
     assert!(
-        !unstable.contains("mapFromArrays") && unstable.contains("OVER (PARTITION BY"),
+        !unstable.contains("groupArrayIf(__nano_k") && unstable.contains("OVER (PARTITION BY"),
         "eventstats after a head INSIDE a subsearch must not double-scan it; got:\n{unstable}"
     );
 }
@@ -1640,7 +1640,7 @@ fn subsearch_eventstats_follows_the_same_stability_rule() {
 #[test]
 fn anomaly_after_stable_stages_keeps_bounded_map_attach() {
     for (query, expected) in [
-        ("* | anomaly bytes_out by dest_ip", "mapFromArrays"),
+        ("* | anomaly bytes_out by dest_ip", "groupArrayIf(__nano_k"),
         ("* | where bytes_out > 0 | anomaly bytes_out by dest_ip method=mad", "__nano_med"),
         ("* | where bytes_out > 0 | anomaly process_name by user", "__nano_cnt"),
         ("* | where bytes_out > 0 | anomaly count() by user", "__nano_stats"),

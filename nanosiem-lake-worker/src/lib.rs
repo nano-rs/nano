@@ -26,6 +26,8 @@ pub mod lean_identity_merge;
 pub mod identity_enrichment;
 pub mod lean_ip_context;
 pub mod landing;
+pub mod landing_cell;
+pub mod landing_hosted;
 pub mod lean_identity_query;
 pub mod lean_ioc_query;
 pub mod lean_collector_errors;
@@ -74,6 +76,8 @@ pub mod object_identity;
 pub mod shared_mode;
 #[cfg(test)]
 mod test_heap;
+#[cfg(test)]
+pub(crate) mod landing_fixture;
 pub mod error_log;
 pub mod executor;
 pub mod generation;
@@ -103,6 +107,7 @@ pub mod otel_handoff;
 pub mod otel_iceberg;
 pub mod otel_lean;
 pub mod otel_local;
+pub mod otel_metric_catalog;
 pub mod part_ingest;
 pub mod part_query;
 pub mod product_payloads;
@@ -132,6 +137,7 @@ pub mod worker_identity;
 pub mod r2_ops;
 
 pub mod query_timing;
+pub mod thread_budget;
 pub mod perf_overrides;
 
 

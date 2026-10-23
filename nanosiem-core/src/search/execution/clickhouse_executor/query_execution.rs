@@ -16,6 +16,7 @@ use crate::search::{parse_clickhouse_error, SearchError};
 
 impl ClickHouseExecutor {
     /// Execute a ClickHouse query using the typed ClickHouseLogReadRow struct
+    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty))]
     pub(crate) async fn execute_typed_query(
         &self,
         sql: &str,
@@ -49,12 +50,14 @@ impl ClickHouseExecutor {
         let results: Vec<serde_json::Value> =
             rows.iter().map(|row| clickhouse_row_to_json(row)).collect();
 
+        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
     /// Execute a ClickHouse query with dynamic schema using JSONEachRow format
     ///
     /// This is used for aggregation queries where the result schema varies
+    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query(
         &self,
         sql: &str,
@@ -108,6 +111,7 @@ impl ClickHouseExecutor {
         );
 
         // Parse JSONEachRow format (one JSON object per line)
+        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in ClickHouse response: {}",
@@ -156,6 +160,7 @@ impl ClickHouseExecutor {
             })
             .collect();
 
+        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
@@ -169,6 +174,7 @@ impl ClickHouseExecutor {
     /// per-priority settings (NAN-1428). The id makes the companion killable
     /// by `KILL QUERY` alongside the data query; the settings bound it by the
     /// same per-priority limits. Neither changes the returned count.
+    #[tracing::instrument(name = "db.clickhouse.count", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_count_query_with_options(
         &self,
         sql: &str,
@@ -209,6 +215,7 @@ impl ClickHouseExecutor {
             }
         }
 
+        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in count response: {}",
@@ -221,6 +228,7 @@ impl ClickHouseExecutor {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                 // Count might be named "cnt" or "count(*)"
                 if let Some(cnt) = json.get("cnt").or_else(|| json.get("count(*)")) {
+                    tracing::Span::current().record("db.response.rows", 1_u64);
                     return Ok(cnt.as_u64().unwrap_or(0));
                 }
             }
@@ -236,6 +244,7 @@ impl ClickHouseExecutor {
     }
 
     /// Execute a dynamic query with a custom query_id
+    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query_with_query_id(
         &self,
         sql: &str,
@@ -271,6 +280,7 @@ impl ClickHouseExecutor {
             }
         }
 
+        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in ClickHouse response: {}",
@@ -315,6 +325,7 @@ impl ClickHouseExecutor {
             })
             .collect();
 
+        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
@@ -322,6 +333,7 @@ impl ClickHouseExecutor {
     ///
     /// Settings are applied via `.with_option()` which maps to HTTP query params
     /// on the clickhouse-rs client. Works on both self-hosted and Cloud.
+    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query_with_settings(
         &self,
         sql: &str,
@@ -370,6 +382,7 @@ impl ClickHouseExecutor {
             }
         }
 
+        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in ClickHouse response: {}",
@@ -412,12 +425,14 @@ impl ClickHouseExecutor {
             })
             .collect();
 
+        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 
     /// Execute one unattended query with server-side result overflow settings
     /// and a matching client-side byte guard. The caller owns `query_id` and can
     /// therefore issue an explicit distributed KILL on timeout or early exit.
+    #[tracing::instrument(name = "db.clickhouse.execute", skip_all, fields(db.response.rows = tracing::field::Empty, db.response.bytes = tracing::field::Empty))]
     pub(crate) async fn execute_dynamic_query_with_execution_limits(
         &self,
         sql: &str,
@@ -470,6 +485,7 @@ impl ClickHouseExecutor {
             }
         }
 
+        tracing::Span::current().record("db.response.bytes", response_bytes.len() as u64);
         let response = String::from_utf8(response_bytes).map_err(|error| {
             SearchError::DatabaseError(sqlx::Error::Protocol(format!(
                 "Invalid UTF-8 in bounded ClickHouse response: {error}"
@@ -492,6 +508,7 @@ impl ClickHouseExecutor {
                 limits.max_result_rows
             )));
         }
+        tracing::Span::current().record("db.response.rows", results.len() as u64);
         Ok(results)
     }
 

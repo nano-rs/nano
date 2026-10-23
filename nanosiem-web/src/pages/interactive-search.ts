@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-import type { SearchApi } from '@/lib/api/search';
+import type { SearchTransport } from '@/lib/search-contract';
 import type { AsyncSearchResponse, SearchRequest, SearchResponse, SearchJobStatus } from '@/lib/api/types';
 import type { AuthorityRetryOptions } from '@/lib/api/search-authority-retry';
 import type { CacheMeta } from '@/lib/api';
@@ -7,7 +7,7 @@ import { AsyncSearchArtifact, pollSearchJob } from './async-search-artifact';
 
 /** Keep admission, cancellation and artifact continuations on one request snapshot. */
 export async function startInteractiveSearch(
-  api: Pick<SearchApi, 'searchInteractive' | 'cancelSearch' | 'cancelSearchJob' | 'getSearchJob' | 'getSearchJobResultPage'>,
+  api: SearchTransport,
   request: Omit<SearchRequest, 'async_mode'>,
   chunkRows: number,
   signal: AbortSignal,

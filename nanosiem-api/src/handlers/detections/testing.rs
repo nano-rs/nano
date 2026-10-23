@@ -334,6 +334,40 @@ pub async fn format_query(
     }))
 }
 
+/// NAN-4372: the MITRE verdict a rule write would return, or `None` when the
+/// request carries no mapping (validate stays database-free for the common
+/// query-only call) or leaves the edited rule's stored mapping unchanged (the
+/// write trigger skips that UPDATE too).
+async fn mitre_mapping_error(
+    pool: &sqlx::PgPool,
+    rule_id: Option<uuid::Uuid>,
+    tactics: Option<&[String]>,
+    techniques: Option<&[String]>,
+) -> Result<Option<String>, ApiError> {
+    if tactics.is_none() && techniques.is_none() {
+        return Ok(None);
+    }
+    if let Some(rule_id) = rule_id {
+        let stored: Option<(Option<Vec<String>>, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT mitre_tactics, mitre_techniques FROM detection_rules WHERE id = $1",
+        )
+        .bind(rule_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(ApiError::from)?;
+        if nanosiem_core::mitre::mitre_mapping_unchanged(stored.as_ref(), tactics, techniques) {
+            return Ok(None);
+        }
+    }
+    nanosiem_core::mitre::validate_mitre_mapping_for_write(
+        pool,
+        tactics.unwrap_or_default(),
+        techniques.unwrap_or_default(),
+    )
+    .await
+    .map_err(ApiError::from)
+}
+
 /// Validate a detection rule configuration before creation
 ///
 /// Returns information about:
@@ -764,6 +798,20 @@ pub async fn validate_detection(
                 "Scheduled mode: will run on a cron schedule".to_string(),
             )
         };
+
+    // NAN-4372: the MITRE mapping a create/update would reject (shape,
+    // catalog, tactic/technique pairing) is reported here instead of first
+    // surfacing at create.
+    if let Some(error) = mitre_mapping_error(
+        &state.pool,
+        request.rule_id,
+        request.mitre_tactics.as_deref(),
+        request.mitre_techniques.as_deref(),
+    )
+    .await?
+    {
+        errors.push(error);
+    }
 
     // valid is false if parsing failed OR if we found invalid fields
     let valid = valid && errors.is_empty();

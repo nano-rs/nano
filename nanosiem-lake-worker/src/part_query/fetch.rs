@@ -481,6 +481,17 @@ impl PartFetcher {
         None
     }
 
+    /// NAN-4164: whether `file` is already on this cell (written by its
+    /// ingest, or a verified reader-cache object), so leasing it reads no R2.
+    pub async fn file_is_local(&self, part: &PartRef, record: &ProvenanceRecord, file: PartFile) -> Result<bool> {
+        if self.local_file_path(part, record, file).is_some() {
+            return Ok(true);
+        }
+        let Some((_, digest, size)) = file_digest(record, file) else { return Ok(false) };
+        let object = ReaderObjectRef { range: None, source_uri: self.file_uri(part, record, file)?, sha256: digest.to_string(), size_bytes: size };
+        Ok(self.cache.is_local(&object).await?)
+    }
+
     /// Lease exactly these files.
     pub async fn ensure_files(&self, wanted: &[(PartRef, PartFile)]) -> Result<LocalParts> {
         self.ensure_files_within(wanted, None).await

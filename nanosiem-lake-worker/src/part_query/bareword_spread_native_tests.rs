@@ -20,7 +20,7 @@
 //! cargo test -p nanosiem-lake-worker --lib part_query::density::bareword_spread_native -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::native::{digest, engine, envelope, granted, ordered_uids, request, rows_of, TENANT};
+use super::native::{digest, engine, envelope, ordered_uids, request, rows_of, TENANT};
 use crate::enrichment::BronzeIngestEnricher;
 use crate::part_ingest::ingest::seed_schema;
 use crate::part_ingest::{IngestConfig, Ingestor, NoticeQueue, SourceNotice, SpoolQueue};
@@ -265,7 +265,7 @@ async fn attempt(
 ) -> (Result<Value, String>, crate::query_timing::Funnel) {
     crate::query_timing::measure("nan3171", async {
         engine.clear_locator_cache();
-        let answer = crate::enrichment_read::scope(granted(), engine.broad_npl(request))
+        let answer = engine.broad_npl(request)
             .await
             .map_err(|error| error.to_string());
         let funnel = crate::query_timing::current()

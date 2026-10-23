@@ -779,8 +779,10 @@ export interface MatchesDetailProps {
   linkedAlertId?: string;
   linkedAlertTitle?: string;
   onOpenInSearch: (view: MatchView) => void;
+  onRunRuleQuery?: (view: MatchView) => void;
   /** Detection rule id, used for parsed-predicate fetch (NAN-501). */
   ruleId?: string;
+  ruleName?: string;
 }
 
 export function MatchesDetail({
@@ -789,7 +791,9 @@ export function MatchesDetail({
   linkedAlertId,
   linkedAlertTitle,
   onOpenInSearch,
+  onRunRuleQuery,
   ruleId,
+  ruleName,
 }: MatchesDetailProps) {
   const [hoveredEventId, setHoveredEventId] = useState<string | null>(null);
   const matchMttd = useMemo(() => (view ? meanTimeToDetect([view]) : null), [view]);
@@ -842,6 +846,11 @@ export function MatchesDetail({
                 <>Single-event match: <span className="font-mono">{view.topActionName || 'Matched event'}</span></>
               )}
             </h2>
+            {ruleName && (
+              <div className="mt-1 text-[10.5px] text-muted-foreground">
+                Rule: <span className="font-mono text-foreground break-all">{ruleName}</span>
+              </div>
+            )}
             <p className="mt-1 text-[12px] text-muted-foreground leading-[1.55]">
               {view.isAggregate ? (
                 <>
@@ -870,6 +879,15 @@ export function MatchesDetail({
             </p>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {onRunRuleQuery && (
+              <button
+                type="button"
+                onClick={() => onRunRuleQuery(view)}
+                className="h-7 px-2 rounded-md border border-border hover:bg-muted text-[11px] font-medium"
+              >
+                Run rule query
+              </button>
+            )}
             <button
               type="button"
               onClick={() => onOpenInSearch(view)}

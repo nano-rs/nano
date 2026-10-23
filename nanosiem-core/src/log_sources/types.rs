@@ -341,6 +341,27 @@ pub struct NewLogSource {
     /// AddFeed wizard sends "draft" for its auto-persisted in-progress feed.
     #[serde(default)]
     pub lifecycle_status: Option<String>,
+    // NAN-4372: the extension (NAN-874) is accepted at create time.
+    /// Parser extension VRL run after the parser, supplied at create time so
+    /// a source does not need a second PUT. Blank is "no extension".
+    #[serde(default)]
+    pub extension_vrl: Option<String>,
+    /// Whether the extension runs. Omitted → enabled exactly when a
+    /// non-blank `extension_vrl` is supplied.
+    #[serde(default)]
+    pub extension_enabled: Option<bool>,
+}
+
+impl NewLogSource {
+    /// The extension to persist: blank collapses to none.
+    pub fn extension(&self) -> Option<&str> {
+        self.extension_vrl.as_deref().filter(|v| !v.trim().is_empty())
+    }
+
+    /// The `extension_enabled` to persist (see the field docs).
+    pub fn extension_is_enabled(&self) -> bool {
+        self.extension_enabled.unwrap_or(self.extension().is_some())
+    }
 }
 
 fn default_namespace() -> String {

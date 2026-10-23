@@ -1082,6 +1082,16 @@ pub struct CurrentUserResponse {
     pub deployment_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_tenant: Option<ActiveTenantResponse>,
+    /// Present only for a live demo analyst of a demo tenant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub demo: Option<CurrentUserDemo>,
+}
+
+/// The caller's demo session (shared demo tenants only).
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct CurrentUserDemo {
+    pub active: bool,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Get current authenticated user
@@ -1105,7 +1115,12 @@ pub async fn get_current_user(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     tenant: Option<Extension<TrustedTenantContext>>,
+    #[cfg(feature = "enterprise")] demo: Option<Extension<nanosiem_core::enterprise_shared_demo::SharedDemoPrincipal>>,
 ) -> Result<Json<CurrentUserResponse>, (StatusCode, Json<AuthApiError>)> {
+    #[cfg(feature = "enterprise")]
+    let demo = demo.map(|Extension(principal)| CurrentUserDemo { active: true, expires_at: principal.expires_at });
+    #[cfg(not(feature = "enterprise"))]
+    let demo: Option<CurrentUserDemo> = None;
     let deployment_mode = match state.config.deployment_mode {
         DeploymentMode::Managed => "managed",
         #[cfg(feature = "enterprise")]
@@ -1134,6 +1149,7 @@ pub async fn get_current_user(
             landing_page: None,
             deployment_mode,
             active_tenant,
+            demo,
         }));
     }
 
@@ -1166,10 +1182,30 @@ pub async fn get_current_user(
         landing_page,
         deployment_mode,
         active_tenant,
+        demo,
     }))
 }
 
-/// Token validation response
+/// Server-resolved identity for an owner-bound agent search key.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AgentLaneIdentity {
+    pub tenant_id: Uuid,
+    pub key_id: Uuid,
+    pub owner_id: Uuid,
+    pub permissions: Vec<String>,
+    pub restricted: bool,
+    pub source: Option<String>,
+    pub source_allowed: Option<bool>,
+}
+
+/// A decision for one requested source; never disclose the viewer's deny sets.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+pub struct AgentLaneValidationQuery {
+    pub agent_tenant: Option<Uuid>,
+    pub agent_source: Option<String>,
+}
+
+/// Token validation response.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TokenValidationResponse {
     pub valid: bool,
@@ -1177,6 +1213,9 @@ pub struct TokenValidationResponse {
     #[schema(value_type = String)]
     pub user_id: Uuid,
     pub expires_at: i64,
+    /// Present only for an owner-bound search API key in a trusted tenant.
+    /// The gateway never accepts a client-supplied tenant or source scope.
+    pub agent_lane: Option<AgentLaneIdentity>,
 }
 
 /// Validate token (for frontend to check if token is still valid)
@@ -1186,20 +1225,49 @@ pub struct TokenValidationResponse {
     get,
     path = "/api/auth/validate",
     tag = "auth",
+    params(AgentLaneValidationQuery),
     responses(
         (status = 200, description = "Token is valid", body = TokenValidationResponse),
         (status = 401, description = "Token is invalid or expired", body = AuthApiError),
+        (status = 403, description = "Requested agent tenant does not match the key", body = AuthApiError),
+        (status = 400, description = "Invalid source decision request", body = AuthApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn validate_token(
     Extension(auth): Extension<AuthContext>,
-) -> Json<TokenValidationResponse> {
-    Json(TokenValidationResponse {
+    tenant: Option<Extension<TrustedTenantContext>>,
+    axum::extract::Query(query): axum::extract::Query<AgentLaneValidationQuery>,
+) -> Result<Json<TokenValidationResponse>, (StatusCode, Json<AuthApiError>)> {
+    if query.agent_tenant.is_some_and(|expected| tenant.as_ref().is_none_or(|t| t.tenant_id != expected)) {
+        return Err((StatusCode::FORBIDDEN, Json(AuthApiError::new("agent_tenant_denied", "The key does not authorize the requested tenant"))));
+    }
+    if query.agent_source.as_ref().is_some_and(|s| s.is_empty() || s.len() > 255
+        || !s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_:-".contains(&b))) {
+        return Err((StatusCode::BAD_REQUEST, Json(AuthApiError::new("invalid_agent_source", "Invalid source decision request"))));
+    }
+    let agent_lane = tenant.and_then(|Extension(tenant)| {
+        if !auth.is_api_key || auth.user_id().is_nil() || tenant.tenant_id.is_nil()
+            || !auth.has_permission("search:execute") {
+            return None;
+        }
+        let scope = auth.effective_viewer_scope();
+        Some(AgentLaneIdentity {
+            tenant_id: tenant.tenant_id,
+            key_id: auth.api_key_id?,
+            owner_id: auth.user_id(),
+            permissions: auth.claims.permissions.clone(),
+            restricted: scope.is_restricted() || scope.is_artifact_restricted(),
+            source_allowed: query.agent_source.as_ref().map(|source| !scope.deny_set().contains(source)),
+            source: query.agent_source,
+        })
+    });
+    Ok(Json(TokenValidationResponse {
         valid: true,
         user_id: auth.claims.sub,
         expires_at: auth.claims.exp,
-    })
+        agent_lane,
+    }))
 }
 
 /// Which authentication methods this deployment currently accepts.
@@ -1276,7 +1344,9 @@ pub async fn get_auth_methods(
         ChangePasswordResponse,
         CurrentUserResponse,
         ActiveTenantResponse,
+        CurrentUserDemo,
         TokenValidationResponse,
+        AgentLaneIdentity,
         AuthMethodsResponse
     ))
 )]
@@ -1285,6 +1355,37 @@ pub struct AuthApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn agent_lane_identity_uses_trusted_tenant_and_canonical_viewer_scope() {
+        let key = nanosiem_core::auth::ApiKeyInfo {
+            id: Uuid::now_v7(), name: "desktop".into(),
+            permissions: vec!["search:execute".into()], user_id: Some(Uuid::now_v7()),
+        };
+        let mut auth = AuthContext::from_api_key(&key);
+        auth.denied_sources = nanosiem_core::auth::ScopeSet::from_denied(
+            ["windows_sysmon".to_string()].into_iter().collect());
+        let tenant = TrustedTenantContext { tenant_id: Uuid::now_v7(), tenant_slug: "tenant-a".into() };
+        let query = || axum::extract::Query(AgentLaneValidationQuery { agent_tenant: Some(tenant.tenant_id), agent_source: Some("windows_sysmon".into()) });
+        let Json(response) = validate_token(Extension(auth.clone()), Some(Extension(tenant.clone())), query()).await.unwrap();
+        let identity = response.agent_lane.unwrap();
+        assert_eq!(identity.tenant_id, tenant.tenant_id);
+        assert_eq!(identity.key_id, key.id);
+        assert_eq!(identity.owner_id, key.user_id.unwrap());
+        assert!(identity.restricted);
+        assert_eq!(identity.source.as_deref(), Some("windows_sysmon"));
+        assert_eq!(identity.source_allowed, Some(false));
+        let encoded = serde_json::to_value(&identity).unwrap();
+        assert!(encoded.get("denied_sources").is_none());
+        assert!(encoded.get("artifact_denied_sources").is_none());
+        let public = || axum::extract::Query(AgentLaneValidationQuery::default());
+        assert!(validate_token(Extension(auth.clone()), None, public()).await.unwrap().0.agent_lane.is_none());
+        auth.is_api_key = false;
+        assert!(validate_token(Extension(auth.clone()), Some(Extension(tenant.clone())), public()).await.unwrap().0.agent_lane.is_none());
+        auth.is_api_key = true;
+        auth.claims.permissions.clear();
+        assert!(validate_token(Extension(auth), Some(Extension(tenant)), public()).await.unwrap().0.agent_lane.is_none());
+    }
 
     /// NAN-3790: on the hosted shared host the plain `emit_audit` path can
     /// persist nothing (the shared emitter refuses tenantless rows), so every

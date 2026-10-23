@@ -70,7 +70,7 @@ afterEach(() => {
 
 it('hosted tenant login discovers and starts SSO through the shared OIDC path only', async () => {
   render(
-    <MemoryRouter>
+    <MemoryRouter initialEntries={[{ pathname: '/login', state: { from: '/search?q=error&start=2026-10-17T12%3A00%3A00Z&end=2026-10-17T13%3A00%3A00Z' } } ]}>
       <Login tenantSlug="ops" />
     </MemoryRouter>,
   );
@@ -79,6 +79,7 @@ it('hosted tenant login discovers and starts SSO through the shared OIDC path on
     fireEvent.click(button);
   });
 
+  expect(JSON.parse(sessionStorage.getItem('nano:enterprise-shared:oidc-pending')!).returnPath).toBe('/search?q=error&start=2026-10-17T12%3A00%3A00Z&end=2026-10-17T13%3A00%3A00Z');
   expect(auth.state.loginWithOidc).not.toHaveBeenCalled();
   expect(calls.map((c) => c.path)).toEqual([
     '/api/auth/shared/oidc/providers',

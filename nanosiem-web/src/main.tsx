@@ -16,6 +16,7 @@ import App from './App.tsx';
 import './index.css';
 import { toast } from 'sonner';
 import { watchForNewBuild } from './lib/build-update';
+import { initTenantPathAlias } from './lib/tenant-auth-shell';
 
 if (import.meta.env.PROD) {
   watchForNewBuild(() => {
@@ -28,6 +29,14 @@ if (import.meta.env.PROD) {
   });
 }
 
-createRoot(document.getElementById('root')!).render(
-  <App />
-);
+// NAN-4152: resolve a `/t/<alias>` web path alias BEFORE the first render, so
+// every tenant selector the app derives from the path is the canonical slug.
+// Off a /t/ path this is a no-op; any failure leaves no alias (the segment is
+// treated as a slug, as before).
+void initTenantPathAlias(window.location.pathname)
+  .catch(() => undefined)
+  .finally(() => {
+    createRoot(document.getElementById('root')!).render(
+      <App />
+    );
+  });

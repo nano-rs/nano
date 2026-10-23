@@ -32,6 +32,21 @@
 //!   instead of answering MEMORY_LIMIT; if even that refuses, the error
 //!   names the cap ([`ExecutorError::MemoryExhausted`]).
 //!
+//! - NAN-4174: threads come from the process thread budget
+//!   ([`crate::thread_budget`]) when the lanes have one: the fixed
+//!   [`INTERACTIVE_MAX_THREADS`] cap then gives way to the pool (a lone
+//!   statement gets all of it, concurrent ones share it, background work
+//!   yields), and the cap stays only for lanes without a budget;
+//! - NAN-4174: a predictable large aggregate (a GROUP BY on a string column
+//!   over a window of [`LARGE_AGGREGATE_WINDOW_CLASS`] or more) starts on
+//!   the large lane instead of spilling on a small one, failing late and
+//!   running again; when every large permit is taken it starts small as
+//!   before rather than queue;
+//! - NAN-4174: the lane memo survives restarts and rolls
+//!   ([`LaneMemo::persist_at`], on the persistent hot volume when there is
+//!   one), so the first 7 d query of a shape after a roll does not pay the
+//!   retry again.
+//!
 //! Every change here is an execution setting: no statement's rows change.
 //!
 //! Kill switch: `NANO_LAKE_LANE_ROUTING_V2=0` (read once when the engine
@@ -45,12 +60,22 @@ use super::memory_budget::{is_memory_limit_error, MIB, MIN_LARGE_QUERY_BYTES, SM
 use crate::executor::{ExecutorError, NativeExecutor};
 use crate::native::NativeQueryOutput;
 use crate::planner::{NativeQueryPlan, ReaderShape};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Interactive statements' thread cap.
+/// Interactive statements' thread cap on lanes without a thread budget.
 pub const INTERACTIVE_MAX_THREADS: u64 = 4;
+/// NAN-4174: the smallest window class (log2 of whole hours: 7 is 65-128 h,
+/// i.e. 3 d and up) whose string GROUP BY starts on the large lane.
+pub const LARGE_AGGREGATE_WINDOW_CLASS: u8 = 7;
+/// NAN-4174: a persisted lane memo entry older than this is dropped on load
+/// (shapes change with releases; an escalation is cheap to relearn).
+const MEMO_MAX_AGE_SECONDS: i64 = 7 * 24 * 3600;
+/// NAN-4174: the persisted lane memo's file name.
+pub const LANE_MEMO_FILE: &str = "lane-memo.v1.json";
 /// A bounded wide-text reader's threads on a small lane.
 pub const BOUNDED_READER_THREADS: u64 = 2;
 /// Decoded bytes one row group of one wide column is assumed to hold
@@ -62,7 +87,8 @@ pub const MAX_LARGE_LANES: usize = 2;
 const MEMO_ENTRIES: usize = 4_096;
 
 /// The lane class a statement runs on, smallest first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LaneClass {
     Small,
     /// One permit of the large lane: its memory / its width.
@@ -223,16 +249,41 @@ pub(crate) struct Start {
     pub sql: String,
     /// The lane memo entry consulted and written (v2 only).
     pub memo_key: Option<String>,
+    /// NAN-4174: the large lane was chosen only because the statement is a
+    /// predictable large aggregate ([`predictable_large_aggregate`]), not by
+    /// its scan size or the memo: it may start small when the large lane is
+    /// full.
+    pub predicted: bool,
 }
 
-pub(crate) fn start(routing_v2: bool, width: u32, memo: &LaneMemo, plan: &NativeQueryPlan) -> Start {
+/// `thread_cap`: the interactive thread cap, the process thread budget's
+/// pool when the lanes have one (the budget then grants each statement its
+/// share at start), else [`INTERACTIVE_MAX_THREADS`].
+pub(crate) fn start(routing_v2: bool, width: u32, memo: &LaneMemo, plan: &NativeQueryPlan, thread_cap: u64) -> Start {
     let by_size = if super::engine::needs_large_lane(plan.budget.estimated_scan_bytes) { LaneClass::Large } else { LaneClass::Small };
     if !crate::perf_overrides::lane_routing_v2(routing_v2) {
-        return Start { v2: false, class: by_size, sql: plan.sql.clone(), memo_key: None };
+        return Start { v2: false, class: by_size, sql: plan.sql.clone(), memo_key: None, predicted: false };
     }
     let memo_key = LaneMemo::key(plan);
     let remembered = memo_key.as_deref().map_or(LaneClass::Small, |key| memo.needed(key));
-    Start { v2: true, class: normalize(width, remembered.max(by_size)), sql: cap_threads(&plan.sql, INTERACTIVE_MAX_THREADS), memo_key }
+    let known = remembered.max(by_size);
+    let by_shape = if predictable_large_aggregate(&plan.reader) { LaneClass::Large } else { LaneClass::Small };
+    Start {
+        v2: true,
+        class: normalize(width, known.max(by_shape)),
+        sql: cap_threads(&plan.sql, thread_cap),
+        memo_key,
+        predicted: by_shape > known,
+    }
+}
+
+/// NAN-4174: a statement whose GROUP BY on a string column over a window of
+/// [`LARGE_AGGREGATE_WINDOW_CLASS`] or more would outgrow a small lane: its
+/// hash table spills at half of 256 MiB and then fails late on memory, and
+/// the rerun on the large lane costs the scan again (measured: 7 d string
+/// aggregates at about 2x their chDB time).
+pub fn predictable_large_aggregate(shape: &ReaderShape) -> bool {
+    shape.string_group_by && shape.window_class >= LARGE_AGGREGATE_WINDOW_CLASS
 }
 
 /// How a statement was routed (for the debug evidence).
@@ -250,8 +301,14 @@ pub struct Route {
 /// that fits where it starts costs nothing here.
 #[derive(Default)]
 pub struct LaneMemo {
-    needed: Mutex<HashMap<String, LaneClass>>,
+    /// key -> (class, unix seconds it was last raised).
+    needed: Mutex<HashMap<String, (LaneClass, i64)>>,
+    /// NAN-4174: where the memo is persisted (`None`: process lifetime).
+    path: Mutex<Option<PathBuf>>,
 }
+
+/// One persisted lane memo entry: (key, class, unix seconds remembered).
+type MemoEntry = (String, LaneClass, i64);
 
 impl LaneMemo {
     /// The memo key of `plan`; `None` for statements without a query hash
@@ -272,16 +329,49 @@ impl LaneMemo {
     }
 
     pub fn needed(&self, key: &str) -> LaneClass {
-        self.needed.lock().expect("lane memo").get(key).copied().unwrap_or(LaneClass::Small)
+        self.needed.lock().expect("lane memo").get(key).map_or(LaneClass::Small, |(class, _)| *class)
     }
 
     pub fn remember(&self, key: &str, class: LaneClass) {
-        let mut needed = self.needed.lock().expect("lane memo");
-        if needed.len() >= MEMO_ENTRIES && !needed.contains_key(key) {
-            needed.clear();
+        let now = chrono::Utc::now().timestamp();
+        // Held through the write: concurrent escalations store one at a time
+        // (they share the temporary file name).
+        let path = self.path.lock().expect("lane memo path");
+        let snapshot = {
+            let mut needed = self.needed.lock().expect("lane memo");
+            if needed.len() >= MEMO_ENTRIES && !needed.contains_key(key) {
+                needed.clear();
+            }
+            let entry = needed.entry(key.to_string()).or_insert((class, now));
+            *entry = (entry.0.max(class), now);
+            path.as_ref().map(|_| Self::entries(&needed))
+        };
+        // Escalations are rare (each one is a failed statement), so the
+        // whole memo is rewritten each time, atomically (`memo::store`).
+        if let (Some(path), Some(snapshot)) = (path.as_ref(), snapshot) {
+            super::memo::store(path, &snapshot);
         }
-        let entry = needed.entry(key.to_string()).or_insert(class);
-        *entry = (*entry).max(class);
+    }
+
+    /// NAN-4174: keep this memo in `path` from now on, loading what an
+    /// earlier process (this pod's, or the previous pod's on a persistent
+    /// hot volume) remembered there. Entries older than a week are dropped;
+    /// a missing or unreadable file starts empty.
+    pub fn persist_at(&self, path: PathBuf) {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(entries) = super::memo::load::<Vec<MemoEntry>>(&path) {
+            let mut needed = self.needed.lock().expect("lane memo");
+            for (key, class, at) in entries.into_iter().filter(|(_, _, at)| now.saturating_sub(*at) <= MEMO_MAX_AGE_SECONDS).take(MEMO_ENTRIES) {
+                let entry = needed.entry(key).or_insert((class, at));
+                *entry = (entry.0.max(class), entry.1.max(at));
+            }
+            tracing::info!(entries = needed.len(), path = %path.display(), "lane memo loaded");
+        }
+        *self.path.lock().expect("lane memo path") = Some(path);
+    }
+
+    fn entries(needed: &HashMap<String, (LaneClass, i64)>) -> Vec<MemoEntry> {
+        needed.iter().map(|(key, (class, at))| (key.clone(), *class, *at)).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -316,17 +406,24 @@ pub async fn run_sized(
     };
     // NAN-3406: the routing decision is per request (an authorized
     // `lane_routing_v2` override); the lane's width is the process's.
-    let Start { v2, class, sql, memo_key: key } = start(large.routing_v2, large.width, memo, &plan);
+    let thread_cap = small.thread_budget().map_or(INTERACTIVE_MAX_THREADS, |budget| budget.total());
+    let Start { v2, class, sql, memo_key: key, predicted } = start(large.routing_v2, large.width, memo, &plan, thread_cap);
     if !v2 {
         return run_sized_v1(small, large, plan).await;
     }
     plan.sql = sql;
+    // NAN-4174: a predicted large aggregate never queues for a full large
+    // lane; it starts small (and escalates on a refusal) as before.
+    let class = if predicted && large.permits.available_permits() == 0 { LaneClass::Small } else { class };
+    if predicted && class != LaneClass::Small {
+        tracing::debug!(class = class.label(), "predictable large aggregate starts on the large lane");
+    }
     let first = class;
     let mut class = class;
     loop {
         let result = match class {
             LaneClass::Small => {
-                let bounded = needs_bounded_reader(&plan.reader, setting(&plan.sql, "max_threads").unwrap_or(INTERACTIVE_MAX_THREADS));
+                let bounded = needs_bounded_reader(&plan.reader, setting(&plan.sql, "max_threads").unwrap_or(thread_cap));
                 let mut small_plan = plan.clone();
                 if bounded {
                     small_plan.sql = bounded_reader_sql(&small_plan.sql, BOUNDED_READER_THREADS);
@@ -490,7 +587,7 @@ mod tests {
     use super::super::memory_budget::GIB;
 
     fn shape(wide_columns: u64, row_groups: u64) -> ReaderShape {
-        ReaderShape { wide_columns, row_groups, window_class: 8, columns_key: 7 }
+        ReaderShape { wide_columns, row_groups, window_class: 8, columns_key: 7, string_group_by: false }
     }
 
     #[test]
@@ -604,19 +701,19 @@ mod tests {
         let routing = |value: Option<bool>| Overrides { lane_routing_v2: value, ..Overrides::default() };
         let flat = |value: bool| Overrides { flat_filter_leaves: Some(value), ..Overrides::default() };
         // v2 process, request asks for v1: NAN-3077 routing, threads as planned, no memo.
-        let off = sync_scoped(routing(Some(false)), || start(true, 2, &memo, &wide));
-        assert_eq!(off, Start { v2: false, class: LaneClass::Small, sql: wide.sql.clone(), memo_key: None });
+        let off = sync_scoped(routing(Some(false)), || start(true, 2, &memo, &wide, INTERACTIVE_MAX_THREADS));
+        assert_eq!(off, Start { v2: false, class: LaneClass::Small, sql: wide.sql.clone(), memo_key: None, predicted: false });
         // v1 process, request asks for v2: capped threads and the memo.
-        let on = sync_scoped(routing(Some(true)), || start(false, 1, &memo, &wide));
+        let on = sync_scoped(routing(Some(true)), || start(false, 1, &memo, &wide, INTERACTIVE_MAX_THREADS));
         assert!(on.v2 && on.sql.contains("max_threads=4") && on.memo_key.is_some(), "{on:?}");
         // No override: the process value, unchanged.
-        assert_eq!(start(true, 2, &memo, &wide), sync_scoped(Overrides::default(), || start(true, 2, &memo, &wide)));
-        assert!(start(true, 2, &memo, &wide).v2 && !start(false, 1, &memo, &wide).v2);
+        assert_eq!(start(true, 2, &memo, &wide, INTERACTIVE_MAX_THREADS), sync_scoped(Overrides::default(), || start(true, 2, &memo, &wide, INTERACTIVE_MAX_THREADS)));
+        assert!(start(true, 2, &memo, &wide, INTERACTIVE_MAX_THREADS).v2 && !start(false, 1, &memo, &wide, INTERACTIVE_MAX_THREADS).v2);
         // A remembered escalation is read by v2 only.
         memo.remember(on.memo_key.as_deref().unwrap(), LaneClass::LargeFull);
-        assert_eq!(sync_scoped(routing(Some(true)), || start(false, 2, &memo, &wide)).class, LaneClass::LargeFull);
-        assert_eq!(sync_scoped(routing(Some(true)), || start(false, 1, &memo, &wide)).class, LaneClass::Large);
-        assert_eq!(sync_scoped(routing(Some(false)), || start(true, 2, &memo, &wide)).class, LaneClass::Small);
+        assert_eq!(sync_scoped(routing(Some(true)), || start(false, 2, &memo, &wide, INTERACTIVE_MAX_THREADS)).class, LaneClass::LargeFull);
+        assert_eq!(sync_scoped(routing(Some(true)), || start(false, 1, &memo, &wide, INTERACTIVE_MAX_THREADS)).class, LaneClass::Large);
+        assert_eq!(sync_scoped(routing(Some(false)), || start(true, 2, &memo, &wide, INTERACTIVE_MAX_THREADS)).class, LaneClass::Small);
         // The memo separates flat-leaf modes: one mode's escalation never routes the other.
         let flat_key = sync_scoped(flat(true), || LaneMemo::key(&wide)).unwrap();
         let nested_key = sync_scoped(flat(false), || LaneMemo::key(&wide)).unwrap();
@@ -644,6 +741,73 @@ mod tests {
         let memo = LaneMemo::default();
         memo.remember(&four, LaneClass::LargeFull);
         assert_eq!(memo.needed(&base), LaneClass::Small);
+    }
+
+    /// NAN-4174: a string GROUP BY over 3 d or more starts on the large
+    /// lane (marked predicted, so a full large lane starts it small); shorter
+    /// windows, other shapes and v1 routing do not; a remembered or
+    /// size-forced class is not a prediction.
+    #[test]
+    fn predictable_large_aggregates_start_on_the_large_lane() {
+        let memo = LaneMemo::default();
+        let mut aggregate = plan("SELECT 1 SETTINGS max_threads=8", ReaderShape { string_group_by: true, ..shape(0, 4_000) });
+        aggregate.query_sha256 = "ef".repeat(32);
+        let started = start(true, 2, &memo, &aggregate, 6);
+        assert_eq!((started.class, started.predicted), (LaneClass::Large, true));
+        assert!(started.sql.contains("max_threads=6"), "the budget's pool caps threads: {}", started.sql);
+        assert_eq!(start(true, 1, &memo, &aggregate, 6).class, LaneClass::Large);
+        // 3 d is the threshold (window class 7: 65-128 h); 2 d is not.
+        for (class, expected) in [(7, LaneClass::Large), (6, LaneClass::Small), (5, LaneClass::Small)] {
+            aggregate.reader.window_class = class;
+            assert_eq!(start(true, 2, &memo, &aggregate, 6).class, expected, "window class {class}");
+        }
+        aggregate.reader.window_class = 8;
+        // Not a string GROUP BY: unchanged.
+        let rows = plan("SELECT 1", shape(0, 4_000));
+        assert_eq!((start(true, 2, &memo, &rows, 6).class, start(true, 2, &memo, &rows, 6).predicted), (LaneClass::Small, false));
+        // v1 routing ignores the hint.
+        use crate::perf_overrides::{sync_scoped, Overrides};
+        let v1 = sync_scoped(Overrides { lane_routing_v2: Some(false), ..Overrides::default() }, || start(true, 2, &memo, &aggregate, 6));
+        assert_eq!((v1.class, v1.predicted), (LaneClass::Small, false));
+        // A remembered escalation (or a large scan) decides by itself.
+        memo.remember(&LaneMemo::key(&aggregate).unwrap(), LaneClass::LargeFull);
+        assert_eq!((start(true, 2, &memo, &aggregate, 6).class, start(true, 2, &memo, &aggregate, 6).predicted), (LaneClass::LargeFull, false));
+        let mut big = plan("SELECT 1", ReaderShape { string_group_by: true, ..shape(0, 4_000) });
+        big.budget.estimated_scan_bytes = super::super::engine::LARGE_SCAN_BYTES + 1;
+        assert!(!start(true, 2, &memo, &big, 6).predicted);
+        // No budget: the fixed interactive cap.
+        assert!(start(true, 2, &LaneMemo::default(), &aggregate, INTERACTIVE_MAX_THREADS).sql.contains("max_threads=4"));
+    }
+
+    /// NAN-4174: the lane memo survives the process in its file, keeps the
+    /// largest class, and drops entries older than a week on load.
+    #[test]
+    fn lane_memo_persists_across_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LANE_MEMO_FILE);
+        let first = LaneMemo::default();
+        first.persist_at(path.clone());
+        assert_eq!(first.len(), 0, "no file yet");
+        first.remember("q:8:1", LaneClass::Large);
+        first.remember("q:8:2", LaneClass::Degraded);
+        first.remember("q:8:1", LaneClass::LargeFull);
+        let second = LaneMemo::default();
+        second.persist_at(path.clone());
+        assert_eq!((second.needed("q:8:1"), second.needed("q:8:2"), second.needed("q:8:3")),
+            (LaneClass::LargeFull, LaneClass::Degraded, LaneClass::Small));
+        // Stale entries are dropped; a corrupt file starts empty.
+        let old = chrono::Utc::now().timestamp() - MEMO_MAX_AGE_SECONDS - 60;
+        super::super::memo::store(&path, &vec![("old".to_string(), LaneClass::Large, old), ("new".to_string(), LaneClass::Large, old + 120)]);
+        let third = LaneMemo::default();
+        third.persist_at(path.clone());
+        assert_eq!((third.needed("old"), third.needed("new")), (LaneClass::Small, LaneClass::Large));
+        std::fs::write(&path, b"{nope").unwrap();
+        let fourth = LaneMemo::default();
+        fourth.persist_at(path.clone());
+        assert_eq!(fourth.len(), 0);
+        // Without a path nothing is written.
+        LaneMemo::default().remember("x", LaneClass::Large);
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() == 1);
     }
 
     #[test]
@@ -699,3 +863,7 @@ mod tests {
 #[cfg(test)]
 #[path = "lane_routing_native_tests.rs"]
 mod native;
+
+#[cfg(test)]
+#[path = "parquet_metadata_cache_native_probe.rs"]
+mod metadata_cache_probe;

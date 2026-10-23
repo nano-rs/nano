@@ -39,6 +39,10 @@ pub const HOSTED_PROGRESS_PHASES: [&str; 8] = [
     "retrying_1", "retrying_2", "retrying_3", "retrying_4",
 ];
 
+/// NAN-4290: the coordinator's claim lane for small jobs
+/// (`contract.mjs`: `command.lane === 'small'`).
+pub const SMALL_LANE: &str = "small";
+
 fn valid_phase(phase: &str) -> bool {
     HOSTED_PROGRESS_PHASES.contains(&phase)
 }
@@ -66,6 +70,15 @@ impl DurableJobRunnerStore for HostedCoordinatorClient {
         lease: Duration,
     ) -> Result<Option<RunnerClaim>, DurableJobStoreError> {
         Ok(HostedCoordinatorClient::claim(self, owner, lease)
+            .await?
+            .map(RunnerClaim::hosted))
+    }
+    async fn claim_small(
+        &self,
+        owner: &str,
+        lease: Duration,
+    ) -> Result<Option<RunnerClaim>, DurableJobStoreError> {
+        Ok(HostedCoordinatorClient::claim_lane(self, owner, lease, Some(SMALL_LANE))
             .await?
             .map(RunnerClaim::hosted))
     }
@@ -107,15 +120,7 @@ impl DurableJobRunnerStore for HostedCoordinatorClient {
         if max_attempts != self.policy.max_execution_failures {
             return Err(rejected());
         }
-        // Child stderr can contain raw query/credential data. Publish a static
-        // category only; the runner retains detailed diagnostics locally.
-        let category = match error {
-            "Search authority temporarily unavailable" => {
-                "Search authority temporarily unavailable"
-            }
-            "This search exceeds the largest durable scan budget. Narrow the time range or add filters." => error,
-            _ => "isolated query execution failed",
-        };
+        let category = published_failure_category(error);
         HostedCoordinatorClient::fail(
             self,
             c.hosted_claim()?,
@@ -130,6 +135,66 @@ impl DurableJobRunnerStore for HostedCoordinatorClient {
     }
     async fn release_claim(&self, c: &RunnerClaim) -> Result<bool, DurableJobStoreError> {
         HostedCoordinatorClient::release_claim(self, c.hosted_claim()?).await
+    }
+}
+
+/// Child stderr can contain raw query/credential data. Publish a static
+/// category only; the runner retains detailed diagnostics locally.
+fn published_failure_category(error: &str) -> &'static str {
+    match error {
+        "Search authority temporarily unavailable" => "Search authority temporarily unavailable",
+        // NAN-3911: the typed `query_too_large` categories are static runner
+        // strings; the job status maps them to an error code.
+        super::jobs::QUERY_TOO_LARGE_SCAN_MESSAGE => super::jobs::QUERY_TOO_LARGE_SCAN_MESSAGE,
+        super::jobs::QUERY_TOO_LARGE_MEMORY_MESSAGE => super::jobs::QUERY_TOO_LARGE_MEMORY_MESSAGE,
+        super::jobs::QUERY_TOO_LARGE_TIME_MESSAGE => super::jobs::QUERY_TOO_LARGE_TIME_MESSAGE,
+        // NAN-4277 (F18): chDB's statement time limit is a known cause, not
+        // free text: publish its static category, never the message itself.
+        raw if raw.contains("TIMEOUT_EXCEEDED") => super::jobs::QUERY_TOO_LARGE_TIME_MESSAGE,
+        _ => "isolated query execution failed",
+    }
+}
+
+#[cfg(test)]
+mod published_failure_category_tests {
+    use super::*;
+
+    #[test]
+    fn query_too_large_categories_survive_and_carry_their_error_code() {
+        for message in [
+            super::super::jobs::QUERY_TOO_LARGE_MEMORY_MESSAGE,
+            super::super::jobs::QUERY_TOO_LARGE_SCAN_MESSAGE,
+            super::super::jobs::QUERY_TOO_LARGE_TIME_MESSAGE,
+        ] {
+            let published = published_failure_category(message);
+            assert_eq!(published, message);
+            assert!(published.len() <= 256, "the coordinator refuses longer errors");
+            assert_eq!(
+                super::super::jobs::search_job_error_code(Some(published)).as_deref(),
+                Some(super::super::jobs::QUERY_TOO_LARGE_ERROR_CODE)
+            );
+        }
+        // Free text never passes through, and never gains an error code.
+        let raw = "cell job returned HTTP 503 (query_budget_exhausted): query memory budget exceeded: SELECT secret";
+        assert_eq!(published_failure_category(raw), "isolated query execution failed");
+        assert_eq!(super::super::jobs::search_job_error_code(Some(raw)), None);
+        assert_eq!(super::super::jobs::search_job_error_code(None), None);
+    }
+
+    /// NAN-4277 (F18, a large hosted tenant, 2026-10-20): a 7 d keyword job's
+    /// statement timed out twice and the user saw only "isolated query
+    /// execution failed". The runner's error (as logged) now publishes the
+    /// static time-limit category; none of its text (SQL, paths) passes.
+    #[test]
+    fn a_statement_timeout_publishes_the_time_limit_category() {
+        let raw = "cell job returned HTTP 500 Internal Server Error (internal): native chDB query failed: chDB query failed: Code: 159. DB::Exception: Timeout exceeded: elapsed 120010.416 ms, maximum: 120000 ms. (TIMEOUT_EXCEEDED)";
+        let published = published_failure_category(raw);
+        assert_eq!(published, super::super::jobs::QUERY_TOO_LARGE_TIME_MESSAGE);
+        assert!(!published.contains("chDB") && published.len() <= 256);
+        assert_eq!(
+            super::super::jobs::search_job_error_code(Some(published)).as_deref(),
+            Some(super::super::jobs::QUERY_TOO_LARGE_ERROR_CODE)
+        );
     }
 }
 
@@ -443,13 +508,29 @@ impl HostedCoordinatorClient {
         owner: &str,
         lease: Duration,
     ) -> Result<Option<HostedClaim>, DurableJobStoreError> {
+        self.claim_lane(owner, lease, None).await
+    }
+
+    /// `lane` [`SMALL_LANE`]: the coordinator selects only small-job-lane jobs
+    /// (NAN-4290, `contract.mjs` `smallJob`); `None`: any queued job, FIFO.
+    pub async fn claim_lane(
+        &self,
+        owner: &str,
+        lease: Duration,
+        lane: Option<&str>,
+    ) -> Result<Option<HostedClaim>, DurableJobStoreError> {
         if self.role != HostedCoordinatorRole::Runner || !valid_id(owner) {
             return Err(rejected());
         }
         let lease_ms = lease_millis(lease)?;
-        let value = self
-            .execute(json!({"op":"claim","owner":owner,"lease_ms":lease_ms}))
-            .await?;
+        let mut command = json!({"op":"claim","owner":owner,"lease_ms":lease_ms});
+        if let Some(lane) = lane {
+            if lane != SMALL_LANE {
+                return Err(rejected());
+            }
+            command["lane"] = json!(lane);
+        }
+        let value = self.execute(command).await?;
         if value.is_null() {
             return Ok(None);
         }

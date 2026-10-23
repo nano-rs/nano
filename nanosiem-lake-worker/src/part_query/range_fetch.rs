@@ -312,10 +312,8 @@ pub fn scope_for(compiled: &CompiledQuery, field_types: &BTreeMap<String, String
 ///   `stats count by` over required `message` reads 27 KB of a 7 MB file).
 ///   The scope is the projected set when the compiler supplies one, else
 ///   `required_columns`, plus `metadata.log_source` (source deny filters).
-/// - Always `time` (source time fences). When a mask can apply
-///   (`src_endpoint`, `dst_endpoint`, `enrichments`, a sensitive leaf), the
-///   masked endpoint roots and `enrichments` whole: masks and the
-///   owner-denial probe read them.
+/// - Always `time` (source time fences). Endpoint and enrichment paths are
+///   plain leaves like any other (NAN-4168: no read-time enrichment masks).
 ///
 /// Absent roots are typed defaults, never read from the file, and are
 /// dropped. A miss is never silent: chDB fails on a hole (an unfetched
@@ -329,38 +327,14 @@ pub fn derive_scope(compiled: &CompiledQuery, schema_roots: &BTreeSet<String>) -
     let required = compiled.required_columns.iter().map(|column| column.name.clone()).collect::<BTreeSet<_>>();
     let mut roots = BTreeSet::from([crate::parts::format::TIME_COLUMN.to_string()]);
     let mut leaves = BTreeSet::new();
-    let paths = if compiled.table_view {
+    if compiled.table_view {
         roots.extend(required.iter().map(|path| root_of(path)));
         roots.insert("metadata".to_string());
-        required
     } else if compiled.projected_scan_columns.is_empty() {
-        leaves.extend(required.iter().cloned());
-        required
+        leaves.extend(required);
     } else {
-        let projected = compiled.projected_scan_columns.iter()
-            .cloned()
-            .chain(std::iter::once("metadata.log_source".to_string()))
-            .collect::<BTreeSet<_>>();
-        leaves.extend(projected.iter().cloned());
-        projected
-    };
-    // Masks run over the planner's projection of `required_columns`: a
-    // masked endpoint is read through its whole root, with `enrichments`.
-    for path in compiled.required_columns.iter().map(|column| &column.name).chain(&paths) {
-        let root = root_of(path);
-        let masked = root == "enrichments"
-            || (matches!(root.as_str(), "src_endpoint" | "dst_endpoint")
-                && (path == &root || crate::enrichment_read::sensitive(path) || crate::enrichment_read::scalar_masked_leaf(path)));
-        if masked {
-            roots.insert(root);
-            roots.insert("enrichments".to_string());
-        }
-    }
-    // The owner-denial probe of `scalar_plan` runs under exactly this
-    // condition and reads every scalar masked leaf of both endpoints.
-    if compiled.required_columns.iter().any(|column| crate::enrichment_read::scalar_masked_leaf(&column.name)) {
-        leaves.extend(crate::enrichment_read::SCALAR_MASKED_LEAVES.iter().map(|leaf| leaf.to_string()));
-        roots.insert("enrichments".to_string());
+        leaves.extend(compiled.projected_scan_columns.iter().cloned());
+        leaves.insert("metadata.log_source".to_string());
     }
     roots.retain(|root| schema_roots.contains(root));
     leaves.retain(|leaf| schema_roots.contains(&root_of(leaf)) && !roots.contains(&root_of(leaf)));
@@ -977,14 +951,11 @@ mod tests {
         let table = compiled("SELECT * FROM __nano_lake_source__ WHERE `api.operation` = 'GetObject'",
             &["api.operation", "time", "actor.user.name"], true, true);
         assert_eq!(scope_of(&table), (set(&["actor", "api", "metadata", "time"]), set(&[])));
-        // A masked endpoint leaf reads its endpoint root and enrichments whole;
-        // a producer-only endpoint leaf stays a leaf; absent roots are dropped.
-        let masked = compiled("SELECT `src_endpoint.location.country`, `dst_endpoint.ip`, count() FROM (SELECT * FROM __nano_lake_source__) GROUP BY 1, 2",
+        // Endpoint enrichment leaves are plain leaves (NAN-4168); absent
+        // roots are dropped.
+        let endpoints = compiled("SELECT `src_endpoint.location.country`, `dst_endpoint.ip`, count() FROM (SELECT * FROM __nano_lake_source__) GROUP BY 1, 2",
             &["src_endpoint.location.country", "dst_endpoint.ip", "time", "nonexistent.leaf"], false, false);
-        // The owner-denial probe also reads every scalar leaf of dst_endpoint.
-        assert_eq!(scope_of(&masked), (set(&["enrichments", "src_endpoint", "time"]), set(&["dst_endpoint.autonomous_system.name",
-            "dst_endpoint.autonomous_system.number", "dst_endpoint.ip", "dst_endpoint.location.continent",
-            "dst_endpoint.location.country", "dst_endpoint.location.provider"])));
+        assert_eq!(scope_of(&endpoints), (set(&["time"]), set(&["dst_endpoint.ip", "src_endpoint.location.country"])));
     }
 
     #[test]

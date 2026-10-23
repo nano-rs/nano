@@ -139,6 +139,14 @@ impl MintRefused {
     pub fn is_policy(&self) -> bool {
         (400..500).contains(&self.status)
     }
+
+    /// NAN-4314: the control plane will mint this token once the tenant's
+    /// first lean assignment commits (`503 lean_assignment_pending`, with
+    /// `Retry-After`). It is a birth precondition that is still settling, not
+    /// a refusal: the spawn waits for it (bounded) instead of failing.
+    pub fn is_assignment_pending(&self) -> bool {
+        self.status == 503 && self.code == "lean_assignment_pending"
+    }
 }
 
 /// Lowercase `[a-z0-9_.:,-]`, spaces to `_`, at most 96 chars: the code ends up
@@ -242,6 +250,19 @@ mod tests {
         assert_eq!(r.code, "service_unavailable");
         assert!(!r.is_policy());
         assert_eq!(r.retry_after, Some(std::time::Duration::from_secs(7)));
+        assert!(!r.is_assignment_pending());
+    }
+
+    /// NAN-4314: only the platform's first-assignment wait is a pending
+    /// precondition; other 503s and every 4xx stay refusals.
+    #[test]
+    fn only_lean_assignment_pending_is_a_pending_precondition() {
+        let body = br#"{"error":"lean_assignment_pending"}"#;
+        let r = MintRefused::from_response(&tenant(), Role::Ingest, 503, body, Some(std::time::Duration::from_secs(5)));
+        assert!(r.is_assignment_pending() && !r.is_policy());
+        assert!(!MintRefused::from_response(&tenant(), Role::Ingest, 403, body, None).is_assignment_pending());
+        let other = br#"{"error":"detect_assignment_unavailable"}"#;
+        assert!(!MintRefused::from_response(&tenant(), Role::Detect, 503, other, None).is_assignment_pending());
     }
 
     /// The production source against a control plane that refuses detect

@@ -14,8 +14,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+mod session;
+pub use session::{SessionLoginParams, SessionResponse, LoginEncoding, CompositeTokenParams};
+use session::{SessionLoginAuth, CompositeTokenAuth};
 
 use crate::broker::{ClientIdentity, OutboundRequest};
 use crate::template::{self, Scope};
@@ -30,6 +34,8 @@ pub enum AuthError {
     MissingCredential(String),
     #[error("token endpoint failed: {0}")]
     Token(String),
+    #[error("authentication endpoint rate limited")]
+    RateLimited,
     #[error("signing failed: {0}")]
     Signing(String),
     /// A platform-brokered auth failure with a stable `<code>: <text>`
@@ -69,6 +75,11 @@ impl fmt::Debug for Credentials {
 #[async_trait::async_trait]
 pub trait TokenFetch: Send + Sync {
     async fn post_form(&self, url: &str, form: &[(String, String)]) -> Result<(u16, Vec<u8>), String>;
+    /// Policy-checked login POST with bounded response headers/body. Never
+    /// follows redirects; implementations must charge authentication budgets.
+    async fn session_login(&self, _request: &OutboundRequest) -> Result<crate::broker::InboundResponse, String> {
+        Err("session login is unavailable".into())
+    }
     /// POST a JSON body to the platform pull broker's DWD-assertion route,
     /// authenticated as the run's tenant by the runner (the plugin never sees
     /// the caller key). Fails with [`crate::pull_broker::UNCONFIGURED`] when
@@ -126,11 +137,16 @@ pub trait AuthPlugin: Send + Sync {
     }
     /// Sign or decorate one request (called again on every retry and hop).
     async fn apply(&self, req: &mut OutboundRequest, cx: &AuthContext<'_>) -> Result<(), AuthError>;
-    /// Drop any cached token (called on a 401); returns true if a retry can
-    /// help.
-    fn invalidate(&self) -> bool {
+    /// Drop the cached token only if it decorated the rejected request.
+    /// A stale rejection may still retry using the newer cached token.
+    async fn invalidate(&self, _rejected: &OutboundRequest) -> bool {
         false
     }
+    /// Configure bounded derived-secret retention from the compiled run cap.
+    fn set_request_limit(&mut self, _max_requests: u32) {}
+    /// Session logins may repeat one request after an explicit 401 refusal.
+    /// Transport errors and other statuses never enable this exception.
+    fn retry_unauthorized(&self) -> bool { false }
     /// Secrets the plugin minted during the run (access tokens). They are
     /// redacted and refused like credentials.
     fn derived_secrets(&self) -> Vec<String> {
@@ -150,8 +166,15 @@ fn params<T: for<'de> Deserialize<'de>>(m: &serde_json::Map<String, Value>) -> R
 }
 
 fn schema_of<T: JsonSchema>() -> Value {
-    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_default()
+    serde_json::to_value(
+        schemars::generate::SchemaSettings::default()
+            .with(|s| s.inline_subschemas = true)
+            .into_generator()
+            .into_root_schema_for::<T>(),
+    )
+    .unwrap_or_default()
 }
+
 
 macro_rules! reg {
     ($name:literal, $summary:literal, $params:ty, $plugin:expr) => {
@@ -195,9 +218,11 @@ pub fn registry() -> Vec<AuthRegistration> {
             p.check()?;
             Ok::<_, AuthError>(OktaBrokerJwtAuth { p, cache: TokenCache::default() })
         }),
+        reg!("session_login", "Credential POST login; cached token or origin-scoped cookie, refreshed once on 401", SessionLoginParams, SessionLoginAuth::new),
+        reg!("composite_token", "One header composed from two named credentials", CompositeTokenParams, CompositeTokenAuth::new),
         reg!("hmac", "HMAC request signature over method/path/timestamp/body", HmacParams, |p: HmacParams| {
-            check_header_name(&p.header)?;
-            Ok::<_, AuthError>(HmacAuth(p))
+            p.check()?;
+            Ok::<_, AuthError>(HmacAuth { p, signatures: Default::default(), max_signatures: crate::spec::Limits::default().max_requests as usize })
         }),
         reg!("aws_sigv4", "AWS Signature Version 4", SigV4Params, |p: SigV4Params| Ok::<_, AuthError>(SigV4Auth(p))),
         reg!("mtls", "TLS client certificate (PEM cert + key credentials), optional bearer", MtlsParams, |p: MtlsParams| Ok::<_, AuthError>(MtlsAuth(p))),
@@ -417,15 +442,18 @@ impl OktaBrokerJwtParams {
     }
 }
 
-#[derive(Deserialize, JsonSchema, Clone, Copy, Default)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum HmacAlg {
+    /// For vendor protocols that explicitly require legacy HMAC-SHA1.
+    Sha1,
+    Sha384,
     #[default]
     Sha256,
     Sha512,
 }
 
-#[derive(Deserialize, JsonSchema, Clone, Copy, Default)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SigEncoding {
     #[default]
@@ -433,14 +461,15 @@ pub enum SigEncoding {
     Base64,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HmacParams {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     _t: Option<String>,
     pub credential: String,
     pub header: String,
-    /// Uses `{method}`, `{path}` (path and query), `{timestamp}` (epoch s), `{body}`.
+    /// Canonical fields: method, path (with query), uri_path, query, host,
+    /// timestamp, body, body_sha256 and body_sha512, in single braces.
     pub message: String,
     #[serde(default)]
     pub algorithm: HmacAlg,
@@ -450,6 +479,8 @@ pub struct HmacParams {
     pub prefix: Option<String>,
     #[serde(default)]
     pub timestamp_header: Option<String>,
+    #[serde(default)]
+    pub timestamp_format: HmacTimestamp,
     #[serde(default)]
     pub key_id_header: Option<String>,
     #[serde(default)]
@@ -554,7 +585,6 @@ impl AuthPlugin for BasicAuth {
 #[derive(Default)]
 pub struct TokenCache {
     slot: tokio::sync::Mutex<Option<(String, Instant)>>,
-    invalidated: std::sync::atomic::AtomicBool,
     pub fetches: std::sync::atomic::AtomicU32,
     /// Every token issued during the run (for redaction).
     issued: std::sync::Mutex<Vec<String>>,
@@ -567,9 +597,6 @@ impl TokenCache {
         Fut: std::future::Future<Output = Result<(String, u64), AuthError>>,
     {
         let mut slot = self.slot.lock().await;
-        if self.invalidated.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            *slot = None;
-        }
         if let Some((tok, exp)) = slot.as_ref() {
             if Instant::now() < *exp {
                 return Ok(tok.clone());
@@ -584,8 +611,22 @@ impl TokenCache {
         Ok(tok)
     }
 
-    fn invalidate(&self) {
-        self.invalidated.store(true, std::sync::atomic::Ordering::SeqCst);
+    async fn invalidate(&self, rejected: &OutboundRequest, header: &str, prefix: &str) -> bool {
+        let Some(token) = rejected
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(header))
+            .and_then(|(_, value)| value.strip_prefix(prefix))
+        else {
+            return false;
+        };
+        // Hold the same lock as get_or_fetch: a late 401 for token A must
+        // never evict token B fetched by another fan-out task.
+        let mut slot = self.slot.lock().await;
+        if slot.as_ref().is_some_and(|(cached, _)| cached == token) {
+            *slot = None;
+        }
+        true
     }
 
     /// Record a secret minted on the way to a token (a signed assertion) so
@@ -657,9 +698,10 @@ impl AuthPlugin for OAuth2Auth {
         set_header(req, "Authorization", format!("Bearer {tok}"));
         Ok(())
     }
-    fn invalidate(&self) -> bool {
-        self.cache.invalidate();
-        true
+    async fn invalidate(&self, rejected: &OutboundRequest) -> bool {
+        self.cache
+            .invalidate(rejected, "Authorization", "Bearer ")
+            .await
     }
     fn derived_secrets(&self) -> Vec<String> {
         self.cache.issued()
@@ -739,9 +781,10 @@ impl AuthPlugin for GoogleSaAuth {
         set_header(req, "Authorization", format!("Bearer {tok}"));
         Ok(())
     }
-    fn invalidate(&self) -> bool {
-        self.cache.invalidate();
-        true
+    async fn invalidate(&self, rejected: &OutboundRequest) -> bool {
+        self.cache
+            .invalidate(rejected, "Authorization", "Bearer ")
+            .await
     }
     fn derived_secrets(&self) -> Vec<String> {
         self.cache.issued()
@@ -913,9 +956,10 @@ impl AuthPlugin for GoogleDwdBrokerAuth {
         set_header(req, "Authorization", format!("Bearer {tok}"));
         Ok(())
     }
-    fn invalidate(&self) -> bool {
-        self.cache.invalidate();
-        true
+    async fn invalidate(&self, rejected: &OutboundRequest) -> bool {
+        self.cache
+            .invalidate(rejected, "Authorization", "Bearer ")
+            .await
     }
     fn derived_secrets(&self) -> Vec<String> {
         self.cache.issued()
@@ -1060,9 +1104,10 @@ impl AuthPlugin for EntraFicBrokerAuth {
         set_header(req, "Authorization", format!("Bearer {tok}"));
         Ok(())
     }
-    fn invalidate(&self) -> bool {
-        self.cache.invalidate();
-        true
+    async fn invalidate(&self, rejected: &OutboundRequest) -> bool {
+        self.cache
+            .invalidate(rejected, "Authorization", "Bearer ")
+            .await
     }
     fn derived_secrets(&self) -> Vec<String> {
         self.cache.issued()
@@ -1215,55 +1260,181 @@ impl AuthPlugin for OktaBrokerJwtAuth {
         set_header(req, "Authorization", format!("Bearer {tok}"));
         Ok(())
     }
-    fn invalidate(&self) -> bool {
-        self.cache.invalidate();
-        true
+    async fn invalidate(&self, rejected: &OutboundRequest) -> bool {
+        self.cache
+            .invalidate(rejected, "Authorization", "Bearer ")
+            .await
     }
     fn derived_secrets(&self) -> Vec<String> {
         self.cache.issued()
     }
 }
 
-pub struct HmacAuth(HmacParams);
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HmacTimestamp {
+    #[default]
+    UnixSeconds,
+    Rfc3339,
+    Rfc2822,
+}
 
+impl HmacParams {
+    fn check(&self) -> Result<(), AuthError> {
+        let mut headers = vec![self.header.as_str()];
+        headers.extend(self.timestamp_header.as_deref());
+        headers.extend(self.key_id_header.as_deref());
+        let mut names = std::collections::BTreeSet::new();
+        for h in headers {
+            check_header_name(h)?;
+            if !names.insert(h.to_ascii_lowercase()) {
+                return Err(AuthError::Params("HMAC headers must be distinct".into()));
+            }
+        }
+        if self.key_id_header.is_some() != self.key_id_credential.is_some()
+            || self.message.is_empty()
+            || self.message.len() > 8192
+            || self
+                .prefix
+                .as_ref()
+                .is_some_and(|p| p.len() > 128 || p.chars().any(char::is_control))
+        {
+            return Err(AuthError::Params("invalid HMAC parameters".into()));
+        }
+        canonical_parts(&self.message)?;
+        Ok(())
+    }
+}
+fn canonical_parts(message: &str) -> Result<Vec<(&str, bool)>, AuthError> {
+    let mut rest = message;
+    let mut parts = Vec::new();
+    while let Some(start) = rest.find('{') {
+        parts.push((&rest[..start], false));
+        let end = rest[start..]
+            .find('}')
+            .map(|i| i + start)
+            .ok_or_else(|| AuthError::Params("invalid HMAC canonical placeholder".into()))?;
+        let field = &rest[start + 1..end];
+        if !matches!(
+            field,
+            "method"
+                | "path"
+                | "uri_path"
+                | "query"
+                | "host"
+                | "timestamp"
+                | "body"
+                | "body_sha256"
+                | "body_sha512"
+        ) {
+            return Err(AuthError::Params(
+                "unknown HMAC canonical placeholder".into(),
+            ));
+        }
+        parts.push((field, true));
+        rest = &rest[end + 1..];
+    }
+    parts.push((rest, false));
+    Ok(parts)
+}
+
+pub struct HmacAuth {
+    p: HmacParams,
+    signatures: std::sync::Mutex<std::collections::VecDeque<String>>,
+    max_signatures: usize,
+}
 #[async_trait::async_trait]
 impl AuthPlugin for HmacAuth {
+    fn set_request_limit(&mut self, max_requests: u32) {
+        self.max_signatures = max_requests as usize;
+    }
     fn credential_fields(&self) -> Vec<String> {
-        let mut v = vec![self.0.credential.clone()];
-        v.extend(self.0.key_id_credential.clone());
+        let mut v = vec![self.p.credential.clone()];
+        v.extend(self.p.key_id_credential.clone());
         v
     }
-    async fn apply(&self, req: &mut OutboundRequest, cx: &AuthContext<'_>) -> Result<(), AuthError> {
-        let ts = cx.now.timestamp().to_string();
+    async fn apply(
+        &self,
+        req: &mut OutboundRequest,
+        cx: &AuthContext<'_>,
+    ) -> Result<(), AuthError> {
+        let ts = match self.p.timestamp_format {
+            HmacTimestamp::UnixSeconds => cx.now.timestamp().to_string(),
+            HmacTimestamp::Rfc3339 => cx.now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            HmacTimestamp::Rfc2822 => cx.now.to_rfc2822(),
+        };
         let path = match req.url.query() {
             Some(q) => format!("{}?{}", req.url.path(), q),
             None => req.url.path().to_string(),
         };
-        let msg = self
-            .0
-            .message
-            .replace("{method}", req.method.as_str())
-            .replace("{path}", &path)
-            .replace("{timestamp}", &ts)
-            .replace("{body}", &String::from_utf8_lossy(&req.body));
-        let alg = match self.0.algorithm {
+        let body256 = sha256_hex(&req.body);
+        let body512 = hex::encode(digest::digest(&digest::SHA512, &req.body).as_ref());
+        let mut msg = Vec::new();
+        // Expand spec tokens once. Body/query bytes containing {timestamp} are
+        // signed literally, never recursively interpreted as placeholders.
+        for (part, field) in canonical_parts(&self.p.message)? {
+            let bytes = if !field {
+                part.as_bytes()
+            } else {
+                match part {
+                    "method" => req.method.as_str().as_bytes(),
+                    "path" => path.as_bytes(),
+                    "uri_path" => req.url.path().as_bytes(),
+                    "query" => req.url.query().unwrap_or_default().as_bytes(),
+                    "host" => req.url.host_str().unwrap_or_default().as_bytes(),
+                    "timestamp" => ts.as_bytes(),
+                    "body" => &req.body,
+                    "body_sha256" => body256.as_bytes(),
+                    "body_sha512" => body512.as_bytes(),
+                    _ => unreachable!("validated placeholder"),
+                }
+            };
+            if msg.len().saturating_add(bytes.len()) > 8 * 1024 * 1024 {
+                return Err(AuthError::Signing("canonical message exceeds limit".into()));
+            }
+            msg.extend_from_slice(bytes);
+        }
+        let alg = match self.p.algorithm {
+            HmacAlg::Sha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
             HmacAlg::Sha256 => hmac::HMAC_SHA256,
+            HmacAlg::Sha384 => hmac::HMAC_SHA384,
             HmacAlg::Sha512 => hmac::HMAC_SHA512,
         };
-        let key = hmac::Key::new(alg, cx.creds.get(&self.0.credential)?.as_bytes());
-        let tag = hmac::sign(&key, msg.as_bytes());
-        let sig = match self.0.encoding {
+        let key = hmac::Key::new(alg, cx.creds.get(&self.p.credential)?.as_bytes());
+        let tag = hmac::sign(&key, &msg);
+        let sig = match self.p.encoding {
             SigEncoding::Hex => hex::encode(tag.as_ref()),
             SigEncoding::Base64 => STANDARD.encode(tag.as_ref()),
         };
-        set_header(req, &self.0.header, format!("{}{}", self.0.prefix.clone().unwrap_or_default(), sig));
-        if let Some(h) = &self.0.timestamp_header {
+        {
+            let mut signatures = self.signatures.lock().expect("HMAC signatures");
+            // Never forget an early signature while its response may still
+            // be reflected. Refuse signing if a caller exceeds the run cap.
+            if signatures.len() >= self.max_signatures {
+                return Err(AuthError::Signing("signature request cap reached".into()));
+            }
+            signatures.push_back(sig.clone());
+        }
+        set_header(
+            req,
+            &self.p.header,
+            format!("{}{}", self.p.prefix.as_deref().unwrap_or_default(), sig),
+        );
+        if let Some(h) = &self.p.timestamp_header {
             set_header(req, h, ts);
         }
-        if let (Some(h), Some(c)) = (&self.0.key_id_header, &self.0.key_id_credential) {
+        if let (Some(h), Some(c)) = (&self.p.key_id_header, &self.p.key_id_credential) {
             set_header(req, h, cx.creds.get(c)?.to_string());
         }
         Ok(())
+    }
+    fn derived_secrets(&self) -> Vec<String> {
+        self.signatures
+            .lock()
+            .expect("HMAC signatures")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -1420,11 +1591,15 @@ mod tests {
     #[test]
     fn every_registered_plugin_has_a_schema_and_builds_from_its_example() {
         let names: Vec<_> = registry().iter().map(|r| r.name).collect();
-        assert_eq!(names.len(), 14, "{names:?}");
+        assert_eq!(names.len(), 16, "{names:?}");
         assert!(build("bearer", &serde_json::json!({"credential": "T"}).as_object().unwrap().clone()).is_ok());
         assert!(build("bearer", &serde_json::json!({"credential": "T", "url": "x"}).as_object().unwrap().clone()).is_err());
         assert!(build("api_key_header", &serde_json::json!({"credential": "T", "header": "Host"}).as_object().unwrap().clone()).is_err());
         assert!(build("nope", &Default::default()).is_err());
+        for (kind, example) in [
+            ("session_login", serde_json::json!({"login_url":"https://api.example.com/login","credential_fields":{"username":"USER","password":"PASSWORD"},"response":{"type":"json_token","pointer":"/token","header":"X-Session"}})),
+            ("composite_token", serde_json::json!({"header":"X-Auth-Token","first_credential":"KEY","second_credential":"ID","separator":"/"})),
+        ] { assert!((registry().into_iter().find(|r| r.name == kind).unwrap().schema)().is_object()); build(kind, example.as_object().unwrap()).unwrap(); }
         let dwd = serde_json::json!({"token_url": "https://oauth2.googleapis.com/token", "scope": "s", "subject": "{{config.ADMIN_EMAIL}}"});
         let p = build("google_dwd_broker", dwd.as_object().unwrap()).unwrap();
         assert!(p.credential_fields().is_empty());

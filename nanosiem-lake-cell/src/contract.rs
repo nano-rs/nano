@@ -93,13 +93,22 @@ pub enum Role {
     /// receives a routed request. Resident beside query[T] when the cell
     /// sets `product_state_role`.
     Product,
+    /// NAN-4137 (`lean_tenzir_landing_v1`): the hosted OCSF bucket drop
+    /// converter. Leases landed files from the tenant's landing ledger,
+    /// converts them (`landing::convert_file`) and appends bronze to the
+    /// tenant edge log. Its own uid; a `landing_reader` credential (the
+    /// tenant's landing prefixes only) plus the landing-ledger and
+    /// edge-log producer tokens: no part, log, signing or consumer grant,
+    /// and Landlock gives it no tenant path but its own. Resident only for
+    /// a tenant placed with `landing: true` on a cell with `tenzir_landing`.
+    Landing,
 }
 
 /// Number of roles (sizes per-role arrays).
-pub const ROLES: usize = 5;
+pub const ROLES: usize = 6;
 
 impl Role {
-    pub const ALL: [Role; ROLES] = [Role::Ingest, Role::Detect, Role::Query, Role::Maintenance, Role::Product];
+    pub const ALL: [Role; ROLES] = [Role::Ingest, Role::Detect, Role::Query, Role::Maintenance, Role::Product, Role::Landing];
 
     /// The role a bootstrap token is minted and exchanged for. product[T]
     /// holds exactly query[T]'s read-only authority, so it asks for that
@@ -118,6 +127,7 @@ impl Role {
             Role::Query => "query",
             Role::Maintenance => "maintenance",
             Role::Product => "product",
+            Role::Landing => "landing",
         }
     }
 
@@ -128,6 +138,7 @@ impl Role {
             "query" => Some(Role::Query),
             "maintenance" => Some(Role::Maintenance),
             "product" => Some(Role::Product),
+            "landing" => Some(Role::Landing),
             _ => None,
         }
     }
@@ -362,7 +373,34 @@ pub struct Assignment {
     /// Unset on every hosted cell; older children ignore it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub trusted_local: bool,
+    /// ingest (NAN-4052): take the Postgres cell writer lease as this pod
+    /// generation before opening the edge log or the part log. Set only on
+    /// cells with the writer handover (`zero_downtime_roll`); unset: the
+    /// peer lease alone decides (single-pod cells).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_lease: Option<WriterLeaseAssignment>,
+    /// ingest (NAN-4183): where the lake-part GC keeps its folded part-log
+    /// view. On a cell with the persistent A/B hot volume (NAN-3647) it is
+    /// ingest[T]'s directory there, `<hot>/tenants/<T>/ingest`, so a rolled
+    /// pod resumes the view instead of refolding the log from seq 0 (the
+    /// state dir is per-pod ephemeral). Unset: the state dir (unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_gc_state_dir: Option<PathBuf>,
 }
+
+/// The cell writer lease ingest[T] holds (NAN-4052).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterLeaseAssignment {
+    /// This pod generation: `<cell>/<boot id>`.
+    pub holder: String,
+    pub ttl_ms: u64,
+}
+
+/// ingest[T] exits with this code when the cell writer lease is held by
+/// another pod generation or was lost (NAN-4052): the supervisor treats the
+/// tenant as standby (no crash, no backoff growth) and retries later.
+pub const WRITER_STANDBY_EXIT_CODE: i32 = 76;
 
 /// When `ingest[T]` cuts an L0 part (NAN-2984): at most `max_age_ms` after
 /// the first buffered row arrived, sooner (down to `min_age_ms`) once the
@@ -523,6 +561,9 @@ pub enum ToSupervisor {
 /// Liveness plus the progress facts the stall/lag signals are built on.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Heartbeat {
+    /// Live ingest pipeline diagnostics; readable independently of the ingest lock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_diagnostics: Option<serde_json::Value>,
     /// Query-only bounded selection evidence and background warm progress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_evidence_cache: Option<serde_json::Value>,
@@ -612,6 +653,57 @@ pub struct Heartbeat {
     /// state. Old children and flag-off ingest omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_directory: Option<IdentityDirectoryStatus>,
+    /// ingest (NAN-4052): the cell writer lease epoch this process commits
+    /// under. `None`: no lease (single-pod cell, or no publish login).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_lease_epoch: Option<u64>,
+    /// ingest (NAN-4052): start-up finished, so this process is the tenant's
+    /// writer on this pod (it holds the lease, or runs without one). The
+    /// supervisor starts maintenance[T] only beside such an ingest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writer_ready: bool,
+    /// landing[T] (NAN-4137): files and rows since process start, for the
+    /// status push. Other roles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<LandingStatus>,
+}
+
+/// landing[T]'s counters since its process started (NAN-4137). Reasons are
+/// value-free codes (`parquet_unreadable`, `source_revoked`, ...), never row
+/// values. Reported per tenant in the status push as `landing`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingStatus {
+    pub files_accepted: u64,
+    pub files_refused: u64,
+    /// Files handed back because the edge log was full (no attempt spent).
+    pub files_held: u64,
+    pub rows_accepted: u64,
+    pub rows_refused: u64,
+    pub segments_appended: u64,
+    pub bytes_appended: u64,
+    pub ticks_failed: u64,
+    /// Unix ms of the last file finished (accepted or refused); 0: none.
+    pub last_file_unix_ms: u64,
+    /// Files refused whole, by reason.
+    #[serde(default)]
+    pub refused_by_reason: std::collections::BTreeMap<String, u64>,
+    /// Per landing source (its UUID).
+    #[serde(default)]
+    pub sources: std::collections::BTreeMap<String, LandingSourceStatus>,
+}
+
+/// One landing source's counters (NAN-4137).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingSourceStatus {
+    pub files_accepted: u64,
+    pub files_refused: u64,
+    pub rows_accepted: u64,
+    pub rows_refused: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reason: Option<String>,
+    pub last_file_unix_ms: u64,
 }
 
 /// Ingest's installed identity directory (NAN-3503).
@@ -780,5 +872,19 @@ mod tests {
         assert!(matches!(back, ToSupervisor::Heartbeat(h) if h.busy));
         let w: ToChild = serde_json::from_str(r#"{"type":"wake","reason":"data_arrival"}"#).unwrap();
         assert!(matches!(w, ToChild::Wake { reason: WakeReason::DataArrival }));
+    }
+}
+
+#[cfg(test)]
+mod ingest_diagnostics_tests {
+    use super::*;
+    #[test]
+    fn ingest_diagnostics_support_old_workers_and_round_trip() {
+        let old: Heartbeat = serde_json::from_str(r#"{"busy":false}"#).unwrap();
+        assert!(old.ingest_diagnostics.is_none());
+        assert!(!serde_json::to_value(&old).unwrap().as_object().unwrap().contains_key("ingest_diagnostics"));
+        let beat = Heartbeat { ingest_diagnostics: Some(serde_json::json!({"buffered_rows": 7})), ..old };
+        let decoded: Heartbeat = serde_json::from_value(serde_json::to_value(&beat).unwrap()).unwrap();
+        assert_eq!(decoded.ingest_diagnostics, beat.ingest_diagnostics);
     }
 }

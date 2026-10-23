@@ -749,7 +749,7 @@ mod tests {
 
 #[cfg(test)]
 #[path = "density_native_tests.rs"]
-mod native;
+pub(super) mod native;
 
 #[cfg(test)]
 #[path = "bareword_native_tests.rs"]
@@ -770,3 +770,7 @@ mod host_timeline_native;
 #[cfg(test)]
 #[path = "bareword_spread_native_tests.rs"]
 mod bareword_spread_native;
+
+#[cfg(test)]
+#[path = "entity_index_native_tests.rs"]
+mod entity_index_native;

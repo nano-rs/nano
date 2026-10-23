@@ -58,6 +58,18 @@ pub const OWNER_BEARER_FALLBACK_LIFETIME: chrono::Duration = chrono::Duration::s
 /// supervisor's mint spacing, a lost-answer timeout and the exchange itself.
 pub const URGENT_REFRESH_WAIT: Duration = Duration::from_secs(60 + 90 + 15);
 
+/// Equal-jitter exponential backoff for the `attempt`-th consecutive
+/// transient refresh failure (1-based): half of `min(cap, base << (attempt-1))`
+/// fixed, the other half uniformly random, so a fleet of roles that failed
+/// together (a control-plane blip) does not retry in lockstep.
+pub fn equal_jitter_backoff(attempt: u32, base: Duration, cap: Duration) -> Duration {
+    let ceiling = base.saturating_mul(1_u32 << attempt.saturating_sub(1).min(16)).min(cap);
+    let half = ceiling / 2;
+    let span_ms = (ceiling - half).as_millis() as u64;
+    let jitter_ms = if span_ms == 0 { 0 } else { (uuid::Uuid::new_v4().as_u128() % (u128::from(span_ms) + 1)) as u64 };
+    half + Duration::from_millis(jitter_ms)
+}
+
 /// When an owner bearer (`owner_sign` / `owner_delete`) must be treated as
 /// expired, from the exchange's `expires_at` taken at receipt (`now`).
 /// Absent or unparseable: [`OWNER_BEARER_FALLBACK_LIFETIME`]. Never later
@@ -480,6 +492,20 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    fn equal_jitter_backoff_is_bounded_and_grows_to_its_cap() {
+        let (base, cap) = (Duration::from_secs(30), Duration::from_secs(240));
+        for _ in 0..200 {
+            for (attempt, ceiling) in [(1, 30), (2, 60), (3, 120), (4, 240), (5, 240), (40, 240)] {
+                let delay = equal_jitter_backoff(attempt, base, cap);
+                let ceiling = Duration::from_secs(ceiling);
+                assert!(delay >= ceiling / 2 && delay <= ceiling, "attempt {attempt}: {delay:?} outside [{:?}, {ceiling:?}]", ceiling / 2);
+            }
+        }
+        let first = equal_jitter_backoff(0, base, cap);
+        assert!(first >= Duration::from_secs(15) && first <= base, "attempt 0 is treated as the first");
     }
 
     #[test]

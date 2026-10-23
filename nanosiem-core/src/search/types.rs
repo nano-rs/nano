@@ -1296,6 +1296,10 @@ pub struct RetroFeedCandidate {
     /// When the indicator most recently landed in the feed table (the watermark
     /// cursor value), as epoch milliseconds.
     pub fetched_at_ms: i64,
+    /// NAN-4169: the platform feed revision that introduced the indicator
+    /// (platform baseline feeds only; `None` for tenant lists/feeds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_revision: Option<i64>,
 }
 
 /// A retro-hunt HIT: a delta indicator that was found in historical logs

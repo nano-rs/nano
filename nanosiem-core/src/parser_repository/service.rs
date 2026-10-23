@@ -1069,6 +1069,8 @@ impl ParserRepositoryService {
             // NAN-1920: repo imports create real, immediately-usable feeds —
             // not wizard drafts — so they stay 'active' (the INSERT default).
             lifecycle_status: None,
+            extension_vrl: None,
+            extension_enabled: None,
         };
 
         // NAN-950: do the log_sources and parser_imports writes inside one

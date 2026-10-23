@@ -95,6 +95,7 @@ impl ClickHouseSqlGenerator {
                         }
                     };
 
+                    let agg_expr = null_when_no_rows(&agg.func, agg_expr, group_by.is_none());
                     let alias = agg.alias.as_ref()
                         .map(|a| format!(" AS {}", escape_identifier(a)))
                         .unwrap_or_else(|| format!(" AS {}", agg.func.as_str()));
@@ -148,6 +149,8 @@ impl ClickHouseSqlGenerator {
                     }
                     AggFunc::Last => format!("anyLast({})", field_expr),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
+                    AggFunc::Earliest if timestamp_available => self.time_ordered_pick(&field_expr, false),
+                    AggFunc::Latest if timestamp_available => self.time_ordered_pick(&field_expr, true),
                     AggFunc::Earliest => format!("min({})", field_expr),
                     AggFunc::Latest => format!("max({})", field_expr),
                     AggFunc::Stdev => format!("stddevPop({})", field_expr),
@@ -199,6 +202,7 @@ impl ClickHouseSqlGenerator {
                 let agg_expr = self
                     .rollup_value_agg(&agg.func, &field_expr, agg.field.as_deref())
                     .unwrap_or(agg_expr);
+                let agg_expr = null_when_no_rows(&agg.func, agg_expr, group_by.is_none());
 
                 // Output column name. The scheme lives on `Aggregation::output_alias`
                 // so downstream rewrites (auto-sort) can reference the same name.
@@ -235,6 +239,20 @@ impl ClickHouseSqlGenerator {
                         // which keeps its raw name to match the shadowed expr
                         // `field_to_sql_expr` just emitted (NAN-1341).
                         let normalized = by_field_output_name(f, self);
+                        // NAN-4295: an Array leaf groups by EACH element (SPL
+                        // multivalue `by`), not by the whole array. NULL
+                        // elements (a repeated object without this leaf) form
+                        // no group; an empty array contributes no row. The
+                        // element takes a private alias: aliased as the field
+                        // itself it would shadow the array column in this
+                        // SELECT's WHERE (`has(privileges, …)` on a scalar).
+                        if self.stats_by_field_is_array(f) {
+                            return format!(
+                                "arrayJoin(arrayFilter(x -> x IS NOT NULL, {})) AS {}",
+                                expr,
+                                escape_identifier(&element_alias(normalized))
+                            );
+                        }
                         // Wrap dynamic/JSON fields with toString() to match GROUP BY clause
                         // Always add explicit alias to ensure column name appears in output
                         if needs_cast {
@@ -255,6 +273,12 @@ impl ClickHouseSqlGenerator {
             let group_fields: Vec<String> = fields
                 .iter()
                 .map(|f| {
+                    // NAN-4295: group by the per-element alias. Repeating the
+                    // expression would apply arrayJoin to the alias (a
+                    // scalar) and fail; the alias is the joined element.
+                    if self.stats_by_field_is_array(f) {
+                        return escape_identifier(&element_alias(by_field_output_name(f, self)));
+                    }
                     let (expr, needs_cast) = field_to_sql_expr(f, self);
                     // Wrap dynamic/JSON fields with toString() to avoid ClickHouse GROUP BY type errors
                     if needs_cast {
@@ -267,12 +291,30 @@ impl ClickHouseSqlGenerator {
             write!(sql, "\n  GROUP BY {}", group_fields.join(", ")).unwrap();
         }
 
+        // NAN-4295: per-element by-fields carry a private alias (see above);
+        // the outer subquery names them back, first, in by-clause order.
+        let element_fields: Vec<&str> = group_by
+            .unwrap_or_default()
+            .iter()
+            .filter(|f| self.stats_by_field_is_array(f))
+            .map(|f| by_field_output_name(f, self))
+            .collect();
+
         // If any aggregation alias shadows its input field, wrap in a subquery
         // that renames `_agg_X` back to `X` so downstream CTEs see a plain column.
-        if !shadowed_aliases.is_empty() {
-            let temp_cols: Vec<String> = shadowed_aliases
+        if !shadowed_aliases.is_empty() || !element_fields.is_empty() {
+            let temp_cols: Vec<String> = element_fields
                 .iter()
-                .map(|name| escape_identifier(&format!("_agg_{}", name)))
+                .map(|name| escape_identifier(&element_alias(name)))
+                .chain(
+                    shadowed_aliases
+                        .iter()
+                        .map(|name| escape_identifier(&format!("_agg_{}", name))),
+                )
+                .collect();
+            let element_renames: Vec<String> = element_fields
+                .iter()
+                .map(|name| format!("{} AS {}", escape_identifier(&element_alias(name)), escape_identifier(name)))
                 .collect();
             let renames: Vec<String> = shadowed_aliases
                 .iter()
@@ -284,15 +326,47 @@ impl ClickHouseSqlGenerator {
                     )
                 })
                 .collect();
+            let leading = element_renames.iter().map(|rename| format!("{rename}, ")).collect::<String>();
+            let trailing = renames.iter().map(|rename| format!(", {rename}")).collect::<String>();
             sql = format!(
-                "  SELECT * EXCEPT({}), {}\n  FROM (\n  {}\n  )",
+                "  SELECT {}* EXCEPT({}){}\n  FROM (\n  {}\n  )",
+                leading,
                 temp_cols.join(", "),
-                renames.join(", "),
+                trailing,
                 sql
             );
         }
 
         Ok(sql)
+    }
+
+    /// NAN-4295: whether a `stats … by` field is an `Array(T)` schema leaf
+    /// (not a same-named column an upstream stage already produced).
+    fn stats_by_field_is_array(&self, field: &str) -> bool {
+        // `is_computed_field` is no guard here: it holds every stats by-field
+        // of the whole query (field_analysis), including this one.
+        !self.is_upstream_computed_field(field)
+            && super::search_expr::stats_by_schema_field_is_array(self.profile.as_ref(), field)
+    }
+
+    /// NAN-4279 (F9): `earliest(x)` / `latest(x)` are the value of `x` on the
+    /// chronologically first / last event that carries one, not min/max of the
+    /// value. `argMin`/`argMax` skip NULL `x`, so the pick is the earliest
+    /// non-null value. Events sharing the extreme timestamp tie-break on the
+    /// value's string form, which keeps the result deterministic across scans
+    /// and slices; `toString` because `argMin` refuses a Dynamic (JSON-path)
+    /// comparison key.
+    pub(super) fn time_ordered_pick(&self, field_expr: &str, latest: bool) -> String {
+        // `earliest(time)` is simply the extreme time.
+        if field_expr == self.time_column() {
+            let extreme = if latest { "max" } else { "min" };
+            return format!("{extreme}({field_expr})");
+        }
+        format!(
+            "{}({field_expr}, ({}, toString({field_expr})))",
+            if latest { "argMax" } else { "argMin" },
+            self.time_column(),
+        )
     }
 
     /// Generate SQL for timechart command
@@ -423,6 +497,8 @@ impl ClickHouseSqlGenerator {
                     }
                     AggFunc::Last => format!("anyLast({})", field_expr),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
+                    AggFunc::Earliest if timestamp_available => self.time_ordered_pick(&field_expr, false),
+                    AggFunc::Latest if timestamp_available => self.time_ordered_pick(&field_expr, true),
                     AggFunc::Earliest => format!("min({})", field_expr),
                     AggFunc::Latest => format!("max({})", field_expr),
                     AggFunc::Stdev => format!("stddevPop({})", field_expr),
@@ -779,7 +855,34 @@ impl ClickHouseSqlGenerator {
                 }
             }
         }
+        // NAN-4236: several series share a bucket; without the series keys
+        // their order (and any row-limit cut) differed between runs. Every
+        // path above ends `ORDER BY time_bucket [WITH FILL …]`.
+        if !split_by.is_empty() {
+            let series = split_by.iter().map(|field| format!("{} ASC", escape_identifier(field)))
+                .collect::<Vec<_>>().join(", ");
+            write!(sql, ", {series}").unwrap();
+        }
 
         Ok(sql)
     }
+}
+
+/// NAN-4291 (F6): an ungrouped `stats` always returns one row, and over no
+/// input rows ClickHouse gives each aggregate its type's default (`max(time)`
+/// is 1970-01-01, `values(x)` is `''`, `min`/`sum` are 0, `avg` is NaN)
+/// instead of "no value". Over zero rows every aggregate but a count is null:
+/// `count` / `dc` / `estdc` stay 0 and a sparkline stays an empty array
+/// (arrays cannot be Nullable). Grouped stats over no rows return no rows,
+/// so they are left as they are.
+fn null_when_no_rows(func: &AggFunc, agg_expr: String, ungrouped: bool) -> String {
+    if !ungrouped || matches!(func, AggFunc::Count | AggFunc::Dc | AggFunc::EstDc | AggFunc::Sparkline) {
+        return agg_expr;
+    }
+    format!("if(count() = 0, NULL, {agg_expr})")
+}
+
+/// NAN-4295: the private alias of a per-element (`arrayJoin`) by-field.
+fn element_alias(name: &str) -> String {
+    format!("_mv_{name}")
 }

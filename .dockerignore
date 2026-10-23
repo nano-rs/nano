@@ -118,10 +118,15 @@ config/vector/sources/parsers/*
 !config/vector/sources/parsers/_router.toml
 !config/vector/sources/parsers/_combiner.toml
 !config/vector/sources/parsers/_enrichment.toml
+# Embedded tenant-bundle sink fixtures, also checked by the context probe.
+!config/vector/sources/parsers/_ocsf_sink.toml
+!config/vector/backup/
+config/vector/backup/*
+!config/vector/backup/_ocsf_sink.toml
 
 # Compile-time Rust include_str!/include_bytes! inputs that would otherwise be
 # hidden by the broad documentation, data, desktop, web, and scripts excludes.
-# Keep this exact-file list machine-checked by validate-build-context-includes.sh.
+# Keep this exact-file list machine-checked by scripts/check-build-context-includes.sh.
 !docs/
 docs/*
 !docs/architecture/
@@ -134,6 +139,7 @@ docs/architecture/*
 !nanosiem-core/docs/ocsf/1.8.0/
 nanosiem-core/docs/ocsf/1.8.0/*
 !nanosiem-core/docs/ocsf/1.8.0/udm_ocsf_mapping.json
+!nanosiem-core/docs/ocsf/1.8.0/dictionary.json
 !nano-desktop/
 nano-desktop/*
 !nano-desktop/src-tauri/

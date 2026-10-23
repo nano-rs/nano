@@ -24,6 +24,15 @@
 //! | any | `/v1/tenants/{t}/query/v1/debug/{rest…}` (operator probes, NAN-3715) | yes | yes† | 403 | 403 |
 //! | anything else | | 404 | 403 | 403 | 403 |
 //!
+//! **Detect on a standby pod (NAN-4052).** Two pods of a cell serve behind one
+//! Service, but each tenant's detect[T] runs on the pod holding its writer
+//! ([`crate::handover`]). A `detect` request that lands on the other pod is
+//! forwarded to the writer pod's router as the caller made it (same bearer,
+//! authenticated and scoped again there; no credential of this pod is added),
+//! marked [`FORWARDED_HEADER`] so it is never forwarded twice. Only when no
+//! peer holds the writer does the pod wait for it and then answer 503
+//! `writer_standby`.
+//!
 //! † Only while `router_accept_cluster_query_token` is on (the default during
 //! the NAN-3289 rollout). Off, the cluster query token reaches `/healthz`,
 //! `GET /v1/status`, a query-role wake and fixed landing aggregates only.
@@ -513,6 +522,16 @@ fn cell_error(e: CellError) -> Response<Body> {
             }
             r
         }
+        // NAN-4128: a spawn that did not finish in time. Never a hang: the
+        // caller retries; a still-running attempt is joined by the retry.
+        CellError::SpawnTimedOut { role, step, secs, still_running } => {
+            let reason = if still_running { "role_spawn_in_progress" } else { "role_spawn_timeout" };
+            let mut r = json(StatusCode::SERVICE_UNAVAILABLE, &serde_json::json!({
+                "error": e.to_string(), "reason": reason, "role": role, "step": step, "elapsed_secs": secs,
+            }));
+            r.headers_mut().insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("2"));
+            r
+        }
         // NAN-3523: over the soft disk ceiling; the caller retries and the
         // backlog stays queued upstream (no data is dropped).
         CellError::DiskPressure { bytes, soft_bytes, retry_after_secs } => {
@@ -809,6 +828,14 @@ impl Router {
                 }
                 self.forward(tenant, Role::Ingest, "/v1/admin/prevalence-restamp".into(), req.map(|body| body.boxed()), None, None, true).await
             }
+            // NAN-3643: list / replay the tenant's quarantined bronze objects.
+            (Method::GET, "admin/bronze-quarantine") | (Method::POST, "admin/bronze-quarantine/replay") => {
+                if scope != Scope::Full {
+                    return Ok(error(StatusCode::FORBIDDEN, "bronze quarantine requires the full operator token"));
+                }
+                let target = if tail == "admin/bronze-quarantine" { "/v1/admin/bronze-quarantine" } else { "/v1/admin/bronze-quarantine/replay" };
+                self.forward(tenant, Role::Ingest, target.into(), req.map(|body| body.boxed()), None, None, true).await
+            }
             (Method::POST, "wake") => {
                 // `{"role","reason"}` is tiny; the query-only token now reaches
                 // this route, so never buffer an unbounded body for it.
@@ -899,16 +926,40 @@ impl Router {
                 } else {
                     crate::contract::WakeReason::Query
                 };
-                // NAN-3004: on a standby pod (the writer is on the other pod
-                // of a roll), wait a bounded time for it to move here.
+                // NAN-4052: on a standby pod, forward to the peer pod that
+                // holds T's writer, as the caller (its own bearer, checked
+                // again there). A request another pod already forwarded is
+                // never forwarded again. With no writer to forward to
+                // (NAN-3004), wait a bounded time for it to move here.
+                let forwarded = req.headers().contains_key(FORWARDED_HEADER);
                 let wait = self.sup.handover().map_or(Duration::ZERO, |h| Duration::from_secs(h.cfg.standby_request_wait_secs));
                 let deadline = Instant::now() + wait;
+                let mut standby_logged = false;
                 loop {
                     match self.sup.wake(&tenant, Role::Detect, reason).await {
                         Ok(_) => break,
-                        Err(CellError::Standby(_))
-                            if Instant::now() < deadline && !self.sup.handover().is_some_and(|h| h.draining()) =>
-                        {
+                        Err(CellError::Standby(why)) => {
+                            // NAN-4128: this wait was silent; name it once.
+                            if !standby_logged {
+                                standby_logged = true;
+                                tracing::info!(tenant = %tenant, why = %why, wait_secs = wait.as_secs(),
+                                    "detect request waiting for the tenant writer (standby)");
+                            }
+                            let handover = self.sup.handover();
+                            if let (false, Some(h)) = (forwarded, handover) {
+                                if let Some(addr) = h.writer_peer(&tenant) {
+                                    match connect_peer(&addr).await {
+                                        Ok(sender) => {
+                                            return Ok(forward_to_writer(sender, req.map(|b| b.boxed()), &addr, &h.me.boot_id).await)
+                                        }
+                                        Err(e) => tracing::warn!(tenant = %tenant, peer = %addr, error = %e,
+                                            "detect forward: writer pod unreachable; waiting for the writer"),
+                                    }
+                                }
+                            }
+                            if Instant::now() >= deadline || handover.is_some_and(|h| h.draining()) {
+                                return Ok(cell_error(CellError::Standby(why)));
+                            }
                             tokio::time::sleep(Duration::from_millis(250)).await;
                         }
                         Err(error) => return Ok(cell_error(error)),
@@ -998,12 +1049,105 @@ pub fn is_operator_debug(sub: &str) -> bool {
     sub.starts_with(OPERATOR_DEBUG_PREFIX) || sub.trim_end_matches('/') == OPERATOR_DEBUG_PREFIX.trim_end_matches('/')
 }
 
+/// NAN-4052: set on a detect request one pod of a cell forwarded to the
+/// pod holding the tenant's writer (value: the forwarding pod's boot id).
+/// Its only effect is that the receiving pod never forwards it again, so a
+/// caller that sets it merely opts out of forwarding; it grants nothing.
+pub const FORWARDED_HEADER: &str = "x-nano-cell-forwarded-by";
+
+/// Bound on reaching the writer pod (connect + HTTP handshake). Past it the
+/// standby pod falls back to waiting for the writer. The exchange itself is
+/// bounded like a local detect RPC: by the caller's own deadline (rule
+/// searches under `detect_runs_rules` legitimately run long).
+pub const PEER_FORWARD_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+type PeerSender = hyper::client::conn::http1::SendRequest<Body>;
+
+/// Open an HTTP/1 connection to a peer pod's router.
+async fn connect_peer(addr: &crate::handover::PeerAddr) -> anyhow::Result<PeerSender> {
+    use crate::handover::PeerAddr;
+    let connect = async {
+        let sender = match addr {
+            PeerAddr::Tcp(a) => {
+                let s = tokio::net::TcpStream::connect(a).await?;
+                let (sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(s)).await?;
+                tokio::spawn(conn);
+                sender
+            }
+            PeerAddr::Unix(p) => {
+                let s = tokio::net::UnixStream::connect(p).await?;
+                let (sender, conn) = hyper::client::conn::http1::handshake::<_, Body>(TokioIo::new(s)).await?;
+                tokio::spawn(conn);
+                sender
+            }
+        };
+        anyhow::Ok(sender)
+    };
+    tokio::time::timeout(PEER_FORWARD_CONNECT_TIMEOUT, connect)
+        .await
+        .map_err(|_| anyhow::anyhow!("connect timed out after {PEER_FORWARD_CONNECT_TIMEOUT:?}"))?
+}
+
+/// The request a standby pod sends to the writer pod: the caller's own
+/// request (method, path, query, body and its `Authorization`, which the
+/// writer pod authenticates and scopes again, exactly as for a direct call)
+/// minus hop-by-hop headers, plus [`FORWARDED_HEADER`]. No credential of
+/// this pod is added, so forwarding opens no internal path: a caller reaches
+/// on the writer pod only what its own token reaches there.
+pub fn peer_forward_request<B>(req: Request<B>, forwarded_by: &str) -> Request<B> {
+    let (mut parts, body) = req.into_parts();
+    for h in [
+        hyper::header::CONNECTION,
+        hyper::header::PROXY_AUTHORIZATION,
+        hyper::header::TE,
+        hyper::header::TRAILER,
+        hyper::header::UPGRADE,
+    ] {
+        parts.headers.remove(h);
+    }
+    parts.headers.remove("keep-alive");
+    parts.headers.remove("proxy-connection");
+    let marker = HeaderValue::from_str(forwarded_by).unwrap_or_else(|_| HeaderValue::from_static("peer"));
+    parts.headers.insert(FORWARDED_HEADER, marker);
+    // Origin form only (the router routes on the path).
+    if let Some(pq) = parts.uri.path_and_query().cloned() {
+        parts.uri = hyper::Uri::from(pq);
+    }
+    Request::from_parts(parts, body)
+}
+
+/// Send a detect request to the writer pod and relay its answer.
+async fn forward_to_writer(mut sender: PeerSender, req: Request<Body>, addr: &crate::handover::PeerAddr, me: &str) -> Response<Body> {
+    let started = Instant::now();
+    let path = req.uri().path().to_owned();
+    let req = peer_forward_request(req, me);
+    match sender.send_request(req).await {
+        Ok(resp) => {
+            tracing::debug!(peer = %addr, %path, status = resp.status().as_u16(), ms = started.elapsed().as_millis() as u64,
+                "detect forwarded to the writer pod");
+            let (mut parts, body) = resp.into_parts();
+            parts.headers.remove(hyper::header::CONNECTION);
+            parts.headers.remove("keep-alive");
+            Response::from_parts(parts, body.boxed())
+        }
+        // The request body is spent; the caller retries (Retry-After).
+        Err(e) => {
+            tracing::warn!(peer = %addr, %path, error = %e, "detect forward to the writer pod failed");
+            let mut r = json(StatusCode::BAD_GATEWAY,
+                &serde_json::json!({"error": format!("writer pod {addr}: {e}"), "reason": "writer_forward_failed"}));
+            r.headers_mut().insert(hyper::header::RETRY_AFTER, HeaderValue::from_static("1"));
+            r
+        }
+    }
+}
+
 /// The headers a tenant process receives: never the router credential or
 /// a caller's claim of how the router admitted the request.
 pub fn sanitize_forward_headers(headers: &mut hyper::HeaderMap, job_auth: Option<&'static str>, operator_debug: bool) {
     headers.remove(AUTHORIZATION);
     headers.remove(hyper::header::PROXY_AUTHORIZATION);
     headers.remove(hyper::header::COOKIE);
+    headers.remove(FORWARDED_HEADER);
     // Only the router says how a job spec was admitted (NAN-3289 P2-2).
     headers.remove(crate::tenant_token::JOB_AUTH_HEADER);
     headers.remove(crate::tenant_token::JOB_SIGNATURE_HEADER);
@@ -1150,7 +1294,7 @@ mod tests {
     #[test]
     fn count_backfill_is_operator_only_for_every_tenant() {
         for (method, admin) in [Method::GET, Method::POST].into_iter()
-            .flat_map(|method| ["count-backfill", "prevalence-restamp"].map(|admin| (method.clone(), admin))) {
+            .flat_map(|method| ["count-backfill", "prevalence-restamp", "bronze-quarantine", "bronze-quarantine/replay"].map(|admin| (method.clone(), admin))) {
             for tenant in ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"] {
                 let path = format!("/v1/tenants/{tenant}/admin/{admin}");
                 let route = classify(&method, &path);
@@ -1678,6 +1822,71 @@ mod tests {
         assert_eq!(headers.get(OPERATOR_DEBUG_HEADER).unwrap(), OPERATOR_DEBUG_ADMITTED);
     }
 
+    /// NAN-4052: a forwarded detect request carries the caller's own
+    /// credential and nothing of this pod's; the marker stops a second hop
+    /// and never reaches a tenant process.
+    #[test]
+    fn peer_forward_keeps_the_callers_identity_and_marks_the_hop() {
+        let req = Request::builder().method(Method::POST)
+            .uri("http://cell/v1/tenants/t1/detect/v1/detections/commit?x=1")
+            .header(AUTHORIZATION, "Bearer nct1.caller")
+            .header(hyper::header::CONNECTION, "keep-alive, x-secret")
+            .header("keep-alive", "timeout=5")
+            .header(hyper::header::PROXY_AUTHORIZATION, "Basic abc")
+            .header(FORWARDED_HEADER, "caller-claim")
+            .header(CONTENT_TYPE, "application/json")
+            .body(()).unwrap();
+        let out = peer_forward_request(req, "boot-a");
+        assert_eq!(out.uri().to_string(), "/v1/tenants/t1/detect/v1/detections/commit?x=1");
+        assert_eq!(out.method(), Method::POST);
+        assert_eq!(out.headers().get(AUTHORIZATION).unwrap(), "Bearer nct1.caller", "the caller's own bearer, re-checked by the writer pod");
+        assert_eq!(out.headers().get(FORWARDED_HEADER).unwrap(), "boot-a");
+        assert_eq!(out.headers().get(CONTENT_TYPE).unwrap(), "application/json");
+        for h in ["connection", "keep-alive", "proxy-authorization"] {
+            assert!(out.headers().get(h).is_none(), "{h}");
+        }
+        let mut headers = out.headers().clone();
+        sanitize_forward_headers(&mut headers, None, false);
+        assert!(headers.get(FORWARDED_HEADER).is_none() && headers.get(AUTHORIZATION).is_none());
+    }
+
+    /// NAN-4052: the standby pod relays the writer pod's answer verbatim
+    /// (status, body), and a dead writer address fails fast.
+    #[tokio::test]
+    async fn forward_to_writer_relays_the_writer_pods_answer() {
+        let dir = std::env::temp_dir().join(format!("nan4052-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("writer.sock");
+        let l = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                let fwd = req.headers().get(FORWARDED_HEADER).map(|v| v.to_str().unwrap().to_owned());
+                let auth = req.headers().get(AUTHORIZATION).map(|v| v.to_str().unwrap().to_owned());
+                let path = req.uri().to_string();
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let v = serde_json::json!({"fwd": fwd, "auth": auth, "path": path, "body": String::from_utf8_lossy(&body)});
+                Ok::<_, std::convert::Infallible>(Response::builder().status(202).body(Full::new(Bytes::from(v.to_string()))).unwrap())
+            });
+            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(s), svc).await;
+        });
+        let addr = crate::handover::PeerAddr::Unix(sock.clone());
+        let sender = connect_peer(&addr).await.unwrap();
+        let req = Request::builder().method(Method::POST).uri("/v1/tenants/t1/detect/v1/run")
+            .header(AUTHORIZATION, "Bearer nct1.caller")
+            .body(Full::new(Bytes::from_static(b"{\"rule\":1}")).map_err(|never| match never {}).boxed()).unwrap();
+        let resp = forward_to_writer(sender, req, &addr, "boot-a").await;
+        assert_eq!(resp.status(), 202);
+        let v: serde_json::Value = serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(v, serde_json::json!({"fwd": "boot-a", "auth": "Bearer nct1.caller", "path": "/v1/tenants/t1/detect/v1/run",
+            "body": "{\"rule\":1}"}));
+        let dead = crate::handover::PeerAddr::Unix(dir.join("gone.sock"));
+        let t0 = Instant::now();
+        assert!(connect_peer(&dead).await.is_err());
+        assert!(t0.elapsed() <= PEER_FORWARD_CONNECT_TIMEOUT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// NAN-3518: `/healthz` reports the crate version and keeps the rest.
     #[test]
     fn healthz_reports_build_version() {
@@ -1709,6 +1918,11 @@ struct LandingBody {
     source: String,
     bundle: String,
     since: chrono::DateTime<chrono::Utc>,
+    /// NAN-4228: the probe's event time (the earliest timestamp the verifier
+    /// found in the sample it sent). Optional: callers without it keep the
+    /// wide window. It only bounds the event window; it never filters rows.
+    #[serde(default)]
+    probe_event_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn landing_query(tenant: &TenantId, bytes: &[u8]) -> Result<serde_json::Value, ()> {
@@ -1732,13 +1946,55 @@ fn landing_query(tenant: &TenantId, bytes: &[u8]) -> Result<serde_json::Value, (
     {
         return Err(());
     }
-    let query = format!("source_type=\"{}\" | eval pending=if(metadata.nano_parser_bundle_sha256=\"{}\",1,0) | eval failed=if(pending=1 AND (class_uid=0 OR unmapped.parse_error!=\"\"),1,0) | stats count() as rows, sum(pending) as n, sum(failed) as errors", r.source, r.bundle);
+    // class_uid=0 is a valid OCSF Base Event, not a parser failure. Native
+    // parts are OCSF-validated; parsers retain errors in unmapped.parse_error.
+    // Legacy metadata.parse_* counter markers are not canonical OCSF paths.
+    //
+    // NAN-4226: landing counts rows by RECORD time, not event time. The
+    // platform's probe is the parser's published sample, whose event time is
+    // whatever the sample says (a catalog syslog sample is dated 2026-08-05),
+    // so an event-time window starting at `since` never saw it and every
+    // catalog parser install rolled back. `metadata.processed_time` is stamped
+    // `now()` (ms) by the OCSF sink when the row is ingested, so the filter
+    // `>= since` is exactly "landed since"; the event window only has to
+    // contain the probe's event time, so it spans the retention horizon.
+    let query = format!("source_type=\"{}\" metadata.processed_time>={} | eval pending=if(metadata.nano_parser_bundle_sha256=\"{}\",1,0) | eval failed=if(pending=1 AND unmapped.parse_error!=\"\",1,0) | stats count() as rows, sum(pending) as n, sum(failed) as errors", r.source, r.since.timestamp_millis(), r.bundle);
+    let (start, end) = landing_event_window(now, r.since, r.probe_event_time);
     Ok(
         serde_json::json!({"request_id":r.request_id, "tenant_id":tenant.as_str(),
         "route":"broad_npl", "dataset":"logs", "query":query,
-        "start":r.since.to_rfc3339(), "end":now.to_rfc3339(), "limit":2, "offset":0,
+        "start":start.to_rfc3339(), "end":end.to_rfc3339(), "limit":2, "offset":0,
         "table_view":false, "use_cache":false, "deny_source_types":[]}),
     )
+}
+
+/// NAN-4226: event-time bounds of the landing read. The record-time filter
+/// (`metadata.processed_time >= since`) decides what counts; this window only
+/// has to contain any row the probe can produce.
+///
+/// NAN-4228: with the probe's event time the window is
+/// `[min(probe_event_time, since) - 1d, now + 1d]`. Every poll of a parser
+/// install's verify then reads only the days that can hold the probe or live
+/// traffic, not a year of the source on a large tenant. The day of slack on
+/// each side covers zone offsets and a year-less sample a parser places a
+/// little later. Without a probe time the window stays wide. Past: longer than
+/// the longest lake retention (365 days). Future: a day, for year-less sample
+/// timestamps a parser places later this year.
+const LANDING_EVENT_LOOKBACK_DAYS: i64 = 400;
+const LANDING_EVENT_LOOKAHEAD_DAYS: i64 = 1;
+const LANDING_PROBE_SLACK_DAYS: i64 = 1;
+
+fn landing_event_window(
+    now: chrono::DateTime<chrono::Utc>,
+    since: chrono::DateTime<chrono::Utc>,
+    probe_event_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    let widest = now - chrono::Duration::days(LANDING_EVENT_LOOKBACK_DAYS);
+    let start = match probe_event_time {
+        Some(probe) => (probe.min(since) - chrono::Duration::days(LANDING_PROBE_SLACK_DAYS)).max(widest),
+        None => widest,
+    };
+    (start, now + chrono::Duration::days(LANDING_EVENT_LOOKAHEAD_DAYS))
 }
 
 #[cfg(test)]
@@ -1763,6 +2019,75 @@ mod native_landing_tests {
             RouteClass::Other
         );
     }
+    /// NAN-4226: the probe is the parser's published sample; its event time
+    /// is the sample's own (Aug 5 for the catalog syslog sample), long before
+    /// `since`. Landing must count it by record time, so the event window has
+    /// to contain it and the record-time floor must be `since`.
+    #[test]
+    fn native_landing_counts_an_old_event_time_probe_by_record_time() {
+        let tenant = TenantId::new("9b99ce5d-0000-4000-8000-000000000000").unwrap();
+        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let body = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"syslog", "bundle":"b".repeat(64),
+            "since":since});
+        let query = landing_query(&tenant, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let start = chrono::DateTime::parse_from_rfc3339(query["start"].as_str().unwrap()).unwrap();
+        let end = chrono::DateTime::parse_from_rfc3339(query["end"].as_str().unwrap()).unwrap();
+        // The probe's event time, ingested now (after `since`).
+        let probe_event_time = chrono::DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z").unwrap();
+        let probe_ingested = chrono::Utc::now();
+        assert!(probe_ingested.timestamp_millis() >= since.timestamp_millis());
+        assert!(start <= probe_event_time && probe_event_time <= end,
+            "an old-event-time probe must fall inside the landing event window ({start}..{end})");
+        assert!(start <= chrono::Utc::now() - chrono::Duration::days(365), "covers the longest retention");
+        assert!(end >= chrono::Utc::now(), "covers rows stamped just now");
+        let npl = query["query"].as_str().unwrap();
+        assert!(npl.starts_with(&format!("source_type=\"syslog\" metadata.processed_time>={} |", since.timestamp_millis())),
+            "landing counts by record time from `since`: {npl}");
+        assert!(npl.ends_with("stats count() as rows, sum(pending) as n, sum(failed) as errors"));
+    }
+
+    /// NAN-4228: with the probe's event time the window is
+    /// `[min(probe, since) - 1d, now + 1d]`: it still holds the old-dated
+    /// probe, and it is days wide instead of 400 days.
+    #[test]
+    fn native_landing_window_is_tight_when_the_probe_time_is_supplied() {
+        let tenant = TenantId::new("9b99ce5d-0000-4000-8000-000000000000").unwrap();
+        let day = chrono::Duration::days(1);
+        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let window = |probe: serde_json::Value| {
+            let body = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"syslog", "bundle":"b".repeat(64),
+                "since":since, "probe_event_time":probe});
+            let query = landing_query(&tenant, &serde_json::to_vec(&body).unwrap()).unwrap();
+            let at = |key: &str| chrono::DateTime::parse_from_rfc3339(query[key].as_str().unwrap()).unwrap().with_timezone(&chrono::Utc);
+            assert!(query["query"].as_str().unwrap().starts_with(&format!("source_type=\"syslog\" metadata.processed_time>={} |",
+                since.timestamp_millis())), "the probe time never filters rows");
+            (at("start"), at("end"))
+        };
+        // An old-dated probe (the catalog syslog sample): its day, minus one.
+        let probe = chrono::DateTime::parse_from_rfc3339("2026-08-05T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let (start, end) = window(serde_json::json!(probe));
+        assert_eq!(start, probe - day);
+        assert!(start <= probe && probe <= end);
+        assert!(end >= chrono::Utc::now() && end <= chrono::Utc::now() + day + chrono::Duration::minutes(1));
+        // A probe dated now (live clock): the window is since - 1d .. now + 1d.
+        let (start, end) = window(serde_json::json!(chrono::Utc::now()));
+        assert_eq!(start, since - day);
+        assert!(end - start < chrono::Duration::days(3), "{start}..{end} is not tight");
+        // A probe dated in the future still keeps `since` (live traffic) inside.
+        let (start, _) = window(serde_json::json!(chrono::Utc::now() + chrono::Duration::hours(6)));
+        assert_eq!(start, since - day);
+        // Older than retention: never wider than the old fixed window.
+        let (start, _) = window(serde_json::json!("2020-01-01T00:00:00Z"));
+        assert!(start >= chrono::Utc::now() - chrono::Duration::days(LANDING_EVENT_LOOKBACK_DAYS) - chrono::Duration::minutes(1));
+        // An explicit null is the old body: the wide window.
+        let (start, _) = window(serde_json::Value::Null);
+        assert!(start <= chrono::Utc::now() - chrono::Duration::days(365));
+        // A malformed time is refused like any other bad field.
+        let bad = serde_json::json!({"request_id":uuid::Uuid::now_v7(), "source":"syslog", "bundle":"b".repeat(64),
+            "since":since, "probe_event_time":"yesterday"});
+        assert!(landing_query(&tenant, &serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+
     #[test]
     fn native_landing_pins_new_tenant_and_rejects_query_injection() {
         let tenant = TenantId::new("22222222-2222-4222-8222-222222222222").unwrap();
@@ -1776,6 +2101,11 @@ mod native_landing_tests {
             .as_str()
             .unwrap()
             .ends_with("stats count() as rows, sum(pending) as n, sum(failed) as errors"));
+        let npl = query["query"].as_str().unwrap();
+        assert!(!npl.contains("class_uid"), "valid Base Events must not fail landing");
+        assert!(npl.contains("pending=1 AND unmapped.parse_error!=\"\""));
+        assert!(npl.contains("metadata.nano_parser_bundle_sha256=\""));
+        assert!(!npl.contains("metadata.parse_failure"));
         for (key, value) in [
             ("query", serde_json::json!("*")),
             ("tenant_id", serde_json::json!("other")),

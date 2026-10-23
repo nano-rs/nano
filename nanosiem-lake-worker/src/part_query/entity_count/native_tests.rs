@@ -236,6 +236,49 @@ fn runtime() -> NativeChdb {
         .clone()
 }
 
+/// One set of chDB lanes for every fixture engine of this process.
+///
+/// Engines of earlier tests leave lane threads (and so chDB connections)
+/// alive after their test returns; a later engine opening fresh connections
+/// beside them failed to connect (`Startup(ConnectionFailed)`) once the
+/// suite ran in one process, while each test passed alone. Shared lanes are
+/// opened once. Every fixture engine used identical lane settings, and each
+/// engine keeps its own caches, memos and state directory.
+fn executors() -> (NativeExecutor, NativeExecutor, NativeExecutor) {
+    static EXECUTORS: std::sync::OnceLock<(NativeExecutor, NativeExecutor, NativeExecutor)> = std::sync::OnceLock::new();
+    EXECUTORS
+        .get_or_init(|| {
+            let runtime = runtime();
+            let small = NativeExecutor::start_with_server_memory_limit(
+                runtime.clone(),
+                1,
+                "parts",
+                ExecutorMode::ReadOnly,
+                Some(256 << 20),
+            )
+            .unwrap()
+            .with_result_limit(64 << 20);
+            let large = NativeExecutor::start_with_server_memory_limit(
+                runtime.clone(),
+                1,
+                "parts-large",
+                ExecutorMode::ReadOnly,
+                Some(3 << 29),
+            )
+            .unwrap();
+            let writer = NativeExecutor::start_with_server_memory_limit(
+                runtime,
+                1,
+                "parts-rw",
+                ExecutorMode::ReadWrite,
+                Some(3 << 29),
+            )
+            .unwrap();
+            (small, large, writer)
+        })
+        .clone()
+}
+
 /// An engine over the fixture whose reader cache holds `cache_bytes`, with
 /// `query_bytes` as its heavy threshold (one heavy slot).
 async fn fixture_engine(
@@ -272,32 +315,7 @@ async fn fixture_engine(
     )
     .unwrap();
     let fetcher = PartFetcher::new(TENANT, bucket, store.clone(), trusted, cache).unwrap();
-    let runtime = runtime();
-    let small = NativeExecutor::start_with_server_memory_limit(
-        runtime.clone(),
-        1,
-        "parts",
-        ExecutorMode::ReadOnly,
-        Some(256 << 20),
-    )
-    .unwrap()
-    .with_result_limit(64 << 20);
-    let large = NativeExecutor::start_with_server_memory_limit(
-        runtime.clone(),
-        1,
-        "parts-large",
-        ExecutorMode::ReadOnly,
-        Some(3 << 29),
-    )
-    .unwrap();
-    let writer = NativeExecutor::start_with_server_memory_limit(
-        runtime,
-        1,
-        "parts-rw",
-        ExecutorMode::ReadWrite,
-        Some(3 << 29),
-    )
-    .unwrap();
+    let (small, large, writer) = executors();
     PartQueryEngine::new(
         EngineSettings {
             tenant_id: TENANT.into(),
@@ -328,7 +346,7 @@ fn request(query: &str, from: DateTime<Utc>, to: DateTime<Utc>) -> BroadNplReque
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires local digest-verified chDB and lake compiler"]
-async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
+async fn entity_count_native_parity_mixed_parts_windows_and_debug() {
     use super::{count, shape};
     let connection = runtime().connect(&[]).unwrap();
     let nulls = connection.query_with_params(
@@ -340,10 +358,6 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
     ingest(root.path(), now).await;
     compact(root.path()).await;
     let engine = fixture_engine(root.path(), "reader", 1 << 30, 1 << 29).await;
-    let authority = nanosiem_core::platform_enrichment::read::ReadAuthorization::unknown(
-        TENANT.parse().unwrap(),
-        now,
-    );
     let pivots = [
         "src_endpoint.ip=\"10.0.0.1\" OR dst_endpoint.ip=\"10.0.0.1\" OR device.ip=\"10.0.0.1\" | stats count",
         "user.name=\"ALICE\" OR actor.user.name=\"Alice\" | stats count",
@@ -353,7 +367,7 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
         "user.name=\"absent\" | stats count as event_count",
     ];
     let mut seed = 3737_u64;
-    crate::enrichment_read::scope(authority, async {
+    async {
         for pivot in pivots {
             for iteration in 0..8 {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -382,16 +396,12 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
                         let selection = engine
                             .select(
                                 from.timestamp_micros(),
-                                to.timestamp_micros(),
+                                to.timestamp_micros() - 1,
                                 &compiled.candidate_hints,
                             )
                             .await
                             .unwrap();
-                        let scalar = engine.scalar_plan(&selection, &compiled).await.unwrap();
-                        let plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || {
-                            crate::part_query::engine::plan_logs(&selection, &compiled, None)
-                        })
-                        .unwrap();
+                        let plan = crate::part_query::engine::plan_logs(&selection, &compiled, None).unwrap();
                         let native = engine.execute(plan).await.unwrap();
                         let rows = crate::part_query::engine::decode_rows(&native.data).unwrap();
                         assert_eq!(
@@ -406,11 +416,12 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
             }
         }
         // Latest complete hour contains indexed parts only. No data row
-        // groups are needed, including when the inclusive end is hour-1us.
+        // groups are needed. NAN-4280: the window is half-open, so the
+        // complete hour is `[hour, next hour)` -- the end IS the hour mark.
         let complete = request(
             pivots[0],
             now - Duration::hours(1),
-            now - Duration::microseconds(1),
+            now,
         );
         let answer = engine.broad_npl(&complete).await.unwrap();
         assert!(
@@ -424,7 +435,7 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
         let probe = request(
             pivots[0],
             now - Duration::hours(8),
-            now - Duration::microseconds(1),
+            now,
         );
         let answer = crate::part_query::debug::collect(engine.broad_npl(&probe))
             .await
@@ -477,7 +488,7 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
         let uncovered = request(
             pivots[0],
             now - Duration::hours(8),
-            now - Duration::hours(7) - Duration::microseconds(1),
+            now - Duration::hours(7),
         );
         let unindexed = fixture_engine(root.path(), "uncovered-reader", 1 << 30, 1 << 29).await;
         unindexed
@@ -610,11 +621,7 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
                     )
                     .await
                     .unwrap();
-                let scalar = engine.scalar_plan(&selection, &compiled).await.unwrap();
-                let plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || {
-                    crate::part_query::engine::plan_logs(&selection, &compiled, None)
-                })
-                .unwrap();
+                let plan = crate::part_query::engine::plan_logs(&selection, &compiled, None).unwrap();
                 let output = engine.execute(plan).await.unwrap();
                 crate::part_query::engine::decode_rows(&output.data).unwrap()
             })
@@ -675,7 +682,7 @@ async fn entity_count_native_parity_mixed_parts_windows_authority_and_debug() {
         let mut foreign = probe;
         foreign.tenant_id = "00000000-0000-0000-0000-000000000002".into();
         assert!(engine.broad_npl(&foreign).await.is_err());
-    })
+    }
     .await;
 }
 
@@ -696,10 +703,9 @@ async fn entity_count_from_signed_count_records_matches_native() {
     let window = request(
         "src_endpoint.ip=\"10.0.0.1\" OR dst_endpoint.ip=\"10.0.0.1\" OR device.ip=\"10.0.0.1\" | stats count",
         now - Duration::hours(8),
-        now - Duration::microseconds(1),
+        now,
     );
-    let authority = || nanosiem_core::platform_enrichment::read::ReadAuthorization::unknown(TENANT.parse().unwrap(), now);
-    let answer = crate::enrichment_read::scope(authority(), crate::part_query::debug::collect(before.broad_npl(&window))).await.unwrap();
+    let answer = crate::part_query::debug::collect(before.broad_npl(&window)).await.unwrap();
     assert!(answer["planner"]["entity_count_native_parts"].as_u64().unwrap() > 0, "fixture: uncovered parts");
     // Counts-only backfill of every live part (covered parts get a record too).
     let store = LocalObjectStore::new(root.path().join("parts")).unwrap();
@@ -713,7 +719,7 @@ async fn entity_count_from_signed_count_records_matches_native() {
             &root.path().join("backfill"), &part, &signed.record, now.timestamp_millis()).await.unwrap();
     }
     let engine = fixture_engine(root.path(), "after", 1 << 30, 1 << 29).await;
-    let answer = crate::enrichment_read::scope(authority(), crate::part_query::debug::collect(engine.broad_npl(&window))).await.unwrap();
+    let answer = crate::part_query::debug::collect(engine.broad_npl(&window)).await.unwrap();
     assert_eq!(answer["planner"]["entity_count_native_parts"], 0, "{answer}");
     let pivots = [
         "src_endpoint.ip=\"10.0.0.1\" OR dst_endpoint.ip=\"10.0.0.1\" OR device.ip=\"10.0.0.1\" | stats count",
@@ -722,27 +728,105 @@ async fn entity_count_from_signed_count_records_matches_native() {
         "device.hostname=\"HOST.example\" OR src_endpoint.hostname=\"Host.example\" | stats count",
         "user.name=\"absent\" | stats count as event_count",
     ];
-    crate::enrichment_read::scope(authority(), async {
+    async {
         for pivot in pivots {
             for (hours, deny) in [(8, None), (3, Some("AuDiT")), (8, Some("windows_sysmon"))] {
-                let (from, to) = (now - Duration::hours(hours), now - Duration::microseconds(1));
+                let (from, to) = (now - Duration::hours(hours), now);
                 let mut request = request(pivot, from, to);
                 if let Some(deny) = deny { request.deny_source_types.insert(deny.into()); }
                 engine.pinned(async {
                     let compiled = engine.compile(&request, engine.field_types().await.unwrap()).await.unwrap();
                     let alias = shape(&compiled).expect("supported compiler shape").alias;
                     let fast = super::run(&engine, &request, &compiled).await.unwrap().expect("records cover the window");
-                    let selection = engine.select(from.timestamp_micros(), to.timestamp_micros(),
+                    let selection = engine.select(from.timestamp_micros(), to.timestamp_micros() - 1,
                         &compiled.candidate_hints).await.unwrap();
-                    let scalar = engine.scalar_plan(&selection, &compiled).await.unwrap();
-                    let plan = crate::enrichment_read::plan_with_scalar_plan(scalar, || {
-                        crate::part_query::engine::plan_logs(&selection, &compiled, None)
-                    }).unwrap();
+                    let plan = crate::part_query::engine::plan_logs(&selection, &compiled, None).unwrap();
                     let rows = crate::part_query::engine::decode_rows(&engine.execute(plan).await.unwrap().data).unwrap();
                     assert_eq!(count(&fast.rows, &alias), count(&rows, &alias), "{pivot} {hours}h deny={deny:?}");
                     assert_eq!(fast.planner["entity_count_native_parts"], 0, "{pivot} {hours}h deny={deny:?}");
                 }).await.unwrap();
             }
         }
-    }).await;
+    }.await;
+}
+
+/// NAN-4298: the typed `count_aggregate` route (what search sends for
+/// `F=v | stats count`) answers entity-field equality counts from the entity
+/// counts, equal to the compiled native scan of the same nPL, over ragged
+/// windows and deny sets; a window of only uncovered parts, and every other
+/// shape, stays on the rollups with the same answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local digest-verified chDB and lake compiler"]
+async fn typed_count_aggregate_uses_entity_counts_and_matches_the_scan() {
+    let root = tempfile::tempdir().unwrap();
+    let now: DateTime<Utc> = "2026-10-12T12:00:00Z".parse().unwrap();
+    ingest(root.path(), now).await;
+    compact(root.path()).await;
+    let engine = fixture_engine(root.path(), "typed-reader", 1 << 30, 1 << 29).await;
+    let typed = |field: &str, value: &str, from: DateTime<Utc>, to: DateTime<Utc>, deny: &[&str]| -> crate::count_aggregate::CountAggregateRequest {
+        serde_json::from_value(json!({"request_id":"nan4298","tenant_id":TENANT,"group_field":field,"group_results":false,
+            "predicate":{"kind":"eq","values":[value]},"count_alias":"count","start":from.to_rfc3339(),"end":to.to_rfc3339(),
+            "max_groups":10,"deny_source_types":deny})).unwrap()
+    };
+    let scan = |field: &str, value: &str, from: DateTime<Utc>, to: DateTime<Utc>, deny: &[&str]| {
+        // The typed route's `end` is inclusive; nPL windows are half-open.
+        let mut request = request(&format!("{field}=\"{value}\" | stats count() as n"), from, to + Duration::microseconds(1));
+        request.deny_source_types = deny.iter().map(|s| s.to_string()).collect();
+        request
+    };
+    let cases = [
+        ("src_endpoint.ip", "10.0.0.1"),
+        ("dst_endpoint.ip", "10.0.0.1"),
+        ("user.name", "alice"),
+        ("actor.user.name", "Alice"),
+        ("device.hostname", "host.example"),
+        ("src_endpoint.hostname", "HOST.example"),
+        ("user.name", "absent"),
+    ];
+    let mut seed = 4298_u64;
+    let mut routed = 0;
+    for (field, value) in cases {
+        for iteration in 0..6 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ragged = if iteration % 2 == 0 { 0 } else { (seed % 3000) as i64 };
+            let from = now - Duration::hours(3 + (seed % 3) as i64) + Duration::seconds(ragged);
+            let to = now - Duration::seconds(ragged / 2);
+            let deny: &[&str] = match iteration % 3 { 0 => &[], 1 => &["audit"], _ => &["audit", "windows_sysmon"] };
+            let (answer, phases) = crate::query_timing::measure("nan4298", async {
+                let answer = super::super::partials::count_aggregate(&engine, &typed(field, value, from, to, deny)).await.unwrap();
+                let phases = crate::query_timing::current().unwrap().lock().unwrap().entity_count_aggregate_routes;
+                Ok::<_, ()>((answer, phases))
+            }).await.unwrap();
+            routed += phases;
+            let native = engine.pinned(async {
+                let request = scan(field, value, from, to, deny);
+                let compiled = engine.compile(&request, engine.field_types().await.unwrap()).await.unwrap();
+                let selection = engine.select(from.timestamp_micros(), to.timestamp_micros(), &compiled.candidate_hints).await.unwrap();
+                let plan = crate::part_query::engine::plan_logs(&selection, &compiled, None).unwrap();
+                let rows = crate::part_query::engine::decode_rows(&engine.execute(plan).await.unwrap().data).unwrap();
+                super::count(&rows, "n")
+            }).await.unwrap();
+            let typed_count = answer["result"]["rows"][0]["count"].as_u64()
+                .or_else(|| answer["result"]["rows"][0]["count"].as_str().and_then(|n| n.parse().ok()));
+            assert_eq!(typed_count, native, "{field}={value} #{iteration} {answer}");
+        }
+    }
+    assert!(routed > 0, "no typed count used the entity counts");
+
+    // Only unindexed parts in the window: the rollups answer, identically.
+    let (from, to) = (now - Duration::hours(8), now - Duration::hours(7) - Duration::microseconds(1));
+    let (answer, phases) = crate::query_timing::measure("nan4298-uncovered", async {
+        let answer = super::super::partials::count_aggregate(&engine, &typed("src_endpoint.ip", "10.0.0.1", from, to, &[])).await.unwrap();
+        let phases = crate::query_timing::current().unwrap().lock().unwrap().entity_count_aggregate_routes;
+        Ok::<_, ()>((answer, phases))
+    }).await.unwrap();
+    assert_eq!(phases, 0, "an uncovered window stays on the rollups");
+    let native = engine.pinned(async {
+        let request = scan("src_endpoint.ip", "10.0.0.1", from, to, &[]);
+        let compiled = engine.compile(&request, engine.field_types().await.unwrap()).await.unwrap();
+        let selection = engine.select(from.timestamp_micros(), to.timestamp_micros(), &compiled.candidate_hints).await.unwrap();
+        let plan = crate::part_query::engine::plan_logs(&selection, &compiled, None).unwrap();
+        super::count(&crate::part_query::engine::decode_rows(&engine.execute(plan).await.unwrap().data).unwrap(), "n")
+    }).await.unwrap();
+    assert_eq!(answer["result"]["rows"][0]["count"].as_u64().or_else(|| answer["result"]["rows"][0]["count"].as_str().and_then(|n| n.parse().ok())), native);
 }

@@ -599,6 +599,23 @@ fn registry() -> &'static OcsfRegistry {
             }
         }
 
+        // The promotion manifest covers only a subset of OCSF enum ids.
+        // Load the vendored dictionary's class-independent top-level enums too.
+        // Class-specific activity labels keep their sibling-column mapping.
+        let dictionary: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/docs/ocsf/1.8.0/dictionary.json"
+        ))).expect("vendored OCSF dictionary");
+        for (field, attribute) in dictionary["attributes"].as_object().expect("OCSF attributes") {
+            if !field.ends_with("_id") || field == "activity_id" { continue; }
+            let Some(values) = attribute["enum"].as_object() else { continue; };
+            let labels = enum_values.entry(field.clone()).or_default();
+            for (id, entry) in values {
+                if let (Ok(id), Some(label)) = (id.parse::<i64>(), entry["caption"].as_str()) {
+                    labels.entry(label.to_lowercase()).or_insert(id);
+                }
+            }
+        }
+
         // Source routing is metadata, not the taxonomy IDs that share its
         // UDM correspondence in the 1.8 promotion manifest.
         udm_to_lake.insert("source_type".into(), "metadata.log_source".into());
@@ -1327,6 +1344,13 @@ impl OcsfProfile {
     /// recursions (the `ext.` / `event.` prefix remaps) stay on this method so
     /// stripped tails are never re-aliased.
     fn resolve_canonical(&self, npl_field: &str) -> FieldResolution {
+        // Analyst compatibility spellings have explicit, layout-independent targets.
+        let npl_field = match npl_field {
+            "auth_result" => "status_id",
+            "protocol" => "connection_info.protocol_num",
+            "protocol_name" => "connection_info.protocol_name",
+            other => other,
+        };
         if self.is_lake_1_9() {
             // Unstamped lake data has no prevalence (#4644). Lean signed parts
             // carry physical ingest-time columns (NAN-2915); open-core lake
@@ -1564,6 +1588,12 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn canonicalize<'a>(&self, npl_field: &'a str) -> Cow<'a, str> {
+        match npl_field {
+            "auth_result" => return Cow::Borrowed("status_id"),
+            "protocol" => return Cow::Borrowed("connection_info.protocol_num"),
+            "protocol_name" => return Cow::Borrowed("connection_info.protocol_name"),
+            _ => {}
+        }
         // A `<p>.hashes` object path (the `[]`-stripped `<p>.hashes[]` the field
         // universe advertises) addresses the leaf that carries the value —
         // layout-dependent, so it is resolved here rather than in the tokenizer

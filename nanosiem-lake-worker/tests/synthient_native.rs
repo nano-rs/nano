@@ -5,7 +5,6 @@
 ))]
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use chrono::{Duration, Utc};
-use nanosiem_core::platform_enrichment::read::ReadAuthorization;
 use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference};
 
 use nanosiem_lake_worker::native::NativeChdb;
@@ -63,7 +62,7 @@ fn data(event: &Value, subject: &str) -> Value {
         .clone()
 }
 #[test]
-fn synthient_native_two_tenants_shared_bytes_rotation_and_masked_export() {
+fn synthient_native_two_tenants_shared_bytes_rotation_and_export() {
     let now = Utc::now();
     let mut f = Fixture::new();
     f.install("synthient", 1, artifact(), Duration::zero());
@@ -103,28 +102,6 @@ fn synthient_native_two_tenants_shared_bytes_rotation_and_masked_export() {
     .unwrap();
     std::mem::forget(runtime.clone());
     let connection = runtime.connect(&[]).unwrap();
-    let mut revisions = Vec::new();
-    for feed in ["synthient"] {
-        for rev in [1, 2] {
-            revisions.push(AuthorizedRevision {
-                tenant_id: Uuid::from_u128(1),
-                reference: RevisionReference {
-                    feed_id: feed.into(),
-                    feed_revision: rev,
-                    tier: "sandbox".into(),
-                    grant_revision: 1,
-                    entitlement_revision: 1,
-                },
-                class: FeedClass::Premium,
-                digest: "ab".repeat(32),
-                mapping_revision: 1,
-                deny_epoch: 0,
-                valid_until: now + Duration::hours(1),
-                evaluated_at: now,
-            });
-        }
-    }
-    let authority = ReadAuthorization::from_resolved(Uuid::from_u128(1), now, &revisions);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
     let parquet = dir.path().join("events.parquet");
@@ -199,17 +176,10 @@ fn synthient_native_two_tenants_shared_bytes_rotation_and_masked_export() {
         .enable_all()
         .build()
         .unwrap();
-    // Identical local artifact handles remain loaded for both tenants. Rights
-    // come from each tenant's read context, not those handles or stored stamps.
-    for (auth, expected) in [
-        (authority.clone(), 1),
-        (ReadAuthorization::unknown(Uuid::from_u128(2), now), 0),
-    ] {
-        let mut config = tenant.clone();
-        config.tenant_id = serde_json::to_value(&auth).unwrap()["tenant_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+    // NAN-4168: stamps are read as stored; the read carries no authority.
+    {
+        let expected = 1;
+        let config = tenant.clone();
         manifest.tenant_id = config.tenant_id.clone();
         let scoped = &manifest;
         for query in [
@@ -218,10 +188,7 @@ fn synthient_native_two_tenants_shared_bytes_rotation_and_masked_export() {
             "synthient_dest_bot=true | stats count",
         ] {
             let compiled = compile(query, &fields).unwrap();
-            let plan = rt.block_on(nanosiem_lake_worker::enrichment_read::scope(
-                auth.clone(),
-                async { plan_broad_log_query(&config, &scoped, &compiled).unwrap() },
-            ));
+            let plan = rt.block_on(async { plan_broad_log_query(&config, &scoped, &compiled).unwrap() });
             let params = plan
                 .params
                 .iter()
@@ -234,10 +201,7 @@ fn synthient_native_two_tenants_shared_bytes_rotation_and_masked_export() {
             assert_eq!(row["count"], expected, "{query}: {row}");
         }
         let compiled = compile("* | table synthient_src_proxy, enrichments.provider, enrichments.data.proxy", &fields).unwrap();
-        let mut plan = rt.block_on(nanosiem_lake_worker::enrichment_read::scope(
-            auth.clone(),
-            async { plan_broad_log_query(&config, &scoped, &compiled).unwrap() },
-        ));
+        let mut plan = rt.block_on(async { plan_broad_log_query(&config, &scoped, &compiled).unwrap() });
         let export = dir.path().join(format!("export-{expected}.parquet"));
         plan.params
             .push(("export".into(), export.to_str().unwrap().into()));
@@ -264,15 +228,7 @@ fn synthient_native_two_tenants_shared_bytes_rotation_and_masked_export() {
         let exported = text.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()).collect::<Vec<_>>();
         assert_eq!(exported.len(), 2);
         let providers = |row: &Value| row.get("enrichments.provider").unwrap().as_array().unwrap().clone();
-        if expected == 0 {
-            for row in &exported {
-                assert!(providers(row).is_empty(), "generic export leaked denied tags: {row}");
-                assert!(row.get("synthient_src_proxy").unwrap().is_null());
-                assert_eq!(row.get("enrichments.data.proxy").unwrap(), &json!([]));
-            }
-        } else {
-            assert!(exported.iter().any(|row| providers(row).contains(&json!("platform/synthient"))), "authorized export lost tags: {text}");
-        }
+        assert!(exported.iter().any(|row| providers(row).contains(&json!("platform/synthient"))), "export lost tags: {text}");
     }
     assert_eq!(
         before,

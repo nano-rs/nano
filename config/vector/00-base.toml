@@ -31,7 +31,9 @@ type = "http_server"
 address = "0.0.0.0:8080"
 strict_path = false
 path = "/"
-headers = ["Authorization", "X-Source-Type", "X-Api-Key", "Content-Type", "X-Forwarded-For", "X-Real-IP", "X-Webhook-Secret"]
+# Credentials are read by source authentication, never copied into events.
+# Forwarding headers are needed by rate_limit_prep.
+headers = ["X-Source-Type", "Content-Type", "X-Forwarded-For", "X-Real-IP"]
 max_body_size = 52428800  # 50MB to match batch size (was 10MB)
 
 # Keep-alive for better connection reuse from log shippers
@@ -104,14 +106,14 @@ type = "http_server"
 address = "0.0.0.0:8090"
 strict_path = false
 path = "/"
-headers = ["Authorization", "X-Source-Type", "Content-Type"]
+headers = ["X-Source-Type", "Content-Type"]
 max_body_size = 52428800
 
 # NAN-3379: authenticate at the source so a bad or missing token gets HTTP 401.
 # The `enrichment_prepare` remap below runs after the source has already answered 200,
 # and VRL cannot change the response, so a sender with a typo'd or rotated
 # token used to see success forever while every event was dropped. Same rules
-# as `auth_check` (kept as defense in depth): `Bearer <VECTOR_AUTH_TOKEN>`, and
+# as the log ingress: `Bearer <VECTOR_AUTH_TOKEN>`, and
 # a blank token refuses everything unless VECTOR_ALLOW_UNAUTHENTICATED_INGEST
 # is explicitly "true" (NAN-1351). Header names are lowercase here.
 # `enrichment_prepare` still refuses a blank token outright, so the
@@ -151,8 +153,9 @@ drop_on_error = true
 reroute_dropped = true
 source = '''
 expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
-auth_header = to_string(.Authorization) ?? to_string(.authorization) ?? ""
-if expected_token == "" || auth_header != "Bearer " + expected_token {
+# The source authenticates the request before decoding. Do not copy its token
+# into the event for a second comparison. A blank token remains forbidden here.
+if expected_token == "" {
     log("Auth failed on dedicated enrichment ingress", level: "warn")
     abort
 }
@@ -182,13 +185,6 @@ print_interval_secs = 0
 type = "remap"
 inputs = ["http_ingest"]
 source = '''
-auth_header = ""
-if exists(.Authorization) {
-    auth_header = to_string(.Authorization) ?? ""
-} else if exists(.authorization) {
-    auth_header = to_string(.authorization) ?? ""
-}
-
 expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
 allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
 # NAN-3770: the source already matched a named ingest token from
@@ -214,11 +210,7 @@ if credential_id != "" {
     # NAN-3806: with an install token configured, every accepted token is a
     # listed, source-bound credential. An event without the stamp got in some
     # other way: refuse it rather than route it by what it declares.
-    if auth_header == "" {
-        log("Auth failed: No Authorization header", level: "warn")
-    } else {
-        log("Auth refused: the token is not bound to a source. Bind it in Ingestion -> Credentials.", level: "warn")
-    }
+    log("Auth refused: the token is not bound to a source. Bind it in Ingestion -> Credentials.", level: "warn")
     abort
 }
 

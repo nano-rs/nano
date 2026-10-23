@@ -9,7 +9,7 @@
 //! cargo test -p nanosiem-lake-worker --lib part_query::density::host_timeline_native -- --ignored --nocapture --test-threads=1
 //! ```
 
-use super::native::{digest, engine, granted, ordered_uids, request, rows_of, statements, TENANT};
+use super::native::{digest, engine, ordered_uids, request, rows_of, statements, TENANT};
 use crate::enrichment::BronzeIngestEnricher;
 use crate::part_ingest::ingest::seed_schema;
 use crate::part_ingest::{IngestConfig, Ingestor, NoticeQueue, SourceNotice, SpoolQueue};
@@ -163,10 +163,7 @@ async fn traced(engine: &PartQueryEngine, step: &BroadNplRequest) -> (Value, f64
     let cpu = crate::query_timing::process_cpu_ms().unwrap();
     let answer = crate::query_timing::measure(
         "nan3169",
-        Box::pin(super::super::debug::collect(crate::enrichment_read::scope(
-            granted(),
-            engine.broad_npl(step),
-        ))),
+        Box::pin(super::super::debug::collect(engine.broad_npl(step))),
     )
     .await
     .unwrap_or_else(|error| panic!("{}: {error}", step.query));

@@ -1,0 +1,6 @@
+from {activity_id: 1, category_uid: 3, class_uid: 3002, type_uid: 300201, severity_id: 1, status_id: 2, auth_protocol_id: 2, is_mfa: false, message: "hive auth 0", time: 2026-10-21T01:11:10.690Z, metadata: {product: {name: "hive-gen", vendor_name: "Tenzir"}, uid: "hive-auth-0", version: "1.9.0"}, src_endpoint: {hostname: "tz-host-0", ip: 10.77.0.0}, dst_endpoint: {hostname: "dc01", ip: 10.0.0.5}, user: {name: "tz-user-0", uid: "u0"}},
+     {activity_id: 1, category_uid: 3, class_uid: 3002, type_uid: 300201, severity_id: 1, status_id: 1, auth_protocol_id: 2, is_mfa: true, message: "hive auth 1", time: 2026-10-21T01:11:11.690Z, metadata: {product: {name: "hive-gen", vendor_name: "Tenzir"}, uid: "hive-auth-1", version: "1.9.0"}, src_endpoint: {hostname: "tz-host-1", ip: 10.77.0.1}, dst_endpoint: {hostname: "dc01", ip: 10.0.0.5}, user: {name: "tz-user-1", uid: "u1"}},
+     {activity_id: 6, category_uid: 4, class_uid: 4001, type_uid: 400106, severity_id: 1, message: "hive net 0", time: 2026-10-21T01:11:12.690Z, metadata: {product: {name: "hive-gen", vendor_name: "Tenzir"}, uid: "hive-net-0", version: "1.9.0"}, src_endpoint: {ip: 10.77.0.2, port: 51515}, dst_endpoint: {ip: 192.0.2.10, port: 443}}
+ocsf_derive
+ocsf_cast null_fill=true
+to_file "/w/out/**/events-{uuid}.parquet", partition_by=[class_uid] { write_parquet }

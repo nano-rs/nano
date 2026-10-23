@@ -130,3 +130,51 @@ it('a repeated trigger of the same run moments later joins it instead of startin
   fireEvent.keyDown(content, { key: 'Enter', code: 'Enter', keyCode: 13 });
   await waitFor(() => expect(searches()).toBe(2));
 }, 20_000);
+
+// NAN-3809: exercise the actual pasted-URL admission and deliberate rerun.
+it('an absolute pasted URL reads cache, while Run of that same query stays live', async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(['schema-fields'], mocks.schema);
+  const entry = '/search?q=metadata.log_source%3D%22conduit_proxy%22&start=2026-10-06T11%3A53%3A42.000Z&end=2026-10-06T12%3A53%3A42.999Z';
+  const { container } = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><Search /></MemoryRouter></QueryClientProvider>);
+  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(1));
+  expect(mocks.interactive.mock.calls[0][0]).toMatchObject({ use_cache: true, query: 'metadata.log_source="conduit_proxy"' });
+  await settle();
+  await new Promise(resolve => setTimeout(resolve, 1_600));
+  fireEvent.click(container.querySelector('button.search-console-action')!);
+  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(2));
+  expect(mocks.interactive.mock.calls[1][0]).toMatchObject({ use_cache: false });
+}, 20_000);
+
+it('a relative pasted URL never opts into cache', async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(['schema-fields'], mocks.schema);
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={['/search?q=error&time=Last+hour']}><Search /></MemoryRouter></QueryClientProvider>);
+  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(1));
+  expect(mocks.interactive.mock.calls[0][0]).toMatchObject({ use_cache: false });
+}, 20_000);
+
+it('a cached pasted URL shows its age and Refresh bypasses cache', async () => {
+  mocks.interactive.mockImplementationOnce(async (_request, _retry, onMeta) => {
+    onMeta?.({ hit: true, ageSecs: 120 });
+    return { results: [{ message: 'cached event' }], total_count: 1, fields: [], execution_time_ms: 0 };
+  });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(['schema-fields'], mocks.schema);
+  const entry = '/search?q=error&start=2026-10-06T11:53:42.000Z&end=2026-10-06T12:53:42.999Z';
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><Search /></MemoryRouter></QueryClientProvider>);
+  const refresh = await screen.findByRole('button', { name: /cached .* ago · refresh/i });
+  await new Promise(resolve => setTimeout(resolve, 1_600));
+  fireEvent.click(refresh);
+  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(2));
+  expect(mocks.interactive.mock.calls[1][0]).toMatchObject({ use_cache: false });
+}, 20_000);
+
+it('a fresh fired-rule deep link honors absolute bounds over a relative preset and preferences', async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(['schema-fields'], mocks.schema);
+  const entry = '/search?q=error&time=Last+hour&start=2026-10-06T11%3A53%3A42.000Z&end=2026-10-06T12%3A53%3A42.999Z';
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[entry]}><Search /></MemoryRouter></QueryClientProvider>);
+  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledTimes(1));
+  expect(mocks.interactive.mock.calls[0][0].time_range).toEqual({ start: '2026-10-06T11:53:42.000Z', end: '2026-10-06T12:53:42.999Z' });
+});

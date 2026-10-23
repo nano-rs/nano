@@ -43,13 +43,46 @@ pub struct ReplayTransport {
     entries: Vec<Recorded>,
     used: Mutex<Vec<bool>>,
     pub log: Mutex<Vec<String>>,
+    expected: Option<Vec<ExpectedRequest>>,
+    session_id: uuid::Uuid,
+}
+
+/// Exact request contract for mechanical fixture validation. Authentication
+/// is applied normally, but credential-bearing headers/query keys may be
+/// omitted from expectations with `auth_query_keys`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedRequest {
+    pub method: String,
+    pub url: String,
+    #[serde(default)] pub query: std::collections::BTreeMap<String,String>,
+    #[serde(default)] pub json: Option<Value>,
+    #[serde(default)] pub form: Option<std::collections::BTreeMap<String,String>>,
+    #[serde(default)] pub auth_query_keys: Vec<String>,
 }
 
 impl ReplayTransport {
     pub fn new(entries: Vec<Recorded>) -> Self {
         let n = entries.len();
-        Self { entries, used: Mutex::new(vec![false; n]), log: Mutex::new(vec![]) }
+        Self { entries, used: Mutex::new(vec![false; n]), log: Mutex::new(vec![]), expected:None, session_id:uuid::Uuid::new_v4() }
     }
+
+    /// Consume exchanges strictly in order, without route repetition. Every
+    /// method, origin, path, query and request body must match exactly.
+    pub fn strict(exchanges: Vec<(ExpectedRequest,Recorded)>) -> Self {
+        let (expected,entries) = exchanges.into_iter().unzip();
+        let mut transport = Self::new(entries);
+        transport.expected = Some(expected);
+        transport
+    }
+
+    pub fn assert_complete(&self) -> Result<(),String> {
+        if self.used.lock().map_err(|_| "replay state unavailable")?.iter().all(|v| *v) { Ok(()) }
+        else { Err("recorded exchanges were not all consumed".into()) }
+    }
+
+    /// Stable identity for isolating auth state across independent recordings.
+    pub fn session_id(&self) -> uuid::Uuid { self.session_id }
 }
 
 #[async_trait::async_trait]
@@ -65,9 +98,26 @@ impl Transport for ReplayTransport {
                 && e.query.iter().all(|(k, v)| q.get(k) == Some(v))
         };
         let mut used = self.used.lock().expect("replay");
-        let idx = (0..self.entries.len())
-            .find(|&i| !used[i] && matches(&self.entries[i]))
-            .or_else(|| (0..self.entries.len()).rev().find(|&i| matches(&self.entries[i])));
+        let idx = if let Some(expected) = &self.expected {
+            let idx = used.iter().position(|v| !*v).ok_or_else(|| BrokerError::Http("strict replay exhausted".into()))?;
+            let e = &expected[idx];
+            let mut url = req.url.clone(); url.set_query(None);
+            let actual_pairs:Vec<_> = req.url.query_pairs().filter(|(k,_)| !e.auth_query_keys.iter().any(|n| n == k)).map(|(k,v)| (k.into_owned(),v.into_owned())).collect();
+            let actual_query:std::collections::BTreeMap<_,_> = actual_pairs.iter().cloned().collect();
+            let body_ok = if let Some(body) = &e.json {
+                serde_json::from_slice::<Value>(&req.body).ok().as_ref() == Some(body)
+            } else if let Some(form) = &e.form {
+                let pairs:Vec<_> = url::form_urlencoded::parse(&req.body).into_owned().collect();
+                pairs.len() == form.len() && pairs.into_iter().collect::<std::collections::BTreeMap<_,_>>() == *form
+            } else { req.body.is_empty() };
+            if !matches(&self.entries[idx]) || req.method.as_str() != e.method || url.as_str() != e.url || actual_pairs.len()!=e.query.len() || actual_query != e.query || !body_ok {
+                return Err(BrokerError::Http("strict replay request mismatch".into()));
+            }
+            Some(idx)
+        } else {
+            (0..self.entries.len()).find(|&i| !used[i] && matches(&self.entries[i]))
+                .or_else(|| (0..self.entries.len()).rev().find(|&i| matches(&self.entries[i])))
+        };
         // Query VALUES are dropped from the log: after auth, an api_key_query
         // plugin has put the credential there.
         let keys: Vec<String> = req.url.query_pairs().map(|(k, _)| k.into_owned()).collect();

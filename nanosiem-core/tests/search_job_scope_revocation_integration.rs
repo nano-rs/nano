@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use chrono::Utc;
 use nanosiem_core::auth::ScopeSet;
 use nanosiem_core::search::{
-    QueryPriority, RedisJobStore, SearchJobStore, SearchRequest, SearchResponse,
+    QueryPriority, RedisJobStore, SearchJobStore, SearchRequest, SearchResponse, SearchTenantScope,
 };
 use nanosiem_core::TimeRangeInput;
 
@@ -120,12 +120,13 @@ async fn redis_legacy_job_without_stamp_still_loads_and_fails_closed() {
         .get_multiplexed_async_connection()
         .await
         .expect("redis conn");
-    let _: i64 = redis::cmd("HDEL")
-        .arg(format!("search:job:{}", job_id))
+    let removed: i64 = redis::cmd("HDEL")
+        .arg(SearchTenantScope::Dedicated.redis_job_key(&format!("job:{job_id}")))
         .arg("scope_deny")
         .query_async(&mut conn)
         .await
         .expect("HDEL scope_deny");
+    assert_eq!(removed, 1, "legacy fixture must remove the stored scope stamp");
 
     // `get()` must still return the job — ownership resolution and cancel
     // depend on it. Before the `Vec<Option<String>>` decode this returned None.

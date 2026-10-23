@@ -221,8 +221,50 @@ impl SearchService {
     /// no-data (no compare, no alert) instead of false-firing an `lt`/`eq 0`
     /// monitor when the metric stops reporting. Bounded by the window + LIMIT
     ///
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn evaluate_metric_monitor(
+        &self,
+        query: &MetricQuery<'_>,
+        time_range: &TimeRange,
+    ) -> Result<Vec<(String, Option<f64>)>, SearchError> {
+        // Built-in derived monitor: both operands use the same bounded event-time
+        // window, tag filters and node grouping on either storage backend.
+        if query.metric_name == "node_filesystem_avail_ratio" {
+            let available = MetricQuery {
+                metric_name: "node_filesystem_avail_bytes",
+                agg: crate::query::MetricAgg::Min,
+                ..query.clone()
+            };
+            let capacity = MetricQuery {
+                metric_name: "node_filesystem_size_bytes",
+                agg: crate::query::MetricAgg::Max,
+                ..query.clone()
+            };
+            let available = self
+                .evaluate_raw_metric_monitor(&available, time_range)
+                .await?;
+            let capacity = self
+                .evaluate_raw_metric_monitor(&capacity, time_range)
+                .await?;
+            return Ok(crate::observability::eval::filesystem_ratios(
+                available, capacity,
+            ));
+        }
+        let rows = self.evaluate_raw_metric_monitor(query, time_range).await?;
+        // NAN-4031: sparse counter labels (e.g. status=500) need not exist
+        // before the first event. Prove absence with a count query: a NULL
+        // rate on an existing but undersampled series must remain unknown.
+        if query.agg != crate::query::MetricAgg::Rate || query.filters.is_empty() {
+            return Ok(rows);
+        }
+        let counts_query = MetricQuery { agg: crate::query::MetricAgg::Count, ..query.clone() };
+        let filtered_counts = self.evaluate_raw_metric_monitor(&counts_query, time_range).await?;
+        let base_query = MetricQuery { filters: &[], ..counts_query };
+        let base_counts = self.evaluate_raw_metric_monitor(&base_query, time_range).await?;
+        Ok(crate::observability::eval::fill_missing_counter_rates(rows, filtered_counts, base_counts))
+    }
+
+    async fn evaluate_raw_metric_monitor(
         &self,
         query: &MetricQuery<'_>,
         time_range: &TimeRange,
@@ -401,7 +443,8 @@ impl SearchService {
                     0.0
                 };
                 let p95_ms = json_f64(&row, "p95_ms");
-                let health = service_health(error_rate, p95_ms);
+                let background = is_background_service(&service);
+                let health = service_health(&service, error_rate, p95_ms);
                 let sparkline = sparklines.remove(&service).unwrap_or_default();
                 let obj = serde_json::json!({
                     "service": service,
@@ -412,6 +455,7 @@ impl SearchService {
                     "p95_ms": p95_ms,
                     "p99_ms": json_f64(&row, "p99_ms"),
                     "health": health,
+                    "workload": if background { "background" } else { "interactive" },
                     "sparkline": sparkline,
                 });
                 (error_rate, health, obj)
@@ -624,9 +668,14 @@ impl SearchService {
     ///   - `cpu_pct`  — `system.cpu.utilization` ×100 (OTLP reports 0..1)
     ///   - `mem_pct`  — `system.memory.utilization` ×100
     ///   - `load`     — `system.cpu.load_average.1m` (as-is)
-    ///   - `net_bytes_per_sec` — `system.network.io` (as-is)
+    ///   - `net_bytes_per_sec` — cumulative network counter rate, or `system.network.io`
+    ///
     ///   - `group`    — `host.group` resource attr, else `service_name`
     ///   - `status`   — `good`|`warn`|`bad` from cpu/mem thresholds
+    ///
+    /// NAN-4028: absent system memory/load/network series fall back to raw
+    /// node-exporter gauges and interface counters in SQL. Existing OTel values,
+    /// including reported zero, take precedence. No collector-side derivation.
     ///
     /// A gauge a host never reported comes back 0 from `argMaxIf`; O52 (NAN-1721)
     /// disambiguates that ABSENT reading from a genuine reported 0.0 via the
@@ -663,19 +712,52 @@ impl SearchService {
             .map(|row| {
                 let host = json_str(&row, "host");
                 let group = json_str(&row, "host_group");
-                // OTLP utilization is a 0..1 fraction → percent.
-                let cpu_pct = json_f64(&row, "cpu_util") * 100.0;
+                let kind = json_str(&row, "kind");
+                let cpu_reported = json_f64(&row, "cpu_n") > 0.0
+                    || (json_f64(&row, "cpu_count") > 0.0 && json_f64(&row, "cpu_cores_n") > 0.0);
+                let cpu_pct = if json_f64(&row, "cpu_n") > 0.0 {
+                    json_f64(&row, "cpu_util") * 100.0
+                } else if json_f64(&row, "cpu_count") > 0.0 && json_f64(&row, "cpu_cores_n") > 0.0 {
+                    json_f64(&row, "cpu_cores") / json_f64(&row, "cpu_count") * 100.0
+                } else {
+                    0.0
+                };
                 let mem_pct = json_f64(&row, "mem_util") * 100.0;
-                let load = json_f64(&row, "load_1m");
-                let net = json_f64(&row, "net_io");
-                let status = host_status(cpu_pct, mem_pct);
+                let utilization_status = host_status(cpu_pct, mem_pct);
+                let status = if json_f64(&row, "health_n") > 0.0 {
+                    let health = json_f64(&row, "health");
+                    if health >= 2.0 || utilization_status == "bad" {
+                        "bad"
+                    } else if health >= 1.0 || utilization_status == "warn" {
+                        "warn"
+                    } else {
+                        "good"
+                    }
+                } else if cpu_reported || json_f64(&row, "mem_n") > 0.0 {
+                    utilization_status
+                } else {
+                    "unknown"
+                };
                 let obj = serde_json::json!({
                     "host": host,
                     "group": if group.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(group) },
-                    "cpu_pct": gauge_or_null(&row, cpu_pct, "cpu_n"),
+                    "cpu_pct": if cpu_reported { serde_json::json!(cpu_pct) } else { serde_json::Value::Null },
                     "mem_pct": gauge_or_null(&row, mem_pct, "mem_n"),
-                    "load": gauge_or_null(&row, load, "load_n"),
-                    "net_bytes_per_sec": gauge_or_null(&row, net, "net_n"),
+                    "load": gauge_or_null(&row, json_f64(&row, "load_1m"), "load_n"),
+                    "net_bytes_per_sec": row.get("net_rate").filter(|value| !value.is_null()).cloned()
+                        .unwrap_or_else(|| gauge_or_null(&row, json_f64(&row, "net_io"), "net_n")),
+                    "kind": kind,
+                    "node_name": json_str(&row, "node_name"),
+                    "pod_name": json_str(&row, "pod_name"),
+                    "namespace": json_str(&row, "namespace"),
+                    "workload": json_str(&row, "workload"),
+                    "phase": json_str(&row, "phase"),
+                    "cluster": json_str(&row, "cluster"),
+                    "region": json_str(&row, "region"),
+                    "instance_type": json_str(&row, "instance_type"),
+                    "cpu_cores": gauge_or_null(&row, json_f64(&row, "cpu_cores"), "cpu_cores_n"),
+                    "mem_bytes": gauge_or_null(&row, json_f64(&row, "mem_bytes"), "mem_bytes_n"),
+                    "restarts": gauge_or_null(&row, json_f64(&row, "restarts"), "restarts_n"),
                     "status": status,
                 });
                 (status, obj)
@@ -1170,13 +1252,25 @@ fn json_bool(row: &serde_json::Value, key: &str) -> bool {
     }
 }
 
+fn is_background_service(service: &str) -> bool {
+    let lower = service.to_ascii_lowercase();
+    let mut tokens = lower.rsplit(['-', '_', '.']);
+    let last = tokens.next().unwrap_or("");
+    let role = if !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()) {
+        tokens.next().unwrap_or("")
+    } else { last };
+    matches!(role, "job" | "jobs" | "scheduler" | "schedulers")
+}
+
 /// Service-health classification from the RED signals (NAN-1536), mirroring the
 /// design's `healthOf` thresholds (obs-data.jsx) re-expressed against the
 /// contract's fractional `error_rate` (the design used whole-percent `errPct`):
 ///   - `bad`  — error_rate ≥ 5% OR p95 ≥ 1000 ms
 ///   - `warn` — error_rate ≥ 1% OR p95 ≥ 600 ms
 ///   - `good` — otherwise
-fn service_health(error_rate: f64, p95_ms: f64) -> &'static str {
+fn service_health(service: &str, error_rate: f64, p95_ms: f64) -> &'static str {
+    // Background jobs have no implicit latency objective. Error thresholds still apply.
+    let p95_ms = if is_background_service(service) { 0.0 } else { p95_ms };
     if error_rate >= 0.05 || p95_ms >= 1000.0 {
         "bad"
     } else if error_rate >= 0.01 || p95_ms >= 600.0 {
@@ -1241,5 +1335,87 @@ fn vital_or_null(row: &serde_json::Value, value_key: &str, count_key: &str) -> s
         serde_json::Value::Null
     } else {
         serde_json::json!(json_f64(row, value_key))
+    }
+}
+
+#[cfg(test)]
+mod child_span_tests {
+    use super::*;
+    use tracing::Instrument;
+    use tracing_subscriber::prelude::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn monitor_evaluation_exports_timed_child_and_preserves_scheduler_parent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 16384];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                if n == 0 || buf[..n].windows(4).any(|v| v == b"\r\n\r\n") { break; }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let body = "{\"series_key\":\"\",\"v\":3.0,\"row_count\":1}\n";
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = crate::db::DualPoolConfig::with_auth(
+            "postgres://unused:unused@127.0.0.1:1/nanosiem", &format!("http://{address}"),
+            "nanosiem", "unused", "unused");
+        let pool = crate::db::DualPool::new_lake_control_plane(&config).await.unwrap();
+        let mut service = SearchService::with_dual_pool_and_profile_unrouted(
+            &pool, std::sync::Arc::new(crate::schema::UdmProfile::new()));
+        service.otel_lake = None;
+        service.ch_executor = Some(ClickHouseExecutor::new(pool.clickhouse().clone()
+            .with_compression(clickhouse::Compression::None)));
+        let (layer, mut rx) = crate::telemetry::OtlpTraceLayer::capture_for_test(1);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        use tracing::instrument::WithSubscriber;
+        async move {
+            let query = MetricQuery { metric_name: "test_metric", service_name: None,
+                agg: crate::query::MetricAgg::Avg, group_by: None, filters: &[], step_secs: 60 };
+            let now = chrono::Utc::now();
+            let range = TimeRange { start: now - chrono::Duration::minutes(1), end: now };
+            let root = tracing::info_span!("scheduler.metric_monitor");
+            // The shared spawn wrapper must retain the active scheduler span.
+            let result = async move {
+                tokio::spawn(crate::search::request_actor::inherit(async move {
+                    service.evaluate_metric_monitor(&query, &range).await
+                })).await.unwrap()
+            }.instrument(root).await.unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].1, Some(3.0));
+        }.with_subscriber(subscriber).await;
+        server.await.unwrap();
+        let mut spans = Vec::new();
+        while let Ok(span) = rx.try_recv() { spans.push(span); }
+        let root = spans.iter().find(|s| s.name == "scheduler.metric_monitor").unwrap();
+        let evaluation = spans.iter().find(|s| s.name == "evaluate_metric_monitor").unwrap();
+        let child = spans.iter().find(|s| s.name == "db.clickhouse.execute").unwrap();
+        assert_eq!(evaluation.parent_span_id, root.span_id);
+        assert_eq!(child.parent_span_id, evaluation.span_id);
+        assert_eq!(child.trace_id, root.trace_id);
+        assert!(child.end_time_unix_nano > child.start_time_unix_nano);
+        assert!(child.attributes.iter().any(|a| a.key == "db.response.rows"));
+        assert!(child.attributes.iter().any(|a| a.key == "db.response.bytes"));
+    }
+}
+
+#[cfg(test)]
+mod background_health_tests {
+    use super::*;
+    #[test]
+    fn background_latency_does_not_change_error_health() {
+        for name in ["lake-jobs", "scheduler", "tenant.scheduler.2", "JOBS"] {
+            assert!(is_background_service(name));
+            assert_eq!(service_health(name, 0.0, 5000.0), "good");
+        }
+        for name in ["jobs-api", "jobs-search", "myjobs", "api"] { assert!(!is_background_service(name)); }
+        assert_eq!(service_health("jobs", 0.05, 5000.0), "bad");
+        assert_eq!(service_health("jobs", 0.01, 5000.0), "warn");
+        assert_eq!(service_health("api", 0.0, 5000.0), "bad");
+
     }
 }

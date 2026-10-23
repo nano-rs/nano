@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+
 // RumTab (NAN-1538) — real-user-monitoring: web vitals, page views, JS errors.
 //
 // Ported from the design handoff's obs-rum.jsx (RUMView) + the WebVital gauge in
@@ -15,8 +17,9 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Globe, AlertTriangle, RefreshCw, MonitorSmartphone, Search } from 'lucide-react';
+import { Globe, AlertTriangle, MonitorSmartphone, Search } from 'lucide-react';
 import { api } from '@/lib/api';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
 import type { CacheMeta } from '@/lib/api';
 import { toApiTimeRange } from '@/hooks/use-api';
 import { parseUTCTimestamp } from '@/lib/date-utils';
@@ -162,7 +165,7 @@ function TopPages({ rum, onPickPage }: { rum: RumResponse; onPickPage: (page: st
 function RecentErrors({ rum, onPickPage }: { rum: RumResponse; onPickPage: (page: string) => void }) {
   const navigate = useNavigate();
   const { capabilities } = useCapabilities();
-  const pivot = (query: string) => navigate(`/search?q=${encodeURIComponent(query)}`);
+  const pivot = (query: string) => navigate(`/search#q=${encodeURIComponent(query)}`);
   return (
     <div className="rounded-lg border border-border bg-card overflow-hidden">
       <div className="px-3.5 py-2.5 border-b border-border font-mono text-[10.5px] uppercase tracking-[0.12em] text-fg-2 font-semibold flex items-center gap-2">
@@ -317,7 +320,7 @@ export function RumTab({ timeRange }: ObservabilityTabProps) {
         aria-label="Filter by deployment environment"
         className="h-8 w-[120px] rounded-md border border-border bg-transparent px-2.5 text-[12px] font-mono outline-none focus:border-brand/50 placeholder:text-fg-4"
       />
-      {loading && rum != null && <RefreshCw className="w-3.5 h-3.5 text-fg-4 animate-spin" />}
+      {loading && rum != null && <LoadingIcon className="w-3.5 h-3.5 text-fg-4" />}
       <span className="flex-1" />
       <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
     </div>
@@ -328,7 +331,7 @@ export function RumTab({ timeRange }: ObservabilityTabProps) {
       <div className="flex flex-col gap-3.5">
         {filterBar}
         <div className="flex items-center justify-center py-16 text-fg-3">
-          <RefreshCw className="w-4 h-4 animate-spin" />
+          <LoadingIcon className="w-4 h-4" />
         </div>
       </div>
     );
@@ -361,7 +364,8 @@ export function RumTab({ timeRange }: ObservabilityTabProps) {
           <MonitorSmartphone className="w-5 h-5 text-fg-4 mx-auto mb-2" />
           {filtersActive
             ? 'No real-user-monitoring data matches the current filters.'
-            : 'No real-user-monitoring data in the selected range. Send web-vitals metrics and pageview spans to populate this view.'}
+            : 'No browser telemetry in the selected range. Send web.vitals.* metrics or pageview spans with page.url; server traces alone do not populate RUM.'}
+          <TelemetrySetupHint />
         </div>
       </div>
     );

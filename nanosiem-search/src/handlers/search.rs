@@ -21,6 +21,7 @@ use super::{
 };
 use crate::error::ErrorResponse;
 use crate::{error::SearchError, metrics::record_search_query, SearchState};
+use nanosiem_core::search::settled_reuse::AttachPoint;
 
 fn deferred_tree_marker(request: &SearchRequest) -> Result<Option<SearchResponse>, SearchError> {
     if request.offset.unwrap_or(0) != 0 || request.limit == Some(0) { return Ok(None); }
@@ -144,6 +145,8 @@ fn unescalatable_exhaustion(kind: &str) -> SearchError {
 /// NAN-3883: the id of a queued or running durable job of this caller that is
 /// computing exactly `request` and that the caller may still read, after the
 /// caller's current authority is re-checked. `None` when there is none.
+/// NAN-4277: `point` decides whether a still-queued job is followed.
+#[allow(clippy::too_many_arguments)]
 async fn attachable_in_flight_job(
     state: &SearchState,
     auth: &crate::AuthContext,
@@ -152,8 +155,9 @@ async fn attachable_in_flight_job(
     user_id: uuid::Uuid,
     scope: &nanosiem_core::auth::ScopeSet,
     durable_authority: Option<&nanosiem_core::search::DurableSearchJobAuthority>,
+    point: AttachPoint,
 ) -> Result<Option<String>, SearchError> {
-    let Some(job) = search_service.in_flight_durable_job_for_attach(request, user_id, scope, durable_authority).await else {
+    let Some(job) = search_service.in_flight_durable_job_for_attach(request, user_id, scope, durable_authority, point).await else {
         return Ok(None);
     };
     let visible = job.result_visible_under(scope.deny_set())
@@ -292,14 +296,89 @@ where
     }
 }
 
+/// NAN-4163: the escalation marker of a bare `*` search routed up front.
+const BARE_STAR_ESCALATED_HEADER: (&str, &str) = ("x-nano-query-escalated", "bare-star-window");
+
+/// NAN-4163: whether this request is routed straight to a durable job, see
+/// [`nanosiem_core::search::lake_candidate_hints::bare_star_routes_to_background_job`].
+/// Only a lean cell with its durable job lane routes, and only the logs dataset.
+fn wants_bare_star_background_job(has_durable_lane: bool, request: &SearchRequest) -> bool {
+    has_durable_lane
+        && request.dataset.as_deref().unwrap_or("logs").eq_ignore_ascii_case("logs")
+        && nanosiem_core::search::lake_candidate_hints::bare_star_routes_to_background_job(
+            &request.query,
+            request.time_range.end - request.time_range.start,
+        )
+}
+
+/// NAN-4163: queue a bare `*` search over more than four hours as its durable
+/// job before any interactive work. `Ok(None)`: not routed (not bare, short
+/// window, no durable lane, or the durable lane cannot take this query), so
+/// the request runs interactively as before.
+#[allow(clippy::too_many_arguments)]
+async fn route_bare_star_to_background_job(
+    state: &SearchState,
+    auth: &crate::AuthContext,
+    search_service: &nanosiem_core::SearchService,
+    request: &SearchRequest,
+    user_id: uuid::Uuid,
+    priority: nanosiem_core::search::QueryPriority,
+    scope: &nanosiem_core::auth::ScopeSet,
+    durable_authority: Option<&nanosiem_core::search::DurableSearchJobAuthority>,
+) -> Result<Option<String>, SearchError> {
+    if !wants_bare_star_background_job(search_service.has_durable_view_lane(), request) {
+        return Ok(None);
+    }
+    match require_current_shared_authority(state, auth).await {
+        Ok(()) => {}
+        // A dependency blip must not refuse the search; run it interactively.
+        Err(SearchError::SearchAuthorityUnavailable) => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    if let Some(job_id) = attachable_in_flight_job(state, auth, search_service, request, user_id, scope, durable_authority, AttachPoint::Submission).await? {
+        return Ok(Some(job_id));
+    }
+    let job_id = match search_service
+        .search_async_with_task(
+            request.clone(),
+            user_id,
+            priority,
+            scope,
+            durable_authority,
+            nanosiem_core::search::DurableLakeTask::SearchNplV1,
+        )
+        .await
+    {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            tracing::info!(error = %error, "bare * search cannot move to a durable job; running it interactively");
+            return Ok(None);
+        }
+    };
+    if let Err(error) = require_current_shared_authority(state, auth).await {
+        // The runner revalidates this immutable stamp independently.
+        // An outage after submission is not evidence of revocation.
+        if !matches!(error, SearchError::SearchAuthorityUnavailable) {
+            if let Err(cancel_error) = search_service.cancel_job(&job_id).await {
+                tracing::warn!(job_id = %job_id, error = %cancel_error,
+                    "failed to cancel bare * background job after authority revocation");
+            }
+        }
+        return Err(error);
+    }
+    tracing::info!(job_id = %job_id, window_secs = (request.time_range.end - request.time_range.start).num_seconds(),
+        "routed bare * search over more than 4 h straight to a durable job");
+    Ok(Some(job_id))
+}
+
 #[utoipa::path(
     post,
     path = "/api/search",
     tag = "search",
     request_body = SearchRequest,
     params(
-        ("x-nano-progressive-views" = Option<String>, Header, description = "1 returns a lean Lateral or native-tree dispatcher; use /api/search/stream for Lateral and /api/search/tree-page for tree roots/children"),
-        ("x-nano-accept-async" = Option<String>, Header, description = "A search still running 45 s after the request arrived (NANO_SEARCH_INTERACTIVE_ESCALATE_AFTER_SECS) is moved to a durable job (body {job_id, status}, header x-nano-query-escalated: deadline), so it never outlives the 60 s edge. 0 opts out: the request runs to completion (a resource-bound query can still answer with a job id). Unless 0, a `use_cache: true` search of a settled absolute window (ending at least 5 min ago) that the caller already ran as a durable job, with the same deny set, authority and unchanged data, answers {job_id, status: completed} with x-nano-cache: hit and x-nano-cache-age; its rows are read through the job result pages."), // NAN-3809
+        ("x-nano-progressive-views" = Option<String>, Header, description = "1 returns a minimal Lateral or native-tree dispatcher; use /api/search/stream for Lateral and /api/search/tree-page for tree roots/children"),
+        ("x-nano-accept-async" = Option<String>, Header, description = "A search still running 45 s after the request arrived (NANO_SEARCH_INTERACTIVE_ESCALATE_AFTER_SECS) is moved to a durable job (body {job_id, status}, header x-nano-query-escalated: deadline), so it never outlives the 60 s edge. On a lake cell a bare `*` search (no search term, source/class scope or entity term, after the where-hoist) over more than 4 h goes straight to that job with no interactive attempt, unless it only lists events (head, table, fields, rename, sort -time) or the 5-minute count rollups answer it without a scan (`* | stats count by metadata.log_source`) (header x-nano-query-escalated: bare-star-window). 0 opts out: the request runs to completion (a resource-bound query can still answer with a job id). Unless 0, a `use_cache: true` search of a settled absolute window (ending at least 5 min ago) that the caller already ran as a durable job, with the same deny set, authority and unchanged data, answers {job_id, status: completed} with x-nano-cache: hit and x-nano-cache-age; its rows are read through the job result pages."), // NAN-3809
     ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
@@ -515,15 +594,38 @@ pub async fn search(
     // NAN-3883: the same search is already running as this caller's durable
     // job (a reload, a reopened tab or history entry, or a re-click of an
     // absolute range while it escalated): follow that job instead of starting
-    // the same long scan a second time.
+    // the same long scan a second time. NAN-4277: only a job a runner has
+    // claimed; a still-queued twin gets an interactive attempt first (its
+    // deadline escalation, or the bare `*` route below, still follows it).
     if !bypass && !opted_out_of_async(&request_headers) {
-        if let Some(job_id) = attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref()).await? {
+        if let Some(job_id) = attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref(), AttachPoint::NewRequest).await? {
             record_search_query("piped_attached_job", 0.0, true);
             return Ok((
                 cache_status_headers(false, None),
                 Json(SearchResultResponse::Async(nanosiem_core::search::AsyncSearchResponse {
                     job_id,
                     status: "running".to_string(),
+                })),
+            ));
+        }
+    }
+
+    // NAN-4163 (Dan's rule): on a lean cell a bare `*` search over more than
+    // four hours goes straight to the durable background job, with no
+    // interactive attempt (a pure listing, `* | head N`, stays interactive:
+    // the newest-first paged head path serves it). It answers exactly like a deadline escalation, so
+    // the client follows the job it already knows how to poll. A query the
+    // durable lane cannot take still runs interactively: never refused here.
+    if !debug && !opted_out_of_async(&request_headers) {
+        if let Some(job_id) = route_bare_star_to_background_job(&state, &auth, &search_service, &request, user_id, priority, &scope, durable_authority.as_ref()).await? {
+            record_search_query("piped_escalated", 0.0, true);
+            let mut headers = cache_status_headers(false, None);
+            headers.insert(BARE_STAR_ESCALATED_HEADER.0, axum::http::HeaderValue::from_static(BARE_STAR_ESCALATED_HEADER.1));
+            return Ok((
+                headers,
+                Json(SearchResultResponse::Async(nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
                 })),
             ));
         }
@@ -562,7 +664,7 @@ pub async fn search(
             }
             // NAN-3883: an identical request (a double-fired run) that
             // escalated first already owns the durable job; share it.
-            if let Some(job_id) = attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref()).await? {
+            if let Some(job_id) = attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref(), AttachPoint::Submission).await? {
                 return Ok(Some(job_id));
             }
             let job_id = match search_service
@@ -628,7 +730,16 @@ pub async fn search(
         // Revalidate before stamping durable work after a long interactive
         // attempt. A dependency outage must not create then cancel a job.
         require_current_shared_authority(&state, &auth).await?;
-        let job_id = search_service
+        // NAN-4277: a new request no longer follows a still-queued twin up
+        // front, so the shed path follows it here instead of queueing a copy.
+        let attached = if opted_out_of_async(&request_headers) {
+            None
+        } else {
+            attachable_in_flight_job(&state, &auth, &search_service, &request, user_id, &scope, durable_authority.as_ref(), AttachPoint::Submission).await?
+        };
+        let job_id = match attached {
+            Some(job_id) => Ok(job_id),
+            None => search_service
             .search_async_with_task(
                 request.clone(),
                 user_id,
@@ -637,7 +748,8 @@ pub async fn search(
                 durable_authority.as_ref(),
                 nanosiem_core::search::DurableLakeTask::shed_from_resource_error(kind),
             )
-            .await;
+            .await,
+        };
         let job_id = match job_id {
             Ok(job_id) => job_id,
             // No durable lane for this tenant (e.g. a lean tenant without its
@@ -2306,5 +2418,64 @@ mod deferred_tree_tests {
         assert!(deferred_tree_marker(&atomic).unwrap().is_none());
         atomic.query = "device.hostname=\"host\" | lateral | tree parent=actor.process.uid child=process.uid label=process.name".into();
         assert!(deferred_tree_marker(&atomic).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod nan4163_bare_star_route {
+    use super::*;
+
+    fn request(query: &str, window: chrono::Duration, dataset: Option<&str>) -> SearchRequest {
+        let end = chrono::DateTime::parse_from_rfc3339("2026-10-19T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let mut value = serde_json::json!({
+            "query": query,
+            "time_range": { "start": (end - window).to_rfc3339(), "end": end.to_rfc3339() },
+        });
+        if let Some(dataset) = dataset {
+            value["dataset"] = serde_json::json!(dataset);
+        }
+        serde_json::from_value(value).expect("search request")
+    }
+
+    #[test]
+    fn a_bare_star_over_four_hours_routes_to_the_job_on_a_lean_cell_only() {
+        let four = chrono::Duration::hours(4);
+        let over = four + chrono::Duration::seconds(1);
+        let corpus = r#"* | eval corpus_process_name=coalesce(nullif(process.name,""),actor.process.name) | where corpus_process_name="svchost.exe""#;
+        let stats = "* | stats dc(device.hostname)";
+        assert!(!wants_bare_star_background_job(true, &request(stats, four, None)), "exactly 4h stays interactive");
+        assert!(wants_bare_star_background_job(true, &request(stats, over, None)), "4h + 1s goes to the job");
+        assert!(wants_bare_star_background_job(true, &request(corpus, chrono::Duration::days(7), None)));
+        assert!(wants_bare_star_background_job(true, &request("* | stats dc(device.hostname) by metadata.log_source", over, Some("logs"))));
+        assert!(!wants_bare_star_background_job(false, &request(stats, over, None)), "no durable lane: interactive");
+        assert!(!wants_bare_star_background_job(true, &request(stats, over, Some("risk"))), "risk dataset is not routed");
+        assert!(!wants_bare_star_background_job(true, &request("device.hostname=h", over, None)));
+        assert!(!wants_bare_star_background_job(true, &request("* | where metadata.log_source=x", over, None)));
+    }
+
+    /// The web search page opens with an empty box (nanosiem-web
+    /// `pages/Search.tsx` `useState(urlQuery || '')`, and an empty query is
+    /// refused client-side) over the user's default window, `last_hour`
+    /// unless changed (`contexts/UserPreferencesContext.tsx`). The default
+    /// view an analyst runs is therefore `*` over 1 h; it and every listing
+    /// (`*`, `* | head N`, `* | table ...`) stay interactive at any window.
+    #[test]
+    fn the_web_default_star_and_listings_stay_interactive() {
+        assert!(!wants_bare_star_background_job(true, &request("*", chrono::Duration::hours(1), None)));
+        for window in [chrono::Duration::hours(24), chrono::Duration::days(7), chrono::Duration::days(30)] {
+            for query in ["*", "* | head 50", "* | table time, message"] {
+                assert!(!wants_bare_star_background_job(true, &request(query, window, None)), "{query}");
+            }
+            assert!(wants_bare_star_background_job(true, &request("* | timechart span=1m count", window, None)));
+        }
+    }
+
+    /// NAN-4184: rollup-answered source inventories stay interactive.
+    #[test]
+    fn rollup_answered_source_inventory_stays_interactive() {
+        let week = chrono::Duration::days(7);
+        assert!(!wants_bare_star_background_job(true, &request("* | stats count by metadata.log_source", week, None)));
+        assert!(!wants_bare_star_background_job(true, &request("* | stats count() as count by metadata.log_source | sort -count", week, None)));
+        assert!(wants_bare_star_background_job(true, &request("* | stats dc(device.hostname) by metadata.log_source", week, None)));
     }
 }

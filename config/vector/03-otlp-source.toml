@@ -30,19 +30,24 @@
 # `otel_spans_raw` / `otel_metrics_raw` tables reuses this exact lane — no
 # Vector required. The MV mapping is shared by both paths.
 #
-# Auth: the OTLP source has no shared-token gate here (OTLP exporters generally
-# terminate auth at the collector / LB tier, like the Vector-native :6000 and
-# HEC :8088 sources). Front it with the LB/mTLS in untrusted networks.
+# Auth: raw ports are internal only in open core. nginx authenticates remote
+# HTTP requests against current source-bound credentials, then replaces reserved
+# identity headers captured below. Do not publish raw HTTP or gRPC ports.
 # =============================================================================
 
 [sources.otlp_ingest]
 type = "opentelemetry"
+# Fixed legacy decoding confines sender body/attributes to message/attributes;
+# reserved edge headers cannot be forged by OTLP payload fields.
+log_namespace = false
+use_otlp_decoding = false
 
 [sources.otlp_ingest.grpc]
 address = "0.0.0.0:4317"
 
 [sources.otlp_ingest.http]
 address = "0.0.0.0:4318"
+headers = ["x-nano-credential-id", "x-nano-source-route"]
 
 # =============================================================================
 # Traces -> spans raw table (NAN-1576)
@@ -67,6 +72,8 @@ inputs = ["otlp_ingest.traces"]
 type = "remap"
 inputs = ["otlp_traces_to_log"]
 source = '''
+%nano_credential_id = %opentelemetry.headers."x-nano-credential-id"
+%nano_credential_name = %opentelemetry.headers."x-nano-source-route"
 ts = .timestamp
 if !is_timestamp(ts) { ts = .start_time_unix_nano }
 if !is_timestamp(ts) { ts = now() }
@@ -151,6 +158,7 @@ for_each(array(.links) ?? []) -> |_il, ln| {
 }
 
 otlp = {
+    "metadata": { "nano_credential_id": %nano_credential_id },
     "traceId": to_string(.trace_id) ?? "",
     "spanId": to_string(.span_id) ?? "",
     "parentSpanId": to_string(.parent_span_id) ?? "",
@@ -192,9 +200,17 @@ inputs = ["otlp_ingest.metrics"]
 # Route native telemetry exactly once. The legacy sink and the lake sink are
 # both present in the static topology so profile switches remain an install-time
 # environment choice, but only the selected backend receives events.
+[transforms.otlp_metrics_identity]
+type = "remap"
+inputs = ["otlp_metrics_to_log"]
+source = '''
+%nano_credential_id = %opentelemetry.headers."x-nano-credential-id"
+%nano_credential_name = %opentelemetry.headers."x-nano-source-route"
+'''
+
 [transforms.otlp_metrics_backend]
 type = "route"
-inputs = ["otlp_metrics_to_log"]
+inputs = ["otlp_metrics_identity"]
 reroute_unmatched = false
 route.lake = 'get_env_var!("NANO_LOG_QUERY_BACKEND") == "lake"'
 route.legacy = 'get_env_var!("NANO_LOG_QUERY_BACKEND") != "lake"'
@@ -223,6 +239,7 @@ for_each(tags) -> |k, v| {
 }
 
 otlp = {
+    "metadata": { "nano_credential_id": %nano_credential_id },
     "name": to_string(.name) ?? "",
     "timeUnixNano": nanos,
     "attributes": attrs,
@@ -296,11 +313,18 @@ type = "remap"
 inputs = ["otlp_ingest.logs"]
 source = '''
 .source_type = "otlp_log"
-# O37: honest provenance, not a token-verified claim. Open OTLP ports are by
-# design in open core (the deployer fronts them with LB/mTLS for managed); this
-# value only records the ingest lane so downstream can distinguish OTLP-lane
-# logs from token-gated HTTP-lane events instead of them reading "authenticated".
-.auth_status = "otlp"
+# The edge overwrites these headers after credential authentication. Direct
+# internal traffic has no credential stamp and cannot impersonate a sender.
+credential_id = del(."x-nano-credential-id")
+source_route = del(."x-nano-source-route")
+if is_string(credential_id) && credential_id != "" {
+    %nano_credential_id = credential_id
+    %nano_credential_name = source_route
+    .source_type = to_string(source_route) ?? "otlp_log"
+    .auth_status = "authenticated"
+} else {
+    .auth_status = "otlp"
+}
 .content_format = "otlp"
 .routing_timestamp = now()
 

@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod broker;
+pub mod egress_proxy;
 pub mod paging;
 pub mod policy;
 pub mod spec;
@@ -30,3 +31,4 @@ pub mod point_forward;
 
 pub mod first_party;
 pub mod lookup;
+pub mod sequence;

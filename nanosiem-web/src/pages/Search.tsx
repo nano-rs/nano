@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
+import { useSearchFragmentParams } from '@/hooks/use-search-fragment-params';
 
 import { AUTHORITY_UNAVAILABLE, AUTHORITY_NOTICE } from '@/lib/api/search-authority-retry';
 
@@ -6,7 +7,7 @@ import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { SearchFooterProvider, PHASE2_REPORTING_MODES, type Phase2Status } from '@/components/search/footer-reporter';
 import { LiveRunProvider } from '@/components/search/live-run-context';
 import { useQueryClient, useQuery } from '@tanstack/react-query';
-import { Link as RouterLink, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link as RouterLink, useNavigate } from 'react-router-dom';
 import { useUserPreferences } from '@/contexts/UserPreferencesContext';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Card, CardContent } from '@/components/ui/card';
@@ -154,6 +155,7 @@ import { flattenEventFields } from '@/components/search/event-flatten';
 // query-rewrite paths split the pipeline identically (regex-aware).
 import { hasStatsPipeline, getBaseSearch, getPipeCommands, buildGroupByQuery } from '@/lib/npl-pipeline';
 import { Checkbox } from '@/components/ui/checkbox';
+import { searchJobFailure } from '@/lib/search-job-error';
 
 interface SearchResult {
   id: string;
@@ -427,7 +429,7 @@ const timeRangePresetToDisplay: Record<string, string> = {
 
 export function Search() {
   const navigate = useNavigate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchFragmentParams();
   // The router's current params for async callbacks (NAN-3263's re-anchor
   // writes the rolling window into the URL after an await).
   const searchParamsRef = useRef(searchParams);
@@ -1304,8 +1306,10 @@ export function Search() {
       clearTimeout(aiSuggestionTimeoutRef.current);
     }
 
-    // Only show if meloD is connected
-    if (!melodStatus?.connected) {
+    // Only show if meloD ships in this build/plan AND is connected. The
+    // capability check is explicit (NAN-4131): `useMelodStatus` keeps its last
+    // data when it flips to `skip`, so `connected` alone can go stale.
+    if (!capabilities.melod || !melodStatus?.connected) {
       setShowAiSuggestion(false);
       return;
     }
@@ -1321,7 +1325,7 @@ export function Search() {
         clearTimeout(aiSuggestionTimeoutRef.current);
       }
     };
-  }, [query, melodStatus?.connected, looksLikeNaturalLanguage]);
+  }, [query, capabilities.melod, melodStatus?.connected, looksLikeNaturalLanguage]);
 
   // URL management - pushHistory=true creates a new browser history entry (for back button)
   const updateUrl = useCallback((q: string, mode: 'piped' | 'sql', time: TimeRangeValue, shortId?: string, pushHistory: boolean = false, prevalence?: number, ds?: import('@/lib/api/types').SearchDataset) => {
@@ -1372,7 +1376,7 @@ export function Search() {
       params.set('dataset', dataset);
     }
     const baseUrl = window.location.origin + window.location.pathname;
-    return params.toString() ? `${baseUrl}?${params.toString()}` : baseUrl;
+    return params.toString() ? `${baseUrl}#${params.toString()}` : baseUrl;
   }, [query, queryMode, timeRange, prevalenceMax, dataset]);
 
   const copyShareableUrl = useCallback(async () => {
@@ -1407,7 +1411,7 @@ export function Search() {
         time_range_end: timeRange.type === 'custom' && timeRange.end ? timeRange.end.toISOString() : undefined,
       });
       setShortUrlId(result.id);
-      const shortUrl = `${window.location.origin}/search?s=${result.id}`;
+      const shortUrl = `${window.location.origin}${window.location.pathname}#s=${result.id}`;
       await navigator.clipboard.writeText(shortUrl);
       setCopiedUrl(true);
       setTimeout(() => setCopiedUrl(false), 2000);
@@ -2240,9 +2244,10 @@ export function Search() {
           // Detect parse errors from async job failures (error message starts with "Parse error" or contains position info)
           const errorMsg = status.error || 'Search job failed';
           const isParseError = /^(Parse error|Query parse error|Unexpected|Expected)/.test(errorMsg);
-          const errCode = isParseError ? 'PARSE_ERROR' : 'JOB_FAILED';
-          setSearchError({ code: errCode, message: errorMsg });
-          requestQueryCorrection(errCode, errorMsg, query);
+          // NAN-3911: query_too_large keeps its own code (no Retry, no correction).
+          const failure = searchJobFailure(status, isParseError ? 'PARSE_ERROR' : 'JOB_FAILED');
+          setSearchError(failure);
+          requestQueryCorrection(failure.code, failure.message, query);
         } else if (status.status === 'cancelled') {
           clearAsyncJob();
           setIsSearching(false);
@@ -2616,10 +2621,11 @@ export function Search() {
     setLimitWarningDismissed(false);
     setIsSearching(true);
     setPhase2(null); // NAN-1598: clear phase-2 footer status on a fresh search
-    // NAN-1602: an explicit user run is live (useCache !== true → bypass); the
-    // only passive caller that opts into the cache is the shared-search load.
-    // Drives both the main bypass below and the special views' initial fetch.
-    if (!append) setLiveRun(useCache !== true);
+    // Passive absolute URL/shared loads may reuse results. Explicit Run and
+    // Refresh stay live; presets resolve against now and never opt in.
+    // The server checks the late-arrival window and all authority/data fences.
+    const readCache = useCache === true && currentTimeRange.type === 'custom';
+    if (!append) setLiveRun(!readCache);
     // NAN-1598: also clear the (now stale) display type so a previous two-phase
     // mode's footer gate can't persist into this search. Without this, a search
     // that errors before metadata arrives (e.g. invalid nPL) would leave
@@ -2776,7 +2782,7 @@ export function Search() {
         }
         const admitted = await startInteractiveSearch(api, {
           query: cleanQuery, time_range: apiTimeRange, limit: requestPageSize, offset,
-          use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0 || splitHistogram || hasStatsPipeline(cleanQuery),
+          use_cache: readCache, skip_field_stats: true, skip_histogram: offset > 0 || splitHistogram || hasStatsPipeline(cleanQuery),
           table_view: true, request_id: requestId, dataset: currentDataset,
         }, artifactRows(import.meta.env.VITE_SEARCH_ARTIFACT_ROWS, requestPageSize), signal,
         () => currentRequestIdRef.current === requestId, {
@@ -2792,7 +2798,7 @@ export function Search() {
             clearAsyncJob();
             setIsSearching(false);
             if (status.status === 'failed') {
-              setSearchError({ code: 'JOB_FAILED', message: status.error || 'Search job failed' });
+              setSearchError(searchJobFailure(status));
             }
             return;
           }
@@ -2846,7 +2852,7 @@ export function Search() {
         startStreamingSearch(
           { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, skip_histogram: hasStatsPipeline(cleanQuery), table_view: true, dataset: currentDataset },
           currentQuery, currentTimeRange, currentMode, isAggregate,
-          useCache !== true // NAN-1602: user runs are live (bypass); only the shared-search load (useCache=true) reads cache
+          !readCache // Explicit runs and relative presets bypass the cache
         );
         // Refresh SQL panel if visible (SSE returns early, so do it before exit)
         if (showSql) {
@@ -2863,7 +2869,7 @@ export function Search() {
         // NAN-1645: page flips (offset > 0) skip the histogram companion — the
         // timeline is page-invariant and frozen from page 1 (mirrors the
         // existing skip_field_stats behavior; the backend offset-gates too).
-        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0 || hasStatsPipeline(cleanQuery), table_view: true, request_id: requestId, dataset: currentDataset });
+        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: readCache, skip_field_stats: true, skip_histogram: offset > 0 || hasStatsPipeline(cleanQuery), table_view: true, request_id: requestId, dataset: currentDataset });
       }
 
       if (currentRequestIdRef.current !== requestId || abortControllerRef.current?.signal.aborted) return;
@@ -4725,9 +4731,9 @@ export function Search() {
           startAsyncJobPolling(urlJobId, urlQuery || '', timeRange, queryMode as 'piped' | 'sql', false);
         } else if (status.status === 'failed') {
           setIsSearching(false);
-          const jobErrMsg = status.error || 'Search job failed';
-          setSearchError({ code: 'JOB_FAILED', message: jobErrMsg });
-          requestQueryCorrection('JOB_FAILED', jobErrMsg, urlQuery || query);
+          const failure = searchJobFailure(status);
+          setSearchError(failure);
+          requestQueryCorrection(failure.code, failure.message, urlQuery || query);
         } else {
           setIsSearching(false);
         }
@@ -5549,7 +5555,7 @@ export function Search() {
               <button
                 type="button"
                 onClick={async () => {
-                  const shortUrl = `${window.location.origin}/search?s=${shortUrlId}`;
+                  const shortUrl = `${window.location.origin}${window.location.pathname}#s=${shortUrlId}`;
                   await navigator.clipboard.writeText(shortUrl);
                   setCopiedShortUrl(true);
                   setTimeout(() => setCopiedShortUrl(false), 2000);
@@ -6261,7 +6267,7 @@ export function Search() {
                     columnOrder={columnOrder}
                     assetPrevalenceFilter={assetPrevalenceFilter}
                     timeRange={apiTimeRange}
-                    melodEnabled={melodStatus?.connected || false}
+                    melodEnabled={capabilities.melod && melodStatus?.connected === true}
                     onSummarize={() => setAnalyzeActive(true)}
                     asyncJobId={asyncJobId}
                     asyncJobStatus={asyncJobStatus}

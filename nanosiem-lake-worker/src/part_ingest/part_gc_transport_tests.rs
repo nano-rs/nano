@@ -2,7 +2,7 @@
 //! Local HTTP fixtures use R2PartStore -> S3 -> GcHttp -> CountingHttp.
 use super::*;
 use crate::lake_part_gc::planner::tests::{Chain, T0};
-use crate::lake_part_gc::request::tests::TENANT_UUID;
+pub(crate) use crate::lake_part_gc::request::tests::TENANT_UUID;
 use crate::part_ingest::s3_store::S3Location;
 use crate::parts::format::LogKeys;
 use crate::parts::part_log::ObjectStore;
@@ -139,13 +139,20 @@ async fn listing(
         return (StatusCode::OK, [("content-type", "application/xml")], format!("<ListBucketResult><IsTruncated>{}</IsTruncated>{next}{objects}</ListBucketResult>", end < total)).into_response();
     }
     let count = bucket.checkpoints.load(Ordering::SeqCst);
-    let entries = (0..count)
+    // Pages like S3: max-keys, start-after and continuation tokens (NAN-4160).
+    let start = query.get("continuation-token").and_then(|n| n.parse::<usize>().ok())
+        .or_else(|| query.get("start-after").and_then(|key| key.rsplit('/').next()?.trim_end_matches(".json").parse::<usize>().ok()).map(|n| n + 1))
+        .unwrap_or(0).min(count);
+    let end = query.get("max-keys").and_then(|n| n.parse::<usize>().ok()).map_or(count, |max| (start + max).min(count));
+    let entries = (start..end)
         .map(|n| format!("<Contents><Key>{prefix}{n:020}.json</Key><Size>10</Size><LastModified>2026-09-28T00:00:00.000Z</LastModified><ETag>e</ETag></Contents>"))
         .collect::<String>();
     let paging = if bucket.endless_pages.load(Ordering::SeqCst) {
-        "<IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken>"
+        "<IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken>".to_string()
+    } else if end < count {
+        format!("<IsTruncated>true</IsTruncated><NextContinuationToken>{end}</NextContinuationToken>")
     } else {
-        "<IsTruncated>false</IsTruncated>"
+        "<IsTruncated>false</IsTruncated>".to_string()
     };
     (
         StatusCode::OK,
@@ -155,9 +162,9 @@ async fn listing(
         .into_response()
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     bucket: Arc<Bucket>,
-    store: Arc<R2PartStore>,
+    pub(crate) store: Arc<R2PartStore>,
     gc: CellSanctionedPartGc,
     server: tokio::task::JoinHandle<()>,
     dir: tempfile::TempDir,
@@ -181,7 +188,7 @@ fn history(entries: u64) -> BTreeMap<u64, Vec<u8>> {
         .collect()
 }
 
-fn permission(gc: &CellSanctionedPartGc, rate: u32, ttl: chrono::Duration) {
+pub(crate) fn permission(gc: &CellSanctionedPartGc, rate: u32, ttl: chrono::Duration) {
     permission_with_owner_ttl(gc, rate, ttl, chrono::Duration::minutes(10));
 }
 
@@ -208,14 +215,14 @@ fn permission_with_owner_ttl(
     );
 }
 
-fn fixture_keys() -> TenantKeySet {
+pub(crate) fn fixture_keys() -> TenantKeySet {
     TenantKeySet::new([(
         crate::parts::provenance::tests::SIGNER.into(),
         crate::parts::provenance::tests::test_key(7).verifying_key(),
     )])
 }
 
-async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture {
+pub(crate) async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture {
     let bucket = Arc::new(Bucket {
         entries: RwLock::new(history(entries)),
         objects: RwLock::new(BTreeMap::new()),
@@ -258,6 +265,7 @@ async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture {
         store.clone(),
         fixture_keys(),
         dir.path(),
+        None,
     )
     .unwrap()
     // Every slice persists: these tests read the view back after folds.
@@ -283,6 +291,77 @@ async fn fold(f: &Fixture) {
             break;
         }
     }
+}
+
+/// NAN-4380: the fixture builds `new_guarded`, the same constructor the cell
+/// uses. Exercise its actual prepare/retire seams; no permissive `new()` path.
+#[tokio::test]
+async fn guarded_gc_never_planned_parts_get_local_receipts_before_worker_delete() {
+    guarded_gc_catalog_case(false).await;
+}
+
+#[tokio::test]
+async fn guarded_gc_historical_parts_block_both_worker_deletes_until_cache_acknowledges() {
+    guarded_gc_catalog_case(true).await;
+}
+
+async fn guarded_gc_catalog_case(ever_planned: bool) {
+    use crate::part_ingest::iceberg_export::lifecycle::{test_support::Basin, TenantCatalog};
+    use crate::parts::part_log::{LocalObjectStore, PartLogWriter};
+    let f = fixture(1, Duration::ZERO, 200).await;
+    let local = tempfile::tempdir().unwrap();
+    let source = Arc::new(LocalObjectStore::new(local.path().join("parts")).unwrap());
+    let writer = PartLogWriter::open(source.as_ref(), TENANT_UUID, 1,
+        &crate::part_ingest::ingest::seed_schema(), chrono::Utc::now().timestamp_millis()).await.unwrap();
+    drop(writer);
+    let backend = Basin::new(TENANT_UUID, local.path().into(), source, fixture_keys()).await;
+    if ever_planned {
+        let history = local.path().join("catalog/export/committed");
+        std::fs::create_dir_all(&history).unwrap();
+        let manifest = crate::part_ingest::export::ExportManifest {
+            tenant_id: TENANT_UUID.into(), planned_at_ms: 1, previous_plan_ms: None,
+            add: vec![], remove_parts: vec![crate::lake_part_gc::request::tests::PART.into()], hours: vec![],
+        };
+        std::fs::write(history.join("0000000000001.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    }
+    let catalog = Arc::new(TenantCatalog::new(TENANT_UUID, local.path().join("catalog"), backend.clone()).unwrap());
+    f.gc.attach_catalog(catalog.clone()).unwrap();
+    let seams = Seams { shared: f.gc.shared.clone(), fence: InventoryFence::capture(&f.gc.shared).unwrap(),
+        receipted: std::sync::Mutex::new(vec![]), catalog_pass: Default::default() };
+    let request = crate::lake_part_gc::request::tests::superseded();
+    let now = chrono::Utc::now();
+    let permit = LakePartDeletePermit { permit_id: request.permit_id().unwrap(),
+        owner_authorization: crate::lake_part_gc::delete_control::DeleteOwnerAuthorization {
+            schema_version: 1, signer_key_id: "fixture-owner".into(), issued_at: now.to_rfc3339(),
+            expires_at: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+            identity_sha256: request.digest().unwrap(), signature_base64: "fixture-signature".into(),
+        }, request };
+    catalog.sync_parts(TENANT_UUID, vec![], now.timestamp_millis(), &crate::parts::levels::MergePolicy::default()).await.unwrap();
+    let checks = backend.checks.load(Ordering::SeqCst);
+    backend.fail_cache.store(true, Ordering::SeqCst);
+    let part = crate::lake_part_gc::request::tests::PART;
+    if ever_planned {
+        for retired in [false, true] {
+            let error = if retired { seams.retire(&permit).await.unwrap_err() } else { seams.prepare(&permit).await.unwrap_err() };
+            assert!(error.to_string().contains("cache still reachable"), "Worker must not be called: {error:#}");
+        }
+        assert!(catalog.require_removed(TENANT_UUID, part).is_err());
+        backend.fail_cache.store(false, Ordering::SeqCst);
+    }
+    // A failed inspection stays cached for that pass. Recovery gets a new pass.
+    let seams = Seams { shared: f.gc.shared.clone(), fence: InventoryFence::capture(&f.gc.shared).unwrap(),
+        receipted: std::sync::Mutex::new(vec![]), catalog_pass: Default::default() };
+    // The fake Worker is deliberately unavailable: once custody is receipted,
+    // the operation reaches that exact production transport and fails there.
+    let error = seams.prepare(&permit).await.unwrap_err();
+    assert!(error.to_string().contains("retention authority"), "{error:#}");
+    catalog.require_removed(TENANT_UUID, part).unwrap();
+    let error = seams.retire(&permit).await.unwrap_err();
+    assert!(error.to_string().contains("retention authority"), "{error:#}");
+    if !ever_planned { assert_eq!(backend.checks.load(Ordering::SeqCst), checks, "never-planned parts use no catalog calls"); }
+    let mut foreign = permit.clone();
+    foreign.request.tenant_uuid = "3867bbbb-0000-4000-8000-000000000002".into();
+    assert!(seams.retire(&foreign).await.unwrap_err().to_string().contains("cross-tenant"));
 }
 
 #[tokio::test]
@@ -373,7 +452,10 @@ async fn production_http_retries_caps_and_checkpoint_limits() {
         );
     }
     f.bucket.body_mode.store(0, Ordering::SeqCst);
+    // NAN-4160: a prefix past one guarded page is paged, not refused; these
+    // fixture checkpoints have no bodies, so the candidate cap still holds.
     f.bucket.checkpoints.store(257, Ordering::SeqCst);
+    let lists = f.bucket.requests.lock().unwrap().iter().filter(|(op, _)| op == "LIST").count();
     assert!(f
         .gc
         .shared
@@ -382,7 +464,9 @@ async fn production_http_retries_caps_and_checkpoint_limits() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("key limit"));
+        .contains("candidate limit"));
+    assert_eq!(f.bucket.requests.lock().unwrap().iter().filter(|(op, _)| op == "LIST").count() - lists, 2,
+        "257 numbered keys are two bounded pages");
     f.bucket.checkpoints.store(17, Ordering::SeqCst);
     assert!(f
         .gc
@@ -788,6 +872,7 @@ async fn production_http_resume_and_background_backoff() {
         f.store.clone(),
         fixture_keys(),
         f.dir.path(),
+        None,
     )
     .unwrap();
     permission(&resumed, 200, chrono::Duration::minutes(10));
@@ -932,3 +1017,81 @@ async fn live_deleted_total_follows_each_bounded_cycle() {
     }
     assert_eq!(SanctionedPartGc::deleted_total(&f.gc), Some(410));
 }
+
+/// NAN-4194: the cell wires the persistent view dir through the production
+/// (guarded) constructor. T57 panicked every ingest role here because the
+/// builder called `Arc::get_mut` after the R2 guard took its weak reference.
+/// A rolled pod (fresh ephemeral state dir) resumes from the hot dir within a
+/// page or two of reads instead of refolding from seq 0.
+#[tokio::test]
+async fn guarded_constructor_resumes_the_view_from_the_hot_dir_on_a_fresh_pod() {
+    let f = fixture(64, Duration::ZERO, 200).await;
+    fold(&f).await;
+    let fresh_pod = tempfile::tempdir().unwrap();
+    let resumed = CellSanctionedPartGc::new_guarded(
+        TENANT_UUID,
+        "http://127.0.0.1:1/",
+        None,
+        f.store.clone(),
+        fixture_keys(),
+        fresh_pod.path(),
+        Some(f.dir.path()),
+    )
+    .unwrap()
+    .with_view_save_interval(Duration::ZERO);
+    permission(&resumed, 200, chrono::Duration::minutes(10));
+    let mut state = resumed.state.lock().await;
+    assert!(
+        advance_view(resumed.shared.views.as_ref(), &resumed.shared, &mut state)
+            .await
+            .unwrap()
+    );
+    assert_eq!(state.view.head_seq(), Some(63));
+    assert!(resumed.reads() <= 9, "resumed from the hot dir, not refolded from seq 0");
+    assert!(!fresh_pod.path().join("lake-part-gc").exists(), "the view lives on the hot dir only");
+}
+
+/// NAN-4188: through the production (guarded) constructor, a receipted append
+/// from this process's writer starts an index publication at the next ingest
+/// tick, beside a pass, once per new append and at most once per gap.
+#[tokio::test]
+async fn guarded_follower_starts_a_publication_per_receipted_append() {
+    let f = fixture(8, Duration::ZERO, 200).await;
+    assert_follower_publishes_per_receipted_append(&f.gc, 7).await;
+}
+
+/// NAN-4188: shared with the cell's production-wiring boot test. `gc` must
+/// have an unreachable owner (the publication fails and backs off) and a
+/// delete route (see [`permission`]); `last_seq` is the log's newest seq.
+pub(crate) async fn assert_follower_publishes_per_receipted_append(gc: &CellSanctionedPartGc, last_seq: u64) {
+    let now = chrono::Utc::now().timestamp_millis();
+    {
+        let mut runner = gc.runner.lock().await;
+        runner.armed = true;
+        // The scheduled index-only cadence is not due: only the follower is.
+        runner.next_index_ms = now + 3_600_000;
+    }
+    let before = gc.shared.follower_publications.load(Ordering::Relaxed);
+    let publications = || gc.shared.follower_publications.load(Ordering::Relaxed) - before;
+    let receipted = gc.receipted_appends();
+    receipted.record(last_seq + 1, now - INDEX_SETTLE_FOR_TESTS);
+    let _ = gc.poll_report(now).await;
+    assert_eq!(publications(), 1, "a receipted append starts a publication at the next tick");
+    loop {
+        let finished = gc.runner.lock().await.index_task.as_ref().is_none_or(|task| task.is_finished());
+        if finished {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = gc.poll_report(now + 1).await;
+    assert_eq!(publications(), 1, "never twice for the same receipted append");
+    receipted.record(last_seq + 2, now);
+    let _ = gc.poll_report(now + FOLLOW_MIN_GAP_MS + 1).await;
+    assert_eq!(publications(), 1, "a failed publication backs the follower off");
+    gc.runner.lock().await.next_follow_ms = 0;
+    let _ = gc.poll_report(now + FOLLOW_MIN_GAP_MS + 2).await;
+    assert_eq!(publications(), 2, "a new receipted append once the back-off ends");
+}
+
+const INDEX_SETTLE_FOR_TESTS: i64 = crate::lake_part_gc::index::INDEX_SETTLE_MS;

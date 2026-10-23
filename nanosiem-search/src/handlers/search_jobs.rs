@@ -255,6 +255,11 @@ pub async fn get_search_job(
                     status.result = Some(response);
                 }
             }
+            // NAN-4282: a failed job's stored reason is operator text; customers
+            // never see the internal code name. `error_code` was derived above.
+            status.error = status
+                .error
+                .map(|error| nanosiem_core::branding::without_internal_code_name(&error).into_owned());
             super::require_current_shared_authority(&state, &auth).await?;
             Ok(Json(status))
         }

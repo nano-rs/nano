@@ -38,6 +38,7 @@ import { parseMonitorAlert } from '@/components/alerts/monitorAlert';
 import { AlertTriageBar } from '@/components/alerts/AlertTriageBar';
 import { AssociateCaseButton } from '@/components/alerts/AssociateCaseButton';
 import { EventViewer } from '@/components/matches/EventViewer';
+import { retroMatchOf, retroSearchUrl, type RetroMatch } from '@/components/search/retro/links';
 import { RiskNotableBreakdown } from '@/enterprise/components/risk/RiskNotableBreakdown';
 import { riskNotableEntity } from '@/lib/risk-notable';
 
@@ -327,13 +328,41 @@ function EventsTab({
       </div>
     );
   }
+  const retro = retroMatchOf(events[0]);
   return (
-    <EventViewer
-      events={events}
-      matchDetectedAt={alertTimestamp}
-      hoveredId={null}
-      onHover={() => {}}
-    />
+    <div className="space-y-2">
+      {retro && <RetroMatchStrip match={retro} />}
+      <EventViewer
+        events={events}
+        matchDetectedAt={alertTimestamp}
+        hoveredId={null}
+        onHover={() => {}}
+      />
+    </div>
+  );
+}
+
+function RetroMatchStrip({ match }: { match: RetroMatch }) {
+  return (
+    <div
+      className="rounded-md border border-border bg-card h-[30px] px-3 flex items-center gap-2 text-[11.5px]"
+      data-testid="retro-match-strip"
+    >
+      <span className="font-mono text-[10.5px] px-1 rounded border border-border text-muted-foreground">retro</span>
+      <span className="font-mono text-foreground truncate">{match.indicator}</span>
+      {match.feed && <span className="font-mono text-[10.5px] text-muted-foreground truncate">{match.feed}</span>}
+      {match.learnedAt && (
+        <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums">learned {match.learnedAt}</span>
+      )}
+      <span className="flex-1" />
+      <Link
+        to={retroSearchUrl(match.indicator, { firstSeen: match.firstSeen, lastSeen: match.lastSeen })}
+        className="h-[22px] px-2 rounded border border-border text-[10.5px] font-mono text-muted-foreground hover:text-foreground flex items-center gap-1"
+      >
+        open in retro view
+        <ExternalLink className="w-3 h-3" strokeWidth={1.5} />
+      </Link>
+    </div>
   );
 }
 

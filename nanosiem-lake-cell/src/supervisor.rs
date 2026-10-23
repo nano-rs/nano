@@ -97,12 +97,17 @@ pub(crate) const FEATURE_ENV: &[&str] = &[
     // part_query/identity_merged.rs (NAN-3399 merged identity index;
     // query role; "0" is the kill switch, default on)
     "NANO_LAKE_IDENTITY_MERGED_INDEX",
+    // NAN-4190: window entity index (build + lookups) and its fields.
+    "NANO_LAKE_ENTITY_INDEX",
+    "NANO_LAKE_ENTITY_INDEX_FIELDS",
     "NANO_LAKE_DURABLE_LATERAL",
     // part_ingest/reindex.rs
     "NANO_LAKE_REINDEX_OLD_HOURS",
     "NANO_LAKE_SIDECAR_BACKFILL",
     // parts/sidecar.rs
     "NANO_LAKE_TRIGRAM_INDEX",
+    "NANO_LAKE_PAIR_INDEX",
+    "NANO_LAKE_IP_TOKEN_INDEX",
     // part_ingest/merge_quota.rs (local and remote compaction budgets)
     "NANO_LAKE_COMPACTION_ROWS_PER_SECOND",
     "NANO_LAKE_COMPACTION_BYTES_PER_SECOND",
@@ -214,6 +219,15 @@ pub(crate) fn product_dir_for(data_tenant_root: &Path, tenant: &str, persistent_
         Some(hot) => hot.join(tenant).join(Role::Product.as_str()),
         None => data_tenant_root.join(Role::Product.as_str()),
     }
+}
+
+/// NAN-4183: where ingest[T]'s lake-part GC keeps its folded part-log view:
+/// ingest[T]'s own directory of its tree on the persistent A/B hot volume
+/// (created by the hot tree with the ingest uid, 0700), so a rolled pod
+/// resumes the view instead of refolding the log from seq 0. None without a
+/// persistent hot volume: the GC keeps it in the (per-pod) state dir.
+pub(crate) fn part_gc_state_dir_for(tenant: &str, persistent_hot_tenants: Option<&Path>) -> Option<PathBuf> {
+    persistent_hot_tenants.map(|hot| hot.join(tenant).join(Role::Ingest.as_str()))
 }
 
 /// NAN-3799: [`external_hot_tenants_dir`] when that volume is persistent.
@@ -422,6 +436,9 @@ mod feature_env_tests {
         ("NANO_LAKE_CELL_JOB_SPEC_KEY_FILE", CREDENTIAL),
         ("NANO_LAKE_CELL_ROUTER_TENANT_KEY_FILE", CREDENTIAL),
         ("NANO_LAKE_CELL_ROUTER_TOKEN_FILE", CREDENTIAL),
+        // The control plane's lean-assignment probe token (nanosiem-core
+        // parser rollout observation, enterprise shared_assignment_generation).
+        ("NANO_LAKE_CELL_ROUTER_QUERY_TOKEN_FILE", CREDENTIAL),
         ("NANO_LAKE_ENRICHMENT_COORDINATOR_TOKEN_FILE", CREDENTIAL),
         ("NANO_LAKE_HOT_TAIL_DISK_CACHE_KEY_FILE", CREDENTIAL),
         ("NANO_LAKE_JOB_SIGNING_KEY_FILE", CREDENTIAL),
@@ -637,6 +654,7 @@ use crate::resources::{
     CellCapacity, CellResourceView, EventKind, KillReason, LimitEvent, TenantLimits, TenantResourceView,
 };
 use crate::procfs::{self, ProcKey};
+use crate::spawn_flight::{FlightError, Progress, RoleLock, SpawnFlight, LOCK_WAIT_LOG_EVERY};
 use crate::watchdog::{kill_all, Monitor, TenantSpec};
 use crate::secrets::KeySource;
 use crate::signals::Signal;
@@ -650,7 +668,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CellError {
     #[error("tenant {0} is not placed on this cell")]
     NotPlaced(TenantId),
@@ -676,6 +694,12 @@ pub enum CellError {
     /// DO keeps the backlog.
     #[error("tenant disk pressure: {bytes} bytes over the {soft_bytes}-byte soft ceiling; ingest not admitted")]
     DiskPressure { bytes: u64, soft_bytes: u64, retry_after_secs: u64 },
+    /// NAN-4128: the role's spawn did not finish in time. `still_running`:
+    /// this caller stopped waiting but the attempt continues (a retry joins
+    /// it); otherwise the attempt hit its deadline at `step` and was torn
+    /// down. Retryable.
+    #[error("{} spawn {} at step {step} after {secs}s", role.as_str(), if *still_running { "still in progress" } else { "timed out" })]
+    SpawnTimedOut { role: Role, step: &'static str, secs: u64, still_running: bool },
 }
 
 /// Backoff for a role whose bootstrap-token mint the control plane refused.
@@ -829,6 +853,7 @@ fn role_idx(r: Role) -> usize {
         Role::Query => 1,
         Role::Maintenance => 3,
         Role::Product => 4,
+        Role::Landing => 5,
     }
 }
 
@@ -841,6 +866,17 @@ fn spawn_blocked_error(st: &TenantStats, role: Role, now: Instant) -> Option<Cel
         code: b.code.clone(),
         retry_after_secs: b.not_before.saturating_duration_since(now).as_secs().max(1),
     })
+}
+
+/// NAN-4052: why this pod is standby for the tenant's writers after its
+/// ingest found the cell writer lease held elsewhere, while that lasts.
+fn writer_standby(st: &TenantStats, now: Instant) -> Option<String> {
+    let until = st.writer_standby_until.filter(|until| *until > now)?;
+    Some(format!(
+        "{}; retry in {} s",
+        st.writer_standby_reason.as_deref().unwrap_or("cell writer lease held by another pod generation"),
+        until.saturating_duration_since(now).as_secs().max(1)
+    ))
 }
 
 /// A warm, unassigned process.
@@ -983,6 +1019,11 @@ struct TenantStats {
     restart_not_before: [Option<Instant>; ROLES],
     /// Control-plane refusal of a role's bootstrap token, until it spawns.
     spawn_blocked: [Option<SpawnBlock>; ROLES],
+    /// NAN-4052: ingest[T] found the cell writer lease held by another pod
+    /// generation (or lost it): no writer of this tenant starts here until
+    /// then, and it is not "down".
+    writer_standby_until: Option<Instant>,
+    writer_standby_reason: Option<String>,
 }
 
 /// Recent limit events kept per tenant.
@@ -1013,12 +1054,20 @@ const QUERY_DURATION_BUCKETS: [f64; 8] = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 1
 struct TenantSlot {
     id: TenantId,
     ids: TenantIds,
-    spawn_lock: [tokio::sync::Mutex<()>; ROLES],
+    /// Per tenant AND role (NAN-4128: a wedged spawn of one tenant never
+    /// holds up another tenant's wake). Records its holder and step, and a
+    /// waiter logs every [`LOCK_WAIT_LOG_EVERY`].
+    spawn_lock: [RoleLock; ROLES],
+    /// NAN-4128: the one detached spawn attempt per role. Wakes join it with
+    /// a bounded wait, and a caller that leaves never cancels it.
+    flights: [SpawnFlight<Arc<Proc>, CellError>; ROLES],
     /// NAN-3875: ONE per tenant (spawn locks are per role). Held across the
     /// tenant-tree ensure, so two roles spawning at once never interleave
     /// the hot-tree ownership check and its quarantine/rebuild (the second
     /// would otherwise quarantine the tree the first just rebuilt).
-    dirs_lock: tokio::sync::Mutex<()>,
+    /// NAN-4128: owned (`Arc`), so a timed-out ensure keeps it until its
+    /// blocking walk really ends.
+    dirs_lock: Arc<tokio::sync::Mutex<()>>,
     procs: Mutex<[Option<Arc<Proc>>; ROLES]>,
     stats: Mutex<TenantStats>,
 }
@@ -1028,14 +1077,16 @@ impl TenantSlot {
         Self {
             id,
             ids,
-            spawn_lock: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
-            dirs_lock: tokio::sync::Mutex::new(()),
+            spawn_lock: std::array::from_fn(|_| RoleLock::default()),
+            flights: std::array::from_fn(|_| SpawnFlight::default()),
+            dirs_lock: Arc::new(tokio::sync::Mutex::new(())),
             procs: Mutex::new(std::array::from_fn(|_| None)),
             stats: Mutex::new(TenantStats::default()),
         }
     }
 
     /// Run `f` (the tenant-tree ensure) under the per-tenant dirs lock.
+    #[cfg(test)]
     async fn with_dirs_lock<T>(&self, f: impl std::future::Future<Output = T>) -> T {
         let _dirs = self.dirs_lock.lock().await;
         f.await
@@ -1410,6 +1461,9 @@ pub fn role_mounts(root: &Path, role: Role, product_state_role: bool, product: &
         Role::Maintenance => (vec![own], vec![]),
         // NAN-3148: query's read access to parts, its own state only.
         Role::Product => (vec![own], vec![parts]),
+        // NAN-4137: its own state only. It never reads parts (landed files
+        // come from R2 through its landing_reader credential).
+        Role::Landing => (vec![own], vec![]),
     };
     if role == Role::Product && rw[0] != product {
         rw.push(product.to_path_buf());
@@ -1421,10 +1475,27 @@ pub fn role_mounts(root: &Path, role: Role, product_state_role: bool, product: &
     (rw, ro)
 }
 
+/// NAN-4137: landing[T]'s ceilings sit on top of the tenant's, like
+/// product[T]'s: a large landed file never squeezes ingest or query.
+pub fn with_landing_role(mut limits: TenantLimits, placement: &TenantPlacement) -> TenantLimits {
+    let landing = placement.effective_role_budget(Role::Landing);
+    limits.cpu_ceiling_millicores = limits.cpu_ceiling_millicores.saturating_add(landing.limit_millicores);
+    limits.memory_soft_bytes = limits.memory_soft_bytes.saturating_add(landing.limit_memory_bytes);
+    limits.memory_hard_bytes = limits.memory_hard_bytes.saturating_add(landing.limit_memory_bytes);
+    limits
+}
+
+/// NAN-4137: does this cell run landing[T] for the tenant? Only on a
+/// `tenzir_landing` cell, for a tenant placed with `landing`.
+pub fn landing_wanted(cell_enabled: bool, placed: Option<&TenantPlacement>) -> bool {
+    cell_enabled && placed.is_some_and(|p| p.landing)
+}
+
 pub fn idle_reapable(role: Role, placed: Option<&TenantPlacement>) -> bool {
     // product[T] (NAN-3148) is never idle-reaped on its own: it has no
     // routed requests, and the keeper ties it to a live query[T].
-    if role == Role::Product {
+    // landing[T] (NAN-4137) likewise: the keeper owns its life.
+    if matches!(role, Role::Product | Role::Landing) {
         return false;
     }
     // maintenance[T] lives beside a resident ingest (the keeper stops
@@ -1850,6 +1921,9 @@ impl Supervisor {
             owners.insert(ids.ingest_uid, (t.clone(), Role::Ingest));
             owners.insert(ids.query_uid, (t.clone(), Role::Query));
             owners.insert(ids.detect_uid, (t.clone(), Role::Detect));
+            if let Some(uid) = ids.landing_uid {
+                owners.insert(uid, (t.clone(), Role::Landing));
+            }
             slots.insert(t, ids.slot);
         }
         let warm: Vec<u32> = self.warm.lock().unwrap().values().flatten().map(|w| w.pid).collect();
@@ -1990,7 +2064,8 @@ impl Supervisor {
 
     fn placement_limits(&self, p: &TenantPlacement) -> TenantLimits {
         let limits = TenantLimits::from_placement(p, &self.capacity(), &self.cfg.resources);
-        if self.cfg.product_state_role { with_product_role(limits, p) } else { limits }
+        let limits = if self.cfg.product_state_role { with_product_role(limits, p) } else { limits };
+        if landing_wanted(self.cfg.tenzir_landing, Some(p)) { with_landing_role(limits, p) } else { limits }
     }
 
     fn ensure_tenant_cgroup(&self, cg: &CgroupTree, tenant: &TenantId, slot: u32, placement: &TenantPlacement) -> std::io::Result<()> {
@@ -2156,7 +2231,11 @@ impl Supervisor {
     /// (see [`crate::tenant_dirs`]). Blocking filesystem work off the
     /// runtime; the fsuid/fsgid-switched walk itself runs on its own
     /// dedicated thread inside `ensure_tenant_tree`.
-    async fn ensure_tenant_dirs(&self, t: &TenantId, ids: &TenantIds) -> std::io::Result<()> {
+    ///
+    /// NAN-4128: takes the tenant's dirs guard and moves it into the blocking
+    /// task, so a caller that times out never lets a second walk start
+    /// while this one still runs.
+    async fn ensure_tenant_dirs(&self, t: &TenantId, ids: &TenantIds, dirs_guard: tokio::sync::OwnedMutexGuard<()>) -> std::io::Result<()> {
         let tenants = self.cfg.data_dir.join("tenants");
         let tenant = t.as_str().to_owned();
         let ids = *ids;
@@ -2170,6 +2249,7 @@ impl Supervisor {
         let external = local_hot_window_enabled().then(|| std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR")).flatten();
         let quarantine = hot_quarantine_dir();
         tokio::task::spawn_blocking(move || {
+            let _dirs_guard = dirs_guard;
             crate::tenant_dirs::ensure_tenant_tree_guarded(&tenants, &tenant, &ids, &foreign)?;
             if let Some(base) = external {
                 let base = PathBuf::from(base);
@@ -2196,6 +2276,9 @@ impl Supervisor {
             Role::Maintenance => &self.cfg.ingest_binary,
             // The query binary builds product state (NAN-3148).
             Role::Product => &self.cfg.query_binary,
+            // The ingest binary serves landing[T] (NAN-4137): the shared
+            // landing conversion, dispatched on the assignment's role.
+            Role::Landing => &self.cfg.ingest_binary,
         }
     }
 
@@ -2216,6 +2299,12 @@ impl Supervisor {
             .kill_on_drop(true);
         if let Ok(v) = std::env::var("RUST_LOG") {
             cmd.env("RUST_LOG", v);
+        }
+        // No endpoint or credential enters a tenant jail: static operation spans
+        // use the existing stdout pipe and the region shipper owns export.
+        if std::env::var("NANO_OTLP_TRACE_STDOUT").as_deref() == Ok("1") {
+            cmd.env("NANO_OTLP_TRACE_STDOUT", "1")
+                .env("NANO_OTLP_TRACE_SERVICE", format!("nano-lake-{}", role.as_str()));
         }
         forward_feature_env(&mut cmd, |name| {
             if !feature_allowed_for_role(name, role) { None }
@@ -2305,7 +2394,14 @@ impl Supervisor {
                 rw.push(PathBuf::from(base).join("tenants").join(t.as_str()).join("query"));
             }
         }
-        if let Some(f) = &self.cfg.feed_dir {
+        // NAN-4183: ingest[T] keeps its GC view on the persistent hot volume.
+        if role == Role::Ingest {
+            rw.extend(part_gc_state_dir_for(t.as_str(), persistent_hot_tenants_dir().as_deref()));
+        }
+        // NAN-4137: landing[T] converts untrusted sender files; it gets no
+        // shared or tenant input path at all (feed, policy, custom context).
+        let tenant_inputs = role != Role::Landing;
+        if let Some(f) = self.cfg.feed_dir.as_ref().filter(|_| tenant_inputs) {
             ro.push(f.clone());
         }
         // The owner-sign CA bundle: its directory, not the file, because a
@@ -2316,10 +2412,10 @@ impl Supervisor {
                 ro.push(dir.to_path_buf());
             }
         }
-        if let Some(policy) = &placement.platform_policy_file {
+        if let Some(policy) = placement.platform_policy_file.as_ref().filter(|_| tenant_inputs) {
             if let Some(parent) = policy.parent() { ro.push(parent.to_path_buf()); }
         }
-        if let Some(custom) = &placement.custom_context_root { ro.push(custom.clone()); }
+        if let Some(custom) = placement.custom_context_root.as_ref().filter(|_| tenant_inputs) { ro.push(custom.clone()); }
         if role == Role::Query && local_hot_window_enabled() {
             let base = std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR")
                 .map(PathBuf::from).unwrap_or_else(|| self.cfg.data_dir.clone());
@@ -2341,7 +2437,7 @@ impl Supervisor {
             // Query shares the tenant gid with detect, which has group-write
             // access to parts. Without Landlock, query would inherit that
             // local write permission through DAC even with read-only R2 keys.
-            require_landlock: self.cfg.require_landlock || (!self.cfg.trusted_local && matches!(role, Role::Query | Role::Detect | Role::Product)),
+            require_landlock: self.cfg.require_landlock || (!self.cfg.trusted_local && matches!(role, Role::Query | Role::Detect | Role::Product | Role::Landing)),
             // RLIMIT_NPROC is per uid. Split the tenant cap across roles.
             max_processes: Some((budget.max_pids / 3).max(64)),
             max_open_files: 65_536,
@@ -2355,6 +2451,7 @@ impl Supervisor {
         slot: &Arc<TenantSlot>,
         placement: &TenantPlacement,
         role: Role,
+        progress: &Progress,
     ) -> Result<Arc<Proc>, CellError> {
         let WarmProc { pid, child, control, pidfd, starttime, label } = warm;
         let fail = |pidfd: &PidFd, msg: String| {
@@ -2366,9 +2463,18 @@ impl Supervisor {
         if let Err(e) = validate_enrichment_mounts(&self.cfg, placement) {
             return Err(fail(&pidfd, format!("enrichment mounts: {e}")));
         }
-        if let Err(e) = slot.with_dirs_lock(self.ensure_tenant_dirs(t, &slot.ids)).await {
+        let to = self.cfg.spawn_timeout();
+        // A hot-tree quarantine/rebuild (NAN-3875) can legitimately outlast
+        // one step timeout, so the tree ensure is bounded by the attempt's
+        // overall deadline only. Its guard travels into the blocking walk:
+        // a torn-down attempt never lets a second walk start beside it.
+        progress.set("tenant_dirs_lock");
+        let dirs_guard = slot.dirs_lock.clone().lock_owned().await;
+        progress.set("tenant_dirs");
+        if let Err(e) = self.ensure_tenant_dirs(t, &slot.ids, dirs_guard).await {
             return Err(fail(&pidfd, format!("tenant dirs: {e}")));
         }
+        progress.set("cgroup");
         // One snapshot for the whole assignment: a live adoption in the
         // middle must not leave the process placed but jailed without its
         // cgroup (or the reverse). A process assigned just before adoption
@@ -2407,6 +2513,7 @@ impl Supervisor {
                 Role::Query => placement.effective_role_budget(Role::Query).limit_memory_bytes,
                 Role::Maintenance => placement.effective_role_budget(Role::Maintenance).limit_memory_bytes,
                 Role::Product => placement.effective_role_budget(Role::Product).limit_memory_bytes,
+                Role::Landing => placement.effective_role_budget(Role::Landing).limit_memory_bytes,
             },
             cpu_millis: placement.effective_role_budget(role).limit_millicores,
             eps: placement.eps,
@@ -2416,7 +2523,7 @@ impl Supervisor {
             // Maintenance uses only its CA (the owner endpoint's trust).
             part_signing: match role {
                 Role::Ingest | Role::Detect | Role::Maintenance => self.cfg.part_signing.clone(),
-                Role::Query | Role::Product => None,
+                Role::Query | Role::Product | Role::Landing => None,
             },
             owner_requires_checksum: self.cfg.owner_requires_checksum,
             // A resident ingest must not exit on its own when idle: the
@@ -2429,20 +2536,20 @@ impl Supervisor {
             ingest_keyword_index: self.cfg.ingest_keyword_index,
             identity_observations: match role {
                 Role::Ingest | Role::Query => self.cfg.identity_observations,
-                Role::Detect | Role::Maintenance | Role::Product => false,
+                Role::Detect | Role::Maintenance | Role::Product | Role::Landing => false,
             },
             identity_directory_enrich: matches!(role, Role::Ingest) && self.cfg.identity_directory_enrich,
             ingest_flush: match role {
                 Role::Ingest => self.cfg.ingest_flush,
-                Role::Detect | Role::Query | Role::Maintenance | Role::Product => None,
+                Role::Detect | Role::Query | Role::Maintenance | Role::Product | Role::Landing => None,
             },
             ingest_merge_policy: match role {
                 Role::Ingest => self.cfg.ingest_merge_policy,
-                Role::Detect | Role::Query | Role::Maintenance | Role::Product => None,
+                Role::Detect | Role::Query | Role::Maintenance | Role::Product | Role::Landing => None,
             },
             ingest_hold_eps: match role {
                 Role::Ingest => placement.effective_ingest_hold_eps(now_ms()),
-                Role::Detect | Role::Query | Role::Maintenance | Role::Product => None,
+                Role::Detect | Role::Query | Role::Maintenance | Role::Product | Role::Landing => None,
             },
             // NAN-3004: the startup warm of a zero-downtime pod gates its
             // first readiness on the prewarm; later respawns stay lazy.
@@ -2451,13 +2558,22 @@ impl Supervisor {
             product_state_role: role == Role::Query && self.cfg.product_state_role,
             product_dir: matches!(role, Role::Query | Role::Product).then(|| self.product_dir(t)),
             trusted_local: self.cfg.trusted_local,
+            // NAN-4052: the Postgres writer lease, wherever pods hand over.
+            writer_lease: match role {
+                Role::Ingest => self.handover.as_ref().map(|h| h.writer_lease_assignment()),
+                Role::Detect | Role::Query | Role::Maintenance | Role::Product | Role::Landing => None,
+            },
+            // NAN-4183: the GC view on the persistent hot volume (mounted rw above).
+            part_gc_state_dir: match role {
+                Role::Ingest => part_gc_state_dir_for(t.as_str(), persistent_hot_tenants_dir().as_deref()),
+                Role::Detect | Role::Query | Role::Maintenance | Role::Product | Role::Landing => None,
+            },
         };
         if let Err(e) = check_assignment_signing(&self.cfg, &assignment) {
             return Err(fail(&pidfd, format!("assignment: {e}")));
         }
         let (runs_rules, memory_cap_bytes, cpu_millis, ingest_hold_eps) =
             (assignment.detect_runs_rules, assignment.memory_cap_bytes, assignment.cpu_millis, assignment.ingest_hold_eps);
-        let to = self.cfg.spawn_timeout();
         let msg = ToChild::Assign { protocol_version: PROTOCOL_VERSION, assignment: Box::new(assignment) };
         // NAN-3139: the jail denies socket(AF_UNIX) and pathname-unix
         // connects, so a query process reaches the volume accountant only
@@ -2473,9 +2589,13 @@ impl Supervisor {
             _ => None,
         };
         let fds: Vec<_> = accountant_fd.iter().map(|fd| fd.as_fd()).collect();
-        if let Err(e) = control.send_json(&msg, &fds).await {
-            return Err(fail(&pidfd, format!("send assign: {e}")));
+        progress.set("send_assign");
+        match tokio::time::timeout(to, control.send_json(&msg, &fds)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(fail(&pidfd, format!("send assign: {e}"))),
+            Err(_) => return Err(fail(&pidfd, format!("send assign: not accepted after {}s", to.as_secs()))),
         }
+        progress.set("jailed");
         match tokio::time::timeout(to, control.recv_json::<ToSupervisor>()).await {
             Ok(Ok(Some((ToSupervisor::Jailed { uid, gid, landlock, seccomp }, _))))
                 if uid == jail.uid && gid == jail.gid && seccomp =>
@@ -2489,7 +2609,11 @@ impl Supervisor {
                     return Err(fail(&pidfd, "landlock not enforced".into()));
                 }
                 // Each role's token is bound to that role; detect exchanges as detect.
-                let secret = match self.keys.mint(t, role.credential_role()).await {
+                progress.set("mint_bootstrap_token");
+                let minted = mint_awaiting_assignment(
+                    self.keys.as_ref(), t, role, to, self.precondition_wait(), &self.stopping_all,
+                ).await;
+                let secret = match minted {
                     Ok(s) => s,
                     Err(e) => {
                         if let Some(r) = e.downcast_ref::<crate::secrets::MintRefused>() {
@@ -2510,10 +2634,14 @@ impl Supervisor {
                     Err(e) => return Err(fail(&pidfd, format!("memfd: {e}"))),
                 };
                 drop(secret);
-                if let Err(e) = control.send_json(&ToChild::Secrets, &[memfd.as_fd()]).await {
-                    return Err(fail(&pidfd, format!("send secrets: {e}")));
+                progress.set("send_secrets");
+                match tokio::time::timeout(to, control.send_json(&ToChild::Secrets, &[memfd.as_fd()])).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(fail(&pidfd, format!("send secrets: {e}"))),
+                    Err(_) => return Err(fail(&pidfd, format!("send secrets: not accepted after {}s", to.as_secs()))),
                 }
                 drop(memfd);
+                progress.set("ready");
                 match tokio::time::timeout(to, control.recv_json::<ToSupervisor>()).await {
                     Ok(Ok(Some((ToSupervisor::Ready, _)))) => {}
                     other => return Err(fail(&pidfd, format!("expected ready: {other:?}"))),
@@ -2565,29 +2693,32 @@ impl Supervisor {
         let keys = self.keys.clone();
         let supervisor = self.clone();
         tokio::spawn(async move {
-            let mut last_refresh: Option<Instant> = None;
+            let pacer = Arc::new(Mutex::new(RefreshPacer::new(REFRESH_MIN_INTERVAL)));
             loop {
                 match proc.control.recv_json::<ToSupervisor>().await {
                     Ok(Some((ToSupervisor::RefreshSecrets, _))) => {
-                        // At most one fresh bootstrap per REFRESH_MIN_INTERVAL.
-                        if last_refresh.is_some_and(|at| at.elapsed() < REFRESH_MIN_INTERVAL) {
-                            tracing::warn!(tenant = %proc.tenant, pid = proc.pid, "refresh request rate-limited");
-                            continue;
-                        }
-                        last_refresh = Some(Instant::now());
-                        let secret = match keys.mint(&proc.tenant, proc.role.credential_role()).await {
-                            Ok(secret) => secret,
-                            Err(error) => {
-                                tracing::warn!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid, %error, "refresh: mint bootstrap token failed; child will retry");
-                                continue;
+                        // At most one fresh bootstrap per REFRESH_MIN_INTERVAL;
+                        // an early request is answered at the interval's end,
+                        // never dropped (NAN-4326).
+                        let pace = pacer.lock().unwrap().request(Instant::now());
+                        match pace {
+                            RefreshPace::MintNow => send_fresh_secret(&keys, &proc).await,
+                            RefreshPace::DeferUntil(at) => {
+                                tracing::info!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid,
+                                    defer_ms = at.saturating_duration_since(Instant::now()).as_millis() as u64,
+                                    "refresh request inside the mint interval; answering at its end");
+                                let (keys, proc, pacer) = (keys.clone(), proc.clone(), pacer.clone());
+                                tokio::spawn(async move {
+                                    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                                    pacer.lock().unwrap().deferred_due(Instant::now());
+                                    if !proc.exited.load(Ordering::SeqCst) {
+                                        send_fresh_secret(&keys, &proc).await;
+                                    }
+                                });
                             }
-                        };
-                        let sent = match fdpass::secret_memfd(&secret) {
-                            Ok(memfd) => proc.control.send_json(&ToChild::Secrets, &[memfd.as_fd()]).await,
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = sent {
-                            tracing::error!(tenant = %proc.tenant, pid = proc.pid, %error, "refresh: send secrets failed");
+                            RefreshPace::AlreadyDeferred => {
+                                tracing::debug!(tenant = %proc.tenant, pid = proc.pid, "refresh request coalesced into the deferred one");
+                            }
                         }
                     }
                     Ok(Some((ToSupervisor::Heartbeat(mut hb), _))) => {
@@ -2667,7 +2798,9 @@ impl Supervisor {
             // one that already took over (and its children) is spared.
             {
                 let i = role_idx(proc.role);
-                let _g = slot.spawn_lock[i].lock().await;
+                let cleanup = Progress::new("exit_cleanup");
+                let _g = slot.spawn_lock[i].lock_logged(&cleanup, slot.id.as_str(), proc.role.as_str(), LOCK_WAIT_LOG_EVERY).await;
+                cleanup.set("kill_role_leftovers");
                 let replacement = slot.procs.lock().unwrap()[i]
                     .as_ref()
                     .filter(|p| !Arc::ptr_eq(p, &proc) && !p.exited.load(Ordering::SeqCst))
@@ -2728,6 +2861,30 @@ impl Supervisor {
         let stopping = proc.stopping.load(Ordering::SeqCst);
         let killed = *proc.killed.lock().unwrap();
         let clean = matches!(&status, Ok(s) if s.success());
+        // NAN-4052: ingest found the cell writer lease held elsewhere (or
+        // lost it). Standby, not a crash: no crash count, no backoff growth;
+        // this pod's other writers of the tenant stop, and it retries later.
+        let standby = proc.role == Role::Ingest
+            && killed.is_none()
+            && matches!(&status, Ok(s) if s.code() == Some(crate::contract::WRITER_STANDBY_EXIT_CODE));
+        if standby {
+            let retry = self.handover.as_ref().map_or(Duration::from_secs(20), |h| h.standby_retry());
+            {
+                let mut st = slot.stats.lock().unwrap();
+                st.writer_standby_until = Some(Instant::now() + retry);
+                st.writer_standby_reason = Some(format!("cell writer lease held by another pod generation (ingest pid {} exited standby)", proc.pid));
+            }
+            tracing::warn!(tenant = %slot.id, pid = proc.pid, retry_secs = retry.as_secs(),
+                "ingest is standby: the cell writer lease is held by another pod generation; stopping this pod's writers for the tenant");
+            let others: Vec<Arc<Proc>> = [Role::Detect, Role::Maintenance]
+                .iter()
+                .filter_map(|r| slot.procs.lock().unwrap()[role_idx(*r)].clone())
+                .filter(|p| !p.exited.load(Ordering::SeqCst))
+                .collect();
+            for p in others {
+                self.stop(p, "writer_lease_standby");
+            }
+        }
         let now = Instant::now();
         // OOM accounting from the tenant cgroup (kernel truth).
         let cgroup_oom = self.note_cgroup_ooms(slot);
@@ -2736,7 +2893,7 @@ impl Supervisor {
         let sigkill = matches!(&status, Ok(s) if s.signal() == Some(libc::SIGKILL));
         let cgroup_oom = cgroup_oom
             || (sigkill && self.cgroups.get().is_some() && st.recent_ooms.back().is_some_and(|t| now.duration_since(*t) < Duration::from_secs(5)));
-        if stopping && (clean || killed == Some("shutdown_grace")) {
+        if (stopping && (clean || killed == Some("shutdown_grace"))) || standby {
             st.reaps[i] += 1;
         } else if killed.is_none() {
             if !cgroup_oom {
@@ -2835,6 +2992,16 @@ impl Supervisor {
             return Err(CellError::Unavailable("the product state role is not enabled on this cell".into()));
         }
         let (slot, placement) = self.slot(t)?;
+        // NAN-4137: landing[T] only for a tenant placed with `landing` on a
+        // `tenzir_landing` cell, and only under its own uid.
+        if role == Role::Landing {
+            if !landing_wanted(self.cfg.tenzir_landing, Some(&placement)) {
+                return Err(CellError::Unavailable("landing is not placed for this tenant on this cell".into()));
+            }
+            if slot.ids.landing_uid.is_none() {
+                return Err(CellError::Unavailable("no landing uid is available for this tenant on this cell".into()));
+            }
+        }
         // NAN-3523: over its soft disk ceiling a tenant gets no new ingest
         // work (wake or spawn): a retryable 503, the backlog stays upstream.
         if role == Role::Ingest {
@@ -2848,7 +3015,93 @@ impl Supervisor {
                 return Ok(p);
             }
         }
-        let _guard = slot.spawn_lock[i].lock().await;
+        // NAN-4128: the spawn runs detached under an overall deadline; this
+        // caller joins it and waits a bounded time. A caller that gives up
+        // (client timeout, dropped request) no longer kills the half-started
+        // process with no log, so the next wake finds it running.
+        let deadline = self.spawn_deadline();
+        let me = self.clone();
+        let flight_slot = slot.clone();
+        let res = slot.flights[i]
+            .run(deadline, deadline + Duration::from_secs(1), move |progress| async move {
+                me.spawn_role(flight_slot, placement, role, progress).await
+            })
+            .await;
+        match res {
+            Ok(p) => Ok(p),
+            Err(FlightError::Failed(e)) => Err(e),
+            Err(FlightError::TimedOut { step, secs }) => {
+                self.spawn_failures.fetch_add(1, Ordering::Relaxed);
+                self.recent_spawn_failures.lock().unwrap().push_back(Instant::now());
+                tracing::error!(tenant = %t, role = role.as_str(), step, deadline_secs = secs,
+                    "spawn timed out; attempt torn down and role lock released");
+                Err(CellError::SpawnTimedOut { role, step, secs, still_running: false })
+            }
+            Err(FlightError::StillRunning { step, secs }) => {
+                tracing::warn!(tenant = %t, role = role.as_str(), step, running_secs = secs,
+                    "wake stopped waiting; spawn continues in the background");
+                Err(CellError::SpawnTimedOut { role, step, secs, still_running: true })
+            }
+        }
+    }
+
+    /// NAN-4128: the overall bound of one spawn attempt: its restart
+    /// backoff, the warm hello, the assignment and jail, the token mint and
+    /// readiness are each bounded by `spawn_timeout`, plus a lock wait.
+    fn spawn_deadline(&self) -> Duration {
+        self.cfg.spawn_timeout().saturating_mul(6).max(Duration::from_secs(5))
+    }
+
+    /// NAN-4314: how long one spawn attempt waits for a birth precondition
+    /// (its enrichment inputs; the first lean assignment behind its token):
+    /// a third of the attempt's deadline each, so both waits plus the
+    /// process start still fit inside it.
+    fn precondition_wait(&self) -> Duration {
+        self.spawn_deadline() / 3
+    }
+
+    /// Wait (bounded) until every enrichment input the placement names
+    /// exists. Logs once when it has to wait and once when the inputs land;
+    /// past the bound the spawn fails with the missing path.
+    async fn await_enrichment_inputs(
+        &self,
+        t: &TenantId,
+        role: Role,
+        placement: &TenantPlacement,
+        progress: &Progress,
+    ) -> Result<(), CellError> {
+        let Some(first) = missing_enrichment_input(&self.cfg, placement) else { return Ok(()) };
+        let bound = self.precondition_wait();
+        progress.set("enrichment_inputs");
+        tracing::info!(tenant = %t, role = role.as_str(), missing = %first.display(), wait_secs = bound.as_secs(),
+            "waiting for enrichment inputs before spawning");
+        match wait_for_enrichment_inputs(&self.cfg, placement, bound, ENRICHMENT_INPUTS_POLL, &self.stopping_all).await {
+            InputsWait::Ready(waited) => {
+                tracing::info!(tenant = %t, role = role.as_str(), waited_ms = waited.as_millis() as u64,
+                    "enrichment inputs present; spawning");
+                Ok(())
+            }
+            InputsWait::Stopping => Err(CellError::Unavailable("cell is shutting down; not starting tenant processes".into())),
+            InputsWait::Missing(path) => Err(CellError::Spawn(format!(
+                "enrichment mounts: {} still missing after {}s", path.display(), bound.as_secs()
+            ))),
+        }
+    }
+
+    /// One spawn attempt of `role` for `slot`, under its role lock. Run only
+    /// through `slot.flights` (detached, deadline-bounded).
+    async fn spawn_role(
+        self: Arc<Self>,
+        slot: Arc<TenantSlot>,
+        placement: TenantPlacement,
+        role: Role,
+        progress: Arc<Progress>,
+    ) -> Result<Arc<Proc>, CellError> {
+        let t = &slot.id;
+        let i = role_idx(role);
+        progress.set("role_lock");
+        let _guard = slot.spawn_lock[i].lock_logged(&progress, t.as_str(), role.as_str(), LOCK_WAIT_LOG_EVERY).await;
+        progress.set("admission");
         if let Some(p) = slot.procs.lock().unwrap()[i].clone() {
             if !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst) {
                 return Ok(p);
@@ -2873,6 +3126,9 @@ impl Supervisor {
             if let Some(h) = &self.handover {
                 if let Err(why) = h.may_write(t) {
                     return Err(CellError::Standby(why.to_string()));
+                }
+                if let Some(why) = writer_standby(&slot.stats.lock().unwrap(), Instant::now()) {
+                    return Err(CellError::Standby(why));
                 }
                 // A predecessor of this role may still be flushing here.
                 if let Some(p) = slot.procs.lock().unwrap()[i].as_ref().filter(|p| !p.exited.load(Ordering::SeqCst)) {
@@ -2903,18 +3159,27 @@ impl Supervisor {
                     )));
                 }
                 tracing::info!(tenant = %t, role = role.as_str(), wait_ms = wait.as_millis() as u64, "restart backoff");
+                progress.set("restart_backoff");
                 tokio::time::sleep(wait).await;
             }
         }
         let t0 = Instant::now();
         let result = async {
+            // NAN-4314: the placement can land before the enrichment inputs
+            // it names (the bundle sidecar writes a new tenant's policy on
+            // its next cycle). Wait for them here, before a warm process or
+            // a cgroup is used, instead of failing every second until then.
+            self.await_enrichment_inputs(t, role, &placement, &progress).await?;
             let warm = self.take_warm(role);
             let warm = match warm {
                 Some(w) => w,
-                None => self.spawn_warm(role).await?,
+                None => {
+                    progress.set("spawn_process");
+                    self.spawn_warm(role).await?
+                }
             };
             self.warm_notify.notify_one();
-            self.assign(warm, &slot, &placement, role).await
+            self.assign(warm, &slot, &placement, role, &progress).await
         }
         .await;
         match result {
@@ -2983,7 +3248,7 @@ impl Supervisor {
     fn warm_target(&self, role: Role) -> usize {
         match role {
             Role::Ingest => self.cfg.warm_ingest,
-            Role::Detect | Role::Maintenance | Role::Product => 0,
+            Role::Detect | Role::Maintenance | Role::Product | Role::Landing => 0,
             Role::Query => self.cfg.warm_query,
         }
     }
@@ -3073,8 +3338,12 @@ impl Supervisor {
             // NAN-3004: standby for a tenant whose writer runs on a peer (or
             // while draining / discovering). Not "down": the peer writes.
             if let Some(h) = &self.handover {
-                if h.may_write(&t).is_err() {
+                let standby = slot.as_ref().and_then(|s| writer_standby(&s.stats.lock().unwrap(), now));
+                if h.may_write(&t).is_err() || standby.is_some() {
                     self.resident_down_since.lock().unwrap().remove(&t);
+                    if let Some(until) = slot.as_ref().and_then(|s| s.stats.lock().unwrap().writer_standby_until).filter(|_| standby.is_some()) {
+                        next = Some(next.map_or(until, |n| n.min(until)));
+                    }
                     continue;
                 }
             }
@@ -3112,6 +3381,50 @@ impl Supervisor {
         }
         if let Some(at) = self.keep_product(&placement, now) {
             next = Some(next.map_or(at, |n| n.min(at)));
+        }
+        if let Some(at) = self.keep_landing(&placement, now) {
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
+        next
+    }
+
+    /// `tenzir_landing` (NAN-4137, `lean_tenzir_landing_v1`): keep
+    /// `landing[T]` running for every tenant placed with `landing` that this
+    /// cell writes for (a standby pod never converts: its edge-log appends
+    /// and ledger commits would race the writer's). The ledger lease fences
+    /// any overlap during a hand-over. Returns the earliest restart-backoff
+    /// deadline still pending.
+    fn keep_landing(self: &Arc<Self>, placement: &Placement, now: Instant) -> Option<Instant> {
+        if !self.cfg.tenzir_landing {
+            return None;
+        }
+        let l = role_idx(Role::Landing);
+        let mut next: Option<Instant> = None;
+        for t in placement.tenants.iter().filter(|t| t.landing).map(|t| t.tenant_id.clone()) {
+            if let Some(h) = &self.handover {
+                if h.may_write(&t).is_err() {
+                    continue;
+                }
+            }
+            if let Some(slot) = self.tenants.lock().unwrap().get(&t).cloned() {
+                let running = slot.procs.lock().unwrap()[l].as_ref()
+                    .is_some_and(|p| !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst));
+                if running || slot.spawn_lock[l].try_lock().is_err() {
+                    continue;
+                }
+                let not_before = slot.stats.lock().unwrap().restart_not_before[l];
+                if let Some(at) = not_before.filter(|at| *at > now) {
+                    next = Some(next.map_or(at, |n| n.min(at)));
+                    continue;
+                }
+            }
+            let me = self.clone();
+            tokio::spawn(async move {
+                match me.ensure_running(&t, Role::Landing).await {
+                    Ok(p) => tracing::info!(tenant = %t, pid = p.pid, "landing converter running"),
+                    Err(e) => tracing::warn!(tenant = %t, error = %e, "landing converter not started; retrying"),
+                }
+            });
         }
         next
     }
@@ -3163,12 +3476,28 @@ impl Supervisor {
         let mut next: Option<Instant> = None;
         for t in placement.tenants.iter().filter(|t| t.ingest == IngestMode::Resident).map(|t| t.tenant_id.clone()) {
             // Only the writer cell compacts (NAN-3004 standby cells do not).
+            let slot = self.tenants.lock().unwrap().get(&t).cloned();
             if let Some(h) = &self.handover {
                 if h.may_write(&t).is_err() {
                     continue;
                 }
+                // NAN-4052: and only beside an ingest that finished start-up
+                // here, i.e. holds the cell writer lease (or runs without
+                // one). A pod cut off from its peer must not open the
+                // compactor (fencing the writer pod's) before ingest learned
+                // the lease is held elsewhere.
+                // One lock at a time (stats, then the process table).
+                let ingest_writes = slot.as_ref().is_some_and(|s| {
+                    let standby = writer_standby(&s.stats.lock().unwrap(), now).is_some();
+                    let ingest = s.procs.lock().unwrap()[role_idx(Role::Ingest)].clone();
+                    !standby && ingest.is_some_and(|p| {
+                        !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst) && p.heartbeat.lock().unwrap().1.writer_ready
+                    })
+                });
+                if !ingest_writes {
+                    continue;
+                }
             }
-            let slot = self.tenants.lock().unwrap().get(&t).cloned();
             if let Some(slot) = &slot {
                 let running = slot.procs.lock().unwrap()[m].as_ref()
                     .is_some_and(|p| !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst));
@@ -3238,10 +3567,12 @@ impl Supervisor {
     pub async fn wake(self: &Arc<Self>, t: &TenantId, role: Role, reason: WakeReason) -> Result<u32, CellError> {
         let p = self.ensure_running(t, role).await?;
         p.touch();
-        p.control
-            .send_json(&ToChild::Wake { reason }, &[])
-            .await
-            .map_err(|e| CellError::Unavailable(e.to_string()))?;
+        // NAN-4128: a child that stopped reading its control socket must not
+        // hang the wake.
+        match tokio::time::timeout(self.cfg.spawn_timeout(), p.control.send_json(&ToChild::Wake { reason }, &[])).await {
+            Ok(r) => r.map_err(|e| CellError::Unavailable(e.to_string()))?,
+            Err(_) => return Err(CellError::Unavailable(format!("{} pid {} did not accept the wake", role.as_str(), p.pid))),
+        }
         Ok(p.pid)
     }
 
@@ -3273,10 +3604,10 @@ impl Supervisor {
         let guard = p.begin_request();
         let (ours, theirs) = fdpass::stream_pair().map_err(|e| CellError::Unavailable(e.to_string()))?;
         let id = p.next_request.fetch_add(1, Ordering::Relaxed);
-        p.control
-            .send_json(&ToChild::Rpc { request_id: id }, &[theirs.as_fd()])
-            .await
-            .map_err(|e| CellError::Unavailable(e.to_string()))?;
+        match tokio::time::timeout(self.cfg.spawn_timeout(), p.control.send_json(&ToChild::Rpc { request_id: id }, &[theirs.as_fd()])).await {
+            Ok(r) => r.map_err(|e| CellError::Unavailable(e.to_string()))?,
+            Err(_) => return Err(CellError::Unavailable(format!("{} pid {} did not accept the rpc", role.as_str(), p.pid))),
+        }
         drop(theirs);
         let std = std::os::unix::net::UnixStream::from(ours);
         std.set_nonblocking(true).map_err(|e| CellError::Unavailable(e.to_string()))?;
@@ -3419,7 +3750,7 @@ impl Supervisor {
             specs.push(TenantSpec {
                 limits: self.placement_limits(&placed),
                 roots: procs.iter().map(|p| (p.pid, p.starttime)).collect(),
-                uids: vec![ids.ingest_uid, ids.query_uid, ids.detect_uid],
+                uids: ids.uids(),
                 exempt: procs.iter().filter(|p| p.stopping.load(Ordering::SeqCst)).map(|p| (p.pid, p.starttime)).collect(),
                 unthrottled_uids: if self.cfg.resources.query_unthrottled { vec![ids.query_uid] } else { vec![] },
                 tenant,
@@ -3482,7 +3813,7 @@ impl Supervisor {
                 }
             }
             if let Some(ids) = ids {
-                Self::kill_uids(&[ids.ingest_uid, ids.query_uid, ids.detect_uid]);
+                Self::kill_uids(&ids.uids());
             }
         }
         for e in out.events {
@@ -3621,6 +3952,11 @@ impl Supervisor {
                     && !q.stopping.load(Ordering::SeqCst) && !q.exited.load(Ordering::SeqCst)) {
                     self.stop(p.clone(), "query_stopped");
                 }
+                // NAN-4137: landing[T] runs only while its tenant is placed
+                // with `landing` on a cell that runs the role.
+                if p.role == Role::Landing && !landing_wanted(self.cfg.tenzir_landing, placed_entry) {
+                    self.stop(p.clone(), "landing_not_placed");
+                }
             }
             if procs.is_empty() {
                 // False while a spawn is in flight: neither remove its
@@ -3629,7 +3965,7 @@ impl Supervisor {
                 // Forget tenants moved off this cell once they are drained,
                 // after making sure nothing runs under their uids.
                 if !placed && settled {
-                    Self::kill_uids(&[slot.ids.ingest_uid, slot.ids.query_uid, slot.ids.detect_uid]);
+                    Self::kill_uids(&slot.ids.uids());
                     self.tenants.lock().unwrap().remove(&slot.id);
                     // Drained: its purge can run now.
                     self.purge_notify.notify_one();
@@ -3810,7 +4146,7 @@ impl Supervisor {
 
         // 1. Nothing of it runs (its uids are never reused by another tenant).
         let ids = self.uidmap.lock().unwrap().get(t);
-        let uids: Vec<u32> = ids.map(|i| vec![i.ingest_uid, i.query_uid, i.detect_uid]).unwrap_or_default();
+        let uids: Vec<u32> = ids.map(|i| i.uids()).unwrap_or_default();
         let running = |uids: &[u32]| if uids.is_empty() { vec![] } else { procfs::processes_of(&procfs::scan(), uids, None) };
         let left = running(&uids);
         if !left.is_empty() {
@@ -4502,7 +4838,17 @@ impl Supervisor {
             .tenants
             .iter()
             .filter(|t| t.ingest == IngestMode::Resident && !writing.contains(&t.tenant_id))
-            .filter_map(|t| h.may_write(&t.tenant_id).err().map(|why| (t.tenant_id.clone(), why.to_string())))
+            .filter_map(|t| {
+                let lease = || {
+                    let slot = self.tenants.lock().unwrap().get(&t.tenant_id).cloned()?;
+                    let st = slot.stats.lock().unwrap();
+                    writer_standby(&st, Instant::now())
+                };
+                match h.may_write(&t.tenant_id) {
+                    Err(why) => Some((t.tenant_id.clone(), why.to_string())),
+                    Ok(()) => lease().map(|why| (t.tenant_id.clone(), why)),
+                }
+            })
             .collect();
         Some(crate::handover::HandoverStatus {
             boot_id: h.me.boot_id.clone(),
@@ -4826,6 +5172,18 @@ impl crate::report::StatusSource for Supervisor {
         } else {
             std::collections::BTreeMap::new()
         };
+        // NAN-4137: each placed tenant's live landing[T] counters, keyed by its spawn time.
+        let landing = if self.cfg.tenzir_landing {
+            placement.tenants.iter().filter(|tp| tp.landing).filter_map(|tp| {
+                let slot = slots.get(&tp.tenant_id)?;
+                let procs = slot.procs.lock().unwrap();
+                let p = procs.iter().flatten().find(|p| p.role == crate::contract::Role::Landing && !p.exited.load(Ordering::SeqCst))?;
+                let status = p.heartbeat.lock().unwrap().1.landing.clone()?;
+                Some((tp.tenant_id.clone(), crate::report::LandingCounters { epoch_ms: p.spawned_unix_ms, status }))
+            }).collect()
+        } else {
+            std::collections::BTreeMap::new()
+        };
         let ledger = self.ledger.snapshot();
         let mut draining: std::collections::BTreeSet<TenantId> = slots.keys().filter(|t| !is_placed(t)).cloned().collect();
         draining.extend(ledger.pending.keys().filter(|t| !is_placed(t)).cloned());
@@ -4836,6 +5194,7 @@ impl crate::report::StatusSource for Supervisor {
             draining: draining.into_iter().collect(),
             purged: ledger.purged.into_iter().collect(),
             ingest,
+            landing,
         }
     }
 
@@ -4923,13 +5282,84 @@ where
 /// Minimum spacing between two `RefreshSecrets` mints for one process.
 pub const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// What to do with one `RefreshSecrets` request ([`RefreshPacer::request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshPace {
+    /// Mint and answer now.
+    MintNow,
+    /// Inside the mint interval: answer at this instant (the interval's end).
+    DeferUntil(Instant),
+    /// A deferred answer is already scheduled; this request rides on it.
+    AlreadyDeferred,
+}
+
+/// Paces one process's `RefreshSecrets` mints: at most one per `interval`.
+/// A request inside the interval is deferred to its end and coalesced with
+/// any other early request; it is never dropped. A dropped request left
+/// maintenance[T] waiting for a bootstrap that never came until its
+/// credential lapsed and it exited (UK cell-uk-1, 2026-10-21, NAN-4326).
+#[derive(Debug)]
+pub struct RefreshPacer {
+    interval: Duration,
+    last_mint: Option<Instant>,
+    deferred: bool,
+}
+
+impl RefreshPacer {
+    pub fn new(interval: Duration) -> Self {
+        Self { interval, last_mint: None, deferred: false }
+    }
+
+    /// A `RefreshSecrets` arrived at `now`.
+    pub fn request(&mut self, now: Instant) -> RefreshPace {
+        if self.deferred {
+            return RefreshPace::AlreadyDeferred;
+        }
+        match self.last_mint {
+            Some(at) if now < at + self.interval => {
+                self.deferred = true;
+                RefreshPace::DeferUntil(at + self.interval)
+            }
+            _ => {
+                self.last_mint = Some(now);
+                RefreshPace::MintNow
+            }
+        }
+    }
+
+    /// The deferred answer is being minted at `now`.
+    pub fn deferred_due(&mut self, now: Instant) {
+        self.deferred = false;
+        self.last_mint = Some(now);
+    }
+}
+
+/// Mint a fresh bootstrap for `proc` and send it as `Secrets` + memfd. A
+/// failure is logged; the child's own retry schedule asks again.
+async fn send_fresh_secret(keys: &Arc<dyn KeySource>, proc: &Proc) {
+    let secret = match keys.mint(&proc.tenant, proc.role.credential_role()).await {
+        Ok(secret) => secret,
+        Err(error) => {
+            tracing::warn!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid, %error, "refresh: mint bootstrap token failed; child will retry");
+            return;
+        }
+    };
+    let sent = match fdpass::secret_memfd(&secret) {
+        Ok(memfd) => proc.control.send_json(&ToChild::Secrets, &[memfd.as_fd()]).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = sent {
+        tracing::error!(tenant = %proc.tenant, pid = proc.pid, %error, "refresh: send secrets failed");
+    }
+}
+
 /// An assignment's owner-signing config must be exactly the release-pinned
 /// cell config for `ingest`/`detect`, and absent for `query`: nothing a tenant process
 /// or tenant data can influence may change which keys it trusts.
 pub fn check_assignment_signing(cfg: &CellConfig, assignment: &Assignment) -> anyhow::Result<()> {
     let expected = match assignment.role {
         Role::Ingest | Role::Detect | Role::Maintenance => cfg.part_signing.as_ref(),
-        Role::Query | Role::Product => None,
+        Role::Query | Role::Product | Role::Landing => None,
     };
     anyhow::ensure!(
         assignment.part_signing.as_ref() == expected,
@@ -4997,6 +5427,102 @@ fn validate_enrichment_mounts(cfg: &CellConfig, placement: &TenantPlacement) -> 
         anyhow::ensure!(std::fs::canonicalize(root)? == *root, "custom context directory must not be a symlink");
     }
     Ok(())
+}
+
+/// How often a spawn re-checks its enrichment inputs while it waits.
+const ENRICHMENT_INPUTS_POLL: Duration = Duration::from_millis(250);
+
+/// NAN-4314: the first enrichment input `validate_enrichment_mounts` opens
+/// that does not exist yet. A missing input is a precondition still
+/// landing (the bundle sidecar writes a new tenant's `policy.json` on its
+/// next cycle after the grants Secret syncs); anything else about an input
+/// that exists is left to the validation, which fails at once.
+fn missing_enrichment_input(cfg: &CellConfig, placement: &TenantPlacement) -> Option<PathBuf> {
+    let feed = cfg.feed_dir.as_ref().filter(|_| cfg.platform_bundle_file.is_some() || cfg.platform_bundle_dir.is_some());
+    feed.into_iter()
+        .chain(cfg.platform_bundle_file.iter())
+        .chain(cfg.platform_bundle_dir.iter())
+        .chain(placement.platform_policy_file.iter())
+        .chain(placement.custom_context_root.iter())
+        .find(|path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound))
+        .cloned()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InputsWait {
+    /// Every input exists; waited this long.
+    Ready(Duration),
+    /// Still missing at the bound: this path.
+    Missing(PathBuf),
+    /// The cell began shutting down.
+    Stopping,
+}
+
+/// Poll until every enrichment input of `placement` exists, at most `bound`.
+async fn wait_for_enrichment_inputs(
+    cfg: &CellConfig,
+    placement: &TenantPlacement,
+    bound: Duration,
+    poll: Duration,
+    stopping: &AtomicBool,
+) -> InputsWait {
+    let t0 = Instant::now();
+    loop {
+        let Some(missing) = missing_enrichment_input(cfg, placement) else { return InputsWait::Ready(t0.elapsed()) };
+        if stopping.load(Ordering::SeqCst) {
+            return InputsWait::Stopping;
+        }
+        let left = bound.saturating_sub(t0.elapsed());
+        if left.is_zero() {
+            return InputsWait::Missing(missing);
+        }
+        tokio::time::sleep(poll.min(left)).await;
+    }
+}
+
+/// NAN-4314: mint `role`'s bootstrap token. Each request is bounded by
+/// `step`. While the control plane answers that the tenant's first lean
+/// assignment is still being committed (`503 lean_assignment_pending`),
+/// wait its `Retry-After` (1–5 s) and ask again, for at most `pending_bound`
+/// in all; past that (or on any other refusal) the refusal is returned for
+/// the caller's backoff, as before.
+async fn mint_awaiting_assignment(
+    keys: &dyn KeySource,
+    t: &TenantId,
+    role: Role,
+    step: Duration,
+    pending_bound: Duration,
+    stopping: &AtomicBool,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let t0 = Instant::now();
+    let mut waiting = false;
+    loop {
+        let minted = match tokio::time::timeout(step, keys.mint(t, role.credential_role())).await {
+            Ok(r) => r,
+            Err(_) => anyhow::bail!("no answer after {}s", step.as_secs()),
+        };
+        let pending = match &minted {
+            Err(e) => e.downcast_ref::<crate::secrets::MintRefused>().filter(|r| r.is_assignment_pending()),
+            Ok(_) => None,
+        };
+        let Some(r) = pending else {
+            if waiting && minted.is_ok() {
+                tracing::info!(tenant = %t, role = role.as_str(), waited_ms = t0.elapsed().as_millis() as u64,
+                    "first lean assignment committed; bootstrap token minted");
+            }
+            return minted;
+        };
+        let pause = r.retry_after.unwrap_or(Duration::from_secs(2)).clamp(Duration::from_secs(1), Duration::from_secs(5));
+        if stopping.load(Ordering::SeqCst) || t0.elapsed() + pause > pending_bound {
+            return minted;
+        }
+        if !waiting {
+            waiting = true;
+            tracing::info!(tenant = %t, role = role.as_str(), reason = %r.code, wait_secs = pending_bound.as_secs(),
+                "waiting for the control plane's first lean assignment before starting the role");
+        }
+        tokio::time::sleep(pause).await;
+    }
 }
 
 #[cfg(test)]
@@ -5175,6 +5701,8 @@ mod signing_tests {
             product_state_role: false,
             product_dir: None,
             trusted_local: false,
+            writer_lease: None,
+            part_gc_state_dir: None,
         }
     }
 
@@ -5320,6 +5848,161 @@ mod enrichment_mount_tests {
         both.platform_bundle_file = Some(feed.join("platform.bundle"));
         assert!(validate_enrichment_mounts(&both, &p).is_err());
         assert!(both.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod birth_precondition_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    const TENANT: &str = "6f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00";
+
+    /// A cell config with a bundle dir, and a placement whose policy file
+    /// the bundle sidecar has not written yet (the birth state, NAN-4314).
+    fn birth(tmp: &Path) -> (CellConfig, TenantPlacement, PathBuf) {
+        let feed = tmp.join("feeds");
+        std::fs::create_dir_all(feed.join("bundles")).unwrap();
+        for d in ["cell-data", "cell-state", "policy"] { std::fs::create_dir(tmp.join(d)).unwrap(); }
+        let cfg: CellConfig = serde_json::from_value(serde_json::json!({
+            "cell_id":"cell-a", "data_dir":tmp.join("cell-data"), "state_dir":tmp.join("cell-state"),
+            "ingest_binary":"/b", "query_binary":"/b",
+            "listen_unix":"/r.sock", "router_token_file":"/t", "placement_file":"/p", "dev_key_dir":"/k",
+            "feed_dir":feed, "platform_bundle_dir":feed.join("bundles")
+        })).unwrap();
+        let policy = tmp.join("policy").join(TENANT).join("policy.json");
+        let mut p = TenantPlacement::legacy(TenantId::new(TENANT).unwrap(), 20.0);
+        p.platform_policy_file = Some(policy.clone());
+        (cfg, p, policy)
+    }
+
+    fn land(policy: &Path) {
+        std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+        std::fs::write(policy, b"{}").unwrap();
+    }
+
+    /// The AU/UK/EAST birth: the placement names a policy that lands a few
+    /// cycles later. The spawn waits for it and then validates cleanly,
+    /// instead of failing "enrichment mounts: ENOENT" every second.
+    #[tokio::test]
+    async fn a_spawn_waits_for_a_policy_that_lands_after_the_placement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, p, policy) = birth(tmp.path());
+        assert_eq!(missing_enrichment_input(&cfg, &p), Some(policy.clone()));
+        assert!(validate_enrichment_mounts(&cfg, &p).is_err(), "the old spawn failed here");
+        let lander = {
+            let policy = policy.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                land(&policy);
+            })
+        };
+        let stop = AtomicBool::new(false);
+        let r = wait_for_enrichment_inputs(&cfg, &p, Duration::from_secs(10), Duration::from_millis(20), &stop).await;
+        lander.await.unwrap();
+        assert!(matches!(r, InputsWait::Ready(w) if w >= Duration::from_millis(250) && w < Duration::from_secs(5)), "{r:?}");
+        validate_enrichment_mounts(&cfg, &p).expect("the landed inputs validate");
+        // Present from the start: no wait at all.
+        let r = wait_for_enrichment_inputs(&cfg, &p, Duration::from_secs(10), Duration::from_millis(20), &stop).await;
+        assert!(matches!(r, InputsWait::Ready(w) if w < Duration::from_millis(20)), "{r:?}");
+    }
+
+    /// A policy that never lands is a real failure: the wait ends at its
+    /// bound and names the missing path. Shutdown ends it at once.
+    #[tokio::test]
+    async fn a_policy_that_never_lands_fails_at_the_bound_and_shutdown_ends_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, p, policy) = birth(tmp.path());
+        let stop = AtomicBool::new(false);
+        let t0 = Instant::now();
+        let r = wait_for_enrichment_inputs(&cfg, &p, Duration::from_millis(200), Duration::from_millis(20), &stop).await;
+        assert_eq!(r, InputsWait::Missing(policy));
+        assert!(t0.elapsed() >= Duration::from_millis(200) && t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        stop.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let r = wait_for_enrichment_inputs(&cfg, &p, Duration::from_secs(30), Duration::from_millis(20), &stop).await;
+        assert_eq!(r, InputsWait::Stopping);
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Only absence is waited for: an input that exists but is wrong (a
+    /// symlinked policy directory) is not "missing", so the validation
+    /// refuses it at once, as before.
+    #[test]
+    fn an_existing_but_invalid_input_is_not_waited_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (cfg, p, policy) = birth(tmp.path());
+        let real = tmp.path().join("elsewhere");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("policy.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&real, policy.parent().unwrap()).unwrap();
+        assert_eq!(missing_enrichment_input(&cfg, &p), None);
+        assert!(validate_enrichment_mounts(&cfg, &p).is_err());
+        // The bundle dir is an input too.
+        let mut no_bundles = cfg.clone();
+        no_bundles.platform_bundle_dir = Some(cfg.feed_dir.clone().unwrap().join("missing"));
+        assert_eq!(missing_enrichment_input(&no_bundles, &p), no_bundles.platform_bundle_dir);
+    }
+
+    /// The control plane's key source as the cell sees it at a birth:
+    /// `pending` mints answer `503 lean_assignment_pending` (Retry-After 1),
+    /// then it mints.
+    struct FirstAssignment { pending: u32, calls: AtomicU32, code: &'static str }
+
+    #[async_trait::async_trait]
+    impl KeySource for FirstAssignment {
+        async fn mint(&self, tenant: &TenantId, role: Role) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.pending {
+                let body = format!(r#"{{"error":"{}"}}"#, self.code);
+                return Err(crate::secrets::MintRefused::from_response(tenant, role, 503, body.as_bytes(), Some(Duration::from_secs(1))).into());
+            }
+            Ok(zeroize::Zeroizing::new(b"bootstrap".to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mint_waits_for_the_first_lean_assignment_instead_of_failing() {
+        let t = TenantId::new(TENANT).unwrap();
+        let stop = AtomicBool::new(false);
+        let keys = FirstAssignment { pending: 1, calls: 0.into(), code: "lean_assignment_pending" };
+        let t0 = Instant::now();
+        let secret = mint_awaiting_assignment(&keys, &t, Role::Ingest, Duration::from_secs(5), Duration::from_secs(30), &stop)
+            .await
+            .expect("minted once the assignment committed");
+        assert_eq!(secret.as_slice(), b"bootstrap");
+        assert_eq!(keys.calls.load(Ordering::SeqCst), 2);
+        assert!(t0.elapsed() >= Duration::from_secs(1), "honours Retry-After");
+    }
+
+    /// Past the bound the pending refusal is returned (the spawn backs off
+    /// and reports it); any other refusal is never waited on.
+    #[tokio::test]
+    async fn the_mint_wait_is_bounded_and_other_refusals_return_at_once() {
+        let t = TenantId::new(TENANT).unwrap();
+        let stop = AtomicBool::new(false);
+        let keys = FirstAssignment { pending: u32::MAX, calls: 0.into(), code: "lean_assignment_pending" };
+        let t0 = Instant::now();
+        let e = mint_awaiting_assignment(&keys, &t, Role::Ingest, Duration::from_secs(5), Duration::from_millis(1500), &stop)
+            .await
+            .unwrap_err();
+        let r = e.downcast_ref::<crate::secrets::MintRefused>().expect("the refusal itself");
+        assert!(r.is_assignment_pending());
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        assert_eq!(keys.calls.load(Ordering::SeqCst), 2, "1 s Retry-After inside a 1.5 s bound: one retry");
+
+        let keys = FirstAssignment { pending: u32::MAX, calls: 0.into(), code: "credential_mint_unavailable" };
+        let e = mint_awaiting_assignment(&keys, &t, Role::Ingest, Duration::from_secs(5), Duration::from_secs(30), &stop)
+            .await
+            .unwrap_err();
+        assert!(e.downcast_ref::<crate::secrets::MintRefused>().is_some_and(|r| r.code == "credential_mint_unavailable"));
+        assert_eq!(keys.calls.load(Ordering::SeqCst), 1);
+
+        // Shutting down: no more waiting.
+        stop.store(true, Ordering::SeqCst);
+        let keys = FirstAssignment { pending: u32::MAX, calls: 0.into(), code: "lean_assignment_pending" };
+        assert!(mint_awaiting_assignment(&keys, &t, Role::Ingest, Duration::from_secs(5), Duration::from_secs(30), &stop).await.is_err());
+        assert_eq!(keys.calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -5537,6 +6220,23 @@ mod startup_heartbeat_tests {
 mod product_role_tests {
     use super::*;
 
+    /// NAN-4183: on a persistent hot volume ingest[T]'s GC view lives in
+    /// ingest[T]'s own hot-tree directory (a roll resumes it); without one it
+    /// stays in the state dir. No other role's data mounts reach it.
+    #[test]
+    fn part_gc_state_dir_is_ingest_own_hot_tree_dir_only_when_persistent() {
+        let hot = Path::new("/hot/tenants");
+        assert_eq!(part_gc_state_dir_for("t1", Some(hot)), Some(hot.join("t1").join("ingest")));
+        assert_eq!(part_gc_state_dir_for("t1", None), None);
+        let root = Path::new("/data/tenants/t1");
+        let published = product_dir_for(root, "t1", Some(hot));
+        for role in Role::ALL {
+            let (rw, ro) = role_mounts(root, role, true, &published);
+            assert!(!rw.iter().chain(&ro).any(|path| path.starts_with(hot.join("t1/ingest"))),
+                "{role:?}'s data mounts never include ingest[T]'s hot dir (jail_spec adds it for ingest only)");
+        }
+    }
+
     #[test]
     fn product_runs_in_its_own_leaf_with_query_authority_and_never_shares_query_quota() {
         let root = Path::new("/data/tenants/t1");
@@ -5686,7 +6386,7 @@ mod nan3875_dirs_lock_tests {
     /// another tenant is not held up by it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tenant_dirs_ensure_is_serialized_per_tenant_not_per_role() {
-        let ids = TenantIds { slot: 0, ingest_uid: 1, query_uid: 1, detect_uid: 1, gid: 1 };
+        let ids = TenantIds { slot: 0, ingest_uid: 1, query_uid: 1, detect_uid: 1, landing_uid: Some(1), gid: 1 };
         let a = Arc::new(TenantSlot::new(TenantId::new("aaaa").unwrap(), ids));
         let b = Arc::new(TenantSlot::new(TenantId::new("bbbb").unwrap(), ids));
         let inside = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5712,5 +6412,68 @@ mod nan3875_dirs_lock_tests {
             t.await.unwrap();
         }
         assert_eq!(max.load(Ordering::SeqCst), 1, "two roles of one tenant were inside the tree ensure at once");
+    }
+
+    /// NAN-4128: a hung detect spawn of tenant A (holding A's detect lock
+    /// with no end) never holds up tenant B's detect wake, and A's own wake
+    /// answers with a bounded error instead of hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hung_detect_spawn_wedges_neither_its_wake_nor_another_tenant() {
+        let ids = TenantIds { slot: 0, ingest_uid: 1, query_uid: 1, detect_uid: 1, landing_uid: Some(1), gid: 1 };
+        let a = Arc::new(TenantSlot::new(TenantId::new("aaaa").unwrap(), ids));
+        let b = Arc::new(TenantSlot::new(TenantId::new("bbbb").unwrap(), ids));
+        let d = role_idx(Role::Detect);
+        let ms = Duration::from_millis;
+        let hung = |slot: Arc<TenantSlot>| move |p: Arc<Progress>| async move {
+            let _g = slot.spawn_lock[d].lock_logged(&p, slot.id.as_str(), "detect", ms(1000)).await;
+            p.set("mint_bootstrap_token");
+            std::future::pending::<Result<Arc<Proc>, CellError>>().await
+        };
+        let t0 = Instant::now();
+        let r = a.flights[d].run(ms(200), ms(5000), hung(a.clone())).await;
+        assert!(matches!(r, Err(FlightError::TimedOut { step: "mint_bootstrap_token", .. })), "{:?}", r.as_ref().err());
+        assert!(t0.elapsed() < ms(2000));
+        tokio::time::sleep(ms(20)).await;
+        assert!(a.spawn_lock[d].try_lock().is_ok(), "the timed-out attempt released A's detect lock");
+
+        // A hangs again; B's detect proceeds at once on its own lock.
+        let r = a.flights[d].run(ms(5000), ms(50), hung(a.clone())).await;
+        assert!(matches!(r, Err(FlightError::StillRunning { .. })), "{:?}", r.as_ref().err());
+        let b2 = b.clone();
+        let t0 = Instant::now();
+        let r = b.flights[d]
+            .run(ms(1000), ms(1000), move |p| async move {
+                let _g = b2.spawn_lock[d].lock_logged(&p, b2.id.as_str(), "detect", ms(1000)).await;
+                Err::<Arc<Proc>, _>(CellError::Spawn("b ran".into()))
+            })
+            .await;
+        assert!(matches!(r, Err(FlightError::Failed(CellError::Spawn(ref m))) if m == "b ran"), "{:?}", r.as_ref().err());
+        assert!(t0.elapsed() < ms(500), "B waited on A: {:?}", t0.elapsed());
+        // A's other roles are not held by its detect lock either.
+        assert!(a.spawn_lock[role_idx(Role::Query)].try_lock().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod refresh_pacer_tests {
+    use super::*;
+
+    /// NAN-4326: a request inside the mint interval is answered at the
+    /// interval's end (not dropped); further early requests coalesce into
+    /// that one answer; the interval still bounds the mint rate.
+    #[test]
+    fn an_early_refresh_is_deferred_to_the_interval_end_not_dropped() {
+        let t0 = Instant::now();
+        let mut pacer = RefreshPacer::new(REFRESH_MIN_INTERVAL);
+        assert_eq!(pacer.request(t0), RefreshPace::MintNow, "the first request mints at once");
+        let early = t0 + Duration::from_secs(15);
+        assert_eq!(pacer.request(early), RefreshPace::DeferUntil(t0 + REFRESH_MIN_INTERVAL));
+        assert_eq!(pacer.request(early + Duration::from_secs(5)), RefreshPace::AlreadyDeferred, "coalesced");
+        let fired = t0 + REFRESH_MIN_INTERVAL;
+        pacer.deferred_due(fired);
+        assert_eq!(pacer.request(fired + Duration::from_secs(1)), RefreshPace::DeferUntil(fired + REFRESH_MIN_INTERVAL),
+            "the deferred mint starts a new interval");
+        pacer.deferred_due(fired + REFRESH_MIN_INTERVAL);
+        assert_eq!(pacer.request(fired + REFRESH_MIN_INTERVAL * 2), RefreshPace::MintNow, "after the interval: at once");
     }
 }

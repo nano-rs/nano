@@ -82,11 +82,98 @@ pub struct FileSummary {
     /// NAN-3155: compressed bytes of every leaf column chunk, per row group,
     /// keyed by its dotted event path (list wrapper levels dropped), so a
     /// statement's scan estimate counts the leaves and row groups it reads.
-    pub column_bytes: Vec<(Box<str>, Box<[u32]>)>,
+    pub column_bytes: ColumnBytes,
     /// NAN-3221: each row group's exact `metadata.log_source` statistics
     /// (empty without that flat column), so a source-family hint prunes
     /// files whose family is not signed (L0/M parts) by their value range.
     pub source_family: Vec<EntityGroup>,
+}
+
+/// NAN-4171: a file's leaf inventory and per-group compressed bytes. The
+/// dotted leaf paths are interned: every file written with the same schema
+/// shares one path list, and the file keeps only its flat byte counts
+/// (column-major, `paths.len() * groups` entries). Before it each summary
+/// owned ~401 path strings (~30 KiB per wide OCSF file), so a 7d window of
+/// ~2,234 files (~67 MiB) overran the 64 MiB summary bound and every 7d
+/// entity hunt re-parsed every footer (9-17 s `footer_read`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ColumnBytes {
+    paths: Option<Arc<[Box<str>]>>,
+    bytes: Box<[u32]>,
+}
+
+/// Interned path lists, keyed by content hash. Held weakly: a list lives as
+/// long as some summary references it. Distinct schemas are few (one per
+/// schema revision), so the table stays small; dead entries are swept when
+/// it grows.
+static INTERNED_PATHS: std::sync::LazyLock<Mutex<std::collections::HashMap<u64, Vec<std::sync::Weak<[Box<str>]>>>>> =
+    std::sync::LazyLock::new(Default::default);
+const INTERNED_SWEEP_AT: usize = 256;
+
+fn intern_paths(paths: Vec<Box<str>>) -> Arc<[Box<str>]> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    paths.hash(&mut hasher);
+    let key = hasher.finish();
+    let Ok(mut table) = INTERNED_PATHS.lock() else { return paths.into() };
+    if let Some(found) = table.get(&key).into_iter().flatten().filter_map(std::sync::Weak::upgrade).find(|list| **list == *paths) {
+        return found;
+    }
+    if table.len() >= INTERNED_SWEEP_AT {
+        table.retain(|_, lists| {
+            lists.retain(|list| list.strong_count() > 0);
+            !lists.is_empty()
+        });
+    }
+    let list: Arc<[Box<str>]> = paths.into();
+    table.entry(key).or_default().push(Arc::downgrade(&list));
+    list
+}
+
+impl ColumnBytes {
+    /// `(leaf path, bytes per row group)` pairs; every pair must have the
+    /// same number of groups (a ragged inventory is dropped: no evidence).
+    pub fn new(columns: Vec<(Box<str>, Box<[u32]>)>) -> Self {
+        let Some(groups) = columns.first().map(|(_, bytes)| bytes.len()) else { return Self::default() };
+        if columns.iter().any(|(_, bytes)| bytes.len() != groups) {
+            return Self::default();
+        }
+        let mut flat = Vec::with_capacity(columns.len() * groups);
+        let mut paths = Vec::with_capacity(columns.len());
+        for (path, bytes) in columns {
+            paths.push(path);
+            flat.extend_from_slice(&bytes);
+        }
+        Self { paths: Some(intern_paths(paths)), bytes: flat.into() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.as_ref().is_none_or(|paths| paths.is_empty())
+    }
+
+    fn paths(&self) -> &[Box<str>] {
+        self.paths.as_deref().unwrap_or(&[])
+    }
+
+    /// `(leaf path, bytes per row group)`.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u32])> {
+        let paths = self.paths();
+        let groups = if paths.is_empty() { 0 } else { self.bytes.len() / paths.len() };
+        paths.iter().enumerate().map(move |(i, path)| (&**path, &self.bytes[i * groups..(i + 1) * groups]))
+    }
+
+    /// Resident bytes owned by this file; the shared path list is charged
+    /// once per distinct list by [`SummaryCache`] (see [`Self::shared`]).
+    fn owned_bytes(&self) -> usize {
+        40 + self.bytes.len() * 4
+    }
+
+    /// `(identity, resident bytes)` of the shared path list.
+    fn shared(&self) -> Option<(usize, usize)> {
+        let paths = self.paths.as_ref()?;
+        let bytes = 32 + paths.iter().map(|path| path.len() + 16).sum::<usize>();
+        Some((Arc::as_ptr(paths) as *const Box<str> as usize, bytes))
+    }
 }
 
 /// One row group of one bloom path: exact statistics (kept when short) and
@@ -190,6 +277,7 @@ impl FileSummary {
                 (leaf_event_path(column.path().parts()).into_boxed_str(), bytes)
             })
             .collect();
+        let column_bytes = ColumnBytes::new(column_bytes);
         Some(Self { ranges, group_times, entities, entities_located, column_bytes, source_family })
     }
 
@@ -198,7 +286,7 @@ impl FileSummary {
     pub fn leaf_bytes(&self, kept: Option<&[bool]>) -> BTreeMap<String, u64> {
         let kept = kept.filter(|mask| mask.len() == self.ranges.len());
         let mut out = BTreeMap::<String, u64>::new();
-        for (path, groups) in &self.column_bytes {
+        for (path, groups) in self.column_bytes.iter() {
             let bytes = groups.iter().enumerate()
                 .filter(|(group, _)| kept.is_none_or(|mask| mask[*group]))
                 .map(|(_, bytes)| u64::from(*bytes))
@@ -216,12 +304,13 @@ impl FileSummary {
         (self.leaf_bytes(kept), drops.then(|| self.leaf_bytes(None)))
     }
 
-    /// Approximate resident bytes (for the cache's byte bound).
+    /// Approximate resident bytes owned by this summary (for the caches'
+    /// byte bounds); the shared column path list is not included.
     fn bytes(&self) -> usize {
         96 + self.ranges.len() * 16
             + self.group_times.as_ref().map_or(0, |times| times.len() * 24)
             + self.entities.iter().map(|(path, groups)| path.len() + 24 + groups.iter().map(EntityGroup::bytes).sum::<usize>()).sum::<usize>()
-            + self.column_bytes.iter().map(|(path, groups)| path.len() + 32 + groups.len() * 4).sum::<usize>()
+            + self.column_bytes.owned_bytes()
             + self.source_family.iter().map(EntityGroup::bytes).sum::<usize>()
     }
 
@@ -243,7 +332,7 @@ impl FileSummary {
     /// equality on it cannot match (the reader fills a missing column with
     /// NULL). A summary without column inventory proves nothing.
     fn lacks_leaf(&self, path: &str) -> bool {
-        !self.column_bytes.is_empty() && leaf_absent(self.column_bytes.iter().map(|(leaf, _)| &**leaf), path)
+        !self.column_bytes.is_empty() && leaf_absent(self.column_bytes.iter().map(|(leaf, _)| leaf), path)
     }
 
     /// Row groups whose exact time bounds touch a membership bucket (groups
@@ -304,7 +393,8 @@ pub const MAX_OPEN_FOOTER_BYTES: usize = 64 * 1024 * 1024;
 /// no descriptors.
 pub const MAX_FILE_SUMMARIES: usize = 16_384;
 /// ...and at most this many resident bytes (identity statistics included;
-/// ~15 KiB per wide file, so a week of files is ~25 MiB).
+/// a wide OCSF file is ~7 KiB once its column path list is shared,
+/// NAN-4171, so a week of ~2,234 files is ~16 MiB).
 pub const MAX_SUMMARY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Default)]
@@ -312,9 +402,43 @@ struct SummaryCache {
     map: std::collections::HashMap<MetadataKey, (u64, Arc<FileSummary>)>,
     tick: u64,
     bytes: usize,
+    /// NAN-4171: resident shared column path lists, `identity -> (summaries
+    /// referencing it, bytes)`, each charged to `bytes` once.
+    shared: std::collections::HashMap<usize, (usize, usize)>,
 }
 
 impl SummaryCache {
+    /// Resident bytes `summary` adds: its own, plus its path list when no
+    /// resident summary shares it yet.
+    fn charge(&mut self, summary: &FileSummary) {
+        self.bytes = self.bytes.saturating_add(summary.bytes());
+        if let Some((identity, bytes)) = summary.column_bytes.shared() {
+            let entry = self.shared.entry(identity).or_insert((0, bytes));
+            if entry.0 == 0 { self.bytes = self.bytes.saturating_add(bytes); }
+            entry.0 += 1;
+        }
+    }
+
+    fn discharge(&mut self, summary: &FileSummary) {
+        self.bytes = self.bytes.saturating_sub(summary.bytes());
+        if let Some((identity, _)) = summary.column_bytes.shared() {
+            if let Some(entry) = self.shared.get_mut(&identity) {
+                entry.0 -= 1;
+                if entry.0 == 0 {
+                    self.bytes = self.bytes.saturating_sub(entry.1);
+                    self.shared.remove(&identity);
+                }
+            }
+        }
+    }
+
+    /// What `summary` would add if inserted now.
+    fn cost(&self, summary: &FileSummary) -> usize {
+        summary.bytes() + summary.column_bytes.shared()
+            .filter(|(identity, _)| !self.shared.contains_key(identity))
+            .map_or(0, |(_, bytes)| bytes)
+    }
+
     fn get(&mut self, key: &MetadataKey) -> Option<Arc<FileSummary>> {
         self.tick += 1;
         let tick = self.tick;
@@ -326,12 +450,11 @@ impl SummaryCache {
 
     fn insert(&mut self, key: MetadataKey, summary: Arc<FileSummary>) {
         self.tick += 1;
-        let size = summary.bytes();
         if let Some((_, previous)) = self.map.remove(&key) {
-            self.bytes = self.bytes.saturating_sub(previous.bytes());
+            self.discharge(&previous);
         }
-        if size > MAX_SUMMARY_BYTES { return; }
-        while (self.map.len() >= MAX_FILE_SUMMARIES || self.bytes.saturating_add(size) > MAX_SUMMARY_BYTES)
+        if self.cost(&summary) > MAX_SUMMARY_BYTES { return; }
+        while (self.map.len() >= MAX_FILE_SUMMARIES || self.bytes.saturating_add(self.cost(&summary)) > MAX_SUMMARY_BYTES)
             && !self.map.is_empty()
         {
             // Evict the least recently used eighth at once, so a sweep over
@@ -341,12 +464,15 @@ impl SummaryCache {
             let (_, threshold, _) = ages.select_nth_unstable(cut);
             let threshold = *threshold;
             self.map.retain(|_, (used, _)| *used > threshold);
-            self.bytes = self.map.values().map(|(_, summary)| summary.bytes()).sum();
+            self.bytes = 0;
+            self.shared.clear();
+            let resident = self.map.values().map(|(_, summary)| summary.clone()).collect::<Vec<_>>();
+            for summary in resident { self.charge(&summary); }
         }
+        self.charge(&summary);
         if let Some((_, previous)) = self.map.insert(key, (self.tick, summary)) {
-            self.bytes = self.bytes.saturating_sub(previous.bytes());
+            self.discharge(&previous);
         }
-        self.bytes = self.bytes.saturating_add(size);
     }
 }
 
@@ -362,32 +488,83 @@ struct ParsedBlooms {
     bytes: usize,
 }
 
+/// LRU over signed digests. NAN-4171: keyed (was a `VecDeque` scanned per
+/// file and hint, O(files^2) string compares on a 7d hunt).
 #[derive(Default)]
 struct ParsedBloomCache {
-    entries: VecDeque<(String, Arc<ParsedBlooms>)>,
+    entries: std::collections::HashMap<String, (u64, Arc<ParsedBlooms>)>,
+    /// Use tick -> digest, oldest first.
+    order: BTreeMap<u64, String>,
+    tick: u64,
     bytes: usize,
 }
 
+fn parsed_bloom_bytes(digest: &str, value: &ParsedBlooms) -> usize {
+    value.bytes.saturating_add(digest.len()).saturating_add(96)
+}
+
 impl ParsedBloomCache {
-    fn get(&mut self, digest: &str) -> Option<Arc<ParsedBlooms>> {
-        let index = self.entries.iter().position(|(key, _)| key == digest)?;
-        let entry = self.entries.remove(index)?;
-        let value = entry.1.clone();
-        self.entries.push_back(entry);
+    fn touch(&mut self, digest: &str) -> Option<Arc<ParsedBlooms>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (used, value) = self.entries.get_mut(digest)?;
+        let previous = std::mem::replace(used, tick);
+        let value = value.clone();
+        if let Some(key) = self.order.remove(&previous) { self.order.insert(tick, key); }
         Some(value)
     }
 
+    fn get(&mut self, digest: &str) -> Option<Arc<ParsedBlooms>> {
+        self.touch(digest)
+    }
+
+    fn contains(&self, digest: &str) -> bool {
+        self.entries.contains_key(digest)
+    }
+
+    fn resident_bytes(&self, digest: &str) -> Option<usize> {
+        self.entries.get(digest).map(|(_, value)| parsed_bloom_bytes(digest, value))
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     fn insert(&mut self, digest: String, value: Arc<ParsedBlooms>, limit: usize) -> bool {
-        let bytes = value.bytes.saturating_add(digest.capacity()).saturating_add(96);
+        let bytes = parsed_bloom_bytes(&digest, &value);
         if bytes > limit { return false; }
-        if self.entries.iter().any(|(key, _)| key == &digest) { return true; }
+        if self.touch(&digest).is_some() { return true; }
         while self.bytes.saturating_add(bytes) > limit {
-            let Some((key, old)) = self.entries.pop_front() else { break };
-            self.bytes = self.bytes.saturating_sub(old.bytes + key.capacity() + 96);
+            let Some((_, key)) = self.order.pop_first() else { break };
+            if let Some((_, old)) = self.entries.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(parsed_bloom_bytes(&key, &old));
+            }
         }
+        self.tick += 1;
         self.bytes += bytes;
-        self.entries.push_back((digest, value));
+        self.order.insert(self.tick, digest.clone());
+        self.entries.insert(digest, (self.tick, value));
         true
+    }
+
+    fn retain(&mut self, live: &std::collections::HashSet<&str>) {
+        self.entries.retain(|digest, _| live.contains(digest.as_str()));
+        let entries = &self.entries;
+        self.order.retain(|_, digest| entries.contains_key(digest));
+        self.bytes = self.entries.iter().map(|(digest, (_, value))| parsed_bloom_bytes(digest, value)).sum();
+    }
+
+    /// Re-rank so the newest digests are evicted last (unranked first).
+    fn order_oldest_first(&mut self, newest_first: &[&str]) {
+        let rank = newest_first.iter().enumerate().map(|(i, digest)| (*digest, i)).collect::<std::collections::HashMap<_, _>>();
+        let mut digests = self.entries.keys().cloned().collect::<Vec<_>>();
+        digests.sort_by_key(|digest| std::cmp::Reverse(rank.get(digest.as_str()).copied().unwrap_or(usize::MAX)));
+        self.order.clear();
+        for digest in digests {
+            self.tick += 1;
+            if let Some((used, _)) = self.entries.get_mut(&digest) { *used = self.tick; }
+            self.order.insert(self.tick, digest);
+        }
     }
 }
 
@@ -397,17 +574,16 @@ impl FileMetadataCache {
     }
 
     pub fn bloom_stats(&self) -> (usize, usize) {
-        self.blooms.lock().map(|cache| (cache.entries.len(), cache.bytes)).unwrap_or_default()
+        self.blooms.lock().map(|cache| (cache.len(), cache.bytes)).unwrap_or_default()
     }
 
     pub fn has_blooms(&self, digest: &str) -> bool {
-        self.blooms.lock().map(|cache| cache.entries.iter().any(|(key, _)| key == digest)).unwrap_or(false)
+        self.blooms.lock().map(|cache| cache.contains(digest)).unwrap_or(false)
     }
 
     pub fn retain_blooms(&self, live: &std::collections::HashSet<&str>) {
         if let Ok(mut cache) = self.blooms.lock() {
-            cache.entries.retain(|(digest, _)| live.contains(digest.as_str()));
-            cache.bytes = cache.entries.iter().map(|(key, value)| key.capacity() + value.bytes + 96).sum();
+            cache.retain(live);
         }
     }
 
@@ -419,14 +595,12 @@ impl FileMetadataCache {
     }
 
     pub fn resident_bloom_bytes(&self, digest: &str) -> Option<usize> {
-        self.blooms.lock().ok()?.entries.iter().find(|(key, _)| key == digest)
-            .map(|(key, value)| key.capacity() + value.bytes + 96)
+        self.blooms.lock().ok()?.resident_bytes(digest)
     }
 
     pub fn order_blooms_oldest_first(&self, newest_first: &[&str]) {
-        let rank = newest_first.iter().enumerate().map(|(i, digest)| (*digest, i)).collect::<std::collections::HashMap<_, _>>();
         if let Ok(mut cache) = self.blooms.lock() {
-            cache.entries.make_contiguous().sort_by_key(|(key, _)| std::cmp::Reverse(rank.get(key.as_str()).copied().unwrap_or(usize::MAX)));
+            cache.order_oldest_first(newest_first);
         }
     }
 
@@ -546,7 +720,16 @@ impl FileMetadataCache {
         // length is answered from its opened footer, as before.
         let blooms = uses_entities(hints);
         let summary = self.summary(path, sha256)?;
-        let parsed = if blooms { self.blooms.lock().ok()?.get(sha256) } else { None };
+        let mut parsed = if blooms { self.blooms.lock().ok()?.get(sha256) } else { None };
+        // NAN-4171 (review F8): a bloom read at query time is kept. Before,
+        // only the background prewarm filled the parsed cache, and a file it
+        // had not reached re-read and re-parsed its blooms on every hunt.
+        if blooms && parsed.is_none() && summary.entities_located
+            && summary.entities.iter().any(|(_, groups)| groups.iter().any(|group| matches!(group.bloom, BloomAt::At(..))))
+            && self.prewarm(path, sha256)
+        {
+            parsed = self.blooms.lock().ok()?.get(sha256);
+        }
         let opened = match (blooms && parsed.is_none() && !summary.entities_located, cache_footer) {
             (false, _) => None,
             (true, true) => Some(self.open(path, sha256)?),
@@ -791,6 +974,38 @@ fn required_tokens(mode: &str, value: &str) -> Option<Vec<String>> {
     }
 }
 
+/// NAN-4164: adjacent token pairs every matching row must hold, for a v5
+/// pair bloom. Only a plain `token` needle (no `*`/`?`) qualifies: the lake
+/// compiler matches it as a term, the needle's characters in order with an
+/// ASCII non-alphanumeric (or edge) on each side, so in a matching value its
+/// pieces are whole, adjacent [`crate::parts::sidecar::tokenize`] tokens.
+/// Non-ASCII needles are left to the token bloom: RE2 case folding and
+/// `to_lowercase` disagree on a few letters. Empty = no pair evidence.
+fn required_pairs(mode: &str, value: &str) -> Vec<[u8; 8]> {
+    if mode != "token" || value.contains(['*', '?']) || !value.is_ascii() {
+        return Vec::new();
+    }
+    let mut pairs = Vec::new();
+    crate::parts::sidecar::adjacent_pairs(value.trim(), |a, b| pairs.push(crate::parts::sidecar::pair_key(a, b)));
+    pairs.sort_unstable();
+    pairs.dedup();
+    pairs
+}
+
+/// NAN-4217: the whole-address token every row matching a plain `token`
+/// needle holds in a v6 index, when the needle is exactly one IP address
+/// with two or more pieces (so the lake compiles it to the exact term
+/// regex, see [`crate::parts::sidecar::address_tokens`]). `None` for
+/// wildcards, other modes and anything else.
+fn required_address(mode: &str, value: &str) -> Option<String> {
+    if mode != "token" || value.contains(['*', '?']) {
+        return None;
+    }
+    let address = crate::parts::sidecar::address_needle(value)?;
+    let pieces = address.split(|c: char| !c.is_ascii_alphanumeric()).filter(|piece| !piece.is_empty()).count();
+    (pieces >= 2).then_some(address)
+}
+
 /// Pieces of a substring needle that any containing text must hold as whole
 /// tokens: runs of ASCII alphanumerics with an ASCII non-alphanumeric,
 /// non-wildcard character on BOTH sides inside the needle. In the text those
@@ -883,19 +1098,62 @@ fn required_trigrams(mode: &str, value: &str) -> Vec<[u8; 3]> {
     grams
 }
 
-fn token_hint(group: &TokenGroup, hint: &CandidateHint) -> bool {
+/// The blooms of one token-index row group that token hints read: a decoded
+/// [`TokenGroup`], or (NAN-4164) a group read in place from its file by
+/// [`super::token_probe`].
+pub(crate) trait GroupBlooms {
+    /// May every token be in the group? An empty token bloom holds none.
+    fn tokens_may_contain_all(&self, tokens: &[String]) -> bool;
+    /// `None`: the group has no trigram bloom (v3 and older).
+    fn trigrams_may_contain_all(&self, grams: &[[u8; 3]]) -> Option<bool>;
+    /// `None`: the group has no pair bloom (v4 and older).
+    fn pairs_may_contain_all(&self, pairs: &[[u8; 8]]) -> Option<bool>;
+    /// v6: the token bloom also holds every whole address of the group.
+    fn holds_addresses(&self) -> bool;
+}
+
+impl GroupBlooms for TokenGroup {
+    fn tokens_may_contain_all(&self, tokens: &[String]) -> bool {
+        self.may_contain_all(tokens)
+    }
+
+    fn trigrams_may_contain_all(&self, grams: &[[u8; 3]]) -> Option<bool> {
+        let bytes = self.trigrams.as_ref()?;
+        let filter = parquet::bloom_filter::Sbbf::new(bytes);
+        Some(grams.iter().all(|gram| filter.check(gram.as_slice())))
+    }
+
+    fn pairs_may_contain_all(&self, pairs: &[[u8; 8]]) -> Option<bool> {
+        Some(self.pairs.as_ref()?.may_contain_all(pairs))
+    }
+
+    fn holds_addresses(&self) -> bool {
+        self.addresses
+    }
+}
+
+pub(crate) fn token_hint<G: GroupBlooms + ?Sized>(group: &G, hint: &CandidateHint) -> bool {
     match hint {
         CandidateHint::Entity { source_path, value } if is_hash_array(source_path) =>
-            query_tokens(value).is_none_or(|tokens| tokens.is_empty() || group.may_contain_all(&tokens)),
+            query_tokens(value).is_none_or(|tokens| tokens.is_empty() || group.tokens_may_contain_all(&tokens)),
         CandidateHint::Keyword { mode, value } => {
-            let tokens_keep = required_tokens(mode, value).is_none_or(|tokens| group.may_contain_all(&tokens));
+            // NAN-4217: in a v6 group a bare IP is one whole token, as rare
+            // as the address; checked first, it decides most groups alone.
+            if group.holds_addresses() {
+                if let Some(address) = required_address(mode, value) {
+                    if !group.tokens_may_contain_all(std::slice::from_ref(&address)) {
+                        return false;
+                    }
+                }
+            }
+            let tokens_keep = required_tokens(mode, value).is_none_or(|tokens| group.tokens_may_contain_all(&tokens));
             if !tokens_keep { return false; }
-            group.trigrams.as_ref().is_none_or(|bytes| {
-                let grams = required_trigrams(mode, value);
-                if grams.is_empty() { return true; }
-                let filter = parquet::bloom_filter::Sbbf::new(bytes);
-                grams.iter().all(|gram| filter.check(gram.as_slice()))
-            })
+            let pairs = required_pairs(mode, value);
+            if !pairs.is_empty() && group.pairs_may_contain_all(&pairs) == Some(false) {
+                return false;
+            }
+            let grams = required_trigrams(mode, value);
+            grams.is_empty() || group.trigrams_may_contain_all(&grams) != Some(false)
         },
         CandidateHint::Any { alternatives } => {
             alternatives.is_empty() || alternatives.iter().any(|alternative| token_hint(group, alternative))
@@ -974,7 +1232,7 @@ pub fn fine_blocks(groups: &[TokenGroup], hints: &[CandidateHint]) -> Option<Fin
             .map(|group| {
                 let index = group.blocks.as_ref().expect("checked above");
                 let keep = hints.iter().fold(None, |acc: Option<Vec<bool>>, hint| {
-                    and_blocks(acc, block_hint(index, hint))
+                    and_blocks(acc, block_hint(index, hint, group.addresses))
                 })?;
                 let kept = keep.iter().filter(|keep| **keep).count();
                 if kept * crate::parts::block_index::COMMON_DIVISOR > keep.len() {
@@ -1007,10 +1265,18 @@ fn and_blocks(left: Option<Vec<bool>>, right: Option<Vec<bool>>) -> Option<Vec<b
 }
 
 /// Blocks of one group that may satisfy `hint`; `None` = every block.
-fn block_hint(index: &crate::parts::block_index::BlockIndex, hint: &CandidateHint) -> Option<Vec<bool>> {
+/// `addresses`: the group's index holds whole-address tokens (v6).
+fn block_hint(index: &crate::parts::block_index::BlockIndex, hint: &CandidateHint, addresses: bool) -> Option<Vec<bool>> {
     match hint {
         CandidateHint::Keyword { mode, value } => {
-            required_tokens(mode, value).filter(|tokens| !tokens.is_empty()).and_then(|tokens| index.blocks_with_all(&tokens))
+            let mut tokens = required_tokens(mode, value).unwrap_or_default();
+            // NAN-4217: the whole address is a rare `fine` key where its
+            // number pieces are `common` (every block), so it fences the
+            // rows to the blocks that hold the IP.
+            if let Some(address) = required_address(mode, value).filter(|_| addresses) {
+                tokens.push(address);
+            }
+            (!tokens.is_empty()).then_some(tokens).and_then(|tokens| index.blocks_with_all(&tokens))
         }
         CandidateHint::Entity { source_path, value } if is_hash_array(source_path) => {
             query_tokens(value).filter(|tokens| !tokens.is_empty()).and_then(|tokens| index.blocks_with_all(&tokens))
@@ -1022,7 +1288,7 @@ fn block_hint(index: &crate::parts::block_index::BlockIndex, hint: &CandidateHin
             let mut union = vec![false; index.blocks()];
             for alternative in alternatives {
                 // One undecidable branch makes the whole OR undecidable.
-                let blocks = block_hint(index, alternative)?;
+                let blocks = block_hint(index, alternative, addresses)?;
                 for (keep, block) in union.iter_mut().zip(blocks) {
                     *keep |= block;
                 }
@@ -1434,6 +1700,95 @@ mod tests {
         assert_eq!(token_mask(Some(&bytes), 3, &[entity("file.hashes.value", "mimikatz")]), Some(vec![true, false, false]));
     }
 
+    /// NAN-4164: on a v5 index a multi-token `token` needle needs its
+    /// adjacent pairs; scattered pieces no longer keep a group. Wildcards,
+    /// substring guards and non-ASCII needles never consult pairs.
+    #[test]
+    fn v5_pairs_prune_scattered_pieces_and_keep_terms() {
+        let encode = |texts: &[&str], pairs: bool| {
+            let groups = texts.iter().map(|text| {
+                let mut builder = if pairs { TokenGroupBuilder::with_pairs(8) } else { TokenGroupBuilder::with_trigrams(8) };
+                builder.add_row_at(0);
+                builder.add_text(text);
+                builder.finish().unwrap()
+            }).collect::<Vec<_>>();
+            crate::parts::sidecar::encode_token_index(&groups).unwrap()
+        };
+        let texts = [
+            "2026-10-01T04:20:10 host 10.1.9.4",
+            "src=10.1.4.20 dst=8.8.8.8",
+            "sshd: Failed password for root",
+            "password failed",
+        ];
+        let v4 = encode(&texts, false);
+        let v5 = encode(&texts, true);
+        for (hint, v4_mask, v5_mask) in [
+            (keyword("token", "10.1.4.20"), vec![true, true, false, false], vec![false, true, false, false]),
+            (keyword("token", "Failed Password"), vec![false, false, true, true], vec![false, false, true, false]),
+            (keyword("token", "sysmon"), vec![false; 4], vec![false; 4]),
+            (keyword("contains", "10.1.4.2"), vec![false, true, false, false], vec![false, true, false, false]),
+            (keyword("token", "10.1.4.2*"), vec![false, true, false, false], vec![false, true, false, false]),
+        ] {
+            let masks = |bytes: &[u8]| token_mask(Some(bytes), 4, std::slice::from_ref(&hint)).unwrap_or(vec![true; 4]);
+            assert_eq!(masks(&v4), v4_mask, "v4 {hint:?}");
+            assert_eq!(masks(&v5), v5_mask, "v5 {hint:?}");
+        }
+        assert!(required_pairs("token", "über alles").is_empty());
+        assert!(required_pairs("token", "sysmon").is_empty());
+        assert_eq!(required_pairs("token", " a.b ").len(), 1);
+    }
+
+    /// NAN-4217: a v6 group answers a bare IP on its whole-address token:
+    /// groups whose number pieces (and even adjacent pairs) are all present
+    /// are pruned unless the address itself is, and the block index fences
+    /// the rows to the blocks holding it. Non-address needles and v5 groups
+    /// are judged exactly as before.
+    #[test]
+    fn v6_address_tokens_prune_ips_and_fence_blocks() {
+        let groups_of = |rows: &[&[&str]], v6: bool| {
+            rows.iter().map(|texts| {
+                let mut builder = if v6 { TokenGroupBuilder::with_addresses(1) } else { TokenGroupBuilder::with_pairs(1) };
+                for (row, text) in texts.iter().enumerate() {
+                    builder.add_row_at(row as i64);
+                    builder.add_text(text);
+                }
+                builder.finish().unwrap()
+            }).collect::<Vec<_>>()
+        };
+        // Group 0 holds every piece and every adjacent pair of 48.170.34.111
+        // but never the address; group 1 holds it in row 5 of 8.
+        let rows: [&[&str]; 3] = [
+            &["148.170.34.1119 48.170.34.11 34.111.0.1 170.34.9.9", "10:48:170 x"],
+            &["48.170.1.1", "1.170.34.2", "34.111.2.2", "48 170 34 111", "x48.170.34.1110", "src=48.170.34.111:443", "48-170-34-111", "h"],
+            &["fe80::1 10.0.0.5"],
+        ];
+        let (v5, v6) = (groups_of(&rows, false), groups_of(&rows, true));
+        for (needle, v5_mask, v6_mask) in [
+            ("48.170.34.111", vec![true, true, false], vec![false, true, false]),
+            ("10.0.0.5", vec![false, false, true], vec![false, false, true]),
+            ("FE80::1", vec![false, false, true], vec![false, false, true]),
+            ("48.170.34.11", vec![true, false, false], vec![true, false, false]),
+            ("170.34", vec![true, true, false], vec![true, true, false]),
+            ("sysmon", vec![false; 3], vec![false; 3]),
+        ] {
+            let hint = [keyword("token", needle)];
+            assert_eq!(token_evidence_of(&v5, 3, &hint).0.unwrap(), v5_mask, "v5 {needle}");
+            assert_eq!(token_evidence_of(&v6, 3, &hint).0.unwrap(), v6_mask, "v6 {needle}");
+        }
+        // The fine runs of group 1 shrink to the IP's block (row 5).
+        let (_, fine) = token_evidence_of(&v6, 3, &[keyword("token", "48.170.34.111")]);
+        assert_eq!(fine.unwrap()[1].as_ref().map(|runs| runs.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>()), Some(vec![(5, 6)]));
+        let (_, fine) = token_evidence_of(&v5, 3, &[keyword("token", "48.170.34.111")]);
+        assert!(fine.unwrap()[1].is_none(), "v5: the number pieces keep every block");
+        // An OR leg and wildcards keep their old meaning.
+        let any = CandidateHint::Any { alternatives: vec![keyword("token", "48.170.34.111"), keyword("token", "10.0.0.5")] };
+        assert_eq!(token_evidence_of(&v6, 3, &[any]).0.unwrap(), vec![false, true, true]);
+        assert_eq!(required_address("token", "48.170.34.1*"), None);
+        assert_eq!(required_address("contains", "48.170.34.111"), None);
+        assert_eq!(required_address("token", "fe80::"), None, "one piece: the SQL is a token search, not the term");
+        assert_eq!(required_address("token", " 10.0.0.5 ").as_deref(), Some("10.0.0.5"));
+    }
+
     fn parquet_with_users(groups: &[&[Option<&str>]]) -> tempfile::NamedTempFile {
         let fields: arrow_schema::Fields = vec![Field::new("name", DataType::Utf8, true)].into();
         let schema = Arc::new(Schema::new(vec![Field::new("user", DataType::Struct(fields.clone()), true)]));
@@ -1620,7 +1975,7 @@ mod tests {
         assert!(!leaf_absent(["file.hashes.value"].into_iter(), "file.hashes.value"), "a repeated leaf is present");
         assert!(!leaf_absent(["device"].into_iter(), "device.ip"), "a scalar ancestor");
         assert!(leaf_absent(["device.ip_v6"].into_iter(), "device.ip"), "a sibling prefix is not the leaf");
-        let empty = FileSummary { column_bytes: Vec::new(), ..summary };
+        let empty = FileSummary { column_bytes: ColumnBytes::default(), ..summary };
         assert!(!empty.lacks_leaf("device.ip"), "no inventory proves nothing");
     }
 
@@ -1783,7 +2138,7 @@ mod tests {
     fn kept_leaf_bytes_keep_the_whole_file_charge_aside_when_groups_drop() {
         let summary = FileSummary {
             ranges: vec![(0, 10), (10, 20), (20, 30)], group_times: None, entities: vec![], entities_located: true,
-            column_bytes: vec![("time".into(), vec![1, 2, 4].into()), ("raw_data".into(), vec![10, 20, 40].into())],
+            column_bytes: ColumnBytes::new(vec![("time".into(), vec![1, 2, 4].into()), ("raw_data".into(), vec![10, 20, 40].into())]),
             source_family: Vec::new(),
         };
         let whole = BTreeMap::from([("raw_data".to_string(), 70), ("time".to_string(), 7)]);
@@ -1797,8 +2152,8 @@ mod tests {
 
     #[test]
     fn summary_cache_rejects_oversized_replacements_and_remains_byte_bounded() {
-        let small = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: vec![], entities_located: true, column_bytes: Vec::new(), source_family: Vec::new() });
-        let big = Arc::new(FileSummary { ranges: vec![(0, 1); MAX_SUMMARY_BYTES / 16 + 1], group_times: None, entities: vec![], entities_located: true, column_bytes: Vec::new(), source_family: Vec::new() });
+        let small = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new() });
+        let big = Arc::new(FileSummary { ranges: vec![(0, 1); MAX_SUMMARY_BYTES / 16 + 1], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new() });
         let mut cache = SummaryCache::default();
         let key = "signed-digest".to_string();
         cache.insert(key.clone(), small);
@@ -1878,6 +2233,38 @@ mod tests {
         assert_eq!(cache.bloom_stats(), (0, 0));
     }
 
+    /// NAN-4171 (F8): a query-time bloom read is kept, so the next hunt on
+    /// any identity path answers from parsed blooms; the answer is the same.
+    #[test]
+    fn query_time_bloom_reads_are_cached() {
+        let file = parquet_with_users(&[&[Some("alice"), Some("bob")], &[Some("carol"), None]]);
+        let cache = FileMetadataCache::default();
+        assert!(!cache.has_blooms("d"));
+        let first = cache.evidence(file.path(), "d", &[entity("user.name", "bob")], None, false, false, None).unwrap().0;
+        assert_eq!(first, Some(vec![true, false]));
+        assert!(cache.has_blooms("d"), "the hunt left its file's blooms parsed");
+        let again = cache.evidence(file.path(), "d", &[entity("user.name", "bob")], None, false, false, None).unwrap().0;
+        assert_eq!(again, first);
+        let carol = cache.evidence(file.path(), "d", &[entity("user.name", "carol")], None, false, false, None).unwrap().0;
+        assert_eq!(carol, Some(vec![false, true]));
+        assert_eq!(cache.bloom_stats().0, 1, "one parsed entry per file");
+    }
+
+    #[test]
+    fn parsed_blooms_reorder_newest_last_and_retain_live() {
+        let mut cache = ParsedBloomCache::default();
+        let value = || Arc::new(ParsedBlooms { fields: Vec::new(), bytes: 100 });
+        for key in ["a", "b", "c"] { assert!(cache.insert(key.into(), value(), 1_000)); }
+        cache.order_oldest_first(&["a", "b"]);
+        // "c" is unranked (evicted first), then "b", then "a".
+        assert!(cache.insert("d".into(), value(), 3 * parsed_bloom_bytes("a", &value())));
+        assert!(!cache.contains("c") && cache.contains("a") && cache.contains("b"));
+        cache.retain(&["a"].into_iter().collect());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes, parsed_bloom_bytes("a", &value()));
+        assert_eq!(cache.order.len(), 1);
+    }
+
     #[test]
     fn parsed_blooms_are_byte_bounded_and_evict_oldest() {
         let mut cache = ParsedBloomCache::default();
@@ -1951,7 +2338,7 @@ mod tests {
             group_times: None,
             entities: vec![("user.name".into(), vec![EntityGroup { min: Some(vec![b'a'; 100].into()), max: Some(vec![b'z'; 100].into()), bloom: BloomAt::Absent }; 4096])],
             entities_located: true,
-            column_bytes: Vec::new(),
+            column_bytes: ColumnBytes::default(),
             source_family: Vec::new(),
         });
         let per = big.bytes();
@@ -1963,10 +2350,57 @@ mod tests {
         assert!(cache.map.len() <= fits);
     }
 
+    /// NAN-4171: a large tenant's 7d window (2,234 wide files, 401 leaves, two
+    /// row groups, every identity path with short statistics) stays resident,
+    /// so a repeated sweep re-parses no footer.
+    #[test]
+    fn a_week_of_wide_summaries_stays_resident_across_sweeps() {
+        const FILES: usize = 2_234;
+        let wide = |i: usize| {
+            let columns = (0..401).map(|c| (format!("ocsf.leaf_{c:03}.value").into_boxed_str(), vec![1_000 + i as u32, 2_000].into_boxed_slice())).collect();
+            let group = EntityGroup { min: Some(vec![b'a'; 24].into()), max: Some(vec![b'z'; 24].into()), bloom: BloomAt::At(0, 4096) };
+            Arc::new(FileSummary {
+                ranges: vec![(0, 65_536), (65_536, 131_072)],
+                group_times: Some(vec![Some((0, 1)), Some((1, 2))]),
+                entities: crate::parts::format::BLOOM_PATHS.iter().map(|path| ((*path).into(), vec![group.clone(); 2])).collect(),
+                entities_located: true,
+                column_bytes: ColumnBytes::new(columns),
+                source_family: vec![group.clone(); 2],
+            })
+        };
+        let mut cache = SummaryCache::default();
+        for i in 0..FILES { cache.insert(format!("digest-{i}"), wide(i)); }
+        assert_eq!(cache.map.len(), FILES);
+        assert!(cache.bytes < MAX_SUMMARY_BYTES / 2, "{} bytes", cache.bytes);
+        assert_eq!(cache.shared.len(), 1, "one schema, one path list");
+        for i in 0..FILES { assert!(cache.get(&format!("digest-{i}")).is_some(), "second sweep, file {i}"); }
+    }
+
+    #[test]
+    fn column_paths_are_shared_and_charged_once() {
+        let columns = || vec![("time".into(), vec![1, 2].into()), ("device.hostname".into(), vec![3, 4].into())];
+        let (a, b) = (ColumnBytes::new(columns()), ColumnBytes::new(columns()));
+        assert!(Arc::ptr_eq(a.paths.as_ref().unwrap(), b.paths.as_ref().unwrap()));
+        assert_eq!(a.iter().collect::<Vec<_>>(), vec![("time", &[1, 2][..]), ("device.hostname", &[3, 4][..])]);
+        assert!(ColumnBytes::new(vec![("a".into(), vec![1].into()), ("b".into(), vec![1, 2].into())]).is_empty(), "ragged is no evidence");
+        let summary = |column_bytes| Arc::new(FileSummary { ranges: vec![(0, 1), (1, 2)], group_times: None, entities: vec![], entities_located: true, column_bytes, source_family: vec![] });
+        let (one, two) = (summary(a), summary(b));
+        let shared = one.column_bytes.shared().unwrap().1;
+        let mut cache = SummaryCache::default();
+        cache.insert("one".into(), one.clone());
+        assert_eq!(cache.bytes, one.bytes() + shared);
+        cache.insert("two".into(), two.clone());
+        assert_eq!(cache.bytes, one.bytes() + two.bytes() + shared, "the path list is charged once");
+        cache.insert("one".into(), summary(ColumnBytes::default()));
+        cache.insert("two".into(), summary(ColumnBytes::default()));
+        assert!(cache.shared.is_empty());
+        assert_eq!(cache.bytes, 2 * summary(ColumnBytes::default()).bytes(), "released with its last summary");
+    }
+
     #[test]
     fn summary_cache_evicts_the_least_recently_used_at_its_bound() {
         let mut cache = SummaryCache::default();
-        let summary = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: Vec::new(), entities_located: true, column_bytes: Vec::new(), source_family: Vec::new() });
+        let summary = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: Vec::new(), entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new() });
         let key = |i: usize| format!("digest-{i}");
         for i in 0..MAX_FILE_SUMMARIES {
             cache.insert(key(i), summary.clone());

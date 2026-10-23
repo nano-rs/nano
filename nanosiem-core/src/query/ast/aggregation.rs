@@ -80,6 +80,71 @@ impl Aggregation {
         }
         self.func.as_str().to_string()
     }
+
+    /// SPL-style display name, `func(arg)` (`dc(device.hostname)`,
+    /// `perc99(bytes)`, `count(eval(...))`).
+    fn display_name(&self) -> String {
+        use crate::query::PrettyPrint;
+        if let (AggFunc::Percentile(pct), Some(field), None) =
+            (self.func, &self.field, &self.field_expr)
+        {
+            return format!("perc{pct}({field})");
+        }
+        Aggregation { alias: None, ..self.clone() }.pretty_print()
+    }
+
+    /// NAN-4279 (F10): give un-aliased aggregations that would share an output
+    /// column a unique, SPL-style name.
+    ///
+    /// The default output name is the bare function (`dc`), so
+    /// `stats dc(a), dc(b)` emitted two `AS dc` columns and chDB refused the
+    /// query (MULTIPLE_EXPRESSIONS_FOR_ALIAS). Only colliding aggregations are
+    /// renamed, to `dc(a)` / `dc(b)`, so every query that worked before keeps
+    /// its column names (`stats dc(src_ip) by x | where dc > 5`). A field-less
+    /// `count` keeps `count`. An exact repeat gets a numeric suffix.
+    pub fn disambiguate_default_aliases(aggregations: &mut [Aggregation]) {
+        use std::collections::{HashMap, HashSet};
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for agg in aggregations.iter() {
+            *uses.entry(agg.output_alias()).or_default() += 1;
+        }
+        if uses.values().all(|&n| n == 1) {
+            return;
+        }
+        let mut taken: HashSet<String> = aggregations
+            .iter()
+            .filter(|agg| agg.alias.is_some())
+            .map(Aggregation::output_alias)
+            .collect();
+        let renamed: Vec<bool> = aggregations
+            .iter()
+            .map(|agg| {
+                agg.alias.is_none()
+                    && uses[&agg.output_alias()] > 1
+                    && (agg.field.is_some() || agg.field_expr.is_some() || agg.condition.is_some())
+            })
+            .collect();
+        // Names that stay as they are are reserved first, so a rename can
+        // never take a column another aggregation keeps.
+        for (agg, renamed) in aggregations.iter().zip(&renamed) {
+            if !renamed {
+                taken.insert(agg.output_alias());
+            }
+        }
+        for (agg, renamed) in aggregations.iter_mut().zip(renamed) {
+            if !renamed {
+                continue;
+            }
+            let base = agg.display_name();
+            let mut name = base.clone();
+            let mut n = 2;
+            while !taken.insert(name.clone()) {
+                name = format!("{base}_{n}");
+                n += 1;
+            }
+            agg.alias = Some(name);
+        }
+    }
 }
 
 /// Aggregation functions

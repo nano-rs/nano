@@ -1252,6 +1252,14 @@ pub struct ClickHouseSqlGenerator {
     /// plain `stats count by method` (no rex) shadow its own schema resolution.
     /// Empty outside `generate_with_options`.
     upstream_computed_fields: RwLock<HashSet<String>>,
+    /// NAN-4276: the subset of upstream-computed names whose values are
+    /// known to be String: a stats/chart/timechart by-field that passes a
+    /// String column through, or an eval output of a String-valued
+    /// expression. A `| where name = 7` against one types the literal as
+    /// text (see `where_scope_text_operand`). Same scope rules as
+    /// `upstream_computed_fields` (reset per generation, swapped per
+    /// subsearch).
+    upstream_string_fields: RwLock<HashSet<String>>,
     /// Reference-side aliases for UN-aliased aggregations (NAN-1339): an
     /// un-aliased `avg(bytes_in)` outputs a column literally named `avg`
     /// (`Aggregation::output_alias` fallback), but users following the
@@ -1336,6 +1344,10 @@ pub struct ClickHouseSqlGenerator {
     ///
     /// [`implicit_time_order`]: ClickHouseSqlGenerator::implicit_time_order
     uid_tiebreak_any_window: bool,
+    /// NAN-4164: a bare keyword of several tokens (`10.1.4.20`, `ws-fin-095`,
+    /// `"failed password"`) must also appear as that literal term, not just
+    /// as scattered tokens (see `bare_keyword_predicate`). Lean lake only.
+    keyword_term_adjacency: bool,
 }
 
 impl Clone for ClickHouseSqlGenerator {
@@ -1351,6 +1363,7 @@ impl Clone for ClickHouseSqlGenerator {
             upstream_timestamp_rewritten: RwLock::new(false),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
+            upstream_string_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::clone(&self.profile),
             base_profile: self.base_profile.clone(),
@@ -1360,6 +1373,7 @@ impl Clone for ClickHouseSqlGenerator {
             is_clustered: self.is_clustered,
             source_scope_deny: self.source_scope_deny.clone(),
             uid_tiebreak_any_window: self.uid_tiebreak_any_window,
+            keyword_term_adjacency: self.keyword_term_adjacency,
         }
     }
 }
@@ -1385,6 +1399,7 @@ impl ClickHouseSqlGenerator {
             upstream_timestamp_rewritten: RwLock::new(false),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
+            upstream_string_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
             base_profile: None,
@@ -1394,6 +1409,7 @@ impl ClickHouseSqlGenerator {
             is_clustered: false,
             source_scope_deny: std::collections::BTreeSet::new(),
             uid_tiebreak_any_window: false,
+            keyword_term_adjacency: false,
         }
     }
 
@@ -1411,6 +1427,7 @@ impl ClickHouseSqlGenerator {
             upstream_timestamp_rewritten: RwLock::new(false),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
+            upstream_string_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
             base_profile: None,
@@ -1420,6 +1437,7 @@ impl ClickHouseSqlGenerator {
             is_clustered: false,
             source_scope_deny: std::collections::BTreeSet::new(),
             uid_tiebreak_any_window: false,
+            keyword_term_adjacency: false,
         }
     }
 
@@ -1679,9 +1697,10 @@ impl ClickHouseSqlGenerator {
 
     /// The base-scan time-bound predicate for the ACTIVE dataset (NAN-1798 P2).
     ///
-    /// Every non-risk dataset emits the exact historical
-    /// `{time_column} BETWEEN '{start}' AND '{end}'` form — byte-identical to
-    /// the previously inlined format strings. The derived `risk` dataset emits
+    /// Every non-risk dataset emits the half-open
+    /// `{time_column} >= '{start}' AND {time_column} < '{end}'` form
+    /// ([`crate::sql_hygiene::half_open_time_bound`], NAN-4280; it was an
+    /// inclusive `BETWEEN` before). The derived `risk` dataset emits
     /// a constant-true predicate instead: its 24h/7d score windows are FIXED
     /// trailing windows anchored at evaluation time and baked into the derived
     /// base source (design §4 — "the search time-picker does not reshape
@@ -1692,11 +1711,12 @@ impl ClickHouseSqlGenerator {
         if matches!(self.dataset, otel::Dataset::Risk) {
             "1 = 1".to_string()
         } else {
-            format!(
-                "{} BETWEEN '{}' AND '{}'",
+            // NAN-4280: half-open `[start, end)`, so adjacent windows never
+            // count a boundary event twice.
+            crate::sql_hygiene::half_open_time_bound(
                 time_column,
-                crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
-                crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
+                &crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+                &crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
             )
         }
     }
@@ -2307,6 +2327,8 @@ impl ClickHouseSqlGenerator {
     }
 
     fn note_upstream_computed(&self, cmd: &Command) {
+        // NAN-4276: typed against the scope BEFORE this command's outputs.
+        let strings = self.string_outputs_of_command(cmd);
         let mut added = {
             let guard = self
                 .upstream_computed_fields
@@ -2338,6 +2360,29 @@ impl ClickHouseSqlGenerator {
                     added.insert(field.name.clone());
                 }
             }
+        }
+        // NAN-4295: `mvexpand` replaces an Array leaf (or an object root's
+        // leaf arrays) with one element per row under the same name. Later
+        // stages must read that column as the scalar it now is, not as the
+        // schema's array (`stats … by` would arrayJoin a scalar).
+        if let Command::Mvexpand { field, .. } = cmd {
+            if !self.is_upstream_computed_field(field) {
+                let leaves = self.profile.object_root_leaves(field);
+                let expanded = if leaves.is_empty() { vec![field.clone()] } else { leaves };
+                added.extend(expanded.into_iter().filter(|leaf| self.field_is_array(leaf)));
+            }
+        }
+        {
+            let mut guard = self
+                .upstream_string_fields
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A name this command (re)computes is String only when this
+            // command says so; otherwise it loses any earlier String typing.
+            for name in &added {
+                guard.remove(name);
+            }
+            guard.extend(strings);
         }
         match self.upstream_computed_fields.write() {
             Ok(mut guard) => guard.extend(added),
@@ -2394,6 +2439,69 @@ impl ClickHouseSqlGenerator {
     /// computed fields — so its generation swaps in an empty set and restores
     /// the outer scope afterwards. Also used to reset the scope at the start
     /// and end of `generate_with_options`.
+    /// Whether an upstream-computed `field` is known to hold String values
+    /// (NAN-4276; see `upstream_string_fields`).
+    pub(crate) fn is_upstream_string_field(&self, field: &str) -> bool {
+        match self.upstream_string_fields.read() {
+            Ok(guard) => guard.contains(field),
+            Err(poisoned) => poisoned.get_ref().contains(field),
+        }
+    }
+
+    /// NAN-4276: the output names of `cmd` known to hold String values,
+    /// judged against the scope before `cmd`. Conservative: only by-fields
+    /// that pass a String column (or an earlier String output) through, and
+    /// eval assignments of an expression that is String by construction.
+    fn string_outputs_of_command(&self, cmd: &Command) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let by_fields: &[String] = match cmd {
+            Command::Stats { group_by: Some(gb), .. } | Command::Chart { group_by: Some(gb), .. } => gb,
+            Command::Timechart { split_by, .. } => split_by,
+            _ => &[],
+        };
+        for field in by_fields {
+            if self.is_string_valued_name(field) {
+                out.insert(helpers::by_field_output_name(field, self).to_string());
+            }
+        }
+        if let Command::Eval { assignments } = cmd {
+            for assignment in assignments {
+                if self.eval_yields_string(&assignment.expression) {
+                    out.insert(assignment.field.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `name`, referenced in the current scope, holds String values.
+    fn is_string_valued_name(&self, name: &str) -> bool {
+        let canonical = self.canonicalize_field(name);
+        self.where_scope_text_operand(name, canonical.as_ref())
+    }
+
+    /// Whether an eval expression is String by construction (NAN-4276).
+    fn eval_yields_string(&self, expression: &EvalExpression) -> bool {
+        match expression {
+            EvalExpression::Literal(Value::String(_)) => true,
+            EvalExpression::Field(name) => self.is_string_valued_name(name),
+            EvalExpression::FunctionCall { name, .. } => matches!(
+                name.to_ascii_lowercase().as_str(),
+                "lower" | "upper" | "tostring" | "substr" | "substring" | "replace" | "trim"
+                    | "ltrim" | "rtrim" | "concat" | "urldecode" | "extract_domain" | "defang"
+                    | "base64_decode" | "md5" | "sha1" | "sha256" | "mvjoin"
+            ),
+            _ => false,
+        }
+    }
+
+    fn swap_upstream_strings(&self, new: HashSet<String>) -> HashSet<String> {
+        match self.upstream_string_fields.write() {
+            Ok(mut guard) => std::mem::replace(&mut *guard, new),
+            Err(poisoned) => std::mem::replace(&mut *poisoned.into_inner(), new),
+        }
+    }
+
     fn swap_upstream_computed(&self, new: HashSet<String>) -> HashSet<String> {
         match self.upstream_computed_fields.write() {
             Ok(mut guard) => std::mem::replace(&mut *guard, new),
@@ -2427,6 +2535,15 @@ impl ClickHouseSqlGenerator {
     /// neither page progressively nor continue from an event cursor.
     pub fn with_uid_tiebreak_any_window(mut self, enabled: bool) -> Self {
         self.uid_tiebreak_any_window = enabled;
+        self
+    }
+
+    /// NAN-4164: match a multi-token bare keyword as an adjacent term (Splunk
+    /// TERM semantics) instead of token-AND. The lean lake compiler turns
+    /// this on; there the body columns are read anyway, so the extra `match`
+    /// only runs on rows the token test already kept.
+    pub fn with_keyword_term_adjacency(mut self, enabled: bool) -> Self {
+        self.keyword_term_adjacency = enabled;
         self
     }
 
@@ -2551,6 +2668,7 @@ impl ClickHouseSqlGenerator {
 
         // Fresh upstream-computed scope for this generation (NAN-1341).
         self.swap_upstream_computed(HashSet::new());
+        self.swap_upstream_strings(HashSet::new());
 
         let result = self.generate_query(query, &mut ctx);
         match self.generation_time_range.write() {
@@ -2566,6 +2684,7 @@ impl ClickHouseSqlGenerator {
             Err(poisoned) => poisoned.into_inner().clear(),
         }
         self.swap_upstream_computed(HashSet::new());
+        self.swap_upstream_strings(HashSet::new());
         result
     }
 
@@ -2596,6 +2715,16 @@ impl ClickHouseSqlGenerator {
         if ctx.unordered {
             drop_count_invariant_reorders(&mut stages);
         }
+        // NAN-4263: `| sort -_time` over raw events in their natural order
+        // restates that order; dropping it lets the projection/head planning
+        // below treat `… | sort -_time | table a | head N` like `… | table a
+        // | head N` (and `_time` is no column on the lake: Code 47).
+        if !ctx.unordered {
+            drop_restated_time_sorts(&mut stages, &ctx.time_column);
+        }
+        // NAN-4214: `… | table a | head N` must cut the newest N events, which
+        // needs `time` / `metadata.uid` still in scope at the cut.
+        hoist_head_before_projections(&mut stages);
 
         // Single stage - no CTEs needed
         if stages.len() == 1 {
@@ -2630,17 +2759,40 @@ impl ClickHouseSqlGenerator {
         // compose default) every raw search and every scheduled detection over
         // a window of 24 h or less failed with Code 47. Only OCSF rows (the
         // ClickHouse `ocsf_logs` table and the lake) carry it.
-        if self.dataset == otel::Dataset::Logs
-            && self.profile.id() == crate::schema::SchemaId::Ocsf
-            && (self.uid_tiebreak_any_window
-                || (ctx.time_range.end - ctx.time_range.start).num_seconds() <= 86_400)
-        {
+        if self.uid_tiebreak_applies(ctx) {
             // The OCSF UID is a Nullable(String) physical leaf. Sorting it
             // directly avoids materializing a second string for every event.
             format!("{} DESC, \"metadata.uid\" DESC", ctx.time_column)
         } else {
             format!("{} DESC", ctx.time_column)
         }
+    }
+
+    /// Whether this window's raw rows tie-break on `metadata.uid` (see
+    /// [`Self::implicit_time_order`]); the same gate bounds the narrow-
+    /// projection sort tie-break on raw rows (NAN-4236).
+    fn uid_tiebreak_applies(&self, ctx: &GeneratorContext<'_>) -> bool {
+        self.dataset == otel::Dataset::Logs
+            && self.profile.id() == crate::schema::SchemaId::Ocsf
+            && self.raw_tiebreak_window(ctx)
+    }
+
+    /// NAN-4278: the implicit newest-first order of raw event rows, when its
+    /// keys are still in scope (no aggregation, no projection dropped them).
+    fn natural_order_in_scope(&self, ctx: &GeneratorContext<'_>) -> Option<String> {
+        let in_scope = |column: &str| ctx.available_columns.as_ref().map_or(true, |columns| columns.contains(column));
+        if ctx.aggregated || !in_scope(ctx.time_column) {
+            return None;
+        }
+        Some(if self.uid_tiebreak_applies(ctx) && in_scope("metadata.uid") {
+            self.implicit_time_order(ctx)
+        } else {
+            format!("{} DESC", ctx.time_column)
+        })
+    }
+
+    fn raw_tiebreak_window(&self, ctx: &GeneratorContext<'_>) -> bool {
+        self.uid_tiebreak_any_window || (ctx.time_range.end - ctx.time_range.start).num_seconds() <= 86_400
     }
 
     /// Generate optimized SQL for search | head N (avoids CTE overhead)
@@ -2666,6 +2818,15 @@ impl ClickHouseSqlGenerator {
             String::new()
         } else {
             format!("ORDER BY {} ", self.implicit_time_order(ctx))
+        };
+        // NAN-4263: an ordered `head N` past the caller's result limit
+        // returns that limit's newest rows (as the CTE paths' outer LIMIT
+        // does), so the statement's trailing LIMIT is the page the lake
+        // worker stops at. `… | sort -time | head 500` (the restated sort
+        // dropped) kept its page-sized limit this way before.
+        let limit = match ctx.limit {
+            Some(page) if !ctx.unordered => limit.min(page),
+            _ => limit,
         };
         Ok(format!(
             "SELECT {} FROM {} WHERE {} AND ({}) {}LIMIT {} {}",
@@ -2834,8 +2995,37 @@ impl ClickHouseSqlGenerator {
         materialized_cols.sort();
         materialized_cols.dedup();
 
+        // NAN-4214: whether the rows entering the current stage are still raw
+        // events in their natural newest-first order (only per-row filters and
+        // enrichers so far). A `head N` over such rows cuts the newest N events;
+        // without the ORDER BY its `LIMIT` kept whichever N rows the reader
+        // threads produced first (03:00-06:59 of a 7 d window, not 22:59).
+        let mut natural_event_order = matches!(stages.first(), Some(QueryStage::Search(_)));
+        // NAN-4263: whether the rows entering the LAST stage are raw events
+        // in natural newest-first order with the order keys still in scope
+        // (an ordered `head N` keeps both).
+        let mut natural_into_last = false;
         for (i, stage) in stages.iter().enumerate() {
             let cte_name = format!("stage_{}", i);
+            if i + 1 == stages.len() {
+                natural_into_last = natural_event_order && i > 0;
+            }
+            if let QueryStage::Command(Command::Head { count }) = stage {
+                if natural_event_order && !ctx.unordered && i > 0 {
+                    cte_parts.push(format!(
+                        "{} AS (\n  SELECT * FROM stage_{}\n  ORDER BY {}\n  LIMIT {}\n)",
+                        cte_name,
+                        i - 1,
+                        self.implicit_time_order(ctx),
+                        count
+                    ));
+                    ctx.current_stage = i;
+                    continue;
+                }
+            }
+            if let QueryStage::Command(cmd) = stage {
+                natural_event_order &= command_keeps_natural_event_order(cmd, &ctx.time_column);
+            }
             let cte_sql = match stage {
                 QueryStage::Search(expr) => {
                     let where_clause = self.generate_search_expr(expr)?;
@@ -2991,6 +3181,37 @@ impl ClickHouseSqlGenerator {
             ctx.current_stage = i;
         }
 
+        // NAN-4236: `… | head N | table a` (and `table a | head N`, which
+        // NAN-4214 hoists to that) keeps the newest-first event order to the
+        // end: the projection becomes the final statement, ordered by the
+        // event key it still reads from the head. ClickHouse orders by source
+        // columns a projection drops, so the statement ends in the cursor
+        // order and the lake walks it newest-first chunk by chunk, stopping
+        // at N rows, instead of ranking the whole window (0.15 s -> 0.64 s
+        // on 24 h after NAN-4214).
+        //
+        // NAN-4263: the same holds with no head at all. A projection
+        // (`table`, `fields`, `rename`) only picks columns, so `* | table a`
+        // is the newest events, newest first -- and the lake search service
+        // pulls `head N` out of `* | head N | table a` / `* | table a | head
+        // N` and sends `* | table a` with limit N. Before, that compiled to an
+        // unordered `SELECT * FROM stage_1 LIMIT N`: whichever N rows the
+        // reader produced first over the whole window (FP T67 7 d: 2291 files,
+        // 5 s, rows from 10:00Z and two days back instead of the newest).
+        let last = stages.len().saturating_sub(1);
+        let folds = !ctx.unordered
+            && natural_into_last
+            && matches!(&stages[last], QueryStage::Command(cmd) if is_order_preserving_projection(cmd, &ctx.time_column));
+        let folded_projection = folds
+            .then(|| cte_parts.last())
+            .flatten()
+            .and_then(|cte| cte.strip_prefix(&format!("stage_{last} AS (\n"))?.strip_suffix("\n)"))
+            .map(|body| body.trim().to_string())
+            .filter(|body| body.starts_with("SELECT ") && !body.contains('\n'));
+        if folded_projection.is_some() {
+            cte_parts.pop();
+        }
+
         sql.push_str(&cte_parts.join(",\n"));
 
         // Final SELECT from the last CTE
@@ -3015,6 +3236,12 @@ impl ClickHouseSqlGenerator {
         // unioned with an eval'd string literal). ClickHouse rejects ORDER
         // BY/GROUP BY on Variant/Dynamic by default — opt in for append
         // queries only, matching append's type-loose union semantics.
+        // NAN-4284 (searchfuzz F19): an unmatched LEFT/OUTER join row reads
+        // NULL for the other side's columns (SQL semantics), not the type
+        // default -- a missing `total` read as `0`.
+        if stages.iter().any(|s| matches!(s, QueryStage::Command(Command::Join { .. }))) {
+            settings.push_str(", join_use_nulls=1");
+        }
         if stages
             .iter()
             .any(|s| matches!(s, QueryStage::Command(Command::Append { .. })))
@@ -3070,7 +3297,30 @@ impl ClickHouseSqlGenerator {
             Some(limit) => format!("LIMIT {} ", limit),
             None => String::new(),
         };
-        if last_stage_has_ordering || has_aggregate_or_projection || ctx.unordered {
+        if let Some(projection) = folded_projection {
+            write!(
+                sql,
+                "\n{} ORDER BY {} {}{}",
+                projection, self.implicit_time_order(ctx), limit_clause, settings
+            )
+            .unwrap();
+        } else if let (RowOrder::Explicit(order), false, false) =
+            (&ctx.row_order, has_aggregate_or_projection, ctx.unordered)
+        {
+            // NAN-4278: an explicit order (`sort`, `tail`, `reverse`) followed
+            // only by row filters and limits ends the statement. The implicit
+            // newest-first order re-sorted `sort -x | head N` by time.
+            write!(
+                sql,
+                "\nSELECT {} FROM {} ORDER BY {} {}{}",
+                select_list, last_cte, order, limit_clause, settings
+            )
+            .unwrap();
+        } else if last_stage_has_ordering
+            || has_aggregate_or_projection
+            || ctx.unordered
+            || ctx.row_order != RowOrder::Natural
+        {
             write!(
                 sql,
                 "\nSELECT {} FROM {} {}{}",
@@ -3121,6 +3371,26 @@ impl ClickHouseSqlGenerator {
         } = cmd
         {
             let limit = resolve_subsearch_limit(*maxout);
+            // NAN-4284: a CTE that holds every main-side row, so the subsearch
+            // can be narrowed to the main side's keys before its cap. That is
+            // `source_cte` itself when re-reading it yields the same rows, or
+            // when it differs only by a trailing ordered `head`/`tail`/`sort N`
+            // run. Those runs are deterministic up to ties at the cut, and the
+            // event order is total on the lake. A `sample` run re-reads
+            // differently, so it narrows to its stable ancestor, a superset.
+            // Rows without a row identity (after stats and similar) keep the
+            // plain cap.
+            let key_source = if stability.rows_stable {
+                Some(source_cte.to_string())
+            } else {
+                stability.snapshot_refetch.as_ref().map(|refetch| {
+                    if prior_stages.iter().any(|stage| matches!(stage, QueryStage::Command(Command::Sample { .. }))) {
+                        refetch.ancestor.clone()
+                    } else {
+                        source_cte.to_string()
+                    }
+                })
+            };
             let inner_sql = self.generate_join_sql(
                 source_cte,
                 join_type,
@@ -3131,7 +3401,12 @@ impl ClickHouseSqlGenerator {
                 ctx,
                 prior_stages,
                 *subsearch_dataset,
+                key_source.as_deref(),
             )?;
+            // NAN-4278: a join does not keep its input's explicit order.
+            if ctx.row_order != RowOrder::Natural {
+                ctx.row_order = RowOrder::Reordered;
+            }
             return Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql));
         }
 
@@ -3140,6 +3415,10 @@ impl ClickHouseSqlGenerator {
             let limit = resolve_subsearch_limit(*maxout);
             let inner_sql =
                 self.generate_append_sql(source_cte, subsearch, limit, ctx, prior_stages)?;
+            // NAN-4278: appended rows have no place in the input's explicit order.
+            if ctx.row_order != RowOrder::Natural {
+                ctx.row_order = RowOrder::Reordered;
+            }
             return Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql));
         }
 
@@ -3169,7 +3448,7 @@ impl ClickHouseSqlGenerator {
         prior_stages: &[QueryStage],
     ) -> Result<String, SqlGenError> {
         // Generate the subsearch SQL
-        let subsearch_sql = self.generate_subsearch_sql(subsearch, ctx, limit)?;
+        let subsearch_sql = self.generate_subsearch_sql(subsearch, ctx, Some(limit))?;
 
         let main_shape = self.pipeline_output_shape(prior_stages);
         let sub_shape = self.pipeline_output_shape(&self.collect_stages(subsearch));
@@ -3531,6 +3810,9 @@ impl ClickHouseSqlGenerator {
         ctx: &GeneratorContext,
         prior_stages: &[QueryStage],
         subsearch_dataset: Option<otel::Dataset>,
+        // NAN-4284: a CTE holding every main-side row (a superset is fine), to
+        // narrow the subsearch to the main side's join keys.
+        key_source: Option<&str>,
     ) -> Result<String, SqlGenError> {
         // NAN-1562: cross-dataset only when the subsearch targets a DIFFERENT
         // dataset than the outer query — `dataset=logs` from a logs query stays
@@ -3582,14 +3864,20 @@ impl ClickHouseSqlGenerator {
         } else {
             (ctx.table_name.to_string(), ctx.time_column.to_string())
         };
+        // NAN-4284 (searchfuzz F19): with a key source, the cap applies AFTER
+        // the subsearch is narrowed to the main side's keys. Capping first
+        // kept an arbitrary 10k of 76k subsearch groups, so the main side's
+        // keys mostly matched nothing: left-join fields read 0 and an inner
+        // join returned no rows.
+        let sub_cap = if key_source.is_some() && !fields.is_empty() { None } else { Some(limit) };
         let subsearch_sql = if cross_dataset {
             let mut sub_ctx = GeneratorContext::new(&sub_table, &sub_time_col, ctx.time_range);
             sub_ctx.required_fields = ctx.required_fields.clone();
             sub_ctx.ext_fields = ctx.ext_fields.clone();
             sub_ctx.use_cache = ctx.use_cache;
-            sub_gen.generate_subsearch_sql(subsearch, &sub_ctx, limit)?
+            sub_gen.generate_subsearch_sql(subsearch, &sub_ctx, sub_cap)?
         } else {
-            self.generate_subsearch_sql(subsearch, ctx, limit)?
+            self.generate_subsearch_sql(subsearch, ctx, sub_cap)?
         };
 
         // Resolve each join key PER SIDE (NAN-1413): the outer (main) side
@@ -3657,11 +3945,29 @@ impl ClickHouseSqlGenerator {
         // (toString of a NULL key yields NULL, which is falsy in WHERE.)
         // Filter on the SUB-side resolved key — the same column the ON clause
         // compares (NAN-1413) — or the eviction misses the rows being joined.
-        let sub_key_filter = sub_keys
+        let mut sub_key_filter = sub_keys
             .iter()
             .map(|k| format!("toString({}) != ''", k))
             .collect::<Vec<_>>()
             .join(" AND ");
+        // NAN-4284: the semi-join that narrows the subsearch to the keys the
+        // main side can match, then the cap over what is left.
+        let mut cap_clause = String::new();
+        if let (Some(key_source), None) = (key_source, sub_cap) {
+            let tuple = |keys: &[String]| match keys {
+                [key] => key.clone(),
+                keys => format!("({})", keys.join(", ")),
+            };
+            write!(
+                sub_key_filter,
+                " AND {} IN (SELECT {} FROM {})",
+                tuple(&sub_keys),
+                main_keys.join(", "),
+                key_source
+            )
+            .unwrap();
+            cap_clause = format!("\n    LIMIT {limit}");
+        }
 
         // `join` matches at most `max` subsearch results per join key (default 1).
         // The old SQL only enforced this for max > 1, via a
@@ -3740,7 +4046,7 @@ impl ClickHouseSqlGenerator {
             _ => "",
         };
         Ok(format!(
-            "  SELECT {} FROM {} AS main\n  {} (\n    SELECT * FROM (\n{}\n    ) WHERE {}{}\n    LIMIT {} BY {}\n  ) AS {} ON {}{}",
+            "  SELECT {} FROM {} AS main\n  {} (\n    SELECT * FROM (\n{}\n    ) WHERE {}{}\n    LIMIT {} BY {}{}\n  ) AS {} ON {}{}",
             select_clause,
             source_cte,
             join_keyword,
@@ -3749,6 +4055,7 @@ impl ClickHouseSqlGenerator {
             sub_order,
             max,
             key_list,
+            cap_clause,
             sub_alias,
             join_condition,
             join_settings
@@ -3761,7 +4068,7 @@ impl ClickHouseSqlGenerator {
         &self,
         subsearch: &Query,
         ctx: &GeneratorContext,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<String, SqlGenError> {
         // A subsearch is its own pipeline scope: its field references must not
         // see the OUTER pipeline's value-computed fields as shadowing columns,
@@ -3769,8 +4076,10 @@ impl ClickHouseSqlGenerator {
         // the join/append OUTPUT columns itself via `note_upstream_computed`).
         // Swap in an empty scope, restore the outer one afterwards (NAN-1341).
         let outer_scope = self.swap_upstream_computed(HashSet::new());
+        let outer_strings = self.swap_upstream_strings(HashSet::new());
         let result = self.generate_subsearch_sql_inner(subsearch, ctx, limit);
         self.swap_upstream_computed(outer_scope);
+        self.swap_upstream_strings(outer_strings);
         result
     }
 
@@ -3778,7 +4087,7 @@ impl ClickHouseSqlGenerator {
         &self,
         subsearch: &Query,
         ctx: &GeneratorContext,
-        limit: usize,
+        limit: Option<usize>,
     ) -> Result<String, SqlGenError> {
         // Collect stages from subsearch
         let stages = self.collect_stages(subsearch);
@@ -3805,12 +4114,12 @@ impl ClickHouseSqlGenerator {
                 // Time column is the (sub)dataset's `ctx.time_column` — `start_time`
                 // for a spans subsearch, not the literal `timestamp` (NAN-1562).
                 return Ok(format!(
-                    "    SELECT {} FROM {}\n    WHERE {}\n    AND ({})\n    LIMIT {}",
+                    "    SELECT {} FROM {}\n    WHERE {}\n    AND ({}){}",
                     base_select,
                     ctx.table_name,
                     self.time_bound_predicate(&ctx.time_column, &ctx.time_range),
                     where_clause,
-                    limit
+                    limit.map(|limit| format!("\n    LIMIT {limit}")).unwrap_or_default()
                 ));
             }
         }
@@ -3908,9 +4217,9 @@ impl ClickHouseSqlGenerator {
         // (`head`/`sort`), and `... LIMIT 5 LIMIT 10000` is a syntax error
         // (NAN-1346 #3).
         Ok(format!(
-            "    (SELECT * FROM ({}) LIMIT {})",
+            "    (SELECT * FROM ({}){})",
             current_sql.replace('\n', "\n    "),
-            limit
+            limit.map(|limit| format!(" LIMIT {limit}")).unwrap_or_default()
         ))
     }
 
@@ -4254,6 +4563,7 @@ impl ClickHouseSqlGenerator {
             false,
             &[],
             false,
+            None,
             false,
             stability,
         )
@@ -4266,8 +4576,37 @@ impl ClickHouseSqlGenerator {
         ctx: &mut GeneratorContext,
         stability: SourceStability,
     ) -> Result<String, SqlGenError> {
+        // NAN-4278: `tail N` is the last N rows of the CURRENT order and
+        // `reverse` flips it, both emitted last row first. Invert the order
+        // the rows are in: the explicit `sort` (`sort x | tail N`), else the
+        // newest-first event order (so `tail N` is the OLDEST N, oldest
+        // first). Before, tail took the newest N and ignored a prior sort.
+        if matches!(cmd, Command::Tail { .. } | Command::Reverse) {
+            let current = match &ctx.row_order {
+                RowOrder::Explicit(order) => Some(order.clone()),
+                RowOrder::Natural => self.natural_order_in_scope(ctx),
+                RowOrder::Reordered => None,
+            };
+            let limit = match cmd {
+                Command::Tail { count } => format!("\n  LIMIT {count}"),
+                _ => String::new(),
+            };
+            if let Some(current) = current {
+                let inverted = invert_order_by(&current);
+                ctx.row_order = RowOrder::Explicit(inverted.clone());
+                return Ok(format!("  SELECT * FROM {source}\n  ORDER BY {inverted}{limit}"));
+            }
+            // Keys out of scope (after an aggregation or a projection): number
+            // the rows in their current order and take them back to front.
+            ctx.row_order = RowOrder::Reordered;
+            return Ok(format!(
+                "  SELECT * EXCEPT (__nano_rn) FROM (\n    SELECT *, rowNumberInAllBlocks() AS __nano_rn FROM {source}\n  )\n  ORDER BY __nano_rn DESC{limit}"
+            ));
+        }
         let sparkline_span = Self::compute_sparkline_span_secs(ctx.time_range);
         let has_prior_risk = ctx.has_prior_risk;
+        let raw_event_order = self.uid_tiebreak_applies(ctx).then(|| self.implicit_time_order(ctx));
+        let raw_tiebreak_window = self.raw_tiebreak_window(ctx);
         let result = self.generate_command_sql_inner(
             source,
             cmd,
@@ -4277,7 +4616,8 @@ impl ClickHouseSqlGenerator {
             has_prior_risk,
             ctx.aggregated,
             &ctx.sort_tie_fields,
-            (ctx.time_range.end - ctx.time_range.start).num_seconds() <= 86_400,
+            raw_tiebreak_window,
+            raw_event_order.as_deref(),
             ctx.single_resolve_identity,
             stability,
         );
@@ -4287,10 +4627,20 @@ impl ClickHouseSqlGenerator {
                     ctx.sort_tie_fields = group_by.as_deref().unwrap_or_default().iter()
                         .map(|field| by_field_output_name(field, self).to_string()).collect();
                 }
-                Command::Timechart { .. }
-                | Command::Top { .. }
-                | Command::Rare { .. }
-                | Command::Transaction { .. }
+                // NAN-4236: a timechart row is unique per (bucket, series)
+                // and a top/rare row per its group key, so a later sort
+                // tie-breaks on those.
+                Command::Timechart { split_by, .. } => {
+                    ctx.sort_tie_fields = std::iter::once("time_bucket".to_string())
+                        .chain(split_by.iter().cloned()).collect();
+                }
+                Command::Top { field, by_fields, .. } | Command::Rare { field, by_fields, .. } => {
+                    ctx.sort_tie_fields = by_fields.iter()
+                        .filter(|by| !by.eq_ignore_ascii_case("count") && !by.eq_ignore_ascii_case("percent"))
+                        .chain(std::iter::once(field))
+                        .map(|by| by_field_output_name(by, self).to_string()).collect();
+                }
+                Command::Transaction { .. }
                 | Command::Sequence { .. }
                 | Command::Funnel { .. }
                 | Command::Anomaly { .. }
@@ -4306,6 +4656,28 @@ impl ClickHouseSqlGenerator {
                     ctx.sort_tie_fields.clear();
                 }
                 _ => {}
+            }
+        }
+        if let Ok(sql) = &result {
+            match cmd {
+                // `sort -time` restates the natural newest-first order.
+                Command::Sort { fields, .. }
+                    if matches!(fields.as_slice(), [field] if field.descending
+                        && ["time", "timestamp", "_time", ctx.time_column].iter().any(|key| field.field.eq_ignore_ascii_case(key))) =>
+                {
+                    ctx.row_order = RowOrder::Natural;
+                }
+                Command::Sort { .. } => {
+                    ctx.row_order = sort_order_by(sql)
+                        .map_or(RowOrder::Reordered, |order| RowOrder::Explicit(order.to_string()));
+                }
+                // Row filters and limits keep the order and every column.
+                Command::Head { .. } | Command::Where { .. } | Command::Tail { .. } | Command::Reverse => {}
+                _ => {
+                    if ctx.row_order != RowOrder::Natural {
+                        ctx.row_order = RowOrder::Reordered;
+                    }
+                }
             }
         }
         if matches!(cmd, Command::Risk { .. }) {
@@ -4337,6 +4709,163 @@ impl ClickHouseSqlGenerator {
         let duration_secs = (time_range.end - time_range.start).num_seconds().max(1) as u64;
         // Target ~30 buckets, minimum 60s per bucket
         (duration_secs / 30).max(60)
+    }
+}
+
+/// NAN-4278: the ORDER BY list of a generated `sort` stage
+/// (`  SELECT * FROM src\n  ORDER BY <list>[\n  LIMIT n]`).
+fn sort_order_by(sql: &str) -> Option<&str> {
+    let (_, order) = sql.split_once("\n  ORDER BY ")?;
+    let order = order.split_once("\n  LIMIT ").map_or(order, |(order, _)| order).trim();
+    (!order.is_empty() && !order.contains('\n')).then_some(order)
+}
+
+/// NAN-4278: the exact reverse of an ORDER BY list: every key flips its
+/// direction AND its NULL placement (ClickHouse puts NULLs last in both
+/// directions, so the reverse of `x ASC` is `x DESC NULLS FIRST`). Splits on
+/// top-level commas only (quotes and parentheses respected).
+fn invert_order_by(order: &str) -> String {
+    let mut keys = Vec::new();
+    let (mut depth, mut quote, mut start) = (0_i32, None::<char>, 0);
+    for (at, ch) in order.char_indices() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(ch),
+            (None, '(') => depth += 1,
+            (None, ')') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                keys.push(&order[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    keys.push(&order[start..]);
+    keys.iter()
+        .map(|key| {
+            let key = key.trim();
+            let (key, nulls_first) = match key.strip_suffix(" NULLS FIRST") {
+                Some(key) => (key, true),
+                None => (key.strip_suffix(" NULLS LAST").unwrap_or(key), false),
+            };
+            let (expr, descending) = match key.strip_suffix(" DESC") {
+                Some(expr) => (expr, true),
+                None => (key.strip_suffix(" ASC").unwrap_or(key), false),
+            };
+            format!(
+                "{expr} {} NULLS {}",
+                if descending { "ASC" } else { "DESC" },
+                if nulls_first { "LAST" } else { "FIRST" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// NAN-4214: whether `cmd` hands on raw events in their incoming order with
+/// the newest-first key (`time`, `metadata.uid`) intact: per-row filters and
+/// enrichers. Anything that sorts, aggregates, projects, synthesizes rows or
+/// reassigns the key ends the natural order (conservative allowlist).
+fn command_keeps_natural_event_order(cmd: &Command, time_column: &str) -> bool {
+    let is_key = |field: &str| {
+        ["time", "timestamp", "metadata.uid", time_column].iter().any(|key| field.eq_ignore_ascii_case(key))
+    };
+    match cmd {
+        // `SELECT *[, extra columns] FROM src [WHERE …]` stages only: the key
+        // columns pass through untouched. Joins and enrichers that rebuild
+        // the row stay out until their shape is reasoned through.
+        Command::Head { .. } | Command::Where { .. } => true,
+        Command::Eval { assignments } => !assignments.iter().any(|assignment| is_key(&assignment.field)),
+        // A capture group or sed target named like the key could shadow it.
+        Command::Rex { field, pattern, .. } => {
+            !field.as_deref().is_some_and(is_key)
+                && !["time", "timestamp", "metadata.uid", time_column]
+                    .iter()
+                    .any(|key| pattern.to_ascii_lowercase().contains(&format!("<{}>", key.to_ascii_lowercase())))
+        }
+        _ => false,
+    }
+}
+
+/// NAN-4263: a projection (`table`, `fields`, `rename`) that can end the
+/// statement ordered by the event key of the rows it reads: none of its
+/// output names reuses an order key (ClickHouse would order by the alias).
+fn is_order_preserving_projection(cmd: &Command, time_column: &str) -> bool {
+    let is_order_key = |name: &str| ["time", "timestamp", "_time", "metadata.uid", time_column]
+        .iter().any(|key| name.eq_ignore_ascii_case(key));
+    match cmd {
+        Command::Table { fields } => fields.iter().all(|field| !field.alias.as_deref().is_some_and(is_order_key)),
+        Command::Fields { keep: true, .. } => true,
+        // `fields - time` would order by a column the statement excluded.
+        Command::Fields { keep: false, fields } => !fields.iter().any(|field| is_order_key(field)),
+        Command::Rename { mappings } => !mappings.iter().any(|mapping| is_order_key(&mapping.to)),
+        _ => false,
+    }
+}
+
+/// NAN-4263: remove the unlimited `sort -time` (`-_time`, `-timestamp`)
+/// stages of a pipeline that only restate the implicit newest-first event
+/// order: apart from them and `head`, it is a search, row-local stages that
+/// keep raw events in natural order (`where`, key-free `eval` / `rex`) and
+/// at most one trailing order-preserving projection. The final statement
+/// (or an ordered head) then applies that very order. A sort ahead of
+/// anything order-sensitive (dedup, streamstats, stats, a second
+/// projection, …) stays.
+fn drop_restated_time_sorts(stages: &mut Vec<QueryStage<'_>>, time_column: &str) {
+    let restates = |stage: &QueryStage<'_>| matches!(
+        stage,
+        QueryStage::Command(Command::Sort { fields, limit: None })
+            if matches!(fields.as_slice(), [field] if field.descending
+                && ["time", "timestamp", "_time", time_column].iter().any(|key| field.field.eq_ignore_ascii_case(key)))
+    );
+    if !matches!(stages.first(), Some(QueryStage::Search(_))) || !stages.iter().any(|stage| restates(stage)) {
+        return;
+    }
+    let rest = stages[1..].iter()
+        .filter(|stage| !restates(stage) && !matches!(stage, QueryStage::Command(Command::Head { .. })))
+        .map(|stage| match stage {
+            QueryStage::Command(cmd) => Some(*cmd),
+            QueryStage::Search(_) => None,
+        })
+        .collect::<Option<Vec<&Command>>>();
+    let Some(rest) = rest else { return };
+    let (row_local, projection) = match rest.split_last() {
+        Some((last, before)) if matches!(last, Command::Table { .. } | Command::Fields { .. } | Command::Rename { .. }) => {
+            (before, Some(*last))
+        }
+        _ => (rest.as_slice(), None),
+    };
+    let restated = projection.map_or(true, |cmd| is_order_preserving_projection(cmd, time_column))
+        && row_local.iter().all(|cmd| {
+            matches!(cmd, Command::Where { .. } | Command::Eval { .. } | Command::Rex { .. })
+                && command_keeps_natural_event_order(cmd, time_column)
+        });
+    if restated {
+        stages.retain(|stage| !restates(stage));
+    }
+}
+
+/// NAN-4214: move each `head N` ahead of the pure 1:1 projections directly
+/// before it (`table`, `fields`, `rename`). A projection keeps every row in
+/// its order, so `… | table a | head N` and `… | head N | table a` return the
+/// same rows -- but only the second can order the cut by `time`, which the
+/// projection drops.
+fn hoist_head_before_projections(stages: &mut [QueryStage<'_>]) {
+    for j in 1..stages.len() {
+        if !matches!(stages[j], QueryStage::Command(Command::Head { .. })) {
+            continue;
+        }
+        let mut k = j;
+        while k > 1
+            && matches!(
+                stages[k - 1],
+                QueryStage::Command(Command::Table { .. } | Command::Fields { .. } | Command::Rename { .. })
+            )
+        {
+            stages.swap(k - 1, k);
+            k -= 1;
+        }
     }
 }
 
@@ -4464,6 +4993,22 @@ struct GeneratorContext<'a> {
     /// sequence/funnel/anomaly) has run — these GROUP BY and drop the raw `timestamp`
     /// column, so order-sensitive commands (tail/reverse) must not ORDER BY timestamp.
     aggregated: bool,
+    /// NAN-4278: the order of the rows entering the next stage, for `tail` /
+    /// `reverse` and the final statement's order.
+    row_order: RowOrder,
+}
+
+/// NAN-4278: the order a pipeline stage hands downstream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum RowOrder {
+    /// The implicit newest-first event order: nothing has reordered the rows.
+    #[default]
+    Natural,
+    /// An explicit order (`sort`, `tail`, `reverse`) followed only by row
+    /// filters and limits, so this ORDER BY list is still in scope.
+    Explicit(String),
+    /// An explicit order whose keys may no longer be in scope.
+    Reordered,
 }
 
 impl<'a> GeneratorContext<'a> {
@@ -4484,6 +5029,7 @@ impl<'a> GeneratorContext<'a> {
             has_prior_risk: false,
             single_resolve_identity: false,
             aggregated: false,
+            row_order: RowOrder::Natural,
         }
     }
 }

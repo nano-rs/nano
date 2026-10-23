@@ -8,6 +8,7 @@
 //! - Scheduled daily syncs
 //! - IP enrichment lookups for ingestion
 
+use crate::telemetry::ObservedRequestBuilderExt;
 use arc_swap::ArcSwapOption;
 use async_compression::tokio::bufread::GzipDecoder;
 use std::io::Write;
@@ -555,7 +556,7 @@ impl EnrichmentService {
             let client = Self::build_http_client(config, &pin_host, &pinned_addrs)?;
 
             let response =
-                client.get(parsed_url.as_str()).send().await.map_err(|e| {
+                client.get(parsed_url.as_str()).send_observed().await.map_err(|e| {
                     EnrichmentError::DownloadError(format!("Request failed: {}", e))
                 })?;
 

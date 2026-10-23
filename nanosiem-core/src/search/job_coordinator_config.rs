@@ -70,10 +70,9 @@ pub const MAX_HOSTED_PRODUCER_CONFIGS: usize = 1024;
 /// Parse `NANO_SHARED_HOSTED_JOB_CONFIG_FILES` (a JSON array of gen1 tenants'
 /// hosted producer config paths) for a startup that attests them.
 ///
-/// An empty list is admitted only when the registry has at least one
-/// lean-lake cell route: cell tenants use a tenant-pinned in-memory store and
-/// need no gen1 producer, so a cluster whose gen1 tenants are all torn down
-/// still boots. An empty list with no cell routes stays a misconfiguration.
+/// An empty list is admitted for a zero-tenant registry at regional bootstrap,
+/// or when lean-lake cell routes exist (cell tenants need no gen1 producer).
+/// A gen1-only registry with assignments still requires producer configs.
 /// A non-empty list is returned for the caller's strict per-file validation.
 pub fn hosted_producer_config_paths(
     raw: &str,
@@ -85,12 +84,12 @@ pub fn hosted_producer_config_paths(
     }
     if paths.is_empty() {
         let cell_routes = registry.cell_route_count();
-        if cell_routes == 0 {
+        if cell_routes == 0 && registry.assignments().next().is_some() {
             return Err(invalid());
         }
         tracing::info!(
             cell_routes,
-            "no gen1 hosted producer configs; booting for lean-lake cell tenants only"
+            "no gen1 hosted producer configs; booting for cell routes or an empty tenant registry"
         );
     }
     Ok(paths)
@@ -515,10 +514,9 @@ mod tests {
         ))
     }
 
-    /// An empty producer list is admitted only when lean-lake cell routes
-    /// exist (gen1 teardown); with no cell routes it stays refused.
+    /// Empty regions and cell-only regions need no gen1 producer configs.
     #[test]
-    fn empty_producer_list_boots_only_with_cell_routes() {
+    fn empty_producer_list_boots_with_cell_routes_or_no_tenants() {
         let dir = tempfile::tempdir().unwrap();
         let with_cells = cell_registry(dir.path(), serde_json::json!({
             Uuid::from_u128(0xa).to_string(): {"cell_origin": "http://nano-cell-cell-us-1.nano-lake-cells.svc:8790",
@@ -539,7 +537,7 @@ mod tests {
         let no_routes_dir = tempfile::tempdir().unwrap();
         let without_cells = cell_registry(no_routes_dir.path(), serde_json::json!({}));
         assert_eq!(without_cells.cell_route_count(), 0);
-        assert!(hosted_producer_config_paths("[]", &without_cells).is_err());
+        assert!(hosted_producer_config_paths("[]", &without_cells).unwrap().is_empty());
 
         // A non-empty list is returned for strict per-file validation; the
         // other bounds are unchanged.

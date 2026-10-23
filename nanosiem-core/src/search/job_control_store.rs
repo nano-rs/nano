@@ -88,6 +88,7 @@ impl<'a> JobControlView<'a> {
     ) -> Result<String, DurableJobStoreError> {
     crate::request_timing::timed(crate::request_timing::Phase::Ledger, async {
 
+        let reuse_key = super::recent_reuse_jobs::key(&request, &request.query, user, scope, authority);
         let window = (request.time_range.start, request.time_range.end);
         let plain_search = matches!(task, DurableLakeTask::SearchNplV1 | DurableLakeTask::SearchNplShedV1 { .. });
         let created = match self.hosted {
@@ -105,6 +106,9 @@ impl<'a> JobControlView<'a> {
         };
         if let (Ok(id), true) = (&created, plain_search) {
             super::in_flight_jobs::InFlightJobs::global().record(id, user, window.0, window.1);
+            if let Some(key) = reuse_key {
+                super::recent_reuse_jobs::RecentReuseJobs::global().record(key, id);
+            }
         }
         created
 
@@ -119,12 +123,16 @@ impl<'a> JobControlView<'a> {
         generation: &DurableLakeGenerationPin,
         authority: Option<&DurableSearchJobAuthority>,
     ) -> Result<String, DurableJobStoreError> {
+        let reuse_key = super::recent_reuse_jobs::key(&request, &request.query, user, scope, authority);
         let window = (request.time_range.start, request.time_range.end);
         let created = self.legacy
             .create_interactive_lake(request, user, priority, scope, generation, authority)
             .await;
         if let Ok(id) = &created {
             super::in_flight_jobs::InFlightJobs::global().record(id, user, window.0, window.1);
+            if let Some(key) = reuse_key {
+                super::recent_reuse_jobs::RecentReuseJobs::global().record(key, id);
+            }
         }
         created
     }
@@ -416,6 +424,7 @@ impl DurableJobControlStore for HostedCoordinatorClient {
             result_ref: job.result_ref.clone(),
             durable_result: None,
             error: job.error.clone(),
+            error_code: super::jobs::search_job_error_code(job.error.as_deref()),
             queue_position: None,
             estimated_wait_seconds: None,
             task_kind: job.task.as_ref().map(|t| t.kind().to_string()),

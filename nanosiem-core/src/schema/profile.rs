@@ -66,6 +66,36 @@ pub trait SchemaProfile: Send + Sync {
         Vec::new()
     }
 
+    /// The queryable leaves beneath an OCSF object or array-of-objects root
+    /// (`http_request`, `enrichments`) on a strict canonical profile, sorted.
+    ///
+    /// NAN-4279 (F13): the lake exposes objects only as dotted leaf columns, so
+    /// a root is addressable by `table` / `fields` / `mvexpand` through its
+    /// leaves. Empty when `root` is itself a field, a wildcard, or has no
+    /// known leaf; always empty on table-backed profiles. Source-computed
+    /// scalars are left out, exactly as wildcard expansion leaves them out.
+    fn object_root_leaves(&self, root: &str) -> Vec<String> {
+        if !self.uses_strict_canonical_fields()
+            || root.is_empty()
+            || root.contains('*')
+            || self.is_known_field(root)
+        {
+            return Vec::new();
+        }
+        let prefix = format!("{root}.");
+        let mut leaves: Vec<String> = self
+            .fields()
+            .iter()
+            .map(|field| field.name.replace("[]", ""))
+            .chain(self.snapshot_fields().into_iter().map(|(name, _)| name))
+            .filter(|name| name.starts_with(&prefix))
+            .filter(|name| self.source_computed_column(name).is_none())
+            .collect();
+        leaves.sort();
+        leaves.dedup();
+        leaves
+    }
+
     /// Resolve an nPL field token to its physical ClickHouse location.
     ///
     /// THE CORE METHOD. Must be O(1). For UDM this reproduces

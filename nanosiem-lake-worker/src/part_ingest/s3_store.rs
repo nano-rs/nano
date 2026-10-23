@@ -393,6 +393,8 @@ fn listed_object(key: &str, meta: &opendal::Metadata) -> Option<crate::lake_part
 /// 32 MiB parsed-allocation reservation; the inventory itself stays bounded by
 /// MAX_GC_LIST_OBJECTS / MAX_GC_LIST_BYTES, not by the page size.
 pub(crate) const GC_LIST_PAGE_KEYS: usize = 1_000;
+/// Largest key page a guarded GC listing accepts (one checkpoint scan).
+pub(crate) const GC_CHECKPOINT_PAGE_KEYS: usize = 256;
 pub(crate) const MAX_GC_LIST_OBJECTS: usize = 262_144;
 pub(crate) const MAX_GC_LIST_BYTES: usize = 64 * 1024 * 1024;
 
@@ -439,6 +441,18 @@ impl ObjectStore for S3ObjectStore {
     async fn object_size(&self, key: &str) -> Result<Option<u64>> {
         match self.op.load().stat(key).await {
             Ok(meta) => Ok(Some(meta.content_length())),
+            Err(e) if e.kind()==ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    async fn modified_ms(&self, key: &str) -> Result<Option<i64>> {
+        match self.op.load().stat(key).await {
+            Ok(meta) => Ok(meta.last_modified().and_then(|modified| {
+                std::time::SystemTime::from(modified)
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|at| at.as_millis() as i64)
+            })),
             Err(e) if e.kind()==ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -545,7 +559,7 @@ impl ObjectStore for S3ObjectStore {
                 count <= MAX_GC_LIST_OBJECTS && bytes <= MAX_GC_LIST_BYTES,
                 "S3 full listing exceeds key budget"
             );
-            ensure!(!guarded || count <= 256, "GC checkpoint scan key limit");
+            ensure!(!guarded || count <= GC_CHECKPOINT_PAGE_KEYS, "GC checkpoint scan key limit");
             if entry.metadata().is_file() {
                 keys.push(entry.path().to_string());
             }
@@ -558,6 +572,18 @@ impl ObjectStore for S3ObjectStore {
         Ok(keys)
         };
         if guarded { crate::r2_ops::bounded_gc_list(listing).await } else { listing.await }
+    }
+
+    /// One page per call. Under the GC guard a page is at most
+    /// [`GC_CHECKPOINT_PAGE_KEYS`] keys and its own bounded LIST budget, the
+    /// same per-call bounds a guarded [`Self::list`] enforces on a whole prefix.
+    async fn list_page(&self, prefix: &str, start_after: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        let guarded = self.gc_guard.read().expect("GC guard lock").is_some();
+        let limit = limit.clamp(1, if guarded { GC_CHECKPOINT_PAGE_KEYS } else { GC_LIST_PAGE_KEYS });
+        let page = async {
+            Ok(self.list_page_after(prefix, start_after, limit).await?.into_iter().map(|listed| listed.key).collect())
+        };
+        if guarded { crate::r2_ops::bounded_gc_list(page).await } else { page.await }
     }
 }
 

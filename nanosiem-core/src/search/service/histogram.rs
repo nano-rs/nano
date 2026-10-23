@@ -723,11 +723,13 @@ fn split_lake_histogram_range(
     if width_us < 2 {
         return None;
     }
+    // NAN-4280: windows are half-open `[start, end)`, so the halves share
+    // `newer_start` and an event on it lands in exactly one half.
     let newer_start = time_range.start + chrono::Duration::microseconds(width_us / 2);
     Some((
         TimeRangeInput {
             start: time_range.start,
-            end: newer_start - chrono::Duration::microseconds(1),
+            end: newer_start,
         },
         TimeRangeInput {
             start: newer_start,
@@ -812,8 +814,7 @@ fn lake_histogram_span_for(
             ) else {
                 return false;
             };
-            !crate::search::lake::lake_rollup_field_is_enrichment_sensitive(&plan.field)
-                && crate::search::lake::lake_count_rollup_field_multi_value(&plan.field)
+            crate::search::lake::lake_count_rollup_field_multi_value(&plan.field)
                     .is_some_and(|multi_value| {
                         !multi_value
                             || predicate.as_ref().is_some_and(|predicate| predicate.kind == "eq")
@@ -908,6 +909,8 @@ mod lake_histogram_tests {
             "metadata.log_source=windows_sysmon",
             "metadata.log_source=windows_sysmon src_endpoint.hostname=\"ws-1.corp.local\"",
             "src_endpoint.ip=\"10.0.0.1\"",
+            // NAN-4168: enrichment leaves are plain columns, rollups included.
+            "src_endpoint.location.country=\"US\"",
             "actor.user.name=\"alice\"",
             // NAN-3153: a dotless host equality also matches the host's
             // FQDNs; the rollup now evaluates exactly that (`host_eq`).
@@ -926,7 +929,6 @@ mod lake_histogram_tests {
             "powershell",
             "process.cmd_line=\"*whoami*\" OR user.name=\"x\"",
             "unmapped.custom_field=\"x\"",
-            "src_endpoint.location.country=\"US\"",
             "enrichments.value!=\"x\"",
             // Negated dotless host equality has no exact rollup form.
             "metadata.log_source=windows_sysmon src_endpoint.hostname!=\"ws-1\"",
@@ -1530,7 +1532,7 @@ mod lake_histogram_tests {
             older
                 .end
                 .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            "2026-08-12T05:59:59.999999Z"
+            "2026-08-12T06:00:00.000000Z"
         );
         assert_eq!(
             newer
@@ -1539,7 +1541,8 @@ mod lake_histogram_tests {
             "2026-08-12T06:00:00Z"
         );
         assert_eq!(newer.end, end);
-        assert_eq!(older.end + chrono::Duration::microseconds(1), newer.start);
+        // NAN-4280: half-open halves share the split instant.
+        assert_eq!(older.end, newer.start);
     }
 
     #[test]

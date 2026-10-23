@@ -14,7 +14,13 @@ use chrono::Datelike;
 use crate::query::{BinaryOperator, Comparator, EvalExpression, SearchExpr, Value};
 use crate::search::evaluator::helpers::parse_datetime_flexible;
 
+use super::eval::ip_in_cidr;
 use super::helpers::get_nested_value;
+
+/// The row's value as an IP address, if it is one.
+fn row_ip(value: Option<&serde_json::Value>) -> Option<std::net::IpAddr> {
+    value?.as_str()?.trim().parse().ok()
+}
 
 // ============================================================================
 // Condition Evaluation
@@ -94,13 +100,111 @@ fn compare_json_to_value(result: &serde_json::Value, op: &Comparator, value: &Va
     }
 }
 
+/// The row value a bare RHS refers to when it is read as a column
+/// (`Some(None)` for a referenced column the row lacks), or `None` when the
+/// RHS is a literal value.
+fn field_reference_operand<'r>(
+    row: &'r serde_json::Value,
+    field: &str,
+    op: &Comparator,
+    value: &Value,
+    rhs: crate::query::RhsSyntax,
+) -> Option<Option<&'r serde_json::Value>> {
+    if !matches!(rhs, crate::query::RhsSyntax::Bareword)
+        || !matches!(
+            op,
+            Comparator::Eq
+                | Comparator::Ne
+                | Comparator::Gt
+                | Comparator::Lt
+                | Comparator::Gte
+                | Comparator::Lte
+        )
+    {
+        return None;
+    }
+    let Value::String(name) = value else {
+        return None;
+    };
+    if !crate::query::is_bareword_identifier(name) {
+        return None;
+    }
+    let other = get_nested_value(row, name);
+    // A dotted OCSF schema path (`dst_endpoint.ip`) is a column even when this
+    // row lacks it; a dotted VALUE (`example.com`) is not a schema path and
+    // stays literal unless the row really carries such a column.
+    static LAKE_PROFILE: std::sync::OnceLock<crate::schema::OcsfProfile> =
+        std::sync::OnceLock::new();
+    if crate::query::clickhouse_sql_gen::search_expr::is_dotted_schema_path(name)
+        && crate::schema::SchemaProfile::is_known_field(
+            LAKE_PROFILE.get_or_init(crate::schema::OcsfProfile::lake_1_9),
+            name,
+        )
+    {
+        return Some(other);
+    }
+    (name != field && other.is_some()).then_some(other)
+}
+
+/// SQL semantics for a column-to-column comparison: NULL on either side never
+/// matches; two numbers compare numerically; text compares case-insensitively
+/// for `=`/`!=` and lexicographically for ordering.
+fn compare_row_columns(
+    left: Option<&serde_json::Value>,
+    op: &Comparator,
+    right: Option<&serde_json::Value>,
+) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return false;
+    };
+    let number = |value: &serde_json::Value| match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    if let (Some(l), Some(r)) = (number(left), number(right)) {
+        return match op {
+            Comparator::Eq => l == r,
+            Comparator::Ne => l != r,
+            Comparator::Lt => l < r,
+            Comparator::Lte => l <= r,
+            Comparator::Gt => l > r,
+            Comparator::Gte => l >= r,
+            _ => false,
+        };
+    }
+    let (Some(l), Some(r)) = (json_to_haystack(left), json_to_haystack(right)) else {
+        return false;
+    };
+    let (l, r) = (l.to_lowercase(), r.to_lowercase());
+    match op {
+        Comparator::Eq => l == r,
+        Comparator::Ne => l != r,
+        Comparator::Lt => l < r,
+        Comparator::Lte => l <= r,
+        Comparator::Gt => l > r,
+        Comparator::Gte => l >= r,
+        _ => false,
+    }
+}
+
 pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Value) -> bool {
     match condition {
         SearchExpr::FieldFilter {
-            field, op, value, ..
+            field, op, value, rhs,
         } => {
             // Use get_nested_value to support dot-notation for nested fields like _prevalence.hash.artifact
             let row_value = get_nested_value(row, field);
+
+            // NAN-4287: `| where a = b` with a bare `b` naming a column is a
+            // field-to-field comparison here too, as the SQL path compiles it
+            // (NAN-4286). A dotted schema path is always a column (absent →
+            // NULL → no match); a flat name is a column when the row carries
+            // it (an upstream eval/stats output). Ambiguous flat names are
+            // rejected by validation before execution.
+            if let Some(other) = field_reference_operand(row, field, op, value, *rhs) {
+                return compare_row_columns(row_value, op, other);
+            }
 
             // Debug logging for prevalence field filtering
             if field == "host_count" || field == "is_rare" || field.starts_with("_prevalence") {
@@ -108,6 +212,16 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
                     "evaluate_condition_on_json: field={}, row_value={:?}, target_value={:?}, op={:?}",
                     field, row_value, value, op
                 );
+            }
+
+            // NAN-4285: `ip=10.0.0.0/8` / `ip!=…` is network membership, as
+            // the SQL path emits; `!=` only matches a row carrying an IP.
+            if let (Value::String(cidr), Comparator::Eq | Comparator::Ne) = (value, op) {
+                if cidr.contains('/') {
+                    if let Some(ip) = row_ip(row_value) {
+                        return ip_in_cidr(ip, cidr) == matches!(op, Comparator::Eq);
+                    }
+                }
             }
 
             // NAN-2361: `Value::Regex` had NO arm here, so it fell through to
@@ -428,7 +542,19 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
         } => {
             // Use get_nested_value to support dot-notation for nested fields
             let row_value = get_nested_value(row, field);
+            // NAN-4285: a CIDR entry is network membership; `NOT IN` with one
+            // only matches a row carrying the field, as the SQL path does.
+            let has_cidr = values.iter().any(|v| matches!(v, Value::String(t) if t.contains('/')));
+            if has_cidr && *negated && row_value.and_then(|v| v.as_str()).is_none_or(str::is_empty) {
+                return false;
+            }
+            let ip = has_cidr.then(|| row_ip(row_value)).flatten();
             let matches = values.iter().any(|v| match (row_value, v) {
+                (Some(serde_json::Value::String(_)), Value::String(target))
+                    if target.contains('/') =>
+                {
+                    ip.is_some_and(|ip| ip_in_cidr(ip, target))
+                }
                 (Some(serde_json::Value::String(s)), Value::String(target)) => s == target,
                 (Some(serde_json::Value::Number(n)), Value::Number(target)) => n
                     .as_f64()
@@ -647,6 +773,20 @@ pub fn evaluate_expression_on_json(
                     // Handle numeric addition
                     if let (Some(l), Some(r)) = (left_val.as_f64(), right_val.as_f64()) {
                         return Some(serde_json::json!(l + r));
+                    }
+                    // NAN-4303: a string operand concatenates (`"a" + "b"`).
+                    if left_val.is_string() || right_val.is_string() {
+                        let text = |v: &serde_json::Value| match v {
+                            serde_json::Value::String(s) => Some(s.clone()),
+                            serde_json::Value::Number(n) => Some(n.to_string()),
+                            serde_json::Value::Bool(b) => Some(b.to_string()),
+                            _ => None,
+                        };
+                        return Some(serde_json::Value::String(format!(
+                            "{}{}",
+                            text(&left_val)?,
+                            text(&right_val)?
+                        )));
                     }
                     None
                 }
@@ -932,5 +1072,113 @@ mod nan3080_datetime_overflow_tests {
         assert!(shift_datetime(now, f64::NAN).is_none());
         assert!(shift_datetime(now, f64::NEG_INFINITY).is_none());
         assert_eq!(shift_datetime(now, -86_400.0), Some(now - chrono::Duration::days(1)));
+    }
+}
+
+/// NAN-4285: Nano-side `| where` (after `| prevalence` / `| risk`) treats a
+/// CIDR in an IN-list or `=`/`!=` as network membership, like the SQL path.
+#[cfg(test)]
+mod nan4285_cidr_tests {
+    use super::evaluate_condition_on_json;
+    use crate::query::{Comparator, RhsSyntax, SearchExpr, Value};
+    use serde_json::json;
+
+    fn list(values: &[&str], negated: bool) -> SearchExpr {
+        SearchExpr::InList {
+            field: "dst_endpoint.ip".into(),
+            values: values.iter().map(|v| Value::String(v.to_string())).collect(),
+            negated,
+        }
+    }
+
+    #[test]
+    fn cidr_entries_are_network_membership() {
+        let row = |ip: &str| json!({"dst_endpoint": {"ip": ip}});
+        let private = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+        assert!(evaluate_condition_on_json(&list(&private, false), &row("10.1.2.3")));
+        assert!(!evaluate_condition_on_json(&list(&private, false), &row("8.8.8.8")));
+        assert!(evaluate_condition_on_json(&list(&private, true), &row("8.8.8.8")));
+        assert!(!evaluate_condition_on_json(&list(&private, true), &row("192.168.4.4")));
+        // Mixed exact + CIDR, IPv6.
+        let mixed = ["8.8.8.8", "fe80::/10"];
+        assert!(evaluate_condition_on_json(&list(&mixed, false), &row("8.8.8.8")));
+        assert!(evaluate_condition_on_json(&list(&mixed, false), &row("fe80::1")));
+        assert!(!evaluate_condition_on_json(&list(&mixed, false), &row("2001:db8::1")));
+        assert!(!evaluate_condition_on_json(&list(&mixed, false), &row("10.0.0.1")));
+        // NOT IN with a CIDR needs the field, as the SQL path does.
+        assert!(!evaluate_condition_on_json(&list(&private, true), &json!({"other": 1})));
+        assert!(!evaluate_condition_on_json(&list(&private, true), &row("")));
+        // `=` / `!=`.
+        let eq = |op: Comparator| SearchExpr::FieldFilter {
+            field: "dst_endpoint.ip".into(), op, value: Value::String("10.0.0.0/8".into()), rhs: RhsSyntax::Literal,
+        };
+        assert!(evaluate_condition_on_json(&eq(Comparator::Eq), &row("10.9.9.9")));
+        assert!(!evaluate_condition_on_json(&eq(Comparator::Eq), &row("11.0.0.1")));
+        assert!(evaluate_condition_on_json(&eq(Comparator::Ne), &row("11.0.0.1")));
+        assert!(!evaluate_condition_on_json(&eq(Comparator::Ne), &row("10.9.9.9")));
+    }
+}
+
+/// NAN-4287: Nano-side `| where` (after `| lookup` / `| prevalence`) compares
+/// two columns when the bare RHS names one, as the SQL path does (NAN-4286).
+#[cfg(test)]
+mod nan4287_field_reference_tests {
+    use super::evaluate_condition_on_json;
+    use crate::query::{Comparator, RhsSyntax, SearchExpr, Value};
+    use serde_json::json;
+
+    fn filter(field: &str, op: Comparator, rhs: &str, syntax: RhsSyntax) -> SearchExpr {
+        SearchExpr::FieldFilter {
+            field: field.into(),
+            op,
+            value: Value::String(rhs.into()),
+            rhs: syntax,
+        }
+    }
+
+    #[test]
+    fn bare_rhs_naming_a_column_compares_columns() {
+        let same = json!({"src_endpoint": {"ip": "10.0.0.1"}, "dst_endpoint": {"ip": "10.0.0.1"}, "c": 404, "code": 404, "len": 500});
+        let differ = json!({"src_endpoint": {"ip": "10.0.0.1"}, "dst_endpoint": {"ip": "10.0.0.2"}, "c": 404, "code": 200, "len": 100});
+        let eq = filter("src_endpoint.ip", Comparator::Eq, "dst_endpoint.ip", RhsSyntax::Bareword);
+        assert!(evaluate_condition_on_json(&eq, &same));
+        assert!(!evaluate_condition_on_json(&eq, &differ));
+        let ne = filter("src_endpoint.ip", Comparator::Ne, "dst_endpoint.ip", RhsSyntax::Bareword);
+        assert!(evaluate_condition_on_json(&ne, &differ));
+        // A dotted reference the row lacks is NULL: neither = nor != matches.
+        let missing = json!({"src_endpoint": {"ip": "10.0.0.1"}});
+        assert!(!evaluate_condition_on_json(&eq, &missing));
+        assert!(!evaluate_condition_on_json(&ne, &missing));
+        // A dotted value that is not a schema path stays literal.
+        let domain = json!({"query": {"hostname": "example.com"}});
+        assert!(evaluate_condition_on_json(
+            &filter("query.hostname", Comparator::Eq, "example.com", RhsSyntax::Bareword),
+            &domain
+        ));
+        // Self-comparison of a schema path.
+        let me = filter("src_endpoint.ip", Comparator::Eq, "src_endpoint.ip", RhsSyntax::Bareword);
+        assert!(evaluate_condition_on_json(&me, &differ));
+        // Flat computed columns, numeric and ordering.
+        let c = filter("code", Comparator::Eq, "c", RhsSyntax::Bareword);
+        assert!(evaluate_condition_on_json(&c, &same));
+        assert!(!evaluate_condition_on_json(&c, &differ));
+        let gt = filter("len", Comparator::Gt, "code", RhsSyntax::Bareword);
+        assert!(evaluate_condition_on_json(&gt, &same));
+        assert!(!evaluate_condition_on_json(&gt, &differ));
+    }
+
+    #[test]
+    fn quoted_or_unknown_rhs_stays_a_literal() {
+        let row = json!({"status": "c", "c": "other"});
+        // Quoted: the literal text, even though a column `c` exists.
+        assert!(evaluate_condition_on_json(&filter("status", Comparator::Eq, "c", RhsSyntax::Literal), &row));
+        // Bare but no such column: the literal text.
+        assert!(evaluate_condition_on_json(
+            &filter("status", Comparator::Ne, "success", RhsSyntax::Bareword),
+            &row
+        ));
+        // A flat self-comparison keeps its literal reading.
+        let user = json!({"user": "user"});
+        assert!(evaluate_condition_on_json(&filter("user", Comparator::Eq, "user", RhsSyntax::Bareword), &user));
     }
 }

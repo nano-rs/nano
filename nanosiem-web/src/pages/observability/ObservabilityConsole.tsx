@@ -175,8 +175,12 @@ export function ObservabilityConsole() {
         {tab === 'rum' && <RumTab {...tabProps} />}
         {tab === 'synthetics' && (
           <>
-            {unavailable && (
-              <TelemetryUnavailableNotice telemetry={telemetry} subject="Synthetic checks" />
+            {telemetry && (
+              <TelemetryUnavailableNotice telemetry={unavailable ? telemetry : {
+                ...telemetry,
+                reason: 'synthetic_runner_disabled',
+                detail: 'Hosted synthetic probes are disabled. Checks are saved definitions and do not produce uptime results.',
+              }} subject="Synthetic checks" />
             )}
             <SyntheticsTab {...tabProps} />
           </>

@@ -128,10 +128,12 @@ pub struct ResultPage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResultManifest {
-    #[serde(default)]
-    pub enrichment_authority: Option<String>,
-    #[serde(default)]
-    pub enrichment_expiry: Option<i64>,
+    /// NAN-4168: read-time enrichment authority was removed. Manifests
+    /// written before it may carry these; they are accepted and ignored.
+    #[serde(default, rename = "enrichment_authority", skip_serializing)]
+    pub legacy_enrichment_authority: Option<String>,
+    #[serde(default, rename = "enrichment_expiry", skip_serializing)]
+    pub legacy_enrichment_expiry: Option<i64>,
     pub schema_version: u64,
     pub job_id: String,
     pub attempt_id: String,
@@ -404,14 +406,12 @@ pub async fn commit_result(
     result: MaterializedJobResult,
 ) -> Result<ResultArtifactRef> {
     spec.validate()?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     let staged = stage_result(spec, result)?;
     let reference = if result_root.starts_with("s3://") {
         commit_s3(result_root, spec, staged).await?
     } else {
         commit_local(result_root, spec, staged)?
     };
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     Ok(reference)
 }
 
@@ -427,7 +427,6 @@ pub async fn commit_parquet_result(
     execution: ResultExecutionMetadata,
 ) -> Result<ResultArtifactRef> {
     spec.validate()?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     let staged = stage_parquet_result(
         spec,
         parquet_path,
@@ -442,7 +441,6 @@ pub async fn commit_parquet_result(
     } else {
         commit_local(result_root, spec, staged)?
     };
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     Ok(reference)
 }
 
@@ -460,7 +458,6 @@ pub async fn commit_bounded_parquet_result(
     execution: ResultExecutionMetadata,
 ) -> Result<ResultArtifactRef> {
     spec.validate()?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     if row_offset != spec.request.offset
         || max_rows == 0
         || max_rows > spec.request.limit
@@ -482,7 +479,6 @@ pub async fn commit_bounded_parquet_result(
     } else {
         commit_local(result_root, spec, staged)?
     };
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     Ok(reference)
 }
 
@@ -502,7 +498,6 @@ pub async fn commit_bounded_parquet_result_to(
     execution: ResultExecutionMetadata,
 ) -> Result<ResultArtifactRef> {
     spec.validate()?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     if row_offset != spec.request.offset
         || max_rows == 0
         || max_rows > spec.request.limit
@@ -522,7 +517,6 @@ pub async fn commit_bounded_parquet_result_to(
     )?;
     let prefix = join_object_prefix(root_prefix, &artifact_prefix(spec));
     let reference = write_staged_s3(operator, bucket, &prefix, spec, &staged).await?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     Ok(reference)
 }
 
@@ -536,12 +530,10 @@ pub async fn commit_result_to(
     result: MaterializedJobResult,
 ) -> Result<ResultArtifactRef> {
     spec.validate()?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     let (bucket, root_prefix) = parse_s3_root(result_root)?;
     let staged = stage_result(spec, result)?;
     let prefix = join_object_prefix(root_prefix, &artifact_prefix(spec));
     let reference = write_staged_s3(operator, bucket, &prefix, spec, &staged).await?;
-    crate::enrichment_read::validate_return(&spec.tenant_id).await?;
     Ok(reference)
 }
 
@@ -757,9 +749,9 @@ fn result_manifest(
     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let query_sha256 = sha256(spec.request.query.as_bytes());
     Ok(ResultManifest {
-        enrichment_authority: Some(crate::enrichment_read::current_for_tenant(&spec.tenant_id).cache_identity()),
-        // Legacy manifest field; new results use dispatch-snapshot masking.
-        enrichment_expiry: None,
+        legacy_enrichment_authority: None,
+        // Not written since NAN-4168 (no read-time enrichment authority).
+        legacy_enrichment_expiry: None,
         schema_version: RESULT_MANIFEST_SCHEMA_VERSION,
         job_id: spec.job_id.clone(),
         attempt_id: spec.attempt_id.clone(),
@@ -1129,21 +1121,12 @@ pub fn read_local_manifest(reference: &ResultArtifactRef) -> Result<ResultManife
     Ok(manifest)
 }
 
-fn validate_result_enrichment(manifest: &ResultManifest, authority: &nanosiem_core::platform_enrichment::read::ReadAuthorization) -> Result<()> {
-    if manifest.enrichment_authority.as_ref().is_some_and(|identity| identity != &authority.cache_identity())
-        || manifest.enrichment_expiry.is_some_and(|expiry| expiry <= Utc::now().timestamp_micros()) {
-        bail!("stored result enrichment authorization expired or changed");
-    }
-    Ok(())
-}
-
 pub async fn read_result_page(
     reference: &ResultArtifactRef,
     expected_job_id: &str,
     expected_tenant_id: &str,
     page: usize,
 ) -> Result<ResultPage> {
-    let authority = crate::enrichment_read::resolve(expected_tenant_id).await;
     let (manifest, part_bytes) = if let Some(path) = reference.manifest_uri.strip_prefix("file://")
     {
         let manifest_bytes = std::fs::read(path)?;
@@ -1153,7 +1136,6 @@ pub async fn read_result_page(
             expected_tenant_id,
             &manifest_bytes,
         )?;
-        validate_result_enrichment(&manifest, &authority)?;
         let part = manifest
             .parts
             .get(page)
@@ -1166,11 +1148,11 @@ pub async fn read_result_page(
     } else if reference.manifest_uri.starts_with("s3://") {
         let (bucket, _) = parse_s3_root(&reference.manifest_uri)?;
         let operator = result_s3_operator(bucket)?;
-        read_s3_manifest_and_page(&operator, reference, expected_job_id, expected_tenant_id, page, &authority).await?
+        read_s3_manifest_and_page(&operator, reference, expected_job_id, expected_tenant_id, page).await?
     } else {
         bail!("result manifest URI uses an unsupported scheme");
     };
-    decode_result_page(manifest, part_bytes, page, &authority)
+    decode_result_page(manifest, part_bytes, page)
 }
 
 /// One page of a result in `bucket`, read with an explicitly granted
@@ -1188,10 +1170,9 @@ pub async fn read_result_page_from(
     if manifest_bucket != bucket {
         bail!("result manifest is outside the granted result bucket");
     }
-    let authority = crate::enrichment_read::resolve(expected_tenant_id).await;
     let (manifest, part_bytes) =
-        read_s3_manifest_and_page(operator, reference, expected_job_id, expected_tenant_id, page, &authority).await?;
-    decode_result_page(manifest, part_bytes, page, &authority)
+        read_s3_manifest_and_page(operator, reference, expected_job_id, expected_tenant_id, page).await?;
+    decode_result_page(manifest, part_bytes, page)
 }
 
 async fn read_s3_manifest_and_page(
@@ -1200,7 +1181,6 @@ async fn read_s3_manifest_and_page(
     expected_job_id: &str,
     expected_tenant_id: &str,
     page: usize,
-    authority: &nanosiem_core::platform_enrichment::read::ReadAuthorization,
 ) -> Result<(ResultManifest, Vec<u8>)> {
     let (_, manifest_key) = parse_s3_root(&reference.manifest_uri)?;
     if manifest_key.is_empty() || !manifest_key.ends_with("/manifest.json") {
@@ -1213,7 +1193,6 @@ async fn read_s3_manifest_and_page(
         expected_tenant_id,
         &manifest_bytes,
     )?;
-    validate_result_enrichment(&manifest, authority)?;
     let part = manifest
         .parts
         .get(page)
@@ -1232,7 +1211,6 @@ fn decode_result_page(
     manifest: ResultManifest,
     part_bytes: Vec<u8>,
     page: usize,
-    authority: &nanosiem_core::platform_enrichment::read::ReadAuthorization,
 ) -> Result<ResultPage> {
     let part = manifest
         .parts
@@ -1261,7 +1239,6 @@ fn decode_result_page(
         .map(serde_json::from_str)
         .collect::<std::result::Result<Vec<Value>, _>>()?;
     restore_dynamic_json_columns(&mut rows, &manifest.json_columns)?;
-    validate_result_enrichment(&manifest, authority)?;
     let row_offset = manifest.parts[..page]
         .iter()
         .try_fold(0_u64, |total, part| total.checked_add(part.rows))

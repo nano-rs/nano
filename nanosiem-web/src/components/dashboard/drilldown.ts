@@ -262,7 +262,7 @@ export function buildSearchUrl(
     params.set('end', opts.endTime);
   }
 
-  return `/search?${params.toString()}`;
+  return `/search#${params.toString()}`;
 }
 
 export default {

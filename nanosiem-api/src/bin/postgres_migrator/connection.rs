@@ -4,7 +4,7 @@
 //! shell-composed URL, command arguments, or a serializable configuration.
 
 use anyhow::{bail, ensure, Context, Result};
-use nanosiem_core::db::Database;
+use nanosiem_core::db::{pool::DatabaseError, Database};
 use sqlx::{
     postgres::{PgConnectOptions, PgSslMode},
     ConnectOptions, PgPool,
@@ -111,7 +111,10 @@ impl MigrationConnection {
             "migration credential and CA paths must be absolute"
         );
         ensure!(
-            valid_host(&host) && valid_login_user(&user, &host, port) && valid_identifier(&database) && port > 0,
+            valid_host(&host)
+                && valid_login_user(&user, &host, port)
+                && valid_identifier(&database)
+                && port > 0,
             "invalid file-backed migration database identity"
         );
         Ok(Self::PrivateFile(PrivateFileConnection {
@@ -127,11 +130,14 @@ impl MigrationConnection {
 
     pub async fn connect(self) -> Result<PgPool> {
         match self {
-            Self::LegacyUrl(url) => Ok(Database::connect(&url)
-                .await
-                .context("connecting to PostgreSQL for migrations")?
-                .pool()
-                .clone()),
+            Self::LegacyUrl(url) => Ok(connect_legacy_with_retry(
+                || Database::connect(&url),
+                tokio::time::sleep,
+            )
+            .await
+            .context("connecting to PostgreSQL for migrations")?
+            .pool()
+            .clone()),
             Self::PrivateFile(config) => {
                 let password =
                     read_private_password(&config.password_file, &config.secret_root).await?;
@@ -155,6 +161,177 @@ impl MigrationConnection {
     }
 }
 
+// A fresh Job can reach DNS before its egress policy reaches the node. Retry
+// only connection transport failures, before the caller can run migration SQL.
+// Authentication, TLS, configuration and database errors remain immediate failures.
+async fn connect_legacy_with_retry<T, F, Fut, S, Sleep>(
+    mut connect: F,
+    mut sleep: S,
+) -> std::result::Result<T, DatabaseError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, DatabaseError>>,
+    S: FnMut(Duration) -> Sleep,
+    Sleep: std::future::Future<Output = ()>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt = 1;
+    loop {
+        match connect().await {
+            Ok(connection) => return Ok(connection),
+            Err(error) if attempt < MAX_ATTEMPTS && retryable_connection_error(&error) => {
+                let delay = Duration::from_secs(2 * u64::from(attempt));
+                // No URL, credentials, or raw error text in retry diagnostics.
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    retry_delay_secs = delay.as_secs(),
+                    "Migration database transport unavailable before SQL; retrying connection"
+                );
+                sleep(delay).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retryable_connection_error(error: &DatabaseError) -> bool {
+    let DatabaseError::ConnectionError(error) = error else {
+        return false;
+    };
+    match error {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Io(error) => {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::AddrNotAvailable
+            ) || error.to_string().starts_with(
+                "failed to lookup address information: Temporary failure in name resolution",
+            )
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod connection_retry_tests {
+    use super::*;
+    use std::{collections::VecDeque, future::ready, io};
+
+    fn transport() -> DatabaseError {
+        sqlx::Error::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "temporary transport failure",
+        ))
+        .into()
+    }
+
+    #[test]
+    fn temporary_dns_retries_but_permanent_lookup_failure_does_not() {
+        let dns =
+            |message| DatabaseError::ConnectionError(sqlx::Error::Io(io::Error::other(message)));
+        assert!(retryable_connection_error(&dns(
+            "failed to lookup address information: Temporary failure in name resolution"
+        )));
+        assert!(!retryable_connection_error(&dns(
+            "failed to lookup address information: Name or service not known"
+        )));
+    }
+
+    #[tokio::test]
+    async fn recovers_before_sql_with_bounded_backoff() {
+        let mut results = VecDeque::from([Err(transport()), Err(transport()), Ok(())]);
+        let mut delays = Vec::new();
+        connect_legacy_with_retry(
+            || ready(results.pop_front().unwrap()),
+            |delay| {
+                delays.push(delay);
+                ready(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(delays, [Duration::from_secs(2), Duration::from_secs(4)]);
+    }
+
+    #[tokio::test]
+    async fn transport_exhaustion_returns_the_last_error() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let result: std::result::Result<(), _> = connect_legacy_with_retry(
+            || {
+                attempts += 1;
+                ready(Err(transport()))
+            },
+            |delay| {
+                delays.push(delay);
+                ready(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DatabaseError::ConnectionError(sqlx::Error::Io(_)))
+        ));
+        assert_eq!(attempts, 3);
+        assert_eq!(delays.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pool_connection_timeout_can_recover() {
+        let mut results = VecDeque::from([
+            Err(DatabaseError::ConnectionError(sqlx::Error::PoolTimedOut)),
+            Ok(()),
+        ]);
+        connect_legacy_with_retry(|| ready(results.pop_front().unwrap()), |_| ready(()))
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_transport_errors_never_retry() {
+        for error in [
+            DatabaseError::ConnectionError(sqlx::Error::Tls(Box::new(io::Error::other(
+                "invalid certificate",
+            )))),
+            DatabaseError::ConnectionError(sqlx::Error::Configuration(Box::new(io::Error::other(
+                "invalid configuration",
+            )))),
+            DatabaseError::ConnectionError(sqlx::Error::Protocol("authentication failure".into())),
+            DatabaseError::ConnectionError(sqlx::Error::Io(io::Error::from(
+                io::ErrorKind::PermissionDenied,
+            ))),
+            DatabaseError::ConnectionError(sqlx::Error::Io(io::Error::from(
+                io::ErrorKind::NotFound,
+            ))),
+            DatabaseError::HealthCheckError("not a connection failure".into()),
+        ] {
+            let mut error = Some(error);
+            let mut delays = Vec::new();
+            let result: std::result::Result<(), _> = connect_legacy_with_retry(
+                || ready(Err(error.take().expect("fatal error must not retry"))),
+                |delay| {
+                    delays.push(delay);
+                    ready(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(delays.is_empty());
+        }
+    }
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
@@ -174,7 +351,9 @@ fn valid_login_user(value: &str, host: &str, port: u16) -> bool {
     };
     valid_identifier(role)
         && (8..=64).contains(&branch.len())
-        && branch.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && branch
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         && (host.ends_with(".horizon.psdb.cloud") || host.ends_with(".pg.psdb.cloud"))
         && port == 5432
 }
@@ -341,7 +520,12 @@ mod tests {
             panic!("expected private-file connection");
         };
         assert_eq!(parsed.user, "postgres.testbranch123");
-        for user in ["postgres.", "postgres.short", "postgres.branch.with.dot", "postgres.branch_bad"] {
+        for user in [
+            "postgres.",
+            "postgres.short",
+            "postgres.branch.with.dot",
+            "postgres.branch_bad",
+        ] {
             values.insert(FILE_FIELDS[2], user.to_owned());
             assert!(parse(&values).is_err());
         }

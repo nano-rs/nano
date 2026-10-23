@@ -57,7 +57,7 @@ fn metrics_timechart_split_by_does_not_force_global_gap_fill() {
 fn rollup_reads_rollup_table_and_passes_state_columns() {
     let sql = roll(r#"metric_name="x" | stats avg(value) by service_name"#);
     assert!(sql.contains("FROM otel_metrics_1m"), "{sql}");
-    assert!(sql.contains("minute BETWEEN"), "{sql}");
+    assert!(sql.contains("minute >= "), "{sql}");
     // SELECT * so the pre-aggregated state columns flow to the aggregation stage.
     assert!(sql.contains("SELECT * FROM otel_metrics_1m"), "{sql}");
 }
@@ -87,7 +87,7 @@ fn raw_path_unaffected_by_rollup_helpers() {
 fn metrics_target_table_and_time_column() {
     let sql = m(r#"metric_name="x""#);
     assert!(sql.contains("FROM otel_metrics"), "{sql}");
-    assert!(sql.contains("timestamp BETWEEN"), "{sql}");
+    assert!(sql.contains("timestamp >= "), "{sql}");
 }
 
 #[test]

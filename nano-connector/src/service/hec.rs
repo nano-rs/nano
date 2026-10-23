@@ -19,6 +19,12 @@
 //! - 429 / 5xx / 408 / connect errors: back off (honoring `Retry-After`) and
 //!   retry the same bytes; when the retry budget is spent, fail without
 //!   a receipt so the cursor does not move. Other 4xx fail at once.
+//! - 401 / 403 (NAN-3660): the ingress no longer accepts the feed's
+//!   credential (revoked, unknown, or not bound to the feed's source). The
+//!   run fails with a [`CREDENTIAL_REVOKED`] / [`CREDENTIAL_REJECTED`]
+//!   error, the runner backs off ([`CREDENTIAL_REFUSED_RETRY_SECS`]) and
+//!   never re-enrolls on its own: only the explicit rotate operation issues
+//!   a new credential, so a tenant's revoke is never silently undone.
 //! - `Idempotency-Key` = a hash of the feed id and the batch bytes. A retry
 //!   of a batch that was in fact accepted replays its first receipt instead
 //!   of storing it twice. A re-run after a crash re-sends identical bytes
@@ -37,6 +43,42 @@ use super::feed::Secret;
 use crate::engine::Sink;
 
 const HEC_EVENT_PATH: &str = "/services/collector/event";
+
+/// NAN-3660: error code of a run whose credential the ingress refused with
+/// HTTP 401 (revoked or unknown token).
+pub const CREDENTIAL_REVOKED: &str = "credential_revoked";
+/// NAN-3660: error code of a run whose credential the ingress refused with
+/// HTTP 403 (valid token, not authorized for the feed's source).
+pub const CREDENTIAL_REJECTED: &str = "credential_rejected";
+/// NAN-3660: how long a feed whose credential was refused waits before it
+/// tries again (one batch). It does not hot-loop against the ingress; the
+/// rotate operation makes it due at once.
+pub const CREDENTIAL_REFUSED_RETRY_SECS: i64 = 3600;
+
+/// NAN-3660: the operator-facing error for an ingress auth refusal, or
+/// `None` for any other status. `class` is the ingress's
+/// `x-nano-error-class` (never a credential).
+pub fn credential_refusal(status: u16, class: &str) -> Option<String> {
+    match status {
+        401 => Some(format!(
+            "{CREDENTIAL_REVOKED}: the ingest endpoint no longer accepts this feed's credential (HTTP 401, {class}); rotate the feed credential"
+        )),
+        403 => Some(format!(
+            "{CREDENTIAL_REJECTED}: the feed's credential is not authorized for its source (HTTP 403, {class}); rotate the feed credential"
+        )),
+        _ => None,
+    }
+}
+
+/// NAN-3660: the credential refusal inside a run error (the engine prefixes
+/// sink errors), starting at its code.
+pub fn credential_refusal_in(error: &str) -> Option<&str> {
+    [CREDENTIAL_REVOKED, CREDENTIAL_REJECTED]
+        .iter()
+        .filter_map(|code| error.find(&format!("{code}: ")))
+        .min()
+        .map(|at| &error[at..])
+}
 
 #[derive(Debug, Clone)]
 pub struct HecConfig {
@@ -184,6 +226,9 @@ impl HecSink {
                     .json(&json!({"acks": [id]})).send().await
                     .map_err(|_| "Vector HEC acknowledgement request failed")?;
                 if !response.status().is_success() {
+                    if let Some(refusal) = credential_refusal(response.status().as_u16(), "ack") {
+                        return Err(refusal);
+                    }
                     return Err("Vector HEC acknowledgement refused".to_string());
                 }
                 let body: Value = response.json().await.map_err(|_| "Invalid Vector HEC acknowledgement")?;
@@ -256,6 +301,9 @@ impl HecSink {
                         return Ok(());
                     }
                     let class = class.unwrap_or_else(|| "-".into());
+                    if let Some(refusal) = credential_refusal(status, &class) {
+                        return Err(refusal);
+                    }
                     if !(status == 429 || status == 408 || status >= 500) {
                         // Error bodies come from fixed tables (never echo
                         // credentials), but keep only the class.
@@ -378,6 +426,20 @@ pub fn hec_endpoint(ingest_url: &str, allow_http: bool) -> Result<url::Url, HecE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_refusals_name_the_credential() {
+        let revoked = credential_refusal(401, "-").unwrap();
+        assert!(revoked.starts_with("credential_revoked: "), "{revoked}");
+        assert!(revoked.ends_with("rotate the feed credential"));
+        assert!(credential_refusal(403, "-").unwrap().starts_with("credential_rejected: "));
+        for status in [400, 404, 413, 429, 500, 503] {
+            assert_eq!(credential_refusal(status, "-"), None, "{status}");
+        }
+        let wrapped = format!("sink: {revoked}");
+        assert_eq!(credential_refusal_in(&wrapped), Some(revoked.as_str()));
+        assert_eq!(credential_refusal_in("sink: ingest refused the batch: HTTP 400 (-)"), None);
+    }
 
     #[test]
     fn endpoint_rules() {

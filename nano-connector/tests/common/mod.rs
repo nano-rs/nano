@@ -18,7 +18,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use nano_connector::auth::Credentials;
-use nano_connector::broker::{BrokerConfig, Dialer, Resolver};
+use nano_connector::broker::{BrokerConfig, DialTarget, Dialer, Resolver};
 use nano_connector::engine::{self, EngineConfig, MemorySink, MemoryStore, RunInput, RunOutput};
 use nano_connector::sandbox::{Enforce, SandboxPolicy};
 use nano_connector::spec::ConnectorSpec;
@@ -353,8 +353,8 @@ pub struct MockDialer {
 
 #[async_trait::async_trait]
 impl Dialer for MockDialer {
-    async fn dial(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
-        self.dialed.lock().unwrap().push(addr);
+    async fn dial(&self, target: DialTarget<'_>) -> std::io::Result<TcpStream> {
+        self.dialed.lock().unwrap().push(target.addr);
         TcpStream::connect(("127.0.0.1", self.port)).await
     }
 }

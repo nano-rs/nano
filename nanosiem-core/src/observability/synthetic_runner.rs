@@ -31,6 +31,7 @@
 //! the failing→healthy edge. Both re-arm and recovery are decided from the
 //! persisted `alerts` table, so they survive a restart / leader failover.
 
+use crate::telemetry::ObservedRequestBuilderExt;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
@@ -123,7 +124,7 @@ impl SyntheticLakeStore {
             .post(self.otlp_metrics_url.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
             .body(body)
-            .send()
+            .send_observed()
             .await?
             .error_for_status()?;
         Ok(())
@@ -412,7 +413,7 @@ impl SyntheticRunner {
                 }
                 Ok(client) => {
                     let started = std::time::Instant::now();
-                    let sent = client.get(&check.target_url).timeout(timeout).send().await;
+                    let sent = client.get(&check.target_url).timeout(timeout).send_observed().await;
                     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
                     match sent {
                         Ok(resp) => (resp.status().as_u16(), String::new(), latency_ms),

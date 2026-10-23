@@ -420,6 +420,56 @@ fn bare_command_diagnostic(input: &str) -> Option<BareCommandDiagnostic> {
     None
 }
 
+/// NAN-4372: the `prevalence` positional shorthand refuses filter field names
+/// and `threshold=` (both used to be silent pass-throughs). Name the filter
+/// syntax instead of the generic "Unexpected token".
+fn prevalence_diagnostic(
+    input: &str,
+    position: usize,
+) -> Option<(String, Vec<String>, Vec<ErrorSuggestion>)> {
+    let stage = input.get(..position)?.rsplit('|').next()?.trim_start();
+    if !stage.get(..10)?.eq_ignore_ascii_case("prevalence") {
+        return None;
+    }
+    let rest = input.get(position..)?;
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if super::commands_security::is_prevalence_filter_field_name(&word) {
+        let word = word.to_ascii_lowercase();
+        let (example, threshold_kind) = if word.ends_with("_first_seen") {
+            (format!("prevalence {word} > now() - 24h"), "`now() - <duration>`")
+        } else {
+            (format!("prevalence {word} < 5"), "a host count")
+        };
+        return Some((
+            format!(
+                "`{word}` is a prevalence filter and needs a comparison against {threshold_kind}, \
+                 e.g. `{example}`"
+            ),
+            vec!["<op> <threshold>".to_string()],
+            vec![ErrorSuggestion {
+                description: format!("filter on {word}"),
+                replacement: example,
+            }],
+        ));
+    }
+    if rest.get(..10).is_some_and(|head| head.eq_ignore_ascii_case("threshold=")) {
+        return Some((
+            "`prevalence <field> threshold=…` is not supported (it never filtered). Enrich and \
+             filter on the decorated columns instead, e.g. `prevalence <field> | where is_rare=true`"
+                .to_string(),
+            vec!["end of stage".to_string()],
+            vec![ErrorSuggestion {
+                description: "keep only rare artifacts".to_string(),
+                replacement: "| where is_rare=true".to_string(),
+            }],
+        ));
+    }
+    None
+}
+
 fn escaped_double_quote_diagnostic(
     input: &str,
     position: usize,
@@ -475,6 +525,10 @@ fn analyze_error_context(
             vec!["a single-quoted string: '…'".to_string()],
             escape_suggestions,
         );
+    }
+
+    if let Some(diagnostic) = prevalence_diagnostic(input, position) {
+        return diagnostic;
     }
 
     // Default message

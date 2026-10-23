@@ -82,6 +82,7 @@ export type ServiceHealth = 'good' | 'warn' | 'bad';
 
 /** One row in the Services overview (RED aggregate per service_name). */
 export interface ServiceSummary {
+  workload?: 'background' | 'interactive';
   service: string;
   request_count: number;
   /** Requests per second over the window. */
@@ -212,6 +213,18 @@ export type HostStatus = 'good' | 'warn' | 'bad';
 
 /** One host row in the Infrastructure waffle (latest per-metric snapshot). */
 export interface InfraHost {
+  kind?: 'node' | 'pod' | '';
+  node_name?: string;
+  pod_name?: string;
+  namespace?: string;
+  workload?: string;
+  phase?: string;
+  cluster?: string;
+  region?: string;
+  instance_type?: string;
+  cpu_cores?: number | null;
+  mem_bytes?: number | null;
+  restarts?: number | null;
   host: string;
   group: string | null;
   /** CPU utilization percent (0..100), or null when unreported. */
@@ -222,7 +235,7 @@ export interface InfraHost {
   load: number | null;
   /** Network throughput in bytes/sec, or null when unreported. */
   net_bytes_per_sec: number | null;
-  status: HostStatus;
+  status: HostStatus | 'unknown';
 }
 
 export interface InfraHostsResponse {
@@ -442,9 +455,15 @@ export class ObservabilityApi {
     ) => Promise<MetricTimeseriesV2Response>,
     private listMetricTagsImpl: (
       metricName: string,
-      key?: string
+      key?: string,
+      timeRange?: TimeRange
     ) => Promise<MetricTagsResponse>
   ) {}
+
+  /** Best-effort, credential-free browser relay; the server validates categories. */
+  async recordBrowserPageview(page: string): Promise<void> {
+    return this.request('/api/observability/browser', { method: 'POST', body: JSON.stringify({ page, duration_ms: 0 }) });
+  }
 
   // --- Telemetry availability (NAN-2361, shared-lake tenants) ---
 
@@ -660,8 +679,8 @@ export class ObservabilityApi {
   }
 
   /** Distinct tag keys (no `key`) or values for one key — NAN-1540. */
-  listMetricTags(metricName: string, key?: string): Promise<MetricTagsResponse> {
-    return this.listMetricTagsImpl(metricName, key);
+  listMetricTags(metricName: string, key?: string, timeRange?: TimeRange): Promise<MetricTagsResponse> {
+    return this.listMetricTagsImpl(metricName, key, timeRange);
   }
 
   // --- Metric monitors — main api service (NAN-1540) ---

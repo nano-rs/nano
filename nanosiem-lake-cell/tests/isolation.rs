@@ -985,6 +985,7 @@ async fn suite() {
     purge_phase(&mnt, &mut r).await;
     detect_refused_phase(&mnt, &mut r).await;
     detect_runs_rules_phase(&mnt, &mut r).await;
+    birth_preconditions_phase(&mnt, &mut r).await;
 
     r.finish();
 }
@@ -1138,6 +1139,103 @@ async fn detect_refused_phase(mnt: &Path, r: &mut Report) {
     let st = cell.status().await;
     let blocked = Cell::tenant_status(&st, "juliet")["role_spawn_blocked"].clone();
     r.check("refused detect: block cleared after a successful spawn", blocked.as_array().is_some_and(|a| a.is_empty()), compact(&blocked));
+    cell.sup.shutdown_all();
+    cell.sup.halt();
+}
+
+/// The control plane at a lean birth: ingest mints answer `503
+/// lean_assignment_pending` (Retry-After 1) until the first assignment
+/// commits after `pending` refusals; every other role mints at once.
+struct FirstAssignment {
+    inner: StaticKeySource,
+    pending: u64,
+    ingest_mints: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl nanosiem_lake_cell::secrets::KeySource for FirstAssignment {
+    async fn mint(&self, tenant: &TenantId, role: Role) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+        use std::sync::atomic::Ordering;
+        if role == Role::Ingest && self.ingest_mints.fetch_add(1, Ordering::SeqCst) < self.pending {
+            return Err(nanosiem_lake_cell::secrets::MintRefused::from_response(
+                tenant, role, 503, br#"{"error":"lean_assignment_pending"}"#, Some(Duration::from_secs(1))).into());
+        }
+        self.inner.mint(tenant, role).await
+    }
+}
+
+/// NAN-4314: a birth as it happens on every lean region. The placement
+/// lands before the tenant's enrichment policy (the bundle sidecar writes
+/// it on its next cycle) and before the first lean assignment commits
+/// (ingest's token is `lean_assignment_pending` once). Resident ingest and
+/// query start together. Both must start on their first attempt: no
+/// "spawn failed" (enrichment mounts ENOENT, cgroup EEXIST, refused token),
+/// no role_spawn_blocked, and each waits for its precondition instead.
+async fn birth_preconditions_phase(mnt: &Path, r: &mut Report) {
+    use std::sync::atomic::Ordering;
+    let mut cfg = config(mnt, "cell-b", CgroupPolicy::Off, 60);
+    cfg.uid_base = 59_000;
+    cfg.uid_slots = 100;
+    cfg.query_resident = true;
+    let bundles = mnt.join("feeds/bundles");
+    std::fs::create_dir_all(&bundles).unwrap();
+    std::fs::set_permissions(&bundles, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cfg.platform_bundle_dir = Some(bundles);
+    let policy_root = mnt.join("policy-b");
+    std::fs::create_dir_all(&policy_root).unwrap();
+    std::fs::set_permissions(&policy_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A platform policy is only placed for a UUID tenant.
+    const HOTEL: &str = "6f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00";
+    let t = tid(HOTEL);
+    let policy = policy_root.join(HOTEL).join("policy.json");
+    let mut placed = TenantPlacement::legacy(t.clone(), 20.0);
+    placed.ingest = IngestMode::Resident;
+    placed.platform_policy_file = Some(policy.clone());
+
+    let mut inner = StaticKeySource::default();
+    for role in Role::ALL {
+        inner = inner.with(&t, role, &secret(HOTEL, role));
+    }
+    let keys = Arc::new(FirstAssignment { inner, pending: 1, ingest_mints: 0.into() });
+    let sup = Supervisor::new(cfg.clone(), keys.clone()).expect("supervisor");
+    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants: vec![placed] }).unwrap();
+    sup.start_background();
+    let router = Router::new(sup.clone()).unwrap();
+    let sock = cfg.listen_unix.clone().unwrap();
+    let l = tokio::net::UnixListener::bind(&sock).unwrap();
+    tokio::spawn(router::serve_unix(router, l));
+    let cell = Cell { sock, sup };
+
+    // The sidecar's next cycle: the policy lands 1.5 s after the placement.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let early = cell.status().await;
+    r.check("birth: nothing spawned (or failed) before the policy lands",
+        Cell::tenant_status(&early, HOTEL)["processes"].as_array().is_some_and(|p| p.is_empty())
+            && early["spawn_failures"] == 0, compact(&early["spawn_failures"]));
+    std::fs::create_dir_all(policy.parent().unwrap()).unwrap();
+    std::fs::set_permissions(policy.parent().unwrap(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&policy, b"{}").unwrap();
+    std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let t0 = Instant::now();
+    let mut st = cell.status().await;
+    while (Cell::pid_of(&st, HOTEL, "ingest").is_none() || Cell::pid_of(&st, HOTEL, "query").is_none())
+        && t0.elapsed() < Duration::from_secs(20)
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        st = cell.status().await;
+    }
+    let hotel = Cell::tenant_status(&st, HOTEL);
+    r.check("birth: resident ingest and query both start once their preconditions land",
+        Cell::pid_of(&st, HOTEL, "ingest").is_some() && Cell::pid_of(&st, HOTEL, "query").is_some(),
+        format!("after {:?}: {}", t0.elapsed(), compact(&hotel["processes"])));
+    r.check("birth: no spawn failed (no ENOENT/EEXIST/refused-token retries)", st["spawn_failures"] == 0,
+        compact(&st["spawn_failures"]));
+    r.check("birth: the pending assignment was waited out inside the spawn, not blocked",
+        hotel["role_spawn_blocked"].as_array().is_some_and(|a| a.is_empty()) && keys.ingest_mints.load(Ordering::SeqCst) == 2,
+        format!("{} ingest mints, blocked {}", keys.ingest_mints.load(Ordering::SeqCst), compact(&hotel["role_spawn_blocked"])));
+    r.check("birth: each role started on its first attempt",
+        hotel["crashes"]["ingest"] == 0 && hotel["crashes"]["query"] == 0, compact(&hotel["crashes"]));
     cell.sup.shutdown_all();
     cell.sup.halt();
 }

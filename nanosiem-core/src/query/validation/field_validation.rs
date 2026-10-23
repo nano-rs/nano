@@ -837,8 +837,14 @@ fn validate_command_fields(
             }
         }
         Command::Mvexpand { field, .. } => {
+            // NAN-4279 (F13): an array-of-objects root (`enrichments`) expands
+            // its parallel leaf arrays together (see the Mvexpand codegen).
+            let is_object_root =
+                || profile.is_some_and(|p| !p.object_root_leaves(field).is_empty());
             if let Err(err) = is_valid_field(field, derived, profile) {
-                errors.push(err);
+                if !is_object_root() {
+                    errors.push(err);
+                }
             }
         }
         Command::Spath { input, output, .. } => {

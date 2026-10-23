@@ -2,6 +2,10 @@
 
 //! NAN-3770: named, revocable per-sender ingest tokens (open core / dedicated).
 //!
+//! OTLP/HTTP authenticates current database state through nginx auth_request;
+//! its verified identity headers are captured by the internal Vector listener.
+//! Raw OTLP ports have no host publication.
+//!
 //! An admin issues one token per sender. The value is returned once and never
 //! stored: PostgreSQL keeps its SHA-256 and a display prefix
 //! (`migrations/postgres/358_ingest_tokens.sql`). [`IngestTokenService`]
@@ -46,7 +50,7 @@ pub use file::{
     render_tokens_file, write_tokens_file, TokenFileEntry, DEFAULT_TOKENS_FILE,
     PLATFORM_PULL_ROUTE,
 };
-pub use repository::{IngestTokenRepository, IngestTokenRepositoryError};
+pub use repository::{BindableSourceCredential, IngestTokenRepository, IngestTokenRepositoryError};
 pub use service::{IngestTokenService, IngestTokenServiceError};
 pub use usage::{parse_credential_request_counts, CREDENTIAL_REQUESTS_METRIC};
 
@@ -80,15 +84,13 @@ const PLATFORM_PULL_DOMAIN: &str = "nanosiem.platform-pull-ingest.v1";
 pub const PLATFORM_PULL_MARKER: &str = "npp_";
 
 /// Log source transports a token can be bound to: the push lanes (HTTP ingest,
-/// HEC, Vector-native, and every routed label). OTLP and the fetch transports
+/// HEC, OTLP, Vector-native, and every routed label). The fetch transports
 /// (Kafka, S3/SQS, Pub/Sub, Event Hubs) never receive pushed events.
 /// Mirrors `parsers::vector_config::router::transport_of`.
 pub fn is_push_capable(source_type: &str) -> bool {
     !matches!(
         source_type,
-        "opentelemetry"
-            | "otlp"
-            | "kafka"
+        "kafka"
             | "aws_s3"
             | "aws_sqs"
             | "s3"
@@ -298,10 +300,12 @@ mod tests {
 
     #[test]
     fn push_capable_transports() {
-        for st in ["routed", "splunk_hec", "vector", "apache_access", "http"] {
+        for st in [
+            "routed", "splunk_hec", "vector", "apache_access", "http", "otlp", "opentelemetry",
+        ] {
             assert!(is_push_capable(st), "{st}");
         }
-        for st in ["otlp", "opentelemetry", "kafka", "aws_s3", "s3", "gcp_pubsub", "azure_event_hubs"] {
+        for st in ["kafka", "aws_s3", "s3", "gcp_pubsub", "azure_event_hubs"] {
             assert!(!is_push_capable(st), "{st}");
         }
     }

@@ -86,6 +86,8 @@ import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import { Markdown } from '@/components/ui/markdown';
 import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { useMelodStatus } from '@/hooks/use-api';
+import { useCapabilities } from '@/hooks/use-capabilities';
+import { useParserSidePanelTabs, type SidePanelTabId } from '@/components/log-sources/parserSidePanelTabs';
 import type { CollectorError, MelodEditParserResponse } from '@/lib/api';
 import { Send } from 'lucide-react';
 import { PivtIcon } from '@/components/icons/PivtIcon';
@@ -713,7 +715,7 @@ export function LogSourceDetail() {
           onClone={() => navigate(`/ingestion/log-sources/new?clone=${logSource.id}`)}
           onViewLogs={() =>
             navigate(
-              `/search?q=${encodeURIComponent(`${searchSourceField}=${effectiveSourceType(logSource)}`)}`,
+              `/search#q=${encodeURIComponent(`${searchSourceField}=${effectiveSourceType(logSource)}`)}`,
             )
           }
         />
@@ -2165,6 +2167,7 @@ function VrlEditorTab({
   onUndo: () => void;
   onAiVrlUpdate: (info: VrlUpdateInfo) => void;
 }) {
+  const sidePanel = useParserSidePanelTabs(sidePanelTab);
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Toolbar */}
@@ -2267,13 +2270,9 @@ function VrlEditorTab({
         {/* Side panel */}
         <div className="flex flex-col min-h-0 bg-card/40">
           <div className="shrink-0 flex items-center gap-1 px-3 py-1.5 border-b border-border">
-            {([
-              { id: 'ai', label: 'pivt', Icon: PivtIcon },
-              { id: 'test', label: 'Test events', Icon: Play },
-              { id: 'diag', label: 'Diagnostics', Icon: AlertTriangle },
-            ] as const).map((t) => {
+            {sidePanel.tabs.map((t) => {
               const Icon = t.Icon;
-              const isActive = sidePanelTab === t.id;
+              const isActive = sidePanel.active === t.id;
               return (
                 <button
                   key={t.id}
@@ -2294,18 +2293,20 @@ function VrlEditorTab({
             {/* Each panel mounts unconditionally so chat history and test-event state
                 survive tab switches; we toggle visibility via `hidden` instead of
                 conditional rendering to avoid losing scroll/typing state. */}
-            <div className={cn('h-full', sidePanelTab === 'ai' ? 'block' : 'hidden')}>
-              <LogSourceAiPanel
-                parserId={source.id}
-                sourceName={source.name}
-                sourceType={effectiveSourceType(source)}
-                currentVrl={currentVrl}
-                onVrlUpdate={onAiVrlUpdate}
-                onUndo={onUndo}
-                canUndo={vrlHistory.length > 0}
-              />
-            </div>
-            <div className={cn('h-full overflow-auto', sidePanelTab === 'test' ? 'block' : 'hidden')}>
+            {sidePanel.aiAvailable && (
+              <div className={cn('h-full', sidePanel.active === 'ai' ? 'block' : 'hidden')}>
+                <LogSourceAiPanel
+                  parserId={source.id}
+                  sourceName={source.name}
+                  sourceType={effectiveSourceType(source)}
+                  currentVrl={currentVrl}
+                  onVrlUpdate={onAiVrlUpdate}
+                  onUndo={onUndo}
+                  canUndo={vrlHistory.length > 0}
+                />
+              </div>
+            )}
+            <div className={cn('h-full overflow-auto', sidePanel.active === 'test' ? 'block' : 'hidden')}>
               <ParserTestLab
                 logSourceId={source.id}
                 vrlCode={editedVrl || source.parser_vrl}
@@ -2313,7 +2314,7 @@ function VrlEditorTab({
                 currentDeployedVrl={source.parser_vrl}
               />
             </div>
-            <div className={cn('h-full overflow-auto', sidePanelTab === 'diag' ? 'block' : 'hidden')}>
+            <div className={cn('h-full overflow-auto', sidePanel.active === 'diag' ? 'block' : 'hidden')}>
               <DiagnosticsPanel result={validationResult} />
             </div>
           </div>
@@ -2976,7 +2977,7 @@ const AI_QUICK_ACTIONS = [
 // rounded-md cards). Uses the same useMelodJob + api.melodEditParser plumbing as the
 // shared ParserEditChat, but renders without the Card chrome and at the smaller text
 // scale called for in design-ref/shadcn/log-source-vrl.jsx (AIAssistPanel, lines 294+).
-function LogSourceAiPanel({
+export function LogSourceAiPanel({
   parserId,
   sourceName,
   sourceType,
@@ -3012,7 +3013,9 @@ function LogSourceAiPanel({
   const searchSourceField = activeSchema?.schema === 'ocsf'
     ? 'metadata.log_source'
     : 'source_type';
-  const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus();
+  // NAN-4132: no AI capability → no ai-availability probe (fail closed).
+  const melodCapable = useCapabilities().capabilities.melod === true;
+  const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus({ skip: !melodCapable });
   const editParserJob = useMelodJob<MelodEditParserResponse>();
   const loading = editParserJob.loading;
   const rawPassThrough = mode === 'parser' && isRawPassThroughVrl(currentVrl);
@@ -3150,7 +3153,7 @@ function LogSourceAiPanel({
       </div>
     );
   }
-  if (!melodStatus?.connected) {
+  if (!melodCapable || !melodStatus?.connected) {
     return (
       <div className="flex flex-col items-center justify-center h-full p-4 text-center">
         <PivtIcon className="w-6 h-6 text-muted-foreground mb-2" />
@@ -3421,7 +3424,8 @@ function ExtensionTab({
   const initialExt = source.extension_vrl ?? '';
   const [editedExt, setEditedExt] = useState(initialExt);
   const [enabled, setEnabled] = useState<boolean>(source.extension_enabled ?? false);
-  const [sidePanelTab, setSidePanelTab] = useState<'ai' | 'test' | 'diag'>('test');
+  const [sidePanelTab, setSidePanelTab] = useState<SidePanelTabId>('test');
+  const sidePanel = useParserSidePanelTabs(sidePanelTab);
   const [validationResult, setValidationResult] = useState<ValidationResult>(null);
   const [validating, setValidating] = useState(false);
   const [validatedJustNow, setValidatedJustNow] = useState(false);
@@ -3560,13 +3564,9 @@ function ExtensionTab({
           <ResizablePanel id="extension-side-panel" defaultSize="42%" minSize="22%">
             <div className="flex flex-col min-h-0 h-full bg-card/40">
               <div className="shrink-0 flex items-center gap-1 px-3 py-1.5 border-b border-border">
-                {([
-                  { id: 'ai', label: 'pivt', Icon: PivtIcon },
-                  { id: 'test', label: 'Test events', Icon: Play },
-                  { id: 'diag', label: 'Diagnostics', Icon: AlertTriangle },
-                ] as const).map((t) => {
+                {sidePanel.tabs.map((t) => {
                   const Icon = t.Icon;
-                  const isActive = sidePanelTab === t.id;
+                  const isActive = sidePanel.active === t.id;
                   return (
                     <button
                       key={t.id}
@@ -3585,18 +3585,20 @@ function ExtensionTab({
               </div>
               <div className="flex-1 min-h-0 overflow-hidden">
                 {/* Each panel mounts unconditionally so chat/test state survives tab switches. */}
-                <div className={cn('h-full', sidePanelTab === 'ai' ? 'block' : 'hidden')}>
-                  <LogSourceAiPanel
-                    parserId={source.id}
-                    sourceName={source.name}
-                    sourceType={effectiveSourceType(source)}
-                    currentVrl={editedExt}
-                    mode="extension"
-                    baseParserVrl={source.parser_vrl}
-                    onVrlUpdate={(info) => setEditedExt(info.newVrl)}
-                  />
-                </div>
-                <div className={cn('h-full overflow-auto', sidePanelTab === 'test' ? 'block' : 'hidden')}>
+                {sidePanel.aiAvailable && (
+                  <div className={cn('h-full', sidePanel.active === 'ai' ? 'block' : 'hidden')}>
+                    <LogSourceAiPanel
+                      parserId={source.id}
+                      sourceName={source.name}
+                      sourceType={effectiveSourceType(source)}
+                      currentVrl={editedExt}
+                      mode="extension"
+                      baseParserVrl={source.parser_vrl}
+                      onVrlUpdate={(info) => setEditedExt(info.newVrl)}
+                    />
+                  </div>
+                )}
+                <div className={cn('h-full overflow-auto', sidePanel.active === 'test' ? 'block' : 'hidden')}>
                   <ParserTestLab
                     logSourceId={source.id}
                     vrlCode={source.parser_vrl}
@@ -3604,7 +3606,7 @@ function ExtensionTab({
                     extensionVrl={editedExt}
                   />
                 </div>
-                <div className={cn('h-full overflow-auto', sidePanelTab === 'diag' ? 'block' : 'hidden')}>
+                <div className={cn('h-full overflow-auto', sidePanel.active === 'diag' ? 'block' : 'hidden')}>
                   <DiagnosticsPanel result={validationResult} />
                 </div>
               </div>

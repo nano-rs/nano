@@ -5,7 +5,6 @@
 ))]
 // SPDX-License-Identifier: AGPL-3.0-or-later
 use chrono::{Duration, Utc};
-use nanosiem_core::platform_enrichment::read::ReadAuthorization;
 use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference};
 
 use nanosiem_lake_worker::native::NativeChdb;
@@ -171,28 +170,6 @@ fn free_adapters_native_stored_selectors_refresh_and_correlation() {
     .unwrap();
     std::mem::forget(runtime.clone());
     let connection = runtime.connect(&[]).unwrap();
-    let mut revisions = Vec::new();
-    for feed in ["tor_exit_nodes", "threatfox"] {
-        for rev in [1, 2] {
-            revisions.push(AuthorizedRevision {
-                tenant_id: Uuid::from_u128(1),
-                reference: RevisionReference {
-                    feed_id: feed.into(),
-                    feed_revision: rev,
-                    tier: "included".into(),
-                    grant_revision: 1,
-                    entitlement_revision: 1,
-                },
-                class: FeedClass::Baseline,
-                digest: "ab".repeat(32),
-                mapping_revision: 1,
-                deny_epoch: 0,
-                valid_until: now + Duration::hours(1),
-                evaluated_at: now,
-            });
-        }
-    }
-    let authority = ReadAuthorization::from_resolved(Uuid::from_u128(1), now, &revisions);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.jsonl");
     let parquet = dir.path().join("events.parquet");
@@ -285,10 +262,7 @@ fn free_adapters_native_stored_selectors_refresh_and_correlation() {
     ] {
         let compiled = compile(query, &fields).unwrap();
         assert!(!compiled.sql.contains("JOIN"));
-        let plan = rt.block_on(nanosiem_lake_worker::enrichment_read::scope(
-            authority.clone(),
-            async { plan_broad_log_query(&tenant, &manifest, &compiled).unwrap() },
-        ));
+        let plan = rt.block_on(async { plan_broad_log_query(&tenant, &manifest, &compiled).unwrap() });
         let params = plan
             .params
             .iter()
@@ -301,10 +275,7 @@ fn free_adapters_native_stored_selectors_refresh_and_correlation() {
         assert_eq!(row["count"], expected, "{query}: {row}");
     }
     let compiled = compile("* | stats count by src_is_tor", &fields).unwrap();
-    let plan = rt.block_on(nanosiem_lake_worker::enrichment_read::scope(
-        authority.clone(),
-        async { plan_broad_log_query(&tenant, &manifest, &compiled).unwrap() },
-    ));
+    let plan = rt.block_on(async { plan_broad_log_query(&tenant, &manifest, &compiled).unwrap() });
     let params = plan
         .params
         .iter()

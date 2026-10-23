@@ -370,6 +370,32 @@ async fn main() -> Result<()> {
         tracing::info!("Demo session cleanup task started (15m interval)");
     }
 
+    // NAN-4152: per-tenant demo sessions on the shared stack. Every replica
+    // may run it: each session is retired in its own signed tenant
+    // transaction that claims the row with SKIP LOCKED.
+    #[cfg(feature = "enterprise")]
+    if config.deployment_mode.is_enterprise_shared() {
+        if let Some(runtime) = state.tenant_ai_rls_runtime.as_ref() {
+            let demo = runtime.demo_runtime();
+            let control = state.pool.clone();
+            let shutdown = state.shutdown_token();
+            let shared_demo_handle = tokio::spawn(async move {
+                let cleanup = async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(900));
+                    loop {
+                        interval.tick().await;
+                        nanosiem_enterprise::handlers::shared_demo_sessions::run_demo_cleanup_tick(&demo, &control).await;
+                    }
+                };
+                let _ = shutdown.run_until_cancelled(cleanup).await;
+            });
+            state.add_task_handle(shared_demo_handle).await;
+            tracing::info!("Shared demo session cleanup task started (15m interval)");
+        } else {
+            tracing::warn!("Shared demo session cleanup not started: no signed tenant runtime");
+        }
+    }
+
     // NAN-3492: rule windows, lake pages and finding reads free large JSON trees
     // back to glibc, not to the kernel; without a trim the cgroup keeps the
     // peak charged and the next burst stacks on it (nano-search does the same).

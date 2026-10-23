@@ -572,26 +572,12 @@ pub fn full_event_locator_enabled() -> bool {
     crate::perf_overrides::probe_flag("full_event_locator", std::env::var("NANO_LAKE_FULL_EVENT_LOCATOR").map_or(true, |value| value != "0"))
 }
 
-/// A path whose value an enrichment authorization mask can rewrite: its
-/// predicate is not decided by the raw producer column alone. Independent of
-/// the request's scalar-mask proof (a locator is planned before it exists).
-fn mask_dependent_path(path: &str) -> bool {
-    path.starts_with("enrichments")
-        || matches!(path, "src_endpoint" | "dst_endpoint")
-        || ["src_endpoint.", "dst_endpoint."].iter().any(|root| {
-            path.strip_prefix(root).is_some_and(|leaf| {
-                leaf.starts_with("location") || leaf.starts_with("autonomous_system")
-            })
-        })
-}
-
 /// NAN-3221: the narrow locator of a full-event newest-first page
 /// (`SELECT * FROM src WHERE p ORDER BY time DESC, uid DESC LIMIT n`).
 ///
 /// Such a page used to be read in one full-width statement: every root of
 /// every row of every kept row group, decoded under the bounded payload
-/// settings (one thread, 128-row blocks) with the enrichment masks applied,
-/// only to keep `n` rows. A needle (an entity and a keyword that each occur
+/// settings (one thread, 128-row blocks), only to keep `n` rows. A needle (an entity and a keyword that each occur
 /// in every row group, together in a few hundred rows an hour) spent 4–6 s
 /// there. The locator reads only the columns `p` names, returns the instants
 /// of the page's rows, and the full-width statement then reads exactly those
@@ -599,12 +585,10 @@ fn mask_dependent_path(path: &str) -> bool {
 ///
 /// Exactness: the locator applies the compiled predicate `p` unchanged to
 /// the same rows, and keeps every row tied at its last instant (the payload
-/// re-applies `p`, the uid tie key and the limit). It is refused when `p`
-/// names a field whose value an authorization mask can change (endpoint
-/// location/AS leaves, endpoint roots, enrichments): there the full-event
-/// statement evaluates the masked value, which the narrow projection does
-/// not reproduce by construction. It is also refused for any order other
-/// than the compiler's event order, any nested statement or pipeline stage.
+/// re-applies `p`, the uid tie key and the limit). Stored enrichment is read
+/// as plain columns (NAN-4168), so every field reads the same in both
+/// passes. It is refused for any order other than the compiler's event
+/// order, any nested statement or pipeline stage.
 pub fn full_event_locator(compiled: &CompiledQuery) -> Option<CompiledQuery> {
     if compiled.table_view
         || !compiled.newest_first_event_rows
@@ -624,7 +608,7 @@ pub fn full_event_locator(compiled: &CompiledQuery) -> Option<CompiledQuery> {
         || compiled
             .required_columns
             .iter()
-            .any(|column| mask_dependent_path(&column.name) || validate_path(&column.name).is_err())
+            .any(|column| validate_path(&column.name).is_err())
     {
         return None;
     }
@@ -771,6 +755,54 @@ pub struct ReaderShape {
     /// Fingerprint of the projected scan columns (one per statement shape
     /// of a query: a stats statement and its companions differ).
     pub columns_key: u64,
+    /// NAN-4174: the statement groups by a string column other than a
+    /// known low-cardinality label ([`groups_by_string`]).
+    pub string_group_by: bool,
+}
+
+/// NAN-4174: string columns whose GROUP BY stays small whatever the window
+/// (enumerated labels), so they never route a statement to the large lane.
+const LOW_CARDINALITY_GROUP_COLUMNS: [&str; 10] = [
+    "metadata.log_source", "metadata.product.name", "metadata.product.vendor_name", "class_name",
+    "category_name", "activity_name", "type_name", "severity", "status", "disposition",
+];
+
+/// NAN-4174: whether `compiled` groups by a `string` required column (a
+/// quoted identifier inside a `GROUP BY` clause) that is not a known
+/// low-cardinality label. A routing hint only: a miss runs where it always
+/// did, a false hit starts on the large lane.
+pub fn groups_by_string(compiled: &CompiledQuery) -> bool {
+    static GROUP_BY: std::sync::OnceLock<[regex::Regex; 3]> = std::sync::OnceLock::new();
+    let [group_by, clause_end, identifier] = GROUP_BY.get_or_init(|| [
+        regex::Regex::new(r"(?i)\bGROUP\s+BY\b").expect("static regex"),
+        regex::Regex::new(r"(?i)\b(?:ORDER\s+BY|LIMIT|HAVING|SETTINGS|UNION|WITH\s+(?:TOTALS|ROLLUP|CUBE)|FORMAT)\b").expect("static regex"),
+        regex::Regex::new(r#""([^"]+)"|`([^`]+)`"#).expect("static regex"),
+    ]);
+    let strings = compiled.required_columns.iter()
+        .filter(|column| column.field_type == "string" && !LOW_CARDINALITY_GROUP_COLUMNS.contains(&column.name.as_str()))
+        .map(|column| column.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if strings.is_empty() {
+        return false;
+    }
+    group_by.find_iter(&compiled.sql).any(|found| {
+        let rest = &compiled.sql[found.end()..];
+        // The clause ends at the subquery's closing parenthesis ...
+        let mut depth = 0_i32;
+        let end = rest.char_indices().find(|(_, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            depth < 0
+        }).map_or(rest.len(), |(index, _)| index);
+        // ... or at the next clause.
+        let clause = &rest[..clause_end.find(&rest[..end]).map_or(end, |next| next.start())];
+        identifier.captures_iter(clause)
+            .filter_map(|captures| captures.get(1).or_else(|| captures.get(2)))
+            .any(|name| strings.contains(name.as_str()))
+    })
 }
 
 /// The free-text leaves whose decoded width dominates a statement's reader
@@ -782,9 +814,7 @@ pub const WIDE_TEXT_COLUMNS: [&str; 2] = ["message", "raw_data"];
 pub fn reader_shape(compiled: &CompiledQuery, manifest: &SourceManifest, candidates: Option<&[CandidateBlock]>) -> ReaderShape {
     let columns = &compiled.projected_scan_columns;
     let text = columns.iter().filter(|column| WIDE_TEXT_COLUMNS.contains(&column.as_str())).count() as u64;
-    // Only an explicit `enrichments` projection: masked entity leaves
-    // (`src_endpoint.ip`, ...) also read the array, but bounding every
-    // entity pivot's reader would slow the common case for no measured gain.
+    // Only an explicit `enrichments` projection reads the array.
     let enrichments = columns.iter().any(|column| column == "enrichments" || column.starts_with("enrichments."));
     let row_groups = match candidates {
         Some(blocks) => blocks.len() as u64,
@@ -804,6 +834,7 @@ pub fn reader_shape(compiled: &CompiledQuery, manifest: &SourceManifest, candida
         row_groups,
         window_class: hours.next_power_of_two().trailing_zeros() as u8,
         columns_key: u64::from_be_bytes(digest[..8].try_into().expect("sha256 prefix")),
+        string_group_by: groups_by_string(compiled),
     }
 }
 
@@ -1079,9 +1110,6 @@ pub fn plan_count_aggregate_query(
         request.end_exclusive_us,
         if request.group_by_source { "\0by-source" } else { "" },
     )));
-    if sql.contains("{nano_enrichment_authority:String}") {
-        params.push(("nano_enrichment_authority".into(), crate::enrichment_read::current().sql_control_metadata()));
-    }
     Ok(Some(NativeQueryPlan {
         query_sha256,
         sql,
@@ -1719,7 +1747,6 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
     // columns than the wrapper form did: measured byte-identical to a
     // hand-written direct query (26,336,313 bytes) where the merge-filter
     // workaround read 59,643,344.
-    // Bound producer-only timeline scans before evaluating display-only masks.
     // The compiler's table view is a flat 25-column SELECT, not SELECT *.
     let page_clause = table_view_page_clause(compiled);
     let page_roots = page_clause.as_ref().map(|_| {
@@ -1727,12 +1754,6 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
         let available_roots = roots_for_available_paths(available_paths.iter().map(String::as_str));
         roots.retain(|root| available_roots.contains(root));
         roots.insert("time".into());
-        if available_roots.contains("enrichments")
-            && required.keys().any(|path| crate::enrichment_read::needs_row_mask(path)
-                || matches!(path.as_str(), "src_endpoint" | "dst_endpoint"))
-        {
-            roots.insert("enrichments".into());
-        }
         roots.iter().map(|root| quoted_identifier(root)).collect::<Result<Vec<_>>>()
             .map(|roots| roots.join(", "))
     }).transpose()?;
@@ -1747,32 +1768,11 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
             Some(required_root_projection(&required, &available_paths)?)
         } else if tail.is_some_and(|tail| !tail.objects.is_empty() && tail.read_schema.is_some()) {
             Some(root_projection_for_paths(available_paths.iter().map(String::as_str))?)
-        } else if !available_paths.iter().any(|p| p == "enrichments" || p.starts_with("enrichments.")) {
-            None
-        } else if manifest.objects.is_empty() {
-            Some(root_projection_for_paths(available_paths.iter().map(String::as_str))?)
         } else {
-            Some(generation_root_projection(manifest, candidates)?)
+            None
         }
     } else {
-        Some(projected_columns_sql_masked(&required, &missing,
-            available_paths.iter().any(|p| p == "enrichments" || p.starts_with("enrichments.")))?)
-    };
-    // NAN-3052: full-event rows read their producer-only endpoint leaves in
-    // the read select itself, from the physical Tuple, not from the masked
-    // root above it (see [`raw_endpoint_leaves`]).
-    let raw_leaves = match (&page_roots, &leaf_projection) {
-        (None, Some(projection)) if native_event_rows && !compiled.table_view && projection_masks_endpoints(projection) =>
-            raw_endpoint_leaves(&compiled.sql, &required, &missing)?,
-        _ => BTreeMap::new(),
-    };
-    let leaf_projection = match leaf_projection {
-        Some(projection) if !raw_leaves.is_empty() => Some(format!(
-            "{}, {projection}",
-            raw_leaves.iter().map(|(name, alias)| Ok(format!("{} AS {alias}", nested_expression(name)?)))
-                .collect::<Result<Vec<_>>>()?.join(", ")
-        )),
-        other => other,
+        Some(projected_columns_sql(&required, &missing)?)
     };
     let (source, base_params, base_overlap) =
         base_snapshot_source_for_window(&source_tenant, object_time_window)?;
@@ -1787,7 +1787,7 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
             .cloned()
             .collect::<Vec<_>>()
     });
-    let (source, mut candidate_params, budget, source_is_path_fenced) =
+    let (source, candidate_params, budget, source_is_path_fenced) =
         match scoped_candidates.as_deref() {
             Some(candidates) => {
                 let (source, params, budget) = candidate_source(
@@ -1836,29 +1836,7 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
     } else {
         let guard = base_window_guard(base_overlap);
         let projection = leaf_projection.as_deref().unwrap_or("*");
-        let split = match (&leaf_projection, &page_roots) {
-            (Some(projection), None)
-                if !native_event_rows
-                    && base_overlap == BaseWindowOverlap::Possible
-                    // A whole endpoint root is rebuilt as a Tuple whose shape
-                    // the branches need not share; leaves only.
-                    && !required.keys().any(|path| matches!(path.as_str(), "src_endpoint" | "dst_endpoint"))
-                    && tail.is_none_or(|tail| tail.objects.is_empty()) =>
-            {
-                split_clean_base(
-                    &source_tenant,
-                    &source,
-                    guard,
-                    object_time_window,
-                    projection,
-                    &mut candidate_params,
-                    || projected_columns_sql_masked(&required, &missing,
-                        available_paths.iter().any(|p| p == "enrichments" || p.starts_with("enrichments."))),
-                )?
-            }
-            _ => None,
-        };
-        split.unwrap_or_else(|| format!("(SELECT {projection} FROM {source} WHERE {guard})"))
+        format!("(SELECT {projection} FROM {source} WHERE {guard})")
     };
     let bound_page = |source: String| -> Result<String> {
         match (&page_clause, &page_roots) {
@@ -1974,33 +1952,12 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
         _ => (guarded_base, Vec::new(), None, leaf_projection.is_some()),
     };
     let guarded_source = if page_clause.is_some() {
-        // Share the permission/ownership reduction across the displayed
-        // leaves. Keep the raw root scan and its producer predicate pushdown;
-        // permissions are evaluated only after each arm's top-K.
-        let page_has_enrichments = available_paths.iter().any(|p| p == "enrichments" || p.starts_with("enrichments."))
-            && required.keys().any(|path| !missing.contains_key(path) && crate::enrichment_read::needs_row_mask(path));
-        // A union can retain K rows from each arm. Select the global page
-        // before computing permissions so at most K lookahead rows are masked.
-        let guarded_source = if page_has_enrichments && tail_objects_considered > 0 {
-            bound_page(guarded_source)?
-        } else {
-            guarded_source
-        };
-        let guarded_source = if page_has_enrichments {
-            projected_source_sql(&guarded_source, &format!("*, {} AS __nano_page_denied_fields",
-                crate::enrichment_read::denied_owned_fields(&crate::enrichment_read::current())))
-        } else {
-            guarded_source
-        };
+        // Keep the raw root scan and its producer predicate pushdown; the
+        // displayed leaves are projected after each arm's top-K.
         let projection = required.keys().map(|name| {
             let quoted = quoted_identifier(name)?;
             let expression = if let Some(kind) = missing.get(name) {
                 missing_expression(name, kind)?.to_string()
-            } else if crate::enrichment_read::scalar_leaf_null(name) {
-                // Proven NULL on every row (checked before the raw-leaf arms).
-                crate::enrichment_read::leaf_expression(name, &crate::enrichment_read::current())
-            } else if page_has_enrichments && crate::enrichment_read::sensitive(name) {
-                format!("if(has(__nano_page_denied_fields, '{name}'), NULL, {})", nested_expression(name)?)
             } else if name.starts_with("src_endpoint.") || name.starts_with("dst_endpoint.") {
                 nested_expression(name)?
             } else {
@@ -2068,7 +2025,7 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
         });
     }
     let (mut replacement, aliases) = if native_event_rows {
-        native_event_source_with(&compiled.sql, &guarded_source, &required, &missing, &raw_leaves)?
+        native_event_source(&compiled.sql, &guarded_source, &required, &missing)?
     } else if source_is_projected {
         (guarded_source, BTreeMap::new())
     } else {
@@ -2159,9 +2116,6 @@ fn plan_broad_log_query_with_candidates_tail_time_and_budget(
         if let Some(flat) = flat_scalar_leaves(&sql, &mut params, &required) {
             sql = flat;
         }
-    }
-    if sql.contains("{nano_enrichment_authority:String}") {
-        params.push(("nano_enrichment_authority".into(), crate::enrichment_read::current().sql_control_metadata()));
     }
     Ok(NativeQueryPlan {
         query_sha256: compiled.query_sha256.clone(),
@@ -2346,8 +2300,8 @@ pub(crate) fn flat_filter_leaves_enabled() -> bool {
 /// every other expression binds unchanged. Only the exact leaf projection
 /// `` `a`.`b` AS `a.b` `` is rewritten to `` `a.b` AS `a.b` ``. Declines (`None`,
 /// plan unchanged) when any Parquet source lacks an explicit read schema, or
-/// when schemas disagree on the leaf's type. Mask roots ([`WHOLE_READ_ROOTS`])
-/// and array/map leaves are never flattened.
+/// when schemas disagree on the leaf's type. Array/map leaves are never
+/// flattened.
 fn flat_scalar_leaves(
     sql: &str,
     params: &mut [(String, String)],
@@ -2372,10 +2326,6 @@ fn flat_scalar_leaves(
     let mut changed = false;
     for path in required.keys() {
         if is_row_identity_column(path) || path.contains(".^") || !path.contains('.') {
-            continue;
-        }
-        let Some((root, _)) = path.split_once('.') else { continue };
-        if WHOLE_READ_ROOTS.contains(&root) {
             continue;
         }
         let (Ok(nested), Ok(flat)) = (nested_projection(path), quoted_identifier(path)) else { continue };
@@ -2457,18 +2407,13 @@ fn scalar_leaf_type(schema: &str, path: &str) -> Option<LeafType> {
     scalar.then(|| LeafType::Scalar(ty.to_string()))
 }
 
-/// Roots whose display masks rebuild the whole physical Tuple (or read the
-/// ownership stamps): never leaf-pruned.
-const WHOLE_READ_ROOTS: [&str; 3] = ["enrichments", "src_endpoint", "dst_endpoint"];
-
 /// NAN-3155: narrow every Tuple root of an explicit read schema to the leaves
 /// in `required` (`metadata.uid` keeps `metadata Tuple(uid …)` only; an
 /// `Array(Tuple(…))` keeps the element leaves). chDB's Parquet reader then
 /// decodes only those column chunks, and every nested expression over the
 /// root (`tupleElement`, `` `root`.`leaf` ``) still binds, with the same types.
 ///
-/// Conservative: a root named whole, a mask root ([`WHOLE_READ_ROOTS`]), a
-/// leaf the type does not show (map keys, an unparseable type) keeps the
+/// Conservative: a root named whole, a leaf the type does not show (map keys, an unparseable type) keeps the
 /// field's whole type. `None` only when the schema itself does not parse.
 fn leaf_read_schema(schema: &str, required: &BTreeMap<String, String>) -> Option<String> {
     let mut fields = Vec::new();
@@ -2483,7 +2428,7 @@ fn leaf_read_schema(schema: &str, required: &BTreeMap<String, String>) -> Option
                 else { path.strip_prefix(name.as_str()).and_then(|rest| rest.strip_prefix('.')).map(str::to_string) }
             })
             .collect::<BTreeSet<_>>();
-        let pruned = if WHOLE_READ_ROOTS.contains(&name.as_str()) || leaves.is_empty() || leaves.contains("") {
+        let pruned = if leaves.is_empty() || leaves.contains("") {
             None
         } else {
             prune_type(ty, &leaves)
@@ -3274,11 +3219,24 @@ fn row_fence(
     set: bool,
     params: &mut Vec<(String, String)>,
 ) -> Result<String> {
+    row_fence_with(fenced, set, &mut |name, key| {
+        params.push((name, candidate_virtual_path(tenant, key)?));
+        Ok(())
+    })
+}
+
+/// [`row_fence`]'s text; `param` receives each file's parameter name and
+/// object key (the caller binds the path).
+fn row_fence_with(
+    fenced: &[FencedBlock<'_>],
+    set: bool,
+    param: &mut dyn FnMut(String, &str) -> Result<()>,
+) -> Result<String> {
     if !set {
         let mut terms = Vec::with_capacity(fenced.len());
         for block in fenced {
             let name = format!("candidate_path_{}", block.index);
-            params.push((name.clone(), candidate_virtual_path(tenant, block.object_key)?));
+            param(name.clone(), block.object_key)?;
             terms.push(format!(
                 "(_path = {{{name}:String}} AND _row_number >= {} AND _row_number < {})",
                 block.row_start, block.row_end
@@ -3301,7 +3259,7 @@ fn row_fence(
     let mut budget = 0_u64;
     for key in order {
         let (name, rows, mut ranges) = files.remove(key).expect("ordered file");
-        params.push((name.clone(), candidate_virtual_path(tenant, key)?));
+        param(name.clone(), key)?;
         ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -3349,6 +3307,90 @@ fn row_fence(
     }
     terms.extend(residual);
     Ok(terms.join(" OR "))
+}
+
+/// The time guard over the fenced blocks' time ranges: a superset of the
+/// row-number fence (every kept row lies inside its block's own time range),
+/// so results are unchanged; it only lets the Parquet statistics filter skip
+/// unselected row groups.
+fn time_guard_sql(mut ranges: Vec<(i64, i64)>, set_fence: bool) -> Option<String> {
+    if ranges.is_empty() {
+        return None;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let literal = |micros: i64| {
+        DateTime::from_timestamp_micros(micros)
+            .map(|time| time.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+    };
+    if set_fence {
+        merged = merge_close_time_ranges(merged);
+    }
+    let ranges = |ranges: &[(i64, i64)]| {
+        ranges
+            .iter()
+            .map(|(start, end)| Some(format!("(time >= '{}' AND time <= '{}')", literal(*start)?, literal(*end)?)))
+            .collect::<Option<Vec<_>>>()
+            .map(|ranges| ranges.join(" OR "))
+    };
+    if !set_fence || merged.len() <= MAX_EXACT_TIME_GUARD_RANGES {
+        return ranges(&merged);
+    }
+    let exact = ranges(&cap_time_ranges(merged.clone(), MAX_TIME_GUARD_HINT_RANGES))?;
+    // NAN-3179: many ranges (sparse block runs) cost one comparison
+    // each per row, like the OR fence. The statistics and page filter
+    // keep the exact ranges through `indexHint` (analysed, never
+    // evaluated per row); rows are filtered by a superset of the
+    // guard, one hash probe on time buckets of `width` microseconds.
+    let (width, buckets) = time_guard_buckets(&merged);
+    Some(format!(
+        "indexHint({exact}) AND intDiv(toUnixTimestamp64Micro(time), {width}) IN ({})",
+        buckets.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+    ))
+}
+
+/// NAN-4211: most bytes of SQL a candidate selection's row fence plus time
+/// guard may add to one statement. chDB rejects a statement past its 256 KiB
+/// `max_query_size`; the rest of the statement (projection, filters, tail)
+/// keeps the remainder.
+pub const MAX_FENCE_SQL_BYTES: usize = 192 * 1024;
+
+/// NAN-4211: the bytes of SQL [`candidate_source`] would render for the row
+/// fence and time guard over `candidates`, every file fenced (an upper bound:
+/// files read whole drop their fence). `object_rows` names each file's row
+/// count; a file it does not know is fenced as if its rows ended at its last
+/// block. A selection with many sparse files (an entity index's exact runs
+/// over one-row-group files) costs a `transform` entry per file plus its
+/// keys, which `MAX_CANDIDATE_BLOCKS` alone does not bound.
+pub fn candidate_fence_sql_bytes(candidates: &[CandidateBlock], object_rows: &dyn Fn(&str) -> Option<u64>) -> usize {
+    let mut time_ranges = Some(Vec::with_capacity(candidates.len()));
+    let fenced = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            match (candidate.time_range_us, time_ranges.as_mut()) {
+                (Some(range), Some(ranges)) => ranges.push(range),
+                _ => time_ranges = None,
+            }
+            FencedBlock {
+                index,
+                object_key: candidate.event_object_key.as_str(),
+                object_rows: object_rows(&candidate.event_object_key).unwrap_or(candidate.row_end).max(candidate.row_end),
+                row_start: candidate.row_start,
+                row_end: candidate.row_end,
+            }
+        })
+        .collect::<Vec<_>>();
+    let set_fence = fence_set_enabled();
+    let fence = row_fence_with(&fenced, set_fence, &mut |_, _| Ok(())).map_or(usize::MAX, |fence| fence.len());
+    let guard = time_ranges.and_then(|ranges| time_guard_sql(ranges, set_fence)).map_or(0, |guard| guard.len());
+    fence.saturating_add(guard)
 }
 
 fn candidate_source(
@@ -3436,44 +3478,7 @@ fn candidate_source(
     // A superset of the row-number fence (every kept row lies inside its
     // block's own time range), so results are unchanged; it only lets the
     // Parquet statistics filter skip unselected row groups.
-    let time_guard = time_ranges.filter(|ranges| !ranges.is_empty()).map(|mut ranges| {
-        ranges.sort_unstable();
-        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            match merged.last_mut() {
-                Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
-                _ => merged.push((start, end)),
-            }
-        }
-        let literal = |micros: i64| {
-            DateTime::from_timestamp_micros(micros)
-                .map(|time| time.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
-        };
-        if set_fence {
-            merged = merge_close_time_ranges(merged);
-        }
-        let ranges = |ranges: &[(i64, i64)]| {
-            ranges
-                .iter()
-                .map(|(start, end)| Some(format!("(time >= '{}' AND time <= '{}')", literal(*start)?, literal(*end)?)))
-                .collect::<Option<Vec<_>>>()
-                .map(|ranges| ranges.join(" OR "))
-        };
-        if !set_fence || merged.len() <= MAX_EXACT_TIME_GUARD_RANGES {
-            return ranges(&merged);
-        }
-        let exact = ranges(&cap_time_ranges(merged.clone(), MAX_TIME_GUARD_HINT_RANGES))?;
-        // NAN-3179: many ranges (sparse block runs) cost one comparison
-        // each per row, like the OR fence. The statistics and page filter
-        // keep the exact ranges through `indexHint` (analysed, never
-        // evaluated per row); rows are filtered by a superset of the
-        // guard, one hash probe on time buckets of `width` microseconds.
-        let (width, buckets) = time_guard_buckets(&merged);
-        Some(format!(
-            "indexHint({exact}) AND intDiv(toUnixTimestamp64Micro(time), {width}) IN ({})",
-            buckets.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
-        ))
-    }).flatten();
+    let time_guard = time_ranges.and_then(|ranges| time_guard_sql(ranges, set_fence));
     let estimated_scan_bytes = unique_objects.values().copied().sum::<u64>();
     if budget_enforcement == BudgetEnforcement::Reject
         && estimated_scan_bytes > tenant.max_query_bytes
@@ -4357,74 +4362,6 @@ enum BaseWindowOverlap {
     EmptyGeneration,
 }
 
-/// NAN-3800: read a snapshot base whose owner proofs were mixed in two
-/// branches: the files proven clean with their location/ASN masks elided
-/// (plain leaf reads), the rest with the masks. Proofs are per file, so this
-/// is the same per-row answer as masking every file; it only stops a few
-/// unclean (expired or denied-stamp) files from forcing an `enrichments`
-/// decode over the whole window. `None` keeps the single masked select:
-/// no split in scope, nothing clean in the window, or the masks would not
-/// change the projection. `project` builds the leaf projection under the
-/// planning scope it is called in. `params` gains the clean branch's source
-/// and has `snapshot_cache_source` narrowed to the unclean files.
-fn split_clean_base(
-    tenant: &TenantQueryConfig,
-    source: &str,
-    guard: &str,
-    window: Option<ObjectTimeWindow>,
-    masked_projection: &str,
-    params: &mut Vec<(String, String)>,
-    project: impl Fn() -> Result<String>,
-) -> Result<Option<String>> {
-    const SOURCE: &str = "{snapshot_cache_source:String}";
-    const CLEAN_SOURCE: &str = "{snapshot_clean_source:String}";
-    let Some(split) = crate::enrichment_read::scalar_split() else { return Ok(None) };
-    let Some(cache) = tenant.snapshot_cache.as_ref().filter(|cache| !cache.bootstrap) else { return Ok(None) };
-    if source.matches(SOURCE).count() != 1 || !params.iter().any(|(name, _)| name == "snapshot_cache_source") {
-        return Ok(None);
-    }
-    let (mut clean, mut unclean): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
-    for object in cache.objects.values() {
-        let Some(path) = object.path.to_str() else { return Ok(None) };
-        if window.is_some_and(|window| !object_path_overlaps_window(path, window)) {
-            continue;
-        }
-        if split.clean.contains(&object.path) { clean.push(path.to_string()) } else { unclean.push(path.to_string()) }
-    }
-    if clean.is_empty() {
-        return Ok(None);
-    }
-    let elided = crate::enrichment_read::plan_with_scalar_plan(
-        crate::enrichment_read::ScalarPlan { elided: true, ..Default::default() },
-        &project,
-    )?;
-    if elided == masked_projection {
-        return Ok(None);
-    }
-    if unclean.is_empty() {
-        // Every file this window names is clean: no mask at all.
-        return Ok(Some(format!("(SELECT {elided} FROM {source} WHERE {guard})")));
-    }
-    let masked = crate::enrichment_read::plan_with_scalar_plan(
-        crate::enrichment_read::ScalarPlan { elided: false, null_leaves: split.unclean_null_leaves, split: None },
-        &project,
-    )?;
-    // An unnameable path set keeps the single masked select (cost, never rows).
-    let (Ok(unclean_spec), Ok(clean_spec)) = (local_path_spec(&mut unclean), local_path_spec(&mut clean)) else {
-        return Ok(None);
-    };
-    for (name, value) in params.iter_mut() {
-        if name == "snapshot_cache_source" {
-            *value = unclean_spec.clone();
-        }
-    }
-    params.push(("snapshot_clean_source".to_string(), clean_spec));
-    let clean_source = source.replace(SOURCE, CLEAN_SOURCE);
-    Ok(Some(format!(
-        "(SELECT {masked} FROM {source} WHERE {guard} UNION ALL SELECT {elided} FROM {clean_source} WHERE {guard})"
-    )))
-}
-
 fn scoped_snapshot_source_spec(
     cache: &SnapshotCache,
     window: Option<ObjectTimeWindow>,
@@ -4596,69 +4533,7 @@ fn native_event_source(
     required: &BTreeMap<String, String>,
     missing: &BTreeMap<String, String>,
 ) -> Result<(String, BTreeMap<String, String>)> {
-    native_event_source_with(sql, source, required, missing, &BTreeMap::new())
-}
-
-/// Masked endpoint roots in a read projection (`… AS `src_endpoint``
-/// computed over `enrichments`, [`crate::enrichment_read::root_expression`]).
-fn projection_masks_endpoints(projection: &str) -> bool {
-    projection.contains("`enrichments`")
-        && (projection.contains("AS `src_endpoint`") || projection.contains("AS `dst_endpoint`"))
-}
-
-/// NAN-3052: the producer-only endpoint leaves a full-event query names
-/// (`src_endpoint.ip`, `dst_endpoint.port`, …), each with the alias it is
-/// read under in the READ select (`__nano_raw_N`).
-///
-/// A full-event read projects each endpoint root through its display mask,
-/// `if(arrayExists(__nano_e -> <platform stamp>, enrichments), <rebuilt>,
-/// root)`. Taking `tupleElement(masked_root, 'ip')` above that select made
-/// every leaf predicate depend on the mask. With both endpoints filtered
-/// (`rdp_lateral_movement`: `dst_endpoint.port` in one stage,
-/// `is_private_ip(src_endpoint.ip) AND is_private_ip(dst_endpoint.ip)` in
-/// the next), chDB's filter push-down moved both masks into the read step,
-/// where their shared `arrayExists(…, enrichments)` node was dropped from
-/// the step's header: `Code: 10. Not found column arrayExists(__nano_e …)`
-/// on every run. Platform stamps never own these leaves (the mask rebuilds
-/// only `location` and `autonomous_system`), so the physical leaf is the
-/// displayed value; reading it in the read select (where
-/// `prefer_column_name_to_alias=1` binds the physical column) keeps the
-/// predicates off the mask entirely. The returned rows still carry the
-/// masked roots. Sensitive leaves keep reading through the mask.
-fn raw_endpoint_leaves(
-    sql: &str,
-    required: &BTreeMap<String, String>,
-    missing: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>> {
-    let mut leaves = BTreeMap::new();
-    for name in required.keys() {
-        let root = name.split('.').next().unwrap_or_default();
-        if missing.contains_key(name)
-            || !matches!(root, "src_endpoint" | "dst_endpoint")
-            || !name.contains('.')
-            || crate::enrichment_read::sensitive(name)
-        {
-            continue;
-        }
-        if !sql.contains(&quoted_identifier(name)?) && !sql.contains(&double_quoted_identifier(name)) {
-            continue;
-        }
-        let alias = format!("__nano_raw_{}", leaves.len());
-        leaves.insert(name.clone(), alias);
-    }
-    Ok(leaves)
-}
-
-/// [`native_event_source`] where `preprojected` leaves already exist as
-/// columns of `source` under their aliases (read in the read select).
-fn native_event_source_with(
-    sql: &str,
-    source: &str,
-    required: &BTreeMap<String, String>,
-    missing: &BTreeMap<String, String>,
-    preprojected: &BTreeMap<String, String>,
-) -> Result<(String, BTreeMap<String, String>)> {
-    let mut aliases = preprojected.clone();
+    let mut aliases = BTreeMap::new();
     let mut additions = Vec::new();
     for (name, field_type) in required.iter().chain(missing.iter()) {
         if aliases.contains_key(name) {
@@ -4710,9 +4585,8 @@ fn native_event_source_with(
 /// whose header carries only the parent root, and the query dies with
 /// `Not found column tupleElement(http_request, 'url') in block`
 /// (NOT_FOUND_COLUMN_IN_BLOCK, the NAN-2374 family). The subcolumn form reads
-/// the leaf directly and keeps PREWHERE. Endpoint roots (display-masked
-/// expressions over `enrichments`) and `enrichments` itself keep the
-/// tupleElement form their masks and tests are built on.
+/// the leaf directly and keeps PREWHERE. Endpoint roots and `enrichments`
+/// keep the nested tupleElement form their plans were verified with.
 fn native_leaf_reads_as_subcolumn(path: &str) -> bool {
     let mut segments = path.split('.');
     let root = segments.next().unwrap_or_default();
@@ -4734,70 +4608,12 @@ fn projected_columns_sql(
     required: &BTreeMap<String, String>,
     missing: &BTreeMap<String, String>,
 ) -> Result<String> {
-    projected_columns_sql_masked(required, missing, false)
-}
-
-fn projected_columns_sql_masked(
-    required: &BTreeMap<String, String>,
-    missing: &BTreeMap<String, String>,
-    has_enrichments: bool,
-) -> Result<String> {
-    projected_columns_sql_masked_with_shared_roots(required, missing, has_enrichments, true)
-}
-
-fn projected_columns_sql_masked_with_shared_roots(
-    required: &BTreeMap<String, String>,
-    missing: &BTreeMap<String, String>,
-    has_enrichments: bool,
-    shared_roots: bool,
-) -> Result<String> {
-    // A masked endpoint needs its physical Tuple. Mixing that root with a
-    // storage-subcolumn predicate makes ClickHouse's automatic prewhere read
-    // header lose the subcolumn (NAN-2374). Keep the original projection for
-    // siblings of a requested masked subtree; producer-only scans stay native.
-    let masked_endpoint_roots = ["src_endpoint", "dst_endpoint"]
-        .into_iter()
-        .filter(|root| {
-            has_enrichments
-                && required.keys().any(|path| {
-                    !missing.contains_key(path)
-                        && path.split('.').next() == Some(*root)
-                        && (path.as_str() == *root || crate::enrichment_read::needs_row_mask(path))
-                })
-        })
-        .collect::<BTreeSet<_>>();
     let mut projection = Vec::new();
-    let shared_mask = shared_roots && required.keys().filter(|path| {
-        !missing.contains_key(*path)
-            && (crate::enrichment_read::needs_row_mask(path)
-                || matches!(path.as_str(), "src_endpoint" | "dst_endpoint"))
-    }).count() > 1;
     for name in required.keys() {
         if missing.contains_key(name) {
             continue;
         }
-        projection.push(format!(
-            "{} AS {}",
-            // Platform stamps cannot own producer endpoint leaves (IP, port,
-            // hostname, etc.). Reconstructing their entire root through JSON
-            // needlessly reads enrichments and evaluates every ownership mask
-            // for each event. Keep the native Parquet leaf for those paths;
-            // sensitive subtrees and whole endpoints retain the existing mask.
-            if has_enrichments
-                && (crate::enrichment_read::sensitive(name)
-                    || masked_endpoint_roots.contains(name.split('.').next().unwrap()))
-            {
-                validate_path(name)?;
-                if shared_mask && crate::enrichment_read::sensitive(name) && !crate::enrichment_read::scalar_masked_leaf(name) {
-                    crate::enrichment_read::shared_leaf_expression(name, &crate::enrichment_read::current())
-                } else {
-                    crate::enrichment_read::leaf_expression(name, &crate::enrichment_read::current())
-                }
-            } else {
-                nested_projection(name)?
-            },
-            quoted_identifier(name)?
-        ));
+        projection.push(format!("{} AS {}", nested_projection(name)?, quoted_identifier(name)?));
     }
     for (name, field_type) in missing {
         projection.push(format!(
@@ -4884,16 +4700,6 @@ fn required_read_roots(
     let mut roots = roots_for_paths(required.keys().map(String::as_str))?;
     roots.retain(|root| available_roots.contains(root));
     roots.insert("time".into());
-    // Native rows return whole endpoint Tuples, including sensitive siblings
-    // of a producer-only predicate such as src_endpoint.ip. Keep their mask
-    // dependencies even when that predicate itself is not sensitive.
-    if available_roots.contains("enrichments")
-        && (roots.contains("src_endpoint") || roots.contains("dst_endpoint")
-            || required.keys().any(|path| available_paths.contains(path)
-                && crate::enrichment_read::needs_row_mask(path)))
-    {
-        roots.insert("enrichments".into());
-    }
     Ok(roots)
 }
 
@@ -4974,12 +4780,7 @@ fn root_projection_for_roots(roots: BTreeSet<String>) -> Result<String> {
     }
     roots
         .iter()
-        .map(|root| {
-            let quoted = quoted_identifier(root)?;
-            if roots.contains("enrichments") && matches!(root.as_str(), "enrichments" | "src_endpoint" | "dst_endpoint") {
-                Ok(format!("{} AS {quoted}", crate::enrichment_read::root_expression(root, &crate::enrichment_read::current())))
-            } else { Ok(quoted) }
-        })
+        .map(|root| quoted_identifier(root))
         .collect::<Result<Vec<_>>>()
         .map(|columns| columns.join(", "))
 }
@@ -5200,34 +5001,19 @@ fn harden_settings(mut sql: String, tenant: &TenantQueryConfig) -> Result<String
     Ok(sql)
 }
 
-// Only the compiler's single-stage, producer-filtered timeline can move its
-// top-K below display masking. Never truncate a pipeline, an offset page, or
-// a predicate/order that depends on read-authorized enrichment values.
-/// Display masks run on at most the top-K page, so a full-file ownership
-/// probe cannot save meaningful work. Keep the default masks instead.
-pub(crate) fn table_view_masks_after_top_k(compiled: &CompiledQuery) -> bool {
-    table_view_page_clause(compiled).is_some()
-}
-
+// Only the compiler's single-stage timeline can move its top-K below the
+// leaf projection. Never truncate a pipeline or an offset page. Whole
+// endpoint roots and `enrichments` keep the full-width path.
 fn table_view_page_clause(compiled: &CompiledQuery) -> Option<String> {
     if !compiled.table_view || !compiled.newest_first_event_rows
         || compiled.projected_scan_columns.is_empty()
-        || compiled.projected_scan_columns.iter().any(|path| {
-            crate::enrichment_read::sensitive(path)
-                || matches!(path.as_str(), "src_endpoint" | "dst_endpoint" | "enrichments")
-                || path.starts_with("enrichments.")
-        })
     {
         return None;
     }
-    if compiled.required_columns.iter().any(|column| {
-        let path = column.name.as_str();
-        path.starts_with("enrichments")
-            || matches!(path, "src_endpoint" | "dst_endpoint")
-            || (crate::enrichment_read::sensitive(path) && !matches!(path.split_once('.').map(|(_, leaf)| leaf),
-                Some("location.country" | "location.continent" | "location.provider"
-                    | "autonomous_system.number" | "autonomous_system.name")))
-    }) {
+    let whole_width = |path: &str| path.starts_with("enrichments") || matches!(path, "src_endpoint" | "dst_endpoint");
+    if compiled.required_columns.iter().any(|column| whole_width(&column.name))
+        || compiled.projected_scan_columns.iter().any(|path| whole_width(path))
+    {
         return None;
     }
     if preserves_full_event_shape(&compiled.sql)
@@ -5452,13 +5238,13 @@ mod tests {
     }
 
     #[test]
-    fn leaf_read_schema_keeps_only_named_leaves_and_mask_roots_whole() {
+    fn leaf_read_schema_keeps_only_named_leaves() {
         let schema = "`time` DateTime64(6, 'UTC'), `metadata` Tuple(`uid` Nullable(String), `product` Tuple(`name` Nullable(String), `vendor_name` Nullable(String)), `profiles` Array(Nullable(String))), `device` Tuple(`hostname` Nullable(String), `type_id` Nullable(Int64)), `process` Tuple(`file` Tuple(`hashes` Array(Tuple(`algorithm` Nullable(String), `value` Nullable(String))), `path` Nullable(String))), `src_endpoint` Tuple(`ip` Nullable(String), `port` Nullable(Int64)), `unmapped` Map(String, String), `odd``name` Tuple(`a` String, `b` String)";
         let required = ["time", "metadata.uid", "metadata.product.name", "device", "process.file.hashes.value", "src_endpoint.ip", "unmapped.^key", "odd`name.b"]
             .into_iter().map(|name| (name.to_string(), "string".to_string())).collect::<BTreeMap<_, _>>();
         assert_eq!(
             leaf_read_schema(schema, &required).unwrap(),
-            "`time` DateTime64(6, 'UTC'), `metadata` Tuple(`uid` Nullable(String), `product` Tuple(`name` Nullable(String))), `device` Tuple(`hostname` Nullable(String), `type_id` Nullable(Int64)), `process` Tuple(`file` Tuple(`hashes` Array(Tuple(`value` Nullable(String))))), `src_endpoint` Tuple(`ip` Nullable(String), `port` Nullable(Int64)), `unmapped` Map(String, String), `odd``name` Tuple(`b` String)"
+            "`time` DateTime64(6, 'UTC'), `metadata` Tuple(`uid` Nullable(String), `product` Tuple(`name` Nullable(String))), `device` Tuple(`hostname` Nullable(String), `type_id` Nullable(Int64)), `process` Tuple(`file` Tuple(`hashes` Array(Tuple(`value` Nullable(String))))), `src_endpoint` Tuple(`ip` Nullable(String)), `unmapped` Map(String, String), `odd``name` Tuple(`b` String)"
         );
         // A leaf the type does not show keeps the whole root (never drops a
         // column a statement reads); the identity columns own no root.
@@ -5535,7 +5321,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_read_schema_keeps_masks_defaults_and_full_event_output() {
+    fn aggregate_read_schema_keeps_leaves_defaults_and_full_event_output() {
         let mut configured = tenant();
         let schema = "`time` DateTime64(6, 'UTC'), `metadata` Tuple(`uid` Nullable(String), `log_source` Nullable(String)), `src_endpoint` Tuple(`ip` Nullable(String), `location` Tuple(`country` Nullable(String))), `enrichments` Array(Tuple(`owned_fields` Array(String))), `unused` String";
         configured.snapshot_cache = Some(SnapshotCache {
@@ -5564,13 +5350,14 @@ mod tests {
             // Exercise the opt-in planner in its own process, without mutating
             // the concurrent test runner's environment.
             let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "planner::tests::aggregate_read_schema_keeps_masks_defaults_and_full_event_output"])
+                .args(["--exact", "planner::tests::aggregate_read_schema_keeps_leaves_defaults_and_full_event_output"])
                 .env("NANO_LAKE_NARROW_AGGREGATE_SCHEMA", "1").output().unwrap();
             assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
             return;
         }
-        assert!(actual.contains("`src_endpoint` Tuple(`ip`"));
-        assert!(actual.contains("`enrichments` Array"));
+        // NAN-4168: the country leaf alone; no endpoint root, no stamps.
+        assert!(actual.contains("`src_endpoint` Tuple(`location` Tuple(`country` Nullable(String)))"), "{actual}");
+        assert!(!actual.contains("`enrichments`"), "{actual}");
         assert!(actual.contains("`time` DateTime64"));
         assert!(!actual.contains("`unused`"));
         assert!(!actual.contains("`metadata`"));
@@ -5581,26 +5368,26 @@ mod tests {
         assert_eq!(plan.params.iter().find(|(name, _)| name == "snapshot_cache_read_schema").unwrap().1, schema);
     }
 
-    /// NAN-3800: mixed per-file owner proofs read the clean files in their
-    /// own branch with the location/ASN masks elided (no `enrichments`
-    /// decode) and keep the mask only over the unclean files.
+    /// NAN-4168: enrichment leaves are plain columns. A 7 d `stats count by
+    /// src_endpoint.location.country` reads the location leaf alone: no
+    /// `enrichments` decode, no mask, no per-file split, and the endpoint
+    /// root's read schema is pruned to that leaf, over files of any stamp
+    /// state (NAN-3800 used to decode `enrichments` for every file once a few
+    /// had expired or denied stamps).
     #[test]
-    fn mixed_owner_proofs_split_clean_files_out_of_the_masked_read() {
-        use crate::enrichment_read::{plan_with_scalar_plan, ScalarPlan, ScalarSplit};
-        let schema = "`time` DateTime64(6, 'UTC'), `metadata` Tuple(`uid` Nullable(String)), `src_endpoint` Tuple(`ip` Nullable(String), `location` Tuple(`country` Nullable(String))), `enrichments` Array(Tuple(`owned_fields` Array(String)))";
+    fn stats_by_country_plans_a_plain_leaf_read() {
+        let schema = "`time` DateTime64(6, 'UTC'), `metadata` Tuple(`uid` Nullable(String)), `src_endpoint` Tuple(`ip` Nullable(String), `location` Tuple(`country` Nullable(String), `continent` Nullable(String)), `autonomous_system` Tuple(`number` Nullable(Int64))), `enrichments` Array(Tuple(`provider` Nullable(String), `owned_fields` Array(String)))";
         let mut source = manifest();
-        source.objects[0].available_paths = vec!["time".into(), "metadata.uid".into(), "src_endpoint.ip".into(), "src_endpoint.location.country".into(), "enrichments.owned_fields".into()].into();
+        source.objects[0].available_paths = vec!["time".into(), "metadata.uid".into(), "src_endpoint.ip".into(), "src_endpoint.location.country".into(), "src_endpoint.location.continent".into(), "src_endpoint.autonomous_system.number".into(), "enrichments.provider".into(), "enrichments.owned_fields".into()].into();
         source.objects[0].field_types.insert("src_endpoint.location.country".into(), "string".into());
         let mut second = source.objects[0].clone();
         second.event_object_key = "s3://bucket/table/data/two.parquet".into();
         source.objects.push(second);
         let mut configured = tenant();
-        // Two 900-byte objects: the fixture's 1,000-byte budget would refuse
-        // the broad read before any split is planned.
         configured.max_query_bytes = 4_000;
         configured.snapshot_cache = Some(SnapshotCache {
-            source_spec: "/cache/{clean,dirty}.parquet".into(),
-            objects: source.objects.iter().zip(["/cache/clean.parquet", "/cache/dirty.parquet"]).map(|(object, path)| (
+            source_spec: "/cache/{a,b}.parquet".into(),
+            objects: source.objects.iter().zip(["/cache/a.parquet", "/cache/b.parquet"]).map(|(object, path)| (
                 object.event_object_key.clone(),
                 SnapshotCacheObject { version_id: object.event_object_version.clone(), bytes: object.event_object_bytes, path: path.into() },
             )).collect(),
@@ -5613,60 +5400,40 @@ mod tests {
             vec![column("time", "timestamp"), column("src_endpoint.location.country", "string")],
         );
         query.table_view = false;
-        let param = |plan: &NativeQueryPlan, name: &str| plan.params.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
-        let split = |clean: &[&str]| ScalarPlan {
-            elided: false,
-            null_leaves: 0,
-            split: Some(std::sync::Arc::new(ScalarSplit {
-                clean: clean.iter().map(PathBuf::from).collect(),
-                unclean_null_leaves: 0,
-            })),
-        };
+        query.start = "2026-08-04T00:00:00Z".into();
+        let plan = plan_broad_log_query(&configured, &source, &query).unwrap();
+        assert!(!plan.sql.contains("enrichments"), "{}", plan.sql);
+        assert!(!plan.sql.contains("UNION ALL"), "{}", plan.sql);
+        assert!(!plan.sql.contains("arrayExists"), "{}", plan.sql);
+        assert!(!plan.sql.contains("owned_fields"), "{}", plan.sql);
+        assert!(plan.params.iter().all(|(name, _)| name != "nano_enrichment_authority"));
+        // The read schema of an aggregate is narrowed only under
+        // NANO_LAKE_NARROW_AGGREGATE_SCHEMA (see
+        // `aggregate_read_schema_keeps_leaves_defaults_and_full_event_output`);
+        // Parquet reads only the columns the SQL names, and it names none of
+        // the stamps.
 
-        // No split in scope: one masked read of every file, as before.
-        let masked = plan_broad_log_query(&configured, &source, &query).unwrap();
-        assert!(masked.sql.contains("enrichments"), "{}", masked.sql);
-        assert!(!masked.sql.contains("UNION ALL"), "{}", masked.sql);
-        assert_eq!(param(&masked, "snapshot_clean_source"), None);
+        // Perf review F2: a 7d `stats count by src_endpoint.ip` projects the
+        // endpoint leaf; neither shape names (and so reads) `enrichments`.
+        for table_view in [false, true] {
+            let mut by_ip = compiled(
+                "SELECT `src_endpoint.ip`, count() FROM __nano_lake_source__ GROUP BY `src_endpoint.ip`",
+                vec![column("time", "timestamp"), column("src_endpoint.ip", "string")],
+            );
+            by_ip.table_view = table_view;
+            by_ip.start = "2026-08-04T00:00:00Z".into();
+            let plan = plan_broad_log_query(&configured, &source, &by_ip).unwrap();
+            assert!(!plan.sql.contains("enrichments"), "table_view={table_view}: {}", plan.sql);
+            assert!(!plan.sql.contains("arrayFilter"), "table_view={table_view}: {}", plan.sql);
+            assert!(plan.sql.contains("`src_endpoint`.`ip`") || plan.sql.contains("`src_endpoint.ip`"), "{}", plan.sql);
+        }
 
-        // Mixed: the unclean file keeps the mask, the clean one reads the leaf.
-        let plan = plan_with_scalar_plan(split(&["/cache/clean.parquet"]), || plan_broad_log_query(&configured, &source, &query)).unwrap();
-        let (unclean_branch, clean_branch) = plan.sql.split_once("UNION ALL").expect(&plan.sql);
-        assert!(unclean_branch.contains("enrichments") && unclean_branch.contains("{snapshot_cache_source:String}"), "{}", plan.sql);
-        let clean_branch = clean_branch.split("{snapshot_clean_source:String}").next().unwrap();
-        assert!(!clean_branch.contains("enrichments"), "{}", plan.sql);
-        assert!(plan.sql.contains("{snapshot_clean_source:String}"), "{}", plan.sql);
-        assert_eq!(param(&plan, "snapshot_cache_source").as_deref(), Some("/cache/dirty.parquet"));
-        assert_eq!(param(&plan, "snapshot_clean_source").as_deref(), Some("/cache/clean.parquet"));
-        assert_eq!(plan.params.iter().filter(|(key, _)| key == "snapshot_cache_source").count(), 1);
-
-        // A split naming no file of this source changes nothing.
-        let none_clean = plan_with_scalar_plan(split(&["/cache/elsewhere.parquet"]), || plan_broad_log_query(&configured, &source, &query)).unwrap();
-        assert_eq!(none_clean.sql, masked.sql);
-        assert_eq!(none_clean.params, masked.params);
-
-        // Every file in the source clean: a single unmasked read.
-        let all_clean = plan_with_scalar_plan(split(&["/cache/clean.parquet", "/cache/dirty.parquet"]), || plan_broad_log_query(&configured, &source, &query)).unwrap();
-        assert!(!all_clean.sql.contains("UNION ALL") && !all_clean.sql.contains("enrichments"), "{}", all_clean.sql);
-        assert_eq!(param(&all_clean, "snapshot_clean_source"), None);
-
-        // Path-fenced candidate reads keep their own source: no split.
-        let selected = [CandidateBlock {
-            event_object_key: source.objects[0].event_object_key.clone(),
-            event_object_bytes: source.objects[0].event_object_bytes,
-            row_start: 0, row_end: 1, max_time_ms: None, time_range_us: None,
-        }];
-        let fenced = plan_with_scalar_plan(split(&["/cache/clean.parquet"]), || {
-            plan_broad_log_query_with_candidates_and_tail(&configured, &source, &query, Some(&selected), None)
-        }).unwrap();
-        assert_eq!(param(&fenced, "snapshot_clean_source"), None);
-        assert!(fenced.sql.contains("enrichments"), "{}", fenced.sql);
-
-        // Full-event rows keep their native shape: no split.
+        // Full-event rows return every root as stored, `enrichments` included.
         let mut rows = query.clone();
         rows.sql = "SELECT * FROM __nano_lake_source__".into();
-        let rows = plan_with_scalar_plan(split(&["/cache/clean.parquet"]), || plan_broad_log_query(&configured, &source, &rows)).unwrap();
-        assert_eq!(param(&rows, "snapshot_clean_source"), None);
+        let rows = plan_broad_log_query(&configured, &source, &rows).unwrap();
+        assert!(!rows.sql.contains("arrayExists"), "{}", rows.sql);
+        assert!(!rows.sql.contains("owned_fields"), "{}", rows.sql);
     }
 
     /// NAN-3406: a per-request `flat_filter_leaves` override flips the read
@@ -5708,8 +5475,8 @@ mod tests {
     }
 
     /// NAN-3386: `NANO_LAKE_FLAT_FILTER_LEAVES` off leaves the plan exactly as
-    /// before; on, a scalar entity leaf is read flat while a mask root
-    /// (`src_endpoint`) and full-event output stay nested.
+    /// before; on, scalar entity leaves (endpoint leaves included, NAN-4168)
+    /// are read flat while full-event output stays nested.
     #[test]
     fn flat_filter_leaves_switch_rewrites_only_scalar_entity_leaves() {
         let mut configured = tenant();
@@ -5730,8 +5497,8 @@ mod tests {
         query.table_view = false;
         let plan = plan_broad_log_query(&configured, &source, &query).unwrap();
         let read = &plan.params.iter().find(|(name, _)| name == "snapshot_cache_read_schema").unwrap().1;
-        assert!(plan.sql.contains("`src_endpoint`.`ip` AS `src_endpoint.ip`"), "{}", plan.sql);
         if std::env::var("NANO_LAKE_FLAT_FILTER_LEAVES").as_deref() != Ok("1") {
+            assert!(plan.sql.contains("`src_endpoint`.`ip` AS `src_endpoint.ip`"), "{}", plan.sql);
             assert!(plan.sql.contains("`device`.`hostname` AS `device.hostname`"), "{}", plan.sql);
             assert!(!read.contains("`device.hostname`"), "flat leaves default off: {read}");
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -5743,7 +5510,8 @@ mod tests {
         assert!(plan.sql.contains("`device.hostname` AS `device.hostname`"), "{}", plan.sql);
         assert!(!plan.sql.contains("`device`.`hostname` AS"), "{}", plan.sql);
         assert_eq!(read.matches("`device.hostname` Nullable(String)").count(), 1, "{read}");
-        assert!(!read.contains("`src_endpoint.ip`"), "mask roots stay nested: {read}");
+        // NAN-4168: endpoint leaves are plain scalar leaves too.
+        assert_eq!(read.matches("`src_endpoint.ip` Nullable(String)").count(), 1, "{read}");
         // A table-view page reads whole roots under its page bound: unchanged.
         let mut page = compiled(
             "SELECT time, \"device.hostname\" FROM __nano_lake_source__ WHERE \"device.hostname\" = 'h' ORDER BY time DESC LIMIT 50",
@@ -5989,42 +5757,22 @@ mod tests {
         ));
     }
 
+    /// NAN-4168: every endpoint and enrichment path projects as a plain
+    /// column read, never through a mask over `enrichments`.
     #[test]
-    fn producer_endpoint_leaves_do_not_reconstruct_masked_roots() {
+    fn endpoint_and_enrichment_paths_project_as_plain_columns() {
         for root in ["src_endpoint", "dst_endpoint"] {
-            for leaf in ["ip", "port", "hostname"] {
-                let path = format!("{root}.{leaf}");
-                let required = BTreeMap::from([(path.clone(), "string".into())]);
-                let sql = projected_columns_sql_masked(&required, &BTreeMap::new(), true).unwrap();
-                assert_eq!(sql, format!("`{root}`.`{leaf}` AS `{path}`"));
+            for suffix in ["", ".ip", ".port", ".location", ".location.country", ".autonomous_system", ".autonomous_system.number"] {
+                let path = format!("{root}{suffix}");
+                let required = BTreeMap::from([(path.clone(), "object".into())]);
+                let sql = projected_columns_sql(&required, &BTreeMap::new()).unwrap();
+                assert_eq!(sql, format!("{} AS {}", nested_projection(&path).unwrap(), quoted_identifier(&path).unwrap()));
+                assert!(!sql.contains("enrichments") && !sql.contains("arrayExists") && !sql.contains("owned_fields"), "{sql}");
             }
-            // Whole roots, intermediate objects and owned leaves must still
-            // consult the original unfiltered stamps before hiding ownership.
-            for suffix in [
-                "",
-                ".location",
-                ".location.country",
-                ".autonomous_system",
-                ".autonomous_system.number",
-            ] {
-                let required = BTreeMap::from([(format!("{root}{suffix}"), "object".into())]);
-                let sql = projected_columns_sql_masked(&required, &BTreeMap::new(), true).unwrap();
-                assert!(sql.contains("arrayExists("), "{sql}");
-                assert!(!sql.contains("JSONMergePatch"), "{sql}");
-                assert!(sql.contains("owned_fields"), "{sql}");
-            }
-            let mixed = BTreeMap::from([
-                (format!("{root}.ip"), "string".into()),
-                (format!("{root}.location.country"), "string".into()),
-            ]);
-            let sql = projected_columns_sql_masked(&mixed, &BTreeMap::new(), true).unwrap();
-            assert!(!sql.contains(&format!("`{root}`.`ip`")), "{sql}");
-            assert_eq!(sql.matches("'owned_fields'").count(), 1, "{sql}");
         }
         let required = BTreeMap::from([("enrichments.provider".into(), "array".into())]);
-        assert!(projected_columns_sql_masked(&required, &BTreeMap::new(), true)
-            .unwrap()
-            .contains("arrayFilter"));
+        let sql = projected_columns_sql(&required, &BTreeMap::new()).unwrap();
+        assert!(!sql.contains("arrayFilter") && !sql.contains("arrayExists"), "{sql}");
     }
 
     #[test]
@@ -6542,6 +6290,57 @@ mod tests {
             assert!(source.len() < 200_000, "stride {stride}: {} bytes", source.len());
             assert!(source.contains("indexHint(") && source.contains("toUnixTimestamp64Micro"), "stride {stride}");
         }
+    }
+
+    /// NAN-4211: the window entity index's exact runs over a busy host's 7d
+    /// (live: ~3,000 runs in ~2,500 one-row-group files) fence every
+    /// file; the rendered source outgrew chDB's 256 KiB `max_query_size`.
+    /// The estimate bounds the rendered fence and guard (so the engine can
+    /// decline that selection), and stays under budget at the one-file
+    /// block bound above.
+    #[test]
+    fn fence_estimate_bounds_the_rendered_source_and_flags_many_file_selections() {
+        let t0 = 1_790_640_000_000_000_i64;
+        let files = 3_000_u64;
+        let key = |file: u64| format!("s3://bucket/table/data/2026/10/{file:05}-0123456789abcdef.parquet");
+        let objects = (0..files)
+            .map(|file| ManifestObject { event_object_key: key(file), rows: 100_000, ..manifest().objects[0].clone() })
+            .collect::<Vec<_>>();
+        let big = SourceManifest { objects, ..manifest() };
+        let blocks = (0..files)
+            .map(|file| CandidateBlock {
+                event_object_key: key(file),
+                event_object_bytes: 900,
+                row_start: 3_072 + file % 7 * 1_024,
+                row_end: 4_096 + file % 7 * 1_024,
+                max_time_ms: None,
+                time_range_us: Some((t0 + file as i64 * 240_000_000, t0 + file as i64 * 240_000_000 + 9_000_000)),
+            })
+            .collect::<Vec<_>>();
+        let rows = |key: &str| big.objects.iter().find(|object| object.event_object_key == key).map(|object| object.rows);
+        let estimate = candidate_fence_sql_bytes(&blocks, &rows);
+        let (source, _, _) = candidate_source(&tenant(), &big, &blocks, BudgetEnforcement::ReportOnly, Some("time")).unwrap();
+        assert!(estimate > MAX_FENCE_SQL_BYTES, "many-file selection must be flagged: {estimate} bytes");
+        assert!(source.len() > 256 * 1024, "the fixture reproduces the overflow: {} bytes", source.len());
+        assert!(source.len() <= estimate + 64 * 1024, "estimate tracks the rendered fence: {estimate} vs {}", source.len());
+
+        // The one-file 4,096-block bound still fits (fine runs stay usable).
+        let one = SourceManifest { objects: vec![ManifestObject { rows: 300_000_000, ..manifest().objects[0].clone() }], ..manifest() };
+        let blocks = (0..4_096_u64)
+            .map(|i| CandidateBlock {
+                event_object_key: "s3://bucket/table/data/one.parquet".to_string(),
+                event_object_bytes: 900,
+                row_start: i * 8_192,
+                row_end: i * 8_192 + 1_024,
+                max_time_ms: None,
+                time_range_us: Some((t0 + i as i64 * 600_000_000, t0 + i as i64 * 600_000_000 + 26_000_000)),
+            })
+            .collect::<Vec<_>>();
+        let rows = |key: &str| one.objects.iter().find(|object| object.event_object_key == key).map(|object| object.rows);
+        let estimate = candidate_fence_sql_bytes(&blocks, &rows);
+        let (source, _, _) = candidate_source(&tenant(), &one, &blocks, BudgetEnforcement::ReportOnly, Some("time")).unwrap();
+        assert!(estimate <= MAX_FENCE_SQL_BYTES, "{estimate}");
+        assert!(estimate <= source.len(), "the estimate is the fence and guard inside the source: {estimate} vs {}", source.len());
     }
 
     #[test]
@@ -7074,6 +6873,47 @@ mod tests {
         let narrow = reader_shape(&query, &source, None);
         assert_eq!(narrow.wide_columns, 0);
         assert_ne!(narrow.columns_key, key);
+        assert!(!narrow.string_group_by);
+    }
+
+    /// NAN-4174: the lane router's large-aggregate hint: a GROUP BY naming a
+    /// string column (not an enumerated label), in any subquery.
+    #[test]
+    fn groups_by_string_sees_string_group_keys_only() {
+        let columns = |names: &[(&str, &str)]| names.iter().map(|(name, kind)| column(name, kind)).collect::<Vec<_>>();
+        let by_ip = compiled(
+            "SELECT \"dst_endpoint.ip\", count() AS count FROM __nano_lake_source__ WHERE time >= 'a' AND time < 'b' \
+             GROUP BY \"dst_endpoint.ip\" ORDER BY count DESC LIMIT 100 SETTINGS max_threads=6",
+            columns(&[("dst_endpoint.ip", "string"), ("time", "timestamp")]),
+        );
+        assert!(groups_by_string(&by_ip));
+        // Nested: the clause ends at the subquery's parenthesis, backticks count too.
+        let nested = compiled(
+            "SELECT * FROM (SELECT `user.name` AS u, `metadata.log_source` AS s, count() AS n FROM __nano_lake_source__ \
+             GROUP BY `user.name`, `metadata.log_source`) WHERE n > 3 ORDER BY n DESC",
+            columns(&[("user.name", "string"), ("metadata.log_source", "string")]),
+        );
+        assert!(groups_by_string(&nested));
+        // A low-cardinality label, a non-string key, or a string only in the
+        // select list / ORDER BY is not a large aggregate.
+        let by_source = compiled(
+            "SELECT \"metadata.log_source\", count() FROM __nano_lake_source__ GROUP BY \"metadata.log_source\" ORDER BY \"user.name\"",
+            columns(&[("metadata.log_source", "string"), ("user.name", "string")]),
+        );
+        assert!(!groups_by_string(&by_source));
+        let by_port = compiled(
+            "SELECT \"dst_endpoint.port\", any(\"user.name\") FROM __nano_lake_source__ GROUP BY \"dst_endpoint.port\"",
+            columns(&[("dst_endpoint.port", "int"), ("user.name", "string")]),
+        );
+        assert!(!groups_by_string(&by_port));
+        let rows = compiled("SELECT * FROM __nano_lake_source__ WHERE \"user.name\" = 'a' ORDER BY time DESC LIMIT 100",
+            columns(&[("user.name", "string")]));
+        assert!(!groups_by_string(&rows));
+        // The reader shape carries it.
+        let mut source = manifest();
+        source.objects[0].rows = 10;
+        assert!(reader_shape(&by_ip, &source, None).string_group_by);
+        assert!(!reader_shape(&by_source, &source, None).string_group_by);
     }
 
     fn compiled(sql: &str, required_columns: Vec<RequiredColumn>) -> CompiledQuery {
@@ -8038,8 +7878,9 @@ mod tests {
                         &configured, &source, &query, candidates, Some(&tail),
                     ).unwrap();
                     let projection = required_root_projection(&required_columns(&query).unwrap(), &already_available).unwrap();
-                    assert!(projection.contains("AS `enrichments`"));
-                    assert_eq!(projection.contains("AS `src_endpoint`"), path.starts_with("src_endpoint"));
+                    // NAN-4168: only the queried root; no stamps beside an endpoint.
+                    assert_eq!(projection.contains("`enrichments`"), path.starts_with("enrichments"), "{projection}");
+                    assert_eq!(projection.contains("`src_endpoint`"), path.starts_with("src_endpoint"), "{projection}");
                     assert!(!projection.contains("`resources`"));
                     assert!(!projection.contains("`metadata`"));
                     let branches = if version == 4 { 2 } else { 3 };
@@ -8062,13 +7903,10 @@ mod tests {
 
     /// NAN-3052 (rdp_lateral_movement): `where is_private_ip(src_endpoint.ip)
     /// AND is_private_ip(dst_endpoint.ip)` over enrichment-stamped parts.
-    /// The producer-only endpoint leaves are read in the read select from the
-    /// physical Tuples (`__nano_raw_N`), never as `tupleElement` of the masked
-    /// roots, so no predicate depends on the `arrayExists(…, enrichments)`
-    /// mask chDB dropped from its prewhere header. Rows still return the
-    /// masked roots, and the raw leaves are temporary aliases.
+    /// NAN-4168: endpoint roots are plain columns, so every predicate leaf is
+    /// a plain `tupleElement` path and nothing reads `enrichments`.
     #[test]
-    fn full_event_endpoint_leaves_are_read_raw_beside_their_masked_roots() {
+    fn full_event_endpoint_predicates_read_plain_roots() {
         let mut source = manifest();
         let object = &mut source.objects[0];
         let extra = [
@@ -8095,22 +7933,13 @@ mod tests {
         query.newest_first_event_rows = false;
         let plan = plan_broad_log_query(&tenant(), &source, &query).expect("plan");
         assert!(plan.native_event_rows);
-        // The read select: raw leaves first, then the masked roots.
-        for (leaf, alias) in [("dst_endpoint`, 'ip'", "__nano_raw_0"), ("dst_endpoint`, 'port'", "__nano_raw_1"), ("src_endpoint`, 'ip'", "__nano_raw_2")] {
-            assert!(plan.sql.contains(&format!("tupleElement(`{leaf}) AS {alias}")), "{}", plan.sql);
+        for leaf in ["tupleElement(`dst_endpoint`, 'ip') AS __nano_path", "tupleElement(`dst_endpoint`, 'port') AS __nano_path",
+            "tupleElement(`src_endpoint`, 'ip') AS __nano_path",
+            "tupleElement(tupleElement(`dst_endpoint`, 'location'), 'country') AS __nano_path"] {
+            assert!(plan.sql.contains(leaf), "{leaf}: {}", plan.sql);
         }
-        let raw = plan.sql.find("AS __nano_raw_2").unwrap();
-        let masked = plan.sql.find("AS `dst_endpoint`").expect("masked root");
-        assert!(raw < masked && plan.sql[raw..masked].contains("`enrichments`"), "one read select: {}", plan.sql);
-        // Predicates name the raw leaves; nothing takes a producer leaf out of a masked root.
-        assert!(plan.sql.contains("toString(__nano_raw_2)") && plan.sql.contains("toString(__nano_raw_0)"), "{}", plan.sql);
-        assert!(plan.sql.contains("__nano_raw_1 = 3389"), "{}", plan.sql);
-        assert!(!plan.sql.contains("tupleElement(`dst_endpoint`, 'port') AS __nano_path"), "{}", plan.sql);
-        // A sensitive leaf still reads through its mask.
-        assert!(plan.sql.contains("tupleElement(tupleElement(`dst_endpoint`, 'location'), 'country') AS __nano_path"), "{}", plan.sql);
-        for alias in ["__nano_raw_0", "__nano_raw_1", "__nano_raw_2"] {
-            assert!(plan.temporary_aliases.contains(alias), "{:?}", plan.temporary_aliases);
-        }
+        assert!(!plan.sql.contains("__nano_raw_"), "{}", plan.sql);
+        assert!(!plan.sql.contains("arrayExists") && !plan.sql.contains("owned_fields"), "{}", plan.sql);
     }
 
     #[test]
@@ -8132,9 +7961,11 @@ mod tests {
             ).unwrap();
             let (available, _) = validate_manifest(&configured, &source).unwrap();
             let projection = required_root_projection(&required_columns(&query).unwrap(), &available).unwrap();
-            for root in ["time", "src_endpoint", "enrichments"] {
+            for root in ["time", "src_endpoint"] {
                 assert!(projection.contains(&format!("`{root}`")), "{projection}");
             }
+            // NAN-4168: no mask, so `enrichments` is not read for a location leaf.
+            assert!(!projection.contains("`enrichments`"), "{projection}");
             assert!(!projection.contains("`resources`"));
             assert!(plan.sql.contains(&format!("SELECT {projection} FROM ")));
             if candidates.is_some() { assert!(plan.sql.contains("WHERE 0")); }
@@ -8142,17 +7973,14 @@ mod tests {
     }
 
     #[test]
-    fn required_roots_keep_masks_for_returned_endpoints_but_not_missing_ones() {
+    fn required_roots_are_plain_and_skip_missing_ones() {
         let available = ["time", "src_endpoint.ip", "enrichments.provider"]
             .map(str::to_string).into_iter().collect();
         let missing = BTreeMap::from([("dst_endpoint.location.country".into(), "string".into())]);
         assert_eq!(required_root_projection(&missing, &available).unwrap(), "`time`");
         let producer = BTreeMap::from([("src_endpoint.ip".into(), "string".into())]);
-        let projection = required_root_projection(&producer, &available).unwrap();
-        assert!(projection.contains(&format!("{} AS `src_endpoint`",
-            crate::enrichment_read::root_expression("src_endpoint", &crate::enrichment_read::current()))));
-        assert!(projection.contains("AS `enrichments`"));
-        assert!(!projection.contains("`dst_endpoint`"));
+        // NAN-4168: the endpoint root is read as stored; no `enrichments` root.
+        assert_eq!(required_root_projection(&producer, &available).unwrap(), "`src_endpoint`, `time`");
     }
 
     #[test]
@@ -8191,7 +8019,7 @@ mod tests {
     }
 
     #[test]
-    fn compiler_table_view_bounds_each_arm_before_display_masks() {
+    fn compiler_table_view_bounds_each_arm() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../tests/fixtures/nan2469-live-tail-read-schema.json")).unwrap();
         let paths: Vec<String> = serde_json::from_value(fixture["available_paths"].clone()).unwrap();
@@ -8203,7 +8031,7 @@ mod tests {
         let query: CompiledQuery = serde_json::from_str(include_str!(
             "../tests/fixtures/nan2523-leaf-compiled.json")).unwrap();
         assert_eq!(query.required_columns.len(), 25);
-        let roots = "`activity_name`, `actor`, `class_uid`, `connection_info`, `dst_endpoint`, `enrichments`, `message`, `metadata`, `process`, `severity`, `src_endpoint`, `status`, `time`, `user`";
+        let roots = "`activity_name`, `actor`, `class_uid`, `connection_info`, `dst_endpoint`, `message`, `metadata`, `process`, `severity`, `src_endpoint`, `status`, `time`, `user`";
         let mut configured = tenant();
         configured.max_query_bytes = 10_000;
         for candidates in [None, Some([].as_slice())] {
@@ -8211,21 +8039,20 @@ mod tests {
                 &configured, &source, &query, candidates, Some(&tail),
             ).unwrap();
             assert!(!plan.native_event_rows);
-            assert_eq!(plan.sql.matches(&format!("SELECT {roots} FROM")).count(), 5);
-            assert_eq!(plan.sql.matches("'owned_fields'").count(), 1);
-            assert_eq!(plan.sql.matches("AS __nano_page_denied_fields").count(), 1);
-            assert_eq!(plan.sql.matches("has(__nano_page_denied_fields,").count(), 6);
-            assert_eq!(plan.sql.matches("LIMIT 101").count(), 4);
-            assert_eq!(plan.sql.matches("ORDER BY time DESC LIMIT 101").count(), 4);
+            // One per bounded arm; no outer display-mask select (NAN-4168).
+            assert_eq!(plan.sql.matches(&format!("SELECT {roots} FROM")).count(), 4, "{}", plan.sql);
+            // NAN-4168: no stamps read and no display masks.
+            assert!(!plan.sql.contains("enrichments") && !plan.sql.contains("owned_fields"), "{}", plan.sql);
+            // Each arm (snapshot, tail) bounded, then the merged page; no
+            // outer display-mask layer bounding again (NAN-4168).
+            assert_eq!(plan.sql.matches("LIMIT 101").count(), 3, "{}", plan.sql);
+            assert_eq!(plan.sql.matches("ORDER BY time DESC LIMIT 101").count(), 3, "{}", plan.sql);
             assert!(!plan.sql.contains("`raw_data`"));
             assert!(!plan.sql.contains("`http_request`"));
             assert!(!plan.sql.contains("`file`"));
             let union = plan.sql.find(" UNION ALL ").unwrap();
             assert!(plan.sql[..union].contains("LIMIT 101"));
             assert!(plan.sql[union..].contains("LIMIT 101"));
-            // Authorization remains outside the bounded raw arms, once only.
-            let mask = plan.sql.find("'owned_fields'").unwrap();
-            assert!(mask < plan.sql.find(&format!("SELECT {roots}")).unwrap());
             eprintln!("NAN-2523 leaf SQL: {}", plan.sql);
         }
         for fixture in [include_str!("../tests/fixtures/nan2523-leaf-compiled.json"),
@@ -8267,7 +8094,7 @@ mod tests {
     /// exactly as `lake_query_compile` emits it.
     fn full_event_needle() -> CompiledQuery {
         let mut query = compiled(
-            "SELECT * FROM __nano_lake_source__ WHERE time BETWEEN '2026-08-10 00:00:00.000000' AND '2026-08-11 00:00:00.000000' \
+            "SELECT * FROM __nano_lake_source__ WHERE time >= '2026-08-10 00:00:00.000000' AND time < '2026-08-11 00:00:00.000000' \
              AND (((lower(\"metadata.log_source\") = 'conduit_proxy' AND \"src_endpoint.ip\" = '10.1.4.63') \
              AND (hasAllTokens(lower(message), 'github') OR hasAllTokens(lower(raw_data), 'github')))) \
              ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 101 SETTINGS max_threads=16, max_execution_time=300, \
@@ -8398,9 +8225,9 @@ mod tests {
     }
 
     #[test]
-    fn full_event_locator_refuses_mask_dependent_predicates_and_other_shapes() {
+    fn full_event_locator_accepts_enrichment_predicates_and_refuses_other_shapes() {
         let base = full_event_needle();
-        // A masked leaf's predicate is evaluated on the masked value.
+        // NAN-4168: enrichment leaves read the same in both passes.
         for path in [
             "src_endpoint.location.country",
             "dst_endpoint.autonomous_system.number",
@@ -8409,11 +8236,7 @@ mod tests {
         ] {
             let mut query = base.clone();
             query.required_columns.push(column(path, "string"));
-            assert!(full_event_locator(&query).is_none(), "{path}");
-            assert!(
-                !mask_dependent_path("src_endpoint.ip") && mask_dependent_path(path),
-                "{path}"
-            );
+            assert!(full_event_locator(&query).is_some(), "{path}");
         }
         let refused = |edit: &dyn Fn(&mut CompiledQuery)| {
             let mut query = base.clone();
@@ -8473,22 +8296,25 @@ mod tests {
     }
 
     #[test]
-    fn table_view_top_k_does_not_cross_sensitive_filters_or_pipelines() {
+    fn table_view_top_k_keeps_whole_roots_and_pipelines_out() {
         let query: CompiledQuery = serde_json::from_str(include_str!(
             "../tests/fixtures/nan2523-leaf-compiled.json")).unwrap();
         assert!(table_view_page_clause(&query).is_some());
-        assert!(table_view_masks_after_top_k(&query));
-        for path in ["src_endpoint.location.country", "dst_endpoint.autonomous_system.number", "enrichments.provider", "src_endpoint"] {
-            let mut sensitive: CompiledQuery = serde_json::from_str(include_str!("../tests/fixtures/nan2523-leaf-compiled.json")).unwrap();
-            sensitive.projected_scan_columns.push(path.into());
-            assert!(table_view_page_clause(&sensitive).is_none(), "{path}");
-            assert!(!table_view_masks_after_top_k(&sensitive), "{path}");
+        // NAN-4168: location/AS leaves are plain columns and may page.
+        for path in ["src_endpoint.location.country", "dst_endpoint.autonomous_system.number"] {
+            let mut leaf: CompiledQuery = serde_json::from_str(include_str!("../tests/fixtures/nan2523-leaf-compiled.json")).unwrap();
+            leaf.projected_scan_columns.push(path.into());
+            assert!(table_view_page_clause(&leaf).is_some(), "{path}");
+        }
+        for path in ["enrichments.provider", "src_endpoint"] {
+            let mut whole: CompiledQuery = serde_json::from_str(include_str!("../tests/fixtures/nan2523-leaf-compiled.json")).unwrap();
+            whole.projected_scan_columns.push(path.into());
+            assert!(table_view_page_clause(&whole).is_none(), "{path}");
         }
         for suffix in [" OFFSET 10", " UNION ALL SELECT * FROM other"] {
             let mut pipeline: CompiledQuery = serde_json::from_str(include_str!("../tests/fixtures/nan2523-leaf-compiled.json")).unwrap();
             pipeline.sql = query.sql.split(" SETTINGS ").next().unwrap().to_string() + suffix;
             assert!(table_view_page_clause(&pipeline).is_none());
-            assert!(!table_view_masks_after_top_k(&pipeline));
         }
     }
 
@@ -9729,11 +9555,20 @@ mod flat_filter_leaf_tests {
     }
 
     #[test]
-    fn array_leaves_mask_roots_and_unprojected_paths_stay_nested() {
-        let sql = statement("`resources`.`hostname` AS `resources.hostname`, `src_endpoint`.`ip` AS `src_endpoint.ip`");
+    fn array_leaves_and_unprojected_paths_stay_nested() {
+        let sql = statement("`resources`.`hostname` AS `resources.hostname`");
         let mut params = params();
-        assert!(flat_scalar_leaves(&sql, &mut params, &required(&["resources.hostname", "src_endpoint.ip", "device.hostname"])).is_none());
+        assert!(flat_scalar_leaves(&sql, &mut params, &required(&["resources.hostname", "device.hostname"])).is_none());
         assert!(params.iter().all(|(name, schema)| !name.ends_with("_read_schema") || schema == SCHEMA));
+    }
+
+    /// NAN-4168: endpoint leaves are plain scalar leaves like any other.
+    #[test]
+    fn endpoint_leaves_flatten_like_any_scalar_leaf() {
+        let sql = statement("`src_endpoint`.`ip` AS `src_endpoint.ip`");
+        let mut params = params();
+        let flat = flat_scalar_leaves(&sql, &mut params, &required(&["src_endpoint.ip"])).unwrap();
+        assert!(!flat.contains("`src_endpoint`.`ip`"), "{flat}");
     }
 
     #[test]

@@ -671,6 +671,11 @@ impl AppState {
                             // NAN-3020: lean tenants' ingest counters come from
                             // their query[T] part rollups through this registry.
                             nanosiem_core::enterprise_shared_lean_ingest::install(Arc::clone(&registry));
+                            // NAN-4149: tenant runners enumerate only tenants this
+                            // region still serves (cell placement or gen1 entry), so
+                            // a destroyed tenant whose control-DB rows stay (non-full
+                            // offboard) is no longer iterated every poll.
+                            nanosiem_core::enterprise_shared_security::install_served_tenants(Arc::clone(&registry) as _);
                             let job_stores: Arc<dyn nanosiem_enterprise::melod::TenantSearchJobStoreFactory> = Arc::new(factory);
                             let tenant_search = Some(Arc::new(attach_tenant_search_rls_runtime(
                                 nanosiem_enterprise::melod::TenantSearchRuntimeResolver::new(
@@ -890,6 +895,25 @@ impl AppState {
         } else {
             None
         };
+        let encryption_service = Arc::new(nanosiem_core::crypto::EncryptionService::from_env());
+        let task_registry = TaskRegistry::default();
+        #[cfg(feature = "enterprise")]
+        let soar_service = if let Some(runtime) = tenant_ai_rls_runtime.as_ref() {
+            match nanosiem_enterprise::soar::service::SoarService::connect_startup(
+                runtime.clone(),
+                encryption_service.clone(),
+            )
+            .await
+            {
+                Ok(service) => Some(Arc::new(service.with_shutdown(task_registry.shutdown_token()))),
+                Err(_) => {
+                    tracing::error!("SOAR service construction unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // NAN-2361 wave 5: queued export runner (jobs binary); needs the tenant
         // search resolver, so it is built after the shared runtime tuple.
         #[cfg(feature = "enterprise")]
@@ -965,6 +989,8 @@ impl AppState {
             #[cfg(feature = "enterprise")]
             tenant_ai_rls_runtime,
             #[cfg(feature = "enterprise")]
+            soar_service,
+            #[cfg(feature = "enterprise")]
             tenant_case_notebook_service,
             #[cfg(feature = "enterprise")]
             tenant_detection_runtime,
@@ -1032,7 +1058,7 @@ impl AppState {
             auth_enabled,
             notification_service,
             tuning_repository,
-            task_registry: TaskRegistry::default(),
+            task_registry,
             // Audit emitter and query service for ClickHouse audit logging
             audit_emitter,
             audit_query_service,
@@ -1048,7 +1074,7 @@ impl AppState {
             demo_service: None,
             #[cfg(feature = "enterprise")]
             license_status: Arc::new(RwLock::new(nanosiem_core::license::LicenseStatus::default())),
-            encryption_service: Arc::new(nanosiem_core::crypto::EncryptionService::from_env()),
+            encryption_service,
             #[cfg(feature = "enterprise")]
             case_events_tx,
             #[cfg(feature = "enterprise")]
@@ -1111,9 +1137,7 @@ impl AppState {
                 #[cfg(feature = "enterprise")]
                 {
                     tracing::info!("Running enterprise PostgreSQL overlay migrations...");
-                    let mut overlay_migrator = sqlx::migrate!("../migrations/postgres-enterprise");
-                    overlay_migrator.set_ignore_missing(true);
-                    overlay_migrator.run(pg_pool).await.map_err(|e| {
+                    nanosiem_enterprise::postgres_migrations::run(pg_pool).await.map_err(|e| {
                         DualPoolError::PostgresConnectionError(format!(
                             "Enterprise overlay migration failed: {}",
                             e

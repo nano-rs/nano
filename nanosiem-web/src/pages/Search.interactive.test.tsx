@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
+import userEvent from '@testing-library/user-event';
 import { useEffect } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ComponentProps } from 'react';
@@ -17,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   stream: vi.fn(), tenantPlan: undefined as object | undefined,
   noop: vi.fn(), mutation: vi.fn().mockResolvedValue({}), history: vi.fn(),
   schema: { schema: 'ocsf', fields: [{ name: 'enrichments.data.host_count' }] },
+  capabilities: {} as Record<string, boolean>, melodStatus: undefined as { connected: boolean } | undefined,
 }));
 vi.mock('@/lib/api', () => ({
   ApiClientError: class extends Error {},
@@ -33,9 +35,10 @@ vi.mock('@/hooks/use-api', async importOriginal => {
   const hooks = Object.fromEntries(Object.keys(original).filter(key => key.startsWith('use')).map(key => [key, () => ({
     mutate: mocks.mutation, data: undefined, loading: false, refetch: mocks.noop,
   })]));
-  return { ...original, ...hooks, useSearch: () => ({ mutate: mocks.legacy }), useFieldStats: () => ({ mutate: mocks.fields }) };
+  return { ...original, ...hooks, useSearch: () => ({ mutate: mocks.legacy }), useFieldStats: () => ({ mutate: mocks.fields }),
+    useMelodStatus: () => ({ data: mocks.melodStatus, loading: false, refetch: mocks.noop }) };
 });
-vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: {}, tenantPlan: mocks.tenantPlan }) }));
+vi.mock('@/hooks/use-capabilities', () => ({ useCapabilities: () => ({ capabilities: mocks.capabilities, tenantPlan: mocks.tenantPlan }) }));
 vi.mock('@/contexts/AuthContext', () => ({ useAuth: () => ({ user: {}, hasPermission: () => true, isAuthenticated: true }) }));
 vi.mock('@/contexts/UserPreferencesContext', () => ({ useUserPreferences: () => ({ defaultTimeRange: '1h', queryMode: 'piped' }) }));
 vi.mock('@/contexts/PageContext', () => ({ useHereCardOverride: () => {} }));
@@ -45,8 +48,9 @@ vi.mock('@/hooks/useSearchHistory', () => ({ useSearchHistory: () => ({ searchHi
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => false }));
 vi.mock('@/components/search', () => ({
   FIELD_STATS_PINNED_COLUMNS: [],
-  SearchQueryInput: ({ query, onQueryChange, onSearch }: { query: string; onQueryChange: (value: string) => void; onSearch: () => void }) => <>
+  SearchQueryInput: ({ query, onQueryChange, onSearch, onAiSearch, aiMode }: { query: string; onQueryChange: (value: string) => void; onSearch: () => void; onAiSearch?: () => void; aiMode?: boolean }) => <>
     <input aria-label="Query" value={query} onChange={event => onQueryChange(event.target.value)} />
+    <div data-testid="query-ai" data-ai-mode={String(!!aiMode)} data-ai-search={String(!!onAiSearch)} />
     <button onClick={() => onSearch()}>Run test search</button>
   </>,
   SearchResults: ({ results, displayType, onLoadMore, onPageChange, onVisibleRowsChange, totalCount, totalCountExact, prependedRowCount, isSearching, asyncJobId }: ComponentProps<typeof import('@/components/search')['SearchResults']>) => <>
@@ -103,7 +107,7 @@ vi.mock('@/components/search/SearchStatsBar', () => ({
 const locations: string[] = [];
 function LocationProbe() {
   const location = useLocation();
-  useEffect(() => { locations.push(`${location.pathname}${location.search}`); }, [location]);
+  useEffect(() => { locations.push(`${location.pathname}${location.search}${location.hash}`); }, [location]);
   return null;
 }
 
@@ -122,6 +126,8 @@ beforeEach(() => {
   // A hosted-shared tenant plan in its minimal contract shape (the parser
   // requires identity + components); no risk grant -> shared search surface.
   mocks.tenantPlan = { identity: { permissions: [] }, components: {} };
+  mocks.capabilities = {};
+  mocks.melodStatus = undefined;
   mocks.fields.mockResolvedValue({ fields: [] });
   mocks.histogram.mockResolvedValue({ histogram: [] });
   mocks.stream.mockImplementation((_request, callbacks) => {
@@ -1048,7 +1054,7 @@ it('re-anchors the timeline count on the rolling window and rolls the range labe
     // The label says the window is rolling, and the URL carries the anchored
     // window (replaced in place: `locations` sees the new URL once).
     expect(screen.getByTestId('time-range-label').textContent).toBe('Last 1h · live');
-    const latest = new URLSearchParams(locations[locations.length - 1].split('?')[1]);
+    const latest = new URLSearchParams(locations[locations.length - 1].split('#')[1]);
     expect(latest.get('start')).toBe(asked.time_range.start);
     expect(latest.get('end')).toBe(asked.time_range.end);
     expect(latest.get('q')).toBeTruthy();
@@ -1221,7 +1227,7 @@ it('a page load over a relative range runs once: one search, one timeline, one f
   // NAN-3884: the URL keeps the relative pick (a reload or shared link
   // re-resolves it), and so does the picker. The run's resolved bounds show
   // in the meta row instead.
-  const url = new URLSearchParams(locations.at(-1)!.split('?')[1]);
+  const url = new URLSearchParams(locations.at(-1)!.split('#')[1]);
   expect(url.get('time')).toBe('Last hour');
   expect(url.get('start')).toBeNull();
   expect(url.get('end')).toBeNull();
@@ -1281,4 +1287,56 @@ it('a newer run aborts the superseded run\'s timeline and field-stats requests',
   const secondStats: AbortSignal = mocks.fields.mock.calls[1][0].signal;
   cleanup();
   expect(secondStats.aborted).toBe(true);
+});
+
+
+it('loads match URL absolute bounds ahead of the saved default range', async () => {
+  mocks.interactive.mockResolvedValue({ results: [{ uid: 'old-match' }], total_count: 1, fields: [], execution_time_ms: 1 });
+  const params = new URLSearchParams({
+    q: '*', start: '2026-10-17T12:25:00.123Z', end: '2026-10-17T12:48:57.686Z', time: 'Last hour',
+  });
+  mount('*', `/search?${params}`);
+  await waitFor(() => expect(mocks.interactive).toHaveBeenCalledOnce());
+  expect(mocks.interactive.mock.calls[0][0].time_range).toEqual({
+    start: '2026-10-17T12:25:00.123Z', end: '2026-10-17T12:48:57.686Z',
+  });
+  await waitFor(() => expect(screen.getByTestId('rows').textContent).toContain('old-match'));
+  expect(mocks.interactive).toHaveBeenCalledOnce();
+});
+
+// NAN-4061: copying a hunt must not send its query through the edge on open.
+it('copies a fragment share link with query and time bounds', async () => {
+  const user = userEvent.setup();
+  const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue();
+  mount("' OR 1=1 --");
+  await user.click(screen.getByRole('button', { name: 'Share' }));
+  await user.click(screen.getByText('Copy link'));
+  await waitFor(() => expect(writeText).toHaveBeenCalledOnce());
+  const url = new URL(writeText.mock.calls[0][0]);
+  expect(url.search).toBe('');
+  const params = new URLSearchParams(url.hash.slice(1));
+  expect(params.get('q')).toBe("' OR 1=1 --");
+  expect(params.get('start')).toBe('2026-09-21T14:20:00.000Z');
+  expect(params.get('end')).toBe('2026-09-21T15:20:00.000Z');
+  writeText.mockRestore();
+});
+
+// NAN-4131: open core ships no AI, so a natural-language query must never
+// light up the AI suggestion — even if a stale provider status says connected.
+it('open core (no melod capability) never offers AI for a natural-language query', async () => {
+  mocks.capabilities = {};
+  mocks.melodStatus = { connected: true };
+  mount('show me logins');
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 500)); });
+  const probe = screen.getByTestId('query-ai');
+  expect(probe.dataset.aiMode).toBe('false');
+  expect(probe.dataset.aiSearch).toBe('false');
+});
+
+it('enterprise with a connected provider still offers AI for a natural-language query', async () => {
+  mocks.capabilities = { melod: true };
+  mocks.melodStatus = { connected: true };
+  mount('show me logins');
+  await waitFor(() => expect(screen.getByTestId('query-ai').dataset.aiMode).toBe('true'));
+  expect(screen.getByTestId('query-ai').dataset.aiSearch).toBe('true');
 });

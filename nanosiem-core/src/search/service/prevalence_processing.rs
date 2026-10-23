@@ -471,6 +471,15 @@ impl SearchService {
         let prevalence_service = match &self.prevalence_lookup {
             Some(service) => service,
             None => {
+                // NAN-4372: a filter the backend cannot evaluate must fail the
+                // query, never pass every row through. Enrich-only stages are
+                // decoration and keep the warn-and-continue behavior (the
+                // output-column guard reports the missing columns).
+                if prevalence_commands.iter().any(|cmd| !cmd.conditions.is_empty()) {
+                    return Err(SearchError::PrevalenceError(
+                        "`prevalence` filter cannot run: no prevalence backend is configured for this tenant".into(),
+                    ));
+                }
                 warn!("Prevalence command found but no prevalence service configured");
                 return Ok(results);
             }
@@ -490,7 +499,13 @@ impl SearchService {
                         artifact_scope,
                     )
                     .await?;
-            } else if !cmd.conditions.is_empty() {
+            }
+            // NAN-4372: `prevalence <cond> enrich=true` both decorates AND
+            // filters. The ClickHouse JOIN path always applied the conditions;
+            // this path used to skip them whenever `enrich` was set, so the
+            // documented `prevalence domain_first_seen > now() - 24h
+            // enrich=true` returned every row.
+            if !cmd.conditions.is_empty() {
                 // Filtering mode: filter results based on prevalence conditions
                 // All conditions must be satisfied (AND logic)
                 for condition in &cmd.conditions {
@@ -589,11 +604,20 @@ impl SearchService {
             )));
         }
 
-        // For timestamp-based fields, we need different handling
-        if field.is_timestamp_field() {
-            warn!("Timestamp-based prevalence filtering (first_seen) not yet implemented");
-            return Ok(results);
-        }
+        // NAN-4372: resolve the comparison up front. A first_seen field takes a
+        // `now() - <duration>` cutoff and a count field takes a number; the
+        // parser pairs them, and any other pairing is an error here, never a
+        // pass-through. (The first_seen form used to `return Ok(results)`, so
+        // `prevalence domain_first_seen > now() - 24h` returned every row.)
+        let comparison = PrevalenceComparison::new(field, threshold, chrono::Utc::now())?;
+        // NAN-4372: first_seen is "when was this artifact first seen", not
+        // "earliest sighting inside `window=`". Lake snapshots are per-window,
+        // so a 24h snapshot's first_seen for a domain known for ten days is
+        // ~24h old; read it from the 30d snapshot whatever `window=` says.
+        // Host counts keep the requested window. The ClickHouse JOIN path
+        // agrees: its `_*_first_seen` reads the unmasked 30d dict, guarded by
+        // 30d presence (see `prevalence_filter_condition_to_sql`).
+        let time_window = lookup_window_for(&comparison, time_window);
 
         // Extract unique artifacts from results
         let artifacts: Vec<String> = results
@@ -604,11 +628,14 @@ impl SearchService {
             .collect();
 
         if artifacts.is_empty() {
+            // NAN-4372: no row carries the artifact, so no row can satisfy the
+            // filter (a row without one is excluded below, like the JOIN
+            // path's NULL). Returning `results` here passed every row.
             debug!(
-                "No artifacts found in fields {:?} for prevalence filtering",
+                "No artifacts found in fields {:?} for prevalence filtering; excluding all rows",
                 artifact_fields
             );
-            return Ok(results);
+            return Ok(Vec::new());
         }
 
         debug!(
@@ -619,7 +646,7 @@ impl SearchService {
         // Single dict-based query handles all artifacts; map keys are
         // lowercase for hash/domain (raw for IP), so lookups below must
         // lowercase the row's artifact field for hash/domain.
-        let mut prevalence_map: std::collections::HashMap<String, u64> =
+        let mut prevalence_map: std::collections::HashMap<String, PrevalenceFacts> =
             std::collections::HashMap::new();
         match prevalence_service
             .lookup(artifacts.as_slice(), time_window, artifact_scope)
@@ -627,7 +654,7 @@ impl SearchService {
         {
             Ok(prevalence_data) => {
                 for data in prevalence_data {
-                    prevalence_map.insert(data.artifact, data.host_count);
+                    prevalence_map.insert(data.artifact.clone(), PrevalenceFacts::from(&data));
                 }
             }
             Err(e) => {
@@ -679,7 +706,7 @@ impl SearchService {
                         "Prevalence summary rescue for dict-missed artifacts"
                     );
                     for data in rescued {
-                        prevalence_map.insert(data.artifact.clone(), data.host_count);
+                        prevalence_map.insert(data.artifact.clone(), PrevalenceFacts::from(&data));
                     }
                 }
                 Err(e) => {
@@ -690,17 +717,6 @@ impl SearchService {
                 }
             }
         }
-
-        // Get threshold value
-        let threshold_value = match threshold {
-            PrevalenceThreshold::Count(n) => *n,
-            PrevalenceThreshold::Duration(_) => {
-                // Duration thresholds are for first_seen comparisons, not count-based filtering
-                // For now, skip filtering for duration thresholds
-                warn!("Duration-based prevalence filtering not yet implemented");
-                return Ok(results);
-            }
-        };
 
         // Capture original count before consuming results
         let original_count = results.len();
@@ -730,8 +746,8 @@ impl SearchService {
                 // opposite of rare. Mirror the JOIN path's NULL semantics: a miss
                 // fails EVERY comparison (SQL `NULL <cmp> x` yields NULL → the row is
                 // dropped by the WHERE).
-                let prevalence = prevalence_map.get(&artifact.to_lowercase()).copied();
-                prevalence_passes_filter(prevalence, operator, threshold_value)
+                let facts = prevalence_map.get(&artifact.to_lowercase()).copied();
+                comparison.passes(facts, operator)
             })
             .collect();
 
@@ -1753,6 +1769,118 @@ fn collect_lake_domains(
     });
 }
 
+/// The per-artifact facts a prevalence FILTER compares against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PrevalenceFacts {
+    pub host_count: u64,
+    pub first_seen: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<&crate::prevalence::PrevalenceData> for PrevalenceFacts {
+    fn from(data: &crate::prevalence::PrevalenceData) -> Self {
+        Self {
+            host_count: data.host_count,
+            first_seen: data.first_seen,
+        }
+    }
+}
+
+/// One resolved `| prevalence <field> <op> <threshold>` comparison.
+///
+/// NAN-4372: `*_first_seen` conditions were parsed and then dropped on every
+/// path (the in-memory filter returned its input, the JOIN pushdown emitted
+/// no predicate), so `prevalence domain_first_seen > now() - 24h` returned
+/// every row. The cutoff is resolved once per query (`now - duration`), and
+/// a field/threshold pairing the parser never produces is an error rather
+/// than a pass-through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PrevalenceComparison {
+    /// `hash_prevalence` / `domain_prevalence` against a host count.
+    HostCount(u64),
+    /// `hash_first_seen` / `domain_first_seen` against an absolute instant.
+    FirstSeen(chrono::DateTime<chrono::Utc>),
+}
+
+impl PrevalenceComparison {
+    pub(crate) fn new(
+        field: &PrevalenceField,
+        threshold: &PrevalenceThreshold,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self, SearchError> {
+        match (field.is_timestamp_field(), threshold) {
+            (false, PrevalenceThreshold::Count(n)) => Ok(Self::HostCount(*n)),
+            (true, PrevalenceThreshold::Duration(duration)) => {
+                let duration = chrono::Duration::from_std(*duration).map_err(|_| {
+                    SearchError::PrevalenceError(format!(
+                        "`prevalence {}` duration is out of range",
+                        field.as_str()
+                    ))
+                })?;
+                let cutoff = now.checked_sub_signed(duration).ok_or_else(|| {
+                    SearchError::PrevalenceError(format!(
+                        "`prevalence {}` duration is out of range",
+                        field.as_str()
+                    ))
+                })?;
+                Ok(Self::FirstSeen(cutoff))
+            }
+            (true, PrevalenceThreshold::Count(_)) => Err(SearchError::PrevalenceError(format!(
+                "`prevalence {}` compares a timestamp: write `{} > now() - 24h`",
+                field.as_str(),
+                field.as_str()
+            ))),
+            (false, PrevalenceThreshold::Duration(_)) => {
+                Err(SearchError::PrevalenceError(format!(
+                    "`prevalence {}` compares a host count: write `{} < 5`",
+                    field.as_str(),
+                    field.as_str()
+                )))
+            }
+        }
+    }
+
+    /// A miss (`None`) fails every comparison, for both kinds: see
+    /// [`prevalence_passes_filter`].
+    pub(crate) fn passes(
+        &self,
+        facts: Option<PrevalenceFacts>,
+        operator: &PrevalenceOperator,
+    ) -> bool {
+        match self {
+            Self::HostCount(threshold) => {
+                prevalence_passes_filter(facts.map(|f| f.host_count), operator, *threshold)
+            }
+            Self::FirstSeen(cutoff) => {
+                let Some(facts) = facts else {
+                    return false;
+                };
+                let first_seen = facts.first_seen;
+                match operator {
+                    PrevalenceOperator::Lt => first_seen < *cutoff,
+                    PrevalenceOperator::Lte => first_seen <= *cutoff,
+                    PrevalenceOperator::Gt => first_seen > *cutoff,
+                    PrevalenceOperator::Gte => first_seen >= *cutoff,
+                    PrevalenceOperator::Eq => first_seen == *cutoff,
+                    PrevalenceOperator::Ne => first_seen != *cutoff,
+                }
+            }
+        }
+    }
+}
+
+/// NAN-4372: the snapshot window a filter comparison reads. first_seen always
+/// reads the 30d snapshot (a per-window snapshot's first_seen is only the
+/// earliest sighting inside that window); host counts use `window=`.
+pub(crate) fn lookup_window_for(
+    comparison: &PrevalenceComparison,
+    requested: crate::prevalence::TimeWindow,
+) -> crate::prevalence::TimeWindow {
+    match comparison {
+        PrevalenceComparison::FirstSeen(_) => crate::prevalence::TimeWindow::ThirtyDays,
+        PrevalenceComparison::HostCount(_) => requested,
+    }
+}
+
 /// Decide whether a row whose looked-up prevalence host_count is `prevalence`
 /// passes a `| prevalence <field> <op> <threshold>` filter condition.
 ///
@@ -1816,36 +1944,36 @@ pub(crate) fn extract_prevalence_artifact(
     })
 }
 
-/// Map a single `| prevalence <field> <op> N` count condition to a SQL predicate over the
-/// windowed, dict-masked host-count aliases the prevalence JOIN CTE computes
-/// (`_hp_host_count` for hash, `_dp_host_count` for domain). Returns None for conditions
-/// that don't push down (timestamp fields, Duration thresholds) — those stay on the
-/// no-op in-memory path, preserving today's behavior.
+/// Map a single `| prevalence <field> <op> <threshold>` condition to a SQL predicate over
+/// the windowed, dict-masked aliases the prevalence JOIN CTE computes (`_hp_*` for hash,
+/// `_dp_*` for domain): `<field>_prevalence` compares `_*_host_count` to N, and
+/// `<field>_first_seen` compares `_*_first_seen` to `now64(6) - <duration>`.
+///
+/// NAN-4372: first_seen conditions used to return None here and the caller dropped them,
+/// so `prevalence domain_first_seen > now() - 24h` matched every row. Every valid
+/// condition now yields a predicate, and a field/threshold pairing the parser never
+/// produces is an error, never a silent drop.
 ///
 /// NAN-1691: the `< 9999` presence guard makes a dict miss / out-of-window entry fail
-/// every operator, mirroring `prevalence_passes_filter(None, …) == false` so the pushdown
-/// yields the SAME row set as the in-memory filter.
+/// every operator, mirroring `PrevalenceComparison::passes(None, …) == false` so the
+/// pushdown yields the SAME row set as the in-memory filter. The first_seen form keeps
+/// the same guard (a miss carries the `toDateTime64(0, 6)` default, which would otherwise
+/// satisfy `< cutoff`).
 ///
 /// NAN-1705 (D4b): this predicate is UNCHANGED — the rescue is applied one level
-/// up, on the `_hp/_dp_host_count` projection aliases (see [`rescue_transform_sql`]).
-/// A rescued dict-blind artifact's alias is rewritten to its TRUE fresh host_count
-/// in-SQL, so `{alias} < 9999 AND {alias} {op} N` matches it directly here — and,
+/// up, on the `_hp/_dp_*` projection aliases (see [`rescue_transform_sql`]).
+/// A rescued dict-blind artifact's aliases are rewritten to its TRUE fresh host_count and
+/// first_seen in-SQL, so the predicate matches it directly here — and,
 /// crucially, so does every downstream reference (the decoration CASEs, a user
 /// `| where host_count < N`). No OR-branch, no post-query patch, no divergence.
 pub(crate) fn prevalence_filter_condition_to_sql(
     cond: &crate::query::PrevalenceCondition,
-) -> Option<String> {
-    use crate::query::{PrevalenceField, PrevalenceOperator, PrevalenceThreshold};
+) -> Result<String, SearchError> {
+    use crate::query::{PrevalenceField, PrevalenceOperator};
 
-    let alias = match cond.field {
-        PrevalenceField::HashPrevalence => "_hp_host_count",
-        PrevalenceField::DomainPrevalence => "_dp_host_count",
-        // first_seen fields have no command-form SQL filter (in-memory no-ops them).
-        PrevalenceField::HashFirstSeen | PrevalenceField::DomainFirstSeen => return None,
-    };
-    let n = match cond.threshold {
-        PrevalenceThreshold::Count(n) => n,
-        PrevalenceThreshold::Duration(_) => return None,
+    let prefix = match cond.field {
+        PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => "_hp",
+        PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => "_dp",
     };
     let op = match cond.operator {
         PrevalenceOperator::Lt => "<",
@@ -1855,7 +1983,27 @@ pub(crate) fn prevalence_filter_condition_to_sql(
         PrevalenceOperator::Eq => "=",
         PrevalenceOperator::Ne => "!=",
     };
-    Some(format!("({alias} < 9999 AND {alias} {op} {n})"))
+    // `now` is only used to validate the pairing and the duration's range; the SQL
+    // resolves the cutoff against ClickHouse's own clock.
+    match PrevalenceComparison::new(&cond.field, &cond.threshold, chrono::Utc::now())? {
+        PrevalenceComparison::HostCount(n) => Ok(format!(
+            "({prefix}_host_count < 9999 AND {prefix}_host_count {op} {n})"
+        )),
+        PrevalenceComparison::FirstSeen(_) => {
+            let crate::query::PrevalenceThreshold::Duration(duration) = cond.threshold else {
+                unreachable!("PrevalenceComparison::FirstSeen is built only from a Duration");
+            };
+            let seconds = duration.as_secs();
+            // NAN-4372: first_seen is judged against the 30d dict whatever
+            // `window=` is (the lake path reads the 30d snapshot), so its
+            // presence guard is 30d presence — a dict hit, i.e. a non-default
+            // first_seen — not the window-masked host count. A miss carries
+            // `toDateTime64(0, 6)`, which would otherwise satisfy `< cutoff`.
+            Ok(format!(
+                "({prefix}_first_seen > toDateTime64(0, 6) AND {prefix}_first_seen {op} subtractSeconds(now64(6), {seconds}))"
+            ))
+        }
+    }
 }
 
 // ============================================================================
@@ -2279,8 +2427,9 @@ pub(crate) fn filter_rescued_artifacts(
         };
         let passes_all = conditions.iter().all(|cond| {
             let PrevalenceThreshold::Count(n) = cond.threshold else {
-                // Non-count conditions never push down (prevalence_filter_condition_to_sql
-                // returns None), so the rescue must not enforce them either.
+                // NAN-4372: first_seen conditions are not enforced here. The rescue
+                // only has to be a SUPERSET: the pushed `_*_first_seen` predicate
+                // narrows in-SQL over the transform-corrected alias.
                 return true;
             };
             prevalence_passes_filter(Some(host_count), &cond.operator, n)

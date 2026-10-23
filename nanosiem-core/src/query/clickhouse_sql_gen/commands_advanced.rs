@@ -68,13 +68,19 @@ pub(super) fn group_keys_present_sql(key_exprs: &[String]) -> Option<String> {
     )
 }
 
-/// Scalar subquery producing a per-group aggregate Map: canonicalized key →
-/// aggregate value(s). Attached per row via `map[<key>]`, this replaces the
+/// Scalar subquery producing a per-group aggregate lookup: a
+/// `(keys, values)` pair of arrays, canonicalized key → aggregate value(s).
+/// Attached per row via [`group_agg_lookup_sql`], this replaces the
 /// whole-partition window shape (`agg(x) OVER (PARTITION BY k)`), which
 /// buffers the entire partition and OOMs (Code 241) at production scale
 /// (NAN-1642: 24h/21.4M rows in 1.9s/155MiB where both the window and a LEFT
 /// JOIN join-back OOM — the JOIN defeats ClickHouse lazy materialization).
 /// The scalar is evaluated once per query (ClickHouse scalar-subquery cache).
+///
+/// NAN-4296: it was a `Map` looked up with `map[key]`, which is a linear
+/// scan of the map's keys for every row (O(rows × groups): 11 s for an hour
+/// of `eventstats ... by src_endpoint.ip`). The arrays are looked up through
+/// `transform`, which hashes the constant keys once per block.
 ///
 /// It is also a SECOND reference to `stats_source`, so callers must only use it
 /// when re-executing that source yields the same rows (NAN-2265).
@@ -84,10 +90,20 @@ pub(super) fn group_agg_map_sql(
     stats_source: &str,
 ) -> String {
     format!(
-        "(SELECT mapFromArrays(groupArrayIf(__nano_k, isNotNull(__nano_v)), \
+        "(SELECT tuple(groupArrayIf(__nano_k, isNotNull(__nano_v)), \
          groupArrayIf(__nano_v, isNotNull(__nano_v))) FROM \
          (SELECT {} AS __nano_k, {} AS __nano_v FROM {} GROUP BY __nano_k))",
         build_key_sql, value_sql, stats_source
+    )
+}
+
+/// The value of group `key_sql` in the [`group_agg_map_sql`] scalar bound to
+/// `alias`. A group with no (non-NULL) aggregate yields the value type's
+/// default, exactly as `map[missing]` did: `transform` maps an unknown key
+/// to index 0 and `arrayElement(values, 0)` is the default.
+pub(super) fn group_agg_lookup_sql(alias: &str, key_sql: &str) -> String {
+    format!(
+        "arrayElement({alias}.2, transform({key_sql}, {alias}.1, arrayEnumerate({alias}.1), 0))"
     )
 }
 
@@ -100,8 +116,11 @@ pub(super) fn group_agg_map_sql(
 /// sync with the format string above — guarded by
 /// `group_agg_map_marker_stays_in_sync`.
 pub(super) fn emits_group_agg_map(sql: &str) -> bool {
-    sql.contains("mapFromArrays(groupArrayIf(__nano_k")
+    sql.contains(GROUP_AGG_MAP_MARKER)
 }
+
+/// The text every [`group_agg_map_sql`] emission contains.
+pub(crate) const GROUP_AGG_MAP_MARKER: &str = "tuple(groupArrayIf(__nano_k";
 
 /// The snapshot id-closure source (NAN-2265): a deterministic stand-in for an
 /// UNSTABLE selector-run source.
@@ -219,10 +238,10 @@ fn zscore_attach_sql(plan: &AttachPlan) -> String {
             );
             format!(
                 "WITH {map} AS __nano_stats\n    \
-                 SELECT *, __nano_stats[{lk}].1 as avg_val, __nano_stats[{lk}].2 as stddev_val\n    \
+                 SELECT *, tupleElement({lk}, 1) as avg_val, tupleElement({lk}, 2) as stddev_val\n    \
                  FROM {atk}",
                 map = map,
-                lk = lookup_key,
+                lk = group_agg_lookup_sql("__nano_stats", lookup_key),
                 atk = attach_source
             )
         }
@@ -234,7 +253,7 @@ fn zscore_attach_sql(plan: &AttachPlan) -> String {
 ///
 /// Stable source: two bounded GROUP BY passes replace the two stacked
 /// whole-partition quantile windows — the second map's build references the
-/// first (`__nano_med[__nano_k]`) to compute the median absolute deviation,
+/// first (the `__nano_med` lookup of `__nano_k`) to compute the median absolute deviation,
 /// and the identical scalar text is computed once (scalar-subquery cache).
 /// Unstable source (NAN-2265): the stacked quantile windows, which read the
 /// rows they annotate.
@@ -276,19 +295,21 @@ fn mad_attach_sql(plan: &AttachPlan) -> String {
             let mad_map = group_agg_map_sql(
                 build_key,
                 &format!(
-                    "toFloat64(quantile(0.5)(abs({} - __nano_med[__nano_k])))",
-                    value_expr
+                    "toFloat64(quantile(0.5)(abs({} - {})))",
+                    value_expr,
+                    group_agg_lookup_sql("__nano_med", "__nano_k")
                 ),
                 stats_source,
             );
             format!(
                 "WITH {med} AS __nano_med,\n      \
                  {mad} AS __nano_mad\n    \
-                 SELECT *, __nano_med[{lk}] as median_val, __nano_mad[{lk}] as mad_val\n    \
+                 SELECT *, {med_lk} as median_val, {mad_lk} as mad_val\n    \
                  FROM {atk}",
                 med = med_map,
                 mad = mad_map,
-                lk = lookup_key,
+                med_lk = group_agg_lookup_sql("__nano_med", lookup_key),
+                mad_lk = group_agg_lookup_sql("__nano_mad", lookup_key),
                 atk = attach_source
             )
         }
@@ -485,10 +506,11 @@ impl ClickHouseSqlGenerator {
                         field_expr, partition_clause, frame_spec),
                     AggFunc::Range => format!("(max({}) OVER ({}ORDER BY {tc} {}) - min({}) OVER ({}ORDER BY {tc} {}))",
                         field_expr, partition_clause, frame_spec, field_expr, partition_clause, frame_spec),
-                    AggFunc::Earliest => format!("min({}) OVER ({}ORDER BY {tc} {})",
-                        field_expr, partition_clause, frame_spec),
-                    AggFunc::Latest => format!("max({}) OVER ({}ORDER BY {tc} {})",
-                        field_expr, partition_clause, frame_spec),
+                    // NAN-4279 (F9): time-ordered pick, not min/max of the value.
+                    AggFunc::Earliest => format!("{} OVER ({}ORDER BY {tc} {})",
+                        self.time_ordered_pick(&field_expr, false), partition_clause, frame_spec),
+                    AggFunc::Latest => format!("{} OVER ({}ORDER BY {tc} {})",
+                        self.time_ordered_pick(&field_expr, true), partition_clause, frame_spec),
                     _ => format!("count({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
                 };
@@ -582,9 +604,8 @@ impl ClickHouseSqlGenerator {
         let grouped = !key_exprs.is_empty();
 
         // O27 (NAN-1721): earliest()/latest() argMin/argMax on the active dataset's
-        // time column (`start_time` for spans), not the logs-only `timestamp`.
-        // Logs keep `timestamp` byte-identical.
-        let tc = self.time_column();
+        // time column (`start_time` for spans), not the logs-only `timestamp`;
+        // `time_ordered_pick` reads it.
 
         // Snapshot id-closure (NAN-2265): an unstable source behind a pure
         // selector run is replaced by its deterministic id-closure — the
@@ -709,8 +730,8 @@ impl ClickHouseSqlGenerator {
                 ),
                 AggFunc::First => windowed(format!("any({})", field_expr)),
                 AggFunc::Last => windowed(format!("anyLast({})", field_expr)),
-                AggFunc::Earliest => windowed(format!("argMin({}, {tc})", field_expr)),
-                AggFunc::Latest => windowed(format!("argMax({}, {tc})", field_expr)),
+                AggFunc::Earliest => windowed(self.time_ordered_pick(&field_expr, false)),
+                AggFunc::Latest => windowed(self.time_ordered_pick(&field_expr, true)),
                 AggFunc::Mode => format!("({})[1]", windowed(format!("topK(1)({})", field_expr))),
                 AggFunc::Sparkline => {
                     return Err(SqlGenError::InvalidQuery(
@@ -795,6 +816,9 @@ impl ClickHouseSqlGenerator {
         let element = |i: usize, base: &str| -> String {
             if value_exprs.len() == 1 {
                 base.to_string()
+            } else if base.contains('(') {
+                // A lookup expression (NAN-4296), not a bare alias.
+                format!("tupleElement({}, {})", base, i + 1)
             } else {
                 format!("{}.{}", base, i + 1)
             }
@@ -809,7 +833,7 @@ impl ClickHouseSqlGenerator {
                 .map(|(i, alias)| {
                     format!(
                         "{} AS {}",
-                        element(i, &format!("__nano_es[{}]", key_sql)),
+                        element(i, &group_agg_lookup_sql("__nano_es", &key_sql)),
                         escape_identifier(alias)
                     )
                 })

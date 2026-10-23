@@ -2,7 +2,7 @@
 //! Hard deny guard for object deletes in a tenant R2 bucket (NAN-2596).
 //!
 //! `nano-shared-r2-<tenant_uuid>` is shared by two owners. nanosiem writes
-//! and reaps its own namespaces (`bronze-v2/`, `raw-handoff-v1/`,
+//! and reaps its own namespaces (`bronze-v2/`, `raw-handoff-v1/`, `raw-handoff-v2/`,
 //! `otel-handoff-v1/`, `query-results-v1/`, `__r2_data_catalog/`, the UID
 //! ledger, ...). The platform owns `tenants/<tenant_uuid>/...`, which holds the
 //! verified tenant parser bundles (`tenants/<uuid>/parser-bundles/<sha>.tar.gz`)
@@ -188,6 +188,7 @@ mod tests {
         for key in [
             "bronze-v2/shard=0/tenant_id=t1/1758585600-x.parquet",
             "raw-handoff-v1/tenant_uuid=u/a.bin",
+            "raw-handoff-v2/tenant_uuid=u/group=0000000000000000000000000000000000000000000000000000000000000000.rawg",
             "otel-handoff-v1/tenant_uuid=u/dataset=spans/hour=1/b",
             "query-results-v1/tenant-abc/job-1/manifest.json",
             "__r2_data_catalog/u/events/data/x.parquet",
@@ -250,6 +251,7 @@ mod tests {
         for prefix in [
             "bronze-v2/",
             "raw-handoff-v1/tenant_uuid=u/",
+            "raw-handoff-v2/tenant_uuid=u/",
             "query-results-v1/",
             "__r2_data_catalog/u/",
             "tenants-archive/",

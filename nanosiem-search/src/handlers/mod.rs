@@ -265,7 +265,8 @@ fn shared_parsed_npl_contract(
 /// cell view whose decay / clear state is bound to the caller's own tenant
 /// (see `SearchState::bind_shared_risk_dataset`); surfaces without such a
 /// view refuse it. Spans and metrics require an attached tenant OTLP evaluator;
-/// a missing route is unavailable (503). Unknown datasets remain caller errors.
+/// without one they are not available for the tenant (400, NAN-4289). Unknown
+/// datasets remain caller errors.
 fn shared_dataset_contract(
     dataset: Option<&str>,
     capabilities: SharedQueryCapabilities,
@@ -274,9 +275,14 @@ fn shared_dataset_contract(
     match selector.as_str() {
         "logs" | "log" => Ok(()),
         "spans" | "metrics" if capabilities.tenant_otel_dataset => Ok(()),
-        "spans" | "metrics" => Err(crate::error::SearchError::ServiceUnavailable(
-            "tenant OTLP dataset is unavailable until an exact tenant route is configured".into(),
-        )),
+        // NAN-4289 (searchfuzz F27): no OTLP route on this tenant's view is a
+        // property of the tenant, not an outage. A 503 told clients to retry
+        // a request that can never succeed (and the UI showed an outage).
+        "spans" | "metrics" => Err(crate::error::SearchError::BadRequest(format!(
+            "dataset `{selector}` is not available for this tenant: no OpenTelemetry \
+             (OTLP) {selector} ingest is configured for it. Search `logs` instead, or \
+             enable OTLP ingest for this tenant"
+        ))),
         "risk" if capabilities.tenant_risk_dataset => Ok(()),
         "risk" => Err(crate::error::SearchError::BadRequest(
             "dataset `risk` is served for enterprise-shared tenants only by search and \

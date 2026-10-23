@@ -7,6 +7,12 @@
 //! - `ingest[T]` uid = `base + 2·slot`
 //! - `query[T]`  uid = `base + 2·slot + 1`
 //! - `detect[T]` uid = `base + 2·max_slots + slot` (preserves existing ids)
+//! - `landing[T]` uid = `base + 2·max_slots + H + slot` (NAN-4137), where
+//!   `H` is half the high range: new slots are allocated below `H` only, so
+//!   the upper half of the high range is free for landing ids. A map that
+//!   still holds a slot at or above `H` (allocated before NAN-4137) gives no
+//!   tenant a landing uid: landing[T] is refused there, never run under a
+//!   uid another tenant's detect[T] could hold.
 //! - tenant gid      = `base + 2·slot` (all roles; lets readers read parts)
 //!
 //! Three uids per tenant keep the roles apart (least privilege: readers can
@@ -69,10 +75,20 @@ pub struct TenantIds {
     pub ingest_uid: u32,
     pub query_uid: u32,
     pub detect_uid: u32,
+    /// NAN-4137: landing[T]'s own uid; `None` where the map cannot give one
+    /// (see the module docs). landing[T] never runs without it.
+    pub landing_uid: Option<u32>,
     pub gid: u32,
 }
 
 impl TenantIds {
+    /// Every uid a process of this tenant may run as (kills, sweeps, purges).
+    pub fn uids(&self) -> Vec<u32> {
+        let mut uids = vec![self.ingest_uid, self.query_uid, self.detect_uid];
+        uids.extend(self.landing_uid);
+        uids
+    }
+
     pub fn uid(&self, role: Role) -> u32 {
         match role {
             Role::Ingest => self.ingest_uid,
@@ -85,6 +101,10 @@ impl TenantIds {
             // Query's uid (same read-only trust domain, NAN-3148): query[T]
             // reads the snapshots it publishes and writes its demand inbox.
             Role::Product => self.query_uid,
+            // Absent: callers check `landing_uid` first (spawn refuses; the
+            // tree has no landing dir). `(uid_t)-1` is never a process's
+            // uid, so nothing can run, match or be killed under it.
+            Role::Landing => self.landing_uid.unwrap_or(u32::MAX),
         }
     }
 }
@@ -172,7 +192,7 @@ impl UidMap {
             .filter(|(t, _)| *t != tenant).filter_map(|(_, s)| *s).collect();
         let slot = match own {
             Some(s) => s,
-            None => (0..self.detect_slots())
+            None => (0..self.allocatable_slots())
                 .find(|s| !used.contains(s) && !claimed.contains(s))
                 .ok_or_else(|| io::Error::other("cell uid slots exhausted"))?,
         };
@@ -209,12 +229,34 @@ impl UidMap {
             // never be granted to the claimant, so its ids are the holder's.
             .filter_map(|t| self.state.slots.get(t).copied()
                 .or_else(|| self.claims.get(t).copied().flatten().filter(|s| !held.contains(s))))
-            .flat_map(|s| { let i = self.ids(s); [i.ingest_uid, i.query_uid, i.detect_uid, i.gid] })
+            .flat_map(|s| { let i = self.ids(s); let mut ids = i.uids(); ids.push(i.gid); ids })
             .collect()
     }
 
     fn detect_slots(&self) -> u32 {
         (DETECT_UID_END - self.state.base - 2 * self.max_slots).min(self.max_slots)
+    }
+
+    /// NAN-4137: where the landing ids start inside the high range: right
+    /// after the detect ids when the range holds both, else its upper half
+    /// (the default 20,000-slot config: 2,767 slots each).
+    fn landing_offset(&self) -> u32 {
+        let high = DETECT_UID_END - self.state.base - 2 * self.max_slots;
+        if high >= 2 * self.max_slots { self.max_slots } else { high / 2 }
+    }
+
+    /// Slots a NEW tenant may take: below both the detect range and the
+    /// landing offset, so a new slot's landing uid is never a detect uid.
+    fn allocatable_slots(&self) -> u32 {
+        self.detect_slots().min(self.landing_offset())
+    }
+
+    fn landing_uid(&self, slot: u32) -> Option<u32> {
+        let limit = self.allocatable_slots();
+        // A legacy slot past the limit would own a detect uid inside the
+        // landing range: no tenant on such a map gets a landing uid.
+        (slot < limit && self.state.slots.values().all(|s| *s < limit))
+            .then(|| self.state.base + self.max_slots * 2 + self.landing_offset() + slot)
     }
 
     /// The slot a tenant tree's ownership names: its root's gid is the
@@ -269,7 +311,14 @@ impl UidMap {
 
     fn ids(&self, slot: u32) -> TenantIds {
         let first = self.state.base + slot * 2;
-        TenantIds { slot, ingest_uid: first, query_uid: first + 1, detect_uid: self.state.base + self.max_slots * 2 + slot, gid: first }
+        TenantIds {
+            slot,
+            ingest_uid: first,
+            query_uid: first + 1,
+            detect_uid: self.state.base + self.max_slots * 2 + slot,
+            landing_uid: self.landing_uid(slot),
+            gid: first,
+        }
     }
 
     /// Every tenant with a slot (placed now or earlier: their uids may still
@@ -282,8 +331,8 @@ impl UidMap {
     /// high range. The platform's unchanged 20,000-slot cell config leaves 5,534
     /// usable stable detect slots inside a 65,536-id pod user namespace.
     pub fn tenant_uid_range(&self) -> (u32, u32) {
-        let detect_slots = (DETECT_UID_END - self.state.base - 2 * self.max_slots).min(self.max_slots);
-        (self.state.base, self.state.base + self.max_slots * 2 + detect_slots)
+        let high = self.detect_slots().max(self.landing_offset() + self.allocatable_slots());
+        (self.state.base, self.state.base + self.max_slots * 2 + high)
     }
 
     /// Is `uid` one of this cell's tenant uids?
@@ -327,7 +376,10 @@ mod tests {
         let mut m = UidMap::load(&p, 20_000, 10).unwrap();
         assert_eq!(m.get_or_allocate(&b).unwrap(), ib);
         assert_eq!(ia.detect_uid, 20_020);
-        assert!(m.is_tenant_uid(20_019) && m.is_tenant_uid(20_020) && !m.is_tenant_uid(20_030) && !m.is_tenant_uid(0));
+        // NAN-4137: landing[T] uids sit above detect (base + 2·max + max + slot).
+        assert_eq!((ia.landing_uid, ib.landing_uid), (Some(20_030), Some(20_031)));
+        assert!(m.is_tenant_uid(20_019) && m.is_tenant_uid(20_020) && m.is_tenant_uid(20_030));
+        assert!(!m.is_tenant_uid(20_040) && !m.is_tenant_uid(0));
         assert!(UidMap::load(&p, 30_000, 10).is_err(), "re-basing must be refused");
     }
 

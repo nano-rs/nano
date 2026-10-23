@@ -26,6 +26,9 @@ impl ClickHouseSqlGenerator {
         aggregated: bool,
         sort_tie_fields: &[String],
         sort_tie_enabled: bool,
+        // NAN-4236: the stage's implicit newest-first event order
+        // (`time DESC, "metadata.uid" DESC`), when its rows carry the UID.
+        raw_event_order: Option<&str>,
         // True when the pipeline has exactly one resolve_identity — the stage
         // then also emits bare `identity_*` aliases (NAN-1346 #5).
         single_resolve_identity: bool,
@@ -116,6 +119,11 @@ impl ClickHouseSqlGenerator {
                             // sort -risk_score`) → UDM and OCSF promoted/computed sorts
                             // stay byte-identical.
                             field_to_sql_expr(&sf.field, self).0
+                        } else if sf.field == "_time" && !self.is_upstream_computed_field(&sf.field) {
+                            // NAN-4263: `_time` is the event time, but only the
+                            // UDM profile canonicalizes it; the lake sorted by
+                            // a `_time` column that does not exist (Code 47).
+                            escape_identifier(self.time_column())
                         } else {
                             // Regular field - normalize (e.g., _time -> timestamp),
                             // except an upstream value-computed field, which keeps
@@ -130,15 +138,28 @@ impl ClickHouseSqlGenerator {
                 // uniquely identify stats rows; explicit projections have
                 // only the named output columns. A whole-row tuple here can
                 // turn a large top-N hunt into a full-width sort.
-                let tie_fields = if !sort_tie_enabled { Vec::new() }
-                else if aggregated {
-                    sort_tie_fields.to_vec()
+                //
+                // NAN-4236: an aggregated stage always breaks ties on its
+                // group keys (a handful of rows, any window); before, windows
+                // over 24 h cut tied top-N rows differently on every run. Raw
+                // rows tie-break on a narrow projection, else on the implicit
+                // newest-first (time, metadata.uid) key while both are still
+                // in scope.
+                let tie_clauses: Vec<String> = if aggregated {
+                    sort_tie_fields.iter().map(|field| format!("{} ASC", escape_identifier(field))).collect()
+                } else if !sort_tie_enabled {
+                    Vec::new()
                 } else if let Some(columns) = available_columns.as_ref().filter(|columns| columns.len() <= 8) {
                     let mut fields = columns.iter().cloned().collect::<Vec<_>>();
                     fields.sort();
-                    fields
+                    fields.iter().map(|field| format!("{} ASC", escape_identifier(field))).collect()
+                } else if let Some(order) = raw_event_order.filter(|_| {
+                    timestamp_available
+                        && available_columns.as_ref().map_or(true, |columns| columns.contains("metadata.uid"))
+                }) {
+                    vec![order.to_string()]
                 } else { Vec::new() };
-                order_clauses.extend(tie_fields.iter().map(|field| format!("{} ASC", escape_identifier(field))));
+                order_clauses.extend(tie_clauses);
                 let limit_clause = limit
                     .map(|n| format!("\n  LIMIT {}", n))
                     .unwrap_or_default();
@@ -153,14 +174,12 @@ impl ClickHouseSqlGenerator {
             Command::Tail { count } => {
                 if timestamp_available {
                     // Raw events: last N by time = oldest N (search default order is newest-first),
-                    // presented oldest-first. Unchanged behavior. O27 (NAN-1721):
-                    // order on the dataset time column (`start_time` for spans);
-                    // logs keep `timestamp` byte-identical.
+                    // presented oldest-first. NAN-4278: this took the NEWEST N. The
+                    // pipeline generator inverts the actual current order instead
+                    // (`generate_command_sql_with_ctx`); this is the context-free form.
+                    // O27 (NAN-1721): order on the dataset time column.
                     let tc = self.time_column();
-                    Ok(format!(
-                        "  SELECT * FROM (\n    SELECT * FROM {}\n    ORDER BY {tc} DESC\n    LIMIT {}\n  )\n  ORDER BY {tc} ASC",
-                        source, count
-                    ))
+                    Ok(format!("  SELECT * FROM {}\n  ORDER BY {tc} ASC\n  LIMIT {}", source, count))
                 } else {
                     // Post-aggregation / timestamp pruned: there is no `timestamp` to order by
                     // (was Code 47, NAN-1146). Tail = last N of the CURRENT result order; capture
@@ -350,7 +369,7 @@ impl ClickHouseSqlGenerator {
             }
             Command::Dedup {
                 fields,
-                keep_first: _,
+                keep_first,
             } => {
                 // Normalize and resolve field names through the active profile
                 // (UDM-byte-identical; OCSF maps UDM aliases → promoted columns)
@@ -384,8 +403,14 @@ impl ClickHouseSqlGenerator {
                 // construction, independent of any id, and lowers to a
                 // LimitByTransform over a key-only hash map — no
                 // MergeSortingTransform, so the NAN-1636 memory win is preserved.
-                // `keep_first` is ignored in both shapes and timestamp ties stay
-                // nondeterministic in both, as before.
+                // Timestamp ties stay nondeterministic in both shapes.
+                //
+                // NAN-4279 (F12): both shapes kept the OLDEST row and ignored
+                // `keepfirst`. Events stream newest-first, so the first
+                // occurrence per key — the default — is the NEWEST row
+                // (`max(time)` / `ORDER BY time DESC`), and `keepfirst=false`
+                // (`keeplast=true`) keeps the oldest, matching the Rust
+                // post-processing dedup that walks rows in pipeline order.
                 //
                 // Guards — ALL must hold, else keep the legacy shape:
                 //  - `source` must be the deterministic base scan: the rewrite
@@ -441,14 +466,19 @@ impl ClickHouseSqlGenerator {
                         .collect::<Vec<_>>()
                         .join(", ");
                     Ok(format!(
-                        "  SELECT * FROM {src}\n  WHERE ({match_keys}, {time_col}) IN (\n    SELECT {match_keys}, min({time_col}) FROM {src}\n    GROUP BY {partition_by}\n  )\n  LIMIT 1 BY {partition_by}",
-                        src = source
+                        "  SELECT * FROM {src}\n  WHERE ({match_keys}, {time_col}) IN (\n    SELECT {match_keys}, {pick}({time_col}) FROM {src}\n    GROUP BY {partition_by}\n  )\n  LIMIT 1 BY {partition_by}",
+                        src = source,
+                        pick = if *keep_first { "max" } else { "min" },
                     ))
                 } else {
                     // ClickHouse uses LIMIT 1 BY for deduplication
                     Ok(format!(
-                        "  SELECT * FROM {}\n  ORDER BY {}, {}\n  LIMIT 1 BY {}",
-                        source, partition_by, time_col, partition_by
+                        "  SELECT * FROM {}\n  ORDER BY {}, {}{}\n  LIMIT 1 BY {}",
+                        source,
+                        partition_by,
+                        time_col,
+                        if *keep_first { " DESC" } else { "" },
+                        partition_by
                     ))
                 }
             }
@@ -837,9 +867,12 @@ impl ClickHouseSqlGenerator {
                 let group_by = group_by_parts.join(", ");
 
                 Ok(format!(
-                    "  SELECT {}\n  FROM {}\n  GROUP BY {}\n  ORDER BY count DESC\n  LIMIT {}",
+                    // NAN-4236: the group key breaks count ties, so the cut
+                    // at LIMIT is the same rows on every run.
+                    "  SELECT {}\n  FROM {}\n  GROUP BY {}\n  ORDER BY count DESC, {}\n  LIMIT {}",
                     select_parts.join(", "),
                     source,
+                    group_by,
                     group_by,
                     limit
                 ))
@@ -918,9 +951,12 @@ impl ClickHouseSqlGenerator {
                 let group_by = group_by_parts.join(", ");
 
                 Ok(format!(
-                    "  SELECT {}\n  FROM {}\n  GROUP BY {}\n  ORDER BY count ASC\n  LIMIT {}",
+                    // NAN-4236: the group key breaks count ties, so the cut
+                    // at LIMIT is the same rows on every run.
+                    "  SELECT {}\n  FROM {}\n  GROUP BY {}\n  ORDER BY count ASC, {}\n  LIMIT {}",
                     select_parts.join(", "),
                     source,
+                    group_by,
                     group_by,
                     limit
                 ))
@@ -1286,11 +1322,45 @@ impl ClickHouseSqlGenerator {
                 None => Ok(format!("  SELECT * FROM {}", source)),
             },
             Command::Mvexpand { field, limit } => {
-                let (field_expr, _) = field_to_sql_expr(field, self);
                 // Apply user limit if specified, otherwise use configurable default to prevent
                 // arrayJoin from expanding billions of rows (expansion happens before LIMIT)
                 let effective_limit = limit.unwrap_or(self.max_mvexpand_rows);
                 let limit_clause = format!(" LIMIT {}", effective_limit);
+
+                // NAN-4279 (F13): an OCSF array-of-objects root (`enrichments`)
+                // is stored as parallel leaf arrays, one element per object
+                // (the snapshot types every descendant of a list root Array).
+                // Expanding the root means one row per object: ARRAY JOIN the
+                // leaf arrays together, which zips them in place (a separate
+                // arrayJoin per leaf would emit their cross product).
+                let leaves = if self.is_upstream_computed_field(field) {
+                    Vec::new()
+                } else {
+                    self.profile.object_root_leaves(field)
+                };
+                if !leaves.is_empty() {
+                    let arrays: Vec<String> = leaves
+                        .iter()
+                        .filter(|leaf| {
+                            self.profile.field_type(leaf) == Some(crate::schema::FieldType::Array)
+                        })
+                        .map(|leaf| escape_identifier(leaf))
+                        .collect();
+                    // Scalar leaves (a typed-NULL leaf this snapshot lacks)
+                    // stay as they are on every expanded row.
+                    if arrays.is_empty() {
+                        return Err(SqlGenError::InvalidQuery(format!(
+                            "mvexpand: `{field}` is an object with no array fields; \
+                             mvexpand expands arrays"
+                        )));
+                    }
+                    return Ok(format!(
+                        "  SELECT * FROM {source} ARRAY JOIN {}{limit_clause}",
+                        arrays.join(", ")
+                    ));
+                }
+
+                let (field_expr, _) = field_to_sql_expr(field, self);
 
                 Ok(format!(
                     // Splunk/nPL mvexpand changes the row grain while keeping

@@ -522,9 +522,11 @@ impl SharedLakeWorkerRegistry {
     pub fn from_env() -> Result<Self, String> {
         // Never fails on a cell problem (logged; cells stay dark).
         let Some(cells) = super::lake_cell::LakeCellRouteSource::from_env() else {
-            // Dark path: exactly the pre-NAN-2891 behaviour.
             let path = required_env("NANO_LAKE_SHARED_WORKER_REGISTRY_FILE")?;
-            return Self::from_file(Path::new(&path));
+            return Self::from_file_for_process(
+                Path::new(&path),
+                crate::schema::tenant_lake_schema::shared_tenancy_process(),
+            );
         };
         // With cells configured, the gen1 registry may be absent or empty (a
         // cluster whose only tenants are lean-lake ones, or whose routes map
@@ -539,6 +541,14 @@ impl SharedLakeWorkerRegistry {
 
     pub fn from_file(path: &Path) -> Result<Self, String> {
         Self::from_file_inner(path, false)
+    }
+
+    /// A new hosted region has no admitted tenants before its first release.
+    /// Its explicit version-1 empty registry authorizes nobody, even before
+    /// cell routes exist. Open-core/gen1 file loading remains strict; malformed
+    /// files and every nonempty assignment retain the same admission checks.
+    fn from_file_for_process(path: &Path, shared_tenancy: bool) -> Result<Self, String> {
+        Self::from_file_inner(path, shared_tenancy)
     }
 
     fn empty() -> Self {
@@ -870,6 +880,13 @@ impl SharedLakeWorkerRegistry {
     /// The live cell route source (`None` when cells are dark).
     pub fn cell_source(&self) -> Option<std::sync::Arc<super::lake_cell::LakeCellRouteSource>> {
         self.cells.clone()
+    }
+
+    /// NAN-4149: whether this registry's tenant set is authoritative yet:
+    /// true for a gen1-only registry, and for a cell registry once its routes
+    /// map has been loaded at least once in this process.
+    pub fn routes_loaded(&self) -> bool {
+        self.cells.as_ref().is_none_or(|cells| cells.has_loaded())
     }
 
     /// Whether this tenant is currently placed on a lean-lake cell.
@@ -2354,6 +2371,7 @@ impl LakeQueryClient {
             .await
     }
 
+    #[tracing::instrument(name = "db.lake.execute", skip_all, fields(db.response.rows = tracing::field::Empty))]
     async fn search_with_product_cursor(
         &self,
         request: &SearchRequest,
@@ -2364,7 +2382,10 @@ impl LakeQueryClient {
     ) -> Result<SearchResponse, SearchError> {
         self.search_cursor_page(request, query_id, risk_config, deny_source_types, cursor)
             .await
-            .map(|(response, _)| response)
+            .map(|(response, _)| {
+                tracing::Span::current().record("db.response.rows", response.results.len() as u64);
+                response
+            })
     }
 
     /// One `broad_npl` page, plus whether query[T] declared its rows raw
@@ -2583,7 +2604,6 @@ impl LakeQueryClient {
             )));
         }
         self.validate_envelope_binding(&envelope, query_id, "broad_npl")?;
-        crate::platform_enrichment::read::record_result_fence(envelope.enrichment_read_fence.clone());
         Ok(envelope)
     }
 
@@ -2695,6 +2715,7 @@ impl LakeQueryClient {
     /// statement is over query[T]'s memory budget before its first page
     /// (smaller cursor pages may still fit). A concurrency refusal (429) is
     /// returned as is: the handler escalates it to a durable job.
+    #[tracing::instrument(name = "db.lake.stream", skip_all)]
     async fn search_streamed<F, Fut>(
         &self,
         request: &SearchRequest,
@@ -2763,7 +2784,6 @@ impl LakeQueryClient {
             return Err(SearchError::ServiceUnavailable("lake query worker refused the streamed read".to_string()));
         }
         self.validate_envelope_binding(&envelope, query_id, "broad_npl")?;
-        crate::platform_enrichment::read::record_result_fence(envelope.enrichment_read_fence.clone());
         let newest_first = envelope.result.as_ref().and_then(|result| result.newest_first_event_rows).unwrap_or(false);
         if !newest_first {
             return Ok(StreamedRead::NotContinuable);
@@ -2990,7 +3010,12 @@ impl LakeQueryClient {
             bucket_span_us,
             count_alias,
             start: time_range.start.to_rfc3339(),
-            end: time_range.end.to_rfc3339(),
+            // NAN-4280: search windows are half-open `[start, end)`; this
+            // route's `end` is inclusive on the wire (the worker adds 1 µs),
+            // so it gets the last covered microsecond. Converting here keeps
+            // the wire contract (and so any worker/search roll order)
+            // unchanged while rollup and scan agree about the end instant.
+            end: (time_range.end - chrono::Duration::microseconds(1)).to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
             source_filter,
             deny_source_types,
             max_groups,
@@ -3035,7 +3060,6 @@ impl LakeQueryClient {
             )));
         }
         self.validate_envelope_binding(&envelope, request_id, "count_aggregate")?;
-        crate::platform_enrichment::read::record_result_fence(envelope.enrichment_read_fence.clone());
         // query[T] reads the verified part log, not a gen1 Iceberg generation:
         // its immutable binding is the log head the answer was computed at.
         if self.lake_cell {
@@ -3725,21 +3749,6 @@ pub fn lake_count_rollup_field_multi_value(field: &str) -> Option<bool> {
         .map(|(_, multi_value)| *multi_value)
 }
 
-/// Fields the worker never answers from rollups because platform enrichment
-/// read authority applies to them (`enrichment_read::sensitive`; taken here
-/// without its scalar-mask elision, i.e. conservatively).
-pub fn lake_rollup_field_is_enrichment_sensitive(field: &str) -> bool {
-    [
-        "enrichments",
-        "src_endpoint.location",
-        "dst_endpoint.location",
-        "src_endpoint.autonomous_system",
-        "dst_endpoint.autonomous_system",
-    ]
-    .iter()
-    .any(|prefix| field.starts_with(prefix))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct LakeCountPredicate {
     pub kind: &'static str,
@@ -3858,8 +3867,6 @@ pub(crate) struct LakeIdentityEntityBatchObservation {
 
 #[derive(Debug, Deserialize)]
 struct LakeQueryEnvelope {
-    #[serde(default)]
-    enrichment_read_fence: Option<crate::platform_enrichment::read::ReadFence>,
     ok: bool,
     #[serde(default)]
     estimated_bytes: Option<u64>,
@@ -4607,6 +4614,58 @@ mod tests {
     }
 
     #[test]
+    fn first_shared_region_can_start_empty_without_authorizing_any_tenant() {
+        let directory = tempfile::tempdir().unwrap();
+        let (path, _) = write_shared_registry(&directory, serde_json::json!([]));
+        let registry = SharedLakeWorkerRegistry::from_file_for_process(&path, true).unwrap();
+        assert_eq!(registry.assignments().count(), 0);
+        assert!(super::super::job_coordinator_config::hosted_producer_config_paths("[]", &registry).unwrap().is_empty());
+        for tenant in [Uuid::from_u128(0xa), Uuid::from_u128(0xb)] {
+            assert!(registry.assignment(tenant).is_none());
+            assert!(registry.cell_route(tenant).is_none());
+        }
+        assert!(SharedLakeWorkerRegistry::from_file_for_process(&path, false).is_err());
+        assert!(SharedLakeWorkerRegistry::from_file(&path).is_err());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn populated_gen1_registry_still_requires_hosted_producer_configs() {
+        let directory = tempfile::tempdir().unwrap();
+        let credential = directory.path().join("worker-token");
+        let tenant = Uuid::from_u128(0xa);
+        let (path, _) = write_shared_registry(&directory, serde_json::json!([{
+            "tenant_id": tenant, "expected_worker_tenant_id": tenant,
+            "internal_endpoint": "http://query-a.nano.svc:8080",
+            "credential_file": credential,
+            "expected_worker_identity": "worker-a", "expected_worker_revision": 7,
+            "prevalence_snapshots": {"one_hour": "prev-1h", "twenty_four_hours": "prev-24h",
+                "seven_days": "prev-7d", "thirty_days": "prev-30d"}
+        }]));
+        let registry = SharedLakeWorkerRegistry::from_file_for_process(&path, true).unwrap();
+        assert_eq!(registry.assignments().count(), 1);
+        assert_eq!(registry.cell_route_count(), 0);
+        assert!(super::super::job_coordinator_config::hosted_producer_config_paths("[]", &registry).is_err());
+        assert!(super::super::job_coordinator_config::hosted_producer_config_paths("not JSON", &registry).is_err());
+    }
+
+    #[test]
+    fn shared_region_empty_startup_still_refuses_broken_registry_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("worker-registry.json");
+        assert!(SharedLakeWorkerRegistry::from_file_for_process(&path, true).is_err());
+        for body in [
+            r#"{"version":2,"assignments":[]}"#,
+            r#"{"version":1}"#,
+            r#"{"version":1,"assignments":[{}]}"#,
+            "not JSON",
+        ] {
+            std::fs::write(&path, body).unwrap();
+            assert!(SharedLakeWorkerRegistry::from_file_for_process(&path, true).is_err());
+        }
+    }
+
+    #[test]
     fn shared_worker_registry_admits_an_optional_erasure_executor() {
         let directory = tempfile::tempdir().unwrap();
         let worker_credential = directory.path().join("worker-token");
@@ -5244,7 +5303,6 @@ mod tests {
     #[test]
     fn envelope_maps_rows_and_page_bound_count() {
         let response = LakeQueryEnvelope {
-            enrichment_read_fence: None,
             identity_index: None,
             log_head: None,
             estimated_bytes: None,
@@ -5290,7 +5348,6 @@ mod tests {
     #[test]
     fn envelope_reports_a_complete_page_as_an_exact_count() {
         let response = LakeQueryEnvelope {
-            enrichment_read_fence: None,
             identity_index: None,
             log_head: None,
             estimated_bytes: None,
@@ -5345,7 +5402,6 @@ mod tests {
             .map(|index| serde_json::Value::String(format!("event-{index}")))
             .collect::<Vec<_>>();
         let response = LakeQueryEnvelope {
-            enrichment_read_fence: None,
             identity_index: None,
             log_head: None,
             estimated_bytes: None,
@@ -5401,7 +5457,6 @@ mod tests {
         )
         .unwrap();
         let mut envelope = LakeQueryEnvelope {
-            enrichment_read_fence: None,
             identity_index: None,
             log_head: None,
             estimated_bytes: None,
@@ -6275,8 +6330,14 @@ mod lake_cell_routing_tests {
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
             let limit = body["limit"].as_u64().unwrap() as usize;
             if limit > self.max_page {
-                return ResponseTemplate::new(503).set_body_json(serde_json::json!({
-                    "ok": false, "reason": "query_budget_exhausted", "error": "query memory budget exceeded"}));
+                // The worker marks its own budget refusal with the reason
+                // header (NAN-3270), so the client answers it at once. Without
+                // it the 503 reads as a worker recycle and each refusal was
+                // replayed until the request deadline (NAN-4304).
+                return ResponseTemplate::new(503)
+                    .insert_header(crate::lake_http::LAKE_REASON_HEADER, crate::lake_http::QUERY_BUDGET_EXHAUSTED_REASON)
+                    .set_body_json(serde_json::json!({
+                        "ok": false, "reason": "query_budget_exhausted", "error": "query memory budget exceeded"}));
             }
             // Event i has time base - i seconds and uid e{i:06}.
             let base = chrono::DateTime::parse_from_rfc3339("2026-09-25T01:00:00Z").unwrap().with_timezone(&chrono::Utc);
@@ -6746,8 +6807,13 @@ mod lake_cell_routing_tests {
             (500, serde_json::json!({"ok": false, "error": "invariant", "reason": "internal"}), "unavailable"),
         ] {
             let server = MockServer::start().await;
+            // The worker echoes every error reason in a header (NAN-3270).
+            let mut template = ResponseTemplate::new(status);
+            if let Some(reason) = body["reason"].as_str() {
+                template = template.insert_header(crate::lake_http::LAKE_REASON_HEADER, reason);
+            }
             Mock::given(method("POST"))
-                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .respond_with(template.set_body_json(body))
                 .mount(&server)
                 .await;
             let client = cell_client(&server, &dir, tenant).await;

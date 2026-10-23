@@ -283,7 +283,7 @@ async fn over_budget_signed_prewarm_finishes_and_remains_queryable() {
         + chrono::Duration::milliseconds((i as i64 % 1000) * 10)).to_rfc3339())).collect::<Vec<_>>();
     let root = tempfile::tempdir().unwrap();
     let engine = engine_over_with_budget(root.path(), &rows, true, now, true, false).await;
-    tokio::time::timeout(Duration::from_secs(10), engine.prewarm_owner_proofs(24)).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), engine.prewarm_parts(24)).await.unwrap().unwrap();
     let request = BroadNplRequest {
         request_id: "bounded-prewarm".into(), tenant_id: TENANT.into(), dataset: "logs".into(),
         query: "powershell | stats count".into(), start: (now - chrono::Duration::minutes(10)).to_rfc3339(),
@@ -370,4 +370,111 @@ async fn part_result_cache_v1_v2_cold_warm_disabled_parity() {
     }
     assert_eq!(all[0], all[1]);
     std::env::remove_var("NANO_LAKE_PART_RESULT_CACHE");
+}
+
+/// NAN-4285: a CIDR inside `IN (...)` / `NOT IN (...)` is network
+/// membership -- the same answer as the equivalent `ip=cidr OR …` chain --
+/// for search terms and `| where`, IPv4 and IPv6, mixed address+CIDR lists
+/// and negation. The lists used to compile to a string IN-list, so
+/// `IN (10.0.0.0/8)` matched nothing and `NOT IN (10.0.0.0/8)` everything.
+/// Runs the real compiler (NANO_LAKE_COMPILER) and native chDB over parts.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires pinned native chDB and lake compiler"]
+async fn cidr_in_lists_are_network_membership_on_native_parts() {
+    const IPS: &[Option<&str>] = &[
+        Some("10.1.2.3"), Some("172.16.5.5"), Some("192.168.1.1"), Some("8.8.8.8"),
+        Some("93.184.216.34"), Some("fe80::1"), Some("2001:db8::5"), Some("2001:4860::8888"), None,
+    ];
+    let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T16:15:00Z").unwrap().with_timezone(&chrono::Utc);
+    let base = now - chrono::Duration::minutes(10);
+    let rows = (0..900).map(|i| {
+        let time = (base + chrono::Duration::milliseconds(i as i64 * 100)).to_rfc3339();
+        let mut event = json!({
+            "activity_id": 6, "activity_name": "Traffic", "category_uid": 4, "category_name": "Network Activity",
+            "class_uid": 4001, "class_name": "Network Activity", "type_uid": 400106,
+            "severity": "Informational", "severity_id": 1, "time": time,
+            "raw_data": format!("conn {i}"), "raw_data_size": format!("conn {i}").len(),
+            "metadata": {"uid": format!("uid-{i:06}"), "version": "1.9.0", "log_source": "zeek_conn", "tenant_uid": TENANT,
+                         "product": {"name": "Zeek", "vendor_name": "Zeek"}},
+            "src_endpoint": {"ip": "10.9.9.9", "port": 50000},
+        });
+        if let Some(ip) = IPS[i % IPS.len()] {
+            event["dst_endpoint"] = json!({"ip": ip, "port": 443});
+        }
+        event
+    }).collect::<Vec<_>>();
+    let in_net = |ip: &str, cidr: &str| -> bool {
+        let ip: std::net::IpAddr = ip.parse().unwrap();
+        let (net, bits) = cidr.split_once('/').unwrap();
+        let (net, bits): (std::net::IpAddr, u32) = (net.parse().unwrap(), bits.parse().unwrap());
+        match (ip, net) {
+            (std::net::IpAddr::V4(a), std::net::IpAddr::V4(n)) => {
+                let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                u32::from(a) & mask == u32::from(n) & mask
+            }
+            (std::net::IpAddr::V6(a), std::net::IpAddr::V6(n)) => {
+                let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                u128::from(a) & mask == u128::from(n) & mask
+            }
+            _ => false,
+        }
+    };
+    let expect = |entries: &[&str], negated: bool| -> u64 {
+        let member = |ip: &str| entries.iter().any(|entry| if entry.contains('/') { in_net(ip, entry) } else { ip == *entry });
+        (0..rows.len()).filter(|i| match IPS[i % IPS.len()] {
+            Some(ip) => member(ip) != negated,
+            None => false,
+        }).count() as u64
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_over(dir.path(), &rows, true, now).await;
+    let count = |query: String| {
+        let engine = &engine;
+        async move {
+            let request: BroadNplRequest = serde_json::from_value(json!({
+                "request_id":"nan4285", "tenant_id":TENANT, "dataset":"logs", "query":query,
+                "start":base.to_rfc3339(), "end":now.to_rfc3339(), "limit":20, "table_view":true,
+            })).unwrap();
+            let answer = engine.broad_npl(&request).await.unwrap_or_else(|e| panic!("{query}: {e}"));
+            answer["result"]["rows"][0]["count"].as_u64().unwrap_or_else(|| panic!("{query}: {answer}"))
+        }
+    };
+    let private = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
+    let cases: &[(&[&str], &str)] = &[
+        (&private, "10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16"),
+        (&["10.0.0.0/8"], "10.0.0.0/8"),
+        (&["10.0.0.0/8", "8.8.8.8"], "10.0.0.0/8, 8.8.8.8"),
+        (&["fe80::/10", "2001:db8::/32"], "\"fe80::/10\", \"2001:db8::/32\""),
+        (&["2001:4860::8888", "fe80::/10", "192.168.0.0/16", "8.8.8.8"], "\"2001:4860::8888\", \"fe80::/10\", 192.168.0.0/16, 8.8.8.8"),
+    ];
+    for (entries, list) in cases {
+        let (hit, miss) = (expect(entries, false), expect(entries, true));
+        assert!(hit > 0 && miss > 0, "{list}: fixture must split the rows");
+        for (query, expected) in [
+            (format!("dst_endpoint.ip IN ({list}) | stats count"), hit),
+            (format!("dst_endpoint.ip NOT IN ({list}) | stats count"), miss),
+            (format!("* | where dst_endpoint.ip IN ({list}) | stats count"), hit),
+            (format!("* | where dst_endpoint.ip NOT IN ({list}) | stats count"), miss),
+        ] {
+            assert_eq!(count(query.clone()).await, expected, "{query}");
+        }
+    }
+    // The control the finding used: the OR chain, `=` and `!=`, here and in `| where`.
+    let chain = private.iter().map(|c| format!("dst_endpoint.ip={c}")).collect::<Vec<_>>().join(" OR ");
+    assert_eq!(count(format!("({chain}) | stats count")).await, expect(&private, false));
+    assert_eq!(count("* | where dst_endpoint.ip=\"10.0.0.0/8\" | stats count".into()).await, expect(&["10.0.0.0/8"], false));
+    assert_eq!(count("* | where dst_endpoint.ip!=\"10.0.0.0/8\" | stats count".into()).await, expect(&["10.0.0.0/8"], true));
+    assert_eq!(count("* | where dst_endpoint.ip=\"fe80::/10\" | stats count".into()).await, expect(&["fe80::/10"], false));
+    // After an aggregation the by-field is still an IP field.
+    let request: BroadNplRequest = serde_json::from_value(json!({
+        "request_id":"nan4285-by", "tenant_id":TENANT, "dataset":"logs",
+        "query":"* | stats count by dst_endpoint.ip | where dst_endpoint.ip IN (10.0.0.0/8, 8.8.8.8)",
+        "start":base.to_rfc3339(), "end":now.to_rfc3339(), "limit":20, "table_view":true,
+    })).unwrap();
+    let answer = engine.broad_npl(&request).await.unwrap();
+    let mut seen = answer["result"]["rows"].as_array().unwrap().iter()
+        .map(|row| row["dst_endpoint.ip"].as_str().map(str::to_owned).unwrap_or_else(|| row["dst_endpoint"]["ip"].to_string()))
+        .collect::<Vec<_>>();
+    seen.sort();
+    assert_eq!(seen, vec!["10.1.2.3".to_string(), "8.8.8.8".to_string()], "{answer}");
 }

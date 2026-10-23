@@ -174,6 +174,7 @@ pub struct GenerateOutcome {
     pub report: BuildReport,
     pub bundle: Option<Vec<u8>>,
     pub tests_toml: Option<String>,
+    pub source_test_configs: Vec<String>,
     pub env: Vec<(String, String)>,
     pub merge_diff: Option<String>,
     pub pull_bundle: Option<Vec<u8>>,
@@ -230,6 +231,7 @@ fn fail_at(
 struct Artifacts {
     bundle: Vec<u8>,
     tests_toml: Option<String>,
+    source_test_configs: Vec<String>,
     env: Vec<(String, String)>,
     merge_diff: Option<String>,
     pull_bundle: Option<Vec<u8>>,
@@ -288,6 +290,7 @@ pub fn generate(inputs: &BuildInputs) -> GenerateOutcome {
             report,
             bundle: Some(a.bundle),
             tests_toml: a.tests_toml,
+            source_test_configs: a.source_test_configs,
             env: a.env,
             merge_diff: a.merge_diff,
             pull_bundle: a.pull_bundle,
@@ -301,6 +304,7 @@ pub fn generate(inputs: &BuildInputs) -> GenerateOutcome {
                 report,
                 bundle: None,
                 tests_toml: None,
+                source_test_configs: Vec::new(),
                 env: Vec::new(),
                 merge_diff: None,
                 pull_bundle: None,
@@ -454,6 +458,10 @@ fn generate_into(
         .filter_map(|g| by_slug(&g.tenant.slug).map(|s| (g, s.samples.as_slice())))
         .collect();
     let tests_toml = vector_tests::render(&cases);
+    let source_test_configs = match vector_tests::source_configs(&candidate, &cases) {
+        Ok(configs) => configs,
+        Err(e) => return input_error(report, e.to_string()),
+    };
 
     // -- pull bundle (NAN-3369) ---------------------------------------------------
     let mut pull_packed = None;
@@ -522,6 +530,7 @@ fn generate_into(
     Some(Artifacts {
         bundle: packed,
         tests_toml,
+        source_test_configs,
         env,
         merge_diff,
         pull_bundle: pull_packed,
@@ -730,6 +739,9 @@ pub fn run_generate(input: &Path, work: &Path) -> Result<GenerateOutcome, Tenant
     }
     if let Some(tests) = &outcome.tests_toml {
         write(&work.join(TESTS_FILE), tests)?;
+    }
+    for (index, config) in outcome.source_test_configs.iter().enumerate() {
+        write(&work.join(format!("source-tests/{index}.toml")), config)?;
     }
     if let Some(diff) = &outcome.merge_diff {
         write(&work.join(MERGE_DIFF_FILE), diff)?;

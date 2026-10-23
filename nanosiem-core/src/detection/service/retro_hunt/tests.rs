@@ -14,6 +14,7 @@ fn candidate(value: &str, key_type: &str, feed: &str, fetched_ms: i64) -> RetroF
         enrichment_name: feed.to_string(),
         confidence: 75,
         fetched_at_ms: fetched_ms,
+        feed_revision: None,
     }
 }
 
@@ -216,4 +217,92 @@ fn build_hit_events_defaults_last_seen_when_absent() {
     // last_seen absent → feed empty → "unknown" feed, but event still well-formed.
     assert!(events[0]["_last_seen"].as_str().is_some());
     assert_eq!(events[0]["indicator"], "9.9.9.9");
+}
+
+// ---------------------------------------------------------------------------
+// NAN-4169: platform feed delta planning
+// ---------------------------------------------------------------------------
+
+fn platform_feed(feed: &str, revision: i64, changed: bool, values: &[(&str, &str)]) -> crate::enrichment::ioc::LakePlatformFeedDelta {
+    crate::enrichment::ioc::LakePlatformFeedDelta {
+        feed: feed.to_string(),
+        display_name: if feed == "threatfox" { "ThreatFox".to_string() } else { String::new() },
+        revision,
+        changed,
+        records: values
+            .iter()
+            .map(|(value, key_type)| crate::enrichment::ioc::LakePlatformRecord {
+                value: value.to_string(),
+                key_type: key_type.to_string(),
+                confidence: 75,
+                tags: vec![],
+            })
+            .collect(),
+    }
+}
+
+fn known(pairs: &[(&str, i64)]) -> std::collections::BTreeMap<String, i64> {
+    pairs.iter().map(|(f, r)| (f.to_string(), *r)).collect()
+}
+
+#[test]
+fn platform_first_sight_baselines_instead_of_hunting_the_whole_feed() {
+    let feeds = [platform_feed("threatfox", 3, true, &[("198.51.100.7", "ip"), ("198.51.100.9:443", "ip:port")])];
+    let plan = plan_platform_delta(&feeds, &known(&[]), &Default::default(), 500, 1_000);
+    assert!(plan.to_hunt.is_empty(), "a newly watched feed is never hunted whole");
+    assert_eq!(plan.baseline.len(), 2);
+    assert_eq!(plan.revisions_after, known(&[("threatfox", 3)]));
+}
+
+#[test]
+fn platform_new_revision_hunts_only_the_added_indicators() {
+    let feeds = [
+        platform_feed("threatfox", 4, true, &[("198.51.100.7", "ip"), ("198.51.100.9:443", "ip:port"), ("evil.example", "domain")]),
+        platform_feed("tor_exit_nodes", 9, false, &[]),
+    ];
+    let seen: std::collections::HashSet<String> = ["198.51.100.7".to_string()].into();
+    let plan = plan_platform_delta(&feeds, &known(&[("threatfox", 3), ("tor_exit_nodes", 9)]), &seen, 500, 1_000);
+    let hunted: Vec<_> = plan.to_hunt.iter().map(|c| (c.value.as_str(), c.key_type.as_str())).collect();
+    assert_eq!(hunted, [("198.51.100.9:443", "ip:port"), ("evil.example", "domain")]);
+    assert!(plan.to_hunt.iter().all(|c| c.feed_revision == Some(4) && c.enrichment_name == "ThreatFox" && c.fetched_at_ms == 1_000));
+    assert!(plan.baseline.is_empty());
+    assert_eq!(plan.revisions_after, known(&[("threatfox", 4), ("tor_exit_nodes", 9)]));
+    assert_eq!((plan.considered, plan.overflow), (2, 0));
+}
+
+#[test]
+fn platform_overflow_keeps_the_old_revision_so_the_next_run_resumes() {
+    let feeds = [platform_feed("threatfox", 4, true, &[("a.example", "domain"), ("b.example", "domain"), ("c.example", "domain")])];
+    let plan = plan_platform_delta(&feeds, &known(&[("threatfox", 3)]), &Default::default(), 2, 1_000);
+    assert_eq!(plan.to_hunt.len(), 2);
+    assert_eq!(plan.overflow, 1);
+    assert_eq!(plan.revisions_after, known(&[("threatfox", 3)]), "revision must not advance past unhunted values");
+    // Next run: the first two are now hunted; the remainder fits and the
+    // revision advances.
+    let seen: std::collections::HashSet<String> = ["a.example".to_string(), "b.example".to_string()].into();
+    let next = plan_platform_delta(&feeds, &known(&[("threatfox", 3)]), &seen, 2, 2_000);
+    assert_eq!(next.to_hunt.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), ["c.example"]);
+    assert_eq!(next.revisions_after, known(&[("threatfox", 4)]));
+}
+
+#[test]
+fn platform_feed_no_longer_granted_drops_out_and_rebaselines() {
+    let feeds = [platform_feed("tor_exit_nodes", 9, false, &[])];
+    let plan = plan_platform_delta(&feeds, &known(&[("threatfox", 3), ("tor_exit_nodes", 9)]), &Default::default(), 500, 1);
+    assert_eq!(plan.revisions_after, known(&[("tor_exit_nodes", 9)]));
+    assert_eq!(platform_delta_values(&feeds), Vec::<String>::new());
+}
+
+#[test]
+fn build_hit_events_mark_the_retro_signal() {
+    let mut c = candidate("198.51.100.9:443", "ip:port", "ThreatFox", 1_760_000_000_000);
+    c.feed_revision = Some(4);
+    let events = build_hit_events(rule_id(), &[hit("198.51.100.9:443", "dst_endpoint.ip", Some("2026-10-19T10:00:00Z"))], &[&c]);
+    let e = &events[0];
+    assert_eq!(e["retro"], true);
+    assert_eq!(e["retro_ioc"], true);
+    assert_eq!(e["retro_feed"], "ThreatFox");
+    assert_eq!(e["retro_feed_revision"], 4);
+    assert_eq!(e["retro_learned_at"], "2025-10-09T08:53:20Z");
+    assert_eq!(e["retro_field"], "dst_endpoint.ip");
 }

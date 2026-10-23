@@ -234,6 +234,12 @@ pub const PLAYBOOKS_MANAGE: &str = "playbooks:manage";
 pub const PLAYBOOKS_RUN: &str = "playbooks:run";
 pub const PLAYBOOKS_PUBLISH: &str = "playbooks:publish";
 
+// Native automation permissions (enterprise endpoints).
+pub const SOAR_VIEW: &str = "soar:view";
+pub const SOAR_MANAGE: &str = "soar:manage";
+pub const SOAR_RUN: &str = "soar:run";
+pub const SOAR_APPROVE: &str = "soar:approve";
+
 // Playbook Repository permissions
 pub const PLAYBOOK_REPOSITORIES_VIEW: &str = "playbook_repositories:view";
 pub const PLAYBOOK_REPOSITORIES_MANAGE: &str = "playbook_repositories:manage";
@@ -459,6 +465,11 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     PLAYBOOKS_MANAGE,
     PLAYBOOKS_RUN,
     PLAYBOOKS_PUBLISH,
+    // Native automation
+    SOAR_VIEW,
+    SOAR_MANAGE,
+    SOAR_RUN,
+    SOAR_APPROVE,
     // Playbook Repositories
     PLAYBOOK_REPOSITORIES_VIEW,
     PLAYBOOK_REPOSITORIES_MANAGE,
@@ -586,6 +597,7 @@ pub const CATEGORIES: &[&str] = &[
     "rule_repositories",
     "parser_repositories",
     "hunts",
+    "soar",
     "gdpr",
 ];
 

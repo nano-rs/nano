@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Optional export foundation. No serving/ingest caller enables this module.
+//! Shared exporter and the agent lane's catalog lifecycle boundary.
 //! Targets authenticate signed parts and either copy them or resolve their URIs.
 //! Only this committer mutates the public contract table.
 
@@ -8,8 +8,8 @@ pub mod schema;
 pub mod customer;
 pub mod egress;
 pub mod runner;
-#[cfg(feature = "enterprise")]
 pub mod hosted;
+pub mod lifecycle;
 #[cfg(feature = "enterprise")]
 pub mod hosted_state;
 #[cfg(feature = "enterprise")]
@@ -82,6 +82,7 @@ pub struct RestIcebergCommitter {
     table_id: TableIdent,
     target: Arc<dyn ExportTarget>,
     frozen_erasure: bool,
+    lifecycle: bool,
 }
 
 impl RestIcebergCommitter {
@@ -117,12 +118,18 @@ impl RestIcebergCommitter {
             table_id,
             target,
             frozen_erasure: false,
+            lifecycle: false,
         })
     }
 
     #[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
     pub(super) fn for_frozen_erasure(mut self) -> Self {
         self.frozen_erasure = true;
+        self
+    }
+
+    pub(super) fn for_lifecycle(mut self) -> Self {
+        self.lifecycle = true;
         self
     }
 
@@ -208,7 +215,7 @@ impl RestIcebergCommitter {
             &self.table.data_prefix,
             self.table.max_files,
         )?;
-        let (snapshot, snapshot_requirements) = prepare_snapshot_inner(
+        let (snapshot, snapshot_requirements) = prepare_snapshot_with_removals(
             &table,
             manifest,
             files,
@@ -216,6 +223,7 @@ impl RestIcebergCommitter {
             &self.table.data_prefix,
             self.table.max_files,
             self.frozen_erasure,
+            self.lifecycle,
         )
         .await
         .map_err(|_| anyhow::anyhow!("export snapshot preparation failed"))?;
@@ -491,9 +499,9 @@ async fn prepare_snapshot(
     prepare_snapshot_inner(table, manifest, added, schema, prefix, max_files, false).await
 }
 
-/// Standard v2 append/overwrite/delete snapshot. Rewrites live entries without
-/// their historical tombstones; old snapshots retain their own manifests.
-async fn prepare_snapshot_inner(
+/// Customer v2 append/overwrite/delete snapshot, retaining removal tombstones.
+#[cfg(test)]
+pub(super) async fn prepare_snapshot_inner(
     table: &Table,
     manifest: &ExportManifest,
     added: BTreeMap<String, Vec<DataFile>>,
@@ -501,6 +509,31 @@ async fn prepare_snapshot_inner(
     prefix: &str,
     max_files: usize,
     frozen_erasure: bool,
+) -> Result<(Snapshot, Vec<TableRequirement>)> {
+    prepare_snapshot_with_removals(table, manifest, added, schema, prefix, max_files, frozen_erasure, false).await
+}
+
+#[cfg(test)]
+pub(super) async fn prepare_lifecycle_snapshot(
+    table: &Table,
+    manifest: &ExportManifest,
+    added: BTreeMap<String, Vec<DataFile>>,
+    schema: &iceberg::spec::Schema,
+    prefix: &str,
+    max_files: usize,
+) -> Result<(Snapshot, Vec<TableRequirement>)> {
+    prepare_snapshot_with_removals(table, manifest, added, schema, prefix, max_files, false, true).await
+}
+
+async fn prepare_snapshot_with_removals(
+    table: &Table,
+    manifest: &ExportManifest,
+    added: BTreeMap<String, Vec<DataFile>>,
+    schema: &iceberg::spec::Schema,
+    prefix: &str,
+    max_files: usize,
+    frozen_erasure: bool,
+    lifecycle: bool,
 ) -> Result<(Snapshot, Vec<TableRequirement>)> {
     let parent = table.metadata().current_snapshot().map(|s| s.snapshot_id());
     let mut live = BTreeMap::new();
@@ -584,11 +617,11 @@ async fn prepare_snapshot_inner(
             .sequence_number()
             .ok_or_else(|| anyhow::anyhow!("export file sequence missing"))?;
         if remove.contains(part_id_from_path(entry.file_path(), prefix)?) {
-            writer.add_delete_file(
-                entry.data_file().clone(),
-                sequence,
-                entry.file_sequence_number,
-            )?;
+            // Only lifecycle custody omits bounds-bearing removal entries.
+            // Preserve the existing customer export tombstone behavior.
+            if !lifecycle {
+                writer.add_delete_file(entry.data_file().clone(), sequence, entry.file_sequence_number)?;
+            }
             deleted += 1;
         } else {
             writer.add_existing_file(

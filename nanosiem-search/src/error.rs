@@ -216,15 +216,19 @@ impl SearchError {
     /// from the lake producers. The payload stays verbatim so callers can still
     /// switch on the kind; only the rendered message is expanded, which keeps
     /// "memory" from reaching a user as the entire explanation.
+    ///
+    /// NAN-4282: the message never carries the internal code name "lean"; the
+    /// variant payload (and any code matching on it) is unchanged.
     pub fn public_message(&self) -> String {
-        match self {
+        let message = match self {
             SearchError::ResourceExhausted(kind)
                 if matches!(kind.as_str(), "memory" | "scan" | "time" | "resource" | "concurrency") =>
             {
                 format!("Interactive query exhausted its {kind} budget")
             }
             other => other.to_string(),
-        }
+        };
+        nanosiem_core::branding::without_internal_code_name(&message).into_owned()
     }
 
     /// Get the HTTP status code
@@ -679,6 +683,18 @@ mod tests {
         ));
         assert_eq!(db.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(db.code(), "INTERNAL_ERROR");
+    }
+
+    /// NAN-4282: the client-facing message never carries the internal code
+    /// name; the variant payload (which code may match on) keeps it.
+    #[test]
+    fn public_message_drops_the_internal_code_name() {
+        let error = SearchError::ServiceUnavailable("tenant is no longer placed on a lean-lake cell".to_string());
+        assert_eq!(error.public_message(), "Service unavailable: tenant is no longer placed on a lake cell");
+        let SearchError::ServiceUnavailable(reason) = &error else { unreachable!() };
+        assert!(reason.contains("lean-lake"));
+        let bad = SearchError::BadRequest("dataset `risk` is served only for lean-lake (cell) tenants".to_string());
+        assert!(!bad.public_message().to_lowercase().contains("lean"), "{}", bad.public_message());
     }
 
     /// Both payload shapes must render as a sentence. Before this, the variant

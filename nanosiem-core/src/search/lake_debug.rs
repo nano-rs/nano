@@ -36,14 +36,15 @@ pub struct LakeDebug {
 }
 
 /// NAN-3406: per-request A/B overrides of query[T]'s speed switches
-/// (`flat_filter_leaves`, `lane_routing_v2`, `identity_merged_index`, and
+/// (`flat_filter_leaves`, `lane_routing_v2`, `identity_merged_index`,
+/// NAN-4190's `entity_index`, and
 /// NAN-3411's numeric `payload_threads` / `payload_block_rows`; see
 /// `nanosiem_lake_worker::perf_overrides`). Honoured only for a request that
 /// already gets debug evidence (`x-nano-search-debug: 1` with `search:sql`).
 pub const PERF_OVERRIDES_HEADER: &str = "x-nano-perf-overrides";
 
 /// Per-request switches query[T] applies.
-const PERF_SWITCHES: &[&str] = &["flat_filter_leaves", "lane_routing_v2", "identity_merged_index"];
+const PERF_SWITCHES: &[&str] = &["flat_filter_leaves", "lane_routing_v2", "identity_merged_index", "entity_index"];
 /// NAN-3411: numeric per-request knobs query[T] applies (and clamps):
 /// the full-event payload statement's reader threads and block rows.
 const PERF_NUMERIC: &[&str] = &["payload_block_rows", "payload_threads"];
@@ -370,6 +371,8 @@ mod tests {
             Some("flat_filter_leaves=1,lane_routing_v2=0,prewarm_throttle=0")
         );
         assert_eq!(canonical_perf_overrides("flat_filter_leaves=0,flat_filter_leaves=1").as_deref(), Some("flat_filter_leaves=1"));
+        // NAN-4211: the window entity index A/B (query[T] reads it per lookup).
+        assert_eq!(canonical_perf_overrides("entity_index=off").as_deref(), Some("entity_index=0"));
         assert_eq!(canonical_perf_overrides("x=1\r\nx-evil: 1"), None);
         assert_eq!(canonical_perf_overrides(""), None);
         assert_eq!(canonical_perf_overrides(&format!("flat_filter_leaves=1,{}", " ".repeat(PERF_OVERRIDES_MAX_BYTES))), None);

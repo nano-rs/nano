@@ -26,6 +26,9 @@ pub enum RetroHuntRepositoryError {
     ConfigNotFound(Uuid),
 }
 
+/// Rows per hunted-set insert (3 binds each, well under the 65535 ceiling).
+pub const RECORD_HUNTED_CHUNK: usize = 5_000;
+
 /// Repository for retro-hunt config, delta state, and run history.
 #[derive(Clone)]
 pub struct RetroHuntRepository {
@@ -203,14 +206,42 @@ impl RetroHuntRepository {
         if indicators.is_empty() {
             return Ok(());
         }
-        let mut qb = sqlx::QueryBuilder::new(
-            "INSERT INTO retro_hunt_hunted_indicators (rule_id, indicator_value, indicator_type) ",
-        );
-        qb.push_values(indicators, |mut b, (value, ty)| {
-            b.push_bind(rule_id).push_bind(value).push_bind(ty);
-        });
-        qb.push(concat!(" ON CONFLICT (", crate::tenant_key!(), "rule_id, indicator_value) DO NOTHING"));
-        qb.build().execute(&self.pool).await?;
+        // NAN-4169: a platform feed baseline records a whole feed at once;
+        // chunk under PostgreSQL's 65535 bind-parameter ceiling.
+        for chunk in indicators.chunks(RECORD_HUNTED_CHUNK) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "INSERT INTO retro_hunt_hunted_indicators (rule_id, indicator_value, indicator_type) ",
+            );
+            qb.push_values(chunk, |mut b, (value, ty)| {
+                b.push_bind(rule_id).push_bind(value).push_bind(ty);
+            });
+            qb.push(concat!(" ON CONFLICT (", crate::tenant_key!(), "rule_id, indicator_value) DO NOTHING"));
+            qb.build().execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
+    /// NAN-4169: persist the platform feed revisions (feed -> revision) this
+    /// rule has finished processing.
+    pub async fn set_platform_revisions(
+        &self,
+        rule_id: Uuid,
+        revisions: &std::collections::BTreeMap<String, i64>,
+    ) -> Result<(), RetroHuntRepositoryError> {
+        let value = serde_json::to_value(revisions).unwrap_or_else(|_| serde_json::json!({}));
+        sqlx::query(
+            concat!(r#"
+            INSERT INTO retro_hunt_rule_state (rule_id, platform_revisions, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT ("#, crate::tenant_key!(), r#"rule_id) DO UPDATE SET
+                platform_revisions = EXCLUDED.platform_revisions,
+                updated_at = now()
+            "#),
+        )
+        .bind(rule_id)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

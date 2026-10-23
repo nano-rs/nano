@@ -149,13 +149,9 @@ fn request(query: &str, now: DateTime<Utc>, id: &str) -> BroadNplRequest {
     }
 }
 
-fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(TENANT.parse().unwrap(), Utc::now(), &[])
-}
-
 async fn answer(engine: &PartQueryEngine, query: &str, now: DateTime<Utc>, id: &str) -> Value {
     let request = request(query, now, id);
-    crate::query_timing::measure(id, Box::pin(crate::enrichment_read::scope(granted(), engine.broad_npl(&request)))).await
+    crate::query_timing::measure(id, Box::pin(engine.broad_npl(&request))).await
         .unwrap_or_else(|error| panic!("{query}: {error}"))
 }
 
@@ -229,6 +225,54 @@ async fn reads_over_the_cold_ceiling_run_in_batches_and_match_the_whole_window()
     assert!(got["planner"]["cold_batches"]["spill_bytes"].as_u64().unwrap() < 1024, "{}", got["planner"]);
     assert_eq!(canonical(&got, false), canonical(&expected, false));
 
+    // NAN-4291: ungrouped aggregates over batches of which only the first
+    // and last hold matching rows (an unindexed regex leases every file).
+    // Batching spools stage_0 and aggregates once, so the empty batches add
+    // no rows; the answer is the whole window's and the fixture's truth.
+    let aggregates = "stats count, sum(traffic.bytes_out) as s, avg(traffic.bytes_out) as a, \
+                      min(traffic.bytes_out) as lo, max(traffic.bytes_out) as hi, \
+                      min(time) as t0, max(time) as t1, values(dst_endpoint.hostname) as v";
+    let matched = [5_usize, 8, 905, 908];
+    let query = format!("metadata.log_source=conduit_proxy message=/^event (5|8|905|908) x/ | {aggregates}");
+    let expected = answer(&truth, &query, now, "truth-mixed").await;
+    small.fetcher().cache().evict_unreferenced(Default::default()).await.unwrap();
+    let got = answer(&small, &query, now, "small-mixed").await;
+    assert!(got["planner"]["cold_batches"]["batches"].as_u64().unwrap_or(0) >= 2, "{}", got["planner"]);
+    let row = |answer: &Value| answer["result"]["rows"][0].clone();
+    let (got_row, expected_row) = (row(&got), row(&expected));
+    let number = |value: &Value| value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| panic!("{value} in {got_row}"));
+    let bytes = matched.iter().map(|i| ((*i as i64 * 37) % 5_000 + 1) as f64).collect::<Vec<_>>();
+    assert_eq!(number(&got_row["count"]), 4.0);
+    assert_eq!(number(&got_row["s"]), bytes.iter().sum::<f64>());
+    assert_eq!(number(&got_row["a"]), bytes.iter().sum::<f64>() / 4.0);
+    assert_eq!(number(&got_row["lo"]), bytes.iter().copied().fold(f64::MAX, f64::min));
+    assert_eq!(number(&got_row["hi"]), bytes.iter().copied().fold(f64::MIN, f64::max));
+    let mut hosts = got_row["v"].as_str().unwrap_or_else(|| panic!("{got_row}")).split(", ").collect::<Vec<_>>();
+    hosts.sort_unstable();
+    assert_eq!(hosts, ["dst2", "dst3", "dst4"]);
+    // chDB renders DateTime64 as naive UTC (`2026-10-21 03:52:51.612000`).
+    let instant = |value: &Value| chrono::NaiveDateTime::parse_from_str(value.as_str().unwrap_or_default(), "%Y-%m-%d %H:%M:%S%.f")
+        .unwrap_or_else(|error| panic!("{value}: {error}")).and_utc();
+    let event_time = |i: usize| now - Duration::seconds(i as i64 * 10 + 30);
+    assert!((instant(&got_row["t0"]) - event_time(908)).num_milliseconds().abs() < 1_000, "{got_row}");
+    assert!((instant(&got_row["t1"]) - event_time(5)).num_milliseconds().abs() < 1_000, "{got_row}");
+    for key in ["count", "s", "a", "lo", "hi", "t0", "t1"] {
+        assert_eq!(got_row[key], expected_row[key], "{key}: batched {got_row} vs whole {expected_row}");
+    }
+
+    // No row anywhere: count 0, every other aggregate null, both ways.
+    let query = format!("message=/zz-no-such-text-zz/ | {aggregates}");
+    for (engine, id) in [(&truth, "truth-none"), (&small, "small-none")] {
+        let got = answer(engine, &query, now, id).await;
+        let got_row = row(&got);
+        assert_eq!(got["result"]["rows"].as_array().map(Vec::len), Some(1), "{id}: {got}");
+        assert!(got_row["count"] == json!(0) || got_row["count"] == json!("0"), "{id}: {got_row}");
+        for key in ["s", "a", "lo", "hi", "t0", "t1", "v"] {
+            assert!(got_row.get(key).is_some_and(Value::is_null), "{id}: {key} in {got_row}");
+        }
+    }
+
     // A newest-first row page walks its chunks, splitting any chunk over
     // the ceiling, and returns the same newest rows.
     let query = "metadata.log_source=windows_sysmon | head 250";
@@ -252,7 +296,7 @@ async fn reads_over_the_cold_ceiling_run_in_batches_and_match_the_whole_window()
     let Some(crate::part_query::engine::PartQueryError::ColdScanTooLarge { needed_bytes, .. }) = refused else {
         panic!("the whole window must be refused by the small cache: {refused:?}");
     };
-    let batched = crate::enrichment_read::scope(granted(), small.cold_batches(&compiled, window, None, needed_bytes, Default::default())).await.unwrap();
+    let batched = small.cold_batches(&compiled, window, None, needed_bytes, Default::default()).await.unwrap();
     let out = tempfile::tempdir().unwrap();
     let path = out.path().join("result.parquet");
     let mut plan = batched.plan.clone();

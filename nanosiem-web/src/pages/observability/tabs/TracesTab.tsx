@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+
 // TracesTab (NAN-1536) — the Observability console's Traces surface. Ported from
 // the design handoff's obs-traces.jsx (TracesExplorer) and wired to REAL data:
 //
@@ -174,7 +176,7 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
     ]
       .filter(Boolean)
       .join(' ');
-    return `/search?dataset=spans${q ? `&q=${encodeURIComponent(q)}` : ''}`;
+    return `/search#dataset=spans${q ? `&q=${encodeURIComponent(q)}` : ''}`;
   }, [svc, errOnly, minDurMs]);
 
   // NAN-1721 (O36): the trace fetch is Dragonfly-cached like every other obs
@@ -359,7 +361,7 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
           <span />
         </div>
         {!tracesQuery.isLoading && traces.length === 0 ? (
-          <div className="text-center py-12 text-[12px] text-fg-3">No traces in range.</div>
+          <div className="text-center py-12 text-[12px] text-fg-3">No traces match this range and filters. Export OTLP traces with service.name to populate this view.<TelemetrySetupHint /></div>
         ) : (
           traces.map((t) => {
             const durMs = t.duration_ns / NS_PER_MS;

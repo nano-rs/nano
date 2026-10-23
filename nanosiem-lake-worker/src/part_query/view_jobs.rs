@@ -316,7 +316,6 @@ pub async fn run_view_job(
         collect_bytes: engine.executor().result_limit_bytes().unwrap_or(DEFAULT_COLLECT_BYTES),
         lane: tokio::sync::Mutex::new(ResultExecutionMetadata::default()),
     };
-    let tenant = spec.tenant_id.clone();
     let work = async {
         let result = execute_view(&reader, spec).await?;
         if cancelled.load(Ordering::Acquire) {
@@ -330,9 +329,7 @@ pub async fn run_view_job(
             })
             .await
     };
-    engine.with_job_statements(
-        crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), work)
-    ).await?
+    engine.with_job_statements(work).await
 }
 
 /// The typed filters of one durable Prevalence export (NAN-3088).
@@ -373,7 +370,6 @@ async fn run_prevalence_export(
         bail!("prevalence export row envelope is invalid");
     }
     let started = Instant::now();
-    let tenant = spec.tenant_id.clone();
     let deny = nanosiem_core::auth::source_visibility::expand_unattributed_sources(&spec.scope_deny)
         .into_iter()
         .collect::<Vec<_>>();
@@ -434,7 +430,7 @@ async fn run_prevalence_export(
         };
         super::jobs::commit_job_result(results, spec, &output_path, &BTreeSet::new(), &execution).await
     };
-    crate::enrichment_read::execute(|| crate::enrichment_read::resolve(&tenant), work).await?
+    work.await
 }
 
 async fn execute_view(reader: &ViewReader<'_>, spec: &LakeQueryJobSpec) -> Result<MaterializedJobResult> {

@@ -90,6 +90,9 @@ fn default_inflight() -> u64 {
 fn default_standby_wait() -> u64 {
     30
 }
+fn default_pg_lease_ttl() -> u64 {
+    10
+}
 
 /// `zero_downtime_roll` in `cell.json`. Present = the feature is on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +123,11 @@ pub struct HandoverConfig {
     /// writer to move here before answering 503.
     #[serde(default = "default_standby_wait")]
     pub standby_request_wait_secs: u64,
+    /// NAN-4052: TTL of the Postgres cell writer lease ingest[T] holds (the
+    /// authority; the peer lease above is the fast path). A writer that
+    /// cannot renew stops within it; a successor takes over after it.
+    #[serde(default = "default_pg_lease_ttl")]
+    pub pg_writer_lease_ttl_secs: u64,
 }
 
 impl HandoverConfig {
@@ -140,6 +148,10 @@ impl HandoverConfig {
         anyhow::ensure!(self.discovery_grace_secs <= 300, "zero_downtime_roll.discovery_grace_secs must be <= 300");
         anyhow::ensure!(self.drain_secs <= 120 && self.inflight_secs <= 600, "zero_downtime_roll drain windows too long");
         anyhow::ensure!(self.standby_request_wait_secs <= 120, "zero_downtime_roll.standby_request_wait_secs must be <= 120");
+        anyhow::ensure!(
+            (2..=600).contains(&self.pg_writer_lease_ttl_secs),
+            "zero_downtime_roll.pg_writer_lease_ttl_secs must be 2..=600"
+        );
         Ok(())
     }
 
@@ -326,6 +338,21 @@ pub fn writer_verdict(
     Ok(())
 }
 
+/// NAN-4052: the peer that holds `t`'s writer as last observed: alive, its
+/// newest answer a readable view younger than one TTL, serving (a draining
+/// pod is releasing its writers), and listing `t` writing. A peer whose last
+/// contact was unreadable is unknown, never a target. Two claimants (only
+/// possible mid-fence) resolve to the senior, the same on every pod. Our
+/// own addresses are never peers, so this never names this pod.
+pub fn writer_peer(peers: &[PeerObs], t: &TenantId, now: Instant, ttl: Duration) -> Option<PeerAddr> {
+    peers
+        .iter()
+        .filter(|p| p.last_contact.zip(p.view.as_ref()).is_some_and(|(contact, (_, read_at))| contact <= *read_at))
+        .filter_map(|p| p.serving_view(now, ttl).filter(|v| v.writing.contains(t)).map(|v| (v, &p.addr)))
+        .min_by(|(a, _), (b, _)| (a.boot_unix_ms, a.boot_id.as_str()).cmp(&(b.boot_unix_ms, b.boot_id.as_str())))
+        .map(|(_, addr)| addr.clone())
+}
+
 /// NAN-3164: should the startup warm latch also wait for each query
 /// process's local hot window (its newest hours resident)? Only while a
 /// serving, Ready peer can carry search — or before discovery has told us
@@ -461,6 +488,22 @@ impl Handover {
         writer_verdict(&self.me, &peers, t, now, ttl, unowned_for)
     }
 
+    /// NAN-4052: how long a tenant stays standby after its ingest found the
+    /// writer lease held by another pod generation, before ingest retries
+    /// (each retry is one credential exchange and one acquisition).
+    pub fn standby_retry(&self) -> Duration {
+        (Duration::from_secs(self.cfg.pg_writer_lease_ttl_secs) * 2).clamp(Duration::from_secs(5), Duration::from_secs(60))
+    }
+
+    /// NAN-4052: the Postgres writer lease ingest[T] takes as this pod
+    /// generation.
+    pub fn writer_lease_assignment(&self) -> crate::contract::WriterLeaseAssignment {
+        crate::contract::WriterLeaseAssignment {
+            holder: format!("{}/{}", self.me.cell_id, self.me.boot_id),
+            ttl_ms: self.cfg.pg_writer_lease_ttl_secs * 1000,
+        }
+    }
+
     /// Our view, as peers read it.
     pub fn view(&self, writing: BTreeSet<TenantId>) -> HandoverView {
         HandoverView {
@@ -494,6 +537,14 @@ impl Handover {
                 last_error: p.last_error.clone(),
             })
             .collect()
+    }
+
+    /// NAN-4052: where `t`'s writer runs now, if on a peer (see
+    /// [`writer_peer`]). The router forwards a detect request there instead
+    /// of waiting on a standby pod.
+    pub fn writer_peer(&self, t: &TenantId) -> Option<PeerAddr> {
+        let peers: Vec<PeerObs> = self.peers.lock().unwrap().values().cloned().collect();
+        writer_peer(&peers, t, Instant::now(), self.cfg.ttl())
     }
 
     async fn resolve(&self) -> Vec<PeerAddr> {
@@ -809,6 +860,32 @@ mod tests {
     }
 
     #[test]
+    fn writer_peer_names_only_a_live_serving_writer() {
+        let now = Instant::now();
+        let t = tid("t1");
+        let writer = peer(1000, Phase::Serving, &["t1"], Duration::from_millis(500), now);
+        let idle = peer(3000, Phase::Serving, &["t2"], Duration::from_millis(500), now);
+        assert_eq!(writer_peer(&[idle.clone(), writer.clone()], &t, now, TTL), Some(writer.addr.clone()));
+        // Nobody writes t1: no target (the caller keeps the standby wait / 503).
+        assert_eq!(writer_peer(std::slice::from_ref(&idle), &t, now, TTL), None);
+        assert_eq!(writer_peer(&[], &t, now, TTL), None);
+        // A draining pod is releasing its writer: never a target.
+        let flushing = peer(1000, Phase::Draining, &["t1"], Duration::from_millis(500), now);
+        assert_eq!(writer_peer(&[flushing], &t, now, TTL), None);
+        // Silent past the TTL: gone.
+        let gone = peer(1000, Phase::Serving, &["t1"], Duration::from_secs(31), now);
+        assert_eq!(writer_peer(&[gone], &t, now, TTL), None);
+        // A later unreadable answer (401, garbage) makes the view unknown.
+        let mut unreadable = writer.clone();
+        unreadable.last_contact = Some(now);
+        assert_eq!(writer_peer(&[unreadable], &t, now, TTL), None);
+        // Two claimants (mid-fence): the senior, deterministically.
+        let junior = peer(2000, Phase::Serving, &["t1"], Duration::ZERO, now);
+        assert_eq!(writer_peer(&[junior.clone(), writer.clone()], &t, now, TTL), Some(writer.addr.clone()));
+        assert_eq!(writer_peer(&[writer.clone(), junior], &t, now, TTL), Some(writer.addr));
+    }
+
+    #[test]
     fn hot_window_gate_waits_only_while_a_ready_peer_serves() {
         let now = Instant::now();
         // Before discovery we cannot know: wait (bounded by discovery grace).
@@ -846,6 +923,20 @@ mod tests {
         }
         assert!(serde_json::from_value::<HandoverConfig>(serde_json::json!({"peers": ["tcp:1.2.3.4:1"], "nope": 1})).is_err());
         assert_eq!(PeerTarget::parse("tcp:10.0.0.1:8790").unwrap(), PeerTarget::Tcp("10.0.0.1:8790".parse().unwrap()));
+    }
+
+    #[test]
+    fn the_pg_writer_lease_defaults_to_ten_seconds_and_names_this_generation() {
+        let cfg: HandoverConfig = serde_json::from_value(serde_json::json!({"peers": ["unix:/nonexistent/peer.sock"]})).unwrap();
+        assert_eq!(cfg.pg_writer_lease_ttl_secs, 10);
+        let h = Handover::new("cell-a", cfg).unwrap();
+        let lease = h.writer_lease_assignment();
+        assert_eq!(lease.ttl_ms, 10_000);
+        assert_eq!(lease.holder, format!("cell-a/{}", h.me.boot_id));
+        for bad in [0, 1, 601] {
+            let c: HandoverConfig = serde_json::from_value(serde_json::json!({"peers": ["tcp:1.2.3.4:1"], "pg_writer_lease_ttl_secs": bad})).unwrap();
+            assert!(c.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -585,17 +585,23 @@ impl SearchService {
             .iter()
             .flat_map(|cmd| cmd.conditions.iter().cloned())
             .collect();
-        let count_conds = |field: PrevalenceField| -> Vec<PrevalenceCondition> {
+        // NAN-4372: a first_seen condition also drives its entity's probe. A
+        // brand-new artifact (exactly what `domain_first_seen > now() - 24h`
+        // hunts) is the one the dict negative-caches; without the rescue the
+        // pushed `_dp_first_seen` predicate could never see it.
+        // `filter_rescued_artifacts` enforces only the count conditions, so the
+        // rescued set is a superset the in-SQL predicate narrows.
+        let entity_conds = |fields: [PrevalenceField; 2]| -> Vec<PrevalenceCondition> {
             conditions
                 .iter()
-                .filter(|c| {
-                    c.field == field && matches!(c.threshold, PrevalenceThreshold::Count(_))
-                })
+                .filter(|c| fields.contains(&c.field))
                 .cloned()
                 .collect()
         };
-        let mut hash_conds = count_conds(PrevalenceField::HashPrevalence);
-        let mut domain_conds = count_conds(PrevalenceField::DomainPrevalence);
+        let mut hash_conds =
+            entity_conds([PrevalenceField::HashPrevalence, PrevalenceField::HashFirstSeen]);
+        let mut domain_conds =
+            entity_conds([PrevalenceField::DomainPrevalence, PrevalenceField::DomainFirstSeen]);
         let mut ip_conds: Vec<PrevalenceCondition> = Vec::new();
 
         // NAN-1705 residual #2: `enrich=true | where <decorated> …`. The
@@ -1007,11 +1013,9 @@ impl SearchService {
         // aliases below are transform-rewritten to the rescued rows' true counts,
         // so `{alias} < 9999 AND {alias} op N` matches them directly here.
         for cond in filter_conditions {
-            if let Some(pred) =
-                super::prevalence_processing::prevalence_filter_condition_to_sql(cond)
-            {
-                where_conditions.push(pred);
-            }
+            where_conditions.push(
+                super::prevalence_processing::prevalence_filter_condition_to_sql(cond)?,
+            );
         }
 
         // Strip ORDER BY and LIMIT from base SQL since we'll add our own

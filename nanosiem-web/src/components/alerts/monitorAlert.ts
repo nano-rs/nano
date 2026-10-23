@@ -35,6 +35,7 @@ export interface MonitorAlertView {
   agg?: string;
   groupBy?: string | null;
   seriesKey?: string;
+  labels?: Record<string, string>;
   comparator?: string;
   threshold?: number;
   value?: number;
@@ -65,6 +66,24 @@ function firstPayload(matched: unknown): Record<string, unknown> {
 const asStr = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 const asNum = (v: unknown): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+
+function monitorLabels(p: Record<string, unknown>): Record<string, string> {
+  const labels: Record<string, string> = {};
+  if (p.labels && typeof p.labels === 'object' && !Array.isArray(p.labels)) {
+    for (const [key, value] of Object.entries(p.labels)) {
+      if (typeof value === 'string' && value) labels[key] = value;
+    }
+  }
+  const group = asStr(p.group_by);
+  const series = asStr(p.series_key);
+  if (group && series) labels[group] = series;
+  return labels;
+}
+
+/** Stable text rendered by the existing mono metadata rows. */
+export function monitorLabelText(m: MonitorAlertView): string {
+  return Object.entries(m.labels ?? {}).map(([key, value]) => `${key}=${value}`).join(' · ');
+}
 
 /**
  * Parse a monitor breach payload off an alert. Returns null for detection
@@ -100,6 +119,7 @@ export function parseMonitorAlert(
     agg: asStr(p.agg),
     groupBy: asStr(p.group_by) ?? null,
     seriesKey: asStr(p.series_key),
+    labels: monitorLabels(p),
     comparator: asStr(p.comparator),
     threshold: asNum(p.threshold),
     value: asNum(p.value),

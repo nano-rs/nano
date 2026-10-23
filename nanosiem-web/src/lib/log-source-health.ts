@@ -78,7 +78,7 @@ export function healthSearchHref(
     params.set('start', opts.start);
     params.set('end', opts.end);
   }
-  return `/search?${params.toString()}`;
+  return `/search#${params.toString()}`;
 }
 
 export function hourWindow(points: HealthSeriesPoint[], idx?: number): { start?: string; end?: string } {

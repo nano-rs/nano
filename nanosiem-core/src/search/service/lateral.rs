@@ -1002,7 +1002,7 @@ impl SearchService {
         &self, request: &SearchRequest, user_id: uuid::Uuid, scope: &ScopeSet,
         authority: Option<&crate::search::DurableSearchJobAuthority>,
     ) -> Result<Option<String>, SearchError> {
-        let (query, earliest, latest) = extract_time_modifiers(&request.query);
+        let (query, earliest, latest) = extract_time_bounds(&request.query)?;
         let Ok(mut parsed) = parse_query(&query) else { return Ok(None); };
         let profile = self.dataset_profile(request.dataset.as_deref());
         crate::search::query_processing::apply_profile_product_semantics(&mut parsed, profile.as_ref());
@@ -1020,9 +1020,8 @@ impl SearchService {
         let query = parsed.pretty_print();
         validate_lake_lateral_job(&query)?;
         let now = chrono::Utc::now();
-        let relative = |seconds| chrono::Duration::try_seconds(seconds).and_then(|duration| now.checked_add_signed(duration)).ok_or(SearchError::InvalidTimeRange);
-        let start = earliest.map(relative).transpose()?.unwrap_or(request.time_range.start);
-        let end = latest.map(relative).transpose()?.unwrap_or(request.time_range.end);
+        let start = earliest.unwrap_or(request.time_range.start);
+        let end = latest.unwrap_or(request.time_range.end);
         let incident = self.retention_bound_input_range(&TimeRangeInput::new(start, end), now)?.ok_or(SearchError::InvalidTimeRange)?;
         // Identity enrichment uses the same 30-day latest-before horizon as
         // the interactive reader. Admit that contribution range explicitly.

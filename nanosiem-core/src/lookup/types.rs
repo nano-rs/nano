@@ -358,6 +358,11 @@ pub struct LookupHistoryEntry {
 /// Maximum number of rows allowed in a lookup table
 pub const MAX_LOOKUP_TABLE_ROWS: i64 = 1_000_000;
 
+/// Maximum number of key values one store-level batch lookup reads. The tenant
+/// lookup store refuses a larger batch; [`crate::lookup::LookupService::lookup_batch`]
+/// splits a larger key set into batches of this size (NAN-4287).
+pub const MAX_BATCH_LOOKUP_KEYS: usize = 10_000;
+
 /// Prefix for dynamically created lookup tables
 pub const LOOKUP_TABLE_PREFIX: &str = "lookup_";
 

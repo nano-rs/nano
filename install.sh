@@ -21,6 +21,8 @@
 #   8. Waits for the API to report healthy
 #   9. POSTs to /api/setup/initialize to create the first admin account
 #  10. Prints the login URL
+#  11. Optionally runs the checksum-verified nano connect wizard (TTY only;
+#      skipped for --yes, CI, and Tenzir-direct installs)
 #
 # Non-interactive use: set the prompt values as env vars before running.
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
@@ -165,6 +167,57 @@ prompt_tty() {
     fi
     [[ -z "$answer" && -n "$default" ]] && answer="$default"
     printf "%s" "$answer"
+}
+
+# Optional onboarding is isolated from the successful install, including SIGINT.
+# The API key stays in memory; connect owns its private 0600 profile.
+onboard_data() {
+    (
+        set +x
+        local url="${API_BASE}" answer="" key="" work="" expected="" actual=""
+        if [[ "${TENZIR_DIRECT:-0}" == "1" ]]; then
+            return 0
+        fi
+        printf '\n  Onboard data later:\n    curl -fsSL https://get.nano.rs/connect | bash -s -- --url %q\n' "$url"
+        if [[ "${NANO_NONINTERACTIVE:-0}" == "1" || -n "${CI:-}" ]] || ! tty_usable; then
+            return 0
+        fi
+        trap 'exit 0' INT TERM
+        answer=$(prompt_tty "Onboard data now? (y/N)" "N")
+        case "$answer" in y|Y|yes|YES) ;; *) return 0 ;; esac
+        printf '\n  Open %s, sign in, then go to Settings → Access Control → API Keys.\n' "$BASE_URL"
+        printf '  Create an API key with settings:system and search:execute permissions.\n'
+        printf '  Return here and paste the key; input is hidden. connect saves its private profile (0600).\n'
+        key=$(prompt_tty "API key (blank to skip)" "" secret)
+        [[ -n "$key" ]] || return 0
+        work=$(mktemp -d) || return 0
+        trap 'rm -rf "$work"' EXIT
+        if ! curl -fsSL --connect-timeout 10 --max-time 120 https://get.nano.rs/connect -o "$work/connect.sh" ||
+           ! curl -fsSL --connect-timeout 10 --max-time 120 https://get.nano.rs/connect.sh.sha256 -o "$work/connect.sh.sha256"; then
+            warn "Could not download nano connect; use the command above later."
+            return 0
+        fi
+        # Accept the release's sha256sum format, but never trust its filename.
+        expected=$(awk 'NR == 1 {print $1}' "$work/connect.sh.sha256")
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual=$(sha256sum "$work/connect.sh") || return 0
+        elif command -v shasum >/dev/null 2>&1; then
+            actual=$(shasum -a 256 "$work/connect.sh") || return 0
+        else
+            warn "No SHA-256 verifier available; skipping onboarding."
+            return 0
+        fi
+        actual=${actual%% *}
+        if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ || "$actual" != "$expected" ]]; then
+            warn "nano connect checksum mismatch; skipping onboarding."
+            return 0
+        fi
+        # No key in argv, installer output, or temporary files. A pipe-fed
+        # installer must give the interactive connector the controlling TTY.
+        if ! NANO_API_KEY="$key" bash "$work/connect.sh" --url "$url" < /dev/tty; then
+            warn "Onboarding stopped; nano is still installed. Use the command above later."
+        fi
+    ) || true
 }
 
 # NAN-3807: the compose profile Vector and the connector runner carry
@@ -1499,7 +1552,7 @@ if [[ "$USE_LEAN" == "1" ]]; then
     upsert_env_file_value NANO_LAKE_FORCE_PATH_STYLE true
     # Host-side port/bind overrides given to the installer must survive a
     # later plain `docker compose up`, which reads only .env.
-    for key in NANO_LAKE_OBJECT_PORT NANO_LAKE_CONSOLE_PORT NANO_OTLP_BIND_ADDRESS NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS; do
+    for key in NANO_LAKE_OBJECT_PORT NANO_LAKE_CONSOLE_PORT NANO_VECTOR_NATIVE_BIND_ADDRESS NANO_FLUENT_BIND_ADDRESS; do
         if [[ -n "${!key:-}" ]]; then upsert_env_file_value "$key" "${!key}"; fi
     done
     SCHEMA_PROFILE=ocsf
@@ -1745,9 +1798,10 @@ elif [[ "$NANO_NONINTERACTIVE" != "1" && -n "${VECTOR_AUTH_TOKEN:-}" ]]; then
     printf "                -d '{\"event\":\"hello nano\"}'\n"
     echo
     printf "  OTLP/HTTP: %s/otlp  (SDK/collector endpoint; /v1/logs, /v1/traces, /v1/metrics)\n" "$BASE_URL"
-    printf "              header 'Authorization: Bearer %s'\n" "$VECTOR_AUTH_TOKEN"
-    printf "              Raw OTLP gRPC/HTTP (:4317/:4318) is unauthenticated and bound to\n"
-    printf "              127.0.0.1 unless NANO_OTLP_BIND_ADDRESS is set.\n"
+    printf "              header 'Authorization: Bearer <source-bound token>'\n"
+    printf "              Create a named token bound to the enabled OpenTelemetry Logs source.\n"
+    printf "              Raw OTLP ports (:4317/:4318) stay internal; remote senders use\n"
+    printf "              authenticated OTLP/HTTP at /otlp with a source-bound ingest token.\n"
     echo
     # NAN-3322: Vector's native `vector` source/sink pair has no auth option, and
     # the :6000 source checks nothing, so the token above does not apply here.
@@ -1776,6 +1830,8 @@ echo
 echo "  Logs:     docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE logs -f"
 echo "  Stop:     docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE down"
 echo "  Reset:    docker compose -f $NANO_INSTALL_DIR/$COMPOSE_FILE down -v   (DELETES ALL DATA)"
+# Open-core installer only; run after health and admin bootstrap succeeded.
+onboard_data
 echo
 
 }

@@ -30,6 +30,9 @@
 //!     group-for-group parity.
 //! lake_part_query_lab ui <work> <steps.json>
 //!     the UI's default search per step: rows page + histogram, concurrently.
+//! lake_part_query_lab keyword-count-parity <work> <queries.txt> <end> [windows]
+//!     NAN-4311: each query with the v3 keyword counts on and off (probe
+//!     knob), rows compared in page order; see lab/keyword_count_parity.rs.
 //! lake_part_query_lab sql <query>
 //!     ad-hoc chDB SQL over local files (JSONEachRow to stdout).
 //! lake_part_query_lab corr-parity <work> <cases.json>
@@ -72,6 +75,8 @@ use std::time::{Duration, Instant};
 
 #[path = "lab/local_search_bench.rs"]
 mod local_search_bench;
+#[path = "lab/keyword_count_parity.rs"]
+mod keyword_count_parity;
 
 const TENANT: &str = "b464ceb9-28a6-4249-8e29-3489627ac5f6";
 const BUCKET: &str = "nan2869-fixture";
@@ -108,42 +113,6 @@ fn cpu_seconds() -> Option<f64> {
     let fields = stat.rsplit_once(')')?.1.split_whitespace().map(str::to_string).collect::<Vec<_>>();
     let ticks = fields.get(11)?.parse::<f64>().ok()? + fields.get(12)?.parse::<f64>().ok()?;
     Some(ticks / 100.0)
-}
-
-/// The platform-enrichment read authority the lab queries under.
-/// `NAN2869_AUTHORITY=grant`: the tenant holds the ipinfo_lite baseline right
-/// (the stamps that own the geo/ASN leaves), as a normal tenant does.
-/// Otherwise: no rights, so every owned leaf is masked (worst case).
-fn lab_authority() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference};
-    let tenant: uuid::Uuid = TENANT.parse().expect("tenant uuid");
-    let now = chrono::Utc::now();
-    if std::env::var("NAN2869_AUTHORITY").as_deref() != Ok("grant") {
-        return nanosiem_core::platform_enrichment::read::ReadAuthorization::unknown(tenant, now);
-    }
-    // Both ipinfo_lite revisions present in the fixture (1 and 2).
-    let revisions = [1_i64, 2]
-        .into_iter()
-        .map(|feed_revision| AuthorizedRevision {
-            tenant_id: tenant,
-            reference: RevisionReference {
-                feed_id: "ipinfo_lite".to_string(),
-                feed_revision,
-                tier: "included".to_string(),
-                grant_revision: 1,
-                entitlement_revision: 1,
-            },
-            class: FeedClass::Baseline,
-            digest: "0".repeat(64),
-            mapping_revision: 1,
-            deny_epoch: 0,
-            // Fixed, so the authority identity is stable across queries (as
-            // a resolved production authority is).
-            valid_until: chrono::DateTime::parse_from_rfc3339("2026-12-01T00:00:00Z").expect("fixed").with_timezone(&chrono::Utc),
-            evaluated_at: now,
-        })
-        .collect::<Vec<_>>();
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(tenant, now, &revisions)
 }
 
 fn rss() -> Value {
@@ -885,10 +854,7 @@ async fn parts_rows(lab: &Lab, request: &BroadNplRequest) -> Result<(Vec<Value>,
     // task-local timing wrapper's inline state (and the caller's stack).
     let envelope = nanosiem_lake_worker::query_timing::measure(
         &request.request_id,
-        Box::pin(nanosiem_lake_worker::enrichment_read::scope(
-            lab_authority(),
-            lab.engine.broad_npl(request),
-        )),
+        Box::pin(lab.engine.broad_npl(request)),
     )
     .await
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1099,10 +1065,7 @@ async fn parity(work: &Path, corpus_path: &Path, rules: &[PathBuf]) -> Result<Va
             "request_id": "count", "tenant_id": TENANT, "group_field": field, "bucket_span_us": span,
             "count_alias": "count", "start": start, "end": end, "max_groups": 1_000_000,
         }))?;
-        let parts = nanosiem_lake_worker::enrichment_read::scope(
-            lab_authority(),
-            partials::count_aggregate(&lab.engine, &request),
-        )
+        let parts = partials::count_aggregate(&lab.engine, &request)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let window = request.window().map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1578,7 +1541,7 @@ async fn lab_count(lab: &Lab, spec: &Value, field: &str, predicate: &Value, grou
     }))?;
     let envelope = nanosiem_lake_worker::query_timing::measure(
         "nan3153-count",
-        Box::pin(nanosiem_lake_worker::enrichment_read::scope(lab_authority(), partials::count_aggregate(&lab.engine, &count))),
+        Box::pin(partials::count_aggregate(&lab.engine, &count)),
     )
     .await
     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1737,10 +1700,7 @@ async fn session(work: &Path, steps_path: &Path) -> Result<Value> {
                     "count_alias": "count", "start": step["start"], "end": step["end"], "max_groups": 1_000_000,
                     "group_results": step["count_route"]["group_results"].as_bool().unwrap_or(true),
                 }))?;
-                let routed = nanosiem_lake_worker::enrichment_read::scope(
-                    lab_authority(),
-                    partials::count_aggregate(&lab.engine, &count),
-                )
+                let routed = partials::count_aggregate(&lab.engine, &count)
                 .await
                 .map(|envelope| {
                     let rows = envelope["result"]["rows"].as_array().cloned().unwrap_or_default();
@@ -2172,6 +2132,13 @@ pub(crate) fn main() -> Result<()> {
             // SAFETY: skip atexit handlers; chDB's static destructors are not exit-safe.
             unsafe { libc::_exit(0) }
         }
+        Some("keyword-count-parity") => {
+            let windows = args.get(5).map_or("24h", String::as_str).split(',').map(str::to_string).collect::<Vec<_>>();
+            let report = rt.block_on(keyword_count_parity::keyword_count_parity(Path::new(&args[2]), Path::new(&args[3]), &args[4], &windows))?;
+            println!("{}", serde_json::to_string(&report)?);
+            // SAFETY: skip atexit handlers; chDB's static destructors are not exit-safe.
+            unsafe { libc::_exit(0) }
+        }
         Some("ui") => {
             let report = rt.block_on(ui(Path::new(&args[2]), Path::new(&args[3])))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2245,15 +2212,15 @@ pub(crate) fn main() -> Result<()> {
             unsafe { libc::_exit(0) }
         }
         Some("prewarm") => {
-            // The background owner-proof/SHA prewarm a cell's query[T] runs on
-            // part arrival (NAN2869_STATE_DIR persists what it proves).
+            // The background SHA prewarm a cell's query[T] runs on part
+            // arrival.
             let hours = std::env::var("NAN2869_PREWARM_HOURS").ok()
                 .and_then(|value| value.parse::<u64>().ok()).unwrap_or(24).clamp(1, 336);
             let report = rt.block_on(async {
                 let cache_dir = Path::new(&args[2]).join(format!("cache-prewarm-{}", std::process::id()));
                 let lab = open_lab(Path::new(&args[2]), &cache_dir, false).await?;
                 let (cpu, started) = (cpu_seconds(), Instant::now());
-                nanosiem_lake_worker::enrichment_read::scope(lab_authority(), lab.engine.prewarm_owner_proofs(hours)).await?;
+                lab.engine.prewarm_parts(hours).await?;
                 let _ = std::fs::remove_dir_all(&cache_dir);
                 Ok::<_, anyhow::Error>(json!({"hours": hours, "wall_s": started.elapsed().as_secs_f64(), "cpu_s": cpu_seconds().zip(cpu).map(|(a, b)| a - b),
                     "verified_in_place_bytes": lab.engine.fetcher().verified_in_place_bytes(), "memory": rss()}))

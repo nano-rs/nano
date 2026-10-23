@@ -194,6 +194,11 @@ fn typed_eval_expression_to_sql_inner(
             if let Some(sql) = datetime_difference_sql(gen, left, *op, right, field_override)? {
                 return Ok(sql);
             }
+            if let Some(sql) = string_plus_sql(gen, left, *op, right, field_override, |side| {
+                typed_eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             if let Some(sql) =
                 array_field_predicate(gen, left, *op, right, field_override, |side| {
                     typed_eval_expression_to_sql_inner(gen, side, false, field_override)
@@ -278,7 +283,73 @@ fn is_datetime_function(name: &str) -> bool {
             | "maketimestamp"
             | "make_date"
             | "makedate"
+            | "strptime"
     )
+}
+
+/// NAN-4286: `relative_time(t, "<modifier>")` with the same modifier grammar as
+/// `earliest=`/`latest=` (see `query::time_modifiers`): an optional signed
+/// offset (`-24h`, `+3d`, `now`) followed by an optional UTC snap (`@d`, `@h`,
+/// `@w1`, `@mon`, `@y`). Resolved at compile time into DateTime64 SQL.
+pub(super) fn relative_time_sql(base: &str, modifier: &str) -> Result<String, SqlGenError> {
+    let invalid = || {
+        SqlGenError::InvalidQuery(format!(
+            "Invalid relative_time() modifier \"{modifier}\": expected a signed offset and/or a \
+             UTC snap, such as \"-24h\", \"+7d\", \"@d\", \"-1d@d\" or \"@w1\""
+        ))
+    };
+    let modifier = modifier.trim();
+    let (offset, snap) = match modifier.split_once('@') {
+        Some((offset, snap)) => (offset, Some(snap.to_ascii_lowercase())),
+        None => (modifier, None),
+    };
+    let mut sql = format!("toDateTime64({base}, 3, 'UTC')");
+    if !(offset.is_empty() || offset.eq_ignore_ascii_case("now")) {
+        let digits_start = offset.find(|c: char| c.is_ascii_digit()).ok_or_else(invalid)?;
+        let (sign, rest) = offset.split_at(digits_start);
+        let negative = match sign {
+            "" | "+" => false,
+            "-" => true,
+            _ => return Err(invalid()),
+        };
+        let unit_start = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(invalid)?;
+        let (number, unit) = rest.split_at(unit_start);
+        let amount: i64 = number.parse().map_err(|_| invalid())?;
+        let function = match unit {
+            "s" | "sec" | "secs" | "second" | "seconds" => "addSeconds",
+            "m" | "min" | "mins" | "minute" | "minutes" => "addMinutes",
+            "h" | "hr" | "hrs" | "hour" | "hours" => "addHours",
+            "d" | "day" | "days" => "addDays",
+            "w" | "week" | "weeks" => "addWeeks",
+            "M" | "mon" | "month" | "months" => "addMonths",
+            "y" | "year" | "years" => "addYears",
+            _ => return Err(invalid()),
+        };
+        let amount = if negative { -amount } else { amount };
+        sql = format!("{function}({sql}, {amount})");
+    }
+    if let Some(snap) = snap {
+        sql = match snap.as_str() {
+            "s" => format!("toStartOfSecond({sql})"),
+            "m" => format!("toStartOfMinute({sql})"),
+            "h" => format!("toStartOfHour({sql})"),
+            "d" => format!("toStartOfDay({sql})"),
+            "mon" => format!("toStartOfMonth({sql})"),
+            "y" => format!("toStartOfYear({sql})"),
+            "w" | "w0" | "w1" | "w2" | "w3" | "w4" | "w5" | "w6" => {
+                // Most recent given weekday (0 = Sunday) at UTC midnight.
+                let target = snap.as_bytes().get(1).map_or(0, |b| i64::from(b - b'0'));
+                format!(
+                    "subtractDays(toStartOfDay({sql}), (toDayOfWeek({sql}) % 7 - {target} + 7) % 7)"
+                )
+            }
+            _ => return Err(invalid()),
+        };
+        sql = format!("toDateTime64({sql}, 3, 'UTC')");
+    }
+    Ok(sql)
 }
 
 /// The DateTime SQL of a datetime-valued expression, or `None`: the event
@@ -447,6 +518,11 @@ fn eval_expression_to_sql_inner(
             if let Some(sql) = datetime_difference_sql(gen, left, *op, right, field_override)? {
                 return Ok(sql);
             }
+            if let Some(sql) = string_plus_sql(gen, left, *op, right, field_override, |side| {
+                eval_expression_to_sql_inner(gen, side, false, field_override)
+            })? {
+                return Ok(sql);
+            }
             if let Some(sql) =
                 array_field_predicate(gen, left, *op, right, field_override, |side| {
                     eval_expression_to_sql_inner(gen, side, false, field_override)
@@ -503,7 +579,7 @@ fn eval_expression_to_sql_inner(
 /// a non-IP string, which failed the whole search when one event carried a
 /// hostname in an IP field; the old `length(x) > 0` guard only caught ''.
 /// The Rust post-processing evaluator implements the same.
-fn guarded_ip_predicate(ip: &str, predicate: &str) -> String {
+pub(super) fn guarded_ip_predicate(ip: &str, predicate: &str) -> String {
     format!(
         "ifNull((isIPv4String(toString({ip})) OR isIPv6String(toString({ip}))) AND ({predicate}), 0)"
     )
@@ -699,6 +775,121 @@ fn regex_literal_comparison(
     } else {
         format!("({matched})")
     }))
+}
+
+/// The static type of a `+` operand, as far as the compiler can tell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlusOperand {
+    Number,
+    Text,
+    /// A stage alias, rex capture, override-resolved or schema-less field:
+    /// no static type.
+    Unknown,
+}
+
+/// NAN-4303: the static type of one side of `+`. Literals and schema fields
+/// are typed; a nested expression takes the type its operator yields.
+fn plus_operand(
+    gen: &ClickHouseSqlGenerator,
+    expr: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+) -> PlusOperand {
+    use crate::schema::FieldType;
+    match expr {
+        EvalExpression::Literal(Value::Number(_) | Value::Bool(_)) => PlusOperand::Number,
+        EvalExpression::Literal(Value::String(_) | Value::Ip(_) | Value::Regex(_)) => {
+            PlusOperand::Text
+        }
+        EvalExpression::Literal(Value::Interval(..)) => PlusOperand::Unknown,
+        EvalExpression::Field(name) => {
+            if field_override.is_some_and(|resolve| resolve(name, false).is_some())
+                || gen.is_upstream_computed_field(name)
+            {
+                return PlusOperand::Unknown;
+            }
+            let field = gen.canonicalize_field(name);
+            if gen.field_is_numeric(field) {
+                return PlusOperand::Number;
+            }
+            match gen.resolved_field_type(field) {
+                Some(
+                    FieldType::Integer
+                    | FieldType::Long
+                    | FieldType::Float
+                    | FieldType::Boolean
+                    | FieldType::Timestamp,
+                ) => PlusOperand::Number,
+                Some(FieldType::String | FieldType::IpAddress | FieldType::Uuid) => {
+                    PlusOperand::Text
+                }
+                Some(FieldType::Array) | None => PlusOperand::Unknown,
+            }
+        }
+        EvalExpression::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Add => {
+                let (l, r) = (
+                    plus_operand(gen, left, field_override),
+                    plus_operand(gen, right, field_override),
+                );
+                if l == PlusOperand::Text || r == PlusOperand::Text {
+                    PlusOperand::Text
+                } else if l == PlusOperand::Number && r == PlusOperand::Number {
+                    PlusOperand::Number
+                } else {
+                    PlusOperand::Unknown
+                }
+            }
+            BinaryOperator::Concat => PlusOperand::Text,
+            _ => PlusOperand::Number,
+        },
+        EvalExpression::FunctionCall { name, .. } => {
+            let name = name.to_ascii_lowercase();
+            if is_datetime_function(&name) {
+                return PlusOperand::Number;
+            }
+            match name.as_str() {
+                "lower" | "tolower" | "upper" | "toupper" | "substr" | "substring" | "trim"
+                | "ltrim" | "rtrim" | "replace" | "tostring" | "urldecode" | "md5" | "sha1"
+                | "sha256" | "sha512" | "base64_encode" | "base64_decode" | "defang"
+                | "extract_domain" | "printf" | "concat" | "mvjoin" => PlusOperand::Text,
+                "len" | "length" | "tonumber" | "abs" | "round" | "floor" | "ceil"
+                | "ceiling" | "sqrt" | "pow" | "exp" | "ln" | "log" => PlusOperand::Number,
+                _ => PlusOperand::Unknown,
+            }
+        }
+    }
+}
+
+/// NAN-4303: `+` with a string operand concatenates, as in the familiar pipe
+/// languages: `"a" + "b"` is `"ab"`, `user + "@corp"` and `"port " + 443`
+/// join text. Number + number stays a numeric add. Without this `+` always
+/// cast both sides to Float64, so a string literal operand failed the whole
+/// search (`Code: 43 … Float64 + String`) and a string field read as NULL.
+///
+/// The operation is chosen from the static operand types. An operand with no
+/// static type (a stage alias, a rex capture) keeps the numeric add, which
+/// never errors (a non-numeric value is NULL) and keeps `stats sum(a) as x,
+/// sum(b) as y | eval t = x + y | sort -t` numeric. A NULL operand makes the
+/// result NULL either way.
+fn string_plus_sql(
+    gen: &ClickHouseSqlGenerator,
+    left: &EvalExpression,
+    op: BinaryOperator,
+    right: &EvalExpression,
+    field_override: Option<&EvalFieldOverride<'_>>,
+    raw_side: impl Fn(&EvalExpression) -> Result<String, SqlGenError>,
+) -> Result<Option<String>, SqlGenError> {
+    if op != BinaryOperator::Add
+        || (plus_operand(gen, left, field_override) != PlusOperand::Text
+            && plus_operand(gen, right, field_override) != PlusOperand::Text)
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "concat(toString({}), toString({}))",
+        raw_side(left)?,
+        raw_side(right)?
+    )))
 }
 
 /// `f = "x"` / `f != "x"` in eval (NAN-3041): case-insensitive against a
@@ -1147,7 +1338,36 @@ fn eval_function_to_sql(
                     "relative_time() requires 2 arguments".into(),
                 ));
             }
-            Ok(format!("{} + {}", arg_sqls[0], arg_sqls[1]))
+            // NAN-4286: this was `time + '-1h'` — DateTime64 plus a String,
+            // chDB Code 43 on every call.
+            let EvalExpression::Literal(Value::String(modifier)) = &args[1] else {
+                return Err(SqlGenError::InvalidQuery(
+                    "relative_time() needs a quoted time modifier as its second argument, \
+                     such as \"-24h\", \"@d\" or \"-7d@d\""
+                        .into(),
+                ));
+            };
+            relative_time_sql(&arg_sqls[0], modifier)
+        }
+        "strptime" => {
+            if arg_sqls.len() != 2 {
+                return Err(SqlGenError::InvalidQuery(
+                    "strptime() requires 2 arguments (text, format)".into(),
+                ));
+            }
+            let EvalExpression::Literal(Value::String(format)) = &args[1] else {
+                return Err(SqlGenError::InvalidQuery(
+                    "strptime() needs a quoted format as its second argument, such as \
+                     \"%Y-%m-%d %H:%M:%S\""
+                        .into(),
+                ));
+            };
+            // NULL (not an error) when a value does not match the format.
+            Ok(format!(
+                "toDateTime64(parseDateTimeOrNull(toString({}), '{}', 'UTC'), 3, 'UTC')",
+                arg_sqls[0],
+                super::escape_string(&convert_strftime_to_clickhouse(format))
+            ))
         }
         "epoch" | "to_epoch" => {
             let arg = arg_sqls
@@ -1182,6 +1402,17 @@ fn eval_function_to_sql(
                 ));
             }
             Ok(format!("{} - {}", arg_sqls[0], arg_sqls[1]))
+        }
+        // NAN-4284 (searchfuzz F21): the documented `time_diff(t1, t2)` —
+        // seconds from t2 to t1 (`time_diff(time, prev)` is the gap since the
+        // previous event), the two-argument `date_diff`.
+        "time_diff" | "timediff" => {
+            if arg_sqls.len() != 2 {
+                return Err(SqlGenError::InvalidQuery(
+                    "time_diff() requires 2 arguments (t1, t2)".into(),
+                ));
+            }
+            Ok(format!("dateDiff('second', {}, {})", arg_sqls[1], arg_sqls[0]))
         }
         "date_diff" | "datediff" => {
             // date_diff supports two forms:

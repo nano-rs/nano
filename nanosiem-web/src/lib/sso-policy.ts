@@ -35,3 +35,28 @@ export function googleInviteOnly(
     (!configured || !policy.google_delegated_admin)
   );
 }
+
+/** Only membership acquisition differs; all presets use the same access policy. */
+export const ssoProviderPresets = {
+  okta: {
+    name: "Okta",
+    slug: "okta",
+    issuer: "https://YOUR-ORG.okta.com",
+    scopes: "openid email profile groups",
+    group_claim: "groups",
+  },
+  entra: {
+    name: "Microsoft Entra ID",
+    slug: "entra",
+    issuer: "https://login.microsoftonline.com/YOUR-TENANT-ID/v2.0",
+    scopes: "openid email profile User.Read",
+    group_claim: "groups",
+  },
+  google: {
+    name: "Google Workspace",
+    slug: "google",
+    issuer: "https://accounts.google.com",
+    scopes: "openid email profile",
+    group_claim: "",
+  },
+} as const;

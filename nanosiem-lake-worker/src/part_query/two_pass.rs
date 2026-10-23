@@ -433,7 +433,7 @@ mod tests {
     const COLUMNS: &[&str] = &["device.hostname", "message", "metadata.uid", "raw_data", "time", "actor.user.name"];
 
     fn where_host(order: &str) -> String {
-        format!("WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__\n  WHERE time BETWEEN '2026-09-30 16:00:00.000000' AND '2026-10-01 16:00:00.000000'\n  AND (1)\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  WHERE \"device.hostname\" = 'ws-1'\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  ORDER BY {order}\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  LIMIT 50\n)\nSELECT * FROM stage_3 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 101 SETTINGS max_threads=16, max_execution_time=300")
+        format!("WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__\n  WHERE time >= '2026-09-30 16:00:00.000000' AND time < '2026-10-01 16:00:00.000000'\n  AND (1)\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  WHERE \"device.hostname\" = 'ws-1'\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  ORDER BY {order}\n),\nstage_3 AS (\n  SELECT * FROM stage_2\n  LIMIT 50\n)\nSELECT * FROM stage_3 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 101 SETTINGS max_threads=16, max_execution_time=300")
     }
 
     #[test]
@@ -459,16 +459,16 @@ mod tests {
             assert!(plan.narrow.required_columns.iter().any(|c| c.name == "_path"));
             assert!(!plan.narrow.required_columns.iter().any(|c| c.name == "raw_data"));
             let payload = &plan.payload.sql;
-            assert!(payload.contains("SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time, _path, _row_number FROM __nano_lake_source__\n  WHERE (_path, _row_number) IN {nano_row_ids:Array(Tuple(String, Int64))} AND time BETWEEN"), "{payload}");
+            assert!(payload.contains("SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time, _path, _row_number FROM __nano_lake_source__\n  WHERE (_path, _row_number) IN {nano_row_ids:Array(Tuple(String, Int64))} AND time >= "), "{payload}");
             assert!(payload.ends_with(&query.sql[query.sql.find("\n  AND (1)").unwrap()..]), "the rest of the statement is unchanged");
         }
     }
 
     #[test]
     fn search_term_sort_head_and_plain_limit_are_two_pass() {
-        let sort_head = "WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", time FROM __nano_lake_source__\n  WHERE time BETWEEN '2026-09-30 16:00:00.000000' AND '2026-10-01 16:00:00.000000'\n  AND (\"device.hostname\" = 'ws-1')\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  ORDER BY time DESC\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  LIMIT 2000\n)\nSELECT * FROM stage_2 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 2000 SETTINGS max_threads=16";
+        let sort_head = "WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", time FROM __nano_lake_source__\n  WHERE time >= '2026-09-30 16:00:00.000000' AND time < '2026-10-01 16:00:00.000000'\n  AND (\"device.hostname\" = 'ws-1')\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  ORDER BY time DESC\n),\nstage_2 AS (\n  SELECT * FROM stage_1\n  LIMIT 2000\n)\nSELECT * FROM stage_2 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 2000 SETTINGS max_threads=16";
         assert!(plan(&compiled(sort_head, COLUMNS)).is_some());
-        let plain = "WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__\n  WHERE time BETWEEN '2026-09-30 16:00:00.000000' AND '2026-10-01 16:00:00.000000'\n  AND (1)\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  WHERE \"device.hostname\" = 'ws-1'\n)\nSELECT * FROM stage_1 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 5001 SETTINGS max_threads=16";
+        let plain = "WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__\n  WHERE time >= '2026-09-30 16:00:00.000000' AND time < '2026-10-01 16:00:00.000000'\n  AND (1)\n),\nstage_1 AS (\n  SELECT * FROM stage_0\n  WHERE \"device.hostname\" = 'ws-1'\n)\nSELECT * FROM stage_1 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 5001 SETTINGS max_threads=16";
         let plan = plan(&compiled(plain, COLUMNS)).unwrap();
         assert!(plan.narrow.sql.contains("FROM stage_1 ORDER BY time DESC LIMIT 5001 WITH TIES"));
     }
@@ -505,8 +505,8 @@ mod tests {
 
     #[test]
     fn single_select_page_is_its_one_stage_pipeline() {
-        let sql = "SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__ WHERE time BETWEEN '2026-09-30 16:00:00.000000' AND '2026-10-01 16:00:00.000000' AND (\"device.hostname\" = 'a ORDER BY b LIMIT 3') ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 5001 SETTINGS max_threads=16";
-        assert_eq!(single_select_as_stages(sql).unwrap(), "WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__\n  WHERE time BETWEEN '2026-09-30 16:00:00.000000' AND '2026-10-01 16:00:00.000000' AND (\"device.hostname\" = 'a ORDER BY b LIMIT 3')\n)\nSELECT * FROM stage_0 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 5001 SETTINGS max_threads=16");
+        let sql = "SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__ WHERE time >= '2026-09-30 16:00:00.000000' AND time < '2026-10-01 16:00:00.000000' AND (\"device.hostname\" = 'a ORDER BY b LIMIT 3') ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 5001 SETTINGS max_threads=16";
+        assert_eq!(single_select_as_stages(sql).unwrap(), "WITH stage_0 AS (\n  SELECT \"device.hostname\", message, \"metadata.uid\", raw_data, time FROM __nano_lake_source__\n  WHERE time >= '2026-09-30 16:00:00.000000' AND time < '2026-10-01 16:00:00.000000' AND (\"device.hostname\" = 'a ORDER BY b LIMIT 3')\n)\nSELECT * FROM stage_0 ORDER BY time DESC, \"metadata.uid\" DESC LIMIT 5001 SETTINGS max_threads=16");
         let plan = plan(&compiled(sql, COLUMNS)).unwrap();
         assert!(plan.narrow.sql.contains("SELECT \"device.hostname\", time, _path, _row_number FROM __nano_lake_source__"), "{}", plan.narrow.sql);
         assert!(plan.narrow.sql.contains("FROM stage_0 ORDER BY time DESC LIMIT 5001 WITH TIES SETTINGS"), "{}", plan.narrow.sql);

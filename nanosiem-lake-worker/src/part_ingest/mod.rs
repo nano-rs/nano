@@ -3,9 +3,11 @@
 //! `ingest[T]` for the lean-lake part model (NAN-2868), implementing
 //! `crate::parts` (the contract, `docs-internal/NAN-2865-part-contract.md`).
 
+pub mod admission_attempts;
 pub mod bronze_list;
 pub mod cell;
 pub mod count_record;
+pub mod credential_activity;
 pub mod dedup;
 pub mod discovery;
 pub mod edge;
@@ -14,6 +16,7 @@ pub mod iceberg_export;
 pub mod late_dedup;
 pub mod lean_erasure;
 pub mod finding_outbox;
+pub mod finding_attempts;
 pub mod finding_append;
 pub mod finding_gate;
 pub mod hold;
@@ -30,6 +33,8 @@ pub mod native_writer;
 pub mod partials;
 pub mod prevalence;
 pub mod prevalence_owner_store;
+pub mod quarantine;
+pub mod quarantine_ledger;
 pub mod r2_put;
 pub mod reindex;
 pub mod restamp;
@@ -37,6 +42,7 @@ pub mod s3_store;
 pub mod schema;
 pub mod stall_watchdog;
 pub mod writer;
+pub mod writer_lease;
 pub mod host_sort;
 #[cfg(test)]
 mod catchup_bench;

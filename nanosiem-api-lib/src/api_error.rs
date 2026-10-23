@@ -316,7 +316,8 @@ impl IntoResponse for ApiError {
                 "This panel uses `| prevalence` and won't run with all wildcards ({}). Set at least one to a specific value and click Run.",
                 fields.iter().map(|f| format!("{}=*", f)).collect::<Vec<_>>().join(", ")
             ),
-            _ => self.to_string(),
+            // NAN-4282: customers never see the internal code name "lean".
+            _ => nanosiem_core::branding::without_internal_code_name(&self.to_string()).into_owned(),
         };
         let body = ErrorResponse {
             error: ErrorDetail {

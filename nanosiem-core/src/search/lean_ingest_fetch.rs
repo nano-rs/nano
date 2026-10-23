@@ -67,8 +67,9 @@ pub async fn source_rollup(
             "lean ingest rollup window must be whole rollup buckets".to_string(),
         ));
     }
-    // The count route's `end` is inclusive.
-    let range = TimeRangeInput::new(start, end_exclusive - chrono::Duration::microseconds(1));
+    // NAN-4280: `count_aggregate` takes the half-open window (it sends the
+    // route's inclusive end itself).
+    let range = TimeRangeInput::new(start, end_exclusive);
     let request_id = format!("lean-ingest-{}", uuid::Uuid::new_v4());
     let rows = client(route, timeout)?
         .count_aggregate(
@@ -205,7 +206,7 @@ pub async fn class_rollup(
     timeout: Duration,
 ) -> Result<Vec<SegmentRollupRow>, SearchError> {
     let span_secs = whole_buckets(start, end_exclusive, bucket_span)?;
-    let range = TimeRangeInput::new(start, end_exclusive - chrono::Duration::microseconds(1));
+    let range = TimeRangeInput::new(start, end_exclusive);
     let request_id = format!("lean-segments-{}", uuid::Uuid::new_v4());
     let rows = client(route, timeout)?
         .count_aggregate(
@@ -238,7 +239,7 @@ pub async fn field_rollup_for_source(
     timeout: Duration,
 ) -> Result<Vec<SegmentRollupRow>, SearchError> {
     let span_secs = whole_buckets(start, end_exclusive, bucket_span)?;
-    let range = TimeRangeInput::new(start, end_exclusive - chrono::Duration::microseconds(1));
+    let range = TimeRangeInput::new(start, end_exclusive);
     let request_id = format!("lean-segments-{}", uuid::Uuid::new_v4());
     let rows = client(route, timeout)?
         .count_aggregate(
@@ -259,11 +260,9 @@ pub async fn field_rollup_for_source(
 
 /// NAN-3762: events in `[start, end_exclusive)` whose `field` is present
 /// (`is_not_null`), summed over whole-window buckets. Both bounds must be
-/// whole rollup buckets, so a non-sensitive rollup field is answered from the
-/// parts' rollup partials alone. An enrichment-sensitive field (endpoint
-/// `location.*` / `autonomous_system.*`) is still read under the tenant's
-/// platform-enrichment read authority, which the worker enforces by reading
-/// the window natively; callers bound that cost by window and cadence.
+/// whole rollup buckets, so a rollup field is answered from the parts'
+/// rollup partials alone (enrichment leaves included: NAN-4168 fixes them at
+/// ingest, so there is no read-time authority to apply).
 pub async fn present_count(
     route: &LakeCellRoute,
     field: &str,
@@ -274,7 +273,7 @@ pub async fn present_count(
     let span = end_exclusive - start;
     let span = Duration::from_secs(u64::try_from(span.num_seconds()).unwrap_or(0));
     let span_secs = whole_buckets(start, end_exclusive, span)?;
-    let range = TimeRangeInput::new(start, end_exclusive - chrono::Duration::microseconds(1));
+    let range = TimeRangeInput::new(start, end_exclusive);
     let request_id = format!("lean-coverage-{}", uuid::Uuid::new_v4());
     let predicate = super::lake::LakeCountPredicate { kind: "is_not_null", values: Vec::new() };
     let rows = client(route, timeout)?

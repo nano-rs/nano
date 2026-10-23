@@ -191,6 +191,35 @@ struct RunnerControl {
     job_failure_streak: std::sync::atomic::AtomicU32,
     /// The circuit breaker tripped: drain, then exit non-zero.
     tripped: std::sync::atomic::AtomicBool,
+    /// NAN-4290: general slots holding a claim. A small-lane slot claims
+    /// only while one does: an idle general slot takes any queued job (small
+    /// ones too) at once, so an idle tenant's small slot sends no request.
+    general_busy: std::sync::atomic::AtomicUsize,
+    general_busy_changed: tokio::sync::Notify,
+}
+
+/// NAN-4290: which queued jobs a runner slot claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotLane {
+    /// Any queued job, oldest first.
+    General,
+    /// Only small-job-lane jobs (`nanosiem_core::search::small_job_lane`),
+    /// so a 1 h listing never queues behind a 30 d aggregate.
+    Small,
+}
+
+/// NAN-4290: how long a small-lane slot sits out after its coordinator
+/// refused the `lane` claim field (a coordinator that predates the lane).
+const SMALL_LANE_UNSUPPORTED_PARK: Duration = Duration::from_secs(600);
+
+/// Held by a general slot while it holds a claim (see `general_busy`).
+struct GeneralBusy<'a>(&'a RunnerControl);
+
+impl Drop for GeneralBusy<'_> {
+    fn drop(&mut self) {
+        self.0.general_busy.fetch_sub(1, Ordering::SeqCst);
+        self.0.general_busy_changed.notify_waiters();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +236,35 @@ impl RunnerControl {
             bounces: std::sync::Mutex::new(PinBounceTracker::new(pin_bounce_bound)),
             job_failure_streak: std::sync::atomic::AtomicU32::new(0),
             tripped: std::sync::atomic::AtomicBool::new(false),
+            general_busy: std::sync::atomic::AtomicUsize::new(0),
+            general_busy_changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// NAN-4290: a general slot took a claim; released when dropped.
+    fn general_claim(&self) -> GeneralBusy<'_> {
+        self.general_busy.fetch_add(1, Ordering::SeqCst);
+        self.general_busy_changed.notify_waiters();
+        GeneralBusy(self)
+    }
+
+    fn general_busy(&self) -> bool {
+        self.general_busy.load(Ordering::SeqCst) > 0
+    }
+
+    /// NAN-4290: resolves once a general slot holds a claim, or on shutdown.
+    async fn until_general_busy(&self) {
+        loop {
+            let changed = self.general_busy_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.general_busy() || self.draining() {
+                return;
+            }
+            tokio::select! {
+                _ = changed => {}
+                _ = self.signalled() => return,
+            }
         }
     }
 
@@ -410,6 +468,10 @@ struct Arguments {
     large_scan_bytes: u64,
     execution_seconds: u64,
     concurrency: usize,
+    /// NAN-4290: small-job-lane slots beside the `concurrency` general ones
+    /// (hosted coordinator only). Each claims only small jobs, and only while
+    /// a general slot is busy.
+    small_lane_slots: usize,
     /// NAN-2653: graceful-drain bound after SIGTERM/SIGINT.
     drain: Duration,
     /// NAN-2653: how long this runner hands back a job whose pin is archived
@@ -764,7 +826,7 @@ async fn current_claim_authority(
 const USAGE: &str = "usage: lake_job_runner --tenant-id <uuid> --result-root <s3://|file://...> \
 [--hosted-coordinator-config <abs path> | --redis-url <url>] [--assignment-revision <n>] \
 --cell-only \
-[--job-signing-key-file <abs path>] [--concurrency <1-16>] [--lease-seconds <n>] [--poll-millis <n>] \
+[--job-signing-key-file <abs path>] [--concurrency <1-16>] [--small-lane-slots <0-4>] [--lease-seconds <n>] [--poll-millis <n>] \
 [--max-attempts <n>] [--execution-seconds <n>] [--drain-seconds <n>] [--once]
   --trusted-local  dedicated UUID tenant, Redis-fenced cell-only execution (no hosted config)
   --iceberg-export  isolated hourly customer export (default OFF; optional --once)
@@ -985,12 +1047,15 @@ async fn main() -> Result<()> {
         arguments.pin_bounce_bound,
     ));
     spawn_shutdown_listener(control.clone())?;
-    let runners = futures::future::try_join_all((0..slots).map(|_| {
+    let small_slots = if arguments.once { 0 } else { arguments.small_lane_slots };
+    let lanes = std::iter::repeat_n(SlotLane::General, slots).chain(std::iter::repeat_n(SlotLane::Small, small_slots));
+    let runners = futures::future::try_join_all(lanes.map(|lane| {
         runner_loop(
             store.as_ref(),
             &arguments,
             authority_validator.as_ref(),
             &control,
+            lane,
         )
     }));
     tokio::pin!(runners);
@@ -1065,12 +1130,18 @@ async fn runner_loop(
     arguments: &Arguments,
     authority_validator: Option<&SharedAuthorityValidator>,
     control: &RunnerControl,
+    lane: SlotLane,
 ) -> Result<()> {
     let mut store_failure_streak = 0_u32;
-    tracing::info!(worker_id = %arguments.worker_id,"durable runner uses unique attempt-session lease owners");
+    tracing::info!(worker_id = %arguments.worker_id, ?lane, "durable runner uses unique attempt-session lease owners");
     let mut pending_claim_owner = None;
     let mut empty_claims = 0_u32;
     loop {
+        // NAN-4290: the small lane waits for a busy general slot. A lost
+        // claim response is still retried at once with the same owner.
+        if lane == SlotLane::Small && pending_claim_owner.is_none() {
+            control.until_general_busy().await;
+        }
         // NAN-2653: a draining runner claims nothing new.
         if control.draining() {
             return Ok(());
@@ -1082,6 +1153,7 @@ async fn runner_loop(
             &mut pending_claim_owner,
             &mut empty_claims,
             control,
+            lane,
         )
         .await
         {
@@ -1124,6 +1196,7 @@ async fn runner_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_iteration(
     store: &dyn nanosiem_core::search::job_runner_store::DurableJobRunnerStore,
     arguments: &Arguments,
@@ -1131,6 +1204,7 @@ async fn run_iteration(
     pending_claim_owner: &mut Option<String>,
     empty_claims: &mut u32,
     control: &RunnerControl,
+    lane: SlotLane,
 ) -> Result<bool> {
     // NAN-3559: the hosted coordinator's claim already recovers expired
     // leases (same transition, policy and bound), and its lease alarm sweeps
@@ -1147,7 +1221,21 @@ async fn run_iteration(
     // hostnames must never deduplicate unrelated concurrent attempts.
     let owner = pending_claim_owner.get_or_insert_with(|| Uuid::now_v7().to_string());
     let claim_started = Instant::now();
-    let claimed = store.claim(owner, arguments.lease).await;
+    let claimed = match lane {
+        SlotLane::General => store.claim(owner, arguments.lease).await,
+        SlotLane::Small => store.claim_small(owner, arguments.lease).await,
+    };
+    if lane == SlotLane::Small && small_lane_refused(&claimed) {
+        // A coordinator that predates the lane: the general slot still runs
+        // every job, as before NAN-4290.
+        *pending_claim_owner = None;
+        tracing::warn!(
+            park_seconds = SMALL_LANE_UNSUPPORTED_PARK.as_secs(),
+            "job coordinator refused the small-lane claim; the small slot sits out"
+        );
+        control.sleep(SMALL_LANE_UNSUPPORTED_PARK).await;
+        return Ok(false);
+    }
     if claimed.is_ok() || !matches!(&claimed, Err(DurableJobStoreError::Unavailable(_))) {
         *pending_claim_owner = None;
     }
@@ -1155,6 +1243,7 @@ async fn run_iteration(
     match claim {
         Some(claim) => {
             *empty_claims = 0;
+            let _busy = (lane == SlotLane::General).then(|| control.general_claim());
             nanosiem_lake_worker::job_capacity::JobPhaseTimings {
                 claim_ms: Some(claim_started.elapsed().as_millis() as u64),
                 ..Default::default()
@@ -1173,6 +1262,20 @@ async fn run_iteration(
         }
     }
     Ok(arguments.once)
+}
+
+/// NAN-4290: the coordinator refused the small-lane claim itself: it
+/// predates the `lane` field (`invalid_command`) or the store has no lanes.
+fn small_lane_refused(
+    claimed: &std::result::Result<Option<nanosiem_core::search::job_runner_store::RunnerClaim>, DurableJobStoreError>,
+) -> bool {
+    match claimed {
+        Err(DurableJobStoreError::Unsupported) => true,
+        Err(DurableJobStoreError::Unavailable(message)) => {
+            message.contains("code invalid_command") || message.contains("code invalid_lane")
+        }
+        _ => false,
+    }
 }
 
 /// NAN-2653: turn one attempt's outcome into a store verdict without letting
@@ -1250,6 +1353,43 @@ async fn settle_claim(
     };
     if is_signature_rejection(&error) || is_claim_rejection(&error) {
         return Err(error);
+    }
+    // NAN-3911: too large to ever run. Fail it once, non-retryable, with the
+    // actionable category. It is the job's shape, not a sick runner, so it
+    // does not count toward the consecutive-failure circuit breaker.
+    if let Some(category) = query_too_large(&error) {
+        // NAN-4290: a small-lane job ran at one interactive lane's memory;
+        // the general lane has the large class's. Retry it once there.
+        if category == nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE && small_lane_job(claim) {
+            tracing::warn!(
+                job_id = %claim.job_id,
+                attempt = claim.attempt,
+                fence = claim.fence,
+                error = %error_chain(&error),
+                "small-lane durable search exceeded its memory; requeued once as large for the general lane"
+            );
+            verdict_or_log(
+                store.fail(claim, category, true, true, arguments.max_attempts).await,
+                claim,
+                "promote small-lane durable attempt",
+            )?;
+            control.record_job_settled();
+            return Ok(());
+        }
+        tracing::warn!(
+            job_id = %claim.job_id,
+            attempt = claim.attempt,
+            fence = claim.fence,
+            error = %error_chain(&error),
+            "durable search is too large to run; failing it without retry"
+        );
+        verdict_or_log(
+            store.fail(claim, category, false, false, arguments.max_attempts).await,
+            claim,
+            "record query-too-large durable attempt",
+        )?;
+        control.record_job_settled();
+        return Ok(());
     }
     match classify_claim_error(&error) {
         ClaimErrorAction::StoreUnavailable => Err(error),
@@ -1491,7 +1631,7 @@ async fn run_cell_claim(
     let resource_class = select_resource_class(
         claim.resource_class, claim.task.required_scan_bytes(),
         arguments.medium_scan_bytes, arguments.large_scan_bytes,
-    ).map_err(anyhow::Error::msg)?;
+    ).map_err(QueryTooLarge)?;
     let scan_budget_bytes = match resource_class {
         ResourceClass::Medium => arguments.medium_scan_bytes,
         ResourceClass::Large => arguments.large_scan_bytes,
@@ -1683,6 +1823,20 @@ async fn run_cell_claim(
             continue 'dispatch;
         }
         cancel_cell_attempt(&client, route, &spec).await;
+        if cell_query_too_large(status, reason.as_deref(), error.as_deref()) {
+            return Err(anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE))
+                .context(format!(
+                    "cell job returned HTTP {status} (query_budget_exhausted): {}",
+                    error.as_deref().unwrap_or("query memory budget exceeded")
+                )));
+        }
+        if cell_statement_timed_out(status, error.as_deref()) {
+            return Err(anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_TIME_MESSAGE))
+                .context(format!(
+                    "cell job returned HTTP {status} (statement time limit): {}",
+                    error.as_deref().unwrap_or("TIMEOUT_EXCEEDED")
+                )));
+        }
         // The cell's typed refusal (e.g. a view past its envelope, or a
         // window the retention cutoff has passed) is the job's failure.
         match (reason, error) {
@@ -1928,7 +2082,53 @@ async fn cancel_current_claim(
     Ok(())
 }
 
-const SCAN_CAPACITY_REASON: &str = "This search exceeds the largest durable scan budget. Narrow the time range or add filters.";
+const SCAN_CAPACITY_REASON: &str = nanosiem_core::search::QUERY_TOO_LARGE_SCAN_MESSAGE;
+
+/// NAN-3911: a durable attempt that can never fit (the scan exceeds the
+/// largest resource class, or query[T]'s per-query memory budget refused it).
+/// Deterministic: the job fails at once with this static, user-facing
+/// category (`query_too_large`) instead of spending retry attempts and then
+/// surfacing "isolated query execution failed".
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct QueryTooLarge(&'static str);
+
+/// NAN-4290: the claim is a small-lane job (not yet promoted to large).
+fn small_lane_job(claim: &DurableSearchJobClaim) -> bool {
+    nanosiem_core::search::small_job_lane(
+        &claim.task,
+        claim.request.time_range.start,
+        claim.request.time_range.end,
+        claim.resource_class == DurableQueryResourceClass::Large,
+    )
+}
+
+fn query_too_large(error: &anyhow::Error) -> Option<&'static str> {
+    error.chain().find_map(|cause| cause.downcast_ref::<QueryTooLarge>().map(|too_large| too_large.0))
+}
+
+/// NAN-3911: query[T]'s memory budget refused the durable attempt itself
+/// (503 `query_budget_exhausted`: a per-query chDB memory limit or an
+/// oversized result). The per-statement cap is fixed by the role's memory,
+/// so the same attempt would fail the same way. A refusal of the engine-wide
+/// total (`(total) memory limit`) can come from concurrent work and stays a
+/// retryable attempt failure.
+/// NAN-4277 (F18): the cell's job statement ran past its statement time
+/// limit (chDB `TIMEOUT_EXCEEDED`; a whole-window job statement has
+/// `JOB_STATEMENT_SECONDS`, and a newest-first job already halved its slow
+/// chunks). Re-running the same attempt would hold the tenant's one durable
+/// lane for the same time again (a large hosted tenant, 2026-10-20: a 7 d keyword
+/// count failed twice at 120 s, ~5 min of lane), so it fails once with the
+/// actionable time-limit category.
+fn cell_statement_timed_out(status: reqwest::StatusCode, error: Option<&str>) -> bool {
+    status.is_server_error() && error.is_some_and(|error| error.contains("TIMEOUT_EXCEEDED"))
+}
+
+fn cell_query_too_large(status: reqwest::StatusCode, reason: Option<&str>, error: Option<&str>) -> bool {
+    status.as_u16() == 503
+        && reason == Some("query_budget_exhausted")
+        && !error.is_some_and(|error| error.contains("(total)"))
+}
 
 fn select_resource_class(
     requested: DurableQueryResourceClass, required: u64, medium: u64, large: u64,
@@ -2084,6 +2284,10 @@ impl Arguments {
             parse_bounded(&mut map, "--poll-millis", DEFAULT_POLL_MILLIS, 10, 60_000)?;
         let max_attempts = parse_bounded(&mut map, "--max-attempts", DEFAULT_MAX_ATTEMPTS, 1, 10)?;
         let concurrency = parse_bounded(&mut map, "--concurrency", 2_usize, 1, 16)?;
+        let small_lane_slots = parse_bounded(&mut map, "--small-lane-slots", 0_usize, 0, 4)?;
+        if small_lane_slots > 0 && hosted_coordinator_config.is_none() {
+            bail!("--small-lane-slots requires --hosted-coordinator-config (only the hosted coordinator has claim lanes)");
+        }
         let medium_scan_bytes = parse_bounded(
             &mut map,
             "--medium-scan-bytes",
@@ -2158,6 +2362,7 @@ impl Arguments {
             large_scan_bytes,
             execution_seconds,
             concurrency,
+            small_lane_slots,
             drain: Duration::from_secs(drain_seconds),
             pin_bounce_bound: Duration::from_secs(pin_bounce_seconds),
             once,
@@ -2493,7 +2698,7 @@ mod tests {
             claims: std::sync::Mutex::new(Vec::new()),
         };
         let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
-        let ran = tokio::time::timeout(IDLE_HOUR, runner_loop(&store, &arguments, None, &control)).await;
+        let ran = tokio::time::timeout(IDLE_HOUR, runner_loop(&store, &arguments, None, &control, SlotLane::General)).await;
         assert!(ran.is_err(), "an idle runner keeps polling for the whole hour");
         let claims = store.claims.lock().unwrap().clone();
         (store.reconciles.load(Ordering::Relaxed), claims)
@@ -2526,6 +2731,121 @@ mod tests {
         let requests = reconciles + claims;
         assert!((6_200..=6_400).contains(&requests), "{requests} requests: the NAN-3559 measurement was ~6.3k/h");
     }
+    /// NAN-4290: a coordinator with one general and one small-lane queue
+    /// view, both empty; counts each lane's claims. `small_refused`: a
+    /// coordinator that predates the lane (409 `invalid_command`).
+    #[derive(Debug, Default)]
+    struct LaneCoordinator {
+        small_refused: bool,
+        general_claims: AtomicU64,
+        small_claims: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl nanosiem_core::search::job_runner_store::DurableJobRunnerStore for LaneCoordinator {
+        async fn reconcile(&self, _: u32) -> std::result::Result<usize, DurableJobStoreError> { unreachable!("hosted claims recover leases") }
+        fn claim_recovers_expired_leases(&self) -> bool { true }
+        async fn claim(&self, _: &str, _: Duration)
+            -> std::result::Result<Option<nanosiem_core::search::job_runner_store::RunnerClaim>, DurableJobStoreError> {
+            tokio::time::sleep(IDLE_ROUND_TRIP).await;
+            self.general_claims.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+        async fn claim_small(&self, _: &str, _: Duration)
+            -> std::result::Result<Option<nanosiem_core::search::job_runner_store::RunnerClaim>, DurableJobStoreError> {
+            tokio::time::sleep(IDLE_ROUND_TRIP).await;
+            self.small_claims.fetch_add(1, Ordering::Relaxed);
+            if self.small_refused {
+                return Err(DurableJobStoreError::Unavailable(
+                    "hosted coordinator refused claim with status 409 code invalid_command".into(),
+                ));
+            }
+            Ok(None)
+        }
+        async fn renew(&self, _: &nanosiem_core::search::job_runner_store::RunnerClaim, _: Duration)
+            -> std::result::Result<bool, DurableJobStoreError> { unreachable!("idle") }
+        async fn progress(&self, _: &nanosiem_core::search::job_runner_store::RunnerClaim, _: &nanosiem_core::search::SearchJobProgress)
+            -> std::result::Result<bool, DurableJobStoreError> { unreachable!("idle") }
+        async fn complete(&self, _: &nanosiem_core::search::job_runner_store::RunnerClaim, _: &nanosiem_core::search::SearchJobResultRef)
+            -> std::result::Result<bool, DurableJobStoreError> { unreachable!("idle") }
+        async fn fail(&self, _: &nanosiem_core::search::job_runner_store::RunnerClaim, _: &str, _: bool, _: bool, _: u32)
+            -> std::result::Result<bool, DurableJobStoreError> { unreachable!("idle") }
+        async fn cancel_claim(&self, _: &nanosiem_core::search::job_runner_store::RunnerClaim)
+            -> std::result::Result<bool, DurableJobStoreError> { unreachable!("idle") }
+    }
+
+    /// NAN-4290 CF cost: an idle tenant's small slot sends no coordinator
+    /// request (an idle general slot takes any queued job, small ones too).
+    /// While a general slot runs a job, the small slot polls the small lane
+    /// at the same ≤ 1/s backoff; once the job ends it stops again.
+    #[tokio::test(start_paused = true)]
+    async fn the_small_slot_polls_only_while_a_general_slot_holds_a_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = runner_arguments(&directory, &[]).unwrap();
+        let store = LaneCoordinator::default();
+        let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
+        let slots = async {
+            tokio::join!(
+                runner_loop(&store, &arguments, None, &control, SlotLane::General),
+                runner_loop(&store, &arguments, None, &control, SlotLane::Small),
+            )
+        };
+        tokio::pin!(slots);
+        macro_rules! run_for {
+            ($slots:expr, $span:expr) => {
+                assert!(tokio::time::timeout($span, $slots).await.is_err(), "slots keep serving")
+            };
+        }
+        // An idle hour: the general slot polls, the small slot never does.
+        run_for!(slots.as_mut(), IDLE_HOUR);
+        assert!(store.general_claims.load(Ordering::Relaxed) >= 3_300);
+        assert_eq!(store.small_claims.load(Ordering::Relaxed), 0, "an idle small slot costs no request");
+        // A general slot runs a 10 min job: the small lane is polled.
+        let busy = control.general_claim();
+        run_for!(slots.as_mut(), Duration::from_secs(600));
+        let polled = store.small_claims.load(Ordering::Relaxed);
+        assert!((300..=600).contains(&polled), "{polled} small-lane claims in 10 min (≤ 1/s)");
+        // The job ends: the small slot stops polling within one backoff.
+        drop(busy);
+        run_for!(slots.as_mut(), Duration::from_secs(5));
+        let after = store.small_claims.load(Ordering::Relaxed);
+        run_for!(slots.as_mut(), Duration::from_secs(600));
+        assert_eq!(store.small_claims.load(Ordering::Relaxed), after, "no small-lane request once the general slot is idle");
+        // A shutdown signal ends both slots.
+        control.begin_drain();
+        let (general, small) = tokio::time::timeout(Duration::from_secs(5), slots).await.unwrap();
+        general.unwrap();
+        small.unwrap();
+    }
+
+    /// NAN-4290: a coordinator that predates the lane refuses the `lane`
+    /// field. The small slot sits out instead of hammering it; the general
+    /// slot keeps running every job as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_coordinator_without_lanes_parks_the_small_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = runner_arguments(&directory, &[]).unwrap();
+        let store = LaneCoordinator { small_refused: true, ..Default::default() };
+        let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
+        let _busy = control.general_claim();
+        let small = runner_loop(&store, &arguments, None, &control, SlotLane::Small);
+        assert!(tokio::time::timeout(Duration::from_secs(1_800), small).await.is_err());
+        let refused = store.small_claims.load(Ordering::Relaxed);
+        assert!((1..=4).contains(&refused), "{refused} refused claims in 30 min: parked {SMALL_LANE_UNSUPPORTED_PARK:?} each");
+        assert!(small_lane_refused(&Err(DurableJobStoreError::Unsupported)));
+        assert!(!small_lane_refused(&Err(DurableJobStoreError::Unavailable("connection reset".into()))));
+        assert!(!small_lane_refused(&Ok(None)));
+    }
+
+    #[test]
+    fn small_lane_slots_need_the_hosted_coordinator() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(runner_arguments(&directory, &[]).unwrap().small_lane_slots, 0, "off unless rendered");
+        let error = runner_arguments(&directory, &["--small-lane-slots", "1"]).unwrap_err();
+        assert!(error.to_string().contains("--small-lane-slots requires --hosted-coordinator-config"), "{error:#}");
+        assert!(runner_arguments(&directory, &["--small-lane-slots", "5"]).is_err());
+    }
+
     #[test]
     fn retry_configuration_rejects_a_placebo_large_class() {
         let directory = tempfile::tempdir().unwrap();
@@ -2913,6 +3233,8 @@ mod rolling_drain_tests {
 
     #[derive(Debug, Default)]
     struct ScriptedStore {
+        /// NAN-4290: claims cover the last hour (a small-lane job).
+        small: std::sync::atomic::AtomicBool,
         inner: nanosiem_core::search::InMemoryJobStore,
         release: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
         fail: std::sync::Mutex<std::collections::VecDeque<Scripted>>,
@@ -2962,8 +3284,10 @@ mod rolling_drain_tests {
             worker_id: &str,
             _lease: Duration,
         ) -> std::result::Result<Option<DurableSearchJobClaim>, DurableJobStoreError> {
+            let end = Utc::now();
+            let start = if self.small.load(Ordering::SeqCst) { end - chrono::Duration::hours(1) } else { end };
             let request = serde_json::from_value(serde_json::json!({
-                "query":"* | stats count", "time_range":{"start":Utc::now(),"end":Utc::now()},
+                "query":"* | stats count", "time_range":{"start":start,"end":end},
                 "skip_histogram":false,"skip_field_stats":false,"use_cache":false,"table_view":false,"async_mode":true
             }))
             .unwrap();
@@ -2993,10 +3317,11 @@ mod rolling_drain_tests {
             _fence: u64,
             error: &str,
             retryable: bool,
-            _promote_resource_class: bool,
+            promote_resource_class: bool,
             _max_attempts: u32,
         ) -> std::result::Result<bool, DurableJobStoreError> {
-            self.calls.lock().unwrap().push(format!("fail:{retryable}:{error}"));
+            let promote = if promote_resource_class { "promote:" } else { "" };
+            self.calls.lock().unwrap().push(format!("fail:{retryable}:{promote}{error}"));
             self.fail.lock().unwrap().pop_front().unwrap_or(Scripted::Changed(true)).result()
         }
         async fn release_durable_claim(
@@ -3061,6 +3386,120 @@ mod rolling_drain_tests {
 
     fn settle_arguments(directory: &tempfile::TempDir) -> Arguments {
         redis_arguments(directory, "redis://127.0.0.1:6379")
+    }
+
+    /// NAN-3911: a memory-limit or scan-capacity refusal fails the job once,
+    /// non-retryable, with the static `query_too_large` category; any other
+    /// attempt failure keeps the generic retryable path.
+    #[tokio::test]
+    async fn query_too_large_fails_once_without_retry() {
+        let store = ScriptedStore::default();
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = settle_arguments(&directory);
+        let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
+        let claim = store.runner_claim().await;
+
+        let memory = anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE))
+            .context("cell job returned HTTP 503 (query_budget_exhausted): query memory budget exceeded");
+        settle_claim(&store, &arguments, &claim, Err(memory), &control).await.unwrap();
+        assert_eq!(
+            store.take_calls(),
+            vec![format!("fail:false:{}", nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE)]
+        );
+
+        let scan: anyhow::Error = select_resource_class(DurableQueryResourceClass::Large, 9 << 30, 1 << 30, 8 << 30)
+            .map_err(QueryTooLarge)
+            .unwrap_err()
+            .into();
+        settle_claim(&store, &arguments, &claim, Err(scan), &control).await.unwrap();
+        assert_eq!(store.take_calls(), vec![format!("fail:false:{SCAN_CAPACITY_REASON}")]);
+
+        // Deterministic job shape, not a sick runner: never trips the breaker.
+        for _ in 0..MAX_CONSECUTIVE_JOB_FAILURES + 1 {
+            let error = anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE));
+            settle_claim(&store, &arguments, &claim, Err(error), &control).await.unwrap();
+        }
+        assert!(!control.draining(), "query_too_large must not trip the circuit breaker");
+        store.take_calls();
+
+        settle_claim(&store, &arguments, &claim, Err(anyhow::anyhow!("cell search job returned HTTP 500")), &control)
+            .await
+            .unwrap();
+        assert_eq!(store.take_calls(), vec![format!("fail:true:{RUNNER_ATTEMPT_FAILURE_REASON}")]);
+    }
+
+    /// NAN-4277 (F18): a statement timeout is the job's shape: classified
+    /// from the cell's error exactly as production logged it, and settled
+    /// once, non-retryable, with the time-limit category.
+    #[tokio::test]
+    async fn a_cell_statement_timeout_fails_once_with_the_time_limit_category() {
+        let status = |code| reqwest::StatusCode::from_u16(code).unwrap();
+        let logged = "native chDB query failed: chDB query failed: Code: 159. DB::Exception: Timeout exceeded: elapsed 120010.416 ms, maximum: 120000 ms. (TIMEOUT_EXCEEDED)";
+        assert!(cell_statement_timed_out(status(500), Some(logged)));
+        assert!(!cell_statement_timed_out(status(500), Some("cell search job failed")));
+        assert!(!cell_statement_timed_out(status(500), None));
+        assert!(!cell_statement_timed_out(status(429), Some(logged)), "a busy refusal is not the statement");
+
+        let store = ScriptedStore::default();
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = settle_arguments(&directory);
+        let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
+        let claim = store.runner_claim().await;
+        let timeout = anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_TIME_MESSAGE))
+            .context(format!("cell job returned HTTP 500 (statement time limit): {logged}"));
+        settle_claim(&store, &arguments, &claim, Err(timeout), &control).await.unwrap();
+        assert_eq!(
+            store.take_calls(),
+            vec![format!("fail:false:{}", nanosiem_core::search::QUERY_TOO_LARGE_TIME_MESSAGE)]
+        );
+    }
+
+    /// NAN-4290: a small-lane job that ran out of a small lane's memory is
+    /// requeued once as large (the general lane's memory) instead of failed;
+    /// a large or long-window job's memory refusal still fails once.
+    #[tokio::test]
+    async fn a_small_lane_memory_refusal_is_promoted_once() {
+        let store = ScriptedStore::default();
+        store.small.store(true, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let arguments = settle_arguments(&directory);
+        let control = RunnerControl::new(Duration::from_secs(45), Duration::from_secs(60));
+        let claim = store.runner_claim().await;
+        assert!(small_lane_job(&claim));
+        let memory = || anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE))
+            .context("cell job returned HTTP 503 (query_budget_exhausted): query memory budget exceeded");
+        settle_claim(&store, &arguments, &claim, Err(memory()), &control).await.unwrap();
+        assert_eq!(
+            store.take_calls(),
+            vec![format!("fail:true:promote:{}", nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE)]
+        );
+        // A statement timeout is not a lane's memory: it still fails once.
+        let timeout = anyhow::Error::new(QueryTooLarge(nanosiem_core::search::QUERY_TOO_LARGE_TIME_MESSAGE));
+        settle_claim(&store, &arguments, &claim, Err(timeout), &control).await.unwrap();
+        assert_eq!(store.take_calls(), vec![format!("fail:false:{}", nanosiem_core::search::QUERY_TOO_LARGE_TIME_MESSAGE)]);
+        // A job that is not small (here: an empty window) fails once.
+        store.small.store(false, Ordering::SeqCst);
+        let claim = store.runner_claim().await;
+        assert!(!small_lane_job(&claim));
+        settle_claim(&store, &arguments, &claim, Err(memory()), &control).await.unwrap();
+        assert_eq!(store.take_calls(), vec![format!("fail:false:{}", nanosiem_core::search::QUERY_TOO_LARGE_MEMORY_MESSAGE)]);
+    }
+
+    /// NAN-3911: only a per-query memory refusal is deterministic.
+    #[test]
+    fn cell_memory_refusal_classification() {
+        let status = |code| reqwest::StatusCode::from_u16(code).unwrap();
+        let budget = Some("query_budget_exhausted");
+        assert!(cell_query_too_large(status(503), budget,
+            Some("query memory budget exceeded: Code: 241. Memory limit (for query) exceeded (MEMORY_LIMIT_EXCEEDED)")));
+        assert!(cell_query_too_large(status(503), budget, None));
+        // Engine-wide total: concurrent work, may pass on a retry.
+        assert!(!cell_query_too_large(status(503), budget,
+            Some("query memory budget exceeded: Code: 241. DB::Exception: (total) memory limit exceeded")));
+        // Concurrency (429) and other 503s are not too-large.
+        assert!(!cell_query_too_large(status(429), budget, None));
+        assert!(!cell_query_too_large(status(503), Some("cold_fetch_timeout"), None));
+        assert!(!cell_query_too_large(status(503), Some("not_ready"), None));
     }
 
     /// Item: a drain that interrupts a running child is charged (retryable

@@ -237,6 +237,21 @@ impl MemoryFeedStore {
         self.inner.lock().expect("store").feeds.iter().find(|f| f.def.feed_id == feed_id).map(|f| f.next_run_at)
     }
 
+    /// NAN-3660 (tests): what the rotate operation plus the credential pass
+    /// do to a feed: a new ingest token, the lease fenced (generation + 1),
+    /// failures reset and the feed due now. Checkpoints are kept.
+    pub fn rotate_ingest_token(&self, feed_id: Uuid, token: super::feed::Secret) {
+        let mut g = self.inner.lock().expect("store");
+        if let Some(f) = g.feeds.iter_mut().find(|f| f.def.feed_id == feed_id) {
+            f.def.ingest_token = token;
+            f.def.consecutive_failures = 0;
+            f.lease_generation += 1;
+            f.lease_owner = None;
+            f.lease_expires_at = None;
+            f.next_run_at = DateTime::<Utc>::MIN_UTC;
+        }
+    }
+
     pub fn set_enabled(&self, feed_id: Uuid, enabled: bool) {
         let mut g = self.inner.lock().expect("store");
         if let Some(f) = g.feeds.iter_mut().find(|f| f.def.feed_id == feed_id) {

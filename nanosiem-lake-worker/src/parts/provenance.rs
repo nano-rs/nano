@@ -279,6 +279,8 @@ pub struct DataFileDigest {
     pub min_time_us: i64,
     pub max_time_us: i64,
     /// Exact non-null log sources in this file. Absent on legacy and overflow files.
+    /// A one-source file holds only rows of that source (NAN-4311: readers
+    /// count keyword hits by source from it without reading the column).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_sources: Option<Vec<String>>,
     /// Signed digest of the UID bloom sidecar, one bitset per row group.

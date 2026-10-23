@@ -1010,6 +1010,7 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
             upstream_ms = timing.milliseconds(Phase::Upstream),
             audit_ms = timing.milliseconds(Phase::Audit),
             attach_ms = timing.milliseconds(Phase::Attach),
+            verify_ms = timing.verify_milliseconds(),
             db_roundtrips = timing.db_roundtrips(),
             admission = timing.admission().as_str(),
             "Request completed"
@@ -1391,14 +1392,16 @@ mod request_timing_log_tests {
         let response = app.oneshot(Request::builder().uri("/missing").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let timing = response.headers().get("server-timing").unwrap().to_str().unwrap();
-        for metric in ["total", "auth", "scope", "authority", "ledger", "upstream", "audit", "attach"] {
+        for metric in ["total", "auth", "scope", "authority", "ledger", "upstream", "audit", "attach", "verify"] {
             let prefix = format!("{metric};dur=");
             assert!(timing.split(", ").find_map(|entry| entry.strip_prefix(&prefix))
                 .and_then(|value| value.parse::<f64>().ok()).is_some(), "missing {metric}: {timing}");
         }
         let events = events.lock().unwrap();
         let event = events.iter().find(|event| event.rendered.contains("Request completed")).expect("completion event");
-        for field in ["auth_ms", "scope_ms", "authority_ms", "ledger_ms", "upstream_ms", "audit_ms", "attach_ms", "duration_ms", "db_roundtrips"] {
+        // NAN-4215: the auth breakdown (round trips, admission path) rides the header too.
+        assert!(timing.contains("db;desc=0") && timing.contains("admission;desc=none"), "{timing}");
+        for field in ["auth_ms", "scope_ms", "authority_ms", "ledger_ms", "upstream_ms", "audit_ms", "attach_ms", "verify_ms", "duration_ms", "db_roundtrips"] {
             let prefix = format!("{field}=");
             let value = event.rendered.split_whitespace().find_map(|word| word.strip_prefix(&prefix));
             assert!(value.and_then(|value| value.parse::<f64>().ok()).is_some(), "missing numeric {field}: {event:?}");

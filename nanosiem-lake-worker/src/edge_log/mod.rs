@@ -15,6 +15,7 @@
 //! Design: `docs-internal/NAN-2865-edge-direct-design.md`; provenance:
 //! part contract section 4.1.1.
 
+pub mod backlog;
 pub mod client;
 pub mod protocol;
 pub mod source;

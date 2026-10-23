@@ -9,6 +9,9 @@ pub enum Phase { Auth, Scope, Authority, Ledger, Upstream, Audit, Attach }
 #[derive(Default)]
 pub struct RequestTiming {
     micros: [AtomicI64; 7],
+    /// NAN-4215: credential hash verification (bcrypt) inside `auth`. A
+    /// breakdown of `auth`, not an exclusive phase.
+    verify_micros: AtomicI64,
     db_roundtrips: AtomicU64,
     lake_result_cache_hits: AtomicU64,
     admission: std::sync::atomic::AtomicU8,
@@ -61,6 +64,9 @@ impl RequestTiming {
 
     pub fn db_roundtrips(&self) -> u64 { self.db_roundtrips.load(Ordering::Relaxed) }
 
+    /// Credential hash verification time (ms) inside `auth`.
+    pub fn verify_milliseconds(&self) -> f64 { self.verify_micros.load(Ordering::Relaxed).max(0) as f64 / 1000.0 }
+
     pub fn admission(&self) -> Admission {
         match self.admission.load(Ordering::Relaxed) {
             1 => Admission::Warm,
@@ -74,11 +80,12 @@ impl RequestTiming {
     /// `total` is wall time until response headers, not response-body streaming.
     pub fn server_timing(&self, total_ms: f64) -> String {
         format!(
-            "total;dur={total_ms:.3}, auth;dur={:.3}, scope;dur={:.3}, authority;dur={:.3}, ledger;dur={:.3}, upstream;dur={:.3}, audit;dur={:.3}, attach;dur={:.3}",
+            "total;dur={total_ms:.3}, auth;dur={:.3}, scope;dur={:.3}, authority;dur={:.3}, ledger;dur={:.3}, upstream;dur={:.3}, audit;dur={:.3}, attach;dur={:.3}, verify;dur={:.3}, db;desc={}, admission;desc={}",
             self.milliseconds(Phase::Auth), self.milliseconds(Phase::Scope),
             self.milliseconds(Phase::Authority), self.milliseconds(Phase::Ledger),
             self.milliseconds(Phase::Upstream), self.milliseconds(Phase::Audit),
-            self.milliseconds(Phase::Attach),
+            self.milliseconds(Phase::Attach), self.verify_milliseconds(),
+            self.db_roundtrips(), self.admission().as_str(),
         )
     }
 }
@@ -93,6 +100,16 @@ pub fn record_lake_result_cache_hit() {
 /// search result cache to key on).
 pub fn lake_result_cache_hit() -> bool {
     TIMING.try_with(|timing| timing.lake_result_cache_hits.load(Ordering::Relaxed) > 0).unwrap_or(false)
+}
+
+/// NAN-4215: time a credential hash verification (bcrypt) of this request.
+/// Informational breakdown of `auth`; outside a request it just runs.
+pub async fn timed_verify<F: Future>(future: F) -> F::Output {
+    let started = Instant::now();
+    let output = future.await;
+    let elapsed = started.elapsed().as_micros().min(i64::MAX as u128) as i64;
+    let _ = TIMING.try_with(|timing| timing.verify_micros.fetch_add(elapsed, Ordering::Relaxed));
+    output
 }
 
 /// Nested phases are exclusive: time spent resolving scope is subtracted from auth.

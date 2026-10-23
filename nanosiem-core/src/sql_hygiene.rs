@@ -118,6 +118,34 @@ pub(crate) fn format_ch_bound_micros(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
 }
 
+/// NAN-4280: the event-time bound of a search window, half-open
+/// `[start, end)`: `column >= 'start' AND column < 'end'`.
+///
+/// The inclusive `BETWEEN` it replaces counted an event exactly on a shared
+/// boundary in BOTH adjacent windows (24 hourly windows, chunked jobs, a
+/// histogram split in two). One plain conjunction keeps ClickHouse/chDB
+/// partition, min-max and move-to-PREWHERE pruning exactly as before.
+///
+/// This is the single source of the text: the lake worker's fast-path
+/// recognizers (keyword counts, entity counts, fragment-cache window
+/// normalization) build their patterns from [`half_open_time_bound_pattern`],
+/// so the two can never drift apart silently.
+pub fn half_open_time_bound(column: &str, start_literal: &str, end_literal: &str) -> String {
+    format!("{column} >= '{start_literal}' AND {column} < '{end_literal}'")
+}
+
+/// [`half_open_time_bound`] as a regex fragment with the two literals as
+/// capture groups (`literal` is the pattern each must match, e.g.
+/// `[0-9: .-]+`). Everything else is matched verbatim.
+pub fn half_open_time_bound_pattern(column: &str, literal: &str) -> String {
+    // Plain-word markers: `regex::escape` leaves them untouched.
+    const START: &str = "NANOSTARTLITERAL";
+    const END: &str = "NANOENDLITERAL";
+    regex::escape(&half_open_time_bound(column, START, END))
+        .replace(START, &format!("({literal})"))
+        .replace(END, &format!("({literal})"))
+}
+
 /// Format a UTC instant as a ClickHouse bound with second precision
 /// (`%Y-%m-%d %H:%M:%S`).
 pub(crate) fn format_ch_bound(dt: &DateTime<Utc>) -> String {

@@ -5,6 +5,7 @@
 //! Unified log source management combining ingestion configuration,
 //! VRL transformation, and metadata into a single entity.
 
+pub mod cadence;
 mod lake_diagnostics;
 pub(crate) mod repository;
 pub(crate) mod service;

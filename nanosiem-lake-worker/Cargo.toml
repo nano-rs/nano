@@ -102,7 +102,9 @@ opendal = { version = "=0.57.0", default-features = false, features = ["services
 # Owner-sign private-CA TLS tests (part_ingest::cell).
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
-
+# NAN-4195: tests/shared_state_builders_static_contract.rs walks the lake
+# worker and cell module trees for production `Arc::get_mut` builders.
+syn = { version = "2", features = ["full", "visit"] }
 
 
 

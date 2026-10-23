@@ -547,6 +547,7 @@
     "udm_field": "protocol",
     "ocsf_path": "connection_info.protocol_num",
     "ch_column_name": "connection_info.protocol_num",
+    "enum_values": {"icmp": 1, "igmp": 2, "tcp": 6, "udp": 17, "ipv6": 41, "gre": 47, "esp": 50, "ah": 51, "icmpv6": 58, "ipv6-icmp": 58, "ospf": 89, "sctp": 132},
     "ch_type": "Int32",
     "index": "none",
     "prewhere": false,

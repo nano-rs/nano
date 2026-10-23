@@ -1,9 +1,2 @@
-# Rendered by the nginx image's envsubst entrypoint into
-# /etc/nginx/conf.d/otlp-auth.conf (included by nginx.opensource.conf).
-# OTLP/HTTP through this edge takes the install's ingest token, exactly like
-# /ingest and HEC: `Authorization: Bearer <VECTOR_AUTH_TOKEN>`. A blank token
-# is refused in the location itself.
-map $http_authorization $otlp_authorized {
-    default 0;
-    "Bearer ${VECTOR_AUTH_TOKEN}" 1;
-}
+# OTLP authentication uses nginx auth_request to nano-api (NAN-3933).
+# Kept as an empty template for image/compose compatibility; no static secrets.

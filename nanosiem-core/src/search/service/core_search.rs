@@ -13,6 +13,80 @@ use crate::search::query_processing::{
 use base64::Engine;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// NAN-4291 (F6): the query an expired window runs instead of returning no
+/// rows, or `None` when no rows is already the query's answer. An ungrouped
+/// `stats` / `chart` returns one row over zero input rows, so a pipeline of
+/// row-local commands around one is kept with its search ANDed with `NOT *`
+/// (matches nothing) and the engine computes exactly what it would over an
+/// empty window. Pipelines with a subsearch (join, append, `IN [search …]`) or
+/// any other command keep the empty answer: their other inputs are windowed
+/// too and would read the substituted window.
+fn expired_window_aggregate_query(query: &Query) -> Option<Query> {
+    fn has_subsearch(expr: &SearchExpr) -> bool {
+        match expr {
+            SearchExpr::InSubsearch { .. } => true,
+            SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+                has_subsearch(left) || has_subsearch(right)
+            }
+            SearchExpr::Not(inner) | SearchExpr::Group(inner) => has_subsearch(inner),
+            _ => false,
+        }
+    }
+    let mut ungrouped = false;
+    let mut cursor = query;
+    let base = loop {
+        match cursor {
+            Query::Search(expr) => break expr,
+            Query::Piped { source, command } => {
+                match command {
+                    Command::Stats { group_by, .. } | Command::Chart { group_by, .. } => {
+                        ungrouped |= group_by.as_ref().is_none_or(|fields| fields.is_empty());
+                    }
+                    Command::Where { condition } if !has_subsearch(condition) => {}
+                    Command::Eval { .. }
+                    | Command::Sort { .. }
+                    | Command::Head { .. }
+                    | Command::Tail { .. }
+                    | Command::Table { .. }
+                    | Command::Fields { .. }
+                    | Command::Rename { .. }
+                    | Command::Fillnull { .. }
+                    | Command::Rex { .. }
+                    | Command::Dedup { .. }
+                    | Command::Bin { .. }
+                    | Command::Spath { .. }
+                    | Command::Mvexpand { .. }
+                    | Command::Reverse
+                    | Command::Top { .. }
+                    | Command::Rare { .. }
+                    | Command::EventStats { .. }
+                    | Command::StreamStats { .. } => {}
+                    _ => return None,
+                }
+                cursor = source;
+            }
+        }
+    };
+    if !ungrouped || has_subsearch(base) {
+        return None;
+    }
+    let mut rewritten = query.clone();
+    let mut cursor = &mut rewritten;
+    loop {
+        match cursor {
+            Query::Search(expr) => {
+                let matched = std::mem::replace(expr, SearchExpr::Keyword("*".to_string()));
+                *expr = SearchExpr::And(
+                    Box::new(SearchExpr::Group(Box::new(matched))),
+                    Box::new(SearchExpr::Not(Box::new(SearchExpr::Keyword("*".to_string())))),
+                );
+                return Some(rewritten);
+            }
+            Query::Piped { source, .. } => cursor = source,
+        }
+    }
+}
+
 fn command_page_marker(query: &Query) -> Result<serde_json::Value, SearchError> {
     let marker = match get_semantic_terminal_command(query) {
         Some(Command::Services) => serde_json::json!({
@@ -185,6 +259,9 @@ tokio::task_local! {
 }
 const LAKE_LOOKUP_MEMBERSHIP_PUSHDOWN_MAX: usize = 4_096;
 const LAKE_INLINE_LOOKUP_MAX_ROWS: i64 = 100;
+/// NAN-4287: the supported way to hunt a lookup/IOC list on the lake, named
+/// by every refusal of a nested lookup shape.
+pub const LAKE_LOOKUP_ALTERNATIVE: &str = "To match events against a lookup or IOC list, use it in the outer pipeline: `<search> | lookup <table> <key> AS <event field> OUTPUT <column> | where isnotnull(<column>)` (lists up to 4,096 keys are pushed into the scan), or search the IOC fields stamped at ingest.";
 const LAKE_INLINE_LOOKUP_MAX_QUERY_BYTES: usize = 192 * 1_024;
 const LAKE_DASHBOARD_BREAKDOWN_FIELD: &str = "__nano.dashboard_breakdown";
 /// The log-source column every count rollup row is keyed by.
@@ -203,7 +280,7 @@ fn interactive_lake_eligible(
     max_limit: usize,
 ) -> bool {
     let duration = request.time_range.end - request.time_range.start;
-    let (_, earliest, latest) = extract_time_modifiers(&request.query);
+    let Ok((_, earliest, latest)) = extract_time_bounds(&request.query) else { return false; };
     matches!(
         priority,
         super::admission::QueryPriority::Interactive | super::admission::QueryPriority::Analytics
@@ -283,10 +360,9 @@ fn validate_lake_nested_post_processing(query: &Query) -> Result<(), SearchError
     if !contains_nested_lake_post_processing(query) {
         return Ok(());
     }
-    Err(SearchError::SqlValidationError(
-        "Nano-side lookup, prevalence, inputlookup, identity, or AI stages are not supported inside lake subsearches; move the stage to the outer pipeline or run the subsearch separately"
-            .to_string(),
-    ))
+    Err(SearchError::SqlValidationError(format!(
+        "Nano-side lookup, prevalence, inputlookup, identity, or AI stages are not supported inside lake subsearches; move the stage to the outer pipeline or run the subsearch separately. {LAKE_LOOKUP_ALTERNATIVE}"
+    )))
 }
 
 /// Whether a Nano-side suffix must see a bounded candidate set before caller
@@ -2581,7 +2657,6 @@ fn lake_rollup_union_side(
     let multi_value = crate::search::lake::lake_count_rollup_field_multi_value(field)?;
     (field != LAKE_SOURCE_FIELD
         && field != LAKE_DASHBOARD_BREAKDOWN_FIELD
-        && !crate::search::lake::lake_rollup_field_is_enrichment_sensitive(field)
         && !multi_value)
         .then_some(predicate)
 }
@@ -2631,8 +2706,7 @@ fn lake_count_plan_rollup_exact(
     // grouped pages only on scalar fields (the ungrouped `eq` route is
     // unchanged and never a page).
     let grouped_by_value = !plan.group_by.is_empty() && !plan.rollup_group_by_source;
-    !crate::search::lake::lake_rollup_field_is_enrichment_sensitive(field)
-        && !(grouped_by_value && lake_rollup_group_field_is_wide(field))
+    !(grouped_by_value && lake_rollup_group_field_is_wide(field))
         && (!multi_value
             || (plan.group_by.is_empty()
                 && predicate.as_ref().is_some_and(|predicate| predicate.kind == "eq")))
@@ -2748,7 +2822,6 @@ pub(super) fn lake_field_values_rollup_served(
         && plan.rollup_source_filter.is_none();
     plan.rollup_union.is_none()
         && !broad_ip_top_n
-        && !crate::search::lake::lake_rollup_field_is_enrichment_sensitive(rollup_field)
         // A grouped rollup read serves scalar fields only.
         && crate::search::lake::lake_count_rollup_field_multi_value(rollup_field) == Some(false)
         && lake_rollup_predicate_is_exact(profile, rollup_field, plan.rollup_predicate.as_ref())
@@ -3105,7 +3178,7 @@ impl SearchService {
         let query_id = request
             .request_id
             .clone()
-            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+            .unwrap_or_else(|| super::background_request::generated_query_id(uuid::Uuid::now_v7()));
         let max_groups = self.query_limits.read().await.max_post_processing_groups as usize;
         match self
             .lake_count_rollup_rows(request, &query_id, scope, &plan, &aggregate_query, max_groups)
@@ -3224,6 +3297,26 @@ fn lake_count_pipeline_plan_for(
     gated: &Query,
     deny_set: &BTreeSet<String>,
 ) -> Option<LakeCountPipelinePlan> {
+    // NAN-4295: `count by <array leaf>` (any element type; the compiler's own
+    // predicate) groups by EACH element. The worker's
+    // typed count groups by `toString(<array>)` (whole-array keys such as
+    // `['T1110']`, and `[null]` for a repeated object's leaf), and its rollups
+    // serve scalar groups only, so such a plan always takes the compiled
+    // page, which joins the elements.
+    lake_count_pipeline_plan_for_inner(profile, gated, deny_set).filter(|plan| {
+        !plan
+            .aggregate
+            .group_by
+            .iter()
+            .any(|field| crate::query::clickhouse_sql_gen::search_expr::stats_by_schema_field_is_array(profile, field))
+    })
+}
+
+fn lake_count_pipeline_plan_for_inner(
+    profile: &dyn crate::schema::SchemaProfile,
+    gated: &Query,
+    deny_set: &BTreeSet<String>,
+) -> Option<LakeCountPipelinePlan> {
     let mut planning = lake_rollup_planning_query(profile, gated);
     // NAN-3883: the stats command too (`count(source_type) by source_type`).
     let output_spelling = lake_rollup_planning_stats(profile, &mut planning);
@@ -3262,6 +3355,31 @@ fn lake_stats_uses_compiled_page(query: &Query, count: Option<&LakeCountPipeline
     crate::query::stats_page::eligible(query)
         && !count.is_some_and(|plan| matches!(plan.aggregate.rollup_field.as_deref(),
             Some("metadata.log_source") | Some(LAKE_DASHBOARD_BREAKDOWN_FIELD)))
+}
+
+/// The worker's count-rollup bucket (`nanosiem-lake-worker`
+/// `COUNT_ROLLUP_BUCKET_US`). The worker refuses a bucketed count request
+/// whose span is not a whole number of these.
+const LAKE_COUNT_ROLLUP_BUCKET_US: i64 = 300_000_000;
+
+/// NAN-4184: whether the lean cell answers `query` from its 5-minute count
+/// rollups without scanning events. It uses the same plan the service sends
+/// to the worker's `/v1/aggregate/count`
+/// ([`lake_count_pipeline_plan_for`] + [`lake_count_plan_rollup_exact`]).
+/// Typical matches are `* | stats count by metadata.log_source`, the
+/// `class_uid` / `source_type` inventories, and a timechart count over whole
+/// rollup buckets. Any suffix the count pipeline runs over the compact
+/// rollup rows (sort, head, where on count, ...) is allowed. Planned for an
+/// unrestricted caller: a caller's source-scope gate is stripped from rollup
+/// planning anyway ([`lake_count_pipeline_plan_scoped`]).
+pub fn lake_count_rollup_answers(profile: &dyn crate::schema::SchemaProfile, query: &Query) -> bool {
+    let Some(plan) = lake_count_pipeline_plan_for(profile, query, &BTreeSet::new()) else {
+        return false;
+    };
+    lake_count_plan_rollup_exact(profile, &plan.aggregate)
+        && plan.aggregate.bucket_span_us.is_none_or(|span| {
+            span >= LAKE_COUNT_ROLLUP_BUCKET_US && span % LAKE_COUNT_ROLLUP_BUCKET_US == 0
+        })
 }
 
 /// How a lean cell answers a raw-search aggregation (NAN-3153).
@@ -3849,9 +3967,10 @@ impl LakeSliceRetries {
     }
 }
 
-/// Bisect one inclusive event-time range without overlap. The lake contract
-/// stores OCSF timestamps at microsecond precision, so the left side ends one
-/// microsecond before the right side starts.
+/// Bisect one half-open `[start, end)` event-time range without overlap
+/// (NAN-4280): the halves share `right_start`, which belongs to the right
+/// half only. (With the old inclusive `BETWEEN` bound the left side had to
+/// end one microsecond earlier.)
 fn split_lake_aggregate_range(
     time_range: &TimeRangeInput,
 ) -> Option<(TimeRangeInput, TimeRangeInput)> {
@@ -3863,7 +3982,7 @@ fn split_lake_aggregate_range(
     Some((
         TimeRangeInput {
             start: time_range.start,
-            end: right_start - chrono::Duration::microseconds(1),
+            end: right_start,
         },
         TimeRangeInput {
             start: right_start,
@@ -4214,6 +4333,10 @@ impl SearchService {
             {
                 return Ok(job_id);
             }
+            // NAN-4288 (F16): the durable lane honours in-query
+            // earliest=/latest= exactly as the interactive one does.
+            let (_, earliest, latest) = extract_time_bounds(&request.query)?;
+            request.time_range = apply_time_bounds(&request.time_range, earliest, latest)?;
             request.time_range = self
                 .retention_bound_input_range(&request.time_range, chrono::Utc::now())?
                 .ok_or(SearchError::InvalidTimeRange)?;
@@ -4441,7 +4564,7 @@ impl SearchService {
     /// exactly `request` and may be re-served through its result pages
     /// instead of re-running the search (a pasted absolute-range URL).
     ///
-    /// The index is the caller's existing job list in the durable job store;
+    /// The index is a bounded process-local exact-request hint (a cold miss runs);
     /// the data fence is the reuse marker the cell wrote next to the job's
     /// result pages in the tenant's R2 result prefix, which the cell checks
     /// against its current part set. Returns `None` on any doubt; a lookup
@@ -4455,6 +4578,7 @@ impl SearchService {
         authority: Option<&crate::search::DurableSearchJobAuthority>,
     ) -> Option<super::jobs::SearchJob> {
         use crate::search::settled_reuse;
+        let lookup_started = std::time::Instant::now();
         let now = chrono::Utc::now();
         if !request.use_cache
             || !settled_reuse::is_settled_end(request.time_range.end, now)
@@ -4465,28 +4589,20 @@ impl SearchService {
         let canonical = self.durable_plain_search_canonical(request, now)?;
         let client = self.lake_query.client.as_ref()?;
         let control = self.job_control();
-        let summaries = match control.list_for_user_checked(user_id).await {
-            Ok(summaries) => summaries,
-            Err(error) => {
-                tracing::debug!(%error, "settled search reuse: job list unavailable; running the search");
+        // One exact candidate, one tenant-pinned metadata read, one cell check.
+        // This hint survives completion independently of the in-flight index.
+        let key = crate::search::recent_reuse_jobs::key(request, &canonical, user_id, scope, authority)?;
+        let job_id = crate::search::recent_reuse_jobs::RecentReuseJobs::global().candidate(key)?;
+        let caller = settled_reuse::ReuseCaller { user_id, deny: scope.deny_set(), authority };
+        {
+            let Ok(Some(job)) = control.get_checked(&job_id).await else { return None };
+            if !settled_reuse::job_matches_reuse_request(&job, request, &canonical, &caller) {
                 return None;
             }
-        };
-        let caller = settled_reuse::ReuseCaller { user_id, deny: scope.deny_set(), authority };
-        // Bounded: the newest finished plain searches only.
-        for summary in summaries
-            .iter()
-            .filter(|job| job.status == super::jobs::SearchJobStatus::Completed && job.task_kind.as_deref() == Some("search_npl_v1"))
-            .take(16)
-        {
-            let Ok(Some(job)) = control.get_checked(&summary.job_id).await else { continue };
-            if !settled_reuse::job_matches_reuse_request(&job, request, &canonical, &caller) {
-                continue;
-            }
-            let Some(reference) = job.result_ref.clone() else { continue };
+            let Some(reference) = job.result_ref.clone() else { return None };
             match client.settled_job_reuse_check(&job.id, &reference).await {
                 Ok(true) => {
-                    tracing::info!(job_id = %job.id, "re-serving a settled durable search job");
+                    tracing::info!(job_id = %job.id, reuse_lookup_ms = lookup_started.elapsed().as_millis() as u64, "re-serving a settled durable search job");
                     return Some(job);
                 }
                 Ok(false) => {}
@@ -4540,12 +4656,14 @@ impl SearchService {
     /// starting the same long scan again. Returns `None` on any doubt; a
     /// lookup failure is a miss. The caller must still re-check the current
     /// search authority and the job's visibility before answering.
+    /// NAN-4277: `point` decides whether a still-queued job is followed.
     pub async fn in_flight_durable_job_for_attach(
         &self,
         request: &SearchRequest,
         user_id: uuid::Uuid,
         scope: &ScopeSet,
         authority: Option<&crate::search::DurableSearchJobAuthority>,
+        point: crate::search::settled_reuse::AttachPoint,
     ) -> Option<super::jobs::SearchJob> {
         use crate::search::{in_flight_jobs::InFlightJobs, settled_reuse};
         crate::request_timing::timed(crate::request_timing::Phase::Attach, async {
@@ -4575,7 +4693,7 @@ impl SearchService {
                     jobs.forget(&job_id);
                     continue;
                 }
-                if settled_reuse::job_matches_attach_request(&job, request, &canonical, &caller) {
+                if settled_reuse::job_matches_attach_request(&job, request, &canonical, &caller, point) {
                     tracing::info!(job_id = %job.id, "attaching to an in-flight durable search job");
                     return Some(job);
                 }
@@ -6075,10 +6193,15 @@ impl SearchService {
                         // post-processing: values(field) is a comma-separated
                         // String, not an implementation-specific JSON array. The
                         // BTreeSet above also makes the distributed merge stable.
-                        row.insert(
-                            alias.to_string(),
-                            serde_json::Value::String(values.join(", ")),
-                        );
+                        // NAN-4291 (F6): like the compiled ungrouped
+                        // aggregate, `values` over no rows is null, not "".
+                        // (A grouped row exists only for a group with rows.)
+                        let state = if values.is_empty() && plan.group_by.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(values.join(", "))
+                        };
+                        row.insert(alias.to_string(), state);
                     }
                     if let Some(alias) = plan.count_output_alias.as_deref() {
                         row.insert(alias.to_string(), serde_json::Value::from(raw_count));
@@ -7356,14 +7479,21 @@ impl SearchService {
             let mut response = match rows {
                 // NAN-2361: a scan-budget rejection of a `stats` whose
                 // aggregations merge exactly over disjoint time slices
-                // (count / earliest / latest / first / last) is recovered by
-                // bisection instead of failing closed. Only the rejection
-                // takes this path, so every query that fits is unchanged.
+                // (count / earliest / latest / first / last; NAN-4313: sum,
+                // avg, numeric min / max) is recovered by bisection instead
+                // of failing closed. Only the rejection takes this path, so
+                // every query that fits is unchanged. Any other rejection
+                // (percentiles, median, dc, values) is returned as the
+                // `ResourceExhausted` the search handler escalates to a
+                // durable job.
                 Err(error)
                     if request_dataset == crate::query::Dataset::Logs
                         && is_lake_scan_budget_rejection(&error) =>
                 {
-                    let Some(plan) = super::lake_stats_merge::lake_mergeable_stats_plan(&parsed)
+                    let Some(plan) = super::lake_stats_merge::lake_mergeable_stats_plan(
+                        &parsed,
+                        &|field: &str| self.active_profile.is_numeric_field(field),
+                    )
                     else {
                         return Err(error);
                     };
@@ -7543,9 +7673,11 @@ impl SearchService {
             .request_id
             .clone()
             .unwrap_or_else(|| {
-                crate::inputlookup::shared::fetch_search_id()
-                    .unwrap_or_else(uuid::Uuid::now_v7)
-                    .to_string()
+                // NAN-4193: `detect-`-prefixed inside a detection scope.
+                super::background_request::generated_query_id(
+                    crate::inputlookup::shared::fetch_search_id()
+                        .unwrap_or_else(uuid::Uuid::now_v7),
+                )
             });
 
         // Register with tracker for cancellation support (if request_id was provided)
@@ -7561,7 +7693,7 @@ impl SearchService {
 
         // Extract time modifiers (earliest=-24h, latest=now, etc.) and clean the query
         let (cleaned_query, earliest_offset, latest_offset) =
-            extract_time_modifiers(&request.query);
+            extract_time_bounds(&request.query)?;
 
         // NAN-1799: inject the caller's source-scope exclusion into the query
         // TEXT before anything downstream touches it — the parse below, SQL
@@ -7596,24 +7728,25 @@ impl SearchService {
             enforce_source_scope(&cleaned_query, scope.deny_set())?
         };
 
-        // Adjust time range based on modifiers
-        let mut adjusted_time_range = request.time_range.clone();
-        if let Some(offset_secs) = earliest_offset {
-            // earliest=-24h means start = now + offset (offset is negative)
-            adjusted_time_range.start = chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-        }
-        if let Some(offset_secs) = latest_offset {
-            // latest=now means end = now + offset (offset is 0 for now)
-            adjusted_time_range.end = chrono::Utc::now() + chrono::Duration::seconds(offset_secs);
-        }
-        if let Some(cutoff) = retention_cutoff {
-            if adjusted_time_range.end <= cutoff {
+        // Adjust time range based on modifiers (NAN-4288: SPL semantics)
+        let mut adjusted_time_range = match apply_time_bounds(
+            &request.time_range,
+            earliest_offset,
+            latest_offset,
+        ) {
+            Ok(range) => range,
+            Err(error) => {
                 if let Some(ref request_id) = request.request_id {
                     self.query_tracker.unregister(request_id);
                 }
-                return Ok(SearchResponse::empty());
+                return Err(error);
             }
-            if adjusted_time_range.start < cutoff {
+        };
+        let mut expired_window_cutoff = None;
+        if let Some(cutoff) = retention_cutoff {
+            if adjusted_time_range.end <= cutoff {
+                expired_window_cutoff = Some(cutoff);
+            } else if adjusted_time_range.start < cutoff {
                 adjusted_time_range.start = cutoff;
             }
         }
@@ -7628,6 +7761,29 @@ impl SearchService {
             Ok(query) => query,
             Err(error) => return Err(convert_parse_error(error)),
         };
+        // An expired window reads no backend. NAN-4291 (F6): an ungrouped
+        // `stats` still answers it with its one row (count 0, the other
+        // aggregates null), so that pipeline runs over a search that matches
+        // nothing in a 1 ms in-retention window; anything else is empty.
+        let mut cleaned_query = cleaned_query;
+        if let Some(cutoff) = expired_window_cutoff {
+            match expired_window_aggregate_query(&query) {
+                Some(empty_query) => {
+                    query = empty_query;
+                    // Every later reader of the text (timeline, cloud view)
+                    // sees the same matches-nothing search.
+                    cleaned_query = query.pretty_print();
+                    adjusted_time_range.start = cutoff;
+                    adjusted_time_range.end = cutoff + chrono::Duration::milliseconds(1);
+                }
+                None => {
+                    if let Some(ref request_id) = request.request_id {
+                        self.query_tracker.unregister(request_id);
+                    }
+                    return Ok(SearchResponse::empty());
+                }
+            }
+        }
         // NAN-3466: lookup key orientation needs the table's columns.
         orient_lookup_keys(&mut query, self.lookup_service.as_ref()).await;
         // NAN-3385: resolve `timechart bins=N` against the effective window.
@@ -7653,6 +7809,40 @@ impl SearchService {
                 "Query blocked by cost analysis: {}",
                 error_messages.join("; ")
             )));
+        }
+
+        // NAN-4289 (F25): a tail that addresses the pivoted series columns runs
+        // after the pivot, in memory, exactly like a terminal timechart plus
+        // the in-memory evaluator.
+        if let (false, Some((source, Command::Timechart { span, aggregations, split_by, limit, useother, .. }, tail))) =
+            (self.histogram_only, super::timechart::split_pivot_tail(&query))
+        {
+            let mut chart_request = request.clone();
+            chart_request.time_range = adjusted_time_range.clone();
+            let mut response = Box::pin(self.complete_timechart(
+                chart_request, scope, source, *span, aggregations, split_by, *limit, *useother,
+            ))
+            .await?;
+            let processed = apply_post_prevalence_commands_with_limit(
+                std::mem::take(&mut response.results),
+                &tail,
+                query_limits.max_post_processing_groups as usize,
+            )?;
+            response.results = processed.results;
+            response.total_count = response.results.len() as u64;
+            response.column_order = response.results.first().and_then(|r| r.as_object()).map(|r| {
+                r.keys().filter(|k| k.as_str() != "_timechart").cloned().collect()
+            });
+            let mut warnings = response.warnings.take().unwrap_or_default();
+            warnings.extend(processed.warnings.into_iter().map(|message| QueryWarningOutput {
+                severity: "warning".to_string(),
+                code: "TIMECHART_POST_PROCESSING".to_string(),
+                message,
+                suggestion: None,
+                impact: None,
+            }));
+            response.warnings = (!warnings.is_empty()).then_some(warnings);
+            return Ok(response);
         }
 
         if let (false, Query::Piped {
@@ -9531,8 +9721,14 @@ mod ext_remap_note_tests {
             let parsed = parse_query(query).unwrap();
             let error = validate_lake_nested_post_processing(&parsed)
                 .expect_err("nested Nano-side stage must fail closed");
-            assert!(matches!(error, SearchError::SqlValidationError(_)));
+            // NAN-4287: the refusal names the supported IOC-hunting shape.
+            assert!(
+                matches!(&error, SearchError::SqlValidationError(m) if m.contains(LAKE_LOOKUP_ALTERNATIVE)),
+                "{error:?}"
+            );
         }
+        assert!(LAKE_LOOKUP_ALTERNATIVE.contains("up to 4,096 keys"));
+        assert_eq!(LAKE_LOOKUP_MEMBERSHIP_PUSHDOWN_MAX, 4_096);
 
         let native =
             parse_query(r#"* | append [* | stats count by process.name] | stats count"#).unwrap();
@@ -10940,6 +11136,39 @@ mod ext_remap_note_tests {
         }
     }
 
+    /// NAN-4295: `count by <array leaf>` must group by each element. The
+    /// worker's typed count groups by the whole array (`['T1110']`, `[null]`)
+    /// and the multi-value rollups never serve grouped results, so such a
+    /// plan is refused and the compiled page (arrayJoin) answers. Ungrouped
+    /// and scalar-grouped counts keep their plans.
+    #[test]
+    fn lake_count_plan_refuses_array_group_by() {
+        let profile = OcsfProfile::lake_1_9();
+        let none = BTreeSet::new();
+        let plan = |query: &str| lake_count_pipeline_plan_for(&profile, &parse_query(query).unwrap(), &none);
+        assert_eq!(
+            crate::schema::SchemaProfile::field_type(&profile, "module.file.signatures.algorithm_id"),
+            Some(crate::schema::FieldType::Array)
+        );
+        for query in [
+            "* | stats count by privileges",
+            "* | stats count by file.hashes.value",
+            "* | stats count by finding_info.attacks.technique.uid",
+            // A non-string repeated leaf (integer_t under a repeated object).
+            "* | stats count by module.file.signatures.algorithm_id",
+            "source_type=windows_sysmon | stats count by metadata.log_source, resources.hostname",
+        ] {
+            assert!(plan(query).is_none(), "{query}");
+        }
+        for query in [
+            "* | stats count by src_endpoint.ip",
+            "* | stats count by metadata.log_source",
+            "file.hashes.value=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | stats count",
+        ] {
+            assert!(plan(query).is_some(), "{query}");
+        }
+    }
+
     /// NAN-3883: `* | stats count(source_type) by source_type` (and
     /// `count by source_type`) scanned 30 days (177 s, escalated) while the
     /// same counts by `metadata.log_source` came from the rollups in 0.2 s.
@@ -11470,7 +11699,8 @@ mod ext_remap_note_tests {
             .with_timezone(&chrono::Utc);
         let (left, right) = split_lake_aggregate_range(&TimeRangeInput { start, end }).unwrap();
         assert_eq!(left.start, start);
-        assert_eq!(left.end + chrono::Duration::microseconds(1), right.start);
+        // NAN-4280: half-open halves share the split instant.
+        assert_eq!(left.end, right.start);
         assert_eq!(right.end, end);
     }
 
@@ -12172,6 +12402,483 @@ mod nan3078_durable_post_processing_tests {
             .all(|row| row["class_uid"] == serde_json::json!(4002)));
         assert_eq!(response.total_count, 2);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// The gen1 worker's `/v1/prevalence/lookup`: answers every requested
+    /// artifact with the first_seen from `first_seen`, echoing the binding.
+    /// Snapshots are per-window, like the lake's: outside the 30d snapshot an
+    /// artifact's first_seen is only its earliest sighting inside the window
+    /// (here: within the last hour, for every artifact seen today).
+    struct PrevalenceLookupWorker {
+        tenant: String,
+        first_seen: std::collections::BTreeMap<&'static str, String>,
+    }
+
+    impl wiremock::Respond for PrevalenceLookupWorker {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let results: Vec<serde_json::Value> = body["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|name| {
+                    let name = name.as_str().unwrap();
+                    let first_seen = self.first_seen.get(name)?;
+                    let first_seen = if body["window"] == "30d" {
+                        first_seen.clone()
+                    } else {
+                        let in_window = chrono::Utc::now() - chrono::Duration::hours(1);
+                        chrono::DateTime::parse_from_rfc3339(first_seen)
+                            .unwrap()
+                            .with_timezone(&chrono::Utc)
+                            .max(in_window)
+                            .to_rfc3339()
+                    };
+                    Some(serde_json::json!({
+                        "artifact": name, "artifact_type": "domain", "host_count": 2,
+                        "total_occurrences": 4, "first_seen": first_seen,
+                        "last_seen": chrono::Utc::now().to_rfc3339(), "is_rare": true,
+                        "prevalence_score": 10,
+                    }))
+                })
+                .collect();
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "ok": true, "tenant_id": self.tenant, "snapshot_id": body["snapshot_id"],
+                    "results": results,
+                }))
+                .insert_header("x-nano-worker-assignment-id", WORKER)
+                .insert_header("x-nano-worker-assignment-revision", "1")
+        }
+    }
+
+    /// NAN-4372: `| prevalence domain_first_seen > now() - 24h` returned every
+    /// candidate row on the lake (the in-memory filter `return Ok(results)`
+    /// for first_seen fields). Through the production tenant view and the
+    /// shared lake post-processing path, only the row whose domain was first
+    /// seen inside the window survives; an old domain, a domain the backend
+    /// does not know, and a row with no domain are all excluded. The same
+    /// condition with `enrich=true` filters too (it used to skip conditions).
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn nan4372_first_seen_filter_keeps_only_new_artifacts_on_the_lake() {
+        let tenant = uuid::Uuid::from_u128(0x4372);
+        let server = wiremock::MockServer::start().await;
+        let now = chrono::Utc::now();
+        let rows = serde_json::json!([
+            {"time": "2026-09-30T10:00:00Z", "class_uid": 4002, "metadata": {"uid": "fresh"},
+             "dst_endpoint": {"hostname": "fresh.example"}},
+            {"time": "2026-09-30T09:59:00Z", "class_uid": 4002, "metadata": {"uid": "old"},
+             "dst_endpoint": {"hostname": "old.example"}},
+            {"time": "2026-09-30T09:58:00Z", "class_uid": 4002, "metadata": {"uid": "unknown"},
+             "dst_endpoint": {"hostname": "unknown.example"}},
+            {"time": "2026-09-30T09:57:00Z", "class_uid": 4002, "metadata": {"uid": "nodomain"}},
+        ]);
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/jobs/result-page"))
+            .respond_with(ResultPageWorker { tenant: tenant.to_string(), rows })
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/prevalence/lookup"))
+            .respond_with(PrevalenceLookupWorker {
+                tenant: tenant.to_string(),
+                first_seen: [
+                    ("fresh.example", (now - chrono::Duration::hours(2)).to_rfc3339()),
+                    ("old.example", (now - chrono::Duration::days(20)).to_rfc3339()),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = tenant_view(&server, tenant, dir.path()).await;
+        let uids = |response: &SearchResponse| -> Vec<String> {
+            response
+                .results
+                .iter()
+                .map(|row| row["metadata"]["uid"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        for (query, expected) in [
+            ("class_uid=4002 | prevalence domain_first_seen > now() - 24h", vec!["fresh"]),
+            ("class_uid=4002 | prevalence domain_first_seen > now() - 24h enrich=true", vec!["fresh"]),
+            ("class_uid=4002 | prevalence domain_first_seen < now() - 7d", vec!["old"]),
+            // NAN-4372 review: `window=` scopes the host count only. A domain
+            // first seen 20 days ago is not new in the last 24h even though
+            // the 24h snapshot's earliest sighting of it is an hour old:
+            // first_seen always reads the 30d snapshot.
+            (
+                "class_uid=4002 | prevalence domain_prevalence < 10 domain_first_seen > now() - 24h window=24h",
+                vec!["fresh"],
+            ),
+            ("class_uid=4002 | prevalence domain_first_seen > now() - 24h window=7d", vec!["fresh"]),
+        ] {
+            let mut job = completed_post_job(
+                tenant,
+                query,
+                now,
+                TimeRangeInput::new(now - chrono::Duration::hours(1), now),
+            );
+            job.result_ref.as_mut().unwrap().rows = 4;
+            let response = view
+                .durable_post_processed_result(&job, &ScopeSet::unrestricted())
+                .await
+                .unwrap_or_else(|error| panic!("{query}: {error:?}"));
+            assert_eq!(uids(&response), expected, "{query}");
+        }
+    }
+
+    /// NAN-4291 (F6): an expired window still answers an ungrouped `stats`
+    /// the way the engine answers any empty window (one row: count 0, the
+    /// other aggregates null), by running it over a matches-nothing search
+    /// in a 1 ms in-retention window. Everything else (grouped stats, raw
+    /// events, a subsearch) answers empty without reaching the worker. Run
+    /// on a 32 MiB stack: the debug `search` future outgrows the 2 MiB test
+    /// thread.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn an_expired_window_runs_only_an_ungrouped_aggregate_over_no_rows() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(expired_window_aggregate_case())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn expired_window_aggregate_case() {
+        let tenant = uuid::Uuid::from_u128(0x4291);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = tenant_view(&server, tenant, dir.path()).await;
+        let now = chrono::Utc::now();
+        let cutoff = view.retention_cutoff_at(now).unwrap().expect("shared view is retained");
+        let expired = |query: &str| -> SearchRequest {
+            serde_json::from_value(serde_json::json!({
+                "query": query,
+                "time_range": {
+                    "start": now - chrono::Duration::days(200),
+                    "end": now - chrono::Duration::days(150),
+                },
+                "limit": 100,
+            }))
+            .unwrap()
+        };
+
+        for query in [
+            "class_uid=4002",
+            "class_uid=4002 | stats count by actor.user.name",
+            "class_uid=4002 | stats count by actor.user.name | sort -count | head 5",
+            "class_uid=4002 | join type=left actor.user.name [search class_uid=3002 | stats count by actor.user.name] | stats count",
+            "class_uid=4002 | timechart span=1h count",
+        ] {
+            let response = view.search(expired(query), &ScopeSet::unrestricted()).await.unwrap();
+            assert!(response.results.is_empty(), "{query}");
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "only an ungrouped aggregate reads an expired window"
+        );
+
+        let _ = view
+            .search(
+                expired("class_uid=4002 | stats count, max(time) as mt, values(actor.user.name) as v | eval n=count"),
+                &ScopeSet::unrestricted(),
+            )
+            .await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty(), "the ungrouped aggregate runs");
+        for request in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let text = body.to_string();
+            assert!(text.contains("NOT *"), "the search matches nothing: {text}");
+            let start = body["start"].as_str().unwrap_or_else(|| panic!("{text}"));
+            let end = body["end"].as_str().unwrap_or_else(|| panic!("{text}"));
+            let start = chrono::DateTime::parse_from_rfc3339(start).unwrap().with_timezone(&chrono::Utc);
+            let end = chrono::DateTime::parse_from_rfc3339(end).unwrap().with_timezone(&chrono::Utc);
+            assert!(start >= cutoff && end - start <= chrono::Duration::milliseconds(1), "{text}");
+        }
+    }
+
+    /// One fixture event: time, `actor.user.name`, `dst_endpoint.port`.
+    #[cfg(feature = "enterprise")]
+    type SliceEvent = (chrono::DateTime<chrono::Utc>, &'static str, i64);
+
+    /// What the compiled statement answers over `events` (one window, no
+    /// slicing): ungrouped, one row with count 0 and every other state null
+    /// over no rows (NAN-4291); grouped by user, one row per user seen. The
+    /// row carries every state any test query names (`s`, `a`, `lo`, `hi`,
+    /// the avg partials `__nano_avg_sum_N` / `__nano_avg_count_N`, …); the
+    /// merge reads only its own. UInt64 counts arrive quoted, as from a cell.
+    #[cfg(feature = "enterprise")]
+    fn slice_statement_rows(query: &str, events: &[&SliceEvent]) -> Vec<serde_json::Value> {
+        use base64::Engine as _;
+        let fmt = |at: &chrono::DateTime<chrono::Utc>| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let state = |rows: &[&SliceEvent]| {
+            let ports = rows.iter().map(|(_, _, port)| *port).collect::<Vec<_>>();
+            let some = !ports.is_empty();
+            let sum = some.then(|| ports.iter().sum::<i64>());
+            let mut row = serde_json::json!({
+                "count": rows.len().to_string(),
+                "first_seen": rows.first().map(|(at, _, _)| fmt(at)),
+                "last_seen": rows.last().map(|(at, _, _)| fmt(at)),
+                "first_user": rows.first().map(|(_, user, _)| user),
+                "last_user": rows.last().map(|(_, user, _)| user),
+                "s": sum,
+                "a": some.then(|| sum.unwrap() as f64 / ports.len() as f64),
+                "lo": ports.iter().min(),
+                "hi": ports.iter().max(),
+                "__nano_distinct_values": some.then(|| rows.iter()
+                    .map(|(_, user, _)| base64::engine::general_purpose::STANDARD.encode(user))
+                    .collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join(", ")),
+            });
+            for index in 0..8 {
+                row[format!("__nano_avg_sum_{index}")] = serde_json::json!(sum);
+                row[format!("__nano_avg_count_{index}")] = serde_json::json!(ports.len().to_string());
+            }
+            row
+        };
+        if query.contains(" by actor.user.name") {
+            let mut users = BTreeMap::<&str, Vec<&SliceEvent>>::new();
+            for event in events {
+                users.entry(event.1).or_default().push(event);
+            }
+            users
+                .into_iter()
+                .map(|(user, rows)| {
+                    let mut row = state(&rows);
+                    row["actor.user.name"] = serde_json::json!(user);
+                    row
+                })
+                .collect()
+        } else {
+            vec![state(events)]
+        }
+    }
+
+    /// A worker whose scan budget refuses any window wider than `max_width`
+    /// (413 `scan_budget_exhausted`, as a cell does), so the sliced-stats and
+    /// distinct-state paths bisect. Each slice is answered by
+    /// [`slice_statement_rows`], the compiled statement's shape (pinned
+    /// natively by `ungrouped_stats_over_no_rows_is_count_zero_and_null_aggregates`).
+    #[cfg(feature = "enterprise")]
+    struct SlicingAggregateWorker {
+        tenant: String,
+        max_width: chrono::Duration,
+        events: Vec<SliceEvent>,
+    }
+
+    #[cfg(feature = "enterprise")]
+    impl wiremock::Respond for SlicingAggregateWorker {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let bound = |key: &str| {
+                chrono::DateTime::parse_from_rfc3339(body[key].as_str().unwrap()).unwrap().with_timezone(&chrono::Utc)
+            };
+            let (start, end) = (bound("start"), bound("end"));
+            if end - start > self.max_width {
+                return wiremock::ResponseTemplate::new(413).set_body_json(serde_json::json!({
+                    "ok": false, "error_code": "RESOURCE_EXHAUSTED", "reason": "scan_budget_exhausted",
+                    "error": "query scan budget rejected",
+                }))
+                .insert_header("x-nano-worker-assignment-id", WORKER)
+                .insert_header("x-nano-worker-assignment-revision", "1");
+            }
+            let mut events: Vec<_> = self.events.iter().filter(|(at, _, _)| *at >= start && *at <= end).collect();
+            events.sort();
+            let rows = slice_statement_rows(body["query"].as_str().unwrap(), &events);
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "ok": true, "tenant_id": self.tenant, "request_id": body["request_id"],
+                    "route": "broad_npl", "source_mode": "parts",
+                    "log_head": {"seq": 1, "sha256": "ab".repeat(32)},
+                    "generation_id": "nan4291", "snapshot_id": "1",
+                    "result": {"rows": rows, "result_rows": rows.len(), "page_has_more": false},
+                }))
+                .insert_header("x-nano-worker-assignment-id", WORKER)
+                .insert_header("x-nano-worker-assignment-revision", "1")
+        }
+    }
+
+    /// NAN-4291 / NAN-4313: the per-slice merges read an empty slice (the
+    /// ungrouped statement's count-0-and-null row, or a grouped slice's
+    /// missing group) as "no rows". Over four slices, two of them empty in
+    /// the middle, every merged aggregate equals the unsliced statement:
+    /// counts, earliest/latest, first/last, dc/values, and (NAN-4313) sum,
+    /// avg (Σsum/Σcount), numeric min/max, ungrouped and by user (bob's rows
+    /// sit in both non-empty slices). Percentiles and medians have no exact
+    /// merge and are never sliced: one request, the budget rejection, which
+    /// the search handler escalates to a durable job.
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn sliced_ungrouped_merges_skip_empty_slices() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(sliced_ungrouped_merge_case())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(feature = "enterprise")]
+    async fn sliced_ungrouped_merge_case() {
+        let tenant = uuid::Uuid::from_u128(0x4292);
+        // The worker reports event times at microsecond precision.
+        let now = chrono::SubsecRound::trunc_subsecs(chrono::Utc::now(), 6);
+        let start = now - chrono::Duration::hours(4);
+        let at = |minutes: i64| start + chrono::Duration::minutes(minutes);
+        // Quarter slices: events only in the first and the last, a distinct
+        // port on each.
+        let events: Vec<SliceEvent> =
+            vec![(at(10), "alice", 443), (at(20), "bob", 22), (at(200), "bob", 8080), (at(230), "carol", 3389)];
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(SlicingAggregateWorker {
+                tenant: tenant.to_string(),
+                max_width: chrono::Duration::minutes(61),
+                events: events.clone(),
+            })
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let view = tenant_view(&server, tenant, dir.path()).await;
+        let search = |query: &str, start: chrono::DateTime<chrono::Utc>| {
+            let request: SearchRequest = serde_json::from_value(serde_json::json!({
+                "query": query,
+                "time_range": {"start": start, "end": start + chrono::Duration::hours(4)},
+                "limit": 100,
+            }))
+            .unwrap();
+            let view = &view;
+            async move {
+                view.search(request, &ScopeSet::unrestricted()).await.unwrap_or_else(|error| panic!("{error}")).results
+            }
+        };
+        let number = |value: &serde_json::Value| {
+            value.as_f64().or_else(|| value.as_str().and_then(|s| s.parse().ok())).unwrap_or_else(|| panic!("{value}"))
+        };
+        let instant = |value: &serde_json::Value| {
+            chrono::DateTime::parse_from_rfc3339(value.as_str().unwrap_or_else(|| panic!("{value}"))).unwrap()
+        };
+
+        let sliced = "metadata.log_source=aws_cloudtrail | stats count, earliest(time) as first_seen, \
+                      latest(time) as last_seen, first(actor.user.name) as first_user, last(actor.user.name) as last_user";
+        let distinct = "metadata.log_source=aws_cloudtrail | stats dc(actor.user.name) as users, values(actor.user.name) as v, count";
+        let requests_before = server.received_requests().await.unwrap().len();
+        let row = search(sliced, start).await.remove(0);
+        assert!(server.received_requests().await.unwrap().len() - requests_before >= 4, "the window was sliced");
+        assert_eq!(number(&row["count"]), 4.0, "{row}");
+        assert_eq!(instant(&row["first_seen"]), at(10), "{row}");
+        assert_eq!(instant(&row["last_seen"]), at(230), "{row}");
+        assert_eq!(row["first_user"], "alice", "{row}");
+        assert_eq!(row["last_user"], "carol", "{row}");
+        let row = search(distinct, start).await.remove(0);
+        assert_eq!(number(&row["users"]), 3.0, "{row}");
+        let mut users = row["v"].as_str().unwrap_or_else(|| panic!("{row}")).split(", ").collect::<Vec<_>>();
+        users.sort_unstable();
+        assert_eq!(users, ["alice", "bob", "carol"], "{row}");
+        assert_eq!(number(&row["count"]), 4.0, "{row}");
+
+        // NAN-4313: sum / avg / numeric min / max slice and merge exactly,
+        // equal to the unsliced statement over the whole window.
+        let numeric = "count, sum(dst_endpoint.port) as s, avg(dst_endpoint.port) as a, \
+                       min(dst_endpoint.port) as lo, max(dst_endpoint.port) as hi";
+        let all: Vec<&SliceEvent> = events.iter().collect();
+        for tail in ["", " by actor.user.name"] {
+            let query = format!("metadata.log_source=aws_cloudtrail | stats {numeric}{tail}");
+            let before = server.received_requests().await.unwrap().len();
+            let mut rows = search(&query, start).await;
+            assert!(server.received_requests().await.unwrap().len() - before >= 4, "{query} was sliced");
+            let mut unsliced = slice_statement_rows(&query, &all);
+            let key = |row: &serde_json::Value| row["actor.user.name"].to_string();
+            rows.sort_by_key(key);
+            unsliced.sort_by_key(key);
+            assert_eq!(rows.len(), unsliced.len(), "{query}: {rows:?}");
+            for (row, expected) in rows.iter().zip(&unsliced) {
+                for state in ["count", "s", "a", "lo", "hi"] {
+                    assert_eq!(number(&row[state]), number(&expected[state]), "{query}: {state} in {row} vs {expected}");
+                }
+            }
+        }
+        let row = search(&format!("metadata.log_source=aws_cloudtrail | stats {numeric}"), start).await.remove(0);
+        assert_eq!((number(&row["s"]), number(&row["a"])), (11_934.0, 2_983.5), "{row}");
+        assert_eq!((number(&row["lo"]), number(&row["hi"])), (22.0, 8_080.0), "{row}");
+        let bob = search(&format!("metadata.log_source=aws_cloudtrail | stats {numeric} by actor.user.name"), start)
+            .await
+            .into_iter()
+            .find(|row| row["actor.user.name"] == "bob")
+            .unwrap();
+        assert_eq!(
+            [number(&bob["count"]), number(&bob["s"]), number(&bob["a"]), number(&bob["lo"]), number(&bob["hi"])],
+            [2.0, 8_102.0, 4_051.0, 22.0, 8_080.0],
+            "bob's rows sit in both non-empty slices: {bob}"
+        );
+
+        // Percentiles and medians have no exact merge from partials: never
+        // sliced, one request, the budget rejection (escalated to a durable
+        // job by the search handler).
+        for aggregate in [
+            "perc95(dst_endpoint.port) as p95",
+            "median(dst_endpoint.port) as med",
+            "count, sum(dst_endpoint.port) as s, median(dst_endpoint.port) as med",
+        ] {
+            let query = format!("metadata.log_source=aws_cloudtrail | stats {aggregate}");
+            let before = server.received_requests().await.unwrap().len();
+            let request: SearchRequest = serde_json::from_value(serde_json::json!({
+                "query": query,
+                "time_range": {"start": start, "end": start + chrono::Duration::hours(4)},
+                "limit": 100,
+            }))
+            .unwrap();
+            let error = view.search(request, &ScopeSet::unrestricted()).await.expect_err(&query);
+            assert!(
+                matches!(error, SearchError::ResourceExhausted(_)) && is_lake_scan_budget_rejection(&error),
+                "{query}: {error}"
+            );
+            assert_eq!(server.received_requests().await.unwrap().len() - before, 1, "{query} was sliced");
+        }
+
+        // Every slice empty.
+        let empty = now - chrono::Duration::days(10);
+        let row = search(sliced, empty).await.remove(0);
+        assert_eq!(number(&row["count"]), 0.0, "{row}");
+        for null in ["first_seen", "last_seen", "first_user", "last_user"] {
+            assert!(row.get(null).is_some_and(serde_json::Value::is_null), "{null}: {row}");
+        }
+        let row = search(distinct, empty).await.remove(0);
+        assert_eq!(number(&row["users"]), 0.0, "{row}");
+        assert_eq!(number(&row["count"]), 0.0, "{row}");
+        assert!(row.get("v").is_some_and(serde_json::Value::is_null), "values over no rows is null: {row}");
+        let row = search(&format!("metadata.log_source=aws_cloudtrail | stats {numeric}"), empty).await.remove(0);
+        assert_eq!(number(&row["count"]), 0.0, "{row}");
+        for null in ["s", "a", "lo", "hi"] {
+            assert!(row.get(null).is_some_and(serde_json::Value::is_null), "{null}: {row}");
+        }
+        assert!(
+            search(&format!("metadata.log_source=aws_cloudtrail | stats {numeric} by actor.user.name"), empty)
+                .await
+                .is_empty(),
+            "grouped stats over no rows have no rows"
+        );
     }
 
     #[cfg(feature = "enterprise")]

@@ -211,6 +211,34 @@ impl TenantDbContextSigner {
     }
 }
 
+/// NAN-4377: transaction-local setting naming the tenant automation key a
+/// request authenticated with. The SOAR source-event trigger
+/// (`nano_shared.enqueue_soar_source_event`) records events written under it
+/// as AI-originated, so a case-triggered flow an API/agent key causes runs
+/// under the AI approval policy instead of as a plain `trigger`.
+pub const ORIGIN_AUTOMATION_KEY_SETTING: &str = "nano_shared.origin_automation_key";
+
+/// Mark this transaction's source writes as caused by an automation key
+/// (`is_local = true`: it ends with the transaction and never reaches the
+/// next pooled user). Interactive sessions never call this. The trigger only
+/// ever tightens policy on a marked event, so an unmarked write by a key
+/// would be the failure mode; every key-admitting tenant write gate marks.
+pub async fn mark_automation_key_origin(
+    transaction: &mut Transaction<'_, Postgres>,
+    key_id: Uuid,
+) -> Result<(), TenantDbError> {
+    if key_id.is_nil() {
+        return Err(TenantDbError::NilIdentity);
+    }
+    sqlx::query("SELECT set_config($1, $2, true)")
+        .bind(ORIGIN_AUTOMATION_KEY_SETTING)
+        .bind(key_id.to_string())
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(TenantDbError::Database)
+}
+
 /// NAN-3080: longest a signed tenant transaction may sit idle between
 /// statements. A transaction held open while its owner awaits something else
 /// (another pool connection, a lake search) locks rows that other tenant

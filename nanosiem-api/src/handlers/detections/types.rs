@@ -185,6 +185,20 @@ pub struct ValidateDetectionRequest {
     pub query: String,
     /// Desired detection mode (real-time or scheduled)
     pub detection_mode: Option<String>,
+    /// MITRE ATT&CK tactic IDs the rule will carry (e.g. `TA0002`). When
+    /// either list is present, validation runs the same mapping checks a
+    /// create/update runs (ID shape, catalog membership, tactic/technique
+    /// pairing).
+    #[serde(default)]
+    pub mitre_tactics: Option<Vec<String>>,
+    /// MITRE ATT&CK technique IDs the rule will carry (e.g. `T1059.001`).
+    #[serde(default)]
+    pub mitre_techniques: Option<Vec<String>>,
+    /// The rule being edited, when this validates an update. A mapping equal
+    /// to the rule's stored one is not re-checked, mirroring the write
+    /// trigger's skip for an UPDATE that leaves the mapping unchanged.
+    #[serde(default)]
+    pub rule_id: Option<uuid::Uuid>,
 }
 
 /// Response from detection validation

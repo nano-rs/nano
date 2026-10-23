@@ -529,10 +529,10 @@ async fn open_query_service(assignment: &Assignment, mut bootstrap: QueryBootstr
         bootstrap.engine.cache_query_bytes = Some(bootstrap.engine.cache_query_bytes.unwrap_or(DETECT_CACHE_QUERY_BYTES).min(DETECT_CACHE_QUERY_BYTES));
         bootstrap.engine.prewarm_hours = bootstrap.engine.prewarm_hours.min(DETECT_PREWARM_HOURS);
     }
-    // Platform read authority comes from the supervisor-rendered
-    // mounts when the cell renders them; configure_cell refuses a
-    // half-rendered pair. A cell without mounts serves as before
-    // (no platform stamps exist to unmask) rather than failing boot.
+    // The platform IOC view (on-demand indicator lookups) comes from the
+    // supervisor-rendered mounts when the cell renders them; configure_cell
+    // refuses a half-rendered pair. A cell without mounts serves without it.
+    // Stored enrichment is never masked at read time (NAN-4168).
     if assignment.platform_bundle_file.is_some() || assignment.platform_bundle_dir.is_some() || assignment.platform_policy_file.is_some() {
         if let Err(error) = nanosiem_lake_worker::enrichment_read::configure_cell(assignment) {
             let _ = control.fatal(&format!("platform assignment: {error:#}")).await;
@@ -654,18 +654,13 @@ async fn open_query_service(assignment: &Assignment, mut bootstrap: QueryBootstr
     if assignment.identity_observations && !detect && !product {
         service.clone().spawn_identity_backfill();
     }
+    // NAN-4190: query[T] keeps the window entity index (switch on only).
+    if nanosiem_lake_worker::part_query::entity_index::enabled() && !detect && !product {
+        service.clone().spawn_entity_index();
+    }
     phases.lap("service_ready");
     phases.log(assignment.tenant.as_str());
     Ok(OpenedQuery { service, swap })
-}
-
-/// NAN-3492: only the explicitly trusted-local cell (cell.json
-/// `trusted_local`, carried on the assignment) has no platform enrichment by
-/// construction: its feeds, registry and publication are hosted-only schema.
-/// Every other cell, a hosted one or a dev cell without a control URL, keeps
-/// the environment pool and its missing-URL warning.
-fn platform_enrichment_absent_by_construction(trusted_local: bool, has_control_url: bool, has_policy_file_env: bool) -> bool {
-    trusted_local && !has_control_url && !has_policy_file_env
 }
 
 /// Stack of every query runtime thread (workers and blocking pool), NAN-3141.
@@ -709,14 +704,6 @@ fn main() -> anyhow::Result<()> {
             );
             if !matches!(assignment.role, Role::Query | Role::Detect | Role::Product) {
                 anyhow::bail!("lake_part_query was assigned a non-query role");
-            }
-            if platform_enrichment_absent_by_construction(
-                assignment.trusted_local,
-                assignment.control_url.is_some(),
-                std::env::var_os("NANO_LAKE_PLATFORM_POLICY_FILE").is_some(),
-            ) {
-                nanosiem_core::platform_enrichment::read::disable_environment_pool(
-                    "trusted-local cell: platform enrichment feeds are hosted-only");
             }
             // `control_url` joins the assignment with the cell credential
             // exchange; read it through serde so this binary works with
@@ -861,16 +848,6 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod refresh_health_tests {
     use super::*;
-
-    #[test]
-    fn platform_enrichment_is_disabled_only_on_an_explicit_trusted_local_cell() {
-        assert!(platform_enrichment_absent_by_construction(true, false, false));
-        // Hosted (control URL) and dev cells without the flag keep the pool.
-        assert!(!platform_enrichment_absent_by_construction(false, false, false));
-        assert!(!platform_enrichment_absent_by_construction(false, true, false));
-        assert!(!platform_enrichment_absent_by_construction(true, true, false));
-        assert!(!platform_enrichment_absent_by_construction(true, false, true));
-    }
 
     #[test]
     fn detect_heartbeat_reports_credential_risk_until_replacement_arrives() {

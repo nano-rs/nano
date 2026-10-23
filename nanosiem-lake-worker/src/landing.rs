@@ -26,12 +26,14 @@
 //!    source, the tenant, the source's credential id and the `landing_bucket`
 //!    lane stamped. A row without `metadata.uid` gets one derived from the
 //!    file's SHA-256 and its ordinal, so a reconverted or re-uploaded file
-//!    yields the same uids.
+//!    yields the same uids. Steps 2-4 stream [`ROW_CHUNK`] rows at a time
+//!    (NAN-4319): memory does not grow with the file's row count.
 //! 3. **Pre-check.** Each row goes through the same checks bronze admission
 //!    runs ([`crate::bronze::precheck_source_row`]: strict OCSF 1.9 included).
 //!    Refused rows are counted by value-free reason and left out.
-//! 4. **Write.** The accepted rows become one bronze object per bronze shard,
-//!    `bronze-v2/[shard=N/]tenant_id=<T>/<unix secs>-<uuid>.parquet`, with the
+//! 4. **Write.** The accepted rows become bronze objects per bronze shard of
+//!    at most [`MAX_OBJECT_ROWS`] rows / [`MAX_OBJECT_EVENT_BYTES`] (Vector's
+//!    bronze batch), `bronze-v2/[shard=N/]tenant_id=<T>/<unix secs>-<uuid>.parquet`, with the
 //!    fixed bronze row contract (`time` + `_nano_bronze_event`). Part ingest
 //!    then admits it like any Vector object: IPinfo / IOC / identity /
 //!    prevalence / platform stamping, the uid window, parts.
@@ -43,11 +45,23 @@
 //! outage leaves the lease to expire and the file is retried; a file that
 //! keeps failing is refused after [`MAX_ATTEMPTS`]. One file never blocks
 //! another.
+//!
+//! Hosted tenants (NAN-3885 / NAN-4137) run the same conversion in the
+//! `landing[T]` lake-cell child behind two traits: [`Discover`] (here the
+//! prefix listing plus the Postgres ledger; hosted, a lease from the
+//! tenant's landing-ledger Durable Object) and [`Emit`] (here `bronze-v2/`
+//! objects; hosted, appends to the tenant edge log). See
+//! [`crate::landing_hosted`].
 
 use anyhow::{Context, Result};
-use arrow_array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt8Type;
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, RecordBatch, RecordBatchOptions,
+    StringArray, StructArray, TimestampMicrosecondArray,
+};
 use arrow_json::LineDelimitedWriter;
-use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, TimeUnit};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -61,7 +75,8 @@ use parquet::file::properties::WriterProperties;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, Read};
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -77,8 +92,10 @@ pub const BRONZE_PREFIX: &str = "bronze-v2/";
 pub const MAX_LANDING_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest decoded NDJSON body.
 pub const MAX_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
-/// Most rows one landed file may carry (one bronze admission's bound).
-pub const MAX_LANDING_ROWS: usize = MAX_BRONZE_ROWS;
+/// Most rows one landed file may carry. Conversion streams and cuts the
+/// file into bronze objects of at most [`MAX_OBJECT_ROWS`] (NAN-4319), so
+/// this bounds conversion time, not memory: 8 bronze admissions' worth.
+pub const MAX_LANDING_ROWS: usize = 8 * MAX_BRONZE_ROWS;
 /// Claims of one file before it is refused whole (`attempts_exhausted`).
 pub const MAX_ATTEMPTS: i32 = 5;
 /// zstd level of written bronze, as Vector's sink default.
@@ -98,6 +115,37 @@ pub struct LandingSource {
 pub struct LandingKey {
     pub source_id: Uuid,
     pub format: FileFormat,
+    /// The OCSF class a Hive-style `class_uid=<N>` folder below the source
+    /// folder names (NAN-4337), validated: a known OCSF 1.9 class.
+    pub partition_class_uid: Option<u32>,
+}
+
+/// A Hive partition folder for `class_uid` (NAN-4337). Tenzir's `to_s3 ...
+/// partition_by=[class_uid]` writes `.../class_uid=4003/events-....parquet`
+/// and drops the column from the file, the way Athena / Spark expect Hive
+/// partition columns to be read back from the path.
+const PARTITION_CLASS_UID: &str = "class_uid=";
+
+/// The `class_uid` a landed file's path (below its source folder, already
+/// checked free of empty, `.` and `..` segments) carries as a Hive partition.
+/// Only folders count, never the file name. `Err` is the value-free refusal
+/// reason: more than one such folder, or a value that is not a known OCSF
+/// class (digits only, no sign, at most six of them).
+fn partition_class_uid(path: &str) -> std::result::Result<Option<u32>, &'static str> {
+    let Some((folders, _file)) = path.rsplit_once('/') else { return Ok(None) };
+    let mut values = folders.split('/').filter_map(|folder| folder.strip_prefix(PARTITION_CLASS_UID));
+    let Some(value) = values.next() else { return Ok(None) };
+    if values.next().is_some() {
+        return Err("class_uid_partition_ambiguous");
+    }
+    if value.is_empty() || value.len() > 6 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("class_uid_partition_invalid");
+    }
+    let class: u32 = value.parse().map_err(|_| "class_uid_partition_invalid")?;
+    if !nanosiem_core::parsers::is_known_ocsf_class(i64::from(class)) {
+        return Err("class_uid_partition_invalid");
+    }
+    Ok(Some(class))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +155,8 @@ pub enum FileFormat {
 }
 
 /// Parse `landing-ocsf-v1/tenant_id=<T>/source=<uuid>/<path>.<ext>`.
-/// `Err` carries the value-free refusal reason.
+/// `Err` carries the value-free refusal reason. A `class_uid=<N>` folder in
+/// `<path>` is read as a Hive partition ([`LandingKey::partition_class_uid`]).
 pub fn parse_key(key: &str, tenant_id: &str) -> std::result::Result<LandingKey, &'static str> {
     let rest = key
         .strip_prefix(LANDING_PREFIX)
@@ -138,7 +187,8 @@ pub fn parse_key(key: &str, tenant_id: &str) -> std::result::Result<LandingKey, 
     } else {
         return Err("format_unsupported");
     };
-    Ok(LandingKey { source_id, format })
+    let partition_class_uid = partition_class_uid(path)?;
+    Ok(LandingKey { source_id, format, partition_class_uid })
 }
 
 /// The key a refused file is moved to.
@@ -154,7 +204,58 @@ pub struct Converted {
     pub rows_accepted: u64,
     pub rows_refused: u64,
     pub first_refusal: Option<RowRefusal>,
+    /// Where [`Self::first_refusal`] happened: its row's `class_uid` and the
+    /// attribute path (NAN-4321). Value-free.
+    pub first_refusal_detail: Option<RefusalDetail>,
+    /// Rows that had no `class_uid` column and took it from the key's Hive
+    /// `class_uid=<N>` folder (NAN-4337).
+    pub rows_class_from_path: u64,
     pub content_sha256: String,
+    /// NAN-4336: accepted rows whose `time` was more than 5 min past the
+    /// conversion (ingest) time and was clamped to it
+    /// ([`crate::bronze::clamp_future_event_time`]).
+    pub rows_time_clamped: u64,
+}
+
+/// Value-free context of a refusal (NAN-4321): the refused row's OCSF
+/// `class_uid` and the bounded attribute path the check named. Never a row
+/// value, so it may go to the ledger, logs and the tenant's status view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusalDetail {
+    pub class_uid: Option<u32>,
+    /// An OCSF attribute path (schema names and array indexes only, at most
+    /// 128 characters: [`RowRefusal::field`]).
+    pub field: Option<String>,
+}
+
+impl RefusalDetail {
+    /// The detail of one row refusal; `None` when nothing is known.
+    pub fn of(refusal: &RowRefusal, class_uid: Option<u32>) -> Option<Self> {
+        let detail = Self { class_uid, field: refusal.field.clone() };
+        (detail.class_uid.is_some() || detail.field.is_some()).then_some(detail)
+    }
+
+    /// `class_uid=4001 field=user` (either part may be absent).
+    pub fn render(&self) -> String {
+        let class = self.class_uid.map(|class| format!("class_uid={class}"));
+        let field = self.field.as_deref().map(|field| format!("field={field}"));
+        class.into_iter().chain(field).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// A row's OCSF `class_uid` when it is a plausible one (a number, at most
+/// six digits): reported with refusals, never trusted for anything else.
+fn class_uid_of(row: &Value) -> Option<u32> {
+    row.get("class_uid").and_then(Value::as_u64).filter(|class| *class <= 999_999).map(|class| class as u32)
+}
+
+/// The top-level attributes every OCSF event carries at least one of. A row
+/// with none of them is not OCSF at all (NAN-4321: such a file was refused
+/// as `raw_data_missing`, which sent senders looking for the wrong thing).
+const OCSF_MARKERS: &[&str] = &["class_uid", "category_uid", "type_uid", "activity_id", "metadata"];
+
+fn looks_like_ocsf(row: &Value) -> bool {
+    OCSF_MARKERS.iter().any(|marker| row.get(marker).is_some())
 }
 
 /// A file refused whole, with its value-free reason.
@@ -162,72 +263,301 @@ pub struct Converted {
 #[error("landed file refused: {reason}")]
 pub struct FileRefusal {
     pub reason: &'static str,
+    /// Rows of the file refused with it (0 when it was refused before its
+    /// rows were read).
+    pub rows: u64,
+    /// Where the (first) row refusal behind it happened, when it came from rows.
+    pub detail: Option<RefusalDetail>,
+}
+
+impl FileRefusal {
+    pub fn new(reason: &'static str) -> Self {
+        Self { reason, rows: 0, detail: None }
+    }
 }
 
 fn refuse<T>(reason: &'static str) -> std::result::Result<T, FileRefusal> {
-    Err(FileRefusal { reason })
+    Err(FileRefusal::new(reason))
 }
 
-/// Read a landed file's rows as JSON objects, exactly as bronze admission
-/// reads Parquet (Arrow's line-delimited JSON writer: nulls omitted).
-pub fn read_rows(bytes: &[u8], format: FileFormat) -> std::result::Result<Vec<Value>, FileRefusal> {
-    let mut rows = Vec::new();
-    fn push(rows: &mut Vec<Value>, line: &[u8]) -> std::result::Result<(), FileRefusal> {
-        if rows.len() >= MAX_LANDING_ROWS {
+/// Rows decoded at a time (NAN-4319): a landed file is read, staged and
+/// pre-checked in chunks of this many rows, never as a whole.
+pub const ROW_CHUNK: usize = 2_048;
+
+/// Visit a landed file's rows as JSON objects in chunks of at most
+/// [`ROW_CHUNK`], exactly as bronze admission reads Parquet (Arrow's
+/// line-delimited JSON writer: nulls omitted). A non-object line is kept as
+/// `Value::Null` (its place counts for the ordinal). Peak memory is one
+/// chunk plus one Parquet record batch, whatever the file's row count
+/// (NAN-4319).
+pub(crate) fn visit_rows(
+    bytes: &[u8],
+    format: FileFormat,
+    mut visit: impl FnMut(Vec<Value>) -> std::result::Result<(), FileRefusal>,
+) -> std::result::Result<usize, FileRefusal> {
+    let mut seen = 0_usize;
+    let mut chunk = Vec::with_capacity(ROW_CHUNK);
+    let mut push = |chunk: &mut Vec<Value>, line: &[u8], seen: &mut usize| -> std::result::Result<(), FileRefusal> {
+        if *seen >= MAX_LANDING_ROWS {
             return refuse("too_many_rows");
         }
+        *seen += 1;
         match serde_json::from_slice::<Value>(line) {
-            Ok(value @ Value::Object(_)) => rows.push(value),
+            Ok(value @ Value::Object(_)) => chunk.push(value),
             // A non-object line is a row the stage refuses; keep its place.
-            Ok(_) | Err(_) => rows.push(Value::Null),
+            Ok(_) | Err(_) => chunk.push(Value::Null),
+        }
+        if chunk.len() >= ROW_CHUNK {
+            visit(std::mem::replace(chunk, Vec::with_capacity(ROW_CHUNK)))?;
         }
         Ok(())
-    }
+    };
     match format {
         FileFormat::Parquet => {
             let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
-                .and_then(|builder| builder.with_batch_size(8_192).build())
+                .and_then(|builder| builder.with_batch_size(ROW_CHUNK).build())
                 .or_else(|_| refuse("parquet_unreadable"))?;
             for batch in reader {
                 let batch = batch.or_else(|_| refuse("parquet_unreadable"))?;
-                if rows.len() + batch.num_rows() > MAX_LANDING_ROWS {
+                let batch = decode_tenzir_extensions(batch).or_else(|_| refuse("parquet_unreadable"))?;
+                if seen + batch.num_rows() > MAX_LANDING_ROWS {
                     return refuse("too_many_rows");
                 }
                 let mut writer = LineDelimitedWriter::new(Vec::new());
                 writer.write(&batch).or_else(|_| refuse("parquet_unreadable"))?;
                 writer.finish().or_else(|_| refuse("parquet_unreadable"))?;
+                drop(batch);
                 for line in writer.into_inner().split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-                    push(&mut rows, line)?;
+                    push(&mut chunk, line, &mut seen)?;
                 }
             }
         }
         FileFormat::Ndjson { gzip } => {
-            let mut decoded = Vec::new();
             let source: Box<dyn Read> = if gzip {
                 Box::new(flate2::read::GzDecoder::new(bytes))
             } else {
                 Box::new(bytes)
             };
-            source
-                .take(MAX_DECODED_BYTES + 1)
-                .read_to_end(&mut decoded)
-                .or_else(|_| refuse("ndjson_unreadable"))?;
-            if decoded.len() as u64 > MAX_DECODED_BYTES {
-                return refuse("file_too_large");
-            }
-            for line in decoded.split(|b| *b == b'\n') {
-                let line = line.strip_suffix(b"\r").unwrap_or(line);
-                if line.iter().all(u8::is_ascii_whitespace) {
+            let mut reader = std::io::BufReader::new(source.take(MAX_DECODED_BYTES + 1));
+            let mut decoded = 0_u64;
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                let read = reader.read_until(b'\n', &mut line).or_else(|_| refuse("ndjson_unreadable"))?;
+                if read == 0 {
+                    break;
+                }
+                decoded += read as u64;
+                if decoded > MAX_DECODED_BYTES {
+                    return refuse("file_too_large");
+                }
+                let text = line.strip_suffix(b"\n").unwrap_or(&line);
+                let text = text.strip_suffix(b"\r").unwrap_or(text);
+                if text.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                push(&mut rows, line)?;
+                push(&mut chunk, text, &mut seen)?;
             }
         }
     }
-    if rows.is_empty() {
+    if !chunk.is_empty() {
+        visit(chunk)?;
+    }
+    if seen == 0 {
         return refuse("no_rows");
     }
+    Ok(seen)
+}
+
+/// Read a landed file's rows as JSON objects, exactly as bronze admission
+/// reads Parquet (Arrow's line-delimited JSON writer: nulls omitted). Holds
+/// every row: tests and small files only; conversion streams
+/// ([`visit_rows`]).
+pub fn read_rows(bytes: &[u8], format: FileFormat) -> std::result::Result<Vec<Value>, FileRefusal> {
+    let mut rows = Vec::new();
+    visit_rows(bytes, format, |chunk| {
+        rows.extend(chunk);
+        Ok(())
+    })?;
     Ok(rows)
+}
+
+/// Arrow extension-name metadata key (and its companion) on a field.
+const EXTENSION_NAME: &str = "ARROW:extension:name";
+const EXTENSION_METADATA: &str = "ARROW:extension:metadata";
+
+/// What a Tenzir extension-typed field turns into for the JSON writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TenzirExtension {
+    /// `tenzir.ip`: FixedSizeBinary(16), IPv4 stored IPv4-mapped.
+    Ip,
+    /// `tenzir.subnet`: struct{address: tenzir.ip, length: uint8}.
+    Subnet,
+}
+
+fn tenzir_extension(field: &Field) -> Option<TenzirExtension> {
+    let name = field.metadata().get(EXTENSION_NAME)?;
+    match (name.as_str(), field.data_type()) {
+        ("tenzir.ip" | "vast.ip", DataType::FixedSizeBinary(16)) => Some(TenzirExtension::Ip),
+        ("tenzir.subnet" | "vast.subnet", DataType::Struct(children))
+            if children.len() == 2
+                && children[0].data_type() == &DataType::FixedSizeBinary(16)
+                && children[1].data_type() == &DataType::UInt8 =>
+        {
+            Some(TenzirExtension::Subnet)
+        }
+        _ => None,
+    }
+}
+
+/// Text of one Tenzir IP: dotted quad for IPv4-mapped, canonical IPv6
+/// otherwise.
+fn tenzir_ip_text(bytes: &[u8]) -> Option<String> {
+    let octets: [u8; 16] = bytes.try_into().ok()?;
+    let ip = Ipv6Addr::from(octets);
+    Some(match ip.to_ipv4_mapped() {
+        Some(v4) => v4.to_string(),
+        None => ip.to_string(),
+    })
+}
+
+/// Text of one Tenzir subnet. Tenzir stores an IPv4 subnet's length in its
+/// IPv6-mapped form (`/24` is stored as 120); a mapped address with a length
+/// under 96 is a real IPv6 network (as Tenzir's own Python decoder reads it).
+fn tenzir_subnet_text(address: &[u8], length: u8) -> Option<String> {
+    let octets: [u8; 16] = address.try_into().ok()?;
+    let ip = Ipv6Addr::from(octets);
+    Some(match ip.to_ipv4_mapped() {
+        Some(v4) if (96..=128).contains(&length) => format!("{v4}/{}", length - 96),
+        _ if length <= 128 => format!("{ip}/{length}"),
+        _ => return None,
+    })
+}
+
+/// The field with its extension tag dropped and its type made Utf8.
+fn as_text_field(field: &Field) -> FieldRef {
+    let mut metadata = field.metadata().clone();
+    metadata.remove(EXTENSION_NAME);
+    metadata.remove(EXTENSION_METADATA);
+    Arc::new(Field::new(field.name(), DataType::Utf8, field.is_nullable()).with_metadata(metadata))
+}
+
+/// Rewrite one column whose (possibly nested) fields carry Tenzir extension
+/// types. `None` when nothing in it changes.
+fn decode_tenzir_column(field: &FieldRef, array: &ArrayRef) -> std::result::Result<Option<(FieldRef, ArrayRef)>, ArrowError> {
+    match tenzir_extension(field) {
+        Some(TenzirExtension::Ip) => {
+            let ips = array.as_fixed_size_binary();
+            let text: StringArray = (0..ips.len())
+                .map(|i| if ips.is_null(i) { None } else { tenzir_ip_text(ips.value(i)) })
+                .collect();
+            return Ok(Some((as_text_field(field), Arc::new(text))));
+        }
+        Some(TenzirExtension::Subnet) => {
+            let subnets = array.as_struct();
+            let addresses = subnets.column(0).as_fixed_size_binary();
+            let lengths = subnets.column(1).as_primitive::<UInt8Type>();
+            let text: StringArray = (0..subnets.len())
+                .map(|i| {
+                    if subnets.is_null(i) || addresses.is_null(i) || lengths.is_null(i) {
+                        None
+                    } else {
+                        tenzir_subnet_text(addresses.value(i), lengths.value(i))
+                    }
+                })
+                .collect();
+            return Ok(Some((as_text_field(field), Arc::new(text))));
+        }
+        None => {}
+    }
+    let rebuilt: ArrayRef = match field.data_type() {
+        DataType::Struct(children) => {
+            let structs = array.as_struct();
+            let Some((fields, columns)) = decode_tenzir_children(children, structs.columns())? else {
+                return Ok(None);
+            };
+            Arc::new(StructArray::try_new(fields, columns, structs.nulls().cloned())?)
+        }
+        DataType::List(item) => {
+            let list = array.as_list::<i32>();
+            let Some((item, values)) = decode_tenzir_column(item, list.values())? else {
+                return Ok(None);
+            };
+            Arc::new(ListArray::try_new(item, list.offsets().clone(), values, list.nulls().cloned())?)
+        }
+        DataType::LargeList(item) => {
+            let list = array.as_list::<i64>();
+            let Some((item, values)) = decode_tenzir_column(item, list.values())? else {
+                return Ok(None);
+            };
+            Arc::new(LargeListArray::try_new(item, list.offsets().clone(), values, list.nulls().cloned())?)
+        }
+        DataType::FixedSizeList(item, size) => {
+            let list = array.as_fixed_size_list();
+            let Some((item, values)) = decode_tenzir_column(item, list.values())? else {
+                return Ok(None);
+            };
+            Arc::new(FixedSizeListArray::try_new(item, *size, values, list.nulls().cloned())?)
+        }
+        DataType::Map(entries_field, sorted) => {
+            let map = array.as_map();
+            let entries: ArrayRef = Arc::new(map.entries().clone());
+            let Some((entries_field, entries)) = decode_tenzir_column(entries_field, &entries)? else {
+                return Ok(None);
+            };
+            Arc::new(MapArray::try_new(
+                entries_field,
+                map.offsets().clone(),
+                entries.as_struct().clone(),
+                map.nulls().cloned(),
+                *sorted,
+            )?)
+        }
+        _ => return Ok(None),
+    };
+    let field = Arc::new(field.as_ref().clone().with_data_type(rebuilt.data_type().clone()));
+    Ok(Some((field, rebuilt)))
+}
+
+/// Rewrite a set of sibling columns; `None` when none of them changes.
+#[allow(clippy::type_complexity)]
+fn decode_tenzir_children(
+    fields: &Fields,
+    columns: &[ArrayRef],
+) -> std::result::Result<Option<(Fields, Vec<ArrayRef>)>, ArrowError> {
+    let mut changed = false;
+    let mut out_fields = Vec::with_capacity(fields.len());
+    let mut out_columns = Vec::with_capacity(columns.len());
+    for (field, column) in fields.iter().zip(columns) {
+        match decode_tenzir_column(field, column)? {
+            Some((field, column)) => {
+                changed = true;
+                out_fields.push(field);
+                out_columns.push(column);
+            }
+            None => {
+                out_fields.push(field.clone());
+                out_columns.push(column.clone());
+            }
+        }
+    }
+    Ok(changed.then(|| (Fields::from(out_fields), out_columns)))
+}
+
+/// Tenzir's `write_parquet` keeps its Arrow extension types (NAN-4301):
+/// `tenzir.ip` is 16 raw bytes and `tenzir.subnet` a struct of those plus a
+/// length, which Arrow's JSON writer would emit as hex / an object and the
+/// strict OCSF `ip_t` / `subnet_t` checks would refuse. Rewrite them, at any
+/// depth (struct, list, map), to the text OCSF expects; nulls stay null.
+/// `tenzir.enumeration` is a string dictionary the JSON writer already
+/// writes as its text, so it is left alone.
+fn decode_tenzir_extensions(batch: RecordBatch) -> std::result::Result<RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    let Some((fields, columns)) = decode_tenzir_children(schema.fields(), batch.columns())? else {
+        return Ok(batch);
+    };
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new_with_options(schema, columns, &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))
 }
 
 /// OCSF `time` is epoch milliseconds. A typed Tenzir time column arrives as
@@ -255,20 +585,27 @@ pub fn encode_bronze(rows: &[&BronzeRow]) -> Result<Vec<u8>> {
     ]));
     let events = StringArray::from_iter_values(rows.iter().map(|row| row.event_json.as_str()));
     let times = TimestampMicrosecondArray::from_iter_values(rows.iter().map(|row| row.time_micros)).with_timezone("UTC");
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(events) as ArrayRef, Arc::new(times) as ArrayRef])?;
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(events) as ArrayRef, Arc::new(times) as ArrayRef])?;
+    encode_bronze_batch(&batch)
+}
+
+/// Encode one bronze record batch (the fixed bronze row contract) exactly
+/// as [`encode_bronze`] does. The hosted emitter re-encodes slices of a
+/// converted object with it to fit edge-log segments (NAN-4137).
+pub fn encode_bronze_batch(batch: &RecordBatch) -> Result<Vec<u8>> {
     let properties = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(BRONZE_ZSTD_LEVEL)?))
         .build();
     let mut out = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties))?;
-    writer.write(&batch)?;
+    let mut writer = ArrowWriter::try_new(&mut out, batch.schema(), Some(properties))?;
+    writer.write(batch)?;
     writer.close()?;
     Ok(out)
 }
 
 /// Read back an encoded bronze object the way admission does: one decoded
 /// event per row, in order.
-fn decode_bronze(bytes: &[u8]) -> Result<Vec<Result<Value>>> {
+pub(crate) fn decode_bronze(bytes: &[u8]) -> Result<Vec<Result<Value>>> {
     let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))?.build()?;
     let mut out = Vec::new();
     for batch in reader {
@@ -287,7 +624,30 @@ pub fn bronze_key(partition: &str, tenant_id: &str, now: DateTime<Utc>) -> Strin
     format!("{BRONZE_PREFIX}{partition}tenant_id={tenant_id}/{}-{}.parquet", now.timestamp(), Uuid::new_v4())
 }
 
+/// Most rows one emitted bronze object carries (NAN-4319), as Vector's
+/// bronze sink batches (`VECTOR_LAKE_BATCH_MAX_EVENTS` default). ingest[T]
+/// admits an object whole, so a landed file is cut into Vector-shaped
+/// objects: a 50k-row Tenzir file as one object OOM-killed ingest.
+pub const MAX_OBJECT_ROWS: usize = 10_000;
+/// Most `_nano_bronze_event` bytes one emitted bronze object carries, as
+/// Vector's bronze sink batches (`VECTOR_LAKE_BATCH_MAX_BYTES` default).
+pub const MAX_OBJECT_EVENT_BYTES: usize = 32 * 1024 * 1024;
+
+/// One bronze shard's rows not yet encoded (at most one object's worth).
+#[derive(Default)]
+struct PendingObject {
+    rows: Vec<BronzeRow>,
+    event_bytes: usize,
+}
+
 /// Convert one landed file. `Err` refuses the file whole.
+///
+/// Streams (NAN-4319): rows are read, staged and pre-checked [`ROW_CHUNK`]
+/// at a time, and accepted rows are encoded into bronze objects of at most
+/// [`MAX_OBJECT_ROWS`] rows / [`MAX_OBJECT_EVENT_BYTES`] event bytes as they
+/// fill. Peak memory is one chunk plus one pending object per bronze shard,
+/// independent of the file's row count; only the encoded (compressed)
+/// objects are kept until the emit.
 pub fn convert_file(
     bytes: &[u8],
     format: FileFormat,
@@ -296,71 +656,153 @@ pub fn convert_file(
     source: &LandingSource,
     now: DateTime<Utc>,
 ) -> std::result::Result<Converted, FileRefusal> {
-    let content_sha256 = hex::encode(Sha256::digest(bytes));
-    let rows = read_rows(bytes, format)?;
-    let credential = source.credential_id.hyphenated().to_string();
-    let mut prepared = Vec::with_capacity(rows.len());
-    let mut rows_refused = 0_u64;
-    let mut first_refusal: Option<RowRefusal> = None;
-    let mut note = |refusal: RowRefusal, refused: &mut u64| {
-        *refused += 1;
-        first_refusal.get_or_insert(refusal);
-    };
-    for (ordinal, mut row) in rows.into_iter().enumerate() {
-        if !row.is_object() {
-            note(RowRefusal::new("event_not_object", None), &mut rows_refused);
-            continue;
+    convert_landed(bytes, format, None, stage, tenant_id, source, now)
+}
+
+/// Apply the key's Hive `class_uid` partition to one row (NAN-4337): a row
+/// without the column takes it (`Ok(true)`); a row whose own `class_uid`
+/// disagrees with the folder refuses the whole file, since the sender's
+/// path and data contradict each other.
+fn apply_partition_class(row: &mut Value, partition: Option<u32>) -> std::result::Result<bool, FileRefusal> {
+    let (Some(class), Some(object)) = (partition, row.as_object_mut()) else { return Ok(false) };
+    match object.get("class_uid") {
+        None | Some(Value::Null) => {
+            object.insert("class_uid".to_string(), Value::from(class));
+            Ok(true)
         }
-        normalize_time(&mut row);
-        let ctx = StageContext {
-            tenant_id,
-            source_type: &source.route_key,
-            credential_id: &credential,
-            event_key: Some(format!("{content_sha256}:{ordinal}")),
-        };
-        match stage.prepare(row, &ctx) {
-            Ok(bronze) => prepared.push(bronze),
-            Err(_) => note(RowRefusal::new("storage_stage_dropped", None), &mut rows_refused),
-        }
+        Some(value) if value.as_u64() == Some(u64::from(class)) => Ok(false),
+        Some(_) => Err(FileRefusal {
+            reason: "class_uid_partition_conflict",
+            rows: 0,
+            detail: Some(RefusalDetail { class_uid: Some(class), field: Some("class_uid".to_string()) }),
+        }),
     }
-    // Pre-check exactly what admission will read: encode, decode, check.
-    let mut accepted: Vec<&BronzeRow> = Vec::with_capacity(prepared.len());
-    if !prepared.is_empty() {
+}
+
+/// [`convert_file`] for a landed key: `partition_class_uid` is the key's
+/// Hive `class_uid=<N>` folder ([`LandingKey::partition_class_uid`]).
+pub fn convert_landed(
+    bytes: &[u8],
+    format: FileFormat,
+    partition_class_uid: Option<u32>,
+    stage: &LandingOcsfStage,
+    tenant_id: &str,
+    source: &LandingSource,
+    now: DateTime<Utc>,
+) -> std::result::Result<Converted, FileRefusal> {
+    let content_sha256 = hex::encode(Sha256::digest(bytes));
+    let credential = source.credential_id.hyphenated().to_string();
+    let mut rows_refused = 0_u64;
+    let mut rows_accepted = 0_u64;
+    let mut rows_class_from_path = 0_u64;
+    // NAN-4336: future-dated rows clamp to the conversion time (the same
+    // rule ingest[T] applies to every source), counted for the ledger.
+    let ingest_ms = now.timestamp_millis();
+    let mut rows_time_clamped = 0_u64;
+    // Every refused row is counted; the first one's reason and detail are
+    // kept (NAN-4321: rows of an accepted file used to vanish unreported).
+    let mut first_refusal: Option<(RowRefusal, Option<u32>)> = None;
+    let mut ordinal = 0_usize;
+    let mut pending: BTreeMap<String, PendingObject> = BTreeMap::new();
+    let mut objects = Vec::new();
+    let encode = |partition: &str, object: PendingObject, objects: &mut Vec<(String, Vec<u8>, u64)>| {
+        let rows = object.rows.iter().collect::<Vec<_>>();
+        let bytes = encode_bronze(&rows).or_else(|_| refuse("bronze_encode_failed"))?;
+        objects.push((bronze_key(partition, tenant_id, now), bytes, rows.len() as u64));
+        Ok::<_, FileRefusal>(())
+    };
+    visit_rows(bytes, format, |chunk| {
+        let mut note = |refusal: RowRefusal, class_uid: Option<u32>| {
+            rows_refused += 1;
+            first_refusal.get_or_insert((refusal, class_uid));
+        };
+        let mut prepared = Vec::with_capacity(chunk.len());
+        let mut classes = Vec::with_capacity(chunk.len());
+        let mut clamped = Vec::with_capacity(chunk.len());
+        for mut row in chunk {
+            let this = ordinal;
+            ordinal += 1;
+            if !row.is_object() {
+                note(RowRefusal::new("event_not_object", None), None);
+                continue;
+            }
+            if !looks_like_ocsf(&row) {
+                note(RowRefusal::new("not_ocsf", None), None);
+                continue;
+            }
+            if apply_partition_class(&mut row, partition_class_uid)? {
+                rows_class_from_path += 1;
+            }
+            let class_uid = class_uid_of(&row);
+            normalize_time(&mut row);
+            let row_clamped = crate::bronze::clamp_future_event_time(&mut row, ingest_ms);
+            let ctx = StageContext {
+                tenant_id,
+                source_type: &source.route_key,
+                credential_id: &credential,
+                event_key: Some(format!("{content_sha256}:{this}")),
+            };
+            match stage.prepare(row, &ctx) {
+                Ok(bronze) => {
+                    prepared.push(bronze);
+                    classes.push(class_uid);
+                    clamped.push(row_clamped);
+                }
+                Err(_) => note(RowRefusal::new("storage_stage_dropped", None), class_uid),
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        // Pre-check exactly what admission will read: encode, decode, check.
         let all = prepared.iter().collect::<Vec<_>>();
         let encoded = encode_bronze(&all).or_else(|_| refuse("bronze_encode_failed"))?;
+        drop(all);
         let decoded = decode_bronze(&encoded).or_else(|_| refuse("bronze_encode_failed"))?;
+        drop(encoded);
         if decoded.len() != prepared.len() {
             return refuse("bronze_encode_failed");
         }
-        for (row, event) in prepared.iter().zip(decoded) {
+        // Each row stands alone: a file mixing classes keeps every valid
+        // row of every class, and each refused row is counted with its class.
+        for (((row, event), class_uid), row_clamped) in prepared.into_iter().zip(decoded).zip(classes).zip(clamped) {
             let verdict = event
                 .map_err(|error| crate::bronze::classify_row_refusal(&error))
                 .and_then(|event| precheck_source_row(event, tenant_id));
-            match verdict {
-                Ok(()) => accepted.push(row),
-                Err(refusal) => note(refusal, &mut rows_refused),
+            if let Err(refusal) = verdict {
+                note(refusal, class_uid);
+                continue;
             }
+            rows_accepted += 1;
+            rows_time_clamped += u64::from(row_clamped);
+            let object = pending.entry(row.partition.clone()).or_default();
+            if !object.rows.is_empty()
+                && (object.rows.len() >= MAX_OBJECT_ROWS || object.event_bytes + row.event_json.len() > MAX_OBJECT_EVENT_BYTES)
+            {
+                let full = std::mem::take(object);
+                encode(&row.partition, full, &mut objects)?;
+            }
+            let object = pending.entry(row.partition.clone()).or_default();
+            object.event_bytes += row.event_json.len();
+            object.rows.push(row);
+        }
+        Ok(())
+    })?;
+    for (partition, object) in std::mem::take(&mut pending) {
+        if !object.rows.is_empty() {
+            encode(&partition, object, &mut objects)?;
         }
     }
-    if accepted.is_empty() {
-        return Err(FileRefusal { reason: first_refusal.map_or("no_rows", |r| r.reason) });
+    let first_refusal_detail = first_refusal.as_ref().and_then(|(refusal, class_uid)| RefusalDetail::of(refusal, *class_uid));
+    let first_refusal = first_refusal.map(|(refusal, _)| refusal);
+    if rows_accepted == 0 {
+        return Err(FileRefusal {
+            reason: first_refusal.map_or("no_rows", |r| r.reason),
+            rows: rows_refused,
+            detail: first_refusal_detail,
+        });
     }
-    let mut by_partition: BTreeMap<&str, Vec<&BronzeRow>> = BTreeMap::new();
-    for row in &accepted {
-        by_partition.entry(row.partition.as_str()).or_default().push(row);
-    }
-    let mut objects = Vec::with_capacity(by_partition.len());
-    for (partition, rows) in by_partition {
-        let bytes = encode_bronze(&rows).or_else(|_| refuse("bronze_encode_failed"))?;
-        objects.push((bronze_key(partition, tenant_id, now), bytes, rows.len() as u64));
-    }
-    Ok(Converted {
-        objects,
-        rows_accepted: accepted.len() as u64,
-        rows_refused,
-        first_refusal,
-        content_sha256,
-    })
+    Ok(Converted { objects, rows_accepted, rows_refused, first_refusal, first_refusal_detail, rows_class_from_path, content_sha256, rows_time_clamped })
 }
 
 /// How a claim came out.
@@ -393,6 +835,227 @@ pub struct TickReport {
     pub redelivered: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Hosted (NAN-4137): files handed back unfinished because the output
+    /// (the tenant edge log) applied backpressure. No attempt is spent; the
+    /// tick stops at the first one. Always 0 on open core.
+    pub held: usize,
+}
+
+// ------------------------------------------------------------ discover / emit
+//
+// NAN-4137: one conversion engine, two deployments.
+//
+// | step     | open core (`Converter`)                 | hosted (`landing[T]`, `landing_hosted`)          |
+// |----------|-----------------------------------------|--------------------------------------------------|
+// | discover | list the landing prefix, claim per      | lease files from the tenant's landing ledger DO  |
+// |          | `(key, etag)` in Postgres               | (epoch-fenced)                                   |
+// | emit     | one `bronze-v2/` object per shard       | edge-log appends of at most 8 MiB each           |
+// | finish   | delete, then record in Postgres         | commit to the DO, then delete                    |
+//
+// Everything between (key parsing, the source check, size caps, read,
+// `convert_file`, refusal reasons, attempts) is the same code for both.
+
+/// One landed file a [`Discover`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub key: String,
+    /// The listing's etag (open core) or the ledger's (hosted).
+    pub etag: Option<String>,
+    pub size: u64,
+    /// Hosted: the ledger already leased this file to this converter.
+    pub leased: Option<LeasedFile>,
+}
+
+/// A file the hosted ledger leased (its claim is the lease).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedFile {
+    /// The ledger's sequence for the file.
+    pub id: i64,
+    pub attempt: i32,
+    /// The consumer epoch that leased it (every write about it carries it).
+    pub epoch: u64,
+    /// When the file landed (ms since the epoch), if the ledger said.
+    pub landed_at_ms: Option<i64>,
+    /// The source the Worker resolved from the sender's key. The folder in
+    /// the key must name the same source, or the file is refused.
+    pub source: Option<LandingSource>,
+}
+
+/// A candidate after its claim.
+#[derive(Debug)]
+pub struct Claimed {
+    pub claim: Claim,
+    pub size: u64,
+    /// Bytes already read while resolving the claim (open core: a store
+    /// that reports no etag is claimed by content digest).
+    pub preloaded: Option<Vec<u8>>,
+}
+
+/// Where landed files come from and where their outcomes go.
+#[async_trait]
+pub trait Discover: Send + Sync {
+    /// The files to look at this tick, in order, and how many were seen.
+    async fn discover(&self, store: &Operator, tenant_id: &str, max: usize) -> Result<(usize, Vec<Candidate>)>;
+    /// Claim one candidate (`source_id`: the folder's, when the key parses).
+    async fn claim(&self, store: &Operator, candidate: &Candidate, source_id: Option<Uuid>) -> Result<Claimed>;
+    /// The source named by the key's folder.
+    async fn source(&self, candidate: &Candidate, source_id: Uuid) -> Result<Option<LandingSource>>;
+    /// The rows are durable downstream (`emitted`): finish the file.
+    async fn finish_accepted(&self, store: &Operator, candidate: &Candidate, id: i64, converted: &Converted, emitted: &str) -> Result<()>;
+    /// The file is refused whole: move it aside and record the reason.
+    async fn finish_refused(&self, store: &Operator, candidate: &Candidate, id: i64, refusal: &FileRefusal, sha: Option<&str>)
+        -> Result<()>;
+    /// An already finished file reappeared.
+    async fn finish_redelivered(&self, store: &Operator, candidate: &Candidate, id: i64) -> Result<()>;
+    /// Hand an unfinished file back without spending an attempt (the output
+    /// applied [`Backpressure`]).
+    async fn release(&self, _candidate: &Candidate, _id: i64) -> Result<()> {
+        Ok(())
+    }
+    /// The file was not finished (a transient store, ledger or output
+    /// failure). Open core: its claim's lease expires and a later tick
+    /// retries it. Hosted: the ledger is told to land it again.
+    async fn failed(&self, _store: &Operator, _candidate: &Candidate) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Where converted rows go.
+#[async_trait]
+pub trait Emit: Send + Sync {
+    /// Make `converted` durable downstream. Returns what the ledger records
+    /// (comma-separated object keys or segment sequences). An error that is
+    /// [`Backpressure`] holds the file without spending an attempt; one that
+    /// is a [`FileRefusal`] refuses it whole (decide that before writing).
+    async fn emit(&self, store: &Operator, tenant_id: &str, candidate: &Candidate, converted: &Converted) -> Result<String>;
+}
+
+/// The output is full (the tenant edge log refuses appends with 503 while
+/// its backlog is over its cap, e.g. under an over-commit hold): hold the
+/// file where it is, never refuse it for this.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("landing output is applying backpressure; the file is held")]
+pub struct Backpressure;
+
+/// The discoverer lost its authority to finish files (hosted: a newer
+/// consumer holds the landing ledger lease). The tick stops and returns it;
+/// nothing is committed under a stale epoch.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("landing ledger lease is held by a newer consumer (fenced)")]
+pub struct Fenced;
+
+/// Open core: claim by listing the tenant's landing folder.
+pub struct PrefixDiscover<'a, L: Ledger> {
+    pub ledger: &'a L,
+}
+
+#[async_trait]
+impl<L: Ledger> Discover for PrefixDiscover<'_, L> {
+    async fn discover(&self, store: &Operator, tenant_id: &str, max: usize) -> Result<(usize, Vec<Candidate>)> {
+        let prefix = format!("{LANDING_PREFIX}tenant_id={tenant_id}/");
+        let entries = store.list_with(&prefix).recursive(true).await.context("list landing prefix")?;
+        let mut objects = entries
+            .into_iter()
+            .filter(|entry| !entry.path().ends_with('/'))
+            .collect::<Vec<_>>();
+        objects.sort_by(|a, b| a.path().cmp(b.path()));
+        let listed = objects.len();
+        let candidates = objects
+            .into_iter()
+            .take(max)
+            .map(|entry| Candidate {
+                key: entry.path().to_string(),
+                etag: entry.metadata().etag().map(str::to_string),
+                size: entry.metadata().content_length(),
+                leased: None,
+            })
+            .collect();
+        Ok((listed, candidates))
+    }
+
+    async fn claim(&self, store: &Operator, candidate: &Candidate, source_id: Option<Uuid>) -> Result<Claimed> {
+        let key = candidate.key.as_str();
+        // Listings normally carry the etag; stat when they do not, and fall
+        // back to the content digest for a store that reports none.
+        let mut preloaded: Option<Vec<u8>> = None;
+        let (etag, size) = match candidate.etag.as_deref().map(|etag| etag.trim_matches('"')) {
+            Some(etag) if !etag.is_empty() => (etag.to_string(), candidate.size),
+            _ => {
+                let meta = store.stat(key).await.context("stat landed object")?;
+                match meta.etag().map(|etag| etag.trim_matches('"')).filter(|etag| !etag.is_empty()) {
+                    Some(etag) => (etag.to_string(), meta.content_length()),
+                    None => {
+                        if meta.content_length() > MAX_LANDING_BYTES {
+                            (format!("size:{}", meta.content_length()), meta.content_length())
+                        } else {
+                            let bytes = store.read(key).await.context("read landed object")?.to_vec();
+                            let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+                            let size = bytes.len() as u64;
+                            preloaded = Some(bytes);
+                            (digest, size)
+                        }
+                    }
+                }
+            }
+        };
+        let claim = self.ledger.claim(key, &etag, size, source_id).await?;
+        Ok(Claimed { claim, size, preloaded })
+    }
+
+    async fn source(&self, _candidate: &Candidate, source_id: Uuid) -> Result<Option<LandingSource>> {
+        self.ledger.source(source_id).await
+    }
+
+    async fn finish_accepted(&self, store: &Operator, candidate: &Candidate, id: i64, converted: &Converted, emitted: &str) -> Result<()> {
+        // Bronze is durable before the landed object goes: a crash here only
+        // means a reconversion, whose rows the uid window drops.
+        store.delete(&candidate.key).await.context("delete converted landed object")?;
+        self.ledger.accepted(id, converted, emitted).await
+    }
+
+    async fn finish_refused(&self, store: &Operator, candidate: &Candidate, id: i64, refusal: &FileRefusal, sha: Option<&str>)
+        -> Result<()> {
+        move_aside(store, &candidate.key).await?;
+        store.delete(&candidate.key).await.context("delete refused landed object")?;
+        self.ledger.refused(id, refusal.reason, refusal.rows, sha).await
+    }
+
+    async fn finish_redelivered(&self, store: &Operator, candidate: &Candidate, id: i64) -> Result<()> {
+        store.delete(&candidate.key).await.context("delete redelivered landed object")?;
+        self.ledger.redelivered(id).await
+    }
+}
+
+/// Copy a refused landed object under [`REFUSED_PREFIX`] (the caller
+/// deletes the original).
+pub async fn move_aside(store: &Operator, key: &str) -> Result<()> {
+    let target = refused_key(key);
+    match store.copy(key, &target).await {
+        Ok(_) => Ok(()),
+        // A store without server-side copy: move it through this process.
+        Err(error) if error.kind() == opendal::ErrorKind::Unsupported => {
+            let body = store.read(key).await.context("read refused landed object")?;
+            store.write(&target, body).await.context("move refused landed object aside")?;
+            Ok(())
+        }
+        Err(error) => Err(anyhow::Error::from(error).context("move refused landed object aside")),
+    }
+}
+
+/// Open core: one `bronze-v2/` object per bronze shard, written to the
+/// same store; part ingest lists them like any Vector object.
+pub struct BronzeObjects;
+
+#[async_trait]
+impl Emit for BronzeObjects {
+    async fn emit(&self, store: &Operator, _tenant_id: &str, _candidate: &Candidate, converted: &Converted) -> Result<String> {
+        let mut keys = Vec::with_capacity(converted.objects.len());
+        for (bronze_key, body, _) in &converted.objects {
+            store.write(bronze_key, body.clone()).await.context("write bronze object")?;
+            keys.push(bronze_key.as_str());
+        }
+        Ok(keys.join(","))
+    }
 }
 
 /// The converter: one object store, one tenant, one ledger.
@@ -408,132 +1071,148 @@ pub struct Converter<L: Ledger> {
 impl<L: Ledger> Converter<L> {
     /// List the tenant's landing folder and handle every unfinished object.
     pub async fn tick(&self) -> Result<TickReport> {
-        let prefix = format!("{LANDING_PREFIX}tenant_id={}/", self.tenant_id);
+        let discover = PrefixDiscover { ledger: &self.ledger };
+        Engine {
+            store: &self.store,
+            discover: &discover,
+            emit: &BronzeObjects,
+            stage: &self.stage,
+            tenant_id: &self.tenant_id,
+            max_files_per_tick: self.max_files_per_tick,
+        }
+        .tick()
+        .await
+    }
+}
+
+/// One tick's wiring: a store, a [`Discover`], an [`Emit`] and the stage.
+pub struct Engine<'a, D: Discover, E: Emit> {
+    pub store: &'a Operator,
+    pub discover: &'a D,
+    pub emit: &'a E,
+    pub stage: &'a LandingOcsfStage,
+    pub tenant_id: &'a str,
+    /// Most files handled per tick.
+    pub max_files_per_tick: usize,
+}
+
+impl<D: Discover, E: Emit> Engine<'_, D, E> {
+    /// Discover and handle every unfinished file. One file never blocks
+    /// another: a transient failure leaves it for a later tick.
+    pub async fn tick(&self) -> Result<TickReport> {
         let mut report = TickReport::default();
-        let entries = self.store.list_with(&prefix).recursive(true).await.context("list landing prefix")?;
-        let mut objects = entries
-            .into_iter()
-            .filter(|entry| !entry.path().ends_with('/'))
-            .collect::<Vec<_>>();
-        objects.sort_by(|a, b| a.path().cmp(b.path()));
-        report.listed = objects.len();
-        for entry in objects.into_iter().take(self.max_files_per_tick) {
-            let key = entry.path().to_string();
-            match self.handle(&key, entry.metadata().etag(), entry.metadata().content_length()).await {
+        let (listed, candidates) = self.discover.discover(self.store, self.tenant_id, self.max_files_per_tick).await?;
+        report.listed = listed;
+        for candidate in candidates {
+            match self.handle(&candidate).await {
                 Ok(Outcome::Accepted) => report.accepted += 1,
                 Ok(Outcome::Refused) => report.refused += 1,
                 Ok(Outcome::Redelivered) => report.redelivered += 1,
                 Ok(Outcome::Skipped) => report.skipped += 1,
+                Ok(Outcome::Held) => {
+                    report.held += 1;
+                    break;
+                }
+                Err(error) if error.downcast_ref::<Fenced>().is_some() => return Err(error),
                 Err(error) => {
-                    // Transient (store or database): the lease expires and a
-                    // later tick retries this file; the rest go on.
-                    tracing::warn!(error = %format!("{error:#}"), "landing file not finished; retrying after its lease");
+                    // Transient (store, database or output): open core lets
+                    // the lease expire; hosted hands the file back to the
+                    // ledger. A later tick retries it; the rest go on.
+                    tracing::warn!(error = %format!("{error:#}"), "landing file not finished; retrying it later");
                     report.failed += 1;
+                    match self.discover.failed(self.store, &candidate).await {
+                        Ok(()) => {}
+                        Err(error) if error.downcast_ref::<Fenced>().is_some() => return Err(error),
+                        Err(error) => tracing::warn!(error = %format!("{error:#}"), "landing file hand-back failed"),
+                    }
                 }
             }
         }
         Ok(report)
     }
 
-    async fn handle(&self, key: &str, listed_etag: Option<&str>, listed_size: u64) -> Result<Outcome> {
-        // Listings normally carry the etag; stat when they do not, and fall
-        // back to the content digest for a store that reports none.
-        let mut preloaded: Option<Vec<u8>> = None;
-        let (etag, size) = match listed_etag.map(|etag| etag.trim_matches('"')) {
-            Some(etag) if !etag.is_empty() => (etag.to_string(), listed_size),
-            _ => {
-                let meta = self.store.stat(key).await.context("stat landed object")?;
-                match meta.etag().map(|etag| etag.trim_matches('"')).filter(|etag| !etag.is_empty()) {
-                    Some(etag) => (etag.to_string(), meta.content_length()),
-                    None => {
-                        if meta.content_length() > MAX_LANDING_BYTES {
-                            (format!("size:{}", meta.content_length()), meta.content_length())
-                        } else {
-                            let bytes = self.store.read(key).await.context("read landed object")?.to_vec();
-                            let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
-                            let size = bytes.len() as u64;
-                            preloaded = Some(bytes);
-                            (digest, size)
-                        }
-                    }
-                }
-            }
-        };
-        let parsed = parse_key(key, &self.tenant_id);
+    async fn handle(&self, candidate: &Candidate) -> Result<Outcome> {
+        let key = candidate.key.as_str();
+        let parsed = parse_key(key, self.tenant_id);
         let source_id = parsed.as_ref().ok().map(|k| k.source_id);
-        let (id, attempt) = match self.ledger.claim(key, &etag, size, source_id).await? {
+        let Claimed { claim, size, preloaded } = self.discover.claim(self.store, candidate, source_id).await?;
+        let (id, attempt) = match claim {
             Claim::Owned { id, attempt } => (id, attempt),
             Claim::Leased => return Ok(Outcome::Skipped),
             Claim::Finished { id } => {
-                self.store.delete(key).await.context("delete redelivered landed object")?;
-                self.ledger.redelivered(id).await?;
+                self.discover.finish_redelivered(self.store, candidate, id).await?;
                 tracing::info!(source_id = ?source_id, "landed file redelivered after it finished; deleted without reconverting");
                 return Ok(Outcome::Redelivered);
             }
         };
         if attempt > MAX_ATTEMPTS {
-            return self.refuse_whole(id, key, "attempts_exhausted", 0, None).await;
+            return self.refuse_whole(candidate, id, FileRefusal::new("attempts_exhausted"), None).await;
         }
         let parsed = match parsed {
             Ok(parsed) => parsed,
-            Err(reason) => return self.refuse_whole(id, key, reason, 0, None).await,
+            Err(reason) => return self.refuse_whole(candidate, id, FileRefusal::new(reason), None).await,
         };
-        let source = match self.ledger.source(parsed.source_id).await? {
+        let source = match self.discover.source(candidate, parsed.source_id).await? {
             Some(source) if source.active => source,
-            Some(_) => return self.refuse_whole(id, key, "source_revoked", 0, None).await,
-            None => return self.refuse_whole(id, key, "source_unknown", 0, None).await,
+            Some(_) => return self.refuse_whole(candidate, id, FileRefusal::new("source_revoked"), None).await,
+            None => return self.refuse_whole(candidate, id, FileRefusal::new("source_unknown"), None).await,
         };
         if size > MAX_LANDING_BYTES {
-            return self.refuse_whole(id, key, "file_too_large", 0, None).await;
+            return self.refuse_whole(candidate, id, FileRefusal::new("file_too_large"), None).await;
         }
         let bytes = match preloaded {
             Some(bytes) => bytes,
             None => self.store.read(key).await.context("read landed object")?.to_vec(),
         };
         if bytes.len() as u64 > MAX_LANDING_BYTES {
-            return self.refuse_whole(id, key, "file_too_large", 0, None).await;
+            return self.refuse_whole(candidate, id, FileRefusal::new("file_too_large"), None).await;
         }
-        let converted = match convert_file(&bytes, parsed.format, &self.stage, &self.tenant_id, &source, Utc::now()) {
+        let converted = match convert_landed(&bytes, parsed.format, parsed.partition_class_uid, self.stage, self.tenant_id, &source, Utc::now()) {
             Ok(converted) => converted,
-            Err(FileRefusal { reason }) => {
+            Err(refusal) => {
                 let sha = hex::encode(Sha256::digest(&bytes));
-                return self.refuse_whole(id, key, reason, 0, Some(&sha)).await;
+                return self.refuse_whole(candidate, id, refusal, Some(&sha)).await;
             }
         };
-        let mut keys = Vec::with_capacity(converted.objects.len());
-        for (bronze_key, body, _) in &converted.objects {
-            self.store.write(bronze_key, body.clone()).await.context("write bronze object")?;
-            keys.push(bronze_key.as_str());
-        }
-        // Bronze is durable before the landed object goes: a crash here only
-        // means a reconversion, whose rows the uid window drops.
-        self.store.delete(key).await.context("delete converted landed object")?;
-        self.ledger.accepted(id, &converted, &keys.join(",")).await?;
+        let emitted = match self.emit.emit(self.store, self.tenant_id, candidate, &converted).await {
+            Ok(emitted) => emitted,
+            Err(error) if error.downcast_ref::<Backpressure>().is_some() => {
+                self.discover.release(candidate, id).await?;
+                tracing::info!(source_id = %source.source_id, "landing output is full; file held for a later tick");
+                return Ok(Outcome::Held);
+            }
+            // The output cannot take this file at all (hosted: a row larger
+            // than one edge segment). Decided before anything is appended.
+            Err(error) => match error.downcast_ref::<FileRefusal>() {
+                Some(refusal) => {
+                    let refusal = refusal.clone();
+                    return self.refuse_whole(candidate, id, refusal, Some(&converted.content_sha256)).await;
+                }
+                None => return Err(error),
+            },
+        };
+        self.discover.finish_accepted(self.store, candidate, id, &converted, &emitted).await?;
         tracing::info!(
             source_id = %source.source_id,
             rows_accepted = converted.rows_accepted,
             rows_refused = converted.rows_refused,
             first_row_reason = converted.first_refusal.as_ref().map_or("", |r| r.reason),
+            first_row_detail = converted.first_refusal_detail.as_ref().map(RefusalDetail::render).unwrap_or_default(),
+            rows_class_from_path = converted.rows_class_from_path,
             bronze_objects = converted.objects.len(),
             "landed file converted to bronze"
         );
         Ok(Outcome::Accepted)
     }
 
-    async fn refuse_whole(&self, id: i64, key: &str, reason: &'static str, rows: u64, sha: Option<&str>) -> Result<Outcome> {
-        let target = refused_key(key);
-        match self.store.copy(key, &target).await {
-            Ok(_) => {}
-            // A store without server-side copy: move it through this process.
-            Err(error) if error.kind() == opendal::ErrorKind::Unsupported => {
-                let body = self.store.read(key).await.context("read refused landed object")?;
-                self.store.write(&target, body).await.context("move refused landed object aside")?;
-            }
-            Err(error) => return Err(anyhow::Error::from(error).context("move refused landed object aside")),
-        }
-        self.store.delete(key).await.context("delete refused landed object")?;
-        self.ledger.refused(id, reason, rows, sha).await?;
-        tracing::warn!(reason, "landed file refused whole; moved under {REFUSED_PREFIX}");
+    async fn refuse_whole(&self, candidate: &Candidate, id: i64, refusal: FileRefusal, sha: Option<&str>) -> Result<Outcome> {
+        self.discover.finish_refused(self.store, candidate, id, &refusal, sha).await?;
+        tracing::warn!(
+            reason = refusal.reason,
+            rows_refused = refusal.rows,
+            detail = refusal.detail.as_ref().map(RefusalDetail::render).unwrap_or_default(),
+            "landed file refused whole; moved under {REFUSED_PREFIX}"
+        );
         Ok(Outcome::Refused)
     }
 }
@@ -543,6 +1222,7 @@ enum Outcome {
     Refused,
     Redelivered,
     Skipped,
+    Held,
 }
 
 /// The Postgres ledger (`landing_sources` / `landing_files`, migration 364).

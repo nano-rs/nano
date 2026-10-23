@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use std::sync::Arc;
 
-pub(super) const TENANT: &str = "3b8d2f61-5c7e-4a9b-8d1f-2e4c6a8b0d13";
+pub(crate) const TENANT: &str = "3b8d2f61-5c7e-4a9b-8d1f-2e4c6a8b0d13";
 /// Three bronze files, three parts, one event every 2 s (~1.7 h).
 pub(super) const ROWS: usize = 3_000;
 const PARTS: usize = 3;
@@ -39,6 +39,9 @@ pub(super) const DENSE_IP: &str = "10.9.9.9";
 pub(super) const SPARSE_IP: &str = "10.7.7.7";
 const SPARSE_ROWS: [usize; 3] = [5, 1_700, 2_900];
 pub(super) const DENSE_HOST: &str = "web1.corp.local";
+/// NAN-4157: in ~1/75 of the rows (not dense), ~13 per part: a `head 10`
+/// page fills inside the density-sized first chunk.
+pub(super) const MEDIUM_IP: &str = "10.8.8.8";
 
 fn signer() -> LocalPartSigner {
     LocalPartSigner::new(
@@ -53,6 +56,8 @@ pub(super) fn src_ip(i: usize) -> String {
         SPARSE_IP.to_string()
     } else if i % 3 == 0 {
         DENSE_IP.to_string()
+    } else if i % 50 == 1 {
+        MEDIUM_IP.to_string()
     } else {
         format!("10.1.{}.{}", i / 250, i % 250)
     }
@@ -116,6 +121,16 @@ fn event_time(now: DateTime<Utc>, i: usize) -> DateTime<Utc> {
 }
 
 pub(super) async fn ingest(root: &std::path::Path, now: DateTime<Utc>) {
+    let per = ROWS / PARTS;
+    // Oldest first, so each part is a disjoint, older-to-newer time slice.
+    let batches = (0..PARTS)
+        .map(|n| ((PARTS - 1 - n) * per..(PARTS - n) * per).map(|i| event(i, &event_time(now, i).to_rfc3339())).collect())
+        .collect();
+    ingest_parts(root, now, batches).await;
+}
+
+/// Ingest `batches` as one part each, in order (oldest first).
+pub(crate) async fn ingest_parts(root: &std::path::Path, now: DateTime<Utc>, batches: Vec<Vec<Value>>) {
     let parts = LocalObjectStore::new(root.join("parts")).unwrap();
     let sources_dir = root.join("sources");
     std::fs::create_dir_all(sources_dir.join("bronze")).unwrap();
@@ -138,13 +153,7 @@ pub(super) async fn ingest(root: &std::path::Path, now: DateTime<Utc>) {
     )
     .await
     .expect("ingest opens");
-    let per = ROWS / PARTS;
-    // Oldest first, so each part is a disjoint, older-to-newer time slice.
-    for n in 0..PARTS {
-        let range = (PARTS - 1 - n) * per..(PARTS - n) * per;
-        let batch = range
-            .map(|i| event(i, &event_time(now, i).to_rfc3339()))
-            .collect::<Vec<_>>();
+    for (n, batch) in batches.into_iter().enumerate() {
         let key = format!("bronze/{n:04}.parquet");
         write_bronze(&sources_dir.join(&key), &batch);
         crate::bronze::admit_bronze_files(&[sources_dir.join(&key)], TENANT)
@@ -170,6 +179,12 @@ pub(super) async fn ingest(root: &std::path::Path, now: DateTime<Utc>) {
 }
 
 pub(super) async fn engine(root: &std::path::Path) -> PartQueryEngine {
+    engine_with_job_cap(root, 3 << 29, 2).await
+}
+
+/// [`engine`] with the large lane (the job lane's memory cap) at `job_bytes`
+/// and statements at `threads`, as the cell builds them.
+pub(crate) async fn engine_with_job_cap(root: &std::path::Path, job_bytes: u64, threads: u64) -> PartQueryEngine {
     let signer = signer();
     let state = root.join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -239,7 +254,7 @@ pub(super) async fn engine(root: &std::path::Path) -> PartQueryEngine {
             max_query_bytes: 64 << 30,
             max_memory_bytes: 256 << 20,
             max_execution_seconds: 120,
-            threads: 2,
+            threads,
         },
         store,
         view,
@@ -248,11 +263,11 @@ pub(super) async fn engine(root: &std::path::Path) -> PartQueryEngine {
     )
     .unwrap()
     .with_writer(writer)
-    .with_large(large, 3 << 29)
+    .with_large(large, job_bytes)
     .with_state_dir(&state)
 }
 
-pub(super) fn request(query: &str, now: DateTime<Utc>, limit: usize) -> BroadNplRequest {
+pub(crate) fn request(query: &str, now: DateTime<Utc>, limit: usize) -> BroadNplRequest {
     BroadNplRequest {
         request_id: "nan3158".into(),
         tenant_id: TENANT.into(),
@@ -276,41 +291,12 @@ pub(super) fn request(query: &str, now: DateTime<Utc>, limit: usize) -> BroadNpl
     }
 }
 
-pub(super) fn granted() -> nanosiem_core::platform_enrichment::read::ReadAuthorization {
-    use nanosiem_core::platform_enrichment::{AuthorizedRevision, FeedClass, RevisionReference};
-    let tenant: uuid::Uuid = TENANT.parse().unwrap();
-    let now = Utc::now();
-    nanosiem_core::platform_enrichment::read::ReadAuthorization::from_resolved(
-        tenant,
-        now,
-        &[AuthorizedRevision {
-            tenant_id: tenant,
-            reference: RevisionReference {
-                feed_id: "ipinfo_lite".into(),
-                feed_revision: 2,
-                tier: "included".into(),
-                grant_revision: 1,
-                entitlement_revision: 1,
-            },
-            class: FeedClass::Baseline,
-            digest: "0".repeat(64),
-            mapping_revision: 1,
-            deny_epoch: 0,
-            valid_until: now + Duration::days(30),
-            evaluated_at: now,
-        }],
-    )
-}
-
-pub(super) async fn envelope(engine: &PartQueryEngine, request: &BroadNplRequest) -> Value {
+pub(crate) async fn envelope(engine: &PartQueryEngine, request: &BroadNplRequest) -> Value {
     // Statement counts are per cold step: no locator reuse across runs.
     engine.clear_locator_cache();
     crate::query_timing::measure(
         "nan3158",
-        Box::pin(crate::enrichment_read::scope(
-            granted(),
-            engine.broad_npl(request),
-        )),
+        Box::pin(engine.broad_npl(request)),
     )
     .await
     .unwrap_or_else(|error| panic!("{}: {error}", request.query))
@@ -338,14 +324,14 @@ async fn with_seed(engine: &PartQueryEngine, request: &BroadNplRequest, on: bool
     answer
 }
 
-pub(super) fn rows_of(answer: &Value) -> Vec<Value> {
+pub(crate) fn rows_of(answer: &Value) -> Vec<Value> {
     answer["result"]["rows"]
         .as_array()
         .cloned()
         .unwrap_or_else(|| panic!("no rows in {answer}"))
 }
 
-pub(super) fn ordered_uids(rows: &[Value]) -> Vec<String> {
+pub(crate) fn ordered_uids(rows: &[Value]) -> Vec<String> {
     rows.iter()
         .map(|row| {
             row["metadata.uid"]
@@ -503,4 +489,126 @@ async fn density_seeded_pivots_match_where_and_run_two_statements() {
             "{query}: cursor pages continue the result exactly"
         );
     }
+}
+
+/// NAN-4157: a pivot that is not dense but whose density estimate fills the
+/// page in the newest chunk walks newest first without a whole-window
+/// preselect: its selections touch only the newest parts, never all of
+/// them, and the rows equal the fixture truth and the seed-off walk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn density_filled_first_chunk_touches_only_the_newest_parts() {
+    std::env::remove_var("NANO_LAKE_PART_RESULT_CACHE");
+    std::env::remove_var(super::FLAG);
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let expected = (0..ROWS)
+        .filter(|i| src_ip(*i) == MEDIUM_IP)
+        .take(10)
+        .map(|i| format!("uid-{i:08}"))
+        .collect::<Vec<_>>();
+    assert!(
+        (0..ROWS / PARTS).filter(|i| src_ip(*i) == MEDIUM_IP).count() >= 10,
+        "fixture: the newest part alone holds the page"
+    );
+    let query = format!("src_endpoint.ip={MEDIUM_IP} | head 10");
+    let step = request(&query, now, 200);
+    let (on, funnel) = funneled(&engine, &step).await;
+    let planner = &on["planner"];
+    println!(
+        "NAN4157 {query:?}: selections={} time_parts={} chunks={} preselect={} density={}",
+        funnel.selections, funnel.time_parts, planner["chunks_executed"], planner["preselect"], planner["density"],
+    );
+    assert_eq!(ordered_uids(&rows_of(&on)), expected, "{query}: truth");
+    assert_eq!(planner["density"]["dense"].as_bool(), Some(false), "{query}: {planner}");
+    assert_eq!(planner["preselect"]["skipped"], "density_first_chunk", "{query}: {planner}");
+    // The window's parts (ingest's merges included): a whole-window
+    // preselect would select every one of them before chunk 1.
+    let window_parts = planner["density"]["estimate"]["window_parts"].as_u64().expect("window parts") as usize;
+    assert!(
+        funnel.time_parts < window_parts,
+        "{query}: the walk selected {} parts (window holds {window_parts}): {planner}",
+        funnel.time_parts
+    );
+    let off = with_seed(&engine, &step, false).await;
+    assert_eq!(digest(&rows_of(&on)), digest(&rows_of(&off)), "{query}: identical with the seed off");
+}
+
+/// NAN-4156: an escalated `<pivot> | head 10` job whose newest part holds
+/// the page reads only that part (the newest-first walk's first window),
+/// not the whole window, and commits exactly the interactive page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "native: NANO_CHDB_LIBRARY_PATH, NANO_CHDB_LIBRARY_SHA256, NANO_LAKE_COMPILER"]
+async fn newest_first_job_touches_only_the_newest_part() {
+    use crate::job::{LakeQueryJobRequest, LakeQueryJobSpec, ResourceClass, JOB_SCHEMA_VERSION};
+    use crate::part_query::job_results::JobResultStore;
+    use crate::part_query::jobs::{result_page, run_job, PartJobPin};
+    use nanosiem_core::search::DurableLakeTask;
+    use std::sync::atomic::AtomicBool;
+
+    std::env::remove_var("NANO_LAKE_PART_RESULT_CACHE");
+    let root = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    ingest(root.path(), now).await;
+    let engine = engine(root.path()).await;
+    let (head, schema) = engine.head_and_schema_fingerprint().await;
+    let pin = PartJobPin::at_head(head, schema.as_deref(), &"b".repeat(64), &"c".repeat(64)).unwrap();
+    let results = JobResultStore::new(TENANT, None);
+    results.install(Some(opendal::Operator::new(opendal::services::Memory::default()).unwrap().finish()));
+    let query = format!("src_endpoint.ip={DENSE_IP} | head 10");
+    let step = request(&query, now, 10);
+    let spec = LakeQueryJobSpec {
+        schema_version: JOB_SCHEMA_VERSION,
+        job_id: "01a15524-96fe-7b50-a08c-d54c419289c8".into(),
+        attempt_id: "attempt-1".into(),
+        fence_token: format!("01a15524-96fe-7b50-a08c-d54c419289c8:1:1:{}", "f".repeat(36)),
+        tenant_id: TENANT.into(),
+        generation_id: pin.generation_id.clone(),
+        event_config_sha256: pin.event_config_sha256.clone(),
+        snapshot_id: pin.snapshot_id,
+        compiler_sha256: pin.compiler_sha256.clone(),
+        native_artifact_sha256: pin.native_artifact_sha256.clone(),
+        hot_tail_manifest_sha256: None,
+        hot_tail_snapshot_id: None,
+        hot_tail_id: None,
+        resource_class: ResourceClass::Medium,
+        scan_budget_bytes: 1 << 34,
+        submitted_at: Utc::now(),
+        scope_deny: Default::default(),
+        task: DurableLakeTask::SearchNplV1,
+        request: LakeQueryJobRequest {
+            dataset: "logs".into(),
+            query: query.clone(),
+            start: step.start.clone(),
+            end: step.end.clone(),
+            limit: 10,
+            offset: 0,
+            table_view: true,
+            anchor_us: None,
+            decay: None,
+            clear_boundaries: Default::default(),
+            minimum_clear_revision: None,
+        },
+        result_page_rows: 10_000,
+        retention_proof: None,
+    };
+    let (reference, funnel) = crate::query_timing::measure("nan4156", async {
+        let reference = run_job(&engine, &spec, &results, &pin, &AtomicBool::new(false))
+            .await
+            .expect("job runs");
+        let funnel = crate::query_timing::current().expect("request scope").lock().unwrap().funnel.clone();
+        Ok::<_, ()>((reference, funnel))
+    })
+    .await
+    .unwrap();
+    let page = result_page(&results, &reference, &spec.job_id, TENANT, 0).await.unwrap();
+    let job_rows = page["rows"].as_array().cloned().unwrap();
+    let expected = (0..ROWS).filter(|i| src_ip(*i) == DENSE_IP).take(10).map(|i| format!("uid-{i:08}")).collect::<Vec<_>>();
+    println!("NAN4156 {query:?}: selections={} time_parts={} rows={}", funnel.selections, funnel.time_parts, job_rows.len());
+    assert_eq!(ordered_uids(&job_rows), expected, "{query}: the job commits the newest page");
+    assert_eq!(ordered_uids(&job_rows), ordered_uids(&rows_of(&envelope(&engine, &step).await)), "{query}: job == interactive");
+    assert_eq!(funnel.selections, 1, "{query}: one window held the page");
+    assert_eq!(funnel.time_parts, 1, "{query}: only the newest of {PARTS} parts was selected");
 }

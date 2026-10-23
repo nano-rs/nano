@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// InfraTab (NAN-1537) — host inventory waffle + per-host snapshot.
-//
-// Ported from the design handoff's obs-infra.jsx (host waffle) + obs-charts.jsx
-// (heatColor, in components/observability/infra-waffle.tsx). One tile per host,
-// shaded by a selectable metric (CPU / mem / load / net), grouped by host.group,
-// with a legend + summary line and a right-side detail panel + "hottest" list.
-//
-// Data is REAL: api.observability.getInfraHosts returns the latest-snapshot
-// CPU/mem/load/net per host over the shared window. A metric a host never
-// reported is null and renders as a faint "unreported" tile (not a hot 0).
-//
-// Deviations from the mock: the wire contract carries no per-host time series,
-// zone/pods metadata, or a `service` field distinct from the group, so the
-// detail panel shows the latest snapshot + status (no per-host CPU sparkline)
-// and pivots to search rather than faking history.
+import { TelemetrySetupHint } from '@/components/observability/TelemetryUnavailable';
+
+// Cluster-scoped Kubernetes node and pod inventory. All metrics are real samples;
+// missing samples are explicit. Reuses the app's Select, Table and LoadingIcon.
+// Both views share the bounded inventory request, environment and health filters.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Server, Box, BarChart3, RefreshCw, Search } from 'lucide-react';
+import { Server, Box, BarChart3, Search } from 'lucide-react';
 import { api } from '@/lib/api';
+import { LoadingIcon } from '@/components/icons/LoadingIcon';
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import type { CacheMeta } from '@/lib/api';
 import { toApiTimeRange } from '@/hooks/use-api';
 import type { TimeRange } from '@/lib/api/types';
@@ -39,8 +32,9 @@ import type { InfraHost, HostStatus } from '@/lib/api/observability';
 import type { ObservabilityTabProps } from '../types';
 import { nplQuotedBody } from '@/lib/npl-quote';
 
-// One page of hosts pulled per fetch; "Load more" appends the next page.
-const PAGE_SIZE = 100;
+// The server bounds inventory to 10,000 entities. Fetch that bounded set so
+// switching between nodes/pods cannot silently omit pods behind the node page.
+const PAGE_SIZE = 10_000;
 
 const STATUS_FILTERS: Array<{ key: HostStatus | 'all'; label: string }> = [
   { key: 'all', label: 'All' },
@@ -66,7 +60,7 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
     );
   }
 
-  const tone = toDesignHealth(host.status);
+  const tone = toDesignHealth(host.status === 'unknown' ? 'warn' : host.status);
   // O34 (NAN-1721) / NAN-2370: pivot on the canonical OCSF host path only.
   //
   // This used to OR the UDM names (`src_host` / `dest_host` / `hostname`)
@@ -75,7 +69,7 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
   // WHOLE predicate and "Explore in search" 400s — the OCSF half never gets a
   // chance to match. UDM is retired on this branch (NAN-2371), so emit the one
   // path that resolves.
-  const hq = nplQuotedBody(host.host);
+  const hq = nplQuotedBody(host.node_name || host.host);
   const hostSearchQuery = `device.hostname="${hq}"`;
   const fmtCell = (v: number | null, fmt: (n: number) => string) => (v == null ? '–' : fmt(v));
   const stats: Array<{ k: string; v: string; hot: boolean }> = [
@@ -98,8 +92,8 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
           <Box className="w-[14px] h-[14px]" />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="font-mono text-[12.5px] text-fg truncate">{host.host}</div>
-          <div className="text-[10px] text-fg-4 truncate">{host.group ?? 'ungrouped'}</div>
+          <div className="font-mono text-[12.5px] text-fg truncate">{host.node_name || host.host}</div>
+          <div className="text-[10px] text-fg-4 truncate">{host.group ?? 'ungrouped'}{host.instance_type ? ` · ${host.instance_type}` : ''}</div>
         </div>
         <span
           className={cn(
@@ -109,7 +103,7 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
           )}
         >
           <span className={cn('w-1.5 h-1.5 rounded-full', HEALTH[tone].dot)} />
-          {HEALTH[tone].label}
+          {host.status === 'unknown' ? 'Unknown' : HEALTH[tone].label}
         </span>
       </div>
       <div className="p-3.5 grid grid-cols-2 gap-y-2.5 gap-x-4">
@@ -124,7 +118,7 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
       </div>
       <div className="p-3 border-t border-border">
         <Link
-          to={`/search?q=${encodeURIComponent(hostSearchQuery)}`}
+          to={`/search#q=${encodeURIComponent(hostSearchQuery)}`}
           className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-border text-[11.5px] text-fg-2 hover:border-border-2 hover:text-foreground"
         >
           <Search className="w-[12px] h-[12px] text-fg-3" />
@@ -180,7 +174,7 @@ function HottestList({
               className="w-2 h-2 rounded-[2px] shrink-0"
               style={{ background: heatColor(Math.min(1, v / scaleMax)) }}
             />
-            <span className="font-mono text-[11px] text-fg truncate flex-1">{h.host}</span>
+            <span className="font-mono text-[11px] text-fg truncate flex-1">{h.node_name || h.host}</span>
             <span className={cn('font-mono text-[11px] tabular-nums', hot ? 'text-danger' : 'text-fg-2')}>
               {metric.fmt(v)}
             </span>
@@ -195,9 +189,32 @@ function HottestList({
 // tab
 // ---------------------------------------------------------------------------
 
+function PodsInventory({ pods }: { pods: InfraHost[] }) {
+  return <div className="rounded-lg border border-border bg-card overflow-x-auto">
+    <Table>
+      <TableHeader><TableRow>
+        {['Cluster / region', 'Namespace / workload', 'Pod', 'Node', 'CPU cores', 'Memory', 'Restarts', 'Status'].map((label) => <TableHead key={label} className="h-7 text-[11px]">{label}</TableHead>)}
+      </TableRow></TableHeader>
+      <TableBody>{pods.map((pod) => <TableRow key={pod.host}>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.cluster} / {pod.region}</TableCell>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.namespace} / {pod.workload || 'unreported'}</TableCell>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.pod_name || pod.host}</TableCell>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.node_name || 'unreported'}</TableCell>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.cpu_cores == null ? 'no samples in range' : pod.cpu_cores.toFixed(3)}</TableCell>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.mem_bytes == null ? 'no samples in range' : `${(pod.mem_bytes / 1048576).toFixed(1)} MiB`}</TableCell>
+        <TableCell className="py-1 font-mono text-[11px] leading-4">{pod.restarts ?? 'no samples in range'}</TableCell>
+        <TableCell className={cn('py-1 font-mono text-[11px] leading-4', pod.status === 'bad' ? 'text-danger' : pod.status === 'warn' ? 'text-warning' : 'text-fg-2')}>
+          {pod.phase || 'Unknown'} · {pod.status === 'good' ? 'Healthy' : pod.status === 'warn' ? 'Degraded' : pod.status === 'bad' ? 'Critical' : 'Unknown'}
+        </TableCell>
+      </TableRow>)}</TableBody>
+    </Table>
+  </div>;
+}
+
 export function InfraTab({ timeRange }: ObservabilityTabProps) {
-  const [hosts, setHosts] = useState<InfraHost[] | null>(null);
-  const [total, setTotal] = useState(0);
+  const [view, setView] = useState<'node' | 'pod'>('node');
+  const [inventory, setHosts] = useState<InfraHost[] | null>(null);
+  const [inventoryTotal, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -298,7 +315,7 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
 
   const loadMore = () => {
     if (loadingMore || !hasMore) return;
-    const offset = hosts?.length ?? 0;
+    const offset = inventory?.length ?? 0;
     setLoadingMore(true);
     api.observability
       .getInfraHosts(windowRef.current, { ...filterArgs, limit: PAGE_SIZE, offset })
@@ -310,6 +327,9 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoadingMore(false));
   };
+
+  const hosts = useMemo(() => inventory?.filter((row) => view === 'pod' ? row.kind === 'pod' : row.kind !== 'pod') ?? null, [inventory, view]);
+  const total = hasMore ? inventoryTotal : hosts?.length ?? 0;
 
   // Group options are derived from the loaded slice (best-effort — the wire
   // contract has no distinct-groups endpoint). A selected group survives even
@@ -339,7 +359,7 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
   if (loading && hosts == null) {
     return (
       <div className="flex items-center justify-center py-16 text-fg-3">
-        <RefreshCw className="w-4 h-4 animate-spin" />
+        <LoadingIcon className="w-4 h-4" />
       </div>
     );
   }
@@ -358,9 +378,15 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
 
   return (
     <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-2">
+        <Select value={view} onValueChange={(value) => { setView(value as 'node' | 'pod'); setSelected(null); setGroup(''); }}>
+          <SelectTrigger aria-label="Infrastructure view" className="w-[180px] font-mono"><SelectValue /></SelectTrigger>
+          <SelectContent><SelectItem value="node">Hosts · Kubernetes nodes</SelectItem><SelectItem value="pod">Pods / workloads</SelectItem></SelectContent>
+        </Select>
+      </div>
       {/* color-metric selector + count + legend */}
       <div className="flex items-center gap-2 flex-wrap">
-        <div className="flex items-center gap-1.5">
+        {view === 'node' && <div className="flex items-center gap-1.5">
           <span className="text-[10px] uppercase tracking-wider text-fg-4 font-mono">color</span>
           <div className="flex items-center gap-px rounded-md bg-foreground/5 border border-border p-0.5">
             {INFRA_METRICS.map((m) => (
@@ -377,14 +403,19 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
               </button>
             ))}
           </div>
-        </div>
+        </div>}
         <div className="flex-1" />
         <span className="font-mono text-[11px] text-fg-3 tabular-nums">
-          {total > rows.length ? `${rows.length}/${total}` : rows.length} {total === 1 ? 'host' : 'hosts'}
-          {summary.avg != null && ` · avg ${metric.label} ${metric.fmt(summary.avg)}`}
+          {total > rows.length ? `${rows.length}/${total}` : rows.length} {view === 'pod' ? 'pods' : total === 1 ? 'host' : 'hosts'}
+          {view === 'node' && summary.avg != null && ` · avg ${metric.label} ${metric.fmt(summary.avg)}`}
         </span>
         <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
-        <InfraLegend metric={metric} scaleMax={scaleMax} />
+        {view === 'node' && <InfraLegend metric={metric} scaleMax={scaleMax} />}
+        {view === 'node' && rows.length > summary.reporters && (
+          <span role="status" className="font-mono text-[11px] text-fg-4">
+            {rows.length - summary.reporters} hosts · no {metric.label} samples in range
+          </span>
+        )}
       </div>
 
       {/* filters — hostname / group / env / status (pushed to backend, NAN-1543) */}
@@ -394,23 +425,19 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Filter hosts"
+            placeholder={view === 'pod' ? 'Filter pods' : 'Filter hosts'}
             className="h-8 w-[180px] rounded-md border border-border bg-transparent pl-8 pr-2.5 text-[12px] font-mono outline-none focus:border-brand/50 placeholder:text-fg-4"
           />
         </div>
-        <select
-          value={group}
-          onChange={(e) => setGroup(e.target.value)}
-          aria-label="Filter by host group"
-          className="h-8 rounded-md border border-border bg-transparent px-2 text-[11.5px] font-mono text-fg-2 outline-none focus:border-brand/50"
-        >
-          <option value="">All groups</option>
-          {groupOptions.map((g) => (
-            <option key={g} value={g}>
-              {g}
-            </option>
-          ))}
-        </select>
+        <Select value={group || '__all__'} onValueChange={(value) => setGroup(value === '__all__' ? '' : value)}>
+          <SelectTrigger aria-label="Filter by infrastructure group" className="w-auto min-w-[140px] font-mono">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__all__">All groups</SelectItem>
+            {groupOptions.map((g) => <SelectItem key={g} value={g}>{g}</SelectItem>)}
+          </SelectContent>
+        </Select>
         <input
           value={env}
           onChange={(e) => setEnv(e.target.value)}
@@ -435,12 +462,15 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
         </div>
       </div>
 
-      {empty ? (
+      {view === 'pod' && !empty ? (
+        <PodsInventory pods={rows} />
+      ) : empty ? (
         <div className="rounded-lg border border-border bg-card px-4 py-12 text-center text-[12.5px] text-fg-3">
           <Server className="w-6 h-6 text-fg-4 mb-2 mx-auto" />
           {filtersActive
-            ? 'No hosts match the current filters.'
-            : 'No host metrics in the selected range. Send OpenTelemetry system metrics (system.cpu.utilization, system.memory.utilization, …) to populate this view.'}
+            ? `No ${view === 'pod' ? 'pods' : 'hosts'} match the current filters.`
+            : `No ${view === 'pod' ? 'pod' : 'node'} inventory in the selected range. Check regional infrastructure collection.`}
+          <TelemetrySetupHint />
         </div>
       ) : (
         <div className="grid grid-cols-[1fr_300px] gap-2.5 items-start">
@@ -465,7 +495,7 @@ export function InfraTab({ timeRange }: ObservabilityTabProps) {
             disabled={loadingMore}
             className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-border text-[11.5px] font-mono text-fg-2 hover:border-border-2 hover:text-foreground disabled:opacity-50"
           >
-            {loadingMore ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
+            {loadingMore ? <LoadingIcon className="w-3 h-3" /> : null}
             Load more · {rows.length}/{total}
           </button>
         </div>

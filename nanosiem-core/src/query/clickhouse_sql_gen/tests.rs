@@ -63,17 +63,77 @@ fn udm_raw_log_page_orders_by_time_only() {
     assert!(!sql.contains("metadata.uid"), "{sql}");
 }
 
+/// NAN-4236: an aggregated sort breaks ties on its group keys on every
+/// window. Over 24 h it used to keep the bare user key, so a tied top-N cut
+/// different groups on every run (the rows are already aggregated; the extra
+/// key is a handful of comparisons).
 #[test]
-fn seven_day_sort_keeps_bounded_sort_plan() {
+fn seven_day_aggregate_sort_breaks_ties_on_group_keys() {
     let gen = ClickHouseSqlGenerator::new();
     let query = parse_query("* | stats dc(user) as hosts by dst_ip | sort -hosts | head 30").unwrap();
-    let window = TimeRange {
+    let sql = gen.generate(&query, &seven_days()).unwrap();
+    assert!(sql.contains("ORDER BY hosts DESC, dst_ip ASC\n)"), "{sql}");
+    let query = parse_query("* | stats count by user, dst_ip | where count > 1 | sort -count").unwrap();
+    let sql = gen.generate(&query, &seven_days()).unwrap();
+    assert!(sql.contains("ORDER BY count DESC, \"user\" ASC, dst_ip ASC"), "{sql}");
+}
+
+fn seven_days() -> TimeRange {
+    TimeRange {
         start: "2024-01-01T00:00:00Z".parse().unwrap(),
         end: "2024-01-08T00:00:00Z".parse().unwrap(),
-    };
-    let sql = gen.generate(&query, &window).unwrap();
-    assert!(sql.contains("ORDER BY hosts DESC"), "{sql}");
-    assert!(!sql.contains("ORDER BY hosts DESC, dst_ip ASC"), "{sql}");
+    }
+}
+
+/// NAN-4236: top / rare cut their LIMIT on count; the group key breaks the
+/// ties, and a later sort tie-breaks on the same key.
+#[test]
+fn top_and_rare_break_count_ties_on_their_group_key() {
+    let gen = ClickHouseSqlGenerator::new();
+    let sql = gen.generate(&parse_query("* | top 3 src_ip").unwrap(), &seven_days()).unwrap();
+    assert!(sql.contains("ORDER BY count DESC, src_ip\n  LIMIT 3"), "{sql}");
+    let sql = gen.generate(&parse_query("* | rare 3 src_ip").unwrap(), &seven_days()).unwrap();
+    assert!(sql.contains("ORDER BY count ASC, src_ip\n  LIMIT 3"), "{sql}");
+    let sql = gen.generate(&parse_query("* | top 3 src_ip | sort -percent").unwrap(), &seven_days()).unwrap();
+    assert!(sql.contains("ORDER BY percent DESC, src_ip ASC"), "{sql}");
+}
+
+/// NAN-4236: series sharing a timechart bucket come back in key order, so a
+/// row-limited chart keeps the same series on every run.
+#[test]
+fn timechart_orders_series_inside_each_bucket() {
+    let gen = ClickHouseSqlGenerator::new();
+    for query in [
+        "* | timechart span=1h count by src_ip",
+        "* | timechart span=1h count by src_ip limit=5",
+        "* | timechart span=1h cont=true count by src_ip",
+    ] {
+        let sql = gen.generate(&parse_query(query).unwrap(), &seven_days()).unwrap();
+        assert!(sql.contains(", src_ip ASC"), "{query}: {sql}");
+        assert!(sql.contains("ORDER BY time_bucket"), "{query}: {sql}");
+    }
+    let sql = gen.generate(&parse_query("* | timechart span=1h count").unwrap(), &seven_days()).unwrap();
+    assert!(!sql.contains("time_bucket,") || !sql.contains("ASC, "), "{sql}");
+}
+
+/// NAN-4236: a raw-event sort over wide rows breaks ties on the implicit
+/// newest-first (time, metadata.uid) key where OCSF rows carry the UID; UDM
+/// rows have no UID and keep the bare key.
+#[test]
+fn raw_event_sort_breaks_ties_newest_first() {
+    use crate::schema::OcsfProfile;
+    let ocsf = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+    let sql = ocsf.generate(&parse_query("* | sort -severity_id | head 20").unwrap(), &time_range()).unwrap();
+    assert!(sql.contains("ORDER BY severity_id DESC, timestamp DESC, \"metadata.uid\" DESC\n)"), "{sql}");
+    // Over 24 h only the lake (any-window UID tie-break) pays the wider key.
+    let sql = ocsf.generate(&parse_query("* | sort -severity_id | head 20").unwrap(), &seven_days()).unwrap();
+    assert!(!sql.contains("severity_id DESC, timestamp DESC"), "{sql}");
+    let lake = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new())).with_uid_tiebreak_any_window(true);
+    let sql = lake.generate(&parse_query("* | sort -severity_id | head 20").unwrap(), &seven_days()).unwrap();
+    assert!(sql.contains("ORDER BY severity_id DESC, timestamp DESC, \"metadata.uid\" DESC\n)"), "{sql}");
+    let udm = ClickHouseSqlGenerator::new();
+    let sql = udm.generate(&parse_query("* | sort -bytes_out | head 20").unwrap(), &time_range()).unwrap();
+    assert!(!sql.contains("metadata.uid"), "{sql}");
 }
 
 /// A1 (NAN-1623): every `MATERIALIZED_COLUMNS` entry must also appear in
@@ -1268,7 +1328,35 @@ fn in_subsearch_does_not_silently_ignore_correlation_stages() {
     let generator = ClickHouseSqlGenerator::new();
     let query = parse_query("src_ip IN [search dest_port=443 | stats count by src_ip]").unwrap();
     let error = generator.generate(&query, &time_range()).unwrap_err();
-    assert!(error.to_string().contains("IN subsearch supports only a search and optional return field"));
+    assert!(error.to_string().contains("IN subsearch supports only a search and an optional single return field"));
+}
+
+/// NAN-4284 (searchfuzz F20): the reference's `field IN [search … | fields f]`
+/// (and `| table f`) is the `| return f` form; a multi-field projection is
+/// still refused rather than guessed.
+#[test]
+fn in_subsearch_accepts_a_single_field_projection_as_its_return_field() {
+    let generator = ClickHouseSqlGenerator::new();
+    let sql = |q: &str| generator.generate(&parse_query(q).unwrap(), &time_range());
+    let returned = sql("user IN [search dest_port=443 | return src_ip]").unwrap();
+    for form in ["user IN [search dest_port=443 | fields src_ip]", "user IN [search dest_port=443 | table src_ip]"] {
+        assert_eq!(sql(form).unwrap(), returned, "{form}");
+    }
+    for refused in ["user IN [search dest_port=443 | fields src_ip, user]", "user IN [search dest_port=443 | table src_ip AS user]"] {
+        assert!(sql(refused).is_err(), "{refused}");
+    }
+}
+
+/// NAN-4284 (searchfuzz F21): the documented `time_diff(t1, t2)` is the
+/// seconds from t2 to t1, the two-argument `date_diff`.
+#[test]
+fn time_diff_is_the_seconds_from_its_second_argument_to_its_first() {
+    let generator = ClickHouseSqlGenerator::new();
+    let sql = |q: &str| generator.generate(&parse_query(q).unwrap(), &time_range());
+    let time_diff = sql("* | eval gap=time_diff(timestamp, timestamp)").unwrap();
+    assert!(time_diff.contains("dateDiff('second', timestamp, timestamp) AS gap"), "{time_diff}");
+    assert_eq!(time_diff, sql("* | eval gap=date_diff(timestamp, timestamp)").unwrap());
+    assert!(sql("* | eval gap=time_diff(timestamp)").is_err());
 }
 
 /// NAN-1412: every generated query carries a SINGLE WHERE with all conjuncts
@@ -1309,7 +1397,7 @@ fn single_where_no_prewhere_both_profiles() {
             // Time bounds stay in the WHERE conjunct chain, same DateTime64
             // literal format as before (only the keyword changed).
             assert!(
-                    sql.contains("WHERE timestamp BETWEEN '2024-01-01 00:00:00.000000' AND '2024-01-02 00:00:00.000000'"),
+                    sql.contains("WHERE timestamp >= '2024-01-01 00:00:00.000000' AND timestamp < '2024-01-02 00:00:00.000000'"),
                     "{profile} `{q}` must carry the time bounds as the first WHERE conjunct, got:\n{sql}"
                 );
             // Exactly one base-scan filter keyword per table scan: every WHERE
@@ -1406,7 +1494,7 @@ fn ip_field_cidr_equality_and_negation_lower_to_membership() {
         .unwrap();
     let eq_where = where_slice(&eq);
     assert!(
-        eq_where.contains("(length(dest_ip) > 0 AND isIPAddressInRange(dest_ip, '10.0.0.0/8'))"),
+        eq_where.contains("ifNull((isIPv4String(toString(dest_ip)) OR isIPv6String(toString(dest_ip))) AND (isIPAddressInRange(toString(dest_ip), '10.0.0.0/8')), 0)"),
         "CIDR equality must use network membership, got:\n{eq_where}"
     );
     assert!(
@@ -1420,7 +1508,7 @@ fn ip_field_cidr_equality_and_negation_lower_to_membership() {
     let ne_where = where_slice(&ne);
     assert!(
         ne_where
-            .contains("(length(dest_ip) > 0 AND NOT isIPAddressInRange(dest_ip, '10.0.0.0/8'))"),
+            .contains("(length(toString(dest_ip)) > 0 AND NOT ifNull((ifNull((isIPv4String(toString(dest_ip)) OR isIPv6String(toString(dest_ip))) AND (isIPAddressInRange(toString(dest_ip), '10.0.0.0/8')), 0)), false))"),
         "CIDR != must require a present field and negate membership, got:\n{ne_where}"
     );
 
@@ -1433,7 +1521,7 @@ fn ip_field_cidr_equality_and_negation_lower_to_membership() {
     let outer_not_where = where_slice(&outer_not);
     assert!(
         outer_not_where
-            .contains("NOT ifNull(((length(dest_ip) > 0 AND isIPAddressInRange(dest_ip, '10.0.0.0/8'))), false)"),
+            .contains("NOT ifNull((ifNull((isIPv4String(toString(dest_ip)) OR isIPv6String(toString(dest_ip))) AND (isIPAddressInRange(toString(dest_ip), '10.0.0.0/8')), 0)), false)"),
         "outer NOT must negate the whole guarded equality, got:\n{outer_not_where}"
     );
 }
@@ -1451,7 +1539,7 @@ fn ocsf_ip_alias_cidr_resolves_to_promoted_column() {
         .unwrap();
     let where_clause = where_slice(&sql);
     assert!(
-        where_clause.contains("isIPAddressInRange(\"src_endpoint.ip\", '2001:db8::/32')"),
+        where_clause.contains("isIPAddressInRange(toString(\"src_endpoint.ip\"), '2001:db8::/32')"),
         "OCSF CIDR must target the promoted IP column, got:\n{where_clause}"
     );
     assert!(
@@ -1874,13 +1962,14 @@ fn select_star_excepts_action_and_renames_to_event_type() {
 /// NAN-671 EXCEPT — the alias still gets projected, but `action`
 /// stays inside `*` so downstream stages can reference it.
 ///
-/// Uses `sort -timestamp` because it doesn't drive field_analysis to
+/// Uses `sort timestamp` because it doesn't drive field_analysis to
 /// enumerate explicit columns; it preserves the wildcard path that
 /// the original NAN-876 reproducer (saturn shadow_hunting at
-/// 16:40:51 UTC) hit.
+/// 16:40:51 UTC) hit. (NAN-4263: not `sort -timestamp`, which restates
+/// the implicit newest-first order and is dropped to a single stage.)
 #[test]
 fn cte_stage_0_preserves_action_for_downstream_reference() {
-    let query = parse_query("error | sort -timestamp").unwrap();
+    let query = parse_query("error | sort timestamp").unwrap();
     let sql = ClickHouseSqlGenerator::new()
         .generate(&query, &time_range())
         .unwrap();
@@ -2665,7 +2754,7 @@ fn ioc_term_expands_across_observable_columns_index_friendly() {
 
     // Single WHERE, full partition-pruning time bound, NO explicit PREWHERE.
     assert!(
-        sql.contains("WHERE timestamp BETWEEN") && !sql.contains("PREWHERE"),
+        sql.contains("WHERE timestamp >= ") && !sql.contains("PREWHERE"),
         "ioc term must emit a single WHERE with no PREWHERE, got:\n{sql}"
     );
 
@@ -2719,7 +2808,7 @@ fn ioc_term_resolves_ocsf_columns_under_ocsf_profile() {
         .unwrap();
 
     assert!(
-        sql.contains("WHERE timestamp BETWEEN") && !sql.contains("PREWHERE"),
+        sql.contains("WHERE timestamp >= ") && !sql.contains("PREWHERE"),
         "single WHERE, no PREWHERE, got:\n{sql}"
     );
     // RAW ingest-lowercased OCSF ip columns as IN-lists (escape_identifier
@@ -3285,8 +3374,8 @@ fn join_subsearch_ext_dotted_is_materialized_in_sub_base() {
 // legacy `ORDER BY <keys>, <time>` — `LIMIT 1 BY` alone no longer
 // distinguishes the shapes, since both now carry it.
 
-/// `dedup` directly over the base scan (stage_0): keep-oldest via a
-/// per-key `min(timestamp)`, one row per key via `LIMIT 1 BY`, no sort.
+/// `dedup` directly over the base scan (stage_0): keep-newest (first in newest-first order) via a
+/// per-key `max(timestamp)`, one row per key via `LIMIT 1 BY`, no sort.
 #[test]
 fn dedup_on_base_scan_is_sort_free_and_one_row_per_key() {
     let query = parse_query("* | dedup src_ip").unwrap();
@@ -3294,8 +3383,8 @@ fn dedup_on_base_scan_is_sort_free_and_one_row_per_key() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("min(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
-        "dedup over the base scan must restrict candidates to each key's oldest \
+        sql.contains("max(timestamp) FROM stage_0") && sql.contains("GROUP BY src_ip"),
+        "dedup over the base scan must restrict candidates to each key's newest \
              row, got:\n{sql}"
     );
     assert!(
@@ -3323,7 +3412,7 @@ fn dedup_multi_key_groups_by_all_keys() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("GROUP BY src_ip, \"user\"") && sql.contains("min(timestamp)"),
+        sql.contains("GROUP BY src_ip, \"user\"") && sql.contains("max(timestamp)"),
         "multi-key dedup must group candidates by all keys, got:\n{sql}"
     );
     assert!(
@@ -3369,7 +3458,7 @@ fn dedup_after_projection_falls_back() {
             "dedup after a projection must keep the legacy shape for {q}, got:\n{sql}"
         );
         assert!(
-            !sql.contains("min(timestamp) FROM"),
+            !sql.contains("max(timestamp) FROM"),
             "the double-scan rewrite must not fire for {q}, got:\n{sql}"
         );
     }
@@ -3389,7 +3478,7 @@ fn dedup_after_eval_falls_back() {
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("LIMIT 1 BY src_ip") && !sql.contains("min(timestamp) FROM"),
+            sql.contains("LIMIT 1 BY src_ip") && !sql.contains("max(timestamp) FROM"),
             "dedup after `eval` must keep the legacy shape for {q}, got:\n{sql}"
         );
     }
@@ -3414,7 +3503,7 @@ fn dedup_after_upstream_command_falls_back() {
             "dedup with a non-base source must keep the legacy shape for {q}, got:\n{sql}"
         );
         assert!(
-            !sql.contains("min(timestamp) FROM"),
+            !sql.contains("max(timestamp) FROM"),
             "the double-scan rewrite must not fire for {q}, got:\n{sql}"
         );
     }
@@ -3433,7 +3522,7 @@ fn dedup_with_requery_command_falls_back() {
     assert!(
         sql.contains("ORDER BY src_host, timestamp")
             && sql.contains("LIMIT 1 BY src_host")
-            && !sql.contains("min(timestamp) FROM"),
+            && !sql.contains("max(timestamp) FROM"),
         "dedup over a LIMITed requery base scan must keep the legacy shape, got:\n{sql}"
     );
 }
@@ -3466,13 +3555,13 @@ fn dedup_on_spans_dataset_uses_the_spans_time_column() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("min(start_time) FROM stage_0")
+        sql.contains("max(start_time) FROM stage_0")
             && sql.contains("GROUP BY service_name")
             && sql.contains("LIMIT 1 BY service_name"),
         "spans dedup must aggregate the spans time column, got:\n{sql}"
     );
     // Never the logs-only `timestamp` column on spans (Code 47).
-    assert!(!sql.contains("min(timestamp)"), "{sql}");
+    assert!(!sql.contains("max(timestamp)"), "{sql}");
 }
 
 /// OCSF: dedup keys resolve through the active profile (src_ip → the
@@ -3486,7 +3575,7 @@ fn dedup_ocsf_resolves_keys_and_rewrites() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("min(timestamp) FROM stage_0") && sql.contains("LIMIT 1 BY "),
+        sql.contains("max(timestamp) FROM stage_0") && sql.contains("LIMIT 1 BY "),
         "OCSF dedup over the base scan must rewrite, got:\n{sql}"
     );
     assert!(
@@ -3500,8 +3589,8 @@ fn dedup_ocsf_resolves_keys_and_rewrites() {
 }
 
 /// Documented ordering behavior (finding 2.7 guard 4): the rewritten dedup
-/// stage carries NO ORDER BY — the survivor SET is unchanged (per-key
-/// oldest), but which of them a downstream bare `head N` picks follows
+/// stage carries NO ORDER BY — the survivor SET is per-key
+/// newest (NAN-4279), but which of them a downstream bare `head N` picks follows
 /// stream order, not the legacy shape's `<keys>, timestamp` sort order.
 /// This artifact-order change is accepted; a terminal dedup still gets the
 /// outer `ORDER BY timestamp DESC` like every non-ordering pipeline.
@@ -3512,7 +3601,7 @@ fn dedup_then_head_keeps_rewrite_without_stage_ordering() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("min(timestamp) FROM stage_0"),
+        sql.contains("max(timestamp) FROM stage_0"),
         "downstream head must not disable the rewrite (guards are about the SOURCE), got:\n{sql}"
     );
     // The dedup stage itself is sort-free — reintroducing the legacy
@@ -3833,7 +3922,7 @@ fn eventstats_grouped_emits_map_scalar_attach_not_window() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("mapFromArrays(groupArrayIf(__nano_k"),
+        sql.contains("tuple(groupArrayIf(__nano_k"),
         "grouped eventstats must build a per-group scalar map, got:\n{sql}"
     );
     // Null-canonicalized key on BOTH the map-build side (GROUP BY) and
@@ -3842,7 +3931,7 @@ fn eventstats_grouped_emits_map_scalar_attach_not_window() {
     let canonical_key = "coalesce(toString(\"user\"), '\\0__null__')";
     assert!(
         sql.contains(&format!("{} AS __nano_k", canonical_key))
-            && sql.contains(&format!("__nano_es[{}]", canonical_key)),
+            && sql.contains(&format!("transform({}, __nano_es.1, arrayEnumerate(__nano_es.1), 0)", canonical_key)),
         "canonicalized key must appear on build and lookup sides, got:\n{sql}"
     );
     assert!(
@@ -3866,7 +3955,7 @@ fn eventstats_multiple_aggs_share_one_tuple_valued_map() {
     // One map, tuple values — the stage source is scanned once for the
     // constants regardless of aggregation count.
     assert_eq!(
-        sql.matches("mapFromArrays").count(),
+        sql.matches("groupArrayIf(__nano_k").count(),
         1,
         "multiple aggregations must share a single map, got:\n{sql}"
     );
@@ -3875,7 +3964,7 @@ fn eventstats_multiple_aggs_share_one_tuple_valued_map() {
         "map value must be a tuple of all aggregates, got:\n{sql}"
     );
     assert!(
-        sql.contains(".1 AS ab") && sql.contains(".2 AS sb"),
+        sql.contains(", 1) AS ab") && sql.contains(", 2) AS sb"),
         "attach must project tuple elements under the user aliases, got:\n{sql}"
     );
 }
@@ -3887,7 +3976,7 @@ fn eventstats_ungrouped_uses_plain_scalar_no_map() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        !sql.contains("mapFromArrays") && !sql.contains("OVER ("),
+        !sql.contains("groupArrayIf(__nano_k") && !sql.contains("OVER ("),
         "no `by` clause = single global group: plain scalar, no map/window, got:\n{sql}"
     );
     assert!(
@@ -3911,7 +4000,7 @@ fn eventstats_multikey_by_canonicalizes_via_tuple_rendering() {
     // NULL token — same expression on the build and lookup sides.
     assert!(
         sql.contains("toString(tuple(\"user\", src_ip)) AS __nano_k")
-            && sql.contains("__nano_es[toString(tuple(\"user\", src_ip))]"),
+            && sql.contains("transform(toString(tuple(\"user\", src_ip)), __nano_es.1"),
         "multi-key BY must canonicalize via tuple rendering on both sides, got:\n{sql}"
     );
     assert!(!sql.contains("OVER ("), "no window may remain, got:\n{sql}");
@@ -3963,13 +4052,13 @@ fn anomaly_zscore_grouped_attaches_stats_from_map_not_window() {
         .generate(&query, &time_range())
         .unwrap();
     assert!(
-        sql.contains("mapFromArrays")
+        sql.contains("tuple(groupArrayIf(__nano_k")
             && sql.contains("tuple(toFloat64(avg(bytes_out)), toFloat64(stddevPop(bytes_out)))"),
         "grouped z-score constants must come from a per-group map, got:\n{sql}"
     );
     assert!(
-        sql.contains("__nano_stats[coalesce(toString(\"user\"), '\\0__null__')].1 as avg_val")
-            && sql.contains(".2 as stddev_val"),
+        sql.contains("tupleElement(arrayElement(__nano_stats.2, transform(coalesce(toString(\"user\"), '\\0__null__'), __nano_stats.1, arrayEnumerate(__nano_stats.1), 0)), 1) as avg_val")
+            && sql.contains(", 2) as stddev_val"),
         "avg_val/stddev_val column names must be preserved, got:\n{sql}"
     );
     // Scoring math and output contract unchanged.
@@ -3995,7 +4084,7 @@ fn anomaly_zscore_ungrouped_uses_scalar_tuple() {
             "ungrouped z-score must use a plain scalar tuple, got:\n{sql}"
         );
     assert!(
-        !sql.contains("mapFromArrays") && !sql.contains("OVER ("),
+        !sql.contains("groupArrayIf(__nano_k") && !sql.contains("OVER ("),
         "no map and no window for the global group, got:\n{sql}"
     );
 }
@@ -4069,7 +4158,7 @@ fn anomaly_mad_grouped_builds_median_then_mad_maps() {
         "median map must aggregate quantile(0.5) per group, got:\n{sql}"
     );
     assert!(
-        sql.contains("quantile(0.5)(abs(bytes_out - __nano_med[__nano_k]))"),
+        sql.contains("quantile(0.5)(abs(bytes_out - arrayElement(__nano_med.2, transform(__nano_k, __nano_med.1, arrayEnumerate(__nano_med.1), 0))))"),
         "MAD map must reference the median map per group, got:\n{sql}"
     );
     assert!(
@@ -5087,7 +5176,9 @@ mod nan2361_canonical_ocsf_array_queries {
     fn exact_hash_value_uses_array_membership() {
         let sql = sql_for("file.hashes.value=ABCDEF");
         assert!(
-            sql.contains("has(\"file.hashes.value\", 'abcdef')"),
+            // NAN-4283: per-element, case-insensitive (producers store
+            // uppercase hashes; has() with a lowered needle missed them).
+            sql.contains("arrayExists(x -> lower(toString(x)) = 'abcdef', \"file.hashes.value\")"),
             "canonical hash equality must use array membership: {sql}"
         );
         assert!(
@@ -5574,4 +5665,53 @@ fn where_on_eval_output_shadowing_ocsf_array_alias_is_scalar() {
     // The alias name without a shadowing eval still resolves to the array.
     let alias = compile("class_uid=6003 | where resource_id!=\"\"");
     assert!(alias.contains("arrayExists"), "{alias}");
+}
+
+#[test]
+fn launch_enum_and_protocol_clickhouse_profile() {
+    use crate::schema::OcsfProfile;
+    let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+    for query in ["auth_result=failure", "status_id=Failure", "protocol=tcp", "protocol_name=TCP", "connection_info.protocol_name=tcp"] {
+        let sql = gen.generate(&parse_query(query).unwrap(), &time_range()).unwrap();
+        let expected = if query.contains("protocol") { "= 6" } else { "= 2" };
+        assert!(sql.contains(expected), "{query}: {sql}");
+    }
+    for query in ["status_id=invalid", "protocol=invalid", "status_id IN (failure, invalid)"] {
+        assert!(gen.generate(&parse_query(query).unwrap(), &time_range()).is_err());
+    }
+}
+
+/// NAN-4214: a `head N` with no explicit sort cuts the newest N events, also
+/// when filters, enrichers or projections sit around it.
+#[test]
+fn head_without_sort_cuts_the_newest_events_around_row_commands() {
+    use crate::schema::OcsfProfile;
+    let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+    let ordered_head = "DESC, \"metadata.uid\" DESC\n  LIMIT 20";
+    for query in [
+        "metadata.log_source=windows_sysmon | table device.hostname | head 20",
+        "metadata.log_source=windows_sysmon | fields device.hostname | head 20",
+        "metadata.log_source=windows_sysmon | rename device.hostname as host | head 20",
+        "metadata.log_source=windows_sysmon | head 20 | table device.hostname",
+        "metadata.log_source=windows_sysmon | eval x=1 | head 20",
+        "metadata.log_source=windows_sysmon | where severity_id>1 | head 20",
+        "metadata.log_source=windows_sysmon | eval x=1 | table device.hostname, x | head 20",
+    ] {
+        let sql = gen.generate(&parse_query(query).unwrap(), &time_range()).unwrap();
+        assert!(sql.contains(ordered_head), "{query}: {sql}");
+        // The head cut precedes the projection, so it sees `time`.
+        let head_at = sql.find(ordered_head).unwrap();
+        if let Some(projection) = sql.find("SELECT \"device.hostname\"") {
+            assert!(projection > head_at, "{query}: {sql}");
+        }
+    }
+    // An explicit sort, an aggregation or a rewritten time owns the order.
+    for query in [
+        "metadata.log_source=windows_sysmon | sort time | head 20",
+        "metadata.log_source=windows_sysmon | stats count by device.hostname | head 20",
+        "metadata.log_source=windows_sysmon | eval time=now() | head 20",
+    ] {
+        let sql = gen.generate(&parse_query(query).unwrap(), &time_range()).unwrap();
+        assert!(!sql.contains(ordered_head), "{query}: {sql}");
+    }
 }

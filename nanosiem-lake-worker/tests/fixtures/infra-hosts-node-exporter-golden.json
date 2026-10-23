@@ -1,0 +1,7 @@
+[
+  {"host":"missing-total","mem_util":null,"mem_n":0,"load_1m":0,"net_rate":null,"net_io":0},
+  {"host":"mixed","mem_util":0,"mem_n":1,"load_1m":0,"net_rate":null,"net_io":7},
+  {"host":"node","mem_util":0.75,"mem_n":1,"load_1m":2.5,"net_rate":2,"net_io":0},
+  {"host":"otel","mem_util":0.4,"mem_n":1,"load_1m":4,"net_rate":1,"net_io":0},
+  {"host":"zero-total","mem_util":null,"mem_n":0,"load_1m":2.5,"net_rate":null,"net_io":0}
+]

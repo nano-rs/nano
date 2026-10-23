@@ -152,3 +152,11 @@ test('continuation selectors are read off any tenant-scoped path, never off a no
     assert.equal(tenantSlugForAuthContinuation(path), undefined, path);
   }
 });
+
+test('return paths preserve literal and encoded timestamps and query values', () => {
+  for (const path of [
+    '/search?q=src_endpoint.ip%3D%22198.51.100.1%22&start=2026-10-17T12:00:00Z&end=2026-10-17T13:00:00Z',
+    '/search?q=https%3A%2F%2Fexample.test&start=2026-10-17T12%3A00%3A00Z#events',
+  ]) assert.equal(safeReturnPath(path), path);
+  for (const path of ['/\n/evil.example', '/\t/evil.example']) assert.equal(safeReturnPath(path), '/');
+});

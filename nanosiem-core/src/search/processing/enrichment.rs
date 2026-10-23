@@ -71,6 +71,16 @@ fn lookup_batch_failure(table: &str, error: LookupError) -> SearchError {
             "Lookup table '{name}' does not exist (it may have been deleted \
              while the search was running)"
         )),
+        // NAN-4287: a refusal of the REQUEST (a key the table cannot hold, a
+        // limit) is deterministic. As a 503 it read as an outage and asked the
+        // analyst to retry a search that could never succeed.
+        error @ (LookupError::InvalidColumn(_)
+        | LookupError::InvalidTableName(_)
+        | LookupError::InvalidData(_)
+        | LookupError::RowLimitExceeded(_)
+        | LookupError::PrimaryKeyNotFound(_)) => SearchError::SqlValidationError(format!(
+            "`| lookup {table}` cannot be applied: {error}"
+        )),
         error => {
             warn!("Lookup failed for table {}: {}", table, error);
             SearchError::ServiceUnavailable(format!(
@@ -608,5 +618,70 @@ mod tests {
             }
             other => panic!("expected SqlValidationError (→ 400), got: {other:?}"),
         }
+    }
+
+    /// NAN-4287 (searchfuzz F31): a `| lookup` over a lake candidate set with
+    /// more distinct keys than the tenant store reads per batch (10k) was a
+    /// 503 on every run. Through the production `LookupService` and
+    /// `apply_lookup_enrichment`: every row is enriched, including keys past
+    /// the first batch.
+    #[tokio::test]
+    async fn nan4287_lookup_reads_more_keys_than_one_store_batch() {
+        use crate::search::service::ioc_lookup_resolve::tests::{make_table, service_with};
+        let table = make_table(
+            "easy_intel",
+            vec![LookupColumn::text("value", false), LookupColumn::text("ioc_type", false)],
+            Some("value"),
+        );
+        let ip = |i: usize| format!("10.{}.{}.{}", i / 65_536, (i / 256) % 256, i % 256);
+        // Two IOCs, one in the first and one in the last key batch.
+        let iocs = [7usize, 24_993];
+        let rows = iocs
+            .iter()
+            .map(|&i| {
+                std::collections::HashMap::from([
+                    ("value".to_string(), serde_json::json!(ip(i))),
+                    ("ioc_type".to_string(), serde_json::json!("ip")),
+                ])
+            })
+            .collect();
+        let service = service_with(table, rows);
+        let events: Vec<_> = (0..25_000)
+            .map(|i| serde_json::json!({"src_endpoint": {"ip": ip(i)}}))
+            .collect();
+        let query = crate::query::parse_query(
+            "* | lookup easy_intel value as src_endpoint.ip OUTPUT ioc_type | stats count by ioc_type",
+        )
+        .unwrap();
+        let commands = crate::search::query_processing::extract_lookup_commands(&query);
+        let enriched = apply_lookup_enrichment(events, &commands, Some(&service))
+            .await
+            .expect("a lookup over more than one store batch of keys must succeed");
+        let hits: Vec<usize> = enriched
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.get("ioc_type") == Some(&serde_json::json!("ip")))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(hits, iocs);
+    }
+
+    /// NAN-4287: a deterministic refusal of the lookup REQUEST is a 400, not a
+    /// 503 asking the analyst to retry; a store failure stays retryable.
+    #[test]
+    fn nan4287_lookup_request_refusals_are_4xx() {
+        for error in [
+            LookupError::InvalidColumn("at most 10000 key values per batch lookup".into()),
+            LookupError::InvalidData("bad".into()),
+            LookupError::RowLimitExceeded(1),
+        ] {
+            assert!(
+                matches!(lookup_batch_failure("easy_intel", error), SearchError::SqlValidationError(_)),
+            );
+        }
+        assert!(matches!(
+            lookup_batch_failure("easy_intel", LookupError::RepositoryError("pool timed out".into())),
+            SearchError::ServiceUnavailable(_)
+        ));
     }
 }

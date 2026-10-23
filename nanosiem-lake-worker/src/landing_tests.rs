@@ -315,7 +315,9 @@ async fn the_converter_accepts_refuses_and_drops_redeliveries_without_wedging() 
 fn the_open_cell_image_builds_the_converter_with_its_admitter() {
     let dockerfile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Dockerfile")).unwrap();
     let stage = dockerfile
-        .split("FROM chef AS open-lake-cell-builder")
+        // NAN-4304: match the stage by name, not its base image (NAN-3901
+        // rebased it from `chef` onto the shared `builder` stage).
+        .split(" AS open-lake-cell-builder\n")
         .nth(1)
         .and_then(|rest| rest.split("\nFROM ").next())
         .expect("open-lake-cell-builder stage");
@@ -434,4 +436,214 @@ async fn deleting_a_log_source_revokes_its_landing_source_and_key() {
     assert!(ledger.orphaned_sources().await.unwrap().is_empty());
 
     sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&pool).await.unwrap();
+}
+
+// --- Tenzir Arrow extension types (NAN-4301) ---
+
+/// Real Tenzir 6.19.1 `ocsf_derive | ocsf_cast | to_s3 { write_parquet }`
+/// output (OCSF 1.9 Authentication): `src_endpoint.ip` / `dst_endpoint.ip`
+/// are `tenzir.ip` (FixedSizeBinary(16), IPv4-mapped).
+const TENZIR_AUTH_PARQUET: &[u8] = include_bytes!("../tests/fixtures/tenzir-6.19.1-ocsf-auth-ip.parquet");
+
+fn tenzir_field(name: &str, data_type: DataType, extension: &str) -> Field {
+    Field::new(name, data_type, true)
+        .with_metadata(std::collections::HashMap::from([(EXTENSION_NAME.to_string(), extension.to_string())]))
+}
+
+fn tenzir_ip_field(name: &str) -> Field {
+    tenzir_field(name, DataType::FixedSizeBinary(16), "tenzir.ip")
+}
+
+fn mapped(v4: [u8; 4]) -> [u8; 16] {
+    std::net::Ipv4Addr::from(v4).to_ipv6_mapped().octets()
+}
+
+fn tenzir_ips(values: &[Option<[u8; 16]>]) -> ArrayRef {
+    Arc::new(arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(values.iter().map(|v| v.as_ref()), 16).unwrap())
+}
+
+fn json_rows(batch: RecordBatch) -> Vec<Value> {
+    let batch = decode_tenzir_extensions(batch).unwrap();
+    let mut writer = LineDelimitedWriter::new(Vec::new());
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+    writer.into_inner().split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(|l| serde_json::from_slice(l).unwrap()).collect()
+}
+
+#[test]
+fn real_tenzir_parquet_with_ip_columns_converts_with_no_refusals() {
+    let converted = convert_file(TENZIR_AUTH_PARQUET, FileFormat::Parquet, &stage(), TENANT, &source(), Utc::now()).unwrap();
+    assert!(converted.rows_accepted > 0);
+    assert_eq!(converted.rows_refused, 0, "first refusal: {:?}", converted.first_refusal);
+    let events = events_of(&converted);
+    assert_eq!(events.len() as u64, converted.rows_accepted);
+    assert_eq!(events[0]["class_uid"], 3002);
+    assert_eq!(events[0]["src_endpoint"]["ip"], "10.77.0.0");
+    assert_eq!(events[0]["dst_endpoint"]["ip"], "10.0.0.5");
+    for event in &events {
+        for endpoint in ["src_endpoint", "dst_endpoint"] {
+            let ip = event[endpoint]["ip"].as_str().unwrap();
+            assert!(ip.parse::<std::net::IpAddr>().is_ok(), "{endpoint}.ip = {ip}");
+        }
+    }
+}
+
+#[test]
+fn tenzir_ips_become_dotted_quad_or_canonical_ipv6_and_nulls_stay_null() {
+    let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let schema = Arc::new(Schema::new(vec![tenzir_ip_field("ip"), Field::new("raw", DataType::FixedSizeBinary(16), true)]));
+    let raw = tenzir_ips(&[Some(mapped([1, 2, 3, 4])), None, Some(v6.octets())]);
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![tenzir_ips(&[Some(mapped([10, 77, 0, 0])), None, Some(v6.octets())]), raw],
+    )
+    .unwrap();
+    let rows = json_rows(batch);
+    assert_eq!(rows[0]["ip"], "10.77.0.0");
+    assert!(rows[1].get("ip").is_none(), "null stays null (omitted)");
+    assert_eq!(rows[2]["ip"], "2001:db8::1");
+    assert_ne!(rows[0]["raw"], "1.2.3.4", "untagged binary is not reinterpreted");
+}
+
+#[test]
+fn tenzir_ips_inside_lists_and_maps_are_decoded() {
+    use arrow_array::builder::{FixedSizeBinaryBuilder, ListBuilder, MapBuilder, StringBuilder, StructBuilder};
+    // endpoints: list<struct<ip: tenzir.ip>>
+    let ip = Arc::new(tenzir_ip_field("ip"));
+    let item = Arc::new(Field::new("item", DataType::Struct(Fields::from(vec![ip.clone()])), true));
+    let mut list = ListBuilder::new(StructBuilder::new(
+        Fields::from(vec![ip.clone()]),
+        vec![Box::new(FixedSizeBinaryBuilder::new(16)) as Box<dyn arrow_array::builder::ArrayBuilder>],
+    ))
+    .with_field(item.clone());
+    for (value, end_of_row) in [
+        (Some(mapped([192, 168, 1, 1])), false),
+        (None, true),
+        (Some("fe80::1".parse::<Ipv6Addr>().unwrap().octets()), true),
+    ] {
+        let ips = list.values().field_builder::<FixedSizeBinaryBuilder>(0).unwrap();
+        match value {
+            Some(bytes) => ips.append_value(bytes).unwrap(),
+            None => ips.append_null(),
+        }
+        list.values().append(true);
+        if end_of_row {
+            list.append(true);
+        }
+    }
+    let list = list.finish();
+    // peers: map<utf8, tenzir.ip>
+    let mut map = MapBuilder::new(None, StringBuilder::new(), FixedSizeBinaryBuilder::new(16))
+        .with_values_field(Arc::new(tenzir_ip_field("value")));
+    map.keys().append_value("gw");
+    map.values().append_value(mapped([10, 0, 0, 1])).unwrap();
+    map.append(true).unwrap();
+    map.append(false).unwrap();
+    let map = map.finish();
+    // ips: list<tenzir.ip> (bare list of IPs)
+    let mut bare = ListBuilder::new(FixedSizeBinaryBuilder::new(16)).with_field(Arc::new(tenzir_ip_field("item")));
+    bare.values().append_value(mapped([8, 8, 8, 8])).unwrap();
+    bare.values().append_null();
+    bare.append(true);
+    bare.append(false);
+    let bare = bare.finish();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("endpoints", list.data_type().clone(), true),
+        Field::new("peers", map.data_type().clone(), true),
+        Field::new("ips", bare.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(list), Arc::new(map), Arc::new(bare)]).unwrap();
+    let rows = json_rows(batch);
+    assert_eq!(rows[0]["endpoints"], json!([{"ip": "192.168.1.1"}, {}]));
+    assert_eq!(rows[1]["endpoints"], json!([{"ip": "fe80::1"}]));
+    assert_eq!(rows[0]["peers"], json!({"gw": "10.0.0.1"}));
+    assert!(rows[1].get("peers").is_none());
+    assert_eq!(rows[0]["ips"], json!(["8.8.8.8", null]));
+    assert!(rows[1].get("ips").is_none());
+}
+
+#[test]
+fn tenzir_subnets_render_as_cidr_text() {
+    let ip = Arc::new(tenzir_ip_field("address"));
+    let children = Fields::from(vec![ip, Arc::new(Field::new("length", DataType::UInt8, true))]);
+    let subnets = StructArray::try_new(
+        children.clone(),
+        vec![
+            tenzir_ips(&[
+                Some(mapped([10, 1, 2, 0])),
+                Some("2001:db8::".parse::<Ipv6Addr>().unwrap().octets()),
+                Some(mapped([18, 52, 0, 0])),
+                None,
+            ]),
+            Arc::new(arrow_array::UInt8Array::from(vec![Some(120), Some(32), Some(80), Some(8)])),
+        ],
+        None,
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![tenzir_field("net", DataType::Struct(children), "tenzir.subnet")]));
+    let rows = json_rows(RecordBatch::try_new(schema, vec![Arc::new(subnets)]).unwrap());
+    assert_eq!(rows[0]["net"], "10.1.2.0/24", "IPv4 length is stored +96");
+    assert_eq!(rows[1]["net"], "2001:db8::/32");
+    assert_eq!(rows[2]["net"], "::ffff:18.52.0.0/80", "a mapped address under /96 is an IPv6 network");
+    assert!(rows[3].get("net").is_none());
+}
+
+#[test]
+fn tenzir_extension_types_survive_a_parquet_round_trip_through_read_rows() {
+    // ip + enumeration (string dictionary) written as Tenzir does, read the
+    // way landing reads every Parquet file.
+    let enum_type = DataType::Dictionary(Box::new(DataType::UInt8), Box::new(DataType::Utf8));
+    let schema = Arc::new(Schema::new(vec![
+        tenzir_ip_field("ip"),
+        tenzir_field("status", enum_type, "tenzir.enumeration"),
+    ]));
+    let status: arrow_array::DictionaryArray<arrow_array::types::UInt8Type> = vec![Some("Success"), None].into_iter().collect();
+    let batch = RecordBatch::try_new(schema.clone(), vec![tenzir_ips(&[Some(mapped([10, 0, 0, 5])), None]), Arc::new(status)]).unwrap();
+    let mut file = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let rows = read_rows(&file, FileFormat::Parquet).unwrap();
+    assert_eq!(rows[0], json!({"ip": "10.0.0.5", "status": "Success"}));
+    assert_eq!(rows[1], json!({}));
+}
+
+// --- Hive `class_uid=<N>` partition folders (NAN-4337) ---
+
+#[test]
+fn a_class_uid_folder_below_the_source_is_read_as_a_hive_partition() {
+    let class = |name: &str| parse_key(&key(name), TENANT).map(|parsed| parsed.partition_class_uid);
+    assert_eq!(class("class_uid=4003/events-1.parquet"), Ok(Some(4003)));
+    assert_eq!(class("2026/10/21/class_uid=3002/x/events-1.parquet"), Ok(Some(3002)));
+    assert_eq!(class("events-1.parquet"), Ok(None));
+    // Only folders count: a file named like a partition is just a name.
+    assert_eq!(class("class_uid=4003.parquet"), Ok(None));
+    assert_eq!(class("not_class_uid=4003/a.parquet"), Ok(None));
+    for junk in ["abc", "", "-1", "+4003", "4003 ", "4003.0", "0x0FA3", "1234567", "99999"] {
+        assert_eq!(class(&format!("class_uid={junk}/a.parquet")), Err("class_uid_partition_invalid"), "{junk:?}");
+    }
+    // Base Event (0) is an OCSF class like any other.
+    assert_eq!(class("class_uid=0/a.parquet"), Ok(Some(0)));
+    assert_eq!(class("class_uid=4003/class_uid=4003/a.parquet"), Err("class_uid_partition_ambiguous"));
+    assert_eq!(class("class_uid=4003/b/class_uid=3002/a.parquet"), Err("class_uid_partition_ambiguous"));
+    // Confinement is unchanged: the folder never lets a key leave its source.
+    assert_eq!(class("class_uid=4003/../a.parquet"), Err("key_malformed"));
+    assert_eq!(class("class_uid=4003//a.parquet"), Err("key_malformed"));
+    let tenant_level = format!("{LANDING_PREFIX}tenant_id={TENANT}/class_uid=4003/source={SOURCE}/a.parquet");
+    assert_eq!(parse_key(&tenant_level, TENANT), Err("key_malformed"));
+}
+
+#[test]
+fn rows_without_class_uid_take_the_partition_and_are_counted() {
+    let mut no_class = sysmon(Some("np"), 7);
+    no_class.as_object_mut().unwrap().remove("class_uid");
+    let file = ndjson(&[no_class.clone(), sysmon(Some("wp"), 8)]);
+    let converted = convert_landed(&file, FileFormat::Ndjson { gzip: false }, Some(1007), &stage(), TENANT, &source(), Utc::now())
+        .unwrap();
+    assert_eq!((converted.rows_accepted, converted.rows_refused, converted.rows_class_from_path), (2, 0, 1));
+    // Without the partition the same file keeps only the row that has it.
+    let plain = convert_file(&file, FileFormat::Ndjson { gzip: false }, &stage(), TENANT, &source(), Utc::now()).unwrap();
+    assert_eq!((plain.rows_accepted, plain.rows_refused, plain.rows_class_from_path), (1, 1, 0));
+    assert_eq!(plain.first_refusal.unwrap().reason, "ocsf_class_uid_missing_or_invalid");
 }

@@ -169,7 +169,7 @@ async fn serve(p: Arc<Mutex<Platform>>) -> String {
 fn own_ids() -> TenantIds {
     // SAFETY: geteuid/getegid never fail.
     let (u, g) = unsafe { (libc::geteuid(), libc::getegid()) };
-    TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, gid: g }
+    TenantIds { slot: 0, ingest_uid: u, query_uid: u, detect_uid: u, landing_uid: Some(u), gid: g }
 }
 
 /// A tree with cache, spill and tmp content, plus links into `sibling`.
