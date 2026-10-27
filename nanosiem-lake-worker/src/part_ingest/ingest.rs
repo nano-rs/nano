@@ -32,11 +32,11 @@ use super::prevalence_owner_store::PrevalenceAccess;
 use super::quarantine::{Kept, Quarantine, QuarantineEntry, Refusal, QUARANTINE_REPLAY_VERSION};
 use super::admission_attempts::{object_id, AdmissionAttempts, ADMISSION_CRASHED, MAX_ADMISSION_CRASHES, RESERVE_REFUSED};
 use super::part_gc_gate::{
-    PartGcAuthority, PartGcDecision, REASON_AUTHORITY_MISSING, REASON_AUTHORITY_UNREADABLE, REASON_SANCTIONED_PASS_PAUSED,
-    REASON_SANCTIONED_PATH_UNAVAILABLE,
+    PartGcAuthority, PartGcDecision, REASON_AUTHORITY_MISSING, REASON_AUTHORITY_UNREADABLE, REASON_CATALOG_HELD,
+    REASON_SANCTIONED_PASS_PAUSED, REASON_SANCTIONED_PATH_UNAVAILABLE,
 };
 use super::schema::{additive_merge, align, coerce_to_schema, decode_parallel, infer_schema};
-use super::writer::{publish_parts, sort_by_time_uid, FinishedPart, PartDraft, PartWriter, PartialSource};
+use super::writer::{sort_by_time_uid, FinishedPart, PartDraft, PartWriter, PartialSource};
 use crate::bronze::{admit_bronze_files_received, ClampedSources, IngestTimes, NoCanonicalEvents, RowRefusal};
 use crate::ingest_source_counters::{RefusedSources, SourceKey};
 use crate::parts::refusal_tally;
@@ -45,7 +45,8 @@ use crate::parts::format::{LogKeys, PartId, PartKeys, PROVENANCE_FILE};
 use crate::parts::levels::{plan_merges_with, FlushPolicy, Level, MergePolicy, FLUSH_MAX_ROWS};
 use crate::parts::part_log::{AppendOutcome, LogEntry, LogOp, LogSchema, ObjectStore, PartLogWriter, PartRef, Rejection, SourceRef, WriteHints, WriterClass};
 use super::finding_append::{FindingAppendRequest, FindingAppendResponse};
-use super::finding_outbox::{committed_receipts, FindingReceipt};
+use super::finding_outbox::{committed_receipts_cached, FindingReceipt};
+use super::finding_floors::{put_floor_logged, FloorCache};
 use super::finding_attempts::{attempted_receipts, legacy_attempt_key, put_attempt_batch, AttemptCache};
 use crate::parts::provenance::{
     Admission, PartInputs, PartSigner, PartialKind, SignedProvenance, SourceObject, TenantKeySet, ADMISSION_CONTRACT,
@@ -71,6 +72,7 @@ pub(crate) fn fatal_ingest_error(error: &anyhow::Error) -> bool {
         cause.downcast_ref::<crate::parts::part_log::Fenced>().is_some()
             || cause.downcast_ref::<crate::edge_log::EdgeLogFenced>().is_some()
             || cause.downcast_ref::<crate::parts::part_log::DoubleConsume>().is_some()
+            || cause.downcast_ref::<AdoptionRefused>().is_some()
             || cause.downcast_ref::<super::r2_put::TerminalPutError>().is_some()
             || cause.downcast_ref::<super::writer_lease::LeaseLost>().is_some()
             // NAN-4336: the owner refused a flush's part reservation
@@ -82,12 +84,67 @@ pub(crate) fn fatal_ingest_error(error: &anyhow::Error) -> bool {
     })
 }
 
+/// NAN-4554 (review P1): one failing quarantine mirror id's retry state.
+#[derive(Debug, Clone, Default)]
+struct MirrorRetry {
+    failures: u32,
+    next_ms: i64,
+    /// Its object PUT already succeeded (only the record is retried).
+    object_mirrored: bool,
+    failing_since_ms: Option<i64>,
+}
+
+/// NAN-4553 (review P1): ingest's tick retry window ran out
+/// (`MAX_RETRY_WINDOW`). Attached as context to the exiting error so the
+/// exit is classified as one the object in flight may have caused.
+#[derive(Debug, thiserror::Error)]
+#[error("ingest tick failing for {0} s (retry window exhausted)")]
+pub(crate) struct RetryWindowExhausted(pub u64);
+
+/// NAN-4553 (review P1): whether a coded ingest exit keeps this process's
+/// crash-ledger charges (the object in flight may be the cause) or undoes
+/// them (it cannot be). `None` is a clean end of the loop.
+///
+/// Kept: the tick retry window ran out ([`RetryWindowExhausted`]), or a
+/// store refusal of a part ingest produced with a 4xx other than 401/403
+/// (400 BadDigest / InvalidArgument are the bytes'). Undone: everything
+/// else that reaches a coded exit: fencing, a double consume, a 401/403
+/// (credentials), the writer lease lost, the owner refusing a reservation
+/// (isolated by its own ledger mark), an epoch change, enrichment, and a
+/// clean end. A wedge (stall watchdog) and a crash never reach this.
+pub(crate) fn exit_keeps_charges(error: Option<&anyhow::Error>) -> bool {
+    let Some(error) = error else { return false };
+    if error.downcast_ref::<RetryWindowExhausted>().is_some() {
+        return true;
+    }
+    error.chain().any(|cause| {
+        cause.downcast_ref::<super::r2_put::TerminalPutError>()
+            .is_some_and(|put| (400..500).contains(&put.status) && put.status != 401 && put.status != 403)
+    })
+}
+
+/// NAN-4539: a flush's parts are already in the part log but its sources
+/// are not consumed there. Only a broken invariant (an id reused, or a log
+/// written by something else) gets here; retrying cannot fix it, so ingest
+/// exits at once instead of retrying until the retry window closes.
+#[derive(Debug, thiserror::Error)]
+#[error("flush parts are already in the part log but their sources are not consumed: refusing to adopt")]
+pub(crate) struct AdoptionRefused;
+
+fn catalog_failure_health(reason: &'static str) -> serde_json::Value {
+    serde_json::json!({"custody_attached":false,"gc_attached":false,"converged":false,
+        "degraded":true,"reason":reason})
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
     pub tenant_id: String,
     /// Tenant-owned catalog custody, supplied by the provisioning runtime.
     /// No environment toggle: a provisioned catalog must participate in erasure.
     pub catalog: Option<Arc<super::iceberg_export::lifecycle::TenantCatalog>>,
+    /// Derived from an installed lane's failed attachment, never an operator
+    /// switch. Continue appends while holding erasure and all physical GC.
+    pub catalog_attachment_failure: Option<&'static str>,
     /// 0700 per-tenant working directory (under ~/.cache in the lab).
     pub work_dir: PathBuf,
     pub build: String,
@@ -109,16 +166,11 @@ pub struct IngestConfig {
     /// cap alone was ~2.2 GiB, plus its decode and sort copies (NAN-3056,
     /// the lab-tenant OOMs at 4.5 GiB). The cell derives it from memory.max.
     pub buffer_budget_bytes: u64,
-    /// Pipelined flushes in flight at once (NAN-3619, [`FLUSH_DEPTH_ENV`]):
-    /// 1 (default) seals the next flush only after the previous one
-    /// committed; 2 lets it seal while the previous one still builds and
-    /// publishes. Capped by the queue's `max_outstanding_ranges`. Commits,
-    /// edge ranges and acks stay in seal order either way.
+    /// Constructor policy ceiling, capped by queue, background handles, memory
+    /// and privacy barriers. Production uses two; one is the serial baseline.
     pub flush_depth: usize,
-    /// Commit a finished flight as soon as it is ready (NAN-3619,
-    /// [`COMMIT_WHEN_READY_ENV`], default off): also after admission and
-    /// before maintenance, not only at the next ingest phase; and look past
-    /// held notices when sizing the pending window. Off: today's path.
+    /// Commit ready flights after admission and before maintenance. Production
+    /// defaults on; retained for the serial comparison in offline tests.
     pub commit_when_ready: bool,
     pub writer_epoch: u64,
     /// Stall threshold: oldest pending notice older than this is `stalled`.
@@ -175,10 +227,23 @@ pub struct IngestConfig {
     /// Prevalence is derived: it never holds a commit (tenant-a 2026-10-13, R2
     /// timeouts held flushes ~2 min behind 45 s waits).
     pub prevalence_ingest_wait: std::time::Duration,
+    /// NAN-4592: longest one admission batch waits for its prevalence
+    /// lookups (never more than `prevalence_ingest_wait`). A batch whose
+    /// lookups are not ready by then is committed unstamped and its hours
+    /// are owed an exact restamp; the reads keep warming the cache.
+    pub prevalence_stamp_wait: std::time::Duration,
+    /// NAN-4592: cap on the remote prevalence state's local disk cache
+    /// (sized from the state's measured SSTs within it,
+    /// [`super::prevalence::object_cache_bytes`]). Production:
+    /// `cell::prevalence_cache_bytes_for`.
+    pub prevalence_cache_max_bytes: u64,
     /// Hard ceiling on one prevalence open running in the background
     /// (NAN-3554): past it the open is taken as hung, aborted, and a fresh
     /// one is retried with the normal backoff.
     pub prevalence_open_hard_timeout: std::time::Duration,
+    /// Reproduce main's read policy for the physical-I/O cost comparison.
+    #[cfg(test)]
+    pub prevalence_main_read_policy: bool,
     /// Read side of the granted prevalence state in place of the grant's S3
     /// endpoint (tests: an in-memory stand-in for R2). Mutations still go
     /// only through the owner. Production leaves it `None`.
@@ -192,6 +257,12 @@ pub struct IngestConfig {
     /// ([`super::prevalence::CATCH_UP_BATCH_ENTRIES`]; tests lower it to
     /// stop a catch-up between batches). Not an operator setting.
     pub prevalence_catch_up_batch_entries: usize,
+    /// NAN-4460: the most partial rows one catch-up batch may fold, from
+    /// the process's memory cap
+    /// ([`super::prevalence::catch_up_max_rows_for`]; the cell sets it from
+    /// the assignment). Batches grow toward it only while the backlog is
+    /// long. Not an operator setting.
+    pub prevalence_catch_up_max_rows: u64,
     /// NAN-3662 ([`refusal_tally::WRITE_ENV`], default off): each `reject`
     /// entry's detail starts with the refused rows per source lane, so
     /// query[T] can count lean refusals per log source.
@@ -213,6 +284,7 @@ impl IngestConfig {
         Self {
             tenant_id: tenant_id.to_string(),
             catalog: None,
+            catalog_attachment_failure: None,
             work_dir: work_dir.as_ref().to_path_buf(),
             build: format!("nanosiem-lake-worker {}", env!("CARGO_PKG_VERSION")),
             merge_policy: MergePolicy::default(),
@@ -221,8 +293,8 @@ impl IngestConfig {
             max_merges_per_tick: 2,
             background_merges: false,
             buffer_budget_bytes: DEFAULT_BUFFER_BUDGET_BYTES,
-            flush_depth: 1,
-            commit_when_ready: false,
+            flush_depth: MAX_FLUSH_DEPTH,
+            commit_when_ready: true,
             writer_epoch: 1,
             lag_alert_ms: 120_000,
             flush_policy: FlushPolicy::default(),
@@ -237,10 +309,15 @@ impl IngestConfig {
             prevalence_rebuild_budget_ms: 2_000,
             prevalence_op_timeout: PREVALENCE_OP_TIMEOUT,
             prevalence_ingest_wait: PREVALENCE_INGEST_WAIT,
+            prevalence_stamp_wait: PREVALENCE_STAMP_WAIT,
+            prevalence_cache_max_bytes: super::prevalence::OBJECT_CACHE_FLOOR_BYTES,
             prevalence_open_hard_timeout: PREVALENCE_OPEN_HARD_TIMEOUT,
+            #[cfg(test)]
+            prevalence_main_read_policy: false,
             prevalence_read_store: None,
             prevalence_rarity_threshold: crate::prevalence::DEFAULT_RARITY_THRESHOLD,
             prevalence_catch_up_batch_entries: super::prevalence::CATCH_UP_BATCH_ENTRIES,
+            prevalence_catch_up_max_rows: super::prevalence::CATCH_UP_BATCH_ROWS,
             refusal_source_counts: false,
         }
     }
@@ -266,6 +343,10 @@ pub struct CoverageFailure {
 /// pages on `stalled`, NAN-2780 pattern).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IngestHealth {
+    /// Present only for a coordinator-installed catalog. Unactivated tenants
+    /// retain the exact old wire representation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_catalog: Option<serde_json::Value>,
     pub tenant_id: String,
     pub updated_at_ms: i64,
     pub last_commit_ms: Option<i64>,
@@ -371,8 +452,33 @@ pub struct IngestHealth {
     /// NAN-4319: objects refused whole because ingest died with them
     /// admitted [`MAX_ADMISSION_CRASHES`] times.
     pub objects_admission_crashed_total: u64,
+    /// NAN-4553: objects too large for the admission budget that were
+    /// admitted in row slices instead of whole.
+    pub objects_admitted_in_slices_total: u64,
     /// NAN-3643: operator replays of quarantined objects that committed.
     pub quarantine_replays_total: u64,
+    /// NAN-4554: quarantine changes mirrored into the tenant bucket, the
+    /// mirror attempts that failed, and the entries a fresh work dir
+    /// restored from it.
+    pub quarantine_mirrored_total: u64,
+    pub quarantine_mirror_failures_total: u64,
+    pub quarantine_restored_total: u64,
+    /// NAN-4554: objects an operator imported from an export (kept new).
+    pub quarantine_imported_total: u64,
+    /// NAN-4554 (review): ids whose mirror is failing now (each backs off on
+    /// its own), and since when the oldest of them has failed.
+    pub quarantine_mirror_failing_ids: usize,
+    pub quarantine_mirror_failing_since_ms: Option<i64>,
+    /// NAN-4554 (review): a fresh work dir's restore has not completed yet
+    /// (retried with backoff), its last error, and a named reason it
+    /// stopped early (`restore_disk_low`). The roll gates on these.
+    pub quarantine_restore_pending: bool,
+    pub quarantine_restore_error: Option<String>,
+    pub quarantine_restore_refused: Option<String>,
+    /// Live entries a restore left in the bucket (beyond the local caps),
+    /// and records it listed past (beyond its read bound).
+    pub quarantine_restore_over_cap: u64,
+    pub quarantine_restore_records_beyond_bound: u64,
     /// NAN-3643: entries in the quarantine now, and their bytes.
     pub quarantine_objects: usize,
     pub quarantine_bytes: u64,
@@ -383,6 +489,9 @@ pub struct IngestHealth {
     /// time, admitted with `time` clamped to it (the original kept in
     /// `metadata.original_time`, `metadata.labels` += `time_clamped`).
     pub rows_time_clamped_total: u64,
+    /// NAN-4573: clamped rows dropped because another delivery of the same
+    /// event was already admitted under its original event hour.
+    pub clamped_cross_hour_duplicates_total: u64,
     /// NAN-4336: the same, per counter source slug (at most
     /// [`MAX_CLAMPED_SOURCES`] slugs; the rest fold into `default`).
     pub rows_time_clamped_by_source: BTreeMap<String, u64>,
@@ -410,6 +519,12 @@ pub struct IngestHealth {
     /// NAN-3781: total degraded time since process start, in ms (closed
     /// spells plus the current one): rows went unstamped for this long.
     pub prevalence_degraded_ms_total: u64,
+    /// NAN-4445: false while this process does not yet know whether a
+    /// degraded spell is under way: it has not read the spell an earlier
+    /// process persisted, or its first open has not settled. The supervisor
+    /// then reports no `prevalence_degraded` signal (a roll must not resolve
+    /// an alert on a 0). True without a prevalence grant.
+    pub prevalence_degraded_known: bool,
     /// Failed prevalence open / reopen attempts since process start.
     pub prevalence_open_failures_total: u64,
     /// Prevalence operations abandoned past `prevalence_op_timeout`.
@@ -424,6 +539,8 @@ pub struct IngestHealth {
     /// NAN-3774: prevalence operations the ingest loop stopped waiting on
     /// at `prevalence_ingest_wait` (ingest went on; prevalence catches up).
     pub prevalence_deferred_total: u64,
+    /// NAN-4460: catch-up batches applied since process start.
+    pub prevalence_catch_up_batches_total: u64,
     /// NAN-3774: admission batches committed unstamped because the state's
     /// lookups were slower than `prevalence_ingest_wait`.
     pub prevalence_unstamped_batches_total: u64,
@@ -461,6 +578,14 @@ pub struct IngestHealth {
     pub flushes_in_flight: usize,
     /// Most flushes that were in flight at once since start.
     pub flushes_in_flight_peak: usize,
+    /// NAN-4539 step 3a: age-due seals deferred beside an unfinished flight,
+    /// seals made before the ready oldest flight committed, and the longest
+    /// one buffer stayed deferred before it sealed (ms): a deferral lasts at
+    /// most until a flight slot frees, so the live check can confirm 3a
+    /// engaged and that its deferral stays bounded.
+    pub seals_deferred_total: u64,
+    pub seals_first_total: u64,
+    pub seal_deferred_max_ms: i64,
     /// Superseded parts kept because the lake-part delete gate is closed
     /// (`part_gc_gate`); `None` while deletion is authorized.
     pub part_gc_blocked: Option<nanosiem_lake_cell::contract::PartGcBlocked>,
@@ -494,6 +619,7 @@ struct Buffered {
     since_ms: Option<i64>,
     buffered_since: Option<std::time::Instant>,
     flush_started_ms: Option<i64>,
+    progress: Option<Arc<std::sync::Mutex<FlushStage>>>,
     rows_in: u64,
     duplicates: u64,
     /// Of `duplicates`: those whose payload differs from the kept row's.
@@ -554,6 +680,7 @@ impl Buffered {
             since_ms: None,
             buffered_since: None,
             flush_started_ms: None,
+            progress: None,
             rows_in: 0,
             duplicates: 0,
             same_uid_payload_diff: 0,
@@ -625,63 +752,18 @@ impl FlushPlan {
     }
 }
 
-/// Read-only pipeline state shared with the heartbeat. These locks are held
-/// only to copy small counters and stages; never across I/O or an await.
-#[derive(Clone, Default)]
-pub struct PipelineDiagnostics(std::sync::Arc<std::sync::Mutex<PipelineSnapshot>>);
-#[derive(Default)]
-struct PipelineSnapshot {
-    rows: usize,
-    bytes: u64,
-    buffered_since: Option<std::time::Instant>,
-    flights: usize,
-    oldest_flush_ms: Option<i64>,
-    oldest_background: Option<std::sync::Arc<std::sync::Mutex<FlushStage>>>,
-    tracking_oldest: bool,
-    stage: &'static str,
-    stage_since: Option<std::time::Instant>,
-}
-struct FlushStage { stage: &'static str, since: std::time::Instant }
-impl FlushStage {
-    fn set(&mut self, stage: &'static str) {
-        if self.stage != stage { self.stage = stage; self.since = std::time::Instant::now(); }
-    }
-}
-impl PipelineDiagnostics {
-    pub fn snapshot(&self) -> serde_json::Value {
-        let state = self.0.lock().expect("pipeline diagnostics");
-        let background = state.oldest_background.as_ref().map(|stage| stage.lock().expect("flush diagnostics"));
-        let stage = background.as_ref().map_or(state.stage, |stage| stage.stage);
-        let stage_age = background.as_ref().map_or_else(
-            || state.stage_since.map_or(0.0, |at| at.elapsed().as_secs_f64()),
-            |stage| stage.since.elapsed().as_secs_f64());
-        serde_json::json!({"buffered_rows": state.rows, "buffered_bytes": state.bytes,
-            "buffered_age_seconds": state.buffered_since.map_or(0.0, |at| at.elapsed().as_secs_f64()),
-            "flushes_in_flight": state.flights,
-            "oldest_flush_age_seconds": state.oldest_flush_ms.map_or(0.0, |ms| (chrono::Utc::now().timestamp_millis() - ms).max(0) as f64 / 1000.0),
-            "oldest_flush_stage": (state.flights > 0).then_some(stage),
-            "oldest_flush_stage_age_seconds": if state.flights > 0 { stage_age } else { 0.0 }})
-    }
-    fn stage(&self, stage: &'static str) {
-        let mut state = self.0.lock().expect("pipeline diagnostics");
-        if state.tracking_oldest {
-            if let Some(progress) = &state.oldest_background {
-                progress.lock().expect("flush diagnostics").set(stage);
-            }
-        }
-        if state.stage != stage {
-            state.stage = stage;
-            state.stage_since = Some(std::time::Instant::now());
-        }
-    }
-}
+pub use super::diagnostics::PipelineDiagnostics;
+use super::diagnostics::FlushStage;
 
 /// A sealed flush (rejections logged, skips acknowledged, edge range
 /// issued, schema logged) whose parts build and upload in the background
-/// while the next buffer admits. At most `flush_depth` exist (NAN-3619);
-/// they commit strictly in seal order (only the oldest commits, a younger
-/// one that finished first waits), so `add` entries, edge acks and edge
-/// ranges keep their order.
+/// while the next buffer admits. At most [`MAX_FLUSH_DEPTH`] exist, fewer
+/// when the queue, background handles, memory or a privacy/catalog barrier
+/// say so (NAN-3619, NAN-4539); they commit strictly in seal order (only the
+/// oldest commits, a younger one that finished first waits), so `add`
+/// entries, edge acks and edge ranges keep their order. A flight leaves the
+/// queue only once its acks landed: a cancelled commit keeps it (and its
+/// reservation, task and immutable output) for the next attempt.
 struct InFlightFlush {
     buffer: Buffered,
     /// Working-budget bytes charged until it commits
@@ -693,10 +775,32 @@ struct InFlightFlush {
     progress: std::sync::Arc<std::sync::Mutex<FlushStage>>,
     /// `None` once taken: awaited, or failed (the retry resumes on the tick).
     task: Option<tokio::task::JoinHandle<Result<(Vec<FinishedPart>, Result<Vec<PartRef>>)>>>,
-    /// Immutable output retained after a failed publish; retries keep part ids.
+    /// Immutable output, kept from build until the flight's acks land:
+    /// retries keep part ids and cache eviction keeps its directories.
     built: Option<Vec<FinishedPart>>,
-    /// Built and published, awaiting the `add`.
-    published: Option<(Vec<FinishedPart>, Vec<PartRef>)>,
+    /// `built` is published (these refs), awaiting the `add`.
+    published: Option<Vec<PartRef>>,
+    /// NAN-4539 step 3a: set by the background task once its parts are
+    /// published. Its build copies and writers are freed by then, so the
+    /// flight holds only its retained rows ([`Ingestor::settle_published_flights`]).
+    published_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What [`Ingestor::commit_add`] needs of a finished part once it is
+/// published: owned, so the immutable output stays with its flush while the
+/// append and the prevalence apply await (NAN-4539 cancellation safety).
+struct AddPart {
+    part_id: PartId,
+    partial_prevalence: PathBuf,
+    max_time_us: i64,
+}
+
+fn add_parts(finished: &[FinishedPart]) -> Vec<AddPart> {
+    finished.iter().map(|part| AddPart {
+        part_id: part.record.part_id.clone(),
+        partial_prevalence: part.dir.join(crate::parts::format::PARTIAL_PREVALENCE_FILE),
+        max_time_us: part.record.max_time_us,
+    }).collect()
 }
 
 /// Where the tenant prevalence state stands against the part log. Rows are
@@ -711,6 +815,11 @@ pub(crate) const PREVALENCE_DEGRADED_LOG_EVERY_MS: i64 = 60_000;
 pub(crate) const PREVALENCE_STEP_FAILING_DEGRADED_MS: i64 = 60_000;
 /// Longest delay between prevalence open retries.
 pub(crate) const PREVALENCE_RETRY_MAX_MS: i64 = 600_000;
+/// NAN-4445: how long a new process may report its degraded spell as
+/// unknown (no `prevalence_degraded` signal) while it reads the persisted
+/// spell and its first open runs (a cold open is about 1-2 min; the large tenant's failing
+/// opens took 21-27 s). Past it the signal is reported regardless.
+pub(crate) const PREVALENCE_SPELL_UNKNOWN_MAX_MS: i64 = 5 * 60_000;
 
 /// NAN-3554: a prevalence open running as its own task. An open replays
 /// the tenant's unflushed WAL and can outlive `prevalence_op_timeout`;
@@ -742,6 +851,9 @@ fn spawn_prevalence_open(cfg: &IngestConfig, access: Option<PrevalenceAccess>, p
     let tenant = cfg.tenant_id.clone();
     let work_dir = cfg.work_dir.clone();
     let reads = cfg.prevalence_read_store.clone();
+    let cache_cap = cfg.prevalence_cache_max_bytes;
+    #[cfg(test)]
+    let main_read_policy = cfg.prevalence_main_read_policy;
     let handle = tokio::spawn(async move {
         if let Some(previous) = previous {
             if let Err(error) = previous.close().await {
@@ -749,7 +861,11 @@ fn spawn_prevalence_open(cfg: &IngestConfig, access: Option<PrevalenceAccess>, p
                     "closing the prevalence state opened on a superseded grant failed");
             }
         }
-        IngestPrevalence::open_with_reads(&tenant, &work_dir, access.as_ref(), reads).await
+        let opened = IngestPrevalence::open_sized(&tenant, &work_dir, access.as_ref(), reads, cache_cap);
+        #[cfg(test)]
+        { return super::prevalence_io::MAIN_POLICY.scope(main_read_policy, opened).await; }
+        #[cfg(not(test))]
+        opened.await
     });
     PrevalenceOpening { handle, started: std::time::Instant::now(), grant_serial }
 }
@@ -818,6 +934,8 @@ pub struct Ingestor<'a> {
     parts: &'a dyn ObjectStore,
     /// NAN-4181: finding batch attempt markers known to this process.
     finding_attempts: Arc<AttemptCache>,
+    /// NAN-4656: replay floor bodies this process read.
+    finding_floors: Arc<FloorCache>,
     sources: &'a dyn ObjectStore,
     queue: &'a dyn NoticeQueue,
     signer: &'a dyn PartSigner,
@@ -846,6 +964,13 @@ pub struct Ingestor<'a> {
     gc_done: HashSet<PartId>,
     /// The lake-part delete gate; `None` = blocked (`authority_missing`).
     gc_authority: Option<Arc<dyn PartGcAuthority>>,
+    /// NAN-4601: the delete gate set aside by [`Self::hold_catalog`]. Only
+    /// its index-only feed is driven (never a delete decision or pass).
+    held_index_feed: Option<Arc<dyn PartGcAuthority>>,
+    /// NAN-4601: when this process first reported the catalog hold, and when
+    /// it last logged it (re-logged every [`CATALOG_HELD_LOG_INTERVAL_MS`]).
+    catalog_held_since_ms: Option<i64>,
+    catalog_held_logged_ms: Option<i64>,
     local_gc: Option<Arc<crate::lake_part_gc::local::LocalDeleteAuthority>>,
     last_sanctioned_pass_ms: Option<i64>,
     /// NAN-3818: the last sanctioned pass stopped after one bounded log-fold
@@ -874,12 +999,17 @@ pub struct Ingestor<'a> {
     /// Background merges, bounded independently by minute/history lane.
     merge_in_flight: Vec<InFlightMerge>,
     /// Pipelined flushes still building/publishing, oldest (next to
-    /// commit) first (NAN-3183; up to `flush_depth`, NAN-3619).
+    /// commit) first (NAN-3183; up to the effective `flush_depth`).
     flush_in_flight: VecDeque<InFlightFlush>,
     diagnostics: PipelineDiagnostics,
     /// Woken when a flight's build/publish task finishes, so the loop
     /// commits it now rather than after its idle sleep (NAN-3619).
     flight_wake: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Age-due seals deferred beside an unfinished flight (NAN-4539 step 3a).
+    /// When the filling buffer's age-due seal was first deferred.
+    seal_deferred_since_ms: Option<i64>,
+    /// Whether the last ingest tick saw fresh notices pending (catch-up).
+    behind_last_tick: bool,
     merge_schedule_log_ms: i64,
     /// NAN-3077 old-hour reindex: per live `h` part, whether all enabled coverage goals
     /// are current (probed once per signed part), failed hours to skip, and the earliest next reindex start.
@@ -956,6 +1086,15 @@ pub struct Ingestor<'a> {
     /// in flight). Capped at [`PREVALENCE_ADMIT_OVERRUN_WAITS`] ingest waits;
     /// reset once the state answers.
     prevalence_admit_waited: std::time::Duration,
+    /// NAN-4460: the catch-up batch scale (1..=`CATCH_UP_MAX_SCALE`) for the
+    /// next batch; it follows the backlog and the cell's headroom
+    /// ([`super::prevalence::next_catch_up_scale`]).
+    prevalence_catch_up_scale: usize,
+    prevalence_read_stats_at_ms: i64,
+    /// NAN-4464: when the catch-up watchdog last saw the state's read or
+    /// commit progress advance, and its value then
+    /// ([`Self::catch_up_reads_patient`]).
+    prevalence_reads_watch: Option<(std::time::Instant, u64)>,
     /// NAN-3774: since when prevalence operations have been overrunning
     /// `prevalence_ingest_wait` without one finishing. While set, the commit
     /// path does not touch the state (rows unstamped, `Add`s pending); only
@@ -982,6 +1121,14 @@ pub struct Ingestor<'a> {
     prevalence_degraded_since_ms: Option<i64>,
     prevalence_degraded_closed_ms: u64,
     prevalence_degraded_logged_ms: i64,
+    /// NAN-4445: the degraded spell's start as persisted in the tenant
+    /// bucket ([`super::prevalence_spell`]), so a roll continues it.
+    prevalence_spell: super::prevalence_spell::SpellSync,
+    /// NAN-4445: this process's first open has settled (state placed, or
+    /// failed and scheduled for retry).
+    prevalence_first_settled: bool,
+    /// NAN-4445: the first health update of this process.
+    prevalence_health_started_ms: Option<i64>,
     /// NAN-3781: since when (ms) every rebuild/catch-up step has failed.
     prevalence_step_failing_since_ms: Option<i64>,
     /// NAN-3849: part-log entries the batched catch-up has read and parsed
@@ -1025,6 +1172,16 @@ pub struct Ingestor<'a> {
     /// the directory could not be opened: refusals then behave as before).
     quarantine: Option<Quarantine>,
     quarantine_swept_ms: i64,
+    /// NAN-4554: since when the bucket has refused a quarantine change (the
+    /// flush acknowledging it waits up to `MIRROR_HOLD_MS`), and the last
+    /// record time written (strictly increasing: the newest record wins).
+    quarantine_mirror_failing_since: Option<i64>,
+    quarantine_record_ms: i64,
+    /// NAN-4554 (review P1): per-id mirror backoff (failures, next try) and
+    /// whether that id's object PUT already succeeded.
+    quarantine_mirror_backoff: BTreeMap<String, MirrorRetry>,
+    /// NAN-4554 (review P1): restore backoff (failures, next try).
+    quarantine_restore_retry: (u32, i64),
     /// A replay may be requested: look at the quarantine directory only
     /// then, not every tick (true at open: a request may predate a restart).
     quarantine_replay_pending: bool,
@@ -1054,6 +1211,8 @@ pub struct FindingAppendContext<'a> {
     pub trusted: TenantKeySet,
     /// NAN-4181: batch attempt marker bodies this process wrote or read.
     pub attempts: Arc<AttemptCache>,
+    /// NAN-4656: replay floor bodies this process read.
+    pub floors: Arc<FloorCache>,
 }
 
 /// A finding append request whose receipts and signed parts were verified.
@@ -1063,6 +1222,10 @@ pub struct ValidatedFinding {
     /// An ingest attempt marker names a receipt: the log decides
     /// whether this is a replay ([`finding_replay_proof`]).
     pub needs_replay_proof: bool,
+    /// NAN-4656: the receipts an attempt marker names, the only ones the
+    /// proof reads the log for. A receipt no marker names was never offered
+    /// to the log (the drain relies on the same rule).
+    pub attempted: Vec<SourceRef>,
     /// Every stored object of every finding part (files + provenance), as
     /// its signed provenance names it.
     objects: Vec<FindingObject>,
@@ -1114,8 +1277,12 @@ pub async fn validate_finding(context: &FindingAppendContext<'_>, request: Findi
     }
     // NAN-4181: one LIST of the batch markers since the oldest receipt
     // (plus the legacy per-receipt probes), not one marker per receipt.
-    let needs_replay_proof = !attempted_receipts(context.parts, tenant_id, &request.receipts, &context.attempts)
-        .await?.is_empty();
+    let marked = attempted_receipts(context.parts, tenant_id, &request.receipts, &context.attempts).await?;
+    let attempted = request.receipts.iter()
+        .filter(|source| marked.contains(&(source.key.clone(), source.sha256.clone(), source.version.clone())))
+        .cloned()
+        .collect::<Vec<_>>();
+    let needs_replay_proof = !attempted.is_empty();
     let proposed = request.schema.to_arrow()?;
     let mut signed_sources = std::collections::BTreeSet::new();
     let mut objects = Vec::new();
@@ -1148,7 +1315,7 @@ pub async fn validate_finding(context: &FindingAppendContext<'_>, request: Findi
         }
     }
     ensure!(signed_sources == wanted.keys().cloned().collect(), "finding part omitted a receipt");
-    Ok(ValidatedFinding { request, proposed, needs_replay_proof, objects, registered: false })
+    Ok(ValidatedFinding { request, proposed, needs_replay_proof, attempted, objects, registered: false })
 }
 
 /// NAN-3499: detect's finding drain PUTs finding parts with its own
@@ -1196,6 +1363,12 @@ pub const PREVALENCE_PREFETCH: usize = 4;
 // exceeding the 5 s ingest wait before the first durable apply.
 pub const PREVALENCE_CATCH_UP_SCAN: u64 = 32;
 pub const PREVALENCE_CATCH_UP_FETCHES: usize = 16;
+/// NAN-4460: a scaled batch (scale `s`) scans `s` times
+/// [`PREVALENCE_CATCH_UP_SCAN`] entries and fetches on `min(s, 4)` times
+/// [`PREVALENCE_CATCH_UP_FETCHES`] lanes. At scale 8 that is a 256-entry
+/// scan on 64 lanes: 4 rounds of GETs, and completed GETs survive a cut
+/// step.
+pub const PREVALENCE_CATCH_UP_FETCH_SCALE_MAX: usize = 4;
 
 /// NAN-3849: how long L0 merges yield to a prevalence catch-up. Merges wait
 /// while the state replays committed `Add`s (they would otherwise race it
@@ -1225,6 +1398,9 @@ enum CatchUpBatch {
     /// large for a batch, a run of non-`Add` entries or a partial that
     /// could not be fetched: its replay-gap handling stays in one place).
     Unbatchable,
+    /// NAN-4464: the batch's reads are still running past the step's
+    /// deadline; a later step commits it.
+    Reading,
 }
 
 /// Default [`IngestConfig::prevalence_op_timeout`].
@@ -1235,7 +1411,15 @@ pub const PREVALENCE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// (`prevalence_rebuild_budget_ms`, 2 s), far below the flush interval.
 pub const PREVALENCE_INGEST_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// NAN-3879: admission waits (each at most the ingest wait) on a state that
+/// Default [`IngestConfig::prevalence_stamp_wait`] (NAN-4592). A warm
+/// lookup (disk-cached state) of a large-tenant-sized batch (~2-5k artifacts at 256
+/// lanes) takes tens of milliseconds; a cold one reads R2 for seconds. The large tenant
+/// (hosted, 2026-10-26) spent the whole 5 s ingest wait on 65 of 274
+/// flushes (~28%) and then committed those batches unstamped anyway: past
+/// this wait the batch is owed a restamp instead of holding admission.
+pub const PREVALENCE_STAMP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// NAN-3879: admission waits (each at most the stamp wait, NAN-4592) on a state that
 /// is overrunning, per overrun spell. Past them batches go unstamped (owed a
 /// restamp) until the state answers again, so a store that stops answering
 /// costs ingest at most this many waits per spell, never a stall.
@@ -1249,8 +1433,17 @@ pub const PREVALENCE_OPEN_HARD_TIMEOUT: std::time::Duration = std::time::Duratio
 /// Concurrent object-store requests for one finding append or drain batch.
 pub const FINDING_IO_CONCURRENCY: usize = 16;
 
-pub async fn finding_replay_proof(context: &FindingAppendContext<'_>, receipts: &[SourceRef]) -> Result<Option<FindingAppendResponse>> {
-    let committed = committed_receipts(context.parts, &context.tenant_id, receipts, &context.trusted).await?;
+/// Is this append a replay of a committed `Add`? `attempted` are the
+/// request's receipts an attempt marker names (the only ones the log can
+/// hold); `receipts` is the whole request. NAN-4656: resumes after the
+/// durable replay floors, so a retry reads only entries not yet proven.
+pub async fn finding_replay_proof(context: &FindingAppendContext<'_>, receipts: &[SourceRef], attempted: &[SourceRef])
+    -> Result<Option<FindingAppendResponse>> {
+    if attempted.is_empty() {
+        return Ok(None);
+    }
+    let committed = committed_receipts_cached(context.parts, &context.tenant_id, attempted, &context.trusted,
+        &context.floors).await?;
     if committed.is_empty() {
         // A marker can precede a failed append or a process crash. No
         // receipt was committed, so the original request remains valid.
@@ -1318,14 +1511,13 @@ impl RestampTask {
             if self.sealed { Err(RestampSkip::Deferred { hour: self.hour, reason }.into()) } else { Ok(None) }
         };
         let distinct = artifacts.len();
-        let budget = if self.sealed { super::restamp::RESTAMP_LOOKUP_TIMEOUT } else { super::restamp::RESTAMP_MERGE_LOOKUP_TIMEOUT };
-        match tokio::time::timeout(budget, self.lookup.clone().observe(artifacts)).await {
-            Ok(Ok(observed)) => {
-                tracing::info!(hour = self.hour, rows, artifacts = distinct, sealed = self.sealed, "prevalence restamp looked up");
-                Ok(Some(Arc::new(RestampMap::new(observed.scalars()))))
+        match self.lookup.clone().observe_restamp(artifacts, self.sealed).await {
+            Ok((scalars, complete)) => {
+                tracing::info!(hour = self.hour, rows, artifacts = distinct, completed_artifacts = scalars.len(),
+                    complete, sealed = self.sealed, "prevalence restamp looked up");
+                Ok(Some(Arc::new(RestampMap::with_completion(scalars, complete))))
             }
-            Ok(Err(error)) => failed(format!("{error:#}")),
-            Err(_) => failed(format!("lookups took over {} s", budget.as_secs())),
+            Err(error) => failed(format!("{error:#}")),
         }
     }
 }
@@ -1333,7 +1525,7 @@ impl RestampTask {
 /// NAN-3864: record what a finished merge restamped.
 fn restamp_applied(map: Option<&super::restamp::RestampMap>, outcome: Option<&super::restamp::RestampOutcome>, ok: bool) {
     if let (Some(map), Some(outcome), true) = (map, outcome, ok) {
-        outcome.set(super::restamp::RestampResult::Applied { rows: map.restamped_rows() });
+        outcome.set(super::restamp::RestampResult::Applied { rows: map.restamped_rows(), complete: map.complete() });
     }
 }
 
@@ -1410,6 +1602,12 @@ fn sampled_value_heap(rows: &[crate::iceberg::EventRow]) -> f64 {
     sampled.iter().sum::<u64>() as f64 * rows.len() as f64 / sampled.len() as f64
 }
 
+/// NAN-4573: the event hour of a clamped row's source time, when it is not
+/// the hour the row is stored in (`clamped`: source time in epoch ms by uid).
+fn original_hour_of(clamped: &BTreeMap<String, i64>, uids: &[String], index: usize, hour: i32) -> Option<i32> {
+    clamped.get(&uids[index]).map(|ms| event_hour_of(ms.saturating_mul(1_000))).filter(|original| *original != hour)
+}
+
 /// The window payload hash of each kept uid, row-aligned (NAN-3704). A uid
 /// admission has no source identity for (never expected) is not compared.
 fn payload_hashes(uids: &[String], digests: &BTreeMap<String, [u8; 32]>) -> Vec<u64> {
@@ -1443,6 +1641,68 @@ fn decoded_rows(rows: Vec<crate::iceberg::EventRow>, decoded: Option<RecordBatch
     Ok((rows.into_iter().map(|row| row.event_uid).collect(), Some(batch)))
 }
 
+/// NAN-4553: removes admission slice files when an admission returns,
+/// whichever way (a missing file is fine: the fold removed it already).
+struct RemoveOnDrop(Vec<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// NAN-4553: cut `file` (one fetched bronze object) into Parquet slices of
+/// at most `rows` rows next to it, each carrying the object's identity.
+/// Admission then holds one slice's JSON values at a time. Row order is
+/// kept; the slices are removed by the caller once admitted.
+fn write_admission_slices(file: &(NoticeHandle, SourceNotice, PathBuf, String, u64), rows: u64)
+    -> Result<Vec<(NoticeHandle, SourceNotice, PathBuf, String, u64)>> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let (handle, notice, path, sha, bytes) = file;
+    let batch_rows = usize::try_from(rows.max(1)).unwrap_or(usize::MAX);
+    let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path)?)?.with_batch_size(batch_rows).build()?;
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .build();
+    let dir = path.parent().context("admission object has no directory")?;
+    let mut slices = Vec::new();
+    let cut = (|| -> Result<()> {
+        for batch in reader {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let slice = dir.join(format!("{sha}.slice-{:05}.parquet", slices.len()));
+            slices.push((handle.clone(), notice.clone(), slice.clone(), sha.clone(), *bytes));
+            let mut writer = parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&slice)?, batch.schema(), Some(props.clone()))?;
+            writer.write(&batch)?;
+            writer.close()?;
+        }
+        ensure!(!slices.is_empty(), "admission object has no rows to slice");
+        Ok(())
+    })();
+    if let Err(error) = cut {
+        for slice in &slices {
+            let _ = std::fs::remove_file(&slice.2);
+        }
+        return Err(error);
+    }
+    Ok(slices)
+}
+
+/// Size ingest[T]'s memory-bound knobs from its process memory cap (the
+/// cell's `memory_cap_bytes`): the uid window, the working budget that
+/// bounds admission, flushes and merges (NAN-3183, NAN-4553), and (NAN-4460)
+/// the prevalence catch-up batch. The production cell and the memory tests
+/// both size through here.
+pub fn size_for_memory_cap(cfg: &mut IngestConfig, memory_cap_bytes: u64) {
+    cfg.max_window_uids = super::dedup::window_cap_for(memory_cap_bytes);
+    cfg.buffer_budget_bytes = buffer_budget_for(memory_cap_bytes);
+    cfg.prevalence_catch_up_max_rows = super::prevalence::catch_up_max_rows_for(memory_cap_bytes);
+}
+
 /// The admission buffer budget for a process memory cap.
 pub fn buffer_budget_for(memory_cap_bytes: u64) -> u64 {
     if memory_cap_bytes == 0 {
@@ -1451,38 +1711,20 @@ pub fn buffer_budget_for(memory_cap_bytes: u64) -> u64 {
     ((memory_cap_bytes as f64 * BUFFER_BUDGET_SHARE) as u64).clamp(64 * 1024 * 1024, 4 * 1024 * 1024 * 1024)
 }
 
-/// Env flag for [`IngestConfig::flush_depth`] (NAN-3619). Unset or `1`:
-/// one flush in flight (the serial contract). `2`: two.
-pub const FLUSH_DEPTH_ENV: &str = "NANO_LAKE_INGEST_FLUSH_DEPTH";
-/// Env flag for [`IngestConfig::commit_when_ready`] (NAN-3619): `1`,
-/// `true` or `on`. Default off.
-pub const COMMIT_WHEN_READY_ENV: &str = "NANO_LAKE_INGEST_COMMIT_WHEN_READY";
-
-/// [`COMMIT_WHEN_READY_ENV`] parsed.
-pub fn commit_when_ready_from_env(value: Option<&str>) -> bool {
-    matches!(value.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("1" | "true" | "on"))
-}
-
-/// Most pipelined flushes ever in flight at once.
+/// Most sealed flushes in flight per tenant. No deployment switch.
 pub const MAX_FLUSH_DEPTH: usize = 2;
 
-/// [`IngestConfig::flush_depth`] from [`FLUSH_DEPTH_ENV`]: `2` turns the
-/// second flight on; anything else (unset, `1`, garbage) keeps 1.
-pub fn flush_depth_from_env(value: Option<&str>) -> usize {
-    match value.map(str::trim) {
-        Some("2") => 2,
-        _ => 1,
-    }
-}
-
 /// The edge source settings for a flush depth: as many outstanding ranges
-/// as flights, and pull headroom for the extra flight's unacked segments.
+/// as flights. The pulled-bytes allowance stays the single-flight one, so a
+/// second range never raises the source's memory (a large first flight
+/// simply leaves less to pull for the second).
 pub fn edge_source_config(flush_depth: usize) -> crate::edge_log::EdgeLogSourceConfig {
     let depth = flush_depth.clamp(1, MAX_FLUSH_DEPTH);
     let base = crate::edge_log::EdgeLogSourceConfig::default();
     crate::edge_log::EdgeLogSourceConfig {
         max_issued_ranges: depth,
-        max_buffered_bytes: base.max_buffered_bytes.saturating_mul(depth as u64),
+        // Range capacity does not increase the source memory allowance.
+        max_buffered_bytes: base.max_buffered_bytes,
         ..base
     }
 }
@@ -1494,7 +1736,17 @@ pub const CATCH_UP_FLUSH_MAX_AGE_MS: i64 = 30_000;
 /// Rows below which an hour of a flush stays one L0 part; above it the
 /// hour is cut into up to [`MAX_PARALLEL_L0_WRITES`] parts of equal rows.
 pub const L0_PARALLEL_MIN_ROWS: usize = 16_384;
+/// NAN-4539 step 3a: the smallest buffer that seals before a published
+/// flight's inline commit (one full L0 part's rows).
+pub const SEAL_FIRST_MIN_ROWS: usize = L0_PARALLEL_MIN_ROWS;
 pub use super::memory::MAX_PARALLEL_L0_WRITES;
+
+/// L0 parts a flush of `buffer` writes: [`l0_chunks`] of every hour.
+fn planned_l0_parts(buffer: &Buffered) -> usize {
+    buffer.hours.values()
+        .map(|batches| l0_chunks(batches.iter().map(|batch| batch.num_rows()).sum()).len())
+        .sum()
+}
 
 /// `(offset, len)` row ranges an hour of `rows` sorted rows is written as.
 pub fn l0_chunks(rows: usize) -> Vec<(usize, usize)> {
@@ -1609,6 +1861,11 @@ async fn initialize_finding_attempt_index(store: &dyn ObjectStore, tenant_id: &s
 }
 
 fn strip_untrusted_risk_fields(event: &mut Value) {
+    // NAN-4664: the IOC indicator columns are derived by the part writer
+    // only; a source-supplied one would shadow them.
+    if let Some(root) = event.as_object_mut() {
+        root.retain(|key, _| !nanosiem_core::search::lake_indicators::is_indicator_column(key));
+    }
     if let Some(unmapped) = event.get_mut("unmapped").and_then(Value::as_object_mut) {
         unmapped.remove("nano_compact_finding");
         unmapped.remove("nano_finding_outbox_trusted");
@@ -1731,10 +1988,11 @@ impl<'a> Ingestor<'a> {
                 "ingest restarted with objects admitted and unacknowledged; admitting one object at a time until they commit");
         }
         let mut ingestor = Self {
-            health: IngestHealth { tenant_id: cfg.tenant_id.clone(), count_backfill_window: count_backfill.clone(), ..IngestHealth::default() },
+            health: IngestHealth { agent_catalog: cfg.catalog_attachment_failure.map(catalog_failure_health), tenant_id: cfg.tenant_id.clone(), count_backfill_window: count_backfill.clone(), ..IngestHealth::default() },
             cfg,
             parts,
             finding_attempts,
+            finding_floors: Arc::new(FloorCache::default()),
             sources,
             queue,
             signer,
@@ -1755,6 +2013,9 @@ impl<'a> Ingestor<'a> {
             catalog_retry_ms: 0,
             gc_done: HashSet::new(),
             gc_authority: None,
+            held_index_feed: None,
+            catalog_held_since_ms: None,
+            catalog_held_logged_ms: None,
             local_gc: None,
             last_sanctioned_pass_ms: None,
             sanctioned_gc_catching_up: false,
@@ -1771,6 +2032,8 @@ impl<'a> Ingestor<'a> {
             flush_in_flight: VecDeque::new(),
             diagnostics: PipelineDiagnostics::default(),
             flight_wake: None,
+            seal_deferred_since_ms: None,
+            behind_last_tick: false,
             merge_schedule_log_ms: 0,
             index_current: Default::default(),
             reindexed_hours: Default::default(),
@@ -1800,6 +2063,9 @@ impl<'a> Ingestor<'a> {
             prevalence_grant_serial: 0,
             prevalence_lookup: None,
             prevalence_admit_waited: std::time::Duration::ZERO,
+            prevalence_catch_up_scale: 1,
+            prevalence_read_stats_at_ms: 0,
+            prevalence_reads_watch: None,
             prevalence_blocked_since: None,
             prevalence_overrun_reads: None,
             prevalence_unplaced: false,
@@ -1809,6 +2075,9 @@ impl<'a> Ingestor<'a> {
             prevalence_degraded_since_ms: None,
             prevalence_degraded_closed_ms: 0,
             prevalence_degraded_logged_ms: 0,
+            prevalence_spell: Default::default(),
+            prevalence_first_settled: false,
+            prevalence_health_started_ms: None,
             prevalence_step_failing_since_ms: None,
             prevalence_log_cache: BTreeMap::new(),
             prevalence_batch_through: None,
@@ -1828,6 +2097,10 @@ impl<'a> Ingestor<'a> {
             credential_activity: None,
             quarantine: None,
             quarantine_swept_ms: 0,
+            quarantine_mirror_failing_since: None,
+            quarantine_record_ms: 0,
+            quarantine_mirror_backoff: BTreeMap::new(),
+            quarantine_restore_retry: (0, i64::MIN),
             quarantine_replay_pending: true,
             quarantine_ledger: None,
             admission_attempts,
@@ -1879,6 +2152,7 @@ impl<'a> Ingestor<'a> {
                 prevalence.advance_watermark(now_ms.saturating_mul(1_000));
             }
         }
+        ingestor.update_pipeline_diagnostics();
         Ok(ingestor)
     }
 
@@ -1927,10 +2201,26 @@ impl<'a> Ingestor<'a> {
         self.credential_activity.as_ref().map(|exec| &exec.activity)
     }
 
+    /// A recorded catalog still owns its files even when its remote service
+    /// is unavailable. Dropping custody here would let GC/erasure bypass it.
+    ///
+    /// NAN-4601: deletes stay held (fail closed), but the sanctioned gate is
+    /// kept aside as [`Self::held_index_feed`] so the part-log index keeps
+    /// following the log; the hold is reported as `catalog_held` and logged
+    /// every [`CATALOG_HELD_LOG_INTERVAL_MS`].
+    pub fn hold_catalog(&mut self, reason: &'static str) {
+        self.cfg.catalog_attachment_failure = Some(reason);
+        self.health.agent_catalog = Some(catalog_failure_health(reason));
+        if let Some(authority) = self.gc_authority.take() {
+            self.held_index_feed = Some(authority);
+        }
+        self.local_gc = None;
+    }
+
     /// Install the lake-part delete gate. Without one, no part file is
     /// ever deleted (fail closed).
     pub fn set_local_gc(&mut self, authority: Arc<crate::lake_part_gc::local::LocalDeleteAuthority>) {
-        if self.cfg.catalog.is_some() {
+        if self.cfg.catalog.is_some() || self.cfg.catalog_attachment_failure.is_some() {
             // Basin is a hosted tenant-bucket lane. Never let a local delete
             // authority silently bypass its catalog custody.
             tracing::error!("local GC cannot own a hosted catalog; keeping parts");
@@ -1943,12 +2233,21 @@ impl<'a> Ingestor<'a> {
     }
 
     pub fn set_part_gc_authority(&mut self, authority: Arc<dyn PartGcAuthority>) {
+        if let Some(reason) = self.cfg.catalog_attachment_failure {
+            self.hold_catalog(reason);
+            // NAN-4601: the index feed only; deletes stay held.
+            self.held_index_feed = Some(authority);
+            return;
+        }
+        self.held_index_feed = None;
         if let Some(catalog) = &self.cfg.catalog {
             if let Err(error) = authority.attach_catalog(catalog.clone()) {
                 tracing::error!(%error, "GC lacks catalog custody; keeping parts");
                 self.gc_authority = None;
+                self.health.agent_catalog = Some(serde_json::json!({"custody_attached":true,"gc_attached":false,"converged":false}));
                 return;
             }
+            self.health.agent_catalog = Some(serde_json::json!({"custody_attached":true,"gc_attached":true,"converged":false}));
         }
         self.gc_authority = Some(authority);
     }
@@ -1977,13 +2276,30 @@ impl<'a> Ingestor<'a> {
     pub fn diagnostics(&self) -> PipelineDiagnostics { self.diagnostics.clone() }
 
     fn update_pipeline_diagnostics(&self) {
-        let mut state = self.diagnostics.0.lock().expect("pipeline diagnostics");
+        let mut state = self.diagnostics.state.lock().expect("pipeline diagnostics");
         state.rows = self.buffer.rows + self.flush_in_flight.iter().map(|flight| flight.buffer.rows).sum::<usize>();
         state.bytes = self.buffer.bytes + self.flush_in_flight.iter().map(|flight| flight.buffer.bytes).sum::<u64>();
         state.flights = self.flush_in_flight.len() + usize::from(self.buffer.flush_started_ms.is_some());
         state.oldest_flush_ms = self.flush_in_flight.front().map(|flight| flight.sealed_ms).into_iter()
             .chain(self.buffer.flush_started_ms).min();
-        state.oldest_background = self.flush_in_flight.front().map(|flight| flight.progress.clone());
+        state.foreground = self.buffer.progress.clone();
+        state.oldest_background = self.flush_in_flight.front().map(|flight| flight.progress.clone()).or_else(|| self.buffer.progress.clone());
+        state.occupancy_observed = Some(std::time::Instant::now());
+        state.occupancy = serde_json::json!({
+            "configured_flush_depth": self.cfg.flush_depth, "effective_flush_depth": self.flush_depth(),
+            "queue_range_capacity": self.queue.max_outstanding_ranges(), "filling_rows": self.buffer.rows,
+            "filling_arrow_bytes": self.buffer.bytes, "filling_objects": self.buffer.handles.len(),
+            "flight_rows": self.flush_in_flight.iter().map(|f| f.buffer.rows).sum::<usize>(),
+            "flight_reserved_bytes": self.flush_in_flight.iter().map(|f| f.reserved_bytes).sum::<u64>(),
+            "merge_reserved_bytes": self.merges_reserved_bytes(), "working_reserved_bytes": self.committed_bytes(),
+            "working_budget_bytes": self.cfg.buffer_budget_bytes,
+            "background_publish_available": self.background_parts.is_some() && self.background_signer.is_some(),
+            "memory_budget_exhausted": self.committed_bytes() >= self.cfg.buffer_budget_bytes,
+            "admission_paused": self.admission_paused, "partially_committed": self.buffer.partially_committed(),
+            "pending_schema_change": self.pending_schema.fields() != self.schema.fields(),
+            "rejections_or_skips": !self.buffer.rejections.is_empty() || !self.buffer.refused.is_empty() || !self.buffer.replayed.is_empty(),
+            "may_seal_beside_flights": self.may_seal_beside_flights(true),
+            "held_notices": self.buffer.handles.len() + self.flush_in_flight.iter().map(|f| f.buffer.handles.len()).sum::<usize>()});
         state.tracking_oldest = false;
         state.buffered_since = self.buffer.buffered_since.into_iter()
             .chain(self.flush_in_flight.iter().filter_map(|flight| flight.buffer.buffered_since)).min();
@@ -2025,7 +2341,7 @@ impl<'a> Ingestor<'a> {
         let context = self.finding_context();
         let mut validated = validate_finding(&context, request).await?;
         if validated.needs_replay_proof {
-            if let Some(committed) = finding_replay_proof(&context, &validated.request.receipts).await? {
+            if let Some(committed) = finding_replay_proof(&context, &validated.request.receipts, &validated.attempted).await? {
                 return Ok(committed);
             }
         }
@@ -2042,6 +2358,7 @@ impl<'a> Ingestor<'a> {
             writer_epoch: self.cfg.writer_epoch,
             trusted: self.trusted.clone(),
             attempts: self.finding_attempts.clone(),
+            floors: self.finding_floors.clone(),
         }
     }
 
@@ -2068,19 +2385,30 @@ impl<'a> Ingestor<'a> {
             self.schema = Arc::new(next);
             self.pending_schema = Arc::new(pending);
         }
+        let op = LogOp::Add { parts: request.parts, consumed: request.receipts, edge_log: None };
+        let LogOp::Add { consumed, .. } = &op else { unreachable!("built as an Add") };
+        // The writer refuses a repeat within its memory; refuse it before
+        // any durable intent is recorded.
+        self.log.live().check_consumes(&op)?;
         // Durable intent precedes the log append. A crash in either gap
         // makes replay scan the authoritative log. NAN-4181: ONE conditional
         // marker PUT per append, whatever its receipt count (one per receipt
         // was a Class A PUT per finding, repeated on every retry).
-        put_attempt_batch(self.parts, &self.cfg.tenant_id, &request.receipts, now_ms, &self.finding_attempts).await?;
+        put_attempt_batch(self.parts, &self.cfg.tenant_id, consumed, now_ms, &self.finding_attempts).await?;
+        // NAN-4656: these receipts are not consumed through the head this
+        // `Add` follows: each was proven absent by the replay proof or was
+        // never offered (no marker). Recorded so the proof of an interrupted
+        // append reads only the entries after it, not the log from genesis.
+        // One conditional PUT per append; best effort.
+        if let Some((seq, sha, _)) = self.log.live().head() {
+            put_floor_logged(self.parts, &self.cfg.tenant_id, seq, sha, consumed).await;
+        }
         // Like `commit_parts`: every committed `Add` reaches the prevalence
         // state in log order. The next tick's `advance_prevalence` replays it.
         if self.prevalence_held() {
             self.prevalence_pending = true;
         }
-        let outcome = self.log.append(LogOp::Add {
-            parts: request.parts, consumed: request.receipts, edge_log: None,
-        }, now_ms).await?;
+        let outcome = self.log.append(op, now_ms).await?;
         let crate::parts::part_log::AppendOutcome::Committed { seq, entry_sha256 } = outcome;
         self.health.last_commit_ms = Some(now_ms);
         Ok(FindingAppendResponse { seq, entry_sha256 })
@@ -2113,6 +2441,11 @@ impl<'a> Ingestor<'a> {
         self.prevalence_pending
     }
 
+    /// NAN-4460: the scale the next catch-up batch is planned at.
+    pub fn prevalence_catch_up_scale(&self) -> usize {
+        self.prevalence_catch_up_scale
+    }
+
     /// `stamping`, or why admitted rows are unstamped.
     pub fn prevalence_status(&self) -> String {
         if let (None, Some(retry)) = (&self.prevalence, &self.prevalence_retry) {
@@ -2142,6 +2475,11 @@ impl<'a> Ingestor<'a> {
     /// NAN-3774: the most the ingest loop waits on one prevalence operation.
     fn ingest_wait(&self) -> std::time::Duration {
         self.cfg.prevalence_ingest_wait.min(self.cfg.prevalence_op_timeout)
+    }
+
+    /// NAN-4592: the most one admission batch waits for its lookups.
+    fn stamp_wait(&self) -> std::time::Duration {
+        self.cfg.prevalence_stamp_wait.min(self.ingest_wait())
     }
 
     /// The commit path may use the state now: open, placed, and not
@@ -2202,14 +2540,15 @@ impl<'a> Ingestor<'a> {
             return;
         }
         match restamp.outcome.get() {
-            Some(RestampResult::Applied { rows }) => {
+            Some(RestampResult::Applied { rows, complete }) => {
                 self.health.prevalence_restamped_rows_total = self.health.prevalence_restamped_rows_total.saturating_add(rows);
                 if restamp.sealed {
                     self.health.prevalence_restamp_rewrites_total = self.health.prevalence_restamp_rewrites_total.saturating_add(1);
                 }
                 self.restamp_retry.remove(&restamp.hour);
-                let cleared = self.hour_is_one_sealed_part(restamp.hour) && self.prevalence_owed.clear_if(restamp.hour, restamp.serial);
-                tracing::info!(tenant = %self.cfg.tenant_id, hour = restamp.hour, rows, sealed = restamp.sealed, cleared,
+                let cleared = complete && self.hour_is_one_sealed_part(restamp.hour)
+                    && self.prevalence_owed.clear_if(restamp.hour, restamp.serial);
+                tracing::info!(tenant = %self.cfg.tenant_id, hour = restamp.hour, rows, complete, sealed = restamp.sealed, cleared,
                     owed = self.prevalence_owed.len(), "prevalence restamp committed");
             }
             Some(RestampResult::NothingOwed) => {
@@ -2506,6 +2845,7 @@ impl<'a> Ingestor<'a> {
         self.prevalence_unplaced = false;
         self.prevalence_step_failing_since_ms = None;
         self.prevalence_batch_through = None;
+        self.prevalence_reads_watch = None;
         self.prevalence_log_cache.clear();
     }
 
@@ -2992,7 +3332,10 @@ impl<'a> Ingestor<'a> {
         // NAN-3849: whole entries in batches (one read pass and one write per
         // batch). The per-entry loop below takes what a batch cannot.
         loop {
-            match self.replay_prevalence_batch().await? {
+            // NAN-4464: never wait on a batch's reads past the step's
+            // deadline while they progress (the watchdog stops this).
+            let patience = deadline.filter(|_| self.catch_up_reads_patient());
+            match self.replay_prevalence_batch(patience).await? {
                 CatchUpBatch::AtHead => {
                     // A prior tick may have been cut after its atomic cursor
                     // write but before WAL durability. Never stamp that cursor
@@ -3005,6 +3348,7 @@ impl<'a> Ingestor<'a> {
                         return Ok(false);
                     }
                 }
+                CatchUpBatch::Reading => return Ok(false),
                 CatchUpBatch::Unbatchable => break,
             }
         }
@@ -3062,9 +3406,21 @@ impl<'a> Ingestor<'a> {
     /// Cancel-safe at every await: entries and partials fetched so far are
     /// kept, and the batch's reads keep running in the state (see
     /// [`IngestPrevalence::apply_entries_batch`]).
-    async fn replay_prevalence_batch(&mut self) -> Result<CatchUpBatch> {
-        use super::prevalence::{partial_rows, BatchEntry, CATCH_UP_BATCH_ENTRIES, CATCH_UP_BATCH_ROWS};
+    ///
+    /// NAN-4464: `patience` bounds the wait for the batch's reads
+    /// ([`IngestPrevalence::apply_entries_batch_within`]); past it the batch
+    /// stays planned ([`CatchUpBatch::Reading`]).
+    async fn replay_prevalence_batch(&mut self, patience: Option<std::time::Instant>) -> Result<CatchUpBatch> {
+        use super::prevalence::{partial_rows, BatchEntry, CATCH_UP_BATCH_ENTRIES, CATCH_UP_BATCH_ROWS, CATCH_UP_MAX_SCALE};
         use futures::stream::{self, StreamExt};
+        // NAN-4460: the batch's size, set when the previous batch committed
+        // (so a batch cut mid-way is planned identically next step).
+        let scale = self.prevalence_catch_up_scale.clamp(1, CATCH_UP_MAX_SCALE);
+        let base_entries = self.cfg.prevalence_catch_up_batch_entries.clamp(1, CATCH_UP_BATCH_ENTRIES);
+        let max_entries = base_entries * scale;
+        let max_rows = (CATCH_UP_BATCH_ROWS * scale as u64)
+            .min(self.cfg.prevalence_catch_up_max_rows.max(CATCH_UP_BATCH_ROWS));
+        let fetches = PREVALENCE_CATCH_UP_FETCHES * scale.min(PREVALENCE_CATCH_UP_FETCH_SCALE_MAX);
         let cursor = self.prevalence.as_ref().context("prevalence is disabled")?
             .applied().await?.context("prevalence state has no replay cursor")?;
         if !cursor.is_complete() {
@@ -3075,7 +3431,7 @@ impl<'a> Ingestor<'a> {
         ensure!(cursor.seq <= head, "prevalence state is ahead of the part log");
         self.prevalence_log_cache.retain(|seq, _| *seq >= cursor.seq);
         let through = self.prevalence_batch_through.filter(|through| *through > cursor.seq);
-        let scan_end = head.min(cursor.seq.saturating_add(PREVALENCE_CATCH_UP_SCAN));
+        let scan_end = head.min(cursor.seq.saturating_add(PREVALENCE_CATCH_UP_SCAN * scale as u64));
         tracing::debug!(tenant = %self.cfg.tenant_id, cursor_seq = cursor.seq, head, scan_end,
             cached_entries = self.prevalence_log_cache.len(), "prevalence catch-up scan");
         let missing = (cursor.seq..=scan_end).filter(|seq| !self.prevalence_log_cache.contains_key(seq)).collect::<Vec<_>>();
@@ -3086,7 +3442,7 @@ impl<'a> Ingestor<'a> {
                 let key = keys.entry(seq);
                 async move { (seq, parts.get(&key).await) }
             }))
-            .buffer_unordered(PREVALENCE_CATCH_UP_FETCHES);
+            .buffer_unordered(fetches);
             // Keep each verified completion before awaiting another GET.
             // Dropping a tick must never discard a whole scan's progress.
             while let Some((seq, bytes)) = fetched.next().await {
@@ -3106,8 +3462,7 @@ impl<'a> Ingestor<'a> {
             ensure!(entry.seq == seq && entry.prev_sha256 == previous, "part-log chain differs at {seq}");
             if let LogOp::Add { parts, .. } = &entry.op {
                 if !parts.is_empty() {
-                    if candidates.len() >= self.cfg.prevalence_catch_up_batch_entries.clamp(1, CATCH_UP_BATCH_ENTRIES)
-                        || through.is_some_and(|through| seq > through) {
+                    if candidates.len() >= max_entries || through.is_some_and(|through| seq > through) {
                         break;
                     }
                     candidates.push((seq, sha.clone(), parts.clone()));
@@ -3126,6 +3481,7 @@ impl<'a> Ingestor<'a> {
             }
             self.prevalence_applied_seq = Some(scanned);
             if scanned == head {
+                self.prevalence_catch_up_scale = 1;
                 return Ok(CatchUpBatch::AtHead);
             }
             return Ok(CatchUpBatch::Applied);
@@ -3148,7 +3504,7 @@ impl<'a> Ingestor<'a> {
         let mut fetched = stream::iter(remote.into_iter().map(|part| async move {
             let fetched = Self::fetch_remote_prevalence_partial(cfg, parts, trusted, &part).await;
             (part, fetched)
-        })).buffer_unordered(PREVALENCE_CATCH_UP_FETCHES);
+        })).buffer_unordered(fetches);
         let mut unfetched = BTreeSet::new();
         while let Some((part, fetched)) = fetched.next().await {
             match fetched {
@@ -3176,10 +3532,10 @@ impl<'a> Ingestor<'a> {
                 entry_rows = entry_rows.saturating_add(partial_rows(path)?);
                 entry_parts.push((part.part_id.as_str().to_owned(), path.clone(), part.max_time_us));
             }
-            if !batch.is_empty() && rows.saturating_add(entry_rows) > CATCH_UP_BATCH_ROWS {
+            if !batch.is_empty() && rows.saturating_add(entry_rows) > max_rows {
                 break;
             }
-            if batch.is_empty() && entry_rows > CATCH_UP_BATCH_ROWS {
+            if batch.is_empty() && entry_rows > max_rows {
                 // Larger than a batch: the per-entry replay chunks it.
                 return Ok(CatchUpBatch::Unbatchable);
             }
@@ -3195,8 +3551,10 @@ impl<'a> Ingestor<'a> {
         self.prevalence_batch_through = Some(last);
         let started = std::time::Instant::now();
         let applied = self.prevalence.as_mut().context("prevalence is disabled")?
-            .apply_entries_batch(&self.cfg.tenant_id, &batch).await?;
+            .apply_entries_batch_within(&self.cfg.tenant_id, &batch, patience).await?;
+        let Some(applied) = applied else { return Ok(CatchUpBatch::Reading) };
         self.prevalence_batch_through = None;
+        self.prevalence_reads_watch = None;
         for entry in &batch {
             for (part_id, _, _) in &entry.parts {
                 if let Some(path) = self.prevalence_prefetched.remove(part_id) {
@@ -3206,17 +3564,59 @@ impl<'a> Ingestor<'a> {
             }
         }
         self.prevalence_applied_seq = Some(covered);
+        self.health.prevalence_catch_up_batches_total = self.health.prevalence_catch_up_batches_total.saturating_add(1);
         let behind = head.saturating_sub(covered);
         tracing::info!(tenant = %self.cfg.tenant_id, first_seq = batch[0].seq, last_seq = last, entries = applied.entries,
             parts = applied.parts, rows = applied.rows, keys = applied.keys, fold_ms = applied.fold_ms,
             read_ms = applied.read_ms, write_ms = applied.write_ms, wall_ms = started.elapsed().as_millis() as u64,
-            behind_entries = behind, "prevalence catch-up batch applied");
+            behind_entries = behind, scale, max_entries, max_rows, "prevalence catch-up batch applied");
+        self.rescale_prevalence_catch_up(behind, base_entries);
         if covered == head {
             let (sha, _) = self.prevalence_log_cache.get(&head).context("part-log entry is missing")?;
             ensure!(*sha == head_sha, "part-log head changed during prevalence replay");
             return Ok(CatchUpBatch::AtHead);
         }
         Ok(CatchUpBatch::Applied)
+    }
+
+    /// NAN-4460: size the next catch-up batch from the backlog left and the
+    /// cell's headroom ([`super::prevalence::next_catch_up_scale`]).
+    fn rescale_prevalence_catch_up(&mut self, behind: u64, base_entries: usize) {
+        let previous = self.prevalence_catch_up_scale;
+        let headroom = super::merge_quota::catch_up_headroom(self.health.lag_ms, self.cfg.lag_alert_ms);
+        let next = super::prevalence::next_catch_up_scale(previous, behind, base_entries, headroom);
+        if next != previous {
+            self.prevalence_catch_up_scale = next;
+            tracing::info!(tenant = %self.cfg.tenant_id, scale = next, previous_scale = previous, behind_entries = behind,
+                headroom = ?headroom, lag_ms = self.health.lag_ms, lag_bound_ms = self.cfg.lag_alert_ms,
+                max_rows = self.cfg.prevalence_catch_up_max_rows,
+                "prevalence catch-up batch scale adjusted to the backlog and cell headroom");
+        }
+    }
+
+    /// NAN-4464: whether a step may return while a catch-up batch's reads
+    /// run (and the tick skip its steps until they finish). True while they
+    /// make progress (completed point reads or durable commits); after
+    /// `prevalence_op_timeout` without any, steps wait on them again, so a
+    /// hung store overruns the ingest wait and trips the stall watchdog
+    /// ([`Self::prevalence_overran`]) as before.
+    fn catch_up_reads_patient(&mut self) -> bool {
+        let Some(progress) = self.prevalence.as_ref().map(IngestPrevalence::watchdog_progress) else { return false };
+        match self.prevalence_reads_watch {
+            Some((since, seen)) if seen == progress => since.elapsed() < self.cfg.prevalence_op_timeout,
+            _ => {
+                self.prevalence_reads_watch = Some((std::time::Instant::now(), progress));
+                true
+            }
+        }
+    }
+
+    /// NAN-4464: a planned catch-up batch whose reads are still running and
+    /// progressing: this tick's step would only wait on them.
+    fn prevalence_catch_up_reading(&mut self) -> bool {
+        self.prevalence_batch_through.is_some()
+            && self.prevalence.as_ref().is_some_and(IngestPrevalence::catch_up_reads_in_flight)
+            && self.catch_up_reads_patient()
     }
 
     /// `Ok(false)`: `deadline` passed; the cursor resumes where this stopped.
@@ -3457,6 +3857,71 @@ impl<'a> Ingestor<'a> {
         self.tick_prevalence_step(now_ms).await;
         // NAN-3864: keep the owed restamp hours saved in the tenant bucket.
         self.sync_restamp_owed(now_ms).await;
+        // NAN-4445: and the degraded spell's start.
+        self.sync_prevalence_spell(now_ms).await;
+    }
+
+    /// NAN-4445: read the degraded spell an earlier process left open, then
+    /// save this process's spell start / end when it changes, as immutable
+    /// records in the tenant bucket ([`super::prevalence_spell`]). Each step
+    /// is bounded by the ingest wait; a failed one is retried a minute later.
+    /// Nothing is written before the stored spell was read and this
+    /// process's first open settled (an unsettled open says nothing yet).
+    async fn sync_prevalence_spell(&mut self, now_ms: i64) {
+        if !self.restamp_eligible() || now_ms < self.prevalence_spell.retry_ms {
+            return;
+        }
+        let wait = self.ingest_wait();
+        let retry_at = now_ms.saturating_add(60_000);
+        if !self.prevalence_spell.loaded {
+            let scan = super::prevalence_spell::scan_spell(self.parts, &self.cfg.tenant_id, &mut self.prevalence_spell.scan, now_ms);
+            match tokio::time::timeout(wait, scan).await {
+                Ok(Ok(None)) => return,
+                Ok(Ok(Some(found))) => {
+                    self.prevalence_spell.loaded = true;
+                    if let Some((written_ms, record)) = found {
+                        self.prevalence_spell.saved = Some(record);
+                        self.prevalence_spell.saved_ms = written_ms;
+                        if record.cleared_ms.is_none() {
+                            tracing::warn!(tenant = %self.cfg.tenant_id, since_ms = record.since_ms,
+                                degraded_secs = now_ms.saturating_sub(record.since_ms) / 1_000,
+                                "an earlier process left a prevalence degraded spell open; continuing it");
+                            self.prevalence_spell.inherited_since_ms = Some(record.since_ms);
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %format!("{error:#}"), "read the prevalence degraded spell failed; retrying in a minute");
+                    self.prevalence_spell.retry_ms = retry_at;
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!("read the prevalence degraded spell timed out; retrying in a minute");
+                    self.prevalence_spell.retry_ms = retry_at;
+                    return;
+                }
+            }
+        }
+        if !self.prevalence_first_settled || self.prevalence_spell.inherited_since_ms.is_some() {
+            return;
+        }
+        let Some(record) = self.prevalence_spell.wanted(self.prevalence_degraded_since_ms, now_ms) else { return };
+        let written_ms = now_ms.max(self.prevalence_spell.saved_ms.saturating_add(1));
+        let save = super::prevalence_spell::persist_spell(self.parts, &self.cfg.tenant_id, record, written_ms);
+        match tokio::time::timeout(wait, save).await {
+            Ok(Ok(())) => {
+                self.prevalence_spell.saved = Some(record);
+                self.prevalence_spell.saved_ms = written_ms;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(error = %format!("{error:#}"), "save the prevalence degraded spell failed; retrying in a minute");
+                self.prevalence_spell.retry_ms = retry_at;
+            }
+            Err(_) => {
+                tracing::warn!("save the prevalence degraded spell timed out; retrying in a minute");
+                self.prevalence_spell.retry_ms = retry_at;
+            }
+        }
     }
 
     async fn tick_prevalence_step(&mut self, now_ms: i64) {
@@ -3491,7 +3956,12 @@ impl<'a> Ingestor<'a> {
             PrevalencePhase::Stamping => self.prevalence_pending,
             PrevalencePhase::Rebuilding { .. } | PrevalencePhase::CatchingUp | PrevalencePhase::Resetting => true,
         };
-        if has_work {
+        if has_work && self.prevalence_catch_up_reading() {
+            // NAN-4464: a catch-up batch's reads are running and progressing;
+            // the first step after they finish commits it. Waiting here
+            // would only take the ingest wait from this tick.
+            tracing::debug!(tenant = %self.cfg.tenant_id, "prevalence catch-up batch still reading; step skipped");
+        } else if has_work {
             match tokio::time::timeout(wait, self.advance_prevalence()).await {
                 Ok(Ok(())) => {
                     self.prevalence_step_failing_since_ms = None;
@@ -3602,18 +4072,29 @@ impl<'a> Ingestor<'a> {
     }
 
     /// NAN-3774: read this batch's prevalence as its own task and wait for
-    /// it at most [`Self::ingest_wait`]. `None`: the batch goes unstamped
-    /// and its hours are owed an exact restamp (not stamping, a committed
-    /// `Add` not yet in the state, or the read failed or was slower than the
-    /// wait; a slow read keeps running in the background, warming the cache).
+    /// it at most [`Self::stamp_wait`] (NAN-4592: 1 s, was the 5 s ingest
+    /// wait). `None`: the batch goes unstamped and its hours are owed an
+    /// exact restamp (not stamping, a committed `Add` not yet in the state,
+    /// or the read failed or was slower than the wait; a slow read keeps
+    /// running in the background, warming the cache).
+    ///
+    /// What a late stamp writes (NAN-4592, unchanged from NAN-3774/3864):
+    /// every row of the batch is committed with no `prevalence_*` column
+    /// value and no nano prevalence enrichment (`strip_stamps`; never a
+    /// partial stamp or a stamp from part of the reads), the batch counts in
+    /// `prevalence_unstamped_batches_total`, and the event hours of its rows
+    /// are marked owed (`prevalence_owed`). The hour's restamp later stamps
+    /// exactly those unstamped rows from the state at the log head; rows
+    /// stamped on arrival are never changed. The late reads never stamp
+    /// anything: their result is dropped and only their cached blocks remain.
     ///
     /// NAN-3879: a stamp is permanent, so it is never taken from a state
     /// missing committed rows: while an `Add` is pending (an apply cut at the
     /// ingest wait, a failed apply, a catch-up) the batch is unstamped and
     /// owed, blocked or not. An earlier batch's lookup still in flight is
-    /// waited out within this batch's one ingest wait (it used to skip at
+    /// waited out within this batch's one stamp wait (it used to skip at
     /// once); per overrun spell admission waits at most
-    /// [`PREVALENCE_ADMIT_OVERRUN_WAITS`] ingest waits.
+    /// [`PREVALENCE_ADMIT_OVERRUN_WAITS`] stamp waits.
     async fn stamp_lookup(&mut self, rows: &[crate::iceberg::EventRow], now_ms: i64) -> Option<super::prevalence::Observed> {
         if self.prevalence_phase != PrevalencePhase::Stamping {
             return None;
@@ -3628,10 +4109,10 @@ impl<'a> Ingestor<'a> {
         }
         let overrunning = self.prevalence_blocked_since.is_some() || self.prevalence_lookup.is_some();
         let wait = if overrunning {
-            let budget = self.ingest_wait().saturating_mul(PREVALENCE_ADMIT_OVERRUN_WAITS);
-            self.ingest_wait().min(budget.saturating_sub(self.prevalence_admit_waited))
+            let budget = self.stamp_wait().saturating_mul(PREVALENCE_ADMIT_OVERRUN_WAITS);
+            self.stamp_wait().min(budget.saturating_sub(self.prevalence_admit_waited))
         } else {
-            self.ingest_wait()
+            self.stamp_wait()
         };
         if wait.is_zero() {
             // The spell's waits are spent: unstamped (owed) until it answers.
@@ -3677,8 +4158,8 @@ impl<'a> Ingestor<'a> {
             Err(_) => {
                 self.prevalence_admit_waited = self.prevalence_admit_waited.saturating_add(started.elapsed());
                 self.health.prevalence_unstamped_batches_total = self.health.prevalence_unstamped_batches_total.saturating_add(1);
-                tracing::warn!(tenant = %self.cfg.tenant_id, wait_ms = self.ingest_wait().as_millis() as u64,
-                    "prevalence lookups slower than the ingest wait; this batch is unstamped, the reads finish in the background");
+                tracing::warn!(tenant = %self.cfg.tenant_id, wait_ms = self.stamp_wait().as_millis() as u64,
+                    "prevalence lookups slower than the stamp wait; this batch is unstamped, the reads finish in the background");
                 self.prevalence_lookup = Some(PrevalenceLookupFlight { handle, started });
                 None
             }
@@ -3694,11 +4175,13 @@ impl<'a> Ingestor<'a> {
 
     /// Tick phase 2: edge points, admission and the due flush.
     pub async fn tick_ingest(&mut self, now_ms: i64) -> Result<(TickReport, Vec<(NoticeHandle, SourceNotice)>)> {
+        self.restore_quarantine(now_ms).await;
         let mut report = TickReport::default();
         // Late-tier runs finished in the background since the last tick.
         self.late.poll(now_ms).await;
+        report.flushed_parts += self.seal_before_commit(now_ms).await?;
         // Pipelined flushes whose parts are published commit first.
-        report.flushed_parts = self.reap_in_flight(now_ms, usize::MAX).await?;
+        report.flushed_parts += self.reap_in_flight(now_ms, usize::MAX).await?;
         self.apply_points(now_ms).await?;
         // NAN-3643: an operator replay is admitted and flushed on its own.
         if self.admit_quarantine_replay(now_ms).await? {
@@ -3708,13 +4191,20 @@ impl<'a> Ingestor<'a> {
         // Look past what is already buffered or in flight (still pending
         // until acked), or a large flight fills the window and catch-up
         // looks idle: no admission and no pipelining (NAN-3619).
-        // (Flag on only; off keeps today's fixed window.)
+        // (Production default; the serial comparison policy keeps the fixed window.)
         let held = if self.cfg.commit_when_ready {
             self.buffer.handles.len() + self.flush_in_flight.iter().map(|flight| flight.buffer.handles.len()).sum::<usize>()
         } else {
             0
         };
-        let pending = self.queue.pending(self.cfg.max_objects_per_admission * 4 + held).await?;
+        let pending_limit = self.cfg.max_objects_per_admission * 4 + held;
+        let pending = self.queue.pending(pending_limit).await?;
+        { let mut diagnostics = self.diagnostics.state.lock().expect("pipeline diagnostics");
+            diagnostics.queue = serde_json::json!({"pending_sampled": pending.len(), "sample_limit": pending_limit,
+                "fresh_pending_sampled": pending.iter().filter(|(handle, _)| !self.buffer.handle_names.contains(&handle.0)
+                    && !self.flush_in_flight.iter().any(|flight| flight.buffer.handle_names.contains(&handle.0))).count(),
+                "may_be_truncated": pending.len() == pending_limit});
+            diagnostics.queue_observed = Some(std::time::Instant::now()); }
         // Handles of the flushes in flight are not acked yet: still pending.
         let in_flight = &self.flush_in_flight;
         let pending_fresh = |handle: &NoticeHandle| !self.buffer.handle_names.contains(&handle.0)
@@ -3750,6 +4240,11 @@ impl<'a> Ingestor<'a> {
             })
             .map(|(_, notice)| notice.clone())
             .collect::<Vec<_>>();
+        // NAN-4539 step 3a: an admission that takes only part of the fresh
+        // notices (bounded by memory or by group) ticks again at once: the
+        // cell loop's idle second otherwise caps catch-up admission at one
+        // bounded group per second.
+        let more_fresh = pending.iter().filter(|(handle, _)| pending_fresh(handle)).count() > fresh.len();
         // NAN-4319: objects acknowledged since leave the crash ledger.
         self.forget_acknowledged(&pending);
         self.admission_deferred = false;
@@ -3767,15 +4262,20 @@ impl<'a> Ingestor<'a> {
                 report.admitted_rows = rows;
                 report.admitted_bytes = fresh.iter().map(|(_, notice)| notice.bytes).sum();
                 report.duplicates = dups;
+                if more_fresh && rows > 0 && !self.admission_deferred {
+                    if let Some(wake) = &self.flight_wake {
+                        wake.notify_one();
+                    }
+                }
             }
         }
         // NAN-3619: a flight that finished while admission ran commits now,
         // not at the next tick (on the load-test tenant they waited 9-26 s). Only ready
         // flights, oldest first: the same commit `flush` would make first.
         if self.cfg.commit_when_ready {
+            report.flushed_parts += self.seal_before_commit(now_ms).await?;
             report.flushed_parts += self.reap_in_flight(now_ms, usize::MAX).await?;
         }
-        let mut interval = self.cfg.flush_interval_override_ms.unwrap_or_else(|| self.cfg.flush_policy.interval_ms(self.health.eps_ewma));
         // Catching up (notices pulled but not yet admitted): the age cap
         // would cut a flush every few seconds whatever its size, and every
         // flush pays fixed owner/R2/edge round trips. Fill the flush to its
@@ -3784,21 +4284,21 @@ impl<'a> Ingestor<'a> {
         let in_flight = &self.flush_in_flight;
         let behind = pending.iter().any(|(handle, _)| !self.buffer.handle_names.contains(&handle.0)
             && !in_flight.iter().any(|flight| flight.buffer.handle_names.contains(&handle.0)));
-        if behind && self.cfg.flush_interval_override_ms.is_none() {
-            interval = interval.max(CATCH_UP_FLUSH_MAX_AGE_MS);
+        self.behind_last_tick = behind;
+        let (due_by_age, due_by_cap) = self.seal_due_parts(now_ms, behind);
+        // NAN-4539 step 3a: behind, a seal that only its age made due and
+        // that would have to wait for an unfinished flight is deferred: the
+        // tick returns, admission keeps filling the buffer (within every cap
+        // and the working budget above), and the seal lands on the first
+        // tick a flight slot is free (the finished-flight wake). Waiting
+        // here held the single ingest task for the whole oldest flight, so
+        // the next seal was small and catch-up ran below its flight cost.
+        let due = due_by_cap || (due_by_age && !(behind && self.seal_would_wait_for_flight(behind && self.buffer.replay.is_none())));
+        if due_by_age && !due {
+            self.diagnostics.stage("seal_deferred_beside_flight");
+            self.health.seals_deferred_total = self.health.seals_deferred_total.saturating_add(1);
+            self.seal_deferred_since_ms.get_or_insert(now_ms);
         }
-        let due = self.buffer.since_ms.is_some_and(|since| now_ms - since >= interval)
-            || self.buffer.rows >= FLUSH_MAX_ROWS
-            || self.buffer.bytes >= super::memory::buffer_cap(self.cfg.buffer_budget_bytes)
-            // The budget is spent (flight + merges + buffer): admission is
-            // stalled, so seal what is buffered rather than wait out the age.
-            || (self.buffer.rows > 0 && self.committed_bytes() >= self.cfg.buffer_budget_bytes)
-            || self.buffer.hours.len() >= MAX_FLUSH_EVENT_HOURS
-            || self.buffer.handles.len() >= MAX_FLUSH_OBJECTS
-            || self.buffer.rejections.len() >= MAX_REJECTIONS_PER_ENTRY
-            // NAN-4319: the next object's decoded rows did not fit beside
-            // the buffer; seal it so the next tick admits from idle.
-            || (self.buffer.rows > 0 && self.admission_deferred);
         if due || self.buffer.partially_committed() || (self.buffer.rows == 0 && !self.buffer.handles.is_empty())
             || self.buffer.replay.is_some()
         {
@@ -3819,6 +4319,10 @@ impl<'a> Ingestor<'a> {
         // A failure keeps the flight oldest; the next ingest phase retries
         // it and reports the error there, exactly as before this reap.
         if self.cfg.commit_when_ready {
+            match self.seal_before_commit(now_ms).await {
+                Ok(parts) => report.flushed_parts += parts,
+                Err(error) => tracing::warn!(error = %format!("{error:#}"), "sealing beside a published flush failed; the ingest phase retries it"),
+            }
             match self.reap_in_flight(now_ms, usize::MAX).await {
                 Ok(parts) => report.flushed_parts += parts,
                 Err(error) => tracing::warn!(error = %format!("{error:#}"), "committing a finished flush failed; the ingest phase retries it"),
@@ -3869,6 +4373,9 @@ impl<'a> Ingestor<'a> {
             tracing::warn!(error = %format!("{error:#}"), "export plan failed");
         }
         self.tick_quarantine(now_ms);
+        if let Err(error) = self.mirror_quarantine(now_ms, false).await {
+            tracing::warn!(error = %format!("{error:#}"), "bronze quarantine mirror failed; retried next tick");
+        }
         // NAN-4338: at most one bounded flight of landing-ledger reports, off the tick.
         if let Some(ledger) = &mut self.quarantine_ledger {
             ledger.tick(now_ms).await;
@@ -3881,18 +4388,38 @@ impl<'a> Ingestor<'a> {
     /// flight owns this tenant's durable catalog state; erasure waits for its
     /// committed log sequence before reporting completion.
     async fn tick_catalog(&mut self, now_ms: i64) {
+        if self.cfg.catalog_attachment_failure.is_some() { return; }
         let Some(catalog) = self.cfg.catalog.clone() else { return };
         if self.catalog_flight.as_ref().is_some_and(|f| f.handle.is_finished()) {
             let mut flight = self.catalog_flight.take().expect("finished catalog flight");
             match (&mut flight.handle).await {
                 Ok(Ok(())) => {
                     self.catalog_applied_seq = Some(flight.head);
+                    if let Some(status)=&mut self.health.agent_catalog {status["converged"]=serde_json::Value::Bool(true);status["part_log_seq"]=flight.head.into();
+                        if let Some(status)=status.as_object_mut() {status.remove("export_blocked");}}
                     self.catalog_due_ms = now_ms.saturating_add(3_600_000);
                     self.catalog_retry_ms = 0;
                 }
                 outcome => {
-                    self.catalog_retry_ms = now_ms.saturating_add(30_000);
-                    tracing::warn!(?outcome, "catalog reconciliation pending; erasure and GC retain custody");
+                    // NAN-4627: an export chain the writer cannot rebuild never
+                    // heals by retrying; surface a stable alert label.
+                    let unrecoverable = matches!(&outcome, Ok(Err(error))
+                        if error.downcast_ref::<super::iceberg_export::ExportStateUnrecoverable>().is_some());
+                    if let Some(status)=&mut self.health.agent_catalog {status["converged"]=serde_json::Value::Bool(false);
+                        if unrecoverable {status["export_blocked"]=super::iceberg_export::ExportStateUnrecoverable::CODE.into();}}
+                    // NAN-4614: a sync that spent its budget committing
+                    // durable batches made progress; resume on the next tick.
+                    let progressed = matches!(&outcome, Ok(Err(error))
+                        if error.downcast_ref::<super::iceberg_export::lifecycle::CatalogSyncIncomplete>().is_some());
+                    if unrecoverable {
+                        tracing::error!(?outcome, reason = super::iceberg_export::ExportStateUnrecoverable::CODE,
+                            "catalog export state unrecoverable; export and GC stay held");
+                    } else if progressed {
+                        tracing::info!(?outcome, "catalog export batches committed; resuming next tick, erasure and GC retain custody");
+                    } else {
+                        tracing::warn!(?outcome, "catalog reconciliation pending; erasure and GC retain custody");
+                    }
+                    self.catalog_retry_ms = if progressed { now_ms } else { now_ms.saturating_add(30_000) };
                 }
             }
         }
@@ -3938,15 +4465,51 @@ impl<'a> Ingestor<'a> {
         }
         let suspected = fresh.iter().any(|(_, notice)| self.admission_attempts.suspect(&object_id(&notice.key, &notice.version)).is_some());
         if suspected {
-            fresh.truncate(1);
+            // NAN-4542: one object, from idle only (it flushes a tick later:
+            // see `crash_recovery_seal`), so a crash names exactly it.
+            if !self.buffer.handles.is_empty() || !self.flush_in_flight.is_empty() {
+                return Ok(Vec::new());
+            }
             let (handle, notice) = fresh[0].clone();
             let id = object_id(&notice.key, &notice.version);
-            if let Some(attempts) = self.admission_attempts.suspect(&id) {
+            // NAN-4553: bisection. A group of the oldest suspects (half of
+            // what the last crash interrupted) goes together; a group that
+            // crashes is halved by the next process. An object already
+            // charged as a singleton stays one.
+            let head = self.admission_attempts.suspect(&id);
+            let group = if head.is_some_and(|attempts| attempts > 0) || self.admission_attempts.reserve_refused(&id) {
+                1
+            } else {
+                fresh.iter().take(self.admission_attempts.group_limit())
+                    .take_while(|(_, notice)| {
+                        // Only uncharged suspects join a group: one charged
+                        // (or marked refused) alone stays alone.
+                        let member = object_id(&notice.key, &notice.version);
+                        self.admission_attempts.suspect(&member) == Some(0) && !self.admission_attempts.reserve_refused(&member)
+                    })
+                    .count()
+                    .max(1)
+            };
+            fresh.truncate(group);
+            if group > 1 {
+                tracing::warn!(key = %notice.key, version = %notice.version, objects = group,
+                    "admitting a group of suspects together: an earlier ingest process died with them admitted and unacknowledged");
+                return Ok(fresh);
+            }
+            if let Some(attempts) = head {
                 // NAN-4336: the owner refused this object's own flush
                 // permanently: refuse it now, whatever its attempt count.
                 let reserve_refused = self.admission_attempts.reserve_refused(&id);
                 if reserve_refused || attempts >= MAX_ADMISSION_CRASHES {
                     let cause = if reserve_refused { PoisonCause::ReserveRefused } else { PoisonCause::Crashed { attempts } };
+                    if !reserve_refused {
+                        // NAN-4553: the refusal reads the object's footer
+                        // (its row count) too; a death there counts, and a
+                        // refusal that died before skips the footer.
+                        if let Err(error) = self.admission_attempts.charge_suspect(&id) {
+                            tracing::warn!(error = %format!("{error:#}"), "admission attempt ledger not written");
+                        }
+                    }
                     self.refuse_poison(&handle, &notice, cause, now_ms).await?;
                     if let Err(error) = self.admission_attempts.forget(&id) {
                         tracing::warn!(error = %format!("{error:#}"), "admission attempt ledger not updated");
@@ -3962,11 +4525,63 @@ impl<'a> Ingestor<'a> {
 
     /// NAN-4319: durably count one admission of each object about to be
     /// admitted (those [`Self::admit`] keeps, never the ones it defers).
-    fn begin_admission(&mut self, files: &[(NoticeHandle, SourceNotice, PathBuf, String, u64)]) {
+    /// NAN-4542: `idle` (nothing buffered or in flight) with one object is an
+    /// admission alone, the only kind a crash is charged to.
+    ///
+    /// NAN-4553: `recorded` is the first object, already recorded before its
+    /// fetch ([`Self::record_before_fetch`]); it is charged now if it turned
+    /// out to be admitted alone and was not charged then.
+    fn begin_admission(&mut self, files: &[(NoticeHandle, SourceNotice, PathBuf, String, u64)], idle: bool, recorded: Option<&str>) {
         let ids = files.iter().map(|(_, notice, ..)| object_id(&notice.key, &notice.version)).collect::<Vec<_>>();
-        if let Err(error) = self.admission_attempts.begin(ids.iter().map(String::as_str)) {
+        let alone = idle && ids.len() == 1;
+        let rest = ids.iter().map(String::as_str).filter(|id| Some(*id) != recorded).collect::<Vec<_>>();
+        let result = match recorded {
+            Some(id) if alone && ids[0] == id => self.admission_attempts.charge(id),
+            _ if rest.is_empty() => Ok(()),
+            _ => self.admission_attempts.begin_group(rest, alone, ids.len()),
+        };
+        if let Err(error) = result {
             // Best effort: a crash then goes uncounted, as before NAN-4319.
             tracing::warn!(error = %format!("{error:#}"), "admission attempt ledger not written");
+        }
+    }
+
+    /// NAN-4553: record the first object of an admission from idle before
+    /// its source GET, digest and footer read: an object that kills ingest
+    /// there must be charged like one that kills it in decode (it used to
+    /// loop forever, uncounted). Charged now when it is the only object
+    /// offered (it can only be admitted alone).
+    fn record_before_fetch(&mut self, notice: &SourceNotice, offered: usize) -> String {
+        let id = object_id(&notice.key, &notice.version);
+        if let Err(error) = self.admission_attempts.begin_group([id.as_str()], offered == 1, offered) {
+            tracing::warn!(error = %format!("{error:#}"), "admission attempt ledger not written");
+        }
+        id
+    }
+
+    /// NAN-4553: ingest is exiting on a coded path. One the object in flight
+    /// may have caused ([`exit_keeps_charges`]: the retry window, a 400 on
+    /// its part) keeps the charges, so a deterministically failing object
+    /// is refused after [`MAX_ADMISSION_CRASHES`] exits; any other undoes
+    /// this process's charges (not a crash, not the object).
+    pub fn note_coded_exit(&mut self, error: Option<&anyhow::Error>, reason: &str) {
+        if exit_keeps_charges(error) {
+            tracing::warn!(tenant = %self.cfg.tenant_id, reason,
+                "coded exit the object in flight may have caused: crash-ledger charges kept");
+            return;
+        }
+        self.note_orderly_exit(reason);
+    }
+
+    /// NAN-4553: undo this process's crash-ledger charges (an exit that is
+    /// never the object's: fencing, an epoch change, the lease lost,
+    /// credentials, enrichment or catalog custody giving up).
+    pub fn note_orderly_exit(&mut self, reason: &str) {
+        match self.admission_attempts.uncharge_this_process() {
+            Ok(0) => {}
+            Ok(undone) => tracing::info!(tenant = %self.cfg.tenant_id, undone, reason,
+                "orderly exit: crash-ledger charges of this process undone (not a crash)"),
+            Err(error) => tracing::warn!(error = %format!("{error:#}"), "admission attempt ledger not updated"),
         }
     }
 
@@ -3989,7 +4604,10 @@ impl<'a> Ingestor<'a> {
             return Ok(());
         }
         let (bytes, sha) = super::writer::file_digest(&target)?;
-        let rows = crate::bronze::bronze_file_row_count(&target).unwrap_or(0);
+        // NAN-4553: a refusal of a crashed object that itself died (it read
+        // the footer) does not read it again: the rows count as unknown (0).
+        let footer_unsafe = matches!(cause, PoisonCause::Crashed { attempts } if attempts > MAX_ADMISSION_CRASHES);
+        let rows = if footer_unsafe { 0 } else { crate::bronze::bronze_file_row_count(&target).unwrap_or(0) };
         let detail = match cause {
             PoisonCause::Crashed { attempts } => {
                 tracing::error!(tenant = %self.cfg.tenant_id, key = %notice.key, version = %notice.version, attempts, rows, bytes,
@@ -4019,12 +4637,35 @@ impl<'a> Ingestor<'a> {
         Ok(())
     }
 
+    /// NAN-4542: while a crash is being isolated (a suspect pending), what
+    /// admission buffered (one object) is due a tick after it was admitted,
+    /// never after the flush age: nothing may join it anyway, and waiting the
+    /// age (up to 30 s while behind) per suspect would turn the recovery from
+    /// a crash with hundreds of objects in flight into hours of lag.
+    fn crash_recovery_seal(&self, now_ms: i64) -> bool {
+        (self.admission_attempts.has_suspects() || self.admission_attempts.has_isolating())
+            && !self.buffer.handles.is_empty()
+            && self.buffer.since_ms.is_some_and(|since| now_ms > since)
+    }
+
     /// NAN-4336: the buffer holds an object a previous process died with
     /// (admitted alone by [`Self::crash_guard`]): admit nothing beside it
     /// until it flushes, so an owner refusal of that flush names exactly it.
+    ///
+    /// NAN-4542: such an object stops being a suspect the moment it is
+    /// admitted, so this used to ask the wrong question and never held:
+    /// later objects joined its buffer (4 per flush in the kill -9 test),
+    /// and the next crash counted against every one of them until healthy
+    /// objects were refused as poison. It now asks whether the buffer, or a
+    /// flush still in flight, holds a re-admitted suspect that is still
+    /// pending: at most one such object is ever admitted and unacknowledged.
     fn buffer_holds_suspect(&self) -> bool {
-        self.admission_attempts.has_suspects()
-            && self.buffer.sources.iter().any(|source| self.admission_attempts.suspect(&object_id(&source.key, &source.version)).is_some())
+        if !self.admission_attempts.has_isolating() {
+            return false;
+        }
+        let isolating = |sources: &[SourceObject]| sources.iter()
+            .any(|source| self.admission_attempts.isolating(&object_id(&source.key, &source.version)));
+        isolating(&self.buffer.sources) || self.flush_in_flight.iter().any(|flight| isolating(&flight.buffer.sources))
     }
 
     /// NAN-4336: a flush failed. When the writer owner refused its part
@@ -4033,7 +4674,7 @@ impl<'a> Ingestor<'a> {
     /// object, mark it so the restarted ingest refuses it whole. A flush of
     /// several objects marks none: the restart admits each alone, and the
     /// culprit's own flush is refused next. Every other failure: nothing.
-    fn note_flush_failure(&mut self, sources: &[SourceObject], replay: Option<&str>, error: &anyhow::Error) {
+    fn note_flush_failure(&mut self, sources: &[SourceObject], replay: Option<&str>, error: &anyhow::Error, now_ms: i64) {
         if !super::native_writer::reservation_refused(error) {
             return;
         }
@@ -4042,7 +4683,7 @@ impl<'a> Ingestor<'a> {
             "INGEST RESERVE REFUSED: the writer owner refused a flush's part reservation permanently; \
              ingest restarts to isolate and quarantine the object");
         if let (Some(id), Some(quarantine)) = (replay, &self.quarantine) {
-            if let Err(error) = quarantine.clear_replay(id) {
+            if let Err(error) = quarantine.clear_replay(id, now_ms) {
                 tracing::warn!(id, error = %format!("{error:#}"), "quarantine replay request could not be cleared");
             }
             return;
@@ -4062,7 +4703,11 @@ impl<'a> Ingestor<'a> {
         let mut files = Vec::new();
         let committed = self.committed_bytes();
         let idle = self.buffer.bytes == 0 && self.flush_in_flight.is_empty();
+        // NAN-4553: the first object from idle, recorded before its fetch.
+        let mut recorded: Option<String> = None;
         let mut decoded_total = 0_u64;
+        // NAN-4553: rows per slice of a lone object too large to admit whole.
+        let mut slice_rows: Option<u64> = None;
         for (handle, notice) in notices {
             ensure!(notice.tenant_id == self.cfg.tenant_id, "notice for another tenant");
             // NAN-3643: a replay reads this tenant's own quarantine, and only
@@ -4076,6 +4721,9 @@ impl<'a> Ingestor<'a> {
                     self.hold_rejection(handle, notice, "0".repeat(64), "object", 0, "admission_invalid", "key outside the tenant's bronze prefix");
                     continue;
                 }
+            }
+            if files.is_empty() && recorded.is_none() && idle && self.buffer.handles.is_empty() {
+                recorded = Some(self.record_before_fetch(notice, notices.len()));
             }
             let target = src_dir.join(format!("fetch-{}.parquet", uuid::Uuid::new_v4().simple()));
             let fetched = match (&replay, &self.quarantine) {
@@ -4121,14 +4769,36 @@ impl<'a> Ingestor<'a> {
             // object from idle always goes (progress); the rest wait,
             // pending, for the next tick (a prefix, so ranges stay
             // contiguous).
+            //
+            // NAN-4553: that first object is no exception to the bound. One
+            // landing object may hold 10k rows / 32 MiB of events (~16x that
+            // as JSON values); admitted whole it OOM-killed a 512 MiB ingest
+            // role every 2-3 min, and the crash ledger then quarantined it
+            // as "poison". An object that does not fit alone is admitted in
+            // row slices, one slice's JSON values at a time.
             let decoded = crate::bronze::bronze_file_decoded_bytes(&target).unwrap_or(0);
             let (heap, arrow) = decoded_admission_cost(decoded_total + decoded);
-            if !(files.is_empty() && idle) && !super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, heap, arrow) {
+            let fits = super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, heap, arrow);
+            if !(files.is_empty() && idle) && !fits {
                 let _ = std::fs::remove_file(&target);
-                self.admission_deferred = true;
+                // NAN-4539 step 3a: seal only when the buffer (with the
+                // flights and merges) is what keeps this object out. When
+                // it alone fits beside them, only this group's transient
+                // decode peak bounded it: the next tick admits it into the
+                // same buffer, so the flush grows to its caps instead of
+                // sealing at one admission group.
+                let (alone_heap, alone_arrow) = decoded_admission_cost(decoded);
+                if !super::memory::admission_fits(self.cfg.buffer_budget_bytes, committed, alone_heap, alone_arrow) {
+                    self.admission_deferred = true;
+                }
                 tracing::info!(objects_admitted = files.len(), decoded_bytes = decoded_total + decoded,
                     "admission bounded by decoded size; the rest stays pending");
                 break;
+            }
+            if !fits {
+                let rows = crate::bronze::bronze_file_row_count(&target).unwrap_or(0);
+                let (heap, arrow) = decoded_admission_cost(decoded);
+                slice_rows = Some(super::memory::admission_slice_rows(self.cfg.buffer_budget_bytes, committed, heap, arrow, rows));
             }
             decoded_total += decoded;
             let path = src_dir.join(format!("{sha}.parquet"));
@@ -4139,7 +4809,33 @@ impl<'a> Ingestor<'a> {
             self.mark_since(now_ms);
             return Ok((0, 0));
         }
-        self.begin_admission(&files);
+        self.begin_admission(&files, idle && self.buffer.handles.is_empty(), recorded.as_deref());
+        // NAN-4553: the lone oversized object, cut into slice files that
+        // carry its identity (handle, notice, sha, bytes) and are admitted
+        // one after another; only their Arrow rows accumulate.
+        let slices = match slice_rows {
+            Some(rows) if files.len() == 1 => match write_admission_slices(&files[0], rows) {
+                Ok(slices) => slices,
+                Err(error) => {
+                    // An object that cannot be re-read in slices (a corrupt
+                    // row group) is admitted whole: its decode refuses it
+                    // whole, as before. Never a tick error: that would retry
+                    // the same object until the retry window ends ingest.
+                    tracing::warn!(tenant = %self.cfg.tenant_id, key = %files[0].1.key, error = %format!("{error:#}"),
+                        "oversized object could not be cut into admission slices; admitting it whole");
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
+        // NAN-4553 (review P3): every return from here (a `?` included)
+        // removes the slice files; the normal paths also remove them early.
+        let _slice_files = RemoveOnDrop(slices.iter().map(|slice| slice.2.clone()).collect());
+        if !slices.is_empty() {
+            tracing::info!(tenant = %self.cfg.tenant_id, key = %files[0].1.key, slices = slices.len(), rows_per_slice = slice_rows.unwrap_or(0),
+                budget_bytes = self.cfg.buffer_budget_bytes, "object larger than the admission budget; admitting it in row slices");
+            self.health.objects_admitted_in_slices_total += 1;
+        }
         // Admit each group, then conform its rows to the (pending) schema
         // BEFORE any row enters the buffer or the uid window:
         // - a row admission refuses on its own (bad or missing `time`,
@@ -4173,9 +4869,24 @@ impl<'a> Ingestor<'a> {
             conflicting_replays: u64,
             /// NAN-4336: rows clamped to their ingest time, per source.
             time_clamped: ClampedSources,
+            /// NAN-4553: a kept row's share of its object's stored bytes when
+            /// the group is one slice of it (None: from the group itself).
+            row_bytes: Option<u64>,
+            /// NAN-4573: clamped rows' source time (epoch ms) by uid.
+            clamped: BTreeMap<String, i64>,
         }
-        let mut queue: Vec<Vec<File>> = vec![files.iter().collect()];
+        let mut queue: Vec<Vec<File>> = if slices.is_empty() {
+            vec![files.iter().collect()]
+        } else {
+            // A stack: the first slice is admitted first.
+            slices.iter().rev().map(|slice| vec![slice]).collect()
+        };
         let mut admitted: Vec<Admitted> = Vec::new();
+        // NAN-4553: a slice whose every row is refused (refused rows of the
+        // object), and a slice admission refused outright (refuses the
+        // whole object, as an unsliced admission would).
+        let mut slice_refused: Option<(u64, RowRefusal, RefusedSources)> = None;
+        let mut slice_failure: Option<String> = None;
         // JSON-value heap of the admitted rows (sampled): sizes the next
         // admission's in-flight share.
         let mut value_heap = 0_f64;
@@ -4211,10 +4922,33 @@ impl<'a> Ingestor<'a> {
                     let by_path = refused.keys().next().filter(|_| refused.len() == 1).map(|path| (path.clone(), sources)).into_iter().collect::<BTreeMap<_, _>>();
                     (admission, refused, by_path)
                 }
-                Err(error) if is_transient(&error) => return Err(error.context("transient admission failure")),
+                Err(error) if is_transient(&error) => {
+                    // NAN-4553: the next admission cuts its own slices.
+                    for slice in &slices {
+                        let _ = std::fs::remove_file(&slice.2);
+                    }
+                    return Err(error.context("transient admission failure"));
+                }
                 Err(error) if group.len() > 1 => {
                     tracing::warn!(error = %error, objects = group.len(), "group admission failed; admitting objects one by one");
                     queue.extend(group.into_iter().map(|file| vec![file]));
+                    continue;
+                }
+                Err(error) if !slices.is_empty() => {
+                    let detail = format!("{error:#}");
+                    match error.downcast_ref::<NoCanonicalEvents>() {
+                        Some(refused) => {
+                            let rows = crate::bronze::bronze_file_row_count(&group[0].2).unwrap_or(0);
+                            let first = refused.first_row.clone().unwrap_or_else(|| RowRefusal::new("no_canonical_events", None));
+                            let entry = slice_refused.get_or_insert_with(|| (0, first, RefusedSources::default()));
+                            entry.0 += rows;
+                            entry.2.merge(&refused.refused_sources);
+                        }
+                        None => {
+                            slice_failure = Some(detail);
+                            break;
+                        }
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -4243,6 +4977,7 @@ impl<'a> Ingestor<'a> {
             let bronze_duplicates = admission.duplicate_rows_removed.saturating_sub(salvaged);
             let conflicting_replays = admission.conflicting_replay_rows_dropped;
             let time_clamped = std::mem::take(&mut admission.time_clamped);
+            let clamped = std::mem::take(&mut admission.clamped_original_ms);
             // The in-batch admission's source identities (NAN-3704): the
             // cross-batch window compares the same normalisation.
             let digests = admission.take_source_identity_digests();
@@ -4334,41 +5069,139 @@ impl<'a> Ingestor<'a> {
                 let credentials = row_credentials(&rows, track_credentials);
                 let (uids, batch) = decoded_rows(rows, decoded, &self.pending_schema)?;
                 let payloads = payload_hashes(&uids, &digests);
-                admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times: times_kept, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped });
+                admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times: times_kept, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
             } else {
                 let credentials = row_credentials(&rows, track_credentials);
                 let (uids, batch) = decoded_rows(rows, decoded, &self.pending_schema)?;
                 let payloads = payload_hashes(&uids, &digests);
-                admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped });
+                admitted.push(Admitted { group, rows_by_path, uids, payloads, batch, times, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes: None, clamped });
+            }
+        }
+        // NAN-4553: fold the slices back into their object. The object is
+        // refused whole exactly when an unsliced admission would refuse it
+        // (an admission error, or every row refused); otherwise its slices
+        // commit as one object: one source, one notice, one row count, one
+        // `reject` entry for its refused rows.
+        if !slices.is_empty() {
+            for slice in &slices {
+                let _ = std::fs::remove_file(&slice.2);
+            }
+            let original = &files[0];
+            let whole_refusal = match (slice_failure, admitted.is_empty()) {
+                (Some(detail), _) => Some((detail, None, None)),
+                (None, true) => {
+                    let (_, first, sources) = slice_refused.take().unwrap_or_else(|| (0, RowRefusal::new("no_canonical_events", None), RefusedSources::default()));
+                    let refused = NoCanonicalEvents { first_row: Some(first), refused_sources: sources };
+                    Some((refused.to_string(), refused.first_row.clone(), Some(refused.refused_sources)))
+                }
+                (None, false) => None,
+            };
+            if let Some((detail, first_row, sources)) = whole_refusal {
+                admitted.clear();
+                let rows = crate::bronze::bronze_file_row_count(&original.2).unwrap_or(0);
+                if let Some(sources) = &sources {
+                    sources.log("part_ingest");
+                }
+                self.hold_rejection_with(&original.0, &original.1, original.3.clone(), "object", rows, "admission_invalid", &detail,
+                    first_row.as_ref(), sources.as_ref());
+                self.quarantine_refused(&original.1, &original.3, &original.2, rows, &detail, now_ms);
+                let _ = std::fs::remove_file(&original.2);
+                self.mark_since(now_ms);
+                return Ok((0, 0));
+            }
+            let kept = admitted.iter().map(|entry| entry.uids.len() as u64).sum::<u64>().max(1);
+            let mut source_rows = 0_u64;
+            let mut refused: Option<(u64, RowRefusal)> = None;
+            let mut refused_sources = RefusedSources::default();
+            if let Some((rows, first, sources)) = slice_refused.take() {
+                source_rows += rows;
+                refused = Some((rows, first));
+                refused_sources.merge(&sources);
+            }
+            for entry in &mut admitted {
+                source_rows += entry.rows_by_path.values().sum::<u64>();
+                for (count, first) in std::mem::take(&mut entry.refused).into_values() {
+                    let total = refused.get_or_insert_with(|| (0, first));
+                    total.0 += count;
+                }
+                for sources in std::mem::take(&mut entry.refused_sources).into_values() {
+                    refused_sources.merge(&sources);
+                }
+                entry.rows_by_path.clear();
+                entry.group.clear();
+                entry.row_bytes = Some(original.4 / kept);
+            }
+            let last = admitted.last_mut().expect("a sliced object admitted rows");
+            last.group = vec![original];
+            last.rows_by_path.insert(original.2.clone(), source_rows);
+            if let Some(refused) = refused {
+                last.refused.insert(original.2.clone(), refused);
+            }
+            if !refused_sources.is_empty() {
+                last.refused_sources.insert(original.2.clone(), refused_sources);
             }
         }
         // Commit groups to the buffer atomically: every fallible step
-        // (window preparation) runs before any row or uid is added, so an
-        // error here leaves the buffer as it was and replay is safe.
+        // (window preparation, remote GETs) runs for EVERY admitted entry
+        // (every row slice of a sliced object) before any row or uid is
+        // added, so an error here leaves the buffer and the window's
+        // observed uids as they were and replay is safe (NAN-4553 review P2:
+        // a failure on slice k+1 left slices 1..k buffered without their
+        // source, so a due flush could commit part of an unacked object).
+        // Preparation only loads committed parts into the window; it never
+        // depends on rows observed by an earlier entry.
+        let mut prepared = Vec::with_capacity(admitted.len());
+        for entry in &admitted {
+            let mut by_hour: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+            for (index, time_us) in entry.times.iter().enumerate() {
+                by_hour.entry(event_hour_of(*time_us)).or_default().push(index);
+            }
+            let mut unverified = BTreeSet::new();
+            for (hour, rows) in &by_hour {
+                if self.prepare_hour(*hour, rows.iter().map(|i| entry.uids[*i].as_str()), now_ms).await? {
+                    unverified.insert(*hour);
+                }
+            }
+            // NAN-4573: a clamped row's `time` is its delivery's ingest
+            // time (clamped here or by the landing stage), so another
+            // delivery of the same event can be stored in another hour
+            // (clamped to a different ingest time, or not clamped at all).
+            // Every delivery shares the source's time: a clamped row is
+            // also deduped against, and recorded under, that time's hour,
+            // where an unclamped copy is stored and every clamped copy is
+            // recorded. In memory only: a clamped copy admitted before a
+            // restart is not found by a later unclamped one (its part is in
+            // the clamped hour); the reverse order hydrates from the parts.
+            let mut by_original: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+            for (hour, rows) in &by_hour {
+                for index in rows {
+                    if let Some(original) = original_hour_of(&entry.clamped, &entry.uids, *index, *hour) {
+                        by_original.entry(original).or_default().push(*index);
+                    }
+                }
+            }
+            for (hour, rows) in &by_original {
+                self.prepare_hour(*hour, rows.iter().map(|i| entry.uids[*i].as_str()), now_ms).await?;
+            }
+            prepared.push((by_hour, unverified));
+        }
         let mut rows_total = 0_u64;
         let mut admitted_bytes = 0_u64;
         let source_bytes = files.iter().map(|f| f.4).sum::<u64>();
         let mut dups_total = 0_u64;
-        for Admitted { group, rows_by_path, uids, payloads, batch, times, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped } in admitted {
-            self.note_time_clamped(&time_clamped, group.len());
+        for (Admitted { group, rows_by_path, uids, payloads, batch, times: _, refused, refused_sources, credentials, bronze_duplicates, conflicting_replays, time_clamped, row_bytes, clamped }, (by_hour, unverified)) in admitted.into_iter().zip(prepared) {
+            self.note_time_clamped(&time_clamped, group.len().max(1));
             // NAN-3899: a kept row's share of its objects' stored bytes.
-            let row_bytes = group.iter().map(|file| file.4).sum::<u64>() / (uids.len().max(1) as u64);
+            let row_bytes = row_bytes.unwrap_or_else(|| group.iter().map(|file| file.4).sum::<u64>() / (uids.len().max(1) as u64));
             self.buffer.bronze_duplicates += bronze_duplicates;
             self.buffer.same_uid_payload_diff += conflicting_replays;
             if conflicting_replays > 0 {
                 self.log_in_batch_conflict(conflicting_replays, group.len(), now_ms);
             }
             self.buffer.rows_refused += refused.values().map(|(count, _)| *count).sum::<u64>();
-            let mut by_hour: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
-            for (index, time_us) in times.iter().enumerate() {
-                by_hour.entry(event_hour_of(*time_us)).or_default().push(index);
-            }
-            let mut unverified = BTreeSet::new();
-            for (hour, rows) in &by_hour {
-                if self.prepare_hour(*hour, rows.iter().map(|i| uids[*i].as_str()), now_ms).await? {
-                    unverified.insert(*hour);
-                }
-            }
+            // NAN-4573: the hours each clamped row is also checked against
+            // and recorded under (see the preparation above).
+            let original_hour = |index: usize, hour: i32| original_hour_of(&clamped, &uids, index, hour);
             for (hour, rows) in by_hour {
                 let mut keep = Vec::with_capacity(rows.len());
                 // NAN-3703: an hour the late tier holds is checked against
@@ -4381,12 +5214,20 @@ impl<'a> Ingestor<'a> {
                     rows_total += 1;
                     let payload = payloads[index];
                     let key = self.window.key(uid);
+                    let original = original_hour(index, hour);
                     let seen = if tiered && !self.window.contains_key(hour, &key) && self.late.contains(hour, &key) {
                         self.health.late_dedup_tier_duplicates_total += 1;
+                        Seen::Duplicate
+                    } else if original.is_some_and(|original| self.window.contains_key(original, &key)
+                        || (self.late.has_hour(original) && self.late.contains(original, &key))) {
+                        self.health.clamped_cross_hour_duplicates_total += 1;
                         Seen::Duplicate
                     } else {
                         self.window.observe_key(hour, key, payload, now_ms)
                     };
+                    if let (Seen::New, Some(original)) = (seen, original) {
+                        self.window.observe_key(original, key, payload, now_ms);
+                    }
                     if seen == Seen::New && unverified {
                         if super::late_dedup::within_horizon(hour, now_ms) {
                             self.health.late_dedup_unverified_rows_total += 1;
@@ -4544,9 +5385,191 @@ impl<'a> Ingestor<'a> {
         }
     }
 
+    /// NAN-4554: once per work dir (a pod replacement starts a fresh one),
+    /// rebuild the quarantine from the tenant bucket before anything is
+    /// admitted or replayed. A failure is retried next tick and never holds
+    /// ingest (the objects stay in the bucket).
+    async fn restore_quarantine(&mut self, now_ms: i64) {
+        let Some(quarantine) = self.quarantine.clone() else { return };
+        if !quarantine.needs_restore() {
+            self.health.quarantine_restore_pending = false;
+            return;
+        }
+        self.health.quarantine_restore_pending = true;
+        // NAN-4554 (review P1): a failing restore backs off (never a LIST
+        // storm every tick).
+        if now_ms < self.quarantine_restore_retry.1 {
+            return;
+        }
+        match super::quarantine_store::restore(self.parts, &quarantine, now_ms).await {
+            Ok(restored) => {
+                self.health.quarantine_restore_error = None;
+                self.health.quarantine_restore_refused = restored.refused.map(str::to_string);
+                if restored.refused.is_some() {
+                    // Review P2: a restore stopped early (restore_disk_low)
+                    // stays pending, so what it left in the bucket is
+                    // restored once space frees; retried at most every
+                    // RESTORE_REFUSED_RETRY_MS (each pass re-reads the
+                    // records). What it already restored is kept.
+                    let failures = self.quarantine_restore_retry.0.saturating_add(1);
+                    let wait = super::quarantine_store::retry_after_ms(failures).max(super::quarantine_store::RESTORE_REFUSED_RETRY_MS);
+                    self.quarantine_restore_retry = (failures, now_ms.saturating_add(wait));
+                    self.health.quarantine_restored_total += restored.entries as u64;
+                    self.quarantine_replay_pending = true;
+                    tracing::warn!(tenant = %self.cfg.tenant_id, restored = restored.entries, refused = ?restored.refused,
+                        retry_in_ms = wait, "bronze quarantine restore stopped early; it stays pending and is retried");
+                    return;
+                }
+                if let Err(error) = quarantine.mark_restored(restored.low_water_ms) {
+                    tracing::warn!(error = %format!("{error:#}"), "bronze quarantine restore marker not written");
+                }
+                self.quarantine_restore_retry = (0, i64::MIN);
+                self.health.quarantine_restore_pending = false;
+                self.health.quarantine_restore_over_cap += restored.over_cap as u64;
+                self.health.quarantine_restore_records_beyond_bound += restored.records_beyond_bound as u64;
+                self.health.quarantine_restored_total += restored.entries as u64;
+                self.quarantine_replay_pending = true;
+                self.quarantine_swept_ms = 0;
+                if restored.entries + restored.skipped + restored.over_cap > 0 || restored.refused.is_some() {
+                    tracing::warn!(tenant = %self.cfg.tenant_id, restored = restored.entries, skipped = restored.skipped,
+                        over_cap = restored.over_cap, beyond_bound = restored.records_beyond_bound, refused = ?restored.refused,
+                        "bronze quarantine restored from the tenant bucket (fresh work dir)");
+                }
+            }
+            Err(error) => {
+                let failures = self.quarantine_restore_retry.0.saturating_add(1);
+                let wait = super::quarantine_store::retry_after_ms(failures);
+                self.quarantine_restore_retry = (failures, now_ms.saturating_add(wait));
+                self.health.quarantine_restore_error = Some(format!("{error:#}").chars().take(300).collect());
+                tracing::warn!(tenant = %self.cfg.tenant_id, error = %format!("{error:#}"), failures, retry_in_ms = wait,
+                    "bronze quarantine restore failed; retried with backoff");
+            }
+        }
+    }
+
+    /// NAN-4554: mirror queued quarantine changes into the tenant bucket.
+    /// `hold` (a flush about to acknowledge refused objects): while the
+    /// bucket refuses, fail the flush (retried in-process) for up to
+    /// `MIRROR_HOLD_MS`, then proceed with the change kept pod-local.
+    async fn mirror_quarantine(&mut self, now_ms: i64, hold: bool) -> Result<()> {
+        let Some(quarantine) = self.quarantine.clone() else { return Ok(()) };
+        let queued = match quarantine.outbox() {
+            Ok(queued) => queued,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "bronze quarantine outbox unreadable");
+                return Ok(());
+            }
+        };
+        // Ids no longer queued (mirrored, or dropped) forget their backoff.
+        self.quarantine_mirror_backoff.retain(|id, _| queued.iter().any(|(queued, _)| queued == id));
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut waiting = false;
+        for (id, _) in queued {
+            let retry = self.quarantine_mirror_backoff.get(&id).cloned().unwrap_or_default();
+            if now_ms < retry.next_ms {
+                // Backing off: not retried before its time (the hold below
+                // still keeps the acknowledging flush waiting).
+                waiting = true;
+                continue;
+            }
+            let written_ms = now_ms.max(self.quarantine_record_ms + 1);
+            let mut object_mirrored = retry.object_mirrored;
+            let result = super::quarantine_store::mirror_once(self.parts, &quarantine, &id, written_ms, &mut object_mirrored).await;
+            match result {
+                Ok(()) => {
+                    self.quarantine_record_ms = written_ms;
+                    self.health.quarantine_mirrored_total += 1;
+                    self.quarantine_mirror_backoff.remove(&id);
+                    if let Err(error) = quarantine.outbox_done(&id) {
+                        tracing::warn!(id, error = %format!("{error:#}"), "bronze quarantine outbox entry not cleared");
+                    }
+                }
+                Err(error) => {
+                    // NAN-4554 (review P1): this id backs off on its own; the
+                    // next ids are still tried (no head-of-line block).
+                    self.health.quarantine_mirror_failures_total += 1;
+                    let failures = retry.failures.saturating_add(1);
+                    let wait = super::quarantine_store::retry_after_ms(failures);
+                    self.quarantine_mirror_backoff.insert(id.clone(), MirrorRetry {
+                        failures, next_ms: now_ms.saturating_add(wait), object_mirrored,
+                        failing_since_ms: retry.failing_since_ms.or(Some(now_ms)),
+                    });
+                    tracing::warn!(tenant = %self.cfg.tenant_id, id, failures, retry_in_ms = wait, error = %format!("{error:#}"),
+                        "bronze quarantine change not mirrored; retried with backoff");
+                    last_error = Some(error);
+                }
+            }
+        }
+        let failing_since = self.quarantine_mirror_backoff.values().filter_map(|retry| retry.failing_since_ms).min();
+        self.health.quarantine_mirror_failing_ids = self.quarantine_mirror_backoff.len();
+        self.health.quarantine_mirror_failing_since_ms = failing_since;
+        self.quarantine_mirror_failing_since = failing_since;
+        if failing_since.is_none() || !hold || !(waiting || last_error.is_some()) {
+            return Ok(());
+        }
+        let detail = last_error.map(|error| format!("{error:#}")).unwrap_or_else(|| "backing off".into());
+        // The hold runs per id from its first failure: a change that only
+        // started failing is held its full window even when another id has
+        // been failing longer.
+        let newest_failure = self.quarantine_mirror_backoff.values().filter_map(|retry| retry.failing_since_ms).max().unwrap_or(now_ms);
+        let since = failing_since.unwrap_or(now_ms);
+        if now_ms.saturating_sub(newest_failure) < super::quarantine_store::MIRROR_HOLD_MS {
+            // Flattened: a mirror refusal (even a 403) only delays the
+            // flush; it is never a fatal ingest error.
+            return Err(anyhow::anyhow!("bronze quarantine change not in the tenant bucket yet; the flush acknowledging it waits: {detail}"));
+        }
+        tracing::error!(tenant = %self.cfg.tenant_id, failing_ids = self.health.quarantine_mirror_failing_ids,
+            failing_for_s = now_ms.saturating_sub(since) / 1_000, error = %detail,
+            "BRONZE QUARANTINE NOT DURABLE: the tenant bucket refused it past the hold; proceeding with the copy pod-local only");
+        Ok(())
+    }
+
     /// NAN-3643: this tenant's quarantined objects (operator listing).
     pub fn quarantine_entries(&self) -> Result<Vec<QuarantineEntry>> {
         self.quarantine.as_ref().context("bronze quarantine is unavailable")?.list()
+    }
+
+    /// NAN-4554: the quarantine directory (an import stages its body there
+    /// without holding the ingestor).
+    pub fn quarantine_handle(&self) -> Option<Quarantine> {
+        self.quarantine.clone()
+    }
+
+    /// NAN-4554: an operator imports one object exported from an earlier pod
+    /// (`staged`, verified and moved in by [`Quarantine::import`]); a kept
+    /// one is mirrored into the tenant bucket by this cell's own credential.
+    /// One audit line per import: ids and counts, never payloads.
+    pub fn import_quarantined(&mut self, entry: &QuarantineEntry, staged: &Path, now_ms: i64)
+        -> Result<super::quarantine::Imported> {
+        use super::quarantine::Imported;
+        let quarantine = match self.quarantine.clone() {
+            Some(quarantine) => quarantine,
+            None => {
+                let _ = std::fs::remove_file(staged);
+                anyhow::bail!("bronze quarantine is unavailable");
+            }
+        };
+        let result = quarantine.import(entry, staged, now_ms);
+        let outcome = match &result {
+            Ok(Imported::New) => "imported",
+            Ok(Imported::Exists) => "exists",
+            Err(error) => match error.downcast_ref::<super::quarantine::ImportRefused>() {
+                Some(_) => "refused",
+                None => "failed",
+            },
+        };
+        let reason = result.as_ref().err().map(|error| format!("{error:#}"));
+        tracing::info!(audit = "bronze_quarantine_import", tenant = %self.cfg.tenant_id, id = %entry.id,
+            bytes = entry.bytes, rows_rejected = entry.rows_rejected, outcome, reason = reason.as_deref().unwrap_or(""),
+            "bronze quarantine import");
+        if let Ok(Imported::New) = result {
+            self.health.quarantine_imported_total += 1;
+            if let Ok((objects, bytes)) = quarantine.usage() {
+                self.health.quarantine_objects = objects;
+                self.health.quarantine_bytes = bytes;
+            }
+        }
+        result
     }
 
     /// NAN-3643: an operator asks to replay quarantined object `id` of
@@ -4869,19 +5892,53 @@ impl<'a> Ingestor<'a> {
     /// in [`Self::reap_in_flight`]. Any flush first commits the one in
     /// flight, so entries, edge ranges and acks stay in flush order.
     async fn flush(&mut self, now_ms: i64, pipeline: bool) -> Result<usize> {
+        self.flush_ordered(now_ms, pipeline, true).await
+    }
+
+    /// [`Self::flush`]; with `commit_ready` false (NAN-4539 step 3a, the
+    /// seal-first tick) a seal that may sit beside every flight left seals
+    /// before the ready oldest commits, so its build overlaps that commit.
+    async fn flush_ordered(&mut self, now_ms: i64, pipeline: bool, commit_ready: bool) -> Result<usize> {
         // Commit what is ready, then wait until this seal may join the
         // flights left (NAN-3619): with depth 1, or whenever this seal would
         // log anything ahead of an earlier flight's `add` (rejections, skip
         // acks, a schema change) or not pipeline at all, every flight
         // commits first, exactly as before.
-        let keep = if self.may_seal_beside_flights(pipeline) { self.flush_depth() - 1 } else { 0 };
-        self.diagnostics.0.lock().expect("pipeline diagnostics").tracking_oldest = false;
+        let mut keep = if self.may_seal_beside_flights(pipeline) { self.flush_depth() - 1 } else { 0 };
+        let mut commit_ready = commit_ready;
+        self.diagnostics.state.lock().expect("pipeline diagnostics").tracking_oldest = false;
         self.diagnostics.stage("waiting_for_oldest_flush");
-        let reaped = self.reap_in_flight(now_ms, keep).await?;
+        // NAN-4539 step 3a: when only the working budget keeps this seal
+        // from sitting beside the flights (a slot is free), wait for the
+        // oldest flight's publication, not its commit. Published, it holds
+        // only its retained rows; if the seal fits then, it seals first and
+        // its build overlaps that flight's inline commit.
+        if self.cfg.commit_when_ready && pipeline && self.flush_in_flight.len() > keep
+            && self.flush_in_flight.len() < self.flush_depth()
+        {
+            self.diagnostics.stage("waiting_for_oldest_publication");
+            self.await_oldest_task().await;
+            self.settle_published_flights();
+            if self.may_seal_beside_flights(pipeline) {
+                keep = self.flush_depth() - 1;
+                commit_ready = false;
+                self.health.seals_first_total = self.health.seals_first_total.saturating_add(1);
+            }
+        }
+        let reaped = if commit_ready || self.flush_in_flight.len() > keep { self.reap_in_flight(now_ms, keep).await? } else { 0 };
         if self.buffer.handles.is_empty() && self.buffer.rows == 0 {
             return Ok(reaped);
         }
+        if let Some(since) = self.seal_deferred_since_ms.take() {
+            self.health.seal_deferred_max_ms = self.health.seal_deferred_max_ms.max(now_ms.saturating_sub(since));
+        }
+        // NAN-4554: a refused object's quarantined copy reaches the tenant
+        // bucket before the flush acknowledging it to its source.
+        self.mirror_quarantine(now_ms, true).await?;
         self.buffer.flush_started_ms.get_or_insert(now_ms);
+        if self.buffer.progress.is_none() {
+            self.buffer.progress = Some(self.diagnostics.new_flush(self.buffer.rows, self.buffer.bytes));
+        }
         self.update_pipeline_diagnostics();
         self.diagnostics.stage("seal_rejections_and_skips");
         let no_rows = self.buffer.rows == 0;
@@ -4912,7 +5969,7 @@ impl<'a> Ingestor<'a> {
             }
             // Nothing to skip: no queue call (every queue treats an empty
             // ack as a no-op; with flights out it must not look like one).
-            // (Either flag on; both off keeps today's unconditional call.)
+            // (The serial comparison policy keeps the unconditional call.)
             // NAN-3643: a replay's handle was never issued by the queue.
             skips.retain(|(handle, _)| !Quarantine::is_replay_handle(&handle.0));
             if !skips.is_empty() || !(self.cfg.commit_when_ready || self.flush_depth() > 1) {
@@ -4938,16 +5995,22 @@ impl<'a> Ingestor<'a> {
                 let reserved_bytes = super::memory::flight_bytes(self.buffer.bytes, plan.writers);
                 let trusted = self.trusted.clone();
                 let wake = self.flight_wake.clone();
-                let progress = std::sync::Arc::new(std::sync::Mutex::new(FlushStage {
-                    stage: "build_parts", since: std::time::Instant::now(),
-                }));
+                let progress = self.buffer.progress.clone().expect("sealed diagnostics");
+                progress.lock().expect("flush diagnostics").set("build_parts");
+                let operations = self.diagnostics.operations.clone();
                 let task_progress = progress.clone();
+                let published_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let task_published = published_ok.clone();
                 let task = tokio::spawn(async move {
                     let result = async {
                         let finished = tokio::task::spawn_blocking(move || plan.build()).await.context("flush part build task")??;
-                        task_progress.lock().expect("flush diagnostics").set("publish_parts");
-                        let refs = publish_parts(store, signer, &trusted, &finished).await;
-                        if refs.is_ok() { task_progress.lock().expect("flush diagnostics").set("awaiting_part_log"); }
+                        { let mut progress = task_progress.lock().expect("flush diagnostics");
+                            progress.built(&finished); progress.set("publish_parts"); }
+                        let refs = super::writer::publish_parts_observed(store, signer, &trusted, &finished, &operations).await;
+                        if refs.is_ok() {
+                            task_progress.lock().expect("flush diagnostics").set("awaiting_part_log");
+                            task_published.store(true, std::sync::atomic::Ordering::Release);
+                        }
                         Ok((finished, refs))
                     }.await;
                     if let Some(wake) = wake {
@@ -4957,7 +6020,7 @@ impl<'a> Ingestor<'a> {
                 });
                 let buffer = std::mem::replace(&mut self.buffer, Buffered::new());
                 let sealed_ms = buffer.flush_started_ms.unwrap_or(now_ms);
-                self.flush_in_flight.push_back(InFlightFlush { buffer, reserved_bytes, schema: self.schema.clone(), sealed_ms, progress, task: Some(task), built: None, published: None });
+                self.flush_in_flight.push_back(InFlightFlush { buffer, reserved_bytes, schema: self.schema.clone(), sealed_ms, progress, task: Some(task), built: None, published: None, published_ok });
                 self.update_pipeline_diagnostics();
                 self.diagnostics.stage("build_and_publish");
                 self.health.flushes_pipelined_total += 1;
@@ -4969,7 +6032,7 @@ impl<'a> Ingestor<'a> {
                 Ok(count) => count,
                 Err(error) => {
                     let (sources, replay) = (self.buffer.sources.clone(), self.buffer.replay.clone());
-                    self.note_flush_failure(&sources, replay.as_deref(), &error);
+                    self.note_flush_failure(&sources, replay.as_deref(), &error, now_ms);
                     return Err(error);
                 }
             };
@@ -4990,6 +6053,7 @@ impl<'a> Ingestor<'a> {
     /// Health accounting of a flush whose acks landed.
     /// `sealed_ms` is when a pipelined flush was sealed (its commit lag).
     fn finish_flush(&mut self, mut buffer: Buffered, now_ms: i64, sealed_ms: Option<i64>) -> usize {
+        if let Some(progress) = &buffer.progress { self.diagnostics.completed(progress); }
         self.update_pipeline_diagnostics();
         self.diagnostics.stage(if self.flush_in_flight.is_empty() { "idle" } else { "build_and_publish" });
         let count = buffer.parts_committed;
@@ -5001,7 +6065,7 @@ impl<'a> Ingestor<'a> {
             if refused_again {
                 // `keep` cleared the request when admission refused it; a
                 // refusal before admission (bytes gone) must not loop.
-                if let Err(error) = quarantine.clear_replay(id) {
+                if let Err(error) = quarantine.clear_replay(id, now_ms) {
                     tracing::warn!(id, error = %format!("{error:#}"), "quarantine replay request could not be cleared");
                 }
             } else {
@@ -5020,7 +6084,7 @@ impl<'a> Ingestor<'a> {
                             "replayed quarantine entry unreadable; the landing ledger keeps its rows as quarantined"),
                     }
                 }
-                match quarantine.release(id) {
+                match quarantine.release(id, now_ms) {
                     Ok(()) => {
                         self.health.quarantine_replays_total += 1;
                         self.quarantine_swept_ms = 0;
@@ -5082,79 +6146,202 @@ impl<'a> Ingestor<'a> {
     /// Commit the oldest flight, waiting for its build/publish if needed:
     /// its `add`, then the acks. Every stage is recorded as it lands; on
     /// error the flight stays the oldest and the next call resumes it.
+    ///
+    /// Cancellation safe (NAN-4539): the flight stays at the front of
+    /// `flush_in_flight` across every await, owning its memory reservation,
+    /// background task (awaited by reference, never detached), immutable
+    /// output and handles; it is removed only after its acks landed. A
+    /// dropped call therefore resumes exactly where it stopped, and an `add`
+    /// that landed under a dropped call is adopted by [`Self::commit_add`],
+    /// never appended twice.
     async fn commit_oldest_flight(&mut self, now_ms: i64) -> Result<usize> {
         self.update_pipeline_diagnostics();
-        self.diagnostics.0.lock().expect("pipeline diagnostics").tracking_oldest = true;
-        let Some(mut flight) = self.flush_in_flight.pop_front() else { return Ok(0) };
-        if flight.published.is_none() && !flight.buffer.add_committed {
-            let outcome = match flight.task.take() {
-                Some(task) => match task.await {
-                    Ok(result) => result,
-                    Err(error) => Err(anyhow::anyhow!("pipelined flush task failed: {error}")),
-                },
-                None => {
-                    if flight.built.is_none() {
-                        self.diagnostics.stage("build_parts");
-                        match self.flush_plan(&flight.buffer, flight.schema.clone(), flight.buffer.issued_range.clone(), now_ms)
-                            .and_then(FlushPlan::build) {
-                            Ok(finished) => flight.built = Some(finished),
-                            Err(error) => {
-                                self.flush_in_flight.push_front(flight);
-                                return Err(error.context("pipelined flush build/publish"));
-                            }
-                        }
-                    }
-                    self.diagnostics.stage("publish_parts");
-                    let finished = flight.built.take().expect("built above");
-                    let refs = publish_parts(self.parts, self.signer, &self.trusted, &finished).await;
-                    Ok((finished, refs))
+        self.diagnostics.state.lock().expect("pipeline diagnostics").tracking_oldest = true;
+        let Some(front) = self.flush_in_flight.front_mut() else { return Ok(0) };
+        let needs_publication = front.published.is_none() && !front.buffer.add_committed;
+        // 1. The background build/publish, if one is still owned.
+        let joined = match front.task.as_mut() {
+            Some(task) if needs_publication => {
+                let joined = task.await;
+                front.task = None;
+                Some(joined)
+            }
+            _ => None,
+        };
+        let mut failure = None;
+        match joined {
+            Some(Ok(Ok((finished, refs)))) => {
+                let front = self.flush_in_flight.front_mut().expect("oldest flight");
+                front.built = Some(finished);
+                match refs {
+                    Ok(refs) => front.published = Some(refs),
+                    Err(error) => failure = Some(error),
                 }
+            }
+            // The build failed: nothing was built, the retry builds again.
+            Some(Ok(Err(error))) => return Err(error.context("pipelined flush build/publish")),
+            Some(Err(error)) => return Err(anyhow::anyhow!("pipelined flush task failed: {error}").context("pipelined flush build/publish")),
+            None => {}
+        }
+        // 2. No task (a retry): build if needed, then publish in place. The
+        // output stays in the flight while the upload awaits.
+        let front = self.flush_in_flight.front().expect("oldest flight");
+        if failure.is_none() && front.published.is_none() && !front.buffer.add_committed {
+            if front.built.is_none() {
+                self.diagnostics.stage("build_parts");
+                let finished = self.flush_plan(&front.buffer, front.schema.clone(), front.buffer.issued_range.clone(), now_ms)
+                    .and_then(FlushPlan::build)
+                    .map_err(|error| error.context("pipelined flush build/publish"))?;
+                self.flush_in_flight.front_mut().expect("oldest flight").built = Some(finished);
+            }
+            self.diagnostics.stage("publish_parts");
+            let front = self.flush_in_flight.front().expect("oldest flight");
+            let finished = front.built.as_ref().expect("built above");
+            front.progress.lock().expect("flush diagnostics").built(finished);
+            match super::writer::publish_parts_observed(self.parts, self.signer, &self.trusted, finished, &self.diagnostics.operations).await {
+                Ok(refs) => self.flush_in_flight.front_mut().expect("oldest flight").published = Some(refs),
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let Some(error) = failure {
+            let (sources, replay) = {
+                let front = self.flush_in_flight.front().expect("oldest flight");
+                (front.buffer.sources.clone(), front.buffer.replay.clone())
             };
-            match outcome {
-                Ok((finished, Ok(refs))) => flight.published = Some((finished, refs)),
-                Ok((mut finished, Err(error))) => {
-                    self.note_flush_failure(&flight.buffer.sources, flight.buffer.replay.as_deref(), &error);
-                    let error = self.rebuild_unresolved_publication(&flight.buffer, flight.schema.clone(), &mut finished, &error, now_ms)
-                        .err().unwrap_or(error);
-                    flight.built = Some(finished);
-                    self.flush_in_flight.push_front(flight);
-                    return Err(error.context("pipelined flush build/publish"));
-                }
-                Err(error) => {
-                    self.flush_in_flight.push_front(flight);
-                    return Err(error.context("pipelined flush build/publish"));
-                }
-            }
+            self.note_flush_failure(&sources, replay.as_deref(), &error, now_ms);
+            // Synchronous: the output is out of the flight only while no
+            // await can drop this call.
+            let mut finished = self.flush_in_flight.front_mut().expect("oldest flight").built.take().expect("published output");
+            let front = self.flush_in_flight.front().expect("oldest flight");
+            let rebuilt = self.rebuild_unresolved_publication(&front.buffer, front.schema.clone(), &mut finished, &error, now_ms);
+            self.flush_in_flight.front_mut().expect("oldest flight").built = Some(finished);
+            let error = rebuilt.err().unwrap_or(error);
+            return Err(error.context("pipelined flush build/publish"));
         }
-        if !flight.buffer.add_committed {
-            let (finished, refs) = flight.published.as_ref().expect("published above");
-            let consumed = consumed_sources(&flight.buffer);
+        // 3. The `add` (adopted if an earlier, dropped attempt landed it).
+        let front = self.flush_in_flight.front().expect("oldest flight");
+        if !front.buffer.add_committed {
+            let refs = front.published.clone().expect("published above");
+            let parts = add_parts(front.built.as_ref().expect("published output is retained"));
+            let (consumed, range) = (consumed_sources(&front.buffer), front.buffer.issued_range.clone());
             self.diagnostics.stage("append_part_log");
-            match self.commit_add(finished, refs.clone(), consumed, flight.buffer.issued_range.clone(), now_ms).await {
-                Ok(count) => {
-                    flight.buffer.parts_committed = count;
-                    flight.buffer.add_committed = true;
-                }
-                Err(error) => {
-                    self.flush_in_flight.push_front(flight);
-                    return Err(error);
-                }
-            }
+            let count = self.commit_add(&parts, refs, consumed, range, now_ms).await?;
+            let front = self.flush_in_flight.front_mut().expect("oldest flight");
+            front.buffer.parts_committed = count;
+            front.buffer.add_committed = true;
         }
-        let handles = flight.buffer.admitted.iter().map(|(h, _, _)| h.clone())
+        // 4. The acks; only then does the flight leave the queue.
+        let handles = self.flush_in_flight.front().expect("oldest flight").buffer.admitted.iter().map(|(h, _, _)| h.clone())
             .filter(|handle| !Quarantine::is_replay_handle(&handle.0)).collect::<Vec<_>>();
         self.diagnostics.stage("edge_ack");
-        if let Err(error) = self.queue.ack(&handles).await {
-            self.flush_in_flight.push_front(flight);
-            return Err(error);
-        }
+        self.queue.ack(&handles).await?;
+        let flight = self.flush_in_flight.pop_front().expect("oldest flight");
         Ok(self.finish_flush(flight.buffer, now_ms, Some(flight.sealed_ms)))
     }
 
     /// Flushes allowed in flight at once: the configured depth, capped by
-    /// what the queue lets be outstanding (NAN-3619).
+    /// what the queue lets be outstanding (NAN-3619). NAN-4539: one (the
+    /// serial contract) without the cell's background handles, while the
+    /// over-commit hold pauses admission, while the catalog attachment is
+    /// degraded and while an erasure order or step is active.
     fn flush_depth(&self) -> usize {
+        if self.background_parts.is_none() || self.background_signer.is_none()
+            || self.admission_paused || self.cfg.catalog_attachment_failure.is_some()
+            || self.erasure_pipeline_barrier()
+        {
+            return 1;
+        }
         self.cfg.flush_depth.clamp(1, MAX_FLUSH_DEPTH).min(self.queue.max_outstanding_ranges().max(1))
+    }
+
+    /// Whether sealing now would block on an unfinished flight (NAN-4539
+    /// step 3a): flights beyond what this seal may sit beside are still out
+    /// (ready ones were committed earlier in the tick). Only with the
+    /// production commit-when-ready policy; the serial comparison policy
+    /// keeps waiting.
+    fn seal_would_wait_for_flight(&self, pipeline: bool) -> bool {
+        if !self.cfg.commit_when_ready || self.flush_in_flight.is_empty()
+            || self.buffer.partially_committed() || self.buffer.replay.is_some() || self.buffer.rows == 0
+        {
+            return false;
+        }
+        let keep = if self.may_seal_beside_flights(pipeline) { self.flush_depth() - 1 } else { 0 };
+        self.flush_in_flight.len() > keep
+    }
+
+    /// Age-due seals deferred beside an unfinished flight, and seals made
+    /// before the ready oldest flight committed (NAN-4539 step 3a).
+    pub fn seals_deferred(&self) -> (u64, u64) {
+        (self.health.seals_deferred_total, self.health.seals_first_total)
+    }
+
+    /// Whether the buffer is due to seal: `(by age, by a cap)`.
+    fn seal_due_parts(&self, now_ms: i64, behind: bool) -> (bool, bool) {
+        let mut interval = self.cfg.flush_interval_override_ms.unwrap_or_else(|| self.cfg.flush_policy.interval_ms(self.health.eps_ewma));
+        if behind && self.cfg.flush_interval_override_ms.is_none() {
+            interval = interval.max(CATCH_UP_FLUSH_MAX_AGE_MS);
+        }
+        let due_by_age = self.buffer.since_ms.is_some_and(|since| now_ms - since >= interval);
+        let due_by_cap = self.buffer.rows >= FLUSH_MAX_ROWS
+            || self.buffer.bytes >= super::memory::buffer_cap(self.cfg.buffer_budget_bytes)
+            // The budget is spent (flight + merges + buffer): admission is
+            // stalled, so seal what is buffered rather than wait out the age.
+            || (self.buffer.rows > 0 && self.committed_bytes() >= self.cfg.buffer_budget_bytes)
+            || self.buffer.hours.len() >= MAX_FLUSH_EVENT_HOURS
+            || self.buffer.handles.len() >= MAX_FLUSH_OBJECTS
+            || self.buffer.rejections.len() >= MAX_REJECTIONS_PER_ENTRY
+            // NAN-4319: the next object's decoded rows did not fit beside
+            // the buffer; seal it so the next tick admits from idle.
+            || (self.buffer.rows > 0 && self.admission_deferred)
+            || self.crash_recovery_seal(now_ms);
+        (due_by_age, due_by_cap)
+    }
+
+    fn seal_due(&self, now_ms: i64, behind: bool) -> bool {
+        let (age, cap) = self.seal_due_parts(now_ms, behind);
+        age || cap
+    }
+
+    /// NAN-4539 step 3a: before a published flight commits inline (its
+    /// part-log append and prevalence apply hold this task, and admission
+    /// with it), a catch-up buffer that fits beside the flights left seals
+    /// first, so its build and upload overlap that commit. Only a buffer
+    /// that is due, or holds at least one full L0 part.
+    async fn seal_before_commit(&mut self, now_ms: i64) -> Result<usize> {
+        self.settle_published_flights();
+        if self.cfg.commit_when_ready && self.behind_last_tick && self.buffer.replay.is_none()
+            && self.flush_in_flight.len() < self.flush_depth()
+            && self.flush_in_flight.front().is_some_and(|front| front.published_ok.load(std::sync::atomic::Ordering::Acquire))
+            && (self.seal_due(now_ms, true) || self.buffer.rows >= SEAL_FIRST_MIN_ROWS)
+            && self.may_seal_beside_flights(true)
+        {
+            self.health.seals_first_total = self.health.seals_first_total.saturating_add(1);
+            return self.flush_ordered(now_ms, true, false).await;
+        }
+        Ok(0)
+    }
+
+    /// Wait until the oldest flight's background task finished (published
+    /// or failed), without taking its result: the commit stays with
+    /// [`Self::commit_oldest_flight`]. Cancellation safe (no state change).
+    /// Without the finished-flight wake it returns at once (the caller then
+    /// waits on the commit, as before).
+    async fn await_oldest_task(&self) {
+        let Some(wake) = self.flight_wake.clone() else { return };
+        while self.flush_in_flight.front().is_some_and(|front| front.task.as_ref().is_some_and(|task| !task.is_finished())) {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(250), wake.notified()).await;
+        }
+    }
+
+    /// NAN-4539 step 3a: a flight whose background task published its parts
+    /// has freed its build copies and writers; it holds only the rows it
+    /// retains until its acks land (a retry rebuilds from them inline).
+    fn settle_published_flights(&mut self) {
+        for flight in &mut self.flush_in_flight {
+            if flight.published_ok.load(std::sync::atomic::Ordering::Acquire) {
+                flight.reserved_bytes = flight.reserved_bytes.min(flight.buffer.bytes);
+            }
+        }
     }
 
     /// Whether the buffer may seal while earlier flights are still in
@@ -5172,6 +6359,13 @@ impl<'a> Ingestor<'a> {
             && self.buffer.refused.is_empty()
             && self.buffer.replayed.is_empty()
             && self.pending_schema.fields() == self.schema.fields()
+            // The one-object progress escape belongs to the serial path. A
+            // second seal must fit its full build/writer reservation, even if
+            // admission itself fitted. Future admission uses the remaining room.
+            && self.flush_in_flight.iter().map(|f| f.reserved_bytes).sum::<u64>()
+                .saturating_add(self.merges_reserved_bytes())
+                .saturating_add(super::memory::flight_bytes(self.buffer.bytes, 1))
+                <= self.cfg.buffer_budget_bytes
     }
 
     /// Append the floor/end op the queue asks for (edge sources), then tell
@@ -5243,7 +6437,9 @@ impl<'a> Ingestor<'a> {
                 .map(|(hour, batches)| (*hour, batches.clone(), buffer.hour_duplicates.get(hour).copied().unwrap_or_default()))
                 .collect(),
             now_ms,
-            writers: self.flush_writers(buffer.bytes),
+            // NAN-4539 step 3a: reserve only the writers the plan can use
+            // (`write_l0_parts_with` runs at most one per part).
+            writers: self.flush_writers(buffer.bytes).min(planned_l0_parts(buffer).max(1)),
         })
     }
 
@@ -5306,44 +6502,71 @@ impl<'a> Ingestor<'a> {
         if self.buffer.built.is_none() {
             self.buffer.built = Some(self.flush_plan(&self.buffer, self.schema.clone(), edge_log.clone(), now_ms)?.build()?);
         }
-        let finished_parts = self.buffer.built.take().expect("built above");
+        // The output stays in the buffer across the awaits below (a dropped
+        // call keeps its part ids; NAN-4539), until the buffer's acks land.
+        let finished_parts = self.buffer.built.as_ref().expect("built above");
+        if let Some(progress) = &self.buffer.progress { progress.lock().expect("flush diagnostics").built(finished_parts); }
         self.diagnostics.stage("publish_parts");
-        let outcome = async {
-            let refs = publish_parts(self.parts, self.signer, &self.trusted, &finished_parts).await?;
-            let consumed = consumed_sources(&self.buffer);
-            self.commit_add(&finished_parts, refs, consumed, edge_log, now_ms).await
-        }.await;
+        let outcome = match super::writer::publish_parts_observed(self.parts, self.signer, &self.trusted, finished_parts, &self.diagnostics.operations).await {
+            Ok(refs) => {
+                let parts = add_parts(finished_parts);
+                let consumed = consumed_sources(&self.buffer);
+                self.commit_add(&parts, refs, consumed, edge_log, now_ms).await
+            }
+            Err(error) => Err(error),
+        };
         match outcome {
             Ok(count) => Ok(count),
             Err(error) => {
-                let mut finished_parts = finished_parts;
-                let error = self.rebuild_unresolved_publication(&self.buffer, self.schema.clone(), &mut finished_parts, &error, now_ms)
-                    .err().unwrap_or(error);
+                // Synchronous: no await while the output is out of the buffer.
+                let mut finished_parts = self.buffer.built.take().expect("built above");
+                let rebuilt = self.rebuild_unresolved_publication(&self.buffer, self.schema.clone(), &mut finished_parts, &error, now_ms);
                 self.buffer.built = Some(finished_parts);
-                Err(error)
+                Err(rebuilt.err().unwrap_or(error))
             }
         }
     }
 
     /// Append the flush's `add` for its published parts and apply it to the
     /// prevalence state. Nothing after the append fails.
-    async fn commit_add(&mut self, finished_parts: &[FinishedPart], refs: Vec<PartRef>, consumed: Vec<SourceRef>,
+    ///
+    /// NAN-4539: an earlier attempt of this same `add` may have committed
+    /// with its outcome lost to a dropped call (a cancelled tick, or one
+    /// cancelled inside the part log's post-commit checkpoint). When the log
+    /// already knows every one of its parts it is adopted, never appended
+    /// again (that would double-consume its sources, a fatal error), and its
+    /// prevalence apply is left to the exactly-once cursor replay.
+    async fn commit_add(&mut self, finished_parts: &[AddPart], refs: Vec<PartRef>, consumed: Vec<SourceRef>,
         edge_log: Option<crate::parts::EdgeLogRange>, now_ms: i64) -> Result<usize> {
-        let prevalence_parts = finished_parts.iter()
-            .map(|part| (part.dir.join(crate::parts::format::PARTIAL_PREVALENCE_FILE), part.record.max_time_us))
-            .collect::<Vec<_>>();
+        let count = refs.len();
+        if !refs.is_empty() && refs.iter().all(|part| self.log.live().knows(&part.part_id)) {
+            // Defense in depth: the landed add also consumed these sources.
+            if !consumed.iter().all(|source| self.log.live().consumed(source)) {
+                return Err(AdoptionRefused.into());
+            }
+            if self.prevalence_held() {
+                self.prevalence_pending = true;
+            }
+            for part in &refs {
+                self.window.load_marker(part.event_hour, part.part_id.as_str(), now_ms);
+            }
+            tracing::warn!(tenant = %self.cfg.tenant_id, parts = count,
+                "flush add already committed by an interrupted attempt; adopted without a second append");
+            return Ok(count);
+        }
         if let Some(prevalence) = &self.prevalence {
             prevalence.check_parts(&self.cfg.tenant_id,
-                &prevalence_parts.iter().map(|(path, time)| (path.as_path(), *time)).collect::<Vec<_>>())?;
+                &finished_parts.iter().map(|part| (part.partial_prevalence.as_path(), part.max_time_us)).collect::<Vec<_>>())?;
         }
-        let count = refs.len();
         // Merges must not consume these L0s until their partials are in the
         // prevalence state; `replay_prevalence` clears this after a failure.
         let already_pending = self.prevalence_pending;
         self.prevalence_pending = self.prevalence_held();
         self.diagnostics.stage("append_part_log");
+        let append_timing = self.diagnostics.operations.start("part_log_append");
         let AppendOutcome::Committed { seq, entry_sha256 } =
             self.log.append(LogOp::Add { parts: refs.clone(), consumed, edge_log }, now_ms).await?;
+        drop(append_timing);
         // The Add is committed: nothing after this may fail the flush, or the
         // retry would re-consume its sources (DoubleConsume, fatal). A state
         // write that fails stays pending and `run_merges` replays it.
@@ -5355,6 +6578,7 @@ impl<'a> Ingestor<'a> {
         // chunks and cursor land together or not at all).
         self.diagnostics.stage("apply_prevalence");
         if self.prevalence_phase == PrevalencePhase::Stamping && self.prevalence_ready() {
+            let _prevalence_timing = self.diagnostics.operations.start("prevalence_apply");
             let wait = self.ingest_wait();
             let applied = if already_pending {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(self.cfg.prevalence_rebuild_budget_ms);
@@ -5383,7 +6607,7 @@ impl<'a> Ingestor<'a> {
     }
 
     async fn apply_committed_prevalence(&mut self, seq: u64, entry_sha256: &str, refs: &[PartRef],
-        finished_parts: &[FinishedPart]) -> Result<()> {
+        finished_parts: &[AddPart]) -> Result<()> {
         let entry = super::prevalence::EntryRef {
             seq,
             sha256: entry_sha256,
@@ -5397,10 +6621,10 @@ impl<'a> Ingestor<'a> {
         let prevalence = self.prevalence.as_mut().context("prevalence is disabled")?;
         for (index, part) in refs.iter().enumerate() {
             let finished = finished_parts.iter()
-                .find(|finished| finished.record.part_id == part.part_id)
+                .find(|finished| finished.part_id == part.part_id)
                 .context("published part has no local draft")?;
             prevalence.apply_part(&self.cfg.tenant_id, &entry, index as u32, part.part_id.as_str(),
-                &finished.dir.join(crate::parts::format::PARTIAL_PREVALENCE_FILE), finished.record.max_time_us).await?;
+                &finished.partial_prevalence, finished.max_time_us).await?;
         }
         self.prevalence_applied_seq = Some(seq);
         Ok(())
@@ -5414,6 +6638,19 @@ impl<'a> Ingestor<'a> {
     /// Run due merges; a failing merge plan is quarantined with backoff
     /// (keyed by level + hour) and never stops ingest.
     async fn run_merges(&mut self, now_ms: i64, lag_ms: i64) -> usize {
+        let overdue = crate::parts::levels::l0_merge_overdue_ms(self.log.live().parts(), now_ms, &self.cfg.merge_policy);
+        if let Some(state) = &self.prevalence {
+            state.update_restamp_headroom(lag_ms, self.cfg.lag_alert_ms, overdue);
+            if now_ms.saturating_sub(self.prevalence_read_stats_at_ms) >= 60_000 {
+                self.prevalence_read_stats_at_ms = now_ms;
+                for read in state.read_stats() {
+                    tracing::info!(tenant = %self.cfg.tenant_id, path = read.path, r2_gets = read.gets,
+                        r2_heads = read.heads, r2_bytes = read.bytes, point_cache_hits = read.point_cache_hits,
+                        memory_cache_hits = read.memory_cache_hits, db_reads = read.db_reads, "prevalence read I/O since open");
+                }
+            }
+        }
+
         // NAN-3772/NAN-3811: sample the backfill's headroom first, so it
         // also sees the ticks whose merges wait for prevalence below (tenant-a:
         // 2.5 h of those, while a rewrite kept pacing).
@@ -5752,6 +6989,19 @@ impl<'a> Ingestor<'a> {
     /// it commits without waiting out the loop's idle sleep (NAN-3619).
     pub fn set_flight_wake(&mut self, wake: std::sync::Arc<tokio::sync::Notify>) {
         self.flight_wake = Some(wake);
+    }
+
+    /// Tests of the cell constructor (NAN-4539): the effective depth.
+    #[cfg(test)]
+    pub(crate) fn effective_flush_depth_for_test(&self) -> usize {
+        self.flush_depth()
+    }
+
+    /// Tests of the cell constructor (NAN-4539): the wake a finished flight
+    /// notifies.
+    #[cfg(test)]
+    pub(crate) fn flight_wake_for_test(&self) -> Option<&std::sync::Arc<tokio::sync::Notify>> {
+        self.flight_wake.as_ref()
     }
 
     /// Keep fetch, pacing and publication off the production admission tick.
@@ -6186,6 +7436,20 @@ impl<'a> Ingestor<'a> {
             }
             (parts, bytes)
         };
+        if let Some(reason) = self.cfg.catalog_attachment_failure {
+            // NAN-4601: fail closed on deletes; the index keeps following the
+            // log (it deletes nothing and every later delete needs it).
+            // `gc_authority` is never consulted here: no decision, no pass.
+            if let Some(feed) = self.held_index_feed.clone() {
+                if let Some(Ok(report)) = feed.feed_index_only(now_ms).await {
+                    // A pass that finished before the hold: history, not permission.
+                    self.gc_deleted_reported = self.gc_deleted_reported.saturating_add(report.deleted);
+                    self.health.part_gc_deleted_total = self.health.part_gc_deleted_total.max(self.gc_deleted_reported);
+                }
+            }
+            self.catalog_held(reason, pending_parts, pending_bytes, now_ms);
+            return Ok(());
+        }
         if let Some(authority) = self.gc_authority.clone() {
             if let Some(result) = authority.poll_report(now_ms).await {
                 self.record_sanctioned_gc_report(result, pending_parts, pending_bytes, now_ms);
@@ -6258,6 +7522,24 @@ impl<'a> Ingestor<'a> {
                 self.gc_blocked(REASON_SANCTIONED_PASS_PAUSED, pending_parts, pending_bytes, now_ms);
             }
         }
+    }
+
+    /// NAN-4601: report the catalog hold as `lake_part_gc_blocked{reason="catalog_held",detail=<attach failure>}`.
+    /// `blocked_seconds` counts from the first held tick (with or without
+    /// pending parts), and the hold is logged at once and then every
+    /// [`CATALOG_HELD_LOG_INTERVAL_MS`], not only on the first tick.
+    fn catalog_held(&mut self, detail: &'static str, parts: u64, bytes: u64, now_ms: i64) {
+        let since = *self.catalog_held_since_ms.get_or_insert(now_ms);
+        let blocked_seconds = now_ms.saturating_sub(since).max(0) as u64 / 1000;
+        if catalog_held_log_due(self.catalog_held_logged_ms, now_ms) {
+            self.catalog_held_logged_ms = Some(now_ms);
+            tracing::error!(reason = REASON_CATALOG_HELD, detail, pending_parts = parts, pending_bytes = bytes,
+                held_seconds = blocked_seconds, index_feed = self.held_index_feed.is_some(),
+                "lake-part deletes held: catalog custody not attached; keeping every part, part-log index feed continues");
+        }
+        self.last_gc_block_reason = Some(REASON_CATALOG_HELD);
+        self.health.part_gc_blocked = Some(nanosiem_lake_cell::contract::PartGcBlocked {
+            reason: REASON_CATALOG_HELD.to_string(), parts, bytes, detail: detail.to_string(), blocked_seconds });
     }
 
     fn gc_blocked(&mut self, reason: &'static str, parts: u64, bytes: u64, now_ms: i64) {
@@ -6447,6 +7729,33 @@ impl<'a> Ingestor<'a> {
         let step_failing = self.prevalence_step_failing_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) >= PREVALENCE_STEP_FAILING_DEGRADED_MS);
         h.prevalence_degraded = (self.prevalence.is_none() && self.prevalence_retry.is_some()) || step_failing;
+        // NAN-4445: continue a spell an earlier process persisted. Until this
+        // process's first open settles it is unknown (the supervisor reports
+        // nothing), unless that open has run past PREVALENCE_SPELL_UNKNOWN_MAX_MS
+        // with the inherited spell still open: rows are still unstamped.
+        let started = *self.prevalence_health_started_ms.get_or_insert(now_ms);
+        let unknown_expired = now_ms.saturating_sub(started) >= PREVALENCE_SPELL_UNKNOWN_MAX_MS;
+        self.prevalence_first_settled |= self.prevalence.is_some() || self.prevalence_retry.is_some();
+        let inherited = self.prevalence_spell.inherited_since_ms;
+        if inherited.is_some() && self.prevalence.is_none() && unknown_expired {
+            h.prevalence_degraded = true;
+        }
+        if let Some(since) = inherited {
+            if h.prevalence_degraded {
+                let current = self.prevalence_degraded_since_ms.unwrap_or(now_ms);
+                if since < current {
+                    self.prevalence_degraded_since_ms = Some(since);
+                    self.prevalence_degraded_logged_ms = now_ms;
+                }
+            }
+            if self.prevalence_first_settled {
+                // Settled: continued above, or the first open succeeded and
+                // the spell ends (sync writes it cleared).
+                self.prevalence_spell.inherited_since_ms = None;
+            }
+        }
+        h.prevalence_degraded_known = !self.cfg.prevalence_enabled || self.prevalence_grant_withheld || unknown_expired
+            || (self.prevalence_spell.loaded && self.prevalence_first_settled);
         // NAN-3781: degraded time is a signal and a counter, and an ongoing
         // spell is logged at ERROR every minute: a reopen that hangs (CT 106,
         // a state stalled at the L0 cap) otherwise logs one ERROR and goes
@@ -6555,6 +7864,14 @@ pub fn key_inside_prefix(key: &str, prefix: &str) -> bool {
 /// tenant's `parts/` prefix).
 pub const SANCTIONED_GC_INTERVAL_MS: i64 = 600_000;
 
+/// NAN-4601: how often a held catalog's delete hold is logged again (the large tenant logged
+/// it once at 15:28Z and then nothing for a day).
+pub const CATALOG_HELD_LOG_INTERVAL_MS: i64 = 15 * 60_000;
+
+pub(crate) fn catalog_held_log_due(last_logged_ms: Option<i64>, now_ms: i64) -> bool {
+    last_logged_ms.is_none_or(|last| now_ms.saturating_sub(last) >= CATALOG_HELD_LOG_INTERVAL_MS)
+}
+
 /// NAN-3818: least time between bounded log-fold steps while a sanctioned
 /// pass is still catching its view up to the log head (after every restart
 /// the local view folds from genesis, [`MAX_LOG_ENTRIES_PER_PASS`] entries a
@@ -6571,6 +7888,20 @@ pub const SANCTIONED_GC_CATCH_UP_INTERVAL_MS: i64 = 5_000;
 pub(crate) fn sanctioned_pass_due(last_pass_ms: Option<i64>, catching_up: bool, now_ms: i64) -> bool {
     let interval = if catching_up { SANCTIONED_GC_CATCH_UP_INTERVAL_MS } else { SANCTIONED_GC_INTERVAL_MS };
     last_pass_ms.is_none_or(|last| now_ms - last >= interval)
+}
+
+#[cfg(test)]
+mod nan4601_catalog_held_log_tests {
+    use super::*;
+
+    /// NAN-4601: the hold is logged at once and then on a fixed cadence, not once per process.
+    #[test]
+    fn the_catalog_hold_is_logged_again_every_interval() {
+        assert!(catalog_held_log_due(None, 0), "the first held tick logs");
+        assert!(!catalog_held_log_due(Some(0), CATALOG_HELD_LOG_INTERVAL_MS - 1));
+        assert!(catalog_held_log_due(Some(0), CATALOG_HELD_LOG_INTERVAL_MS));
+        assert!(catalog_held_log_due(Some(1_000), 1_000 + 24 * 3_600_000), "a day later it is still logged");
+    }
 }
 
 /// A pass that stopped mid log-fold and asks for no back-off: progressing.
@@ -7064,11 +8395,23 @@ mod nan4319_ingest_tests;
 
 #[cfg(test)]
 #[path = "nan4336_ingest_tests.rs"]
-mod nan4336_ingest_tests;
+pub(super) mod nan4336_ingest_tests;
+
+#[cfg(test)]
+#[path = "nan4553_ingest_tests.rs"]
+mod nan4553_ingest_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_committed_partial_restamp_preserves_its_incomplete_outcome() {
+        let map = super::super::restamp::RestampMap::with_completion(Default::default(), false);
+        let outcome = super::super::restamp::RestampOutcome::default();
+        restamp_applied(Some(&map), Some(&outcome), true);
+        assert_eq!(outcome.get(), Some(super::super::restamp::RestampResult::Applied { rows: 0, complete: false }));
+    }
 
     /// Seven hours at one log entry / 20 s. Exercise the real planner,
     /// durable scan cursor, timeout and restart, while the writer continues
@@ -7124,7 +8467,7 @@ mod tests {
         assert_eq!(seq, 0);
         store.hold_genesis.store(true, Ordering::Relaxed);
         assert!(tokio::time::timeout(std::time::Duration::from_millis(100),
-            ingestor.replay_prevalence_batch()).await.is_err());
+            ingestor.replay_prevalence_batch(None)).await.is_err());
         assert_eq!(ingestor.prevalence_log_cache.len(), PREVALENCE_CATCH_UP_SCAN as usize,
             "completed GETs survive cancellation even when the first request hangs");
         store.hold_genesis.store(false, Ordering::Relaxed);
@@ -7136,7 +8479,7 @@ mod tests {
             // The producer keeps publishing during catch-up.
             ingestor.log.append(op.clone(), now + (7 * 3_600 + tick * 20) * 1_000).await.unwrap();
             let outcome = tokio::time::timeout(std::time::Duration::from_millis(100),
-                ingestor.replay_prevalence_batch()).await.expect("bounded scan must yield to foreground").unwrap();
+                ingestor.replay_prevalence_batch(None)).await.expect("bounded scan must yield to foreground").unwrap();
             let cursor = ingestor.prevalence.as_ref().unwrap().applied().await.unwrap().unwrap();
             assert!(cursor.seq > previous, "every tick must durably advance");
             previous = cursor.seq;
@@ -7165,6 +8508,42 @@ mod tests {
         // Existing merge scheduling remains bounded even if prevalence is slow.
         assert!(l0_merges_run_beside_prevalence(PREVALENCE_L0_YIELD_MS));
         ingestor.prevalence.take().unwrap().close().await.unwrap();
+    }
+
+    /// NAN-4464 (a large hosted tenant, 2026-10-23 20:37Z): with #7678 live the
+    /// catch-up scale never left 1. The large tenant's ingest lag sat at 72-98 s while
+    /// ingest kept up, and the 30 s backfill backoff read that as pressure on
+    /// every batch. Through the production constructor and rescale path:
+    /// The large tenant's live lag lets the scale rise to the backlog's, and only lag past
+    /// the ingest stall bound halves it.
+    #[tokio::test]
+    async fn b12_live_ingest_lag_lets_the_catch_up_scale_rise() {
+        use crate::parts::{part_log::LocalObjectStore, provenance::LocalPartSigner};
+        use super::super::prevalence::{catch_up_max_rows_for, CATCH_UP_BATCH_ENTRIES, CATCH_UP_MAX_SCALE};
+        let root = tempfile::tempdir().unwrap();
+        let tenant = "00000000-0000-4000-8000-0000000000c4";
+        let store = LocalObjectStore::new(root.path().join("store")).unwrap();
+        let signer = LocalPartSigner::new("scale-test", ed25519_dalek::SigningKey::from_bytes(&[7; 32])).unwrap();
+        let queue = super::super::discovery::SpoolQueue::new(root.path().join("spool"), tenant).unwrap();
+        let mut cfg = IngestConfig::new(tenant, root.path().join("work"));
+        cfg.prevalence_enabled = false;
+        cfg.prevalence_catch_up_max_rows = catch_up_max_rows_for(4_831_838_208);
+        let mut ingestor = Ingestor::open(cfg, &store, &store, &queue, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), 1_800_000_000_000).await.unwrap();
+        assert_eq!(ingestor.cfg.lag_alert_ms, 120_000);
+        assert_eq!(ingestor.prevalence_catch_up_scale(), 1);
+        // the large tenant's "count backfill pace adjusted" lag samples, then two in between.
+        let mut scales = Vec::new();
+        for (lag_ms, behind) in [(71_910, 8_423), (98_018, 8_397), (85_000, 8_371), (76_000, 8_345), (98_018, 8_190)] {
+            ingestor.health.lag_ms = lag_ms;
+            ingestor.rescale_prevalence_catch_up(behind, CATCH_UP_BATCH_ENTRIES);
+            scales.push(ingestor.prevalence_catch_up_scale());
+        }
+        assert_eq!(scales, [2, 2, 4, 8, 8], "the large tenant's lag grows the scale (holds near the bound), never pins it at 1");
+        assert_eq!(scales.last().copied(), Some(CATCH_UP_MAX_SCALE));
+        ingestor.health.lag_ms = 120_001;
+        ingestor.rescale_prevalence_catch_up(8_000, CATCH_UP_BATCH_ENTRIES);
+        assert_eq!(ingestor.prevalence_catch_up_scale(), 4, "lag past the ingest stall bound halves it");
     }
 
     /// Foreground cache churn is not evidence of a responding state store.
@@ -7938,6 +9317,7 @@ mod tests {
             anyhow::Error::new(crate::parts::part_log::Fenced { seq: 1 }),
             anyhow::Error::new(crate::edge_log::EdgeLogFenced),
             anyhow::Error::new(crate::parts::part_log::DoubleConsume { key: "test".into() }),
+            anyhow::Error::new(AdoptionRefused),
             anyhow::Error::new(super::super::r2_put::TerminalPutError {
                 key: "test".into(), status: 403, code: "AccessDenied".into(),
             }),
@@ -8081,6 +9461,52 @@ mod tests {
         assert!(!unrelated.exists());
     }
 
+    /// NAN-4539 step 3a: a flight is charged its full build reservation
+    /// until its background task publishes, then only the rows it retains;
+    /// the writers a plan reserves never exceed the L0 parts it writes.
+    #[tokio::test]
+    async fn a_published_flight_holds_only_its_retained_rows() {
+        use crate::parts::part_log::LocalObjectStore;
+        use crate::parts::provenance::LocalPartSigner;
+        use super::super::memory::flight_bytes;
+        const TENANT: &str = "00000000-0000-4000-8000-0000000000f6";
+        const MIB: u64 = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let store: &'static LocalObjectStore = Box::leak(Box::new(LocalObjectStore::new(dir.path().join("store")).unwrap()));
+        let signer: &'static LocalPartSigner = Box::leak(Box::new(LocalPartSigner::new("lab-signer-settle", ed25519_dalek::SigningKey::from_bytes(&[8; 32])).unwrap()));
+        let queue = super::super::discovery::SpoolQueue::new(dir.path().join("spool"), TENANT).unwrap();
+        let mut cfg = IngestConfig::new(TENANT, dir.path().join("ingest"));
+        cfg.prevalence_enabled = false;
+        cfg.buffer_budget_bytes = 4096 * MIB;
+        let mut ingestor = Ingestor::open(cfg, store, store, &queue, signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), 1_800_000_000_000).await.unwrap();
+        let rows = 100 * MIB;
+        let flight = |published: bool, ingestor: &Ingestor<'_>| {
+            let mut buffer = Buffered::new();
+            buffer.bytes = rows;
+            InFlightFlush {
+                buffer, reserved_bytes: flight_bytes(rows, 4), schema: ingestor.schema.clone(), sealed_ms: 0,
+                progress: ingestor.diagnostics.new_flush(0, 0), task: None, built: None, published: None,
+                published_ok: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(published)),
+            }
+        };
+        let (oldest, younger) = (flight(true, &ingestor), flight(false, &ingestor));
+        ingestor.flush_in_flight.push_back(oldest);
+        ingestor.flush_in_flight.push_back(younger);
+        assert_eq!(ingestor.committed_bytes(), 2 * flight_bytes(rows, 4));
+        ingestor.settle_published_flights();
+        assert_eq!(ingestor.committed_bytes(), rows + flight_bytes(rows, 4),
+            "the published flight keeps only its rows; the building one keeps its full reservation");
+        // Settling is idempotent and never raises a reservation.
+        ingestor.settle_published_flights();
+        assert_eq!(ingestor.committed_bytes(), rows + flight_bytes(rows, 4));
+        // An empty buffer plans no parts and reserves one writer at most.
+        ingestor.flush_in_flight.clear();
+        assert_eq!(planned_l0_parts(&ingestor.buffer), 0);
+        assert_eq!(l0_chunks(L0_PARALLEL_MIN_ROWS - 1).len(), 1, "a sub-16k-row hour is one part, one writer");
+        assert_eq!(l0_chunks(4 * L0_PARALLEL_MIN_ROWS).len(), MAX_PARALLEL_L0_WRITES);
+    }
+
     /// NAN-3183 OOM: the working budget is charged with the flush in flight
     /// at its build cost (rows + build copies + writers) and with every
     /// running merge, not only with buffered rows; a tight budget gives the
@@ -8110,7 +9536,7 @@ mod tests {
         assert_eq!(reserved, 3 * rows + 4 * L0_WRITER_BYTES);
         ingestor.flush_in_flight.push_back(InFlightFlush {
             buffer: Buffered::new(), reserved_bytes: reserved, schema: ingestor.schema.clone(), sealed_ms: 0,
-            progress: std::sync::Arc::new(std::sync::Mutex::new(FlushStage { stage: "build_parts", since: std::time::Instant::now() })), task: None, built: None, published: None,
+            progress: ingestor.diagnostics.new_flush(0, 0), task: None, built: None, published: None, published_ok: Default::default(),
         });
         ingestor.buffer.bytes = 0;
         assert_eq!(ingestor.committed_bytes(), reserved, "the in-flight flush is charged its build, not only its rows");
@@ -8905,6 +10331,104 @@ mod tests {
         ingestor.suspend_prevalence().await;
         assert!(!ingestor.restamp_eligible(), "no grant: nothing owed");
     }
+
+    /// NAN-4445 (the large tenant, 41 h): a degraded spell survives a roll. The first
+    /// process persists the spell's start in the tenant bucket; the next
+    /// pod (new volume, new epoch) continues it, so the `prevalence_degraded`
+    /// value is the spell's real age, not the time since the roll. The spell
+    /// ends (and is recorded cleared) when the state opens.
+    #[tokio::test]
+    async fn prevalence_degraded_spell_survives_a_roll_and_clears_on_open() {
+        use super::super::discovery::SpoolQueue;
+        use super::super::prevalence_spell::{scan_spell, spell_prefix, SpellScan};
+        use crate::parts::part_log::LocalObjectStore;
+        use crate::parts::provenance::LocalPartSigner;
+        const TENANT: &str = "00000000-0000-4000-8000-000000004445";
+
+        let owner = Owner {
+            objects: Arc::new(slatedb::object_store::memory::InMemory::new()),
+            refuse: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let app = axum::Router::new().route("/mutate", axum::routing::post(owner_mutate)).with_state(owner.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path().join("store")).unwrap();
+        let queue = SpoolQueue::new(dir.path().join("spool"), TENANT).unwrap();
+        let signer = LocalPartSigner::new("lab-signer-prev", ed25519_dalek::SigningKey::from_bytes(&[9; 32])).unwrap();
+        let config = |pod: &str, epoch: u64| {
+            let mut cfg = IngestConfig::new(TENANT, dir.path().join(pod));
+            cfg.writer_epoch = epoch;
+            let mut access = nan3554_access(TENANT, address, "owner-token");
+            access.owner.writer_epoch = epoch as i64;
+            cfg.prevalence_location = Some(access);
+            cfg.prevalence_read_store = Some(owner.objects.clone());
+            cfg
+        };
+        let newest = |at: i64| {
+            let store = &store;
+            async move {
+                let mut scan = SpellScan::default();
+                loop {
+                    if let Some(found) = scan_spell(store, TENANT, &mut scan, at).await.unwrap() { return found; }
+                }
+            }
+        };
+
+        let t0 = 1_800_000_000_000_i64;
+        let mut ingestor = Ingestor::open(config("pod-a", 3), &store, &store, &queue, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), t0).await.unwrap();
+        assert!(ingestor.prevalence.is_none());
+        ingestor.tick(t0 + 1_000).await.unwrap();
+        ingestor.tick(t0 + 2_000).await.unwrap();
+        assert!(ingestor.health().prevalence_degraded);
+        assert!(ingestor.health().prevalence_degraded_known);
+        let (_, open) = newest(t0 + 2_000).await.expect("the spell is persisted in the tenant bucket");
+        assert_eq!(open.cleared_ms, None);
+        let since = open.since_ms;
+        assert!((t0..=t0 + 1_000).contains(&since), "spell start {since}");
+        let records = store.list(&spell_prefix(TENANT).unwrap()).await.unwrap().len();
+        ingestor.tick(t0 + 3_000).await.unwrap();
+        assert_eq!(store.list(&spell_prefix(TENANT).unwrap()).await.unwrap().len(), records, "an unchanged spell is not rewritten");
+        drop(ingestor);
+
+        // The roll, an hour later: a new pod and epoch, the owner still refusing.
+        let tb = t0 + 3_600_000;
+        let mut ingestor = Ingestor::open(config("pod-b", 4), &store, &store, &queue, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), tb).await.unwrap();
+        ingestor.tick(tb + 1_000).await.unwrap();
+        ingestor.tick(tb + 2_000).await.unwrap();
+        let health = ingestor.health();
+        assert!(health.prevalence_degraded && health.prevalence_degraded_known);
+        assert_eq!(health.prevalence_degraded_ms, (tb + 2_000 - since) as u64, "the spell's age, not the time since the roll");
+        assert!(health.prevalence_degraded_ms >= 3_600_000, "past the page threshold");
+        assert_eq!(newest(tb + 2_000).await.unwrap().1, open, "the continued spell is the same record");
+
+        // The owner recovers: the state opens, the spell ends and is cleared.
+        owner.refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+        let tc = tb + 10 * PREVALENCE_RETRY_BASE_MS;
+        ingestor.tick(tc).await.unwrap();
+        assert!(ingestor.prevalence.is_some(), "prevalence re-opened");
+        ingestor.tick(tc + 1_000).await.unwrap();
+        assert!(!ingestor.health().prevalence_degraded);
+        assert_eq!(ingestor.health().prevalence_degraded_ms, 0);
+        let (_, cleared) = newest(tc + 1_000).await.unwrap();
+        assert_eq!(cleared.since_ms, since);
+        assert!(cleared.cleared_ms.is_some_and(|at| at >= tc), "{cleared:?}");
+        drop(ingestor);
+
+        // The next pod starts clean.
+        let td = tc + 60_000;
+        let mut ingestor = Ingestor::open(config("pod-c", 5), &store, &store, &queue, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), td).await.unwrap();
+        ingestor.tick(td + 1_000).await.unwrap();
+        ingestor.tick(td + 2_000).await.unwrap();
+        assert!(!ingestor.health().prevalence_degraded && ingestor.health().prevalence_degraded_known);
+        assert_eq!(ingestor.health().prevalence_degraded_ms, 0);
+    }
 }
 
 #[cfg(test)]
@@ -8988,7 +10512,7 @@ mod pipeline_diagnostics_tests {
     fn stalled_pipeline_snapshot_is_independent_and_ages_without_an_ingest_tick() {
         let diagnostics = PipelineDiagnostics::default();
         {
-            let mut state = diagnostics.0.lock().unwrap();
+            let mut state = diagnostics.state.lock().unwrap();
             state.rows = 17;
             state.bytes = 4096;
             state.flights = 1;
@@ -9015,11 +10539,10 @@ mod oldest_flush_diagnostics_tests {
     #[test]
     fn younger_flush_work_cannot_replace_oldest_background_stage() {
         let diagnostics = PipelineDiagnostics::default();
-        let background = std::sync::Arc::new(std::sync::Mutex::new(FlushStage {
-            stage: "build_parts", since: std::time::Instant::now(),
-        }));
+        let background = diagnostics.new_flush(0, 0);
+        background.lock().unwrap().set("build_parts");
         {
-            let mut state = diagnostics.0.lock().unwrap();
+            let mut state = diagnostics.state.lock().unwrap();
             state.flights = 2;
             state.oldest_background = Some(background.clone());
         }
@@ -9027,8 +10550,12 @@ mod oldest_flush_diagnostics_tests {
         assert_eq!(diagnostics.snapshot()["oldest_flush_stage"], "build_parts");
         background.lock().unwrap().set("publish_parts");
         assert_eq!(diagnostics.snapshot()["oldest_flush_stage"], "publish_parts");
-        diagnostics.0.lock().unwrap().tracking_oldest = true;
+        diagnostics.state.lock().unwrap().tracking_oldest = true;
         diagnostics.stage("append_part_log");
         assert_eq!(diagnostics.snapshot()["oldest_flush_stage"], "append_part_log");
     }
 }
+
+#[cfg(test)]
+#[path = "prevalence_pipeline_tests.rs"]
+mod prevalence_pipeline_tests;

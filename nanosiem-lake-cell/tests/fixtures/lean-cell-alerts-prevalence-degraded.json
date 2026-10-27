@@ -1,0 +1,47 @@
+{
+  "cell_id": "cell-us-d-aaaaaaaa",
+  "evaluated_at": "2026-10-23T16:00:00Z",
+  "alerts": [
+    {
+      "alert_key": "01034d340e378baec299c2cfc7b671115e4d52c5f9879b44d173626f70ffc1ed",
+      "tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "cell_id": "cell-us-d-aaaaaaaa",
+      "role": "prevalence",
+      "stage": "ingest",
+      "signal": "prevalence_degraded",
+      "severity": "page",
+      "state": "firing",
+      "value": 147600.0,
+      "threshold": 3600.0,
+      "unit": "seconds",
+      "detail": "prevalence state unavailable; rows go unstamped"
+    },
+    {
+      "alert_key": "01034d340e378baec299c2cfc7b671115e4d52c5f9879b44d173626f70ffc1ed",
+      "tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "cell_id": "cell-us-d-aaaaaaaa",
+      "role": "prevalence",
+      "stage": "ingest",
+      "signal": "prevalence_degraded",
+      "severity": "warn",
+      "state": "firing",
+      "value": 1200.0,
+      "threshold": 900.0,
+      "unit": "seconds",
+      "detail": "prevalence state unavailable; rows go unstamped"
+    },
+    {
+      "alert_key": "01034d340e378baec299c2cfc7b671115e4d52c5f9879b44d173626f70ffc1ed",
+      "tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "cell_id": "cell-us-d-aaaaaaaa",
+      "role": "prevalence",
+      "stage": "ingest",
+      "signal": "prevalence_degraded",
+      "severity": "warn",
+      "state": "resolved",
+      "value": 0.0,
+      "threshold": 900.0,
+      "unit": "seconds"
+    }
+  ]
+}

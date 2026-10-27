@@ -29,7 +29,7 @@
 use std::path::Path;
 
 use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -198,6 +198,12 @@ impl DurableJobSigningKey {
     /// mode rules as the master key).
     pub fn from_file(path: &Path, tenant_id: Uuid) -> Result<Self, DurableJobSigningError> {
         Ok(Self::from_bytes(read_key_file(path)?, tenant_id))
+    }
+
+    /// Non-secret key commitment for attesting a customer-local job namespace.
+    /// Private key material remains inside this zeroizing key object.
+    pub fn verification_fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(&self.key).into()
     }
 
     /// Hex-encode the derived key for delivery to a runner Secret. Only the

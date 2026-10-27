@@ -188,23 +188,42 @@ static CELL_RUNTIME: std::sync::OnceLock<NativeChdb> = std::sync::OnceLock::new(
 /// Retain it for the process lifetime: unloading loses chDB's auxv cache.
 pub fn initialize_cell_runtime() -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let path = Path::new("/usr/local/lib/nano-chdb/libchdb.so");
+    let executable = std::env::current_exe()?;
+    let (path, expected_owner, native) = cell_artifact_location(&executable)?;
     let digest_path = path.with_file_name("libchdb.sha256");
     for artifact in [path, digest_path.as_path()] {
         for component in artifact.ancestors() {
             let metadata = std::fs::symlink_metadata(component)?;
             anyhow::ensure!(
-                !metadata.file_type().is_symlink() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
-                "native release path must be root-owned and immutable: {}",
+                !metadata.file_type().is_symlink() && metadata.uid() == expected_owner && metadata.mode() & 0o022 == 0,
+                "native release path must be release-owned and immutable: {}",
                 component.display()
             );
         }
         anyhow::ensure!(artifact.is_file(), "native release artifact is not a file");
+        if native {
+            use std::os::unix::ffi::OsStrExt;
+            let name = CString::new(artifact.as_os_str().as_bytes())?;
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            anyhow::ensure!(unsafe { libc::statvfs(name.as_ptr(), &mut stat) } == 0
+                && stat.f_flag & libc::ST_RDONLY != 0, "native worker artifact mount must be read-only");
+        }
     }
     let digest = std::fs::read_to_string(digest_path)?;
     let runtime = NativeChdb::load_verified(path, digest.trim())?;
     anyhow::ensure!(CELL_RUNTIME.set(runtime).is_ok(), "cell native runtime already initialized");
     Ok(())
+}
+
+/// The kernel executable path selects the installed native envelope, never
+/// caller argv/environment. Unknown /cell paths cannot borrow hosted libraries.
+fn cell_artifact_location(executable: &Path) -> anyhow::Result<(&'static Path, u32, bool)> {
+    if matches!(executable.to_str(), Some("/cell/workers/query/lib/ld.so" | "/cell/workers/query/bin/worker")) {
+        Ok((Path::new("/cell/workers/query/lib/libchdb.so"), 65534, true))
+    } else {
+        anyhow::ensure!(!executable.starts_with("/cell"), "unknown native worker execution path");
+        Ok((Path::new("/usr/local/lib/nano-chdb/libchdb.so"), 0, false))
+    }
 }
 
 fn cell_runtime(path: &Path, digest: &str) -> Result<Option<NativeChdb>> {
@@ -1143,5 +1162,27 @@ mod tests {
             output.storage_rows_read,
             output.storage_bytes_read
         );
+    }
+}
+
+#[cfg(test)]
+mod native_cell_artifact_tests {
+    use super::*;
+    #[test]
+    fn native_loader_uses_only_its_bundled_engine_and_unmapped_owner() {
+        let (path, owner, native) = cell_artifact_location(Path::new("/cell/workers/query/lib/ld.so")).unwrap();
+        assert_eq!(path, Path::new("/cell/workers/query/lib/libchdb.so"));
+        assert_eq!(owner, 65534); assert!(native);
+    }
+    #[test]
+    fn unknown_native_path_cannot_fall_back_to_the_host_engine() {
+        assert!(cell_artifact_location(Path::new("/cell/workers/foreign/bin/worker")).is_err());
+        assert!(cell_artifact_location(Path::new("/cell/workers/query/lib/wrong.so")).is_err());
+    }
+    #[test]
+    fn hosted_worker_retains_its_existing_root_owned_release_path() {
+        let (path, owner, native) = cell_artifact_location(Path::new("/usr/local/bin/lake_part_query")).unwrap();
+        assert_eq!(path, Path::new("/usr/local/lib/nano-chdb/libchdb.so"));
+        assert_eq!(owner, 0); assert!(!native);
     }
 }

@@ -774,3 +774,7 @@ mod bareword_spread_native;
 #[cfg(test)]
 #[path = "entity_index_native_tests.rs"]
 mod entity_index_native;
+
+#[cfg(test)]
+#[path = "ioc_indicator_native_tests.rs"]
+mod ioc_indicator_native;

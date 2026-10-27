@@ -148,11 +148,19 @@ pub struct PartWriter {
     host_sorted_group_rows: Option<usize>,
     /// The last row's hostname of a host-sorted family.
     last_host: Option<Option<String>>,
+    /// NAN-4664: the active family is written in `(class_uid, time, uid)`
+    /// order ([`super::class_sort`]).
+    class_sorted: bool,
+    /// The last row's class of a class-sorted family.
+    last_class: Option<Option<i64>>,
     logical_merkle_root: Option<String>,
     min: i64,
     max: i64,
     partials: Option<RowPartials>,
     partial_source: PartialSource,
+    /// NAN-4664: the IOC indicator columns every data file of this part
+    /// carries (`None`: a file without them, which no reader trusts).
+    indicators: Option<crate::parts::indicators::Derivation>,
 }
 
 /// A finished, unsigned part on local disk.
@@ -223,6 +231,7 @@ impl PartWriter {
             PartialSource::Merge(_) => None,
         };
         let token_block_rows = crate::parts::block_index::enabled().then_some(crate::parts::block_index::BLOCK_ROWS);
+        let indicators = crate::parts::indicators::Derivation::for_schema(&draft.schema);
         let entity_locator_write = entity_locator_write_enabled(
             draft.level, &settings, std::env::var("NANO_LAKE_ENTITY_LOCATOR_WRITE").ok().as_deref(),
         );
@@ -259,11 +268,14 @@ impl PartWriter {
             family_mode: false,
             host_sorted_group_rows: None,
             last_host: None,
+            class_sorted: false,
+            last_class: None,
             logical_merkle_root: None,
             min: i64::MAX,
             max: i64::MIN,
             partials,
             partial_source,
+            indicators,
         })
     }
 
@@ -295,14 +307,23 @@ impl PartWriter {
                 )?,
                 None => self.properties.clone(),
             };
+            let schema = self.indicators.as_ref().map_or_else(|| self.draft.schema.clone(), |derived| derived.file_schema.clone());
             let mut writer = ArrowWriter::try_new(
                 File::create(self.dir.join(data_file_name(index)))?,
-                self.draft.schema.clone(),
+                schema,
                 Some(properties),
             )?;
+            if self.indicators.is_some() {
+                use nanosiem_core::search::lake_indicators::{FILE_MARKER_KEY, VERSION};
+                writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(FILE_MARKER_KEY.to_string(), VERSION.to_string()));
+            }
             if self.host_sorted_group_rows.is_some() {
                 writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
                     super::host_sort::ROW_ORDER_KEY.to_string(), super::host_sort::HOST_ROW_ORDER.to_string(),
+                ));
+            } else if self.class_sorted {
+                writer.append_key_value_metadata(parquet::file::metadata::KeyValue::new(
+                    super::host_sort::ROW_ORDER_KEY.to_string(), super::class_sort::CLASS_ROW_ORDER.to_string(),
                 ));
             }
             self.current = Some(OpenFile { index, writer, rows: 0, min: i64::MAX, max: i64::MIN, token_groups: Vec::new(), log_sources: self.active_log_source.as_ref().map(|s| vec![s.clone()]) });
@@ -396,8 +417,24 @@ impl PartWriter {
         self.active_class_id = None;
         self.family_mode = true;
         self.host_sorted_group_rows = None;
+        self.class_sorted = false;
         self.last = None;
         self.last_host = None;
+        self.last_class = None;
+        Ok(())
+    }
+
+    /// NAN-4664: start a multi-class family of an hour part whose rows
+    /// arrive in `(class_uid, time, uid)` order, written in the default row
+    /// groups to one data file tagged [`super::host_sort::ROW_ORDER_KEY`] =
+    /// [`super::class_sort::CLASS_ROW_ORDER`]. Like a host-sorted family the
+    /// file never rolls (the signed record requires a family's files in time
+    /// order); a family past [`crate::parts::format::DATA_FILE_SPLIT_BYTES`]
+    /// fails the write, and the merge then redoes the hour time-sorted.
+    pub fn start_class_sorted_family(&mut self, source: Option<&str>, class_id: Option<i64>) -> Result<()> {
+        ensure!(self.draft.level == Level::Hour, "class-sorted families are only written by hour merges");
+        self.start_source_class(source, class_id)?;
+        self.class_sorted = true;
         Ok(())
     }
 
@@ -574,6 +611,7 @@ impl PartWriter {
         let uids = uid_strings(batch)?;
         let hosts = self.host_sorted_group_rows.map(|_| super::host_sort::host_strings(batch)).transpose()?;
         let host_at = |row: usize| hosts.as_ref().and_then(|hosts| (!hosts.is_null(row)).then(|| hosts.value(row)));
+        let classes = self.class_sorted.then(|| super::class_sort::class_keys(batch)).transpose()?;
         let digests = match (self.family_mode, self.draft.level) {
             (true, _) => None,
             // Merge outputs digest on the bounded merge pool; L0 flushes
@@ -605,6 +643,15 @@ impl PartWriter {
                     (host, time_us, uid) > (host_at(row - 1), times[row - 1], uids.value(row - 1))
                 };
                 ensure!(ordered, "host-sorted part rows are not strictly sorted by (device.hostname, time, uid)");
+            } else if let Some(classes) = &classes {
+                let class = classes[row];
+                let ordered = if row == 0 {
+                    self.last.as_ref().zip(self.last_class.as_ref())
+                        .is_none_or(|((t, u), c)| (class, time_us, uid) > (*c, *t, u.as_str()))
+                } else {
+                    (class, time_us, uid) > (classes[row - 1], times[row - 1], uids.value(row - 1))
+                };
+                ensure!(ordered, "class-sorted part rows are not strictly sorted by (class_uid, time, uid)");
             } else {
                 let ordered = if row == 0 {
                     self.last.as_ref().is_none_or(|(t, u)| (time_us, uid) > (*t, u.as_str()))
@@ -639,16 +686,26 @@ impl PartWriter {
         if hosts.is_some() {
             self.last_host = Some(host_at(batch.num_rows() - 1).map(str::to_owned));
         }
+        if let Some(classes) = &classes {
+            self.last_class = Some(classes[batch.num_rows() - 1]);
+        }
         // Write in slices of at most WRITE_SLICE_ROWS that never cross a
         // row-group boundary. A group ends at `row_group_rows` rows, or early
         // once the writer's buffered group reaches ROW_GROUP_MEMORY_CAP (wide
         // OCSF rows), so a file can roll exactly between groups and the
         // writer's memory stays bounded.
         let group_rows = self.host_sorted_group_rows.unwrap_or(self.settings.row_group_rows);
+        // NAN-4664: the file rows carry the derived indicator columns; the
+        // digests, tokens, counts and partials above and below see only the
+        // part row.
+        let file_batch = match &self.indicators {
+            Some(derived) => derived.extend(batch)?,
+            None => batch.clone(),
+        };
         let mut offset = 0;
         while offset < batch.num_rows() {
             let take = (group_rows - self.rows_in_group).min(WRITE_SLICE_ROWS).min(batch.num_rows() - offset);
-            let slice = batch.slice(offset, take);
+            let slice = file_batch.slice(offset, take);
             for row in offset..offset + take {
                 self.token_group.add_row_at(times[row]);
                 for (path, body) in &token_paths {
@@ -675,17 +732,7 @@ impl PartWriter {
             let file = self.current.as_mut().expect("open");
             let full = self.rows_in_group == group_rows || file.writer.memory_size() >= ROW_GROUP_MEMORY_CAP;
             if full {
-                file.writer.flush()?;
-                let fresh = TokenGroupBuilder::for_writer(self.token_block_rows);
-                let group = std::mem::replace(&mut self.token_group, fresh);
-                file.token_groups.push(group.finish()?);
-                self.rows_in_group = 0;
-                if self.host_sorted_group_rows.is_some() {
-                    ensure!((file.writer.bytes_written() as u64) < crate::parts::format::DATA_FILE_SPLIT_BYTES,
-                        "host-sorted family exceeds one data file");
-                } else if file.writer.bytes_written() as u64 >= self.settings.max_file_bytes {
-                    self.close_file()?;
-                }
+                self.finish_row_group()?;
             }
         }
         if let Some(counts) = &mut self.entity_counts {
@@ -698,6 +745,35 @@ impl PartWriter {
             partials.add_batch(batch)?;
         }
         Ok(())
+    }
+
+    /// End the open row group (if it holds rows) at a row-group boundary,
+    /// rolling the data file when it reached its split size.
+    fn finish_row_group(&mut self) -> Result<()> {
+        if self.rows_in_group == 0 {
+            return Ok(());
+        }
+        let file = self.current.as_mut().expect("rows were written to an open file");
+        file.writer.flush()?;
+        let fresh = TokenGroupBuilder::for_writer(self.token_block_rows);
+        let group = std::mem::replace(&mut self.token_group, fresh);
+        file.token_groups.push(group.finish()?);
+        self.rows_in_group = 0;
+        if self.host_sorted_group_rows.is_some() || self.class_sorted {
+            ensure!((file.writer.bytes_written() as u64) < crate::parts::format::DATA_FILE_SPLIT_BYTES,
+                "host- or class-sorted family exceeds one data file");
+        } else if file.writer.bytes_written() as u64 >= self.settings.max_file_bytes {
+            self.close_file()?;
+        }
+        Ok(())
+    }
+
+    /// NAN-4664: end the open row group early in a class-sorted family, so
+    /// a large class starts (and ends) on a row-group boundary and its
+    /// groups' `class_uid` statistics hold that class alone.
+    pub fn end_class_run(&mut self) -> Result<()> {
+        ensure!(self.class_sorted, "class runs end only in a class-sorted family");
+        self.finish_row_group()
     }
 
     /// Close every file and build the unsigned record.
@@ -1064,14 +1140,22 @@ pub async fn publish_parts(
     trusted: &TenantKeySet,
     finished: &[FinishedPart],
 ) -> Result<Vec<PartRef>> {
-    publish_parts_with_quota(store, signer, trusted, finished, false, true).await
+    publish_parts_with_quota(store, signer, trusted, finished, false, true, None).await
+}
+
+/// Foreground ingest publication shares only value-free, process-local timings.
+pub(super) async fn publish_parts_observed(
+    store: &dyn ObjectStore, signer: &dyn PartSigner, trusted: &TenantKeySet,
+    finished: &[FinishedPart], timings: &super::timing::Timings,
+) -> Result<Vec<PartRef>> {
+    publish_parts_with_quota(store, signer, trusted, finished, false, true, Some(timings)).await
 }
 
 pub async fn publish_compacted_parts(
     store: &dyn ObjectStore, signer: &dyn PartSigner, trusted: &TenantKeySet,
     finished: &[FinishedPart],
 ) -> Result<Vec<PartRef>> {
-    publish_parts_with_quota(store, signer, trusted, finished, true, true).await
+    publish_parts_with_quota(store, signer, trusted, finished, true, true, None).await
 }
 
 /// Historical coverage output must not evict the foreground producer cache.
@@ -1080,7 +1164,7 @@ pub(super) async fn publish_backfilled_parts(
     store: &dyn ObjectStore, signer: &dyn PartSigner, trusted: &TenantKeySet,
     finished: &[FinishedPart],
 ) -> Result<Vec<PartRef>> {
-    publish_parts_with_quota(store, signer, trusted, finished, true, false).await
+    publish_parts_with_quota(store, signer, trusted, finished, true, false, None).await
 }
 
 /// Producer-cache warms of one publication in flight at once (each is a
@@ -1100,8 +1184,9 @@ async fn warm_one(store: &dyn ObjectStore, key: String, path: PathBuf, digest: S
 
 async fn publish_parts_with_quota(
     store: &dyn ObjectStore, signer: &dyn PartSigner, trusted: &TenantKeySet,
-    finished: &[FinishedPart], compacting: bool, warm_cache: bool,
+    finished: &[FinishedPart], compacting: bool, warm_cache: bool, timings: Option<&super::timing::Timings>,
 ) -> Result<Vec<PartRef>> {
+    let upload_timing = timings.map(|t| t.start("part_file_upload"));
     if compacting {
         // Parts upload one after another (each part's files concurrently),
         // so a multi-part merge output never holds more than one part's writes.
@@ -1118,6 +1203,8 @@ async fn publish_parts_with_quota(
         }
         settle_all(uploads).await?;
     }
+    drop(upload_timing);
+    let payload_timing = timings.map(|t| t.start("signature_payload_upload"));
     // Large records are signed by reference: stage their canonical bytes at
     // `{part_dir}/provenance.pending.json` first (contract 4.4).
     let payloads = finished.iter().map(|part| SignPayload::for_record(&part.record)).collect::<Result<Vec<_>>>()?;
@@ -1130,12 +1217,17 @@ async fn publish_parts_with_quota(
         });
     }
     settle_all(staged).await?;
+    drop(payload_timing);
     let mut refs = Vec::with_capacity(finished.len());
     let Some(first) = finished.first() else { return Ok(refs) };
     // Byte-bounded calls (NAN-3006): a count-only split of a multi-hour
     // flush overran the owner's 64 KiB body fence.
     let records = finished.iter().map(|f| f.record.clone()).collect::<Vec<_>>();
-    let signatures = sign_within_budget(signer, &first.record.tenant_id, &records).await?;
+    let signatures = {
+        let _timing = timings.map(|t| t.start("signatures"));
+        sign_within_budget(signer, &first.record.tenant_id, &records).await?
+    };
+    let _publication_timing = timings.map(|t| t.start("provenance_and_cache"));
     ensure!(signatures.len() == records.len(), "owner returned a partial signature batch");
     if !crate::producer_cache::index_enabled() {
         // NAN-3610 flag off: today's path, part by part, file by file.
@@ -1722,6 +1814,7 @@ mod tests {
     /// The bloom sidecar prunes both the dense and the sparse field.
     #[test]
     fn wide_hour_groups_write_blooms_and_no_empty_locator() {
+        let _workload = super::super::test_resources::PREVALENCE_WORKLOAD.blocking_read();
         use crate::part_query::prune::{entity_summary_mask, EntityBlooms};
         use crate::planner::CandidateHint;
         // Above the 8 x 65,536-row fragmentation floor, like a 300-eps hour.
@@ -1792,6 +1885,238 @@ mod tests {
         writer.entity_sidecar_fields = entity_sidecar_fields(fields);
         writer.write(&rows).unwrap();
         writer.finish().unwrap()
+    }
+
+    /// NAN-4664: the derived IOC indicator column. Over files written with
+    /// it, without it (the layout before), and with the column but no
+    /// trusted footer marker, every row group holding a match is kept for
+    /// every hint (no false negative, every evidence path), and on the new
+    /// layout the groups without one are pruned for the domain leaves no
+    /// scalar bloom answers. A non-ASCII literal (Unicode-lowered by the SQL)
+    /// and a bare term are never decided by the column.
+    #[test]
+    fn ioc_indicator_columns_prune_row_groups_without_false_negatives() {
+        use crate::part_query::prune::{entity_mask, FileMetadataCache};
+        use crate::planner::CandidateHint;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        const GROUP: usize = 8_192;
+        const ROWS: usize = 3 * GROUP;
+        const PLANTED: usize = GROUP + 777;
+        let sha256 = "5B7C2E1F0A9D8C7B6A5F4E3D2C1B0A9F8E7D6C5B4A3F2E1D0C9B8A7F6E5D4C3B";
+        let events = (0..ROWS).map(|i| {
+            let planted = i == PLANTED;
+            let hash = if planted { sha256.to_string() } else { format!("{:064x}", (i % 4_000) as u128 * 0x9e37_79b9_7f4a_7c15) };
+            let message = if planted { "seen evil.example.com on WS-9".to_string() } else { format!("job {} ran on 10.9.{}.{}", i % 977, i % 200, i % 250) };
+            serde_json::json!({
+                "time": format!("2026-09-25T10:{:02}:{:02}.{:06}Z", (i / 60) % 60, i % 60, i),
+                "metadata": {"uid": format!("u-{i:07}")},
+                "class_uid": 1007,
+                "message": message,
+                "process": {"name": format!("p{}.exe", i % 300), "file": {"hashes": [{"algorithm": "SHA-256", "value": hash}]}},
+                "dst_endpoint": {"ip": format!("10.0.{}.{}", i % 200, i % 250), "domain": if planted { "Evil.Example.COM".to_string() } else { format!("d{}.example.net", i % 5_000) }},
+                "query": {"hostname": if planted { "b\u{fc}cher.example".to_string() } else { format!("q{}.example.net", i % 3_000) }},
+                "evidences": [{"query": {"hostname": if planted { "Ev.Example." } else { "ev.example.net" }}}],
+                "device": {"hostname": format!("ws-{}.corp", i % 1_000), "ip": if planted { "2001:DB8::7".to_string() } else { format!("10.1.{}.{}", i % 200, i % 250) }},
+            })
+        }).collect::<Vec<_>>();
+        let entity = |path: &str, value: &str| CandidateHint::Entity { source_path: path.into(), value: value.into() };
+        let keyword = |value: &str| CandidateHint::Keyword { mode: "token".into(), value: value.into() };
+        // (hint, row groups holding a matching row, decided by the column
+        // on the new layout).
+        let cases = [
+            (entity("dst_endpoint.domain", "evil.example.com"), vec![1], true),
+            (entity("dst_endpoint.domain", "EVIL.example.com"), vec![1], true),
+            (entity("evidences.query.hostname", "ev.example."), vec![1], true),
+            (entity("device.ip", "2001:db8::7"), vec![1], true),
+            // `lower(col) = 'bücher.example'` (the SQL's Unicode lowering of
+            // the literal) matches the stored row; the ASCII-folded column
+            // holds `bücher.example` and the ASCII fold of the literal is
+            // `bÜcher.example`: deciding would drop the match.
+            (entity("query.hostname", "B\u{dc}CHER.example"), vec![1], false),
+            (entity("query.hostname", "b\u{fc}cher.example"), vec![1], false),
+            (CandidateHint::Any { alternatives: vec![
+                entity("dst_endpoint.domain", "evil.example.com"), entity("query.hostname", "evil.example.com"),
+                entity("http_request.url.hostname", "evil.example.com"),
+            ] }, vec![1], true),
+            // Absent everywhere: no group holds a match.
+            (entity("dst_endpoint.domain", "absent.example.org"), vec![], true),
+            (entity("query.hostname", "absent.example.org"), vec![], true),
+            // Routed nowhere: never pruned by the column. A bare term
+            // compiles to `message` / `raw_data`, which it does not index.
+            (keyword("evil"), vec![0, 1, 2], true),
+            (keyword("evil.example.com"), vec![0, 1, 2], true),
+            (entity("process.file.hashes.value", sha256), vec![0, 1, 2], true),
+            (entity("process.cmd_line", "absent"), vec![0, 1, 2], true),
+        ];
+        let write = |dir: &Path, indicators: bool| -> PathBuf {
+            let refs = events.iter().collect::<Vec<_>>();
+            let rows = sort_by_time_uid(&decode(Arc::new(infer_schema(&refs).unwrap()), &refs).unwrap()).unwrap();
+            let mut spec = draft(rows.schema(), Level::Hour, PartInputs::Parts { parts: vec![crate::parts::provenance::InputPart {
+                part_id: PartId::new(1).unwrap(), level: Level::L0, provenance_sha256: "0".repeat(64), rows: ROWS as u64, merkle_root: "0".repeat(64),
+            }] });
+            spec.rows_in = ROWS as u64;
+            let settings = ParquetSettings::for_level(Level::Hour).compaction_layout(Level::Hour, Some("8192:268435456")).unwrap();
+            let mut writer = PartWriter::create_with(dir, spec, PartialSource::FromRows, 1, ROWS as u64, settings).unwrap();
+            if !indicators {
+                writer.indicators = None;
+            }
+            writer.write(&rows).unwrap();
+            let part = writer.finish().unwrap();
+            assert_eq!(part.record.files.data.len(), 1);
+            part.dir.join(&part.record.files.data[0].name)
+        };
+        let new_dir = tempfile::tempdir().unwrap();
+        let old_dir = tempfile::tempdir().unwrap();
+        let new = write(new_dir.path(), true);
+        let old = write(old_dir.path(), false);
+        // The same columns without the trusted footer marker (as if a source
+        // had supplied them): never answered.
+        let unmarked = new_dir.path().join("unmarked.parquet");
+        {
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&new).unwrap()).unwrap();
+            let schema = reader.schema().clone();
+            let properties = ParquetSettings::for_level(Level::Hour).compaction_layout(Level::Hour, Some("8192:268435456")).unwrap()
+                .writer_properties(ROWS as u64, &PartId::new(1).unwrap(), Level::Hour, TENANT, "fp").unwrap();
+            let mut writer = ArrowWriter::try_new(File::create(&unmarked).unwrap(), schema, Some(properties)).unwrap();
+            for batch in reader.build().unwrap() {
+                writer.write(&batch.unwrap()).unwrap();
+            }
+            writer.close().unwrap();
+        }
+        {
+            let reader = SerializedFileReader::new(File::open(&new).unwrap()).unwrap();
+            assert_eq!(reader.metadata().num_row_groups(), 3);
+            let leaves = reader.metadata().file_metadata().schema_descr().columns().iter().map(|c| c.path().string()).collect::<Vec<_>>();
+            for kind in nanosiem_core::search::lake_indicators::Kind::ALL {
+                assert!(leaves.contains(&format!("{}.list.item", kind.column())), "{kind:?}");
+            }
+            assert!(crate::parts::indicators::is_marked(reader.metadata().file_metadata()));
+            let unmarked_reader = SerializedFileReader::new(File::open(&unmarked).unwrap()).unwrap();
+            assert!(!crate::parts::indicators::has_any_marker(unmarked_reader.metadata().file_metadata()));
+            let old_reader = SerializedFileReader::new(File::open(&old).unwrap()).unwrap();
+            assert!(!old_reader.metadata().file_metadata().schema_descr().columns().iter().any(|c| c.path().string().starts_with("nano_ioc")));
+        }
+        for (file, layout, digest) in [(&new, "new", "d-new"), (&old, "old", "d-old"), (&unmarked, "unmarked", "d-unmarked")] {
+            for (hint, truth, decided) in &cases {
+                let hints = std::slice::from_ref(hint);
+                let footer = entity_mask(file, hints);
+                let cache = FileMetadataCache::default();
+                let summary = cache.evidence(file, digest, hints, None, false, true, None).unwrap().0;
+                assert!(cache.prewarm(file, digest), "{layout}");
+                let parsed = cache.evidence(file, digest, hints, None, false, true, None).unwrap().0;
+                for (path, mask) in [("footer", &footer), ("summary", &summary), ("parsed", &parsed)] {
+                    let mask = mask.clone().unwrap_or_else(|| vec![true; 3]);
+                    for group in truth {
+                        assert!(mask[*group], "{layout} {path} {hint:?}: false negative in group {group}");
+                    }
+                    // Old and unmarked files fall back: only a scalar bloom
+                    // (`device.ip`) may still prune there.
+                    let scalar = matches!(hint, CandidateHint::Entity { source_path, .. } if source_path == "device.ip");
+                    if layout == "new" || !scalar {
+                        let expected = (0..3).map(|group| layout != "new" || !decided || truth.contains(&group)).collect::<Vec<_>>();
+                        assert_eq!(mask, expected, "{layout} {path} {hint:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// NAN-4664: a merge re-derives the indicator column over every input
+    /// row (a marked input mixed with one written before the column), and
+    /// never drops a `nano_ioc_*` source column an unmarked input committed
+    /// before the namespace was reserved.
+    #[test]
+    fn merge_rederives_indicators_and_keeps_legacy_source_columns() {
+        use crate::part_ingest::merge::{merge_parts, MergeInput};
+        use arrow_array::{Array, ListArray};
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let event = |i: usize, extra: Option<&str>| {
+            let mut event = serde_json::json!({
+                "time": format!("2026-09-25T10:00:{:02}Z", i), "class_uid": 4001,
+                "metadata": {"uid": format!("u-{i:03}"), "log_source": "fw"},
+                "dst_endpoint": {"domain": format!("D{i}.Example.COM")},
+            });
+            if let Some(value) = extra {
+                event["nano_ioc_legacy"] = serde_json::json!(value);
+            }
+            event
+        };
+        let part = |dir: &Path, events: &[serde_json::Value], schema: &SchemaRef, indicators: bool| -> FinishedPart {
+            let refs = events.iter().collect::<Vec<_>>();
+            let rows = sort_by_time_uid(&decode(schema.clone(), &refs).unwrap()).unwrap();
+            let fingerprint = crate::parts::format::schema_fingerprint(schema).unwrap();
+            let draft = PartDraft {
+                tenant_id: TENANT.into(), signer_key_id: crate::parts::provenance::tests::SIGNER.into(), level: Level::Minute,
+                event_hour: rows_hour(&rows), schema: schema.clone(), schema_fingerprint: fingerprint,
+                inputs: PartInputs::Parts { parts: vec![crate::parts::provenance::InputPart { part_id: PartId::new(1).unwrap(), level: Level::L0,
+                    provenance_sha256: "0".repeat(64), rows: events.len() as u64, merkle_root: "0".repeat(64) }] },
+                admission: None, rows_in: events.len() as u64, duplicates_dropped: 0, window: DedupWindow::Exact, build: "test".into(),
+            };
+            let mut writer = PartWriter::create(dir, draft, PartialSource::FromRows, 1, events.len() as u64).unwrap();
+            if !indicators { writer.indicators = None; }
+            writer.write(&rows).unwrap();
+            writer.finish().unwrap()
+        };
+        fn rows_hour(rows: &RecordBatch) -> i32 {
+            let first = crate::generation::event_time_us_from_array(rows.column_by_name("time").unwrap().as_ref(), 0).unwrap();
+            first.div_euclid(crate::parts::HOUR_US) as i32
+        }
+        let merge = |dir: &Path, inputs: &[&FinishedPart], schema: &SchemaRef| -> FinishedPart {
+            let inputs = inputs.iter().map(|part| MergeInput { part: PartRef::from_record(&part.record, &"0".repeat(64), true), dir: part.dir.clone() })
+                .collect::<Vec<_>>();
+            let fingerprint = crate::parts::format::schema_fingerprint(schema).unwrap();
+            merge_parts(dir, TENANT, Level::Hour, inputs[0].part.event_hour, &inputs, schema.clone(), &fingerprint,
+                crate::parts::provenance::tests::SIGNER, "test", 5).unwrap().finished
+        };
+        let read = |part: &FinishedPart| -> (bool, Vec<RecordBatch>) {
+            let path = part.dir.join(&part.record.files.data[0].name);
+            let marked = crate::parts::indicators::is_marked(SerializedFileReader::new(File::open(&path).unwrap()).unwrap().metadata().file_metadata());
+            let batches = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap()
+                .build().unwrap().map(Result::unwrap).collect();
+            (marked, batches)
+        };
+
+        // Mixed: an input written before the column and a marked one.
+        let dir = tempfile::tempdir().unwrap();
+        let events = (0..20).map(|i| event(i, None)).collect::<Vec<_>>();
+        let schema = Arc::new(infer_schema(&events.iter().collect::<Vec<_>>()).unwrap());
+        let old = part(&dir.path().join("old"), &events[..10], &schema, false);
+        let new = part(&dir.path().join("new"), &events[10..], &schema, true);
+        assert!(!read(&old).0 && read(&new).0);
+        let merged = merge(&dir.path().join("merged"), &[&old, &new], &schema);
+        let (marked, batches) = read(&merged);
+        assert!(marked);
+        let mut domains = Vec::new();
+        for batch in &batches {
+            let list = batch.column_by_name("nano_ioc_domains").unwrap().as_any().downcast_ref::<ListArray>().unwrap();
+            for row in 0..list.len() {
+                let values = list.value(row);
+                let values = values.as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+                domains.extend((0..values.len()).map(|i| values.value(i).to_string()));
+            }
+        }
+        domains.sort();
+        let mut expected = (0..20).map(|i| format!("d{i}.example.com")).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(domains, expected, "every input row re-derived");
+
+        // A legacy source column of the reserved prefix: the part gets no
+        // indicator column and a merge keeps the source values.
+        let dir = tempfile::tempdir().unwrap();
+        let events = (0..10).map(|i| event(i, Some(&format!("legacy-{i}")))).collect::<Vec<_>>();
+        let schema = Arc::new(infer_schema(&events.iter().collect::<Vec<_>>()).unwrap());
+        let legacy = part(&dir.path().join("legacy"), &events, &schema, true);
+        assert!(!read(&legacy).0);
+        let merged = merge(&dir.path().join("merged"), &[&legacy], &schema);
+        let (marked, batches) = read(&merged);
+        assert!(!marked);
+        let values = batches.iter().flat_map(|batch| {
+            let column = batch.column_by_name("nano_ioc_legacy").expect("legacy column kept").as_any()
+                .downcast_ref::<arrow_array::StringArray>().unwrap().clone();
+            (0..column.len()).map(move |i| column.value(i).to_string())
+        }).collect::<Vec<_>>();
+        assert_eq!(values.len(), 10);
+        assert!(values.iter().all(|value| value.starts_with("legacy-")));
     }
 
     /// NAN-3694: the entity sidecar carries a folded bloom per foldable

@@ -3,10 +3,9 @@
 /**
  * CreateDashboardDialog — the core "new dashboard" surface (NAN-2356).
  *
- * Rendered by `Dashboards.tsx` whenever the meloD capability is absent, which
- * is every open-core build. The enterprise build keeps the richer
- * `DashboardGenerationWizard` (blank + generate in one sheet); both render the
- * same `BlankDashboardForm`, so the blank path cannot drift between editions.
+ * Rendered by `Dashboards.tsx` in every edition. NAN-4600: the enterprise
+ * `DashboardGenerationWizard` sheet (blank + generate) is gone; generation runs
+ * in the pivt panel (`@dashboard`), so this is the only blank-create surface.
  *
  * Deliberately NOT a stub in `src/enterprise-stubs/` — that tree is for
  * placeholders, and creating a dashboard is core functionality.

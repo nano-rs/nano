@@ -277,23 +277,55 @@ impl Settings {
         }))
     }
     pub fn capacity(&self, resident_bytes: u64) -> Result<u64> {
+        self.capacities(resident_bytes, 0, 0).map(|(capacity, _)| capacity)
+    }
+
+    /// NAN-4591: [`Self::capacity`] with `evicted_bytes` this process deleted
+    /// that the volume accountant may not have walked yet. The accountant
+    /// re-walks every ~30 s, so between walks its figure still counts every
+    /// object evicted since; read as "other data grew", each eviction shrank
+    /// the next admission's capacity by the same amount and the cache evicted
+    /// all it had admitted since the walk, again, on every download (a 7 d
+    /// cold read cleared the hot window and then waited out the walk).
+    /// Crediting them back keeps the estimate of other data honest. The
+    /// download fence (the accountant itself) stays the hard limit.
+    pub fn capacity_credited(&self, resident_bytes: u64, in_flight_bytes: u64, evicted_bytes: u64) -> Result<u64> {
+        self.capacities(resident_bytes, in_flight_bytes, evicted_bytes).map(|(_, credited)| credited)
+    }
+
+    /// ([`Self::capacity`], [`Self::capacity_credited`]) from one volume read.
+    ///
+    /// NAN-4591: `in_flight_bytes` are this cache's admitted, not yet indexed
+    /// downloads. The accountant already counts their fence grants (and their
+    /// landed bytes until the next walk), and admission adds them again as
+    /// reservations: read as other data, every concurrent download shrank
+    /// the limit by its own size and evicted the oldest hot objects the same
+    /// pass had just fetched. Subtracting them can only overstate capacity by
+    /// the unfenced remainder of those downloads; the fence stays the hard
+    /// limit.
+    pub fn capacities(&self, resident_bytes: u64, in_flight_bytes: u64, evicted_bytes: u64) -> Result<(u64, u64)> {
         let headroom = capacity(&self.root, self.reserve_bytes, resident_bytes)?;
         match nanosiem_lake_cell::volume_usage::usage(
             &nanosiem_lake_cell::volume_usage::volume_root(&self.root),
         ) {
-            Ok(usage) => Ok(headroom.min(
-                self.max_bytes
-                    .saturating_sub(usage.saturating_sub(resident_bytes)),
-            )),
+            Ok(usage) => {
+                let other = usage.saturating_sub(resident_bytes).saturating_sub(in_flight_bytes);
+                Ok((
+                    headroom.min(self.max_bytes.saturating_sub(other)),
+                    headroom.min(self.max_bytes.saturating_sub(other.saturating_sub(evicted_bytes))),
+                ))
+            }
             // NAN-3139: an unreachable accountant must not fail admission;
             // fall back to free-space headroom under the volume target.
             Err(error) => {
                 warn_accounting_unavailable(&error);
-                Ok(headroom.min(self.max_bytes))
+                let capacity = headroom.min(self.max_bytes);
+                Ok((capacity, capacity))
             }
         }
     }
 }
+
 /// Rate-limited (once per 5 min): accounting is degraded, not search.
 pub fn warn_accounting_unavailable(error: &dyn std::fmt::Display) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -427,6 +459,34 @@ impl Coverage {
     }
 }
 
+/// NAN-4591: share of the reader cache the hot window never fills: the
+/// cold-read reserve (one fifth).
+pub const COLD_READ_RESERVE_DIVISOR: u64 = 5;
+/// NAN-4591: the reserve is never below this (or the per-query heavy-read
+/// threshold, if larger)...
+pub const MIN_COLD_READ_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// NAN-4591: bytes of a `cache_max_bytes` reader cache kept out of the hot
+/// window's reach for foreground cold reads (7 d hunts and counts read the
+/// parts older than the window from R2 through it).
+///
+/// The window used to fill the cache to its capacity minus the per-query
+/// heavy-read threshold (512 MiB on the large tenant). Every 7 d search then cold-read
+/// through that sliver and, with the cache at its volume target, waited out
+/// the accountant's 30 s re-walk: cold_queue_ms 27-40 s, 45 s cancels, and
+/// 503/500 `reader_cache_saturated` give-ups after 120 s / 600 s waits.
+///
+/// One fifth of the cache, at least [`MIN_COLD_READ_RESERVE_BYTES`] and the
+/// heavy-read threshold, at most half the cache (a small cache keeps a hot
+/// window). Half of it is kept free by eviction (see the reader cache's
+/// `reserve`), half holds recently read cold objects.
+pub fn cold_read_reserve(cache_max_bytes: u64, query_max_bytes: u64) -> u64 {
+    (cache_max_bytes / COLD_READ_RESERVE_DIVISOR)
+        .max(query_max_bytes)
+        .max(MIN_COLD_READ_RESERVE_BYTES)
+        .min(cache_max_bytes / 2)
+}
+
 /// Reserve three of the fifteen minutes for startup and object/verification overhead.
 /// Explicit caps win; the default follows the selected bytes, not CPU shares.
 pub fn hydrate_rate(configured: u64, target: u64) -> u64 {
@@ -483,6 +543,20 @@ mod tests {
         assert_eq!(select(vec![(20, 1, ())], 21, 8).len(), 0);
         assert_eq!(select(vec![(20, 1, ())], 20, 8).len(), 1);
     }
+    /// NAN-4591: a fifth of the cache, floored at 1 GiB and the heavy-read
+    /// threshold, capped at half the cache.
+    #[test]
+    fn cold_read_reserve_is_a_fifth_with_floor_and_cap() {
+        const GIB: u64 = 1 << 30;
+        // the large tenant: a ~40 GiB hot volume target, 512 MiB heavy threshold.
+        assert_eq!(cold_read_reserve(40 * GIB, 512 << 20), 8 * GIB);
+        assert!(cold_read_reserve(40 * GIB, 512 << 20) > 8 * (512 << 20), "far more than the old 512 MiB sliver");
+        assert_eq!(cold_read_reserve(4 * GIB, 512 << 20), GIB, "1 GiB floor");
+        assert_eq!(cold_read_reserve(12 * GIB, 4 * GIB), 4 * GIB, "never below the heavy threshold");
+        assert_eq!(cold_read_reserve(64 << 20, 1 << 20), 32 << 20, "small caches keep half for the window");
+        assert_eq!(cold_read_reserve(0, 1), 0);
+    }
+
     #[test]
     fn derived_rate_and_progress() {
         assert!(hydrate_rate(0, 16 * 1024 * 1024 * 1024) * 720 >= 16 * 1024 * 1024 * 1024);

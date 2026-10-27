@@ -17,7 +17,7 @@ function caps(sso: boolean): Capabilities {
     search: true, cases: false, notebooks: false, risk: false, melod: false,
     queryCorrection: false, customEnrichment: false, agentEnrichment: false,
     aiTuning: false, playbooks: false, incidents: false, siemHealth: true,
-    sso, observabilityConvergence: false, iocLists: false,
+    sso, observabilityConvergence: false, iocLists: false, soar: false,
   };
 }
 

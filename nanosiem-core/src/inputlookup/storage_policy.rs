@@ -220,6 +220,63 @@ pub fn redact_url_credentials(text: &str) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn browser_policy_cases_use_the_production_validator() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!("storage_policy_cases.json")).unwrap();
+        for case in cases["entries"].as_array().unwrap() {
+            let actual = normalize_entry(case["raw"].as_str().unwrap()).ok();
+            assert_eq!(actual.as_deref(), case["normalized"].as_str(), "{}", case["raw"]);
+        }
+        for case in cases["urls"].as_array().unwrap() {
+            let entries: Vec<String> = serde_json::from_value(case["entries"].clone()).unwrap();
+            let result = validate_storage_url(case["raw"].as_str().unwrap(), &entries);
+            assert_eq!(result.is_ok(), case["allowed"].as_bool().unwrap());
+            if let Some(error) = case["error"].as_str() { assert_eq!(result.unwrap_err(), error); }
+        }
+    }
+    #[test]
+    fn browser_suffix_snapshot_matches_production_psl() {
+        use std::collections::BTreeSet;
+        let (mut exact, mut wildcard, mut exceptions) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        let mut bases = BTreeSet::new();
+        let mut branches = BTreeSet::new();
+        for rule in include_str!("../../../nanosiem-web/src/lib/lookup-public-suffixes.txt").lines() {
+            if rule.is_empty() || rule.starts_with("//") { continue; }
+            let base = rule.strip_prefix('!').or_else(|| rule.strip_prefix("*.")).unwrap_or(rule);
+            let host = Url::parse(&format!("https://{base}/")).unwrap().host_str().unwrap().to_owned();
+            let labels: Vec<_> = host.split('.').collect();
+            for index in 0..labels.len() { branches.insert(labels[index..].join(".")); }
+            bases.insert(host.clone());
+            if rule.starts_with('!') { exceptions.insert(host); }
+            else if rule.starts_with("*.") { wildcard.insert(host); }
+            else { exact.insert(host); }
+        }
+        // Probe every exact, wildcard, exception and private rule, both at the
+        // suffix boundary and below it. The browser mirrors the generated
+        // psl trie: explicit child branches override wildcard fallback.
+        for base in bases {
+            for host in [base.clone(), format!("lookup-probe.{base}"), format!("child.lookup-probe.{base}")] {
+                let labels: Vec<_> = host.split('.').collect();
+                let mut suffix_labels = 0;
+                let mut exception = false;
+                for index in (0..labels.len()).rev() {
+                    let tail = labels[index..].join(".");
+                    if !branches.contains(&tail) {
+                        if index + 1 < labels.len() && wildcard.contains(&labels[index+1..].join(".")) {
+                            suffix_labels = labels.len() - index;
+                        }
+                        break;
+                    }
+                    if exceptions.contains(&tail) { exception = true; break; }
+                    if exact.contains(&tail) { suffix_labels = labels.len() - index; }
+                }
+                let browser = exception || (suffix_labels > 0 && labels.len() > suffix_labels);
+                let server = psl::domain(host.as_bytes()).is_some()
+                    && psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.is_known());
+                assert_eq!(browser, server, "PSL parity for {host}");
+            }
+        }
+    }
+    #[test]
     fn default_policy_excludes_providers_outside_the_review_scope() {
         for host in ["account.r2.cloudflarestorage.com", "pub-abc123.r2.dev"] {
             let raw = format!("https://{host}/feed.csv");

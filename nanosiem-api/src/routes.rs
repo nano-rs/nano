@@ -738,6 +738,10 @@ pub fn create_router(state: AppState) -> Router {
             .merge(eh::enterprise_shared_enrichment::enterprise_shared_enrichment_routes::<AppState>())
             .merge(eh::soar::routes::<AppState>())
             .merge(eh::enterprise_shared_melod::enterprise_shared_melod_routes::<AppState>())
+            // NAN-4535: pivt SOAR flow drafting (needs meloD + SOAR state).
+            .merge(eh::enterprise_shared_flow_draft::enterprise_shared_flow_draft_routes::<AppState>())
+            // NAN-4653: pivt edit-session turns (needs meloD + SOAR state for flows).
+            .merge(eh::enterprise_shared_edit_session::enterprise_shared_edit_session_routes::<AppState>())
             .merge(eh::enterprise_shared_cases_extras::enterprise_shared_cases_extras_routes::<AppState>())
             .merge(eh::enterprise_shared_hunting::enterprise_shared_hunting_routes::<AppState>())
             .merge(eh::enterprise_shared_playbooks::enterprise_shared_playbooks_routes::<AppState>())

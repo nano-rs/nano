@@ -4,7 +4,7 @@ export { TimelineVisualization } from './TimelineVisualization';
 export { FieldsPanel, FIELD_STATS_PINNED_COLUMNS, type FieldStat } from './FieldsPanel';
 export { SearchResults } from './SearchResults';
 export { SearchQueryInput } from './SearchQueryInput';
-// AnalyzeView lifted to @/enterprise/components/search/AnalyzeView (NAN-745).
+// Search Analyze runs in the pivt panel (NAN-4589): enterprise/components/pivt/drafts/search-analysis.ts.
 export { QueryLibrary } from './QueryLibrary';
 export { SavedQueriesPalette } from './SavedQueriesPalette';
 export { SearchJobsModal } from './SearchJobsModal';

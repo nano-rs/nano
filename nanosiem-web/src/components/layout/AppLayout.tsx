@@ -54,10 +54,9 @@ import {
 } from '@/components/layout/nav-icons';
 import { PivtIcon } from '@/components/icons/PivtIcon';
 import { cn } from '@/lib/utils';
-import { isPlaceholderDimensionDetail } from '@/lib/siem-health-placeholders';
 import { swaggerUiPath } from '@/lib/tenant-auth-shell';
 import { useAuth } from '@/contexts/AuthContext';
-import { useOnboardingProgress, useSiemHealthLatest, useIngestionHistory } from '@/hooks/use-api';
+import { useOnboardingProgress } from '@/hooks/use-api';
 import { VersionBadge } from '@/components/VersionBadge';
 import { ScrollContainerProvider } from '@/contexts/ScrollContainerContext';
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext';
@@ -66,7 +65,6 @@ import { LicenseBanner } from '@/components/LicenseBanner';
 import { AiAllowanceBanner } from '@/components/AiAllowanceBanner';
 import { AppBreadcrumbs, useCurrentPageTitle } from '@/components/layout/AppBreadcrumbs';
 import { useNotebookOptional } from '@/enterprise/contexts/NotebookContext';
-import { useLayoutOptional } from '@/contexts/LayoutContext';
 import { usePivtState, type PivtState } from '@/enterprise/hooks/use-pivt-state';
 import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { PivtShellOverlay } from '@/enterprise/components/pivt/PivtShellOverlay';
@@ -78,6 +76,9 @@ const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').t
 import { Button } from '@/components/ui/button';
 import { useSharedTenant } from '@/hooks/use-shared-tenant';
 import { ingestionNavigation, visibleOnEdition } from './ingestion-navigation';
+import { StatusBar } from './StatusBar';
+import { AUTOMATION_SECTION_ICON, useAutomationNav } from '@/pages/Automation/automation-nav';
+import { ApprovalsBell } from '@/pages/Automation/ApprovalsBell';
 import { Logo } from '@/components/ui/logo';
 import { ThemeSwatches } from '@/components/ui/theme-swatches';
 import {
@@ -374,141 +375,12 @@ function TopBar({
           @-commands cover notebook creation; the floating pivt panel
           owns the read surface. */}
       <div className="flex items-center gap-1 shrink-0">
+        {/* NAN-4546: SOAR approvals waiting on you (renders nothing unless SOAR is on). */}
+        <ApprovalsBell />
         {melodEnabled && <PivtSummon state={pivt} />}
         <NotificationBell />
       </div>
     </div>
-  );
-}
-
-/**
- * Strip markdown so AI-generated narrative renders cleanly inside the
- * single-line footer cell. The full markdown source still flows to
- * `/platform/health` where `<Markdown>` formats it properly; here we
- * collapse both block-level structures (tables, code fences, lists,
- * blockquotes — which `truncate` would otherwise render as literal `|`,
- * `>`, `-`) and inline markers (`**bold**`, `*italic*`, `` `code` ``)
- * to plain prose, then squash whitespace so the footer reads as one
- * legible sentence (NAN-914 F-2, NAN-936 F-2).
- */
-function stripInlineMarkdown(text: string): string {
-  // Skip underscore-italic stripping — UDM field names (src_ip,
-  // windows_event_log, src_ip_filled_pct, etc.) routinely appear in the
-  // narrative and the `_..._` regex would mangle them. The AI prompt
-  // produces `**bold**`/`*italic*` style markdown, not underscore italics.
-  const blockStripped = text
-    // Fenced code blocks: ```...``` (multi-line)
-    .replace(/```[\s\S]*?```/g, '')
-    // Markdown table rows: any line that starts and ends with a pipe,
-    // including the `|---|---|` separator. The footer's `truncate`
-    // flattens these to literal `|` glyphs across the visible line.
-    .replace(/^\s*\|.*\|\s*$/gm, '')
-    // List bullets and numbered list markers at line start
-    .replace(/^\s*[-*+]\s+/gm, '')
-    .replace(/^\s*\d+\.\s+/gm, '')
-    // Blockquote bars
-    .replace(/^\s*>\s*/gm, '')
-    // Heading hashes
-    .replace(/^\s*#{1,6}\s+/gm, '');
-
-  return blockStripped
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*]+)\*/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    // Collapse any whitespace run (including newlines left by stripped
-    // blocks) to a single space; `truncate` would do the same visually
-    // but normalizing here avoids stray gaps where rows used to be.
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/**
- * Status bar — 22px-tall strip at the bottom. Mono text on --panel bg.
- * Wired to SIEM health + ingestion history. Rendered on every page, so queries
- * should stay cheap (both return single aggregates / small arrays).
- */
-function StatusBar() {
-  const currentTitle = useCurrentPageTitle();
-  // SIEM Health: the endpoint, status classifier (Fresh/Stalled/Live),
-  // overall_score, and the stalled-ingestion narrative are all core
-  // heuristics (`nanosiem-core/src/siem_health/analyzer.rs`). Only the
-  // per-dimension Live-state commentary is AI-driven; the core fallback
-  // fills it with the literal string "AI analysis unavailable", which
-  // we filter out below so open builds don't render that placeholder.
-  const { data: siemHealth } = useSiemHealthLatest();
-  const { data: ingestHistory } = useIngestionHistory(1);
-  const layout = useLayoutOptional();
-
-  // Platform status: tint the leading dot + label by SIEM overall_status.
-  const status = siemHealth?.overall_status ?? 'unknown';
-  const statusColor = status === 'healthy'
-    ? 'var(--success)'
-    : status === 'degraded'
-    ? 'var(--warning)'
-    : status === 'unhealthy' || status === 'critical'
-    ? 'var(--destructive)'
-    : 'var(--muted-foreground)';
-
-  // Ingest summary: prefer the backend's human-readable ingestion detail; fall
-  // back to "N% ingest" from the score if the string isn't populated. Filter
-  // out the AI-unavailable placeholder so open builds drop down to score.
-  const rawIngestDetail = siemHealth?.dimension_details?.ingestion?.trim();
-  const ingestDetail = isPlaceholderDimensionDetail(rawIngestDetail) ? undefined : rawIngestDetail;
-  // The narrative is markdown; strip inline formatting for the single-line
-  // footer cell so `**foo**` etc. don't render as literal asterisks (F-2).
-  const ingestDetailDisplay = ingestDetail ? stripInlineMarkdown(ingestDetail) : undefined;
-  const ingestScore = siemHealth ? `${Math.round(siemHealth.ingestion_score)}% ingest` : null;
-
-  // Events/min: sum the last hour of ingestion-history points across source
-  // types, divide by 60. IngestionHistoryPoint[] bucketing varies, but hours=1
-  // typically returns ~60 per-minute buckets or a handful of per-hour ones.
-  const totalLastHour = (ingestHistory ?? []).reduce((s, p) => s + p.count, 0);
-  const eventsPerMin = Math.round(totalLastHour / 60);
-  const eventsLabel = ingestHistory && ingestHistory.length > 0
-    ? `${eventsPerMin.toLocaleString()} events/min`
-    : null;
-
-  // When a page has contributed page-specific status (e.g. Search's query
-  // stats), show it in place of the default ingest detail + events-per-min.
-  // Platform dot + page name on the right are preserved.
-  const pageStatus = layout?.pageStatus;
-
-  return (
-    <footer
-      className="hidden md:flex items-center px-3.5 h-[22px] border-t border-border font-mono text-[10.5px] text-muted-foreground gap-[18px] tracking-wide shrink-0"
-      style={{ background: 'var(--panel)' }}
-    >
-      <span style={{ color: statusColor }}>● platform {status}</span>
-      {pageStatus ? (
-        <span className="flex items-center gap-[18px] min-w-0">{pageStatus}</span>
-      ) : (
-        <>
-          {ingestDetailDisplay ? (
-            // AI narrative is the meaningful content — wire the cell as a link
-            // to the full /platform/health report so the truncated text has a
-            // clear expand-on-click affordance (NAN-914 F-6).
-            <Link
-              to="/platform/health"
-              className="hidden lg:inline truncate max-w-[280px] hover:text-foreground transition-colors"
-              title={ingestDetailDisplay}
-            >
-              {ingestDetailDisplay}
-            </Link>
-          ) : ingestScore ? (
-            <span
-              className="hidden lg:inline truncate max-w-[280px]"
-              title={ingestScore}
-            >
-              {ingestScore}
-            </span>
-          ) : null}
-          {eventsLabel && <span className="hidden lg:inline">{eventsLabel}</span>}
-        </>
-      )}
-      <span className="flex-1" />
-      <span>nano · {currentTitle.toLowerCase()}</span>
-    </footer>
   );
 }
 
@@ -687,22 +559,27 @@ function MainAppShell({ children }: AppLayoutProps) {
   const filteredDetectionNavigation = useMemo(() => filterNavItems(detectionNavigation), [filterNavItems]);
   const filteredIngestionNavigation = useMemo(() => filterNavItems(ingestionNavigation), [filterNavItems]);
   const filteredSettingsNavigation = useMemo(() => filterNavItems(settingsNavigation), [filterNavItems]);
+  // NAN-4540: empty unless SOAR is enabled; flips live with Settings → SOAR.
+  const automationNav = useAutomationNav();
+  const automationItems = automationNav.items;
 
 
   const isCasesActive = location.pathname.startsWith('/inbox')
     || location.pathname.startsWith('/cases')
     || location.pathname.startsWith('/playbooks');
   const isDetectionActive = location.pathname.startsWith('/rules');
+  const isAutomationActive = location.pathname.startsWith('/automation');
   const isIngestionActive = filteredIngestionNavigation.some(item => location.pathname.startsWith(item.href));
   const isSettingsActive = filteredSettingsNavigation.some(item => location.pathname.startsWith(item.href));
 
   // Accordion state - only one section can be open at a time.
   // Settings is no longer part of the accordion (NAN-537) — it's a single
   // top-level link that hands off to the dedicated /settings shell.
-  type NavSection = 'cases' | 'detections' | 'ingestion' | null;
+  type NavSection = 'cases' | 'detections' | 'automation' | 'ingestion' | null;
   const getInitialOpenSection = (): NavSection => {
     if (isCasesActive) return 'cases';
     if (isDetectionActive) return 'detections';
+    if (isAutomationActive) return 'automation';
     if (isIngestionActive) return 'ingestion';
     return null;
   };
@@ -717,6 +594,7 @@ function MainAppShell({ children }: AppLayoutProps) {
   const casesOpen = openSection === 'cases';
   const detectionsOpen = openSection === 'detections';
   const ingestionOpen = openSection === 'ingestion';
+  const automationOpen = openSection === 'automation';
 
   // Auto-expand section when navigating to a page within it
   useEffect(() => {
@@ -724,10 +602,12 @@ function MainAppShell({ children }: AppLayoutProps) {
       setOpenSection('cases');
     } else if (isDetectionActive && openSection !== 'detections') {
       setOpenSection('detections');
+    } else if (isAutomationActive && openSection !== 'automation') {
+      setOpenSection('automation');
     } else if (isIngestionActive && openSection !== 'ingestion') {
       setOpenSection('ingestion');
     }
-  }, [isCasesActive, isDetectionActive, isIngestionActive]);
+  }, [isCasesActive, isDetectionActive, isAutomationActive, isIngestionActive]);
 
   // Mobile menu state
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -1070,6 +950,73 @@ function MainAppShell({ children }: AppLayoutProps) {
               <NavSquares className="w-[15px] h-[15px]" />
               {!sidebarCollapsed && 'Marketplace'}
             </Link>
+          )}
+
+          {/* Automation Section (NAN-4540) — only while SOAR is enabled */}
+          {automationItems.length > 0 && (
+            <div className="pt-2" data-testid="nav-automation">
+              {sidebarCollapsed ? (
+                <CollapsedSectionFlyout
+                  icon={AUTOMATION_SECTION_ICON}
+                  label="Automation"
+                  items={automationItems}
+                  isActive={isAutomationActive}
+                  location={location}
+                  handleNavClick={handleNavClick}
+                  iconSize="w-[15px] h-[15px]"
+                />
+              ) : (
+                <button
+                  onClick={() => toggleSection('automation')}
+                  className={cn(
+                    'relative flex items-center w-full h-8 px-2 gap-2.5 rounded-md text-[12.5px] font-medium transition-colors justify-between',
+                    isAutomationActive
+                      ? 'bg-primary/10 text-primary'
+                      : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                  )}
+                >
+                  <div className="flex items-center gap-3">
+                    <AUTOMATION_SECTION_ICON className="w-[15px] h-[15px]" strokeWidth={1.5} />
+                    Automation
+                  </div>
+                  <span className="flex items-center gap-1.5">
+                    {automationNav.pendingApprovals && (
+                      <span className="font-mono text-[10px] tabular-nums text-warn" title="Pending approvals">
+                        {automationNav.pendingApprovals}
+                      </span>
+                    )}
+                    <ChevronDown className={cn('w-4 h-4 transition-transform', automationOpen && 'rotate-180')} />
+                  </span>
+                </button>
+              )}
+              {automationOpen && !sidebarCollapsed && (
+                <div className="mt-1 ml-6 space-y-0.5 border-l border-border/40 pl-2">
+                  {automationItems.map((item) => {
+                    const Icon = item.icon;
+                    const isActive = location.pathname === item.href || location.pathname.startsWith(item.href + '/');
+                    return (
+                      <Link
+                        key={item.name}
+                        to={item.href}
+                        onClick={(e) => handleNavClick(e, item.href)}
+                        className={cn(
+                          'flex items-center h-7 gap-2 rounded-md px-2 text-[12px] transition-colors',
+                          isActive
+                            ? 'bg-primary/10 text-primary'
+                            : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                        )}
+                      >
+                        <Icon className="w-3 h-3" />
+                        <span className="flex-1">{item.name}</span>
+                        {item.href === '/automation/approvals' && automationNav.pendingApprovals && (
+                          <span className="font-mono text-[10px] tabular-nums text-warn">{automationNav.pendingApprovals}</span>
+                        )}
+                      </Link>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           )}
 
           {/* Ingestion Section - feeds, parsers, credentials */}
@@ -1436,6 +1383,51 @@ function MainAppShell({ children }: AppLayoutProps) {
                 <NavSquares className="w-[15px] h-[15px]" />
                 Marketplace
               </Link>
+            )}
+
+            {/* Automation Section (NAN-4540) */}
+            {automationItems.length > 0 && (
+              <div className="pt-2">
+                <button
+                  onClick={() => toggleSection('automation')}
+                  className={cn(
+                    'relative flex items-center w-full h-8 px-2 gap-2.5 rounded-md text-[12.5px] font-medium transition-colors justify-between',
+                    isAutomationActive
+                      ? 'bg-primary/10 text-primary'
+                      : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                  )}
+                >
+                  <div className="flex items-center gap-3">
+                    <AUTOMATION_SECTION_ICON className="w-[15px] h-[15px]" strokeWidth={1.5} />
+                    Automation
+                  </div>
+                  <ChevronDown className={cn('w-4 h-4 transition-transform', automationOpen && 'rotate-180')} />
+                </button>
+                {automationOpen && (
+                  <div className="mt-1 ml-4 space-y-1">
+                    {automationItems.map((item) => {
+                      const Icon = item.icon;
+                      const isActive = location.pathname === item.href || location.pathname.startsWith(item.href + '/');
+                      return (
+                        <Link
+                          key={item.name}
+                          to={item.href}
+                          onClick={(e) => handleNavClick(e, item.href)}
+                          className={cn(
+                            'flex items-center gap-3 px-3 py-2 text-sm font-medium transition-all border-l-2',
+                            isActive
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'
+                          )}
+                        >
+                          <Icon className="w-3.5 h-3.5" />
+                          {item.name}
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             )}
 
             {/* Ingestion Section */}

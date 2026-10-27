@@ -9,7 +9,7 @@
 //! written. Unknown physical leaves also fail closed so chDB never encounters
 //! a sparse mixed-schema generation.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int64Array, LargeStringArray, RecordBatch, StringArray,
     StringViewArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
@@ -570,6 +570,17 @@ pub struct GenerationRewriteResult {
 
 impl CatalogConfig {
     pub async fn load(&self) -> Result<RestCatalog> {
+        self.load_with_bearer(None, None, None).await
+    }
+
+    /// Platform catalog control credentials stay in memory. This does not add
+    /// an environment/configuration switch or project a provider token file.
+    pub(crate) async fn load_with_bearer(
+        &self,
+        bearer: Option<&str>,
+        client: Option<reqwest12::Client>,
+        storage: Option<Arc<dyn iceberg::io::StorageFactory>>,
+    ) -> Result<RestCatalog> {
         // sqlx enables rustls/ring while reqwest 0.13 enables rustls/aws-lc.
         // With both providers compiled, rustls deliberately refuses to guess
         // and panics on the first HTTPS request unless the application chooses
@@ -592,7 +603,7 @@ impl CatalogConfig {
         }
         match (
             self.credential.is_some(),
-            self.token_file.is_some(),
+            self.token_file.is_some() || bearer.is_some(),
             self.allow_anonymous,
         ) {
             (false, false, false) => bail!(
@@ -606,6 +617,10 @@ impl CatalogConfig {
             ),
             _ => {}
         }
+        ensure!(
+            bearer.is_none() || self.token_file.is_none(),
+            "catalog token sources are mutually exclusive"
+        );
         if (self.oauth_scope.is_some()
             || self.oauth_audience.is_some()
             || self.oauth_server_uri.is_some())
@@ -724,6 +739,49 @@ impl CatalogConfig {
                 String::from_utf8(token).context("catalog workload token is not UTF-8")?,
             );
         }
+        if let Some(token) = bearer {
+            ensure!(
+                storage.is_some(),
+                "platform catalog requires controlled metadata storage"
+            );
+            ensure!(
+                (32..=16384).contains(&token.len()) && !token.chars().any(char::is_control),
+                "invalid in-memory catalog control token"
+            );
+            properties.insert("token".into(), token.into());
+            let http = client
+                .as_ref()
+                .context("platform catalog requires pinned transport")?;
+            let mut response = http
+                .get(format!("{}/v1/config", self.uri.trim_end_matches('/')))
+                .query(&[("warehouse", &self.warehouse)])
+                .bearer_auth(token)
+                .send()
+                .await?;
+            ensure!(
+                response.status().is_success(),
+                "platform catalog config refused"
+            );
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                ensure!(
+                    body.len().saturating_add(chunk.len()) <= 65536,
+                    "platform catalog config too large"
+                );
+                body.extend_from_slice(&chunk);
+            }
+            let config: Value = serde_json::from_slice(&body)?;
+            ensure!(
+                config["defaults"].as_object().is_some_and(|v| v.is_empty())
+                    && config["overrides"]
+                        .as_object()
+                        .is_some_and(|v| v.is_empty())
+                    && config
+                        .as_object()
+                        .is_some_and(|v| v.keys().all(|k| k == "defaults" || k == "overrides")),
+                "platform catalog returned an authority override"
+            );
+        }
         if let Some(realm) = &self.realm {
             properties.insert("header.Polaris-Realm".to_string(), realm.clone());
         }
@@ -746,9 +804,17 @@ impl CatalogConfig {
             );
         }
         crate::r2_ops::install_iceberg_http_client();
-        RestCatalogBuilder::default()
-            .with_storage_factory(Arc::new(OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
+        let builder = RestCatalogBuilder::default();
+        let builder = if let Some(client) = client {
+            builder.with_client(client)
+        } else {
+            builder
+        };
+        builder
+            .with_storage_factory(storage.unwrap_or_else(|| {
+                Arc::new(OpenDalStorageFactory::S3 {
+                    customized_credential_load: None,
+                })
             }))
             .load("nano-security-event-publisher", properties)
             .await

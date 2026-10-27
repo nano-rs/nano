@@ -1,52 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // @vitest-environment jsdom
 
-// NAN-3453: pivt on the Pipe page — editor button, `@pipe` routing, the
-// `pivt:open-pipe-wizard` listener, and the wizard's diff → accept/reject flow.
+// NAN-3453 / NAN-4609: pivt on the Pipe page — the editor button, the
+// selected step it reports, and the page bridge pivt applies VRL through.
+// The panel conversation itself is covered in pages/__tests__/pipe-pivt-panel.test.tsx.
 
-import type { ReactNode } from 'react';
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
-import type { MelodEditParserResponse } from '@/lib/api';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import type { PipelineCapabilities, PipelineDraft } from '@/lib/pipeline-types';
 import type { PipelineEditorProps } from './types';
+import {
+  PIPE_VRL_GONE_ERROR,
+  PIPE_VRL_READ_ONLY_ERROR,
+  PIPE_VRL_STALE_ERROR,
+  applyPipeVrlOnPage,
+  readPipePivtContext,
+  usePipePivtBridge,
+  type PivtPipeSnapshot,
+} from '@/hooks/use-pipe-pivt-bridge';
 
-const melodEditParser = vi.fn();
-let nextResponse: MelodEditParserResponse;
-vi.mock('@/lib/api', () => ({ api: { melodEditParser: (...args: unknown[]) => melodEditParser(...args) } }));
-vi.mock('@/enterprise/hooks/use-melod-job', () => ({
-  useMelodJob: () => ({
-    start: async (fn: () => Promise<unknown>) => {
-      await fn();
-      return nextResponse;
-    },
-    loading: false,
-    progress: null,
-    result: null,
-    error: null,
-    reset: () => {},
-  }),
-}));
-vi.mock('@/components/ui/markdown', () => ({ Markdown: ({ children }: { children: ReactNode }) => <div>{children}</div> }));
 vi.mock('@/contexts/PageContext', () => ({ usePageContext: () => ({ pageKey: 'pipelines' }) }));
 
 import { PipelineEditor } from './PipelineEditor';
 import { pipePivtUnavailableReason } from './usePipePivt';
-import { PipePivtWizard, type PipePivtWizardProps } from '@/enterprise/components/pipelines/PipePivtWizard';
-import { PIPE_WIZARD_EVENT, usePipeWizardListener } from '@/hooks/use-pipe-wizard-listener';
-import { usePivtCommands, PIVT_OPEN_PIPE_WIZARD } from '@/enterprise/components/pivt/commands/router';
-import { PIVT_OPEN_PIPE_WIZARD as STUB_PIPE_EVENT } from '@/enterprise-stubs/components/pivt/commands/router';
 
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', {
     writable: true,
     value: () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} }),
   });
-});
-beforeEach(() => {
-  melodEditParser.mockReset();
-  melodEditParser.mockResolvedValue({ job_id: 'job-1', status: 'running' });
 });
 afterEach(cleanup);
 
@@ -89,6 +71,14 @@ describe('Pipe editor pivt button', () => {
     expect(onAssistant).toHaveBeenCalledWith('p');
   });
 
+  it('reports the selected step to the page (what @pipe works on)', () => {
+    const onSelectedStepChange = vi.fn();
+    render(<PipelineEditor {...props({ onSelectedStepChange })} />);
+    expect(onSelectedStepChange).toHaveBeenLastCalledWith('p');
+    fireEvent.click(screen.getAllByText('Tag')[0]);
+    expect(onSelectedStepChange).toHaveBeenLastCalledWith('v');
+  });
+
   it('names why pivt is off', () => {
     expect(pipePivtUnavailableReason('open', false, false)).toMatch(/Enterprise/);
     expect(pipePivtUnavailableReason('enterprise', false, true)).toMatch(/not enabled/);
@@ -97,141 +87,48 @@ describe('Pipe editor pivt button', () => {
   });
 });
 
-describe('pivt:open-pipe-wizard', () => {
-  it('keeps the event name identical in the enterprise router and the open stub', () => {
-    expect(PIVT_OPEN_PIPE_WIZARD).toBe(PIPE_WIZARD_EVENT);
-    expect(STUB_PIPE_EVENT).toBe(PIPE_WIZARD_EVENT);
+describe('Pipe page bridge (NAN-4609)', () => {
+  const snap = (overrides: Partial<PivtPipeSnapshot> = {}): PivtPipeSnapshot => ({
+    sourceId: 's1', sourceName: 'Firewall', sourceType: 'fw', draft, selectedStepId: 'v', sample: null, preview: null,
+    previewError: null, canApply: true, unavailableReason: null, ...overrides,
   });
 
-  it('opens for the open pipeline only and carries step + prompt', () => {
-    const { result } = renderHook(() => usePipeWizardListener('s1', true));
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PIPE_WIZARD_EVENT, { detail: { sourceId: 'other' } }));
-    });
-    expect(result.current.request).toBeNull();
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PIPE_WIZARD_EVENT, { detail: { stepId: 'v', prompt: 'explain' } }));
-    });
-    expect(result.current.request).toEqual({ seq: 1, stepId: 'v', prompt: 'explain' });
+  it('answers the context probe only while mounted', () => {
+    const { unmount } = renderHook(() => usePipePivtBridge({ snapshot: snap(), onApply: vi.fn() }));
+    expect(readPipePivtContext()?.selectedStepId).toBe('v');
+    unmount();
+    expect(readPipePivtContext()).toBeNull();
   });
 
-  it('does not listen when pivt is unavailable', () => {
-    const { result } = renderHook(() => usePipeWizardListener('s1', false));
-    act(() => {
-      window.dispatchEvent(new CustomEvent(PIPE_WIZARD_EVENT, { detail: {} }));
-    });
-    expect(result.current.request).toBeNull();
-  });
-
-  it('@pipe dispatches the wizard event on a pipeline page', () => {
-    window.history.pushState({}, '', '/ingestion/pipelines/s1');
-    const seen = vi.fn();
-    window.addEventListener(PIPE_WIZARD_EVENT, seen);
-    const { result } = renderHook(() => usePivtCommands(), { wrapper: ({ children }) => <MemoryRouter>{children}</MemoryRouter> });
-    const outcome = result.current.dispatch('@pipe fix the error');
-    window.removeEventListener(PIPE_WIZARD_EVENT, seen);
-    expect(outcome).toEqual({ handled: true, action: 'open pipe assistant' });
-    expect((seen.mock.calls[0][0] as CustomEvent).detail).toEqual({ prompt: 'fix the error' });
-    window.history.pushState({}, '', '/');
-  });
-});
-
-describe('PipePivtWizard', () => {
-  const wizardProps = (overrides: Partial<PipePivtWizardProps> = {}): PipePivtWizardProps => ({
-    open: true,
-    onOpenChange: vi.fn(),
-    openSeq: 1,
-    sourceId: '11111111-1111-1111-1111-111111111111',
-    sourceName: 'Firewall',
-    sourceType: 'fw',
-    draft,
-    initialStepId: 'v',
-    sample: { name: 'Recent events', events: [{ id: '1', input: { message: '{"user":"bob"}' } }] },
-    previewError: 'function call error for "parse_json"',
-    canApply: true,
-    onApply: vi.fn(),
-    ...overrides,
-  });
-
-  it('sends the step, prior steps, samples and preview error only on request', async () => {
-    nextResponse = { session_id: 'sess', message: 'This step tags events.' };
-    render(<PipePivtWizard {...wizardProps()} />);
-    expect(melodEditParser).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Explain this step' }));
-    await screen.findByText('This step tags events.');
-    const request = melodEditParser.mock.calls[0][0];
-    expect(request.parser_id).toBe('11111111-1111-1111-1111-111111111111');
-    expect(request.current_vrl).toBe('.tagged = true');
-    expect(request.base_parser_vrl).toContain('parse_json!');
-    expect(request.sample_logs).toEqual(['{"user":"bob"}']);
-    expect(request.message).toContain('function call error for "parse_json"');
-    expect(request.message).toContain('Explain this step');
-    // An explanation proposes no code.
-    expect(screen.queryByRole('region', { name: 'pivt proposal' })).toBeNull();
-  });
-
-  it('omits samples when the analyst detaches them', async () => {
-    nextResponse = { session_id: 'sess', message: 'ok' };
-    render(<PipePivtWizard {...wizardProps()} />);
-    fireEvent.click(screen.getByRole('checkbox'));
-    fireEvent.click(screen.getByRole('button', { name: 'Explain this step' }));
-    await screen.findByText('ok');
-    expect(melodEditParser.mock.calls[0][0].sample_logs).toBeUndefined();
-  });
-
-  it('shows a diff and applies only on accept', async () => {
-    nextResponse = { session_id: 'sess', message: 'Fixed.', updated_vrl: '.tagged = "yes"', validation: { valid: true, errors: [] } };
+  it('applies a replace to the draft, unsaved, and refuses a stale one', () => {
     const onApply = vi.fn();
-    render(<PipePivtWizard {...wizardProps({ onApply })} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Fix the preview error' }));
-    await screen.findByRole('region', { name: 'pivt proposal' });
-    const diff = screen.getByTestId('pipe-pivt-diff').textContent ?? '';
-    expect(diff).toContain('- .tagged = true');
-    expect(diff).toContain('+ .tagged = "yes"');
+    renderHook(() => usePipePivtBridge({ snapshot: snap(), onApply }));
+    expect(applyPipeVrlOnPage('s1', { kind: 'replace', stepId: 'v' }, '.tagged = false', '.x = 1')).toEqual({
+      applied: false, insertedStepId: undefined, error: PIPE_VRL_STALE_ERROR,
+    });
     expect(onApply).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('button', { name: 'Apply to step' }));
-    expect(onApply).toHaveBeenCalledTimes(1);
+    expect(applyPipeVrlOnPage('s1', { kind: 'replace', stepId: 'v' }, '.tagged = true', '.tagged = "yes"').applied).toBe(true);
     expect(onApply.mock.calls[0][0].steps[1]).toMatchObject({ id: 'v', kind: 'vrl', config: { code: '.tagged = "yes"' } });
-    expect(screen.queryByRole('region', { name: 'pivt proposal' })).toBeNull();
   });
 
-  it('discards a rejected proposal without touching the draft', async () => {
-    nextResponse = { session_id: 'sess', message: 'Fixed.', updated_vrl: '.tagged = 2' };
+  it('inserts after the anchor and names the new step', () => {
     const onApply = vi.fn();
-    render(<PipePivtWizard {...wizardProps({ onApply })} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Fix the preview error' }));
-    await screen.findByRole('region', { name: 'pivt proposal' });
-    fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+    renderHook(() => usePipePivtBridge({ snapshot: snap(), onApply }));
+    const result = applyPipeVrlOnPage('s1', { kind: 'insert', afterStepId: 'p' }, '.', '.new = 1');
+    expect(result.applied).toBe(true);
+    const steps = onApply.mock.calls[0][0].steps;
+    expect(steps.map((s: { id: string }) => s.id)).toEqual(['p', result.insertedStepId, 'v']);
+  });
+
+  it('refuses without edit access, for a gone step, and ignores another pipeline', () => {
+    const onApply = vi.fn();
+    const { rerender } = renderHook((props: { s: PivtPipeSnapshot }) => usePipePivtBridge({ snapshot: props.s, onApply }), {
+      initialProps: { s: snap({ canApply: false }) },
+    });
+    expect(applyPipeVrlOnPage('s1', { kind: 'replace', stepId: 'v' }, '.tagged = true', '.x').error).toBe(PIPE_VRL_READ_ONLY_ERROR);
+    rerender({ s: snap() });
+    expect(applyPipeVrlOnPage('s1', { kind: 'replace', stepId: 'gone' }, '.', '.x').error).toBe(PIPE_VRL_GONE_ERROR);
+    expect(applyPipeVrlOnPage('s2', { kind: 'replace', stepId: 'v' }, '.tagged = true', '.x')).toEqual({ applied: false, insertedStepId: undefined, error: undefined });
     expect(onApply).not.toHaveBeenCalled();
-    expect(screen.getByText(/Rejected the proposal/)).toBeTruthy();
-  });
-
-  it('drafts a new step and inserts it after the selected one', async () => {
-    nextResponse = { session_id: 'sess', message: 'Drafted.', updated_vrl: '.region = "us"' };
-    const onApply = vi.fn();
-    render(<PipePivtWizard {...wizardProps({ onApply, initialStepId: 'p' })} />);
-    fireEvent.click(screen.getByRole('radio', { name: 'New step after' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Draft a step from the sample events' }));
-    await screen.findByRole('region', { name: 'pivt proposal' });
-    expect(melodEditParser.mock.calls[0][0].current_vrl).toBe('.');
-    fireEvent.click(screen.getByRole('button', { name: 'Insert step' }));
-    const next = onApply.mock.calls[0][0] as PipelineDraft;
-    expect(next.steps.map((s) => s.id).slice(0, 1)).toEqual(['p']);
-    expect(next.steps[1]).toMatchObject({ kind: 'vrl', config: { code: '.region = "us"' } });
-    expect(next.steps[2].id).toBe('v');
-  });
-
-  it('blocks a stale proposal and read-only viewers', async () => {
-    nextResponse = { session_id: 'sess', message: 'Fixed.', updated_vrl: '.tagged = 3' };
-    const { rerender } = render(<PipePivtWizard {...wizardProps()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Fix the preview error' }));
-    await screen.findByRole('region', { name: 'pivt proposal' });
-    const changed = { ...draft, steps: [draft.steps[0], { ...draft.steps[1], config: { code: '.edited = 1' } }] };
-    rerender(<PipePivtWizard {...wizardProps({ draft: changed })} />);
-    await waitFor(() => expect((screen.getByRole('button', { name: 'Apply to step' }) as HTMLButtonElement).disabled).toBe(true));
-    expect(screen.getByText(/changed after pivt proposed/)).toBeTruthy();
-    rerender(<PipePivtWizard {...wizardProps({ canApply: false })} />);
-    expect((screen.getByRole('button', { name: 'Apply to step' }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByText(/Requires permission/)).toBeTruthy();
   });
 });

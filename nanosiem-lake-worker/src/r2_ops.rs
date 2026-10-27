@@ -434,6 +434,8 @@ impl HttpFetch for CountingHttp {
         ) {
             return Err(opendal::Error::new(opendal::ErrorKind::PermissionDenied, refusal.to_string()));
         }
+        #[cfg(test)]
+        let req = test_origin::rewrite(req);
         let started = std::time::Instant::now();
         let response = self.0.fetch(req).await;
         note_attempt(&response, started.elapsed());
@@ -473,6 +475,38 @@ pub fn install_iceberg_http_client() {
     let _ = counters();
     let _ = iceberg_storage_opendal::install_http_client(shared_http_client());
 }
+/// Test seam: within [`test_origin::R2_ORIGIN`]'s scope, requests for a
+/// production-shaped `https://<account>.r2.cloudflarestorage.com` endpoint go
+/// to a loopback fake instead. Everything above the wire (credential
+/// validation, operators, SigV4, per-key credential routing) is production.
+#[cfg(test)]
+pub(crate) mod test_origin {
+    tokio::task_local! {
+        pub(crate) static R2_ORIGIN: String;
+    }
+    /// The same rewrite for the checksummed PUT path's own client, so no
+    /// test request can leave the loopback fake.
+    pub(crate) fn rewrite_url(url: String) -> String {
+        let Ok(origin) = R2_ORIGIN.try_with(Clone::clone) else { return url };
+        let Some(rest) = url.strip_prefix("https://") else { return url };
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if !host.ends_with(".r2.cloudflarestorage.com") {
+            return url;
+        }
+        format!("{}/{path}", origin.trim_end_matches('/'))
+    }
+    pub(super) fn rewrite(mut req: super::Request<opendal::Buffer>) -> super::Request<opendal::Buffer> {
+        let Ok(origin) = R2_ORIGIN.try_with(Clone::clone) else { return req };
+        let uri = req.uri();
+        if uri.scheme_str() != Some("https") || !uri.host().is_some_and(|h| h.ends_with(".r2.cloudflarestorage.com")) {
+            return req;
+        }
+        let path = uri.path_and_query().map_or("/", |p| p.as_str());
+        *req.uri_mut() = format!("{}{path}", origin.trim_end_matches('/')).parse().expect("loopback R2 origin");
+        req
+    }
+}
+
 pub fn layer() -> HttpClientLayer {
     let _ = counters();
     HttpClientLayer::new(shared_http_client())

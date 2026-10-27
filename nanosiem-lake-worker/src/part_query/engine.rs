@@ -5138,7 +5138,11 @@ fn common_lowercase_paths<'a>(named: BTreeSet<String>, records: impl IntoIterato
 
 async fn run_compiler(path: &std::path::Path, request: &CompilerRequest<'_>, timeout_seconds: u64) -> QueryResult<CompiledQuery> {
     let input = serde_json::to_vec(request).map_err(internal)?;
-    let mut child = tokio::process::Command::new(path)
+    // H02: retain the GNU compiler's bytes as the identity pin, while native
+    // execution goes through its static, package-bound bundled-loader shim.
+    let launch = nanosiem_lake_cell::worker_launch::compiler_launch_path(path)
+        .map_err(|_| internal("native compiler launch denied"))?;
+    let mut child = tokio::process::Command::new(launch)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

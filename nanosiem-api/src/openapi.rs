@@ -91,6 +91,12 @@ struct SecurityAddon;
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         if let Some(components) = openapi.components.as_mut() {
+            #[cfg(feature = "enterprise")]
+            components.add_security_scheme(
+                "nano_main_service_identity",
+                SecurityScheme::Http(HttpBuilder::new().scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("JWT").description(Some("Private mTLS connection and operation, tenant and body-bound platform JWT required")).build()),
+            );
             components.add_security_scheme(
                 "bearer_auth",
                 SecurityScheme::Http(
@@ -272,9 +278,14 @@ fn shared_sub_docs() -> Vec<utoipa::openapi::OpenApi> {
         nanosiem_enterprise::handlers::enterprise_shared_sources::EnterpriseSharedSourcesApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_enrichment::EnterpriseSharedEnrichmentApiDoc::openapi(),
         nanosiem_enterprise::handlers::soar::SoarApiDoc::openapi(),
+        nanosiem_enterprise::handlers::shared_soar_mail::SoarMailBridgeApiDoc::openapi(),
         // NAN-4369: the egress proxy's SOAR check (internal, helper bearer).
         nanosiem_enterprise::soar::egress::SoarEgressApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_melod::EnterpriseSharedMelodApiDoc::openapi(),
+        // NAN-4535: pivt SOAR flow drafting.
+        nanosiem_enterprise::handlers::enterprise_shared_flow_draft::EnterpriseSharedFlowDraftApiDoc::openapi(),
+        // NAN-4653: pivt edit-session turns.
+        nanosiem_enterprise::handlers::enterprise_shared_edit_session::EnterpriseSharedEditSessionApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_cases_extras::EnterpriseSharedCasesExtrasApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_hunting::EnterpriseSharedHuntingApiDoc::openapi(),
         nanosiem_enterprise::handlers::enterprise_shared_playbooks::EnterpriseSharedPlaybooksApiDoc::openapi(),
@@ -1196,7 +1207,7 @@ mod tests {
         // NAN-2942 adds provisioning-outbox:expedite;
         // NAN-2980 adds hec-sources:credentials.
         // SOAR owner status and signed delivery remain private-only.
-        assert_eq!(private["paths"].as_object().unwrap().len(), 30);
+        assert_eq!(private["paths"].as_object().unwrap().len(), 31);
         assert!(private["paths"]["/internal/v1/enterprise-shared/hec-sources:credentials"]["post"].is_object());
         assert!(!build_openapi().paths.paths.contains_key("/internal/v1/enterprise-shared/hec-sources:credentials"),
             "hec-sources:credentials must stay off the public spec");
@@ -1265,7 +1276,7 @@ mod tests {
         // reject, are counted here too; so are NAN-2879's two lake-part
         // paths, which this count had missed, and NAN-2942's
         // provisioning-outbox:expedite, and NAN-2980's hec-sources:credentials).
-        assert_eq!(private["paths"].as_object().unwrap().len(), 30);
+        assert_eq!(private["paths"].as_object().unwrap().len(), 31);
         let path = "/internal/v1/enterprise-shared/hec-sources:enroll";
         assert_eq!(private["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/HecSourceEnrollRequest");
@@ -1440,7 +1451,7 @@ mod tests {
         use nanosiem_enterprise::handlers::shared_egress_expected::EnterpriseSharedEgressExpectedApiDoc;
         // NAN-4371: nano-main's leader refresh reads egress-expected:read; it
         // must never leak into the customer spec, and its destination carries
-        // exactly tenant_id / purpose / host.
+        // tenant_id / purpose / host, plus the optional configured SMTP port.
         let private = serde_json::to_value(EnterpriseSharedEgressExpectedApiDoc::openapi()).unwrap();
         let paths = private["paths"].as_object().unwrap();
         assert_eq!(paths.keys().collect::<Vec<_>>(), ["/internal/v1/enterprise-shared/egress-expected:read"]);
@@ -1448,7 +1459,13 @@ mod tests {
         assert!(!public.paths.paths.contains_key("/internal/v1/enterprise-shared/egress-expected:read"));
         let properties = private["components"]["schemas"]["EnterpriseSharedEgressExpectedDestination"]["properties"]
             .as_object().unwrap();
-        assert_eq!(properties.keys().collect::<Vec<_>>(), ["host", "purpose", "tenant_id"]);
+        assert_eq!(properties.keys().collect::<Vec<_>>(), ["host", "port", "purpose", "tenant_id"]);
+        let mut required: Vec<_> = private["components"]["schemas"]["EnterpriseSharedEgressExpectedDestination"]["required"]
+            .as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        required.sort_unstable();
+        assert_eq!(required, ["host", "purpose", "tenant_id"]);
+        assert_eq!(private["components"]["schemas"]["EnterpriseSharedEgressPurpose"]["enum"],
+            serde_json::json!(["inputlookup", "soar", "soar_smtp"]));
     }
 
     #[cfg(feature = "enterprise")]
@@ -1906,12 +1923,63 @@ mod tests {
         // NAN-4369: the internal egress check, one.
         // NAN-4380: tenant-bound agent query receipts, one.
         #[cfg(feature = "enterprise")]
-        let min_paths = min_paths + 23;
+        let min_paths = min_paths + 28; // NAN-4471: mail settings, recipients and SMTP egress.
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 2; // NAN-4465 CP2: saved and draft flow test admission.
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 2; // NAN-4496: SOAR upstream list and apply-all.
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 1; // NAN-4556: SOAR run volume.
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 1; // NAN-4535: /api/melod/flow/draft (POST).
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 1; // NAN-4585: /api/soar/flows/validate-search (POST).
+        #[cfg(feature = "enterprise")]
+        let min_paths = min_paths + 1; // NAN-4653: /api/melod/edit/turn (POST).
 
         assert!(
             path_count >= min_paths,
             "Expected at least {min_paths} paths, got {path_count}"
         );
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn soar_upstream_updates_match_repository_contracts() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        for (path, method, response) in [
+            ("/api/soar/packs/upstream-updates", "get", "SoarUpstreamUpdates"),
+            ("/api/soar/packs/apply-all-upstream-updates", "post", "BulkApplySoarUpstreamResult"),
+        ] {
+            let op = &spec["paths"][path][method];
+            assert_eq!(op["security"], serde_json::json!([{"bearer_auth":[]},{"api_key":[]}]));
+            assert_eq!(op["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],format!("#/components/schemas/{response}"));
+            assert!(!op["responses"]["409"].is_null());
+        }
+        for (schema, fields) in [
+            ("SoarPack", vec!["upstream_changed", "upstream_version"]),
+            ("SoarPacks", vec!["upstream_changed_count"]),
+            ("SoarUpstreamUpdates", vec!["updates", "total_count"]),
+            ("BulkApplySoarUpstreamResult", vec!["updated", "failed", "results"]),
+        ] {
+            for field in fields { assert!(!spec["components"]["schemas"][schema]["properties"][field].is_null(),"{schema}.{field}"); }
+        }
+        assert!(!spec["paths"]["/api/soar/packs/{name}/upgrade"]["post"].is_null());
+    }
+
+    #[cfg(feature = "enterprise")]
+    #[test]
+    fn soar_saved_and_draft_test_paths_have_request_and_timeline_schemas() {
+        let spec=serde_json::to_value(build_openapi()).unwrap();
+        for (path,request) in [
+            ("/api/soar/flows/{id}/test","TestFlow"),
+            ("/api/soar/flows/test","TestDraftFlow"),
+        ] {
+            let post=&spec["paths"][path]["post"];
+            assert_eq!(post["requestBody"]["content"]["application/json"]["schema"]["$ref"],format!("#/components/schemas/{request}"));
+            assert_eq!(post["responses"]["202"]["content"]["application/json"]["schema"]["$ref"],"#/components/schemas/SoarTestRun");
+        }
+        assert!(!spec["components"]["schemas"]["SoarStepResult"].is_null());
     }
 
     #[test]
@@ -1920,7 +1988,9 @@ mod tests {
         let spec = serde_json::to_value(build_openapi()).unwrap();
         let paths: Vec<_> = spec["paths"].as_object().unwrap().iter()
             .filter(|(path, _)| path.starts_with("/api/soar/")).collect();
-        assert_eq!(paths.len(), 20);
+        // NAN-4544 added GET /api/soar/flows/stats; NAN-4556 GET /api/soar/runs/volume;
+        // NAN-4585 POST /api/soar/flows/validate-search.
+        assert_eq!(paths.len(), 30);
         let mut ids = std::collections::BTreeSet::new();
         for (_, path) in paths {
             for method in ["get", "post", "put", "delete"] {
@@ -1932,8 +2002,37 @@ mod tests {
                 }
             }
         }
-        assert_eq!(ids.len(), 28);
+        assert_eq!(ids.len(), 40);
         let schemas = &spec["components"]["schemas"];
+        // NAN-4544 read-only UI fields: names, blast radius, stage deadlines
+        // and the one-query per-flow 24h aggregate.
+        for (schema, field) in [
+            ("SoarRun", "requested_by_name"),
+            ("SoarRun", "affected_entities"),
+            ("SoarApproval", "requested_by_name"),
+            ("SoarApproval", "decided_by_name"),
+            ("SoarStepResult", "deadline_at"),
+            ("SoarFlowStats", "window_hours"),
+            ("SoarFlowStats", "since"),
+            ("SoarFlowStats", "flows"),
+            ("SoarFlowRunStats", "runs"),
+            ("SoarFlowRunStats", "succeeded"),
+            ("SoarFlowRunStats", "failed"),
+        ] {
+            let text = schemas[schema].to_string();
+            assert!(text.contains(&format!("\"{field}\"")), "{schema}.{field}");
+        }
+        let stats = &spec["paths"]["/api/soar/flows/stats"]["get"];
+        assert_eq!(stats["operationId"], "soar_flow_stats");
+        assert_eq!(
+            stats["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/SoarFlowStats"
+        );
+        assert_eq!(schemas["UpdateMailTransport"]["properties"]["password"]["writeOnly"], true);
+        let transport = schemas["MailTransport"]["properties"].as_object().unwrap();
+        for secret in ["password", "password_encrypted", "password_nonce"] {
+            assert!(!transport.contains_key(secret));
+        }
         for request in ["SoarCreateConnection", "SoarUpdateConnection"] {
             assert_eq!(schemas[request]["properties"]["credentials"]["writeOnly"], true);
         }
@@ -1943,16 +2042,27 @@ mod tests {
         }
         let parameters = spec["paths"]["/api/soar/runs"]["get"]["parameters"].as_array().unwrap();
         assert!(parameters.iter().all(|p| p["in"] == "query"));
+        // NAN-4540: optional case filter for the case-linked Automation panel.
+        let case_filter = parameters.iter().find(|p| p["name"] == "case_id").expect("case_id");
+        assert_ne!(case_filter["required"], true);
         for decision in ["approve", "reject"] {
             let path = format!("/api/soar/approvals/{{id}}/{decision}");
             assert_eq!(spec["paths"][&path]["post"]["security"], serde_json::json!([{"bearer_auth": []}]));
         }
         assert_eq!(spec["paths"]["/api/soar/runs/{id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/SoarRunDetail");
-        for schema in ["CreateFlow", "UpdateFlow", "ValidateFlow", "RunFlow", "DecideApproval"] {
+        for schema in ["CreateFlow", "UpdateFlow", "ValidateFlow", "RunFlow", "TestFlow", "TestDraftFlow", "DecideApproval"] {
             assert_eq!(schemas[schema]["additionalProperties"], false, "{schema}");
         }
         for schema in ["SoarFlow", "SoarFlows", "FlowValidation", "SoarRunDetail", "SoarStepExecution", "SoarApproval", "SoarApprovals"] {
             assert!(schemas[schema].is_object(), "{schema}");
+        }
+        for schema in ["SoarSettings", "UpdateSoarSettings"] {
+            assert!(schemas[schema]["properties"]["ai_daily_token_budget"].is_object(), "{schema}");
+        }
+        assert!(schemas["SoarSettings"]["properties"]["ai_usage"].is_object());
+        assert!(schemas["SoarRunDetail"].to_string().contains("ai_usage"));
+        for field in ["ai_tokens", "ai_budget_tokens", "ai_cached"] {
+            assert!(schemas["SoarStepExecution"]["properties"][field].is_object(), "{field}");
         }
         assert!(schemas["RequestAuthority"].is_null());
         assert!(schemas["SoarFlows"]["properties"]["event_overflow_count"].is_object());
@@ -1982,18 +2092,21 @@ mod tests {
         let human_only = human_session_only_operations();
         for (path, method) in [
             ("/api/soar/settings", "put"),
+            ("/api/soar/recipients", "put"),
+            ("/api/soar/mail-transport", "put"),
+            ("/api/soar/mail-transport/test", "post"),
             ("/api/soar/approvals/{id}/approve", "post"),
             ("/api/soar/approvals/{id}/reject", "post"),
         ] {
             assert!(human_only.contains(&(path.to_string(), method)), "{method} {path}");
         }
-        assert_eq!(human_only.len(), 3, "{human_only:?}");
+        assert_eq!(human_only.len(), 6, "{human_only:?}");
         let spec = tenant_openapi("buddytenant");
         for (path, method) in human_only {
             assert!(spec["paths"][&path][method].is_null(), "tenant doc advertises {method} {path} with api_key");
         }
         // Key-capable SOAR operations stay, on the key scheme.
-        for (path, method) in [("/api/soar/settings", "get"), ("/api/soar/approvals", "get"), ("/api/soar/runs/{id}", "get")] {
+        for (path, method) in [("/api/soar/settings", "get"), ("/api/soar/approvals", "get"), ("/api/soar/runs/{id}", "get"), ("/api/soar/flows/{id}/test", "post"), ("/api/soar/flows/test", "post")] {
             let operation = &spec["paths"][path][method];
             assert!(operation.is_object(), "missing tenant {method} {path}");
             assert_eq!(operation["security"], serde_json::json!([{ "api_key": [] }]), "{method} {path}");

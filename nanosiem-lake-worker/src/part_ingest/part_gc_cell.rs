@@ -713,6 +713,8 @@ struct Shared {
     follower_publications: AtomicU64,
     /// NAN-4188: catch-up stops on control's NL009 (`lake_part_index_incomplete`).
     index_incomplete_total: AtomicU64,
+    /// NAN-4567: earliest start of the next bronze quarantine expiry pass.
+    quarantine_due_ms: std::sync::atomic::AtomicI64,
 }
 
 /// What the GC progress line reports (NAN-3459). Process-local.
@@ -871,6 +873,7 @@ impl CellSanctionedPartGc {
             follower_publications: AtomicU64::new(0),
             index_incomplete_total: AtomicU64::new(0),
             receipted_appends: Arc::default(),
+            quarantine_due_ms: std::sync::atomic::AtomicI64::new(0),
         });
         if let Some((store, _)) = store {
             let weak = Arc::downgrade(&shared);
@@ -1239,11 +1242,11 @@ async fn run_one(
     if let Some(views) = shared.views.as_ref() {
         views.save_refused(&shared.tenant_uuid, &mut state, now_ms);
     }
-    let receipted = seams
-        .receipted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     {
+        let receipted = seams
+            .receipted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // NAN-4162: deleted and refused keys leave the inventory; with budget
         // and candidates left the task runs the next bounded pass at once.
         let saved = inventory.as_mut().expect("inventory initialized");
@@ -1257,7 +1260,34 @@ async fn run_one(
         report.paused_reason = Some("log_catching_up".into());
         report.backoff = false;
     }
+    // NAN-4567: after a clean part pass, at most once per interval.
+    if report.paused_reason.is_none() && !report.backoff {
+        quarantine_expiry_if_due(&shared, &seams, &mut state, &route.tenant_slug, now_ms).await;
+        if let Some(views) = shared.views.as_ref() {
+            views.save_refused(&shared.tenant_uuid, &mut state, now_ms);
+        }
+    }
     Ok(report)
+}
+
+/// NAN-4567: one bounded bronze quarantine expiry pass, when due. Never
+/// fails the part pass: an error is logged and retried next interval.
+async fn quarantine_expiry_if_due(
+    shared: &Shared, authority: &dyn LakePartDeleteAuthority, state: &mut LakePartGcState,
+    tenant_slug: &str, now_ms: i64,
+) -> Option<crate::lake_part_gc::quarantine_expiry::QuarantineExpiryReport> {
+    use crate::lake_part_gc::quarantine_expiry;
+    if shared.quarantine_due_ms.load(Ordering::SeqCst) > now_ms {
+        return None;
+    }
+    shared.quarantine_due_ms.store(now_ms.saturating_add(quarantine_expiry::QUARANTINE_EXPIRY_INTERVAL_MS), Ordering::SeqCst);
+    match quarantine_expiry::run(authority, shared.lister.as_ref(), state, tenant_slug, &shared.tenant_uuid, now_ms).await {
+        Ok(report) => Some(report),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "bronze quarantine expiry pass failed; retried next interval");
+            None
+        }
+    }
 }
 
 const LOG_UNVERIFIABLE: &str = "log_unverifiable";
@@ -2306,6 +2336,24 @@ impl SanctionedPartGc for CellSanctionedPartGc {
         result
     }
 
+    /// NAN-4601: while ingest holds a recorded catalog (custody unattached)
+    /// the delete gate is closed, but the part-log index must keep following
+    /// the log: control's NL009 and every later delete need it, and a frozen
+    /// head hid the large-tenant hold for a day. Only the index-only task and the
+    /// receipted-append follower run here (both publish, neither plans,
+    /// authorizes or deletes). A pass is never started, resumed after a
+    /// back-off or scheduled; one that finished before the hold is reaped so
+    /// its deletes are still counted.
+    async fn feed_index_only(&self, now_ms: i64) -> Option<Result<PassReport>> {
+        let mut runner = self.runner.lock().await;
+        let result = collect_report(&mut runner, now_ms).await;
+        collect_index(&mut runner, now_ms).await;
+        // The same open-grant condition the gate's schedule arms on.
+        runner.armed |= self.shared.current().is_ok();
+        self.spawn_index_only_if_idle(&mut runner, now_ms);
+        result
+    }
+
     fn deleted_total(&self) -> Option<u64> {
         // Folded per bounded cycle by `report_progress`, so it moves while a
         // task (up to TASK_LIFETIME) is still running.
@@ -2339,7 +2387,39 @@ struct Seams {
 }
 
 impl Seams {
+    /// The Worker's retention operations; empty for another contract.
+    async fn worker_operations(&self) -> Result<Vec<String>> {
+        self.fence.wait_current(&self.shared).await?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Capability {
+            schema_version: u8,
+            contract: String,
+            operations: Vec<String>,
+        }
+        let capability: Capability = self
+            .worker_post(WORKER_CAPABILITIES_PATH, &serde_json::json!({"schema_version": DELETE_CONTROL_SCHEMA_VERSION}))
+            .await?;
+        if capability.schema_version != DELETE_CONTROL_SCHEMA_VERSION || capability.contract != DELETE_CONTROL_CONTRACT {
+            return Ok(Vec::new());
+        }
+        Ok(capability.operations)
+    }
+
+    /// NAN-4567: a bronze quarantine key is no part: the catalog and the
+    /// producer cache never hold it.
+    fn is_quarantine(permit: &LakePartDeletePermit) -> Result<bool> {
+        if permit.request.reason != crate::lake_part_gc::LakePartDeleteReason::QuarantineExpired {
+            return Ok(false);
+        }
+        permit.request.validate()?;
+        Ok(true)
+    }
+
     async fn catalog_receipt(&self, permit: &LakePartDeletePermit) -> Result<()> {
+        if Self::is_quarantine(permit)? {
+            return Ok(());
+        }
         let catalog = self.shared.catalog.read().map_err(|_| anyhow::anyhow!("catalog GC guard poisoned"))?.clone();
         if let Some(catalog) = catalog { catalog.guard_delete_in_pass(permit, &self.catalog_pass).await?; }
         Ok(())
@@ -2425,21 +2505,13 @@ async fn bounded(response: reqwest::Response) -> Result<Vec<u8>> {
 #[async_trait]
 impl LakePartDeleteAuthority for Seams {
     async fn worker_supports_lake_part_delete(&self) -> Result<bool> {
-        self.fence.wait_current(&self.shared).await?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Capability {
-            schema_version: u8,
-            contract: String,
-            operations: Vec<String>,
-        }
-        let capability: Capability = self
-            .worker_post(WORKER_CAPABILITIES_PATH, &serde_json::json!({"schema_version": DELETE_CONTROL_SCHEMA_VERSION}))
-            .await?;
-        let supported = capability.schema_version == DELETE_CONTROL_SCHEMA_VERSION
-            && capability.contract == DELETE_CONTROL_CONTRACT
-            && capability.operations.iter().any(|op| op == OPERATION);
-        Ok(supported)
+        Ok(self.worker_operations().await?.iter().any(|op| op == OPERATION))
+    }
+
+    async fn worker_supports_quarantine_expiry(&self) -> Result<bool> {
+        let operations = self.worker_operations().await?;
+        Ok(operations.iter().any(|op| op == OPERATION)
+            && operations.iter().any(|op| op == crate::lake_part_gc::quarantine_expiry::QUARANTINE_OPERATION))
     }
 
     async fn authorize(&self, request: &LakePartDeleteRequest) -> Result<LakePartDeletePermit> {
@@ -2455,6 +2527,9 @@ impl LakePartDeleteAuthority for Seams {
     async fn retire(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeleteReceipt> {
         self.catalog_receipt(permit).await?;
         let receipt: LakePartDeleteReceipt = self.worker_post(WORKER_RETIRE_PATH, permit).await?;
+        if Self::is_quarantine(permit)? {
+            return Ok(receipt);
+        }
         if receipt.verify(permit).is_ok() {
             self.receipted
                 .lock()
@@ -2488,6 +2563,13 @@ impl PartObjectLister for R2PartLister {
 
     async fn list_part_objects(&self, prefix: &str) -> Result<Vec<ListedPartObject>> {
         self.0.list_part_objects(prefix).await
+    }
+
+    async fn get_small_object(&self, key: &str, limit: usize) -> Result<Option<Vec<u8>>> {
+        use crate::parts::part_log::ObjectStore;
+        let bytes = self.0.get(key).await?;
+        ensure!(bytes.as_ref().is_none_or(|bytes| bytes.len() <= limit), "object is over {limit} bytes");
+        Ok(bytes)
     }
 
     async fn list_selected_part_objects(
@@ -2651,15 +2733,24 @@ mod tests {
             inner: ChainReader,
             in_flight: std::sync::atomic::AtomicUsize,
             started: std::sync::Mutex<Vec<(u64, usize)>>,
+            delay_once: std::sync::Mutex<std::collections::BTreeMap<u64, Duration>>,
+        }
+
+        /// Speculative reads are cancelled at a slice boundary. Their fixture
+        /// occupancy must fall too, or a serial resume could falsely look parallel.
+        struct LatencyFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for LatencyFlight<'_> {
+            fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
         }
 
         #[async_trait]
         impl PartLogReader for LatencyReader {
             async fn verified_entry(&self, seq: u64) -> Result<Option<VerifiedEntryBytes>> {
                 let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let _flight = LatencyFlight(&self.in_flight);
                 self.started.lock().unwrap().push((seq, now));
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                let delay = self.delay_once.lock().unwrap().remove(&seq).unwrap_or(Duration::from_millis(1));
+                tokio::time::sleep(delay).await;
                 self.inner.verified_entry(seq).await
             }
             async fn newest_checkpoint(&self) -> Result<Option<CheckpointClaim>> {
@@ -2674,26 +2765,68 @@ mod tests {
         /// bounded slices. It used to restart serially (window 1) on every
         /// 2 s slice once the view had a head, so a genesis refold of a
         /// ~19k-entry log ran at one store RTT per entry for most of an hour.
-        #[tokio::test]
+        // This case exercises the entry cap. Freeze Tokio time so unrelated CPU
+        // load cannot turn it into the separate two-second-deadline case below.
+        #[tokio::test(start_paused = true)]
         async fn a_backlog_fold_keeps_its_read_ahead_across_slices() {
             let dir = tempfile::tempdir().unwrap();
             let reader = Arc::new(LatencyReader {
                 inner: ChainReader { chain: chain(VIEW_PERSIST_EVERY + 600), checkpoint: None },
                 in_flight: Default::default(),
                 started: Default::default(),
+                delay_once: Default::default(),
             });
+            let entry_cap_bytes: usize = reader.inner.chain.entries.iter().take(VIEW_PERSIST_EVERY as usize)
+                .map(|(entry, _)| entry.to_bytes().unwrap().len()).sum();
+            assert!(entry_cap_bytes < CATCH_UP_BYTES, "this fixture exercises the entry cap, not the byte cap");
             let gc = pass_with_reader(reader.clone(), dir.path());
             let first = gc.run_pass_now(T0).await.unwrap();
             assert_eq!(first.paused_reason.as_deref(), Some("log_catching_up"));
             assert_eq!(gc.state.lock().await.view.head_seq(), Some(VIEW_PERSIST_EVERY - 1));
+            assert_eq!(reader.in_flight.load(Ordering::SeqCst), 0);
+            let first_slice_reads = reader.started.lock().unwrap().len();
             gc.run_pass_now(T0 + 1).await.unwrap();
             assert_eq!(gc.state.lock().await.view.head_seq(), Some(VIEW_PERSIST_EVERY + 599));
             let started = reader.started.lock().unwrap().clone();
-            let second_slice_start = started.iter().filter(|(seq, _)| (VIEW_PERSIST_EVERY..VIEW_PERSIST_EVERY + 8).contains(seq))
+            let second_slice_start = started[first_slice_reads..].iter().filter(|(seq, _)| (VIEW_PERSIST_EVERY..VIEW_PERSIST_EVERY + 8).contains(seq))
                 .map(|(_, in_flight)| *in_flight).max().unwrap();
             assert!(second_slice_start > 1, "the second slice resumed serially: {second_slice_start}");
             // At the live tail the next slice starts serially again.
             assert_eq!(gc.shared.fold_window.load(Ordering::SeqCst), 1);
+        }
+
+        /// The two-second budget can legitimately stop BEFORE the entry cap.
+        /// Prove that this cursor, its parallelism and speculative-read accounting
+        /// survive a deadline cut, not just an entry-cap cut.
+        #[tokio::test(start_paused = true)]
+        async fn a_backlog_fold_keeps_read_ahead_after_time_cut_and_cancels_speculation() {
+            let dir = tempfile::tempdir().unwrap();
+            let reader = Arc::new(LatencyReader {
+                inner: ChainReader { chain: chain(VIEW_PERSIST_EVERY + 600), checkpoint: None },
+                in_flight: Default::default(), started: Default::default(),
+                delay_once: std::sync::Mutex::new(std::collections::BTreeMap::from([
+                    (0, CATCH_UP_SLICE + Duration::from_millis(1)),
+                    (1, Duration::from_secs(20)),
+                ])),
+            });
+            let gc = pass_with_reader(reader.clone(), dir.path());
+            let began = tokio::time::Instant::now();
+            let first = gc.run_pass_now(T0).await.unwrap();
+            assert!(began.elapsed() >= CATCH_UP_SLICE && began.elapsed() < LOG_READ_TIMEOUT);
+            assert_eq!(first.paused_reason.as_deref(), Some("log_catching_up"));
+            assert_eq!(gc.state.lock().await.view.head_seq(), Some(0), "time budget precedes the entry cap");
+            assert_eq!(reader.in_flight.load(Ordering::SeqCst), 0, "cancelled speculation holds no fixture slots");
+            assert!(gc.shared.fold_window.load(Ordering::SeqCst) > 1);
+            let first_slice_reads = reader.started.lock().unwrap().len();
+            gc.run_pass_now(T0 + 1).await.unwrap();
+            let started = reader.started.lock().unwrap().clone();
+            assert!(started[first_slice_reads..].iter().filter(|(seq, _)| (1..9).contains(seq))
+                .any(|(_, in_flight)| *in_flight > 1), "resume must really be concurrent, not leaked occupancy");
+            assert_eq!(reader.in_flight.load(Ordering::SeqCst), 0);
+            gc.run_pass_now(T0 + 2).await.unwrap();
+            assert_eq!(gc.state.lock().await.view.head_seq(), Some(VIEW_PERSIST_EVERY + 599));
+            assert_eq!(gc.shared.fold_window.load(Ordering::SeqCst), 1);
+            assert_eq!(reader.in_flight.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]

@@ -560,7 +560,7 @@ pub(crate) fn handshake(control: &std::os::fd::OwnedFd, assignment: Value) {
     let (hello, _) = fdpass::recv_json::<ToSupervisor>(control.as_fd())
         .unwrap()
         .unwrap();
-    let ToSupervisor::Hello { pid, protocol_version } = hello else {
+    let ToSupervisor::Hello { pid, protocol_version, .. } = hello else {
         panic!("child did not announce its process: {hello:?}")
     };
     assert_eq!(protocol_version, PROTOCOL_VERSION);

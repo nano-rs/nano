@@ -79,6 +79,15 @@ pub const ENTITY_SIDECAR_PATHS: &[&str] = &[
     "user.email_addr",
     "actor.user.email_addr",
     "actor.process.user.name",
+    // NAN-4664: domain and hash leaves the IOC indicator columns cover. No
+    // scalar bloom answers them (a long mixed-case value has no bounded
+    // spelling set), so before this a domain hunt such as the three-field
+    // `dst_endpoint.domain OR query.hostname OR http_request.url.hostname`
+    // carried no hint and scanned every row group of the window.
+    "dst_endpoint.domain",
+    "src_endpoint.domain",
+    "http_request.url.hostname",
+    "actor.process.file.hashes.value",
 ];
 
 // The contract lives in `crate::search::keyword_sidecar` so the lake
@@ -251,6 +260,7 @@ fn candidate_hint_for_expression(
                 value: exact_text(value).expect("guarded above"),
             })
         }
+        SearchExpr::IocMatch { values, feed: None, lookup: None } if !values.is_empty() => ioc_match_hint(values, profile),
         SearchExpr::Keyword(value) if !value.trim().is_empty() && value.trim() != "*" => {
             // A wildcard keyword (`svch*`, `*svchost*`, `c?d`) compiles to a
             // substring `iLike`, not `hasAllTokens`: its pieces may be PARTIAL
@@ -362,6 +372,45 @@ fn candidate_hint_for_expression(
         }
         _ => None,
     }
+}
+
+/// NAN-4664: an `ioc=` / `ioc in [...]` literal term compiles to one
+/// equality (`col IN (lowered values)`, raw or `lower(col)`) per observable
+/// leaf its value types scope to, so every matching row holds one of the
+/// lowercased values in one of those leaves: the union of those entity
+/// lookups is a candidate superset. Before this the term carried no hint and
+/// every `ioc=` hunt read every row group of its window. Non-ASCII values
+/// (Unicode lowercasing is not the readers' ASCII folding) and unions past
+/// the probe bound get no hint.
+fn ioc_match_hint(values: &[Value], profile: &dyn SchemaProfile) -> Option<CandidateHint> {
+    use crate::query::clickhouse_sql_gen::search_expr::{resolve_ioc_observables, scope_observables};
+    let texts = values
+        .iter()
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>();
+    if texts.iter().any(|text| text.is_empty() || !text.is_ascii()) {
+        return None;
+    }
+    let observables = scope_observables(&resolve_ioc_observables(profile), &texts);
+    let mut alternatives = Vec::new();
+    for observable in &observables {
+        for text in &texts {
+            let hint = CandidateHint::Entity { source_path: observable.logical.to_string(), value: text.to_lowercase() };
+            if !alternatives.contains(&hint) {
+                alternatives.push(hint);
+            }
+        }
+    }
+    if alternatives.is_empty() || alternatives.len() > MAX_CANDIDATE_HINTS {
+        return None;
+    }
+    Some(match <[CandidateHint; 1]>::try_from(alternatives) {
+        Ok([single]) => single,
+        Err(alternatives) => CandidateHint::Any { alternatives },
+    })
 }
 
 /// NAN-3188: the class a positive `class_uid = <integer>` filter requires,

@@ -31,7 +31,9 @@
 
 use anyhow::{bail, ensure, Context, Result};
 use nanosiem_core::parsers::landing_ocsf::LandingOcsfStage;
-use nanosiem_lake_worker::landing::{source_policy, Converter, CredentialRemover, PgLedger, LANDING_PREFIX, REFUSED_PREFIX};
+use nanosiem_lake_worker::landing::{
+    source_policy, BronzeObjects, Converter, CredentialRemover, Ledger, PgLedger, LANDING_PREFIX, REFUSED_PREFIX,
+};
 use opendal::{layers::RetryLayer, services::S3, Operator};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -142,10 +144,11 @@ async fn run(env: Env) -> Result<()> {
     let max_files_per_tick = parsed("NANO_LANDING_MAX_FILES_PER_TICK", 64_usize)?.clamp(1, 10_000);
     let converter = Converter {
         store: env.store()?,
-        ledger: PgLedger { pool: env.pool().await?, lease },
+        ledger: PgLedger::new(env.pool().await?, lease, env.tenant_id.clone()),
         stage: LandingOcsfStage::new(shards).map_err(|e| anyhow::anyhow!("compile the lake storage stage: {e}"))?,
         tenant_id: env.tenant_id.clone(),
         max_files_per_tick,
+        emit: BronzeObjects,
     };
     tracing::info!(
         tenant_id = %env.tenant_id,
@@ -156,7 +159,22 @@ async fn run(env: Env) -> Result<()> {
         "OCSF bucket drop converter started"
     );
     let mut ticks: u64 = 0;
+    // Ledger rows from before migration 374 carry no tenant (NAN-4629). A
+    // pre-374 row stays invisible to this tenant until adopted, so a failed
+    // adoption is retried every tick until it succeeds once.
+    let mut adopted = false;
     loop {
+        if !adopted {
+            match converter.ledger.adopt_legacy_rows().await {
+                Ok((files, sources)) => {
+                    adopted = true;
+                    if files + sources > 0 {
+                        tracing::info!(files, sources, "adopted pre-374 landing ledger rows for this tenant");
+                    }
+                }
+                Err(error) => tracing::warn!(error = %format!("{error:#}"), "adopting pre-374 landing ledger rows failed; retrying"),
+            }
+        }
         match converter.tick().await {
             Ok(report) if report.listed > 0 => tracing::info!(?report, "landing tick"),
             Ok(_) => {}
@@ -312,13 +330,14 @@ async fn add(env: Env, args: &[String]) -> Result<()> {
         _ => anyhow::anyhow!("create log source: {e}"),
     })?;
     sqlx::query(
-        "INSERT INTO landing_sources (source_id, route_key, credential_id, object_user, created_by) \
-         VALUES ($1, $2, $3, $4, 'lean-landing-admin')",
+        "INSERT INTO landing_sources (source_id, route_key, credential_id, object_user, created_by, tenant_id) \
+         VALUES ($1, $2, $3, $4, 'lean-landing-admin', $5)",
     )
     .bind(source_id)
     .bind(&route)
     .bind(credential_id)
     .bind(&access_key)
+    .bind(&env.tenant_id)
     .execute(&mut *tx)
     .await
     .context("create landing source")?;
@@ -379,8 +398,9 @@ async fn revoke(env: Env, args: &[String]) -> Result<()> {
     let source_id: Uuid = args.first().context("revoke needs <source_id>")?.parse().context("source_id is not a UUID")?;
     let pool = env.pool().await?;
     let row: Option<(String, String)> =
-        sqlx::query_as("SELECT object_user, state FROM landing_sources WHERE source_id = $1")
+        sqlx::query_as("SELECT object_user, state FROM landing_sources WHERE source_id = $1 AND tenant_id = $2")
             .bind(source_id)
+            .bind(&env.tenant_id)
             .fetch_optional(&pool)
             .await
             .context("read landing source")?;
@@ -396,9 +416,11 @@ async fn revoke(env: Env, args: &[String]) -> Result<()> {
     }
     let _ = rc.run("admin policy remove", &["admin", "policy", "remove", "nano-root", &policy_name]);
     sqlx::query(
-        "UPDATE landing_sources SET state = 'revoked', revoked_at = COALESCE(revoked_at, NOW()) WHERE source_id = $1",
+        "UPDATE landing_sources SET state = 'revoked', revoked_at = COALESCE(revoked_at, NOW()) \
+          WHERE source_id = $1 AND tenant_id = $2",
     )
     .bind(source_id)
+    .bind(&env.tenant_id)
     .execute(&pool)
     .await
     .context("mark landing source revoked")?;
@@ -413,15 +435,23 @@ async fn list(env: Env) -> Result<()> {
         "SELECT s.source_id, l.name, s.route_key, s.state, \
                 COUNT(f.id) FILTER (WHERE f.state = 'accepted'), COUNT(f.id) FILTER (WHERE f.state = 'refused') \
            FROM landing_sources s JOIN log_sources l ON l.id = s.source_id \
-           LEFT JOIN landing_files f ON f.source_id = s.source_id \
+           LEFT JOIN landing_files f ON f.source_id = s.source_id AND f.tenant_id = s.tenant_id \
+          WHERE s.tenant_id = $1 \
           GROUP BY s.source_id, l.name, s.route_key, s.state, s.created_at ORDER BY s.created_at",
     )
+    .bind(&env.tenant_id)
     .fetch_all(&pool)
     .await
     .context("list landing sources")?;
     println!("{:<36}  {:<8}  {:>8}  {:>8}  {:<24}  NAME", "SOURCE_ID", "STATE", "ACCEPTED", "REFUSED", "ROUTE_KEY");
     for (id, name, route, state, accepted, refused) in rows {
         println!("{id:<36}  {state:<8}  {accepted:>8}  {refused:>8}  {route:<24}  {name}");
+    }
+    // Health: the oldest unfinished landed file (alert past 15 minutes).
+    let ledger = PgLedger::new(pool, Duration::from_secs(600), env.tenant_id.clone());
+    match ledger.backlog_age().await? {
+        Some(age) => println!("backlog age: {}s (oldest unfinished landed file)", age.as_secs()),
+        None => println!("backlog age: none (every landed file is finished)"),
     }
     Ok(())
 }

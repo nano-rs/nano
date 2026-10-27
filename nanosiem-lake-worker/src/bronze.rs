@@ -94,6 +94,24 @@ pub fn clamp_future_event_time(event: &mut Value, ingest_ms: i64) -> bool {
     true
 }
 
+/// NAN-4573: the time a clamped row's source sent, when it is later than
+/// the row's (clamped) `time`: the `metadata.original_time` of a row labelled
+/// [`TIME_CLAMPED_LABEL`] (clamped here, or upstream by the landing stage;
+/// a re-clamp keeps the first original), else `clamped_now`'s pre-clamp
+/// time. Every delivery of the event shares it, whatever its clamp target.
+fn clamped_original_time_ms(event: &Value, clamped_now: Option<i64>) -> Option<i64> {
+    let stored = crate::iceberg::ocsf_time_millis(event.get("time"))?;
+    let labelled = event
+        .pointer("/metadata/labels")
+        .and_then(Value::as_array)
+        .is_some_and(|labels| labels.iter().any(|label| label.as_str() == Some(TIME_CLAMPED_LABEL)));
+    labelled
+        .then(|| crate::iceberg::ocsf_time_millis(event.pointer("/metadata/original_time")))
+        .flatten()
+        .or(clamped_now)
+        .filter(|original| *original > stored)
+}
+
 /// NAN-4336: the ingest time a row is clamped to: its own
 /// `metadata.processed_time` (stamped by the tenant's Vector lake sink or the
 /// landing stage when the row was parsed, so a crash replay of the same
@@ -156,6 +174,14 @@ pub struct BronzeAdmission {
     /// NAN-4336: rows whose `time` was more than [`MAX_FUTURE_EVENT_SKEW_MS`]
     /// past their ingest time and was clamped to it, per source slug.
     pub time_clamped: ClampedSources,
+    /// NAN-4573: the time (epoch ms) each clamped row's source sent, by
+    /// `metadata.uid`: clamped here or upstream (landing), see
+    /// [`clamped_original_time_ms`]. The clamp target is per delivery (its
+    /// object's receipt time or the row's `processed_time`), so two
+    /// deliveries of one event can land in different event hours; the uid
+    /// window also keys a clamped row by the hour of this original time,
+    /// which every delivery shares.
+    pub clamped_original_ms: BTreeMap<String, i64>,
     /// Pre-enrichment semantic identities keyed by Vector's stable OCSF UID.
     ///
     /// This is deliberately captured before IOC, IP context, IPinfo, or
@@ -217,6 +243,9 @@ struct AdmittedEvent {
     digest: [u8; 32],
     /// NAN-4336: `time` was clamped to the row's ingest time.
     time_clamped: bool,
+    /// NAN-4573: the source's time (epoch ms) of a clamped row
+    /// ([`clamped_original_time_ms`]).
+    original_time_ms: Option<i64>,
     time_ms: i64,
     event_hour: i32,
     row: EventRow,
@@ -327,7 +356,7 @@ pub fn admit_bronze_files_with_enrichment(
     tenant_id: &str,
     enricher: &BronzeIngestEnricher,
 ) -> Result<BronzeAdmission> {
-    admit_bronze_files_inner(paths, tenant_id, enricher, None, &IngestTimes::now())
+    admit_bronze_files_inner(paths, tenant_id, enricher, None, &IngestTimes::now(), None)
 }
 
 /// NAN-4336: the ingest time ceiling of each admitted file: when its object
@@ -454,8 +483,68 @@ pub fn admit_bronze_files_received(
     times: &IngestTimes,
 ) -> Result<(BronzeAdmission, RefusedRows, RefusedSources)> {
     let mut salvage = Salvage::default();
-    let admission = admit_bronze_files_inner(paths, tenant_id, enricher, Some(&mut salvage), times)?;
+    let admission = admit_bronze_files_inner(paths, tenant_id, enricher, Some(&mut salvage), times, None)?;
     Ok((admission, salvage.rows, salvage.sources))
+}
+
+/// H02 CP34 (pR P2-1): [`admit_bronze_files_received`] over bytes the caller
+/// has ALREADY verified, so the decoded, hashed and counted bytes are exactly
+/// those bytes. The path is only the object's identity (ordering, ingest
+/// times, the admission record); the filesystem is never read.
+pub fn admit_bronze_bytes_received(
+    sources: &[(PathBuf, bytes::Bytes)],
+    tenant_id: &str,
+    enricher: &BronzeIngestEnricher,
+    times: &IngestTimes,
+) -> Result<(BronzeAdmission, RefusedRows, RefusedSources)> {
+    let mut verified = BTreeMap::new();
+    for (path, bytes) in sources {
+        if verified.insert(path.clone(), bytes.clone()).is_some() {
+            bail!("bronze admission source paths must be unique");
+        }
+    }
+    let paths: Vec<PathBuf> = sources.iter().map(|(path, _)| path.clone()).collect();
+    let mut salvage = Salvage::default();
+    let admission = admit_bronze_files_inner(&paths, tenant_id, enricher, Some(&mut salvage), times, Some(&verified))?;
+    Ok((admission, salvage.rows, salvage.sources))
+}
+
+/// Where admission reads each source: the filesystem, or caller-verified bytes.
+struct SourceBytes<'a>(Option<&'a BTreeMap<PathBuf, bytes::Bytes>>);
+impl SourceBytes<'_> {
+    fn verified(&self, path: &Path) -> Result<Option<&bytes::Bytes>> {
+        match self.0 {
+            None => Ok(None),
+            Some(map) => map.get(path).map(Some).context("bronze source is not a verified object"),
+        }
+    }
+    fn validate(&self, path: &Path) -> Result<()> {
+        if self.verified(path)?.is_some() {
+            if !path.is_absolute() || path.extension().and_then(|value| value.to_str()) != Some("parquet") {
+                bail!("bronze source is not one absolute Parquet file");
+            }
+            return Ok(());
+        }
+        validate_source_file(path)
+    }
+    fn len(&self, path: &Path) -> Result<u64> {
+        match self.verified(path)? {
+            Some(bytes) => Ok(bytes.len() as u64),
+            None => Ok(std::fs::metadata(path)?.len()),
+        }
+    }
+    fn sha256(&self, path: &Path) -> Result<String> {
+        match self.verified(path)? {
+            Some(bytes) => Ok(hex::encode(Sha256::digest(bytes))),
+            None => sha256_file(path),
+        }
+    }
+    fn reader(&self, path: &Path, batch_rows: usize) -> Result<parquet::arrow::arrow_reader::ParquetRecordBatchReader> {
+        Ok(match self.verified(path)? {
+            Some(bytes) => ParquetRecordBatchReaderBuilder::try_new(bytes.clone())?.with_batch_size(batch_rows).build()?,
+            None => ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?.with_batch_size(batch_rows).build()?,
+        })
+    }
 }
 
 fn admit_bronze_files_inner(
@@ -464,7 +553,9 @@ fn admit_bronze_files_inner(
     enricher: &BronzeIngestEnricher,
     mut refused: Option<&mut Salvage>,
     times: &IngestTimes,
+    verified: Option<&BTreeMap<PathBuf, bytes::Bytes>>,
 ) -> Result<BronzeAdmission> {
+    let source = SourceBytes(verified);
     if paths.is_empty() || paths.len() > MAX_BRONZE_FILES {
         bail!("bronze admission requires one to {MAX_BRONZE_FILES} files");
     }
@@ -481,6 +572,7 @@ fn admit_bronze_files_inner(
     let mut timings = AdmissionTimings::default();
     let mut identities = AdmittedIdentities::new();
     let mut time_clamped = ClampedSources::new();
+    let mut clamped_original_ms = BTreeMap::new();
     #[cfg(all(feature = "enterprise", target_os = "linux"))]
     let _platform_batch_budget = if enricher.platform.is_some() {
         Some(
@@ -504,8 +596,8 @@ fn admit_bronze_files_inner(
         ];
         let mut pinned_bytes = 0_u64;
         for path in &ordered {
-            validate_source_file(path)?;
-            let bytes = std::fs::metadata(path)?.len();
+            source.validate(path)?;
+            let bytes = source.len(path)?;
             pinned_bytes = pinned_bytes
                 .checked_add(bytes)
                 .context("source bytes overflow")?;
@@ -514,7 +606,7 @@ fn admit_bronze_files_inner(
             }
         }
         for path in &ordered {
-            let digest = sha256_file(path)?;
+            let digest = source.sha256(path)?;
             object_pins.insert(path.clone(), digest);
         }
         stamper.pin_objects(tenant_id, &object_pins.values().cloned().collect::<Vec<_>>(), &legacy)?;
@@ -524,8 +616,8 @@ fn admit_bronze_files_inner(
         rayon::ThreadPoolBuilder::new().num_threads(crate::platform_stamping::ADMISSION_CONCURRENCY).build()
     }).transpose()?;
     for path in &ordered {
-        validate_source_file(path)?;
-        let byte_count = std::fs::metadata(path)?.len();
+        source.validate(path)?;
+        let byte_count = source.len(path)?;
         source_bytes = source_bytes
             .checked_add(byte_count)
             .context("bronze source byte count overflow")?;
@@ -536,9 +628,7 @@ fn admit_bronze_files_inner(
         let group_rows = if enricher.platform.is_some() { crate::platform_stamping::CLAIM_GROUP_ROWS } else { 8_192 };
         #[cfg(not(all(feature = "enterprise", target_os = "linux")))]
         let group_rows = 8_192;
-        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?
-            .with_batch_size(group_rows)
-            .build()?;
+        let reader = source.reader(path, group_rows)?;
         let before = source_rows;
         let ceiling_ms = times.ceiling(path);
         for batch in reader {
@@ -630,6 +720,9 @@ fn admit_bronze_files_inner(
                 if admitted.time_clamped {
                     *time_clamped.entry(SourceKey::of(&admitted.row.ocsf_event).source_slug).or_default() += 1;
                 }
+                if let Some(original_ms) = admitted.original_time_ms {
+                    clamped_original_ms.insert(admitted.event_uid.clone(), original_ms);
+                }
                 merge_admission_timings(&mut timings, &admitted.timings);
                 merge_enrichment_metrics(&mut enrichment, &admitted.enrichment);
                 insert_admitted_event(&mut identities, admitted)?;
@@ -642,7 +735,7 @@ fn admit_bronze_files_inner(
         #[cfg(all(feature = "enterprise", target_os = "linux"))]
         if let Some(stamper) = &enricher.platform {
             let object = object_pins.get(path).context("platform source object pin required")?;
-            anyhow::ensure!(sha256_file(path)? == *object, "bronze object changed before sidecar commit");
+            anyhow::ensure!(source.sha256(path)? == *object, "bronze object changed before sidecar commit");
             stamper.flush_object(object)?;
         }
         files.push(BronzeFileAdmission {
@@ -651,7 +744,7 @@ fn admit_bronze_files_inner(
             bytes: byte_count,
             sha256: {
                 let hash_start = std::time::Instant::now();
-                let digest = sha256_file(path)?;
+                let digest = source.sha256(path)?;
                 if object_pins
                     .get(path)
                     .is_some_and(|pinned| pinned != &digest)
@@ -750,6 +843,7 @@ fn admit_bronze_files_inner(
         files,
         batch: NormalizedEventBatch::from_admitted(tenant_id, normalized)?,
         time_clamped,
+        clamped_original_ms,
         source_identity_digests,
     })
 }
@@ -924,6 +1018,7 @@ fn admit_event(
     // a redelivery is still the same event) and before decoration and
     // normalization (so the part, its event hour and the reservation's
     // max_event_time all see the clamped time).
+    let pre_clamp_ms = crate::iceberg::ocsf_time_millis(event.get("time"));
     let time_clamped = match ingest_ceiling_ms {
         Some(ceiling) => {
             let ingest_ms = row_ingest_ms(&event, ceiling);
@@ -931,6 +1026,7 @@ fn admit_event(
         }
         None => false,
     };
+    let original_time_ms = clamped_original_time_ms(&event, pre_clamp_ms.filter(|_| time_clamped));
     #[cfg(all(feature = "enterprise", target_os = "linux"))]
     let mut platform = enricher
         .platform
@@ -1024,6 +1120,7 @@ fn admit_event(
         event_uid,
         digest,
         time_clamped,
+        original_time_ms,
         time_ms,
         event_hour,
         row: normalized,

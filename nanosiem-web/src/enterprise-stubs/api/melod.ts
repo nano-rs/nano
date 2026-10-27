@@ -14,9 +14,9 @@ import type {
   MelodEditParserRequest,
   GenerateDashboardRequest,
   DraftPlaybookRequest,
+  DraftFlowRequest,
+  EditTurnRequest,
   RefineDashboardRequest,
-  FetchUrlForDetectionResponse,
-  GenerateDetectionHintsRequest,
   AiAvailability,
   TenantAiSettings,
   UpdateTenantAiSettingsRequest,
@@ -101,19 +101,17 @@ export class MelodApi {
   melodDraftPlaybook(_request: DraftPlaybookRequest): Promise<MelodJobStartResponse> {
     return ENTERPRISE_ONLY();
   }
+  melodDraftFlow(_request: DraftFlowRequest): Promise<MelodJobStartResponse> {
+    return ENTERPRISE_ONLY();
+  }
+  melodEditTurn(_request: EditTurnRequest): Promise<MelodJobStartResponse> {
+    return ENTERPRISE_ONLY();
+  }
   melodGetDashboardJob(_jobId: string): Promise<MelodJobStatusResponse> {
     return ENTERPRISE_ONLY();
   }
   melodRefineDashboard(
     _request: RefineDashboardRequest,
-  ): Promise<MelodJobStartResponse> {
-    return ENTERPRISE_ONLY();
-  }
-  fetchUrlForDetection(_url: string): Promise<FetchUrlForDetectionResponse> {
-    return ENTERPRISE_ONLY();
-  }
-  generateDetectionHints(
-    _request: GenerateDetectionHintsRequest,
   ): Promise<MelodJobStartResponse> {
     return ENTERPRISE_ONLY();
   }

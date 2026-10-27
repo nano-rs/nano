@@ -264,8 +264,14 @@ pub struct HostedJobPage {
 }
 
 #[derive(Clone)]
+enum CoordinatorBackend {
+    Hosted(HostedCoordinatorTransport),
+    Postgres(Arc<super::job_coordinator_postgres::PostgresJobCoordinator>),
+}
+
+#[derive(Clone)]
 pub struct HostedCoordinatorClient {
-    transport: HostedCoordinatorTransport,
+    backend: CoordinatorBackend,
     tenant: SearchTenantScope,
     assignment: HostedAssignment,
     epoch: String,
@@ -383,6 +389,26 @@ impl HostedCoordinatorClient {
         policy: HostedCoordinatorPolicy,
         signer: Arc<DurableJobSigningKey>,
     ) -> Result<Self, DurableJobStoreError> {
+        Self::new_backend(
+            CoordinatorBackend::Hosted(transport),
+            tenant,
+            assignment,
+            epoch,
+            role,
+            policy,
+            signer,
+        )
+    }
+
+    fn new_backend(
+        backend: CoordinatorBackend,
+        tenant: SearchTenantScope,
+        assignment: HostedAssignment,
+        epoch: String,
+        role: HostedCoordinatorRole,
+        policy: HostedCoordinatorPolicy,
+        signer: Arc<DurableJobSigningKey>,
+    ) -> Result<Self, DurableJobStoreError> {
         tenant
             .require_retention_identity()
             .map_err(|_| rejected())?;
@@ -396,7 +422,7 @@ impl HostedCoordinatorClient {
             return Err(rejected());
         }
         Ok(Self {
-            transport,
+            backend,
             tenant,
             assignment,
             epoch,
@@ -405,6 +431,34 @@ impl HostedCoordinatorClient {
             signer,
             history: Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+
+    pub(super) async fn connect_postgres(
+        coordinator: Arc<super::job_coordinator_postgres::PostgresJobCoordinator>,
+        config: &super::job_coordinator_postgres::PostgresJobConfig,
+        role: HostedCoordinatorRole,
+        signer: Arc<DurableJobSigningKey>,
+    ) -> Result<Self, DurableJobStoreError> {
+        let client = Self::new_backend(
+            CoordinatorBackend::Postgres(coordinator),
+            config.tenant,
+            config.assignment,
+            config.epoch.clone(),
+            role,
+            config.policy,
+            signer,
+        )?;
+        client.attest().await?;
+        Ok(client)
+    }
+
+    /// Sovereign history cache is advisory: its bytes never substitute for a
+    /// current grant or a durable namespace read, including during PG outage.
+    pub(super) async fn revalidate_history(&self) -> Result<(), DurableJobStoreError> {
+        if matches!(&self.backend, CoordinatorBackend::Postgres(_)) {
+            self.attest().await?;
+        }
+        Ok(())
     }
 
     /// Must pass before runtime startup. Missing storage, wrong token namespace,
@@ -433,6 +487,21 @@ impl HostedCoordinatorClient {
             .tenant
             .require_retention_identity()
             .map_err(|_| rejected())?;
+        if let CoordinatorBackend::Postgres(coordinator) = &self.backend {
+            return serde_json::to_string(&(
+                "nano-sovereign-job-v1",
+                coordinator.signing_namespace()?,
+                self.signer.tenant_id(),
+                revision,
+                days,
+                floor,
+                self.assignment.entitlement_revision,
+                self.assignment.worker_revision,
+                &self.epoch,
+                id,
+            ))
+            .map_err(|_| rejected());
+        }
         serde_json::to_string(&(
             "nano-hosted-job-v2",
             self.signer.tenant_id(),
@@ -660,7 +729,10 @@ impl HostedCoordinatorClient {
             || job.created <= 0
             || job.created as u64 > MAX_SAFE_INTEGER
             || job.progress.is_some_and(|n| n > 100)
-            || job.phase.as_deref().is_some_and(|phase| !valid_phase(phase))
+            || job
+                .phase
+                .as_deref()
+                .is_some_and(|phase| !valid_phase(phase))
             || job.error.as_ref().is_some_and(|s| s.len() > 1024)
             || job.owner.as_ref().is_some_and(|s| !valid_id(s))
         {
@@ -751,7 +823,10 @@ impl HostedCoordinatorClient {
             || job.result.is_some()
             || job.completed.is_some()
             || job.progress.is_some_and(|n| n > 100)
-            || job.phase.as_deref().is_some_and(|phase| !valid_phase(phase))
+            || job
+                .phase
+                .as_deref()
+                .is_some_and(|phase| !valid_phase(phase))
             || job.error.as_ref().is_some_and(|s| s.len() > 1024)
             || job.execution_failures >= self.policy.max_execution_failures
             || job.lease_recoveries >= self.policy.max_lease_recoveries
@@ -842,6 +917,15 @@ impl HostedCoordinatorClient {
             claim.claim.fence,
             result,
         )?;
+        if matches!(&self.backend, CoordinatorBackend::Postgres(_)) {
+            result
+                .verify_retention_for_range(
+                    self.tenant,
+                    &claim.claim.request.time_range,
+                    Utc::now(),
+                )
+                .map_err(|_| rejected())?;
+        }
         command["result"] = json!(serde_json::to_string(result).map_err(|_| rejected())?);
         Ok(command)
     }
@@ -869,7 +953,13 @@ impl HostedCoordinatorClient {
         result.verify_tenant(self.tenant).map_err(|_| rejected())?;
         let tenant = self.signer.tenant_id().to_string();
         let tenant_hash = hex::encode(Sha256::digest(tenant.as_bytes()));
-        let expected=format!("s3://nano-shared-r2-{tenant}/{tenant}/durable-query-result/v1/tenant-{tenant_hash}/job-{id}/attempt-attempt-{attempt}-fence-{fence}/manifest.json");
+        let prefix = match &self.backend {
+            CoordinatorBackend::Hosted(_) => format!("s3://nano-shared-r2-{tenant}/{tenant}"),
+            CoordinatorBackend::Postgres(coordinator) => coordinator.result_prefix(),
+        };
+        let expected = format!(
+            "{prefix}/durable-query-result/v1/tenant-{tenant_hash}/job-{id}/attempt-attempt-{attempt}-fence-{fence}/manifest.json"
+        );
         if result.manifest_uri != expected
             || result.manifest_sha256.len() != 64
             || !result
@@ -904,7 +994,10 @@ impl HostedCoordinatorClient {
     pub async fn release_claim(&self, claim: &HostedClaim) -> Result<bool, DurableJobStoreError> {
         let mut command = self.stamp(claim, "release_claim")?;
         command["epoch"] = json!(self.epoch);
-        match self.transport.execute_detailed(&command).await {
+        let CoordinatorBackend::Hosted(transport) = &self.backend else {
+            return self.boolean(command).await;
+        };
+        match transport.execute_detailed(&command).await {
             Ok(value) => value.as_bool().ok_or_else(rejected),
             Err(failure)
                 if matches!(
@@ -939,10 +1032,13 @@ impl HostedCoordinatorClient {
     }
     async fn execute(&self, mut command: Value) -> Result<Value, DurableJobStoreError> {
         command["epoch"] = json!(self.epoch);
-        self.transport
-            .execute_detailed(&command)
-            .await
-            .map_err(unavailable)
+        match &self.backend {
+            CoordinatorBackend::Hosted(transport) => transport
+                .execute_detailed(&command)
+                .await
+                .map_err(unavailable),
+            CoordinatorBackend::Postgres(coordinator) => coordinator.execute(&command).await,
+        }
     }
     async fn boolean(&self, command: Value) -> Result<bool, DurableJobStoreError> {
         self.execute(command).await?.as_bool().ok_or_else(rejected)

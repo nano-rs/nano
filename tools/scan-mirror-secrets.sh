@@ -63,7 +63,15 @@ PATTERNS+='|-----BEGIN [A-Z ]*PRIVATE KEY-----[[:space:]]*[A-Za-z0-9+/]{40,}'
 #
 #   AKIAIOSFODNN7EXAMPLE — AWS's own published documentation example key,
 #                          used as a test fixture in nanosiem-core/src/crypto.rs.
+#   tools/log-blaster/tenzir/fixtures/{raw,mapped}.ndjson AKIA<16 hex> —
+#                          synthetic CloudTrail access key ids from the
+#                          log-blaster corpus generators (NAN-4679). AWS key
+#                          ids are base32 (A-Z, 2-7); these are hex and every
+#                          one carries a 0/1/8/9, so none can be a real key.
+#                          Scoped to those two files and to a hex id that
+#                          holds a non-base32 digit.
 ALLOW='AKIAIOSFODNN7EXAMPLE'
+ALLOW+='|/tools/log-blaster/tenzir/fixtures/(raw|mapped)\.ndjson:[0-9]+:.*AKIA[0-9A-F]{0,15}[0189][0-9A-F]{0,15}([^0-9A-Z]|$)'
 
 # Real AWS account ids. Not a credential, but an identifier that pins the
 # published tree to a live account: it names S3 buckets, and every ARN built
@@ -113,7 +121,12 @@ ACCOUNT_PATTERNS+='|[Aa][Cc][Cc][Oo][Uu][Nn][Tt]([[:space:]]+([Ii][Dd]|[Nn][Oo]\
 #                  source-config assume-role tests.
 #   234567890123 — ascending-sequence fixture in the nPL parser tests
 #                  (`account=234567890123`) and the synthetic CloudTrail corpus.
+#   345678901234, 456789012345 — the next two steps of that ascending
+#                  sequence, used by the same synthetic CloudTrail generators;
+#                  allowed only in the two log-blaster Tenzir fixtures that
+#                  carry them (NAN-4679).
 ACCOUNT_ALLOW='000000000000|123456789012|210987654321|234567890123'
+ACCOUNT_ALLOW+='|/tools/log-blaster/tenzir/fixtures/(raw|mapped)\.ndjson:[0-9]+:.*(345678901234|456789012345)'
 
 # Hosted identifiers (NAN-3861): the hosted Cloudflare account id and the
 # internal lean tenant ids. Neither is a credential, but the account id pins

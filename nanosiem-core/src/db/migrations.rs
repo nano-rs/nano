@@ -36,7 +36,7 @@
 //!    deployments.
 
 use sqlx::migrate::Migrator;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgConnection, PgPool, Postgres};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -89,6 +89,11 @@ pub enum MigrationError {
     /// table-exists probe fails.
     #[error("nan-922 collision repair failed: {0}")]
     RepairFailed(#[source] sqlx::Error),
+
+    /// Acquiring the single migration session, or restoring its session
+    /// state after the open chain (NAN-4461), failed.
+    #[error("migration session setup failed: {0}")]
+    SessionFailed(#[source] sqlx::Error),
 }
 
 /// Mode for [`run_postgres_migrations`], controlled by the
@@ -212,12 +217,16 @@ const NAN922_BRAND_RENAME_DESCRIPTION: &str = "brand rename system ai";
 /// Errors are not silenced: callers receive [`MigrationError::RepairFailed`]
 /// so a broken privilege model surfaces as a boot failure rather than
 /// half-fixing the DB and proceeding.
-pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Error> {
+pub async fn repair_nan922_185_collision<'c, A>(conn: A) -> Result<(), sqlx::Error>
+where
+    A: Acquire<'c, Database = Postgres>,
+{
+    let mut conn = conn.acquire().await?;
     let has_sqlx_table: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_name = '_sqlx_migrations')",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if !has_sqlx_table {
         return Ok(());
@@ -225,7 +234,7 @@ pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Erro
 
     let row_185: Option<(String,)> =
         sqlx::query_as("SELECT description FROM public._sqlx_migrations WHERE version = 185")
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await?;
     let Some((description_185,)) = row_185 else {
         return Ok(());
@@ -237,7 +246,7 @@ pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Erro
     let has_187: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version = 187)",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     if has_187 {
         return Ok(());
@@ -254,7 +263,7 @@ pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Erro
          WHERE version = 185 AND description = $1",
     )
     .bind(NAN922_BRAND_RENAME_DESCRIPTION)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     Ok(())
@@ -280,7 +289,7 @@ pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Erro
 /// `migrations_to_backfill` helper isolates the filter so it can be
 /// unit-tested without a real PG.
 async fn backfill_legacy_migration_history(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     migrator: &Migrator,
 ) -> Result<(), sqlx::Error> {
     // Schema-qualify everything as `public.*`. The snapshot's pg_dump
@@ -297,7 +306,7 @@ async fn backfill_legacy_migration_history(
             execution_time BIGINT NOT NULL \
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     let mut count = 0usize;
@@ -311,7 +320,7 @@ async fn backfill_legacy_migration_history(
         .bind(migration.version)
         .bind(migration.description.as_ref())
         .bind(migration.checksum.as_ref())
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         count += 1;
     }
@@ -386,24 +395,38 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
         },
     };
 
+    // NAN-4461: every step that can change session state runs on ONE
+    // connection, which is returned to the caller's pool with the session
+    // state a freshly opened connection has. The snapshot's pg_dump preamble
+    // and core 001 both `SET row_security = off` session-wide; left on a
+    // pooled connection it leaks into whatever runs next on that pool (the
+    // enterprise overlay). There, on an activated role contract, the
+    // owner-held SECURITY DEFINER playbook-ACL trigger bodies fired by a
+    // `role_permissions` write (9014310 and later) read the FORCE-RLS
+    // `playbook_permissions` with row_security=off and fail with 42501
+    // "query would be affected by row-level security policy". A live
+    // release migrate Job never ran 001 in its own session, so the overlay
+    // must see the same session here, deterministically, whichever pooled
+    // connection serves it.
+    let mut conn = pool.acquire().await.map_err(MigrationError::SessionFailed)?;
+
     if take_fresh_path {
         info!("Applying open-init snapshot (migrations/postgres-open/000_open_init.sql)");
         sqlx::raw_sql(OPEN_INIT_SNAPSHOT)
-            .execute(pool)
+            .execute(&mut *conn)
             .await
             .map_err(MigrationError::SnapshotFailed)?;
         // Defense-in-depth: `tools/nan749_split_open_overlay.py` strips
         // `set_config('search_path', '', false)` from the snapshot at
         // generation time (load-bearing fix), but if a regenerated
-        // snapshot ever ships with that line restored — or if a pool
-        // connection reuses session state from elsewhere — RESET
-        // search_path here ensures `public.*` resolves for the
-        // subsequent backfill INSERTs and `migrator.run()`.
+        // snapshot ever ships with that line restored, RESET search_path
+        // here ensures `public.*` resolves for the subsequent backfill
+        // INSERTs and `migrator.run()`.
         sqlx::query("RESET search_path")
-            .execute(pool)
+            .execute(&mut *conn)
             .await
             .map_err(MigrationError::SnapshotFailed)?;
-        backfill_legacy_migration_history(pool, &open_migrator)
+        backfill_legacy_migration_history(&mut conn, &open_migrator)
             .await
             .map_err(MigrationError::BackfillFailed)?;
         info!("Open-init snapshot applied; legacy history backfilled");
@@ -414,12 +437,20 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
     // on fresh DBs (signal: _sqlx_migrations absent), DBs that already
     // applied the new 185 (signal: description mismatch), and DBs that have
     // already self-healed (signal: 187 row present).
-    repair_nan922_185_collision(pool)
+    repair_nan922_185_collision(&mut *conn)
         .await
         .map_err(MigrationError::RepairFailed)?;
 
     info!("Running PostgreSQL migrations (sqlx::migrate!('../migrations/postgres'))");
-    open_migrator.run(pool).await?;
+    open_migrator.run(&mut *conn).await?;
+    // NAN-4461: undo the snapshot / 001 session-wide `row_security = off`.
+    // RESET restores the role/database default a fresh session starts with
+    // (on, unless an operator configured otherwise), i.e. exactly what a
+    // live upgrade Job's overlay run sees.
+    sqlx::query("RESET row_security")
+        .execute(&mut *conn)
+        .await
+        .map_err(MigrationError::SessionFailed)?;
     info!("PostgreSQL migrations complete");
     Ok(())
 }

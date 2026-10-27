@@ -91,14 +91,12 @@ import {
   type RuleVersionSummary,
   type ViewMode,
 } from '@/components/rule-editor';
-import { NewRuleAiPanel } from '@/enterprise/components/rule-editor/NewRuleAiPanel';
-import { AiTuningPanel } from '@/enterprise/components/detection/AiTuningPanel';
-import { useTuningWizardListener, TUNING_WIZARD_EVENT } from '@/hooks/use-tuning-wizard-listener';
-import { useAiTuningMode, AI_TUNING_OFF_EXPLANATION } from '@/hooks/use-ai-tuning-mode';
+import { usePivtCommands } from '@/enterprise/components/pivt/commands/router';
+import { useRuleEditBridge, type PivtRuleEdit } from '@/hooks/use-rule-edit-bridge';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { UpstreamMergeModal } from '@/components/repositories/UpstreamMergeModal';
 import { ruleDiffAccess } from '@/components/repositories/repository-action-policy';
-import type { AiTriageHints, CaseVisibility, GeneratedDetection, TestDetectionResult } from '@/lib/api/types';
+import type { AiTriageHints, CaseVisibility, TestDetectionResult } from '@/lib/api/types';
 import type { PlaybookSelectorMode } from '@/enterprise/components/detection/editor/RulePlaybookSelector';
 
 /** Cron for a scheduled rule saved without one: every minute (NAN-3468). */
@@ -179,39 +177,21 @@ export function RuleEditorRedesign() {
   const [lastTest, setLastTest] = useState<TestDetectionResult | null>(null);
   const [testDrawerOpen, setTestDrawerOpen] = useState(false);
   const [validationDetailsOpen, setValidationDetailsOpen] = useState(false);
-  // New-rule AI panel — shown by default in new-rule mode so the narrative /
-  // batch-generation entry point is visible next to a blank template. Closable.
-  // NAN-2356: NewRuleAiPanel is enterprise and renders nothing in open builds.
-  // It used to default OPEN for a new rule, so an open-core operator started the
-  // create flow with an invisible panel held open and no way to close it.
+  // NAN-4595: drafting a new rule from a narrative runs in the pivt panel
+  // (`@detection`); its "Open in editor" lands here through the rule-editor
+  // bridge. The old auto-open NewRuleAiPanel aside is gone.
   const { capabilities } = useCapabilities();
   // NAN-2361: the hosted-shared lake has no materialized-view real-time path;
   // shared authoring accepts scheduled rules only. Default to scheduled and
   // never offer the real-time flip there.
   const sharedLake = user?.deployment_mode === 'enterprise_shared';
   const defaultDetectionMode: 'realtime' | 'scheduled' = sharedLake ? 'scheduled' : 'realtime';
-  const [aiPanelOpen, setAiPanelOpen] = useState(isNewMode && capabilities.melod);
-  // NAN-3208: the AI tuning wizard. The Tune action and pivt `@tune` dispatch
-  // `pivt:open-tuning-wizard`; this editor is the listener for the focused
-  // saved rule (nothing listened after NAN-484, so the wizard never opened).
+  // NAN-4590: AI tuning runs in the pivt panel (panel-first, NAN-4588). The
+  // Tune action sends `@tune`; pivt reads this editor and writes accepted
+  // suggestions back through the rule-editor bridge below. A tenant that
+  // turned AI tuning off (NAN-3219) gets the explanation in pivt.
   const aiTuningAvailable = capabilities.melod && capabilities.aiTuning;
-  const tuningWizard = useTuningWizardListener(
-    !isNewMode ? id : undefined,
-    aiTuningAvailable && canEdit,
-  );
-  // NAN-3219: a tenant that turned AI tuning off gets an explanation instead
-  // of the wizard, from the Tune action and from pivt `@tune` alike (the
-  // backend refuses the tune job too).
-  const { mode: aiTuningMode } = useAiTuningMode(aiTuningAvailable);
-  const tuningOffTenantWide = aiTuningMode === 'off';
-  const tuningWizardSeq = tuningWizard.request?.seq;
-  const closeTuningWizard = tuningWizard.close;
-  useEffect(() => {
-    if (tuningWizardSeq === undefined || !tuningOffTenantWide) return;
-    toast.error('AI tuning is off', { description: AI_TUNING_OFF_EXPLANATION });
-    closeTuningWizard();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tuningWizardSeq, tuningOffTenantWide]);
+  const { dispatch: pivtDispatch } = usePivtCommands();
   // `?merge=upstream` entry point — Rule Repositories page sends analysts
   // here when they click "Merge upstream" on a forked rule. Open the modal
   // once; after they apply or close, we leave the URL param alone (clearing
@@ -842,10 +822,9 @@ export function RuleEditorRedesign() {
       });
       return;
     }
-    // Same event pivt `@tune` fires; `useTuningWizardListener` opens the
-    // wizard for this rule (NAN-3208).
-    window.dispatchEvent(new CustomEvent(TUNING_WIZARD_EVENT, { detail: { ruleId: id } }));
-  }, [id, aiTuningAvailable]);
+    // Same as typing `@tune` in pivt on this rule: tunes in the pivt panel.
+    pivtDispatch('@tune');
+  }, [aiTuningAvailable, pivtDispatch]);
 
   // Rail row actions — act on any rule in the list, not just the focused one.
   // Each short-circuits into the same mutation hooks the topbar uses.
@@ -986,6 +965,47 @@ export function RuleEditorRedesign() {
     setTriageHints(next);
     setTriageHintsChanged(true);
   }, []);
+
+  // NAN-4590: rule-editor bridge for pivt panel runs. pivt reads the focused
+  // rule (query, hints, access) and writes accepted suggestions (a tuned
+  // query, triage hints) into the buffer as unsaved edits; Save then writes
+  // the rule version + audit like any hand edit.
+  const applyPivtEdit = useCallback((edit: PivtRuleEdit) => {
+    if (edit.kind === 'query') {
+      setEditorContent((prev) => serializeDetectionMetadata(parseDetectionMetadata(prev).metadata, edit.query));
+    } else if (edit.kind === 'content') {
+      // NAN-4595: a pivt-drafted rule for the new-rule editor. Fill what the
+      // draft leaves to the editor (author, default detection mode).
+      const draft = parseDetectionMetadata(edit.content);
+      setEditorContent(
+        serializeDetectionMetadata(
+          {
+            ...draft.metadata,
+            author: draft.metadata.author || user?.name || '',
+            detection_mode: draft.metadata.detection_mode || defaultDetectionMode,
+          },
+          draft.query,
+        ),
+      );
+    } else {
+      handleHintsChange(edit.hints);
+      setInspectorCollapsed(false);
+    }
+  }, [handleHintsChange, user?.name, defaultDetectionMode]);
+  useRuleEditBridge({
+    ready: isNewMode || (!ruleLoading && apiRule?.id === id && savedContent !== ''),
+    snapshot: {
+      ruleId: isNewMode ? null : (id ?? null),
+      ruleName: apiRule?.name || metadata.title || '',
+      query: actualQuery,
+      hints: triageHints,
+      canEdit,
+      tuneAvailable: aiTuningAvailable,
+    },
+    onApply: applyPivtEdit,
+    navState: location.state,
+    clearNavState: () => navigate(`${location.pathname}${location.search}${location.hash}`, { replace: true, state: null }),
+  });
 
   const handleRunTest = useCallback(async () => {
     try {
@@ -1235,84 +1255,6 @@ export function RuleEditorRedesign() {
         onPendingVersionConsumed={() => setPendingVersionFocusId(null)}
       />
 
-      {/* Mounted only while open: the panel fetches the rule's alerts and
-          matches on mount, which an idle editor must not pay for. */}
-      {!isNewMode && id && aiTuningAvailable && !tuningOffTenantWide && tuningWizard.request !== null && (
-        <AiTuningPanel
-          key={tuningWizard.request.seq}
-          open
-          onOpenChange={(next) => {
-            if (!next) tuningWizard.close();
-          }}
-          ruleId={id}
-          ruleName={apiRule?.name ?? metadata.title ?? ''}
-          initialFeedback={tuningWizard.request?.prompt}
-          onApplySuggestion={(modifiedQuery) => {
-            // Lands in the editor as an unsaved edit: the analyst reviews and
-            // saves, which writes the rule version + audit like any edit.
-            setEditorContent((prev) =>
-              serializeDetectionMetadata(parseDetectionMetadata(prev).metadata, modifiedQuery),
-            );
-          }}
-        />
-      )}
-
-      {isNewMode && aiPanelOpen && capabilities.melod && (
-        <NewRuleAiPanel
-          initialNarrative={initialNarrative}
-          disabled={!canEdit}
-          onClose={() => setAiPanelOpen(false)}
-          onApply={(det) => {
-            const content = serializeDetectionMetadata(
-              {
-                title: det.name,
-                description: det.description || '',
-                author: user?.name || '',
-                severity: (det.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low',
-                mode: 'staging',
-                detection_mode: defaultDetectionMode,
-                tags: det.tags?.join(', '),
-                mitre_tactics: det.mitre_tactics?.join(', '),
-                mitre_techniques: det.mitre_techniques?.join(', '),
-              },
-              det.query,
-            );
-            setEditorContent(content);
-          }}
-          onBatchCreate={async (detections: GeneratedDetection[]) => {
-            let created = 0;
-            const failed: string[] = [];
-            for (const det of detections) {
-              try {
-                await createDetection({
-                  name: det.name,
-                  description: det.description,
-                  query: det.query,
-                  severity: (det.severity || 'medium') as 'critical' | 'high' | 'medium' | 'low',
-                  mode: 'staging',
-                  detection_mode: sharedLake ? 'scheduled' : 'real-time',
-                  author: user?.name,
-                  tags: det.tags,
-                  mitre_tactics: det.mitre_tactics,
-                  mitre_techniques: det.mitre_techniques,
-                });
-                created += 1;
-              } catch {
-                failed.push(det.name);
-              }
-            }
-            if (created > 0) {
-              toast.success(`Created ${created} draft rule${created === 1 ? '' : 's'}`);
-              refetchRules();
-            }
-            if (failed.length > 0) {
-              toast.error(`Failed to create ${failed.length} rule${failed.length === 1 ? '' : 's'}`, {
-                description: failed.join(', '),
-              });
-            }
-          }}
-        />
-      )}
 
       {/* Test drawer — absolute-positioned child of the content row so its
           backdrop dims the rule rail + main pane + inspector, and the

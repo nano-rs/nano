@@ -569,6 +569,11 @@ pub struct CgroupTree {
     /// not create the cgroup must not return (and attach its process) before
     /// the creator has written the initial `memory.high` / `cpu.max`.
     init: std::sync::Arc<std::sync::Mutex<()>>,
+    /// NAN-4642: `memory.max` shrinks not yet applied in full, keyed by
+    /// tenant and role leaf (`None` = the tenant cgroup) → the target. The
+    /// written limit sits between the target and the old limit until
+    /// [`CgroupTree::retighten_memory`] can lower it without an OOM.
+    pending_memory: std::sync::Arc<std::sync::Mutex<PendingMemory>>,
     /// Test only: the creator pauses after `mkdir`, widening the window a
     /// concurrent role would attach in without [`Self::init`].
     #[cfg(test)]
@@ -661,6 +666,45 @@ pub(crate) fn read_kv(path: &Path, key: &str) -> Option<u64> {
 
 fn read_u64(path: &Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// NAN-4642: deferred `memory.max` shrinks, (tenant, role leaf or `None`
+/// for the tenant cgroup) → target bytes.
+type PendingMemory = std::collections::HashMap<(TenantId, Option<Role>), u64>;
+
+/// NAN-4642: how far a `memory.max` shrink may go right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShrinkFloor {
+    /// A process in the cgroup is being replaced (stopping, not yet
+    /// exited): keep the written limit. Lowering it under a process that
+    /// is flushing on its way out is what cgroup-OOM-killed a tenant's
+    /// detect on the 2026-10-26 cell-us-1 reload.
+    Hold,
+    /// Never below `memory.current` (the placement reload itself).
+    Usage,
+    /// Never below what reclaim cannot free: `memory.current` minus the
+    /// clean file LRUs (no swap, so anon, shmem, kernel memory and dirty /
+    /// writeback file pages stay). Used by
+    /// the follow-up ticks so page cache cannot pin the old limit forever.
+    Unreclaimable,
+}
+
+/// NAN-4642: the `memory.max` to write for `target` given the cgroup's
+/// `written` limit (`None` = `max` or unset), its `current` usage and its
+/// `reclaimable` file cache. A grow (or a first write) is the target at
+/// once; a shrink never goes below the floor and never raises the limit.
+pub fn shrink_step(target: u64, written: Option<u64>, current: u64, reclaimable: u64, floor: ShrinkFloor) -> u64 {
+    // `max`/unset: nothing to hold on to; never below usage either.
+    let written = written.unwrap_or(u64::MAX);
+    if target >= written {
+        return target;
+    }
+    let floor = match floor {
+        ShrinkFloor::Hold if written != u64::MAX => written,
+        ShrinkFloor::Hold | ShrinkFloor::Usage => current,
+        ShrinkFloor::Unreclaimable => current.saturating_sub(reclaimable),
+    };
+    target.max(floor).min(written)
 }
 
 /// Write `cpu.max` = `line` into `dir`, and with `burst` also
@@ -804,6 +848,7 @@ impl CgroupTree {
             }
         }
         let tree = Self { slots: Default::default(), root, rel_root, controllers, io_max, io_max_unresolved: None, cpu_max_burst, init: Default::default(),
+            pending_memory: Default::default(),
             #[cfg(test)]
             pause_after_create: None };
         tree.enable_controllers(&tree.root)?;
@@ -1009,6 +1054,12 @@ impl CgroupTree {
     /// watchdog applies the desired throttle / pressure every tick): they are
     /// initialised only when the cgroup is created, never overwritten here.
     pub fn ensure_tenant(&self, t: &TenantId, slot: u32, l: &TenantLimits) -> io::Result<()> {
+        self.ensure_tenant_with_floor(t, slot, l, ShrinkFloor::Usage)
+    }
+
+    /// [`CgroupTree::ensure_tenant`] with the floor a `memory.max` shrink of
+    /// the tenant cgroup may go to now (NAN-4642).
+    pub fn ensure_tenant_with_floor(&self, t: &TenantId, slot: u32, l: &TenantLimits, floor: ShrinkFloor) -> io::Result<()> {
         match self.slots.read().unwrap().get(t) {
             Some(s) if *s != slot => {
                 return Err(io::Error::other(format!("tenant {t} is registered as slot {s}, not {slot}")));
@@ -1030,8 +1081,9 @@ impl CgroupTree {
             std::thread::sleep(pause);
         }
         // Order: raise max before high before low, so no intermediate state
-        // has low > high or high > max rejected or OOMing.
-        write(&dir.join("memory.max"), &l.memory_hard_bytes.to_string())?;
+        // has low > high or high > max rejected or OOMing. A shrink below
+        // what the tenant uses now is deferred (NAN-4642).
+        let max = self.apply_memory_max(t, None, l.memory_hard_bytes, floor)?;
         // memory.high rests at the ceiling (no throttling while the cell
         // has headroom: burst is allowed). The watchdog lowers it toward
         // the soft limit only under memory contention. A static
@@ -1039,7 +1091,7 @@ impl CgroupTree {
         // minutes instead of letting it burst or OOM (measured: 900 MiB
         // against high 512 / max 640 MiB wedged > 10 min).
         if fresh {
-            write(&dir.join("memory.high"), &l.memory_hard_bytes.to_string())?;
+            write(&dir.join("memory.high"), &max.to_string())?;
         }
         write(&dir.join("memory.low"), &l.memory_guarantee_bytes.to_string())?;
         // No swap: a tenant at its ceiling hits its own OOM instead of
@@ -1092,8 +1144,14 @@ impl CgroupTree {
         write(&self.tenant_dir(t).join(role.as_str()).join("cpu.weight"), &request_millicores.clamp(1, 10_000).to_string())
     }
     pub fn set_role_memory(&self, t: &TenantId, role: Role, request_bytes: u64, limit_bytes: u64) -> io::Result<()> {
+        self.set_role_memory_with_floor(t, role, request_bytes, limit_bytes, ShrinkFloor::Usage)
+    }
+
+    /// [`CgroupTree::set_role_memory`] with the floor a `memory.max` shrink
+    /// of the role leaf may go to now (NAN-4642).
+    pub fn set_role_memory_with_floor(&self, t: &TenantId, role: Role, request_bytes: u64, limit_bytes: u64, floor: ShrinkFloor) -> io::Result<()> {
         let leaf = self.tenant_dir(t).join(role.as_str());
-        write(&leaf.join("memory.max"), &limit_bytes.to_string())?;
+        self.apply_memory_max(t, Some(role), limit_bytes, floor)?;
         if role != Role::Query {
             write(&leaf.join("memory.low"), &request_bytes.to_string())?;
         }
@@ -1102,6 +1160,77 @@ impl CgroupTree {
 
     pub fn set_memory_high(&self, t: &TenantId, bytes: u64) -> io::Result<()> {
         write(&self.tenant_dir(t).join("memory.high"), &bytes.to_string())
+    }
+
+    /// NAN-4642: write `target` to the `memory.max` of `t` (`role` = `None`)
+    /// or of its role leaf, but a shrink only as far as `floor` allows; the
+    /// rest stays pending for [`CgroupTree::retighten_memory`]. Returns the
+    /// value written.
+    pub fn apply_memory_max(&self, t: &TenantId, role: Option<Role>, target: u64, floor: ShrinkFloor) -> io::Result<u64> {
+        let dir = match role {
+            Some(r) => self.tenant_dir(t).join(r.as_str()),
+            None => self.tenant_dir(t),
+        };
+        let written = read_u64(&dir.join("memory.max"));
+        let current = read_u64(&dir.join("memory.current")).unwrap_or(0);
+        // Clean file cache only: dirty and under-writeback pages cannot be
+        // dropped by the reclaim a `memory.max` write runs, and a write it
+        // cannot reach by reclaim OOM-kills inside the cgroup.
+        let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+        let kv = |k: &str| stat.lines().find_map(|l| {
+            let mut it = l.split_whitespace();
+            (it.next() == Some(k)).then(|| it.next()?.parse::<u64>().ok()).flatten()
+        }).unwrap_or(0);
+        let reclaimable = kv("active_file").saturating_add(kv("inactive_file"))
+            .saturating_sub(kv("file_dirty").saturating_add(kv("file_writeback")));
+        let value = shrink_step(target, written, current, reclaimable, floor);
+        if written != Some(value) {
+            write(&dir.join("memory.max"), &value.to_string())?;
+        }
+        let key = (t.clone(), role);
+        let mut pending = self.pending_memory.lock().unwrap_or_else(|p| p.into_inner());
+        if value > target {
+            if pending.insert(key, target) != Some(target) {
+                tracing::info!(tenant = %t, role = role.map(|r| r.as_str()).unwrap_or("tenant"), target, written = value,
+                    current, ?floor, "memory.max shrink deferred: usage is above the new limit");
+            }
+        } else if pending.remove(&key).is_some() {
+            tracing::info!(tenant = %t, role = role.map(|r| r.as_str()).unwrap_or("tenant"), target, "memory.max shrink applied");
+        }
+        Ok(value)
+    }
+
+    /// NAN-4642: the limit written while a shrink of `t` (`role` = `None`
+    /// for the tenant cgroup) is still pending, else `None`.
+    pub fn pending_memory_max(&self, t: &TenantId, role: Option<Role>) -> Option<u64> {
+        if !self.pending_memory.lock().unwrap_or_else(|p| p.into_inner()).contains_key(&(t.clone(), role)) {
+            return None;
+        }
+        let dir = match role {
+            Some(r) => self.tenant_dir(t).join(r.as_str()),
+            None => self.tenant_dir(t),
+        };
+        read_u64(&dir.join("memory.max"))
+    }
+
+    /// NAN-4642: lower every pending `memory.max` shrink as far as `floor`
+    /// allows now; a cgroup that is gone drops its entry.
+    pub fn retighten_memory(&self, floor: impl Fn(&TenantId, Option<Role>) -> ShrinkFloor) {
+        let pending: Vec<((TenantId, Option<Role>), u64)> =
+            self.pending_memory.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for ((t, role), target) in pending {
+            let dir = match role {
+                Some(r) => self.tenant_dir(&t).join(r.as_str()),
+                None => self.tenant_dir(&t),
+            };
+            if !dir.exists() {
+                self.pending_memory.lock().unwrap_or_else(|p| p.into_inner()).remove(&(t, role));
+                continue;
+            }
+            if let Err(e) = self.apply_memory_max(&t, role, target, floor(&t, role)) {
+                tracing::warn!(tenant = %t, error = %e, "memory.max retighten failed");
+            }
+        }
     }
 
     pub fn place(&self, pid: u32, t: &TenantId, role: Role) -> io::Result<()> {
@@ -1531,6 +1660,81 @@ mod tests {
         tree2.ensure_tenant(&t, 0, &l).unwrap();
         assert!(!d2.path().join("tenants/s0/cpu.max").exists());
         assert_eq!(rd(&d2.path().join("tenants/s0/memory.low")), (350 * MIB).to_string());
+    }
+
+    #[test]
+    fn shrink_step_grows_at_once_and_never_shrinks_below_the_floor() {
+        use ShrinkFloor::*;
+        // Grow (or equal): the target, whatever the usage.
+        assert_eq!(shrink_step(900, Some(600), 800, 0, Hold), 900);
+        assert_eq!(shrink_step(600, Some(600), 800, 0, Usage), 600);
+        // First write of a fresh cgroup (`max`): the target.
+        assert_eq!(shrink_step(500, None, 0, 0, Usage), 500);
+        // The 2026-10-26 reload: limit 9.0 -> 6.07 GB at 8.33 GB usage.
+        let (old, new, used) = (9_000, 6_070, 8_330);
+        assert_eq!(shrink_step(new, Some(old), used, 3_000, Hold), old, "a stopping process keeps its limit");
+        assert_eq!(shrink_step(new, Some(old), used, 3_000, Usage), used, "a reload never goes below usage");
+        assert_eq!(shrink_step(new, Some(used), used, 3_000, Unreclaimable), new, "cache alone never pins the old limit");
+        assert_eq!(shrink_step(new, Some(used), used, 1_000, Unreclaimable), 7_330, "anon above the target is kept");
+        // Never raised by a growing usage while pending.
+        assert_eq!(shrink_step(new, Some(7_330), 8_000, 0, Usage), 7_330);
+        // Usage under the target: the target.
+        assert_eq!(shrink_step(new, Some(old), 4_000, 0, Usage), new);
+    }
+
+    #[test]
+    fn deferred_shrink_holds_then_retightens_to_the_target() {
+        let d = fake_root("cpu memory pids\n");
+        let tree = CgroupTree::adopt_root(d.path().to_path_buf(), "/".into(), vec![], true).unwrap();
+        let t = TenantId::new("echo").unwrap();
+        let l = TenantLimits { cpu_guarantee_millicores: 50, cpu_ceiling_millicores: 500, cpu_weight: 50,
+            memory_guarantee_bytes: 100 * MIB, memory_soft_bytes: 1000 * MIB, memory_hard_bytes: 1000 * MIB, max_pids: 512, io_weight: 100 };
+        tree.ensure_tenant(&t, 0, &l).unwrap();
+        tree.set_role_memory(&t, Role::Detect, 64 * MIB, 600 * MIB).unwrap();
+        let dir = d.path().join("tenants/s0");
+        let set = |rel: &str, f: &str, v: String| std::fs::write(dir.join(rel).join(f), v).unwrap();
+        set(".", "memory.current", (800 * MIB).to_string());
+        set(".", "memory.stat", format!("anon {}\nactive_file {}\ninactive_file {}\n", 500 * MIB, 200 * MIB, 100 * MIB));
+        set("detect", "memory.current", (550 * MIB).to_string());
+        set("detect", "memory.stat", format!("anon {}\nactive_file 0\ninactive_file 0\n", 550 * MIB));
+        let smaller = TenantLimits { memory_hard_bytes: 500 * MIB, ..l };
+        // Detect is being replaced: neither its leaf nor the tenant shrinks.
+        tree.ensure_tenant_with_floor(&t, 0, &smaller, ShrinkFloor::Hold).unwrap();
+        tree.set_role_memory_with_floor(&t, Role::Detect, 64 * MIB, 256 * MIB, ShrinkFloor::Hold).unwrap();
+        assert_eq!(rd(&dir.join("memory.max")), (1000 * MIB).to_string());
+        assert_eq!(rd(&dir.join("detect/memory.max")), (600 * MIB).to_string());
+        assert_eq!(tree.pending_memory_max(&t, None), Some(1000 * MIB));
+        assert_eq!(tree.pending_memory_max(&t, Some(Role::Detect)), Some(600 * MIB));
+        // Strict (reload/spawn) without a stopping process: down to usage.
+        tree.ensure_tenant_with_floor(&t, 0, &smaller, ShrinkFloor::Usage).unwrap();
+        assert_eq!(rd(&dir.join("memory.max")), (800 * MIB).to_string());
+        // The tick: the old detect exited (its leaf emptied), cache reclaims.
+        set("detect", "memory.current", (10 * MIB).to_string());
+        tree.retighten_memory(|_, _| ShrinkFloor::Unreclaimable);
+        assert_eq!(rd(&dir.join("memory.max")), (500 * MIB).to_string());
+        assert_eq!(rd(&dir.join("detect/memory.max")), (256 * MIB).to_string());
+        assert_eq!(tree.pending_memory_max(&t, None), None);
+        assert_eq!(tree.pending_memory_max(&t, Some(Role::Detect)), None);
+    }
+
+    #[test]
+    fn deferred_shrink_never_counts_dirty_file_pages_as_reclaimable() {
+        let d = fake_root("cpu memory pids\n");
+        let tree = CgroupTree::adopt_root(d.path().to_path_buf(), "/".into(), vec![], true).unwrap();
+        let t = TenantId::new("echo").unwrap();
+        let l = TenantLimits { cpu_guarantee_millicores: 50, cpu_ceiling_millicores: 500, cpu_weight: 50,
+            memory_guarantee_bytes: 100 * MIB, memory_soft_bytes: 1000 * MIB, memory_hard_bytes: 1000 * MIB, max_pids: 512, io_weight: 100 };
+        tree.ensure_tenant(&t, 0, &l).unwrap();
+        let dir = d.path().join("tenants/s0");
+        std::fs::write(dir.join("memory.current"), (800 * MIB).to_string()).unwrap();
+        std::fs::write(dir.join("memory.stat"), format!("anon {}\nactive_file {}\ninactive_file {}\nfile_dirty {}\nfile_writeback {}\n",
+            500 * MIB, 200 * MIB, 100 * MIB, 100 * MIB, 50 * MIB)).unwrap();
+        tree.ensure_tenant(&t, 0, &TenantLimits { memory_hard_bytes: 500 * MIB, ..l }).unwrap();
+        assert_eq!(rd(&dir.join("memory.max")), (800 * MIB).to_string());
+        // 300 MiB of file cache, 150 MiB of it dirty or under writeback.
+        tree.retighten_memory(|_, _| ShrinkFloor::Unreclaimable);
+        assert_eq!(rd(&dir.join("memory.max")), (650 * MIB).to_string());
+        assert_eq!(tree.pending_memory_max(&t, None), Some(650 * MIB));
     }
 
     /// A writer that enforces the kernel's `cpu.max` / `cpu.max.burst`

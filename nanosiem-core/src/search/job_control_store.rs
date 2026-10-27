@@ -506,6 +506,7 @@ where
     F: Fn(&SearchJob) -> Option<T>,
 {
     tokio::time::timeout(Duration::from_secs(5), async {
+        client.revalidate_history().await?;
         let mut snapshot = client.history.lock().await;
         if let Some((at, jobs)) = snapshot.as_ref() {
             if at.elapsed() < Duration::from_secs(2) {

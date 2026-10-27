@@ -60,6 +60,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-jobs");
+    // NAN-4666: sovereign installation facts gate boot; missing or invalid
+    // facts refuse to start.
+    nanosiem_core::sovereign_runtime::require_at_boot()
+        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
     nanosiem_core::crypto::EncryptionService::try_from_env()?;
 
     tracing::info!("Starting NanoSIEM Jobs Service");

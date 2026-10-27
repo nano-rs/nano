@@ -13,7 +13,7 @@ export { SigmaConverter, convertSigmaRule } from './editor/SigmaConverter';
 // Panel components
 export { RightPanel } from './panels/RightPanel';
 export { RulesListPanel } from './panels/RulesListPanel';
-// AiGenerationPanel lifted to @/enterprise/components/detection/panels/AiGenerationPanel (NAN-745).
+// AiGenerationPanel (lifted to enterprise in NAN-745) was removed in NAN-4595: drafting runs in pivt (`@detection`).
 
 // Dialog components
 export { SaveConfirmDialog, DeleteConfirmDialog, ArchiveConfirmDialog } from './dialogs';

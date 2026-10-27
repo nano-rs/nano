@@ -10,6 +10,7 @@ pub mod egress;
 pub mod runner;
 pub mod hosted;
 pub mod lifecycle;
+pub mod activation;
 #[cfg(feature = "enterprise")]
 pub mod hosted_state;
 #[cfg(feature = "enterprise")]
@@ -43,8 +44,32 @@ use schema::SchemaContract;
 
 const CHECKPOINT: &str = "nano.export.planned_at_ms";
 const DIGEST: &str = "nano.export.manifest_sha256";
+/// The catalog round trips of one attempt (session, load, commit).
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
+/// NAN-4614: plus target preparation, which verifies every added byte (a
+/// full read for hosted references): budgeted at this floor rate, so a
+/// bounded batch is never cut off by a timeout sized for metadata alone.
+const ATTEMPT_PREPARE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+const ATTEMPT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 const ATTEMPTS: usize = 3;
+const STAGE_SESSION: usize = 0;
+const STAGE_PREPARE: usize = 1;
+const STAGE_SNAPSHOT: usize = 2;
+const STAGE_COMMIT: usize = 3;
+const TIMED_OUT_IN: [&str; 4] = [
+    "attempt_timeout_catalog_session",
+    "attempt_timeout_target_prepare",
+    "attempt_timeout_snapshot_write",
+    "attempt_timeout_commit",
+];
+
+/// The bound on one commit attempt of `manifest`. This is NOT the caller's
+/// sync budget: the lifecycle sync bounds how many batches it starts, each
+/// commit bounds only its own attempts.
+pub(crate) fn attempt_timeout(manifest: &ExportManifest) -> Duration {
+    let bytes = manifest.add.iter().fold(0u64, |sum, part| sum.saturating_add(part.bytes));
+    (ATTEMPT_TIMEOUT + Duration::from_secs(bytes / ATTEMPT_PREPARE_BYTES_PER_SEC)).min(ATTEMPT_TIMEOUT_MAX)
+}
 
 /// The boundary shared by customer-copy and hosted-reference implementations.
 /// Implementations must verify signed provenance/checksums, inspect each Parquet
@@ -83,6 +108,11 @@ pub struct RestIcebergCommitter {
     target: Arc<dyn ExportTarget>,
     frozen_erasure: bool,
     lifecycle: bool,
+    platform_auth: Option<(
+        Arc<super::platform_tls::PlatformCatalogClient>,
+        String,
+        Arc<dyn iceberg::io::StorageFactory>,
+    )>,
 }
 
 impl RestIcebergCommitter {
@@ -119,6 +149,7 @@ impl RestIcebergCommitter {
             target,
             frozen_erasure: false,
             lifecycle: false,
+            platform_auth: None,
         })
     }
 
@@ -133,16 +164,58 @@ impl RestIcebergCommitter {
         self
     }
 
+    pub(super) fn with_platform_auth(
+        mut self,
+        client: Arc<super::platform_tls::PlatformCatalogClient>,
+        token: String,
+        storage: Arc<dyn iceberg::io::StorageFactory>,
+    ) -> Self {
+        self.platform_auth = Some((client, token, storage));
+        self
+    }
+
+    async fn load_catalog(&self) -> Result<iceberg_catalog_rest::RestCatalog> {
+        let (token, client, storage) = if let Some((client, token, storage)) = &self.platform_auth {
+            (
+                Some(token.as_str()),
+                Some(client.iceberg_client()?),
+                Some(storage.clone()),
+            )
+        } else {
+            (None, None, None)
+        };
+        self.config.load_with_bearer(token, client, storage).await
+    }
+
+    async fn commit_client(&self) -> Result<RestTableCommitClient> {
+        let (token, client) = self
+            .platform_auth
+            .as_ref()
+            .map_or((None, None), |(client, token, _storage)| {
+                (Some(token.as_str()), Some(client.client()))
+            });
+        RestTableCommitClient::new_with_bearer(&self.config, &self.table_id, token, client).await
+    }
+
     pub fn table_id(&self) -> &TableIdent {
         &self.table_id
     }
 
-    async fn attempt(&self, manifest: &ExportManifest) -> Result<bool> {
+    /// `Ok(Ok(()))`: the manifest is in the catalog. `Ok(Err(stage))`: this
+    /// bounded attempt did not land and may be retried; `stage` is value-free.
+    async fn attempt(
+        &self,
+        manifest: &ExportManifest,
+        reached: &std::sync::atomic::AtomicUsize,
+    ) -> Result<std::result::Result<(), &'static str>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // NAN-4614: name the slow stage. Value-free: counts and timings only.
+        let started = std::time::Instant::now();
+        reached.store(STAGE_SESSION, Relaxed);
         // Rebuild both sessions on every bounded attempt, proactively acquiring
         // fresh OAuth/workload tokens before hourly work (no 3600s token cache).
         let catalog = self
-            .config
-            .load()
+            .load_catalog()
             .await
             .map_err(|_| anyhow::anyhow!("export catalog session failed"))?;
         if !catalog
@@ -156,7 +229,7 @@ impl RestIcebergCommitter {
                 .await
                 .is_err()
             {
-                return Ok(false);
+                return Ok(Err("create_namespace"));
             }
         }
         if !catalog
@@ -176,7 +249,7 @@ impl RestIcebergCommitter {
                 .await
                 .is_err()
             {
-                return Ok(false);
+                return Ok(Err("create_table"));
             }
         }
         let table = catalog
@@ -197,8 +270,11 @@ impl RestIcebergCommitter {
             )?;
         }
         if checkpoint(&table, manifest)? {
-            return Ok(true);
+            tracing::debug!(load_ms = started.elapsed().as_millis() as u64, "export batch already at the catalog checkpoint");
+            return Ok(Ok(()));
         }
+        let loaded_ms = started.elapsed().as_millis() as u64;
+        reached.store(STAGE_PREPARE, Relaxed);
         let (schema, mut requirements, mut updates) = if self.frozen_erasure {
             (table.metadata().current_schema().as_ref().clone(), Vec::new(), Vec::new())
         } else {
@@ -215,6 +291,8 @@ impl RestIcebergCommitter {
             &self.table.data_prefix,
             self.table.max_files,
         )?;
+        let prepared_ms = started.elapsed().as_millis() as u64;
+        reached.store(STAGE_SNAPSHOT, Relaxed);
         let (snapshot, snapshot_requirements) = prepare_snapshot_with_removals(
             &table,
             manifest,
@@ -227,6 +305,8 @@ impl RestIcebergCommitter {
         )
         .await
         .map_err(|_| anyhow::anyhow!("export snapshot preparation failed"))?;
+        let snapshot_ms = started.elapsed().as_millis() as u64;
+        reached.store(STAGE_COMMIT, Relaxed);
         requirements.extend(snapshot_requirements);
         let snapshot_id = snapshot.snapshot_id();
         updates.extend([
@@ -245,10 +325,23 @@ impl RestIcebergCommitter {
                 ]),
             },
         ]);
-        let client = RestTableCommitClient::new(&self.config, &self.table_id)
+        let client = self
+            .commit_client()
             .await
             .map_err(|_| anyhow::anyhow!("export REST session failed"))?;
-        match client.commit(requirements, updates).await {
+        let outcome = client.commit(requirements, updates).await;
+        tracing::info!(
+            parts = manifest.add.len(),
+            removed = manifest.remove_parts.len(),
+            bytes = manifest.add.iter().fold(0u64, |sum, part| sum.saturating_add(part.bytes)),
+            load_ms = loaded_ms,
+            prepare_ms = prepared_ms - loaded_ms,
+            snapshot_ms = snapshot_ms - prepared_ms,
+            commit_ms = started.elapsed().as_millis() as u64 - snapshot_ms,
+            committed = matches!(outcome, Ok(CommitOutcome::Committed(_))),
+            "export commit attempt stages"
+        );
+        match outcome {
             Ok(CommitOutcome::Committed(response)) => {
                 ensure!(
                     response.metadata.properties().get(DIGEST) == Some(&manifest_digest(manifest)?)
@@ -259,11 +352,12 @@ impl RestIcebergCommitter {
                         && response.metadata.uuid() == table.metadata().uuid(),
                     "export commit response omitted checkpoint"
                 );
-                Ok(true)
+                Ok(Ok(()))
             }
             // Transport errors include ambiguous successes. Reload/check the
             // catalog checkpoint on retry, never blindly append the same files.
-            Ok(CommitOutcome::Conflict) | Err(_) => Ok(false),
+            Ok(CommitOutcome::Conflict) => Ok(Err("commit_conflict")),
+            Err(_) => Ok(Err("commit_transport")),
         }
     }
 }
@@ -273,10 +367,20 @@ impl IcebergCommitter for RestIcebergCommitter {
     async fn commit(&self, manifest: &ExportManifest) -> Result<()> {
         validate_manifest(manifest, &self.table.tenant_id, self.table.max_files)?;
         for attempt in 0..ATTEMPTS {
-            match tokio::time::timeout(ATTEMPT_TIMEOUT, self.attempt(manifest)).await {
-                Ok(Ok(true)) => return Ok(()),
+            // NAN-4612: a retryable miss used to vanish into the final
+            // "exhausted" error; name the stage (value-free) per attempt.
+            // NAN-4614: a timeout also names the stage it cut off.
+            let reached = std::sync::atomic::AtomicUsize::new(STAGE_SESSION);
+            let stage = match tokio::time::timeout(attempt_timeout(manifest), self.attempt(manifest, &reached)).await {
+                Ok(Ok(Ok(()))) => return Ok(()),
                 Ok(Err(error)) => return Err(error),
-                Ok(Ok(false)) | Err(_) => {}
+                Ok(Ok(Err(stage))) => stage,
+                Err(_) => TIMED_OUT_IN[reached.load(std::sync::atomic::Ordering::Relaxed)],
+            };
+            if attempt + 1 < ATTEMPTS {
+                tracing::warn!(attempt = attempt + 1, stage, "export commit attempt did not land; retrying within bound");
+            } else {
+                tracing::warn!(attempt = attempt + 1, stage, "export commit attempt did not land; bound exhausted");
             }
             if attempt + 1 < ATTEMPTS {
                 tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
@@ -301,13 +405,23 @@ fn checkpoint(table: &Table, manifest: &ExportManifest) -> Result<bool> {
         .get(CHECKPOINT)
         .map(|v| v.parse::<i64>())
         .transpose()?;
+    checkpoint_decision(previous, properties.get(DIGEST).map(String::as_str), manifest)
+}
+
+/// The catalog-side ordering rule, shared with test catalogs so a fixture
+/// enforces exactly the predecessor chain the REST committer does.
+pub(crate) fn checkpoint_decision(
+    previous: Option<i64>,
+    digest: Option<&str>,
+    manifest: &ExportManifest,
+) -> Result<bool> {
     if let Some(previous) = previous {
         if manifest.planned_at_ms < previous {
             return Ok(true);
         }
         if manifest.planned_at_ms == previous {
             ensure!(
-                properties.get(DIGEST) == Some(&manifest_digest(manifest)?),
+                digest == Some(manifest_digest(manifest)?.as_str()),
                 "export checkpoint collision"
             );
             return Ok(true);
@@ -318,6 +432,98 @@ fn checkpoint(table: &Table, manifest: &ExportManifest) -> Result<bool> {
         "export predecessor missing; replay pending manifests in order"
     );
     Ok(false)
+}
+
+/// NAN-4627: the remote export chain head. After a cell roll wipes the
+/// writer's `export/state.json`, this (not a guess) is what the writer
+/// rebuilds its predecessor and per-hour export state from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportHead {
+    /// The table's `nano.export.planned_at_ms`; `None` for a table that has
+    /// never committed an export (or does not exist yet).
+    pub checkpoint: Option<i64>,
+    /// Part id -> event hour (from its data-file key) of every live file in
+    /// the current snapshot. Empty unless requested.
+    pub parts: BTreeMap<String, i32>,
+}
+
+/// The remote export state cannot be trusted as a predecessor. Fails closed;
+/// `reason` is a stable, value-free alert label.
+#[derive(Debug, thiserror::Error)]
+#[error("catalog export state cannot be rebuilt: {reason}")]
+pub struct ExportStateUnrecoverable {
+    pub reason: &'static str,
+}
+
+impl ExportStateUnrecoverable {
+    pub const CODE: &'static str = "export_state_unrecoverable";
+}
+
+/// Read the export chain head from one loaded table version.
+pub(crate) async fn export_head_of(
+    table: &Table,
+    prefix: &str,
+    max_files: usize,
+    with_parts: bool,
+) -> Result<ExportHead> {
+    let checkpoint = match table.metadata().properties().get(CHECKPOINT) {
+        None => None,
+        Some(value) => match value.parse::<i64>() {
+            Ok(at) if at > 0 => Some(at),
+            _ => {
+                return Err(ExportStateUnrecoverable {
+                    reason: "remote export checkpoint is malformed",
+                }
+                .into())
+            }
+        },
+    };
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(ExportHead { checkpoint, parts: BTreeMap::new() });
+    };
+    if checkpoint.is_none() {
+        return Err(ExportStateUnrecoverable {
+            reason: "remote catalog holds a snapshot without an export checkpoint",
+        }
+        .into());
+    }
+    let mut parts = BTreeMap::new();
+    if !with_parts {
+        return Ok(ExportHead { checkpoint, parts });
+    }
+    let list = table.manifest_list_reader(snapshot).load().await?;
+    ensure!(list.entries().len() <= max_files, "export manifest list exceeds bound");
+    let mut inspected = 0usize;
+    for descriptor in list.entries() {
+        ensure!(
+            descriptor.content == ManifestContentType::Data && descriptor.partition_spec_id == 0,
+            "unsupported export manifest content"
+        );
+        let loaded = descriptor.load_manifest(table.file_io()).await?;
+        inspected = inspected
+            .checked_add(loaded.entries().len())
+            .ok_or_else(|| anyhow::anyhow!("export entry count overflow"))?;
+        ensure!(inspected <= max_files, "export table exceeds file bound");
+        for entry in loaded.entries().iter().filter(|e| e.is_alive()) {
+            let part = part_id_from_path(entry.file_path(), prefix)?;
+            let hour = event_hour_of_path(entry.file_path())?;
+            ensure!(
+                *parts.entry(part.to_string()).or_insert(hour) == hour,
+                "export part spans two key hours"
+            );
+        }
+    }
+    Ok(ExportHead { checkpoint, parts })
+}
+
+/// The event hour encoded in a part data file's key (a day part's first hour).
+pub(crate) fn event_hour_of_path(path: &str) -> Result<i32> {
+    let parsed =
+        reqwest::Url::parse(path).map_err(|_| anyhow::anyhow!("invalid export object URI"))?;
+    let key = crate::lake_part_gc::parse_part_file_key(parsed.path().trim_start_matches('/'))
+        .ok_or_else(|| anyhow::anyhow!("export data file key has no event hour"))?;
+    i32::try_from(key.path_hour.timestamp().div_euclid(3_600))
+        .map_err(|_| anyhow::anyhow!("export data file hour out of range"))
 }
 
 fn validate_manifest(manifest: &ExportManifest, tenant: &str, max_files: usize) -> Result<()> {

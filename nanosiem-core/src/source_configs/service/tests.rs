@@ -4077,7 +4077,7 @@ fn pull_routing_stashes_source_type_for_ocsf_parsers() {
 /// and the pinned image; opt in with `NANO_VECTOR_CONTAINER_TESTS=1`.
 #[test]
 fn event_hubs_generated_config_passes_vector_validate_in_the_fork() {
-    const IMAGE: &str = "ghcr.io/nano-rs/vector:0.59.0-nano.7-debian@sha256:3219f912af603e68a23100fb0909d139635aab56bb253461fc794fca88c079d6";
+    const IMAGE: &str = "ghcr.io/nano-rs/vector:0.59.0-nano.12-debian@sha256:add06b5413292f53db629161c8f3805e8a3ed61bcb0785b5a0f252ae5ae0ecea";
     if std::env::var("NANO_VECTOR_CONTAINER_TESTS").as_deref() != Ok("1") {
         eprintln!("skipped: set NANO_VECTOR_CONTAINER_TESTS=1 (needs docker + {IMAGE})");
         return;

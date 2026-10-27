@@ -86,6 +86,8 @@ export interface SearchQueryEditorProps {
   onTabPress?: () => void;
   /** Enable CodeMirror-native autocomplete. 'auto' = as-you-type, 'manual' = Ctrl+Space only, false = off */
   autocomplete?: 'auto' | 'manual' | false;
+  /** Extra caller extensions (e.g. decorations); reconfigured when the array identity changes. */
+  extensions?: Extension[];
 }
 
 /**
@@ -104,6 +106,7 @@ export function SearchQueryEditor({
   onSubmit,
   onTabPress,
   autocomplete: autocompleteProp = false,
+  extensions: extraExtensions,
   ref,
 }: SearchQueryEditorProps & { ref?: React.Ref<SearchQueryEditorRef> }) {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -113,6 +116,9 @@ export function SearchQueryEditor({
     const languageCompartment = useRef(new Compartment());
     const keymapCompartment = useRef(new Compartment());
     const autocompleteCompartment = useRef(new Compartment());
+    const extraCompartment = useRef(new Compartment());
+    const extraRef = useRef(extraExtensions);
+    extraRef.current = extraExtensions;
 
     // Store callbacks in refs - updated synchronously via useLayoutEffect
     const callbacksRef = useRef({
@@ -308,6 +314,9 @@ export function SearchQueryEditor({
 
         // Allow line wrapping for multi-line queries
         EditorView.lineWrapping,
+
+        // Caller extensions
+        extraCompartment.current.of(extraRef.current ?? []),
       ].flat();
     }, [placeholder, createUpdateListener, createFocusHandlers, createCustomKeymap]);
 
@@ -332,6 +341,11 @@ export function SearchQueryEditor({
         viewRef.current = null;
       };
     }, []); // Only on mount
+
+    // Reconfigure caller extensions when they change
+    useEffect(() => {
+      viewRef.current?.dispatch({ effects: extraCompartment.current.reconfigure(extraExtensions ?? []) });
+    }, [extraExtensions]);
 
     // Handle external value changes
     useEffect(() => {

@@ -320,27 +320,79 @@ pub fn shared_deployment() -> bool {
     std::env::var("DEPLOYMENT_MODE").as_deref() == Ok("enterprise_shared")
 }
 pub fn hosted_proxy_configured() -> bool {
-    shared_deployment() && std::env::var_os("HTTPS_PROXY").is_some()
+    EgressAuthority::from_env().hosted_proxy_configured()
 }
 pub fn key_from_env() -> Result<Vec<u8>, &'static str> {
     let key = std::env::var("NANOSIEM_INPUTLOOKUP_EGRESS_HMAC_KEY").map_err(|_| "proxy authority is unavailable")?;
+    checked_key(key.into_bytes())
+}
+fn checked_key(key: Vec<u8>) -> Result<Vec<u8>, &'static str> {
     if key.len() < 32 { return Err("invalid proxy authority"); }
-    Ok(key.into_bytes())
+    Ok(key)
 }
 pub fn runtime_tenant(tenant: Uuid) -> Uuid {
-    if shared_deployment() { tenant } else { LOCAL_TENANT }
+    EgressAuthority::from_env().runtime_tenant(tenant)
 }
 
 pub fn client_builder(
     tenant: Uuid,
     purpose: Purpose,
 ) -> Result<reqwest::ClientBuilder, &'static str> {
-    if !hosted_proxy_configured() { return Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())); }
-    let key = key_from_env()?;
-    Ok(reqwest::Client::builder()
-        .no_proxy()
-        .proxy(Principal::new(&key, runtime_tenant(tenant), purpose)?.proxy()?)
-        .redirect(reqwest::redirect::Policy::none()))
+    EgressAuthority::from_env().client_builder(tenant, purpose)
+}
+
+/// The process egress configuration as a value (NAN-4563): deployment mode,
+/// whether the hosted proxy is installed, and the proxy HMAC authority.
+/// Production reads it once from the environment ([`Self::from_env`]); callers
+/// that hold a client for its lifetime capture it at construction, so tests
+/// can pass an explicit authority instead of mutating process-global env.
+#[derive(Clone)]
+pub struct EgressAuthority {
+    shared: bool,
+    proxy_configured: bool,
+    key: Result<Vec<u8>, &'static str>,
+}
+impl std::fmt::Debug for EgressAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EgressAuthority")
+            .field("shared", &self.shared)
+            .field("proxy_configured", &self.proxy_configured)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+impl EgressAuthority {
+    /// `DEPLOYMENT_MODE`, `HTTPS_PROXY` and `NANOSIEM_INPUTLOOKUP_EGRESS_HMAC_KEY`
+    /// exactly as the free functions above read them.
+    pub fn from_env() -> Self {
+        let shared = shared_deployment();
+        let proxy_configured = shared && std::env::var_os("HTTPS_PROXY").is_some();
+        // The key is only needed (and only reported missing) on the hosted path.
+        let key = if proxy_configured { key_from_env() } else { Err("proxy authority is unavailable") };
+        Self { shared, proxy_configured, key }
+    }
+    /// Hosted-shared deployment with the regional proxy installed.
+    pub fn hosted(key: Vec<u8>) -> Result<Self, &'static str> {
+        Ok(Self { shared: true, proxy_configured: true, key: Ok(checked_key(key)?) })
+    }
+    /// Open-core / dedicated: direct transport, the local tenant principal.
+    pub fn local() -> Self {
+        Self { shared: false, proxy_configured: false, key: Err("proxy authority is unavailable") }
+    }
+    pub fn hosted_proxy_configured(&self) -> bool {
+        self.proxy_configured
+    }
+    pub fn runtime_tenant(&self, tenant: Uuid) -> Uuid {
+        if self.shared { tenant } else { LOCAL_TENANT }
+    }
+    pub fn client_builder(&self, tenant: Uuid, purpose: Purpose) -> Result<reqwest::ClientBuilder, &'static str> {
+        if !self.proxy_configured { return Ok(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())); }
+        let key = self.key.as_ref().map_err(|error| *error)?;
+        Ok(reqwest::Client::builder()
+            .no_proxy()
+            .proxy(Principal::new(key, self.runtime_tenant(tenant), purpose)?.proxy()?)
+            .redirect(reqwest::redirect::Policy::none()))
+    }
 }
 
 #[cfg(test)]
@@ -374,6 +426,20 @@ mod tests {
                 "runtime authority source {source} failed"
             );
         }
+    }
+    #[test]
+    fn explicit_authority_needs_no_process_env() {
+        let tenant = Uuid::from_u128(10);
+        let local = EgressAuthority::local();
+        assert!(!local.hosted_proxy_configured());
+        assert_eq!(local.runtime_tenant(tenant), LOCAL_TENANT);
+        assert!(local.client_builder(tenant, Purpose::Ai).is_ok());
+        let hosted = EgressAuthority::hosted(b"fixture-hosted-proxy-authority-32-bytes".to_vec()).unwrap();
+        assert!(hosted.hosted_proxy_configured());
+        assert_eq!(hosted.runtime_tenant(tenant), tenant);
+        assert!(hosted.client_builder(tenant, Purpose::Ai).is_ok());
+        assert!(EgressAuthority::hosted(b"short".to_vec()).is_err(), "short keys stay refused");
+        assert!(!format!("{hosted:?}").contains("fixture-hosted"), "the key is redacted");
     }
     #[test]
     #[ignore = "invoked in isolated subprocesses by the runtime authority test"]

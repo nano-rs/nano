@@ -14,7 +14,7 @@ use nanosiem_core::parsers::VrlValidator;
 use sha2::{Digest, Sha256};
 
 const BASE: &[u8] = include_bytes!("../src/parsers/tenant_bundle/testdata/platform-base.tar.gz");
-const IMAGE: &str = "ghcr.io/nano-rs/vector:0.59.0-nano.7-debian@sha256:3219f912af603e68a23100fb0909d139635aab56bb253461fc794fca88c079d6";
+const IMAGE: &str = "ghcr.io/nano-rs/vector:0.59.0-nano.12-debian@sha256:add06b5413292f53db629161c8f3805e8a3ed61bcb0785b5a0f252ae5ae0ecea";
 
 const GOOD_VRL: &str = r#"parts = split(string!(.message), " ")
 . = {

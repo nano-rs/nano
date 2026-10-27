@@ -148,6 +148,15 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/settings/api-keys', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'API Keys' }] },
   { path: '/settings/sessions', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Sessions' }] },
   { path: '/settings/audit', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Access Control', href: '/settings/access-control' }, { label: 'Audit Log' }] },
+  // NAN-4540: Automation workspace
+  { path: '/automation/runs', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs' }], capability: 'soar' },
+  { path: '/automation/runs/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Runs', href: '/automation/runs' }, { label: 'Run' }], capability: 'soar' },
+  { path: '/automation/flows', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Flows' }], capability: 'soar' },
+  { path: '/automation/flows/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Flows', href: '/automation/flows' }, { label: 'Flow' }], capability: 'soar' },
+  { path: '/automation/approvals', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Approvals' }], capability: 'soar' },
+  { path: '/automation/approvals/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Approvals', href: '/automation/approvals' }, { label: 'Approval' }], capability: 'soar' },
+  { path: '/automation/capabilities', segments: [{ label: 'Home', href: '/' }, { label: 'Automation', href: '/automation/runs' }, { label: 'Capabilities' }], capability: 'soar' },
+  { path: '/settings/soar', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'SOAR' }], capability: 'soar' },
   { path: '/settings/gdpr', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'GDPR Anonymization' }] },
   { path: '/settings/user', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'User Settings' }] },
 

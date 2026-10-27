@@ -162,6 +162,15 @@ pub async fn background_hydrate_shared<T>(
     HYDRATE_RATE.scope(Arc::new(HydratePacing::new(share.max(1), bucket)), work).await
 }
 
+/// NAN-4591: run `work` as unpaced background maintenance (the identity
+/// observation backfill): its cache reads yield to foreground reads like
+/// hot-window hydration (no admission while a search waits out saturation,
+/// never into the cold-read reserve, no saturation wait of its own), and
+/// its fetch deadline assumes the foreground floor rate.
+pub async fn background_maintenance<T>(work: impl std::future::Future<Output = T>) -> T {
+    background_hydrate_shared(HydrateBucket::new(0), FOREGROUND_FETCH_FLOOR_BYTES_PER_SECOND, work).await
+}
+
 /// NAN-3644: the slowest foreground cold read the fetch deadline still
 /// allows. A lease is fetched as a whole under one deadline; a flat 60 s
 /// failed every lease over ~60 s of bandwidth (a cell whose data volume is
@@ -761,6 +770,15 @@ impl State {
         self.clock
     }
 
+    /// NAN-4591: bytes of resident hot-window objects.
+    fn hot_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|(digest, _)| self.hot.contains_key(*digest))
+            .map(|(_, entry)| entry.stamp.bytes)
+            .sum()
+    }
+
     fn stored_bytes(&self) -> u64 {
         let mut inodes = BTreeSet::new();
         self.entries
@@ -824,6 +842,18 @@ struct Inner {
     /// NAN-4138: test override of the saturation wait, in ms
     /// (`u64::MAX`: the interactive/durable defaults).
     saturation_wait_ms: AtomicU64,
+    /// NAN-4591: foreground reads waiting out saturation right now. While
+    /// any waits, background hydration admits nothing (it defers and its
+    /// pass retries later), so freed capacity goes to the search.
+    foreground_waiting: std::sync::atomic::AtomicUsize,
+    /// NAN-4591: (when, bytes) of objects this process deleted, which the
+    /// volume accountant may not have walked yet (see
+    /// [`crate::local_hot_window::Settings::capacity_credited`]).
+    unwalked_evictions: Mutex<std::collections::VecDeque<(Instant, u64)>>,
+    /// Test override of the cold-read reserve (the large tenant's one-fifth regime needs
+    /// a cache of at least 5 GiB otherwise).
+    #[cfg(test)]
+    cold_reserve_override: Mutex<Option<u64>>,
 }
 
 #[derive(Clone)]
@@ -901,6 +931,10 @@ impl ReaderObjectCache {
     /// Reconcile even when the window is already warm and no download occurs.
     pub async fn trim_pressure(&self) -> Result<(), ReaderCacheError> {
         let inner = self.inner.clone();
+        // Runs on a blocking thread, outside any hydration scope: foreground
+        // semantics, so it also evicts cold objects ahead until half the
+        // cold-read reserve is free (NAN-4591). Hot objects go only when the
+        // volume itself needs the room.
         blocking(move || {
             match inner.reserve(0) {
                 Ok(reservation) => drop(reservation),
@@ -912,6 +946,18 @@ impl ReaderObjectCache {
     }
 
     pub fn query_max_bytes(&self) -> u64 { self.inner.settings.query_max_bytes }
+
+    /// NAN-4591: the share of this cache the hot window leaves to foreground
+    /// cold reads ([`crate::local_hot_window::cold_read_reserve`]).
+    pub fn cold_read_reserve(&self) -> u64 { self.inner.cold_read_reserve() }
+
+    /// NAN-4591: bytes this process evicted that the volume accountant may
+    /// not have walked yet.
+    pub fn eviction_credit(&self) -> u64 { self.inner.eviction_credit() }
+
+    /// NAN-4591: bytes of downloads (and scratch) admitted but not yet
+    /// indexed in this process.
+    pub fn in_flight_bytes(&self) -> u64 { self.inner.state().reserved }
 
     /// The heavy-read threshold of the current query: the interactive
     /// `query_max_bytes`, or a durable job's own (larger) budget inside
@@ -1007,6 +1053,12 @@ impl ReaderObjectCache {
     }
 
     #[cfg(test)]
+    /// Test override of the cold-read reserve.
+    #[cfg(test)]
+    pub(crate) fn set_cold_read_reserve(&self, bytes: u64) {
+        *self.inner.cold_reserve_override.lock().unwrap_or_else(|e| e.into_inner()) = Some(bytes);
+    }
+
     pub(crate) fn set_saturation_wait(&self, wait: Duration) {
         self.inner.saturation_wait_ms.store(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX - 1), Ordering::Relaxed);
     }
@@ -1017,11 +1069,17 @@ impl ReaderObjectCache {
         // More than the whole cache never fits: no wait.
         let budget = if bytes > self.inner.settings.max_bytes { Duration::ZERO } else { self.saturation_wait() };
         let mut wait = SaturationWait::new(budget);
+        // NAN-4591: hold background hydration off while this waits.
+        let mut _waiting: Option<ForegroundWaiting<'_>> = None;
+        let background = hydrating();
         loop {
             let inner = self.inner.clone();
-            match blocking(move || inner.reserve(bytes)).await {
+            match blocking(move || inner.reserve_as(bytes, background, None)).await {
                 Ok(reservation) => return Ok(ScratchReservation { _reservation: reservation }),
                 Err(error @ ReaderCacheError::Saturated { .. }) => {
+                    if !background {
+                        _waiting.get_or_insert_with(|| ForegroundWaiting::new(&self.inner.foreground_waiting));
+                    }
                     if !wait.wait(&self.inner.tenant_id, bytes).await {
                         return Err(error);
                     }
@@ -1150,6 +1208,10 @@ impl ReaderObjectCache {
             fence_slab_bytes: AtomicU64::new(HOT_WINDOW_FENCE_SLAB_BYTES),
             scrubbing: std::sync::atomic::AtomicBool::new(false),
             saturation_wait_ms: AtomicU64::new(u64::MAX),
+            foreground_waiting: std::sync::atomic::AtomicUsize::new(0),
+            unwalked_evictions: Mutex::default(),
+            #[cfg(test)]
+            cold_reserve_override: Mutex::default(),
         });
         inner.with_global_lock(|| {
             inner.sweep_temporaries()?;
@@ -1207,9 +1269,10 @@ impl ReaderObjectCache {
     pub async fn warm_local(&self, object: &ReaderObjectRef, source: &Path) -> Result<(), ReaderCacheError> {
         self.inner.authorize(object)?;
         let (inner, object, source) = (self.inner.clone(), object.clone(), source.to_path_buf());
+        let background = hydrating();
         blocking(move || {
             if inner.verified_hit(&object)? { return Ok(()) }
-            let reservation = inner.reserve(object.size_bytes)?;
+            let reservation = inner.reserve_as(object.size_bytes, background, Some(&object.sha256))?;
             let mut temporary = tempfile::NamedTempFile::new_in(&inner.objects)?;
             let mut input = File::open(source)?;
             if let Some(range) = &object.range {
@@ -1220,7 +1283,7 @@ impl ReaderObjectCache {
             let policy = inner.hot_capacity.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let _write_guard = if let Some(policy) = policy {
                 let block = temporary.as_file().metadata()?.blksize().max(4096);
-                volume_fence(&policy, limit.div_ceil(block).saturating_mul(block))?
+                inner.fence(&policy, limit.div_ceil(block).saturating_mul(block))?
             } else { None };
             std::io::copy(&mut std::io::Read::take(input, limit), &mut temporary)?;
             drop(_write_guard);
@@ -1351,6 +1414,9 @@ impl ReaderObjectCache {
         // the search. Background hydration still defers at once: its pass
         // retries later and must not hold capacity hostage.
         let mut saturation = foreground.then(|| SaturationWait::new(self.saturation_wait()));
+        // NAN-4591: from its first saturation until the lease is taken, this
+        // read holds background hydration off the capacity it waits for.
+        let mut _waiting: Option<ForegroundWaiting<'_>> = None;
         let mut rounds = 0;
         while rounds < 2 {
             if misses.is_empty() {
@@ -1382,6 +1448,7 @@ impl ReaderObjectCache {
                 Ok(_) => rounds += 1,
                 Err(error @ ReaderCacheError::Saturated { needed_bytes }) => {
                     let Some(wait) = saturation.as_mut() else { return Err(error) };
+                    _waiting.get_or_insert_with(|| ForegroundWaiting::new(&self.inner.foreground_waiting));
                     // Pin what did land; only the rest waits. Nothing is
                     // staged while waiting (the failed fetches dropped their
                     // reservations and temp files).
@@ -1461,6 +1528,7 @@ impl ReaderObjectCache {
                 inner.drop_read_link(&digest, &pinned)?;
                 state.entries.remove(&digest);
                 inner.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                inner.note_evicted(stamp.bytes);
             }
             Ok(deferred)
         })).await
@@ -1496,6 +1564,7 @@ impl ReaderObjectCache {
                 inner.drop_read_link(&digest, &pinned)?;
                 state.entries.remove(&digest);
                 inner.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                inner.note_evicted(size);
                 objects += 1;
                 bytes += size;
             }
@@ -1582,7 +1651,7 @@ impl ReaderObjectCache {
         let reservation = self.inner.reserve(bytes)?;
         let policy = self.inner.hot_capacity.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let guard = match policy {
-            Some(policy) => volume_fence(&policy, bytes)?,
+            Some(policy) => self.inner.fence(&policy, bytes)?,
             None => None,
         };
         let value = write()?;
@@ -1632,7 +1701,100 @@ fn bind_marker(directory: &Path, objects: &Path, expected: &Marker) -> Result<()
     Err(mismatch())
 }
 
+/// NAN-4591: how long an eviction is credited back against the volume
+/// accountant's figure: two of its default 30 s re-walks, after which the
+/// walk has seen the deletion. Too short only means the old over-eviction
+/// for a moment; too long is caught by the download fence (a refusal clears
+/// the credit).
+const UNWALKED_EVICTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// NAN-4591: the volume accountant's default re-walk interval
+/// (`nanosiem_lake_cell::volume_usage`, 30 s).
+const ACCOUNTANT_REWALK: Duration = Duration::from_secs(30);
+
+/// NAN-4591: counts a foreground read as waiting out saturation for as long
+/// as it lives (see `Inner::foreground_waiting`).
+struct ForegroundWaiting<'a>(&'a std::sync::atomic::AtomicUsize);
+impl<'a> ForegroundWaiting<'a> {
+    fn new(counter: &'a std::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter)
+    }
+}
+impl Drop for ForegroundWaiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// NAN-4591: is the current task background hydration (hot window, arrival
+/// prewarm, identity backfill), which must yield to foreground reads?
+fn hydrating() -> bool {
+    HYDRATE_RATE.try_with(|_| ()).is_ok()
+}
+
 impl Inner {
+    /// NAN-4591: remember `bytes` deleted now (the accountant counts them
+    /// until its next walk).
+    fn note_evicted(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut log = self.unwalked_evictions.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        while log.front().is_some_and(|(at, _)| now.duration_since(*at) > UNWALKED_EVICTION_WINDOW) {
+            log.pop_front();
+        }
+        log.push_back((now, bytes));
+    }
+
+    /// NAN-4591: bytes deleted within [`UNWALKED_EVICTION_WINDOW`].
+    fn eviction_credit(&self) -> u64 {
+        let mut log = self.unwalked_evictions.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        while log.front().is_some_and(|(at, _)| now.duration_since(*at) > UNWALKED_EVICTION_WINDOW) {
+            log.pop_front();
+        }
+        log.iter().map(|(_, bytes)| bytes).sum()
+    }
+
+    /// NAN-4591: the volume fence refused a write. Credit that is older than
+    /// one accountant re-walk has most likely been walked already (it would
+    /// then overstate the room and stall eviction until it expired), so drop
+    /// it. Fresher credit stays: clearing it re-armed the over-eviction
+    /// (every saturation retry evicted another read's worth that the fence
+    /// could not see either).
+    fn expire_walked_credit(&self) {
+        let mut log = self.unwalked_evictions.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        while log.front().is_some_and(|(at, _)| now.duration_since(*at) > ACCOUNTANT_REWALK) {
+            log.pop_front();
+        }
+    }
+
+    /// [`volume_fence`], expiring walked credit on a refusal.
+    fn fence(
+        &self,
+        policy: &crate::local_hot_window::Settings,
+        growth: u64,
+    ) -> Result<Option<nanosiem_lake_cell::volume_usage::WriteGuard>, ReaderCacheError> {
+        let fenced = volume_fence(policy, growth);
+        if matches!(fenced, Err(ReaderCacheError::Saturated { .. })) {
+            self.expire_walked_credit();
+        }
+        fenced
+    }
+
+    /// NAN-4591: the cold-read reserve of this cache (see
+    /// [`crate::local_hot_window::cold_read_reserve`]).
+    fn cold_read_reserve(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(bytes) = self.cold_reserve_override.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return *bytes;
+        }
+        crate::local_hot_window::cold_read_reserve(self.settings.max_bytes, self.settings.query_max_bytes)
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -2212,7 +2374,11 @@ impl Inner {
             }
             let inner = self.clone();
             let bytes = object.size_bytes;
-            let reservation = blocking(move || inner.reserve(bytes)).await?;
+            // NAN-4591: hydration's limits, unless a foreground read joined
+            // (promoted) this download while it queued.
+            let background = hydrating() && _background.is_some();
+            let digest = object.sha256.clone();
+            let reservation = blocking(move || inner.reserve_as(bytes, background, Some(&digest))).await?;
             for attempt in 1..=2 {
                 match self.download(object).await {
                     Ok(temporary) => {
@@ -2287,7 +2453,7 @@ impl Inner {
                         .max(fenced.saturating_add(slab).min(expected))
                         .div_ceil(block)
                         .saturating_mul(block);
-                    write_guard = volume_fence(policy, target - fenced).map_err(|error| {
+                    write_guard = self.fence(policy, target - fenced).map_err(|error| {
                         let message = anyhow::anyhow!("hot-window allocation deferred: {error}");
                         sink_error = Some(error);
                         message
@@ -2327,35 +2493,110 @@ impl Inner {
 
     /// Reserve `bytes` for one download, evicting unleased, unprotected
     /// objects in LRU order. Never evicts a pinned, held or protected object.
+    ///
+    /// NAN-4591, with a hot-window policy:
+    /// - Background hydration keeps hot objects within the capacity minus
+    ///   the cold-read reserve ([`crate::local_hot_window::cold_read_reserve`])
+    ///   and the total within the capacity minus half of it (a new window
+    ///   object evicts the oldest hot one, not recent cold reads), and
+    ///   admits nothing at all while a foreground read waits out saturation.
+    /// - A foreground read also evicts cold (non-hot) objects ahead of need
+    ///   until half the reserve is free. The volume accountant counts
+    ///   deleted objects until its next ~30 s walk, so its fence admits only
+    ///   what was free at that walk; space freed just in time was invisible
+    ///   to it, and every cold read at a full cache waited out the walk
+    ///   (the large tenant: cold_queue_ms 27-40 s). Hot objects still go only when the
+    ///   admission itself needs the room.
+    /// - Capacity is estimated with this process's unwalked evictions
+    ///   credited back, for every limit including the one hot objects are
+    ///   evicted against, so neither one cold read nor the saturation retries
+    ///   of a fenced one evict what the accountant cannot see yet; the fence
+    ///   stays the hard limit.
     fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation, ReaderCacheError> {
+        self.reserve_as(bytes, hydrating(), None)
+    }
+
+    /// [`Self::reserve`] for a caller that ran inside (`background`) or
+    /// outside background hydration: task-locals do not reach the blocking
+    /// threads most admissions run on, so callers there capture it first.
+    ///
+    /// `object` is the digest being admitted, if any: the background window
+    /// limit applies only to window (hot) objects. NAN-4637: a background
+    /// read of anything else (the identity observation backfill, scratch)
+    /// counted against it and slid the window, evicting hot objects the next
+    /// hydration pass downloaded again.
+    fn reserve_as(
+        self: &Arc<Self>,
+        bytes: u64,
+        background: bool,
+        object: Option<&str>,
+    ) -> Result<Reservation, ReaderCacheError> {
+        let saturated = || ReaderCacheError::Saturated { needed_bytes: bytes };
+        if background && self.foreground_waiting.load(Ordering::Acquire) > 0 {
+            return Err(saturated());
+        }
         let policy = self.hot_capacity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cache_max = self.settings.max_bytes;
         // NAN-3139: a hot-window accounting failure degrades to the plain
         // cache budget; it must never fail ordinary cache admission.
-        let max = match policy.map(|policy| policy.capacity(self.state().stored_bytes())) {
-            Some(Ok(capacity)) => capacity.min(self.settings.max_bytes),
-            Some(Err(error)) => {
-                crate::local_hot_window::warn_accounting_unavailable(&error);
-                self.settings.max_bytes
+        //
+        // NAN-4591 (review of #8001): every limit here uses the CREDITED
+        // figure. The accountant counts deleted-but-unwalked bytes as other
+        // data, so against its raw figure each saturation retry of a fenced
+        // read evicted another read's worth (the hot window first-to-last)
+        // without the fence seeing any of it. The credited figure still
+        // includes the statvfs headroom, and every write still passes the
+        // fence (the accountant itself), so a stale credit can only admit a
+        // reservation whose write the fence then refuses: it waits, it never
+        // evicts again and never overfills the volume.
+        let credited = match &policy {
+            Some(policy) => {
+                let (stored, in_flight) = {
+                    let state = self.state();
+                    (state.stored_bytes(), state.reserved)
+                };
+                match policy.capacities(stored, in_flight, self.eviction_credit()) {
+                    Ok((_, credited)) => credited.min(cache_max),
+                    Err(error) => {
+                        crate::local_hot_window::warn_accounting_unavailable(&error);
+                        cache_max
+                    }
+                }
             }
-            None => self.settings.max_bytes,
+            None => cache_max,
         };
-        let saturated = || ReaderCacheError::Saturated { needed_bytes: bytes };
-        if bytes > max {
+        let reserve = if policy.is_some() { self.cold_read_reserve() } else { 0 };
+        // (admission limit, cold eviction target, hot-window limit).
+        // Foreground: the whole cache, cold objects evicted ahead until half
+        // the reserve is free. Background: the window (hot objects) up to
+        // capacity minus the reserve, and the total up to capacity minus half
+        // of it, so recent cold reads keep the other half of the reserve and
+        // a new window object slides the window (evicts the oldest hot one)
+        // instead of evicting them.
+        let (max, evict_to, hot_limit) = if background {
+            let total = credited.saturating_sub(reserve / 2);
+            let in_window = policy.is_some() && object.is_some_and(|digest| self.state().hot.contains_key(digest));
+            (total, total, in_window.then(|| credited.saturating_sub(reserve)))
+        } else {
+            (credited, credited.saturating_sub(reserve / 2), None)
+        };
+        if bytes > max || hot_limit.is_some_and(|limit| bytes > limit) {
             return Err(saturated());
         }
         self.with_global_lock(|| {
-            let fits = |state: &State, used: u64| {
-                used.saturating_add(state.reserved).saturating_add(bytes) <= max
+            let fits = |state: &State, used: u64, limit: u64| {
+                used.saturating_add(state.reserved).saturating_add(bytes) <= limit
             };
+            let hot_fits = |hot_used: u64| hot_limit.is_none_or(|limit| hot_used.saturating_add(bytes) <= limit);
             {
                 let mut state = self.state();
-                if fits(&state, state.stored_bytes()) {
+                if fits(&state, state.stored_bytes(), evict_to) && (hot_limit.is_none() || hot_fits(state.hot_bytes())) {
                     state.reserved += bytes;
                     return Ok(());
                 }
             }
-            // Over budget: refresh from disk (other processes admit and evict
-            // in the same directory), then evict.
+            // Over the eviction target: refresh from disk (other processes
+            // admit and evict in the same directory), then evict.
             let pinned = self.pinned_inodes()?;
             let mut state = self.state();
             self.refresh_index(&mut state, false)?;
@@ -2371,9 +2612,35 @@ impl Inner {
                 .collect();
             candidates.sort();
             let mut used = state.stored_bytes();
-            for (_, _, _, _, sha256) in candidates {
-                if fits(&state, used) {
+            let mut hot_used = if hot_limit.is_some() { state.hot_bytes() } else { 0 };
+            if let Some(limit) = hot_limit {
+                // Background with the window full: slide it first (oldest
+                // hot objects, which also free total room), so recent cold
+                // reads are evicted only if the total still does not fit.
+                let mut over = hot_used.saturating_add(bytes).saturating_sub(limit);
+                let mut slide = Vec::new();
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if over == 0 {
+                        break;
+                    }
+                    if candidate.0 {
+                        slide.push(index);
+                        over = over.saturating_sub(state.entries.get(&candidate.4).map_or(0, |entry| entry.stamp.bytes));
+                    }
+                }
+                let first = slide.iter().rev().map(|&index| candidates.remove(index)).collect::<Vec<_>>();
+                candidates.splice(0..0, first.into_iter().rev());
+            }
+            for (hot, _, _, _, sha256) in candidates {
+                let needed = !fits(&state, used, max);
+                let ahead = !hot && !fits(&state, used, evict_to);
+                let window_full = !hot_fits(hot_used);
+                if !needed && !ahead && !window_full {
                     break;
+                }
+                if !needed && !ahead && !hot {
+                    // Only the window limit binds: keep recent cold reads.
+                    continue;
                 }
                 match std::fs::remove_file(self.object_path(&sha256)) {
                     Ok(()) => {}
@@ -2381,11 +2648,16 @@ impl Inner {
                     Err(error) => return Err(error.into()),
                 }
                 self.drop_read_link(&sha256, &pinned)?;
-                state.entries.remove(&sha256);
+                if let Some(entry) = state.entries.remove(&sha256) {
+                    self.note_evicted(entry.stamp.bytes);
+                    if hot {
+                        hot_used = hot_used.saturating_sub(entry.stamp.bytes);
+                    }
+                }
                 self.counters.evictions.fetch_add(1, Ordering::Relaxed);
                 used = state.stored_bytes();
             }
-            if !fits(&state, used) {
+            if !fits(&state, used, max) || !hot_fits(hot_used) {
                 return Err(saturated());
             }
             state.reserved += bytes;
@@ -3074,6 +3346,183 @@ pub(crate) mod tests {
         assert!(!cache.object_path(&hot[0].sha256).exists(), "oldest hot goes only once nothing else is evictable");
         assert!(cache.object_path(&hot[3].sha256).exists());
         drop(lease);
+    }
+
+    /// NAN-4591: while a foreground read waits out saturation, background
+    /// hydration admits nothing (it defers at once and its pass retries
+    /// later), so the capacity that frees goes to the search, which then
+    /// completes within one backoff step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_hydration_yields_while_a_foreground_read_waits() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 1_000, &source);
+        cache.set_saturation_wait(Duration::from_secs(10));
+        let blocker = cache.reserve_scratch(900).unwrap();
+        let wanted = source.put("wanted", 300);
+        let waiting = tokio::spawn({
+            let (cache, wanted) = (cache.clone(), wanted.clone());
+            async move { cache.ensure_local(std::slice::from_ref(&wanted)).await }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.inner.foreground_waiting.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(cache.inner.foreground_waiting.load(Ordering::Acquire), 1, "the search is waiting");
+        drop(blocker);
+        let warming = source.put("warming", 100);
+        let deferred = background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(&warming))).await;
+        assert!(matches!(deferred, Err(ReaderCacheError::Saturated { .. })), "background must defer: {deferred:?}");
+        let freed = Instant::now();
+        let lease = tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap().unwrap();
+        assert!(freed.elapsed() < Duration::from_millis(2_500), "one backoff step, took {:?}", freed.elapsed());
+        assert_eq!(lease.fetched_bytes(), 300);
+        assert_eq!(cache.inner.foreground_waiting.load(Ordering::Acquire), 0);
+        drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(&warming))).await.unwrap());
+    }
+
+    /// NAN-4591 (review of #8001): cold demand beyond the fence's room
+    /// between accountant walks. The accountant never re-walks here, as
+    /// between two 30 s walks, so it never sees an eviction. The large tenant's one-fifth
+    /// reserve, window full at capacity minus the reserve. The saturation
+    /// retries of a fenced read must not evict the hot window, and evictions
+    /// stay bounded by the cold bytes requested. (Against the uncredited
+    /// figure every retry evicted another read's worth, oldest hot first,
+    /// until the cache was empty.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fenced_cold_reads_beyond_the_walk_never_evict_the_hot_window() {
+        const MIB: u64 = 1 << 20;
+        let (root, source) = fixture();
+        let volume = 10 * MIB;
+        let _accountant = nanosiem_lake_cell::volume_usage::start_with(
+            root.path().to_path_buf(), vec![root.path().to_path_buf()],
+            nanosiem_lake_cell::volume_usage::AccountantConfig::every(Duration::from_secs(3600)),
+        ).unwrap();
+        let cache = open(root.path(), volume, &source);
+        cache.set_hot_capacity(crate::local_hot_window::Settings {
+            root: root.path().to_path_buf(), hours: 72, bytes_per_second: 0,
+            reserve_bytes: Some(0), max_bytes: volume, schedule: Default::default(), persistent: false,
+        });
+        cache.set_cold_read_reserve(volume / crate::local_hot_window::COLD_READ_RESERVE_DIVISOR);
+        // Eight window objects, just under capacity minus the reserve (the
+        // volume's directories take a few blocks).
+        let hot = (0..8).map(|n| source.put(&format!("hot-{n}"), (MIB - 64 * 1024) as usize)).collect::<Vec<_>>();
+        cache.set_hot(hot.iter().enumerate().map(|(end, object)| (object.sha256.clone(), end as i64 + 1)).collect());
+        for object in &hot {
+            drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(object))).await.unwrap());
+        }
+        let resident = |objects: &[ReaderObjectRef]| objects.iter().filter(|o| cache.object_path(&o.sha256).exists()).count();
+        assert_eq!(resident(&hot), 8, "the window fits: {:?}", cache.stats());
+        let evictions_before = cache.stats().evictions;
+        cache.set_saturation_wait(Duration::from_millis(1_000));
+        let mut outcomes = Vec::new();
+        for round in 0..4 {
+            let cold = (0..2).map(|n| source.put(&format!("cold-{round}-{n}"), MIB as usize)).collect::<Vec<_>>();
+            let outcome = cache.ensure_local(&cold).await.map(drop);
+            outcomes.push((round, outcome.is_ok(), resident(&hot), cache.stats().evictions - evictions_before));
+        }
+        assert!(outcomes[0].1, "the reserve takes the first cold read: {outcomes:?}");
+        for (round, _, hot_left, _) in &outcomes {
+            assert_eq!(*hot_left, 8, "round {round}: a fenced cold read evicted the hot window: {outcomes:?}");
+        }
+        let (_, _, _, evictions) = outcomes[3];
+        assert!(evictions <= 2 * 4, "evictions are bounded by the cold objects requested: {outcomes:?}");
+    }
+
+    /// NAN-4591: with a hot-window policy, background hydration never admits
+    /// into the cold-read reserve, while a foreground read may use all of it.
+    #[tokio::test]
+    async fn background_hydration_stops_at_the_cold_read_reserve() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 1 << 20, &source);
+        cache.set_hot_capacity(crate::local_hot_window::Settings {
+            root: root.path().to_path_buf(), hours: 72, bytes_per_second: 0,
+            reserve_bytes: Some(0), max_bytes: 1 << 40, schedule: Default::default(), persistent: false,
+        });
+        let reserve = cache.cold_read_reserve();
+        assert_eq!(reserve, 512 << 10, "small caches: half");
+        let hot = (0..4).map(|n| source.put(&format!("hot-{n}"), 128 << 10)).collect::<Vec<_>>();
+        for object in &hot {
+            drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(object))).await.unwrap());
+        }
+        cache.set_hot(hot.iter().enumerate().map(|(end, object)| (object.sha256.clone(), end as i64 + 1)).collect());
+        // The window is at capacity minus the reserve: one more background
+        // window object evicts the oldest hot one rather than entering the
+        // reserve.
+        let more = source.put("hot-more", 128 << 10);
+        cache.set_hot(hot.iter().chain([&more]).enumerate().map(|(end, object)| (object.sha256.clone(), end as i64 + 1)).collect());
+        drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(&more))).await.unwrap());
+        assert!(cache.stats().stored_bytes <= (1 << 20) - reserve, "{:?}", cache.stats());
+        assert!(!cache.object_path(&hot[0].sha256).exists());
+        // A foreground read uses the reserve without evicting the window.
+        let cold = (0..3).map(|n| source.put(&format!("cold-{n}"), 128 << 10)).collect::<Vec<_>>();
+        let lease = cache.ensure_local(&cold).await.unwrap();
+        for object in &hot[1..] {
+            assert!(cache.object_path(&object.sha256).exists(), "a cold read evicted the window");
+        }
+        drop(lease);
+    }
+
+    /// NAN-4591 (review of #8001): a window object admitted in the
+    /// background slides the window (evicts the oldest hot object) instead
+    /// of evicting recent cold reads, so a repeated 7 d search finds its
+    /// older parts still local after a prewarm or hydration pass.
+    #[tokio::test]
+    async fn a_sliding_window_keeps_recent_cold_reads() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 1 << 20, &source);
+        cache.set_hot_capacity(crate::local_hot_window::Settings {
+            root: root.path().to_path_buf(), hours: 72, bytes_per_second: 0,
+            reserve_bytes: Some(0), max_bytes: 1 << 40, schedule: Default::default(), persistent: false,
+        });
+        assert_eq!(cache.cold_read_reserve(), 512 << 10);
+        let hot = (0..5).map(|n| source.put(&format!("hot-{n}"), 128 << 10)).collect::<Vec<_>>();
+        let window = |objects: &[ReaderObjectRef]| {
+            objects.iter().enumerate().map(|(end, object)| (object.sha256.clone(), end as i64 + 1)).collect()
+        };
+        cache.set_hot(window(&hot[..4]));
+        for object in &hot[..4] {
+            drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(object))).await.unwrap());
+        }
+        let cold = (0..2).map(|n| source.put(&format!("cold-{n}"), 128 << 10)).collect::<Vec<_>>();
+        drop(cache.ensure_local(&cold).await.unwrap());
+        cache.set_hot(window(&hot));
+        drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(&hot[4]))).await.unwrap());
+        assert!(!cache.object_path(&hot[0].sha256).exists(), "the window slid");
+        for object in hot[1..].iter().chain(&cold) {
+            assert!(cache.object_path(&object.sha256).exists(), "{:?}", cache.stats());
+        }
+    }
+
+    /// NAN-4637: a background read of an object outside the window (the
+    /// identity observation backfill) with the window full evicts no hot
+    /// object. It counted against the window limit and slid the window,
+    /// and the next hydration pass downloaded those objects again.
+    #[tokio::test]
+    async fn background_reads_outside_the_window_never_slide_it() {
+        let (root, source) = fixture();
+        let cache = open(root.path(), 1 << 20, &source);
+        cache.set_hot_capacity(crate::local_hot_window::Settings {
+            root: root.path().to_path_buf(), hours: 72, bytes_per_second: 0,
+            reserve_bytes: Some(0), max_bytes: 1 << 40, schedule: Default::default(), persistent: false,
+        });
+        assert_eq!(cache.cold_read_reserve(), 512 << 10);
+        let hot = (0..4).map(|n| source.put(&format!("hot-{n}"), 128 << 10)).collect::<Vec<_>>();
+        cache.set_hot(hot.iter().enumerate().map(|(end, object)| (object.sha256.clone(), end as i64 + 1)).collect());
+        for object in &hot {
+            drop(background_hydrate(1 << 30, cache.ensure_local(std::slice::from_ref(object))).await.unwrap());
+        }
+        // The window is full (capacity minus the reserve). Three backfill
+        // reads: the first two fit the background total (capacity minus
+        // half the reserve); the third evicts the oldest of them.
+        let backfill = (0..3).map(|n| source.put(&format!("identity-{n}"), 128 << 10)).collect::<Vec<_>>();
+        for object in &backfill {
+            drop(background_maintenance(cache.ensure_local(std::slice::from_ref(object))).await.unwrap());
+        }
+        for object in &hot {
+            assert!(cache.object_path(&object.sha256).exists(), "a backfill read slid the window: {:?}", cache.stats());
+        }
+        assert!(!cache.object_path(&backfill[0].sha256).exists(), "the total limit still binds, cold first");
+        assert!(cache.object_path(&backfill[2].sha256).exists());
     }
 
     #[tokio::test]

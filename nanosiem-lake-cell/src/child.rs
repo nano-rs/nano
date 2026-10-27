@@ -33,6 +33,20 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
+mod native;
+pub use native::{NativeBootstrapped, NativeControlChannel, NativeEvent, NativeHeartbeat, ServiceBoot};
+pub(crate) use native::validate_assignment as validate_native_assignment;
+
+/// H02 CP32 offline gate: the receiver's own pre-jail check
+/// ([`native::validate_assignment`], the step before `jail::apply_native`) on a
+/// decoded assignment frame, exactly as `bootstrap_native` runs it.
+#[doc(hidden)]
+pub fn native_receiver_preflight(
+    service: crate::contract::NativeChildService,
+    assignment: &crate::contract::NativeLandingAssignment,
+) -> anyhow::Result<()> {
+    native::validate_assignment(&[service], crate::contract::PROTOCOL_VERSION, service, assignment, &[])
+}
 
 /// A confined, assigned tenant process, before its async runtime starts.
 pub struct Bootstrapped {
@@ -79,13 +93,33 @@ pub fn bootstrap() -> anyhow::Result<Bootstrapped> {
 /// still single-threaded and before the jail makes `/proc/self/auxv` unreadable.
 /// The callback must not open tenant data, receive secrets, or start threads.
 pub fn bootstrap_with_native_init(init: impl FnOnce(&Assignment) -> anyhow::Result<()>) -> anyhow::Result<Bootstrapped> {
+    match bootstrap_services_with_native_init(&[], init)? {
+        ServiceBoot::Hosted(boot) => Ok(boot),
+        ServiceBoot::Native(_) => bail!("native service was not advertised"),
+    }
+}
+
+/// Only the compiled application entry advertises supported byte services.
+/// The legacy bootstrap advertises none, so it cannot silently select native.
+pub fn bootstrap_with_services(services: &[crate::contract::NativeChildService]) -> anyhow::Result<ServiceBoot> {
+    bootstrap_services_with_native_init(services, |_| Ok(()))
+}
+
+fn bootstrap_services_with_native_init(
+    services: &[crate::contract::NativeChildService],
+    init: impl FnOnce(&Assignment) -> anyhow::Result<()>,
+) -> anyhow::Result<ServiceBoot> {
+    anyhow::ensure!(crate::contract::valid_native_services(services), "invalid native service advertisement");
     crate::crash_capture::install().context("install native crash capture")?;
     let control = control_fd_from_args()?;
-    send(&control, &ToSupervisor::Hello { pid: std::process::id(), protocol_version: PROTOCOL_VERSION })?;
+    send(&control, &ToSupervisor::Hello { pid: std::process::id(), protocol_version: PROTOCOL_VERSION, native_services: services.to_vec() })?;
 
     // Warm: wait (possibly minutes) for an assignment.
     let assignment = match fdpass::recv_json::<ToChild>(control.as_fd())? {
         None => std::process::exit(0), // supervisor gone or pool shrunk
+        Some((ToChild::NativeAssign { protocol_version, service, assignment }, fds)) => {
+            return native::bootstrap_native(control, services, protocol_version, service, *assignment, fds);
+        }
         Some((ToChild::Assign { protocol_version, assignment }, mut fds)) => {
             if protocol_version != PROTOCOL_VERSION {
                 let _ = send(&control, &ToSupervisor::Fatal { error: format!("protocol {protocol_version}") });
@@ -134,6 +168,7 @@ pub fn bootstrap_with_native_init(init: impl FnOnce(&Assignment) -> anyhow::Resu
             gid: report.gid,
             landlock: report.landlock.clone(),
             seccomp: report.seccomp,
+            cgroupns: report.cgroupns,
         },
     )?;
 
@@ -143,7 +178,7 @@ pub fn bootstrap_with_native_init(init: impl FnOnce(&Assignment) -> anyhow::Resu
         Some((other, _)) => bail!("expected secrets, got {other:?}"),
     };
     send(&control, &ToSupervisor::Ready)?;
-    Ok(Bootstrapped { assignment, jail: report, secret, control })
+    Ok(ServiceBoot::Hosted(Bootstrapped { assignment, jail: report, secret, control }))
 }
 
 impl Bootstrapped {
@@ -226,7 +261,7 @@ impl ControlChannel {
                     }
                     Event::Secrets(fdpass::read_secret_memfd(fds.remove(0))?)
                 }
-                ToChild::Assign { .. } => {
+                ToChild::Assign { .. } | ToChild::NativeAssign { .. } | ToChild::NativeRun { .. } => {
                     tracing::warn!("ignoring handshake message after ready");
                     continue;
                 }

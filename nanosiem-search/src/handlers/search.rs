@@ -250,6 +250,14 @@ fn opted_out_of_async(headers: &axum::http::HeaderMap) -> bool {
         .is_some_and(|value| value.trim() == "0")
 }
 
+/// NAN-4593: whether a resource-bound (shed) query may be answered with a
+/// durable job id. `x-nano-accept-async: 0` means the caller cannot follow a
+/// job, so `{job_id, status}` (no `results`) would read as "no matches"; it
+/// gets the explicit `RESOURCE_EXHAUSTED` refusal instead.
+fn shed_may_answer_with_job(headers: &axum::http::HeaderMap) -> bool {
+    !opted_out_of_async(headers)
+}
+
 /// NAN-3474: the part of `deadline` left after `elapsed` of request setup
 /// (auth, scope, cache lookup), so the cap is measured from when the proxy
 /// started waiting, never restarted at execution.
@@ -371,6 +379,34 @@ async fn route_bare_star_to_background_job(
     Ok(Some(job_id))
 }
 
+/// NAN-4664: the `/api/search` body, plus whether `use_cache` was sent at
+/// all (`SearchRequest::use_cache` reads an absent field as `false`, which
+/// the result cache must not treat as an explicit opt-out).
+pub struct SearchBody {
+    pub request: SearchRequest,
+    pub explicit_use_cache: Option<bool>,
+}
+
+impl<S: Send + Sync> axum::extract::FromRequest<S> for SearchBody {
+    type Rejection = axum::response::Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        use axum::response::IntoResponse;
+        let Json(value) = Json::<serde_json::Value>::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let explicit_use_cache = value.get("use_cache").and_then(serde_json::Value::as_bool);
+        let request = serde_json::from_value::<SearchRequest>(value).map_err(|error| {
+            (
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                format!("Failed to deserialize the JSON body into the target type: {error}"),
+            )
+                .into_response()
+        })?;
+        Ok(Self { request, explicit_use_cache })
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/api/search",
@@ -378,7 +414,8 @@ async fn route_bare_star_to_background_job(
     request_body = SearchRequest,
     params(
         ("x-nano-progressive-views" = Option<String>, Header, description = "1 returns a minimal Lateral or native-tree dispatcher; use /api/search/stream for Lateral and /api/search/tree-page for tree roots/children"),
-        ("x-nano-accept-async" = Option<String>, Header, description = "A search still running 45 s after the request arrived (NANO_SEARCH_INTERACTIVE_ESCALATE_AFTER_SECS) is moved to a durable job (body {job_id, status}, header x-nano-query-escalated: deadline), so it never outlives the 60 s edge. On a lake cell a bare `*` search (no search term, source/class scope or entity term, after the where-hoist) over more than 4 h goes straight to that job with no interactive attempt, unless it only lists events (head, table, fields, rename, sort -time) or the 5-minute count rollups answer it without a scan (`* | stats count by metadata.log_source`) (header x-nano-query-escalated: bare-star-window). 0 opts out: the request runs to completion (a resource-bound query can still answer with a job id). Unless 0, a `use_cache: true` search of a settled absolute window (ending at least 5 min ago) that the caller already ran as a durable job, with the same deny set, authority and unchanged data, answers {job_id, status: completed} with x-nano-cache: hit and x-nano-cache-age; its rows are read through the job result pages."), // NAN-3809
+        ("x-nano-accept-async" = Option<String>, Header, description = "A search still running 45 s after the request arrived (NANO_SEARCH_INTERACTIVE_ESCALATE_AFTER_SECS) is moved to a durable job (body {job_id, status}, header x-nano-query-escalated: deadline), so it never outlives the 60 s edge. On a lake cell a bare `*` search (no search term, source/class scope or entity term, after the where-hoist) over more than 4 h goes straight to that job with no interactive attempt, unless it only lists events (head, table, fields, rename, sort -time) or the 5-minute count rollups answer it without a scan (`* | stats count by metadata.log_source`) (header x-nano-query-escalated: bare-star-window). 0 opts out: the request runs to completion and never answers with a job id (a resource-bound query answers 422 RESOURCE_EXHAUSTED instead). Unless 0, a `use_cache: true` search of a settled absolute window (ending at least 5 min ago) that the caller already ran as a durable job, with the same deny set, authority and unchanged data, answers {job_id, status: completed} with x-nano-cache: hit and x-nano-cache-age; its rows are read through the job result pages."), // NAN-3809
+        ("x-nano-admission-wait-ms" = Option<u64>, Header, description = "How long this search may wait in the tenant's fair admission queue for a slot, in ms (default 60000, or the full queue timeout for x-nano-accept-async: 0; always capped at the configured search queue timeout, 300 s by default). Agents running many hunts at once set it so they slow down instead of failing; 0 fails fast. A 429 ADMISSION_DENIED with Retry-After: 2 comes only when this budget ends or the queue is full."), // NAN-4664
     ),
     security(("bearer_auth" = []), ("api_key" = [])),
     responses(
@@ -387,7 +424,7 @@ async fn route_bare_star_to_background_job(
         (status = 400, description = "Invalid query", body = ErrorResponse),
         (status = 422, description = "Too large to run interactively (COLD_SCAN_TOO_LARGE): one pass would stage more uncached data than the tenant reader's cold-read ceiling (derived from its cache size). Body carries needed_bytes and ceiling_bytes, plus background_ceiling_bytes when an async search could run it. A cold read under the ceiling is never refused: it queues for the reader's heavy cold-read slot and the stream reports progress events with phase cold_scan.", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 429, description = "Admission denied; ADMISSION_BACKEND_UNAVAILABLE includes Retry-After: 2 and a retryable dependency marker", body = ErrorResponse),
+        (status = 429, description = "Admission denied (the x-nano-admission-wait-ms budget ended or the admission queue is full), Retry-After: 2; ADMISSION_BACKEND_UNAVAILABLE also carries a retryable dependency marker", body = ErrorResponse),
         (status = 409, description = "Query was cancelled (request_id was killed via DELETE /api/search/{request_id} or an admin cancel)", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
         (status = 503, description = "Search authority temporarily unavailable; retry after two seconds", body = ErrorResponse),
@@ -398,7 +435,7 @@ pub async fn search(
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     request_headers: axum::http::HeaderMap,
-    Json(mut request): Json<SearchRequest>,
+    SearchBody { mut request, explicit_use_cache }: SearchBody,
 ) -> Result<(axum::http::HeaderMap, Json<SearchResultResponse>), SearchError> {
     use crate::cache::cache_status_headers;
     use nanosiem_core::search::QueryPriority;
@@ -528,12 +565,15 @@ pub async fn search(
     // NAN-2361 wave 6: a shared tenant's cache identity carries the serving
     // generation (erasure / retention swaps invalidate at once); dedicated
     // deployments have none. Resolved once per request, before the lookup.
-    let serving_generation = if crate::is_shared_scope(auth.tenant_scope) && state.result_cache.is_some() {
+    // NAN-4664: also the in-flight sharing identity, so resolved for every
+    // shared request (not only with a result cache).
+    let serving_generation = if crate::is_shared_scope(auth.tenant_scope) {
         search_service.serving_generation_key().await
     } else {
         None
     };
-    if !bypass {
+    // NAN-4664: `use_cache` is tri-state; an explicit `false` skips this read.
+    if crate::cache::reads_result_cache(bypass, explicit_use_cache) {
         if let Some(ref cache) = state.result_cache {
             if let Some(mut cached) = cache
                 .get_for(auth.tenant_scope, &request, &scope, serving_generation.as_ref())
@@ -636,8 +676,46 @@ pub async fn search(
     // per-user limit / queue / timeout entirely, so dashboard panel
     // refreshes overshot `max_concurrent_queries_for_user`.
     let start = Instant::now();
-    let execution = nanosiem_core::search::streaming::DEFER_LATERAL_VIEW.scope(progressive_views,
-        search_service.search_with_admission(request.clone(), user_id, priority, &scope));
+    // NAN-4664: identical searches already running share one run (the
+    // leader holds the admission slot; followers take none). Fresh, not
+    // cached, so it applies to `use_cache: false` and bypass refreshes too.
+    let share_key = crate::inflight::share_eligible(
+        &request.query,
+        scope.deny_set(),
+        crate::is_shared_scope(auth.tenant_scope),
+        serving_generation.is_some(),
+        debug,
+        progressive_views,
+        risk_uncached,
+    )
+    .then(|| {
+        crate::cache::SearchResultCache::inflight_key_for(
+            auth.tenant_scope,
+            &request,
+            &scope,
+            serving_generation.as_ref(),
+            &inflight_authority_fingerprint(&auth, priority),
+        )
+    });
+    // Set when this request followed another's run (an atomic: the handler
+    // future must stay Send).
+    let followed = std::sync::atomic::AtomicBool::new(false);
+    let run_search = || {
+        nanosiem_core::search::streaming::DEFER_LATERAL_VIEW.scope(progressive_views,
+            search_service.search_with_admission(request.clone(), user_id, priority, &scope))
+    };
+    let execution = async {
+        match share_key.as_deref() {
+            Some(key) => {
+                let (result, role) = crate::inflight::searches()
+                    .run(key, run_search, crate::inflight::query_determined_failure)
+                    .await;
+                followed.store(role == crate::inflight::Role::Follower, std::sync::atomic::Ordering::Relaxed);
+                result
+            }
+            None => run_search().await,
+        }
+    };
     // NAN-3883: a cancel drops the execution (and with it the lake read).
     let execution = async {
         match cancel_signal.as_mut() {
@@ -727,6 +805,13 @@ pub async fn search(
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     if let Err(nanosiem_core::SearchError::ResourceExhausted(kind)) = &result {
+        // NAN-4593: a caller that opted out (`x-nano-accept-async: 0`) reads
+        // `results` only; a job id would reach it as a silent empty answer.
+        // It gets the explicit budget refusal, and no job is queued for it.
+        if !shed_may_answer_with_job(&request_headers) {
+            record_search_query("piped", duration_ms, false);
+            return Err(SearchError::ResourceExhausted(kind.clone()));
+        }
         // Revalidate before stamping durable work after a long interactive
         // attempt. A dependency outage must not create then cancel a job.
         require_current_shared_authority(&state, &auth).await?;
@@ -823,7 +908,9 @@ pub async fn search(
     // overrides (the key is computed inside the spawned write, outside this
     // request's override scope, so it would land under the ordinary key).
     let perf_overrides = nanosiem_core::search::lake_debug::perf_overrides().is_some();
-    if let (Ok(response), false) = (&result, risk_uncached || progressive_views || perf_overrides) {
+    // NAN-4664: a follower's result is the leader's, which the leader writes.
+    let follower = followed.load(std::sync::atomic::Ordering::Relaxed);
+    if let (Ok(response), false) = (&result, risk_uncached || progressive_views || perf_overrides || follower) {
         if let Some(ref cache) = state.result_cache {
             let cache = cache.clone();
             let req = request.clone();
@@ -854,6 +941,35 @@ pub async fn search(
         ));
     }
     Ok((headers, Json(SearchResultResponse::Sync(super::SearchPageResponse::new(response, &request)))))
+}
+
+/// NAN-4664: every server-resolved authority dimension beyond the tenant,
+/// serving generation and deny sets that could shape a shared search's
+/// result: the shared plan/entitlement revisions, the prevalence component,
+/// the tenant's query-retention policy and the admission priority (its
+/// ClickHouse budgets). Folded into the in-flight identity so a follower only
+/// ever receives a run computed under the same authority as its own.
+pub(crate) fn inflight_authority_fingerprint(
+    auth: &crate::AuthContext,
+    priority: nanosiem_core::search::QueryPriority,
+) -> Vec<u8> {
+    let retention = auth.shared_request_authority.as_ref().map(|authority| {
+        let r = &authority.retention;
+        (
+            authority.entitlement_assignment_revision,
+            r.assignment_revision,
+            r.retention_revision,
+            r.retention_entitlement_revision,
+            r.retention_option_revision,
+            r.retention_days,
+            r.irreversible_event_time_floor.timestamp_micros(),
+        )
+    });
+    format!(
+        "ent={:?};prev={};ret={:?};pri={:?}",
+        auth.shared_search_entitlement_revision, auth.shared_prevalence_entitled, retention, priority,
+    )
+    .into_bytes()
 }
 
 /// Header that asks `/api/search` for per-phase lake evidence (NAN-3077).
@@ -2069,6 +2185,48 @@ mod effective_scope_split_tests {
         items.iter().map(|item| item.to_string()).collect()
     }
 
+    /// NAN-4664 review: the in-flight identity of two callers of one tenant
+    /// differs whenever their effective visibility or authority does (audit
+    /// gate, plan/entitlement, prevalence, admission priority), and matches
+    /// only when nothing result-shaping differs (a search-only and an admin
+    /// key with the same scope legitimately share).
+    #[test]
+    fn inflight_identity_separates_every_authority_dimension() {
+        use nanosiem_core::search::QueryPriority;
+        let request: nanosiem_core::SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "* | stats count by metadata.log_source",
+            "time_range": {"start": "2026-10-26T00:00:00Z", "end": "2026-10-27T00:00:00Z"},
+        }))
+        .unwrap();
+        let key = |auth: &crate::AuthContext, priority: QueryPriority| {
+            crate::cache::SearchResultCache::inflight_key_for(
+                auth.tenant_scope,
+                &request,
+                &super::effective_scope(auth),
+                None,
+                &super::inflight_authority_fingerprint(auth, priority),
+            )
+        };
+        let interactive = QueryPriority::Interactive;
+        let search_only = api_key_auth(&[SEARCH_EXECUTE_ID]);
+        let admin = api_key_auth(&[SEARCH_EXECUTE_ID, nanosiem_core::auth::permissions::SEARCH_SQL]);
+        assert_eq!(key(&search_only, interactive), key(&admin, interactive), "same visibility shares");
+        let auditor = api_key_auth(&[SEARCH_EXECUTE_ID, AUDIT_VIEW_ID]);
+        assert_ne!(key(&search_only, interactive), key(&auditor, interactive), "audit:view sees audit rows");
+        let mut scoped = search_only.clone();
+        scoped.denied_sources = ScopeSet::from_denied(set(&["insider_threat"]));
+        assert_ne!(key(&search_only, interactive), key(&scoped, interactive), "source scope");
+        let mut entitled = search_only.clone();
+        entitled.shared_search_entitlement_revision = Some(7);
+        let mut next_plan = entitled.clone();
+        next_plan.shared_search_entitlement_revision = Some(8);
+        assert_ne!(key(&entitled, interactive), key(&next_plan, interactive), "plan revision");
+        let mut prevalence = search_only.clone();
+        prevalence.shared_prevalence_entitled = true;
+        assert_ne!(key(&search_only, interactive), key(&prevalence, interactive), "prevalence component");
+        assert_ne!(key(&search_only, interactive), key(&search_only, QueryPriority::Analytics), "priority budgets");
+    }
+
     /// NAN-3077: debug evidence needs the header AND `search:sql`.
     #[test]
     fn search_debug_needs_the_header_and_search_sql() {
@@ -2254,6 +2412,20 @@ mod nan3229_deadline_escalation {
         let mut progressive = axum::http::HeaderMap::new();
         progressive.insert("x-nano-progressive-views", axum::http::HeaderValue::from_static("1"));
         assert!(interactive_escalation_deadline(&progressive, false).is_some());
+    }
+
+    /// NAN-4593: an opted-out caller reads `results` only, so a shed query
+    /// must not answer it with a job id (a silent empty 200); every other
+    /// caller still follows the job.
+    #[test]
+    fn a_shed_query_answers_an_opted_out_caller_with_the_refusal_not_a_job() {
+        assert!(!shed_may_answer_with_job(&headers(Some("0"))));
+        assert!(!shed_may_answer_with_job(&headers(Some(" 0 "))));
+        assert!(shed_may_answer_with_job(&headers(Some("1"))));
+        assert!(shed_may_answer_with_job(&headers(None)));
+        let refusal = SearchError::ResourceExhausted("scan".into());
+        assert_eq!(refusal.status_code(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refusal.code(), "RESOURCE_EXHAUSTED");
     }
 
     #[test]
@@ -2477,5 +2649,51 @@ mod nan4163_bare_star_route {
         assert!(!wants_bare_star_background_job(true, &request("* | stats count by metadata.log_source", week, None)));
         assert!(!wants_bare_star_background_job(true, &request("* | stats count() as count by metadata.log_source | sort -count", week, None)));
         assert!(wants_bare_star_background_job(true, &request("* | stats dc(device.hostname) by metadata.log_source", week, None)));
+    }
+}
+
+#[cfg(test)]
+mod nan4664_search_body_tests {
+    use super::SearchBody;
+    use axum::body::Body;
+    use tower::ServiceExt;
+
+    async fn explicit(body: serde_json::Value) -> (axum::http::StatusCode, String) {
+        let app = axum::Router::new().route(
+            "/api/search",
+            axum::routing::post(|SearchBody { request, explicit_use_cache }: SearchBody| async move {
+                format!("{explicit_use_cache:?} {}", request.use_cache)
+            }),
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/api/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// The production extractor tells an omitted `use_cache` from an
+    /// explicit `false`, and keeps the request's own field as before.
+    #[tokio::test]
+    async fn use_cache_is_tri_state_on_the_wire() {
+        let base = serde_json::json!({"query": "*", "time_range": {"start": "2026-10-26T00:00:00Z", "end": "2026-10-27T00:00:00Z"}});
+        assert_eq!(explicit(base.clone()).await, (axum::http::StatusCode::OK, "None false".into()));
+        let mut off = base.clone();
+        off["use_cache"] = false.into();
+        assert_eq!(explicit(off).await.1, "Some(false) false");
+        let mut on = base.clone();
+        on["use_cache"] = true.into();
+        assert_eq!(explicit(on).await.1, "Some(true) true");
+        let mut null = base.clone();
+        null["use_cache"] = serde_json::Value::Null;
+        assert_eq!(explicit(null).await.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY, "a null bool is still rejected");
+        assert_eq!(explicit(serde_json::json!({"query": 1})).await.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

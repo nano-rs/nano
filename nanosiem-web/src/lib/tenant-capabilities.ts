@@ -28,7 +28,20 @@ export const TENANT_COMPONENT_CODES = [
   'sso',
 ] as const;
 
-export type TenantComponentCode = (typeof TENANT_COMPONENT_CODES)[number];
+/**
+ * Components the server recognizes but serializes only when the plan has a
+ * row for them (`OPTIONAL_TENANT_COMPONENTS` in
+ * `nanosiem-core/src/tenant_entitlements.rs`). Old immutable plans predate
+ * them, so absence means disabled rather than an invalid manifest. Any code
+ * outside both lists is still refused.
+ */
+export const OPTIONAL_TENANT_COMPONENT_CODES = [
+  'soar',
+] as const;
+
+export type RequiredTenantComponentCode = (typeof TENANT_COMPONENT_CODES)[number];
+export type OptionalTenantComponentCode = (typeof OPTIONAL_TENANT_COMPONENT_CODES)[number];
+export type TenantComponentCode = RequiredTenantComponentCode | OptionalTenantComponentCode;
 
 export const ENTERPRISE_SHARED_FEATURE_FLAG_CODES = [
   'parser_cell_canary',
@@ -317,13 +330,24 @@ export function validateTenantCapabilitySnapshot(
     throw new TenantCapabilityContractError('Tenant component manifest is missing');
   }
   const componentManifest = value.components;
-  const actualComponentCodes = Object.keys(componentManifest).sort();
-  const expectedComponentCodes = [...TENANT_COMPONENT_CODES].sort();
-  if (!sameStringSet(actualComponentCodes, expectedComponentCodes)) {
+  const knownComponentCodes = new Set<string>([
+    ...TENANT_COMPONENT_CODES,
+    ...OPTIONAL_TENANT_COMPONENT_CODES,
+  ]);
+  const actualComponentCodes = Object.keys(componentManifest);
+  if (TENANT_COMPONENT_CODES.some((code) => !Object.hasOwn(componentManifest, code))
+      || actualComponentCodes.some((code) => !knownComponentCodes.has(code))) {
     throw new TenantCapabilityContractError('Tenant component manifest is incomplete or unknown');
   }
 
-  const components = Object.fromEntries(TENANT_COMPONENT_CODES.map((code) => {
+  const components = Object.fromEntries([
+    ...TENANT_COMPONENT_CODES,
+    ...OPTIONAL_TENANT_COMPONENT_CODES,
+  ].map((code) => {
+    // Optional components the plan predates are disabled, never inherited.
+    if (!Object.hasOwn(componentManifest, code)) {
+      return [code, { enabled: false, configuration: {} }];
+    }
     const grant = componentManifest[code];
     if (!isRecord(grant)
         || typeof grant.enabled !== 'boolean'

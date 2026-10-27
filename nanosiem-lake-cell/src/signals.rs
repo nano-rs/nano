@@ -91,14 +91,18 @@ pub fn prevalence_behind(tenant_id: Option<TenantId>, seconds: f64, entries: u64
         (seconds > 0.0).then(|| format!("prevalence state {entries} committed part-log entries behind")))
 }
 
-/// NAN-3781: `prevalence_degraded` warns after 2 min. Degraded means the
-/// state could not be opened or used and rows go unstamped (ingest goes on).
-/// A hosted R2 read stall reopens in about 10 s (tenant-a, 2026-10-13); a spell
-/// past two minutes is a store that is not coming back by itself (CT 106: a
-/// state stalled at SlateDB's L0 cap, 2026-10-13).
-pub const PREVALENCE_DEGRADED_WARN_SECS: f64 = 2.0 * 60.0;
-/// NAN-3781: pages at 15 min of unstamped rows.
-pub const PREVALENCE_DEGRADED_PAGE_SECS: f64 = 15.0 * 60.0;
+/// `prevalence_degraded` warns after 15 min (NAN-4445; NAN-3781 had 2).
+/// Degraded means the state could not be opened or used and rows go
+/// unstamped (ingest goes on). A hosted R2 read stall reopens in about 10 s
+/// (tenant-a, 2026-10-13) and one failed open retries after 30 s, 1, 2, 4 and
+/// 8 min: a spell past 15 min has outlived several reopens and is a store
+/// that is not coming back by itself (the large tenant 2026-10-21: an abandoned WAL owner
+/// reservation; CT 106: a state stalled at SlateDB's L0 cap).
+pub const PREVALENCE_DEGRADED_WARN_SECS: f64 = 15.0 * 60.0;
+/// NAN-4445: pages at 60 min of unstamped rows. The value is the spell's
+/// age across cell rolls (the ingest persists the spell's start in the
+/// tenant bucket), so a roll no longer restarts the clock.
+pub const PREVALENCE_DEGRADED_PAGE_SECS: f64 = 60.0 * 60.0;
 
 /// NAN-3781: the tenant's prevalence state is unavailable. Unlike
 /// [`prevalence_behind`] (a state that works but lags) nothing is being
@@ -107,6 +111,16 @@ pub fn prevalence_degraded(tenant_id: Option<TenantId>, seconds: f64) -> Signal 
     Signal::evaluate(tenant_id, "ingest", "prevalence", "prevalence_degraded", "seconds", seconds,
         PREVALENCE_DEGRADED_WARN_SECS, PREVALENCE_DEGRADED_PAGE_SECS,
         (seconds > 0.0).then(|| "prevalence state unavailable; rows go unstamped".to_string()))
+}
+
+/// NAN-4445: [`prevalence_degraded`] as the supervisor reports it for one
+/// ingest heartbeat. `known == Some(false)` (a new process still reading the
+/// spell its predecessor persisted, or before its first open finished):
+/// nothing, so a cell roll leaves a firing alert as it is instead of
+/// resolving it on a 0 and re-firing it as a flap minutes later. `None` (a
+/// child that predates the field) reports as before.
+pub fn prevalence_degraded_reported(tenant_id: Option<TenantId>, seconds: f64, known: Option<bool>) -> Option<Signal> {
+    (known != Some(false)).then(|| prevalence_degraded(tenant_id, seconds))
 }
 
 /// NAN-3701: `l0_merge_overdue` warns at 15 min. The value counts from the
@@ -217,6 +231,10 @@ impl Hysteresis {
     pub fn for_signal(signal: &str) -> Self {
         match signal {
             "query_throttled_5m" => Self::SUSTAINED_CAPACITY,
+            // NAN-4610: a burst of findings is drained in a few 512-row passes;
+            // only a depth that holds for 10 min is an alert (the age signal
+            // already covers a stuck drain).
+            "finding_outbox_backlog" => Self::SUSTAINED_CAPACITY,
             _ => Self::DEFAULT,
         }
     }
@@ -410,16 +428,57 @@ mod tests {
         assert_eq!(prevalence_behind(None, 3_600.0, 120).severity, Severity::Page);
     }
 
-    /// NAN-3781: tenant-a's ~10 s R2 read-stall reopen stays quiet; CT 106's
-    /// state stuck at the L0 cap warns at 2 min and pages at 15.
+    /// NAN-4445: tenant-a's ~10 s R2 read-stall reopen and a few failed
+    /// reopens stay quiet; a spell warns at 15 min and pages at 60 (the large tenant sat
+    /// 41 h degraded while each roll restarted its clock).
     #[test]
-    fn prevalence_degraded_warns_at_two_minutes_and_pages_at_fifteen() {
+    fn prevalence_degraded_warns_at_fifteen_minutes_and_pages_at_sixty() {
         let quiet = prevalence_degraded(None, 0.0);
         assert_eq!((quiet.signal, quiet.component, quiet.severity), ("prevalence_degraded", "prevalence", Severity::Ok));
         assert!(quiet.detail.is_none());
         assert_eq!(prevalence_degraded(None, 10.0).severity, Severity::Ok, "tenant-a's R2 stall reopen");
-        assert_eq!(prevalence_degraded(None, 120.0).severity, Severity::Warn);
-        assert_eq!(prevalence_degraded(None, 15.0 * 60.0).severity, Severity::Page);
+        assert_eq!(prevalence_degraded(None, 14.0 * 60.0).severity, Severity::Ok);
+        assert_eq!(prevalence_degraded(None, 15.0 * 60.0).severity, Severity::Warn);
+        assert_eq!(prevalence_degraded(None, 59.0 * 60.0).severity, Severity::Warn);
+        assert_eq!(prevalence_degraded(None, 60.0 * 60.0).severity, Severity::Page);
+    }
+
+    /// NAN-4445: an unknown spell (a process right after a roll) reports no
+    /// row at all; a known one and a child predating the field report.
+    #[test]
+    fn prevalence_degraded_is_absent_until_the_new_process_knows() {
+        assert!(prevalence_degraded_reported(None, 0.0, Some(false)).is_none());
+        assert!(prevalence_degraded_reported(None, 7_200.0, Some(false)).is_none());
+        assert_eq!(prevalence_degraded_reported(None, 7_200.0, Some(true)).unwrap().severity, Severity::Page);
+        assert_eq!(prevalence_degraded_reported(None, 0.0, None).unwrap().severity, Severity::Ok, "old child");
+        let fresh = crate::contract::Heartbeat { prevalence_degraded_known: Some(false), ..Default::default() };
+        let json = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(json["prevalence_degraded_known"], false);
+        // A child predating the field never sends it.
+        let old_json = serde_json::to_value(crate::contract::Heartbeat::default()).unwrap();
+        assert!(old_json.get("prevalence_degraded_known").is_none());
+        let old: crate::contract::Heartbeat = serde_json::from_value(old_json).unwrap();
+        assert_eq!(old.prevalence_degraded_known, None);
+    }
+
+    /// NAN-4445: the exact `/v1/lean-cell-alerts` rows the control plane's
+    /// lake-pipeline-alerts consumer reads for `prevalence_degraded` (page,
+    /// warn, resolved). The control plane's contract test parses the same fixture.
+    #[test]
+    fn prevalence_degraded_feed_matches_the_platform_contract_fixture() {
+        let tenant = || Some(TenantId::new("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap());
+        let feed = LeanCellAlertFeed::from_signals("cell-us-d-aaaaaaaa", vec![
+            prevalence_degraded(tenant(), 41.0 * 3_600.0),
+            prevalence_degraded(tenant(), 20.0 * 60.0),
+            prevalence_degraded(tenant(), 0.0),
+        ]);
+        let mut got = serde_json::to_value(&feed).unwrap();
+        got.as_object_mut().unwrap().remove("evaluated_at").expect("feed carries evaluated_at");
+        let want: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/lean-cell-alerts-prevalence-degraded.json")).unwrap();
+        let mut want = want;
+        want.as_object_mut().unwrap().remove("evaluated_at");
+        assert_eq!(got, want, "regenerate both copies of the fixture together");
     }
 
     /// NAN-3701: the merge-deadline signal alerts even when ingestion is

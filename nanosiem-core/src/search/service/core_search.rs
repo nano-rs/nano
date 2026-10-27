@@ -2530,13 +2530,29 @@ fn lake_rollup_covers(field: &str) -> bool {
     crate::search::lake::lake_count_rollup_field_multi_value(field).is_some()
 }
 
+/// Whether the worker accepts `span_us` as a count-rollup bucket span: a
+/// whole number of [`LAKE_COUNT_ROLLUP_BUCKET_US`] (the worker's
+/// `validate_shape` refuses anything else as invalid).
+fn lake_rollup_span_supported(span_us: Option<i64>) -> bool {
+    span_us.is_none_or(|span| span >= LAKE_COUNT_ROLLUP_BUCKET_US && span % LAKE_COUNT_ROLLUP_BUCKET_US == 0)
+}
+
 /// The single-field rollup request (`field`, exact predicate) for `plan`, or
-/// `None` when the rollups cannot answer it (uncovered field, or a predicate
-/// the rollup cannot express exactly).
+/// `None` when the rollups cannot answer it (uncovered field, a predicate
+/// the rollup cannot express exactly, or a bucket span finer than or not
+/// aligned to the rollup bucket).
+///
+/// NAN-4664: before the span check, `class_uid=4001 | timechart span=1m
+/// count` sent a `-count-rollup` request with a 60 s span on every search;
+/// the worker refused it as invalid and the search then ran its raw scan,
+/// so each such hunt paid a wasted worker round-trip first.
 fn lake_count_rollup_request<'a>(
     profile: &dyn crate::schema::SchemaProfile,
     plan: &'a LakeCountStatsPlan,
 ) -> Option<(&'a str, Option<LakeCountPredicate>)> {
+    if !lake_rollup_span_supported(plan.bucket_span_us) {
+        return None;
+    }
     let field = plan.rollup_field.as_deref().filter(|field| lake_rollup_covers(field))?;
     lake_rollup_exact_predicate(profile, field, plan.rollup_predicate.as_ref())
         .map(|predicate| (field, predicate))
@@ -2687,7 +2703,10 @@ fn lake_count_plan_rollup_exact(
             && lake_rollup_union_side(profile, &union.right_field, &union.right_predicate).is_some();
     }
     if plan.rollup_union.is_some() {
-        return plan.group_by.is_empty()
+        // NAN-4664: the union answers window totals only (see
+        // `lake_count_rollup_rows`), never a bucketed series.
+        return plan.bucket_span_us.is_none()
+            && plan.group_by.is_empty()
             && plan.rollup_union.as_ref().is_some_and(|union| {
                 lake_rollup_predicate_is_exact(profile, &union.field, Some(&union.predicate))
             });
@@ -3377,9 +3396,7 @@ pub fn lake_count_rollup_answers(profile: &dyn crate::schema::SchemaProfile, que
         return false;
     };
     lake_count_plan_rollup_exact(profile, &plan.aggregate)
-        && plan.aggregate.bucket_span_us.is_none_or(|span| {
-            span >= LAKE_COUNT_ROLLUP_BUCKET_US && span % LAKE_COUNT_ROLLUP_BUCKET_US == 0
-        })
+        && lake_rollup_span_supported(plan.aggregate.bucket_span_us)
 }
 
 /// How a lean cell answers a raw-search aggregation (NAN-3153).
@@ -4502,7 +4519,9 @@ impl SearchService {
         let mut request_with_id = request;
         request_with_id.request_id = Some(query_id);
 
-        tokio::spawn(super::super::request_actor::inherit(async move {
+        // NAN-4664: a background job outlives its request; it waits for
+        // admission up to the configured queue timeout, not the HTTP budget.
+        tokio::spawn(super::super::request_actor::inherit(crate::search::admission::without_wait_budget(async move {
             // Step 1: Acquire admission permit
             let _permit = if let Some(ref controller) = admission_controller {
                 match service
@@ -4549,7 +4568,7 @@ impl SearchService {
                 }
             }
             // Step 5: _permit drops here, freeing the admission slot
-        }));
+        })));
 
         tracing::info!(
             "Created admission-controlled async search job: {} (user={}, priority={})",
@@ -4725,7 +4744,8 @@ impl SearchService {
         let service = self.clone();
         let job_id = id.clone();
         let scope = scope.clone();
-        tokio::spawn(super::super::request_actor::inherit(async move {
+        // NAN-4664: as above, the job's admission is not bound by the HTTP budget.
+        tokio::spawn(super::super::request_actor::inherit(crate::search::admission::without_wait_budget(async move {
             let result = async {
                 let _permit = match controller {
                     Some(ref controller) => Some(
@@ -4752,7 +4772,7 @@ impl SearchService {
             service
                 .finish_interactive_lake(&job_id, &scope, result)
                 .await;
-        }));
+        })));
         tracing::info!(job_id = %id, "started interactive lake search job");
         Ok(id)
     }
@@ -5393,9 +5413,12 @@ impl SearchService {
                 "lake query backend is enabled without a worker client".to_string(),
             )
         })?;
+        // The union counts are three window totals: they answer an
+        // ungrouped, unbucketed count only (never a timechart's series).
         if let Some((union, union_predicate)) = plan
             .rollup_union
             .as_ref()
+            .filter(|_| plan.bucket_span_us.is_none() && plan.group_by.is_empty())
             .filter(|union| lake_rollup_covers(&union.field))
             .and_then(|union| {
                 lake_rollup_exact_predicate(
@@ -6314,6 +6337,11 @@ impl SearchService {
         let Some(paged) = paged else { return Ok(None) };
         if over_budget.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(SearchError::ResourceExhausted("memory".to_string()));
+        }
+        // NAN-4593: the row consumer went away mid-read, so the rows gathered
+        // here are a prefix. Never hand that back as a complete answer.
+        if paged.stopped {
+            return Err(SearchError::Cancelled);
         }
         let mut response = paged.first.ok_or_else(|| {
             SearchError::SqlValidationError("paged lake search returned no first page".to_string())
@@ -12912,3 +12940,7 @@ mod nan3078_durable_post_processing_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "enterprise"))]
+#[path = "nan4664_rollup_sibling_tests.rs"]
+mod nan4664_rollup_sibling_tests;

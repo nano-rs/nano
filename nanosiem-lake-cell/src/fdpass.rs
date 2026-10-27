@@ -189,6 +189,26 @@ impl AsyncSeqpacket {
         }
     }
 
+    /// Recheck lifecycle under the same gate as stop/drain, at the actual
+    /// nonblocking sendmsg. No lock is retained while waiting for writability.
+    pub async fn send_json_guarded<T: Serialize>(
+        &self, msg: &T, fds: &[BorrowedFd<'_>], gate: &std::sync::Mutex<()>,
+        current: impl Fn() -> io::Result<()>,
+    ) -> io::Result<()> {
+        let data = serde_json::to_vec(msg).map_err(io::Error::other)?;
+        loop {
+            let mut ready = self.inner.writable().await?;
+            match ready.try_io(|fd| {
+                let _permit = gate.lock().map_err(|_| io::Error::other("secret delivery gate poisoned"))?;
+                current()?;
+                send_packet(fd.get_ref().as_fd(), &data, fds)
+            }) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
     pub async fn recv_json<T: DeserializeOwned>(&self) -> io::Result<Option<(T, Vec<OwnedFd>)>> {
         loop {
             let mut guard = self.inner.readable().await?;
@@ -338,5 +358,54 @@ mod tests {
         let (pid, uid, _) = peer_cred(a.as_fd()).unwrap();
         assert_eq!(pid as u32, std::process::id());
         assert_eq!(uid, unsafe { libc::geteuid() });
+    }
+
+    #[tokio::test]
+    async fn guarded_secret_send_rechecks_after_backpressure_without_delivering_fds() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+        let (sender, receiver) = seqpacket_pair().unwrap();
+        set_nonblocking(&sender).unwrap();
+        set_nonblocking(&receiver).unwrap();
+        let filler = vec![0_u8; 4096];
+        let mut queued = 0;
+        loop {
+            match send_packet(sender.as_fd(), &filler, &[]) {
+                Ok(()) => queued += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("prepare real socket backpressure: {error}"),
+            }
+        }
+        let gate = Arc::new(Mutex::new(()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let socket = Arc::new(AsyncSeqpacket::new(sender).unwrap());
+        let (g, s, a) = (gate.clone(), stopped.clone(), socket.clone());
+        let task = tokio::spawn(async move {
+            let secret = secret_memfd(b"synthetic-bootstrap-token").unwrap();
+            a.send_json_guarded(&serde_json::json!({"type":"secrets"}), &[secret.as_fd()], &g, || {
+                if s.load(Ordering::SeqCst) { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { Ok(()) }
+            }).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "send is actually waiting for the full socket");
+        { let _permit = gate.lock().unwrap(); stopped.store(true, Ordering::SeqCst); }
+        for _ in 0..queued {
+            let (_, fds) = recv_packet(receiver.as_fd()).unwrap().unwrap();
+            assert!(fds.is_empty(), "fillers never carried a secret");
+        }
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(recv_packet(receiver.as_fd()).unwrap_err().kind(), io::ErrorKind::WouldBlock,
+            "no packet or ancillary fd was exposed after stop");
+    }
+
+    #[tokio::test]
+    async fn guarded_secret_send_preserves_real_memfd_delivery_when_current() {
+        let (sender, receiver) = seqpacket_pair().unwrap();
+        let sender = AsyncSeqpacket::new(sender).unwrap();
+        let secret = secret_memfd(b"synthetic-bootstrap-token").unwrap();
+        sender.send_json_guarded(&serde_json::json!({"type":"secrets"}), &[secret.as_fd()], &std::sync::Mutex::new(()), || Ok(())).await.unwrap();
+        let (_, mut fds) = recv_packet(receiver.as_fd()).unwrap().unwrap();
+        assert_eq!(fds.len(), 1);
+        assert_eq!(read_secret_memfd(fds.remove(0)).unwrap().as_slice(), b"synthetic-bootstrap-token");
     }
 }

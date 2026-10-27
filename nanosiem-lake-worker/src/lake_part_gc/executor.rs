@@ -61,6 +61,26 @@ pub const MAX_AUTHORIZES_PER_MINUTE: u32 = 240;
 #[error("owner refused the lake-part delete bearer (401)")]
 pub struct BearerRefused;
 
+/// NAN-4612: the tenant's catalog custody guard refused a prepare / retire
+/// before any Worker call: the catalog may still reference the part, or the
+/// writer has not yet rebuilt its planned index from the remote catalog (a
+/// fresh or wiped data volume). Nothing was deleted. This is a pass pause, not
+/// a Worker failure: it must never read as `worker_unavailable`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("catalog custody holds the part: {reason}")]
+pub struct CatalogCustodyHeld {
+    pub reason: String,
+    /// Only this part is still referenced by the catalog: skip the key, keep
+    /// the pass. Otherwise the refusal is pass-wide (index not rebuilt, plan
+    /// pending, inspection failed, ...) and the pass stops.
+    pub part_pinned: bool,
+}
+
+/// Pause reason of a pass the catalog custody guard stopped (NAN-4612).
+pub const CATALOG_CUSTODY_HELD: &str = "catalog_custody_held";
+/// Per-key skip code: the catalog still references the part (NAN-4612).
+pub const CATALOG_PINNED: &str = "catalog_pinned";
+
 /// An owner / control refusal: `{"error": code}` with its HTTP status
 /// (`None` for a transport fault).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -203,6 +223,11 @@ impl LakePartDeleteReceipt {
 pub trait LakePartDeleteAuthority: Send + Sync {
     /// The Worker lists `lake_part_delete` in its retention capabilities.
     async fn worker_supports_lake_part_delete(&self) -> Result<bool>;
+    /// NAN-4567: the Worker also admits `quarantine_expired` permits
+    /// ([`super::quarantine_expiry::QUARANTINE_OPERATION`]). Default: no.
+    async fn worker_supports_quarantine_expiry(&self) -> Result<bool> {
+        Ok(false)
+    }
     /// Owner `lake-part-deletes:authorize`. Refusals are [`LakePartRefusal`].
     async fn authorize(&self, request: &LakePartDeleteRequest) -> Result<LakePartDeletePermit>;
     /// Worker `lake-part/prepare`: durable tombstone; echoes the permit.
@@ -450,6 +475,20 @@ fn sanitize_worker_error(text: &str) -> String {
     words.join(" ").chars().take(WORKER_ERROR_LOG_CHARS).collect()
 }
 
+/// A pass-wide custody refusal stops the pass with a back-off: every later
+/// key would meet the same guard. A part the catalog still pins is skipped
+/// (remembered under the refusal TTL) so it never starves the rest (NAN-4612).
+fn custody_held(request: &LakePartDeleteRequest, phase: &'static str, error: &anyhow::Error) -> Option<Step> {
+    let held = error.downcast_ref::<CatalogCustodyHeld>()?;
+    if held.part_pinned {
+        tracing::debug!(key = %request.key, phase, "lake part GC skipped a part the catalog still references");
+        return Some(Step::Skip(CATALOG_PINNED.into()));
+    }
+    let reason = sanitize_worker_error(&held.reason);
+    tracing::warn!(key = %request.key, phase, %reason, "lake part GC held by catalog custody; nothing deleted");
+    Some(Step::Stop { reason: CATALOG_CUSTODY_HELD.into(), backoff: true })
+}
+
 async fn delete_one(authority: &dyn LakePartDeleteAuthority, request: &LakePartDeleteRequest, trusted_local: bool) -> Step {
     if request.validate_with_local(trusted_local).is_err() {
         return Step::Skip("invalid_request".into());
@@ -475,6 +514,9 @@ async fn delete_one(authority: &dyn LakePartDeleteAuthority, request: &LakePartD
     let prepared = match authority.prepare(&permit).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            if let Some(step) = custody_held(request, "prepare", &error) {
+                return step;
+            }
             log_worker_failure(request, "prepare", &error);
             return Step::WorkerFailure("worker_prepare_failed");
         }
@@ -485,6 +527,9 @@ async fn delete_one(authority: &dyn LakePartDeleteAuthority, request: &LakePartD
     let receipt = match authority.retire(&permit).await {
         Ok(receipt) => receipt,
         Err(error) => {
+            if let Some(step) = custody_held(request, "retire", &error) {
+                return step;
+            }
             log_worker_failure(request, "retire", &error);
             return Step::WorkerFailure("worker_retire_failed");
         }
@@ -556,6 +601,16 @@ pub(crate) async fn execute_local(
         authority, requests, &mut Vec::new(), &mut RefusedKeys::default(), &mut AuthorizePacer::default(),
         chrono::Utc::now().timestamp_millis(), true, None,
     ).await
+}
+
+/// NAN-4567: execute a bronze quarantine expiry plan. Shares the pass's
+/// refused-key memory and authorize pacer; deleted keys are not queued for
+/// the control report (a quarantine key has no part writer rows).
+pub(crate) async fn execute_quarantine(
+    authority: &dyn LakePartDeleteAuthority, requests: &[LakePartDeleteRequest],
+    refused: &mut RefusedKeys, pacer: &mut AuthorizePacer, now_ms: i64,
+) -> PassReport {
+    execute_requests(authority, requests, &mut Vec::new(), refused, pacer, now_ms, false, None).await
 }
 
 async fn execute_requests<I, R>(
@@ -1003,6 +1058,76 @@ mod tests {
         let report = execute(&authority, &requests(2), &mut Vec::new()).await;
         assert_eq!((report.planned, report.deleted, report.paused_reason.clone()), (2, 2, None));
         assert!(authority.calls()[..3].iter().zip(["authorize", "prepare", "retire"]).all(|(c, s)| c.starts_with(s)));
+    }
+
+    /// NAN-4612: the catalog guard in front of the Worker refuses (the large tenant after
+    /// the T91 wipe: `os error 2` on the missing planned index). The pass
+    /// stops at once with a custody reason: no Worker call, no retire, and
+    /// never `worker_unavailable` / `worker_prepare_failed`.
+    #[tokio::test]
+    async fn catalog_custody_refusal_pauses_the_pass_without_reaching_the_worker() {
+        struct Held(FakeAuthority);
+        #[async_trait]
+        impl LakePartDeleteAuthority for Held {
+            async fn worker_supports_lake_part_delete(&self) -> Result<bool> {
+                self.0.worker_supports_lake_part_delete().await
+            }
+            async fn authorize(&self, request: &LakePartDeleteRequest) -> Result<LakePartDeletePermit> {
+                self.0.authorize(request).await
+            }
+            async fn prepare(&self, _: &LakePartDeletePermit) -> Result<LakePartDeletePermit> {
+                // Context layers (as Seams / Hosted wrappers may add) keep the type.
+                Err(anyhow::Error::new(CatalogCustodyHeld {
+                    reason: "catalog planned index not initialized".into(),
+                    part_pinned: false,
+                })
+                .context("catalog GC guard"))
+            }
+            async fn retire(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeleteReceipt> {
+                self.0.retire(permit).await
+            }
+        }
+        let authority = Held(FakeAuthority::capable());
+        let report = execute(&authority, &requests(3), &mut Vec::new()).await;
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.paused_reason.as_deref(), Some(CATALOG_CUSTODY_HELD));
+        assert!(report.backoff);
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let calls = authority.0.calls();
+        assert_eq!(calls.len(), 1, "one authorize, then stop: {calls:?}");
+        assert!(calls[0].starts_with("authorize"));
+    }
+
+    /// NAN-4612: a part the catalog still references is a per-key skip; the
+    /// next deletable key of the same pass is still deleted.
+    #[tokio::test]
+    async fn a_catalog_pinned_part_is_skipped_without_starving_the_pass() {
+        struct Pinned(FakeAuthority, String);
+        #[async_trait]
+        impl LakePartDeleteAuthority for Pinned {
+            async fn worker_supports_lake_part_delete(&self) -> Result<bool> {
+                self.0.worker_supports_lake_part_delete().await
+            }
+            async fn authorize(&self, request: &LakePartDeleteRequest) -> Result<LakePartDeletePermit> {
+                self.0.authorize(request).await
+            }
+            async fn prepare(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeletePermit> {
+                if permit.request.key == self.1 {
+                    return Err(CatalogCustodyHeld { reason: "catalog metadata still pins part".into(), part_pinned: true }.into());
+                }
+                self.0.prepare(permit).await
+            }
+            async fn retire(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeleteReceipt> {
+                self.0.retire(permit).await
+            }
+        }
+        let reqs = requests(3);
+        let authority = Pinned(FakeAuthority::capable(), reqs[0].key.clone());
+        let report = execute(&authority, &reqs, &mut Vec::new()).await;
+        assert_eq!(report.deleted, 2, "{report:?}");
+        assert_eq!(report.paused_reason, None);
+        assert_eq!(report.skipped.get(CATALOG_PINNED), Some(&1));
+        assert!(!authority.0.calls().iter().any(|c| *c == format!("retire {}", reqs[0].key)));
     }
 
     /// NAN-3495: a key the owner refused per key (404 object not found) is

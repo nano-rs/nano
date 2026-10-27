@@ -1791,11 +1791,13 @@ impl QueryService {
                     wait = super::identity::BACKFILL_BUSY_POLL;
                     continue;
                 };
-                let pass = async {
+                // NAN-4591: background maintenance; its reads yield to
+                // searches (a saturated cache fails the pass, retried later).
+                let pass = crate::reader_object_cache::background_maintenance(async {
                     self.engine.refresh().await?;
                     super::identity::backfill_once(&self.engine, &self.state_dir, chrono::Utc::now().timestamp_micros(),
                         super::identity::BACKFILL_PARTS_PER_TICK, Some(slot)).await
-                };
+                });
                 wait = match pass.await {
                     Ok(report) => {
                         if report.derived > 0 || report.removed > 0 || report.unindexable > 0 {
@@ -3553,6 +3555,7 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
     fn heartbeat(&self) -> nanosiem_lake_cell::contract::Heartbeat {
         let inflight = self.inflight.load(Ordering::Relaxed);
         nanosiem_lake_cell::contract::Heartbeat {
+            agent_catalog_custody: None,
             startup_progress: None,
             busy: inflight > 0,
             lag_seconds: 0.0,
@@ -3562,6 +3565,7 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
             prevalence_behind_entries: 0,
             prevalence_degraded_seconds: 0.0,
             prevalence_degraded_seconds_total: 0.0,
+            prevalence_degraded_known: None,
             last_progress_unix_ms: self.last_progress_ms.load(Ordering::Relaxed),
             queue_depth: inflight,
             objects_rejected: 0,
@@ -3577,6 +3581,7 @@ impl nanosiem_lake_cell::child::TenantService for QueryService {
             writer_lease_epoch: None,
             writer_ready: false,
             landing: None,
+            finding_outbox: None,
             ingest_diagnostics: None,
         }
     }

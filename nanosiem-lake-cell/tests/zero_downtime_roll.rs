@@ -468,7 +468,7 @@ async fn start_cell_full(mnt: &Path, name: &'static str, uid_base: u32, store_po
         tenants.push(p);
     }
     let sup = Supervisor::new(cfg.clone(), Arc::new(keys)).expect("supervisor");
-    sup.set_placement(Placement { cell_id: CELL_ID.into(), revision: 1, tenants }).unwrap();
+    sup.set_placement(Placement { cell_id: CELL_ID.into(), revision: 1, tenants }).await.unwrap();
     sup.start_background();
     let router = Router::new(sup.clone()).unwrap();
     let sock = cfg.listen_unix.clone().unwrap();
@@ -678,7 +678,7 @@ async fn drain_during_maintenance_mint(mnt: &Path, port: u16) -> bool {
     });
     let sup = Supervisor::new(cfg, keys.clone()).unwrap();
     sup.set_placement(Placement { cell_id: CELL_ID.into(), revision: 1,
-        tenants: vec![TenantPlacement::legacy(t.clone(), 20.0)] }).unwrap();
+        tenants: vec![TenantPlacement::legacy(t.clone(), 20.0)] }).await.unwrap();
     let spawning = { let sup = sup.clone(); let t = t.clone();
         tokio::spawn(async move { sup.ensure_running(&t, Role::Maintenance).await }) };
     tokio::time::timeout(Duration::from_secs(10), keys.entered.notified()).await.unwrap();
@@ -761,6 +761,83 @@ async fn partition_phase(mnt: &Path, report: &mut Vec<(String, bool, String)>) {
         format!("takeover {takeover:?} (bound {bound:?}) after the crash ({:?}), q crashes {q_crashes2}", crash.elapsed())));
     feeding.store(false, Ordering::SeqCst);
     q.terminate().await;
+}
+
+/// NAN-4642: a placement eps change restarts the running ingest[T] at the
+/// new budget (graceful stop: flush, commit, exit; then a new edge-log lease
+/// resumes at the committed point) while the source keeps producing. Every
+/// event must be committed exactly once, in order, with no fenced or
+/// conflicting request; the other tenant's ingest is left alone.
+async fn ingest_budget_restart_phase(mnt: &Path, report: &mut Vec<(String, bool, String)>) {
+    let store = Arc::new(Store::default());
+    let port = serve_store(store.clone()).await;
+    let feeding = Arc::new(AtomicBool::new(true));
+    {
+        let (store, feeding) = (store.clone(), feeding.clone());
+        tokio::spawn(async move {
+            while feeding.load(Ordering::SeqCst) {
+                store.produce();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+    let e = start_cell_with(mnt, "e", 56_000, port, false).await;
+    wait_for("pod e writes both tenants", Duration::from_secs(30), || {
+        TENANTS.iter().all(|t| store.with(t, |l| l.committed > 0))
+    })
+    .await;
+    let (t1, t2) = (TENANTS[0], TENANTS[1]);
+    // (pid, assigned eps, assigned memory cap, stopping)
+    let ingest = |t: &str| {
+        e.sup.status().tenants.iter().find(|s| s.tenant_id.as_str() == t).and_then(|s| {
+            s.processes.iter().find(|p| p.role == Role::Ingest).map(|p| (p.pid, p.ingest_eps, p.ingest_memory_cap_bytes, p.stopping))
+        })
+    };
+    let crashes = || -> u64 {
+        e.sup.status().tenants.iter().filter(|s| TENANTS.contains(&s.tenant_id.as_str()))
+            .map(|s| s.crashes.get("ingest").copied().unwrap_or(0)).sum()
+    };
+    let (b1, b2, crashes_before) = (ingest(t1), ingest(t2), crashes());
+    // Let the first writer buffer and commit for a while under load.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut tenants = Vec::new();
+    for t in SEARCH_TENANTS {
+        let mut p = TenantPlacement::legacy(TenantId::new(t).unwrap(), if t == t1 { 40.0 } else { 20.0 });
+        if t != QUERY_ONLY {
+            p.ingest = IngestMode::Resident;
+        }
+        tenants.push(p);
+    }
+    e.sup.set_placement(Placement { cell_id: CELL_ID.into(), revision: 2, tenants }).await.unwrap();
+    let restart = wait_for("t1 ingest restarts at the new eps and commits", Duration::from_secs(30), || {
+        ingest(t1).is_some_and(|i| Some(i.0) != b1.map(|b| b.0) && i.1 == Some(40.0) && !i.3)
+            && store.with(t1, |l| l.leases.len() == 2 && l.commits.iter().any(|c| c.0 == 2))
+    })
+    .await;
+    let a1 = ingest(t1);
+    // Keep producing under the new writer, then drain the source.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    feeding.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for("every produced event committed (budget restart)", Duration::from_secs(20), || {
+        TENANTS.iter().all(|t| store.with(t, |l| l.committed == l.head))
+    })
+    .await;
+    report.push(("ingest budget change: t1 ingest restarts at the new eps, t2 untouched, no crash".into(),
+        b1.is_some_and(|b| b.1 == Some(20.0)) && a1.is_some_and(|a| a.2 > b1.and_then(|b| b.2))
+            && ingest(t2).map(|i| i.0) == b2.map(|i| i.0) && store.with(t2, |l| l.leases.len()) == 1
+            && crashes() == crashes_before,
+        format!("t1 {b1:?} -> {a1:?} in {restart:?}, t2 {b2:?} -> {:?}, ingest crashes {crashes_before} -> {}", ingest(t2), crashes())));
+    for t in TENANTS {
+        let (head, seqs_ok, bad, leases_n, commits_n) = store.with(t, |l| {
+            let seqs_ok = l.seqs.len() as u64 == l.head && l.seqs.iter().enumerate().all(|(i, s)| *s == i as u64 + 1);
+            (l.head, seqs_ok, l.stale_pulls + l.stale_commits + l.conflicts, l.leases.len(), l.commits.len())
+        });
+        report.push((format!("ingest budget change: {t} commits every event exactly once across the restart"),
+            seqs_ok && bad == 0,
+            format!("{head} events in {commits_n} commits over {leases_n} leases, stale/conflicting requests {bad}")));
+    }
+    e.terminate().await;
 }
 
 async fn suite() {
@@ -995,6 +1072,8 @@ async fn suite() {
     }
 
     partition_phase(&mnt, &mut report).await;
+
+    ingest_budget_restart_phase(&mnt, &mut report).await;
 
     report.push(("maintenance: SIGTERM during slow bootstrap mint prevents writer start".into(),
         drain_during_maintenance_mint(&mnt, port).await,

@@ -20,6 +20,7 @@ mod execution;
 pub mod field_usage;
 pub mod field_utils;
 pub mod job_coordinator_client;
+pub mod job_coordinator_postgres;
 pub mod job_coordinator_config;
 #[cfg(feature = "enterprise")]
 pub mod hosted_producer_reload;
@@ -33,6 +34,7 @@ pub mod job_signing;
 pub mod jobs;
 pub mod keyword_sidecar;
 pub mod lake_candidate_hints;
+pub mod lake_indicators;
 mod lake;
 pub mod lake_cell;
 pub mod lake_debug;

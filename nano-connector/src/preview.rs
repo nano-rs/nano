@@ -56,6 +56,8 @@ pub struct ExpectedRequest {
     pub method: String,
     pub url: String,
     #[serde(default)] pub query: std::collections::BTreeMap<String,String>,
+    /// Non-secret request headers required by the independent HTTP contract.
+    #[serde(default)] pub headers: std::collections::BTreeMap<String,String>,
     #[serde(default)] pub json: Option<Value>,
     #[serde(default)] pub form: Option<std::collections::BTreeMap<String,String>>,
     #[serde(default)] pub auth_query_keys: Vec<String>,
@@ -110,7 +112,11 @@ impl Transport for ReplayTransport {
                 let pairs:Vec<_> = url::form_urlencoded::parse(&req.body).into_owned().collect();
                 pairs.len() == form.len() && pairs.into_iter().collect::<std::collections::BTreeMap<_,_>>() == *form
             } else { req.body.is_empty() };
-            if !matches(&self.entries[idx]) || req.method.as_str() != e.method || url.as_str() != e.url || actual_pairs.len()!=e.query.len() || actual_query != e.query || !body_ok {
+            let headers_ok = e.headers.iter().all(|(name, value)| {
+                let mut actual = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name));
+                actual.next().is_some_and(|(_, v)| v == value) && actual.next().is_none()
+            });
+            if !headers_ok || !matches(&self.entries[idx]) || req.method.as_str() != e.method || url.as_str() != e.url || actual_pairs.len()!=e.query.len() || actual_query != e.query || !body_ok {
                 return Err(BrokerError::Http("strict replay request mismatch".into()));
             }
             Some(idx)

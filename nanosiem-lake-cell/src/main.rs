@@ -83,7 +83,7 @@ async fn supervise(cfg: CellConfig) -> anyhow::Result<()> {
     // ranks above the supervisor for the OOM killer.
     nanosiem_lake_cell::oom::protect_supervisor(cfg.resources.tenant_oom_score_adj);
     let sup = Supervisor::new(cfg.clone(), keys)?;
-    if let Err(e) = sup.reload_placement() {
+    if let Err(e) = sup.reload_placement().await {
         tracing::warn!(error = %e, "no initial placement; starting empty");
     }
     sup.start_background();

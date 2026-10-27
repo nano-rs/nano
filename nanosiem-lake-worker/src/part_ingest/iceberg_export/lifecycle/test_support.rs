@@ -33,6 +33,9 @@ pub(crate) struct Basin {
     pub fail_expiry: AtomicBool,
     pub fail_cache: AtomicBool,
     pub ambiguous_commit: AtomicBool,
+    /// NAN-4662: the catalog's commit-state read fails (catalog unreachable).
+    pub fail_commit_state: AtomicBool,
+    pub commit_state_reads: AtomicUsize,
     pub commits: AtomicUsize,
     pub checks: AtomicUsize,
     pub trace: Mutex<Vec<&'static str>>,
@@ -121,6 +124,8 @@ impl Basin {
             fail_expiry: AtomicBool::new(false),
             fail_cache: AtomicBool::new(false),
             ambiguous_commit: AtomicBool::new(false),
+            fail_commit_state: AtomicBool::new(false),
+            commit_state_reads: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             checks: AtomicUsize::new(0),
             trace: Mutex::new(vec![]),
@@ -219,6 +224,26 @@ impl Basin {
             .current_snapshot_id()
             .unwrap()
     }
+    pub async fn checkpoint(&self) -> Option<i64> {
+        self.table
+            .lock()
+            .await
+            .metadata()
+            .properties()
+            .get(export::CHECKPOINT)
+            .map(|v| v.parse().unwrap())
+    }
+    /// NAN-4614: every live data file of the current snapshot, duplicates kept.
+    pub async fn live_files(&self) -> Vec<String> {
+        let table = self.table.lock().await;
+        let Some(snapshot) = table.metadata().current_snapshot() else { return vec![] };
+        let mut files = vec![];
+        for descriptor in table.manifest_list_reader(snapshot).load().await.unwrap().entries() {
+            let manifest = descriptor.load_manifest(table.file_io()).await.unwrap();
+            files.extend(manifest.entries().iter().filter(|e| e.is_alive()).map(|e| e.file_path().to_string()));
+        }
+        files
+    }
     pub async fn snapshot_count(&self) -> usize {
         self.table.lock().await.metadata().snapshots().len()
     }
@@ -258,8 +283,9 @@ impl IcebergCommitter for Basin {
         let mut added = self.target.prepare(manifest, schema).await?;
         // Include real per-column bounds, to detect leaking values through
         // deleted entries in the current manifest after snapshot expiry.
-        let field = schema.field_by_name("user.name").unwrap().id;
+        // Resolved per added file: an empty delta needs no fixture column.
         for file in added.values_mut().flatten() {
+            let field = schema.field_by_name("user.name").unwrap().id;
             let mut names = self.file_names(file.file_path())?;
             names.sort();
             *file = DataFileBuilder::default()
@@ -344,6 +370,18 @@ impl CatalogLifecycleBackend for Basin {
             "automatic maintenance enabled"
         );
         Ok(())
+    }
+    async fn export_head(&self, with_parts: bool) -> Result<export::ExportHead> {
+        let table = self.table.lock().await;
+        export::export_head_of(&table, &self.target.data_prefix(), 100_000, with_parts).await
+    }
+    async fn no_committed_snapshot(&self) -> Result<bool> {
+        self.commit_state_reads.fetch_add(1, Ordering::SeqCst);
+        ensure!(
+            !self.fail_commit_state.load(Ordering::SeqCst),
+            "catalog commit-state lookup unavailable"
+        );
+        Ok(never_committed(&*self.table.lock().await))
     }
     async fn close_and_drain(&self) -> Result<()> {
         self.blocked.store(true, Ordering::SeqCst);

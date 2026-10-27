@@ -26,6 +26,7 @@ pub mod lean_identity_merge;
 pub mod identity_enrichment;
 pub mod lean_ip_context;
 pub mod landing;
+pub mod landing_admission;
 pub mod landing_cell;
 pub mod landing_hosted;
 pub mod lean_identity_query;

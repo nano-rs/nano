@@ -10,13 +10,17 @@
 //! start times differ and the handle is dropped. Once open, the pidfd pins
 //! the process identity for the handle's whole lifetime.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 /// A pidfd-backed handle: signals can never hit a recycled pid.
 #[derive(Debug)]
 pub struct PidFd {
     fd: OwnedFd,
     pid: u32,
+}
+
+impl AsFd for PidFd {
+    fn as_fd(&self) -> BorrowedFd<'_> { self.fd.as_fd() }
 }
 
 impl PidFd {

@@ -328,6 +328,8 @@ pub const CELL_FEATURES: &[&str] = &[
     // reporting this. No cell config key. The worker side is pinned by
     // `part_ingest::lean_erasure` tests (`cell_feature_lean_erasure_v1_is_backed`).
     "lean_erasure_v1",
+    "lean_agent_catalog_custody_v1",
+    "lean_agent_catalog_platform_v2",
     // NAN-4290: query[T] runs a second durable job lane for small jobs (a
     // search over at most a day, `nanosiem_core::search::small_job_lane`): its
     // own read-write chDB connection at one interactive lane's memory, holding
@@ -337,6 +339,17 @@ pub const CELL_FEATURES: &[&str] = &[
     // images reporting this. No cell config key. The worker side is pinned by
     // `part_query` tests (`cell_feature_lean_job_small_lane_v1_is_backed`).
     "lean_job_small_lane_v1",
+    // NAN-4675: landing[T] runs the platform `audit` lane
+    // (`platform_audit_lane::AUDIT_LANE_VRL`: tenant/class/product guard,
+    // NAN-3304 null anchors, `unmapped` as one JSON string) before the
+    // storage stage for files of the platform audit landing source (route
+    // key `audit`), so a Vector-less (hosted Tenzir) tenant's platform audit
+    // lands as exactly the row Vector writes. The platform delivers a
+    // Vector-less tenant's audit through its bucket drop only while every
+    // running cell image reports this. No cell config key. The worker side is
+    // pinned by `landing` tests
+    // (`cell_feature_lean_landing_platform_audit_v1_is_backed`).
+    "lean_landing_platform_audit_v1",
 ];
 
 /// The label value: names joined with commas.
@@ -902,9 +915,20 @@ mod tests {
             // Ingest-only (exchange field + executor); the cell forwards
             // nothing and renders no key for it.
             ("lean_erasure_v1", || !CELL_FEATURES.is_empty()),
+            // Ingest-only: production custody construction/absence and teardown
+            // are exercised by the lake-worker activation/serving tests.
+            ("lean_agent_catalog_custody_v1", || {
+                crate::contract::catalog_custody_runway_seconds(
+                    Some(&serde_json::json!({"credential_expires_at_ms":2000})),1000)==Some(1.0)
+            }),
+            ("lean_agent_catalog_platform_v2", || {
+                crate::contract::catalog_custody_runway_seconds(
+                    Some(&serde_json::json!({"credential_expires_at_ms":2000})),1000)==Some(1.0)
+            }),
             // Query-only (a job lane inside query[T] and a runner flag); the
             // cell forwards nothing and renders no key for it.
             ("lean_job_small_lane_v1", || !CELL_FEATURES.is_empty()),
+            ("lean_landing_platform_audit_v1", || !CELL_FEATURES.is_empty()),
         ]
     }
 

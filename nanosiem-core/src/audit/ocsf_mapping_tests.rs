@@ -16,10 +16,13 @@ use uuid::Uuid;
 /// A new action must be added here with a deliberate classification —
 /// `every_emitted_action_is_classified` fails until it is.
 pub(crate) const EVERY_AUDIT_ACTION: &[(&str, i64, i64)] = &[
+    ("agent_cell_feature_admission", 6003, 99), // search (agent lane admission decision)
+    ("agent_cell_feature_completed", 6003, 99), // search (agent lane feature execution)
     ("agent_enrichment_created", 6003, 1), // agent_enrichment
     ("agent_enrichment_credentials_updated", 6003, 3), // agent_enrichment
     ("agent_enrichment_deleted", 6003, 4), // agent_enrichment
     ("agent_enrichment_updated", 6003, 3), // agent_enrichment
+    ("agent_query_reported", 6003, 99), // search (agent gateway query execution receipt)
     ("threat_intel_lookup_fetched", 6003, 2), // agent_enrichment (NAN-3763)
     ("threat_intel_provider_installed", 6003, 1), // agent_enrichment (NAN-3763)
     ("threat_intel_provider_uninstalled", 6003, 4), // agent_enrichment (NAN-3763)
@@ -248,10 +251,12 @@ pub(crate) const EVERY_AUDIT_ACTION: &[(&str, i64, i64)] = &[
     ("marketplace_sync_triggered", 6003, 99), // marketplace
     ("marketplace_uninstalled", 6003, 4), // marketplace
     ("marketplace_updated", 6003, 3), // marketplace
+    ("melod_artifact_revision_drafted", 6003, 1), // settings (NAN-4653)
     ("melod_background_ai_ran", 6003, 99), // settings
     ("melod_config_updated", 6003, 3), // settings
     ("melod_connection_validated", 6003, 99), // settings
     ("melod_credentials_updated", 6003, 3), // settings
+    ("melod_flow_drafted", 6003, 1), // settings (NAN-4535)
     ("melod_playbook_drafted", 6003, 1), // settings
     ("merged", 6003, 3), // case
     ("mfa_admin_reset", 3001, 11), // auth
@@ -397,6 +402,7 @@ pub(crate) const EVERY_AUDIT_ACTION: &[(&str, i64, i64)] = &[
     ("siem_health_suppression_recorded", 6003, 1), // settings
     ("siem_health_suppression_revoked", 6003, 4), // settings
     ("sigma_converted", 6003, 99), // rule_repo
+    ("soar.run.canceled", 6003, 3), // soar
     ("source_authority_login_bound", 6003, 3), // operator
     ("source_authority_login_verified", 6003, 99), // operator
     ("source_config_created", 6003, 1), // source_config
@@ -413,6 +419,9 @@ pub(crate) const EVERY_AUDIT_ACTION: &[(&str, i64, i64)] = &[
     ("source_visibility_bypass", 6003, 99), // source_scope
     ("source_visibility_group_set", 6003, 3), // source_scope
     ("source_visibility_member_set", 6003, 3), // source_scope
+    ("sovereign_capacity_recommended", 6003, 99), // storage (capacity advisor)
+    ("sso_group_grants_synchronized", 6003, 3), // oidc
+    ("sso_sign_in_denied", 3002, 1), // auth
     ("status_changed", 6003, 3), // case
     ("system_health_acknowledged", 6003, 3), // settings
     ("system_health_resolved", 6003, 3), // settings
@@ -541,14 +550,14 @@ fn every_emitted_action_is_classified() {
 }
 
 #[cfg(feature = "enterprise")]
-/// The SQL copy (`nano_shared.platform_audit_ocsf_iam_class`, 9012100) lists
+/// The SQL copy (`nano_shared.platform_audit_ocsf_iam_class`, 9015390) lists
 /// exactly `IAM_ACTIONS`, in order, so a SQL-built row and a Rust-built row
 /// of the same action get the same class.
 #[test]
 fn sql_iam_table_matches_rust() {
     // Runtime read (the open-core mirror strips postgres-enterprise).
     let path = concat!(env!("CARGO_MANIFEST_DIR"),
-        "/../migrations/postgres-enterprise/9012100_platform_audit_ocsf_iam_classes.sql");
+        "/../migrations/postgres-enterprise/9015390_audit_ocsf_mapping_gaps.sql");
     let sql = match std::fs::read_to_string(path) {
         Ok(sql) => sql,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -572,7 +581,7 @@ fn sql_iam_table_matches_rust() {
         let mfa = row.mfa.map_or("NULL", |m| if m { "TRUE" } else { "FALSE" });
         format!("('{action}', {}, {}, '{subject}', {protocol}, {mfa})", row.class.class_uid(), row.activity_id)
     }).collect();
-    assert_eq!(rows, expected, "9012100 IAM table drifted from IAM_ACTIONS");
+    assert_eq!(rows, expected, "9015390 IAM table drifted from IAM_ACTIONS");
 }
 
 /// Every audit action, from every writer shape, is a valid OCSF 1.9 event
@@ -689,6 +698,30 @@ fn a_login_is_an_authentication_logon() {
     assert!(failed.get("is_mfa").is_none(), "unknown for a failed password logon");
     assert!(failed.get("http_request").is_none(), "an unknown user agent is absent");
     assert_eq!(failed["unmapped"], json!({"details": {"error": "invalid credentials"}}));
+
+    // A refused SSO logon (NAN-3904) after the ID token validated names the
+    // IdP-asserted account (NAN-4547): Authentication Logon, Failure, OpenID —
+    // the failed twin of oidc_login.
+    let denied = AuditEvent::builder(AuditSource::Auth, "sso_sign_in_denied")
+        .actor(None, Some("ghost@example.com".into()))
+        .success(false)
+        .details(json!({"provider": "okta", "reason": "admission_denied",
+            "identity": "validated", "idp_subject": "idp-sub-1"}))
+        .build()
+        .to_ocsf_event_with(Utc::now(), true);
+    assert_eq!((denied["class_uid"].as_i64(), denied["activity_id"].as_i64()), (Some(3002), Some(1)));
+    assert_eq!(denied["status_id"], 2);
+    assert_eq!(denied["auth_protocol_id"], 4);
+    assert_eq!(denied["status_detail"], "admission_denied");
+    // Refused before the token validated: no trusted identity, so it records
+    // `unvalidated`, OCSF has no `user` to name, and it stays API Activity.
+    let anonymous = AuditEvent::builder(AuditSource::Auth, "sso_sign_in_denied")
+        .success(false)
+        .details(json!({"reason": "idp_validation_failed", "identity": "unvalidated"}))
+        .build()
+        .to_ocsf_event_with(Utc::now(), true);
+    assert_eq!(anonymous["class_uid"], 6003);
+    assert_eq!(anonymous["status_id"], 2);
 
     // Logoff: the session's holder.
     let logout = AuditEvent::builder(AuditSource::Auth, "logout")

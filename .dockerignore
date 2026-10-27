@@ -155,6 +155,8 @@ nanosiem-web/src/*
 !nanosiem-web/src/lib/
 nanosiem-web/src/lib/*
 !nanosiem-web/src/lib/enterprise-shared-membership-acceptance.ts
+# The src/ inline Rust parity test is conservatively checked by the context probe.
+!nanosiem-web/src/lib/lookup-public-suffixes.txt
 nanosiem-web/Dockerfile
 !scripts/
 scripts/*

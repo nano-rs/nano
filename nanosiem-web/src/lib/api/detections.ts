@@ -51,12 +51,15 @@ export class DetectionsApi {
     search?: string;
     /** Include archived (deleted) rules, which the API hides by default. */
     includeArchived?: boolean;
+    /** NAN-4586: at most this many rules (1–50). Omit for the full list. */
+    limit?: number;
   }): Promise<DetectionRule[]> {
     const searchParams = new URLSearchParams();
     if (params?.severity) searchParams.set('severity', params.severity);
     if (params?.mode) searchParams.set('mode', params.mode);
     if (params?.search) searchParams.set('search', params.search);
     if (params?.includeArchived) searchParams.set('include_archived', 'true');
+    if (params?.limit) searchParams.set('limit', String(params.limit));
 
     const query = searchParams.toString();
     return this.request(`/api/rules${query ? `?${query}` : ''}`);

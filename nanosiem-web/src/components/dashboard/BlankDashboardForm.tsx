@@ -11,9 +11,9 @@
  * density cards, and the empty state. Creating a blank dashboard is core
  * functionality; only the meloD *generation* half is enterprise.
  *
- * Controlled on purpose: the enterprise wizard resets its draft from
- * `resetWizard()` on close, and the open dialog resets on open. Owning the
- * state here would make both of those impossible without a remount hack.
+ * Controlled on purpose: CreateDashboardDialog resets its draft on open.
+ * (The enterprise wizard that also rendered it was removed in NAN-4600;
+ * generation runs in the pivt panel.)
  */
 
 import { Globe, Info, Lock, Plus } from 'lucide-react';

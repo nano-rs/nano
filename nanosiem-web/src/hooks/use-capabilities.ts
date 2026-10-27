@@ -67,6 +67,12 @@ export interface Capabilities {
    * the nav item and page are hidden there (NAN-3467).
    */
   iocLists: boolean;
+  /**
+   * SOAR entitlement (NAN-4462): the tenant plan grants the optional `soar`
+   * component. Eligibility only — the tenant's own opt-in
+   * (`GET /api/soar/settings`) decides whether automation runs.
+   */
+  soar: boolean;
 }
 
 /**

@@ -102,8 +102,8 @@ struct Args {
     hec: bool,
 
     /// Ship RAW events to a Tenzir `accept_http` listener instead of
-    /// Vector/HEC (NAN-1402). Tenzir parses the raw payloads to OCSF 1.8.0
-    /// and writes directly into ClickHouse `nanosiem.ocsf_logs` — see
+    /// Vector/HEC (NAN-4484). Tenzir parses raw payloads to OCSF 1.9
+    /// and writes Parquet through the hosted bucket drop — see
     /// `tools/log-blaster/tenzir/` for the pipeline + runner. Takes the
     /// listener URL; bare `--tenzir` targets the default local rig
     /// (`http://localhost:9095`). Mutually exclusive with `--hec`/`--dev`;
@@ -1072,13 +1072,18 @@ async fn run_blast_mode(
         TokioDuration::from_millis(args.max_batch_latency_ms),
     );
 
+    // Tenzir's per-request OCSF pipeline pays for each distinct source/class
+    // shape. Keep its small paced requests homogeneous by source, using the
+    // same weighted schedule as Vector, rather than fragmenting every batch.
+    let source_homogeneous_batches =
+        args.vector_source_homogeneous_batches || matches!(transport, Transport::Tenzir { .. });
     info!(
-        "BLAST MODE: Target {} EPS with {} threads, batch size {} (requested {}), Vector source-homogeneous batches: {}",
+        "BLAST MODE: Target {} EPS with {} threads, batch size {} (requested {}), source-homogeneous batches: {}",
         args.eps,
         args.threads,
         effective_batch_size,
         args.batch_size,
-        args.vector_source_homogeneous_batches
+        source_homogeneous_batches
     );
 
     let accounting = source_tokens::Accounting::default();
@@ -1090,7 +1095,6 @@ async fn run_blast_mode(
     // events per request; the default preserves the established behavior.
     let inflight_per_thread = args.inflight_per_thread;
     let batches_per_thread = args.blast_batches_per_thread;
-    let vector_source_homogeneous_batches = args.vector_source_homogeneous_batches;
     let thread_count = args.threads;
     let max_batch_latency = TokioDuration::from_millis(args.max_batch_latency_ms);
     let mut handles = Vec::new();
@@ -1106,7 +1110,7 @@ async fn run_blast_mode(
         let send_retries = args.send_retries.unwrap_or(LEGACY_SEND_RETRIES);
         let source_policy = source_retry_policy(args.send_retries, args.send_deadline_secs);
         let batch_limit = batches_per_thread;
-        let source_homogeneous = vector_source_homogeneous_batches
+        let source_homogeneous = source_homogeneous_batches
             || (matches!(transport, Transport::Hec { .. }) && source_config.configured);
         // NAN-3174: per-event jitter + shaped rate; both None/false by default.
         let time_jitter = variance.is_some_and(|v| v.time_jitter);
@@ -2178,6 +2182,62 @@ mod paced_batch_tests {
 #[cfg(test)]
 mod blast_accumulation_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tenzir_batches_are_homogeneous_with_the_existing_weighted_mix() {
+        for threads in [1, 2] {
+            let (url, receiver) =
+                source_tokens::tests::scripted_receiver(vec![("200 OK", None); 50]).await;
+            let mut args = Args::parse_from([
+                "log-blaster", "--blast", "--tenzir", &url, "--eps", "0",
+                "--threads", &threads.to_string(), "--batch-size", "4",
+                "--inflight-per-thread", "4", "--blast-batches-per-thread",
+                &(50 / threads).to_string(), "--chain-interval-secs", "0",
+            ]);
+            let config = source_tokens::SourceConfig::resolve(&mut args, None, None).unwrap();
+            assert!(!config.configured);
+            tokio::time::timeout(
+                TokioDuration::from_secs(10),
+                run_blast_mode(
+                    args, Transport::Tenzir { url },
+                    Arc::new(parking_lot::RwLock::new(WorldState::new(10))),
+                    config, None,
+                ),
+            ).await.unwrap().unwrap();
+            let seen = receiver.await.unwrap();
+            let mut counts = std::collections::BTreeMap::new();
+            assert_eq!(seen.len(), 50);
+            for (_, request) in seen {
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let events: Vec<serde_json::Value> = body.lines()
+                    .map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(events.len(), 4);
+                let source = events[0]["source_type"].as_str().unwrap();
+                assert!(events.iter().all(|event| event["source_type"] == source));
+                *counts.entry(source.to_owned()).or_insert(0) += 1;
+            }
+            assert_eq!(counts, std::collections::BTreeMap::from([
+                ("windows_sysmon".to_owned(), 30), ("windows_event".to_owned(), 5),
+                ("conduit_proxy".to_owned(), 6), ("apache_access".to_owned(), 5),
+                ("aws_cloudtrail".to_owned(), 4),
+            ]));
+        }
+    }
+
+    #[test]
+    fn canary_unit_reserves_listener_capacity_for_smoke() {
+        // The hosted loadgen unit lives under deploy/, which the public mirror
+        // does not carry: read it at run time and skip where it is absent.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/loadgen/vm/tzd-tenzir-blaster.service");
+        let Ok(unit) = std::fs::read_to_string(path) else { return };
+        let command = unit.lines().find_map(|line| line.strip_prefix("ExecStart=")).unwrap();
+        let args = Args::try_parse_from(command.split_whitespace()).unwrap();
+        assert_eq!(args.tenzir.as_deref(), Some("http://127.0.0.1:9095"));
+        assert_eq!((args.eps, args.threads, args.batch_size), (150, 1, 150));
+        assert_eq!(args.inflight_per_thread, 4);
+        assert!(args.threads * args.inflight_per_thread + 1 < 10,
+            "the ten-request listener must retain capacity for the smoke marker");
+    }
     use clap::Parser;
 
     #[tokio::test]

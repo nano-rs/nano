@@ -548,3 +548,83 @@ async fn customer_export_keeps_removal_tombstones_while_lifecycle_omits_them() {
 
 #[path = "lifecycle/rest_tests.rs"]
 mod lifecycle_rest;
+
+/// NAN-4614: the batch splitter registers each part once (a day part in the
+/// batch of its first hour), keeps every removal in the last batch, chains
+/// the batches, and is exactly the legacy manifest when one batch fits.
+#[test]
+fn export_plan_batches_chain_each_part_once_and_removals_last() {
+    use super::super::export::{split_manifest, ExportBatchBounds};
+    use crate::parts::{format::PartId, levels::Level, part_log::PartRef};
+    let part = |i: usize, level: Level, hour: i32| PartRef {
+        part_id: PartId::parse(&format!("{:013}-cccccccccccccccc", i)).unwrap(),
+        level,
+        event_hour: hour,
+        event_day: None,
+        rows: 1,
+        min_time_us: i64::from(hour) * 3_600_000_000,
+        max_time_us: i64::from(hour) * 3_600_000_000 + if level == Level::Day { 23 * 3_600_000_000 } else { 0 },
+        schema_fingerprint: "0".repeat(64),
+        provenance_sha256: "0".repeat(64),
+        merkle_root: "0".repeat(64),
+        sorted: true,
+        data_bytes: 10,
+        row_groups: 1,
+        data_files: 2,
+    };
+    // A day part over hours 0..24, then ten hour parts; hour 40 was
+    // exported with a part that is now gone (a removal).
+    let mut live = vec![part(1, Level::Day, 0)];
+    live.extend((0..10).map(|i| part(i + 2, Level::Hour, 24 + i as i32)));
+    let gone = "0000000000099-cccccccccccccccc".to_string();
+    let state = ExportState { exported: BTreeMap::from([(40, vec![gone.clone()])]), last_plan_ms: 5 };
+    let now = 200 * 3_600_000;
+    let pending = plan_export_reconciled(&live, &state, now, &MergePolicy::default());
+    let whole = {
+        let dir = TempDir::new().unwrap();
+        let path = state.clone().record_durable_plan(dir.path(), TENANT_ID, &pending, now).unwrap();
+        let mut m: ExportManifest = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        (m.planned_at_ms, m.previous_plan_ms) = (0, None);
+        m
+    };
+    let one = state.split_plan(TENANT_ID, &pending, ExportBatchBounds::DEFAULT).unwrap();
+    assert_eq!(one, vec![whole.clone()], "one batch is the legacy manifest");
+    let batches = state
+        .split_plan(TENANT_ID, &pending, ExportBatchBounds { max_files: 4, max_bytes: u64::MAX })
+        .unwrap();
+    assert!(batches.len() > 1);
+    let mut added = batches.iter().flat_map(|b| b.add.iter().map(|p| p.part_id.clone())).collect::<Vec<_>>();
+    let total = added.len();
+    added.sort();
+    added.dedup();
+    assert_eq!((total, added.len()), (whole.add.len(), whole.add.len()), "each part exactly once");
+    assert!(batches[0].add.iter().any(|p| p.part_id == live[0].part_id.to_string()), "the day part in its first hour's batch");
+    let (last, rest) = batches.split_last().unwrap();
+    assert!(rest.iter().all(|b| b.remove_parts.is_empty()), "earlier batches are add-only");
+    assert_eq!(last.remove_parts, vec![gone]);
+    assert_eq!(
+        batches.iter().flat_map(|b| b.hours.clone()).collect::<Vec<_>>(),
+        whole.hours,
+        "every hour once, in order"
+    );
+    assert_eq!(split_manifest(whole, ExportBatchBounds { max_files: 4, max_bytes: u64::MAX }).unwrap(), batches);
+    // Recorded as one chain; a crash after any prefix of it is recoverable.
+    let dir = TempDir::new().unwrap();
+    let mut recorded = state.clone();
+    let paths = recorded.record_durable_batches(dir.path(), batches.clone(), now).unwrap();
+    assert_eq!(recorded.last_plan_ms, now + batches.len() as i64 - 1);
+    let chain = paths
+        .iter()
+        .map(|p| serde_json::from_slice::<ExportManifest>(&std::fs::read(p).unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(chain[0].previous_plan_ms, Some(5));
+    assert!(chain.windows(2).all(|w| w[1].previous_plan_ms == Some(w[0].planned_at_ms)));
+    std::fs::write(dir.path().join("export/state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+    for path in &paths[1..] {
+        std::fs::remove_file(path).unwrap();
+    }
+    let prefix = ExportState::load_durable(dir.path()).unwrap();
+    assert_eq!(prefix.last_plan_ms, now, "the durable prefix is recovered");
+    let rest = plan_export_reconciled(&live, &prefix, now + 10, &MergePolicy::default());
+    assert!(!rest.is_empty() && rest.len() < pending.len(), "only the lost batches replan");
+}

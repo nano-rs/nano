@@ -26,6 +26,7 @@
 //! | `sanctioned_path_unavailable` | grant enabled, but this cell has no owner/Worker delete route |
 //! | `authority_unreadable` | reading any of the above failed |
 //! | `sanctioned_pass_paused` | the sanctioned pass ran and stopped (hold, grant refused, back-off) |
+//! | `catalog_held` | a recorded catalog's custody is not attached (detail = the attach failure); deletes held, the index-only feed keeps running (NAN-4601) |
 //!
 //! Superseded parts are unreferenced by the live set, so keeping them never
 //! changes a query answer; it only costs storage.
@@ -48,6 +49,8 @@ pub const REASON_GRANT_EXPIRED: &str = "grant_expired";
 pub const REASON_SANCTIONED_PATH_UNAVAILABLE: &str = "sanctioned_path_unavailable";
 pub const REASON_AUTHORITY_UNREADABLE: &str = "authority_unreadable";
 pub const REASON_SANCTIONED_PASS_PAUSED: &str = "sanctioned_pass_paused";
+/// NAN-4601: the tenant's recorded catalog is held (custody not attached).
+pub const REASON_CATALOG_HELD: &str = "catalog_held";
 
 /// The tenant's lake_part delete grant as the platform delivers it in the
 /// credential-exchange response (`lake_part_delete_grant`). See
@@ -103,6 +106,11 @@ pub trait SanctionedPartGc: Send + Sync {
     /// Collect a completed background report without starting a destructive pass.
     async fn poll_report(&self, _now_ms: i64) -> Option<Result<PassReport>> { None }
 
+    /// NAN-4601: keep publishing the part log to control's index while
+    /// deletes are held (catalog custody unattached). Never starts, resumes
+    /// or schedules a delete pass; only reaps one that already finished.
+    async fn feed_index_only(&self, _now_ms: i64) -> Option<Result<PassReport>> { None }
+
     /// NAN-3852: receipted deletes so far in this process, including those of
     /// a pass still in flight. `None` when only completed reports count.
     fn deleted_total(&self) -> Option<u64> { None }
@@ -138,6 +146,10 @@ pub trait PartGcAuthority: Send + Sync {
 
     /// Completion is observable even after the route or grant is withdrawn.
     async fn poll_report(&self, _now_ms: i64) -> Option<Result<PassReport>> { None }
+
+    /// NAN-4601: the index-only feed while deletes are held (see
+    /// [`SanctionedPartGc::feed_index_only`]). Never a delete decision.
+    async fn feed_index_only(&self, _now_ms: i64) -> Option<Result<PassReport>> { None }
 
     /// NAN-3852: live receipted-delete count of the wired pass (see
     /// [`SanctionedPartGc::deleted_total`]).
@@ -205,6 +217,13 @@ impl PartGcAuthority for ExchangedGrantAuthority {
         }
     }
 
+    async fn feed_index_only(&self, now_ms: i64) -> Option<Result<PassReport>> {
+        match &self.sanctioned {
+            Some(pass) => pass.feed_index_only(now_ms).await,
+            None => None,
+        }
+    }
+
     fn blocked_detail(&self) -> &'static str {
         self.sanctioned.as_ref().map_or("sanctioned_route_not_wired", |pass| pass.unavailable_detail())
     }
@@ -239,6 +258,14 @@ pub trait PartObjectLister: Send + Sync {
     }
 
     async fn list_part_objects(&self, prefix: &str) -> Result<Vec<ListedPartObject>>;
+
+    /// NAN-4567: one small object's bytes (`None` when absent), refused over
+    /// `limit` bytes. Listers that cannot read refuse, which keeps every
+    /// quarantine object (see `lake_part_gc::quarantine_expiry`).
+    async fn get_small_object(&self, key: &str, limit: usize) -> Result<Option<Vec<u8>>> {
+        let _ = (key, limit);
+        anyhow::bail!("this part lister cannot read objects")
+    }
 
     /// Complete scan with bounded candidate retention. The production adapter
     /// streams; the default preserves compatibility for in-memory test listers.
@@ -331,6 +358,40 @@ mod tests {
         assert_eq!(counting.deleted_total(), Some(410));
         assert_eq!(ExchangedGrantAuthority::new(T, Some(Arc::new(NoPass))).deleted_total(), None);
         assert_eq!(ExchangedGrantAuthority::new(T, None).deleted_total(), None);
+    }
+
+    struct FeedOnly {
+        fed: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait]
+    impl SanctionedPartGc for FeedOnly {
+        async fn run_pass(&self, _now_ms: i64) -> Result<PassReport> {
+            panic!("the held feed never runs a pass")
+        }
+        async fn schedule_pass(&self, _now_ms: i64) -> Option<Result<PassReport>> {
+            panic!("the held feed never schedules a pass")
+        }
+        async fn poll_report(&self, _now_ms: i64) -> Option<Result<PassReport>> {
+            panic!("the held feed never polls (polling may resume a backed-off pass)")
+        }
+        async fn feed_index_only(&self, _now_ms: i64) -> Option<Result<PassReport>> {
+            self.fed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// NAN-4601: the gate forwards the held index feed to the wired pass and
+    /// to nothing else; no wired pass is a no-op.
+    #[tokio::test]
+    async fn the_gate_forwards_only_the_index_feed_while_held() {
+        let pass = Arc::new(FeedOnly { fed: Default::default() });
+        let gate = ExchangedGrantAuthority::new(T, Some(pass.clone()));
+        gate.update(Some(&grant(true, "2030-01-01T00:00:00Z")));
+        assert!(gate.feed_index_only(NOW).await.is_none());
+        assert!(gate.feed_index_only(NOW + 1).await.is_none());
+        assert_eq!(pass.fed.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(ExchangedGrantAuthority::new(T, None).feed_index_only(NOW).await.is_none());
     }
 
     fn grant(enabled: bool, expires_at: &str) -> serde_json::Value {

@@ -104,13 +104,19 @@ struct FakeDo(Arc<Mutex<DoState>>);
 
 impl FakeDo {
     fn append(&self, key: &str, body: Vec<u8>) {
+        let seq = self.0.lock().unwrap().segments.len() as u64 + 1;
+        self.append_at(key, body, DAY0_S * 1_000 + seq as i64);
+    }
+    /// Append a segment the edge received at `received_at_ms` (NAN-4336:
+    /// ingest clamps a row more than 5 min past its receipt to the receipt).
+    fn append_at(&self, key: &str, body: Vec<u8>, received_at_ms: i64) {
         let mut s = self.0.lock().unwrap();
         let seq = s.segments.len() as u64 + 1;
         let prev = s.segments.last().map(|x| x.chain.clone()).unwrap_or_else(|| edge_log_genesis(TENANT));
         let sha = sha256_hex(&body);
         let chain = edge_log_next_chain(&prev, seq, key, &sha, body.len() as u64);
         s.segments.push(Segment { seq, key: key.into(), sha256: sha, length: body.len() as u64, prev_chain: prev, chain,
-            received_at_ms: DAY0_S * 1_000 + seq as i64, bytes: body });
+            received_at_ms, bytes: body });
     }
     fn committed(&self) -> u64 {
         self.0.lock().unwrap().committed
@@ -489,7 +495,11 @@ async fn a_restart_backlog_across_an_hour_boundary_signs_under_the_owner_body_ca
                 row
             })
             .collect::<Vec<_>>();
-        fake.append(&backlog_seg_key(i), parquet_bytes(&events));
+        // The edge receives each segment just after its events (NAN-4336
+        // clamps rows more than 5 min past receipt to it, which would fold
+        // the whole backlog into the first hour).
+        let received_at_ms = (hour_end - 150 + (i as i64 * 5) / 2 + 2) * 1_000;
+        fake.append_at(&backlog_seg_key(i), parquet_bytes(&events), received_at_ms);
     };
     // The first process commits a few segments, then dies (a roll).
     for i in 1..=6 {
@@ -725,4 +735,126 @@ async fn the_same_landed_file_under_a_new_key_adds_zero_searchable_rows() {
     assert_eq!(third.iter().filter(|uid| first.contains(uid)).count(), 10);
     run_ingest(&fake, &parts, &dir.path().join("w2"), (DAY0_S + 7_000) * 1_000, 3).await.unwrap();
     assert_eq!(live_uids(&parts).await.len(), 70);
+}
+
+/// NAN-4539: the background part store with a fixed per-PUT delay, so
+/// consecutive flights overlap.
+struct SlowParts {
+    inner: LocalObjectStore,
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ObjectStore for SlowParts {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+    async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let written = self.inner.put_if_absent(key, bytes).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        written
+    }
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// NAN-4539: the production edge-source settings for the default depth
+/// ([`edge_source_config`] of `MAX_FLUSH_DEPTH`, as the cell opens it) over
+/// the real `EdgeLogSource`: two ranges outstanding at most, committed to the
+/// DO strictly in issue order (the fake refuses a gap), each segment once,
+/// with the single-flight pull allowance. A one-range source (the serial
+/// contract) drains the same backlog with one flight at most.
+///
+/// NAN-4539 step 3a: with one range (depth 1), an age-due seal beside the
+/// unfinished flight is deferred and admission keeps filling the buffer, so
+/// that run drains in fewer, larger flushes (2 here, not ~20 at 8 objects
+/// each); it still must never overlap two flights and must commit in order,
+/// exactly once. The two-range run must still overlap several flights.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_edge_source_overlaps_two_flights_and_commits_ranges_in_order() {
+    use nanosiem_lake_worker::part_ingest::ingest::{edge_source_config, MAX_FLUSH_DEPTH};
+    assert_eq!(edge_source_config(MAX_FLUSH_DEPTH).max_issued_ranges, 2);
+    assert_eq!(edge_source_config(MAX_FLUSH_DEPTH).max_buffered_bytes, EdgeLogSourceConfig::default().max_buffered_bytes,
+        "a second range never raises the pulled-bytes allowance");
+    for (source_config, max_peak, min_pipelined) in [(edge_source_config(MAX_FLUSH_DEPTH), 2, 4), (EdgeLogSourceConfig::default(), 1, 2)] {
+        let dir = tempfile::tempdir().unwrap();
+        let parts = LocalObjectStore::new(dir.path().join("parts")).unwrap();
+        let background: &'static SlowParts = Box::leak(Box::new(SlowParts {
+            inner: LocalObjectStore::new(dir.path().join("parts")).unwrap(), in_flight: Default::default(), peak: Default::default(),
+        }));
+        let background_signer: &'static LocalPartSigner = Box::leak(Box::new(signer()));
+        let fake = FakeDo::default();
+        let total = 160;
+        let mut expected = HashSet::new();
+        for i in 1..=total {
+            let events = (0..4).map(|r| {
+                let uid = format!("depth-{i:04}-{r}");
+                expected.insert(uid.clone());
+                event(&uid, DAY0_S + 3_000 + i as i64, i * 4 + r)
+            }).collect::<Vec<_>>();
+            fake.append(&backlog_seg_key(i), parquet_bytes(&events));
+        }
+        let source = Arc::new(EdgeLogSource::open(fake.clone(), TENANT, "ingest", None, source_config).await.unwrap());
+        let queue = EdgeQueue::new(source.clone(), TENANT);
+        let segments = EdgeSegments::new(source);
+        let signer = signer();
+        let mut cfg = IngestConfig::new(TENANT, dir.path().join("work"));
+        cfg.flush_interval_override_ms = Some(10_000);
+        cfg.max_objects_per_admission = 8;
+        let mut ingestor = Ingestor::open(cfg, &parts, &segments, &queue, &signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), (DAY0_S + 3_300) * 1_000).await.unwrap();
+        ingestor.set_background_store(background);
+        ingestor.set_background_signer(background_signer);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        ingestor.set_flight_wake(wake.clone());
+        let mut clock = (DAY0_S + 3_300) * 1_000;
+        // The widest modeled wait for the next DO commit (from the start or
+        // the previous commit), to bound how long a deferred seal waits.
+        let (mut last_commit, mut last_committed, mut widest_commit_wait) = (clock, 0, 0_i64);
+        for _ in 0..400 {
+            clock += 11_000;
+            ingestor.tick(clock).await.unwrap();
+            if fake.committed() != last_committed {
+                widest_commit_wait = widest_commit_wait.max(clock - last_commit);
+                (last_commit, last_committed) = (clock, fake.committed());
+            }
+            if fake.committed() == total as u64 && ingestor.health().flushes_in_flight == 0 {
+                break;
+            }
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        }
+        ingestor.flush_now(clock + 11_000).await.unwrap();
+        assert_eq!(fake.committed(), total as u64, "every segment committed, ranges in order");
+        let health = ingestor.health();
+        let (deferred, first) = ingestor.seals_deferred();
+        assert!(health.flushes_pipelined_total >= min_pipelined, "catch-up pipelined: {} (depth {max_peak}; seals deferred {deferred}, \
+            sealed first {first})", health.flushes_pipelined_total);
+        assert_eq!((health.seals_deferred_total, health.seals_first_total), (deferred, first), "3a's counters are in health");
+        if max_peak == 1 {
+            // The one-range source is where 3a defers (the modeled
+            // convergence cases never do): it engaged, and a deferred seal
+            // sealed by the next commit, within one 11 s tick of it.
+            assert!(deferred > 0, "depth 1 deferred no age-due seal beside its flight");
+            assert!(health.seal_deferred_max_ms > 0 && health.seal_deferred_max_ms <= widest_commit_wait + 11_000,
+                "a deferred seal waited {} ms; the widest commit wait was {widest_commit_wait} ms", health.seal_deferred_max_ms);
+        }
+        assert_eq!(health.flushes_in_flight_peak, max_peak, "flights in flight at once");
+        let commits = fake.0.lock().unwrap().commits.iter().map(|(through, _)| *through).collect::<Vec<_>>();
+        assert!(commits.windows(2).all(|pair| pair[0] < pair[1]), "DO commits strictly in order: {commits:?}");
+        let uids = live_uids(&parts).await;
+        assert_eq!(uids.len(), expected.len(), "no loss, no duplicates");
+        assert_eq!(uids.into_iter().collect::<HashSet<_>>(), expected);
+    }
 }

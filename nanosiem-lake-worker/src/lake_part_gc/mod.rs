@@ -15,6 +15,7 @@
 //! - [`executor`]: [`run_pass`], [`execute`] and the refusal policy.
 //! - [`store_reader`]: the part-log reader over the tenant's part store.
 //! - [`delete_control`]: the delete-control wire contract.
+//! - [`quarantine_expiry`]: NAN-4567, expired bronze quarantine keys.
 //! - `http` (hosted build only): the owner / Worker HTTP implementations of
 //!   the seams.
 
@@ -26,13 +27,14 @@ pub mod index;
 pub mod local;
 pub mod local_bronze;
 pub mod planner;
+pub mod quarantine_expiry;
 pub mod receipt_backfill;
 pub mod receipt_reconcile_exchange;
 pub mod request;
 pub mod store_reader;
 
 pub use executor::{
-    execute, run_pass, LakePartDeleteAuthority, LakePartGcState, PassInput, LakePartDeletePermit, LakePartDeleteReceipt, LakePartRefusal,
+    execute, run_pass, CatalogCustodyHeld, LakePartDeleteAuthority, LakePartGcState, PassInput, LakePartDeletePermit, LakePartDeleteReceipt, LakePartRefusal,
     PassReport, RefusalAction,
 };
 #[cfg(feature = "enterprise")]

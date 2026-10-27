@@ -19,6 +19,8 @@ impl StartupProgress {
             busy: true,
             detail: Some("starting: credentials".into()),
             startup_progress: Some(1),
+            // NAN-4445: a starting ingest has no prevalence verdict yet.
+            prevalence_degraded_known: Some(false),
             ..Heartbeat::default()
         })))
     }

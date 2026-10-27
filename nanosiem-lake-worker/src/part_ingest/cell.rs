@@ -95,6 +95,8 @@ pub struct ExchangedR2Credential {
 #[derive(Deserialize)]
 pub struct ExchangeResponse {
     #[serde(default)]
+    pub agent_catalog: Option<super::iceberg_export::activation::CatalogActivation>,
+    #[serde(default)]
     pub owner_write: Option<super::native_writer::WritePermission>,
     pub schema_version: u8,
     pub tenant_id: String,
@@ -178,6 +180,7 @@ pub struct PartCreds {
 }
 
 pub struct IngestCredentials {
+    pub agent_catalog: Option<super::iceberg_export::activation::CatalogActivation>,
     pub native_writer: Option<Arc<super::native_writer::NativePartWriter>>,
     pub writer_epoch: u64,
     pub input: InputCreds,
@@ -249,6 +252,7 @@ pub fn trusted_from(signing: &PartSigning) -> Result<TenantKeySet> {
 
 /// The fresh credentials one exchange yields (production path).
 pub struct Exchanged {
+    pub agent_catalog: Option<super::iceberg_export::activation::CatalogActivation>,
     pub write_permission: Option<super::native_writer::WritePermission>,
     pub writer_epoch: u64,
     pub input: InputCreds,
@@ -596,7 +600,8 @@ pub async fn exchange_received(token: &[u8], assignment: &Assignment, received: 
     if let Some(at) = erasure_ledger.as_ref().and_then(|ledger| ledger.validate(tenant, chrono::Utc::now()).ok()) {
         expires_at = expires_at.min(at);
     }
-    Ok(Exchanged { write_permission, writer_epoch, input, parts, prevalence, enrichment, bearer, expires_at,
+    if let Some(record)=&exchange.agent_catalog {record.validate(tenant)?;}
+    Ok(Exchanged { agent_catalog:exchange.agent_catalog, write_permission, writer_epoch, input, parts, prevalence, enrichment, bearer, expires_at,
         part_delete_grant: exchange.lake_part_delete_grant, part_gc, erasure_ledger })
 }
 
@@ -621,6 +626,7 @@ pub async fn credentials_from_secret(secret: &[u8], assignment: &Assignment) -> 
             None => input_from(lab.edge_log_consumer_endpoint, lab.edge_log_consumer_token, lab.bronze, lab.notices)?,
         };
         return Ok(IngestCredentials {
+            agent_catalog: None,
             native_writer: None,
             writer_epoch: lab.writer_epoch,
             input,
@@ -657,6 +663,7 @@ pub async fn credentials_from_secret(secret: &[u8], assignment: &Assignment) -> 
     // Recover completion evidence using the freshly exchanged owner permission.
     native_writer.replay_pending().await?;
     Ok(IngestCredentials {
+        agent_catalog: fresh.agent_catalog,
         native_writer: Some(native_writer),
         writer_epoch: fresh.writer_epoch,
         input: fresh.input,
@@ -985,6 +992,8 @@ pub struct IngestService {
     _append_lock: std::fs::File,
     writer_epoch: u64,
     epoch_changed: AtomicBool,
+    /// NAN-4553: the stall watchdog asked for the respawn (charges kept).
+    stall_terminated: AtomicBool,
     active_appends: AtomicUsize,
     wake: Arc<tokio::sync::Notify>,
     heartbeat: std::sync::Mutex<Heartbeat>,
@@ -995,6 +1004,7 @@ pub struct IngestService {
     idle_exit: bool,
     /// Production only: refreshable stores and signer.
     refresh: Option<Refreshable>,
+    agent_catalog: super::iceberg_export::activation::IngestCatalog,
     enrichment: Option<LeanEnrichmentSnapshots<'static>>,
     initial_enrichment_pointer: Option<SnapshotPointer>,
     platform_paths: Option<PlatformPaths>,
@@ -1404,8 +1414,7 @@ impl IngestService {
                         tenant,
                         "ingest",
                         point.as_ref(),
-                        super::ingest::edge_source_config(super::ingest::flush_depth_from_env(
-                            std::env::var(super::ingest::FLUSH_DEPTH_ENV).ok().as_deref())),
+                        super::ingest::edge_source_config(super::ingest::MAX_FLUSH_DEPTH),
                     )
                     .await?,
                 );
@@ -1532,6 +1541,12 @@ impl IngestService {
         };
         let mut cfg = IngestConfig::new(tenant, &assignment.state_dir)
             .with_owner_requires_checksum(assignment.owner_requires_checksum);
+        let mut agent_catalog = if credentials.agent_catalog.is_some() {
+            let source=credentials.parts.as_ref().context("activated catalog requires hosted part credentials")?;
+            super::iceberg_export::activation::attach_for_ingest(&mut cfg, credentials.agent_catalog.as_ref(),
+                &assignment.state_dir.join("agent-catalog"), &source.part, &source.log, credentials.trusted.clone(),
+                assignment.control_url.as_deref().context("activated catalog requires control plane")?, &assignment.cell_id).await?
+        } else { Default::default() };
         cfg.merge_policy.day_merges = assignment.ingest_day_merges;
         apply_merge_policy(&mut cfg, assignment.ingest_merge_policy.as_ref())?;
         // Merges never hold the tick (admission, flushes, edge commits).
@@ -1554,12 +1569,12 @@ impl IngestService {
         // Share the existing ingest disk allocation between merge inputs and
         // fresh producer objects instead of doubling the tenant's footprint.
         cfg.cache_max_bytes = if r2_parts.is_some() { cache_bytes_for(assignment) / 2 } else { cache_bytes_for(assignment) };
-        cfg.max_window_uids = super::dedup::window_cap_for(assignment.memory_cap_bytes);
-        cfg.buffer_budget_bytes = super::ingest::buffer_budget_for(assignment.memory_cap_bytes);
-        // NAN-3619: flushes in flight at once (default 1; the edge source
-        // above is opened with the same depth).
-        cfg.flush_depth = super::ingest::flush_depth_from_env(std::env::var(super::ingest::FLUSH_DEPTH_ENV).ok().as_deref());
-        cfg.commit_when_ready = super::ingest::commit_when_ready_from_env(std::env::var(super::ingest::COMMIT_WHEN_READY_ENV).ok().as_deref());
+        // NAN-4592: the remote prevalence state's disk cache, sized from the
+        // state at open within this cap.
+        cfg.prevalence_cache_max_bytes = prevalence_cache_bytes_for(assignment);
+        super::ingest::size_for_memory_cap(&mut cfg, assignment.memory_cap_bytes);
+        // Constructor defaults enable bounded ordered overlap. The queue,
+        // available memory and privacy/custody state determine actual depth.
         // NAN-3662: per-source refusal counts in `reject` details (default off).
         cfg.refusal_source_counts = crate::parts::refusal_tally::write_enabled_from_env(
             std::env::var(crate::parts::refusal_tally::WRITE_ENV).ok().as_deref());
@@ -1612,12 +1627,9 @@ impl IngestService {
         // cell's 'static part store (it stays off unless enabled).
         ingestor.set_background_store(parts);
         ingestor.set_background_signer(signer);
-        // NAN-3619 (commit-when-ready flag): a finished flight wakes the
-        // loop to commit it now. Off: the loop wakes as before.
+        // A completed publication wakes the single part-log owner immediately.
         let wake = Arc::new(tokio::sync::Notify::new());
-        if super::ingest::commit_when_ready_from_env(std::env::var(super::ingest::COMMIT_WHEN_READY_ENV).ok().as_deref()) {
-            ingestor.set_flight_wake(wake.clone());
-        }
+        ingestor.set_flight_wake(wake.clone());
         // Deletes only through the sanctioned route, only while the grant is
         // enabled (`part_gc_gate`); without a delivered route the gate says
         // `sanctioned_path_unavailable` and every part is kept.
@@ -1643,6 +1655,15 @@ impl IngestService {
         // platform delivers the ledger login (it declares this cell the
         // executor only for `lean_erasure_v1` images).
         ingestor.set_erasure_ledger(erasure_ledger.clone(), format!("lean-cell:{}", assignment.cell_id));
+        if let Some(runtime) = agent_catalog.runtime() {
+            if let Err(error) = runtime.report_attachment(ingestor.health().agent_catalog.as_ref()).await {
+                ingestor.hold_catalog("catalog_attachment_report_failed");
+                agent_catalog.mark_degraded();
+                tracing::error!(tenant = %ingestor.health().tenant_id, reason="catalog_attachment_report_failed", stage="writer_attached", error_class=super::iceberg_export::activation::attachment_error_class(&error), "agent lane degraded; ingest continues, erasure and GC held");
+            } else {
+                agent_catalog.mark_attached();
+            }
+        }
         // NAN-3899: hosted lean ingest records per-credential activity (the
         // Credentials table's last seen / 24 h events) through the same
         // tenant-bound `publish` login; nothing is written without it.
@@ -1670,14 +1691,17 @@ impl IngestService {
             _append_lock: lock,
             writer_epoch: credentials.writer_epoch,
             epoch_changed: AtomicBool::new(false),
+            stall_terminated: AtomicBool::new(false),
             active_appends: AtomicUsize::new(0),
             wake,
-            heartbeat: std::sync::Mutex::new(Heartbeat::default()),
+            // NAN-4445: no prevalence verdict before the first health update.
+            heartbeat: std::sync::Mutex::new(Heartbeat { prevalence_degraded_known: Some(false), ..Heartbeat::default() }),
             pipeline_diagnostics,
             native_writer_diagnostics: credentials.native_writer.clone(),
             assignment: assignment.clone(),
             idle_exit,
             refresh,
+            agent_catalog,
             enrichment: enrichment.map(|(_, snapshots)| snapshots),
             initial_enrichment_pointer,
             platform_paths,
@@ -1741,6 +1765,7 @@ impl IngestService {
                 heartbeat.busy = true;
                 heartbeat.detail = Some(format!("edge_log_stalled: {stall}").chars().take(200).collect());
             }
+            this.stall_terminated.store(true, Ordering::SeqCst);
             this.terminate(format!("edge-log stall watchdog: {stall}"));
         })
     }
@@ -1771,6 +1796,13 @@ impl IngestService {
         let mut terminal = self.terminal.subscribe();
         let refresher = self.spawn_refresher(control.clone());
         let watchdog = self.spawn_stall_watchdog();
+        let catalog_recovery = self.agent_catalog.recovery().map(|recovery| {
+            let this = self.clone();
+            tokio::spawn(async move {
+                recovery.wait_for_restart().await;
+                this.terminate("catalog custody changed; restart to attach after verified platform recovery".into());
+            })
+        });
         // NAN-3503: the identity directory refreshes in its own task.
         let identity_refresh = self.identity.as_ref().map(|(directories, handle)| {
             tokio::spawn(crate::identity_enrichment::run_identity_refresh(
@@ -1798,7 +1830,19 @@ impl IngestService {
             async move { this.run_loop(&control).await }
         });
         let result = tokio::select! {
-            joined = &mut work => joined.unwrap_or_else(|error| Err(anyhow::anyhow!("ingest loop task: {error}"))),
+            joined = &mut work => match joined {
+                // NAN-4553: every return of the loop is a coded exit. Those
+                // the object in flight may cause (the retry window, a 400 on
+                // its part) keep this process's crash-ledger charges, so it
+                // is refused in bounded time; the rest undo them
+                // (`ingest::exit_keeps_charges`). A panic keeps them.
+                Ok(result) => {
+                    let reason = result.as_ref().err().map(|error| format!("{error:#}")).unwrap_or_else(|| "ingest loop ended".into());
+                    self.note_coded_exit(result.as_ref().err(), &reason).await;
+                    result
+                }
+                Err(error) => Err(anyhow::anyhow!("ingest loop task: {error}")),
+            },
             reason = terminal.wait_for(Option::is_some) => {
                 if let Some(lost) = self.writer_lease.as_ref().and_then(|lease| lease.lost()) {
                     // Standby, not a failure: no fatal report; the binary exits
@@ -1808,8 +1852,12 @@ impl IngestService {
                         std::process::exit(nanosiem_lake_cell::contract::WRITER_STANDBY_EXIT_CODE);
                     });
                     work.abort();
+                    // NAN-4553: losing the lease is not a crash.
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut work).await;
+                    self.note_orderly_exit(&lost.to_string()).await;
                     refresher.abort();
                     watchdog.abort();
+                    if let Some(task) = &catalog_recovery { task.abort(); }
                     if let Some(task) = &lease_renewer {
                         task.abort();
                     }
@@ -1822,6 +1870,15 @@ impl IngestService {
                 let reason = reason.map(|reason| reason.clone().unwrap_or_default())
                     .unwrap_or_else(|_| "terminal channel closed".into());
                 tracing::error!(reason = %reason, "ingest exiting for a respawn");
+                // NAN-4553 (review P2): credential refresh giving up and a
+                // catalog custody change or refresh failure are never the
+                // object's: undo the charges. A stall-watchdog respawn keeps
+                // them (a wedge in the object's admission looks the same).
+                if !self.stall_terminated.load(Ordering::SeqCst) {
+                    work.abort();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut work).await;
+                    self.note_orderly_exit(&reason).await;
+                }
                 let _ = tokio::time::timeout(Duration::from_secs(5), control.fatal(&reason)).await;
                 // The binary exits as soon as this returns; should anything
                 // hold it up (a blocked thread), exit regardless.
@@ -1835,6 +1892,7 @@ impl IngestService {
         };
         refresher.abort();
         watchdog.abort();
+        if let Some(task) = catalog_recovery { task.abort(); }
         if let Some(task) = lease_renewer {
             task.abort();
         }
@@ -1843,6 +1901,26 @@ impl IngestService {
             task.abort();
         }
         result
+    }
+
+    /// NAN-4553: undo this process's crash-ledger charges on a coded exit
+    /// that is never the object's.
+    /// Bounded: a lock held by a wedged tick must not hold up the exit (the
+    /// charge then stays, as for a crash).
+    async fn note_orderly_exit(&self, reason: &str) {
+        match tokio::time::timeout(Duration::from_secs(2), self.ingestor.lock()).await {
+            Ok(mut ingestor) => ingestor.note_orderly_exit(reason),
+            Err(_) => tracing::warn!("ingest lock busy at exit; crash-ledger charges kept"),
+        }
+    }
+
+    /// NAN-4553 (review P1): classify a run-loop exit and keep or undo the
+    /// charges (`ingest::exit_keeps_charges`). Same 2 s bound.
+    async fn note_coded_exit(&self, error: Option<&anyhow::Error>, reason: &str) {
+        match tokio::time::timeout(Duration::from_secs(2), self.ingestor.lock()).await {
+            Ok(mut ingestor) => ingestor.note_coded_exit(error, reason),
+            Err(_) => tracing::warn!("ingest lock busy at exit; crash-ledger charges kept"),
+        }
     }
 
     /// NAN-4129: teardown stops renewing the cell writer lease.
@@ -2084,6 +2162,12 @@ impl IngestService {
                         }
                         tracing::error!(error = %format!("{error:#}"), fenced, failing_for_s = since.elapsed().as_secs(), "ingest exiting: tick failure is fatal (fenced, or failing longer than MAX_RETRY_WINDOW)");
                         let _ = control.fatal(&format!("{error:#}")).await;
+                        // NAN-4553 (review P1): a window exit the object in
+                        // flight may cause keeps its charge (not an epoch
+                        // change, not a fencing-class refusal).
+                        if !fenced && !self.epoch_changed.load(Ordering::Relaxed) {
+                            return Err(error.context(super::ingest::RetryWindowExhausted(since.elapsed().as_secs())));
+                        }
                         return Err(error);
                     }
                     // Classification precedes maintenance: fatal errors and
@@ -2117,7 +2201,10 @@ impl IngestService {
             if (report.admitted_rows > 0 || report.flushed_parts > 0) && !held_back {
                 self.wake.notify_one();
             }
-            let health = ingestor.health().clone();
+            let mut health = ingestor.health().clone();
+            if let (Some(status),Some(catalog))=(&mut health.agent_catalog,self.agent_catalog.runtime()) {
+                status["credential_expires_at_ms"]=catalog.credential_expires_at_ms().into();
+            }
             if last_dedupe_health_log.elapsed() >= DEDUPE_HEALTH_LOG_INTERVAL {
                 last_dedupe_health_log = Instant::now();
                 tracing::info!(tenant = %health.tenant_id, counters = %dedupe_health_counters(&health), "ingest dedupe health");
@@ -2127,6 +2214,7 @@ impl IngestService {
                 last_work = Instant::now();
             }
             *self.heartbeat.lock().expect("heartbeat lock") = Heartbeat {
+                agent_catalog_custody: health.agent_catalog.clone(),
                 ingest_diagnostics: None,
                 startup_progress: None,
                 busy,
@@ -2137,6 +2225,7 @@ impl IngestService {
                 prevalence_behind_entries: health.prevalence_behind_entries,
                 prevalence_degraded_seconds: health.prevalence_degraded_ms as f64 / 1_000.0,
                 prevalence_degraded_seconds_total: health.prevalence_degraded_ms_total as f64 / 1_000.0,
+                prevalence_degraded_known: Some(health.prevalence_degraded_known),
                 last_progress_unix_ms: health.last_commit_ms.unwrap_or(0).max(0) as u64,
                 queue_depth: (health.pending_notices + health.merge_backlog) as u64,
                 objects_rejected: health.objects_rejected_total,
@@ -2165,6 +2254,7 @@ impl IngestService {
                 writer_lease_epoch: None,
                 writer_ready: false,
                 landing: None,
+                finding_outbox: None,
             };
             if self.idle_exit && !busy && last_work.elapsed() >= IDLE_EXIT {
                 ingestor.flush_now(now_ms()).await?;
@@ -2186,8 +2276,20 @@ pub fn cache_bytes_for(assignment: &Assignment) -> u64 {
     (bytes * 0.75) as u64
 }
 
+/// NAN-4592: cap on the tenant's prevalence disk cache: half of the part
+/// cache's allocation ([`cache_bytes_for`]), never below the 256 MiB every
+/// state had before. What it uses is twice the state's SSTs at open
+/// ([`super::prevalence::object_cache_bytes`]), so a small tenant's small
+/// state stays small. The tenant disk ceiling's soft figure is at least
+/// twice the budget's disk (`disk_ceiling`); with this cap ingest's caches
+/// stay within 1.125x of that disk ([`cache_bytes_for`] hands out 0.75x).
+pub fn prevalence_cache_bytes_for(assignment: &Assignment) -> u64 {
+    (cache_bytes_for(assignment) / 2).max(super::prevalence::OBJECT_CACHE_FLOOR_BYTES)
+}
+
 // Copy after polling, including clearing a previously blocked state.
 fn update_gc_heartbeat(heartbeat: &mut Heartbeat, health: &super::ingest::IngestHealth) {
+    heartbeat.agent_catalog_custody=health.agent_catalog.clone();
     heartbeat.part_gc_blocked = health.part_gc_blocked.clone();
     heartbeat.part_gc_deleted_total = health.part_gc_deleted_total;
 }
@@ -2419,9 +2521,127 @@ async fn bronze_quarantine_replay(axum::extract::State(service): axum::extract::
     }
 }
 
+/// NAN-4554: the header carrying an imported object's entry (base64 JSON,
+/// the export's `entry`); the body is the object's bytes.
+pub const QUARANTINE_IMPORT_ENTRY_HEADER: &str = "x-nano-quarantine-entry";
+/// Review P3: an entry's strings are capped (detail 480 chars, source key
+/// 1024, version 256), but escaping and multi-byte chars can grow them.
+const QUARANTINE_IMPORT_ENTRY_MAX: usize = 32 * 1024;
+
+/// Removes an import's staging file however the request ends (review: a
+/// write error such as ENOSPC, or a client disconnect dropping the future).
+struct StagedImport(std::path::PathBuf);
+
+impl Drop for StagedImport {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// NAN-4554: stream `body` into `path`, at most `limit` bytes (`Ok(false)`
+/// when over: the file is removed). Never holds the object in memory.
+pub(crate) async fn stage_import_body(body: axum::body::Body, path: &std::path::Path, limit: u64) -> Result<bool> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await.with_context(|| format!("create {}", path.display()))?;
+    let mut stream = body.into_data_stream();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                anyhow::bail!("import body: {error}");
+            }
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > limit {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Ok(false);
+        }
+        file.write_all(&chunk).await?;
+    }
+    file.sync_all().await?;
+    Ok(true)
+}
+
+/// NAN-4554: decode the entry header of an import.
+pub(crate) fn import_entry(headers: &axum::http::HeaderMap) -> Option<super::quarantine::QuarantineEntry> {
+    use base64::Engine;
+    let value = headers.get(QUARANTINE_IMPORT_ENTRY_HEADER)?.as_bytes();
+    if value.len() > QUARANTINE_IMPORT_ENTRY_MAX {
+        return None;
+    }
+    let json = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
+    serde_json::from_slice(&json).ok()
+}
+
+/// NAN-4554: import one object exported from an earlier pod (the pod-local
+/// copy a replacement lost). The cell verifies it before any write (tenant,
+/// id == sha256(bytes), size, expiry, per-object / byte / entry caps), keeps
+/// it, and its own mirror writes it to the tenant bucket: no operator
+/// credential. Idempotent per id.
+#[utoipa::path(post, path = "/v1/tenants/{tenant}/admin/bronze-quarantine/import", tag = "lake-admin",
+    params(("tenant" = String, Path), ("x-nano-quarantine-entry" = String, Header, description = "base64 JSON QuarantineEntry")),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses((status = 201, body = serde_json::Value, description = "Kept and queued for the tenant bucket"),
+        (status = 200, body = serde_json::Value, description = "Already kept with these bytes (no-op)"),
+        (status = 400, description = "Malformed entry, bytes that do not match it, or an expired entry"),
+        (status = 403, description = "Full operator token required, or another tenant's entry"),
+        (status = 409, body = serde_json::Value, description = "The id is kept with different bytes, was already released (its replay committed: `released: true`), or is older than the restore's read bound"),
+        (status = 413, description = "Over the per-object, byte or entry cap"),
+        (status = 503, description = "Quarantine unavailable, or its restore from the tenant bucket has not completed")), security(("operator_bearer" = [])))]
+async fn bronze_quarantine_import(axum::extract::State(service): axum::extract::State<Arc<IngestService>>, request: axum::extract::Request) -> axum::response::Response {
+    use super::quarantine::{ImportRefused, Imported, MAX_QUARANTINED_OBJECT_BYTES};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let Some(entry) = import_entry(request.headers()) else {
+        return (StatusCode::BAD_REQUEST, "invalid import entry header").into_response();
+    };
+    if !crate::parts::is_sha256_hex(&entry.id) {
+        return (StatusCode::BAD_REQUEST, "invalid import id").into_response();
+    }
+    let Some(quarantine) = service.ingestor.lock().await.quarantine_handle() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "bronze quarantine is unavailable").into_response();
+    };
+    let staged = StagedImport(quarantine.staging_path(&format!("import-{}", uuid::Uuid::new_v4().simple())));
+    let staged = &staged.0;
+    match stage_import_body(request.into_body(), staged, MAX_QUARANTINED_OBJECT_BYTES).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::PAYLOAD_TOO_LARGE, "the object is over the per-object cap").into_response(),
+        Err(error) => return (StatusCode::BAD_REQUEST, format!("{error:#}")).into_response(),
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let result = service.ingestor.lock().await.import_quarantined(&entry, staged, now);
+    match result {
+        Ok(Imported::New) => {
+            service.wake.notify_one();
+            (StatusCode::CREATED, axum::Json(serde_json::json!({"imported": true, "id": entry.id}))).into_response()
+        }
+        Ok(Imported::Exists) => (StatusCode::OK, axum::Json(serde_json::json!({"imported": false, "id": entry.id}))).into_response(),
+        Err(error) => {
+            let status = match error.downcast_ref::<ImportRefused>() {
+                Some(ImportRefused::CrossTenant) => StatusCode::FORBIDDEN,
+                Some(ImportRefused::Released) => {
+                    return (StatusCode::CONFLICT, axum::Json(serde_json::json!({
+                        "imported": false, "released": true, "id": entry.id, "error": error.to_string()}))).into_response();
+                }
+                Some(ImportRefused::Conflict | ImportRefused::BeyondRestoreBound) => StatusCode::CONFLICT,
+                Some(ImportRefused::RestorePending) => StatusCode::SERVICE_UNAVAILABLE,
+                Some(ImportRefused::ObjectTooLarge | ImportRefused::OverCap | ImportRefused::TooManyEntries) => StatusCode::PAYLOAD_TOO_LARGE,
+                Some(ImportRefused::Malformed | ImportRefused::Digest | ImportRefused::Size | ImportRefused::Expired) => StatusCode::BAD_REQUEST,
+                None => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, error.to_string()).into_response()
+        }
+    }
+}
+
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(count_backfill_status, start_count_backfill, prevalence_restamp_status, start_prevalence_restamp,
-    bronze_quarantine_list, bronze_quarantine_replay),
+    bronze_quarantine_list, bronze_quarantine_replay, bronze_quarantine_import),
     components(schemas(super::reindex::CountBackfill, BronzeQuarantineReplay, super::quarantine::QuarantineEntry)))]
 pub struct CountBackfillApiDoc;
 
@@ -2433,6 +2653,9 @@ impl TenantService for IngestService {
             .route("/v1/admin/prevalence-restamp", axum::routing::get(prevalence_restamp_status).post(start_prevalence_restamp))
             .route("/v1/admin/bronze-quarantine", axum::routing::get(bronze_quarantine_list))
             .route("/v1/admin/bronze-quarantine/replay", axum::routing::post(bronze_quarantine_replay))
+            // NAN-4554: bodies up to the per-object cap (streamed to disk).
+            .route("/v1/admin/bronze-quarantine/import", axum::routing::post(bronze_quarantine_import)
+                .layer(axum::extract::DefaultBodyLimit::disable()))
             .with_state(self);
         let _ = hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(app)).await;
@@ -2561,6 +2784,14 @@ impl TenantService for IngestService {
                 }
                 self.part_gc.update(fresh.part_delete_grant.as_ref());
                 self.erasure_ledger.set(fresh.erasure_ledger.clone());
+                if let Err(error) = self.agent_catalog.refresh(fresh.agent_catalog.as_ref()) {
+                    self.terminate(format!("catalog activation refresh: {error}"));return;
+                }
+                // NAN-4543: the attached export source reads parts with the
+                // same short-lived pair; keep it on ingest's fresh credentials.
+                if let Err(error) = self.agent_catalog.refresh_parts(fresh.parts.as_ref().map(|c| (&c.part, &c.log))) {
+                    self.terminate(format!("catalog part credential refresh: {error}"));return;
+                }
                 // Applied by the ingest loop at its next iteration (on the
                 // ingest runtime, which owns the prevalence state): this swap
                 // must never wait for a tick, a merge or a finding append
@@ -3013,6 +3244,22 @@ mod tests {
         assert!(flush_policy_for(&a).is_err());
     }
 
+    /// NAN-4592: the prevalence disk-cache cap follows the tenant's disk
+    /// budget and never falls below the 256 MiB every state had before.
+    #[test]
+    fn prevalence_cache_cap_follows_the_disk_budget() {
+        const MIB: u64 = 1024 * 1024;
+        let mut a = assignment("00000000-0000-4000-8000-000000004592", None);
+        a.eps = 20.0;
+        assert_eq!(prevalence_cache_bytes_for(&a), 384 * MIB, "a 20 eps tenant: half of 768 MiB");
+        a.eps = 0.0;
+        assert!(prevalence_cache_bytes_for(&a) >= super::super::prevalence::OBJECT_CACHE_FLOOR_BYTES);
+        a.eps = 500.0;
+        let large = prevalence_cache_bytes_for(&a);
+        assert_eq!(large, cache_bytes_for(&a) / 2);
+        assert!(large > 4 * 1024 * MIB, "a large-tenant-sized tenant's cap holds its ~3 GiB state: {large}");
+    }
+
     /// NAN-2984: after a dependency recovers, a held buffer is retried
     /// within 15 s (was up to 60 s).
     #[test]
@@ -3421,6 +3668,203 @@ mod tests {
         assert_eq!(epoch(both.clone()).await.unwrap(), 3);
         both["writer_epoch"] = serde_json::json!(4);
         assert!(epoch(both).await.is_err());
+    }
+
+    /// NAN-4539: bounded flush overlap through the production cell
+    /// constructor (`IngestService::start` with edge input against a local
+    /// edge-log stand-in): the edge source allows two ranges, the background
+    /// handles are wired, so the effective depth is two; the finished-flight
+    /// wake is the loop's wake; and the hold, a degraded catalog and an
+    /// erasure order each drop it to the serial path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cell_constructor_wires_bounded_flush_overlap_and_every_serial_fallback() {
+        use axum::{http::StatusCode, routing::post, Router};
+        const TENANT: &str = "00000000-0000-4000-8000-000000004539";
+        async fn lease() -> (StatusCode, Vec<u8>) {
+            // A fresh tenant: nothing committed, the log's genesis chain.
+            let genesis = crate::parts::provenance::edge_log_genesis(TENANT);
+            (StatusCode::OK, serde_json::json!({"kind": "ok", "epoch": 1, "committedThrough": 0, "committedChain": genesis,
+                "lastPartId": null, "head": 0, "atChain": null}).to_string().into_bytes())
+        }
+        async fn pull() -> (StatusCode, Vec<u8>) {
+            (StatusCode::OK, crate::edge_log::protocol::encode_pull(&crate::edge_log::PullBatch {
+                committed_through: 0, head: 0, mode: "do".into(), overflow_objects: 0, segments: vec![] }))
+        }
+        let router = Router::new()
+            .route("/edge-log/v1/lease", post(lease))
+            .route("/edge-log/v1/pull", post(pull))
+            .route("/edge-log/v1/commit", post(|| async { (StatusCode::CONFLICT, br#"{"kind":"fenced"}"#.to_vec()) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let mut assignment = assignment(TENANT, None);
+        for (path, name) in [(&mut assignment.tenant_dir, "tenant"), (&mut assignment.parts_dir, "parts"),
+            (&mut assignment.state_dir, "state"), (&mut assignment.tmp_dir, "tmp")] {
+            *path = dir.path().join(name);
+            std::fs::create_dir_all(&*path).unwrap();
+        }
+        // The constructor sets process-wide state other tests share: a zero
+        // memory cap keeps the merge decode window and cap at their static
+        // defaults. The index and observation flags are set on, as several
+        // other tests also do; part_query::keyword_count_native_tests turns
+        // two of them back off, a pre-existing race among those tests that
+        // none of this test's assertions depend on.
+        assignment.memory_cap_bytes = 0;
+        assignment.ingest_keyword_index = true;
+        assignment.identity_observations = true;
+        assignment.eps = 300.0;
+        let secret = serde_json::json!({
+            "kind": LAB_CREDENTIALS_KIND,
+            "tenant_id": TENANT,
+            "writer_epoch": 1,
+            "edge_log_consumer_endpoint": format!("http://127.0.0.1:{}", address.port()),
+            "edge_log_consumer_token": "consumer-token-for-tests",
+            "lab_signer_key_id": "lab-signer-4539",
+            "lab_signer_seed_hex": hex::encode([45_u8; 32])
+        })
+        .to_string();
+        let service = IngestService::start(&assignment, Zeroizing::new(secret.into_bytes())).await
+            .unwrap_or_else(|error| panic!("production cell constructor: {error:#}"));
+        assert!(service.edge_source.is_some(), "edge input");
+        let mut ingestor = service.ingestor.lock().await;
+        assert_eq!(ingestor.effective_flush_depth_for_test(), super::super::ingest::MAX_FLUSH_DEPTH,
+            "the cell constructor enables bounded overlap");
+        assert_eq!(ingestor.effective_flush_depth_for_test(), 2);
+        let wake = ingestor.flight_wake_for_test().expect("the cell wires the finished-flight wake");
+        assert!(Arc::ptr_eq(wake, &service.wake), "a finished flight wakes the loop the cell waits on");
+        // Every serial fall-back, each through its production setter.
+        ingestor.set_admission_hold(Some(1), true);
+        assert_eq!(ingestor.effective_flush_depth_for_test(), 1, "over-commit hold pause");
+        ingestor.set_admission_hold(None, false);
+        assert_eq!(ingestor.effective_flush_depth_for_test(), 2);
+        ingestor.set_erasure_order_for_test(true);
+        assert_eq!(ingestor.effective_flush_depth_for_test(), 1, "active erasure order");
+        ingestor.set_erasure_order_for_test(false);
+        assert_eq!(ingestor.effective_flush_depth_for_test(), 2);
+        ingestor.hold_catalog("catalog_attachment_report_failed");
+        assert_eq!(ingestor.effective_flush_depth_for_test(), 1, "degraded catalog attachment");
+        drop(ingestor);
+        drop(service);
+        server.abort();
+    }
+
+    /// NAN-4573 through the production cell constructor: an edge tenant
+    /// (Vector/HEC) receives one future-dated event twice, in two objects
+    /// that reached the edge either side of an hour boundary. The first copy
+    /// is clamped to its receipt (the hour before the event), the second is
+    /// within the skew and keeps its time; the second must be a duplicate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cell_drops_a_redelivery_its_clamp_put_in_another_hour() {
+        use crate::edge_log::{PullBatch, Segment};
+        use crate::parts::provenance::{edge_log_genesis, edge_log_next_chain};
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use super::super::ingest::nan4336_ingest_tests::{bronze_bytes, fixture_event};
+        const TENANT: &str = "00000000-0000-4000-8000-000000004573";
+        #[derive(Default)]
+        struct Stand { segments: Vec<Segment>, visible: usize, committed: u64 }
+        type Shared = Arc<std::sync::Mutex<Stand>>;
+        fn chain_at(stand: &Stand, seq: u64) -> String {
+            if seq == 0 { edge_log_genesis(TENANT) } else { stand.segments[seq as usize - 1].chain.clone() }
+        }
+        async fn lease(State(stand): State<Shared>, Json(request): Json<serde_json::Value>) -> (StatusCode, Vec<u8>) {
+            let stand = stand.lock().unwrap();
+            let at = request["at"].as_u64().filter(|at| *at as usize <= stand.visible).map(|at| chain_at(&stand, at));
+            (StatusCode::OK, serde_json::json!({"kind": "ok", "epoch": 1, "committedThrough": stand.committed,
+                "committedChain": chain_at(&stand, stand.committed), "lastPartId": null, "head": stand.visible,
+                "atChain": at}).to_string().into_bytes())
+        }
+        async fn pull(State(stand): State<Shared>, Json(request): Json<serde_json::Value>) -> (StatusCode, Vec<u8>) {
+            let stand = stand.lock().unwrap();
+            let after = request["after"].as_u64().unwrap() as usize;
+            let segments = stand.segments[after.min(stand.visible)..stand.visible].to_vec();
+            (StatusCode::OK, crate::edge_log::protocol::encode_pull(&PullBatch {
+                committed_through: stand.committed, head: stand.visible as u64, mode: "do".into(), overflow_objects: 0, segments }))
+        }
+        async fn commit(State(stand): State<Shared>, Json(request): Json<serde_json::Value>) -> (StatusCode, Vec<u8>) {
+            let mut stand = stand.lock().unwrap();
+            let through = request["through"].as_u64().unwrap();
+            if through <= stand.committed {
+                return (StatusCode::OK, br#"{"kind":"replay"}"#.to_vec());
+            }
+            stand.committed = through;
+            (StatusCode::OK, br#"{"kind":"ok"}"#.to_vec())
+        }
+
+        // Two hours back from the wall clock (the cell ticks on it): the
+        // event is 10 min into hour H. Object one reached the edge 1 min
+        // before H (the event is 11 min ahead of it: clamped into H - 1);
+        // object two 9 min into H (1 min ahead: kept in H). Each carries one
+        // other row, so the objects differ.
+        let hour = now_ms() / 3_600_000 - 2;
+        let base = hour * 3_600_000;
+        let event = fixture_event(TENANT, "nan4573-redelivered", 0, base + 10 * 60_000);
+        let stand: Shared = Arc::default();
+        {
+            let mut stand = stand.lock().unwrap();
+            for (index, (received, other)) in [(base - 60_000, base - 120_000), (base + 9 * 60_000, base + 60_000)].into_iter().enumerate() {
+                let body = bronze_bytes(&[event.clone(), fixture_event(TENANT, &format!("nan4573-other-{index}"), index + 1, other)]);
+                let key = format!("bronze-v2/shard=0/tenant_id={TENANT}/k{index}.parquet");
+                let seq = index as u64 + 1;
+                let prev_chain = chain_at(&stand, seq - 1);
+                let sha256 = crate::parts::sha256_hex(&body);
+                let chain = edge_log_next_chain(&prev_chain, seq, &key, &sha256, body.len() as u64);
+                stand.segments.push(Segment { seq, key, sha256, length: body.len() as u64, prev_chain, chain,
+                    received_at_ms: received, bytes: body });
+            }
+            stand.visible = 1;
+        }
+        let router = Router::new()
+            .route("/edge-log/v1/lease", post(lease))
+            .route("/edge-log/v1/pull", post(pull))
+            .route("/edge-log/v1/commit", post(commit))
+            .with_state(stand.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let dir = tempfile::tempdir().unwrap();
+        let mut assignment = assignment(TENANT, None);
+        for (path, name) in [(&mut assignment.tenant_dir, "tenant"), (&mut assignment.parts_dir, "parts"),
+            (&mut assignment.state_dir, "state"), (&mut assignment.tmp_dir, "tmp")] {
+            *path = dir.path().join(name);
+            std::fs::create_dir_all(&*path).unwrap();
+        }
+        assignment.eps = 300.0;
+        let secret = serde_json::json!({
+            "kind": LAB_CREDENTIALS_KIND,
+            "tenant_id": TENANT,
+            "writer_epoch": 1,
+            "edge_log_consumer_endpoint": format!("http://127.0.0.1:{}", address.port()),
+            "edge_log_consumer_token": "consumer-token-for-tests",
+            "lab_signer_key_id": "lab-signer-4573",
+            "lab_signer_seed_hex": hex::encode([73_u8; 32])
+        })
+        .to_string();
+        let service = IngestService::start(&assignment, Zeroizing::new(secret.into_bytes())).await
+            .unwrap_or_else(|error| panic!("production cell constructor: {error:#}"));
+        let mut ingestor = service.ingestor.lock().await;
+        // Each object is its own admission (within one, bronze dedups uids
+        // first): the second is published only once the first is committed.
+        for through in 1..=2_u64 {
+            stand.lock().unwrap().visible = through as usize;
+            for _ in 0..200 {
+                ingestor.tick(now_ms()).await.unwrap();
+                ingestor.flush_now(now_ms()).await.unwrap();
+                if stand.lock().unwrap().committed >= through {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(stand.lock().unwrap().committed, through, "object {through} committed: {:?}", ingestor.health());
+        }
+        let live = ingestor.live_parts();
+        let hours = live.iter().map(|part| i64::from(part.event_hour)).collect::<std::collections::BTreeSet<_>>();
+        assert!(hours.contains(&(hour - 1)) && hours.contains(&hour), "the copies straddle the hour: {live:?}");
+        assert_eq!(ingestor.health().rows_time_clamped_total, 1, "only the first copy is clamped");
+        assert_eq!(live.iter().map(|part| part.rows).sum::<u64>(), 3, "the event once, plus each object's other row: {live:?}");
+        drop(ingestor);
+        drop(service);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3941,6 +4385,15 @@ mod tests {
                 let bad = Fixture::new(bad);
                 assert!(bad.signer(port, Some(&bad.ca_file)).is_err());
             }
+        }
+
+        #[tokio::test]
+        async fn catalog_attach_trust_owner_signing_rejects_platform_chain() {
+            let owner = Ca::new("private owner");
+            let platform = Ca::new("public platform fixture CA");
+            let f = Fixture::new(&owner.pem());
+            let port = f.serve(platform.leaf("localhost")).await;
+            assert!(sign(&f.signer(port, Some(&f.ca_file)).unwrap()).await.is_err());
         }
 
         /// The prevalence owner proxy is the same owner endpoint: its client

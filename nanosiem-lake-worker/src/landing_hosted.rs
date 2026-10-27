@@ -54,7 +54,7 @@ use zeroize::Zeroizing;
 
 use crate::landing::{
     encode_bronze_batch, move_aside, Backpressure, Candidate, Claim, Claimed, Converted, Discover, Emit, FileRefusal,
-    LandingSource, LeasedFile, RefusalDetail, BRONZE_PREFIX, LANDING_PREFIX,
+    LandingSource, LeasedFile, RefusalDetail, RefusedCopy, BRONZE_PREFIX, LANDING_PREFIX,
 };
 use crate::parts::provenance::is_edge_segment_key;
 use crate::parts::sha256_hex;
@@ -619,8 +619,21 @@ impl<T: LandingLedgerTransport> Discover for LeaseDiscover<T> {
         Ok(())
     }
 
-    async fn finish_refused(&self, store: &Operator, candidate: &Candidate, _id: i64, refusal: &FileRefusal, _sha: Option<&str>)
-        -> Result<()> {
+    async fn finish_refused(
+        &self,
+        store: &Operator,
+        candidate: &Candidate,
+        _id: i64,
+        refusal: &FileRefusal,
+        _sha: Option<&str>,
+        // The hosted edge-log output never keeps refused copies itself: this
+        // always copies aside before deleting. It never asks to keep a file
+        // in place; refuse that rather than delete without a copy.
+        copy: RefusedCopy,
+    ) -> Result<()> {
+        if copy == RefusedCopy::InPlace {
+            bail!("hosted landing cannot keep a refused file in place");
+        }
         let leased = self.leased(candidate)?;
         // Moved first, then committed: a bad file can never wedge the ledger,
         // and a crash in between re-refuses it (the move tolerates NotFound).

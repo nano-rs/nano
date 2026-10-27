@@ -466,13 +466,18 @@ async fn hydrate_with(
         .trim_pressure()
         .await
         .map_err(|e| map_fetch_error(e.into()))?;
+    // NAN-4591: credited with this process's evictions the accountant has
+    // not walked yet, so the window does not shrink by every byte a cold
+    // read just turned over.
     let capacity = settings
-        .capacity(fetcher.cache().stats().stored_bytes)
+        .capacity_credited(fetcher.cache().stats().stored_bytes, fetcher.cache().in_flight_bytes(), fetcher.cache().eviction_credit())
         .map_err(map_fetch_error)?;
-    // Retain space for on-demand signed ranges and older queries.
+    // NAN-4591: retain the cold-read reserve (a fifth of the cache) for
+    // on-demand signed ranges and older queries; it was the 512 MiB
+    // heavy-read threshold, and 7 d searches queued behind the window.
     let target = capacity
         .min(fetcher.cache().stats().max_bytes)
-        .saturating_sub(fetcher.cache().query_max_bytes());
+        .saturating_sub(fetcher.cache().cold_read_reserve());
     let mut buckets = [
         Bucket {
             hours: 1,
@@ -1913,6 +1918,141 @@ mod tests {
         drop(blocker);
         assert!(settled.warm, "{settled:?}");
         assert_eq!((settled.cache_hit_objects as usize, settled.cache_miss_objects), (objects, 0), "{settled:?}");
+    }
+
+    /// NAN-4591, the large-tenant regression through the production constructors (a
+    /// cache with the hot-window volume policy and a volume accountant that
+    /// does not re-walk during the test, as between its 30 s walks):
+    ///
+    /// 1. the window fills the cache only up to its cold-read reserve, and
+    ///    repeated passes converge: every window object is downloaded once
+    ///    (backlog x cost, bounded), later passes download nothing;
+    /// 2. a 7 d host hunt (data files of parts older than the window) and a
+    ///    count (their token indexes) leasing concurrently, twice over, with
+    ///    the window full: zero saturation give-ups, each lease admitted in
+    ///    well under a second, no hot-window object evicted (the R2 churn),
+    ///    and the next passes still download nothing.
+    ///
+    /// Before: the window filled to capacity minus the 512 MiB heavy-read
+    /// threshold, so the first cold lease had to evict hot objects the
+    /// accountant still counted; its fence refused the download until the
+    /// next walk (the large tenant: cold_queue_ms 27-40 s, 45 s cancels, 503/500 give-ups).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn full_hot_window_leaves_cold_reads_room_and_converges() {
+        let root = tempfile::tempdir().unwrap();
+        // 48 hourly parts of 512 KiB data + 64 KiB token index each.
+        let (store, source, signer, live) = slow_fixture(root.path(), 48, 512 * 1024).await;
+        let cache_root = root.path().join("volume");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let accountant = nanosiem_lake_cell::volume_usage::start_with(
+            cache_root.clone(),
+            vec![cache_root.clone()],
+            nanosiem_lake_cell::volume_usage::AccountantConfig::every(Duration::from_secs(3600)),
+        )
+        .unwrap();
+        // The hot volume target and the cache budget are one figure in
+        // production (server.rs: max_bytes = the hot window's max_bytes).
+        let volume = 16_u64 << 20;
+        let cache = ReaderObjectCache::open(
+            ReaderObjectCacheSettings {
+                root: cache_root.clone(),
+                max_bytes: volume,
+                query_max_bytes: 1 << 20,
+                fetch_concurrency: 8,
+                fetch_deadline: Duration::from_secs(5),
+            },
+            TENANT,
+            "lab",
+            &parts_key_prefix(TENANT).unwrap(),
+            Arc::new(StoreObjectSource::local("lab", store.clone(), source.clone())),
+        )
+        .unwrap();
+        let settings = crate::local_hot_window::Settings {
+            root: cache_root.clone(),
+            hours: 48,
+            bytes_per_second: 1 << 30,
+            reserve_bytes: Some(0),
+            max_bytes: volume,
+            schedule: crate::local_hot_window::Schedule { concurrency: 4, ..Default::default() },
+            persistent: false,
+        };
+        cache.set_hot_capacity(settings.clone());
+        let reserve = cache.cold_read_reserve();
+        let fetcher = PartFetcher::new(TENANT, "lab", store.clone(), signer.trusted(), cache)
+            .unwrap()
+            .with_hot_window(Some(settings));
+        let pass = || async {
+            hydrate(&fetcher, TENANT, live.clone(), &AtomicU64::new(0), Instant::now()).await.unwrap();
+            fetcher.hot_coverage.lock().unwrap().clone()
+        };
+
+        // 1. Fill, then converge.
+        let first = pass().await;
+        let window_bytes = first.selected_bytes;
+        assert!(first.warm && first.deferred_objects == 0, "{first:?}");
+        assert!(first.selected_parts > 4 && first.selected_parts < live.len(), "the cache bounds the window: {first:?}");
+        assert!(window_bytes <= volume - reserve, "the window stays out of the reserve: {first:?}");
+        assert_eq!(fetcher.cache().stats().fetched_bytes, window_bytes, "each window object downloaded once");
+        for _ in 0..3 {
+            let again = pass().await;
+            assert_eq!((again.cache_miss_objects, again.deferred_objects), (0, 0), "converged: {again:?}");
+            assert_eq!(again.selected_parts, first.selected_parts);
+        }
+        assert_eq!(fetcher.cache().stats().fetched_bytes, window_bytes, "later passes download nothing");
+        let hot_digests = {
+            let mut parts = live.clone();
+            parts.sort_by_key(|part| std::cmp::Reverse(part.max_time_us));
+            let window = parts[..first.selected_parts].to_vec();
+            let records = fetcher.records(&window).await.unwrap();
+            window.iter().zip(&records)
+                .flat_map(|(part, record)| resident_files(record).into_iter().map(|(file, digest, bytes)| {
+                    crate::reader_object_cache::ReaderObjectRef {
+                        range: None,
+                        source_uri: fetcher.file_uri(part, record, file).unwrap(),
+                        sha256: digest.to_string(),
+                        size_bytes: bytes,
+                    }
+                }).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+
+        // 2. Concurrent 7 d host hunt + count over the older parts, twice.
+        // A give-up would surface as an error after this wait.
+        fetcher.cache().set_saturation_wait(Duration::from_secs(5));
+        let mut older = live.clone();
+        older.sort_by_key(|part| std::cmp::Reverse(part.max_time_us));
+        let older = older[first.selected_parts..].to_vec();
+        assert!(older.len() >= 24, "{}", older.len());
+        let fetches_before = fetcher.cache().stats().fetched_bytes;
+        for round in 0..2 {
+            let (hunt_parts, count_parts) = (&older[round * 12..round * 12 + 6], &older[round * 12 + 6..round * 12 + 12]);
+            let hunt = async {
+                let started = std::time::Instant::now();
+                (fetcher.ensure(hunt_parts, &[super::super::fetch::FileSet::AllData]).await, started.elapsed())
+            };
+            let count = async {
+                let started = std::time::Instant::now();
+                (fetcher.ensure(count_parts, &[super::super::fetch::FileSet::AllTokens]).await, started.elapsed())
+            };
+            let ((hunt, hunt_wait), (count, count_wait)) = tokio::join!(hunt, count);
+            let (hunt, count) = (hunt.expect("7 d host hunt admitted"), count.expect("7 d count admitted"));
+            for (name, wait) in [("hunt", hunt_wait), ("count", count_wait)] {
+                assert!(wait < Duration::from_millis(800), "round {round}: the {name} lease waited {wait:?}");
+            }
+            drop((hunt, count));
+            for object in &hot_digests {
+                assert!(fetcher.cache().is_local(object).await.unwrap(), "round {round}: hot-window object evicted by a cold read");
+            }
+        }
+        // Two rounds of 6 data files (512 KiB) + 6 token indexes (64 KiB),
+        // the second past the eviction target (round one's go, LRU).
+        assert!(fetcher.cache().stats().fetched_bytes > fetches_before);
+        // The window was never churned: its passes still download nothing.
+        let fetched = fetcher.cache().stats().fetched_bytes;
+        let settled = pass().await;
+        assert_eq!((settled.cache_miss_objects, settled.deferred_objects), (0, 0), "{settled:?}");
+        assert_eq!(fetcher.cache().stats().fetched_bytes, fetched);
+        assert!(accountant.stats().walks >= 1);
     }
 
     /// NAN-3180: one hourly part with a data file, its token index, and the

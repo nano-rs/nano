@@ -20,7 +20,7 @@
 //!
 //! [`IAM_ACTIONS`] lists the actions that leave API Activity, verbatim; every
 //! other action stays API Activity. The SQL copy in
-//! enterprise migration `9012100_platform_audit_ocsf_iam_classes.sql`
+//! enterprise migration `9015390_audit_ocsf_mapping_gaps.sql`
 //! (`nano_shared.platform_audit_ocsf_iam_class`, used to classify SQL-built
 //! audit rows) must list exactly the same rows — `sql_iam_table_matches_rust`
 //! enforces it. The golden test (`ocsf_mapping_tests.rs`) pins the class and
@@ -193,6 +193,9 @@ pub const IAM_ACTIONS: &[(&str, IamAction)] = &[
     ("login_success", auth(1, Some(Password), None)),
     ("login_failed", auth(1, Some(Password), None)),
     ("oidc_login", auth(1, Some(OpenId), None)),
+    // A refused SSO logon (NAN-3904 group-gated JIT): the failed twin of
+    // oidc_login, as login_failed is of login_success.
+    ("sso_sign_in_denied", auth(1, Some(OpenId), None)),
     ("apikey_authenticated", auth(1, Some(ApiKey), Some(false))),
     ("mfa_challenge_failed", auth(1, Some(Totp), Some(true))),
     ("auth_session_created", auth(1, None, None)),

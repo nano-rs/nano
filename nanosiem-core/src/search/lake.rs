@@ -1800,6 +1800,11 @@ impl LakeQueryClient {
                     |(estimated, budget)| format!("scan; estimated_bytes={estimated}; budget_bytes={budget}"),
                 ))
             }
+            // NAN-4593: a cancelled job (409 `job_cancelled`) or a statement
+            // chDB cancelled (`QUERY_WAS_CANCELLED`, sent as a 422 query
+            // failure) is a cancel, never "rejected query" or "retry".
+            (409, Some("job_cancelled")) => SearchError::Cancelled,
+            (_, Some("query_execution_failed")) if message.contains("QUERY_WAS_CANCELLED") => SearchError::Cancelled,
             (400, Some("invalid_request")) | (422, _) | (_, Some("query_execution_failed")) => {
                 SearchError::SqlValidationError(format!("lake query rejected: {message}"))
             }
@@ -6642,6 +6647,108 @@ mod lake_cell_routing_tests {
         assert_eq!(queries.len(), 2);
         assert!(queries[0].headers.get("x-nano-search-debug").is_none());
         assert_eq!(queries[1].headers.get("x-nano-search-debug").unwrap(), "1");
+    }
+
+    /// NAN-4593: query[T]'s wire answer for one broad nPL search.
+    fn broad_npl_ok(tenant: &str, rows: serde_json::Value) -> serde_json::Value {
+        let count = rows.as_array().map_or(0, Vec::len);
+        serde_json::json!({
+            "ok": true, "schema_version": 1, "request_id": "q-1", "tenant_id": tenant,
+            "route": "broad_npl", "source_mode": "parts", "wall_seconds": 0.01,
+            "result": {"result_rows": count, "rows": rows,
+                       "page_offset": 0, "page_limit": 100, "page_has_more": false}
+        })
+    }
+
+    /// NAN-4593: a search that query[T] cancels, times out or gives up on
+    /// must reach the caller as an explicit error, never as `Ok` with no
+    /// rows (an analyst reads that as "no activity"). Each body is the one
+    /// query[T]'s `ApiError` funnel writes; the client is the production
+    /// cell client.
+    #[tokio::test]
+    async fn cell_cancel_deadline_and_cache_give_up_are_errors_never_empty_results() {
+        let tenant = Uuid::from_u128(0x4593);
+        let cases: Vec<(&str, u16, serde_json::Value, fn(&SearchError) -> bool)> = vec![
+            // Deadline: chDB's max_execution_time (55 s) fired.
+            ("deadline", 413, serde_json::json!({"ok": false, "reason": "scan_budget_exhausted",
+                "error": "native chDB query failed: Code: 159. DB::Exception: Timeout exceeded: elapsed 55.0 seconds. (TIMEOUT_EXCEEDED)"}),
+                |error| matches!(error, SearchError::ResourceExhausted(_))),
+            // Client / admin cancel of the job the read belongs to.
+            ("job cancel", 409, serde_json::json!({"ok": false, "reason": "job_cancelled", "error": "search job was cancelled"}),
+                |error| matches!(error, SearchError::Cancelled)),
+            // The statement itself was cancelled inside chDB.
+            ("chdb cancel", 422, serde_json::json!({"ok": false, "reason": "query_execution_failed",
+                "error": "native chDB query failed: Code: 394. DB::Exception: Query was cancelled. (QUERY_WAS_CANCELLED)"}),
+                |error| matches!(error, SearchError::Cancelled)),
+            // Reader cache saturated: the read gave up waiting for room.
+            ("cache saturated", 503, serde_json::json!({"ok": false, "reason": "part_data_unavailable",
+                "error": "reader cache is saturated by leased or protected objects; 268435456 bytes could not be admitted"}),
+                |error| matches!(error, SearchError::ServiceUnavailable(_))),
+            // A cold fetch outlived its deadline.
+            ("cold fetch timeout", 503, serde_json::json!({"ok": false, "reason": "cold_fetch_timeout",
+                "error": "reader cache fetch timed out"}),
+                |error| matches!(error, SearchError::ServiceUnavailable(_))),
+            // The lane stayed busy past its wait.
+            ("lane wait", 503, serde_json::json!({"ok": false, "reason": "lane_wait_timeout",
+                "error": "native chDB lane wait timed out; retry the request"}),
+                |error| matches!(error, SearchError::ServiceUnavailable(_))),
+        ];
+        for (name, status, body, expected) in cases {
+            let server = MockServer::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            Mock::given(method("POST"))
+                .and(path(format!("/v1/tenants/{tenant}/query/v1/query")))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let client = cell_client(&server, &dir, tenant).await;
+            let result = client.search(&search_request(), "q-1", None, &BTreeSet::new()).await;
+            let error = match result {
+                Ok(response) => panic!("{name}: answered Ok with {} rows instead of an error", response.results.len()),
+                Err(error) => error,
+            };
+            assert!(expected(&error), "{name}: wrong error {error:?}");
+        }
+    }
+
+    /// NAN-4593: the search service's own deadline on the cell call (the
+    /// client timeout) is an explicit `Timeout`, never an empty answer.
+    #[tokio::test]
+    async fn cell_call_past_the_client_deadline_is_a_timeout_not_an_empty_result() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = Uuid::from_u128(0x4594);
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/tenants/{tenant}/query/v1/query")))
+            .respond_with(ResponseTemplate::new(200)
+                .set_body_json(broad_npl_ok(&tenant.to_string(), serde_json::json!([{"metadata.uid": "late"}])))
+                .set_delay(Duration::from_secs(3)))
+            .mount(&server)
+            .await;
+        let route = cell_route(&dir, tenant, &server.uri());
+        let client = LakeQueryRuntime::from_lake_cell_route(&route, Duration::from_millis(300))
+            .unwrap().client.unwrap();
+        let error = client.search(&search_request(), "q-1", None, &BTreeSet::new()).await.unwrap_err();
+        assert!(matches!(error, SearchError::Timeout(_) | SearchError::ServiceUnavailable(_)), "{error:?}");
+    }
+
+    /// NAN-4593: a search with genuinely no matches is still a successful,
+    /// exact, empty answer.
+    #[tokio::test]
+    async fn cell_search_with_no_matches_is_an_exact_empty_success() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let tenant = Uuid::from_u128(0x4595);
+        Mock::given(method("POST"))
+            .and(path(format!("/v1/tenants/{tenant}/query/v1/query")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(broad_npl_ok(&tenant.to_string(), serde_json::json!([]))))
+            .mount(&server)
+            .await;
+        let client = cell_client(&server, &dir, tenant).await;
+        let response = client.search(&search_request(), "q-1", None, &BTreeSet::new()).await.unwrap();
+        assert!(response.results.is_empty());
+        assert_eq!(response.total_count, 0);
+        assert!(response.total_count_exact);
     }
 
     /// NAN-3245: a fake query[T] that answers every `/v1/query` route with

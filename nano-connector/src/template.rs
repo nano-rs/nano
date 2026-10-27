@@ -11,6 +11,8 @@ pub use expression::{evaluate, expression_references};
 /// Values a template may read.
 #[derive(Debug, Clone, Default)]
 pub struct Scope {
+    /// Supplied by the trusted request runner, never by template data.
+    pub secret_guard: Option<SecretGuard>,
     pub config: Value,
     pub state: Value,
     pub item: Value,
@@ -28,6 +30,35 @@ pub struct Scope {
     /// Read as `{{initial_cursor}}`; `{{backfill_from}}` is a deprecated
     /// alias with the same value (there is no operator backfill).
     pub initial_cursor: Option<String>,
+}
+
+/// Check every evaluated value, before an outer helper can transform it again.
+/// Opaque Debug prevents credential-matching patterns from entering diagnostics.
+#[derive(Clone)]
+pub struct SecretGuard {
+    connection: crate::secrets::SecretSet,
+    caller: crate::secrets::SecretSet,
+    raw_preview: bool,
+}
+impl std::fmt::Debug for SecretGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretGuard([REDACTED])")
+    }
+}
+impl SecretGuard {
+    pub(crate) fn new(connection: crate::secrets::SecretSet, caller: crate::secrets::SecretSet) -> Self {
+        Self { connection, caller, raw_preview: false }
+    }
+    pub(crate) fn for_preview(mut self) -> Self {
+        self.raw_preview = true;
+        self
+    }
+    pub(super) fn allows_raw_preview(&self) -> bool {
+        self.raw_preview
+    }
+    pub(super) fn contains(&self, bytes: &[u8]) -> bool {
+        self.connection.contains_decoded(bytes) || self.caller.contains_decoded(bytes)
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

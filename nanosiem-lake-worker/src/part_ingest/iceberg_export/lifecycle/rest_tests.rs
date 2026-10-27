@@ -31,6 +31,13 @@ struct Wire {
     fail_commit: bool,
     stale_reload: bool,
     fail_delete: bool,
+    expected_control: Option<String>,
+    rest_auth_seen: usize,
+    config_override: Option<String>,
+    rest_uri: String,
+    commit_fixtures: Vec<serde_json::Value>,
+    /// NAN-4662: answer every request for the table with this status.
+    table_status: Option<u16>,
 }
 struct Authority(Arc<Mutex<Wire>>, String, String);
 #[async_trait::async_trait]
@@ -120,6 +127,12 @@ fn changed(table: &Table, updates: Vec<TableUpdate>) -> Table {
 async fn handler(State(state): State<Arc<Mutex<Wire>>>, request: Request<Body>) -> Response<Body> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
+    let authorization = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let range = request
         .headers()
         .get("range")
@@ -127,10 +140,30 @@ async fn handler(State(state): State<Arc<Mutex<Wire>>>, request: Request<Body>) 
         .map(str::to_string);
     let body = to_bytes(request.into_body(), 2_000_000).await.unwrap();
     let mut state = state.lock().unwrap();
+    if let Some(expected) = &state.expected_control {
+        if path.starts_with("/v1/") {
+            assert_eq!(authorization, format!("Bearer {expected}"));
+            state.rest_auth_seen += 1;
+        } else {
+            assert!(
+                !authorization.contains(expected),
+                "control capability leaked to object storage"
+            );
+        }
+    }
     if path == "/v1/config" {
+        if let Some(uri) = &state.config_override {
+            return json(serde_json::json!({"defaults":{},"overrides":{"uri":uri}}));
+        }
         return json(serde_json::json!({"defaults":{},"overrides":{}}));
     }
-    if path == "/v1/namespaces/nano/tables/events_v1" {
+    if path == "/v1/namespaces/nano/tables/events_v1"
+        || path == "/v1/namespaces/agent/tables/events_v1"
+    {
+        if let Some(status) = state.table_status {
+            return Response::builder().status(status).header("content-type", "application/json")
+                .body(Body::from(r#"{"error":{"message":"fixture","type":"AgentCatalogRefused","code":0}}"#)).unwrap();
+        }
         if method == "POST" {
             state.events.push("commit");
             if state.fail_commit {
@@ -209,12 +242,26 @@ async fn setup() -> (
     RestLifecycleBackend,
     Arc<Mutex<Wire>>,
 ) {
+    setup_mode(false).await
+}
+async fn setup_mode(
+    platform: bool,
+) -> (
+    tempfile::TempDir,
+    Server,
+    RestLifecycleBackend,
+    Arc<Mutex<Wire>>,
+) {
     let (dir, _catalog, table) = fixture().await;
     let bucket = crate::lake_part_gc::request::tenant_bucket(TENANT_ID);
-    let location = format!(
-        "s3://{bucket}/{}/nano/events_v1",
-        crate::parts::format::iceberg_export_prefix(TENANT_ID).unwrap()
-    );
+    let location = if platform {
+        format!("s3://{bucket}/__r2_data_catalog/agent/v2/tenant={TENANT_ID}/agent/events_v1")
+    } else {
+        format!(
+            "s3://{bucket}/{}/nano/events_v1",
+            crate::parts::format::iceberg_export_prefix(TENANT_ID).unwrap()
+        )
+    };
     let metadata = table
         .metadata()
         .clone()
@@ -225,7 +272,10 @@ async fn setup() -> (
         .metadata;
     let mut table = Table::builder()
         .metadata(metadata)
-        .identifier(table.identifier().clone())
+        .identifier(
+            iceberg::TableIdent::from_strs([if platform { "agent" } else { "nano" }, "events_v1"])
+                .unwrap(),
+        )
         .file_io(FileIO::new_with_memory())
         .runtime(iceberg::Runtime::current())
         .metadata_location(format!("{location}/metadata/initial.metadata.json"))
@@ -250,6 +300,7 @@ async fn setup() -> (
         table.metadata_location().unwrap().to_string(),
         serde_json::to_vec(table.metadata()).unwrap(),
     )]);
+    let mut commit_fixtures=Vec::new();
     for (at, part, removed, value) in [
         (1, HOUR_ID, vec![], "erased-subject"),
         (2, DAY_ID, vec![HOUR_ID], "survivor"),
@@ -269,7 +320,7 @@ async fn setup() -> (
             .build()
             .unwrap();
         let delta = manifest(at, (at > 1).then_some(at - 1), Some(part), &removed);
-        let (snapshot, _) = prepare_lifecycle_snapshot(
+        let (snapshot, snapshot_requirements) = prepare_lifecycle_snapshot(
             &table,
             &delta,
             added,
@@ -279,6 +330,14 @@ async fn setup() -> (
         )
         .await
         .unwrap();
+        let (_,mut requirements,mut updates)=contract(false).evolution(&table).unwrap();
+        requirements.extend(snapshot_requirements);
+        updates.extend([
+            TableUpdate::AddSnapshot{snapshot:snapshot.clone()},
+            TableUpdate::SetSnapshotRef{ref_name:MAIN_BRANCH.into(),reference:SnapshotReference::new(snapshot.snapshot_id(),SnapshotRetention::branch(None,None,None))},
+            TableUpdate::SetProperties{updates:HashMap::from([(CHECKPOINT.into(),at.to_string()),(DIGEST.into(),manifest_digest(&delta).unwrap())])},
+        ]);
+        commit_fixtures.push(serde_json::json!({"before":table.metadata(),"request":iceberg_catalog_rest::CommitTableRequest{identifier:Some(table.identifier().clone()),requirements,updates}}));
         let list = table
             .manifest_list_reader(&Arc::new(snapshot.clone()))
             .load()
@@ -326,9 +385,17 @@ async fn setup() -> (
         fail_commit: false,
         stale_reload: false,
         fail_delete: false,
+        expected_control: platform
+            .then(|| "tenant-scoped-platform-control-fixture-123456789".to_string()),
+        rest_auth_seen: 0,
+        config_override: None,
+        rest_uri: String::new(),
+        commit_fixtures,
+        table_status: None,
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    state.lock().unwrap().rest_uri = endpoint.clone();
     let app = Router::new()
         .fallback(any(handler))
         .with_state(state.clone());
@@ -344,8 +411,8 @@ async fn setup() -> (
         oauth_audience: None,
         oauth_server_uri: None,
         realm: None,
-        allow_anonymous: true,
-        s3_endpoint: endpoint,
+        allow_anonymous: !platform,
+        s3_endpoint: endpoint.clone(),
         s3_region: "us-east-1".into(),
         s3_access_key: "fixture".into(),
         s3_secret_key: "fixture".into(),
@@ -366,7 +433,7 @@ async fn setup() -> (
         config,
         ExportTable {
             tenant_id: TENANT_ID.into(),
-            namespace: "nano".into(),
+            namespace: if platform { "agent" } else { "nano" }.into(),
             dataset: "events".into(),
             location,
             data_prefix,
@@ -379,7 +446,65 @@ async fn setup() -> (
         metadata,
     )
     .unwrap();
+    let backend = if platform {
+        let token = state.lock().unwrap().expected_control.clone().unwrap();
+        backend.with_platform_auth(
+            Arc::new(crate::part_ingest::platform_tls::PlatformCatalogClient::new(&endpoint,Duration::from_secs(20),Default::default()).unwrap()),
+            token.clone(),
+            Arc::new(crate::part_ingest::iceberg_export::activation::platform_io::PlatformMetadataFactory::new(
+                TENANT_ID,&crate::lake_part_gc::request::tenant_bucket(TENANT_ID),&format!("__r2_data_catalog/agent/v2/tenant={TENANT_ID}/agent/"),
+                &endpoint,uuid::Uuid::new_v4(),token.clone(),
+                Arc::new(crate::part_ingest::platform_tls::PlatformCatalogClient::new(&endpoint,Duration::from_secs(20),Default::default()).unwrap()),dir.path(),
+            ).unwrap()),
+        )
+    } else {
+        backend
+    };
     (dir, server, backend, state)
+}
+#[tokio::test]
+async fn production_platform_client_expires_and_purges_without_a_bearer_file_or_vendor_key() {
+    let (dir, _server, backend, state) = setup_mode(true).await;
+    assert_eq!(
+        backend.expire_and_inspect().await.unwrap(),
+        BTreeSet::from([DAY_ID.to_string()])
+    );
+    let state = state.lock().unwrap();
+    assert!(state.rest_auth_seen >= 4);
+    assert!(state.events.contains(&"commit") && state.events.contains(&"delete"));
+    assert_eq!(state.table.metadata().snapshots().len(), 1);
+    assert!(!state
+        .objects
+        .values()
+        .any(|bytes| bytes.windows(14).any(|w| w == b"erased-subject")));
+    let token = state.expected_control.as_ref().unwrap().as_bytes();
+    let mut directories = vec![dir.path().to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                let bytes = std::fs::read(path).unwrap();
+                assert!(
+                    !bytes.windows(token.len()).any(|w| w == token),
+                    "control capability projected to disk"
+                );
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn production_platform_client_refuses_a_runtime_authority_override_before_table_io() {
+    let (_dir, _server, backend, state) = setup_mode(true).await;
+    {
+        let mut state = state.lock().unwrap();
+        state.config_override = Some(format!("{}/escape", state.rest_uri));
+    }
+    assert!(backend.expire_and_inspect().await.is_err());
+    let state = state.lock().unwrap();
+    assert_eq!(state.rest_auth_seen, 1);
+    assert!(state.events.is_empty());
 }
 #[tokio::test]
 async fn production_rest_expires_reloads_inspects_and_purges_all_old_metadata() {
@@ -443,4 +568,55 @@ async fn production_rest_metadata_delete_failure_is_not_a_successful_expiry() {
         .unwrap_err()
         .to_string()
         .contains("metadata delete unavailable"));
+}
+
+/// Offline fixture refresh for the platform scope decoder. The bytes are emitted
+/// by the production Iceberg writer; no provider or credential is involved.
+#[tokio::test]
+#[ignore = "explicit fixture regeneration only"]
+async fn emit_platform_scope_fixture() {
+    use base64::Engine;
+    let (_dir, _server, _backend, state) = setup_mode(true).await;
+    let state = state.lock().unwrap();
+    let metadata = serde_json::to_value(state.table.metadata()).unwrap();
+    let snapshot = metadata["snapshots"].as_array().unwrap().last().unwrap();
+    let objects: std::collections::BTreeMap<_, _> = state
+        .objects
+        .iter()
+        .filter(|(p, _)| p.ends_with(".avro"))
+        .map(|(p, b)| (p, base64::engine::general_purpose::STANDARD.encode(b)))
+        .collect();
+    println!(
+        "NAN4438_FIXTURE {}",
+        serde_json::json!({"tenant":TENANT_ID,"root":state.table.metadata().location(),"snapshot":snapshot,"objects":objects,"commits":state.commit_fixtures})
+    );
+}
+
+/// NAN-4662: the production REST read behind "no committed snapshot". Only an
+/// absent table (404) or one holding no snapshot at all (current or retained
+/// for time travel) proves it; any other answer is an error, never "absent".
+#[tokio::test]
+async fn production_rest_commit_state_needs_an_absent_or_snapshotless_table() {
+    let (_dir, _server, backend, state) = setup().await;
+    assert!(!backend.no_committed_snapshot().await.unwrap(), "committed history");
+    let ids = {
+        let mut state = state.lock().unwrap();
+        let ids = state.table.metadata().snapshots().map(|s| s.snapshot_id()).collect::<Vec<_>>();
+        state.table = changed(&state.table, vec![TableUpdate::RemoveSnapshotRef { ref_name: MAIN_BRANCH.into() }]);
+        assert!(state.table.metadata().current_snapshot_id().is_none());
+        ids
+    };
+    assert!(!backend.no_committed_snapshot().await.unwrap(), "retained snapshots still reference parts");
+    {
+        let mut state = state.lock().unwrap();
+        state.table = changed(&state.table, vec![TableUpdate::RemoveSnapshots { snapshot_ids: ids }]);
+        assert_eq!(state.table.metadata().snapshots().len(), 0);
+    }
+    assert!(backend.no_committed_snapshot().await.unwrap(), "never committed");
+    state.lock().unwrap().table_status = Some(404);
+    assert!(backend.no_committed_snapshot().await.unwrap(), "absent");
+    for status in [403, 500, 503] {
+        state.lock().unwrap().table_status = Some(status);
+        assert!(backend.no_committed_snapshot().await.is_err(), "{status} is not absence");
+    }
 }

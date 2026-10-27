@@ -91,6 +91,12 @@ pub use clickhouse_sql_gen::otel::{
 };
 pub(crate) use parser::{extract_time_modifier_tokens, strip_comments, subsearch_depths};
 pub use parser::{comment_may_start_after, parse_query, ParseError};
+/// Detect outer time overrides with the same comment/quote-aware scanner as
+/// Search execution. Quoted data is not a modifier; nested modifiers are
+/// rejected separately by `parse_query`.
+pub fn has_outer_time_modifiers(query: &str) -> bool {
+    !parser::extract_time_modifier_tokens(&parser::strip_comments(query)).is_empty()
+}
 pub(crate) use pretty_print::npl_quoted_literal;
 pub use pretty_print::PrettyPrint;
 pub use sql_gen::{SqlGenError, TimeRange};

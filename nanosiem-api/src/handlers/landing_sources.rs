@@ -40,7 +40,7 @@ pub struct LandingSourceList {
 pub struct LandingFilesQuery {
     /// Files to return, 1-200 (default 50).
     pub limit: Option<i64>,
-    /// Only files in this state: `claimed`, `accepted` or `refused`.
+    /// Only files in this state: `listed`, `claimed`, `accepted` or `refused`.
     pub state: Option<String>,
 }
 
@@ -61,6 +61,26 @@ fn dedicated_only(state: &AppState) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// NAN-4629: the tenant this API serves, the caller's tenant. A dedicated
+/// or sovereign API process serves exactly one tenant
+/// (`NANO_LAKE_TENANT_ID`, the same variable and normalization as the
+/// landing converter); several tenants may share the database (an MSSP
+/// sovereign install), so every status read is bound to it. Unset: no
+/// tenant, nothing is served (fail closed).
+fn serving_tenant() -> Result<String, ApiError> {
+    tenant_from(std::env::var("NANO_LAKE_TENANT_ID").ok())
+}
+
+fn tenant_from(raw: Option<String>) -> Result<String, ApiError> {
+    raw.map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| {
+            !t.is_empty()
+                && t.len() <= 128
+                && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .ok_or_else(|| ApiError::NotFound("Bucket drop sources are not configured on this deployment".into()))
+}
+
 fn repository_error(error: LandingSourceRepositoryError) -> ApiError {
     tracing::error!(%error, "landing source storage error");
     ApiError::InternalError("Bucket drop source storage unavailable".into())
@@ -77,8 +97,9 @@ pub async fn list_landing_sources(
 ) -> Result<Json<LandingSourceList>, ApiError> {
     ensure_permission(&auth, permissions::LOG_SOURCES_VIEW)?;
     dedicated_only(&state)?;
+    let tenant = serving_tenant()?;
     let sources = LandingSourceRepository::new(state.pool.clone())
-        .list_sources()
+        .list_sources(&tenant)
         .await
         .map_err(repository_error)?;
     Ok(Json(LandingSourceList { sources }))
@@ -100,12 +121,14 @@ pub async fn list_landing_files(
     ensure_permission(&auth, permissions::LOG_SOURCES_VIEW)?;
     dedicated_only(&state)?;
     let file_state = validate_state(query.state.as_deref())?;
+    let tenant = serving_tenant()?;
     let repo = LandingSourceRepository::new(state.pool.clone());
-    if !repo.source_exists(source_id).await.map_err(repository_error)? {
+    // Another tenant's source is indistinguishable from an unknown one.
+    if !repo.source_exists(&tenant, source_id).await.map_err(repository_error)? {
         return Err(ApiError::NotFound("Bucket drop source not found".into()));
     }
     let files = repo
-        .list_files(source_id, query.limit, file_state)
+        .list_files(&tenant, source_id, query.limit, file_state)
         .await
         .map_err(repository_error)?;
     Ok(Json(LandingFileList { files }))
@@ -133,6 +156,16 @@ pub struct LandingSourcesApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_status_view_is_bound_to_the_serving_tenant_and_fails_closed() {
+        assert_eq!(tenant_from(Some(" 7B2D3F1A-0C8E-4D6F-A1B2-C3D4E5F60718 ".into())).unwrap(),
+            "7b2d3f1a-0c8e-4d6f-a1b2-c3d4e5f60718");
+        assert_eq!(tenant_from(Some("default".into())).unwrap(), "default");
+        for bad in [None, Some(String::new()), Some("  ".into()), Some("a/b".into()), Some("x".repeat(129))] {
+            assert!(matches!(tenant_from(bad), Err(ApiError::NotFound(_))));
+        }
+    }
 
     #[test]
     fn state_filter_accepts_only_known_states() {

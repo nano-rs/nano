@@ -159,6 +159,16 @@ Auth parameters name credential fields; they never hold the secrets themselves.
   `separator: /` produces `<first>/<second>`. Both fields must be present;
   values and the composed header are redacted. The spec stores field names,
   never the credential values.
+- `json_body_credential {credential, field}`:
+  inserts one named credential as a top-level JSON string field after rendering.
+  Intended for APIs such as PagerDuty Events v2 that require authentication in
+  the body. The body must be a JSON object on a POST, PUT or PATCH with one
+  `application/json` content type. An existing field is refused, so templates
+  and inputs cannot override authentication. Field names are literal and
+  bounded to 64 ASCII letters/digits/underscores. The final body is capped at
+  1 MiB and the credential at 16 KiB. Credentials stay in the credential store;
+  config, templates and outputs never receive them. Strict catalog replay uses
+  generated `fixture-only-<NAME>-not-a-secret` placeholders, not real keys.
 - `hmac {credential, header, message, algorithm?, encoding?, prefix?, timestamp_header?, timestamp_format?, key_id_header?, key_id_credential?}`:
   signs the canonical `message` with HMAC-SHA256 (default), SHA384, SHA512 or
   explicitly selected legacy SHA1. Signature encoding is hex (default) or
@@ -480,11 +490,23 @@ template namespaces. A host controls which namespaces its format admits.
 Credentials, auth, secret and environment namespaces remain forbidden.
 
 The closed helpers are `coalesce a b`, `first array`, `join array delimiter`,
-`lower string` and `json_quote value`. JSON double-quoted literals and parenthesized
+`lower string`, `json_quote value`, `base64url string`,
+`notification_body format event target`, and `with_field object key value`. JSON double-quoted literals and parenthesized
 nested calls are supported. Examples: `{{coalesce input.id steps.resolve.ids.0}}`
 and `{{join input.ids ","}}`. `coalesce` evaluates lazily. There is no general
 expression evaluation, scripting, filtering or access to host functions.
-Evaluation and aggregate rendering have byte budgets.
+Evaluation and aggregate rendering have byte budgets. `base64url` returns RFC
+4648 URL-safe Base64 without padding, for read-only URL identifier lookups. It
+accepts only strings and checks the encoded size before allocation. Empty JSON
+array/object literals (`[]`, `{}`) can supply typed `coalesce` defaults.
+
+Request execution checks every evaluated expression value against registered
+connection/caller credentials and derived tokens before an outer helper runs.
+Nested encoding, JSON quoting, case conversion, and reconstruction with `join`
+cannot conceal credential material. A refusal occurs before vendor dispatch;
+dry runs also refuse credential-bearing helper operands while preserving
+redaction of raw preview values. Diagnostics never include the refused value.
+Unselected lazy `coalesce` branches remain unevaluated.
 
 Sequence response expectations can require multiple exact JSON values with
 `expect.fields`, a map of at most 16 dotted paths (256 bytes each) to literal
@@ -494,12 +516,32 @@ values. Every field must exist and match its value and type. For example,
 An explicit null requires a present JSON null; missing fields fail. Paths use
 alphanumeric/underscore segments and array indexes. Values are not templates.
 Empty `fields` is omitted from serialization, preserving existing sequence bytes.
+An explicitly empty `expect.path` selects the complete JSON body. Combine
+`path: ""`, `items: 1` and exact `fields` checks for root-array batch receipts;
+for example, HTTP 207 alone does not prove that its individual items were accepted.
+Form fields whose entire value is a missing `input.*` reference are omitted,
+matching optional query parameters. Literal empty strings and explicit helpers
+remain present. This supports bounded optional AWS Query group parameters
+without sending empty group IDs or discarding supplied restoration state.
 
 A URL may start with a single `{{config.base_url}}` containing an HTTPS origin,
 or retain the existing `https://{{config.host}}/path` form with a bare host.
 Origins cannot contain userinfo, query, fragment, a path prefix or a non-443
 port. Dynamic origins still need constrained allow rules. Path substitutions
 are encoded as single segments, and dot-segment substitutions are refused.
+
+SOAR action packs may explicitly type a non-secret connection field as
+`format: https_endpoint`. A request URL consisting of exactly
+`{{config.<field>}}` then selects that complete configured HTTPS URL, including
+its non-secret path. It requires a DNS hostname on port 443 and refuses
+userinfo, query, fragment, reserved names, IP literals and embedded templates.
+It is resolved before native request compilation into one exact host; private
+or mixed DNS answers and platform denials remain blocked by the broker. The
+existing tenant/connection/revision-bound egress helper and inventory publish
+that same exact host. Optional vendor suffixes, enumerated values and path
+constraints still apply. A flow input cannot select or append to the endpoint.
+This opt-in belongs to the signed pack definition, not to an environment flag
+or to ordinary untyped config. Token/login endpoints do not use this format.
 
 `preview::ReplayTransport::strict` consumes expected exchanges in order and
 checks the exact method, URL, query and JSON/form body. Unexpected duplicate
@@ -526,3 +568,136 @@ its connection context. A context retains at most 1,024 session tokens for
 redaction; after that, re-create the context. Dry runs show authentication
 placeholders and make no login request or usage charge. This example is not a
 vendor action pack and contains no credential values.
+
+### Duo v5 authentication
+
+`duo_hmac {integration_key_credential, secret_key_credential}` implements the
+vendor's [current signing protocol](https://duo.com/docs/adminapi#authentication)
+for Admin/Auth/Device APIs. It uses the engine clock for Date, RFC 3986 sorted
+query parameters, SHA-512 hashes of the exact JSON body and canonical X-Duo
+headers, then HMAC-SHA512 in an HTTP Basic envelope. GET/DELETE bodies, form
+mutations, malformed query encodings, duplicate query/header names and unknown
+plugin fields are refused before sending. POST/PUT/PATCH require a JSON object.
+The plugin owns Date/Authorization and retains derived signatures for redaction
+within the compiled request cap. No v2/SHA-1 fallback or shared credential cache
+is used. Declare the exact vendor API host and path scope in `allow`.
+
+OAuth client credentials additionally accepts `client_auth: basic` (default:
+`body`). Basic authenticates only the token POST; it does not duplicate secrets
+in the grant form. `scope` may reference connection `config.*`, never flow inputs;
+the rendered scope is bounded to 4096 characters and cannot contain controls.
+
+A response expectation can use `path: findingIds, json_type: array` to accept
+an empty documented result while refusing missing/wrong-type fields. Supported
+`json_type` values are `array`, `object`, `string`, `number`, `boolean` and `null`;
+`null` requires an explicitly present field. `path: ""` selects the JSON root.
+
+Independent replay request contracts may declare non-secret `headers` alongside
+method, URL, query and body. Header names match case-insensitively; values match
+exactly, and a missing or duplicate matching header fails replay. Auth-bearing
+headers can stay omitted so fixtures never need credentials. Use this for
+vendor API-version, media-type and required client-identification headers.
+
+SOAR input `type: text` accepts multiline ticket/alert content with a hard 16 KiB
+UTF-8 byte ceiling. Optional `max_bytes` can lower it (1–16384); tabs, CR and LF
+are allowed as JSON payload data, while other control characters are refused.
+`max_bytes` is valid only on text inputs. Identifier `string` keeps its existing
+2 KiB/no-control grammar. Regex patterns stay identifier-only; use the text byte
+ceiling for long descriptions. URL/header policy and encoded-secret outbound
+checks still run before any transport call. No text value becomes a template or
+host program.
+
+SOAR `deployment_scope: self_hosted_sovereign` is a signed publisher restriction. Only the trusted `SelfHosted` startup profile (including sovereign customer installations) may install, connect or execute it; hosted/shared/demo profiles refuse it. Customer config, action inputs and run metadata cannot select deployment authority. `config.format: https_origin` is available only with that scope and accepts one certificate-valid HTTPS FQDN origin on port 443; action paths append to it, while the exact configured host and reviewed API path prefixes remain mandatory. `https_endpoint` keeps its complete-URL/public-only behavior.
+
+For scoped packs the native broker permits RFC1918/ULA corporate DNS answers, pins and checks every answer, and keeps explicit platform/tenant denies. Loopback, link-local, CGNAT, cloud metadata (including `fd00:ec2::/32`), reserved addresses, Kubernetes service/cluster DNS and IP literals stay refused. A trusted self-managed startup saves its original dialer for scoped packs inside the existing authority-guarded transports; public packs retain the proxy route and public-only IP policy. Private pack hosts never become hosted proxy grants. There is no direct fallback from a failed public proxy request, or customer/network environment knob enabling this authority.
+
+SigV4 retains each issued Authorization value and isolated signature as derived secrets, so reflected response bodies, summaries and downstream action outputs are scrubbed like raw credentials. Retention is bounded by the compiled request cap; signing refuses before send at the cap rather than evicting an early signature that a later response could reflect. The closed auth registry reflection suite must cover every registered plugin.
+
+## SOAR action output contracts
+
+Native action packs may declare `output_types` alongside `outputs`. The keys
+must cover exactly the extracted output names. Supported JSON types are
+`string`, `integer`, `number`, `boolean`, `array`, and `object`. Values are
+validated after native execution and secret redaction, without coercion:
+
+```yaml
+outputs:
+  score: steps.lookup.score
+  matches: steps.lookup.matches
+output_types:
+  score: integer
+  matches: array
+```
+
+Missing or null output paths already fail native extraction. A Read action with
+a wrong output type fails with `invalid_outputs`; after an accepted mutation,
+the result is ambiguous so a flow cannot retry it as a known failure. Dry runs
+render requests without requiring vendor response values. Declared scalar
+outputs may be used as compile-time-validated Judge entity references. Object
+and array outputs remain usable as evidence but cannot serve as scalar entities.
+Omitting the map preserves existing pack behavior and canonical bytes. These
+fields belong to the native ActionPack schema, rather than the collector
+ConnectorSpec schema linked above.
+
+A native action output may reference an entire preceding response with `steps.<step_id>` (including a top-level JSON array). It has the same prior-step visibility and secret-redaction rules as field extraction; declare `array` or `object` in `output_types` to enforce the required shape.
+
+## SOAR deployment eligibility
+
+Action packs restricted to self-hosted/sovereign installations declare the
+signed top-level field `deployment_scope: self_hosted_sovereign`. Omitting it
+preserves the unrestricted legacy default and canonical bytes. A `self_hosted` category
+requires this field; a category alone grants no deployment permission.
+
+The trusted startup deployment policy used by private SMTP also gates pack
+installation/upgrades, connection creation/update/use, and action execution.
+Managed, shared-enterprise, and demo deployments cannot admit these packs;
+tenant configuration cannot override the gate. Offline converter replay
+selects the self-hosted profile only for scoped artifacts. This field
+does not relax artifact validation or hosted egress. Private-network admission
+requires the trusted self-hosted scope and native DNS/deny rules documented above.
+
+## Scoped JSON credentials with existing OAuth
+
+`oauth2_json_credential` wraps the existing `oauth2_client_credentials` plugin;
+its `oauth2` object uses the same parameters, token allowlist, cache, 401 handling
+and secret retention. It does not introduce another OAuth implementation.
+`credential`, `field_pointer`, `selector_pointer` and `selector_value` select a
+native credential and a single bounded JSON mutation discriminator. Pointers
+are literal object identifier paths (1–8 segments); JSON Pointer escapes and
+array traversal are refused. The selected field must be absent from the initial
+request. Other discriminator values and reads use OAuth without injection.
+All plugin credential fields remain required by sequence admission.
+
+For example, Jamf `DEVICE_LOCK` uses `/commandData/commandType` as discriminator,
+`/commandData/pin` as destination and `six_digit_pin` as `format`. The PIN stays
+in the connection credential store, never in flow inputs/config/templates.
+`opaque` is the default format, with the engine minimum secret length and a
+16 KiB ceiling. Mutation bodies require application/json, an object and a
+1 MiB limit. Fields cannot alias OAuth credentials. Retained summaries and
+response echoes use existing secret redaction. Exact already-decorated request
+fingerprints allow auth reapplication without allowing initial field overrides;
+retention is bounded by the native request limit (max 4096), never evicted.
+
+`{{with_field steps.current.properties "status" input.status}}` creates a copy
+of a JSON object with one field replaced. The key must be a 1–64 byte ASCII
+alphanumeric/underscore identifier; this is a field name, not a path or program.
+Existing expression depth/size, deferred-response and secret-namespace guards
+apply. Sentinel uses it to preserve every fetched incident property during its
+etag-protected status PUT, avoiding silent resets of owner/labels/description.
+
+### Bind mutation targets to an identity Read
+
+Sequence `expect.input_equals` maps at most 16 response JSON paths to literal
+required string input names, for example `input_equals: {id: device_id}`. Paths
+use the same bounded dotted grammar as `expect.fields`; input names cannot be
+templates, namespaces or helpers. Both values must exist as nonempty strings and
+match exactly, without coercion. Missing/null/wrong-type/mismatched identities
+refuse before the next step. SOAR admission requires each named input to be a
+required string. Empty maps are omitted from serialized definitions.
+
+Device mutations perform the Read inside the same approved native sequence and
+connection/auth context, then derive their command target from `steps.identity`.
+For Jamf, bind both the inventory `id` and `general.managementId` to the selected
+`computer_id` and `management_id`; dispatch only the returned management UUID.
+This avoids trusting an independent flow input as the command target. No external
+identity receipt, cross-tenant cache or credential/egress change is introduced.

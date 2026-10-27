@@ -488,6 +488,7 @@ pub const ALL_PERMISSIONS: &[&str] = &[
 
 /// Permissions granted to demo users — analyst experience without admin access
 pub const DEMO_PERMISSIONS: &[&str] = &[
+    "soar:view",
     // Search — full power
     SEARCH_VIEW,
     SEARCH_EXECUTE,

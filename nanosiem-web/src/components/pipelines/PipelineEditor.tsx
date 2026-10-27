@@ -282,6 +282,7 @@ export function PipelineEditor(props: PipelineEditorProps) {
     sampleNotice,
     inputs,
     onAssistant,
+    onSelectedStepChange,
     onReloadLatest,
     onKeepLocalEdits,
     onDiscardDraft,
@@ -344,6 +345,10 @@ export function PipelineEditor(props: PipelineEditorProps) {
   const stepStatus = stepPreviewStatus(preview);
   const selected =
     draft.steps.find((step) => step.id === selectedId) ?? draft.steps[0];
+  const selectedStepId = selected?.id ?? null;
+  useEffect(() => {
+    onSelectedStepChange?.(selectedStepId);
+  }, [onSelectedStepChange, selectedStepId]);
   const readOnly = !permissions.edit;
   // Release managers can review and publish a draft saved by an editor.
   const canReview = permissions.edit || permissions.release;

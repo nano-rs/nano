@@ -81,6 +81,8 @@ export interface PipelineEditorProps {
   inputs?: PipelineInputsPanelProps;
   /** Opens pivt focused on the selected step (NAN-3453). */
   onAssistant?: (selectedStepId: string | null) => void;
+  /** NAN-4609: the selected step, so pivt (`@pipe`) works on what the analyst is looking at. */
+  onSelectedStepChange?: (stepId: string | null) => void;
   /** Conflict recovery: discard local edits and load the server's latest saved draft. */
   onReloadLatest?: () => void;
   /** Conflict recovery: keep local edits and save over the server's latest draft. */

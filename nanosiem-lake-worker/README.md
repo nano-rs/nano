@@ -301,3 +301,286 @@ identity, immutable read/write, HEAD/stat, notifications, and delete/retention
 semantics, followed by the same overwrite/replay/compaction/activation drills
 on each provider. An S3-compatibility facade may be used for experiments but is
 not the native production portability claim.
+
+## Ingest stage diagnostics
+
+The existing tenant ingest heartbeat's `ingest_diagnostics` includes default-on,
+process-local timings. It adds no configuration, route or provider operation.
+The original buffered/oldest-stage gauges and native started/completed counters
+retain their meaning. A fresh production `Ingestor::open` initializes occupancy;
+short stage transitions remain visible after the next heartbeat.
+
+| Field | Meaning |
+| --- | --- |
+| `oldest_flush` | Current oldest flush's stage, input `rows`/`arrow_bytes`, built part count/rows/file bytes and bounded transition history |
+| `last_completed_flush` | Most recently ACKed flush's completed history, retained until another flush completes |
+| `flush_stage_timings` | Cumulative stage residence, including any wait/retry residence before a transition |
+| `operation_timings` | Part-file upload, signature-payload staging, signature batch, provenance/cache publication, Add append and actual prevalence-apply scopes |
+| `native_writer.timings` | Per-attempt authorize/complete/PUT scopes plus separate pacer wait (lock and sleep) |
+| `occupancy` | Configured/effective flush depth, queue range capacity, filling/flight rows and bytes, reservations/budget, held notices and structural/resource constraints |
+| `queue_sample` | Count/limit from the existing bounded pending-notice read; `may_be_truncated` does not claim a total backlog count |
+
+All times are monotonic. Each timing has `in_flight`, `finished_total`,
+`elapsed_us_total`, `max_us`, `last_us`, `bucket_upper_us` and `bucket_counts`.
+Buckets are disjoint (1/10/50/100/500ms,1/5s,overflow); `null` is the open-ended
+last upper bound. Histograms count terminated scopes, including failure and
+cancellation, with in-flight elapsed excluded until termination. Native legacy
+completion counts still distinguish successful parsed replies/PUT200s. Request
+latency includes response-body/JSON handling for owner calls; PUT ends at response
+headers, before its separate owner completion call. Pacer wait includes time
+waiting for the pacing mutex and timer and is excluded from request latency.
+Retry backoff is outside each native HTTP scope.
+
+Stage history keeps the last32 transitions with a dropped count, never an
+unbounded trace. Rows/Arrow bytes describe the sealed input; part-file bytes
+exclude signed provenance generated later. Foreground and background flights
+retain independent histories; younger work cannot relabel the oldest. Stage
+residence and nested operations overlap and must not be summed as independent
+wall time. Native timings include other writes sharing that writer (e.g. merges)
+and are not automatically attributable to the oldest flush. Missing timing labels
+mean the operation has not run in this process. Counters reset on process restart;
+compare deltas only within one PID/epoch. Atomic timing snapshots are diagnostic,
+not a transactional ledger. Occupancy/queue sample ages continue increasing when
+an ingest tick stalls; they are sampled state, not fresh provider reads.
+
+Only numeric counts/times, booleans and static code-defined stage/operation labels
+are emitted. No tenant, source/object/part IDs, event values, URLs, keys, signatures
+or raw errors enter these timings. Each production constructor owns its handles;
+no process-global telemetry shares one tenant's measurements with another.
+Heartbeat reads never take the mutable ingest lock or hold timing locks across IO.
+
+The diagnostics themselves only observe the pipeline: they add no object-store
+reads/writes and do not change batching, ordering, ACKs, fences or owner pacing.
+Histories are bounded and cumulative metrics have a fixed set of code labels;
+existing heartbeat payloads grow slightly. The flush depth they report is set by
+the bounded overlap described in the next section.
+
+The default library tests share one process and CPU allocation. Timed prevalence
+admission scenarios take an exclusive test-only workload guard; large analytical,
+heap and wide-part component fixtures use shared guards. This preserves the full
+five-second/3,500-row admission-plus-flush assertion without charging another
+fixture's million-row CPU experiment to that bound. Unrelated tests remain
+parallel; there is no deployment setting or change to production scheduling.
+GC read-ahead tests use a controlled Tokio clock to exercise entry-cap and early
+time-cut paths independently, with cancellation-safe fixture occupancy. The
+production two-second, byte and entry bounds are unchanged.
+
+## Bounded flush overlap
+
+Catch-up ingest keeps at most **two** sealed flushes in flight per tenant
+(`MAX_FLUSH_DEPTH`), plus the memory-budgeted filling buffer. This is the coded
+production path: the constructor defaults are `flush_depth = 2` and
+`commit_when_ready = true`, and the retired rollout switches are no
+longer read or forwarded (the supervisor drift test guards both names). There is
+no environment switch or default-off rollout.
+
+The effective depth is derived per tick, never configured by hand. It is one
+(the serial contract) unless all of these hold: the cell supplied the background
+store and signer; the queue allows two outstanding ranges (the cell opens the
+edge source with `edge_source_config(MAX_FLUSH_DEPTH)`, whose pulled-bytes
+allowance stays the single-flight 64 MiB); admission is not paused by the
+over-commit hold; the catalog attachment is not degraded; and no erasure order or
+step is active. A second seal additionally needs rows, no rejections/skips/
+replays, no pending schema growth, no partially committed buffer, and its full
+minimum build/writer reservation must fit beside the earlier flights and merges.
+The one-object progress escape stays on the serial path.
+
+Order is unchanged: only the oldest flight appends its `add` and ACKs, so seal
+order is `add`, edge-range and ACK order; a younger flight that finished first
+waits. A finished publication wakes the single part-log owner immediately.
+Prevalence still applies in part-log cursor order inside the oldest commit.
+
+Native writes share one 32-permit envelope per production writer
+(`NativePartWriter::write_guard`), across overlapping publications, merges and
+part-log appends. A permit is taken per write (never a partial group), released
+on success, failure or cancellation, and waited on under the fixed timing label
+`write_slot_wait`. Owner pacing and its EPS-derived interval are unchanged.
+
+Cancellation: the oldest flight stays at the front of the in-flight queue across
+every await (its task is awaited by reference, its immutable output and memory
+reservation stay owned) and leaves only after its ACKs land. Serial flushes keep
+their built output the same way. If an `add` committed under a dropped call, the
+retry finds every part already in the log and adopts it instead of appending a
+second `add` (which would double-consume its sources); its prevalence apply is
+left to the exactly-once cursor replay.
+
+### Modeled convergence suite
+
+`tests/nan4539_flush_convergence.rs` drives the production constructor and tick
+loop on Tokio's paused clock with real admission, Parquet builds, signatures and
+part log; only IO and time are modeled. IO delays are **MODELED**, calibrated from
+the T84 read-only RCA occupancy/residency estimates (not measured latencies): 3.65 s
+per native object write (7.3 s publication residency over two write rounds), 2.72 s
+build charged on each L0 data PUT, 2.47 s part-log append plus 3.49 s prevalence
+folded into each `add` append, an assumed 100 ms per read. `3x` multiplies every delay as a
+p95 **stand-in**, not a percentile. CPU costs zero modeled time. Each PUT holds one
+permit of a 32-permit FIFO pool like the native envelope, and pays two owner calls
+(authorize before, complete after) through one process-wide 50 ms pacer shared by
+both publications, merges and appends, as `NativePartWriter` paces them at 300 EPS.
+Catch-up, lag and drain are measured after each tick, so the committing tick counts. Rows are real (40 per
+object, 300 EPS offered). Backlog durations are scaled per case: the throughput gates use
+a 1h backlog at scale 4 and a 3h backlog at scale 12 (270,000 backlog rows each since
+Step 3a cut larger flushes; Step 2 used scales 6/18, 180,000 rows; the
+zero-cost 3h case uses scale 10), so at least ten flushes commit before catch-up; the
+deadline is 5,400 s or 1,800 s divided by the scale. The gated rate is committed rows per
+modeled second over the steady-state window (first backlog commit to the commit at
+catch-up, at least ten flushes), which keeps the first flush's fill and commit latency out
+of it. A 60x smoke run (1h = 18,000 rows, two or three flushes) checks only the deadline,
+catch-up and drain no later than serial, and exactly-once; it is too short to measure a
+rate. `CAUGHT_UP_LAG_MS` (60 s) is not scaled: with every backlog notice acked it is
+effectively "the frontier passed the outage". The suite compares a serial baseline and the
+bounded default on identical sources, and checks exactly-once rows, one `add` per
+source, in-order ACKs, at most two flights and 32 concurrent writes, ingest-path
+requests per committed row, a tight-memory serial fallback (a 533 MiB cell: the working
+budget and the merge decode window derive from the cap as in the cell constructor) and
+bounded replay cost after transient publication failures. It prints one
+`NAN4539-MODELED` line per run. These are scheduling and request-cost bounds, not
+physical or live EPS.
+
+Modeled results at Step 2 (run10; serial vs bounded, steady-state rate over at least ten
+flushes). Step 3a's results on the rescaled gates are in the next section:
+
+| Case | Serial | Bounded | Gate |
+| --- | --- | --- | --- |
+| 1h at estimate, scale 6 (deadline 300 s) | 815 s, 387 rows/s | 170 s, 1,442 rows/s, 2 flights | passes |
+| 3h at estimate, scale 18 (deadline 300 s) | 817 s, 386 rows/s | 173 s, 1,414 rows/s, 2 flights | passes |
+| 3h at zero cost, scale 10 (deadline 540 s) | 257 s, 1,512 rows/s | 132 s, 2,649 rows/s | passes |
+| 1h and 3h at 3x, scales 6/18 (deadline 300 s) | 2,117-2,135 s, 148 rows/s | 680 s, 466 rows/s | **misses the deadline**, reported only |
+| 3h at estimate, scale 60 (deadline 90 s) | 283 s | 73 s, 915 rows/s (1.7% over 900) | smoke reference |
+| same with three transient 503s | 283 s | 104 s, 686 rows/s | **misses the deadline**; bounded replay cost |
+| 1h smoke, scale 60, estimate (deadline 30 s) | 53 s | 29 s | deadline only |
+| tight 533 MiB cell, 3h at estimate, scale 60 | 261 s | 89 s, 1 flight, drained 161 s | fallback |
+
+The 1h-at-scale-6 and 3h-at-scale-18 cases are the same 180,000-row workload (each a
+600 modeled second backlog); the scale was chosen so that both span ten flushes. Bounded
+ingest-path requests per committed row are at or below serial in every case.
+
+Overlap applies only to edge-input tenants: the effective depth is 2 only when the
+queue allows two outstanding ranges, which today only the edge source does. Bronze/spool
+tenants keep depth 1.
+
+**Card acceptance is not met by Step 2.** The serial commit stage (the oldest flight's
+part-log append plus prevalence apply, about 6 s per flush at the estimate and 18 s at
+3x) caps throughput at rows-per-flush divided by that time, whatever the depth. At 3x it
+stays below 900 rows/s, and the scale-60 3h estimate case clears with a 1.7% margin
+(915 rows/s). Step 3 addresses the commit stage (`nan4539-step3-design.md`, design only).
+
+Pacing gaps in the model: owner sign RPCs (`HttpPartSigner`) are not charged, owner
+503/504 retry windows and journal replay are not modeled, and non-native checkpoint keys
+are paced here but not in production (a slight overcharge).
+
+What the suite does **not** prove: prevalence under overlap (disabled; its apply
+estimate is folded into the append delay), build and admission CPU contention (CPU
+costs zero time), the real `EdgeLogSource` (a spool queue stands in; the edge tests
+cover order), the cell loop (the cell constructor test covers its wiring), and
+physical or live EPS. Calibrate the native pacer against live `pacer_wait` timings
+before any live qualification.
+
+Recalibration: after a coordinator train carries Step 1, read the tenant's
+`ingest_diagnostics` (`native_writer.timings` authorize/complete/PUT and
+`pacer_wait`, `operation_timings` part-log append and prevalence apply, stage
+residence for `build_parts`) over one process epoch, take the bucket containing the
+median and the 95th percentile of each, and replace the `ESTIMATE` constants with
+those bucket bounds (label them measured only then, with sample sizes and epoch).
+
+The offline physical benchmark is an explicitly invoked, ignored test on the real
+clock and local disk (no modeled delay, real CPU):
+
+```bash
+cargo test --release -p nanosiem-lake-worker --test nan4539_flush_convergence \
+  physical_wall_clock_benchmark -- --ignored --nocapture
+```
+
+Run serial and bounded on the same host and CPU allocation; it reports wall-clock
+committed rows per second for both and is not a live EPS claim.
+
+
+## Catch-up flush size and seal order
+
+Step 2's overlap stayed near serial in large-tenant-shaped catch-up. The 3x probe
+(728-row segments, ~4.5 KB Arrow rows, the large tenant's 5.63 GB ingest cap) ran at 287 rows/s.
+The cause was not memory. The single ingest task stopped admitting while it
+waited on a flight, so flushes stayed small (~9-10k rows) while the working
+budget sat half empty. Step 3a keeps the task admitting and lets the next build
+overlap the inline commit. All of these are coded defaults, with no switch:
+
+- **Age-due seals defer beside a building flight.** Behind, a seal that only its
+  age made due, and that would wait on an unfinished flight, is skipped for this
+  tick. Admission keeps filling the buffer under every cap and the budget. Hard
+  caps still seal or wait exactly as before: rows, bytes, objects, hours,
+  rejections, budget spent, a buffer-bound admission deferral, and the crash seal.
+- **A group's transient decode peak no longer seals the buffer.** Admission
+  bounds one call by its objects' JSON peak. The buffer now seals only
+  when the next object would not fit beside the buffer, flights and merges on
+  its own. A partial admission ticks again at once (the finished-flight wake)
+  instead of after the cell loop's idle second.
+- **Published flights hold only their retained rows.** Once a flight's
+  background task has published, its build copies and writers are freed, so it
+  is charged `buffer.bytes`, not `flight_bytes`.
+- **Seal before commit.** Before a published flight commits inline (its
+  part-log append and prevalence apply hold the task), a catch-up buffer seals
+  first if both of these hold: it fits beside the flights, and it is due or holds
+  at least one full L0 part (`SEAL_FIRST_MIN_ROWS` = 16,384). Its build and upload
+  then overlap that commit. A seal that only the budget blocks (a slot is free)
+  waits for the oldest flight's **publication**, not its commit, and seals first
+  if it then fits.
+- **Writers are reserved for the parts the plan writes**:
+  min(fitting, `l0_chunks` per hour). A sub-16k-row flush no longer reserves
+  4 × 48 MiB.
+
+Order and exactly-once are unchanged. The new seal passes the same
+`may_seal_beside_flights` barrier: no part-log op ahead of an earlier `add`, and no
+skips, rejections or schema growth. Only the oldest flight appends and ACKs. The
+serial comparison policy (`commit_when_ready = false`) keeps every old wait.
+
+Prevalence stays inline and was not deferred (option 3b was rejected). The T84
+per-flush fit shows apply nearly fixed per flush (39 µs/row, r = 0.11). Stamping at
+admission also needs prevalence not to be pending, so a deferred apply would
+unstamp catch-up rows.
+
+### Step 3 modeled gate (release; `cargo test --release ... -- --ignored step3_`)
+
+All three runs use large-tenant-shaped sources in a large-tenant-sized cell (working budget 1,690 MB)
+on the fitted `ROW_THREE_X` costs, which are 3x of:
+
+| Cost | Fixed | Per row |
+| --- | --- | --- |
+| PUT | 3,650 ms | |
+| build | | 271 µs |
+| append | 2,470 ms | |
+| prevalence | 2,548 ms | 94 µs |
+
+| Case | Serial | Bounded (Step 3a) | Gate |
+| --- | --- | --- | --- |
+| 3h backlog, scale 4 (810k rows; deadline 1,350 s) | 1,460 s, 839 rows/s | **1,286 s, 917 rows/s over 22 flushes**, peak L0 28, 9 merges | **passes** |
+| same, prevalence fully linear (1,041 µs/row at 3x) | 2,604 s, 543 rows/s | 2,186 s, 645 rows/s | reported, misses |
+| 3h backlog, scale 12 probe (4-5 flushes; deadline 450 s) | 644 s | 495 s, 810 rows/s | reported, misses |
+
+The same probe before Step 3a: serial 2,204 s at 214 rows/s; bounded 1,633 s at
+287 rows/s.
+
+Step 2 suite with Step 3a, rescaled gates (`ONE_HOUR_SCALE` 4, `THREE_HOUR_SCALE` 12;
+deadline 450 s):
+
+| Case | Serial | Bounded |
+| --- | --- | --- |
+| 1h at estimate | 1,243 s, 380 rows/s | 226 s, 1,444 rows/s over 14, ~13.9k rows per add |
+| 3h at estimate | 1,244 s, 380 rows/s | 224 s, 1,464 rows/s over 14 |
+| 3h at zero cost, scale 10 | 256 s | 14 s |
+| 1h and 3h at 3x (`THREE_X`, fixed per flush) | ~3,175 s, ~149 rows/s | ~963 s, 491 rows/s; reported (misses) |
+| tight 533 MiB cell, 3h at estimate, scale 60 | 261 s | 48 s, 2 flights, within depth |
+
+`THREE_X` keeps Step 2's flush-fixed costs (no per-row term) on 40-row objects. Its
+flushes stop at `MAX_FLUSH_OBJECTS` (512 objects, 20,480 rows), so each pays the
+~18 s fixed commit (append and prevalence) for at most 20k rows. That is a 40-row
+test-object artifact: large-tenant segments are ~728 rows, so the object cap is not
+binding there. The large-tenant-shaped `ROW_THREE_X` gate above is the per-row-fitted 3x
+case.
+
+Scale 4 is the smallest scale whose backlog spans ten ~65k-row flushes. At scale 12,
+the first flush's fill and commit latency (~80 s) and the 60 s lag tail dominate the
+450 s deadline. The margin at scale 4 is thin: 1.9% on rate, 4.7% on the deadline. The
+fully linear prevalence case misses. That makes the live FP catch-up measurement after
+the train the deciding evidence, and 3b stays the fallback if live prevalence is
+row-linear. In this model prevalence is disabled and charged as delay, so "no unstamped
+batches" is vacuous here.

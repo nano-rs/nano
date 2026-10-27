@@ -75,6 +75,21 @@ fn public_material(key: &[u8; 32]) -> bool {
 }
 
 impl KeyRing {
+    pub(super) fn selected(id: &str, root: &[u8]) -> Result<Self, CryptoError> {
+        if !valid_id(id) {
+            return Err(CryptoError::InvalidEnvelope);
+        }
+        let mut ring = Self::raw(root)?;
+        let key = ring
+            .keys
+            .remove(LEGACY_ID)
+            .ok_or(CryptoError::InvalidEnvelope)?;
+        ring.active = id.into();
+        ring.keys.insert(id.into(), key);
+        ring.legacy.clear();
+        Ok(ring)
+    }
+
     pub fn raw(key: &[u8]) -> Result<Self, CryptoError> {
         let key: [u8; 32] = key.try_into().map_err(|_| CryptoError::InvalidKeyLength)?;
         if public_material(&key) {

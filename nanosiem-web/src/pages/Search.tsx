@@ -136,7 +136,8 @@ import { useIsMobile } from '@/hooks/use-mobile';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useNotebookCapture } from '@/enterprise/contexts/NotebookContext';
 import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, DatasetSelector, type FieldStat } from '@/components/search';
-import { AnalyzeView } from '@/enterprise/components/search/AnalyzeView';
+import { registerSearchAnalysisSource, startSearchAnalysis, MAX_ANALYZE_ROWS, NO_SEARCH_TO_ANALYZE, type SearchAnalysisContext } from '@/enterprise/components/pivt/drafts/search-analysis';
+import { openPivtPanel } from '@/enterprise/components/pivt/commands/router';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { tenantSearchSurface } from '@/lib/tenant-capabilities';
 import { ScheduleReportDialog, type ScheduleReportPreset } from '@/components/reports/ScheduleReportDialog';
@@ -707,37 +708,6 @@ export function Search() {
   const isMobile = useIsMobile();
   const [mobileFieldsOpen, setMobileFieldsOpen] = useState(false);
   
-  // Analyze mode — when true, the results area is replaced by AnalyzeView
-  // (a full-page LLM analysis of the current result set). Back button in
-  // AnalyzeView flips this back to false and the user lands on their
-  // existing results with query + time range intact.
-  const [analyzeActive, setAnalyzeActive] = useState(false);
-
-  // ONE predicate, used with its exact inverse below. These two guards were
-  // never complementary: AnalyzeView also required `hasSearched` and a non-empty
-  // result set, while the results area was hidden on `analyzeActive` alone — so
-  // `analyzeActive` with no results rendered NEITHER and the page went blank.
-  // `pivt:summarize` sets `analyzeActive` unconditionally, so it could reach
-  // exactly that state. Deriving both from one value makes the blank case
-  // unrepresentable (NAN-2356).
-  const showAnalyze =
-    analyzeActive && capabilities.melod && hasSearched && searchResults.length > 0;
-
-  // pivt bridge — `@summarize` from anywhere in the app fires
-  // `pivt:summarize`. Route to the Analyze view the same way the
-  // toolbar button does. (Router navigates to /search first if the
-  // user isn't here yet, so the listener is always mounted in time.)
-  // NAN-2356: only wired when meloD is available. AnalyzeView is enterprise and
-  // stubs to `return null` in open builds, while `analyzeActive` ALSO hides the
-  // fields + results area below — so firing this in an open build would blank
-  // the whole search page.
-  useEffect(() => {
-    if (!capabilities.melod) return;
-    const handler = () => setAnalyzeActive(true);
-    window.addEventListener('pivt:summarize', handler);
-    return () => window.removeEventListener('pivt:summarize', handler);
-  }, [capabilities.melod]);
-
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [pagingComplete, setPagingComplete] = useState(false);
@@ -3493,6 +3463,35 @@ export function Search() {
     [tailState.rows, searchResults],
   );
 
+  // NAN-4589: pivt analyzes the results on screen in its panel (Analyze
+  // button, `@summarize [focus]`). The page hands pivt the run the rows came
+  // from through a getter, read when a run starts; the results area is never
+  // replaced. Open builds get an inert stub.
+  const analysisSourceRef = useRef<() => SearchAnalysisContext | { unavailable: string }>(() => ({ unavailable: '' }));
+  analysisSourceRef.current = () => {
+    if (isSearching) return { unavailable: 'The search is still running. Wait for results, then ask again.' };
+    if (!hasSearched || displayResults.length === 0) {
+      return { unavailable: NO_SEARCH_TO_ANALYZE };
+    }
+    const scope = runScopeRef.current;
+    const scopeTime = scope?.timeRange ?? timeRange;
+    return {
+      query: executedQuery || query,
+      queryMode,
+      dataset,
+      timeRange: scopeTime,
+      range: scope?.range ?? toApiTimeRange(scopeTime),
+      results: displayResults.slice(0, MAX_ANALYZE_ROWS).map((r) => r.fields),
+      totalCount: displayTotalCount,
+      histogram: histogramData,
+    };
+  };
+  useEffect(() => registerSearchAnalysisSource(() => analysisSourceRef.current()), []);
+  const analyzeInPivt = useCallback(() => {
+    openPivtPanel();
+    void startSearchAnalysis('');
+  }, []);
+
   const handleStopSearch = useCallback(() => {
     artifactRef.current = null;
     // Abort SSE stream (closes connection, backend detects disconnect and kills ClickHouse query)
@@ -6133,29 +6132,8 @@ export function Search() {
           </div>
         )}
 
-        {/* Analyze mode — replaces the normal fields + results area with
-            a full-page LLM analysis view when active. */}
-        {showAnalyze && (
-          <div className="flex-1 flex flex-col min-h-0 min-w-0">
-            <AnalyzeView
-              query={query}
-              queryMode={queryMode}
-              results={displayResults}
-              totalCount={displayTotalCount}
-              timeRange={timeRange}
-              histogram={histogramData}
-              onBack={() => setAnalyzeActive(false)}
-              onRunQuery={(q) => {
-                setQuery(q);
-                setAnalyzeActive(false);
-                handleSearch(1, false, q, queryMode);
-              }}
-            />
-          </div>
-        )}
-
         {/* Fields panel + Results area - Fields panel hidden for full-width visualizations */}
-        {!showAnalyze && (() => {
+        {(() => {
           const showFieldsPanel = fieldsPanelVisible && !isTreeView &&
             displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'baseline';
           return (
@@ -6268,7 +6246,7 @@ export function Search() {
                     assetPrevalenceFilter={assetPrevalenceFilter}
                     timeRange={apiTimeRange}
                     melodEnabled={capabilities.melod && melodStatus?.connected === true}
-                    onSummarize={() => setAnalyzeActive(true)}
+                    onSummarize={analyzeInPivt}
                     asyncJobId={asyncJobId}
                     asyncJobStatus={asyncJobStatus}
                     asyncJobProgress={asyncJobProgress}

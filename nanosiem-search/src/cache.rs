@@ -61,6 +61,74 @@ fn skip_cache_reason(response: &SearchResponse) -> Option<&'static str> {
     None
 }
 
+/// NAN-4664: a conservative normal form of an nPL query for cache and
+/// in-flight identity. Leading and trailing whitespace is trimmed, and runs
+/// of spaces and tabs outside `"..."` / `'...'` strings collapse to one space.
+/// It never changes meaning: newlines are kept (a `//` comment ends at one),
+/// and a query containing `/` (regex literals, comments, division), `\` or
+/// a backtick, or with an unbalanced quote, is only trimmed.
+pub fn normalize_query(query: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = query.trim();
+    if trimmed.contains(['/', '\\', '`']) {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut quote: Option<char> = None;
+    let mut pending_space = false;
+    for c in trimmed.chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None if c == ' ' || c == '\t' => pending_space = true,
+            None => {
+                if pending_space {
+                    out.push(' ');
+                    pending_space = false;
+                }
+                if c == '"' || c == '\'' {
+                    quote = Some(c);
+                }
+                out.push(c);
+            }
+        }
+    }
+    if quote.is_some() || out == trimmed {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    // The lexical pass above guesses where strings are. The parser is the
+    // authority: collapse only when the collapsed text parses to exactly the
+    // same query (an apostrophe or quote inside a bare word, or anything the
+    // lexer misreads, keeps the trimmed text, which never merges meanings).
+    if parses_identically(trimmed, &out) {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
+}
+
+/// Whether two nPL texts parse to the same AST (both must parse).
+fn parses_identically(a: &str, b: &str) -> bool {
+    matches!(
+        (nanosiem_core::query::parse_query(a), nanosiem_core::query::parse_query(b)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
+/// NAN-4664: whether this request may READ the Redis result cache.
+/// `use_cache` is tri-state on the wire: absent keeps the historical
+/// behavior (read, for API keys, agents and sessions alike), an explicit
+/// `true` reads, an explicit `false` skips the read (a fresh run that still
+/// writes the cache and still shares an identical in-flight run). The
+/// `x-nano-cache-bypass` header (and the handler's other bypasses) always
+/// skip the read.
+pub fn reads_result_cache(bypass: bool, explicit_use_cache: Option<bool>) -> bool {
+    !bypass && explicit_use_cache.unwrap_or(true)
+}
+
 /// Search result cache backed by Dragonfly/Redis
 #[derive(Clone)]
 pub struct SearchResultCache {
@@ -123,52 +191,71 @@ impl SearchResultCache {
         scope: &ScopeSet,
         generation: Option<&ServingGenerationKey>,
     ) -> String {
+        Self::search_identity_key(tenant, "search", request, scope, generation, &[])
+    }
+
+    /// NAN-4664: the identity of one in-flight search run, shared by every
+    /// identical concurrent request: everything [`Self::cache_key_for`] folds
+    /// (tenant, serving generation, effective source and artifact deny sets,
+    /// perf overrides, normalized query, exact time bounds, limit, offset,
+    /// result-shaping flags, dataset) plus `include_sql`, which shapes the
+    /// response too.
+    ///
+    /// Also `use_cache` (an explicit `true` lets ClickHouse serve its own
+    /// query cache, so a `false` caller never follows such a run) and
+    /// `authority`: the caller's server-resolved authority fingerprint
+    /// (plan/entitlement, prevalence and retention revisions, admission
+    /// priority; see the search handler), so nothing that can shape a result
+    /// differs between a leader and its followers.
+    pub fn inflight_key_for(
+        tenant: SearchTenantScope,
+        request: &SearchRequest,
+        scope: &ScopeSet,
+        generation: Option<&ServingGenerationKey>,
+        authority: &[u8],
+    ) -> String {
+        let include_sql: &[u8] = if request.include_sql.unwrap_or(false) { b"sql1" } else { b"sql0" };
+        let use_cache: &[u8] = if request.use_cache { b"uc1" } else { b"uc0" };
+        Self::search_identity_key(tenant, "inflight", request, scope, generation, &[include_sql, use_cache, authority])
+    }
+
+    fn search_identity_key(
+        tenant: SearchTenantScope,
+        prefix: &str,
+        request: &SearchRequest,
+        scope: &ScopeSet,
+        generation: Option<&ServingGenerationKey>,
+        extra: &[&[u8]],
+    ) -> String {
         let mut generation_bytes = Vec::new();
         if let Some(generation) = generation {
             generation.fold_identity(&mut generation_bytes);
         }
+        let query = normalize_query(&request.query);
+        let start = request.time_range.start.timestamp_micros().to_string();
+        let end = request.time_range.end.timestamp_micros().to_string();
+        let limit = request.limit.unwrap_or(100).to_string();
+        let offset = request.offset.unwrap_or(0).to_string();
         // Length-prefixed components (see `companion_key`): the query is
         // free-form and contains `|`, so a delimiter join is collision-prone.
-        Self::companion_key_with_generation(
-            tenant,
-            "search",
-            &[
+        let mut components: Vec<&[u8]> = vec![
                 generation_bytes.as_slice(),
-                request.query.as_bytes(),
-                request
-                    .time_range
-                    .start
-                    .timestamp_micros()
-                    .to_string()
-                    .as_bytes(),
-                request
-                    .time_range
-                    .end
-                    .timestamp_micros()
-                    .to_string()
-                    .as_bytes(),
-                request.limit.unwrap_or(100).to_string().as_bytes(),
-                request.offset.unwrap_or(0).to_string().as_bytes(),
+                query.as_bytes(),
+                start.as_bytes(),
+                end.as_bytes(),
+                limit.as_bytes(),
+                offset.as_bytes(),
                 if request.table_view { b"tv1" } else { b"tv0" },
-                if request.skip_histogram {
-                    b"sh1"
-                } else {
-                    b"sh0"
-                },
-                if request.skip_field_stats {
-                    b"sf1"
-                } else {
-                    b"sf0"
-                },
+                if request.skip_histogram { b"sh1" } else { b"sh0" },
+                if request.skip_field_stats { b"sf1" } else { b"sf0" },
                 // NAN-1569: the same nPL string runs against different physical
                 // tables per dataset (logs / otel_spans / otel_metrics). Without
                 // this, a query cached for one dataset is served for another →
                 // cross-dataset cache poisoning.
                 request.dataset.as_deref().unwrap_or("logs").as_bytes(),
-            ],
-            scope,
-            generation.is_some(),
-        )
+        ];
+        components.extend_from_slice(extra);
+        Self::companion_key_with_generation(tenant, prefix, &components, scope, generation.is_some())
     }
 
     /// Try to get a cached search response for this request under the
@@ -1103,7 +1190,7 @@ mod tests {
 /// Whether an nPL query reads tenant state that the serving generation does
 /// not version: lookup tables, IOC lookup/feed sources, or `| ai` (NAN-2922).
 /// An unparseable query is treated as uncacheable.
-fn reads_state_outside_the_generation(query: &str) -> bool {
+pub(crate) fn reads_state_outside_the_generation(query: &str) -> bool {
     use nanosiem_core::query::{Command, Query, SearchExpr};
     fn expr(e: &SearchExpr) -> bool {
         match e {
@@ -1155,5 +1242,87 @@ mod shared_state_cache_tests {
         for query in ["* | stats count() by user.name", "* | output x", "ioc=\"1.2.3.4\""] {
             assert!(!uncacheable(query), "{query}");
         }
+    }
+}
+
+#[cfg(test)]
+mod nan4664_cache_identity_tests {
+    use super::*;
+
+    #[test]
+    fn normalization_trims_and_collapses_only_outside_strings() {
+        assert_eq!(normalize_query("  class_uid=1007   |  stats count by  process.name \t"), "class_uid=1007 | stats count by process.name");
+        // Inside quotes whitespace is data.
+        assert_eq!(normalize_query(r#"message="a   b"  |  head 5"#), r#"message="a   b" | head 5"#);
+        assert_eq!(normalize_query("user='x  y'   | head"), "user='x  y' | head");
+        // Newlines are kept: a `//` comment ends at one.
+        assert_eq!(normalize_query("a\n  | head 5"), "a\n | head 5");
+    }
+
+    #[test]
+    fn normalization_is_conservative_where_meaning_could_change() {
+        // Regex literals, comments, division: only trimmed.
+        for query in ["user=/admin  .*/i", "a // note  x\n| head", "eval r=a/b  | head", r#"message="a\"  b""#, "x=`y  z`"] {
+            assert_eq!(normalize_query(&format!("  {query}  ")), query);
+        }
+        // An unbalanced quote: only trimmed.
+        assert_eq!(normalize_query(r#" message="a   b "#), r#"message="a   b"#);
+        // Different meanings never collapse together.
+        assert_ne!(normalize_query(r#"message="a b""#), normalize_query(r#"message="a  b""#));
+    }
+
+    /// Review (NAN-4664): whatever the lexer guesses, a normalized query is
+    /// either the trimmed text or parses to exactly the original's AST, so
+    /// two queries of different meaning can never share an identity.
+    #[test]
+    fn normalization_never_changes_the_parsed_query() {
+        let corpus = [
+            "class_uid=1007   |  stats count by  process.name",
+            r#"x=a"b m="p   q" y=c"d"#,
+            r#"user=O'Brien   m="x  ' y   z"   n='w'"#,
+            r#"* | eval label="a   b"  |  table label"#,
+            r#"* | rex field=message "(?<user>\w+)  logged"  | head 5"#,
+            "* | where  count  >  10\n  | head  5",
+            "process.name=cmd.exe\t\t| stats  count",
+            r#"message="unterminated   | head"#,
+        ];
+        for query in corpus {
+            let normalized = normalize_query(query);
+            if normalized.as_ref() != query.trim() {
+                assert!(
+                    parses_identically(query.trim(), &normalized),
+                    "{query:?} normalized to {normalized:?} with a different meaning"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn use_cache_tri_state_read_decision() {
+        // Absent: today's behavior (read) for every caller.
+        assert!(reads_result_cache(false, None));
+        assert!(reads_result_cache(false, Some(true)));
+        // Explicit false: a fresh run (it still writes and still shares).
+        assert!(!reads_result_cache(false, Some(false)));
+        // The bypass header always wins.
+        assert!(!reads_result_cache(true, None));
+        assert!(!reads_result_cache(true, Some(true)));
+    }
+
+    #[test]
+    fn cache_key_uses_the_normalized_query() {
+        let request = |query: &str| -> SearchRequest {
+            serde_json::from_value(serde_json::json!({"query": query,
+                "time_range": {"start": "2026-10-26T00:00:00Z", "end": "2026-10-27T00:00:00Z"}})).unwrap()
+        };
+        let scope = ScopeSet::default();
+        assert_eq!(
+            SearchResultCache::cache_key(&request(" class_uid=1007  | head 5 "), &scope),
+            SearchResultCache::cache_key(&request("class_uid=1007 | head 5"), &scope),
+        );
+        assert_ne!(
+            SearchResultCache::cache_key(&request(r#"m="a  b""#), &scope),
+            SearchResultCache::cache_key(&request(r#"m="a b""#), &scope),
+        );
     }
 }

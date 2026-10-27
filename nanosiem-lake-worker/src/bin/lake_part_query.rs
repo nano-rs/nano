@@ -21,7 +21,7 @@ use futures::FutureExt;
 use nanosiem_lake_worker::part_ingest::cell::{trusted_from, HttpPartSigner};
 use nanosiem_lake_worker::part_ingest::r2_put::R2PartStore;
 use nanosiem_lake_worker::part_ingest::s3_store::S3Location;
-use nanosiem_lake_worker::part_ingest::finding_outbox::{drain_pass_cached, DrainLogCache, DrainPass};
+use nanosiem_lake_worker::part_ingest::finding_outbox::{drain_pass_cached, retention_overdue_ms, DrainLogCache, DrainPass};
 use nanosiem_lake_worker::part_ingest::finding_append::{FindingAppendRequest, FindingAppendResponse, FindingAppendTransport, submit_stream};
 use nanosiem_lake_cell::contract::{Assignment, Role};
 use nanosiem_lake_cell::child::TenantService;
@@ -51,6 +51,11 @@ struct FindingDrainService {
     /// `created_at` unix ms of the oldest unpublished row; 0 = none. The
     /// heartbeat reports its live age, so a pass that hangs still ages it.
     oldest_pending_ms: AtomicI64,
+    /// NAN-4610: `published_at` unix ms of the oldest delivered row still
+    /// retained, from the last scheduled retention check; 0 = none retained
+    /// or not yet checked. The heartbeat ages it, so a prune that stops
+    /// deleting shows as a growing `retention_overdue_seconds`.
+    oldest_retained_published_ms: AtomicI64,
     wake: tokio::sync::Notify,
     next_peer: AtomicU64,
     peers: tokio::sync::Mutex<std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<tokio::net::UnixStream>>>,
@@ -120,11 +125,14 @@ impl TenantService for FindingDrainService {
     fn heartbeat(&self) -> nanosiem_lake_cell::contract::Heartbeat {
         let backlog = self.backlog.load(Ordering::Relaxed);
         let oldest = self.oldest_pending_ms.load(Ordering::Relaxed);
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let age_s = if backlog > 0 && oldest > 0 {
-            (chrono::Utc::now().timestamp_millis() - oldest).max(0) as f64 / 1000.0
+            (now_ms - oldest).max(0) as f64 / 1000.0
         } else {
             0.0
         };
+        let retained = self.oldest_retained_published_ms.load(Ordering::Relaxed);
+        let overdue_s = retention_overdue_ms((retained != 0).then_some(retained), now_ms) as f64 / 1000.0;
         nanosiem_lake_cell::contract::Heartbeat {
             credential_refresh_at_risk: self.refresher.get().is_some_and(|refresh| refresh.at_risk()),
             busy: self.busy.load(Ordering::Relaxed),
@@ -133,6 +141,9 @@ impl TenantService for FindingDrainService {
             queue_depth: backlog,
             lag_seconds: age_s,
             detail: (backlog > 0).then(|| format!("finding outbox: {backlog} pending, oldest {age_s:.0}s")),
+            finding_outbox: Some(nanosiem_lake_cell::contract::FindingOutboxStatus {
+                backlog, oldest_age_seconds: age_s, retention_overdue_seconds: overdue_s,
+            }),
             ..Default::default()
         }
     }
@@ -214,14 +225,24 @@ impl TenantService for DetectService {
     }
 
     fn heartbeat(&self) -> nanosiem_lake_cell::contract::Heartbeat {
-        let (drain, query) = (self.drain.heartbeat(), self.query.heartbeat());
-        nanosiem_lake_cell::contract::Heartbeat {
-            credential_refresh_at_risk: drain.credential_refresh_at_risk,
-            busy: drain.busy || query.busy,
-            last_progress_unix_ms: drain.last_progress_unix_ms.max(query.last_progress_unix_ms),
-            queue_depth: query.queue_depth,
-            ..Default::default()
-        }
+        detect_heartbeat(self.drain.heartbeat(), self.query.heartbeat())
+    }
+}
+
+/// detect[T]'s heartbeat with the rule engine: its `queue_depth` is the
+/// engine's, and the drain's outbox facts travel in `finding_outbox`
+/// (NAN-4610: before, they were dropped, so `finding_outbox_age` read 0 for
+/// every rule-running tenant however stuck its drain was).
+fn detect_heartbeat(drain: nanosiem_lake_cell::contract::Heartbeat, query: nanosiem_lake_cell::contract::Heartbeat)
+    -> nanosiem_lake_cell::contract::Heartbeat {
+    nanosiem_lake_cell::contract::Heartbeat {
+        credential_refresh_at_risk: drain.credential_refresh_at_risk,
+        busy: drain.busy || query.busy,
+        last_progress_unix_ms: drain.last_progress_unix_ms.max(query.last_progress_unix_ms),
+        queue_depth: query.queue_depth,
+        finding_outbox: drain.finding_outbox,
+        detail: drain.detail,
+        ..Default::default()
     }
 }
 
@@ -266,6 +287,12 @@ fn record_backlog(service: &FindingDrainService, report: &DrainPass) {
     // re-reads the exact count and oldest row.
     service.backlog.store(report.backlog.saturating_sub(report.committed as u64), Ordering::Relaxed);
     service.oldest_pending_ms.store(report.oldest_created_ms.unwrap_or(0), Ordering::Relaxed);
+    // Only a pass that ran the scheduled check updates the retained age; a
+    // failed check keeps the last reading (which keeps ageing).
+    if let Some(retention) = report.retention {
+        service.oldest_retained_published_ms
+            .store(retention.oldest_retained_published_ms.unwrap_or(0), Ordering::Relaxed);
+    }
 }
 
 /// Every pass that saw pending rows, claimed rows or skipped them logs one
@@ -860,5 +887,45 @@ mod refresh_health_tests {
         assert!(service.heartbeat().credential_refresh_at_risk);
         refresher.refreshed(chrono::Utc::now() + chrono::Duration::seconds(600));
         assert!(!service.heartbeat().credential_refresh_at_risk);
+    }
+
+    /// NAN-4610: the drain's outbox facts reach the supervisor for both
+    /// detect shapes (drain-only and with the rule engine), including how
+    /// far delivered rows have outlived retention.
+    #[test]
+    fn detect_heartbeat_carries_the_drain_outbox_facts() {
+        use nanosiem_lake_worker::part_ingest::finding_outbox::RetentionCheck;
+        let service = FindingDrainService::default();
+        let now = chrono::Utc::now().timestamp_millis();
+        let fresh = service.heartbeat().finding_outbox.unwrap();
+        assert_eq!((fresh.backlog, fresh.oldest_age_seconds, fresh.retention_overdue_seconds), (0, 0.0, 0.0));
+        let report = DrainPass {
+            backlog: 1_200, committed: 200, oldest_created_ms: Some(now - 700_000),
+            retention: Some(RetentionCheck { oldest_retained_published_ms: Some(now - 10 * 86_400_000) }),
+            ..DrainPass::default()
+        };
+        record_backlog(&service, &report);
+        let drain = service.heartbeat();
+        let outbox = drain.finding_outbox.unwrap();
+        assert_eq!(outbox.backlog, 1_000);
+        assert!(outbox.oldest_age_seconds >= 700.0, "{outbox:?}");
+        assert!((2.0 * 86_400.0..2.0 * 86_400.0 + 60.0).contains(&outbox.retention_overdue_seconds), "{outbox:?}");
+        // A pass without a retention check keeps the last reading.
+        record_backlog(&service, &DrainPass::default());
+        assert!(service.heartbeat().finding_outbox.unwrap().retention_overdue_seconds >= 2.0 * 86_400.0);
+        // Healthy: the oldest delivered row is inside the window.
+        record_backlog(&service, &DrainPass { retention: Some(RetentionCheck { oldest_retained_published_ms: Some(now - 86_400_000) }),
+            ..DrainPass::default() });
+        assert_eq!(service.heartbeat().finding_outbox.unwrap().retention_overdue_seconds, 0.0);
+
+        // With the rule engine: queue_depth is the engine's, the outbox block the drain's.
+        record_backlog(&service, &report);
+        let query = nanosiem_lake_cell::contract::Heartbeat { queue_depth: 3, busy: true, ..Default::default() };
+        let detect = detect_heartbeat(service.heartbeat(), query);
+        assert_eq!(detect.queue_depth, 3);
+        let view = detect.finding_outbox_view();
+        assert_eq!(view.backlog, 1_000);
+        assert!(view.oldest_age_seconds >= 700.0 && view.retention_overdue_seconds >= 86_400.0, "{view:?}");
+        assert!(detect.detail.as_deref().is_some_and(|d| d.contains("1000 pending")), "{detect:?}");
     }
 }

@@ -70,6 +70,57 @@ pub const RECEIPT_RECONCILE_AUDIENCE: &str = "nano-lake-receipt-reconcile";
 /// Largest secret blob delivered over the secrets memfd.
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 
+/// Fixed image-owned service support, never a caller-selected authority.
+/// Advertising this is compatibility information, not execution provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeChildService {
+    LandingBytesV1,
+    /// H02 B2 (C14 Option A): the socketless ingest worker. It writes its
+    /// spool under its own role dir; the supervisor publishes. Exactly one
+    /// part-channel fd arrives with `NativeRun`.
+    IngestPartsV1,
+    /// H02 B2: the socketless query worker. Every part byte comes through
+    /// its one part-channel fd; it has no tenant read path.
+    QueryPartsV1,
+}
+
+impl NativeChildService {
+    /// The one role each service serves.
+    pub fn role(self) -> Role {
+        match self {
+            NativeChildService::LandingBytesV1 => Role::Landing,
+            NativeChildService::IngestPartsV1 => Role::Ingest,
+            NativeChildService::QueryPartsV1 => Role::Query,
+        }
+    }
+    /// Services that receive exactly one supervisor part-channel fd.
+    pub fn has_part_channel(self) -> bool {
+        !matches!(self, NativeChildService::LandingBytesV1)
+    }
+}
+
+/// Bounds of a native part channel: one connected AF_UNIX SOCK_STREAM pair,
+/// u32 little-endian length-prefixed frames. The frame schema belongs to the
+/// cell composition (C14); the transport enforces only these bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartChannelLimits {
+    pub max_frame_bytes: u32,
+}
+impl PartChannelLimits {
+    /// 4 MiB range payload plus 64 KiB of frame header.
+    pub const MAX_FRAME_BYTES: u32 = 4 * 1024 * 1024 + 64 * 1024;
+    pub const DEFAULT: Self = Self { max_frame_bytes: Self::MAX_FRAME_BYTES };
+    pub fn valid(self) -> bool {
+        (1024..=Self::MAX_FRAME_BYTES).contains(&self.max_frame_bytes)
+    }
+}
+
+pub(crate) fn valid_native_services(services: &[NativeChildService]) -> bool {
+    services.len() <= 1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -245,6 +296,27 @@ pub struct JailSpec {
     /// RLIMIT_CORE is always 0; RLIMIT_NOFILE soft/hard.
     pub max_open_files: u64,
 }
+
+/// Native byte conversion receives no control URL, signing/proxy credential,
+/// writer lease, feed or storage endpoint. Existing Landing role isolation is
+/// still mandatory; this payload and Hello support alone grant no authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeLandingAssignment {
+    pub tenant: TenantId,
+    pub cell_id: String,
+    pub state_dir: PathBuf,
+    pub tmp_dir: PathBuf,
+    pub memory_cap_bytes: u64,
+    pub cpu_millis: u32,
+    pub jail: JailSpec,
+    /// Present exactly for services with a part channel (H02 B2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_channel: Option<PartChannelLimits>,
+}
+/// H02 B2: the same reduced payload serves Landing, Ingest and Query; the
+/// service fixes the role, its state dir and its system closure.
+pub type NativeRoleAssignment = NativeLandingAssignment;
 
 /// Redact credentials even when an assignment appears in a diagnostic.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -535,6 +607,12 @@ pub struct TrustedSignerKey {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToChild {
     Assign { protocol_version: u32, assignment: Box<Assignment> },
+    /// Reader-first only; native parent emission awaits verified package and
+    /// actual worker readiness. Old workers reject this distinct tag.
+    NativeAssign { protocol_version: u32, service: NativeChildService, assignment: Box<NativeLandingAssignment> },
+    /// Authorizes starting the fixed byte service after the guarded jail check,
+    /// with NO secret/memfd. It is not source/storage/publication authority.
+    NativeRun { service: NativeChildService },
     /// A sealed memfd is attached. Sent once in the handshake and again in
     /// answer to `RefreshSecrets`.
     Secrets,
@@ -553,8 +631,8 @@ pub enum ToChild {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToSupervisor {
-    Hello { pid: u32, protocol_version: u32 },
-    Jailed { uid: u32, gid: u32, landlock: String, seccomp: bool },
+    Hello { pid: u32, protocol_version: u32, #[serde(default, skip_serializing_if = "Vec::is_empty")] native_services: Vec<NativeChildService> },
+    Jailed { uid: u32, gid: u32, landlock: String, seccomp: bool, #[serde(default)] cgroupns: bool },
     Ready,
     Heartbeat(Heartbeat),
     Fatal { error: String },
@@ -571,6 +649,8 @@ pub enum ToSupervisor {
 /// Liveness plus the progress facts the stall/lag signals are built on.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Heartbeat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_catalog_custody: Option<serde_json::Value>,
     /// Live ingest pipeline diagnostics; readable independently of the ingest lock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingest_diagnostics: Option<serde_json::Value>,
@@ -619,6 +699,14 @@ pub struct Heartbeat {
     /// Old children omit it (0).
     #[serde(default)]
     pub prevalence_degraded_seconds_total: f64,
+    /// NAN-4445, ingest: `Some(false)` while a new process does not yet know
+    /// whether a degraded spell is under way (it is still reading the spell a
+    /// previous process persisted, or its first open has not finished). The
+    /// supervisor then reports no `prevalence_degraded` signal, so a cell roll
+    /// leaves a firing alert firing instead of resolving it on a 0. Old
+    /// children omit it (`None`): reported as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prevalence_degraded_known: Option<bool>,
     /// Unix ms of the last unit of forward progress (part appended, merge
     /// finished, query answered). 0 = none yet.
     #[serde(default)]
@@ -676,6 +764,40 @@ pub struct Heartbeat {
     /// status push. Other roles omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub landing: Option<LandingStatus>,
+    /// detect (NAN-4610): the finding drain's own outbox facts. With
+    /// `detect_runs_rules` the generic `queue_depth` is the rule engine's
+    /// queue and `lag_seconds` is not the drain's, so the drain reports here.
+    /// Old children omit it; the supervisor then reads the drain-only
+    /// `queue_depth` / `lag_seconds` as before ([`Heartbeat::finding_outbox_view`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_outbox: Option<FindingOutboxStatus>,
+}
+
+/// detect[T]'s finding-outbox drain state (NAN-4610).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct FindingOutboxStatus {
+    /// Rows not yet in the lake (risk or event component unacknowledged).
+    #[serde(default)]
+    pub backlog: u64,
+    /// Age of the oldest of those rows; 0 with no backlog.
+    #[serde(default)]
+    pub oldest_age_seconds: f64,
+    /// How long the oldest retained *delivered* row has outlived the
+    /// retention window; 0 while the scheduled prune keeps up.
+    #[serde(default)]
+    pub retention_overdue_seconds: f64,
+}
+
+impl Heartbeat {
+    /// The detect role's outbox facts: the dedicated block when the child
+    /// sends one, else the drain-only process's generic fields (old children).
+    pub fn finding_outbox_view(&self) -> FindingOutboxStatus {
+        self.finding_outbox.unwrap_or(FindingOutboxStatus {
+            backlog: self.queue_depth,
+            oldest_age_seconds: self.lag_seconds,
+            retention_overdue_seconds: 0.0,
+        })
+    }
 }
 
 /// landing[T]'s counters since its process started (NAN-4137). Reasons are
@@ -801,8 +923,20 @@ impl PartGcBlocked {
     }
 }
 
+pub fn catalog_custody_runway_seconds(status: Option<&serde_json::Value>, now_ms: u64) -> Option<f64> {
+    let expires=status?.get("credential_expires_at_ms")?.as_i64()?;
+    (expires>0).then_some(expires.saturating_sub(i64::try_from(now_ms).unwrap_or(i64::MAX)) as f64/1000.0)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_custody_expiry_metric_reports_expired_and_omits_uninstalled() {
+        assert_eq!(super::catalog_custody_runway_seconds(None,1000),None);
+        let status=serde_json::json!({"credential_expires_at_ms":2000});
+        assert_eq!(super::catalog_custody_runway_seconds(Some(&status),1000),Some(1.0));
+        assert_eq!(super::catalog_custody_runway_seconds(Some(&status),3000),Some(-1.0));
+    }
     use super::*;
 
     #[test]
@@ -882,6 +1016,30 @@ mod tests {
         assert!(matches!(back, ToSupervisor::Heartbeat(h) if h.busy));
         let w: ToChild = serde_json::from_str(r#"{"type":"wake","reason":"data_arrival"}"#).unwrap();
         assert!(matches!(w, ToChild::Wake { reason: WakeReason::DataArrival }));
+    }
+
+    /// NAN-4610: an old detect child (no `finding_outbox`) keeps reporting
+    /// through `queue_depth` / `lag_seconds`; a new one is read from its own
+    /// block even when the generic fields carry the rule engine's numbers.
+    #[test]
+    fn finding_outbox_view_prefers_the_drain_block_and_reads_old_children() {
+        let old: Heartbeat = serde_json::from_str(r#"{"busy":false,"queue_depth":7,"lag_seconds":42.0}"#).unwrap();
+        assert_eq!(old.finding_outbox_view(),
+            FindingOutboxStatus { backlog: 7, oldest_age_seconds: 42.0, retention_overdue_seconds: 0.0 });
+        let new = Heartbeat {
+            queue_depth: 3,
+            finding_outbox: Some(FindingOutboxStatus { backlog: 900, oldest_age_seconds: 700.0, retention_overdue_seconds: 5.0 }),
+            ..Default::default()
+        };
+        let back: Heartbeat = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.finding_outbox_view(), new.finding_outbox.unwrap());
+        assert!(!serde_json::to_string(&Heartbeat::default()).unwrap().contains("finding_outbox"));
+    }
+
+    #[test]
+    fn legacy_jailed_report_does_not_assert_a_cgroup_namespace() {
+        let message: ToSupervisor = serde_json::from_str(r#"{"type":"jailed","uid":20000,"gid":20000,"landlock":"full","seccomp":true}"#).unwrap();
+        assert!(matches!(message, ToSupervisor::Jailed { cgroupns: false, .. }));
     }
 }
 

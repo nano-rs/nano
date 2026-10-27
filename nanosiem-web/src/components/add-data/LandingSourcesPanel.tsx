@@ -56,7 +56,7 @@ function StateBadge({ state }: { state: string }) {
       ? 'text-emerald-500 border-emerald-500/40'
       : state === 'refused'
         ? 'text-red-500 border-red-500/40'
-        : state === 'claimed'
+        : state === 'claimed' || state === 'listed'
           ? 'text-amber-500 border-amber-500/40'
           : 'text-muted-foreground border-border';
   return <span className={cn('inline-flex items-center h-4 px-1.5 rounded-sm border font-mono text-[10px]', tone)}>{state}</span>;

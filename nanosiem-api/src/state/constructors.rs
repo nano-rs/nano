@@ -899,13 +899,24 @@ impl AppState {
         let task_registry = TaskRegistry::default();
         #[cfg(feature = "enterprise")]
         let soar_service = if let Some(runtime) = tenant_ai_rls_runtime.as_ref() {
-            match nanosiem_enterprise::soar::service::SoarService::connect_startup(
+            match nanosiem_enterprise::soar::service::SoarService::connect_startup_for_deployment(
                 runtime.clone(),
                 encryption_service.clone(),
+                config.deployment_mode.soar_smtp_deployment(),
             )
             .await
             {
-                Ok(service) => Some(Arc::new(service.with_shutdown(task_registry.shutdown_token()))),
+                Ok(mut service) => {
+                    if let Some(resolver) = tenant_search_runtime_resolver.as_ref() {
+                        service = service.with_tenant_search(pg_pool.clone(), resolver.clone());
+                    }
+                    service = service.with_tenant_judge(pg_pool.clone(), Arc::new(
+                        nanosiem_enterprise::melod::TenantSystemAiPrincipalFactory::new(
+                            pg_pool.clone(),runtime.clone(),agent_config_registry.clone(),
+                        ),
+                    ));
+                    Some(Arc::new(service.with_shutdown(task_registry.shutdown_token())))
+                }
                 Err(_) => {
                     tracing::error!("SOAR service construction unavailable");
                     None

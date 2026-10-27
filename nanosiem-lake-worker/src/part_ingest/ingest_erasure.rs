@@ -107,6 +107,15 @@ struct StepContext {
 }
 
 impl<'a> Ingestor<'a> {
+    /// NAN-4539: while an erasure order or step is active, ingest keeps the
+    /// serial (one flight) pipeline it ran beside erasure before bounded
+    /// overlap: no second sealed flight is started across a privacy
+    /// transition. Steps are not held for the single flight (that would
+    /// starve an order for as long as catch-up lasts).
+    pub(super) fn erasure_pipeline_barrier(&self) -> bool {
+        self.erasure.order.is_some() || self.erasure.flight.is_some()
+    }
+
     /// Install the exchange's `erasure_ledger` slot. Without it (an image
     /// whose platform does not declare it the tenant's executor) ingest never
     /// touches an erasure order.
@@ -135,6 +144,7 @@ impl<'a> Ingestor<'a> {
     /// One bounded erasure step. Failures are isolated like merges: logged,
     /// counted on the order, backed off.
     pub(super) async fn tick_erasure(&mut self, now_ms: i64, lag_ms: i64) {
+        if self.cfg.catalog_attachment_failure.is_some() { return; }
         if (self.erasure.slot.is_none() && self.erasure.fixed.is_none()) || now_ms < self.erasure.retry_not_before_ms {
             return;
         }
@@ -497,6 +507,7 @@ impl<'a> Ingestor<'a> {
     }
 
     async fn complete_erasure(&mut self, now_ms: i64) -> Result<()> {
+        if self.cfg.catalog_attachment_failure.is_some() { return Ok(()); }
         if self.cfg.catalog.is_some() {
             self.tick_catalog(now_ms).await;
             let order = self.erasure.order.as_ref().context("order")?;
@@ -574,4 +585,116 @@ async fn run_step(
 ) -> Result<StepOutcome> {
     let io = LakeStepIo { store, signer, context, order };
     execute_step(&io, hour, candidates, truncated).await
+}
+
+/// Tests of the cell constructor (NAN-4539): an active erasure order.
+#[cfg(test)]
+impl Ingestor<'_> {
+    pub(crate) fn set_erasure_order_for_test(&mut self, active: bool) {
+        self.erasure.order = active.then(pipeline_barrier_tests::order);
+    }
+}
+
+/// NAN-4539: the effective flush depth through the production constructor.
+/// Two only with the cell's background handles and a two-range queue; one
+/// (the serial contract) under every barrier, and a second seal never uses
+/// the one-object progress escape.
+#[cfg(test)]
+mod pipeline_barrier_tests {
+    use crate::enrichment::BronzeIngestEnricher;
+    use crate::erasure::{ErasureIdentifierType, ErasureSubject};
+    use crate::part_ingest::discovery::NoticeHandle;
+    use crate::part_ingest::ingest::{seed_schema, IngestConfig, Ingestor};
+    use crate::part_ingest::lean_erasure::{LeanErasureOrder, LeanPhase, LeanProgress, LEAN_EXECUTOR_KIND};
+    use crate::part_ingest::{NoticeQueue, SourceNotice, SpoolQueue};
+    use crate::parts::part_log::LocalObjectStore;
+    use crate::parts::provenance::LocalPartSigner;
+    use anyhow::Result;
+
+    const TENANT: &str = "45390000-0000-4000-8000-000000000001";
+
+    struct TwoRanges(SpoolQueue);
+
+    #[async_trait::async_trait]
+    impl NoticeQueue for TwoRanges {
+        async fn pending(&self, max: usize) -> Result<Vec<(NoticeHandle, SourceNotice)>> {
+            self.0.pending(max).await
+        }
+        async fn ack(&self, handles: &[NoticeHandle]) -> Result<()> {
+            self.0.ack(handles).await
+        }
+        fn max_outstanding_ranges(&self) -> usize {
+            2
+        }
+    }
+
+    pub(super) fn order() -> LeanErasureOrder {
+        LeanErasureOrder {
+            tenant_id: TENANT.into(),
+            order_id: uuid::Uuid::from_u128(0x4539),
+            request_id: uuid::Uuid::from_u128(0x4540),
+            subject: ErasureSubject::new(ErasureIdentifierType::Username, "jdoe").unwrap(),
+            identifier_hash: Some("0".repeat(64)),
+            redact_free_text: true,
+            floor_us: 0,
+            cutoff_us: i64::MAX / 2,
+            progress: LeanProgress { executor: LEAN_EXECUTOR_KIND.into(), phase: LeanPhase::Scan, sweep_started_ms: Some(0), ..LeanProgress::default() },
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_overlap_needs_handles_and_drops_to_serial_at_every_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: &'static LocalObjectStore = Box::leak(Box::new(LocalObjectStore::new(dir.path().join("parts")).unwrap()));
+        let signer: &'static LocalPartSigner = Box::leak(Box::new(
+            LocalPartSigner::new("lab-signer-barrier", ed25519_dalek::SigningKey::from_bytes(&[9; 32])).unwrap()));
+        let queue = TwoRanges(SpoolQueue::new(dir.path().join("spool"), TENANT).unwrap());
+        let serial_queue = SpoolQueue::new(dir.path().join("spool-serial"), TENANT).unwrap();
+        let cfg = |work: &str| {
+            let mut cfg = IngestConfig::new(TENANT, dir.path().join(work));
+            cfg.prevalence_enabled = false;
+            cfg
+        };
+        let now_ms = 1_800_000_000_000_i64;
+        // A one-range queue stays serial whatever the handles.
+        let mut serial = Ingestor::open(cfg("serial"), store, store, &serial_queue, signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), now_ms).await.unwrap();
+        serial.set_background_store(store);
+        serial.set_background_signer(signer);
+        assert_eq!(serial.flush_depth(), 1, "queue range capacity caps the depth");
+        drop(serial);
+        let mut ingestor = Ingestor::open(cfg("bounded"), store, store, &queue, signer, signer.trusted(),
+            BronzeIngestEnricher::disabled(), &seed_schema(), now_ms).await.unwrap();
+        assert_eq!(ingestor.cfg.flush_depth, 2, "the constructor default, no deployment switch");
+        assert_eq!(ingestor.flush_depth(), 1, "without the cell's background handles: serial");
+        ingestor.set_background_store(store);
+        assert_eq!(ingestor.flush_depth(), 1, "a store without a signer is not enough");
+        ingestor.set_background_signer(signer);
+        assert_eq!(ingestor.flush_depth(), 2);
+        ingestor.admission_paused = true;
+        assert_eq!(ingestor.flush_depth(), 1, "an over-commit hold pause keeps the serial path");
+        ingestor.admission_paused = false;
+        ingestor.cfg.catalog_attachment_failure = Some("catalog_attach_failed");
+        assert_eq!(ingestor.flush_depth(), 1, "a degraded catalog attachment keeps the serial path");
+        ingestor.cfg.catalog_attachment_failure = None;
+        ingestor.erasure.order = Some(order());
+        assert!(ingestor.erasure_pipeline_barrier());
+        assert_eq!(ingestor.flush_depth(), 1, "an active erasure order keeps the serial path");
+        ingestor.erasure.order = None;
+        assert_eq!(ingestor.flush_depth(), 2);
+        // A second seal must fit its full minimum build reservation beside
+        // the flights and merges, not only the admission estimate.
+        ingestor.buffer.rows = 1;
+        ingestor.buffer.bytes = 1;
+        assert!(ingestor.may_seal_beside_flights(true));
+        assert!(!ingestor.may_seal_beside_flights(false), "a non-pipelined flush never seals beside a flight");
+        ingestor.buffer.bytes = ingestor.cfg.buffer_budget_bytes;
+        assert!(!ingestor.may_seal_beside_flights(true), "an oversized buffer drains to the serial path");
+        ingestor.buffer.bytes = 1;
+        ingestor.pending_schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("nan4539_growth", arrow_schema::DataType::Utf8, true)]));
+        assert!(!ingestor.may_seal_beside_flights(true), "schema growth drains earlier flights first");
+        ingestor.pending_schema = ingestor.schema.clone();
+        ingestor.buffer.rows = 0;
+    }
 }

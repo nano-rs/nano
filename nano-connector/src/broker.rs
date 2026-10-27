@@ -107,6 +107,7 @@ pub struct EgressGrant {
 pub enum GrantPurpose {
     /// A native SOAR vendor call.
     Soar,
+    SoarSmtp,
     Connector,
     ThreatIntel,
 }
@@ -115,6 +116,7 @@ impl GrantPurpose {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Soar => "soar",
+            Self::SoarSmtp => "soar_smtp",
             Self::Connector => "connector",
             Self::ThreatIntel => "threat_intel",
         }

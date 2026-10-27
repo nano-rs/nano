@@ -439,7 +439,7 @@ async fn start_cell_placed(cfg: CellConfig, tenants: Vec<TenantPlacement>) -> Ce
         }
     }
     let sup = Supervisor::new(cfg.clone(), Arc::new(keys)).expect("supervisor");
-    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants }).unwrap();
+    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants }).await.unwrap();
     sup.start_background();
     let router = Router::new(sup.clone()).unwrap();
     let sock = cfg.listen_unix.clone().unwrap();
@@ -847,6 +847,103 @@ async fn suite() {
         r.check("bravo remains alive while alpha is CPU throttled",
             cell.whoami("bravo").await["pid"].as_u64() == b_pid_before,
             format!("bravo pid before {b_pid_before:?}"));
+
+        // --- NAN-4642: a placement reload that shrinks a tenant below its
+        // usage while its process is being replaced (the 2026-10-26
+        // cell-us-1 reload cgroup-OOM-killed a tenant's stopping detect).
+        const MIB: u64 = 1 << 20;
+        let num = |p: PathBuf| std::fs::read_to_string(&p).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let oom_kills = |d: &Path| std::fs::read_to_string(d.join("memory.events")).unwrap_or_default().lines()
+            .find_map(|l| l.strip_prefix("oom_kill ").and_then(|v| v.parse::<u64>().ok())).unwrap_or(0);
+        let q_before = Cell::pid_of(&cell.status().await, "alpha", "query");
+        r.allowed("alpha/query holds 300 MiB before the reload", &cell.probe("alpha", "alloc", "mb=300").await);
+        let (q_used, t_used) = (num(a_dir.join("query/memory.current")).unwrap_or(0), num(a_dir.join("memory.current")).unwrap_or(0));
+        // The supervisor's count: the tenant cgroup itself may be removed
+        // and recreated once every alpha process has exited.
+        let sup_ooms = |st: &Value| Cell::tenant_status(st, "alpha")["oom_kills"].as_u64().unwrap_or(0);
+        let ooms_before = (oom_kills(&a_dir), sup_ooms(&cell.status().await));
+        // The limits the stopping query runs under now: a shrink holds them
+        // (not merely >= usage) until it has exited.
+        let (q_max_before, t_max_before) = (num(a_dir.join("query/memory.max")), num(a_dir.join("memory.max")));
+        // Query 3 -> 1 CPU (its threads change: it restarts) and every role
+        // budget far below what alpha uses now.
+        let shrunk = TenantPlacement {
+            ingest_request_millicores: Some(50), ingest_limit_millicores: Some(500),
+            ingest_request_memory_bytes: Some(32 * MIB), ingest_limit_memory_bytes: Some(64 * MIB),
+            detect_request_millicores: Some(50), detect_limit_millicores: Some(500),
+            detect_request_memory_bytes: Some(32 * MIB), detect_limit_memory_bytes: Some(64 * MIB),
+            query_request_millicores: Some(250), query_limit_millicores: Some(1_000),
+            query_request_memory_bytes: Some(32 * MIB), query_limit_memory_bytes: Some(128 * MIB),
+            ..TenantPlacement::legacy(tid("alpha"), 20.0)
+        };
+        cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 2,
+            tenants: vec![shrunk.clone(), TenantPlacement::legacy(tid("bravo"), 20.0)] }).await.unwrap();
+        let (q_max, t_max) = (num(a_dir.join("query/memory.max")), num(a_dir.join("memory.max")));
+        let st = cell.status().await;
+        let stopping = Cell::tenant_status(&st, "alpha")["processes"].as_array().unwrap().iter()
+            .any(|p| p["role"] == "query" && p["stopping"] == true);
+        r.check("reload shrink: the stopping query's leaf and the tenant keep their limit (>= usage) until it exits",
+            stopping && q_max.is_some() && q_max == q_max_before && t_max.is_some() && t_max == t_max_before
+                && q_max.is_some_and(|m| m >= q_used) && t_max.is_some_and(|m| m >= t_used) && q_used > 128 * MIB && t_used > 256 * MIB,
+            format!("query max {q_max_before:?} -> {q_max:?} used {q_used}, tenant max {t_max_before:?} -> {t_max:?} used {t_used}, query stopping {stopping}"));
+        tokio::time::sleep(Duration::from_millis(cfg.shutdown_grace_ms + 1500)).await;
+        let ooms_after = (if a_dir.is_dir() { oom_kills(&a_dir) } else { 0 }, sup_ooms(&cell.status().await));
+        let events = Cell::tenant_status(&cell.status().await, "alpha")["limit_events"].clone();
+        let cg_ooms = events.as_array().map_or(0, |v| v.iter().filter(|e| e["kind"] == "cgroup_oom_kill").count());
+        r.check("reload shrink: no cgroup OOM kill of the process being replaced",
+            ooms_after.1 == ooms_before.1 && (ooms_after.0 == ooms_before.0 || ooms_after.0 == 0),
+            format!("cgroup oom_kill {} -> {}, supervisor oom_kills {} -> {}, cgroup_oom_kill events {cg_ooms}",
+                ooms_before.0, ooms_after.0, ooms_before.1, ooms_after.1));
+        let q_after = cell.whoami("alpha").await["pid"].as_u64();
+        let t_shrink = Instant::now();
+        let target_t = nanosiem_lake_cell::resources::TenantLimits::from_placement(&shrunk, &cell.sup.capacity(), &cfg.resources).memory_hard_bytes;
+        let (mut q_max, mut t_max) = (None, None);
+        while t_shrink.elapsed() < Duration::from_secs(10) {
+            (q_max, t_max) = (num(a_dir.join("query/memory.max")), num(a_dir.join("memory.max")));
+            if q_max == Some(128 * MIB) && t_max == Some(target_t) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            cell.whoami("alpha").await;
+        }
+        r.check("reload shrink: the new limits apply once the old process exited (replacement serving)",
+            q_after.is_some() && q_after != q_before && q_max == Some(128 * MIB) && t_max == Some(target_t),
+            format!("query {q_before:?} -> {q_after:?}, query max {q_max:?}, tenant max {t_max:?} (target {target_t}) after {:?}", t_shrink.elapsed()));
+
+        // --- NAN-4642: an eps change reaches a running ingest (graceful
+        // restart at the new budget), as tzd's 145 -> 220 did not.
+        cell.wake("alpha", "ingest", "data_arrival").await;
+        let st = cell.status().await;
+        let ingest_of = |st: &Value| Cell::tenant_status(st, "alpha")["processes"].as_array().unwrap().iter()
+            .find(|p| p["role"] == "ingest").cloned().unwrap_or(Value::Null);
+        let i_before = ingest_of(&st);
+        let crashes_before = Cell::tenant_status(&st, "alpha")["crashes"]["ingest"].as_u64().unwrap_or(0);
+        let grown = TenantPlacement { eps: 40.0, ..TenantPlacement::legacy(tid("alpha"), 20.0) };
+        cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 3,
+            tenants: vec![grown, TenantPlacement::legacy(tid("bravo"), 20.0)] }).await.unwrap();
+        let t_eps = Instant::now();
+        let mut i_after = Value::Null;
+        while t_eps.elapsed() < Duration::from_secs(cfg.shutdown_grace_ms / 1000 + 10) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let _ = call(&cell.sock, Method::POST, "/v1/tenants/alpha/wake", Some(json!({"role": "ingest", "reason": "data_arrival"})), true).await;
+            i_after = ingest_of(&cell.status().await);
+            if i_after["ingest_eps"] == 40.0 && i_after["stopping"] != true {
+                break;
+            }
+        }
+        r.check("eps change: ingest restarts gracefully and runs at the new eps budget",
+            i_before["ingest_eps"] == 20.0 && i_after["pid"] != i_before["pid"] && i_after["ingest_eps"] == 40.0
+                && i_after["ingest_memory_cap_bytes"].as_u64() > i_before["ingest_memory_cap_bytes"].as_u64(),
+            format!("{} -> {} after {:?}", compact(&i_before), compact(&i_after), t_eps.elapsed()));
+        let crashes = Cell::tenant_status(&cell.status().await, "alpha")["crashes"]["ingest"].as_u64().unwrap_or(0);
+        r.check("eps change: the ingest restart is a stop, not a crash", crashes == crashes_before, format!("{crashes_before} -> {crashes}"));
+        // Back to the suite's placement for the checks below.
+        cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 4,
+            tenants: vec![TenantPlacement::legacy(tid("alpha"), 20.0), TenantPlacement::legacy(tid("bravo"), 20.0)] }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(cfg.shutdown_grace_ms + 500)).await;
+        cell.whoami("alpha").await;
+        cell.wake("alpha", "ingest", "data_arrival").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let (_, signals) = call(&cell.sock, Method::GET, "/v1/signals", None, true).await;
     let oom_sig = signals.as_array().unwrap().iter().any(|s| s["tenant_id"] == "alpha" && s["signal"] == "oom_kills" && s["severity"] != "ok");
@@ -1033,7 +1130,7 @@ async fn detect_runs_rules_phase(mnt: &Path, r: &mut Report) {
     // Shrink kilo's detect budget below the engine floor: the running
     // detect restarts, and /detect falls back to query[T].
     cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 2,
-        tenants: vec![sized("kilo", GIB / 4), TenantPlacement::legacy(tid("lima"), 20.0)] }).unwrap();
+        tenants: vec![sized("kilo", GIB / 4), TenantPlacement::legacy(tid("lima"), 20.0)] }).await.unwrap();
     let t0 = Instant::now();
     let mut after = (0u16, Value::Null);
     while t0.elapsed() < Duration::from_secs(10) {
@@ -1090,7 +1187,7 @@ async fn detect_refused_phase(mnt: &Path, r: &mut Report) {
     }
     let keys = Arc::new(RefusingDetect { inner, allow: false.into(), detect_mints: 0.into() });
     let sup = Supervisor::new(cfg.clone(), keys.clone()).expect("supervisor");
-    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants: vec![TenantPlacement::legacy(t.clone(), 20.0)] }).unwrap();
+    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants: vec![TenantPlacement::legacy(t.clone(), 20.0)] }).await.unwrap();
     sup.start_background();
     let router = Router::new(sup.clone()).unwrap();
     let sock = cfg.listen_unix.clone().unwrap();
@@ -1198,7 +1295,7 @@ async fn birth_preconditions_phase(mnt: &Path, r: &mut Report) {
     }
     let keys = Arc::new(FirstAssignment { inner, pending: 1, ingest_mints: 0.into() });
     let sup = Supervisor::new(cfg.clone(), keys.clone()).expect("supervisor");
-    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants: vec![placed] }).unwrap();
+    sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 1, tenants: vec![placed] }).await.unwrap();
     sup.start_background();
     let router = Router::new(sup.clone()).unwrap();
     let sock = cfg.listen_unix.clone().unwrap();
@@ -1318,7 +1415,7 @@ async fn resident_ingest(mnt: &Path, r: &mut Report) {
 
     // Un-placed: drained and no longer kept.
     cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 2,
-        tenants: vec![TenantPlacement::legacy(tid("golf"), 20.0)] }).unwrap();
+        tenants: vec![TenantPlacement::legacy(tid("golf"), 20.0)] }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(cfg.shutdown_grace_ms + 3000)).await;
     let left: Vec<(u32, u32)> = tenant_uid_procs(cfg.uid_base, cfg.uid_slots);
     r.check("resident: un-placed tenant is drained and not respawned", left.is_empty(), format!("{left:?}"));
@@ -1384,7 +1481,7 @@ async fn resident_query(mnt: &Path, r: &mut Report) {
     // Un-placed: drained, not restarted; the placed sibling keeps running.
     let india_before = query_pid(&cell.status().await, "india");
     cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 2,
-        tenants: vec![TenantPlacement::legacy(tid("india"), 20.0)] }).unwrap();
+        tenants: vec![TenantPlacement::legacy(tid("india"), 20.0)] }).await.unwrap();
     tokio::time::sleep(Duration::from_millis(cfg.shutdown_grace_ms + 3000)).await;
     let st = cell.status().await;
     let hotel_left = st["tenants"].as_array().unwrap().iter().find(|x| x["tenant_id"] == "hotel")
@@ -1470,7 +1567,7 @@ async fn purge_phase(mnt: &Path, r: &mut Report) {
 
     // Placement change: P1 and P3 removed.
     cell.sup.set_placement(Placement { cell_id: cfg.cell_id.clone(), revision: 2,
-        tenants: vec![TenantPlacement::legacy(tid(P2), 20.0)] }).unwrap();
+        tenants: vec![TenantPlacement::legacy(tid(P2), 20.0)] }).await.unwrap();
     let t0 = Instant::now();
     let p1_id = tid(P1);
     while !cell.sup.purge_ledger().purged.contains_key(&p1_id) && t0.elapsed() < Duration::from_secs(30) {

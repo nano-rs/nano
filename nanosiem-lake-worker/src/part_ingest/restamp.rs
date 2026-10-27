@@ -4,7 +4,7 @@
 //!
 //! Ingest never waits for prevalence. While the tenant state is not at the
 //! part-log head (catching up after a reopen, rebuilding, resetting, a
-//! lookup slower than the ingest wait, or a stalled store), admitted rows
+//! lookup slower than the stamp wait, or a stalled store), admitted rows
 //! are written with no `prevalence_*` values: a stamp is permanent, and a
 //! count read from a state that is missing the last N `Add`s would invent
 //! rarity ("absent from the baseline" reads as "brand new"). Before this
@@ -79,13 +79,13 @@ const MIN_COLUMN: &str = "prevalence_min";
 /// Gap between two sealed-hour restamp rewrites (the reindex spacing).
 pub const RESTAMP_SPACING_MS: i64 = super::reindex::REINDEX_SPACING_MS;
 
-/// Lookups for one restamp may take this long before the merge goes on
-/// without it (the hour stays owed and is retried).
+/// Stall bound for one restamp point read. A large hour may take longer
+/// overall as long as its budgeted lookup stream keeps making progress.
 pub const RESTAMP_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// A restamp riding on a routine merge waits at most this for its lookups,
-/// so it never holds the minute/hour merge cadence; past it the merge goes
-/// on and the hour stays owed (its seal or a sealed rewrite retries).
+/// Lookup work per budget slice. Routine merges publish completed rows
+/// after one slice and keep the hour owed; sealed rewrites resume the same
+/// stream, outside the ingest tick, without discarding completed lookups.
 pub const RESTAMP_MERGE_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Consecutive failed sealed-hour restamps before an hour is given up
@@ -203,7 +203,7 @@ impl OwedHours {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestampResult {
     /// Lookups ran; `rows` unstamped rows were stamped.
-    Applied { rows: u64 },
+    Applied { rows: u64, complete: bool },
     /// The inputs held no unstamped row.
     NothingOwed,
     /// The lookups failed or timed out: the hour stays owed.
@@ -244,11 +244,20 @@ pub enum RestampSkip {
 pub struct RestampMap {
     scalars: HashMap<String, u64>,
     restamped: AtomicU64,
+    complete: bool,
 }
 
 impl RestampMap {
     pub fn new(scalars: HashMap<String, u64>) -> Self {
-        Self { scalars, restamped: AtomicU64::new(0) }
+        Self::with_completion(scalars, true)
+    }
+
+    pub(super) fn with_completion(scalars: HashMap<String, u64>, complete: bool) -> Self {
+        Self { scalars, restamped: AtomicU64::new(0), complete }
+    }
+
+    pub(super) fn complete(&self) -> bool {
+        self.complete
     }
 
     pub fn restamped_rows(&self) -> u64 {
@@ -507,7 +516,8 @@ mod tests {
     #[test]
     fn a_row_whose_artifact_was_not_looked_up_stays_unstamped() {
         let input = batch(&[(Some("8.8.8.8"), None), (Some("9.9.9.9"), None)]);
-        let map = RestampMap::new(HashMap::from([("8.8.8.8".to_string(), 2)]));
+        let map = RestampMap::with_completion(HashMap::from([("8.8.8.8".to_string(), 2)]), false);
+        assert!(!map.complete(), "a budget yield must keep the hour owed");
         let out = restamp_batch(input, &map).unwrap();
         assert_eq!(column(&out, "prevalence_min"), vec![Some(2), None]);
         assert_eq!(map.restamped_rows(), 1);
@@ -581,14 +591,16 @@ mod tests {
     /// shrinks: unsealed hours ride their seal merge (no extra rewrite),
     /// sealed ones drain one rewrite at a time. Per-step cost from tenant-a: an
     /// hour merge of 867k rows took 76 s (cold, right after the roll);
-    /// lookups are bounded by RESTAMP_LOOKUP_TIMEOUT. Ingest is never in the
-    /// loop: sealed restamps run only while ingest is not catching up.
+    /// this historical NAN-3864 model charges 120 s for lookups. NAN-4472's
+    /// production-path test also charges streaming GETs and the much slower
+    /// the large-tenant rewrite. Ingest is never in the loop: sealed restamps run only
+    /// while ingest is not catching up.
     #[test]
     fn the_b12_gap_drains_in_bounded_time_and_never_grows_once_caught_up() {
         const MIN: i64 = 60_000;
         let rows_per_hour = 1_000_000_u64;
         let rewrite_ms = |rows: u64| (rows as f64 / (867_498.0 / 76.0) * 1_000.0) as i64;
-        let lookup_ms = RESTAMP_LOOKUP_TIMEOUT.as_millis() as i64; // worst case
+        let lookup_ms = 120_000; // NAN-3864's historical per-hour charge
         let behind_from = 5 * 60 * MIN; // 05:00Z
         let at_head = (21 * 60 + 36) * MIN; // 21:36Z
         let mut owed = OwedHours::default();

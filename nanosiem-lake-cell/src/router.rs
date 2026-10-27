@@ -829,11 +829,17 @@ impl Router {
                 self.forward(tenant, Role::Ingest, "/v1/admin/prevalence-restamp".into(), req.map(|body| body.boxed()), None, None, true).await
             }
             // NAN-3643: list / replay the tenant's quarantined bronze objects.
-            (Method::GET, "admin/bronze-quarantine") | (Method::POST, "admin/bronze-quarantine/replay") => {
+            // NAN-4554: import an exported object (verified by ingest[T]).
+            (Method::GET, "admin/bronze-quarantine") | (Method::POST, "admin/bronze-quarantine/replay")
+            | (Method::POST, "admin/bronze-quarantine/import") => {
                 if scope != Scope::Full {
                     return Ok(error(StatusCode::FORBIDDEN, "bronze quarantine requires the full operator token"));
                 }
-                let target = if tail == "admin/bronze-quarantine" { "/v1/admin/bronze-quarantine" } else { "/v1/admin/bronze-quarantine/replay" };
+                let target = match tail {
+                    "admin/bronze-quarantine" => "/v1/admin/bronze-quarantine",
+                    "admin/bronze-quarantine/replay" => "/v1/admin/bronze-quarantine/replay",
+                    _ => "/v1/admin/bronze-quarantine/import",
+                };
                 self.forward(tenant, Role::Ingest, target.into(), req.map(|body| body.boxed()), None, None, true).await
             }
             (Method::POST, "wake") => {
@@ -1294,7 +1300,7 @@ mod tests {
     #[test]
     fn count_backfill_is_operator_only_for_every_tenant() {
         for (method, admin) in [Method::GET, Method::POST].into_iter()
-            .flat_map(|method| ["count-backfill", "prevalence-restamp", "bronze-quarantine", "bronze-quarantine/replay"].map(|admin| (method.clone(), admin))) {
+            .flat_map(|method| ["count-backfill", "prevalence-restamp", "bronze-quarantine", "bronze-quarantine/replay", "bronze-quarantine/import"].map(|admin| (method.clone(), admin))) {
             for tenant in ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"] {
                 let path = format!("/v1/tenants/{tenant}/admin/{admin}");
                 let route = classify(&method, &path);

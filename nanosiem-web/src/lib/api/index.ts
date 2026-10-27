@@ -59,6 +59,7 @@ import { WebhooksApi } from './webhooks';
 import { PullSourcesApi } from './pull-sources';
 import { MarketplaceApi } from './marketplace';
 import { LookupUrlAllowlistApi } from './lookup-url-allowlist';
+import { SoarApi } from './soar';
 import { ThreatIntelApi } from './threat-intel';
 import { IntegrationsApi } from './integrations';
 import { GdprApi } from './gdpr';
@@ -221,6 +222,7 @@ class ApiClient {
   private _marketplace: MarketplaceApi;
   private _pullSources: PullSourcesApi;
   private _lookupUrlAllowlist: LookupUrlAllowlistApi;
+  private _soar: SoarApi;
   private _threatIntel: ThreatIntelApi;
   private _integrations: IntegrationsApi;
   private _gdpr: GdprApi;
@@ -306,6 +308,7 @@ class ApiClient {
     this._marketplace = new MarketplaceApi(this.request.bind(this));
     this._pullSources = new PullSourcesApi(this.request.bind(this));
     this._lookupUrlAllowlist = new LookupUrlAllowlistApi(this.request.bind(this));
+    this._soar = new SoarApi(this.request.bind(this));
     this._threatIntel = new ThreatIntelApi(this.request.bind(this));
     this._integrations = new IntegrationsApi(this.request.bind(this));
     this._gdpr = new GdprApi(this.request.bind(this));
@@ -395,6 +398,8 @@ class ApiClient {
   }
 
   get lookupUrlAllowlist(): LookupUrlAllowlistApi { return this._lookupUrlAllowlist; }
+  /** Tenant SOAR opt-in (NAN-4462). */
+  get soar(): SoarApi { return this._soar; }
   get threatIntel(): ThreatIntelApi { return this._threatIntel; }
 
   /** Integration collectors (NAN-2189) — instances of collector-category
@@ -1146,14 +1151,6 @@ class ApiClient {
 
   async melodEditParser(request: import('./types').MelodEditParserRequest): Promise<import('./types').MelodJobStartResponse> {
     return this._melod.melodEditParser(request);
-  }
-
-  async fetchUrlForDetection(url: string): Promise<import('./types').FetchUrlForDetectionResponse> {
-    return this._melod.fetchUrlForDetection(url);
-  }
-
-  async generateDetectionHints(request: import('./types').GenerateDetectionHintsRequest): Promise<import('./types').MelodJobStartResponse> {
-    return this._melod.generateDetectionHints(request);
   }
 
   // AI Providers (LiteLLM multi-provider support)
@@ -2287,6 +2284,15 @@ class ApiClient {
   // NAN-3205: pivt playbook drafting (async job → PlaybookDraft)
   async melodDraftPlaybook(request: import('./types').DraftPlaybookRequest): Promise<import('./types').MelodJobStartResponse> {
     return this._melod.melodDraftPlaybook(request);
+  }
+
+  // NAN-4535: pivt SOAR flow drafting (async job → FlowDraftCreated)
+  async melodDraftFlow(request: import('./types').DraftFlowRequest): Promise<import('./types').MelodJobStartResponse> {
+    return this._melod.melodDraftFlow(request);
+  }
+  // NAN-4653: pivt edit-session turn on the open artifact (async job → EditTurnResult)
+  async melodEditTurn(request: import('./types').EditTurnRequest): Promise<import('./types').MelodJobStartResponse> {
+    return this._melod.melodEditTurn(request);
   }
 
   /** @deprecated Use getMelodJobStatus instead */

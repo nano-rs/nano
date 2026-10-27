@@ -18,6 +18,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod session;
+mod duo;
+pub use duo::DuoHmacParams;
+use duo::DuoHmacAuth;
+mod oauth_json;
+pub use oauth_json::{OAuth2JsonCredentialParams, JsonCredentialFormat};
+use oauth_json::OAuth2JsonCredentialAuth;
+mod json_body;
+pub use json_body::JsonBodyCredentialParams;
+use json_body::JsonBodyCredentialAuth;
 pub use session::{SessionLoginParams, SessionResponse, LoginEncoding, CompositeTokenParams};
 use session::{SessionLoginAuth, CompositeTokenAuth};
 
@@ -206,12 +215,14 @@ pub fn registry() -> Vec<AuthRegistration> {
             Ok::<_, AuthError>(HeaderAuth { header: p.header, prefix: p.prefix.unwrap_or_default(), credential: p.credential, optional: p.optional })
         }),
         reg!("api_key_query", "?<param>=<credential>, applied by the engine", ApiKeyQueryParams, |p: ApiKeyQueryParams| Ok::<_, AuthError>(QueryAuth(p))),
-        reg!("basic", "Authorization: Basic base64(user:password)", BasicParams, |p: BasicParams| Ok::<_, AuthError>(BasicAuth(p))),
+        reg!("json_body_credential", "One credential in a top-level JSON request field", JsonBodyCredentialParams, JsonBodyCredentialAuth::new),
+        reg!("basic", "Authorization: Basic base64(user:password)", BasicParams, |p: BasicParams| Ok::<_, AuthError>(BasicAuth { params: p, issued: Default::default(), max_requests: crate::spec::Limits::default().max_requests as usize })),
         reg!("oauth2_client_credentials", "RFC 6749 client credentials, cached, refreshed on 401", OAuth2Params, |p: OAuth2Params| {
             p.check()?;
             Ok::<_, AuthError>(OAuth2Auth { p, cache: TokenCache::default() })
         }),
-        reg!("google_service_account", "Google service account JWT (RFC 7523, RS256), cached, refreshed on 401", GoogleSaParams, |p: GoogleSaParams| Ok::<_, AuthError>(GoogleSaAuth { p, cache: TokenCache::default() })),
+        reg!("oauth2_json_credential", "OAuth client credentials with a scoped secret JSON field", OAuth2JsonCredentialParams, OAuth2JsonCredentialAuth::new),
+        reg!("google_service_account", "Google service account JWT (RFC 7523, RS256), cached, refreshed on 401", GoogleSaParams, |p: GoogleSaParams| { p.check()?; Ok::<_, AuthError>(GoogleSaAuth { p, cache: TokenCache::default() }) }),
         reg!("google_dwd_broker", "Keyless Google domain-wide delegation: the platform pull broker signs the assertion for the tenant's own service account (hosted only), cached, refreshed on 401", GoogleDwdBrokerParams, |p: GoogleDwdBrokerParams| Ok::<_, AuthError>(GoogleDwdBrokerAuth { p, cache: TokenCache::default(), service_account: Default::default() })),
         reg!("entra_fic_broker", "Keyless Microsoft Entra (Graph): the platform pull broker mints a Graph access token for the tenant's app registration with nano's federated identity credential (hosted only), cached, refreshed on 401", EntraFicBrokerParams, |p: EntraFicBrokerParams| Ok::<_, AuthError>(EntraFicBrokerAuth { p, cache: TokenCache::default() })),
         reg!("okta_broker_jwt", "Keyless Okta (API Services app, private_key_jwt): the platform pull broker signs the client assertion with the tenant's broker-held key; the runner trades it for an access token (hosted only), cached, refreshed on 401", OktaBrokerJwtParams, |p: OktaBrokerJwtParams| {
@@ -224,7 +235,8 @@ pub fn registry() -> Vec<AuthRegistration> {
             p.check()?;
             Ok::<_, AuthError>(HmacAuth { p, signatures: Default::default(), max_signatures: crate::spec::Limits::default().max_requests as usize })
         }),
-        reg!("aws_sigv4", "AWS Signature Version 4", SigV4Params, |p: SigV4Params| Ok::<_, AuthError>(SigV4Auth(p))),
+        reg!("duo_hmac", "Duo v5 HMAC-SHA512 with JSON body and signed headers", DuoHmacParams, DuoHmacAuth::new),
+        reg!("aws_sigv4", "AWS Signature Version 4", SigV4Params, SigV4Auth::new),
         reg!("mtls", "TLS client certificate (PEM cert + key credentials), optional bearer", MtlsParams, |p: MtlsParams| Ok::<_, AuthError>(MtlsAuth(p))),
     ]
 }
@@ -324,7 +336,7 @@ pub struct BasicParams {
     pub password_credential: String,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OAuth2Params {
     #[serde(rename = "type", default)]
@@ -345,7 +357,14 @@ pub struct OAuth2Params {
     pub client_secret_credential: String,
     #[serde(default)]
     pub scope: Option<String>,
+    /// RFC 6749 client authentication: form fields (default), or HTTP Basic.
+    #[serde(default)]
+    pub client_auth: OAuth2ClientAuth,
 }
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuth2ClientAuth { #[default] Body, Basic }
 
 /// Plugin parameters that may template only `config.*`.
 fn config_only(what: &str, t: &str) -> Result<(), AuthError> {
@@ -360,6 +379,7 @@ fn config_only(what: &str, t: &str) -> Result<(), AuthError> {
 impl OAuth2Params {
     fn check(&self) -> Result<(), AuthError> {
         config_only("token_url", &self.token_url)?;
+        if let Some(scope) = &self.scope { config_only("scope", scope)?; }
         match (&self.client_id_credential, &self.client_id) {
             (Some(_), None) => Ok(()),
             (None, Some(c)) => config_only("client_id", c),
@@ -368,10 +388,10 @@ impl OAuth2Params {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleSaParams {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     _t: Option<String>,
     pub token_url: String,
     pub private_key_credential: String,
@@ -380,6 +400,17 @@ pub struct GoogleSaParams {
     /// Domain-wide delegation subject; a template such as `{{config.ADMIN_EMAIL}}`.
     #[serde(default)]
     pub subject: Option<String>,
+}
+impl GoogleSaParams {
+    fn check(&self) -> Result<(), AuthError> {
+        config_only("service-account token_url", &self.token_url)?;
+        if self.scope.is_empty() || self.scope.len() > 4096 || !template::references(&self.scope)
+            .map_err(|_| AuthError::Params("invalid service-account scope".into()))?.is_empty() {
+            return Err(AuthError::Params("service-account scope must be literal".into()));
+        }
+        if let Some(subject) = &self.subject { config_only("service-account subject", subject)?; }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -487,10 +518,10 @@ pub struct HmacParams {
     pub key_id_credential: Option<String>,
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SigV4Params {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     _t: Option<String>,
     pub region: String,
     pub service: String,
@@ -498,6 +529,24 @@ pub struct SigV4Params {
     pub secret_key_credential: String,
     #[serde(default)]
     pub session_token_credential: Option<String>,
+}
+impl SigV4Params {
+    fn check(&self) -> Result<(), AuthError> {
+        config_only("SigV4 region", &self.region)?;
+        if self.service.is_empty() || self.service.len() > 64
+            || !self.service.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+            return Err(AuthError::Params("invalid SigV4 service".into()));
+        }
+        Ok(())
+    }
+}
+fn sigv4_region(p: &SigV4Params, scope: &Scope) -> Result<String, AuthError> {
+    let region = template::render_str(&p.region, scope).map_err(|_| AuthError::Params("invalid SigV4 region".into()))?;
+    if region.is_empty() || region.len() > 64
+        || !region.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return Err(AuthError::Params("invalid SigV4 region".into()));
+    }
+    Ok(region)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -567,16 +616,39 @@ impl AuthPlugin for QueryAuth {
     }
 }
 
-pub struct BasicAuth(BasicParams);
+pub struct BasicAuth {
+    params: BasicParams,
+    issued: std::sync::Mutex<Vec<[String; 2]>>,
+    max_requests: usize,
+}
 
 #[async_trait::async_trait]
 impl AuthPlugin for BasicAuth {
+    fn set_request_limit(&mut self, max_requests: u32) {
+        self.max_requests = max_requests as usize;
+    }
     fn credential_fields(&self) -> Vec<String> {
-        vec![self.0.username_credential.clone(), self.0.password_credential.clone()]
+        vec![self.params.username_credential.clone(), self.params.password_credential.clone()]
+    }
+    fn derived_secrets(&self) -> Vec<String> {
+        self.issued.lock().expect("Basic issued authorization").iter().flatten().cloned().collect()
     }
     async fn apply(&self, req: &mut OutboundRequest, cx: &AuthContext<'_>) -> Result<(), AuthError> {
-        let raw = format!("{}:{}", cx.creds.get(&self.0.username_credential)?, cx.creds.get(&self.0.password_credential)?);
-        set_header(req, "Authorization", format!("Basic {}", STANDARD.encode(raw)));
+        let raw = format!("{}:{}", cx.creds.get(&self.params.username_credential)?, cx.creds.get(&self.params.password_credential)?);
+        let encoded = STANDARD.encode(raw);
+        let authorization = format!("Basic {encoded}");
+        {
+            let mut issued = self.issued.lock().expect("Basic issued authorization");
+            // A Basic envelope is itself encoded credential material; retain
+            // it for vendors reflecting another encoding of the whole header.
+            if !issued.iter().any(|pair| pair[0] == authorization) {
+                if issued.len() >= self.max_requests {
+                    return Err(AuthError::Signing("authorization request cap reached".into()));
+                }
+                issued.push([authorization.clone(), encoded]);
+            }
+        }
+        set_header(req, "Authorization", authorization);
         Ok(())
     }
 }
@@ -684,15 +756,38 @@ impl AuthPlugin for OAuth2Auth {
                 if client_id.is_empty() {
                     return Err(AuthError::Params("oauth2_client_credentials: client_id is empty".into()));
                 }
-                let mut form = vec![
-                    ("grant_type".to_string(), "client_credentials".to_string()),
-                    ("client_id".to_string(), client_id),
-                    ("client_secret".to_string(), cx.creds.get(&self.p.client_secret_credential)?.to_string()),
-                ];
-                if let Some(s) = &self.p.scope {
-                    form.push(("scope".into(), s.clone()));
+                let client_secret = cx.creds.get(&self.p.client_secret_credential)?;
+                let mut form = vec![("grant_type".to_string(), "client_credentials".to_string())];
+                if self.p.client_auth == OAuth2ClientAuth::Body {
+                    form.push(("client_id".into(), client_id.clone()));
+                    form.push(("client_secret".into(), client_secret.to_string()));
                 }
-                exchange(cx, &render(&self.p.token_url)?, form).await
+                if let Some(s) = &self.p.scope {
+                    let scope = render(s)?;
+                    if scope.is_empty() || scope.len() > 4096 || scope.chars().any(char::is_control) {
+                        return Err(AuthError::Params("invalid OAuth scope".into()));
+                    }
+                    form.push(("scope".into(), scope));
+                }
+                let url = render(&self.p.token_url)?;
+                if self.p.client_auth == OAuth2ClientAuth::Body { return exchange(cx, &url, form).await; }
+                // RFC 6749 2.3.1: form-encode each credential before Basic.
+                let encode = |value: &str| url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("", value).finish().trim_start_matches('=').to_string();
+                let encoded = STANDARD.encode(format!("{}:{}", encode(&client_id), encode(client_secret)));
+                self.cache.remember(&encoded);
+                let authorization = format!("Basic {encoded}");
+                self.cache.remember(&authorization);
+                let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(&form).finish();
+                let response = cx.fetch.session_login(&OutboundRequest {
+                    method: http::Method::POST,
+                    url: url.parse().map_err(|_| AuthError::Params("invalid OAuth token URL".into()))?,
+                    headers: vec![("Content-Type".into(), "application/x-www-form-urlencoded".into()),
+                        ("Authorization".into(), authorization), ("Accept".into(), "application/json".into())],
+                    body: body.into(),
+                }).await.map_err(|_| AuthError::Token("OAuth token exchange unavailable".into()))?;
+                if response.status == 429 { return Err(AuthError::RateLimited); }
+                token_response(response.status, &response.body)
             })
             .await?;
         set_header(req, "Authorization", format!("Bearer {tok}"));
@@ -733,7 +828,7 @@ pub fn google_assertion(p: &GoogleSaParams, cx: &AuthContext<'_>) -> Result<Stri
     let mut claims = serde_json::json!({
         "iss": cx.creds.get(&p.client_email_credential)?,
         "scope": p.scope,
-        "aud": p.token_url,
+        "aud": template::render_str(&p.token_url, cx.scope).map_err(|_| AuthError::Params("invalid service-account token URL".into()))?,
         "iat": iat,
         "exp": iat + 3600,
     });
@@ -767,9 +862,10 @@ impl AuthPlugin for GoogleSaAuth {
             .cache
             .get_or_fetch(|| async {
                 let assertion = google_assertion(&self.p, cx)?;
+                self.cache.remember(&assertion);
                 exchange(
                     cx,
-                    &self.p.token_url,
+                    &template::render_str(&self.p.token_url, cx.scope).map_err(|_| AuthError::Params("invalid service-account token URL".into()))?,
                     vec![
                         ("grant_type".into(), "urn:ietf:params:oauth:grant-type:jwt-bearer".into()),
                         ("assertion".into(), assertion),
@@ -1438,7 +1534,17 @@ impl AuthPlugin for HmacAuth {
     }
 }
 
-pub struct SigV4Auth(SigV4Params);
+pub struct SigV4Auth {
+    params: SigV4Params,
+    issued: std::sync::Mutex<Vec<[String; 2]>>,
+    max_requests: usize,
+}
+impl SigV4Auth {
+    fn new(params: SigV4Params) -> Result<Self, AuthError> {
+        params.check()?;
+        Ok(Self { params, issued: Default::default(), max_requests: crate::spec::Limits::default().max_requests as usize })
+    }
+}
 
 fn sha256_hex(b: &[u8]) -> String {
     hex::encode(digest::digest(&digest::SHA256, b).as_ref())
@@ -1518,25 +1624,44 @@ pub fn sigv4_headers(
 
 #[async_trait::async_trait]
 impl AuthPlugin for SigV4Auth {
+    fn set_request_limit(&mut self, max_requests: u32) {
+        self.max_requests = max_requests as usize;
+    }
+    fn derived_secrets(&self) -> Vec<String> {
+        self.issued.lock().expect("SigV4 issued signatures").iter().flatten().cloned().collect()
+    }
     fn credential_fields(&self) -> Vec<String> {
-        let mut v = vec![self.0.access_key_credential.clone(), self.0.secret_key_credential.clone()];
-        v.extend(self.0.session_token_credential.clone());
+        let mut v = vec![self.params.access_key_credential.clone(), self.params.secret_key_credential.clone()];
+        v.extend(self.params.session_token_credential.clone());
         v
     }
     async fn apply(&self, req: &mut OutboundRequest, cx: &AuthContext<'_>) -> Result<(), AuthError> {
-        let token = match &self.0.session_token_credential {
+        let token = match &self.params.session_token_credential {
             Some(c) => Some(cx.creds.get(c)?.to_string()),
             None => None,
         };
         let hs = sigv4_headers(
             req,
-            &self.0.region,
-            &self.0.service,
-            cx.creds.get(&self.0.access_key_credential)?,
-            cx.creds.get(&self.0.secret_key_credential)?,
+            &sigv4_region(&self.params, cx.scope)?,
+            &self.params.service,
+            cx.creds.get(&self.params.access_key_credential)?,
+            cx.creds.get(&self.params.secret_key_credential)?,
             token.as_deref(),
             cx.now,
         );
+        let authorization = hs.iter().find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+            .map(|(_, v)| v).ok_or_else(|| AuthError::Signing("SigV4 authorization missing".into()))?;
+        let signature = authorization.rsplit_once("Signature=")
+            .map(|(_, value)| value).ok_or_else(|| AuthError::Signing("SigV4 signature missing".into()))?;
+        {
+            let mut issued = self.issued.lock().expect("SigV4 issued signatures");
+            // Never evict an early signature while a later response may echo it.
+            // Refuse before decorating/sending when the compiled run cap is spent.
+            if issued.len() >= self.max_requests {
+                return Err(AuthError::Signing("signature request cap reached".into()));
+            }
+            issued.push([authorization.clone(), signature.to_owned()]);
+        }
         for (k, v) in hs {
             set_header(req, &k, v);
         }
@@ -1570,6 +1695,13 @@ impl AuthPlugin for MtlsAuth {
 mod tests {
     use super::*;
 
+    #[test]
+    fn committed_schema_covers_registered_auth() {
+        let actual=crate::spec::ConnectorSpec::json_schema();
+        let expected:Value=serde_json::from_str(include_str!("../docs/connector.schema.json")).unwrap();
+        assert_eq!(actual, expected, "regenerate docs/connector.schema.json");
+    }
+
     /// AWS sig-v4 test suite, `get-vanilla`.
     #[test]
     fn sigv4_matches_aws_test_vector() {
@@ -1591,7 +1723,10 @@ mod tests {
     #[test]
     fn every_registered_plugin_has_a_schema_and_builds_from_its_example() {
         let names: Vec<_> = registry().iter().map(|r| r.name).collect();
-        assert_eq!(names.len(), 16, "{names:?}");
+        assert_eq!(names.len(), 19, "{names:?}");
+        assert!(names.contains(&"json_body_credential"));
+        assert!(names.contains(&"duo_hmac"));
+        assert!(names.contains(&"oauth2_json_credential"));
         assert!(build("bearer", &serde_json::json!({"credential": "T"}).as_object().unwrap().clone()).is_ok());
         assert!(build("bearer", &serde_json::json!({"credential": "T", "url": "x"}).as_object().unwrap().clone()).is_err());
         assert!(build("api_key_header", &serde_json::json!({"credential": "T", "header": "Host"}).as_object().unwrap().clone()).is_err());
@@ -1599,6 +1734,9 @@ mod tests {
         for (kind, example) in [
             ("session_login", serde_json::json!({"login_url":"https://api.example.com/login","credential_fields":{"username":"USER","password":"PASSWORD"},"response":{"type":"json_token","pointer":"/token","header":"X-Session"}})),
             ("composite_token", serde_json::json!({"header":"X-Auth-Token","first_credential":"KEY","second_credential":"ID","separator":"/"})),
+            ("duo_hmac", serde_json::json!({"integration_key_credential":"IKEY","secret_key_credential":"SKEY"})),
+            ("oauth2_json_credential", serde_json::json!({"oauth2":{"token_url":"https://api.example.com/token","client_id_credential":"CLIENT_ID","client_secret_credential":"CLIENT_SECRET"},"credential":"PIN","field_pointer":"/command/pin","selector_pointer":"/command/type","selector_value":"LOCK","format":"six_digit_pin"})),
+            ("json_body_credential", serde_json::json!({"credential":"ROUTING_KEY","field":"routing_key"})),
         ] { assert!((registry().into_iter().find(|r| r.name == kind).unwrap().schema)().is_object()); build(kind, example.as_object().unwrap()).unwrap(); }
         let dwd = serde_json::json!({"token_url": "https://oauth2.googleapis.com/token", "scope": "s", "subject": "{{config.ADMIN_EMAIL}}"});
         let p = build("google_dwd_broker", dwd.as_object().unwrap()).unwrap();
@@ -1612,3 +1750,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod reflection_tests;

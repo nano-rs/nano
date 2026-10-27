@@ -25,6 +25,11 @@
 //!   a replay refused again stays quarantined with the new reason.
 //!
 //! Admission rules are unchanged: this only keeps what they refuse.
+//!
+//! NAN-4554: the directory is a working copy. Every change is queued in its
+//! `outbox/` and mirrored into the tenant bucket
+//! ([`super::quarantine_store`]), and a fresh work dir (a replaced pod) is
+//! restored from there.
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,6 +48,22 @@ pub const SWEEP_INTERVAL_MS: i64 = 10 * 60_000;
 
 const ENTRY_KIND: &str = "nano.lake.bronze-quarantine.v1";
 const DIR: &str = "bronze-quarantine";
+/// NAN-4554: ids whose change still has to reach the tenant bucket.
+const OUTBOX: &str = "outbox";
+/// NAN-4554: present once this work dir was restored from the bucket. It
+/// holds the restore's low-water mark (see [`Quarantine::mark_restored`]).
+const RESTORED_MARKER: &str = "restored-v1";
+/// NAN-4554 (review P1): `released/{id}` holds when `id` was released (its
+/// replay committed), for [`QUARANTINE_TTL_MS`]: an import of a released id
+/// is refused, so its rows can never be admitted twice (uid dedupe sees only
+/// the 72 h late tier; quarantined objects are often older).
+const RELEASED: &str = "released";
+/// NAN-4554 (review P3): an import's staging file younger than this is never
+/// swept (the body streams without the quarantine lock).
+const IMPORT_STAGING_MAX_AGE_MS: i64 = 60 * 60_000;
+/// Clock skew allowed between the pod that wrote a bucket record and the
+/// entry's `quarantined_at_ms` (the restore horizon's slack too).
+const RECORD_SKEW_MS: i64 = 86_400_000;
 /// Notice handles of replays carry this prefix; they are never acked to the
 /// source queue (the queue never issued them).
 pub const REPLAY_HANDLE_PREFIX: &str = "bronze-quarantine-replay:";
@@ -92,6 +113,55 @@ pub enum Kept {
     TooLarge,
 }
 
+/// NAN-4554: entries an operator import may bring the quarantine to (the
+/// byte cap still applies on top).
+pub const MAX_IMPORTED_ENTRIES: usize = 1_024;
+
+/// What [`Quarantine::import`] did with one exported object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Imported {
+    /// Kept and queued for the tenant-bucket mirror.
+    New,
+    /// The id is already kept with these bytes: a no-op.
+    Exists,
+}
+
+/// Why an operator import of one exported object was refused (nothing was
+/// written).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ImportRefused {
+    #[error("the entry names another tenant's quarantine")]
+    CrossTenant,
+    #[error("the entry is not a bronze quarantine entry")]
+    Malformed,
+    #[error("the bytes do not hash to the entry's id")]
+    Digest,
+    #[error("the bytes do not have the entry's size")]
+    Size,
+    #[error("the entry expired")]
+    Expired,
+    #[error("the object is over the per-object cap")]
+    ObjectTooLarge,
+    #[error("the quarantine would exceed its byte cap")]
+    OverCap,
+    #[error("the quarantine would exceed its entry cap")]
+    TooManyEntries,
+    #[error("the id is kept with different bytes")]
+    Conflict,
+    /// Its replay already committed (a release tombstone, local or restored
+    /// from the bucket): importing it again could commit its rows twice.
+    #[error("the id was already released (its replay committed)")]
+    Released,
+    /// This work dir has not been restored from the tenant bucket yet, so a
+    /// release recorded there is not known here: retry once it is.
+    #[error("the quarantine restore from the tenant bucket has not completed")]
+    RestorePending,
+    /// Older than the records the bounded restore read: a release of it
+    /// may exist in the bucket unread.
+    #[error("the entry is older than the restore's read bound")]
+    BeyondRestoreBound,
+}
+
 /// The tenant's quarantine directory.
 #[derive(Debug, Clone)]
 pub struct Quarantine {
@@ -115,7 +185,8 @@ impl Quarantine {
     pub fn open(work_dir: &Path, tenant: &str) -> Result<Self> {
         crate::parts::format::validate_tenant_uuid(tenant)?;
         let dir = work_dir.join(DIR);
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(dir.join(OUTBOX)).with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(dir.join(RELEASED)).with_context(|| format!("create {}", dir.display()))?;
         Ok(Self { dir, tenant: tenant.to_string(), max_bytes: MAX_QUARANTINE_BYTES, max_object_bytes: MAX_QUARANTINED_OBJECT_BYTES })
     }
 
@@ -128,6 +199,16 @@ impl Quarantine {
 
     pub fn tenant(&self) -> &str {
         &self.tenant
+    }
+
+    /// NAN-4554: the caps a restore applies before it downloads anything.
+    pub(crate) fn limits(&self) -> (u64, u64) {
+        (self.max_bytes, self.max_object_bytes)
+    }
+
+    /// NAN-4554: the directory (its volume's free space bounds a restore).
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The notice handle a replay of `id` is admitted under.
@@ -181,6 +262,7 @@ impl Quarantine {
             entry.refusals = entry.refusals.saturating_add(1);
             entry.replay_requested_at_ms = None;
             self.store(&entry)?;
+            self.enqueue(id, now_ms)?;
             return Ok(Kept::Again);
         }
         let staged = self.dir.join(format!(".{id}.parquet.tmp"));
@@ -203,6 +285,7 @@ impl Quarantine {
             refusals: 1,
             replay_requested_at_ms: None,
         })?;
+        self.enqueue(id, now_ms)?;
         self.enforce_cap(Some(id))?;
         Ok(Kept::New)
     }
@@ -276,6 +359,7 @@ impl Quarantine {
         }
         entry.replay_requested_at_ms.get_or_insert(now_ms);
         self.store(&entry)?;
+        self.enqueue(id, now_ms)?;
         Ok(entry)
     }
 
@@ -291,17 +375,54 @@ impl Quarantine {
     /// Clear a replay request that cannot proceed (the replay was refused
     /// before admission ran, e.g. its bytes vanished); the entry stays
     /// until it expires or an operator asks again.
-    pub fn clear_replay(&self, id: &str) -> Result<()> {
+    pub fn clear_replay(&self, id: &str, now_ms: i64) -> Result<()> {
         if let Some(mut entry) = self.load(id)? {
             if entry.replay_requested_at_ms.take().is_some() {
                 self.store(&entry)?;
+                self.enqueue(id, now_ms)?;
             }
         }
         Ok(())
     }
 
-    /// Drop `id` (its replay committed, or it expired).
-    pub fn release(&self, id: &str) -> Result<()> {
+    /// Drop `id`: its replay committed. The release is mirrored, so a
+    /// restored quarantine never offers it again.
+    pub fn release(&self, id: &str, now_ms: i64) -> Result<()> {
+        // The tombstone first: a crash after it never leaves the id
+        // importable again.
+        self.tombstone(id, now_ms)?;
+        self.remove_local(id)?;
+        self.enqueue(id, now_ms)
+    }
+
+    /// NAN-4554 (review P1): record that `id` was released at `at_ms` (kept
+    /// for [`QUARANTINE_TTL_MS`] from then; an earlier time already kept wins).
+    pub(crate) fn tombstone(&self, id: &str, at_ms: i64) -> Result<()> {
+        ensure!(crate::parts::is_sha256_hex(id), "invalid quarantine id");
+        if self.released_at(id)?.is_some_and(|kept| kept <= at_ms) {
+            return Ok(());
+        }
+        let staged = self.dir.join(RELEASED).join(format!(".{id}.tmp"));
+        std::fs::write(&staged, at_ms.to_string())?;
+        std::fs::File::open(&staged)?.sync_all()?;
+        std::fs::rename(&staged, self.dir.join(RELEASED).join(id))?;
+        Ok(())
+    }
+
+    /// NAN-4554: when `id` was released, if its tombstone is kept. An
+    /// unreadable tombstone counts as released (fail closed).
+    pub fn released_at(&self, id: &str) -> Result<Option<i64>> {
+        ensure!(crate::parts::is_sha256_hex(id), "invalid quarantine id");
+        match std::fs::read_to_string(self.dir.join(RELEASED).join(id)) {
+            Ok(at) => Ok(Some(at.trim().parse::<i64>().unwrap_or(i64::MAX))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Drop `id` here only (expiry, the cap, a restored release): every
+    /// copy applies the same expiry and cap, so nothing is mirrored.
+    pub(crate) fn remove_local(&self, id: &str) -> Result<()> {
         ensure!(crate::parts::is_sha256_hex(id), "invalid quarantine id");
         for path in [self.entry_path(id), self.data_path(id)] {
             match std::fs::remove_file(&path) {
@@ -319,7 +440,7 @@ impl Quarantine {
         let mut dropped = 0;
         for entry in self.list()? {
             if entry.expires_at_ms <= now_ms {
-                self.release(&entry.id)?;
+                self.remove_local(&entry.id)?;
                 dropped += 1;
             }
         }
@@ -329,7 +450,20 @@ impl Quarantine {
             let orphan = name
                 .strip_suffix(".parquet")
                 .is_some_and(|id| !self.entry_path(id).exists());
+            // Review P3: an import still streaming its body is not swept.
+            if name.starts_with(".import-") && young(&path, now_ms) {
+                continue;
+            }
             if name.starts_with('.') || orphan {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        for item in std::fs::read_dir(self.dir.join(RELEASED))? {
+            let path = item?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else { continue };
+            let expired = crate::parts::is_sha256_hex(name)
+                && self.released_at(name)?.is_some_and(|at| at != i64::MAX && at.saturating_add(QUARANTINE_TTL_MS) <= now_ms);
+            if expired || name.starts_with('.') {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -350,11 +484,174 @@ impl Quarantine {
             }
             tracing::warn!(tenant = %self.tenant, id = %entry.id, source = %entry.source_key, bytes = entry.bytes,
                 "bronze quarantine over its size cap; evicting the oldest object");
-            self.release(&entry.id)?;
+            self.remove_local(&entry.id)?;
             total = total.saturating_sub(entry.bytes);
             evicted += 1;
         }
         Ok(evicted)
+    }
+
+    // ---------------------------------------------------------- NAN-4554
+
+    /// Queue `id` for the bucket mirror (an entry kept before mirroring).
+    pub(crate) fn enqueue_mirror(&self, id: &str, now_ms: i64) -> Result<()> {
+        ensure!(crate::parts::is_sha256_hex(id), "invalid quarantine id");
+        self.enqueue(id, now_ms)
+    }
+
+    /// Queue `id` for the bucket mirror (survives a process restart).
+    fn enqueue(&self, id: &str, now_ms: i64) -> Result<()> {
+        let path = self.dir.join(OUTBOX).join(id);
+        if path.exists() {
+            return Ok(());
+        }
+        let staged = self.dir.join(OUTBOX).join(format!(".{id}.tmp"));
+        std::fs::write(&staged, now_ms.to_string())?;
+        std::fs::File::open(&staged)?.sync_all()?;
+        std::fs::rename(&staged, &path)?;
+        Ok(())
+    }
+
+    /// Ids whose change has not reached the bucket yet, with when each was
+    /// first queued, oldest first.
+    pub fn outbox(&self) -> Result<Vec<(String, i64)>> {
+        let mut queued = Vec::new();
+        for item in std::fs::read_dir(self.dir.join(OUTBOX))? {
+            let item = item?;
+            let Some(id) = item.file_name().to_str().map(str::to_string) else { continue };
+            if !crate::parts::is_sha256_hex(&id) {
+                continue;
+            }
+            let at = std::fs::read_to_string(item.path()).ok().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+            queued.push((id, at));
+        }
+        queued.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+        Ok(queued)
+    }
+
+    /// `id`'s change reached the bucket.
+    pub fn outbox_done(&self, id: &str) -> Result<()> {
+        ensure!(crate::parts::is_sha256_hex(id), "invalid quarantine id");
+        match std::fs::remove_file(self.dir.join(OUTBOX).join(id)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The kept bytes of `id` and their length.
+    pub fn data_file(&self, id: &str) -> Result<Option<(PathBuf, u64)>> {
+        ensure!(crate::parts::is_sha256_hex(id), "invalid quarantine id");
+        let path = self.data_path(id);
+        match std::fs::metadata(&path) {
+            Ok(meta) => Ok(Some((path, meta.len()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A scratch file in the directory (swept like any staging file).
+    pub fn staging_path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!(".{name}.tmp"))
+    }
+
+    /// Take a restored entry and its verified bytes (`staged`, moved in).
+    pub fn adopt(&self, entry: &QuarantineEntry, staged: &Path) -> Result<()> {
+        ensure!(entry.tenant_id == self.tenant && crate::parts::is_sha256_hex(&entry.id), "restored entry for another scope");
+        std::fs::File::open(staged)?.sync_all()?;
+        std::fs::rename(staged, self.data_path(&entry.id))?;
+        self.store(entry)
+    }
+
+    /// NAN-4554: take one object exported from an earlier pod (`staged`, in
+    /// this directory, moved in) with its entry, after verifying everything
+    /// before any write: kind, tenant, id == sha256(bytes), size, expiry,
+    /// the per-object, byte and entry caps. Idempotent per id: an id kept
+    /// with the same bytes is a no-op; different bytes are refused. A kept
+    /// import is queued for the tenant-bucket mirror (its replay request,
+    /// if any, is cleared: the operator replays on this pod).
+    pub fn import(&self, entry: &QuarantineEntry, staged: &Path, now_ms: i64) -> Result<Imported> {
+        let refused = |reason: ImportRefused| -> Result<Imported> {
+            let _ = std::fs::remove_file(staged);
+            Err(reason.into())
+        };
+        if entry.tenant_id != self.tenant {
+            return refused(ImportRefused::CrossTenant);
+        }
+        if entry.kind != ENTRY_KIND || !crate::parts::is_sha256_hex(&entry.id) {
+            return refused(ImportRefused::Malformed);
+        }
+        // Review P1, fail closed: a released id (here or, via the restore,
+        // in the bucket) is never kept again.
+        if self.needs_restore() {
+            return refused(ImportRefused::RestorePending);
+        }
+        if self.released_at(&entry.id)?.is_some() {
+            return refused(ImportRefused::Released);
+        }
+        if self.restore_low_water_ms()?.is_some_and(|low| entry.quarantined_at_ms < low.saturating_add(RECORD_SKEW_MS)) {
+            return refused(ImportRefused::BeyondRestoreBound);
+        }
+        let (bytes, digest) = super::writer::file_digest(staged)?;
+        if digest != entry.id {
+            return refused(ImportRefused::Digest);
+        }
+        if bytes != entry.bytes {
+            return refused(ImportRefused::Size);
+        }
+        if entry.expires_at_ms <= now_ms {
+            return refused(ImportRefused::Expired);
+        }
+        if bytes > self.max_object_bytes {
+            return refused(ImportRefused::ObjectTooLarge);
+        }
+        if self.get(&entry.id)?.is_some() {
+            return match self.data_file(&entry.id)? {
+                Some((path, _)) if super::writer::file_digest(&path)?.1 == entry.id => {
+                    let _ = std::fs::remove_file(staged);
+                    Ok(Imported::Exists)
+                }
+                _ => refused(ImportRefused::Conflict),
+            };
+        }
+        let (entries, used) = self.usage()?;
+        if entries + 1 > MAX_IMPORTED_ENTRIES {
+            return refused(ImportRefused::TooManyEntries);
+        }
+        if used.saturating_add(bytes) > self.max_bytes {
+            return refused(ImportRefused::OverCap);
+        }
+        let entry = QuarantineEntry { replay_requested_at_ms: None, ..entry.clone() };
+        self.adopt(&entry, staged)?;
+        self.enqueue_mirror(&entry.id, now_ms)?;
+        Ok(Imported::New)
+    }
+
+    /// Whether this work dir still has to be restored from the bucket.
+    pub fn needs_restore(&self) -> bool {
+        !self.dir.join(RESTORED_MARKER).exists()
+    }
+
+    /// The restore completed. `low_water_ms`: the write time of the oldest
+    /// bucket record it read when it read only the newest records (bounded);
+    /// entries quarantined before that (less the clock skew) are not
+    /// imported, as their release may be in an unread record.
+    pub fn mark_restored(&self, low_water_ms: Option<i64>) -> Result<()> {
+        let body = low_water_ms.map_or_else(|| "1".to_string(), |low| format!("low_water_ms={low}"));
+        let staged = self.dir.join(format!(".{RESTORED_MARKER}.tmp"));
+        std::fs::write(&staged, body)?;
+        std::fs::File::open(&staged)?.sync_all()?;
+        std::fs::rename(&staged, self.dir.join(RESTORED_MARKER))?;
+        Ok(())
+    }
+
+    /// The low-water mark the restore recorded, if it was bounded.
+    fn restore_low_water_ms(&self) -> Result<Option<i64>> {
+        match std::fs::read_to_string(self.dir.join(RESTORED_MARKER)) {
+            // Unparseable counts as everything beyond the bound (fail closed).
+            Ok(body) => Ok(body.trim().strip_prefix("low_water_ms=").map(|low| low.parse::<i64>().unwrap_or(i64::MAX))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// (entries, bytes) held now.
@@ -362,6 +659,15 @@ impl Quarantine {
         let entries = self.list()?;
         Ok((entries.len(), entries.iter().map(|entry| entry.bytes).sum()))
     }
+}
+
+/// Whether `path` was modified less than [`IMPORT_STAGING_MAX_AGE_MS`]
+/// before `now_ms` (unknown: treated as young; a later sweep removes it).
+fn young(path: &Path, now_ms: i64) -> bool {
+    let modified_ms = std::fs::metadata(path).and_then(|meta| meta.modified()).ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|at| at.as_millis() as i64);
+    modified_ms.is_none_or(|at| now_ms.saturating_sub(at) < IMPORT_STAGING_MAX_AGE_MS)
 }
 
 #[cfg(test)]
@@ -469,5 +775,53 @@ mod tests {
         assert_eq!(count, fits);
         assert!(bytes <= max_bytes);
         assert!(quarantine.list().unwrap().iter().all(|entry| entry.id != format!("{:064x}", 0)), "the oldest was evicted");
+    }
+
+    /// NAN-4554 review P1/P3: a release tombstone refuses a re-import and
+    /// lasts the TTL; a bounded restore's low-water mark refuses older
+    /// entries; an import still staging is not swept.
+    #[test]
+    fn released_ids_and_entries_beyond_the_restore_bound_are_never_imported() {
+        let root = tempfile::tempdir().unwrap();
+        let source = Quarantine::open(&root.path().join("old"), TENANT).unwrap();
+        let (file, id) = object(root.path(), b"replayed bytes");
+        source.keep(&file, &id, &refusal(), 1_000).unwrap();
+        let entry = source.get(&id).unwrap().unwrap();
+        let quarantine = Quarantine::open(&root.path().join("new"), TENANT).unwrap();
+        let stage = |name: &str| {
+            let path = quarantine.staging_path(name);
+            std::fs::write(&path, b"replayed bytes").unwrap();
+            path
+        };
+        let refused = |result: Result<Imported>| result.unwrap_err().downcast::<ImportRefused>().unwrap();
+        assert_eq!(refused(quarantine.import(&entry, &stage("import-a"), 2_000)), ImportRefused::RestorePending);
+        quarantine.mark_restored(None).unwrap();
+        assert_eq!(quarantine.import(&entry, &stage("import-b"), 2_000).unwrap(), Imported::New);
+        quarantine.release(&id, 3_000).unwrap();
+        assert_eq!(quarantine.released_at(&id).unwrap(), Some(3_000));
+        assert_eq!(refused(quarantine.import(&entry, &stage("import-c"), 4_000)), ImportRefused::Released);
+        quarantine.sweep(3_000 + QUARANTINE_TTL_MS - 1).unwrap();
+        assert!(quarantine.released_at(&id).unwrap().is_some(), "kept for the TTL");
+        quarantine.sweep(3_000 + QUARANTINE_TTL_MS).unwrap();
+        assert!(quarantine.released_at(&id).unwrap().is_none(), "then swept");
+
+        // A bounded restore whose oldest read record is no older than the
+        // entry (less the skew): its release may be unread, so it is refused.
+        let bounded = Quarantine::open(&root.path().join("bounded"), TENANT).unwrap();
+        bounded.mark_restored(Some(entry.quarantined_at_ms)).unwrap();
+        let path = bounded.staging_path("import-d");
+        std::fs::write(&path, b"replayed bytes").unwrap();
+        assert_eq!(refused(bounded.import(&entry, &path, 4_000)), ImportRefused::BeyondRestoreBound);
+
+        // A young import staging file survives a sweep; other dot-files do not.
+        let staging = quarantine.staging_path("import-live");
+        let stray = quarantine.staging_path("stray");
+        std::fs::write(&staging, b"x").unwrap();
+        std::fs::write(&stray, b"x").unwrap();
+        let wall = chrono::Utc::now().timestamp_millis();
+        quarantine.sweep(wall).unwrap();
+        assert!(staging.exists() && !stray.exists());
+        quarantine.sweep(wall + IMPORT_STAGING_MAX_AGE_MS + 1_000).unwrap();
+        assert!(!staging.exists(), "an abandoned import staging file is swept once old");
     }
 }

@@ -109,6 +109,16 @@ impl TenantIds {
     }
 }
 
+/// Pure dedicated-cell allocation check, sharing the production slot arithmetic.
+/// No file recovery, allocation or ownership repair takes place.
+pub fn ids_for_slot(base: u32, max_slots: u32, slot: u32) -> Option<TenantIds> {
+    let high = DETECT_UID_END.checked_sub(base.checked_add(max_slots.checked_mul(2)?)?)?;
+    if base == 0 || max_slots == 0 || high == 0 { return None; }
+    let map = UidMap { path: PathBuf::new(), max_slots,
+        state: Persisted { base, slots: BTreeMap::new() }, claims: BTreeMap::new() };
+    (slot < map.allocatable_slots()).then(|| map.ids(slot))
+}
+
 impl UidMap {
     /// Load `path` (creating an empty map if absent). A persisted base that
     /// differs from `base` is an error: silently re-basing would hand

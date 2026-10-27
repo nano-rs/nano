@@ -1,47 +1,9 @@
-// log-blaster --tenzir → Tenzir → OCSF 1.8.0 → direct ClickHouse (NAN-1402).
-//
-// Receives the blaster's RAW NDJSON envelopes ({message, timestamp,
-// source_type}) on a single HTTP listener, routes on source_type, parses each
-// feed's raw payload (JSON or Apache combined-log text), maps it to OCSF
-// 1.8.0 with the same class_uid/activity_id/promoted-field coverage as the
-// native Vector OCSF parsers (parsers-ocsf/{apache,aws_cloudtrail,
-// conduit_proxy,sysmon_json,windows_event}/parser.yaml), wraps each record in
-// the wire shape {event, source_type}, and streams it via the native
-// `to_clickhouse` operator into nanosiem.ocsf_logs_raw per the producer
-// contract (docs/user-guide/direct-ocsf-ingestion.md).
-//
-// NAN-1788: native `to_clickhouse` writes straight into ocsf_logs_raw. Requires
-// Tenzir >= 6.6.0 — the first release whose to_clickhouse accepts ocsf_logs_raw's
-// LowCardinality / tz-qualified DateTime64 columns AND omits the server-derived
-// timestamp/id so their ClickHouse DEFAULTs fire. This rig runs the unpinned
-// tenzir/tenzir image (v6.6.0+, matching the bundled pipeline). On Tenzir
-// 6.4.0–6.5.x, target the legacy nanosiem.ocsf_logs_native_raw entrypoint
-// instead. The legacy HTTP `to_http`-JSONEachRow sink was removed in NAN-1603.
-//
-// Run it (see tenzir/README.md for the full recipe):
-//
-//   docker run -d --name tenzir-blaster --network nanosiem_default \
-//     -p 9095:9095 -e NANO_CH_INGEST_PASSWORD=<CLICKHOUSE_INGEST_PASSWORD> \
-//     -v "$PWD/tools/log-blaster/tenzir/blaster_to_ocsf.tql:/pipeline.tql:ro" \
-//     tenzir/tenzir -f /pipeline.tql
-//
-// Parameters (environment — no secrets are committed in this file):
-//   NANO_CH_INGEST_PASSWORD  REQUIRED. The nanosiem_ingest password
-//                            (CLICKHOUSE_INGEST_PASSWORD; local dev default
-//                            is in docker-compose.yml).
-//   NANO_CH_INGEST_USER      INSERT-only user.            Default nanosiem_ingest
-//   NANO_CH_HOST             ClickHouse host.             Default clickhouse
-//   NANO_CH_NATIVE_PORT      ClickHouse native TCP port.  Default 9000
-//   NANO_TENZIR_LISTEN       Listener address.            Default 0.0.0.0:9095
+// NAN-4484: raw blaster envelopes -> strict OCSF 1.9 -> hosted bucket drop.
+// Render credential placeholders with the canary credential tool. Never commit
+// the filled file. The listener is local to the dedicated canary VM.
 
-let $ch_user = env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest")
-let $ch_host = env("NANO_CH_HOST").otherwise("clickhouse")
-let $ch_port = int(env("NANO_CH_NATIVE_PORT").otherwise("9000"))
-let $listen = env("NANO_TENZIR_LISTEN").otherwise("0.0.0.0:9095")
-
-// max_connections raised above the default 10 so blast mode (threads ×
-// inflight sends) doesn't queue on the listener.
-accept_http $listen, max_connections=100 { read_ndjson }
+// Cap concurrent requests shared by the single blaster worker and smoke.
+accept_http "127.0.0.1:9095", max_connections=10 { read_ndjson }
 
 // ---- envelope ------------------------------------------------------------
 src = string(source_type?).otherwise("unknown")
@@ -63,7 +25,7 @@ if src == "windows_sysmon" {
       class_uid: 1007, category_uid: 1, activity_id: 99, type_uid: 100799,
       severity_id: 1, status_id: 0, time: 0, message: raw,
       metadata: {
-        version: "1.8.0", uid: uuid(), log_level: "error",
+        version: "1.9.0", uid: uuid(), log_level: "error",
         product: {name: "Sysmon", vendor_name: "Microsoft"},
       },
     }
@@ -295,7 +257,7 @@ if src == "windows_sysmon" {
     ev.time = time_ms
     ev.message = raw
     ev.metadata = {
-      version: "1.8.0",
+      version: "1.9.0",
       uid: string(p.record_id?).otherwise(uuid()),
       log_name: string(p.channel?).otherwise("Microsoft-Windows-Sysmon/Operational"),
       log_provider: string(p.provider_name?).otherwise("Microsoft-Windows-Sysmon"),
@@ -314,7 +276,7 @@ if src == "windows_sysmon" {
       class_uid: 3002, category_uid: 3, activity_id: 99, type_uid: 300299,
       severity_id: 1, status_id: 0, time: 0, message: raw,
       metadata: {
-        version: "1.8.0", uid: uuid(), log_level: "error",
+        version: "1.9.0", uid: uuid(), log_level: "error",
         product: {name: "Windows", vendor_name: "Microsoft"},
       },
     }
@@ -469,7 +431,7 @@ if src == "windows_sysmon" {
     ev.time = time_ms
     ev.message = msg
     ev.metadata = {
-      version: "1.8.0",
+      version: "1.9.0",
       uid: string(p.record_id?).otherwise(uuid()),
       log_name: string(p.channel?).otherwise("Security"),
       log_provider: string(p.provider_name?).otherwise("Microsoft-Windows-Security-Auditing"),
@@ -486,7 +448,7 @@ if src == "windows_sysmon" {
       class_uid: 4002, category_uid: 4, activity_id: 99, type_uid: 400299,
       severity_id: 1, status_id: 0, time: 0, message: raw,
       metadata: {
-        version: "1.8.0", uid: uuid(), log_level: "error",
+        version: "1.9.0", uid: uuid(), log_level: "error",
         product: {name: "Conduit Proxy", vendor_name: "Conduit"},
       },
     }
@@ -580,7 +542,7 @@ if src == "windows_sysmon" {
       time: time_ms,
       message: raw,
       metadata: {
-        version: "1.8.0",
+        version: "1.9.0",
         uid: string(p.id?).otherwise(uuid()),
         log_name: "conduit-proxy",
         product: {name: "Conduit Proxy", vendor_name: "Conduit"},
@@ -637,7 +599,7 @@ if src == "windows_sysmon" {
       ev.user = {name: auth_user.to_lower()}
     }
   }
-} else if src == "apache_access" or src == "apache" {
+} else if src == "apache_access" or src == "apache" or src == "apache_http_server" {
   // ==== Apache combined log (TEXT) -> HTTP Activity 4002 ===================
   // Mirrors parsers-ocsf/apache/parser.yaml. Combined logs carry only a
   // request path (no scheme/host), so the OCSF url is path-only.
@@ -648,7 +610,7 @@ if src == "windows_sysmon" {
       class_uid: 4002, category_uid: 4, activity_id: 99, type_uid: 400299,
       severity_id: 1, status_id: 0, time: 0, message: raw,
       metadata: {
-        version: "1.8.0", uid: uuid(), log_level: "error",
+        version: "1.9.0", uid: uuid(), log_level: "error",
         product: {name: "Apache HTTP Server", vendor_name: "Apache Software Foundation"},
       },
     }
@@ -725,7 +687,7 @@ if src == "windows_sysmon" {
       time: time_ms,
       message: raw,
       metadata: {
-        version: "1.8.0",
+        version: "1.9.0",
         uid: uuid(),
         product: {name: "Apache HTTP Server", vendor_name: "Apache Software Foundation"},
       },
@@ -757,7 +719,7 @@ if src == "windows_sysmon" {
       class_uid: 6003, category_uid: 6, activity_id: 99, type_uid: 600399,
       severity_id: 1, status_id: 0, time: 0, message: raw,
       metadata: {
-        version: "1.8.0", uid: uuid(), log_level: "error",
+        version: "1.9.0", uid: uuid(), log_level: "error",
         product: {name: "AWS CloudTrail", vendor_name: "Amazon"},
       },
     }
@@ -836,7 +798,7 @@ if src == "windows_sysmon" {
       time: time_ms,
       message: raw,
       metadata: {
-        version: "1.8.0",
+        version: "1.9.0",
         uid: string(p.eventID?).otherwise(uuid()),
         log_name: "CloudTrail",
         log_provider: "AWS CloudTrail",
@@ -884,35 +846,542 @@ if src == "windows_sysmon" {
     class_uid: 1007, category_uid: 1, activity_id: 99, type_uid: 100799,
     severity_id: 1, status_id: 0, time: 0, message: raw,
     metadata: {
-      version: "1.8.0", uid: uuid(), log_level: "error",
+      version: "1.9.0", uid: uuid(), log_level: "error",
       product: {name: "log-blaster", vendor_name: "nano"},
     },
     unmapped: {unrouted_source_type: src},
   }
 }
 
-// ---- producer-contract wire shape + sink ----------------------------------
-// `src` is guarded with `.otherwise("unknown")` above — a null in a required
-// column drops the event even with a DEFAULT (only ABSENT columns default).
-this = {event: ev, source_type: src}
+// ---- OCSF 1.9 normalization ----------------------------------------------
+// The original payload is kept byte-exact; searchable message is a summary.
+ev.raw_data = raw
+ev.metadata.profiles = ["host"]
+if ev.class_uid == 6003 {
+  ev.metadata.profiles = ["host", "cloud"]
+  if ev.api? == null { ev.api = {operation: "unparsed", service: {name: "AWS"}} }
+  if ev.cloud? == null { ev.cloud = {provider: "AWS"} }
+  if ev.src_endpoint? == null { ev.src_endpoint = {hostname: "unknown"} }
+}
+if ev.class_uid != 3002 and ev.class_uid != 3003 and ev.user? != null {
+  ev.unmapped.legacy_user = ev.user
+  drop ev.user
+}
+if ev.src_endpoint?.ip? != null {
+  if string(ev.src_endpoint.ip) == "" { drop ev.src_endpoint.ip }
+  else { ev.src_endpoint.ip = ip(ev.src_endpoint.ip) }
+}
+if ev.dst_endpoint?.ip? != null {
+  if string(ev.dst_endpoint.ip) == "" { drop ev.dst_endpoint.ip }
+  else { ev.dst_endpoint.ip = ip(ev.dst_endpoint.ip) }
+}
+ev.metadata.uid = "blaster:" + src + ":" + hash_sha256(raw)
+ev.message = src + " " + string(ev.class_name?).otherwise("OCSF activity") + " " + string(ev.activity_name?).otherwise("Other") + " " + string(ev.process?.cmd_line?).otherwise(string(ev.api?.operation?).otherwise(string(ev.http_request?.url?.url_string?).otherwise(string(ev.http_request?.url?.path?).otherwise(string(ev.metadata.uid)))))
+// Arrow's landing JSON writer omits nulls. A null-filled empty actor can
+// appear valid before Parquet but fails OCSF's actor constraint after decode.
+if ev.actor? == null { ev.actor = {} }
+if ev.actor.process? == null and ev.actor.user? == null {
+  ev.actor.user = {name: "unknown"}
+}
+// OCSF process identity is required even for an unparsed/unknown process.
+if ev.process? != null and ev.process.pid? == null and ev.process.uid? == null and ev.process.cpid? == null {
+  ev.process.pid = 0
+}
+if ev.actor.process? != null and ev.actor.process.pid? == null and ev.actor.process.uid? == null and ev.actor.process.cpid? == null {
+  ev.actor.process.pid = 0
+}
+if ev.class_uid == 4003 and ev.src_endpoint? == null and ev.dst_endpoint? == null {
+  ev.src_endpoint = {hostname: string(ev.device?.hostname?).otherwise("unknown")}
+}
+if ev.class_uid == 3002 and ev.service? == null and ev.dst_endpoint? == null {
+  ev.service = {name: "Windows Security"}
+}
+if ev.class_uid == 4002 and ev.http_request? == null and ev.http_response? == null {
+  ev.http_response = {code: 0}
+}
+if ev.class_uid == 1005 and ev.module?.load_type_id? == null and ev.module?.function_name? == null {
+  ev.module.load_type_id = 0
+}
+if ev.class_uid == 1007 and ev.process? == null { ev.process = {name: "unparsed", pid: 0} }
+if ev.category_uid == 1 {
+  if ev.device? == null { ev.device = {hostname: "unknown"} }
+}
+if ev.device? != null { ev.device.type_id = int(ev.device.type_id?).otherwise(0) }
+if ev.connection_info? != null { ev.connection_info.direction_id = int(ev.connection_info.direction_id?).otherwise(0) }
+if (ev.class_uid == 3002 or ev.class_uid == 3003) and ev.user? == null { ev.user = {name: "unknown"} }
+if ev.class_uid == 201001 or ev.class_uid == 201002 {
+  ev.metadata.extensions = [{name: "win", uid: "2", version: "1.0.0"}]
+}
+// Preserve source-specific details in a stable, legal free-form object. One
+// schema per OCSF class prevents Parquet schema churn from rotating tiny files.
+ev.unmapped = {generator_feed: src, details: print_json(ev.unmapped?.otherwise({}))}
+// v6.19.1's timestamp_to_ms caster requires a typed timestamp as input.
+if int(ev.time?).otherwise(0) <= 0 {
+  ev.time = int(time(string(timestamp?)).since_epoch().count_milliseconds()).otherwise(int(now().since_epoch().count_milliseconds()))
+}
+ev.time = 1970-01-01T00:00:00Z + int(ev.time) * 1ms
+this = ev
+// Source-homogeneous requests still split into tiny class/schema slices.
+// Coalesce per schema before the strict cast and null-only projection; ordered
+// batching would flush at each interleaved schema change. Sparse input flushes
+// within one second, and EOF drains all rows. Sender ordering is not required.
+unordered { batch 1024, timeout=1s }
+ocsf_cast null_fill=true, timestamp_to_ms=true
 
-// NAN-1839: coalesce before the sink. This rig emits maximally HETEROGENEOUS
-// OCSF (every class / field-set is a distinct Tenzir schema), so without this the
-// stream fragments into ~1-row table slices and `to_clickhouse` does one native
-// INSERT per event — at 200 eps that backs up in memory and OOM-kills the node
-// (measured: avg 1.4 rows/insert, 0.5% landed). `batch` buffers PER SCHEMA and in
-// the default ORDERED mode flushes on every schema change (can't coalesce
-// interleaved schemas); `unordered { batch }` accumulates same-schema events into
-// large inserts (measured avg ~23 rows/insert, max 183, bounded memory, 16× more
-// landed). Ordering is irrelevant once rows are in ClickHouse.
-unordered { batch 65536, timeout=2s }
+// ---- compact OCSF projection -------------------------------------------
+// Remove only null-only standard fields; keep the mapped field set per class.
+// Drop preserves nullable-record validity, unlike rebuilding nested records.
+// The validator proves non-null values survive and tests actual Parquet decode.
+if class_uid == 1001 {
+  drop access_mask, actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role,
+    actor.idp, actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables,
+    actor.process.file.accessed_time, actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id,
+    actor.process.file.created_time, actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id,
+    actor.process.file.encryption_details, actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted,
+    actor.process.file.is_readonly, actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner,
+    actor.process.file.parent_folder, actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size,
+    actor.process.file.tags, actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url,
+    actor.process.file.version, actor.process.file.volume, actor.process.file.xattributes, actor.process.integrity, actor.process.integrity_id, actor.process.lineage,
+    actor.process.loaded_modules, actor.process.parent_process.ancestry, actor.process.parent_process.cpid, actor.process.parent_process.created_time, actor.process.parent_process.environment_variables, actor.process.parent_process.file,
+    actor.process.parent_process.integrity, actor.process.parent_process.integrity_id, actor.process.parent_process.lineage, actor.process.parent_process.loaded_modules, actor.process.parent_process.path, actor.process.parent_process.ptid,
+    actor.process.parent_process.sandbox, actor.process.parent_process.session, actor.process.parent_process.terminated_time, actor.process.parent_process.tid, actor.process.parent_process.uid_numeric, actor.process.parent_process.user,
+    actor.process.parent_process.working_directory, actor.process.parent_process.xattributes, actor.process.path, actor.process.ptid, actor.process.sandbox, actor.process.session,
+    actor.process.terminated_time, actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory, actor.process.xattributes,
+    actor.session, actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr,
+    actor.user.forward_addr, actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org,
+    actor.user.phone_number, actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type,
+    actor.user.type_id, actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, component, connection_uid,
+    count, create_mask, device.agent_list, device.autoscale_uid, device.boot_time, device.boot_uid,
+    device.created_time, device.desc, device.domain, device.eid, device.first_seen_time, device.groups,
+    device.hw_info, device.hypervisor, device.iccid, device.image, device.imei, device.imei_list,
+    device.instance_uid, device.interface_name, device.interface_uid, device.ip, device.is_backed_up, device.is_compliant,
+    device.is_managed, device.is_mobile_account_active, device.is_personal, device.is_shared, device.is_supervised, device.is_trusted,
+    device.last_seen_time, device.location, device.mac, device.mac_vendor, device.meid, device.model,
+    device.modified_time, device.name, device.network_interfaces, device.org, device.os, device.os_machine_uuid,
+    device.owner, device.peripheral_devices, device.pool, device.region, device.risk_level, device.risk_level_id,
+    device.risk_score, device.subnet, device.subnet_uid, device.type, device.udid, device.uid,
+    device.uid_alt, device.uid_numeric, device.vendor_name, device.vlan_uid, device.vpc_uid, device.zone,
+    duration, end_time, enrichments, file.accessed_time, file.accessor, file.attributes,
+    file.company_name, file.confidentiality, file.confidentiality_id, file.created_time, file.creator, file.desc,
+    file.download_info, file.drive_type, file.drive_type_id, file.encryption_details, file.ext, file.imported_symbols,
+    file.internal_name, file.is_deleted, file.is_encrypted, file.is_readonly, file.is_system, file.mime_type,
+    file.modified_time, file.modifier, file.owner, file.parent_folder, file.product, file.security_descriptor,
+    file.signature, file.signatures, file.size, file.tags, file.type, file.uid,
+    file.uid_numeric, file.uri, file.url, file.version, file.volume, file.xattributes,
+    file_diff, file_result, metadata.correlation_uid, metadata.debug, metadata.event_code, metadata.extension,
+    metadata.extensions, metadata.is_truncated, metadata.labels, metadata.log_format, metadata.log_level, metadata.log_version,
+    metadata.logged_time, metadata.loggers, metadata.modified_time, metadata.original_event_uid, metadata.original_time, metadata.processed_time,
+    metadata.product.cpe_name, metadata.product.feature, metadata.product.lang, metadata.product.path, metadata.product.uid, metadata.product.uid_numeric,
+    metadata.product.url_string, metadata.product.version, metadata.reporter, metadata.sequence, metadata.source, metadata.tags,
+    metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time, metadata.type, metadata.untruncated_size, observables,
+    raw_data_hash, raw_data_size, start_time, status_code, status_detail, timezone_offset,
+    type_name
+}
+if class_uid == 1005 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables, actor.process.file.accessed_time,
+    actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id, actor.process.file.created_time,
+    actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id, actor.process.file.encryption_details,
+    actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted, actor.process.file.is_readonly,
+    actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner, actor.process.file.parent_folder,
+    actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size, actor.process.file.tags,
+    actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url, actor.process.file.version,
+    actor.process.file.volume, actor.process.file.xattributes, actor.process.integrity, actor.process.integrity_id, actor.process.lineage, actor.process.loaded_modules,
+    actor.process.parent_process, actor.process.path, actor.process.ptid, actor.process.sandbox, actor.process.session, actor.process.terminated_time,
+    actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory, actor.process.xattributes, actor.session,
+    actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr, actor.user.forward_addr,
+    actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org, actor.user.phone_number,
+    actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type, actor.user.type_id,
+    actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, count, device.agent_list, device.autoscale_uid,
+    device.boot_time, device.boot_uid, device.created_time, device.desc, device.domain, device.eid,
+    device.first_seen_time, device.groups, device.hw_info, device.hypervisor, device.iccid, device.image,
+    device.imei, device.imei_list, device.instance_uid, device.interface_name, device.interface_uid, device.ip,
+    device.is_backed_up, device.is_compliant, device.is_managed, device.is_mobile_account_active, device.is_personal, device.is_shared,
+    device.is_supervised, device.is_trusted, device.last_seen_time, device.location, device.mac, device.mac_vendor,
+    device.meid, device.model, device.modified_time, device.name, device.network_interfaces, device.org,
+    device.os, device.os_machine_uuid, device.owner, device.peripheral_devices, device.pool, device.region,
+    device.risk_level, device.risk_level_id, device.risk_score, device.subnet, device.subnet_uid, device.type,
+    device.udid, device.uid, device.uid_alt, device.uid_numeric, device.vendor_name, device.vlan_uid,
+    device.vpc_uid, device.zone, duration, end_time, enrichments, metadata.correlation_uid,
+    metadata.debug, metadata.event_code, metadata.extension, metadata.extensions, metadata.is_truncated, metadata.labels,
+    metadata.log_format, metadata.log_level, metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time,
+    metadata.original_event_uid, metadata.original_time, metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang,
+    metadata.product.path, metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter,
+    metadata.sequence, metadata.source, metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time,
+    metadata.type, metadata.untruncated_size, module.base_address, module.file.accessed_time, module.file.accessor, module.file.attributes,
+    module.file.company_name, module.file.confidentiality, module.file.confidentiality_id, module.file.created_time, module.file.creator, module.file.desc,
+    module.file.download_info, module.file.drive_type, module.file.drive_type_id, module.file.encryption_details, module.file.ext, module.file.hashes,
+    module.file.imported_symbols, module.file.internal_name, module.file.is_deleted, module.file.is_encrypted, module.file.is_readonly, module.file.is_system,
+    module.file.mime_type, module.file.modified_time, module.file.modifier, module.file.owner, module.file.parent_folder, module.file.product,
+    module.file.security_descriptor, module.file.signature, module.file.signatures, module.file.size, module.file.tags, module.file.type,
+    module.file.uid, module.file.uid_numeric, module.file.uri, module.file.url, module.file.version, module.file.volume,
+    module.file.xattributes, module.function_invocation, module.function_name, module.load_type, module.start_address, module.type,
+    observables, raw_data_hash, raw_data_size, start_time, status_code, status_detail,
+    timezone_offset, type_name
+}
+if class_uid == 1007 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables, actor.process.file.accessed_time,
+    actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id, actor.process.file.created_time,
+    actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id, actor.process.file.encryption_details,
+    actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted, actor.process.file.is_readonly,
+    actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner, actor.process.file.parent_folder,
+    actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size, actor.process.file.tags,
+    actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url, actor.process.file.version,
+    actor.process.file.volume, actor.process.file.xattributes, actor.process.integrity, actor.process.integrity_id, actor.process.lineage, actor.process.loaded_modules,
+    actor.process.parent_process.ancestry, actor.process.parent_process.cpid, actor.process.parent_process.created_time, actor.process.parent_process.environment_variables, actor.process.parent_process.file, actor.process.parent_process.integrity,
+    actor.process.parent_process.integrity_id, actor.process.parent_process.lineage, actor.process.parent_process.loaded_modules, actor.process.parent_process.path, actor.process.parent_process.ptid, actor.process.parent_process.sandbox,
+    actor.process.parent_process.session, actor.process.parent_process.terminated_time, actor.process.parent_process.tid, actor.process.parent_process.uid_numeric, actor.process.parent_process.user, actor.process.parent_process.working_directory,
+    actor.process.parent_process.xattributes, actor.process.path, actor.process.ptid, actor.process.sandbox, actor.process.session, actor.process.terminated_time,
+    actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory, actor.process.xattributes, actor.session,
+    actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr, actor.user.forward_addr,
+    actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org, actor.user.phone_number,
+    actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type, actor.user.type_id,
+    actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, actual_permissions, count, device.agent_list,
+    device.autoscale_uid, device.boot_time, device.boot_uid, device.created_time, device.desc, device.domain,
+    device.eid, device.first_seen_time, device.groups, device.hw_info, device.hypervisor, device.iccid,
+    device.image, device.imei, device.imei_list, device.instance_uid, device.interface_name, device.interface_uid,
+    device.ip, device.is_backed_up, device.is_compliant, device.is_managed, device.is_mobile_account_active, device.is_personal,
+    device.is_shared, device.is_supervised, device.is_trusted, device.last_seen_time, device.location, device.mac,
+    device.mac_vendor, device.meid, device.model, device.modified_time, device.name, device.network_interfaces,
+    device.org, device.os, device.os_machine_uuid, device.owner, device.peripheral_devices, device.pool,
+    device.region, device.risk_level, device.risk_level_id, device.risk_score, device.subnet, device.subnet_uid,
+    device.type, device.udid, device.uid, device.uid_alt, device.uid_numeric, device.vendor_name,
+    device.vlan_uid, device.vpc_uid, device.zone, duration, end_time, enrichments,
+    exit_code, injection_type, injection_type_id, launch_type, launch_type_id, metadata.correlation_uid,
+    metadata.debug, metadata.event_code, metadata.extension, metadata.extensions, metadata.is_truncated, metadata.labels,
+    metadata.log_format, metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time, metadata.original_event_uid,
+    metadata.original_time, metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang, metadata.product.path,
+    metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter, metadata.sequence,
+    metadata.source, metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time, metadata.type,
+    metadata.untruncated_size, module, observables, process.ancestry, process.cpid, process.created_time,
+    process.environment_variables, process.file.accessed_time, process.file.accessor, process.file.attributes, process.file.company_name, process.file.confidentiality,
+    process.file.confidentiality_id, process.file.created_time, process.file.creator, process.file.desc, process.file.download_info, process.file.drive_type,
+    process.file.drive_type_id, process.file.encryption_details, process.file.ext, process.file.imported_symbols, process.file.internal_name, process.file.is_deleted,
+    process.file.is_encrypted, process.file.is_readonly, process.file.is_system, process.file.mime_type, process.file.modified_time, process.file.modifier,
+    process.file.owner, process.file.parent_folder, process.file.product, process.file.security_descriptor, process.file.signature, process.file.signatures,
+    process.file.size, process.file.tags, process.file.type, process.file.uid, process.file.uid_numeric, process.file.uri,
+    process.file.url, process.file.version, process.file.volume, process.file.xattributes, process.integrity, process.integrity_id,
+    process.lineage, process.loaded_modules, process.parent_process, process.path, process.ptid, process.sandbox,
+    process.session, process.terminated_time, process.tid, process.uid_numeric, process.user, process.working_directory,
+    process.xattributes, raw_data_hash, raw_data_size, requested_permissions, start_time, status_code,
+    status_detail, timezone_offset, type_name
+}
+if class_uid == 3002 {
+  drop account_switch_type, account_switch_type_id, actor.app_name, actor.app_uid, actor.application, actor.authorizations,
+    actor.iam_role, actor.idp, actor.invoked_by, actor.process, actor.session, actor.user.account,
+    actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr, actor.user.forward_addr, actor.user.full_name,
+    actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org, actor.user.phone_number, actor.user.programmatic_credentials,
+    actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type, actor.user.type_id, actor.user.uid,
+    actor.user.uid_alt, actor.user.uid_numeric, auth_factors, authentication_token, certificate, count,
+    device.agent_list, device.autoscale_uid, device.boot_time, device.boot_uid, device.created_time, device.desc,
+    device.domain, device.eid, device.first_seen_time, device.groups, device.hw_info, device.hypervisor,
+    device.iccid, device.image, device.imei, device.imei_list, device.instance_uid, device.interface_name,
+    device.interface_uid, device.ip, device.is_backed_up, device.is_compliant, device.is_managed, device.is_mobile_account_active,
+    device.is_personal, device.is_shared, device.is_supervised, device.is_trusted, device.last_seen_time, device.location,
+    device.mac, device.mac_vendor, device.meid, device.model, device.modified_time, device.name,
+    device.network_interfaces, device.org, device.os, device.os_machine_uuid, device.owner, device.peripheral_devices,
+    device.pool, device.region, device.risk_level, device.risk_level_id, device.risk_score, device.subnet,
+    device.subnet_uid, device.type, device.udid, device.uid, device.uid_alt, device.uid_numeric,
+    device.vendor_name, device.vlan_uid, device.vpc_uid, device.zone, dst_endpoint.agent_list, dst_endpoint.autonomous_system,
+    dst_endpoint.domain, dst_endpoint.fingerprints, dst_endpoint.hw_info, dst_endpoint.instance_uid, dst_endpoint.interface_name, dst_endpoint.interface_uid,
+    dst_endpoint.intermediate_ips, dst_endpoint.ip, dst_endpoint.isp, dst_endpoint.isp_org, dst_endpoint.location, dst_endpoint.mac,
+    dst_endpoint.mac_vendor, dst_endpoint.name, dst_endpoint.network_scope, dst_endpoint.network_scope_id, dst_endpoint.os, dst_endpoint.owner,
+    dst_endpoint.pool, dst_endpoint.port, dst_endpoint.proxy_endpoint, dst_endpoint.subnet_uid, dst_endpoint.svc_name, dst_endpoint.type,
+    dst_endpoint.type_id, dst_endpoint.uid, dst_endpoint.uid_numeric, dst_endpoint.vlan_uid, dst_endpoint.vpc_uid, dst_endpoint.zone,
+    duration, end_time, enrichments, http_request, http_response, is_cleartext,
+    is_new_logon, is_remote, logon_process, logon_type, logon_type_id, metadata.correlation_uid,
+    metadata.debug, metadata.event_code, metadata.extension, metadata.extensions, metadata.is_truncated, metadata.labels,
+    metadata.log_format, metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time, metadata.original_event_uid,
+    metadata.original_time, metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang, metadata.product.path,
+    metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter, metadata.sequence,
+    metadata.source, metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time, metadata.type,
+    metadata.untruncated_size, observables, raw_data_hash, raw_data_size, service.labels, service.tags,
+    service.uid, service.uid_numeric, service.version, session.count, session.created_time, session.credential_uid,
+    session.expiration_reason, session.expiration_time, session.is_mfa, session.is_remote, session.is_vpn, session.issuer,
+    session.terminal, session.uid_alt, session.uuid, src_endpoint.agent_list, src_endpoint.autonomous_system, src_endpoint.domain,
+    src_endpoint.fingerprints, src_endpoint.hw_info, src_endpoint.instance_uid, src_endpoint.interface_name, src_endpoint.interface_uid, src_endpoint.intermediate_ips,
+    src_endpoint.isp, src_endpoint.isp_org, src_endpoint.location, src_endpoint.mac, src_endpoint.mac_vendor, src_endpoint.name,
+    src_endpoint.network_scope, src_endpoint.network_scope_id, src_endpoint.os, src_endpoint.owner, src_endpoint.pool, src_endpoint.proxy_endpoint,
+    src_endpoint.subnet_uid, src_endpoint.svc_name, src_endpoint.type, src_endpoint.type_id, src_endpoint.uid, src_endpoint.uid_numeric,
+    src_endpoint.vlan_uid, src_endpoint.vpc_uid, src_endpoint.zone, start_time, status_code, status_detail,
+    timezone_offset, type_name, user.account, user.credential_uid, user.display_name, user.email_addr,
+    user.forward_addr, user.full_name, user.groups, user.has_mfa, user.ldap_person, user.org,
+    user.phone_number, user.programmatic_credentials, user.risk_level, user.risk_level_id, user.risk_score, user.type,
+    user.type_id, user.uid_alt, user.uid_numeric
+}
+if class_uid == 3003 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process, actor.session, actor.user.account, actor.user.credential_uid, actor.user.display_name,
+    actor.user.domain, actor.user.email_addr, actor.user.forward_addr, actor.user.full_name, actor.user.groups, actor.user.has_mfa,
+    actor.user.ldap_person, actor.user.org, actor.user.phone_number, actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id,
+    actor.user.risk_score, actor.user.type, actor.user.type_id, actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric,
+    count, device.agent_list, device.autoscale_uid, device.boot_time, device.boot_uid, device.created_time,
+    device.desc, device.domain, device.eid, device.first_seen_time, device.groups, device.hw_info,
+    device.hypervisor, device.iccid, device.image, device.imei, device.imei_list, device.instance_uid,
+    device.interface_name, device.interface_uid, device.ip, device.is_backed_up, device.is_compliant, device.is_managed,
+    device.is_mobile_account_active, device.is_personal, device.is_shared, device.is_supervised, device.is_trusted, device.last_seen_time,
+    device.location, device.mac, device.mac_vendor, device.meid, device.model, device.modified_time,
+    device.name, device.network_interfaces, device.org, device.os, device.os_machine_uuid, device.owner,
+    device.peripheral_devices, device.pool, device.region, device.risk_level, device.risk_level_id, device.risk_score,
+    device.subnet, device.subnet_uid, device.type, device.udid, device.uid, device.uid_alt,
+    device.uid_numeric, device.vendor_name, device.vlan_uid, device.vpc_uid, device.zone, dst_endpoint,
+    duration, end_time, enrichments, group, groups, http_request,
+    http_response, iam_roles, metadata.correlation_uid, metadata.debug, metadata.event_code, metadata.extension,
+    metadata.extensions, metadata.is_truncated, metadata.labels, metadata.log_format, metadata.log_level, metadata.log_version,
+    metadata.logged_time, metadata.loggers, metadata.modified_time, metadata.original_event_uid, metadata.original_time, metadata.processed_time,
+    metadata.product.cpe_name, metadata.product.feature, metadata.product.lang, metadata.product.path, metadata.product.uid, metadata.product.uid_numeric,
+    metadata.product.url_string, metadata.product.version, metadata.reporter, metadata.sequence, metadata.source, metadata.tags,
+    metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time, metadata.type, metadata.untruncated_size, observables,
+    raw_data_hash, raw_data_size, session.count, session.created_time, session.credential_uid, session.expiration_reason,
+    session.expiration_time, session.is_mfa, session.is_remote, session.is_vpn, session.issuer, session.terminal,
+    session.uid_alt, session.uuid, src_endpoint, start_time, status_code, status_detail,
+    timezone_offset, type_name, user.account, user.credential_uid, user.display_name, user.email_addr,
+    user.forward_addr, user.full_name, user.groups, user.has_mfa, user.ldap_person, user.org,
+    user.phone_number, user.programmatic_credentials, user.risk_level, user.risk_level_id, user.risk_score, user.type,
+    user.type_id, user.uid_alt, user.uid_numeric
+}
+if class_uid == 4001 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables, actor.process.file.accessed_time,
+    actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id, actor.process.file.created_time,
+    actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id, actor.process.file.encryption_details,
+    actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted, actor.process.file.is_readonly,
+    actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner, actor.process.file.parent_folder,
+    actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size, actor.process.file.tags,
+    actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url, actor.process.file.version,
+    actor.process.file.volume, actor.process.file.xattributes, actor.process.integrity, actor.process.integrity_id, actor.process.lineage, actor.process.loaded_modules,
+    actor.process.parent_process.ancestry, actor.process.parent_process.cpid, actor.process.parent_process.created_time, actor.process.parent_process.environment_variables, actor.process.parent_process.file, actor.process.parent_process.integrity,
+    actor.process.parent_process.integrity_id, actor.process.parent_process.lineage, actor.process.parent_process.loaded_modules, actor.process.parent_process.path, actor.process.parent_process.ptid, actor.process.parent_process.sandbox,
+    actor.process.parent_process.session, actor.process.parent_process.terminated_time, actor.process.parent_process.tid, actor.process.parent_process.uid_numeric, actor.process.parent_process.user, actor.process.parent_process.working_directory,
+    actor.process.parent_process.xattributes, actor.process.path, actor.process.ptid, actor.process.sandbox, actor.process.session, actor.process.terminated_time,
+    actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory, actor.process.xattributes, actor.session,
+    actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr, actor.user.forward_addr,
+    actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org, actor.user.phone_number,
+    actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type, actor.user.type_id,
+    actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, app_name, app_protocol_name, connection_info.boundary,
+    connection_info.boundary_id, connection_info.community_uid, connection_info.direction, connection_info.flag_history, connection_info.protocol_name, connection_info.protocol_ver,
+    connection_info.protocol_ver_id, connection_info.session, connection_info.tcp_flags, connection_info.uid, count, cumulative_traffic,
+    device.agent_list, device.autoscale_uid, device.boot_time, device.boot_uid, device.created_time, device.desc,
+    device.domain, device.eid, device.first_seen_time, device.groups, device.hw_info, device.hypervisor,
+    device.iccid, device.image, device.imei, device.imei_list, device.instance_uid, device.interface_name,
+    device.interface_uid, device.ip, device.is_backed_up, device.is_compliant, device.is_managed, device.is_mobile_account_active,
+    device.is_personal, device.is_shared, device.is_supervised, device.is_trusted, device.last_seen_time, device.location,
+    device.mac, device.mac_vendor, device.meid, device.model, device.modified_time, device.name,
+    device.network_interfaces, device.org, device.os, device.os_machine_uuid, device.owner, device.peripheral_devices,
+    device.pool, device.region, device.risk_level, device.risk_level_id, device.risk_score, device.subnet,
+    device.subnet_uid, device.type, device.udid, device.uid, device.uid_alt, device.uid_numeric,
+    device.vendor_name, device.vlan_uid, device.vpc_uid, device.zone, dst_endpoint.agent_list, dst_endpoint.autonomous_system,
+    dst_endpoint.domain, dst_endpoint.fingerprints, dst_endpoint.hw_info, dst_endpoint.instance_uid, dst_endpoint.interface_name, dst_endpoint.interface_uid,
+    dst_endpoint.intermediate_ips, dst_endpoint.isp, dst_endpoint.isp_org, dst_endpoint.location, dst_endpoint.mac, dst_endpoint.mac_vendor,
+    dst_endpoint.name, dst_endpoint.network_scope, dst_endpoint.network_scope_id, dst_endpoint.os, dst_endpoint.owner, dst_endpoint.pool,
+    dst_endpoint.proxy_endpoint, dst_endpoint.subnet_uid, dst_endpoint.svc_name, dst_endpoint.type, dst_endpoint.type_id, dst_endpoint.uid,
+    dst_endpoint.uid_numeric, dst_endpoint.vlan_uid, dst_endpoint.vpc_uid, dst_endpoint.zone, duration, end_time,
+    enrichments, initiator, initiator_id, is_src_dst_assignment_known, ja4_fingerprint_list, metadata.correlation_uid,
+    metadata.debug, metadata.event_code, metadata.extension, metadata.extensions, metadata.is_truncated, metadata.labels,
+    metadata.log_format, metadata.log_level, metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time,
+    metadata.original_event_uid, metadata.original_time, metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang,
+    metadata.product.path, metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter,
+    metadata.sequence, metadata.source, metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time,
+    metadata.type, metadata.untruncated_size, network_observation_point, observables, observation_point, observation_point_id,
+    packet_list, proxy, raw_data_hash, raw_data_size, src_endpoint.agent_list, src_endpoint.autonomous_system,
+    src_endpoint.domain, src_endpoint.fingerprints, src_endpoint.hw_info, src_endpoint.instance_uid, src_endpoint.interface_name, src_endpoint.interface_uid,
+    src_endpoint.intermediate_ips, src_endpoint.isp, src_endpoint.isp_org, src_endpoint.location, src_endpoint.mac, src_endpoint.mac_vendor,
+    src_endpoint.name, src_endpoint.network_scope, src_endpoint.network_scope_id, src_endpoint.os, src_endpoint.owner, src_endpoint.pool,
+    src_endpoint.proxy_endpoint, src_endpoint.subnet_uid, src_endpoint.svc_name, src_endpoint.type, src_endpoint.type_id, src_endpoint.uid,
+    src_endpoint.uid_numeric, src_endpoint.vlan_uid, src_endpoint.vpc_uid, src_endpoint.zone, start_time, status_code,
+    status_detail, timezone_offset, tls, traffic, type_name, url
+}
+if class_uid == 4002 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process, actor.session, actor.user.account, actor.user.credential_uid, actor.user.display_name,
+    actor.user.domain, actor.user.email_addr, actor.user.forward_addr, actor.user.full_name, actor.user.groups, actor.user.has_mfa,
+    actor.user.ldap_person, actor.user.org, actor.user.phone_number, actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id,
+    actor.user.risk_score, actor.user.type, actor.user.type_id, actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric,
+    app_name, app_protocol_name, connection_info, count, cumulative_traffic, device,
+    dst_endpoint.agent_list, dst_endpoint.autonomous_system, dst_endpoint.domain, dst_endpoint.fingerprints, dst_endpoint.hw_info, dst_endpoint.instance_uid,
+    dst_endpoint.interface_name, dst_endpoint.interface_uid, dst_endpoint.intermediate_ips, dst_endpoint.isp, dst_endpoint.isp_org, dst_endpoint.location,
+    dst_endpoint.mac, dst_endpoint.mac_vendor, dst_endpoint.name, dst_endpoint.network_scope, dst_endpoint.network_scope_id, dst_endpoint.os,
+    dst_endpoint.owner, dst_endpoint.pool, dst_endpoint.proxy_endpoint, dst_endpoint.subnet_uid, dst_endpoint.svc_name, dst_endpoint.type,
+    dst_endpoint.type_id, dst_endpoint.uid, dst_endpoint.uid_numeric, dst_endpoint.vlan_uid, dst_endpoint.vpc_uid, dst_endpoint.zone,
+    duration, end_time, enrichments, file, http_cookies, http_request.args,
+    http_request.body_length, http_request.http_headers, http_request.length, http_request.uid, http_request.url.categories, http_request.url.category_ids,
+    http_request.url.domain, http_request.url.port, http_request.url.query_string, http_request.url.resource_type, http_request.url.scheme, http_request.url.subdomain,
+    http_request.version, http_request.x_forwarded_for, http_response.body_length, http_response.content_type, http_response.http_headers, http_response.latency,
+    http_response.message, http_status, ja4_fingerprint_list, metadata.correlation_uid, metadata.debug, metadata.event_code,
+    metadata.extension, metadata.extensions, metadata.is_truncated, metadata.labels, metadata.log_format, metadata.log_provider,
+    metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time, metadata.original_event_uid, metadata.original_time,
+    metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang, metadata.product.path, metadata.product.uid,
+    metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter, metadata.sequence, metadata.source,
+    metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time, metadata.type, metadata.untruncated_size,
+    network_observation_point, observables, observation_point, observation_point_id, packet_list, proxy,
+    raw_data_hash, raw_data_size, src_endpoint.agent_list, src_endpoint.autonomous_system, src_endpoint.domain, src_endpoint.fingerprints,
+    src_endpoint.hostname, src_endpoint.hw_info, src_endpoint.instance_uid, src_endpoint.interface_name, src_endpoint.interface_uid, src_endpoint.intermediate_ips,
+    src_endpoint.isp, src_endpoint.isp_org, src_endpoint.location, src_endpoint.mac, src_endpoint.mac_vendor, src_endpoint.name,
+    src_endpoint.network_scope, src_endpoint.network_scope_id, src_endpoint.os, src_endpoint.owner, src_endpoint.pool, src_endpoint.port,
+    src_endpoint.proxy_endpoint, src_endpoint.subnet_uid, src_endpoint.svc_name, src_endpoint.type, src_endpoint.type_id, src_endpoint.uid,
+    src_endpoint.uid_numeric, src_endpoint.vlan_uid, src_endpoint.vpc_uid, src_endpoint.zone, start_time, status_code,
+    status_detail, timezone_offset, tls, traffic.bytes, traffic.bytes_missed, traffic.chunks,
+    traffic.chunks_in, traffic.chunks_out, traffic.end_time, traffic.packets, traffic.packets_in, traffic.packets_out,
+    traffic.start_time, traffic.timespan, type_name
+}
+if class_uid == 4003 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables, actor.process.file.accessed_time,
+    actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id, actor.process.file.created_time,
+    actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id, actor.process.file.encryption_details,
+    actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted, actor.process.file.is_readonly,
+    actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner, actor.process.file.parent_folder,
+    actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size, actor.process.file.tags,
+    actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url, actor.process.file.version,
+    actor.process.file.volume, actor.process.file.xattributes, actor.process.integrity, actor.process.integrity_id, actor.process.lineage, actor.process.loaded_modules,
+    actor.process.parent_process.ancestry, actor.process.parent_process.cpid, actor.process.parent_process.created_time, actor.process.parent_process.environment_variables, actor.process.parent_process.file, actor.process.parent_process.integrity,
+    actor.process.parent_process.integrity_id, actor.process.parent_process.lineage, actor.process.parent_process.loaded_modules, actor.process.parent_process.path, actor.process.parent_process.ptid, actor.process.parent_process.sandbox,
+    actor.process.parent_process.session, actor.process.parent_process.terminated_time, actor.process.parent_process.tid, actor.process.parent_process.uid_numeric, actor.process.parent_process.user, actor.process.parent_process.working_directory,
+    actor.process.parent_process.xattributes, actor.process.path, actor.process.ptid, actor.process.sandbox, actor.process.session, actor.process.terminated_time,
+    actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory, actor.process.xattributes, actor.session,
+    actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr, actor.user.forward_addr,
+    actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org, actor.user.phone_number,
+    actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type, actor.user.type_id,
+    actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, app_name, app_protocol_name, authority,
+    connection_info, count, cumulative_traffic, device.agent_list, device.autoscale_uid, device.boot_time,
+    device.boot_uid, device.created_time, device.desc, device.domain, device.eid, device.first_seen_time,
+    device.groups, device.hw_info, device.hypervisor, device.iccid, device.image, device.imei,
+    device.imei_list, device.instance_uid, device.interface_name, device.interface_uid, device.ip, device.is_backed_up,
+    device.is_compliant, device.is_managed, device.is_mobile_account_active, device.is_personal, device.is_shared, device.is_supervised,
+    device.is_trusted, device.last_seen_time, device.location, device.mac, device.mac_vendor, device.meid,
+    device.model, device.modified_time, device.name, device.network_interfaces, device.org, device.os,
+    device.os_machine_uuid, device.owner, device.peripheral_devices, device.pool, device.region, device.risk_level,
+    device.risk_level_id, device.risk_score, device.subnet, device.subnet_uid, device.type, device.udid,
+    device.uid, device.uid_alt, device.uid_numeric, device.vendor_name, device.vlan_uid, device.vpc_uid,
+    device.zone, dst_endpoint, duration, end_time, enrichments, flag_ids,
+    flags, ja4_fingerprint_list, metadata.correlation_uid, metadata.debug, metadata.event_code, metadata.extension,
+    metadata.extensions, metadata.is_truncated, metadata.labels, metadata.log_format, metadata.log_level, metadata.log_version,
+    metadata.logged_time, metadata.loggers, metadata.modified_time, metadata.original_event_uid, metadata.original_time, metadata.processed_time,
+    metadata.product.cpe_name, metadata.product.feature, metadata.product.lang, metadata.product.path, metadata.product.uid, metadata.product.uid_numeric,
+    metadata.product.url_string, metadata.product.version, metadata.reporter, metadata.sequence, metadata.source, metadata.tags,
+    metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time, metadata.type, metadata.untruncated_size, network_observation_point,
+    observables, observation_point, observation_point_id, opcode, opcode_id, packet_list,
+    proxy, query.class, query.opcode, query.opcode_id, query.packet_uid, query.type,
+    query_additional, query_time, raw_data_hash, raw_data_size, rcode, rcode_id,
+    response_additional, response_time, src_endpoint.agent_list, src_endpoint.autonomous_system, src_endpoint.domain, src_endpoint.fingerprints,
+    src_endpoint.hw_info, src_endpoint.instance_uid, src_endpoint.interface_name, src_endpoint.interface_uid, src_endpoint.intermediate_ips, src_endpoint.ip,
+    src_endpoint.isp, src_endpoint.isp_org, src_endpoint.location, src_endpoint.mac, src_endpoint.mac_vendor, src_endpoint.name,
+    src_endpoint.network_scope, src_endpoint.network_scope_id, src_endpoint.os, src_endpoint.owner, src_endpoint.pool, src_endpoint.port,
+    src_endpoint.proxy_endpoint, src_endpoint.subnet_uid, src_endpoint.svc_name, src_endpoint.type, src_endpoint.type_id, src_endpoint.uid,
+    src_endpoint.uid_numeric, src_endpoint.vlan_uid, src_endpoint.vpc_uid, src_endpoint.zone, start_time, status_code,
+    status_detail, timezone_offset, tls, traffic, transaction_id, type_name
+}
+if class_uid == 6003 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process, actor.session, actor.user.account, actor.user.credential_uid, actor.user.display_name,
+    actor.user.domain, actor.user.email_addr, actor.user.forward_addr, actor.user.full_name, actor.user.groups, actor.user.has_mfa,
+    actor.user.ldap_person, actor.user.org, actor.user.phone_number, actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id,
+    actor.user.risk_score, actor.user.type_id, actor.user.uid_alt, actor.user.uid_numeric, api.group, api.request,
+    api.response, api.service.labels, api.service.tags, api.service.uid, api.service.uid_numeric, api.service.version,
+    api.token, api.version, cloud.account.is_disabled, cloud.account.is_locked, cloud.account.is_on_premises_sync_enabled, cloud.account.labels,
+    cloud.account.tags, cloud.account.type, cloud.account.type_id, cloud.account.uid_numeric, cloud.cloud_partition, cloud.org,
+    cloud.project_uid, cloud.zone, count, device, dst_endpoint, duration,
+    end_time, enrichments, http_request.args, http_request.body_length, http_request.http_headers, http_request.http_method,
+    http_request.length, http_request.referrer, http_request.uid, http_request.url, http_request.version, http_request.x_forwarded_for,
+    http_response, metadata.debug, metadata.event_code, metadata.extension, metadata.extensions, metadata.is_truncated,
+    metadata.labels, metadata.log_format, metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time,
+    metadata.original_event_uid, metadata.original_time, metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang,
+    metadata.product.path, metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter,
+    metadata.sequence, metadata.source, metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time,
+    metadata.type, metadata.untruncated_size, observables, raw_data_hash, raw_data_size, src_endpoint.agent_list,
+    src_endpoint.autonomous_system, src_endpoint.domain, src_endpoint.fingerprints, src_endpoint.hw_info, src_endpoint.instance_uid, src_endpoint.interface_name,
+    src_endpoint.interface_uid, src_endpoint.intermediate_ips, src_endpoint.isp, src_endpoint.isp_org, src_endpoint.location, src_endpoint.mac,
+    src_endpoint.mac_vendor, src_endpoint.name, src_endpoint.network_scope, src_endpoint.network_scope_id, src_endpoint.os, src_endpoint.owner,
+    src_endpoint.pool, src_endpoint.port, src_endpoint.proxy_endpoint, src_endpoint.subnet_uid, src_endpoint.svc_name, src_endpoint.type,
+    src_endpoint.type_id, src_endpoint.uid, src_endpoint.uid_numeric, src_endpoint.vlan_uid, src_endpoint.vpc_uid, src_endpoint.zone,
+    start_time, status_code, status_detail, timezone_offset, type_name
+}
+if class_uid == 201001 {
+  drop access_mask, actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role,
+    actor.idp, actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables,
+    actor.process.file.accessed_time, actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id,
+    actor.process.file.created_time, actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id,
+    actor.process.file.encryption_details, actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted,
+    actor.process.file.is_readonly, actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner,
+    actor.process.file.parent_folder, actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size,
+    actor.process.file.tags, actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url,
+    actor.process.file.version, actor.process.file.volume, actor.process.file.xattributes, actor.process.hosted_services, actor.process.integrity, actor.process.integrity_id,
+    actor.process.lineage, actor.process.loaded_modules, actor.process.parent_process, actor.process.path, actor.process.ptid, actor.process.sandbox,
+    actor.process.session, actor.process.terminated_time, actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory,
+    actor.process.xattributes, actor.session, actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain,
+    actor.user.email_addr, actor.user.forward_addr, actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person,
+    actor.user.org, actor.user.phone_number, actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score,
+    actor.user.type, actor.user.type_id, actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, count,
+    create_mask, device.agent_list, device.autoscale_uid, device.boot_time, device.boot_uid, device.created_time,
+    device.desc, device.domain, device.eid, device.first_seen_time, device.groups, device.hw_info,
+    device.hypervisor, device.iccid, device.image, device.imei, device.imei_list, device.instance_uid,
+    device.interface_name, device.interface_uid, device.ip, device.is_backed_up, device.is_compliant, device.is_managed,
+    device.is_mobile_account_active, device.is_personal, device.is_shared, device.is_supervised, device.is_trusted, device.last_seen_time,
+    device.location, device.mac, device.mac_vendor, device.meid, device.model, device.modified_time,
+    device.name, device.network_interfaces, device.org, device.os, device.os_machine_uuid, device.owner,
+    device.peripheral_devices, device.pool, device.region, device.risk_level, device.risk_level_id, device.risk_score,
+    device.subnet, device.subnet_uid, device.type, device.udid, device.uid, device.uid_alt,
+    device.uid_numeric, device.vendor_name, device.vlan_uid, device.vpc_uid, device.zone, duration,
+    end_time, enrichments, metadata.correlation_uid, metadata.debug, metadata.event_code, metadata.extension,
+    metadata.is_truncated, metadata.labels, metadata.log_format, metadata.log_level, metadata.log_version, metadata.logged_time,
+    metadata.loggers, metadata.modified_time, metadata.original_event_uid, metadata.original_time, metadata.processed_time, metadata.product.cpe_name,
+    metadata.product.feature, metadata.product.lang, metadata.product.path, metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string,
+    metadata.product.version, metadata.reporter, metadata.sequence, metadata.source, metadata.tags, metadata.total_queued_duration,
+    metadata.transformation_info_list, metadata.transmit_time, metadata.type, metadata.untruncated_size, observables, open_mask,
+    prev_reg_key, raw_data_hash, raw_data_size, reg_key.is_system, reg_key.modified_time, reg_key.security_descriptor,
+    start_time, status_code, status_detail, timezone_offset, type_name
+}
+if class_uid == 201002 {
+  drop actor.app_name, actor.app_uid, actor.application, actor.authorizations, actor.iam_role, actor.idp,
+    actor.invoked_by, actor.process.ancestry, actor.process.cpid, actor.process.created_time, actor.process.environment_variables, actor.process.file.accessed_time,
+    actor.process.file.accessor, actor.process.file.attributes, actor.process.file.company_name, actor.process.file.confidentiality, actor.process.file.confidentiality_id, actor.process.file.created_time,
+    actor.process.file.creator, actor.process.file.desc, actor.process.file.download_info, actor.process.file.drive_type, actor.process.file.drive_type_id, actor.process.file.encryption_details,
+    actor.process.file.ext, actor.process.file.imported_symbols, actor.process.file.internal_name, actor.process.file.is_deleted, actor.process.file.is_encrypted, actor.process.file.is_readonly,
+    actor.process.file.is_system, actor.process.file.mime_type, actor.process.file.modified_time, actor.process.file.modifier, actor.process.file.owner, actor.process.file.parent_folder,
+    actor.process.file.product, actor.process.file.security_descriptor, actor.process.file.signature, actor.process.file.signatures, actor.process.file.size, actor.process.file.tags,
+    actor.process.file.type, actor.process.file.uid, actor.process.file.uid_numeric, actor.process.file.uri, actor.process.file.url, actor.process.file.version,
+    actor.process.file.volume, actor.process.file.xattributes, actor.process.hosted_services, actor.process.integrity, actor.process.integrity_id, actor.process.lineage,
+    actor.process.loaded_modules, actor.process.parent_process, actor.process.path, actor.process.ptid, actor.process.sandbox, actor.process.session,
+    actor.process.terminated_time, actor.process.tid, actor.process.uid_numeric, actor.process.user, actor.process.working_directory, actor.process.xattributes,
+    actor.session, actor.user.account, actor.user.credential_uid, actor.user.display_name, actor.user.domain, actor.user.email_addr,
+    actor.user.forward_addr, actor.user.full_name, actor.user.groups, actor.user.has_mfa, actor.user.ldap_person, actor.user.org,
+    actor.user.phone_number, actor.user.programmatic_credentials, actor.user.risk_level, actor.user.risk_level_id, actor.user.risk_score, actor.user.type,
+    actor.user.type_id, actor.user.uid, actor.user.uid_alt, actor.user.uid_numeric, count, device.agent_list,
+    device.autoscale_uid, device.boot_time, device.boot_uid, device.created_time, device.desc, device.domain,
+    device.eid, device.first_seen_time, device.groups, device.hw_info, device.hypervisor, device.iccid,
+    device.image, device.imei, device.imei_list, device.instance_uid, device.interface_name, device.interface_uid,
+    device.ip, device.is_backed_up, device.is_compliant, device.is_managed, device.is_mobile_account_active, device.is_personal,
+    device.is_shared, device.is_supervised, device.is_trusted, device.last_seen_time, device.location, device.mac,
+    device.mac_vendor, device.meid, device.model, device.modified_time, device.name, device.network_interfaces,
+    device.org, device.os, device.os_machine_uuid, device.owner, device.peripheral_devices, device.pool,
+    device.region, device.risk_level, device.risk_level_id, device.risk_score, device.subnet, device.subnet_uid,
+    device.type, device.udid, device.uid, device.uid_alt, device.uid_numeric, device.vendor_name,
+    device.vlan_uid, device.vpc_uid, device.zone, duration, end_time, enrichments,
+    metadata.correlation_uid, metadata.debug, metadata.event_code, metadata.extension, metadata.is_truncated, metadata.labels,
+    metadata.log_format, metadata.log_level, metadata.log_version, metadata.logged_time, metadata.loggers, metadata.modified_time,
+    metadata.original_event_uid, metadata.original_time, metadata.processed_time, metadata.product.cpe_name, metadata.product.feature, metadata.product.lang,
+    metadata.product.path, metadata.product.uid, metadata.product.uid_numeric, metadata.product.url_string, metadata.product.version, metadata.reporter,
+    metadata.sequence, metadata.source, metadata.tags, metadata.total_queued_duration, metadata.transformation_info_list, metadata.transmit_time,
+    metadata.type, metadata.untruncated_size, observables, prev_reg_value, raw_data_hash, raw_data_size,
+    reg_value.is_default, reg_value.is_system, reg_value.modified_time, reg_value.reg_binary_data, reg_value.reg_integer_data, reg_value.reg_string_data,
+    reg_value.reg_string_list_data, reg_value.type, reg_value.type_id, start_time, status_code, status_detail,
+    timezone_offset, type_name
+}
 
-// NAN-1788: native `to_clickhouse` (Tenzir >= 6.6.0) streams straight into
-// ocsf_logs_raw over the native protocol — no HTTP shooter, no per-second
-// micro-batching. `mode="append"` writes the existing JSON `event` column;
-// `tls=false` because the in-cluster CH port is plaintext (the operator
-// defaults to TLS otherwise). 6.6.0 is the first release whose to_clickhouse
-// accepts ocsf_logs_raw's LowCardinality / tz-qualified DateTime64 columns and
-// omits the server-derived timestamp/id. On Tenzir 6.4.0–6.5.x, target the
-// legacy ocsf_logs_native_raw entrypoint instead — see clickhouse/ocsf/init.sql.
-to_clickhouse table="nanosiem.ocsf_logs_raw", host=$ch_host, port=$ch_port, user=$ch_user, password=env("NANO_CH_INGEST_PASSWORD"), tls=false, mode="append"
+// Nano's landing stage re-stamps these from the immutable folder/key binding.
+// Add nano extensions AFTER ocsf_cast so the standard-schema cast keeps them.
+metadata.log_source = "__NANO_ROUTE_KEY__"
+metadata.tenant_uid = "__NANO_TENANT_UUID__"
+// metadata.nano_credential_id is derived by the landing authority from the SigV4 key.
+metadata.ingress_transport = "landing_bucket"
+
+// ---- hosted S3 front -----------------------------------------------------
+// to_s3 removes the partition field, leaving class_uid in every stored row.
+// Nested paths are accepted inside the key's own tenant/source prefix.
+_ocsf_class = class_uid
+to_s3 "s3://landing/landing-ocsf-v1/tenant_id=__NANO_TENANT_UUID__/source=__NANO_SOURCE_ID__/**/events-{uuid}.parquet?endpoint_override=__NANO_INGEST_HOST__&region=us-east-1",
+  aws_iam={access_key_id: "__NANO_ACCESS_KEY_ID__", secret_access_key: "__NANO_SECRET_ACCESS_KEY__"},
+  max_size=64M, timeout=5min, partition_by=[_ocsf_class] {
+  write_parquet
+}

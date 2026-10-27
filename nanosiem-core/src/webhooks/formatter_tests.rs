@@ -548,3 +548,54 @@ fn severity_hex_is_distinct_per_level() {
     assert_eq!(unique.len(), 5);
     assert_eq!(severity_hex("nonsense"), severity_hex("informational"));
 }
+
+#[test]
+fn catalog_transports_reuse_existing_channel_cards_and_generic_bytes() {
+    use serde_json::{Value, json};
+    let event = sample_alert();
+    let ctx = FormatContext {
+        routing_key: Some("fixture-key"),
+    };
+    let slack: Value = serde_json::from_slice(
+        &build_notification_body(
+            NotificationTransport::SlackChat {
+                channel: "C0123456789",
+            },
+            &event,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let original = SlackFormatter.format(&event, &ctx);
+    assert_eq!(slack["attachments"], original["attachments"]);
+    assert_eq!(slack["text"], original["text"]);
+    assert_eq!(slack["channel"], json!("C0123456789"));
+    let teams: Value = serde_json::from_slice(
+        &build_notification_body(NotificationTransport::TeamsGraph, &event).unwrap(),
+    )
+    .unwrap();
+    let card: Value =
+        serde_json::from_str(teams["attachments"][0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        card,
+        TeamsFormatter.format(&event, &ctx)["attachments"][0]["content"]
+    );
+    let mut pd: Value = serde_json::from_slice(
+        &build_notification_body(NotificationTransport::PagerDuty, &event).unwrap(),
+    )
+    .unwrap();
+    assert!(pd.get("routing_key").is_none());
+    pd["routing_key"] = json!("fixture-key");
+    assert_eq!(
+        serde_json::to_vec(&pd).unwrap(),
+        build_channel_body(ChannelType::PagerDuty, &event, &ctx)
+            .unwrap()
+            .bytes
+    );
+    assert_eq!(
+        build_notification_body(NotificationTransport::Generic, &event).unwrap(),
+        build_channel_body(ChannelType::Generic, &event, &ctx)
+            .unwrap()
+            .bytes
+    );
+}

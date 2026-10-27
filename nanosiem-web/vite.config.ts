@@ -4,6 +4,7 @@ import { readFileSync } from 'fs';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig, loadEnv, Plugin } from 'vite';
+import { applyCsp, assertInlineScriptsAllowed } from './csp';
 
 // Stamp the package.json version into the bundle as `__APP_VERSION__` so
 // pre-auth surfaces (Login terminal banner) can display a real release
@@ -21,45 +22,34 @@ function resolveEdition(env: Record<string, string>): 'open' | 'enterprise' {
   return env.VITE_EDITION === 'enterprise' ? 'enterprise' : 'open';
 }
 
-// SHA-256 hash of the inline theme initialization script in index.html.
-// If that script changes, regenerate with:
-//   node -e "const c=require('crypto');const fs=require('fs');const html=fs.readFileSync('index.html','utf8');const m=html.match(/<script>\n([\s\S]*?)<\/script>/);console.log('sha256-'+c.createHash('sha256').update(m[0].replace('<script>','').replace('</script>','')).digest('base64'))"
-const THEME_SCRIPT_HASH = 'sha256-xDrT8IFmjIpMzTvgu+zkap91EejskcGBkCScJ4QjSMc=';
-
+// CSP for index.html. Production hashes are derived from the inline scripts at
+// build time (see csp.ts); the build re-checks the emitted HTML and fails if an
+// inline script is not covered, so the policy can't drift from the script.
 function cspPlugin(): Plugin {
   return {
     name: 'csp',
     transformIndexHtml: {
       order: 'pre',
       handler(html, ctx) {
-        const isDev = !!ctx.server;
-
-        // Dev needs 'unsafe-inline' for Vite HMR + React Refresh injected scripts.
-        // Prod uses a hash allowlist for the single inline theme script.
-        const scriptSrc = isDev
-          ? "'self' 'unsafe-inline'"
-          : `'self' '${THEME_SCRIPT_HASH}'`;
-
-        // Dev: allow direct localhost API access (bypass Vite proxy) for testing.
-        // Prod: 'self' covers all requests (nginx proxies everything same-origin).
-        // CSP3: 'self' on https pages also matches wss:// same-origin.
-        const connectSrc = isDev
-          ? "'self' http://localhost:3000 http://localhost:3001 http://localhost:3002 ws://localhost:*"
-          : "'self'";
-
-        const csp = [
-          "default-src 'self'",
-          `script-src ${scriptSrc}`,
-          "style-src 'self' 'unsafe-inline'",
-          "img-src 'self' data: blob:",
-          "font-src 'self' data:",
-          `connect-src ${connectSrc}`,
-          "base-uri 'self'",
-          "form-action 'self'",
-        ].join('; ');
-
-        return html.replace('__CSP__', csp);
+        return applyCsp(html, !!ctx.server);
       },
+    },
+  };
+}
+
+function cspVerifyPlugin(): Plugin {
+  return {
+    name: 'csp-verify',
+    apply: 'build',
+    enforce: 'post',
+    writeBundle(_options, bundle) {
+      for (const asset of Object.values(bundle)) {
+        if (asset.type !== 'asset' || !asset.fileName.endsWith('.html')) continue;
+        const html = typeof asset.source === 'string'
+          ? asset.source
+          : new TextDecoder().decode(asset.source);
+        assertInlineScriptsAllowed(html);
+      }
     },
   };
 }
@@ -130,7 +120,7 @@ export default defineConfig(({ mode }) => {
         return [{ tag: 'meta', attrs: { name: 'nano-build-id', content: id }, injectTo: 'head' }];
       },
     },
-  }],
+  }, cspVerifyPlugin()],
   define: {
     __APP_VERSION__: JSON.stringify(pkgVersion),
     __EDITION__: JSON.stringify(edition),

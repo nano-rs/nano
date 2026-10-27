@@ -5,7 +5,7 @@
  * Sources are created by the `lean-landing-admin` CLI, never through the API.
  */
 
-export type LandingFileState = 'claimed' | 'accepted' | 'refused';
+export type LandingFileState = 'listed' | 'claimed' | 'accepted' | 'refused';
 
 export interface LandingSourceStatus {
   /** Log source id; also the `source=<id>` folder senders write under. */

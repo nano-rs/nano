@@ -15,8 +15,14 @@
 //! - one append at a time (the part log has one writer), each under one
 //!   deadline ([`FindingGateConfig::deadline`], below detect's ack timeout);
 //! - validation and the replay proof run WITHOUT the ingestor lock. A proof
-//!   runs in the background and is cached, so a proof longer than the
-//!   deadline completes for the retry instead of restarting each time;
+//!   runs in the background, so a proof longer than the deadline completes
+//!   for the retry instead of restarting each time;
+//! - NAN-4656: one proof runs at a time, and a retry waits on the running
+//!   one. The proof records durable floors as it goes
+//!   ([`super::finding_floors`]), so a proof started later (a new receipt
+//!   set, a restart, detect's own drain proof) resumes after them. The ops
+//!   tenant (2026-10-26) lost its finished proofs to a TTL counted from the
+//!   START of an 11-minute scan and re-read 57.8k entries every retry;
 //! - every object of the finding parts is registered with the owner writer
 //!   authority (NAN-3499) without the lock, before the commit;
 //! - only the commit (schema, attempt markers, log `Add`) takes the lock, and
@@ -42,7 +48,9 @@ pub struct FindingGateConfig {
     pub deadline: Duration,
     /// Replay proofs kept (running or finished, not yet consumed).
     pub max_proofs: usize,
-    /// A finished proof nobody consumed is dropped after this long.
+    /// A finished proof that found its replay is dropped this long after it
+    /// FINISHED if nobody consumed it. A finished "not committed" outcome is
+    /// never reused: the next proof extends it from its floor to the head.
     pub proof_ttl: Duration,
 }
 
@@ -64,11 +72,25 @@ pub enum FindingRefused {
     ProofsBusy,
 }
 
-type ProofOutcome = Option<std::result::Result<Option<FindingAppendResponse>, String>>;
+/// `(finished at, result)` once the proof ends.
+type ProofOutcome = Option<(Instant, std::result::Result<Option<FindingAppendResponse>, String>)>;
 
 struct Proof {
     outcome: tokio::sync::watch::Receiver<ProofOutcome>,
-    started: Instant,
+}
+
+impl Proof {
+    fn running(&self) -> bool {
+        self.outcome.borrow().is_none()
+    }
+
+    /// A finished outcome worth handing to a later retry: a found replay
+    /// (permanent, the log is append-only) still within its TTL. An error
+    /// or "not committed" is re-proven from the durable floors instead, so
+    /// a stale "absent" can never let a second `Add` through.
+    fn reusable(&self, ttl: Duration) -> bool {
+        matches!(&*self.outcome.borrow(), Some((finished, Ok(Some(_)))) if finished.elapsed() < ttl)
+    }
 }
 
 pub struct FindingGate {
@@ -115,7 +137,8 @@ impl FindingGate {
             .map_err(|_| FindingRefused::Deadline("validating receipts and signed parts"))??;
         if validated.needs_replay_proof {
             let receipts = validated.request.receipts.clone();
-            if let Some(committed) = self.replay_proof(context, &receipts, deadline).await? {
+            let attempted = validated.attempted.clone();
+            if let Some(committed) = self.replay_proof(context, &receipts, &attempted, deadline).await? {
                 return Ok(committed);
             }
         }
@@ -132,43 +155,58 @@ impl FindingGate {
         ingestor.commit_finding(validated, now_ms()).await
     }
 
-    /// The cached background proof for `receipts`. Consumed (removed) once
-    /// its outcome is returned; a proof still running at the deadline stays
-    /// for the retry.
+    /// The background proof for `receipts`. Consumed (removed) once its
+    /// outcome is returned; a proof still running at the deadline stays for
+    /// the retry. NAN-4656: at most one proof runs; another receipt set
+    /// waits for it (its floors then shorten the next one).
     async fn replay_proof(
         &self,
         context: &FindingAppendContext<'static>,
         receipts: &[SourceRef],
+        attempted: &[SourceRef],
         deadline: tokio::time::Instant,
     ) -> Result<Option<FindingAppendResponse>> {
         let key = proof_key(receipts);
-        let mut outcome = {
-            let mut proofs = self.proofs.lock().expect("proof lock");
-            let ttl = self.config.proof_ttl;
-            proofs.retain(|_, proof| proof.outcome.borrow().is_none() || proof.started.elapsed() < ttl);
-            match proofs.get(&key) {
-                Some(proof) => proof.outcome.clone(),
-                None => {
-                    if proofs.len() >= self.config.max_proofs {
-                        return Err(FindingRefused::ProofsBusy.into());
-                    }
-                    let (sender, receiver) = tokio::sync::watch::channel(None);
-                    let context = context.clone();
-                    let receipts = receipts.to_vec();
-                    tokio::spawn(async move {
-                        let result = finding_replay_proof(&context, &receipts).await.map_err(|error| format!("{error:#}"));
-                        let _ = sender.send(Some(result));
-                    });
-                    proofs.insert(key.clone(), Proof { outcome: receiver.clone(), started: Instant::now() });
-                    receiver
+        let mut outcome = loop {
+            let busy = {
+                let mut proofs = self.proofs.lock().expect("proof lock");
+                let ttl = self.config.proof_ttl;
+                proofs.retain(|_, proof| proof.running() || proof.reusable(ttl));
+                match proofs.get(&key) {
+                    Some(proof) => break proof.outcome.clone(),
+                    None => match proofs.values().find(|proof| proof.running()) {
+                        Some(other) => other.outcome.clone(),
+                        None => {
+                            if proofs.len() >= self.config.max_proofs {
+                                return Err(FindingRefused::ProofsBusy.into());
+                            }
+                            let (sender, receiver) = tokio::sync::watch::channel(None);
+                            let context = context.clone();
+                            let receipts = receipts.to_vec();
+                            let attempted = attempted.to_vec();
+                            tokio::spawn(async move {
+                                let result = finding_replay_proof(&context, &receipts, &attempted).await
+                                    .map_err(|error| format!("{error:#}"));
+                                let _ = sender.send(Some((Instant::now(), result)));
+                            });
+                            proofs.insert(key.clone(), Proof { outcome: receiver.clone() });
+                            break receiver;
+                        }
+                    },
                 }
-            }
+            };
+            // Another receipt set's proof is reading the log: wait for it
+            // rather than read the same entries twice.
+            let mut busy = busy;
+            tokio::time::timeout_at(deadline, busy.wait_for(Option::is_some)).await
+                .map_err(|_| FindingRefused::Deadline("waiting for another replay proof (continues in the background)"))?
+                .map_err(|_| anyhow::anyhow!("finding replay proof task ended without an outcome"))?;
         };
         let finished = tokio::time::timeout_at(deadline, outcome.wait_for(Option::is_some)).await;
         let result = match finished {
             Err(_) => return Err(FindingRefused::Deadline("proving a replay against the part log (continues in the background)").into()),
             Ok(Err(_)) => Err(anyhow::anyhow!("finding replay proof task ended without an outcome")),
-            Ok(Ok(value)) => value.clone().expect("outcome is set").map_err(anyhow::Error::msg),
+            Ok(Ok(value)) => value.clone().expect("outcome is set").1.map_err(anyhow::Error::msg),
         };
         self.proofs.lock().expect("proof lock").remove(&key);
         result
@@ -188,3 +226,7 @@ fn proof_key(receipts: &[SourceRef]) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "finding_replay_tests.rs"]
+mod replay_tests;

@@ -34,6 +34,20 @@ pub struct MetadataGc {
 }
 
 impl MetadataGc {
+    /// A serving table was dropped and its public name fenced before this is
+    /// called. Its whole immutable metadata prefix can now be retired.
+    pub(super) async fn purge_dropped(&self) -> Result<()> {
+        let inventory=self.authority.inventory().await?;
+        ensure!(inventory.len()<=1_000_000,"catalog metadata inventory exceeds bound");
+        for key in &inventory {self.validate_path(key)?;}
+        for key in inventory {
+            let request=MetadataDeleteRequest {tenant_id:self.tenant.clone(),bucket:self.bucket.clone(),metadata_prefix:self.prefix.clone(),key,
+                current_metadata:String::new(),table_uuid:uuid::Uuid::nil()};
+            ensure!(self.authority.retire(&request).await?==request,"metadata retirement acknowledgment differs");
+        }
+        ensure!(self.authority.inventory().await?.is_empty(),"dropped serving metadata remains reachable");
+        Ok(())
+    }
     pub fn new(
         tenant: &str,
         table_location: &str,
@@ -46,9 +60,25 @@ impl MetadataGc {
             "s3://{bucket}/{}/",
             crate::parts::format::iceberg_export_prefix(tenant)?
         );
-        let suffix = table_location
-            .strip_prefix(&root)
-            .context("foreign catalog metadata location")?;
+        // NAN-4614: the R2-managed platform root, or the legacy one a recorded
+        // installation keeps until its writer rotation. Exactly this tenant's.
+        let platform_roots = [
+            format!("s3://{bucket}/__r2_data_catalog/agent/v2/tenant={tenant}/"),
+            format!("s3://{bucket}/lake/agent-catalog/v2/tenant={tenant}/"),
+        ];
+        let suffix = if let Some(suffix) = table_location.strip_prefix(&root) {
+            suffix
+        } else {
+            let suffix = platform_roots
+                .iter()
+                .find_map(|platform_root| table_location.strip_prefix(platform_root.as_str()))
+                .context("foreign catalog metadata location")?;
+            ensure!(
+                suffix.starts_with("agent/"),
+                "foreign platform metadata location"
+            );
+            suffix
+        };
         ensure!(
             suffix.split('/').count() == 2 && suffix.split('/').all(|s| !s.is_empty()),
             "invalid catalog table location"
@@ -321,5 +351,39 @@ mod tests {
         )
         .is_err());
         assert!(MetadataGc::new(TENANT, &format!("{location}/other"), authority).is_err());
+    }
+    /// NAN-4614: platform tables live under this tenant's R2-managed root (or
+    /// its legacy root until rotation), never another tenant's or a wider one.
+    #[test]
+    fn metadata_gc_accepts_only_this_tenants_platform_roots() {
+        const OTHER: &str = "3867bbbb-0000-4000-8000-000000000002";
+        let bucket = format!("nano-shared-r2-{TENANT}");
+        let gc = |location: String| {
+            let authority = Arc::new(Authority {
+                tenant: TENANT.into(),
+                prefix: format!("{location}/metadata/"),
+                objects: Mutex::new(Vec::new()),
+                requests: Mutex::new(vec![]),
+                acknowledge_only: AtomicBool::new(false),
+            });
+            MetadataGc::new(TENANT, &location, authority)
+        };
+        gc(format!(
+            "s3://{bucket}/__r2_data_catalog/agent/v2/tenant={TENANT}/agent/events_v1"
+        ))
+        .unwrap();
+        gc(format!(
+            "s3://{bucket}/lake/agent-catalog/v2/tenant={TENANT}/agent/events_v1"
+        ))
+        .unwrap();
+        for refused in [
+            format!("s3://{bucket}/__r2_data_catalog/agent/v2/tenant={OTHER}/agent/events_v1"),
+            format!("s3://{bucket}/__r2_data_catalog/agent/v2/agent/events_v1"),
+            format!("s3://{bucket}/__r2_data_catalog/{TENANT}/agent/events_v1"),
+            format!("s3://{bucket}/__r2_data_catalog/agent/v2/tenant={TENANT}/other/events_v1"),
+            format!("s3://nano-shared-r2-{OTHER}/__r2_data_catalog/agent/v2/tenant={TENANT}/agent/events_v1"),
+        ] {
+            assert!(gc(refused.clone()).is_err(), "{refused}");
+        }
     }
 }

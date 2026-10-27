@@ -67,6 +67,36 @@ pub enum OidcError {
     JwtError(String),
 }
 
+/// A refused OIDC callback (NAN-4547). `identity` is set only once the ID
+/// token has validated, and then holds only what the IdP asserted in it —
+/// never raw claims from an unverified token, never tokens or codes.
+#[derive(Debug)]
+pub struct OidcCallbackError {
+    pub error: OidcError,
+    pub identity: Option<OidcAssertedIdentity>,
+}
+
+/// The IdP-asserted identity of a validated ID token: `sub`, plus `email`
+/// (else `preferred_username`, the Entra UPN) when present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcAssertedIdentity {
+    pub subject: String,
+    pub email: Option<String>,
+}
+
+impl OidcAssertedIdentity {
+    /// Only for claims returned by [`OidcService::validate_id_token`].
+    pub fn from_validated_claims(claims: &IdTokenClaims) -> Self {
+        Self {
+            subject: claims.sub.clone(),
+            email: claims
+                .email
+                .clone()
+                .or_else(|| claims.preferred_username.clone()),
+        }
+    }
+}
+
 impl From<OidcRepositoryError> for OidcError {
     fn from(err: OidcRepositoryError) -> Self {
         OidcError::RepositoryError(err.to_string())
@@ -605,7 +635,35 @@ impl OidcService {
         redirect_uri: &str,
         ip_address: Option<&str>,
         user_agent: Option<&str>,
-    ) -> Result<(User, OidcUser, bool), OidcError> {
+    ) -> Result<(User, OidcUser, bool), OidcCallbackError> {
+        let (provider, claims, access_token) = self
+            .validate_callback(provider_slug, code, state, redirect_uri)
+            .await
+            .map_err(|error| OidcCallbackError {
+                error,
+                identity: None,
+            })?;
+        // From here on the ID token is verified: a refusal carries the
+        // IdP-asserted identity so the denial audit can name it (NAN-4547).
+        let identity = OidcAssertedIdentity::from_validated_claims(&claims);
+        self.admit_validated(provider, claims, &access_token, ip_address, user_agent)
+            .await
+            .map_err(|error| OidcCallbackError {
+                error,
+                identity: Some(identity),
+            })
+    }
+
+    /// The callback up to and including ID-token validation: provider,
+    /// transaction, code exchange, signature/nonce checks. Nothing it
+    /// returns on error is trusted identity.
+    async fn validate_callback(
+        &self,
+        provider_slug: &str,
+        code: &str,
+        state: &str,
+        redirect_uri: &str,
+    ) -> Result<(OidcProvider, IdTokenClaims, String), OidcError> {
         // Get provider
         let provider = self
             .oidc_repo
@@ -666,7 +724,7 @@ impl OidcService {
             .ok_or_else(|| OidcError::InvalidIdToken("No ID token in response".to_string()))?;
 
         // Validate ID token — using the *server-stored* nonce
-        let mut claims = self
+        let claims = self
             .validate_id_token(
                 &id_token,
                 &provider,
@@ -674,8 +732,20 @@ impl OidcService {
                 &transaction.nonce,
             )
             .await?;
+        Ok((provider, claims, token_response.access_token))
+    }
 
-        resolve_entra_groups(&mut claims, &token_response.access_token).await?;
+    /// The callback after ID-token validation: group resolution, user
+    /// extraction and provisioning (where group-gated JIT may refuse).
+    async fn admit_validated(
+        &self,
+        provider: OidcProvider,
+        mut claims: IdTokenClaims,
+        access_token: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<(User, OidcUser, bool), OidcError> {
+        resolve_entra_groups(&mut claims, access_token).await?;
 
         // Extract user info
         let mut oidc_user = self.extract_user_info(&claims, &provider)?;

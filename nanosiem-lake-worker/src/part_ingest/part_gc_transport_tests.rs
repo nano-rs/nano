@@ -18,6 +18,9 @@ use axum::{
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::AtomicUsize;
 
+#[path = "part_gc_catalog_wipe_tests.rs"]
+mod catalog_wipe_tests;
+
 struct Bucket {
     entries: RwLock<BTreeMap<u64, Vec<u8>>>,
     objects: RwLock<BTreeMap<String, Vec<u8>>>,
@@ -31,6 +34,10 @@ struct Bucket {
     endless_pages: AtomicBool,
     body_mode: AtomicUsize,
     page_objects: AtomicUsize,
+    /// NAN-4567: per-key LastModified for `objects` listings (default
+    /// 2026-09-28T00:00:00Z), and a listing that leaks another tenant's key.
+    modified: RwLock<BTreeMap<String, String>>,
+    leak_foreign: AtomicBool,
 }
 struct Active(Arc<Bucket>);
 impl Drop for Active {
@@ -128,6 +135,21 @@ async fn listing(
         .unwrap()
         .push(("LIST".into(), std::time::Instant::now()));
     let prefix = query.get("prefix").cloned().unwrap_or_default();
+    if prefix.contains("/bronze-quarantine-v1/") {
+        // NAN-4567: the stored objects under the prefix, one page.
+        let modified = bucket.modified.read().unwrap();
+        let mut keys: Vec<(String, usize)> = bucket.objects.read().unwrap().iter()
+            .filter(|(key, _)| key.starts_with(&prefix)).map(|(key, bytes)| (key.clone(), bytes.len())).collect();
+        if bucket.leak_foreign.load(Ordering::SeqCst) {
+            keys.push((format!("{prefix}objects/{}.parquet", "f".repeat(64))
+                .replace(TENANT_UUID, "7f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00"), 10));
+        }
+        let objects = keys.iter().map(|(key, size)| format!(
+            "<Contents><Key>{key}</Key><Size>{size}</Size><LastModified>{}</LastModified><ETag>e-{size}</ETag></Contents>",
+            modified.get(key).map_or("2026-09-28T00:00:00.000Z", String::as_str))).collect::<String>();
+        return (StatusCode::OK, [("content-type", "application/xml")],
+            format!("<ListBucketResult><IsTruncated>false</IsTruncated>{objects}</ListBucketResult>")).into_response();
+    }
     let total = bucket.page_objects.load(Ordering::SeqCst);
     if total > 0 {
         let start = query.get("continuation-token").and_then(|n| n.parse::<usize>().ok())
@@ -223,6 +245,10 @@ pub(crate) fn fixture_keys() -> TenantKeySet {
 }
 
 pub(crate) async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture {
+    fixture_with_owner(entries, delay, rate, "http://127.0.0.1:1/").await
+}
+
+async fn fixture_with_owner(entries: u64, delay: Duration, rate: u32, owner_url: &str) -> Fixture {
     let bucket = Arc::new(Bucket {
         entries: RwLock::new(history(entries)),
         objects: RwLock::new(BTreeMap::new()),
@@ -236,6 +262,8 @@ pub(crate) async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture
         endless_pages: AtomicBool::new(false),
         body_mode: AtomicUsize::new(0),
         page_objects: AtomicUsize::new(0),
+        modified: RwLock::new(BTreeMap::new()),
+        leak_foreign: AtomicBool::new(false),
     });
     let app = Router::new()
         .route("/{bucket}", get(listing))
@@ -260,7 +288,7 @@ pub(crate) async fn fixture(entries: u64, delay: Duration, rate: u32) -> Fixture
     );
     let gc = CellSanctionedPartGc::new_guarded(
         TENANT_UUID,
-        "http://127.0.0.1:1/",
+        owner_url,
         None,
         store.clone(),
         fixture_keys(),
@@ -1095,3 +1123,215 @@ pub(crate) async fn assert_follower_publishes_per_receipted_append(gc: &CellSanc
 }
 
 const INDEX_SETTLE_FOR_TESTS: i64 = crate::lake_part_gc::index::INDEX_SETTLE_MS;
+
+/// NAN-4567: the owner + Worker stand-in for the bronze quarantine expiry
+/// tests. It answers like the real route and, like the Worker, deletes the
+/// permitted key from the fixture bucket.
+struct QuarantineAuthority {
+    bucket: Arc<Bucket>,
+    quarantine: bool,
+    authorized: std::sync::Mutex<Vec<LakePartDeleteRequest>>,
+}
+
+#[async_trait]
+impl LakePartDeleteAuthority for QuarantineAuthority {
+    async fn worker_supports_lake_part_delete(&self) -> Result<bool> { Ok(true) }
+    async fn worker_supports_quarantine_expiry(&self) -> Result<bool> { Ok(self.quarantine) }
+    async fn authorize(&self, request: &LakePartDeleteRequest) -> Result<LakePartDeletePermit> {
+        request.validate()?;
+        self.authorized.lock().unwrap().push(request.clone());
+        let now = chrono::Utc::now();
+        Ok(LakePartDeletePermit {
+            request: request.clone(),
+            permit_id: request.permit_id()?,
+            owner_authorization: crate::lake_part_gc::delete_control::DeleteOwnerAuthorization {
+                schema_version: 1, signer_key_id: "fixture-owner".into(), issued_at: now.to_rfc3339(),
+                expires_at: (now + chrono::Duration::minutes(5)).to_rfc3339(),
+                identity_sha256: request.digest()?, signature_base64: "fixture-signature".into(),
+            },
+        })
+    }
+    async fn prepare(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeletePermit> { Ok(permit.clone()) }
+    async fn retire(&self, permit: &LakePartDeletePermit) -> Result<LakePartDeleteReceipt> {
+        self.bucket.objects.write().unwrap().remove(&permit.request.key);
+        Ok(LakePartDeleteReceipt {
+            schema_version: crate::lake_part_gc::delete_control::DELETE_CONTROL_SCHEMA_VERSION,
+            permit_id: permit.permit_id.clone(),
+            identity_sha256: permit.owner_authorization.identity_sha256.clone(),
+            receipt_sha256: "a".repeat(64), state: "receipt_appended".into(), final_head_absent: true,
+        })
+    }
+}
+
+/// A restore-readable record of `id` at `written_ms`: its key and bytes.
+fn quarantine_record(tenant: &str, id: &str, written_ms: i64) -> (String, Vec<u8>) {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "kind": "nano.lake.bronze-quarantine-record.v1", "tenant_id": tenant, "id": id, "entry": null,
+    })).unwrap();
+    let key = format!("{}records/{written_ms:013}-{}.json",
+        crate::lake_part_gc::quarantine_expiry::quarantine_prefix(tenant), &crate::parts::sha256_hex(&body)[..16]);
+    assert_eq!(crate::part_ingest::quarantine_store::record_id(tenant, &key, &body).as_deref(), Some(id));
+    (key, body)
+}
+
+fn rfc3339_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// NAN-4567: through `new_guarded` (the cell's constructor) and its guarded
+/// R2 lister, the GC deletes exactly the expired quarantine keys, objects
+/// before records; young entries, and another tenant's keys, survive.
+#[tokio::test]
+async fn guarded_gc_expires_only_the_tenants_expired_bronze_quarantine() {
+    use crate::lake_part_gc::quarantine_expiry::{quarantine_prefix, QuarantineExpiryReport};
+    let f = fixture(1, Duration::ZERO, 200).await;
+    let listed_at = chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00Z").unwrap().timestamp_millis();
+    let now = listed_at + 27 * 86_400_000;
+    let day = 86_400_000;
+    let prefix = quarantine_prefix(TENANT_UUID);
+    let other = "7f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00";
+    let (expired, reused, young) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+    let expired_object = format!("{prefix}objects/{expired}.parquet");
+    let reused_object = format!("{prefix}objects/{reused}.parquet");
+    let young_object = format!("{prefix}objects/{young}.parquet");
+    let (old_record, old_body) = quarantine_record(TENANT_UUID, &expired, listed_at);
+    // A later keep of the same bytes as an old object: its young record keeps it.
+    let (young_record, young_body) = quarantine_record(TENANT_UUID, &reused, now - day);
+    let foreign_object = format!("{}objects/{expired}.parquet", quarantine_prefix(other));
+    let (foreign_record, foreign_body) = quarantine_record(other, &expired, listed_at);
+    {
+        let mut objects = f.bucket.objects.write().unwrap();
+        for key in [&expired_object, &reused_object, &young_object, &foreign_object] {
+            objects.insert(key.clone(), b"parquet".to_vec());
+        }
+        objects.insert(old_record.clone(), old_body);
+        objects.insert(young_record.clone(), young_body);
+        objects.insert(foreign_record.clone(), foreign_body);
+        let mut modified = f.bucket.modified.write().unwrap();
+        modified.insert(young_object.clone(), rfc3339_ms(now - day));
+        modified.insert(young_record.clone(), rfc3339_ms(now - day));
+    }
+    let surviving = |f: &Fixture| f.bucket.objects.read().unwrap().keys().cloned().collect::<Vec<_>>();
+
+    // An older Worker (no quarantine capability): nothing is asked.
+    let old_worker = QuarantineAuthority { bucket: f.bucket.clone(), quarantine: false, authorized: Default::default() };
+    let mut state = f.gc.state.lock().await;
+    let report = quarantine_expiry_if_due(&f.gc.shared, &old_worker, &mut state, "fixture", now).await.unwrap();
+    assert_eq!(report.skipped, Some("worker_capability_missing"));
+    assert!(old_worker.authorized.lock().unwrap().is_empty());
+    // Not due again inside the interval.
+    let authority = QuarantineAuthority { bucket: f.bucket.clone(), quarantine: true, authorized: Default::default() };
+    assert!(quarantine_expiry_if_due(&f.gc.shared, &authority, &mut state, "fixture", now + 1).await.is_none());
+
+    let next = now + crate::lake_part_gc::quarantine_expiry::QUARANTINE_EXPIRY_INTERVAL_MS;
+    let report: QuarantineExpiryReport =
+        quarantine_expiry_if_due(&f.gc.shared, &authority, &mut state, "fixture", next).await.unwrap();
+    let asked: Vec<_> = authority.authorized.lock().unwrap().iter().map(|r| r.key.clone()).collect();
+    assert_eq!(asked, vec![expired_object.clone(), old_record.clone()], "objects before records; nothing young");
+    assert_eq!((report.plan.objects, report.plan.records, report.plan.kept_by_young_record), (1, 1, 1));
+    assert_eq!(report.young_records, 1);
+    assert_eq!(report.executed.deleted, 2);
+    for request in authority.authorized.lock().unwrap().iter() {
+        assert_eq!(request.reason, crate::lake_part_gc::LakePartDeleteReason::QuarantineExpired);
+        assert_eq!(request.tenant_uuid, TENANT_UUID);
+        assert_eq!(request.bucket, crate::lake_part_gc::request::tenant_bucket(TENANT_UUID));
+    }
+    let mut left = surviving(&f);
+    left.sort();
+    let mut expected = vec![reused_object.clone(), young_object.clone(), young_record.clone(),
+        foreign_object.clone(), foreign_record.clone()];
+    expected.sort();
+    assert_eq!(left, expected, "young entries and the other tenant's keys survive");
+
+    // A listing that names another tenant's key fails the pass: nothing asked.
+    f.bucket.leak_foreign.store(true, Ordering::SeqCst);
+    let leaky = QuarantineAuthority { bucket: f.bucket.clone(), quarantine: true, authorized: Default::default() };
+    assert!(quarantine_expiry_if_due(&f.gc.shared, &leaky, &mut state, "fixture",
+        next + crate::lake_part_gc::quarantine_expiry::QUARANTINE_EXPIRY_INTERVAL_MS).await.is_none(), "an escaped listing fails the pass");
+    assert!(leaky.authorized.lock().unwrap().is_empty());
+    assert_eq!(surviving(&f).len(), 5);
+}
+
+/// NAN-4601: the owner's index route as control answers it (exact chain,
+/// no gaps); every other owner route (authorize) is only counted.
+#[derive(Default)]
+struct OwnerIndex {
+    shas: std::sync::Mutex<Vec<String>>,
+    other_calls: AtomicUsize,
+}
+
+async fn owner_index_stub(State(owner): State<Arc<OwnerIndex>>, body: axum::body::Bytes) -> Response {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mut shas = owner.shas.lock().unwrap();
+    for entry in request["entries"].as_array().unwrap() {
+        assert_eq!(entry["seq"].as_u64().unwrap(), shas.len() as u64, "index pushed out of order");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(entry["entry_base64"].as_str().unwrap()).unwrap();
+        shas.push(hex::encode(sha2::Sha256::digest(&bytes)));
+    }
+    assert!(request["deleted"].as_array().unwrap().is_empty(), "a held feed reports no deletes");
+    axum::Json(serde_json::json!({
+        "tenant_uuid": TENANT_UUID,
+        "indexed_through_seq": shas.len().checked_sub(1),
+        "head_entry_sha256": shas.last(),
+        "checkpoint_seq": null,
+        "folded_through_seq": null,
+    }))
+    .into_response()
+}
+
+async fn owner_other(State(owner): State<Arc<OwnerIndex>>) -> Response {
+    owner.other_calls.fetch_add(1, Ordering::SeqCst);
+    (StatusCode::FORBIDDEN, "not expected while held").into_response()
+}
+
+/// NAN-4601 on the cell's guarded constructor (`new_guarded`, the R2 part
+/// store the cell wires): while ingest holds a recorded catalog the gate only
+/// drives `feed_index_only`. The part log reaches control's index through the
+/// owner, and no delete pass is ever started: no authorize, no Worker call,
+/// no pass task, no view fold.
+#[tokio::test]
+async fn guarded_held_feed_publishes_the_index_and_never_starts_a_pass() {
+    let owner = Arc::new(OwnerIndex::default());
+    let app = Router::new()
+        .route(crate::lake_part_gc::INDEX_PATH, axum::routing::post(owner_index_stub))
+        .fallback(owner_other)
+        .with_state(owner.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let owner_url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // `fixture` delivers an enabled grant and the route (`permission`).
+    let f = fixture_with_owner(8, Duration::ZERO, 200, &owner_url).await;
+    let start = chrono::Utc::now().timestamp_millis();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut tick = 0;
+        while owner.shas.lock().unwrap().len() < 8 {
+            // What the ingest gate forwards while held (part_gc_gate tests
+            // pin the forwarding); never a pass report here.
+            assert!(SanctionedPartGc::feed_index_only(&f.gc, start + tick).await.is_none(), "no pass ever reports");
+            tick += 1;
+            f.gc.wait_index_idle().await;
+            // The scheduled cadence after a publication is a minute.
+            f.gc.runner.lock().await.next_index_ms = 0;
+        }
+    })
+    .await
+    .expect("the held feed published the whole log to control's index");
+    let runner = f.gc.runner.lock().await;
+    assert!(runner.task.is_none(), "the held feed never starts a delete pass");
+    assert!(runner.armed, "an open grant arms the index feed");
+    drop(runner);
+    assert_eq!(owner.other_calls.load(Ordering::SeqCst), 0, "no authorize or other owner call");
+    assert!(f.gc.index_only_indexed() >= 8);
+    assert!(!f.gc.shared.view_complete.load(Ordering::SeqCst), "no view was folded: nothing to plan from");
+    // Withdrawing the grant closes the feed too (it needs the open route).
+    f.gc.update(None, None);
+    f.gc.runner.lock().await.next_index_ms = 0;
+    let calls = owner.shas.lock().unwrap().len();
+    assert!(SanctionedPartGc::feed_index_only(&f.gc, start + 1_000_000).await.is_none());
+    f.gc.wait_index_idle().await;
+    assert!(f.gc.runner.lock().await.index_task.is_none(), "no publication without the route");
+    assert_eq!(owner.shas.lock().unwrap().len(), calls);
+    server.abort();
+}

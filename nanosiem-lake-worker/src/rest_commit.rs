@@ -49,11 +49,35 @@ pub struct RestTableCommitClient {
 
 impl RestTableCommitClient {
     pub async fn new(config: &CatalogConfig, table_id: &TableIdent) -> Result<Self> {
-        let client = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(60))
-            .build()?;
-        let token = catalog_token(&client, config).await?;
+        Self::new_with_bearer(config, table_id, None, None).await
+    }
+
+    pub(crate) async fn new_with_bearer(
+        config: &CatalogConfig,
+        table_id: &TableIdent,
+        bearer: Option<&str>,
+        client: Option<Client>,
+    ) -> Result<Self> {
+        let client = if let Some(client) = client {
+            client
+        } else {
+            Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?
+        };
+        let token = if let Some(token) = bearer {
+            validate_token(token)?;
+            anyhow::ensure!(
+                config.credential.is_none()
+                    && config.token_file.is_none()
+                    && !config.allow_anonymous,
+                "platform catalog refuses ambient auth"
+            );
+            Some(token.to_owned())
+        } else {
+            catalog_token(&client, config).await?
+        };
         let base = config.uri.trim_end_matches('/');
         let request = authenticated(
             client
@@ -74,6 +98,12 @@ impl RestTableCommitClient {
             .json()
             .await
             .context("decode Iceberg REST runtime config")?;
+        if bearer.is_some() {
+            anyhow::ensure!(
+                runtime.defaults.is_empty() && runtime.overrides.is_empty(),
+                "platform catalog returned an authority override"
+            );
+        }
         let runtime_uri = runtime
             .overrides
             .get("uri")

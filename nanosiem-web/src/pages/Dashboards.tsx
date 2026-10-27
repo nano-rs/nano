@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { validateDashboardImportShape } from '@/lib/dashboard-import';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Box,
@@ -60,10 +60,9 @@ import type {
   CreateDashboardRequest,
   DashboardSummary,
   DashboardVisibility,
-  GeneratedDashboard,
 } from '@/lib/api';
 
-import { DashboardGenerationWizard } from '@/enterprise/components/dashboard/DashboardGenerationWizard';
+import { openPivtPanel } from '@/enterprise/components/pivt/commands/router';
 import { CreateDashboardDialog } from '@/components/dashboard/CreateDashboardDialog';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { WireframePreview, synthesizePreview } from '@/components/dashboard/WireframePreview';
@@ -230,12 +229,10 @@ function DashCardList({ d, onDelete, canDelete }: DashCardProps) {
 function NewDashboardCard({
   density,
   onClick,
-  canGenerate,
 }: {
   density: Density;
+  /** Opens the blank dialog; pivt generation has its own button (NAN-4600). */
   onClick: () => void;
-  /** False in open builds — the card can only open the blank dialog (NAN-2356). */
-  canGenerate: boolean;
 }) {
   if (density === 'list') {
     return (
@@ -249,7 +246,7 @@ function NewDashboardCard({
         </div>
         <span className="text-[13px] font-semibold">New dashboard</span>
         <span className="text-[11px] text-muted-foreground font-normal">
-          {canGenerate ? 'Create a blank or pivt-generated board' : 'Create a blank board'}
+          Create a blank board
         </span>
       </button>
     );
@@ -265,21 +262,9 @@ function NewDashboardCard({
       </div>
       <div className="flex flex-col gap-0.5">
         <div className="text-[13px] font-semibold text-foreground">New Dashboard</div>
-        <div className="text-[11px] text-muted-foreground">{canGenerate ? 'Blank board or pivt-generate' : 'Blank board'}</div>
+        <div className="text-[11px] text-muted-foreground">Blank board</div>
       </div>
-      {/* The meta line advertises what this card can actually do. Open builds
-          only get the blank path, so naming pivt there promises a mode that
-          isn't reachable (NAN-2356). */}
-      <div className="mt-1 text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70 flex items-center gap-1.5">
-        {canGenerate ? (
-          <>
-            <PivtIcon className="w-[11px] h-[11px] text-primary" />
-            <span><span className="lowercase">pivt</span> · BLANK</span>
-          </>
-        ) : (
-          <span>BLANK</span>
-        )}
-      </div>
+      <div className="mt-1 text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70">BLANK</div>
     </button>
   );
 }
@@ -365,12 +350,13 @@ export function Dashboards() {
   const { recentDashboardIds, removeRecentDashboard } = useRecentlyViewedDashboards();
 
   const canCreate = hasPermission('dashboards:create');
-  // NAN-2356: the meloD generation wizard is enterprise-only and resolves to a
-  // `return null` stub in open builds. Creating a BLANK dashboard is core, so
-  // the two paths are split: `canGenerate` gates only the AI affordances, and
-  // the blank path always renders a real dialog.
+  // NAN-4600: generating a dashboard runs in the pivt panel (`@dashboard`);
+  // creating a BLANK dashboard is the core dialog in every edition
+  // (NAN-2356). `canGenerate` gates only the pivt affordances, on the
+  // permissions /api/melod/dashboard/generate checks (NAN-4607).
   const { capabilities } = useCapabilities();
-  const canGenerate = canCreate && capabilities.melod;
+  const canGenerate =
+    canCreate && capabilities.melod && hasPermission('melod:dashboard') && hasPermission('search:execute');
   const canDelete = hasPermission('dashboards:delete');
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -385,21 +371,8 @@ export function Dashboards() {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [dashboardToDelete, setDashboardToDelete] = useState<DashboardSummary | null>(null);
-  const [builderInitialMode, setBuilderInitialMode] = useState<'blank' | 'generate'>('blank');
-
-  // pivt bridge — `@dashboard <prompt>` opens the builder pre-seeded to generate
-  // mode. Only wired when generation is actually available: in open builds the
-  // wizard is a null stub, so opening it would flip state and render nothing
-  // (NAN-2356).
-  useEffect(() => {
-    if (!canGenerate) return;
-    const handler = () => {
-      setBuilderInitialMode('generate');
-      setCreateDialogOpen(true);
-    };
-    window.addEventListener('pivt:open-dashboard-wizard', handler);
-    return () => window.removeEventListener('pivt:open-dashboard-wizard', handler);
-  }, [canGenerate]);
+  // Panel-first (NAN-4588): pivt asks for the brief in its own panel.
+  const generateWithPivt = useCallback(() => openPivtPanel('@dashboard '), []);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -437,10 +410,7 @@ export function Dashboards() {
     }
   };
 
-  const openBuilder = (mode: 'blank' | 'generate') => {
-    setBuilderInitialMode(mode);
-    setCreateDialogOpen(true);
-  };
+  const openBlank = () => setCreateDialogOpen(true);
 
   const handleCreateDashboard = async (data: { name: string; description: string; visibility: DashboardVisibility }) => {
     try {
@@ -487,72 +457,6 @@ export function Dashboards() {
   const confirmDelete = (dashboard: DashboardSummary) => {
     setDashboardToDelete(dashboard);
     setDeleteDialogOpen(true);
-  };
-
-  const handleGeneratedDashboardComplete = async (
-    generatedDashboard: GeneratedDashboard,
-    _sessionId: string,
-  ) => {
-    try {
-      const newDashboard: CreateDashboardRequest = {
-        name: generatedDashboard.name,
-        description: generatedDashboard.description || undefined,
-        layout: {
-          columns: generatedDashboard.layout.columns,
-          rowHeight: generatedDashboard.layout.row_height,
-          items: generatedDashboard.layout.items.map(item => ({
-            i: item.panel_id,
-            x: item.x,
-            y: item.y,
-            w: item.w,
-            h: item.h,
-          })),
-          variables: generatedDashboard.variables.map(v => ({
-            name: v.name,
-            label: v.label,
-            type: v.variable_type,
-            defaultValue: v.default_value || '',
-            options: v.options,
-            query: v.query,
-            queryField: v.query_field,
-            multi: v.multi,
-          })),
-        },
-        panels: generatedDashboard.panels.map(panel => ({
-          id: panel.id,
-          title: panel.title,
-          query: panel.query,
-          queryMode: panel.query_mode,
-          visualizationType: panel.visualization_type as
-            | 'bar'
-            | 'line'
-            | 'area'
-            | 'pie'
-            | 'table'
-            | 'single_value'
-            | 'timeline',
-          visualizationConfig: panel.visualization_config,
-          timeRangeMode: 'dashboard' as const,
-          drilldownEnabled: false,
-        })),
-        visibility: 'private',
-        refresh_interval: generatedDashboard.refresh_interval || undefined,
-      };
-
-      const created = await createDashboard(newDashboard);
-      toast({
-        title: 'Dashboard created',
-        description: `pivt-generated dashboard "${generatedDashboard.name}" has been created.`,
-      });
-      refetch();
-      navigate(`/dashboards/${created.id}?edit=true`);
-    } catch (err) {
-      toast({
-        title: 'Error',
-        description: err instanceof Error ? err.message : 'Failed to create dashboard',
-        variant: 'destructive',
-      });
-    }
   };
 
   const handleImportClick = () => fileInputRef.current?.click();
@@ -655,8 +559,14 @@ export function Dashboards() {
               Import
             </Button>
           )}
+          {canGenerate && (
+            <Button variant="outline" size="sm" className="h-[30px]" onClick={generateWithPivt}>
+              <PivtIcon className="w-[12px] h-[12px]" />
+              Generate with pivt
+            </Button>
+          )}
           {canCreate && (
-            <Button size="sm" className="h-[30px]" onClick={() => openBuilder('blank')}>
+            <Button size="sm" className="h-[30px]" onClick={() => openBlank()}>
               <Plus className="w-[12px] h-[12px]" />
               New Dashboard
             </Button>
@@ -756,15 +666,15 @@ export function Dashboards() {
         <EmptyState
           searching={!!searchQuery}
           canCreate={canCreate}
-          onNew={() => openBuilder('blank')}
-          onAi={() => openBuilder('generate')}
+          onNew={() => openBlank()}
+          onAi={generateWithPivt}
           showAi={canGenerate}
         />
       ) : density === 'gallery' ? (
         <div className="flex flex-col gap-2">
           <SectionHeader label="All dashboards" count={filteredDashboards.length} />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-            {canCreate && <NewDashboardCard density="gallery" canGenerate={canGenerate} onClick={() => openBuilder('blank')} />}
+            {canCreate && <NewDashboardCard density="gallery" onClick={() => openBlank()} />}
             {filteredDashboards.map(d => (
               <DashCardGallery
                 key={d.id}
@@ -780,7 +690,7 @@ export function Dashboards() {
         <div className="flex flex-col gap-2">
           <SectionHeader label="All dashboards" count={filteredDashboards.length} />
           <div className="bg-card border border-border rounded-lg overflow-hidden">
-            {canCreate && <NewDashboardCard density="list" canGenerate={canGenerate} onClick={() => openBuilder('blank')} />}
+            {canCreate && <NewDashboardCard density="list" onClick={() => openBlank()} />}
             {filteredDashboards.map(d => (
               <DashCardList
                 key={d.id}
@@ -814,25 +724,13 @@ export function Dashboards() {
         </DialogContent>
       </Dialog>
 
-      {/* NAN-2356: the wizard covers blank + generate, but it's enterprise-only.
-          Open builds get the core blank dialog so creating a dashboard works. */}
-      {canGenerate ? (
-        <DashboardGenerationWizard
-          open={createDialogOpen}
-          onOpenChange={setCreateDialogOpen}
-          onComplete={handleGeneratedDashboardComplete}
-          onCreateBlank={handleCreateDashboard}
-          creatingBlank={creating}
-          initialMode={builderInitialMode}
-        />
-      ) : (
-        <CreateDashboardDialog
-          open={createDialogOpen}
-          onOpenChange={setCreateDialogOpen}
-          onCreate={handleCreateDashboard}
-          creating={creating}
-        />
-      )}
+      {/* Blank create, every edition (NAN-2356). Generation is pivt (NAN-4600). */}
+      <CreateDashboardDialog
+        open={createDialogOpen}
+        onOpenChange={setCreateDialogOpen}
+        onCreate={handleCreateDashboard}
+        creating={creating}
+      />
     </div>
   );
 }
@@ -862,7 +760,7 @@ function EmptyState({
   canCreate: boolean;
   onNew: () => void;
   onAi: () => void;
-  /** False in open builds — the generation wizard is enterprise (NAN-2356). */
+  /** pivt generation available (meloD + chat); opens the pivt panel (NAN-4600). */
   showAi: boolean;
 }) {
   if (searching) {

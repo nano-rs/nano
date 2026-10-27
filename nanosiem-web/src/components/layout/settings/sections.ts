@@ -45,6 +45,7 @@ import {
   MessageSquare,
   Zap,
   PackageOpen,
+  Workflow,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -183,6 +184,19 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     desc: 'Slack, Teams, PagerDuty, and webhook channels — plus routing.',
     href: '/settings/notifications',
     permissions: 'settings:webhooks',
+    status: 'ok',
+  },
+  // Tenant SOAR opt-in (NAN-4462). Only plans with the optional `soar`
+  // component show it; `soar:view` reads, `settings:system` saves.
+  {
+    id: 'soar',
+    label: 'SOAR',
+    group: 'workspace',
+    icon: Workflow,
+    desc: 'Turn automated response on or off for this tenant.',
+    href: '/settings/soar',
+    permissions: ['soar:view', 'settings:system'],
+    capability: 'soar',
     status: 'ok',
   },
   // The standalone Webhooks rail item is retired in favor of the unified

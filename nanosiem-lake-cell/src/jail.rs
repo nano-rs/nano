@@ -39,6 +39,8 @@ use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
     TargetArch,
 };
+#[cfg(target_arch = "x86_64")]
+use seccompiler::sock_filter;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -87,13 +89,26 @@ pub fn thread_count() -> usize {
 
 /// Apply the jail to the calling (single-threaded) process. Irreversible.
 pub fn apply(spec: &JailSpec) -> Result<JailReport, JailError> {
+    apply_with(spec, seccomp_filter)
+}
+
+/// The native byte-service jail: the same Landlock/cgroup/rlimit jail with
+/// [`native_seccomp_filter`], so the child can create no socket at all.
+pub fn apply_native(spec: &JailSpec) -> Result<JailReport, JailError> {
+    apply_with(spec, native_seccomp_filter)
+}
+
+fn apply_with(
+    spec: &JailSpec,
+    filter: fn() -> Result<Vec<BpfProgram>, seccompiler::Error>,
+) -> Result<JailReport, JailError> {
     let threads = thread_count();
     if threads != 1 {
         return Err(JailError::MultiThreaded(threads));
     }
     // Build everything that allocates or opens paths while still privileged
     // enough to open them: the seccomp program and the landlock path fds.
-    let bpf = seccomp_filter().map_err(|e| JailError::Seccomp(e.to_string()))?;
+    let bpf = filter().map_err(|e| JailError::Seccomp(e.to_string()))?;
     let own_proc = PathBuf::from(format!("/proc/{}", std::process::id()));
     let ruleset = build_landlock(spec, &own_proc)?;
 
@@ -154,7 +169,13 @@ pub fn apply(spec: &JailSpec) -> Result<JailReport, JailError> {
 }
 
 fn set_rlimits(spec: &JailSpec) -> Result<(), JailError> {
-    fn set(res: libc::__rlimit_resource_t, soft: u64, hard: u64, op: &'static str) -> Result<(), JailError> {
+    // glibc exposes an unsigned enum typedef; musl's ABI uses c_int and does
+    // not define __rlimit_resource_t. Keep the native libc constant's type.
+    #[cfg(target_env = "gnu")]
+    type RlimitResource = libc::__rlimit_resource_t;
+    #[cfg(not(target_env = "gnu"))]
+    type RlimitResource = libc::c_int;
+    fn set(res: RlimitResource, soft: u64, hard: u64, op: &'static str) -> Result<(), JailError> {
         let lim = libc::rlimit { rlim_cur: soft as libc::rlim_t, rlim_max: hard as libc::rlim_t };
         // SAFETY: valid pointer to a stack rlimit.
         if unsafe { libc::setrlimit(res, &lim) } != 0 {
@@ -387,6 +408,18 @@ fn open_rule_path(path: &Path, required: bool, uid: u32, gid: u32) -> Result<Opt
 
 /// Build the tenant seccomp programs: default allow, deny-list with EPERM.
 pub fn seccomp_filter() -> Result<Vec<BpfProgram>, seccompiler::Error> {
+    build_seccomp_filter(false)
+}
+
+/// Native LandingBytesV1 children use only fds the supervisor passes. Every
+/// socket(2) is denied, including AF_INET/AF_INET6: Landlock network rules
+/// cover TCP only, so UDP and raw IP would otherwise stay reachable.
+/// Connection socketpairs stay allowed as in the shared filter.
+pub fn native_seccomp_filter() -> Result<Vec<BpfProgram>, seccompiler::Error> {
+    build_seccomp_filter(true)
+}
+
+fn build_seccomp_filter(no_sockets: bool) -> Result<Vec<BpfProgram>, seccompiler::Error> {
     let arch = TargetArch::try_from(std::env::consts::ARCH)?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for sys in denied_syscalls() {
@@ -400,6 +433,10 @@ pub fn seccomp_filter() -> Result<Vec<BpfProgram>, seccompiler::Error> {
     let mut sock_rules = vec![SeccompRule::new(vec![fam(SeccompCmpOp::Gt, 10)?])?];
     for v in [0u64, 1, 3, 4, 5, 6, 7, 8, 9] {
         sock_rules.push(SeccompRule::new(vec![fam(SeccompCmpOp::Eq, v)?])?);
+    }
+    if no_sockets {
+        // An empty rule list matches unconditionally: socket(2) is EPERM.
+        sock_rules.clear();
     }
     rules.insert(libc::SYS_socket, sock_rules);
     // socketpair(2) only makes AF_UNIX sockets and tokio's signal driver
@@ -445,7 +482,40 @@ pub fn seccomp_filter() -> Result<Vec<BpfProgram>, seccompiler::Error> {
     let mut c3 = BTreeMap::new();
     c3.insert(libc::SYS_clone3, vec![]);
     let enosys = SeccompFilter::new(c3, SeccompAction::Allow, SeccompAction::Errno(libc::ENOSYS as u32), arch)?;
-    Ok(vec![deny.try_into()?, enosys.try_into()?])
+    let mut programs: Vec<BpfProgram> = vec![deny.try_into()?, enosys.try_into()?];
+    #[cfg(target_arch = "x86_64")]
+    programs.push(x32_deny_program());
+    Ok(programs)
+}
+
+/// NAN-4545: x32 syscalls run under `AUDIT_ARCH_X86_64` with
+/// `nr | __X32_SYSCALL_BIT`, so seccompiler's per-number `JEQ` rules never
+/// match them and the deny-list's default Allow applied to every denied
+/// syscall (socket, unshare, mount, ptrace, bpf, io_uring...) on kernels
+/// with `CONFIG_X86_X32_ABI`. No cell child is an x32 program, so refuse
+/// every syscall number at or above the x32 bit (the libseccomp/Docker
+/// pattern). A separate program: seccomp evaluates every installed filter
+/// and the most restrictive result wins. Other arches are left to the
+/// seccompiler programs, which kill a foreign audit arch.
+#[cfg(target_arch = "x86_64")]
+fn x32_deny_program() -> BpfProgram {
+    const LD_W_ABS: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+    const JEQ_K: u16 = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+    const JGE_K: u16 = (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16;
+    const RET_K: u16 = (libc::BPF_RET | libc::BPF_K) as u16;
+    const AUDIT_ARCH_X86_64: u32 = 62 | 0x8000_0000 | 0x4000_0000;
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    let op = |code, jt, jf, k| sock_filter { code, jt, jf, k };
+    vec![
+        op(LD_W_ABS, 0, 0, 4), // seccomp_data.arch
+        op(JEQ_K, 0, 3, AUDIT_ARCH_X86_64),
+        op(LD_W_ABS, 0, 0, 0), // seccomp_data.nr
+        op(JGE_K, 0, 1, X32_SYSCALL_BIT),
+        op(RET_K, 0, 0, SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        op(RET_K, 0, 0, SECCOMP_RET_ALLOW),
+    ]
 }
 
 #[cfg(test)]
@@ -583,6 +653,139 @@ mod tests {
         .join()
         .unwrap();
         assert!(victim.recv(&mut buf).is_err(), "nothing reached tenant B's abstract datagram socket");
+    }
+
+    /// H02 CP24 P2-1: a native child gets no IP (or any) socket, while the
+    /// shared tenant filter still allows AF_INET for TCP-port Landlock roles.
+    #[test]
+    fn native_seccomp_refuses_every_socket_family_including_inet() {
+        let open = |family: libc::c_int, ty: libc::c_int| {
+            // SAFETY: plain socket(2); a returned fd is closed below.
+            let fd = unsafe { libc::socket(family, ty | libc::SOCK_CLOEXEC, 0) };
+            if fd >= 0 {
+                // SAFETY: fd was just returned by socket(2).
+                unsafe { libc::close(fd) };
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error().raw_os_error())
+            }
+        };
+        std::thread::spawn(move || {
+            // SAFETY: plain prctl on the calling thread.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+            for program in seccomp_filter().unwrap() {
+                seccompiler::apply_filter(&program).unwrap();
+            }
+            // Control: the shared filter leaves UDP/IP to Landlock (TCP only).
+            assert_eq!(open(libc::AF_INET, libc::SOCK_DGRAM), Ok(()), "shared filter control");
+        })
+        .join()
+        .unwrap();
+        std::thread::spawn(move || {
+            // SAFETY: plain prctl on the calling thread.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+            for program in native_seccomp_filter().unwrap() {
+                seccompiler::apply_filter(&program).unwrap();
+            }
+            let eperm = Err(Some(libc::EPERM));
+            for (family, ty) in [
+                (libc::AF_INET, libc::SOCK_DGRAM),
+                (libc::AF_INET, libc::SOCK_STREAM),
+                (libc::AF_INET, libc::SOCK_RAW),
+                (libc::AF_INET6, libc::SOCK_DGRAM),
+                (libc::AF_INET6, libc::SOCK_STREAM),
+                (libc::AF_UNIX, libc::SOCK_STREAM),
+                (libc::AF_NETLINK, libc::SOCK_DGRAM),
+                (libc::AF_PACKET, libc::SOCK_RAW),
+            ] {
+                assert_eq!(open(family, ty), eperm, "native socket({family}, {ty})");
+            }
+            // The supervisor-passed connection pair type stays usable.
+            socketpair(libc::SOCK_STREAM).expect("stream socketpair stays allowed");
+            assert_eq!(socketpair(libc::SOCK_DGRAM).unwrap_err(), libc::EPERM);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// NAN-4545: an x32 syscall (`nr | 0x40000000`) must not slip past the
+    /// per-number deny rules. EPERM from the x32 program, or ENOSYS on a
+    /// kernel built without x32; never success.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x32_abi_syscalls_cannot_bypass_the_deny_list() {
+        const X32: libc::c_long = 0x4000_0000;
+        let x32 = |nr: libc::c_long, a: libc::c_long, b: libc::c_long, c: libc::c_long| {
+            // SAFETY: raw syscall with integer args; a returned fd is closed.
+            let rc = unsafe { libc::syscall(X32 | nr, a, b, c) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if rc >= 0 && nr == libc::SYS_socket {
+                // SAFETY: rc is a fresh fd.
+                unsafe { libc::close(rc as libc::c_int) };
+            }
+            (rc, errno)
+        };
+        let refused = |(rc, errno): (libc::c_long, Option<i32>)| rc == -1 && matches!(errno, Some(libc::EPERM | libc::ENOSYS));
+        // SAFETY: getpid takes no arguments.
+        let x32_live = unsafe { libc::syscall(X32 | libc::SYS_getpid) } > 0;
+        eprintln!("NAN-4545 x32 ABI live on this kernel: {x32_live}");
+        if x32_live {
+            // Control: the pre-NAN-4545 programs alone let the x32 socket through.
+            std::thread::spawn(move || {
+                // SAFETY: plain prctl on the calling thread.
+                assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+                for program in seccomp_filter().unwrap().into_iter().take(2) {
+                    seccompiler::apply_filter(&program).unwrap();
+                }
+                let (rc, _) = x32(libc::SYS_socket, libc::AF_UNIX.into(), libc::SOCK_DGRAM.into(), 0);
+                assert!(rc >= 0, "control: without the x32 program the bypass is real");
+            })
+            .join()
+            .unwrap();
+        }
+        std::thread::spawn(move || {
+            // SAFETY: plain prctl on the calling thread.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+            let programs = seccomp_filter().unwrap();
+            assert_eq!(programs.len(), 3, "deny-list, clone3 and x32 programs");
+            for program in programs {
+                seccompiler::apply_filter(&program).unwrap();
+            }
+            // AF_UNIX is denied by the native rules, AF_INET goes to Landlock:
+            // the x32 path must refuse both, plus a plain deny-list member.
+            let socket_unix = x32(libc::SYS_socket, libc::AF_UNIX.into(), libc::SOCK_DGRAM.into(), 0);
+            assert!(refused(socket_unix), "x32 socket(AF_UNIX): {socket_unix:?}");
+            let socket_inet = x32(libc::SYS_socket, libc::AF_INET.into(), libc::SOCK_DGRAM.into(), 0);
+            assert!(refused(socket_inet), "x32 socket(AF_INET): {socket_inet:?}");
+            let unshare = x32(libc::SYS_unshare, libc::CLONE_NEWUSER.into(), 0, 0);
+            assert!(refused(unshare), "x32 unshare(CLONE_NEWUSER): {unshare:?}");
+            // The ordinary x86_64 numbers behave as before.
+            // SAFETY: getpid takes no arguments.
+            assert!(unsafe { libc::syscall(libc::SYS_getpid) } > 0);
+            // SAFETY: raw socket syscall with integer args.
+            assert_eq!(unsafe { libc::syscall(libc::SYS_socket, libc::AF_UNIX, libc::SOCK_DGRAM, 0) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::EPERM));
+        })
+        .join()
+        .unwrap();
+        // H02 CP28: the native no-socket filter carries the same x32 program.
+        std::thread::spawn(move || {
+            // SAFETY: plain prctl on the calling thread.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }, 0);
+            let programs = native_seccomp_filter().unwrap();
+            assert_eq!(programs.len(), 3, "native deny-list, clone3 and x32 programs");
+            for program in programs {
+                seccompiler::apply_filter(&program).unwrap();
+            }
+            for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6, libc::AF_NETLINK] {
+                let socket = x32(libc::SYS_socket, family.into(), libc::SOCK_DGRAM.into(), 0);
+                assert!(refused(socket), "native x32 socket({family}): {socket:?}");
+            }
+            let unshare = x32(libc::SYS_unshare, libc::CLONE_NEWUSER.into(), 0, 0);
+            assert!(refused(unshare), "native x32 unshare(CLONE_NEWUSER): {unshare:?}");
+        })
+        .join()
+        .unwrap();
     }
 
     fn abstract_sockaddr(name: &str) -> (libc::sockaddr_un, libc::socklen_t) {

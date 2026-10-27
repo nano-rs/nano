@@ -17,6 +17,7 @@
 pub mod block_index;
 pub mod count_record;
 pub mod format;
+pub mod indicators;
 pub mod entity_locators;
 pub mod entity_counts;
 pub mod levels;

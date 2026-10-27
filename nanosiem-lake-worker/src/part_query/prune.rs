@@ -87,6 +87,10 @@ pub struct FileSummary {
     /// (empty without that flat column), so a source-family hint prunes
     /// files whose family is not signed (L0/M parts) by their value range.
     pub source_family: Vec<EntityGroup>,
+    /// NAN-4664: the file carries the derived IOC indicator columns (its
+    /// footer marker names the current derivation). Their per-group
+    /// statistics and blooms are in `entities` under the column names.
+    pub indicators: bool,
 }
 
 /// NAN-4171: a file's leaf inventory and per-group compressed bytes. The
@@ -256,8 +260,18 @@ impl FileSummary {
         });
         let mut entities = Vec::new();
         let mut entities_located = true;
+        let indicators = has_indicator_marker(metadata.file_metadata());
         for (index, column) in metadata.file_metadata().schema_descr().columns().iter().enumerate() {
-            let path = column.path().string();
+            let mut path = column.path().string();
+            if indicators && column.max_rep_level() == 1 {
+                if let Some(kind) = indicator_leaf_kind(column.path().parts()) {
+                    path = kind.column().to_string();
+                    let groups = metadata.row_groups().iter().map(|group| EntityGroup::of(group.column(index))).collect::<Vec<_>>();
+                    entities_located &= groups.iter().all(|group| group.bloom != BloomAt::Unlocated);
+                    entities.push((path.into_boxed_str(), groups));
+                    continue;
+                }
+            }
             if column.max_rep_level() != 0 || !crate::parts::format::BLOOM_PATHS.contains(&path.as_str()) {
                 continue;
             }
@@ -278,7 +292,7 @@ impl FileSummary {
             })
             .collect();
         let column_bytes = ColumnBytes::new(column_bytes);
-        Some(Self { ranges, group_times, entities, entities_located, column_bytes, source_family })
+        Some(Self { ranges, group_times, entities, entities_located, column_bytes, source_family, indicators })
     }
 
     /// Compressed bytes per event leaf over the row groups `kept` (every
@@ -350,6 +364,20 @@ impl FileSummary {
     /// Exact bounds of every row group; `None` if any group lacks them.
     fn time_bounds(&self) -> Option<Vec<(i64, i64)>> {
         self.group_times.as_ref()?.iter().copied().collect()
+    }
+}
+
+/// NAN-4664: the footer marks the current IOC indicator derivation.
+fn has_indicator_marker(metadata: &parquet::file::metadata::FileMetaData) -> bool {
+    crate::parts::indicators::is_marked(metadata)
+}
+
+/// The indicator kind of a `<column>.list.item` Parquet leaf.
+fn indicator_leaf_kind(parts: &[String]) -> Option<nanosiem_core::search::lake_indicators::Kind> {
+    use nanosiem_core::search::lake_indicators::Kind;
+    match parts {
+        [column, list, item] if list == "list" && item == "item" => Kind::of_column(column),
+        _ => None,
     }
 }
 
@@ -1386,6 +1414,73 @@ impl Blooms<'_> {
     }
 }
 
+impl Blooms<'_> {
+    /// NAN-4664: `Some(false)` only when the file's indicator column of
+    /// `kind` proves no row of the group holds `value` (ASCII case-folded);
+    /// `None` for a file without the columns or a literal the column cannot
+    /// decide (non-ASCII: the SQL lowers it with Unicode rules), never proof
+    /// of absence.
+    fn indicator_may_contain(self, group: usize, kind: nanosiem_core::search::lake_indicators::Kind, value: &str) -> Option<bool> {
+        let probe = nanosiem_core::search::lake_indicators::probe(value)?;
+        let column = kind.column();
+        match self {
+            Blooms::Footer(reader, file) => {
+                let metadata = reader.metadata();
+                if !has_indicator_marker(metadata.file_metadata()) {
+                    return None;
+                }
+                let index = metadata.file_metadata().schema_descr().columns().iter()
+                    .position(|leaf| leaf.max_rep_level() == 1 && indicator_leaf_kind(leaf.path().parts()) == Some(kind))?;
+                let chunk = metadata.row_group(group).column(index);
+                indicator_contains(&EntityGroup::of(chunk), probe.as_bytes(), || Sbbf::read_from_column_chunk(chunk, file).ok().flatten().map(Arc::new))
+            }
+            Blooms::Parsed(summary, parsed) => {
+                if !summary.indicators {
+                    return None;
+                }
+                let entity = summary.entity(column)?.get(group)?;
+                indicator_contains(entity, probe.as_bytes(), || parsed.fields.iter()
+                    .find(|(name, _)| &**name == column)
+                    .and_then(|(_, groups)| groups.get(group)).cloned().flatten())
+            }
+            Blooms::Summary(summary, file) => {
+                if !summary.indicators {
+                    return None;
+                }
+                let entity = summary.entity(column)?.get(group)?;
+                indicator_contains(entity, probe.as_bytes(), || match entity.bloom {
+                    BloomAt::At(offset, length) => read_bloom_at(file, offset, length).map(Arc::new),
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    /// Entity evidence: the hinted leaf's own statistics and bloom, then
+    /// (NAN-4664) the indicator column covering that leaf. Both are safe
+    /// supersets, so either proving absence prunes the group.
+    fn entity_keep(self, group: usize, path: &str, value: &str) -> bool {
+        if self.may_contain(group, path, value) == Some(false) {
+            return false;
+        }
+        nanosiem_core::search::lake_indicators::classify(path)
+            .is_none_or(|kind| self.indicator_may_contain(group, kind, value) != Some(false))
+    }
+}
+
+/// One indicator decision: the column holds exactly the lowercased values,
+/// so `probe` is its only spelling. Missing statistics or an unreadable
+/// bloom keep the group.
+fn indicator_contains(group: &EntityGroup, probe: &[u8], bloom: impl FnOnce() -> Option<Arc<Sbbf>>) -> Option<bool> {
+    if group.min.as_ref().is_some_and(|min| probe < &**min) || group.max.as_ref().is_some_and(|max| probe > &**max) {
+        return Some(false);
+    }
+    if group.bloom == BloomAt::Absent {
+        return Some(true);
+    }
+    Some(bloom().is_none_or(|bloom| bloom.check(probe)))
+}
+
 /// A serialized bloom (header + bitset) at `offset`.
 fn read_bloom_at(file: &File, offset: u64, length: usize) -> Option<Sbbf> {
     use std::os::unix::fs::FileExt;
@@ -1428,7 +1523,7 @@ fn may_contain(group: &EntityGroup, path: &str, value: &str, bloom: impl FnOnce(
 fn combined_hint(bloom: Option<Blooms<'_>>, group: usize, tokens: Option<&TokenGroup>, hint: &CandidateHint) -> bool {
     match hint {
         CandidateHint::Entity { source_path, value } =>
-            bloom.is_none_or(|bloom| bloom.may_contain(group, source_path, value).unwrap_or(true))
+            bloom.is_none_or(|bloom| bloom.entity_keep(group, source_path, value))
                 && tokens.is_none_or(|tokens| token_hint(tokens, hint)),
         CandidateHint::SourceFamily { .. } | CandidateHint::Class { .. } => true,
         CandidateHint::Keyword { .. } => tokens.is_none_or(|tokens| token_hint(tokens, hint)),
@@ -1439,7 +1534,7 @@ fn combined_hint(bloom: Option<Blooms<'_>>, group: usize, tokens: Option<&TokenG
 
 fn entity_hint(bloom: Blooms<'_>, group: usize, hint: &CandidateHint) -> bool {
     match hint {
-        CandidateHint::Entity { source_path, value } => bloom.may_contain(group, source_path, value).unwrap_or(true),
+        CandidateHint::Entity { source_path, value } => bloom.entity_keep(group, source_path, value),
         CandidateHint::SourceFamily { .. } | CandidateHint::Class { .. } => true,
         CandidateHint::Any { alternatives } => {
             alternatives.is_empty() || alternatives.iter().any(|alternative| entity_hint(bloom, group, alternative))
@@ -2140,6 +2235,7 @@ mod tests {
             ranges: vec![(0, 10), (10, 20), (20, 30)], group_times: None, entities: vec![], entities_located: true,
             column_bytes: ColumnBytes::new(vec![("time".into(), vec![1, 2, 4].into()), ("raw_data".into(), vec![10, 20, 40].into())]),
             source_family: Vec::new(),
+            indicators: false,
         };
         let whole = BTreeMap::from([("raw_data".to_string(), 70), ("time".to_string(), 7)]);
         let (kept, aside) = summary.kept_and_whole_leaf_bytes(Some(&[true, false, true]));
@@ -2152,8 +2248,8 @@ mod tests {
 
     #[test]
     fn summary_cache_rejects_oversized_replacements_and_remains_byte_bounded() {
-        let small = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new() });
-        let big = Arc::new(FileSummary { ranges: vec![(0, 1); MAX_SUMMARY_BYTES / 16 + 1], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new() });
+        let small = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), indicators: false });
+        let big = Arc::new(FileSummary { ranges: vec![(0, 1); MAX_SUMMARY_BYTES / 16 + 1], group_times: None, entities: vec![], entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), indicators: false });
         let mut cache = SummaryCache::default();
         let key = "signed-digest".to_string();
         cache.insert(key.clone(), small);
@@ -2340,6 +2436,7 @@ mod tests {
             entities_located: true,
             column_bytes: ColumnBytes::default(),
             source_family: Vec::new(),
+            indicators: false,
         });
         let per = big.bytes();
         let fits = MAX_SUMMARY_BYTES / per;
@@ -2366,6 +2463,7 @@ mod tests {
                 entities_located: true,
                 column_bytes: ColumnBytes::new(columns),
                 source_family: vec![group.clone(); 2],
+                indicators: false,
             })
         };
         let mut cache = SummaryCache::default();
@@ -2383,7 +2481,7 @@ mod tests {
         assert!(Arc::ptr_eq(a.paths.as_ref().unwrap(), b.paths.as_ref().unwrap()));
         assert_eq!(a.iter().collect::<Vec<_>>(), vec![("time", &[1, 2][..]), ("device.hostname", &[3, 4][..])]);
         assert!(ColumnBytes::new(vec![("a".into(), vec![1].into()), ("b".into(), vec![1, 2].into())]).is_empty(), "ragged is no evidence");
-        let summary = |column_bytes| Arc::new(FileSummary { ranges: vec![(0, 1), (1, 2)], group_times: None, entities: vec![], entities_located: true, column_bytes, source_family: vec![] });
+        let summary = |column_bytes| Arc::new(FileSummary { ranges: vec![(0, 1), (1, 2)], group_times: None, entities: vec![], entities_located: true, column_bytes, source_family: vec![], indicators: false });
         let (one, two) = (summary(a), summary(b));
         let shared = one.column_bytes.shared().unwrap().1;
         let mut cache = SummaryCache::default();
@@ -2400,7 +2498,7 @@ mod tests {
     #[test]
     fn summary_cache_evicts_the_least_recently_used_at_its_bound() {
         let mut cache = SummaryCache::default();
-        let summary = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: Vec::new(), entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new() });
+        let summary = Arc::new(FileSummary { ranges: vec![(0, 1)], group_times: None, entities: Vec::new(), entities_located: true, column_bytes: ColumnBytes::default(), source_family: Vec::new(), indicators: false });
         let key = |i: usize| format!("digest-{i}");
         for i in 0..MAX_FILE_SUMMARIES {
             cache.insert(key(i), summary.clone());

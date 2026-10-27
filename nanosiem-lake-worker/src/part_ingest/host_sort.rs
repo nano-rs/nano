@@ -178,7 +178,7 @@ impl HostBuckets {
 /// Spill `batches` into `buckets` IPC streams under `dir` by `bucket_of`
 /// (row order within a bucket is the input order). Returns each bucket's
 /// stream path, `None` for an empty bucket.
-fn spill<I, F>(dir: &Path, schema: &SchemaRef, batches: I, buckets: usize, mut bucket_of: F) -> Result<Vec<Option<PathBuf>>>
+pub(super) fn spill<I, F>(dir: &Path, schema: &SchemaRef, batches: I, buckets: usize, mut bucket_of: F) -> Result<Vec<Option<PathBuf>>>
 where
     I: Iterator<Item = Result<RecordBatch>>,
     F: FnMut(&RecordBatch) -> Result<Vec<usize>>,
@@ -214,7 +214,7 @@ where
     writers.into_iter().map(|slot| slot.map(|(path, mut writer)| { writer.finish()?; Ok(path) }).transpose()).collect()
 }
 
-fn read_stream(path: &Path) -> Result<impl Iterator<Item = Result<RecordBatch>>> {
+pub(super) fn read_stream(path: &Path) -> Result<impl Iterator<Item = Result<RecordBatch>>> {
     Ok(StreamReader::try_new(File::open(path)?, None)?.map(|batch| batch.map_err(anyhow::Error::from)))
 }
 

@@ -117,6 +117,11 @@ impl ProxyDialer {
         let purpose = match grant.purpose {
             GrantPurpose::Connector | GrantPurpose::ThreatIntel => unreachable!(),
             GrantPurpose::Soar => EgressPurpose::Soar { connection: grant.connection, revision: grant.revision },
+            GrantPurpose::SoarSmtp => EgressPurpose::SoarSmtp {
+                connection: grant.connection,
+                revision: grant.revision,
+                port: target.addr.port(),
+            },
         };
         // The host passed the broker's allowlist check (a lowercase DNS
         // name); it is re-validated here because it is written into a
@@ -202,6 +207,20 @@ impl Dialer for RefusingDialer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smtp_connect_token_binds_the_exact_configured_port() {
+        let key=b"smtp-egress-fixture-key-32-bytes!!";
+        let dialer=ProxyDialer::new("http://proxy.example.test:3128",key).unwrap();
+        let grant=EgressGrant{tenant:uuid::Uuid::new_v4(),connection:uuid::Uuid::new_v4(),revision:2,purpose:GrantPurpose::SoarSmtp};
+        let target=DialTarget{host:"smtp.example.com",addr:"93.184.215.14:587".parse().unwrap(),grant:Some(&grant)};
+        let request=dialer.connect_request(&target,1000).unwrap();
+        assert!(request.starts_with("CONNECT smtp.example.com:587 HTTP/1.1\r\n"));
+        assert!(request.contains("X-Nano-Egress-Purpose: soar_smtp\r\n"));
+        let token=request.split("X-Nano-Egress-Token: ").nth(1).unwrap().split("\r\n").next().unwrap();
+        let smtp=EgressPurpose::SoarSmtp{connection:grant.connection,revision:2,port:587};
+        assert!(egress_auth::verify_for(key,smtp,grant.tenant,target.host,token,1050,1000));
+        assert!(!egress_auth::verify_for(key,EgressPurpose::SoarSmtp{connection:grant.connection,revision:2,port:465},grant.tenant,target.host,token,1050,1000));
+    }
     use super::*;
     use crate::broker::EgressGrant;
 

@@ -149,6 +149,10 @@ impl R2PartStore {
         writer.check_store_binding(&self.tenant_prefix, &self.location.read().expect("location lock"))?;
         self.native_writer = Some(writer); Ok(self)
     }
+    #[cfg(test)]
+    pub(crate) fn native_writer_for_tests(&self) -> &super::native_writer::NativePartWriter {
+        self.native_writer.as_deref().expect("store has a native writer")
+    }
     pub fn replace_write_permission(&self, permission: super::native_writer::WritePermission) -> Result<()> {
         self.native_writer.as_ref().context("store has no native writer")?.replace_permission(permission)
     }
@@ -312,8 +316,14 @@ impl R2PartStore {
         hints: Option<&WriteHints>, native_writer: Option<&std::sync::Arc<super::native_writer::NativePartWriter>>) -> Result<bool> {
         let native_attempt = match native_writer {
             Some(writer) => {
-                match writer.begin(key, sha256_hex, bytes, hints.context("native writes require exact event bounds")?).await? {
-                Some(attempt) => Some(attempt), None => return Ok(true),
+                let hints = hints.context("native writes require exact event bounds")?;
+                // NAN-4592: part objects written together authorize together.
+                match writer.begin_coalesced(key, sha256_hex, bytes, hints).await {
+                    Ok(Some(attempt)) => Some(attempt),
+                    Ok(None) => return Ok(true),
+                    Err(error) if error.downcast_ref::<super::native_writer::NativePutUnresolved>().is_some() =>
+                        return self.resolve_unresolved(key, sha256_hex, bytes, hints, writer, error).await,
+                    Err(error) => return Err(error),
                 }
             }, None => None,
         };
@@ -356,22 +366,29 @@ impl R2PartStore {
         let file = tokio::fs::File::open(path).await?;
         ensure!(file.metadata().await?.len() == bytes, "local part file size changed before upload");
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let url = format!("{}{}", location.endpoint.trim_end_matches('/'), canonical_uri);
+        #[cfg(test)]
+        let url = crate::r2_ops::test_origin::rewrite_url(url);
         let mut request = self
             .client
-            .put(format!("{}{}", location.endpoint.trim_end_matches('/'), canonical_uri))
+            .put(url)
             .header(reqwest::header::AUTHORIZATION, authorization)
             .header(reqwest::header::CONTENT_LENGTH, bytes);
         for (name, value) in headers.iter().filter(|(name, _)| name != "host") {
             request = request.header(name.as_str(), value.as_str());
         }
-        if let Some(writer) = native_writer { writer.put_started(); }
-        let response = request.body(body).send().await?;
+        let response = {
+            let _timing = native_writer.map(|writer| writer.put_started());
+            request.body(body).send().await?
+        };
         match response.status().as_u16() {
             200 => {
                 if let Some(writer) = native_writer { writer.put_completed(); }
                 if let (Some(writer), Some(attempt)) = (native_writer, native_attempt) {
                     let etag = response.headers().get(reqwest::header::ETAG).context("native PUT has no ETag")?.to_str()?;
-                    writer.finish(attempt, etag).await?;
+                    // NAN-4592: a part object's owner completion is
+                    // write-behind; the next part-log write waits for it.
+                    writer.finish_deferred(attempt, etag).await?;
                 }
                 Ok(true)
             },
@@ -404,14 +421,18 @@ impl R2PartStore {
     /// The native writer that authorizes `key`. Finding receipts and the
     /// exact ingest index metadata marker retain their scoped conditional
     /// path, as do admitted count-backfill windows and owed prevalence
-    /// restamp snapshots (writer state the owner's closed key grammar does not
-    /// cover); numbered checkpoints still authorize.
+    /// restamp snapshots, NAN-4445 degraded spell records and the NAN-4554
+    /// bronze quarantine mirror (writer state
+    /// the owner's closed key grammar does not cover); numbered checkpoints
+    /// still authorize.
     fn native_writer_for(&self, key: &str) -> Option<&std::sync::Arc<super::native_writer::NativePartWriter>> {
         self.native_writer.as_ref().filter(|_| !key.starts_with(
             &format!("{}finding-outbox/receipts/", self.tenant_prefix))
             && key != format!("{}log/checkpoints/{}", self.tenant_prefix, super::ingest::FINDING_ATTEMPT_INDEX_READY)
             && !key.starts_with(&format!("{}log/checkpoints/{}", self.tenant_prefix, super::ingest::COUNT_BACKFILL_DIR))
-            && !key.starts_with(&format!("{}log/checkpoints/{}", self.tenant_prefix, super::ingest::PREVALENCE_RESTAMP_DIR)))
+            && !key.starts_with(&format!("{}log/checkpoints/{}", self.tenant_prefix, super::ingest::PREVALENCE_RESTAMP_DIR))
+            && !key.starts_with(&format!("{}log/checkpoints/{}", self.tenant_prefix, super::prevalence_spell::PREVALENCE_DEGRADED_DIR))
+            && !key.starts_with(&format!("{}log/checkpoints/{}", self.tenant_prefix, super::quarantine_store::QUARANTINE_STORE_DIR)))
     }
 
     /// NAN-3499: authorize, HEAD, complete for an object already stored by
@@ -433,6 +454,51 @@ impl R2PartStore {
             writer.finish(attempt, &etag).await?;
         }
         replay.0 = None;
+        Ok(true)
+    }
+
+    /// NAN-4444: an earlier attempt of exactly this write was authorized but
+    /// its PUT outcome is unknown (R2 500 or a timeout; under a degraded
+    /// provider the bytes often landed anyway). Read the object back instead
+    /// of demanding owner recovery: when it holds these bytes, complete the
+    /// journaled attempt with the stored object's strong ETag (the owner
+    /// still HEADs the provider before registering) and report the create as
+    /// ours (`Ok(true)`). Other bytes under the key: `Ok(false)` (the key is
+    /// taken; the caller compares). Absent or unreadable: the original
+    /// [`NativePutUnresolved`](super::native_writer::NativePutUnresolved),
+    /// never a second PUT. CF cost: one HEAD (plus one small GET for objects
+    /// within [`crate::parts::part_log::MAX_RANGE_GET_BYTES`]) only on this ambiguous path.
+    async fn resolve_unresolved(&self, key: &str, sha256_hex: &str, bytes: u64, hints: &WriteHints,
+        writer: &super::native_writer::NativePartWriter, unresolved: anyhow::Error) -> Result<bool> {
+        let reader = self.reader_for(key);
+        let (etag, length) = match reader.stat_strong(key).await {
+            Ok(Some(stat)) => stat,
+            Ok(None) => return Err(unresolved),
+            Err(error) => {
+                tracing::warn!(key, error = %format!("{error:#}"), "native unresolved PUT read-back failed");
+                return Err(unresolved);
+            }
+        };
+        if length != bytes {
+            return Ok(false);
+        }
+        // The owner verifies the SHA-256 checksum on completion; small
+        // objects (every log entry) are also compared here so another
+        // writer's same-length bytes are never completed under our request.
+        if bytes <= crate::parts::part_log::MAX_RANGE_GET_BYTES {
+            match reader.get(key).await {
+                Ok(Some(stored)) if hex::encode(Sha256::digest(&stored)) == sha256_hex => {}
+                Ok(Some(_)) => return Ok(false),
+                Ok(None) => return Err(unresolved),
+                Err(error) => {
+                    tracing::warn!(key, error = %format!("{error:#}"), "native unresolved PUT read-back failed");
+                    return Err(unresolved);
+                }
+            }
+        }
+        let Some(attempt) = writer.unresolved_attempt(key, sha256_hex, bytes, hints)? else { return Err(unresolved) };
+        writer.finish(attempt, &etag).await?;
+        tracing::warn!(key, "native PUT outcome was unresolved; the object landed with these bytes, owner receipt completed");
         Ok(true)
     }
 
@@ -472,6 +538,17 @@ impl ObjectStore for R2PartStore {
     async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Option<Vec<u8>>> {
         self.check_key(key)?;
         self.reader_for(key).get_range(key, range).await
+    }
+
+    async fn object_size(&self, key: &str) -> Result<Option<u64>> {
+        // The agent-catalog export source (NAN-4543) verifies part sizes.
+        self.check_key(key)?;
+        self.reader_for(key).object_size(key).await
+    }
+
+    async fn object_identity(&self, key: &str) -> Result<Option<(String, u64)>> {
+        self.check_key(key)?;
+        self.reader_for(key).stat_strong(key).await
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -535,7 +612,7 @@ impl ObjectStore for R2PartStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// AWS SigV4 test suite `get-vanilla`.
@@ -722,7 +799,7 @@ mod tests {
     /// the platform mints them for ingest: access key `part` covers `parts/` +
     /// `log/checkpoints/`, `log` covers `log/entries/`; anything else is 403
     /// (GET, LIST and PUT). Missing in-scope keys are 404, as R2 answers.
-    mod scoped_r2 {
+    pub(crate) mod scoped_r2 {
         use axum::{
             body::Bytes,
             extract::{Path, Query, State},
@@ -731,6 +808,7 @@ mod tests {
             routing::get,
             Router,
         };
+        use sha2::Digest as _;
         use std::collections::{BTreeMap, HashMap};
         use std::sync::{Arc, Mutex};
 
@@ -804,8 +882,10 @@ mod tests {
             if headers.get("if-none-match").is_some_and(|v| v == "*") && bucket.objects.contains_key(&key) {
                 return (StatusCode::PRECONDITION_FAILED, "<Error><Code>PreconditionFailed</Code></Error>").into_response();
             }
+            // A strong ETag, as R2 answers: native writes journal it.
+            let etag = format!("\"{}\"", hex::encode(&sha2::Sha256::digest(&body)[..16]));
             bucket.objects.insert(key, body.to_vec());
-            StatusCode::OK.into_response()
+            (StatusCode::OK, [("etag", etag)]).into_response()
         }
 
         pub async fn serve(bucket: Bucket) -> (std::net::SocketAddr, Shared) {
@@ -901,7 +981,7 @@ mod tests {
         let app = Router::new().route("/{*path}", put(move |axum::extract::Path(path): axum::extract::Path<String>, headers: axum::http::HeaderMap| {
             let count = count.clone(); let authorized = authorized.clone();
             async move {
-                if !path.contains("/finding-outbox/receipts/") && !path.ends_with("/log/checkpoints/finding-attempt-index-v1") && !path.contains("/log/checkpoints/count-backfill-v1/") && !path.contains("/log/checkpoints/prevalence-restamp-v1/") { assert!(authorized.load(Ordering::SeqCst) > 0, "authorize must precede provider PUT"); }
+                if !path.contains("/finding-outbox/receipts/") && !path.ends_with("/log/checkpoints/finding-attempt-index-v1") && !path.contains("/log/checkpoints/count-backfill-v1/") && !path.contains("/log/checkpoints/prevalence-restamp-v1/") && !path.contains("/log/checkpoints/prevalence-degraded-v1/") && !path.contains("/log/checkpoints/bronze-quarantine-v1/") { assert!(authorized.load(Ordering::SeqCst) > 0, "authorize must precede provider PUT"); }
                 assert_eq!(headers["if-none-match"], "*");
                 let expected = if path.contains("/log/entries/") { "Credential=log/" } else { "Credential=part/" };
                 assert!(headers["authorization"].to_str().unwrap().contains(expected));
@@ -923,7 +1003,17 @@ mod tests {
             let (store, dir, a, c, puts, owner, provider) = native_store(true, 200).await;
             let key = format!("lake/parts/v1/tenant={T}/{family}");
             let hints = WriteHints { class, event_hour: 1, min_time_ms: 3600000, max_time_ms: 3600001 };
-            assert!(store.put_if_absent_with(&key, b"payload", &hints).await.is_err());
+            if class == WriterClass::LakePart {
+                // A part's completion is write-behind (NAN-4592): its write
+                // returns with the PUT journaled; the refused completion
+                // stays pending and arms the replay the next write runs.
+                assert!(store.put_if_absent_with(&key, b"payload", &hints).await.unwrap());
+                let writer = store.native_writer.as_ref().unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), writer.write_behind_idle_for_tests()).await.unwrap();
+                assert!(writer.needs_replay.load(Ordering::SeqCst));
+            } else {
+                assert!(store.put_if_absent_with(&key, b"payload", &hints).await.is_err());
+            }
             let intent = std::fs::read_dir(dir.path().join("native-writer-receipts/pending")).unwrap().next().unwrap().unwrap().path();
             let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
             assert_eq!(saved["object"]["etag"], "\"actual-put-etag\"");
@@ -937,6 +1027,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_stage_timings_cover_real_authorize_put_complete_and_pacer_without_values() {
+        let (store, _dir, _, _, _, owner, provider) = native_store(false, 200).await;
+        let key = format!("lake/parts/v1/tenant={T}/parts/l0/object");
+        let hints = WriteHints { class: WriterClass::LakePart, event_hour: 1, min_time_ms: 3600000, max_time_ms: 3600001 };
+        assert!(store.put_if_absent_with(&key, b"payload", &hints).await.unwrap());
+        let writer = store.native_writer.as_ref().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer.write_behind_idle_for_tests()).await.unwrap();
+        let diagnostics = writer.diagnostics();
+        for operation in ["authorize", "put", "complete"] {
+            assert_eq!(diagnostics["timings"][operation]["finished_total"], 1, "{operation}");
+            assert_eq!(diagnostics["timings"][operation]["in_flight"], 0);
+            assert!(diagnostics["timings"][operation]["elapsed_us_total"].as_u64().unwrap() > 0);
+        }
+        assert_eq!(diagnostics["timings"]["pacer_wait"]["finished_total"], 2);
+        for secret in [T, "test-only-token", "actual-put-etag", "payload", key.as_str()] {
+            assert!(!diagnostics.to_string().contains(secret));
+        }
+        owner.abort(); provider.abort();
+    }
+
+    #[tokio::test]
     async fn native_unknown_upload_and_412_never_complete_or_retry_put() {
         use std::sync::atomic::Ordering;
         for status in [503, 412] {
@@ -947,6 +1058,9 @@ mod tests {
             if status == 412 { assert!(!result.unwrap()); } else { assert!(result.is_err()); }
             assert!(store.put_if_absent_with(&key, b"payload", &hints).await.unwrap_err().to_string().contains("unresolved"));
             assert_eq!(a.load(Ordering::SeqCst), 1); assert_eq!(c.load(Ordering::SeqCst), 0); assert_eq!(puts.load(Ordering::SeqCst), 1);
+            let timing = store.native_writer.as_ref().unwrap().diagnostics();
+            assert_eq!(timing["timings"]["put"]["finished_total"], 1);
+            assert_eq!(timing["timings"]["put"]["in_flight"], 0);
             owner.abort(); provider.abort();
         }
     }
@@ -979,10 +1093,119 @@ mod tests {
             super::super::ingest::PREVALENCE_RESTAMP_DIR);
         assert!(store.put_if_absent(&owed, b"[]").await.unwrap());
         assert_eq!(a.load(Ordering::SeqCst), 0); assert_eq!(c.load(Ordering::SeqCst), 0); assert_eq!(puts.load(Ordering::SeqCst), 4);
+        // NAN-4445: and the prevalence degraded spell records.
+        let spell = format!("lake/parts/v1/tenant={T}/log/checkpoints/{}1800000000000-0123456789abcdef.json",
+            super::super::prevalence_spell::PREVALENCE_DEGRADED_DIR);
+        assert!(store.put_if_absent(&spell, b"{}").await.unwrap());
+        assert_eq!(a.load(Ordering::SeqCst), 0); assert_eq!(c.load(Ordering::SeqCst), 0); assert_eq!(puts.load(Ordering::SeqCst), 5);
+        // NAN-4554: and the bronze quarantine mirror records.
+        let quarantined = format!("lake/parts/v1/tenant={T}/log/checkpoints/{}records/1800000000000-0123456789abcdef.json",
+            super::super::quarantine_store::QUARANTINE_STORE_DIR);
+        assert!(store.put_if_absent(&quarantined, b"{}").await.unwrap());
+        assert_eq!(a.load(Ordering::SeqCst), 0); assert_eq!(c.load(Ordering::SeqCst), 0); assert_eq!(puts.load(Ordering::SeqCst), 6);
         let hints = WriteHints { class: WriterClass::LakePart, event_hour: 1, min_time_ms: 3600000, max_time_ms: 3600001 };
         assert!(store.put_if_absent_with(&format!("lake/parts/v1/tenant={T}/log/checkpoints/00000000000000000001.json"), b"payload", &hints).await.unwrap());
-        assert_eq!(a.load(Ordering::SeqCst), 1); assert_eq!(c.load(Ordering::SeqCst), 1); assert_eq!(puts.load(Ordering::SeqCst), 5);
+        assert_eq!(a.load(Ordering::SeqCst), 1); assert_eq!(c.load(Ordering::SeqCst), 1); assert_eq!(puts.load(Ordering::SeqCst), 7);
         owner.abort(); provider.abort();
+    }
+
+    /// NAN-4444: a provider whose entry PUT for seq 1 lands and then answers
+    /// 500 (`hang: false`) or lands and never answers (`hang: true`, a
+    /// timeout). GET/HEAD serve stored objects with a strong ETag.
+    async fn ambiguous_native_store(hang: bool) -> (R2PartStore, tempfile::TempDir,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>, std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+        use axum::{extract::State, http::{HeaderMap, StatusCode}, response::IntoResponse, routing::get, Router};
+        type Objects = Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>;
+        let (writer, dir, _a, c, owner) = super::super::native_writer::tests::fixture_for(false, T, "nano-shared-r2-t").await;
+        let objects: Objects = Arc::default();
+        let entry_puts = Arc::new(AtomicUsize::new(0));
+        let list = |State((objects, _)): State<(Objects, Arc<AtomicUsize>)>, axum::extract::Path(bucket): axum::extract::Path<String>,
+            axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+            let prefix = format!("{bucket}/{}", query.get("prefix").cloned().unwrap_or_default());
+            let contents: String = objects.lock().unwrap().iter().filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(k, v)| format!("<Contents><Key>{}</Key><Size>{}</Size><LastModified>2026-10-23T00:00:00.000Z</LastModified><ETag>\"e\"</ETag></Contents>",
+                    &k[bucket.len() + 1..], v.len()))
+                .collect();
+            ([("content-type", "application/xml")], format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>{bucket}</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"))
+        };
+        let app = Router::new().route("/{bucket}", get(list)).route("/{bucket}/", get(list)).route("/{bucket}/{*key}", get(|State((objects, _)): State<(Objects, Arc<AtomicUsize>)>, axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>| async move {
+            let path = format!("{bucket}/{key}");
+            match objects.lock().unwrap().get(&path) {
+                Some(bytes) => ([("etag", "\"actual-put-etag\"")], bytes.clone()).into_response(),
+                None => (StatusCode::NOT_FOUND, "<Error><Code>NoSuchKey</Code></Error>").into_response(),
+            }
+        }).put(move |State((objects, puts)): State<(Objects, Arc<AtomicUsize>)>, axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>, headers: HeaderMap, body: axum::body::Bytes| async move {
+            let path = format!("{bucket}/{key}");
+            assert_eq!(headers["if-none-match"], "*");
+            let ambiguous = path.ends_with("/log/entries/00000000000000000001.json");
+            let attempt = if ambiguous { puts.fetch_add(1, Ordering::SeqCst) } else { 1 };
+            {
+                let mut objects = objects.lock().unwrap();
+                if objects.contains_key(&path) {
+                    return (StatusCode::PRECONDITION_FAILED, "<Error><Code>PreconditionFailed</Code></Error>").into_response();
+                }
+                objects.insert(path, body.to_vec());
+            }
+            if attempt == 0 {
+                if hang { tokio::time::sleep(std::time::Duration::from_secs(3600)).await; }
+                return (StatusCode::INTERNAL_SERVER_ERROR, "<Error><Code>InternalError</Code></Error>").into_response();
+            }
+            (StatusCode::OK, [("etag", "\"actual-put-etag\"")]).into_response()
+        })).with_state((objects.clone(), entry_puts.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let store = R2PartStore::new_split(&location(addr, "part"), &location(addr, "log"), T, &dir.path().join("spill")).unwrap()
+            .with_native_writer(Arc::new(writer)).unwrap();
+        (store, dir, c, entry_puts, objects, owner, provider)
+    }
+
+    fn reject_op() -> crate::parts::part_log::LogOp {
+        use crate::parts::part_log::{LogOp, Rejection, SourceRef};
+        LogOp::Reject { rejections: vec![Rejection {
+            source: SourceRef { key: "bronze/1.parquet".into(), version: "1".into(), sha256: "d".repeat(64) },
+            scope: "object".into(), rows_rejected: 0, reason: "missing".into(), detail: String::new() }] }
+    }
+
+    /// NAN-4444 (cell-us-1, 2026-10-23), through the production store: R2
+    /// answered 500 to an entry PUT that landed (or never answered). The
+    /// retry re-sends the identical entry; the native writer reads the
+    /// object back, completes the journaled attempt (control's receipt) and
+    /// the part log commits it: no fence, no second provider PUT, the
+    /// receipt recorded for the GC watermark.
+    #[tokio::test]
+    async fn native_ambiguous_entry_put_that_landed_is_adopted_with_its_receipt() {
+        use crate::lake_part_gc::index::{ReceiptedAppends, INDEX_SETTLE_MS};
+        use crate::parts::part_log::{AppendOutcome, Fenced, PartLogWriter};
+        use std::sync::atomic::Ordering;
+        for hang in [false, true] {
+            let (store, _dir, completions, entry_puts, objects, owner, provider) = ambiguous_native_store(hang).await;
+            let mut writer = PartLogWriter::open(&store, T, 1, &log_schema(), 3_600_000).await.unwrap();
+            let ledger = std::sync::Arc::new(ReceiptedAppends::default());
+            writer.set_receipted_appends(ledger.clone());
+            let genesis_completions = completions.load(Ordering::SeqCst);
+            if hang {
+                // The caller's deadline cancels the append mid-PUT (a timeout).
+                assert!(tokio::time::timeout(std::time::Duration::from_millis(500), writer.append(reject_op(), 3_600_010)).await.is_err());
+            } else {
+                let error = writer.append(reject_op(), 3_600_010).await.unwrap_err();
+                assert!(error.downcast_ref::<Fenced>().is_none(), "{error:#}");
+            }
+            let key = format!("nano-shared-r2-t/lake/parts/v1/tenant={T}/log/entries/00000000000000000001.json");
+            assert!(objects.lock().unwrap().contains_key(&key), "the ambiguous PUT landed");
+            assert_eq!(completions.load(Ordering::SeqCst), genesis_completions, "no receipt yet");
+            let AppendOutcome::Committed { seq, .. } = writer.append(reject_op(), 3_600_500).await.unwrap();
+            assert_eq!(seq, 1, "hang={hang}");
+            assert_eq!(entry_puts.load(Ordering::SeqCst), 1, "read back, never re-PUT");
+            assert_eq!(completions.load(Ordering::SeqCst), genesis_completions + 1, "owner receipt completed");
+            assert_eq!(ledger.receipted_through(3_600_010 + INDEX_SETTLE_MS), Some(1), "receipt recorded");
+            let stored = crate::parts::part_log::LogEntry::parse_bytes(
+                &store.get(&format!("lake/parts/v1/tenant={T}/log/entries/00000000000000000001.json")).await.unwrap().unwrap(), T).unwrap();
+            assert_eq!(stored.appended_at_ms, 3_600_010, "the first attempt's bytes");
+            owner.abort(); provider.abort();
+        }
     }
 
     /// NAN-3499: an object another principal already stored (the detect

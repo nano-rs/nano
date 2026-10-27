@@ -59,6 +59,9 @@ struct Cursor {
     files: std::collections::VecDeque<PathBuf>,
     batch_rows: usize,
     reader: Option<ParquetRecordBatchReader>,
+    /// NAN-4664: the head file carries derived indicator columns (its
+    /// footer marker); they are dropped here and re-derived by the writer.
+    reader_marked: bool,
     batch: Option<RecordBatch>,
     times: Vec<i64>,
     uids: Option<StringArray>,
@@ -69,21 +72,23 @@ struct Cursor {
 impl Cursor {
     fn open(files: Vec<PathBuf>, batch_rows: usize, filter: Option<ActiveFilter>) -> Result<Self> {
         let files = files.into_iter().collect();
-        Ok(Self { files, batch_rows, reader: None, batch: None, times: Vec::new(), uids: None, row: 0, filter })
+        Ok(Self { files, batch_rows, reader: None, reader_marked: false, batch: None, times: Vec::new(), uids: None, row: 0, filter })
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         loop {
             if let Some(reader) = &mut self.reader {
                 if let Some(batch) = reader.next() {
-                    return Ok(Some(batch?));
+                    let batch = batch?;
+                    // NAN-4664: derived columns are rebuilt by the writer.
+                    return Ok(Some(if self.reader_marked { crate::parts::indicators::strip(batch)? } else { batch }));
                 }
                 self.reader = None;
             }
             let Some(path) = self.files.pop_front() else { return Ok(None) };
-            self.reader = Some(
-                ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?.with_batch_size(self.batch_rows).build()?,
-            );
+            let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(&path)?)?;
+            self.reader_marked = crate::parts::indicators::has_any_marker(builder.metadata().file_metadata());
+            self.reader = Some(builder.with_batch_size(self.batch_rows).build()?);
         }
     }
 
@@ -190,6 +195,43 @@ fn decode_window_rows() -> usize {
 
 /// Rows one host-sort bucket holds in memory (NAN-3412): half the merge
 /// decode window, which the main k-way merge no longer uses by then.
+/// The row order of an hour merge's family files (NAN-3412, NAN-4664).
+/// [`HourOrder::TIME`] is the `(time, uid)` layout every reader assumes;
+/// the others are written tagged with their order and read back through
+/// [`super::host_sort::restore_time_order`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HourOrder {
+    /// Endpoint families in `(device.hostname, time, uid)` order, in groups
+    /// of this many rows.
+    pub host_sort: Option<usize>,
+    /// Every other multi-class family in `(class_uid, time, uid)` order.
+    pub class_sort: bool,
+}
+
+impl HourOrder {
+    pub const TIME: Self = Self { host_sort: None, class_sort: false };
+
+    pub const fn host(group_rows: usize) -> Self {
+        Self { host_sort: Some(group_rows), class_sort: false }
+    }
+
+    fn is_time(self) -> bool {
+        self == Self::TIME
+    }
+}
+
+/// NAN-4664: a family is class-sorted only while its file stays well under
+/// one data file (a class-sorted family cannot roll). Estimated from the
+/// inputs' compressed bytes per row (L0/minute inputs compress worse than
+/// the zstd-9 hour output, so the estimate is high).
+const CLASS_SORT_MAX_FAMILY_BYTES: u64 = crate::parts::format::DATA_FILE_SPLIT_BYTES / 2;
+
+fn class_sort_max_rows(inputs: &[MergeInput]) -> u64 {
+    let rows = inputs.iter().map(|input| input.part.rows).sum::<u64>();
+    let bytes = inputs.iter().map(|input| input.part.data_bytes).sum::<u64>().max(1);
+    u64::try_from(u128::from(rows) * u128::from(CLASS_SORT_MAX_FAMILY_BYTES) / u128::from(bytes)).unwrap_or(u64::MAX)
+}
+
 fn host_sort_bucket_rows() -> usize {
     (decode_window_rows() / 2).max(1_024)
 }
@@ -383,12 +425,18 @@ struct FamilySpool {
     host_sort: Option<(usize, usize)>,
     /// Rows per `device.hostname` of each endpoint family (host sort only).
     host_counts: BTreeMap<Family, super::host_sort::HostCounts>,
+    /// NAN-4664: most rows a family may hold and still be class-sorted;
+    /// `None`: class sort off.
+    class_sort_max_rows: Option<u64>,
+    /// Rows per `class_uid` of each family that is not host-sorted (class
+    /// sort only).
+    class_counts: BTreeMap<Family, super::class_sort::ClassCounts>,
 }
 
 impl FamilySpool {
     fn new(work_dir: &Path, schema: SchemaRef, chosen: BTreeSet<String>) -> Result<Self> {
         ensure!(chosen.len() <= MAX_DEDICATED_FAMILIES, "too many selected families");
-        Ok(Self { dir: tempfile::Builder::new().prefix(".family-").tempdir_in(work_dir)?, chosen, streams: BTreeMap::new(), schema, merkle: MerkleBuilder::new(), class_clustering: false, class_families: BTreeSet::new(), source_rest: false, host_sort: None, host_counts: BTreeMap::new() })
+        Ok(Self { dir: tempfile::Builder::new().prefix(".family-").tempdir_in(work_dir)?, chosen, streams: BTreeMap::new(), schema, merkle: MerkleBuilder::new(), class_clustering: false, class_families: BTreeSet::new(), source_rest: false, host_sort: None, host_counts: BTreeMap::new(), class_sort_max_rows: None, class_counts: BTreeMap::new() })
     }
 
     /// Cluster by `(source, class)` into exactly these dedicated families.
@@ -417,6 +465,21 @@ impl FamilySpool {
     /// groups, sorting at most about `bucket_rows` rows at a time.
     fn set_host_sort(&mut self, group_rows: usize, bucket_rows: usize) {
         self.host_sort = Some((group_rows, bucket_rows));
+    }
+
+    /// Write every multi-class family that is not host-sorted in
+    /// `(class_uid, time, uid)` order (NAN-4664), up to `max_rows` rows a
+    /// family.
+    fn set_class_sort(&mut self, max_rows: u64) {
+        self.class_sort_max_rows = Some(max_rows);
+    }
+
+    /// Whether `family` is written class-sorted.
+    fn class_sorted(&self, family: &Family) -> bool {
+        !self.host_sorted(family)
+            && self.class_sort_max_rows.is_some_and(|max_rows| self.class_counts.get(family)
+                .is_some_and(|counts| counts.mixed() && counts.rows() <= max_rows
+                    && counts.classes.len() <= super::class_sort::MAX_SORT_CLASSES))
     }
 
     fn host_sorted(&self, family: &Family) -> bool {
@@ -463,6 +526,14 @@ impl FamilySpool {
                 }
             }
         }
+        if self.class_sort_max_rows.is_some() && groups.keys().any(|family| !self.host_sorted(family)) {
+            let classes = super::class_sort::class_keys(batch)?;
+            for (family, rows) in &groups {
+                if self.host_sorted(family) { continue; }
+                self.class_counts.entry(family.clone()).or_default()
+                    .add_batch(&classes, rows.iter().map(|row| *row as usize));
+            }
+        }
         for (family, rows) in groups {
             if !self.streams.contains_key(&family) {
                 let path = self.dir.path().join(format!("{}.arrow", self.streams.len()));
@@ -491,6 +562,21 @@ impl FamilySpool {
                 let counts = self.host_counts.remove(&family).unwrap_or_default();
                 super::host_sort::host_sort_stream(self.dir.path(), &self.schema, &path, &counts, bucket_rows,
                     |batch| writer.write(batch))?;
+                std::fs::remove_file(&path)?;
+                continue;
+            }
+            if self.class_sorted(&family) {
+                let (source, class) = match &family {
+                    Family::Named(source) => (Some(source.as_str()), None),
+                    Family::SourceClass(source, class) => (Some(source.as_str()), Some(*class)),
+                    Family::Overflow => (None, None),
+                };
+                writer.start_class_sorted_family(source, class)?;
+                let counts = self.class_counts.remove(&family).unwrap_or_default();
+                super::class_sort::class_sort_stream(self.dir.path(), &self.schema, &path, &counts, |event| match event {
+                    super::class_sort::ClassSortEvent::Rows(batch) => writer.write(batch),
+                    super::class_sort::ClassSortEvent::RunBoundary => writer.end_class_run(),
+                })?;
                 std::fs::remove_file(&path)?;
                 continue;
             }
@@ -620,7 +706,15 @@ fn merge_parts_with(
                 let signed: SignedProvenance = serde_json::from_slice(&std::fs::read(&provenance)?)?;
                 signed.record.validate()?;
                 ensure!(signed.record.part_id == input.part.part_id, "merge input provenance names another part");
-                if signed.record.files.data.iter().any(|file| file.log_sources.is_some()) {
+                // NAN-4664: an hour of overflow rows only (no
+                // `metadata.log_source`) is one untagged-source family file
+                // that may still be class-sorted; any row-order tag needs
+                // the per-file restore below, or the k-way merge reads it
+                // out of time order and the hour never merges again.
+                let tagged = signed.record.files.data.iter()
+                    .map(|file| super::host_sort::is_host_sorted(&input.dir.join(&file.name)))
+                    .collect::<Result<Vec<_>>>()?.contains(&true);
+                if tagged || signed.record.files.data.iter().any(|file| file.log_sources.is_some()) {
                     force_row_partials = true;
                     for file in &signed.record.files.data {
                         let dir = scratch.join(format!("virtual-{}", expanded.len()));
@@ -664,7 +758,7 @@ fn merge_parts_with(
                 std::fs::create_dir_all(&dir)?;
                 let Some(merged) = merge_streaming(
                     &dir, tenant_id, level, event_hour, group, group, schema.clone(), schema_fingerprint, signer_key_id,
-                    build, now_ms, false, force_row_partials, true, None, filter.clone(),
+                    build, now_ms, false, force_row_partials, true, HourOrder::TIME, filter.clone(),
                 )? else {
                     // Every row of this group was filtered out.
                     filtered_out += group.iter().map(|input| input.part.rows).sum::<u64>();
@@ -685,20 +779,26 @@ fn merge_parts_with(
             return Ok(None);
         }
         let cluster_output = level == Level::Hour || (level == Level::Minute && std::env::var("NANO_LAKE_COMPACTION_LAYOUT").is_ok());
-        let host_sort = (level == Level::Hour).then(super::host_sort::group_rows).flatten();
-        // NAN-3412: the host-sorted layout is an optimization. It is written
-        // under the scratch directory (removed below, so a failed attempt
-        // leaves nothing) and moved into `work_dir` once finished; any
-        // failure (e.g. a family past one data file) redoes the merge in the
-        // time-sorted layout instead of wedging the hour.
-        let attempt = match host_sort {
-            Some(group_rows) => {
-                let dir = scratch.join("host-sorted");
+        // NAN-4664: every sealed hour writes its multi-class families
+        // class-sorted, so `class_uid` row-group statistics prune; endpoint
+        // families are host-sorted instead when NAN-3412 is on.
+        let order = HourOrder {
+            host_sort: (level == Level::Hour).then(super::host_sort::group_rows).flatten(),
+            class_sort: level == Level::Hour,
+        };
+        // NAN-3412: the host/class-sorted layout is an optimization. It is
+        // written under the scratch directory (removed below, so a failed
+        // attempt leaves nothing) and moved into `work_dir` once finished;
+        // any failure (e.g. a family past one data file) redoes the merge in
+        // the time-sorted layout instead of wedging the hour.
+        let attempt = match order {
+            order if !order.is_time() => {
+                let dir = scratch.join("hour-sorted");
                 std::fs::create_dir_all(&dir)?;
                 match merge_streaming(
                     &dir, tenant_id, level, event_hour, &current, inputs, schema.clone(), schema_fingerprint, signer_key_id,
-                    build, now_ms, cluster_output, force_row_partials, false, Some(group_rows), filter.clone(),
-                ).and_then(|merged| merged.context("host-sorted filtered merge is empty")).and_then(|mut merged| {
+                    build, now_ms, cluster_output, force_row_partials, false, order, filter.clone(),
+                ).and_then(|merged| merged.context("hour-sorted filtered merge is empty")).and_then(|mut merged| {
                     let target = work_dir.join(merged.finished.dir.file_name().context("merge output has no directory name")?);
                     std::fs::rename(&merged.finished.dir, &target)?;
                     merged.finished.dir = target;
@@ -706,18 +806,18 @@ fn merge_parts_with(
                 }) {
                     Ok(merged) => Some(merged),
                     Err(error) => {
-                        tracing::warn!(error = %format!("{error:#}"), event_hour, "host-sorted endpoint merge failed; writing time-sorted layout");
+                        tracing::warn!(error = %format!("{error:#}"), event_hour, "host/class-sorted hour merge failed; writing time-sorted layout");
                         None
                     }
                 }
             }
-            None => None,
+            _ => None,
         };
         let mut merged = match attempt {
             Some(merged) => merged,
             None => match merge_streaming(
                 work_dir, tenant_id, level, event_hour, &current, inputs, schema.clone(), schema_fingerprint, signer_key_id,
-                build, now_ms, cluster_output, force_row_partials, false, None, filter.clone(),
+                build, now_ms, cluster_output, force_row_partials, false, HourOrder::TIME, filter.clone(),
             )? {
                 Some(merged) => merged,
                 None => return Ok(None),
@@ -766,12 +866,12 @@ fn merge_streaming(
     cluster_output: bool,
     force_row_partials: bool,
     intermediate: bool,
-    host_sort: Option<usize>,
+    order: HourOrder,
     filter: Option<std::sync::Arc<dyn RowFilter>>,
 ) -> Result<Option<MergeResult>> {
     let Some(result) = merge_streaming_mode(work_dir, tenant_id, level, event_hour, cursor_inputs,
         recorded_inputs, schema.clone(), schema_fingerprint, signer_key_id, build, now_ms,
-        cluster_output, force_row_partials, intermediate, false, host_sort, filter.clone())? else {
+        cluster_output, force_row_partials, intermediate, false, order, filter.clone())? else {
         return Ok(None);
     };
     if intermediate || std::env::var("NANO_LAKE_COMPACTION_LAYOUT").is_err() {
@@ -788,7 +888,7 @@ fn merge_streaming(
     // Both passes consume the same verified inputs and compaction quotas.
     let baseline = merge_streaming_mode(work_dir, tenant_id, level, event_hour, cursor_inputs,
         recorded_inputs, schema, schema_fingerprint, signer_key_id, build, now_ms,
-        level == Level::Hour, force_row_partials, intermediate, true, None, filter)?
+        level == Level::Hour, force_row_partials, intermediate, true, HourOrder::TIME, filter)?
         .context("layout baseline of a non-empty filtered merge is empty")?;
     ensure!(result.finished.record.rows == baseline.finished.record.rows
         && result.finished.record.merkle_root == baseline.finished.record.merkle_root
@@ -823,7 +923,7 @@ fn merge_streaming_mode(
     force_row_partials: bool,
     intermediate: bool,
     legacy_layout: bool,
-    host_sort: Option<usize>,
+    order: HourOrder,
     filter: Option<std::sync::Arc<dyn RowFilter>>,
 ) -> Result<Option<MergeResult>> {
     let merged_partials = if force_row_partials || filter.is_some() { PartialSource::FromRows } else {
@@ -831,13 +931,13 @@ fn merge_streaming_mode(
     };
     match merge_pass(
         work_dir, tenant_id, level, event_hour, cursor_inputs, recorded_inputs, schema.clone(), schema_fingerprint,
-        signer_key_id, build, now_ms, merged_partials, cluster_output, intermediate, legacy_layout, host_sort, filter.clone(),
+        signer_key_id, build, now_ms, merged_partials, cluster_output, intermediate, legacy_layout, order, filter.clone(),
     )? {
         PassOutcome::Done(result) => Ok(Some(result)),
         PassOutcome::Empty => Ok(None),
         PassOutcome::HadDuplicates => match merge_pass(
             work_dir, tenant_id, level, event_hour, cursor_inputs, recorded_inputs, schema, schema_fingerprint,
-            signer_key_id, build, now_ms, PartialSource::FromRows, cluster_output, intermediate, legacy_layout, host_sort, filter,
+            signer_key_id, build, now_ms, PartialSource::FromRows, cluster_output, intermediate, legacy_layout, order, filter,
         )? {
             PassOutcome::Done(result) => Ok(Some(result)),
             PassOutcome::Empty => Ok(None),
@@ -871,7 +971,7 @@ fn merge_pass(
     cluster_output: bool,
     intermediate: bool,
     legacy_layout: bool,
-    host_sort: Option<usize>,
+    order: HourOrder,
     filter: Option<std::sync::Arc<dyn RowFilter>>,
 ) -> Result<PassOutcome> {
     let inputs = cursor_inputs;
@@ -945,8 +1045,12 @@ fn merge_pass(
                 });
             spool.set_class_families_with_source_rest(families)?;
         }
-        if let Some(group_rows) = host_sort.filter(|_| level == Level::Hour && !intermediate && !legacy_layout) {
+        let final_hour = level == Level::Hour && !intermediate && !legacy_layout;
+        if let Some(group_rows) = order.host_sort.filter(|_| final_hour) {
             spool.set_host_sort(group_rows, host_sort_bucket_rows());
+        }
+        if order.class_sort && final_hour {
+            spool.set_class_sort(class_sort_max_rows(inputs));
         }
     }
     let streams = inputs.iter().map(|input| Ok((local_data_files(&input.dir)?, input.part.min_time_us)))
@@ -1263,9 +1367,9 @@ mod tests {
         let part = writer.finish().unwrap();
         let inputs = [MergeInput { part: PartRef::from_record(&part.record, &"0".repeat(64), true), dir: part.dir }];
         let baseline = merge_streaming_mode(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs,
-            schema.clone(), &fingerprint, SIGNER, "test", 3, true, true, false, true, None, None).unwrap().unwrap();
+            schema.clone(), &fingerprint, SIGNER, "test", 3, true, true, false, true, HourOrder::TIME, None).unwrap().unwrap();
         let output = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs,
-            schema, &fingerprint, SIGNER, "test", 4, true, true, false, None, None).unwrap().unwrap();
+            schema, &fingerprint, SIGNER, "test", 4, true, true, false, HourOrder::TIME, None).unwrap().unwrap();
         assert_eq!(output.finished.record.rows, 65_536);
         assert_eq!(output.finished.record.merkle_root, baseline.finished.record.merkle_root);
         assert!(output.finished.record.files.data_bytes() as u128 * 100 <= baseline.finished.record.files.data_bytes() as u128 * 105);
@@ -1406,9 +1510,9 @@ mod tests {
         let (schema, fingerprint, input) = host_sort_fixture(dir.path());
         let inputs = [input];
         let off = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
-            SIGNER, "test", 3, true, false, false, None, None).unwrap().unwrap().finished;
+            SIGNER, "test", 3, true, false, false, HourOrder::TIME, None).unwrap().unwrap().finished;
         let on = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
-            SIGNER, "test", 4, true, false, false, Some(1_024), None).unwrap().unwrap().finished;
+            SIGNER, "test", 4, true, false, false, HourOrder::host(1_024), None).unwrap().unwrap().finished;
         assert_eq!(on.record.rows, 24_000);
         assert_eq!(on.record.merkle_root, off.record.merkle_root, "same logical rows");
         assert_eq!(on.record.hours[0].merkle_root, off.record.hours[0].merkle_root);
@@ -1485,13 +1589,317 @@ mod tests {
         let mut all_rewrite = Vec::new();
         for file in &rewrite.finished.record.files.data {
             let path = rewrite.finished.dir.join(&file.name);
-            assert_eq!(file_row_order(&path).unwrap(), None, "switch unset: time order");
-            let rows = file_rows(&path);
-            assert!(rows.windows(2).all(|w| (w[0].1, &w[0].2) < (w[1].1, &w[1].2)));
+            // Host sort unset: no host order. NAN-4664: the two-class
+            // families are class-sorted, so each class run is time-ordered.
+            assert_eq!(file_row_order(&path).unwrap().as_deref(), Some(super::super::class_sort::CLASS_ROW_ORDER), "{}", file.name);
+            let classes = class_file_rows(&path);
+            assert!(classes.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order");
+            all_rewrite.extend(file_rows(&path));
+        }
+        all_rewrite.sort();
+        assert_eq!(all_rewrite, all_off);
+    }
+
+    /// `(class_uid, time, uid)` of every row of one data file, in file order.
+    fn class_file_rows(path: &Path) -> Vec<(Option<i64>, i64, String)> {
+        let mut out = Vec::new();
+        for batch in ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap()).unwrap().build().unwrap() {
+            let batch = batch.unwrap();
+            let classes = super::super::class_sort::class_keys(&batch).unwrap();
+            let uids = uid_strings(&batch).unwrap();
+            let time = batch.column_by_name("time").unwrap();
+            for row in 0..batch.num_rows() {
+                out.push((classes[row], event_time_us_from_array(time.as_ref(), row).unwrap(), uids.value(row).to_string()));
+            }
+        }
+        out
+    }
+
+    /// NAN-4664 synthetic OCSF hour: four sources, eleven classes with a
+    /// realistic skew (process and network activity dominate), class-specific
+    /// fields, arrival interleaved in time. No tenant data.
+    fn class_sort_fixture(dir: &Path, rows: usize) -> (SchemaRef, String, MergeInput) {
+        class_sort_fixture_with(dir, rows, true)
+    }
+
+    /// `with_source = false`: no row carries `metadata.log_source`, so the
+    /// whole hour is the overflow family.
+    fn class_sort_fixture_with(dir: &Path, rows: usize, with_source: bool) -> (SchemaRef, String, MergeInput) {
+        use std::sync::Arc;
+        use super::super::schema::{decode, infer_schema};
+        use super::super::writer::sort_by_time_uid;
+        use crate::parts::provenance::tests::{TENANT, SIGNER};
+        // (source, class, weight)
+        const MIX: &[(&str, i64, usize)] = &[
+            ("windows_sysmon", 1007, 30), ("windows_sysmon", 4001, 22), ("windows_sysmon", 1001, 8),
+            ("windows_sysmon", 4003, 6), ("windows_sysmon", 1006, 3), ("windows_event", 3002, 9),
+            ("windows_event", 1007, 4), ("windows_event", 3005, 2), ("aws_cloudtrail", 6003, 8),
+            ("aws_cloudtrail", 3002, 2), ("zeek", 4001, 4), ("zeek", 4003, 1), ("zeek", 4002, 1),
+        ];
+        let total: usize = MIX.iter().map(|(_, _, weight)| weight).sum();
+        let pick = |row: usize| {
+            let mut slot = (row.wrapping_mul(2_654_435_761) >> 7) % total;
+            for entry in MIX { if slot < entry.2 { return *entry; } slot -= entry.2; }
+            unreachable!()
+        };
+        let events = (0..rows).map(|row| {
+            let (source, class, _) = pick(row);
+            let host = format!("ws-{:03}.corp.local", (row * 7) % 250);
+            let mut event = serde_json::json!({
+                "time": chrono::DateTime::from_timestamp_micros((row as i64) * (3_599_000_000 / rows as i64)).unwrap().to_rfc3339(),
+                "class_uid": class,
+                "category_uid": class / 1000,
+                "activity_id": 1 + (row % 3) as i64,
+                "severity_id": 1,
+                "metadata": { "uid": format!("u{row:07}"), "log_source": source, "product": { "name": source } },
+                "device": { "hostname": host },
+                "message": format!("{source} {class} event {}", row % 1_000),
+            });
+            if !with_source {
+                event["metadata"] = serde_json::json!({ "uid": format!("u{row:07}") });
+            }
+            match class {
+                1007 => {
+                    event["process"] = serde_json::json!({ "name": (["powershell.exe", "cmd.exe", "svchost.exe", "chrome.exe"][row % 4]),
+                        "cmd_line": format!("C:\\Windows\\System32\\x.exe -arg {}", row % 300), "pid": (row % 9_000) as i64 });
+                    event["actor"] = serde_json::json!({ "user": { "name": format!("user{}", row % 40) } });
+                }
+                4001 | 4002 => {
+                    event["src_endpoint"] = serde_json::json!({ "ip": format!("10.0.{}.{}", row % 20, row % 250), "port": (49_152 + row % 10_000) as i64 });
+                    event["dst_endpoint"] = serde_json::json!({ "ip": format!("203.0.113.{}", row % 200), "port": ([443, 80, 445, 53][row % 4]) });
+                }
+                4003 => { event["query"] = serde_json::json!({ "hostname": format!("host{}.example.com", row % 500) }); }
+                1001 | 1006 => { event["file"] = serde_json::json!({ "path": format!("C:\\Users\\u{}\\f{}.txt", row % 40, row % 900), "name": format!("f{}.txt", row % 900) }); }
+                3002 | 3005 => {
+                    event["user"] = serde_json::json!({ "name": format!("user{}", row % 40) });
+                    event["status_id"] = serde_json::json!(1 + (row % 2) as i64);
+                }
+                _ => { event["api"] = serde_json::json!({ "operation": (["GetObject", "PutObject", "AssumeRole"][row % 3]) }); }
+            }
+            event
+        }).collect::<Vec<_>>();
+        let refs = events.iter().collect::<Vec<_>>();
+        // Without sources the column still exists (null in every row), as
+        // in a tenant schema that has seen `metadata.log_source` before.
+        let template = serde_json::json!({ "metadata": { "log_source": "template" } });
+        let schema = Arc::new(infer_schema(&refs.iter().copied().chain((!with_source).then_some(&template)).collect::<Vec<_>>()).unwrap());
+        let fingerprint = crate::parts::format::schema_fingerprint(&schema).unwrap();
+        let batch = sort_by_time_uid(&decode(schema.clone(), &refs).unwrap()).unwrap();
+        let draft = PartDraft {
+            tenant_id: TENANT.into(), signer_key_id: SIGNER.into(), level: Level::Minute, event_hour: 0,
+            schema: schema.clone(), schema_fingerprint: fingerprint.clone(),
+            inputs: PartInputs::Parts { parts: vec![InputPart { part_id: PartId::new(1).unwrap(), level: Level::L0, provenance_sha256: "0".repeat(64), rows: rows as u64, merkle_root: "0".repeat(64) }] },
+            admission: None, rows_in: rows as u64, duplicates_dropped: 0, window: DedupWindow::Exact, build: "test".into(),
+        };
+        let mut writer = PartWriter::create(dir, draft, PartialSource::FromRows, 2, rows as u64).unwrap();
+        writer.write(&batch).unwrap();
+        let part = writer.finish().unwrap();
+        (schema, fingerprint, MergeInput { part: PartRef::from_record(&part.record, &"0".repeat(64), true), dir: part.dir })
+    }
+
+    /// `(row groups, row groups chDB's min/max push-down keeps for
+    /// class_uid ∈ classes, rows in the kept groups, matching rows)` over a
+    /// part directory. The keep rule is ClickHouse's KeyCondition on
+    /// row-group statistics: a group survives unless every class lies
+    /// outside its `[min, max]`.
+    fn class_pruning(dir: &Path, classes: &[i64]) -> (usize, usize, u64, u64) {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        use parquet::file::statistics::Statistics;
+        let (mut groups, mut kept, mut kept_rows, mut matching) = (0, 0, 0, 0);
+        for path in local_data_files(dir).unwrap() {
+            let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+            let column = reader.metadata().file_metadata().schema_descr().columns().iter()
+                .position(|column| column.path().string() == "class_uid").unwrap();
+            for metadata in reader.metadata().row_groups() {
+                groups += 1;
+                let bounds = match metadata.column(column).statistics() {
+                    Some(Statistics::Int64(stats)) => stats.min_opt().copied().zip(stats.max_opt().copied()),
+                    Some(Statistics::Int32(stats)) => stats.min_opt().map(|v| i64::from(*v)).zip(stats.max_opt().map(|v| i64::from(*v))),
+                    other => panic!("class_uid has no integer row-group statistics: {other:?}"),
+                };
+                let (min, max) = bounds.expect("class_uid min/max present");
+                if classes.iter().any(|class| (min..=max).contains(class)) {
+                    kept += 1;
+                    kept_rows += metadata.num_rows() as u64;
+                }
+            }
+            matching += class_file_rows(&path).iter().filter(|row| row.0.is_some_and(|class| classes.contains(&class))).count() as u64;
+        }
+        (groups, kept, kept_rows, matching)
+    }
+
+    /// NAN-4664: a sealed hour (production `merge_parts` path) writes its
+    /// multi-class families in `(class_uid, time, uid)` order: the same rows
+    /// and logical root as the time-sorted layout, no row lost or
+    /// duplicated, strict order in every tagged file, `class_uid` page
+    /// statistics, far fewer row groups kept for a class filter, and a later
+    /// rewrite (late data, reindex, erasure) still merges it exactly.
+    #[tokio::test]
+    async fn class_sorted_hour_matches_time_sorted_and_prunes() {
+        use crate::parts::provenance::tests::{signer, TENANT, SIGNER};
+        use super::super::class_sort::CLASS_ROW_ORDER;
+        use super::super::host_sort::file_row_order;
+        use super::super::writer::publish_parts;
+        const ROWS: usize = 200_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, fingerprint, input) = class_sort_fixture(dir.path(), ROWS);
+        let inputs = [input];
+        let off = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
+            SIGNER, "test", 3, true, false, false, HourOrder::TIME, None).unwrap().unwrap().finished;
+        let on = merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema.clone(), &fingerprint, SIGNER, "test", 4)
+            .unwrap().finished;
+        assert_eq!(on.record.rows, ROWS as u64);
+        assert_eq!(on.record.merkle_root, off.record.merkle_root, "same logical rows");
+        assert_eq!(on.record.hours[0].merkle_root, off.record.hours[0].merkle_root);
+        assert_eq!(on.record.files.data.len(), off.record.files.data.len(), "same families");
+        let (mut all_on, mut all_off) = (Vec::new(), Vec::new());
+        for file in &on.record.files.data {
+            let path = on.dir.join(&file.name);
+            let rows = class_file_rows(&path);
+            assert_eq!(file_row_order(&path).unwrap().as_deref(), Some(CLASS_ROW_ORDER), "{}: every family here is multi-class", file.name);
+            assert!(rows.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order in {}", file.name);
+            assert_eq!(file.rows as usize, rows.len());
+            assert_eq!(file.min_time_us, rows.iter().map(|r| r.1).min().unwrap());
+            assert_eq!(file.max_time_us, rows.iter().map(|r| r.1).max().unwrap());
+            // Page statistics (column index) on class_uid, not only chunk stats.
+            let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(File::open(&path).unwrap(),
+                parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required)).unwrap();
+            let column = reader.parquet_schema().columns().iter().position(|c| c.path().string() == "class_uid").unwrap();
+            let index = reader.metadata().column_index().expect("page index written");
+            assert!(index.iter().all(|group| !matches!(group[column], parquet::file::page_index::column_index::ColumnIndexMetaData::NONE)),
+                "class_uid has page statistics in {}", file.name);
+            all_on.extend(rows);
+        }
+        for file in &off.record.files.data {
+            let path = off.dir.join(&file.name);
+            assert_eq!(file_row_order(&path).unwrap(), None);
+            all_off.extend(class_file_rows(&path));
+        }
+        let unique = all_on.iter().map(|row| row.2.clone()).collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), ROWS, "no row duplicated or lost");
+        all_on.sort();
+        all_off.sort();
+        assert_eq!(all_on, all_off, "identical row sets");
+
+        let bytes = |record: &crate::parts::provenance::ProvenanceRecord| record.files.data_bytes() as f64 / record.rows as f64;
+        let (time_bpr, class_bpr) = (bytes(&off.record), bytes(&on.record));
+        eprintln!("NAN-4664 bytes/row: (time, uid) {time_bpr:.1}, (class_uid, time, uid) {class_bpr:.1} ({:+.1}%)",
+            (class_bpr / time_bpr - 1.0) * 100.0);
+        for classes in [&[1007][..], &[4001], &[3002], &[6003], &[3002, 1007], &[4003, 4002]] {
+            let (groups_off, kept_off, rows_off, matching) = class_pruning(&off.dir, classes);
+            let (groups_on, kept_on, rows_on, matching_on) = class_pruning(&on.dir, classes);
+            assert_eq!(matching_on, matching, "{classes:?}: same matching rows");
+            assert!(kept_on <= kept_off, "{classes:?}: {kept_on} > {kept_off}");
+            eprintln!("NAN-4664 class_uid IN {classes:?}: time-sorted keeps {kept_off}/{groups_off} groups ({rows_off} rows), \
+                class-sorted keeps {kept_on}/{groups_on} ({rows_on} rows); {matching} rows match");
+        }
+        // A 30% class keeps few groups beyond its own rows; a 2% class keeps
+        // at most the groups its run touches in each family file.
+        let (_, kept, kept_rows, matching) = class_pruning(&on.dir, &[1007]);
+        assert!(kept_rows < matching * 2, "1007 reads {kept_rows} rows for {matching}");
+        assert!(kept < class_pruning(&off.dir, &[1007]).1, "1007 prunes groups");
+        let (_, _, kept_rows, matching) = class_pruning(&on.dir, &[6003]);
+        assert!(kept_rows <= matching + 2 * 65_536, "6003 reads {kept_rows} rows for {matching}");
+
+        // A later rewrite of the published class-sorted hour restores time
+        // order for the k-way merge and re-sorts the same rows.
+        let store = crate::parts::part_log::LocalObjectStore::new(dir.path().join("store")).unwrap();
+        let owner = signer(1);
+        let part = publish_parts(&store, &owner, &owner.trusted(), &[on]).await.unwrap().remove(0);
+        let rewrite = merge_parts(dir.path(), TENANT, Level::Hour, 0,
+            &[MergeInput { dir: dir.path().join(part.part_id.as_str()), part }], schema, &fingerprint, SIGNER, "test", 5).unwrap();
+        assert_eq!(rewrite.duplicates_dropped, 0);
+        assert_eq!(rewrite.finished.record.rows, ROWS as u64);
+        assert_eq!(rewrite.finished.record.merkle_root, off.record.merkle_root);
+        let mut all_rewrite = Vec::new();
+        for file in &rewrite.finished.record.files.data {
+            let rows = class_file_rows(&rewrite.finished.dir.join(&file.name));
+            assert!(rows.windows(2).all(|w| w[0] < w[1]));
             all_rewrite.extend(rows);
         }
         all_rewrite.sort();
         assert_eq!(all_rewrite, all_off);
+    }
+
+    /// NAN-4664 review: an hour whose rows carry no `metadata.log_source` is
+    /// one overflow file (no `log_sources` in the record) that is still
+    /// class-sorted. A later rewrite (late data, reindex, erasure) must
+    /// restore its time order first, or the k-way merge reads it out of order
+    /// and the hour can never merge again.
+    #[tokio::test]
+    async fn class_sorted_overflow_only_hour_merges_again() {
+        use crate::parts::provenance::tests::{signer, TENANT, SIGNER};
+        use super::super::class_sort::CLASS_ROW_ORDER;
+        use super::super::host_sort::file_row_order;
+        use super::super::writer::publish_parts;
+        const ROWS: usize = 30_000;
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, fingerprint, input) = class_sort_fixture_with(dir.path(), ROWS, false);
+        let inputs = [input];
+        let off = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
+            SIGNER, "test", 3, true, false, false, HourOrder::TIME, None).unwrap().unwrap().finished;
+        let on = merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema.clone(), &fingerprint, SIGNER, "test", 4)
+            .unwrap().finished;
+        assert_eq!(on.record.files.data.len(), 1, "overflow only");
+        assert!(on.record.files.data[0].log_sources.is_none());
+        assert_eq!(file_row_order(&on.dir.join(&on.record.files.data[0].name)).unwrap().as_deref(), Some(CLASS_ROW_ORDER));
+        let store = crate::parts::part_log::LocalObjectStore::new(dir.path().join("store")).unwrap();
+        let owner = signer(1);
+        let part = publish_parts(&store, &owner, &owner.trusted(), &[on]).await.unwrap().remove(0);
+        let rewrite = merge_parts(dir.path(), TENANT, Level::Hour, 0,
+            &[MergeInput { dir: dir.path().join(part.part_id.as_str()), part }], schema, &fingerprint, SIGNER, "test", 5).unwrap();
+        assert_eq!(rewrite.duplicates_dropped, 0);
+        assert_eq!(rewrite.finished.record.rows, ROWS as u64);
+        assert_eq!(rewrite.finished.record.merkle_root, off.record.merkle_root);
+        let mut all_rewrite = Vec::new();
+        for file in &rewrite.finished.record.files.data {
+            let rows = class_file_rows(&rewrite.finished.dir.join(&file.name));
+            assert!(rows.windows(2).all(|w| w[0] < w[1]));
+            all_rewrite.extend(rows);
+        }
+        let mut all_off = off.record.files.data.iter().flat_map(|file| class_file_rows(&off.dir.join(&file.name))).collect::<Vec<_>>();
+        all_rewrite.sort();
+        all_off.sort();
+        assert_eq!(all_rewrite, all_off);
+    }
+
+    /// A single-class family keeps the time-sorted layout (no tag, byte-
+    /// identical order), and a family over the class-sort row cap too.
+    #[test]
+    fn class_sort_skips_single_class_and_oversized_families() {
+        use crate::parts::provenance::tests::{TENANT, SIGNER};
+        use super::super::host_sort::file_row_order;
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, fingerprint, input) = class_sort_fixture(dir.path(), 20_000);
+        let inputs = [input];
+        let mut spool = FamilySpool::new(dir.path(), schema.clone(), BTreeSet::from(["windows_sysmon".to_string()])).unwrap();
+        spool.set_class_sort(1);
+        let rows = class_file_rows(&local_data_files(&inputs[0].dir).unwrap()[0]);
+        assert!(rows.len() > 1);
+        let family = Family::Named("windows_sysmon".into());
+        let mut counts = super::super::class_sort::ClassCounts::default();
+        counts.add_batch(&[Some(1007), Some(4001)], 0..2);
+        spool.class_counts.insert(family.clone(), counts);
+        assert!(!spool.class_sorted(&family), "over the row cap");
+        spool.set_class_sort(u64::MAX);
+        assert!(spool.class_sorted(&family));
+        let mut single = super::super::class_sort::ClassCounts::default();
+        single.add_batch(&[Some(1007), Some(1007)], 0..2);
+        spool.class_counts.insert(family.clone(), single);
+        assert!(!spool.class_sorted(&family), "one class");
+        let mut junk = super::super::class_sort::ClassCounts::default();
+        let keys = (0..=super::super::class_sort::MAX_SORT_CLASSES as i64).map(Some).collect::<Vec<_>>();
+        junk.add_batch(&keys, 0..keys.len());
+        spool.class_counts.insert(family.clone(), junk);
+        assert!(!spool.class_sorted(&family), "too many distinct classes");
+        // The estimate scales the inputs' bytes per row to half a data file.
+        let max = class_sort_max_rows(&inputs);
+        let per_row = inputs[0].part.data_bytes as f64 / inputs[0].part.rows as f64;
+        assert!(((max as f64 * per_row) - CLASS_SORT_MAX_FAMILY_BYTES as f64).abs() / (CLASS_SORT_MAX_FAMILY_BYTES as f64) < 0.01);
+        let merged = merge_parts(dir.path(), TENANT, Level::Minute, 0, &inputs, schema, &fingerprint, SIGNER, "test", 9).unwrap();
+        for file in &merged.finished.record.files.data {
+            assert_eq!(file_row_order(&merged.finished.dir.join(&file.name)).unwrap(), None, "minute parts stay time-sorted");
+        }
     }
 
     /// Merge CPU of the host-sorted layout against the time-sorted one on
@@ -1504,7 +1912,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (schema, fingerprint, input) = host_sort_fixture_rows(dir.path(), 240_000);
         let inputs = [input];
-        for (round, host_sort) in [None, Some(8_192), None, Some(8_192)].into_iter().enumerate() {
+        for (round, host_sort) in [HourOrder::TIME, HourOrder::host(8_192), HourOrder::TIME, HourOrder::host(8_192)].into_iter().enumerate() {
             let started = std::time::Instant::now();
             let merged = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
                 SIGNER, "test", 10 + round as i64, true, false, false, host_sort, None).unwrap().unwrap().finished;
@@ -1529,6 +1937,7 @@ mod tests {
         // The input is time-sorted, which is not host order.
         let batch = ParquetRecordBatchReaderBuilder::try_new(File::open(local_data_files(&input.dir).unwrap()[0].clone()).unwrap())
             .unwrap().with_batch_size(512).build().unwrap().next().unwrap().unwrap();
+        let batch = crate::parts::indicators::strip(batch).unwrap();
         let error = writer.write(&batch).unwrap_err();
         assert!(format!("{error:#}").contains("device.hostname"), "{error:#}");
     }
@@ -1592,9 +2001,12 @@ mod tests {
                 file.row_groups, file.min_time_us, file.max_time_us));
             let path = finished.dir.join(&file.name);
             let reader = SerializedFileReader::new(File::open(&path).unwrap()).unwrap();
+            // NAN-4664: the derived indicator columns are not part of the
+            // pre-switch layout this pins.
             for group in reader.metadata().row_groups() {
                 hash.update(format!("rg {} {}\n", group.num_rows(),
-                    group.columns().iter().map(|c| c.compressed_size().to_string()).collect::<Vec<_>>().join(",")));
+                    group.columns().iter().filter(|c| !nanosiem_core::search::lake_indicators::is_indicator_column(c.column_path().string().as_str()))
+                        .map(|c| c.compressed_size().to_string()).collect::<Vec<_>>().join(",")));
             }
             for batch in ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap().build().unwrap() {
                 for uid in uid_strings(&batch.unwrap()).unwrap().iter().flatten() { hash.update(uid); hash.update(b"\n"); }
@@ -1619,12 +2031,42 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let (schema, fingerprint, input) = class_family_fixture(dir.path());
-        let merged = merge_parts(dir.path(), TENANT, Level::Hour, 0, &[input], schema, &fingerprint, SIGNER, "test", 7).unwrap();
+        let inputs = [input];
+        // The time-sorted hour order (NAN-4664's fallback) is still exactly
+        // the pre-switch layout.
+        let time_sorted = merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs, &inputs, schema.clone(), &fingerprint,
+            SIGNER, "test", 7, true, false, false, HourOrder::TIME, None).unwrap().unwrap().finished;
+        assert_eq!(layout_digest(&time_sorted), PRE_SWITCH_HOUR_LAYOUT);
+        let merged = merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema, &fingerprint, SIGNER, "test", 7).unwrap();
         let digest = layout_digest(&merged.finished);
         eprintln!("nan3437 unset layout digest {digest} files={:?}", merged.finished.record.files.data.iter()
             .map(|file| (file.log_sources.clone(), file.class_id, file.rows)).collect::<Vec<_>>());
         assert!(merged.finished.record.files.data.iter().all(|file| file.class_id.is_none()));
-        assert_eq!(digest, PRE_SWITCH_HOUR_LAYOUT);
+        assert_default_hour_order(&merged.finished, &time_sorted);
+    }
+
+    /// NAN-4664: the default hour has the time-sorted hour's families, rows
+    /// and logical root; each multi-class family is tagged and strictly
+    /// `(class_uid, time, uid)`-ordered, a single-class one is untouched.
+    fn assert_default_hour_order(merged: &FinishedPart, time_sorted: &FinishedPart) {
+        use super::super::class_sort::CLASS_ROW_ORDER;
+        use super::super::host_sort::file_row_order;
+        assert_eq!(merged.record.merkle_root, time_sorted.record.merkle_root);
+        let shape = |part: &FinishedPart| part.record.files.data.iter()
+            .map(|file| (file.log_sources.clone(), file.class_id, file.rows)).collect::<Vec<_>>();
+        assert_eq!(shape(merged), shape(time_sorted));
+        for (file, before) in merged.record.files.data.iter().zip(&time_sorted.record.files.data) {
+            let path = merged.dir.join(&file.name);
+            let rows = class_file_rows(&path);
+            let classes = rows.iter().map(|row| row.0).collect::<BTreeSet<_>>();
+            if classes.len() > 1 {
+                assert_eq!(file_row_order(&path).unwrap().as_deref(), Some(CLASS_ROW_ORDER), "{}", file.name);
+                assert!(rows.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order in {}", file.name);
+            } else {
+                assert_eq!(file_row_order(&path).unwrap(), None, "{}", file.name);
+                assert_eq!(rows, class_file_rows(&time_sorted.dir.join(&before.name)), "{} untouched", file.name);
+            }
+        }
     }
 
     /// Runs `body` with the NAN-3437 switch forced for this thread only.
@@ -1651,9 +2093,14 @@ mod tests {
         use crate::parts::provenance::tests::{TENANT, SIGNER};
         let dir = tempfile::tempdir().unwrap();
         let (schema, fingerprint, input) = class_family_fixture(dir.path());
-        let merged = with_class_families(Some(false), || merge_parts(dir.path(), TENANT, Level::Hour, 0, &[input], schema,
+        let inputs = [input];
+        let time_sorted = with_class_families(Some(false), || merge_streaming(dir.path(), TENANT, Level::Hour, 0, &inputs,
+            &inputs, schema.clone(), &fingerprint, SIGNER, "test", 7, true, false, false, HourOrder::TIME, None))
+            .unwrap().unwrap().finished;
+        assert_eq!(layout_digest(&time_sorted), PRE_SWITCH_HOUR_LAYOUT);
+        let merged = with_class_families(Some(false), || merge_parts(dir.path(), TENANT, Level::Hour, 0, &inputs, schema,
             &fingerprint, SIGNER, "test", 7)).unwrap();
-        assert_eq!(layout_digest(&merged.finished), PRE_SWITCH_HOUR_LAYOUT);
+        assert_default_hour_order(&merged.finished, &time_sorted);
     }
 
     /// Dedicated class families: largest first, at most
@@ -1708,8 +2155,14 @@ mod tests {
         for file in &on.record.files.data {
             assert_eq!(file.row_groups as u64, file.rows.div_ceil(default_rows as u64), "{}", file.name);
             let path = on.dir.join(&file.name);
-            let rows = file_rows(&path);
-            assert!(rows.windows(2).all(|w| (w[0].1, &w[0].2) < (w[1].1, &w[1].2)), "strict (time, uid) order");
+            if file.class_id.is_some() {
+                let rows = file_rows(&path);
+                assert!(rows.windows(2).all(|w| (w[0].1, &w[0].2) < (w[1].1, &w[1].2)), "strict (time, uid) order");
+            } else {
+                // NAN-4664: a multi-class rest file is class-sorted.
+                let rows = class_file_rows(&path);
+                assert!(rows.windows(2).all(|w| w[0] < w[1]), "strict (class, time, uid) order");
+            }
             for batch in ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap().build().unwrap() {
                 let batch = batch.unwrap();
                 let classes = batch.column_by_name("class_uid").unwrap();

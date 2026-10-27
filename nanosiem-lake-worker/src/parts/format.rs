@@ -25,6 +25,8 @@ pub const ROW_GROUP_ROWS: usize = 65_536;
 pub const MAX_ROW_GROUP_ROWS: usize = 262_144;
 /// Bloom false-positive probability for entity columns.
 pub const BLOOM_FPP: f64 = 0.0001;
+/// NAN-4664: target false-positive rate of the IOC indicator blooms.
+pub const INDICATOR_BLOOM_FPP: f64 = 0.001;
 /// Lower bound on the bloom ndv so tiny L0 parts keep a useful filter.
 pub const BLOOM_MIN_NDV: u64 = 1_024;
 /// `created_by` suffix written into every part.
@@ -341,6 +343,18 @@ impl ParquetSettings {
                 .set_column_bloom_filter_enabled(column.clone(), true)
                 .set_column_bloom_filter_fpp(column.clone(), BLOOM_FPP)
                 .set_column_bloom_filter_ndv(column, ndv);
+        }
+        // NAN-4664: the derived IOC indicator lists (absent columns ignored),
+        // sized for a quarter of the group distinct at a 0.1% target; a group
+        // past the sizing only loses pruning (a saturated bloom keeps more
+        // groups, never fewer).
+        let indicator_ndv = (ndv / 4).max(BLOOM_MIN_NDV);
+        for kind in nanosiem_core::search::lake_indicators::Kind::ALL {
+            let column = ColumnPath::new(crate::parts::indicators::leaf_path(kind).to_vec());
+            builder = builder
+                .set_column_bloom_filter_enabled(column.clone(), true)
+                .set_column_bloom_filter_fpp(column.clone(), INDICATOR_BLOOM_FPP)
+                .set_column_bloom_filter_ndv(column, indicator_ndv);
         }
         Ok(builder.build())
     }

@@ -10,5 +10,5 @@ export { BottomTray, type RuleVersionSummary } from './BottomTray';
 export { InspectorDrawer } from './InspectorDrawer';
 export { TestDrawer } from './TestDrawer';
 export { ValidationDetailsDialog } from './ValidationDetailsDialog';
-// NewRuleAiPanel lifted to @/enterprise/components/rule-editor/NewRuleAiPanel (NAN-745).
+// NewRuleAiPanel (lifted to enterprise in NAN-745) was removed in NAN-4595: drafting runs in pivt (`@detection`).
 export * from './helpers';

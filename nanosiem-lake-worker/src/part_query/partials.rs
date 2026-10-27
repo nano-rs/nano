@@ -162,13 +162,52 @@ enum ChunkError {
 /// finished chunk's answer to `keep` before the next chunk starts. A caller
 /// that is cancelled (its future dropped) or fails part-way has kept every
 /// chunk that finished.
-async fn by_chunks<T: Clone, R, E, F, Fut>(items: &[T], chunk: usize, mut run: F, mut keep: impl FnMut(R)) -> Result<(), E>
+#[cfg(test)]
+async fn by_chunks<T: Clone, R, E, F, Fut>(items: &[T], chunk: usize, run: F, keep: impl FnMut(R)) -> Result<(), E>
 where
     F: FnMut(Vec<T>) -> Fut,
     Fut: std::future::Future<Output = Result<R, E>>,
 {
-    for items in items.chunks(chunk.max(1)) {
-        keep(run(items.to_vec()).await?);
+    by_chunks_splitting(items, chunk, 1, run, keep, |_| false).await
+}
+
+/// NAN-4591: a too-wide rollup chunk is halved down to this many parts and
+/// no further: a count too wide even for a few parts (a high-cardinality
+/// group-by) falls back to the merged plan after at most four failed
+/// statements per 32-part chunk instead of six.
+const ROLLUP_MIN_SPLIT_PARTS: usize = 4;
+
+/// [`by_chunks`] that, when a chunk of at least `2 * min_half` items fails
+/// with an error `split` accepts, runs its two halves instead (in order;
+/// each may split again). NAN-4591: a 7 d `stats count` on the large tenant outgrew the result
+/// budget by 3% (22,071,994 > 21,483,325 bytes) in one 32-part chunk and the
+/// whole count fell off the per-part path to the merged plan, unmemoized,
+/// on every search. Halving keeps every statement inside the same memory
+/// and result budget; only a single item too wide on its own fails. At
+/// most `2n - 1` runs for `n` items.
+async fn by_chunks_splitting<T: Clone, R, E, F, Fut>(
+    items: &[T],
+    chunk: usize,
+    min_half: usize,
+    mut run: F,
+    mut keep: impl FnMut(R),
+    split: impl Fn(&E) -> bool,
+) -> Result<(), E>
+where
+    F: FnMut(Vec<T>) -> Fut,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    let mut pending = items.chunks(chunk.max(1)).map(<[T]>::to_vec).collect::<std::collections::VecDeque<_>>();
+    while let Some(items) = pending.pop_front() {
+        match run(items.clone()).await {
+            Ok(answer) => keep(answer),
+            Err(error) if items.len() >= 2 * min_half.max(1) && split(&error) => {
+                let (first, second) = items.split_at(items.len() / 2);
+                pending.push_front(second.to_vec());
+                pending.push_front(first.to_vec());
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -236,7 +275,7 @@ async fn rollup_fragment(
         // at a time. A read cancelled at its caller's deadline (the segments
         // refresh gives each read 6 s) keeps every chunk it finished, so the
         // next retry starts where it stopped instead of re-reading every part.
-        let chunked = by_chunks(&local, ROLLUP_MEMO_CHUNK_PARTS, |chunk| {
+        let chunked = by_chunks_splitting(&local, ROLLUP_MEMO_CHUNK_PARTS, ROLLUP_MIN_SPLIT_PARTS, |chunk| {
             let (by_path, selection_tenant) = (&by_path, &selection_tenant);
             async move {
                 let first = chunk.iter().map(|partial| partial.min_bucket_start_us).min().expect("chunks are not empty");
@@ -289,7 +328,7 @@ async fn rollup_fragment(
                 memo.insert(key.clone(), part, rows.clone());
                 answers.push(rows);
             }
-        }).await;
+        }, |error| matches!(error, ChunkError::TooWide(_))).await;
         drop(partials);
         match chunked {
             Ok(()) => {}
@@ -3011,6 +3050,61 @@ mod nan4293_tests {
         let result = by_chunks(&items, 3, |chunk| async move { if chunk[0] == 6 { Err("too wide") } else { Ok(chunk) } }, |chunk| kept.push(chunk)).await;
         assert_eq!(result, Err("too wide"));
         assert_eq!(kept, [vec![0, 1, 2], vec![3, 4, 5]]);
+    }
+
+    /// NAN-4591: an over-budget chunk halves until it fits.
+    #[tokio::test]
+    async fn a_too_wide_rollup_chunk_splits_instead_of_leaving_the_per_part_path() {
+        // NAN-4591, the large-tenant 7 d count: one 32-part chunk answered 22,071,994
+        // bytes against a 21,483,325-byte result budget (3% over).
+        const ANSWER: u64 = 22_071_994;
+        const BUDGET: u64 = 21_483_325;
+        let per_part = ANSWER / ROLLUP_MEMO_CHUNK_PARTS as u64;
+        let items = (0..70).collect::<Vec<u32>>();
+        let (mut kept, runs) = (Vec::new(), std::sync::atomic::AtomicUsize::new(0));
+        let result = by_chunks_splitting(&items, ROLLUP_MEMO_CHUNK_PARTS, ROLLUP_MIN_SPLIT_PARTS, |chunk| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if chunk.len() as u64 * per_part > BUDGET { Err("too wide") } else { Ok(chunk) }
+            }
+        }, |chunk| kept.push(chunk), |error| *error == "too wide").await;
+        assert_eq!(result, Ok(()), "the count stays on the per-part path");
+        assert_eq!(kept.iter().map(Vec::len).collect::<Vec<_>>(), [16, 16, 16, 16, 6], "only the over-budget chunks halve");
+        assert_eq!(kept.concat(), items, "every part answered once, in order");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 7, "two failed 32-part runs, four halves, one tail");
+        assert!(runs.load(std::sync::atomic::Ordering::Relaxed) <= 2 * items.len() - 1);
+    }
+
+    /// Splitting is bounded: a single part too wide on its own still fails
+    /// (the caller answers from the merged plan), and an error `split`
+    /// refuses is never retried.
+    #[tokio::test]
+    async fn a_single_part_too_wide_or_another_error_still_fails() {
+        let items = (0..8).collect::<Vec<u32>>();
+        let mut kept = Vec::new();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = by_chunks_splitting(&items, 4, 1, |chunk| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move { if chunk.contains(&5) { Err("too wide") } else { Ok(chunk) } }
+        }, |chunk| kept.push(chunk), |error| *error == "too wide").await;
+        assert_eq!(result, Err("too wide"));
+        assert_eq!(kept, [vec![0, 1, 2, 3], vec![4]], "finished chunks are kept");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 5, "[0..4] [4..8] [4,5] [4] [5]");
+        let mut kept = Vec::new();
+        let result = by_chunks_splitting(&items, 4, 1, |chunk| async move { if chunk[0] == 4 { Err("deadline") } else { Ok(chunk) } },
+            |chunk| kept.push(chunk), |error| *error == "too wide").await;
+        assert_eq!(result, Err("deadline"));
+        assert_eq!(kept, [vec![0, 1, 2, 3]], "other errors are never split");
+        // The rollup's minimum: a 32-part chunk too wide at every size stops
+        // at 4 parts (32, 16, 8, 4: four statements, not six).
+        let items = (0..32).collect::<Vec<u32>>();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = by_chunks_splitting(&items, ROLLUP_MEMO_CHUNK_PARTS, ROLLUP_MIN_SPLIT_PARTS, |chunk| {
+            runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move { if chunk.contains(&0) { Err("too wide") } else { Ok(chunk) } }
+        }, |_| {}, |error| *error == "too wide").await;
+        assert_eq!(result, Err("too wide"));
+        assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 4, "32, 16, 8, 4");
     }
 
     /// The segments refresh shape: the caller's deadline drops the read

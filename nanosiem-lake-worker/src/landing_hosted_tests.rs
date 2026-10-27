@@ -429,7 +429,7 @@ async fn open_core_parity_and_hosted_append_the_same_bronze_bytes() {
 
     let store = memory();
     store.write(&key(TENANT, "a.parquet"), file.clone()).await.unwrap();
-    let converter = Converter { store: store.clone(), ledger: NullLedger::default(), stage: stage(), tenant_id: TENANT.into(), max_files_per_tick: 10 };
+    let converter = Converter { store: store.clone(), ledger: NullLedger::default(), stage: stage(), tenant_id: TENANT.into(), max_files_per_tick: 10, emit: BronzeObjects };
     let report = converter.tick().await.unwrap();
     assert_eq!(report, TickReport { listed: 1, accepted: 1, ..Default::default() });
     let bronze = keys_under(&store, BRONZE_PREFIX).await;

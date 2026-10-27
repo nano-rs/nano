@@ -34,6 +34,10 @@ pub struct Request {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub json: Option<Value>,
+    /// Exact JSON text, rendered by the production template engine. Used when
+    /// the canonical serializer's field order is part of the body contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_text: Option<String>,
     #[serde(default)]
     pub form: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -51,16 +55,23 @@ pub enum ResponseFormat {
 }
 
 impl Request {
-    pub fn engine_template(&self) -> RequestTemplate {
+    // Validation-only projection: the common compiler walks expressions in
+    // JSON strings. The sequence renderer below preserves json_text bytes.
+    fn compiler_template(&self) -> RequestTemplate {
         RequestTemplate {
             method: self.method,
             url: self.url.clone(),
             query: self.query.clone(),
             headers: self.headers.clone(),
-            body: (self.json.is_some() || self.form.is_some()).then(|| Body {
-                json: self.json.clone(),
-                form: self.form.clone(),
-            }),
+            body: (self.json.is_some() || self.form.is_some() || self.json_text.is_some()).then(
+                || Body {
+                    json: self
+                        .json
+                        .clone()
+                        .or_else(|| self.json_text.clone().map(Value::String)),
+                    form: self.form.clone(),
+                },
+            ),
         }
     }
     pub fn strings(&self) -> Vec<String> {
@@ -76,6 +87,9 @@ impl Request {
             }
         }
         let mut out = vec![self.url.clone()];
+        if let Some(text) = &self.json_text {
+            out.push(text.clone());
+        }
         for m in [&self.query, &self.headers] {
             for (k, v) in m {
                 out.extend([k.clone(), v.clone()]);
@@ -125,9 +139,28 @@ pub struct Expect {
     /// Require the selected JSON value to match exactly, including its type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equals: Option<Value>,
+    /// Assert a JSON type without rejecting an empty array/object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_type: Option<JsonType>,
     /// Additional literal JSON field assertions; an explicit null must be present.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub fields: BTreeMap<String, Value>,
+    /// Bind response string identities to required input strings before the next step.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub input_equals: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonType { Array, Object, String, Number, Boolean, Null }
+impl JsonType {
+    fn accepts(self, value: &Value) -> bool {
+        match self {
+            Self::Array => value.is_array(), Self::Object => value.is_object(),
+            Self::String => value.is_string(), Self::Number => value.is_number(),
+            Self::Boolean => value.is_boolean(), Self::Null => value.is_null(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -146,6 +179,7 @@ pub struct Until {
 }
 
 pub struct Plan {
+    pub network_scope: crate::policy::NetworkScope,
     pub allow: Vec<AllowRule>,
     pub auth: Arc<dyn AuthPlugin>,
     pub auth_config: AuthConfig,
@@ -183,6 +217,13 @@ pub fn compile(
         .chain(poll.map(|p| &p.request));
     let mut streams = Vec::new();
     for (i, r) in requests.enumerate() {
+        if usize::from(r.json.is_some())
+            + usize::from(r.form.is_some())
+            + usize::from(r.json_text.is_some())
+            > 1
+        {
+            return Err("request must use only one body encoding".into());
+        }
         if let Some(h) = &r.idempotency_header {
             if r.headers.keys().any(|k| k.eq_ignore_ascii_case(h)) {
                 return Err("idempotency header collides with a static header".into());
@@ -206,9 +247,19 @@ pub fn compile(
                 return Err("idempotency header is reserved".into());
             }
         }
-        streams.push(json!({"id": format!("request_{i}"), "request": r.engine_template()}));
+        streams.push(json!({"id": format!("request_{i}"), "request": r.compiler_template()}));
     }
     for s in steps {
+        if s.expect.input_equals.len() > 16
+            || s.expect.input_equals.iter().any(|(path, input)| {
+                path.len() > 256 || path.split('.').any(|p| p.is_empty()
+                    || !p.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+                    || input.is_empty() || input.len() > 64
+                    || !input.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            })
+        {
+            return Err("expect.input_equals requires at most 16 JSON paths and literal input names".into());
+        }
         if s.expect.fields.len() > 16
             || s.expect.fields.keys().any(|p| {
                 p.len() > 256
@@ -222,7 +273,7 @@ pub fn compile(
         }
         if s.expect.status.is_empty()
             || s.expect.status.iter().any(|s| !(200..300).contains(s))
-            || ((s.expect.non_empty || s.expect.items.is_some() || s.expect.equals.is_some())
+            || ((s.expect.non_empty || s.expect.items.is_some() || s.expect.equals.is_some() || s.expect.json_type.is_some())
                 && s.expect.path.is_none())
         {
             return Err("expect requires successful statuses and a path for non_empty".into());
@@ -232,6 +283,7 @@ pub fn compile(
     let compiled =
         engine::compile(&spec, &engine::default_ceilings()).map_err(|e| e.to_string())?;
     Ok(Plan {
+        network_scope: crate::policy::NetworkScope::Public,
         allow: allow.to_vec(),
         auth: compiled.auth,
         auth_config: auth.clone(),
@@ -291,6 +343,9 @@ pub fn path<'a>(value: &'a Value, path: &str) -> &'a Value {
 }
 
 fn field_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    // An explicitly empty expectation path selects the complete JSON body,
+    // including root-array receipts returned by batch response APIs.
+    if path.is_empty() { return Some(value); }
     path.split('.').try_fold(value, |v, p| match v {
         Value::Object(m) => m.get(p),
         Value::Array(a) => p.parse::<usize>().ok().and_then(|i| a.get(i)),
@@ -342,7 +397,13 @@ fn render(r: &Request, scope: &Scope, key: Option<&str>) -> Result<OutboundReque
         )?;
         headers.push((k.clone(), value));
     }
-    let body = if let Some(v) = &r.json {
+    let body = if let Some(text) = &r.json_text {
+        headers.push(("Content-Type".into(), "application/json".into()));
+        let rendered = template::render_str(text, scope).map_err(bad)?;
+        serde_json::from_str::<Value>(&rendered)
+            .map_err(|_| Error::Invalid("json_text must render valid JSON".into()))?;
+        rendered.into_bytes()
+    } else if let Some(v) = &r.json {
         headers.push(("Content-Type".into(), "application/json".into()));
         template::render_json(v, scope)
             .map_err(bad)?
@@ -355,6 +416,16 @@ fn render(r: &Request, scope: &Scope, key: Option<&str>) -> Result<OutboundReque
         ));
         let mut body = String::new();
         for (k, v) in m {
+            // A missing whole input value is absent, matching optional query
+            // parameters. Preserve literal empty strings and explicit helpers.
+            if let Some(reference) = v.strip_prefix("{{").and_then(|s| s.strip_suffix("}}")) {
+                let reference = reference.trim();
+                if reference.starts_with("input.")
+                    && reference.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+                    && template::evaluate(reference, scope).map_err(bad)?.is_null() {
+                    continue;
+                }
+            }
             let value = template::render_str(v, scope).map_err(bad)?;
             let pair = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair(k, &value)
@@ -591,6 +662,8 @@ pub async fn run(
     mut scope: Scope,
     mode: Mode<'_>,
 ) -> Result<Output, Error> {
+    let guard = template::SecretGuard::new(all_secrets(ctx, plan)?, ctx.secrets.clone());
+    scope.secret_guard = Some(if matches!(&mode, Mode::DryRun) { guard.for_preview() } else { guard });
     let broker_deny = EgressDeny {
         hosts: ctx
             .engine
@@ -600,7 +673,7 @@ pub async fn run(
             .collect(),
         cidrs: vec![],
     };
-    let hosts = HostPolicy::compile(&plan.allow, &scope)
+    let hosts = HostPolicy::compile_for_network(&plan.allow, &scope, plan.network_scope)
         .and_then(|p| {
             p.with_deny(
                 ctx.engine
@@ -711,6 +784,7 @@ pub async fn run(
                 }
             }
         }
+        scope.secret_guard = Some(template::SecretGuard::new(all_secrets(ctx, plan)?, ctx.secrets.clone()));
         let mut outputs = serde_json::Map::new();
         let mut remaining = template::MAX_RENDER_BYTES;
         for (k, p) in &plan.outputs {
@@ -770,8 +844,11 @@ async fn request(
     r: &Request,
     expect: Option<&Expect>,
 ) -> Result<(Value, HttpSummary), Error> {
-    let mut req = render(r, scope, ctx.idempotency_key)?;
     let secrets = all_secrets(ctx, plan)?;
+    let mut guarded = scope.clone();
+    guarded.secret_guard = Some(template::SecretGuard::new(secrets.clone(), ctx.secrets.clone()));
+    let scope = &guarded;
+    let mut req = render(r, scope, ctx.idempotency_key)?;
     let material = format!(
         "{}{:?}{}",
         req.url,
@@ -873,7 +950,13 @@ async fn request(
     };
     if let Some(e) = expect {
         if (e.non_empty && !present(path(&body, e.path.as_deref().unwrap_or_default())))
+            || e.json_type.is_some_and(|kind| field_path(&body, e.path.as_deref().unwrap_or_default()).is_none_or(|value| !kind.accepts(value)))
             || e.fields.iter().any(|(p, v)| field_path(&body, p) != Some(v))
+            || e.input_equals.iter().any(|(p, input)| {
+                let expected = scope.input.get(input).and_then(Value::as_str);
+                expected.is_none_or(str::is_empty)
+                    || field_path(&body, p).and_then(Value::as_str) != expected
+            })
             || e.equals
                 .as_ref()
                 .is_some_and(|v| path(&body, e.path.as_deref().unwrap_or_default()) != v)
@@ -1102,6 +1185,58 @@ fn dry_run(
 mod tests {
     use super::*;
 
+    struct IdentityCapture {
+        body: Value,
+        calls: std::sync::Mutex<Vec<http::Method>>,
+    }
+    #[async_trait::async_trait]
+    impl Transport for IdentityCapture {
+        async fn send_once(&self, r: &OutboundRequest, _: &HostPolicy, _: BodyCaps) -> Result<InboundResponse, BrokerError> {
+            self.calls.lock().unwrap().push(r.method.clone());
+            if r.method == http::Method::POST {
+                assert_eq!(r.url.path(), "/devices/selected/lock");
+            }
+            Ok(InboundResponse { status: 200, headers: Default::default(), body: Bytes::from(serde_json::to_vec(&self.body).unwrap()) })
+        }
+    }
+    #[tokio::test]
+    async fn identity_input_equals_refuses_before_mutation_and_never_coerces() {
+        let allow: Vec<AllowRule> = serde_json::from_value(json!([{"host":"api.vendor.com"}])).unwrap();
+        let steps: Vec<Step> = serde_json::from_value(json!([
+            {"id":"identity","request":{"method":"GET","url":"https://api.vendor.com/devices/selected"},"expect":{"status":[200],"input_equals":{"id":"device_id"}}},
+            {"id":"write","request":{"method":"POST","url":"https://api.vendor.com/devices/{{steps.identity.id}}/lock"},"expect":{"status":[200]}}
+        ])).unwrap();
+        for (input, body, accepted) in [
+            (json!({"device_id":"selected"}), json!({"id":"selected"}), true),
+            (json!({"device_id":"selected"}), json!({"id":"unrelated"}), false),
+            (json!({"device_id":"selected"}), json!({}), false),
+            (json!({"device_id":"selected"}), json!({"id":null}), false),
+            (json!({"device_id":"selected"}), json!({"id":42}), false),
+            (json!({"device_id":""}), json!({"id":""}), false),
+            (json!({}), json!({}), false),
+            (json!({"device_id":42}), json!({"id":42}), false),
+        ] {
+            let transport = Arc::new(IdentityCapture { body, calls: Default::default() });
+            let mut engine = EngineConfig::try_new("/unused-no-code".into()).unwrap();
+            engine.transport = Some(transport.clone());
+            let plan = compile(&allow, &AuthConfig::default(), &steps, None, &BTreeMap::new(), 10).unwrap();
+            let credentials = Credentials::new(Default::default());
+            let secrets = SecretSet::new(std::iter::empty::<&str>());
+            let context = RunContext { engine: &engine, credentials: &credentials, secrets: &secrets, deny: EgressDeny::default(), idempotency_key: None, budget: &AllowBudget };
+            let result = run(&context, &plan, Scope { input, ..Default::default() }, Mode::Live).await;
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(*transport.calls.lock().unwrap(), if accepted { vec![http::Method::GET,http::Method::POST] } else { vec![http::Method::GET] });
+        }
+    }
+    #[test]
+    fn identity_input_equals_rejects_namespaces_paths_and_unbounded_maps() {
+        let allow: Vec<AllowRule> = serde_json::from_value(json!([{"host":"api.vendor.com"}])).unwrap();
+        for bindings in [json!({"id":"credential.TOKEN"}), json!({"id":"input.device_id"}), json!({"id":"{{input.device_id}}"}), json!({"a..id":"device_id"}), json!({"id":""}), Value::Object((0..17).map(|i|(format!("id{i}"),json!("device_id"))).collect())] {
+            let steps: Vec<Step> = serde_json::from_value(json!([{"id":"read","request":{"method":"GET","url":"https://api.vendor.com/devices"},"expect":{"status":[200],"input_equals":bindings}}])).unwrap();
+            assert!(compile(&allow, &AuthConfig::default(), &steps, None, &BTreeMap::new(), 10).is_err());
+        }
+    }
+
     struct PurposeCapture(std::sync::Mutex<Vec<RequestPurpose>>);
     #[async_trait::async_trait]
     impl Transport for PurposeCapture {
@@ -1275,5 +1410,36 @@ mod tests {
             );
             assert!(replay.assert_complete().is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod json_text_tests {
+    use super::*;
+    #[test]
+    fn exact_json_text_preserves_order_and_rejects_invalid_or_oversize_json() {
+        let request: Request = serde_json::from_value(json!({"method":"POST", "url":"https://hooks.example.com/inbox", "json_text":"{{input.body}}"})).unwrap();
+        let mut scope = Scope {
+            input: json!({"body":"{\"z\":1,\"a\":2}"}),
+            ..Default::default()
+        };
+        assert_eq!(
+            render(&request, &scope, None).unwrap().body.as_ref(),
+            br#"{"z":1,"a":2}"#
+        );
+        for value in [
+            "invalid".to_string(),
+            serde_json::to_string(&"x".repeat(template::MAX_RENDER_BYTES)).unwrap(),
+        ] {
+            scope.input = json!({"body":value});
+            assert!(render(&request, &scope, None).is_err());
+        }
+        assert!(request.strings().contains(&"{{input.body}}".into()));
+        let step: Step = serde_json::from_value(json!({"id":"send", "request":{"method":"POST","url":"https://hooks.example.com/inbox", "json":{},"json_text":"{}"},"expect":{"status":[200]}})).unwrap();
+        let allow: Vec<AllowRule> = serde_json::from_value(json!([{"host":"hooks.example.com"}])).unwrap();
+        let mut valid = step.clone();
+        valid.request.json = None;
+        assert!(compile(&allow, &AuthConfig::default(), &[valid], None, &BTreeMap::new(), 10).is_ok());
+        assert!(compile(&allow, &AuthConfig::default(), &[step], None, &BTreeMap::new(), 10).is_err());
     }
 }

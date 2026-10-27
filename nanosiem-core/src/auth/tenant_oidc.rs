@@ -245,6 +245,16 @@ pub struct ValidatedTenantOidcIdentity {
 }
 
 impl ValidatedTenantOidcIdentity {
+    /// The IdP `sub` of this verified ID token (audit naming, NAN-4547).
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// The IdP-asserted e-mail (or UPN) of this verified ID token.
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+
     pub fn from_verified_id_token(
         subject: String,
         email: String,

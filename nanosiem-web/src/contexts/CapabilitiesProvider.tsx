@@ -68,6 +68,8 @@ const FALLBACK_CAPABILITIES: CapabilitiesContextValue = {
     // NAN-3467: `/api/ioc-lists` is mounted only on the hosted-shared tenant
     // substrate, never by a dedicated build of either edition.
     iocLists: false,
+    // Only a hosted-shared tenant plan can grant SOAR (NAN-4462).
+    soar: false,
   },
 };
 
@@ -90,6 +92,7 @@ const SHARED_FAIL_CLOSED_CAPABILITIES: CapabilitiesContextValue = {
     sso: false,
     observabilityConvergence: false,
     iocLists: false,
+    soar: false,
   },
 };
 
@@ -196,6 +199,7 @@ async function fetchTenantCapabilities(
       observabilityConvergence: tenantPlan.components.observability_convergence.enabled,
       // NAN-3467: always mounted in shared mode; `enrichments:view` gates it.
       iocLists: true,
+      soar: tenantPlan.components.soar.enabled,
     },
   };
 }

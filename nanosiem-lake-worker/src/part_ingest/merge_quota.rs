@@ -326,6 +326,61 @@ pub fn observe_backfill_headroom(lag_ms: i64, prevalence_behind_ms: u64, l0_merg
     }
 }
 
+/// NAN-4460 / NAN-4464: the cell's room for a larger prevalence catch-up
+/// batch. Pressured when ingest lag is past its bound (`lag_bound_ms`, the
+/// ingest stall alert), or this role or its tenant slot is CPU-throttled, or
+/// this process's R2 attempts are strained (the count backfill's throttle
+/// and strain thresholds). Lag within [`super::prevalence::CATCH_UP_LAG_HOLD_SHARE`]
+/// of the bound holds the scale.
+///
+/// NAN-4464 (a large hosted tenant, 2026-10-23): this used the count backfill's 30 s
+/// lag backoff. A healthy cell's lag is the age of its oldest pending notice,
+/// which already spans a flush interval (~30 s on the large tenant), so the large tenant sat at 72-98 s
+/// with ingest keeping up (4-10 notices pending). Pressure held on every
+/// batch, and the scale never left 1.
+///
+/// The backfill's own pressure test does not apply here. Its
+/// `ingest_maintenance_behind` term is always true during a catch-up, and
+/// quota utilization is not starvation: a larger batch costs less CPU and
+/// fewer bytes per entry it drains, because its reads sweep the state once
+/// either way. Cheap: two small cgroup reads at most every 5 s.
+pub fn catch_up_headroom(lag_ms: i64, lag_bound_ms: i64) -> super::prevalence::CatchUpHeadroom {
+    catch_up_headroom_given(lag_ms, lag_bound_ms, catch_up_cell_strained())
+}
+
+/// [`catch_up_headroom`] for a given cell strain (CPU throttling or R2 strain).
+pub fn catch_up_headroom_given(lag_ms: i64, lag_bound_ms: i64, strained: bool) -> super::prevalence::CatchUpHeadroom {
+    use super::prevalence::{CatchUpHeadroom, CATCH_UP_LAG_HOLD_SHARE};
+    if lag_ms > lag_bound_ms || strained {
+        CatchUpHeadroom::Pressured
+    } else if lag_ms as f64 > lag_bound_ms as f64 * CATCH_UP_LAG_HOLD_SHARE {
+        CatchUpHeadroom::Hold
+    } else {
+        CatchUpHeadroom::Room
+    }
+}
+
+fn catch_up_cell_strained() -> bool {
+    type Sample = (Instant, Vec<CpuCounters>, (u64, u64), bool);
+    static LAST: Mutex<Option<Sample>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else { return false };
+    if let Some((at, _, _, strained)) = last.as_ref() {
+        if at.elapsed() < HEADROOM_SAMPLE_INTERVAL {
+            return *strained;
+        }
+    }
+    let now = Instant::now();
+    let counters = CpuCounters::read_own_and_parent();
+    let wire = crate::r2_ops::strain_counters();
+    let strained = last.as_ref().is_some_and(|(at, previous, previous_wire, _)| {
+        let (_, throttled) = cpu_pressure(previous, &counters, now.duration_since(*at));
+        throttled.is_some_and(|t| t > BACKFILL_THROTTLED_BACKOFF)
+            || r2_strain(*previous_wire, wire).is_some_and(|s| s > BACKFILL_R2_STRAIN_BACKOFF)
+    });
+    *last = Some((now, counters, wire, strained));
+    strained
+}
+
 /// Strained share of R2 wire attempts between two cumulative samples. A
 /// single slow or failed request among many is noise, not pressure.
 pub fn r2_strain(previous: (u64, u64), now: (u64, u64)) -> Option<f64> {

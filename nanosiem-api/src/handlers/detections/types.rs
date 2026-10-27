@@ -19,6 +19,37 @@ pub struct ListDetectionsQuery {
     /// Include archived (deleted) rules. Default false, same as hosted.
     #[serde(default)]
     pub include_archived: bool,
+    /// Case-insensitive "contains" over rule name or id (max 200 characters).
+    pub search: Option<String>,
+    /// Return at most this many rules (1–50). Omit for the full list.
+    pub limit: Option<i64>,
+}
+
+/// Longest accepted `search` term (characters); same as the hosted listing.
+pub const RULE_SEARCH_MAX_CHARS: usize = 200;
+/// Largest `limit` accepted by `GET /api/rules`.
+pub const RULE_LIST_MAX_LIMIT: i64 = 50;
+
+impl ListDetectionsQuery {
+    /// Apply `search` and `limit` to an already-filtered, ordered listing.
+    pub fn search_and_limit(&self, mut rules: Vec<DetectionRule>) -> Result<Vec<DetectionRule>, String> {
+        if let Some(limit) = self.limit {
+            if !(1..=RULE_LIST_MAX_LIMIT).contains(&limit) {
+                return Err(format!("limit must be between 1 and {RULE_LIST_MAX_LIMIT}"));
+            }
+        }
+        if let Some(term) = self.search.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+            if term.chars().count() > RULE_SEARCH_MAX_CHARS {
+                return Err("search is too long".into());
+            }
+            let needle = term.to_lowercase();
+            rules.retain(|r| r.name.to_lowercase().contains(&needle) || r.id.to_string().contains(&needle));
+        }
+        if let Some(limit) = self.limit {
+            rules.truncate(limit as usize);
+        }
+        Ok(rules)
+    }
 }
 
 /// Request for testing a detection rule

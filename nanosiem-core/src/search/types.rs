@@ -363,8 +363,15 @@ pub struct SearchRequest {
     /// Skip field statistics generation (useful for detection execution)
     #[serde(default)]
     pub skip_field_stats: bool,
-    /// Enable query cache (useful for shared searches with fixed time ranges)
-    /// When true, adds SETTINGS use_query_cache=1, query_cache_ttl=300
+    /// Optional, tri-state on `POST /api/search`. Omitted: the search reads and
+    /// writes the per-tenant result cache, as it always has (API keys, agents and
+    /// sessions alike). `true`: reads it, and also lets a settled absolute window
+    /// re-serve the caller's finished durable job; for ClickHouse it adds
+    /// `SETTINGS use_query_cache=1, query_cache_ttl=300`. `false`: never served
+    /// from the result cache (a fresh run), but the result is still written to
+    /// it, and the search may share an identical `use_cache: false` search
+    /// already running for the same tenant, scope and authority (computed now,
+    /// not cached). `x-nano-cache-bypass: 1` always skips the cache read.
     #[serde(default)]
     pub use_cache: bool,
     /// Table view mode - only return minimal columns (id, timestamp, source_type, message + query fields)

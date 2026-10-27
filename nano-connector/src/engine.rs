@@ -834,6 +834,9 @@ impl Run {
     }
 
     fn build_request(&self, tpl: &RequestTemplate, scope: &Scope, extra_query: &BTreeMap<String, String>) -> Result<OutboundRequest, EngineError> {
+        let mut guarded = scope.clone();
+        guarded.secret_guard = Some(template::SecretGuard::new(self.secrets().as_ref().clone(), SecretSet::default()));
+        let scope = &guarded;
         let mut url = template::render_url(&tpl.url, scope)?;
         {
             let mut q: BTreeMap<String, String> = BTreeMap::new();
@@ -874,6 +877,9 @@ impl Run {
 
     /// Turn a program's `next_request` into a request. No headers can be set.
     fn build_next(&self, base: Option<&OutboundRequest>, tpl: Option<&RequestTemplate>, n: &NextRequest, scope: &Scope) -> Result<OutboundRequest, EngineError> {
+        let mut guarded = scope.clone();
+        guarded.secret_guard = Some(template::SecretGuard::new(self.secrets().as_ref().clone(), SecretSet::default()));
+        let scope = &guarded;
         let static_headers: Vec<(String, String)> = match tpl {
             Some(t) => t
                 .headers

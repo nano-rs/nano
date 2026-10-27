@@ -1,0 +1,38 @@
+{
+  "tenzir_version": "6.19.1",
+  "fixture_rows": 170,
+  "classes": [
+    1001,
+    1005,
+    1007,
+    3002,
+    3003,
+    4001,
+    4002,
+    4003,
+    6003,
+    201001,
+    201002
+  ],
+  "http_coalescing": {
+    "requests": 10,
+    "rows": 3861,
+    "concurrency": 4,
+    "sparse_flush_seconds": 1.120124634122476,
+    "rows_equal_before_listener_close": true
+  },
+  "objects_per_fixture_flush": 11,
+  "s3_requests_per_fixture_flush": {
+    "multipart_create": 11,
+    "PUT": 11,
+    "multipart_complete": 11
+  },
+  "parquet_bytes_per_fixture_flush": 647749,
+  "projection_preserves_meaningful_fields": true,
+  "flush_seconds": 300,
+  "flush_windows_per_day": 288,
+  "projected_objects_per_day": 3168,
+  "projected_puts_per_day": 3168,
+  "projected_s3_mutations_per_day": 9504,
+  "basis": "finite fixture measured through local S3 stub; EOF flush, not a live R2 bill; assumes every class active and files below 64 MB"
+}

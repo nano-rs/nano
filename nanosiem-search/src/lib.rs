@@ -13,6 +13,7 @@ mod auth_cache;
 mod enterprise_shared_runtime;
 pub mod denied_source_audit;
 pub mod cache;
+mod inflight;
 pub mod config;
 pub mod error;
 pub mod handlers;
@@ -1534,6 +1535,8 @@ pub fn create_router(
         ))
         // NAN-3282: per-request + process-wide memory budget for product views.
         .layer(axum_middleware::from_fn(middleware::product_view_memory_middleware))
+        // NAN-4664: the caller's admission wait budget for every search.
+        .layer(axum_middleware::from_fn(middleware::admission_wait_budget_middleware))
         // NAN-3077: opt-in route-wide lake evidence (inside auth: needs AuthContext).
         .layer(axum_middleware::from_fn(handlers::lake_debug_middleware))
         // Add auth middleware

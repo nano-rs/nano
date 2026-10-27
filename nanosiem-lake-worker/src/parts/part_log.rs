@@ -924,6 +924,11 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Exact immutable object length for bounded export verification.
     async fn object_size(&self, _key: &str) -> Result<Option<u64>> { bail!("object size unsupported") }
+    /// NAN-4614: the object's strong identity (its ETag, or a local
+    /// equivalent that changes whenever the object is replaced) and length,
+    /// in one HEAD. `None` when the object is absent OR the store cannot
+    /// tell; callers must treat `None` as unknown (and verify in full).
+    async fn object_identity(&self, _key: &str) -> Result<Option<(String, u64)>> { Ok(None) }
     /// NAN-4181: the object's Last-Modified time (unix ms). `None` when the
     /// object is absent OR the store cannot tell; callers must treat `None`
     /// as "unknown" (finding attempt lookups then list every marker).
@@ -1102,6 +1107,18 @@ impl ObjectStore for LocalObjectStore {
     async fn object_size(&self, key: &str) -> Result<Option<u64>> {
         match std::fs::metadata(self.path(key)?) {
             Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    async fn object_identity(&self, key: &str) -> Result<Option<(String, u64)>> {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(self.path(key)?) {
+            // Any rewrite or replacement moves the inode or a timestamp.
+            Ok(meta) => Ok(Some((
+                format!("\"{:x}-{:x}-{:x}.{:x}-{:x}.{:x}\"", meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec()),
+                meta.len(),
+            ))),
             Err(e) if e.kind()==std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -1389,6 +1406,13 @@ pub struct PartLogWriter<'a> {
     receipted: Option<std::sync::Arc<crate::lake_part_gc::index::ReceiptedAppends>>,
     /// NAN-4052: checked before every commit.
     gate: Option<std::sync::Arc<dyn AppendGate>>,
+    /// NAN-4444: the last attempted entry whose create outcome is unknown (an
+    /// error, a timeout or a cancelled append after the PUT may have been
+    /// sent). Set before the create and cleared on every definite outcome. A
+    /// retry of the same op at the same head re-sends these IDENTICAL bytes
+    /// (same `appended_at_ms`, hence the same owner request), so an earlier
+    /// PUT that landed resolves as this append instead of a foreign writer.
+    pending: Option<LogEntry>,
 }
 
 impl<'a> PartLogWriter<'a> {
@@ -1407,7 +1431,7 @@ impl<'a> PartLogWriter<'a> {
             }
         }
         let mut writer =
-            Self { store, tenant_id: tenant_id.to_string(), log_keys: LogKeys::new(tenant_id)?, writer_epoch, set, key_held_total: 0, receipted: None, gate: None };
+            Self { store, tenant_id: tenant_id.to_string(), log_keys: LogKeys::new(tenant_id)?, writer_epoch, set, key_held_total: 0, receipted: None, gate: None, pending: None };
         if writer.set.head().is_none() {
             writer.append(LogOp::Genesis { schema: LogSchema::from_arrow(initial_schema)? }, now_ms).await?;
         }
@@ -1452,21 +1476,52 @@ impl<'a> PartLogWriter<'a> {
     }
 
     /// Append one op. The conditional single-PUT create of the entry is the
-    /// commit. A lost create (412 with other bytes) or an owner 409 fences.
+    /// commit. A lost create (412 or owner 409 with ANOTHER writer's entry)
+    /// fences. NAN-4444: an entry this writer itself landed under an
+    /// ambiguous earlier attempt (R2 500 or a timeout after the bytes were
+    /// stored) is adopted, never fenced: see [`Self::is_own_entry`].
     pub async fn append(&mut self, op: LogOp, now_ms: i64) -> Result<AppendOutcome> {
-        let (seq, prev) = match self.set.head() {
-            Some((seq, sha, _)) => (seq + 1, sha.to_string()),
-            None => (0, GENESIS_PREV.to_string()),
-        };
-        let entry = LogEntry {
+        loop {
+            let (seq, prev) = match self.set.head() {
+                Some((seq, sha, _)) => (seq + 1, sha.to_string()),
+                None => (0, GENESIS_PREV.to_string()),
+            };
+            // An unresolved attempt at another head is moot: the head moved.
+            let pending = self.pending.take().filter(|pending| pending.seq == seq && pending.prev_sha256 == prev);
+            let entry = match pending {
+                // The same op again: re-send the identical bytes.
+                Some(pending) if pending.op == op => pending,
+                // A different op while an earlier one is unresolved: settle
+                // the earlier one first (one GET) so a landed earlier entry is
+                // adopted instead of fencing this append.
+                Some(pending) => {
+                    if self.settle_pending(pending, now_ms).await? {
+                        continue;
+                    }
+                    self.new_entry(seq, prev, op.clone(), now_ms)
+                }
+                None => self.new_entry(seq, prev, op.clone(), now_ms),
+            };
+            return self.create(entry, now_ms).await;
+        }
+    }
+
+    fn new_entry(&self, seq: u64, prev_sha256: String, op: LogOp, now_ms: i64) -> LogEntry {
+        LogEntry {
             format: LOG_FORMAT.to_string(),
             tenant_id: self.tenant_id.clone(),
             seq,
-            prev_sha256: prev,
+            prev_sha256,
             writer_epoch: self.writer_epoch,
             appended_at_ms: now_ms,
             op,
-        };
+        }
+    }
+
+    /// One conditional create of `entry` (its own `appended_at_ms` drives the
+    /// owner hints, so a re-send is the same owner request).
+    async fn create(&mut self, entry: LogEntry, now_ms: i64) -> Result<AppendOutcome> {
+        let seq = entry.seq;
         let bytes = entry.to_bytes()?;
         let sha = sha256_hex(&bytes);
         // Validate against a scratch copy before committing anything.
@@ -1477,44 +1532,51 @@ impl<'a> PartLogWriter<'a> {
         if let Some(gate) = &self.gate {
             gate.check_append()?;
         }
-        match self.store.put_if_absent_with(&key, &bytes, &Self::log_hints(now_ms)).await {
+        let hints = Self::log_hints(entry.appended_at_ms);
+        // Survives an error AND a cancelled future: the PUT may land either way.
+        self.pending = Some(entry.clone());
+        match self.store.put_if_absent_with(&key, &bytes, &hints).await {
             Ok(true) => {
+                self.pending = None;
                 if let Some(receipted) = &self.receipted {
-                    receipted.record(seq, now_ms);
+                    receipted.record(seq, entry.appended_at_ms);
                 }
             }
             Ok(false) => {
                 let existing = self.store.get(&key).await?.context("conflicting entry vanished")?;
+                self.pending = None;
                 if existing != bytes {
-                    return Err(Fenced { seq }.into());
+                    return self.adopt_or_fence(&entry, &existing, now_ms).await;
                 }
             }
-            Err(error) if error.downcast_ref::<OwnerConflict>().is_some() => return Err(Fenced { seq }.into()),
+            Err(error) if error.downcast_ref::<OwnerConflict>().is_some() => {
+                // R2 409 (a concurrent conditional write won): under a degraded
+                // provider that write can be this writer's own earlier attempt.
+                self.pending = None;
+                return match self.store.get(&key).await {
+                    Ok(Some(existing)) if existing == bytes => self.committed(seq, next, sha, now_ms).await,
+                    Ok(Some(existing)) => self.adopt_or_fence(&entry, &existing, now_ms).await,
+                    Ok(None) | Err(_) => Err(Fenced { seq }.into()),
+                };
+            }
             Err(error) => {
                 if error.chain().any(|cause| cause.downcast_ref::<LogKeyHeld>().is_some()) {
                     self.key_held_total = self.key_held_total.saturating_add(1);
                     // NAN-3493: the owner also answers 409 for a key that is
                     // already COMPLETED, and a completed key is never taken
-                    // over. That is what an earlier attempt of this very
-                    // writer leaves behind when its PUT landed but `complete`
-                    // failed (owner 503 during a control roll) and the journal
-                    // replay registered it later: the entry exists, our head
-                    // never advanced, and every rebuilt retry (new
-                    // appended_at_ms, new request id) is refused forever.
-                    // Probe the key: an existing entry with other bytes means
-                    // this seq is committed and our head is stale, exactly
-                    // the lost-create case below the owner plane, so fence
-                    // (reload and respawn) instead of retrying a key that can
-                    // never be handed over. A probe failure keeps the retry.
+                    // over. Probe the key: an entry holding these bytes is
+                    // this append; one this writer landed earlier (NAN-4444)
+                    // is adopted; any other writer's entry fences (reload and
+                    // respawn). A probe failure keeps the retry.
                     match self.store.get(&key).await {
                         Ok(Some(existing)) if existing == bytes => {
+                            self.pending = None;
                             tracing::warn!(seq, key = %key, "part-log entry key held but already holds this entry; committed");
                             return self.committed(seq, next, sha, now_ms).await;
                         }
-                        Ok(Some(_)) => {
-                            tracing::warn!(seq, key = %key, held_total = self.key_held_total,
-                                "part-log entry key is already committed (an earlier attempt's PUT landed); head is stale, fencing to reload");
-                            return Err(Fenced { seq }.into());
+                        Ok(Some(existing)) => {
+                            self.pending = None;
+                            return self.adopt_or_fence(&entry, &existing, now_ms).await;
                         }
                         Ok(None) => {}
                         Err(probe) => tracing::warn!(seq, key = %key, error = %format!("{probe:#}"),
@@ -1523,11 +1585,103 @@ impl<'a> PartLogWriter<'a> {
                     tracing::warn!(seq, key = %key, held_total = self.key_held_total,
                         takeover_idle_s = LOG_KEY_TAKEOVER_IDLE.as_secs(),
                         "part-log entry key held by an unfinished earlier reservation; not fenced, retrying in-process");
+                } else if error.chain().any(|cause| cause.downcast_ref::<crate::part_ingest::native_writer::NativePutUnresolved>().is_some()) {
+                    // The read-back found no object: that attempt did not land
+                    // (yet). Its owner request can never be retried, so the
+                    // next append builds a fresh entry (the owner hands the
+                    // key over once the old reservation idles). If the old PUT
+                    // lands late, the fresh create meets it and adopts it.
+                    self.pending = None;
+                } else {
+                    tracing::warn!(seq, key = %key, error = %format!("{error:#}"),
+                        "part-log append outcome unknown; the next append re-sends the identical entry");
                 }
                 return Err(error);
             }
         }
         self.committed(seq, next, sha, now_ms).await
+    }
+
+    /// NAN-4444: `existing` is this writer's own entry for `entry`'s slot:
+    /// the same seq, writer epoch, predecessor and op. Only `appended_at_ms`
+    /// may differ (an earlier attempt of the same append). Any other entry is
+    /// another writer's (or a different epoch's) and must fence.
+    fn is_own_entry(existing: &LogEntry, entry: &LogEntry) -> bool {
+        existing.seq == entry.seq
+            && existing.writer_epoch == entry.writer_epoch
+            && existing.prev_sha256 == entry.prev_sha256
+            && existing.op == entry.op
+    }
+
+    /// The key for `entry` already holds other bytes. Adopt them when they
+    /// are this writer's own earlier attempt of the same append; fence
+    /// otherwise.
+    async fn adopt_or_fence(&mut self, entry: &LogEntry, existing: &[u8], now_ms: i64) -> Result<AppendOutcome> {
+        let seq = entry.seq;
+        let decoded = match LogEntry::parse_bytes(existing, &self.tenant_id) {
+            Ok(decoded) if Self::is_own_entry(&decoded, entry) => decoded,
+            Ok(decoded) => {
+                tracing::warn!(seq, existing_epoch = decoded.writer_epoch, our_epoch = entry.writer_epoch,
+                    same_prev = decoded.prev_sha256 == entry.prev_sha256, same_op = decoded.op == entry.op,
+                    "part-log seq committed by another writer; fencing");
+                return Err(Fenced { seq }.into());
+            }
+            Err(error) => {
+                tracing::warn!(seq, error = %format!("{error:#}"), "part-log seq holds an undecodable entry; fencing");
+                return Err(Fenced { seq }.into());
+            }
+        };
+        self.adopt(decoded, existing, now_ms).await
+    }
+
+    /// Advance the head to this writer's own landed entry `entry` (stored as
+    /// `bytes`). The receipt: re-send those exact bytes under the original
+    /// attempt's hints, which is the original owner request; the native store
+    /// resolves it by reading the object back and completing the owner
+    /// receipt (`Ok(true)`). Only that records a receipt; anything else
+    /// leaves it unknown (never claimed).
+    async fn adopt(&mut self, entry: LogEntry, bytes: &[u8], now_ms: i64) -> Result<AppendOutcome> {
+        let seq = entry.seq;
+        let sha = sha256_hex(bytes);
+        self.set.check_consumes(&entry.op)?;
+        let mut next = self.set.clone();
+        next.apply(&entry, &sha)?;
+        let key = self.log_keys.entry(seq);
+        let receipted = match self.store.put_if_absent_with(&key, bytes, &Self::log_hints(entry.appended_at_ms)).await {
+            Ok(true) => {
+                if let Some(receipted) = &self.receipted {
+                    receipted.record(seq, entry.appended_at_ms);
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!(seq, key = %key, error = %format!("{error:#}"),
+                    "part-log adopted entry's receipt not confirmed; receipt unknown");
+                false
+            }
+        };
+        tracing::warn!(seq, key = %key, appended_at_ms = entry.appended_at_ms, receipted,
+            "part-log entry landed by this writer's earlier ambiguous attempt; adopted, not fenced");
+        self.committed(seq, next, sha, now_ms).await
+    }
+
+    /// An earlier attempt (`pending`, a different op) is unresolved at the
+    /// current head: `Ok(true)` when it had landed and is now adopted (the
+    /// head moved), `Ok(false)` when its key is empty (that attempt is
+    /// dropped). Another writer's entry fences.
+    async fn settle_pending(&mut self, pending: LogEntry, now_ms: i64) -> Result<bool> {
+        let key = self.log_keys.entry(pending.seq);
+        let existing = match self.store.get(&key).await {
+            Ok(existing) => existing,
+            Err(error) => {
+                self.pending = Some(pending);
+                return Err(error);
+            }
+        };
+        let Some(existing) = existing else { return Ok(false) };
+        self.adopt_or_fence(&pending, &existing, now_ms).await?;
+        Ok(true)
     }
 
     /// Adopt a committed append: advance the head, then checkpoint on
@@ -1565,6 +1719,7 @@ impl<'a> PartLogWriter<'a> {
 
     /// Re-read the log (used after a [`Fenced`] error before exiting).
     pub async fn reload(&mut self) -> Result<()> {
+        self.pending = None;
         self.set = load_log(self.store, &self.tenant_id).await?;
         Ok(())
     }
@@ -1862,12 +2017,12 @@ mod tests {
 
     /// NAN-3493 regression (the load-test tenant, 2026-10-10): the owner went away
     /// between an entry's PUT and its `complete`. The entry is committed, so
-    /// the owner refuses every rebuilt retry with 409 and never hands the key
-    /// over. The writer must fence on the first held retry (the respawn
-    /// reloads the log) instead of retrying forever; the reloaded log holds
-    /// the first attempt exactly once and the next append continues after it.
+    /// the owner refuses every retry with 409 and never hands the key over.
+    /// NAN-4444: the retry of the same op re-sends the identical entry, so
+    /// the held-key probe finds exactly these bytes and commits: no fence,
+    /// no livelock, the first attempt's entry exactly once.
     #[tokio::test]
-    async fn an_entry_committed_before_an_owner_outage_fences_instead_of_livelocking() {
+    async fn an_entry_committed_before_an_owner_outage_commits_on_the_identical_resend() {
         use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
         let store = CompletedKeyStore {
@@ -1883,17 +2038,12 @@ mod tests {
         let error = writer.append(op(1), 10).await.unwrap_err();
         assert!(error.downcast_ref::<Fenced>().is_none() && error.downcast_ref::<LogKeyHeld>().is_none(), "{error:#}");
         assert_eq!(writer.live().head().map(|(seq, _, _)| seq), Some(0));
-        // The rebuilt retry (new appended_at_ms, new request) is refused as
-        // held; the probe finds the committed entry and fences at once.
-        let error = writer.append(op(1), 25).await.unwrap_err();
-        assert_eq!(error.downcast_ref::<Fenced>().map(|fenced| fenced.seq), Some(1), "{error:#}");
+        // The retry (later clock) re-sends the first attempt's bytes; the
+        // owner refuses it as held and the probe finds those bytes.
+        let AppendOutcome::Committed { seq, .. } = writer.append(op(1), 25).await.unwrap();
+        assert_eq!(seq, 1);
         assert_eq!(writer.log_key_held_total(), 1);
         assert_eq!(store.authorize_calls.load(Ordering::SeqCst) - genesis_calls, 2, "one refused retry, no livelock");
-        // Respawn: the reloaded log has the first attempt once, no double
-        // consume is possible, and ingest continues at the next seq.
-        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 30).await.unwrap();
-        assert_eq!(writer.live().head().map(|(seq, _, _)| seq), Some(1));
-        assert!(writer.live().knows(&part(1, Level::L0).part_id));
         assert!(writer.live().consumed(&source(1)));
         let AppendOutcome::Committed { seq, .. } = writer.append(op(2), 40).await.unwrap();
         assert_eq!(seq, 2);
@@ -1901,6 +2051,170 @@ mod tests {
         assert_eq!(reloaded.head().map(|(seq, _, _)| seq), Some(2));
         let entry = LogEntry::parse_bytes(&store.inner.get(&LogKeys::new(TENANT).unwrap().entry(1)).await.unwrap().unwrap(), TENANT).unwrap();
         assert_eq!(entry.appended_at_ms, 10, "the first attempt's entry is the committed one");
+    }
+
+    /// NAN-4444: a store whose next entry create is ambiguous: `land` stores
+    /// the bytes and still fails the call (R2 500 after the write landed),
+    /// otherwise it fails without storing (a timeout that never landed).
+    /// `unresolved` makes the next create fail the way the native store does
+    /// when its read-back finds no object.
+    struct AmbiguousPutStore {
+        inner: LocalObjectStore,
+        fail_next: std::sync::atomic::AtomicBool,
+        land: std::sync::atomic::AtomicBool,
+        unresolved_next: std::sync::atomic::AtomicBool,
+        entry_puts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AmbiguousPutStore {
+        fn new(dir: &Path) -> Self {
+            Self { inner: LocalObjectStore::new(dir).unwrap(), fail_next: Default::default(), land: Default::default(),
+                unresolved_next: Default::default(), entry_puts: Default::default() }
+        }
+        fn fail_next(&self, land: bool) {
+            use std::sync::atomic::Ordering;
+            self.land.store(land, Ordering::SeqCst);
+            self.fail_next.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for AmbiguousPutStore {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.get(key).await
+        }
+        async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+            use std::sync::atomic::Ordering;
+            if !key.contains("/log/entries/") {
+                return self.inner.put_if_absent(key, bytes).await;
+            }
+            self.entry_puts.fetch_add(1, Ordering::SeqCst);
+            if self.unresolved_next.swap(false, Ordering::SeqCst) {
+                return Err(crate::part_ingest::native_writer::NativePutUnresolved { key: key.to_string() }.into());
+            }
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                if self.land.load(Ordering::SeqCst) {
+                    self.inner.put_if_absent(key, bytes).await?;
+                }
+                bail!("R2 PUT {key}: HTTP 500 InternalError");
+            }
+            self.inner.put_if_absent(key, bytes).await
+        }
+        async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put(key, bytes).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    fn add(n: u64) -> LogOp {
+        LogOp::Add { parts: vec![part(n, Level::L0)], consumed: vec![source(n)], edge_log: None }
+    }
+
+    /// NAN-4444 (cell-us-1, 2026-10-23): R2 answered 500 to an entry PUT
+    /// that landed. The retry re-sends the identical entry: committed once,
+    /// never "committed by another writer".
+    #[tokio::test]
+    async fn a_put_that_landed_then_failed_commits_on_the_retry_not_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AmbiguousPutStore::new(dir.path());
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        store.fail_next(true);
+        let error = writer.append(add(1), 10).await.unwrap_err();
+        assert!(error.downcast_ref::<Fenced>().is_none(), "{error:#}");
+        let AppendOutcome::Committed { seq, entry_sha256 } = writer.append(add(1), 99).await.unwrap();
+        assert_eq!(seq, 1);
+        let stored = store.inner.get(&LogKeys::new(TENANT).unwrap().entry(1)).await.unwrap().unwrap();
+        assert_eq!(entry_sha256, sha256_hex(&stored));
+        assert_eq!(LogEntry::parse_bytes(&stored, TENANT).unwrap().appended_at_ms, 10, "identical bytes re-sent");
+        let AppendOutcome::Committed { seq, .. } = writer.append(add(2), 100).await.unwrap();
+        assert_eq!(seq, 2);
+        assert_eq!(load_log(&store.inner, TENANT).await.unwrap().head().map(|(seq, _, _)| seq), Some(2));
+    }
+
+    /// A different op after an ambiguous attempt that landed: the earlier
+    /// entry is adopted first, then the new op commits at the next seq.
+    #[tokio::test]
+    async fn a_different_op_after_a_landed_ambiguous_attempt_adopts_it_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AmbiguousPutStore::new(dir.path());
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        store.fail_next(true);
+        writer.append(add(1), 10).await.unwrap_err();
+        let AppendOutcome::Committed { seq, .. } = writer.append(add(2), 20).await.unwrap();
+        assert_eq!(seq, 2);
+        assert!(writer.live().consumed(&source(1)) && writer.live().consumed(&source(2)));
+        // A different op after an attempt that did NOT land: dropped, the
+        // new op takes the slot.
+        store.fail_next(false);
+        writer.append(add(3), 30).await.unwrap_err();
+        let AppendOutcome::Committed { seq, .. } = writer.append(add(4), 40).await.unwrap();
+        assert_eq!(seq, 3);
+        assert!(!writer.live().consumed(&source(3)));
+    }
+
+    /// The native read-back found nothing (the attempt never landed): the
+    /// next append is a fresh entry; when the old PUT lands late anyway, the
+    /// fresh create meets this writer's own entry and adopts it.
+    #[tokio::test]
+    async fn an_own_entry_landing_late_under_a_fresh_attempt_is_adopted() {
+        use crate::lake_part_gc::index::{ReceiptedAppends, INDEX_SETTLE_MS};
+        let dir = tempfile::tempdir().unwrap();
+        let store = AmbiguousPutStore::new(dir.path());
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        let ledger = std::sync::Arc::new(ReceiptedAppends::default());
+        writer.set_receipted_appends(ledger.clone());
+        store.fail_next(false);
+        writer.append(add(1), 10).await.unwrap_err();
+        store.unresolved_next.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.append(add(1), 20).await.unwrap_err();
+        // The first attempt (appended_at 10) lands late.
+        let late = LogEntry { format: LOG_FORMAT.into(), tenant_id: TENANT.into(), seq: 1,
+            prev_sha256: writer.live().head().unwrap().1.to_string(), writer_epoch: 1, appended_at_ms: 10, op: add(1) };
+        store.inner.put_if_absent(&LogKeys::new(TENANT).unwrap().entry(1), &late.to_bytes().unwrap()).await.unwrap();
+        let AppendOutcome::Committed { seq, entry_sha256 } = writer.append(add(1), 30).await.unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(entry_sha256, sha256_hex(&late.to_bytes().unwrap()), "the landed entry is the head");
+        // The local store has no writer authority: the receipt stays unknown.
+        assert_eq!(ledger.receipted_through(30 + INDEX_SETTLE_MS), None);
+        assert_eq!(load_log(&store.inner, TENANT).await.unwrap().head().map(|(seq, _, _)| seq), Some(1));
+    }
+
+    /// The safety property: an ambiguous attempt never adopts another
+    /// writer's entry. A different epoch at that seq fences.
+    #[tokio::test]
+    async fn an_ambiguous_retry_meeting_a_foreign_writers_entry_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AmbiguousPutStore::new(dir.path());
+        let mut ours = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        store.fail_next(false);
+        ours.append(add(1), 10).await.unwrap_err();
+        // A successor (epoch 2) commits seq 1, even with the very same op.
+        let mut theirs = PartLogWriter::open(&store, TENANT, 2, &schema(), 1).await.unwrap();
+        theirs.append(add(1), 11).await.unwrap();
+        let error = ours.append(add(1), 20).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<Fenced>().map(|fenced| fenced.seq), Some(1), "{error:#}");
+        assert!(!ours.live().knows(&part(1, Level::L0).part_id));
+    }
+
+    /// Same epoch and op but another predecessor is not this writer's entry.
+    #[tokio::test]
+    async fn an_ambiguous_retry_meeting_another_chain_is_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AmbiguousPutStore::new(dir.path());
+        let mut writer = PartLogWriter::open(&store, TENANT, 1, &schema(), 1).await.unwrap();
+        store.fail_next(false);
+        writer.append(add(1), 10).await.unwrap_err();
+        let other = LogEntry { format: LOG_FORMAT.into(), tenant_id: TENANT.into(), seq: 1,
+            prev_sha256: "f".repeat(64), writer_epoch: 1, appended_at_ms: 10, op: add(1) };
+        store.inner.put_if_absent(&LogKeys::new(TENANT).unwrap().entry(1), &other.to_bytes().unwrap()).await.unwrap();
+        let error = writer.append(add(1), 20).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<Fenced>().map(|fenced| fenced.seq), Some(1), "{error:#}");
+        assert!(!writer.live().consumed(&source(1)));
     }
 
     /// The probe is no fence for an identical entry: a held key that already

@@ -1184,7 +1184,7 @@ export function SearchResults({
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom" className="bg-card border-border text-xs">
-                    <p>Generate AI analysis of these results</p>
+                    <p>Analyze these results with pivt</p>
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>

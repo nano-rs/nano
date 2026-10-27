@@ -271,6 +271,9 @@ impl IntoResponse for SearchError {
         }
         let authority_unavailable = matches!(self, Self::SearchAuthorityUnavailable);
         let view_memory_busy = matches!(self, Self::ViewMemoryBusy);
+        // NAN-4664: an admission refusal (wait budget ended, queue full) is
+        // retryable; tell the caller when.
+        let admission_denied = matches!(self, Self::AdmissionDenied(_));
         // NAN-2361: a 503 is an operator signal, never a client mistake, so it
         // must always leave a log line naming its reason. Handlers build
         // `ServiceUnavailable` directly (tenant runtime resolution, retention
@@ -361,7 +364,7 @@ impl IntoResponse for SearchError {
         };
 
         let mut response = (status, Json(body)).into_response();
-        if authority_unavailable || admission_unavailable || view_memory_busy {
+        if authority_unavailable || admission_unavailable || view_memory_busy || admission_denied {
             response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("2"));
         }
         response
@@ -721,6 +724,24 @@ mod tests {
         );
     }
 
+    /// NAN-4593: every way a lake read ends early (deadline, cancel, cache
+    /// give-up, budget) is an error status with a code at the HTTP boundary,
+    /// never a 200.
+    #[test]
+    fn cancelled_timed_out_and_given_up_reads_are_never_a_200() {
+        for (core, status, code) in [
+            (nanosiem_core::SearchError::Cancelled, StatusCode::CONFLICT, "QUERY_CANCELLED"),
+            (nanosiem_core::SearchError::ResourceExhausted("scan".into()), StatusCode::UNPROCESSABLE_ENTITY, "RESOURCE_EXHAUSTED"),
+            (nanosiem_core::SearchError::ServiceUnavailable("reader cache is saturated".into()), StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
+        ] {
+            let mapped = SearchError::from(core);
+            assert_eq!(mapped.status_code(), status, "{mapped:?}");
+            assert_eq!(mapped.code(), code, "{mapped:?}");
+        }
+        let timeout = SearchError::from(nanosiem_core::SearchError::Timeout(45_000));
+        assert!(!timeout.status_code().is_success(), "{timeout:?}");
+    }
+
     #[test]
     fn resource_exhaustion_remains_machine_readable_for_escalation() {
         let mapped = SearchError::from(nanosiem_core::SearchError::ResourceExhausted(
@@ -902,6 +923,15 @@ mod dependency_contract_tests {
 #[cfg(test)]
 mod cold_budget_tests {
     use super::*;
+
+    /// NAN-4664: an admission refusal (wait budget ended, queue full) is a
+    /// 429 that tells the caller when to retry.
+    #[tokio::test]
+    async fn admission_refusal_is_429_with_retry_after() {
+        let response = SearchError::AdmissionDenied("Search queue timeout after 5000ms".into()).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "2");
+    }
 
     /// NAN-3644: only the reader's ceiling is a 422 now (never a cold read
     /// under it); it keeps its bytes and is not retryable.

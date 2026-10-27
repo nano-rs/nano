@@ -13,6 +13,8 @@
  */
 
 import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { auditFiltersFromSearch } from '@/lib/audit-filters';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 // Badge not used in redesign pass
@@ -52,6 +54,8 @@ import { browserTenantRuntime } from '@/lib/tenant-runtime';
 // Common audit actions for filtering (underscore convention)
 const AUDIT_ACTIONS = [
   { value: '', label: 'All Actions' },
+  { value: 'soar.settings.updated', label: 'SOAR Settings Updated' },
+  { value: 'inputlookup_allowlist_updated', label: 'Lookup URL Allowlist Updated' },
   { value: 'inputlookup_fetch', label: 'Inputlookup Fetch' },
   { value: 'inputlookup_egress_denied', label: 'Inputlookup Egress Denied' },
   { value: 'login_success', label: 'Login Success' },
@@ -151,6 +155,7 @@ function actorLabel(log: AuditLogEntry): string {
 
 export function AuditLogContent() {
   const { toast } = useToast();
+  const [searchParams] = useSearchParams();
 
   // Data state
   const [logs, setLogs] = useState<AuditLogEntry[]>([]);
@@ -158,10 +163,11 @@ export function AuditLogContent() {
   const [loading, setLoading] = useState(true);
 
   // Filter state
-  const [filters, setFilters] = useState<AuditLogQuery>({
-    limit: 50,
-    offset: 0,
-  });
+  const [filters, setFilters] = useState<AuditLogQuery>(() => auditFiltersFromSearch(searchParams));
+  useEffect(() => {
+    const next = auditFiltersFromSearch(searchParams);
+    setFilters((current) => current.action === next.action && current.resource_type === next.resource_type && current.source === next.source ? current : next);
+  }, [searchParams]);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterOpen, setFilterOpen] = useState(false);
 

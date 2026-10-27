@@ -166,6 +166,13 @@ impl ExportState {
         Ok(())
     }
 
+    /// NAN-4627: atomically replace the durable state with one rebuilt from
+    /// the remote catalog's export head (never a fabricated predecessor).
+    pub(crate) fn persist_durable(&self, work_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(work_dir.join("export"))?;
+        atomic_write(&state_path(work_dir), &serde_json::to_vec(self)?, false)
+    }
+
     /// Under an exclusive target planner lease, publish a complete immutable
     /// manifest before atomically advancing state. Reload/replan after an error.
     pub fn record_durable_plan(&mut self, work_dir: &Path, tenant_id: &str, pending: &[(ExportHour, Vec<PartRef>)], now_ms: i64) -> Result<PathBuf> {
@@ -184,6 +191,122 @@ impl ExportState {
         *self = next;
         Ok(path)
     }
+}
+
+/// NAN-4614: the most data one export commit registers. A first export onto
+/// a fresh table (an agent-lane prefix rotate, a new install) used to be ONE
+/// manifest naming the tenant's whole live set; its preparation outran every
+/// sync budget, nothing landed and every retry started from zero. Bounded
+/// batches each commit (and checkpoint) on their own, so a cut-off sync
+/// resumes at the first uncommitted batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportBatchBounds {
+    pub max_files: usize,
+    pub max_bytes: u64,
+}
+
+impl ExportBatchBounds {
+    /// Sized for one bounded commit attempt: 2 GiB (the largest single data
+    /// file) verified at a conservative 8 MiB/s stays inside its timeout.
+    pub const DEFAULT: Self = Self { max_files: 512, max_bytes: 2 * 1024 * 1024 * 1024 };
+    /// Batches per plan stay under this, however large the live set: every
+    /// batch is one retained snapshot until the plan settles (snapshot
+    /// inspection is bounded at 1024), and every batch is a catalog commit.
+    pub const MAX_BATCHES: u64 = 256;
+
+    /// One manifest, whatever its size (the pre-batching shape).
+    pub const UNBOUNDED: Self = Self { max_files: usize::MAX, max_bytes: u64::MAX };
+}
+
+impl ExportState {
+    /// Split one reconciled plan into chained, individually committable
+    /// manifests (times and predecessors are assigned by
+    /// [`Self::record_durable_batches`]). Every part is added exactly once,
+    /// in the batch of the first hour naming it; an hour whose parts were all
+    /// added earlier rides along. All removals go in the LAST batch, so the
+    /// earlier batches are add-only and a removal is never exposed before
+    /// every replacement in the same plan is committed. A single batch is
+    /// exactly the manifest [`Self::record_durable_plan`] writes.
+    pub fn split_plan(&self, tenant_id: &str, pending: &[(ExportHour, Vec<PartRef>)], bounds: ExportBatchBounds) -> Result<Vec<ExportManifest>> {
+        split_manifest(make_manifest(self, tenant_id, pending, 0, None)?, bounds)
+    }
+
+    /// Publish `batches` (from [`Self::split_plan`]) as the chain
+    /// `first_at, first_at + 1, ...`, each immutable manifest durable before
+    /// the next, and then the advanced state. A crash part way leaves a valid
+    /// chain prefix that [`Self::load_durable`] recovers; the rest is
+    /// replanned. Reload/replan after an error.
+    pub fn record_durable_batches(&mut self, work_dir: &Path, mut batches: Vec<ExportManifest>, first_at: i64) -> Result<Vec<PathBuf>> {
+        ensure!(!batches.is_empty(), "export plan has no batch");
+        ensure!(first_at > self.last_plan_ms, "export plan time must advance");
+        let dir = work_dir.join("export").join("pending");
+        std::fs::create_dir_all(&dir)?;
+        let mut next = self.clone();
+        let mut paths = Vec::with_capacity(batches.len());
+        let mut previous = (self.last_plan_ms > 0).then_some(self.last_plan_ms);
+        for (index, manifest) in batches.iter_mut().enumerate() {
+            let at = first_at.checked_add(index as i64).ok_or_else(|| anyhow::anyhow!("export plan clock overflow"))?;
+            manifest.planned_at_ms = at;
+            manifest.previous_plan_ms = previous;
+            let path = dir.join(format!("{at:013}.json"));
+            atomic_write(&path, &serde_json::to_vec_pretty(&manifest)?, true)?;
+            for hour in &manifest.hours {
+                next.exported.insert(hour.event_hour, hour.parts.clone());
+            }
+            previous = Some(at);
+            paths.push(path);
+        }
+        next.last_plan_ms = previous.expect("one batch");
+        atomic_write(&state_path(work_dir), &serde_json::to_vec(&next)?, false)?;
+        *self = next;
+        Ok(paths)
+    }
+}
+
+/// The batches of one whole manifest (see [`ExportState::split_plan`]); the
+/// times and predecessors of the result are unset.
+pub fn split_manifest(whole: ExportManifest, bounds: ExportBatchBounds) -> Result<Vec<ExportManifest>> {
+    ensure!(bounds.max_files > 0 && bounds.max_bytes > 0, "invalid export batch bounds");
+    let files = whole.add.iter().map(|p| p.keys.len() as u64).sum::<u64>();
+    let bytes = whole.add.iter().fold(0u64, |sum, p| sum.saturating_add(p.bytes));
+    let max_files = (bounds.max_files as u64).max(files.div_ceil(ExportBatchBounds::MAX_BATCHES));
+    let max_bytes = bounds.max_bytes.max(bytes.div_ceil(ExportBatchBounds::MAX_BATCHES));
+    let mut by_id = whole.add.into_iter().map(|p| (p.part_id.clone(), p)).collect::<BTreeMap<_, _>>();
+    let mut batches: Vec<(BTreeMap<String, ExportFile>, Vec<ExportHour>)> = vec![Default::default()];
+    let (mut batch_files, mut batch_bytes) = (0u64, 0u64);
+    for hour in whole.hours {
+        let full = batch_files >= max_files || batch_bytes >= max_bytes;
+        if full && hour.parts.iter().any(|id| by_id.contains_key(id)) {
+            batches.push(Default::default());
+            (batch_files, batch_bytes) = (0, 0);
+        }
+        let (add, hours) = batches.last_mut().expect("one batch");
+        for id in &hour.parts {
+            if let Some(part) = by_id.remove(id) {
+                batch_files += part.keys.len() as u64;
+                batch_bytes = batch_bytes.saturating_add(part.bytes);
+                add.insert(id.clone(), part);
+            }
+        }
+        hours.push(hour);
+    }
+    // An add no hour names (never produced by the planner) stays with the
+    // removals, so nothing is dropped.
+    batches.last_mut().expect("one batch").0.append(&mut by_id);
+    let last = batches.len() - 1;
+    let mut removals = Some(whole.remove_parts);
+    Ok(batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, (add, hours))| ExportManifest {
+            tenant_id: whole.tenant_id.clone(),
+            planned_at_ms: 0,
+            previous_plan_ms: None,
+            add: add.into_values().collect(),
+            remove_parts: if index == last { removals.take().unwrap_or_default() } else { vec![] },
+            hours,
+        })
+        .collect())
 }
 
 fn make_manifest(state: &ExportState, tenant_id: &str, pending: &[(ExportHour, Vec<PartRef>)], now_ms: i64, previous_plan_ms: Option<i64>) -> Result<ExportManifest> {

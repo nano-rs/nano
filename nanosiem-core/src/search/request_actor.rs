@@ -52,6 +52,13 @@ where
             Some(scope) => Box::pin(crate::search::denied_source_audit::with_scope(scope, future)),
             None => future,
         };
+    // NAN-4664: the caller's admission wait budget follows spawned search
+    // work (histogram / field-stats side tasks admit there).
+    let future: std::pin::Pin<Box<dyn Future<Output = F::Output> + Send>> =
+        match crate::search::admission::current_wait_budget() {
+            Some(budget) => Box::pin(crate::search::admission::with_wait_budget(budget, future)),
+            None => future,
+        };
     use tracing::Instrument;
     use tracing::instrument::WithSubscriber;
     let future = Box::pin(future.instrument(tracing::Span::current()).with_current_subscriber());

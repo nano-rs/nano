@@ -219,7 +219,12 @@ impl Ledger for MemoryLedger {
     async fn claim(&self, key: &str, etag: &str, _size: u64, _source_id: Option<Uuid>) -> Result<Claim> {
         let mut files = self.files.lock().unwrap();
         if let Some((id, file)) = files.iter().enumerate().find(|(_, f)| f.0 == key && f.1 == etag) {
-            return Ok(if file.2 == "claimed" { Claim::Leased } else { Claim::Finished { id: id as i64 } });
+            // Refused in place: never claimed again, never a (deleting) redelivery.
+            return Ok(if file.2 == "claimed" || file.2 == "refused_in_place" {
+                Claim::Leased
+            } else {
+                Claim::Finished { id: id as i64 }
+            });
         }
         files.push((key.into(), etag.into(), "claimed".into(), None));
         Ok(Claim::Owned { id: files.len() as i64 - 1, attempt: 1 })
@@ -233,6 +238,12 @@ impl Ledger for MemoryLedger {
     async fn refused(&self, id: i64, reason: &str, _rows: u64, _sha: Option<&str>) -> Result<()> {
         let mut files = self.files.lock().unwrap();
         files[id as usize].2 = "refused".into();
+        files[id as usize].3 = Some(reason.into());
+        Ok(())
+    }
+    async fn refused_in_place(&self, id: i64, reason: &str, _rows: u64, _sha: Option<&str>) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        files[id as usize].2 = "refused_in_place".into();
         files[id as usize].3 = Some(reason.into());
         Ok(())
     }
@@ -271,6 +282,7 @@ async fn the_converter_accepts_refuses_and_drops_redeliveries_without_wedging() 
         stage: stage(),
         tenant_id: TENANT.into(),
         max_files_per_tick: 100,
+        emit: BronzeObjects,
     };
     let good = parquet(&[sysmon(Some("sysmon:wks-01:5"), 5)]);
     store.write(&key("a/good.parquet"), good.clone()).await.unwrap();
@@ -397,13 +409,19 @@ async fn deleting_a_log_source_revokes_its_landing_source_and_key() {
     // A finished file of the source keeps its history after the revoke.
     sqlx::query(
         "INSERT INTO landing_files (object_key, etag, source_id, size_bytes, state, finished_at) \
-         VALUES ('k', 'e', $1, 1, 'accepted', NOW())",
+         VALUES ($2, 'e', $1, 1, 'accepted', NOW())",
     )
     .bind(deleted)
+    .bind(format!("{LANDING_PREFIX}tenant_id={TENANT}/source={deleted}/k"))
     .execute(&pool)
     .await
     .unwrap();
-    let ledger = PgLedger { pool: pool.clone(), lease: std::time::Duration::from_secs(60) };
+    // Rows from before migration 374 carry no tenant: the install's
+    // converter adopts them (one tenant on this database).
+    sqlx::raw_sql(include_str!("../../migrations/postgres/374_landing_tenant_lister.sql")).execute(&pool).await.expect("374");
+    let ledger = PgLedger::new(pool.clone(), std::time::Duration::from_secs(60), TENANT);
+    assert!(ledger.source(deleted).await.unwrap().is_none(), "an unadopted source is unknown to every tenant");
+    assert_eq!(ledger.adopt_legacy_rows().await.unwrap(), (1, 4));
     assert!(ledger.source(deleted).await.unwrap().unwrap().active);
 
     sqlx::query("DELETE FROM log_sources WHERE id = ANY($1)")
@@ -425,7 +443,7 @@ async fn deleting_a_log_source_revokes_its_landing_source_and_key() {
     assert!(ledger.source(kept).await.unwrap().is_some());
     // A removal that failed keeps the row (and its key) for the next sweep.
     assert!(ledger.source(stuck).await.unwrap().is_some());
-    let file_source: Option<Uuid> = sqlx::query_scalar("SELECT source_id FROM landing_files WHERE object_key = 'k'")
+    let file_source: Option<Uuid> = sqlx::query_scalar("SELECT source_id FROM landing_files WHERE object_key LIKE '%/k'")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -647,3 +665,755 @@ fn rows_without_class_uid_take_the_partition_and_are_counted() {
     assert_eq!((plain.rows_accepted, plain.rows_refused, plain.rows_class_from_path), (1, 1, 0));
     assert_eq!(plain.first_refusal.unwrap().reason, "ocsf_class_uid_missing_or_invalid");
 }
+
+// --- Sovereign `--tenzir` HA: N converters on one ledger (NAN-4629) ---
+
+/// A sovereign tenant id (UUID), as the installer assigns it.
+const HA_TENANT: &str = "6a1c2f0e-1b7d-4c55-9c1e-2f3a4b5c6d7e";
+/// Active-active converters, one per node. Deliberately not 4: nothing in the
+/// claim path may assume the minimum host count.
+const HA_NODES: usize = 5;
+
+fn ha_key(source: Uuid, name: &str) -> String {
+    format!("{LANDING_PREFIX}tenant_id={HA_TENANT}/source={source}/{name}")
+}
+
+/// A pool on its own throwaway schema. One pool per converter: each node has
+/// its own connections to the shared (Patroni) database.
+async fn ha_pool(url: &str, schema: &str) -> sqlx::PgPool {
+    let schema = schema.to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _| {
+            let schema = schema.clone();
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, format!("SET search_path TO {schema}").as_str()).await.map(|_| ())
+            })
+        })
+        .connect(url)
+        .await
+        .expect("connect")
+}
+
+/// NAN-4629 production path for the sovereign Tenzir model: the UNCHANGED
+/// open-core bucket drop (`Converter` = `PrefixDiscover` + `PgLedger` +
+/// `BronzeObjects`, migration 364) run active-active by several nodes over
+/// one bucket and one database. Tenzir-shaped objects (a real Tenzir 6.19.1
+/// `write_parquet` file, typed Parquet, NDJSON, gzipped NDJSON) are landed
+/// under the source folder; every one must be claimed exactly once per
+/// (key, etag), become exactly one set of bronze objects that bronze
+/// admission admits under the folder's tenant/source/credential, and leave
+/// the landing folder empty. A file abandoned by a dead node (expired lease)
+/// is taken over by another node. Negatives: another tenant's folder is never
+/// touched; an unknown source is refused whole and moved aside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
+async fn sovereign_tenzir_drop_is_claimed_once_across_active_active_converters() {
+    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else { return };
+    let schema = format!("nan4629_{}", Uuid::new_v4().simple());
+    let admin = ha_pool(&url, &schema).await;
+    sqlx::raw_sql(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.log_sources (id UUID PRIMARY KEY);"))
+        .execute(&admin)
+        .await
+        .expect("setup");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/364_landing_ocsf.sql")).execute(&admin).await.expect("364");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/374_landing_tenant_lister.sql")).execute(&admin).await.expect("374");
+    let landing = source();
+    sqlx::query("INSERT INTO log_sources (id) VALUES ($1)").bind(landing.source_id).execute(&admin).await.unwrap();
+    sqlx::query(
+        "INSERT INTO landing_sources (source_id, route_key, credential_id, object_user, tenant_id) \
+         VALUES ($1, $2, $3, 'nlhatenzir', $4)",
+    )
+    .bind(landing.source_id)
+    .bind(&landing.route_key)
+    .bind(landing.credential_id)
+    .bind(HA_TENANT)
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    // One bucket behind the datastore LB: every node sees the same objects.
+    let store = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let mut landed = Vec::new();
+    let mut expect_rows = 0_u64;
+    let tenzir = read_rows(TENZIR_AUTH_PARQUET, FileFormat::Parquet).unwrap().len() as u64;
+    store.write(&ha_key(landing.source_id, "tenzir-auth.parquet"), TENZIR_AUTH_PARQUET.to_vec()).await.unwrap();
+    landed.push(ha_key(landing.source_id, "tenzir-auth.parquet"));
+    expect_rows += tenzir;
+    for i in 0..12_i64 {
+        let events: Vec<Value> = (0..3).map(|j| sysmon(Some(&format!("ha:{i}:{j}")), 1000 + i * 10 + j)).collect();
+        let (name, body) = match i % 3 {
+            0 => (format!("{}.parquet", Uuid::new_v4()), parquet(&events)),
+            1 => (format!("{}.ndjson", Uuid::new_v4()), ndjson(&events)),
+            _ => (format!("{}.ndjson.gz", Uuid::new_v4()), gzip(&ndjson(&events))),
+        };
+        let key = ha_key(landing.source_id, &name);
+        store.write(&key, body).await.unwrap();
+        landed.push(key);
+        expect_rows += events.len() as u64;
+    }
+    // A node claimed this file and died: its lease is expired, not finished.
+    let abandoned = ha_key(landing.source_id, &format!("{}.ndjson", Uuid::new_v4()));
+    store.write(&abandoned, ndjson(&[sysmon(Some("ha:abandoned"), 7)])).await.unwrap();
+    expect_rows += 1;
+    {
+        let dead = PgLedger::new(ha_pool(&url, &schema).await, std::time::Duration::from_secs(600), HA_TENANT);
+        let entry = store.stat(&abandoned).await.unwrap();
+        let candidate =
+            Candidate { key: abandoned.clone(), etag: entry.etag().map(str::to_string), size: entry.content_length(), leased: None };
+        let claimed = PrefixDiscover { ledger: &dead }.claim(&store, &candidate, Some(landing.source_id)).await.unwrap();
+        assert!(matches!(claimed.claim, Claim::Owned { attempt: 1, .. }));
+        sqlx::query("UPDATE landing_files SET lease_until = NOW() - INTERVAL '1 second' WHERE object_key = $1")
+            .bind(&abandoned)
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+    // Negatives: another tenant's folder, and a source nobody created.
+    let foreign = format!("{LANDING_PREFIX}tenant_id=7b2d3f1a-0c8e-4d6f-a1b2-c3d4e5f60718/source={}/x.ndjson", landing.source_id);
+    store.write(&foreign, ndjson(&[sysmon(Some("foreign"), 1)])).await.unwrap();
+    let unknown = ha_key(Uuid::new_v4(), "x.ndjson");
+    store.write(&unknown, ndjson(&[sysmon(Some("unknown"), 1)])).await.unwrap();
+
+    let mut nodes = Vec::new();
+    for _ in 0..HA_NODES {
+        nodes.push(Converter {
+            store: store.clone(),
+            ledger: PgLedger::new(ha_pool(&url, &schema).await, std::time::Duration::from_secs(600), HA_TENANT),
+            stage: stage(),
+            tenant_id: HA_TENANT.into(),
+            // Small ticks so the nodes interleave over the same listing.
+            max_files_per_tick: 4,
+            emit: BronzeObjects,
+        });
+    }
+    let mut total = TickReport::default();
+    for _ in 0..40 {
+        let reports = futures::future::join_all(nodes.iter().map(Converter::tick)).await;
+        for report in reports {
+            let report = report.expect("tick");
+            total.accepted += report.accepted;
+            total.refused += report.refused;
+            total.redelivered += report.redelivered;
+            total.skipped += report.skipped;
+            total.failed += report.failed;
+        }
+        if keys_under(&store, &format!("{LANDING_PREFIX}tenant_id={HA_TENANT}/")).await.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        keys_under(&store, &format!("{LANDING_PREFIX}tenant_id={HA_TENANT}/")).await.is_empty(),
+        "every landed file finished: {total:?}"
+    );
+    assert_eq!(total.accepted, landed.len() + 1, "each file accepted by exactly one node: {total:?}");
+    assert_eq!(total.refused, 1, "only the unknown source is refused: {total:?}");
+    assert_eq!(keys_under(&store, REFUSED_PREFIX).await, vec![refused_key(&unknown)]);
+    assert_eq!(keys_under(&store, &foreign).await, vec![foreign.clone()], "another tenant's folder is untouched");
+
+    // The ledger: one row per (key, etag); one claim each, two for the takeover.
+    let rows: Vec<(String, String, i32, i64)> =
+        sqlx::query_as("SELECT object_key, state, attempts, rows_accepted FROM landing_files ORDER BY object_key")
+            .fetch_all(&admin)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), landed.len() + 2);
+    for (key, state, attempts, _) in &rows {
+        let expected = if *key == abandoned { 2 } else { 1 };
+        assert_eq!(*attempts, expected, "{key}: claimed {attempts} times");
+        assert_eq!(state, if *key == unknown { "refused" } else { "accepted" }, "{key}");
+    }
+    assert_eq!(rows.iter().map(|r| r.3 as u64).sum::<u64>(), expect_rows);
+
+    // Exactly one bronze set, admitted under the folder's identity only.
+    let bronze = keys_under(&store, BRONZE_PREFIX).await;
+    assert_eq!(bronze.len(), landed.len() + 1, "no duplicate bronze from concurrent nodes");
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    let mut events = Vec::new();
+    for (index, key) in bronze.iter().enumerate() {
+        assert!(key.contains(&format!("tenant_id={HA_TENANT}/")), "{key}");
+        let bytes = store.read(key).await.unwrap().to_vec();
+        events.extend(decode_bronze(&bytes).unwrap().into_iter().map(Result::unwrap));
+        let path = dir.path().join(format!("{index}.parquet"));
+        std::fs::write(&path, bytes).unwrap();
+        paths.push(path);
+    }
+    let admission = crate::bronze::admit_bronze_files(&paths, HA_TENANT).unwrap();
+    assert_eq!(admission.source_rows, expect_rows);
+    assert_eq!(events.len() as u64, expect_rows);
+    for event in &events {
+        assert_eq!(event["metadata"]["tenant_uid"], HA_TENANT, "sender metadata cannot choose the tenant");
+        assert_eq!(event["metadata"]["log_source"], landing.route_key.as_str());
+        assert_eq!(event["metadata"]["nano_credential_id"], CREDENTIAL);
+        assert_eq!(event["metadata"]["ingress_transport"], "landing_bucket");
+    }
+    let uids: std::collections::BTreeSet<_> =
+        events.iter().filter_map(|e| e["metadata"]["uid"].as_str().map(str::to_string)).collect();
+    assert!(uids.contains("ha:abandoned") && uids.contains("ha:11:2"));
+    // One lister lease for the tenant, held by one of the nodes.
+    let holders: Vec<(String, Uuid)> =
+        sqlx::query_as("SELECT tenant_id, holder FROM landing_listers").fetch_all(&admin).await.unwrap();
+    assert_eq!(holders.len(), 1);
+    assert_eq!(holders[0].0, HA_TENANT);
+    assert!(nodes.iter().any(|node| node.ledger.node == holders[0].1));
+    assert_eq!(nodes[0].ledger.backlog_age().await.unwrap(), None, "nothing left unfinished");
+
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+}
+
+/// NAN-4629 (coordinator Q-C, Q-D, Q-F) on the production `PgLedger`, two
+/// tenants on one database (an MSSP sovereign install):
+/// - another tenant's converter never sees or claims tenant A's rows, even
+///   handed A's exact (key, etag);
+/// - a source registered for tenant A is unknown in tenant B's folder, so
+///   B's file naming it is refused whole (the folder must match the source's
+///   credential tenant);
+/// - one lister per tenant: a second node does not get the lease while it is
+///   live and takes it over once it lapses; listing records `listed` rows
+///   that any node claims (attempt 1), and drops a listed row whose object
+///   vanished;
+/// - the backlog age is the oldest unfinished landed file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
+async fn sovereign_ledger_is_tenant_bound_and_lists_under_one_lease() {
+    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else { return };
+    const OTHER: &str = "7b2d3f1a-0c8e-4d6f-a1b2-c3d4e5f60718";
+    let schema = format!("nan4629_{}", Uuid::new_v4().simple());
+    let admin = ha_pool(&url, &schema).await;
+    sqlx::raw_sql(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.log_sources (id UUID PRIMARY KEY);"))
+        .execute(&admin)
+        .await
+        .expect("setup");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/364_landing_ocsf.sql")).execute(&admin).await.expect("364");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/374_landing_tenant_lister.sql")).execute(&admin).await.expect("374");
+    let landing = source();
+    sqlx::query("INSERT INTO log_sources (id) VALUES ($1)").bind(landing.source_id).execute(&admin).await.unwrap();
+    sqlx::query(
+        "INSERT INTO landing_sources (source_id, route_key, credential_id, object_user, tenant_id) \
+         VALUES ($1, $2, $3, 'nltenanta', $4)",
+    )
+    .bind(landing.source_id)
+    .bind(&landing.route_key)
+    .bind(landing.credential_id)
+    .bind(HA_TENANT)
+    .execute(&admin)
+    .await
+    .unwrap();
+    // Legacy adoption never crosses tenants: B finds a source named for A.
+    let lease = std::time::Duration::from_secs(600);
+    let a1 = PgLedger::new(ha_pool(&url, &schema).await, lease, HA_TENANT);
+    let a2 = PgLedger::new(ha_pool(&url, &schema).await, lease, HA_TENANT);
+    let b = PgLedger::new(ha_pool(&url, &schema).await, lease, OTHER);
+    assert_eq!(b.adopt_legacy_rows().await.unwrap(), (0, 0));
+
+    let store = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let a_key = ha_key(landing.source_id, "a.ndjson");
+    store.write(&a_key, ndjson(&[sysmon(Some("tenant-a"), 1)])).await.unwrap();
+    let gone = ha_key(landing.source_id, "gone.ndjson");
+    store.write(&gone, ndjson(&[sysmon(Some("gone"), 2)])).await.unwrap();
+    // B's folder, naming A's source: the folder decides the tenant.
+    let b_key = format!("{LANDING_PREFIX}tenant_id={OTHER}/source={}/b.ndjson", landing.source_id);
+    store.write(&b_key, ndjson(&[sysmon(Some("tenant-b"), 3)])).await.unwrap();
+
+    // One lister per tenant; B's lease is its own.
+    assert!(a1.hold_lister().await.unwrap());
+    assert!(!a2.hold_lister().await.unwrap(), "a live lease is not shared");
+    assert!(a1.hold_lister().await.unwrap(), "the holder renews");
+    assert!(b.hold_lister().await.unwrap());
+    // a2 claims what a1's listing recorded, without listing itself.
+    let (open, found) = a1.pending(&store, HA_TENANT, 10).await.unwrap().unwrap();
+    assert_eq!(open, 2);
+    assert_eq!(found.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(), vec![a_key.as_str(), gone.as_str()]);
+    assert!(a1.backlog_age().await.unwrap().is_some());
+    let (_, seen_by_a2) = a2.pending(&store, HA_TENANT, 10).await.unwrap().unwrap();
+    assert_eq!(seen_by_a2, found);
+    // Tenant B sees none of A's rows, and cannot claim them even by name.
+    let (b_open, b_found) = b.pending(&store, OTHER, 10).await.unwrap().unwrap();
+    assert_eq!((b_open, b_found.iter().map(|c| c.key.clone()).collect::<Vec<_>>()), (1, vec![b_key.clone()]));
+    let a_etag = found[0].etag.clone().unwrap();
+    assert_eq!(b.claim(&a_key, &a_etag, 1, Some(landing.source_id)).await.unwrap(), Claim::Leased);
+    assert!(b.pending(&store, HA_TENANT, 10).await.is_err(), "a ledger refuses another tenant's folder");
+    let state: (String, i32) = sqlx::query_as("SELECT state, attempts FROM landing_files WHERE object_key = $1")
+        .bind(&a_key)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(state, ("listed".to_string(), 0), "B's claim attempt left A's row untouched");
+    // A's source is unknown to B's ledger: B's file naming it is refused.
+    assert!(b.source(landing.source_id).await.unwrap().is_none());
+    assert!(a2.source(landing.source_id).await.unwrap().unwrap().active);
+    let b_converter = Converter {
+        store: store.clone(),
+        ledger: b,
+        stage: stage(),
+        tenant_id: OTHER.into(),
+        max_files_per_tick: 10,
+        emit: BronzeObjects,
+    };
+    let report = b_converter.tick().await.unwrap();
+    assert_eq!((report.accepted, report.refused), (0, 1));
+    assert_eq!(keys_under(&store, REFUSED_PREFIX).await, vec![refused_key(&b_key)]);
+    let reason: String = sqlx::query_scalar("SELECT reason FROM landing_files WHERE object_key = $1")
+        .bind(&b_key)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(reason, "source_unknown");
+
+    // A listed object that vanished is dropped from the queue by the next
+    // complete listing (after the listing clock passed its first sighting).
+    store.delete(&gone).await.unwrap();
+    sqlx::query("UPDATE landing_files SET first_seen_at = NOW() - INTERVAL '1 minute' WHERE object_key = $1")
+        .bind(&gone)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(a1.list_into_ledger(&store).await.unwrap(), 1);
+    let left: Vec<String> = sqlx::query_scalar("SELECT object_key FROM landing_files WHERE tenant_id = $1 ORDER BY object_key")
+        .bind(HA_TENANT)
+        .fetch_all(&admin)
+        .await
+        .unwrap();
+    assert_eq!(left, vec![a_key.clone()]);
+
+    // Lister failover: a1 stops renewing; a2 takes the lease once it lapses.
+    sqlx::query("UPDATE landing_listers SET lease_until = NOW() - INTERVAL '1 second' WHERE tenant_id = $1")
+        .bind(HA_TENANT)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert!(a2.hold_lister().await.unwrap(), "a lapsed lease fails over");
+    assert!(!a1.hold_lister().await.unwrap(), "the old holder does not take it back while it is live");
+
+    // a2 converts A's file from the ledger (attempt 1); the backlog drains.
+    let a_converter = Converter {
+        store: store.clone(),
+        ledger: a2,
+        stage: stage(),
+        tenant_id: HA_TENANT.into(),
+        max_files_per_tick: 10,
+        emit: BronzeObjects,
+    };
+    let report = a_converter.tick().await.unwrap();
+    assert_eq!((report.accepted, report.refused, report.backlog_age_secs), (1, 0, None));
+    let row: (String, i32) = sqlx::query_as("SELECT state, attempts FROM landing_files WHERE object_key = $1")
+        .bind(&a_key)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(row, ("accepted".to_string(), 1));
+    // B's row is still B's: A's ledger never touched it.
+    let b_tenant: Option<String> = sqlx::query_scalar("SELECT tenant_id FROM landing_files WHERE object_key = $1")
+        .bind(&b_key)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    assert_eq!(b_tenant.as_deref(), Some(OTHER));
+
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+}
+
+/// NAN-4629 (coordinator Q-A): the converter's policy reaches only its
+/// tenant's landing folder, list/get/delete only (no put anywhere).
+#[test]
+fn converter_policy_is_scoped_to_the_tenant_landing_folder() {
+    let policy = converter_policy("nano-lake", HA_TENANT);
+    let statements = policy["Statement"].as_array().unwrap();
+    assert_eq!(statements.len(), 2);
+    let folder = format!("landing-ocsf-v1/tenant_id={HA_TENANT}/");
+    assert_eq!(statements[0]["Action"], json!(["s3:ListBucket"]));
+    assert_eq!(statements[0]["Resource"], json!(["arn:aws:s3:::nano-lake"]));
+    assert_eq!(statements[0]["Condition"]["StringLike"]["s3:prefix"], json!([folder.clone(), format!("{folder}*")]));
+    assert_eq!(statements[1]["Action"], json!(["s3:GetObject", "s3:DeleteObject"]));
+    assert_eq!(statements[1]["Resource"], json!([format!("arn:aws:s3:::nano-lake/{folder}*")]));
+    // Negative: no put, no bronze or refused folder, no bucket-wide object
+    // action, no other verbs.
+    let text = policy.to_string();
+    assert!(!text.contains("bronze") && !text.contains("nano-lake/*") && !text.contains("s3:*"));
+    assert!(!text.contains("PutObject") && !text.contains("refused"));
+    for statement in statements {
+        for resource in statement["Resource"].as_array().unwrap() {
+            let resource = resource.as_str().unwrap();
+            assert!(resource == "arn:aws:s3:::nano-lake" || resource.contains(&format!("tenant_id={HA_TENANT}/")), "{resource}");
+        }
+    }
+}
+
+/// NAN-4629 (coordinator Q-B): sovereign bronze is published through the
+/// consumer store's immutable create, never written raw to the landing store.
+#[tokio::test]
+async fn sovereign_bronze_is_published_through_put_if_absent() {
+    use crate::parts::part_log::ObjectStore;
+    #[derive(Default)]
+    struct Published(Mutex<Vec<(String, Vec<u8>)>>);
+    #[async_trait]
+    impl ObjectStore for Published {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, b)| b.clone()))
+        }
+        async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+            let mut objects = self.0.lock().unwrap();
+            if objects.iter().any(|(k, _)| k == key) {
+                return Ok(false);
+            }
+            objects.push((key.to_string(), bytes.to_vec()));
+            Ok(true)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(prefix)).map(|(k, _)| k.clone()).collect())
+        }
+        async fn put(&self, _key: &str, _bytes: &[u8]) -> Result<()> {
+            anyhow::bail!("published bronze is immutable")
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            anyhow::bail!("published bronze is immutable")
+        }
+    }
+    let landing = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let converter = Converter {
+        store: landing.clone(),
+        ledger: MemoryLedger { sources: vec![source()], ..Default::default() },
+        stage: stage(),
+        tenant_id: TENANT.into(),
+        max_files_per_tick: 10,
+        emit: PublishedBronze { store: Published::default() },
+    };
+    landing.write(&key("x.parquet"), TENZIR_AUTH_PARQUET.to_vec()).await.unwrap();
+    let unknown = format!("{LANDING_PREFIX}tenant_id={TENANT}/source={}/y.ndjson", Uuid::new_v4());
+    landing.write(&unknown, ndjson(&[sysmon(Some("u"), 1)])).await.unwrap();
+    let report = converter.tick().await.unwrap();
+    assert_eq!((report.accepted, report.refused), (1, 1), "{report:?}");
+    assert!(keys_under(&landing, BRONZE_PREFIX).await.is_empty(), "nothing raw next to the landing folder");
+    assert!(keys_under(&landing, REFUSED_PREFIX).await.is_empty(), "the refused copy is published, not written raw");
+    assert!(keys_under(&landing, LANDING_PREFIX).await.is_empty());
+    let mut published = converter.emit.store.0.lock().unwrap().clone();
+    let refused_at = published.iter().position(|(k, _)| *k == refused_key(&unknown)).expect("refused copy published");
+    assert_eq!(published.remove(refused_at).1, ndjson(&[sysmon(Some("u"), 1)]));
+    assert!(!published.is_empty());
+    for (key, bytes) in published.iter() {
+        assert!(key.starts_with(BRONZE_PREFIX) && key.contains(&format!("tenant_id={TENANT}/")), "{key}");
+        assert!(decode_bronze(bytes).unwrap().into_iter().all(|row| row.is_ok()));
+    }
+}
+
+/// NAN-4629 (coordinator Q-B): the published refused copy is write-if-absent
+/// yet never lossy. A retry of the same refusal is a no-op; a second, different
+/// refused file under the same landed key is kept beside the first.
+#[tokio::test]
+async fn published_refused_copy_never_drops_a_second_file_under_the_same_key() {
+    use crate::parts::part_log::ObjectStore;
+    #[derive(Default)]
+    struct Published(Mutex<Vec<(String, Vec<u8>)>>);
+    #[async_trait]
+    impl ObjectStore for Published {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, b)| b.clone()))
+        }
+        async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+            let mut objects = self.0.lock().unwrap();
+            if objects.iter().any(|(k, _)| k == key) {
+                return Ok(false);
+            }
+            objects.push((key.to_string(), bytes.to_vec()));
+            Ok(true)
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(prefix)).map(|(k, _)| k.clone()).collect())
+        }
+        async fn put(&self, _key: &str, _bytes: &[u8]) -> Result<()> {
+            anyhow::bail!("immutable")
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            anyhow::bail!("immutable")
+        }
+    }
+    let landing = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let emit = PublishedBronze { store: Published::default() };
+    let landed = key("same.ndjson");
+    landing.write(&landed, b"first".to_vec()).await.unwrap();
+    assert_eq!(emit.keep_refused(&landing, &landed).await.unwrap(), RefusedCopy::Kept);
+    assert_eq!(emit.keep_refused(&landing, &landed).await.unwrap(), RefusedCopy::Kept, "a retried refusal is idempotent");
+    assert_eq!(emit.store.0.lock().unwrap().len(), 1);
+    landing.write(&landed, b"second".to_vec()).await.unwrap();
+    assert_eq!(emit.keep_refused(&landing, &landed).await.unwrap(), RefusedCopy::Kept);
+    let kept = emit.store.0.lock().unwrap().clone();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0], (refused_key(&landed), b"first".to_vec()));
+    assert_eq!(
+        kept[1],
+        (format!("{}.sha256-{}", refused_key(&landed), hex::encode(Sha256::digest(b"second"))), b"second".to_vec())
+    );
+    // Gone already (a crash after the delete): nothing to keep.
+    landing.delete(&landed).await.unwrap();
+    assert_eq!(emit.keep_refused(&landing, &landed).await.unwrap(), RefusedCopy::Kept);
+}
+
+/// NAN-4629 (coordinator Q-C): pre-374 rows on a database that turns out to
+/// hold two tenants. Whichever converter adopts first, it takes only its own
+/// files (by folder) and only sources whose files are in its folder; a
+/// file-less source is adopted only when the database shows no other tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
+async fn legacy_adoption_never_takes_another_tenants_source() {
+    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else { return };
+    const OTHER: &str = "7b2d3f1a-0c8e-4d6f-a1b2-c3d4e5f60718";
+    let schema = format!("nan4629_{}", Uuid::new_v4().simple());
+    let admin = ha_pool(&url, &schema).await;
+    sqlx::raw_sql(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.log_sources (id UUID PRIMARY KEY);"))
+        .execute(&admin)
+        .await
+        .expect("setup");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/364_landing_ocsf.sql")).execute(&admin).await.expect("364");
+    // Pre-374 state: A's source with a file in A's folder, a file-less source.
+    let with_files = source();
+    let file_less = LandingSource { source_id: Uuid::new_v4(), credential_id: Uuid::new_v4(), ..source() };
+    for (s, user) in [(&with_files, "nllegacya"), (&file_less, "nllegacyz")] {
+        sqlx::query("INSERT INTO log_sources (id) VALUES ($1)").bind(s.source_id).execute(&admin).await.unwrap();
+        sqlx::query("INSERT INTO landing_sources (source_id, route_key, credential_id, object_user) VALUES ($1, $2, $3, $4)")
+            .bind(s.source_id)
+            .bind(&s.route_key)
+            .bind(s.credential_id)
+            .bind(user)
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+    let a_key = ha_key(with_files.source_id, "legacy.ndjson");
+    sqlx::query(
+        "INSERT INTO landing_files (object_key, etag, source_id, size_bytes, state, attempts, finished_at) \
+         VALUES ($1, 'e1', $2, 1, 'accepted', 1, NOW())",
+    )
+    .bind(&a_key)
+    .bind(with_files.source_id)
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../../migrations/postgres/374_landing_tenant_lister.sql")).execute(&admin).await.expect("374");
+    let lease = std::time::Duration::from_secs(600);
+    let a = PgLedger::new(ha_pool(&url, &schema).await, lease, HA_TENANT);
+    let b = PgLedger::new(ha_pool(&url, &schema).await, lease, OTHER);
+    // B first: A's file is outside B's folder, so B adopts nothing.
+    assert_eq!(b.adopt_legacy_rows().await.unwrap(), (0, 0));
+    assert!(b.source(with_files.source_id).await.unwrap().is_none());
+    assert!(b.source(file_less.source_id).await.unwrap().is_none());
+    // A: its file, the source whose file is in A's folder, and the file-less
+    // source (no other tenant's source or file exists yet).
+    assert_eq!(a.adopt_legacy_rows().await.unwrap(), (1, 2));
+    assert!(a.source(with_files.source_id).await.unwrap().unwrap().active);
+    assert!(a.source(file_less.source_id).await.unwrap().unwrap().active);
+    let tenants: Vec<Option<String>> = sqlx::query_scalar("SELECT tenant_id FROM landing_sources ORDER BY source_id")
+        .fetch_all(&admin)
+        .await
+        .unwrap();
+    assert_eq!(tenants, vec![Some(HA_TENANT.to_string()); 2]);
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+}
+
+/// An in-memory consumer store (write-if-absent, immutable).
+#[derive(Default)]
+struct PublishedMem(Mutex<Vec<(String, Vec<u8>)>>);
+#[async_trait]
+impl crate::parts::part_log::ObjectStore for PublishedMem {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.0.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, b)| b.clone()))
+    }
+    async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        let mut objects = self.0.lock().unwrap();
+        if objects.iter().any(|(k, _)| k == key) {
+            return Ok(false);
+        }
+        objects.push((key.to_string(), bytes.to_vec()));
+        Ok(true)
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.0.lock().unwrap().iter().filter(|(k, _)| k.starts_with(prefix)).map(|(k, _)| k.clone()).collect())
+    }
+    async fn put(&self, _key: &str, _bytes: &[u8]) -> Result<()> {
+        anyhow::bail!("immutable")
+    }
+    async fn delete(&self, _key: &str) -> Result<()> {
+        anyhow::bail!("immutable")
+    }
+}
+
+/// NAN-4629 (coordinator, data loss rule): a refused file the consumer store
+/// cannot take (over its 64 MiB write bound, or empty) is never deleted
+/// without a copy. It stays where it landed, is recorded refused in place,
+/// and later ticks neither reclaim nor delete it as a redelivery.
+#[tokio::test]
+async fn a_refused_file_too_big_to_publish_stays_where_it_landed() {
+    let landing = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let converter = Converter {
+        store: landing.clone(),
+        ledger: MemoryLedger { sources: vec![source()], ..Default::default() },
+        stage: stage(),
+        tenant_id: TENANT.into(),
+        max_files_per_tick: 10,
+        emit: PublishedBronze { store: PublishedMem::default() },
+    };
+    // Unknown source: refused whole before any read or conversion.
+    let folder = format!("{LANDING_PREFIX}tenant_id={TENANT}/source={}/", Uuid::new_v4());
+    let big = format!("{folder}big.ndjson");
+    let empty = format!("{folder}empty.ndjson");
+    let small = format!("{folder}small.ndjson");
+    let big_len = usize::try_from(MAX_PUBLISHED_REFUSED_BYTES).unwrap() + 1;
+    landing.write(&big, vec![b'x'; big_len]).await.unwrap();
+    landing.write(&empty, Vec::<u8>::new()).await.unwrap();
+    landing.write(&small, ndjson(&[sysmon(Some("s"), 1)])).await.unwrap();
+    for round in 0..3 {
+        let report = converter.tick().await.unwrap();
+        if round == 0 {
+            assert_eq!((report.accepted, report.refused), (0, 3), "{report:?}");
+        } else {
+            assert_eq!((report.refused, report.redelivered, report.skipped), (0, 0, 2), "round {round}: {report:?}");
+        }
+        // Never deleted without a copy: the two uncopyable files stay, byte for byte.
+        assert_eq!(landing.read(&big).await.unwrap().len(), big_len);
+        assert!(landing.exists(&empty).await.unwrap());
+        // The copyable one was published, then deleted.
+        assert!(!landing.exists(&small).await.unwrap());
+    }
+    let published = converter.emit.store.0.lock().unwrap().clone();
+    assert_eq!(published.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), vec![refused_key(&small)]);
+    let files = converter.ledger.files.lock().unwrap().clone();
+    let state_of = |key: &str| files.iter().find(|f| f.0 == key).map(|f| (f.2.clone(), f.3.clone())).unwrap();
+    assert_eq!(state_of(&big), ("refused_in_place".to_string(), Some("source_unknown".to_string())));
+    assert_eq!(state_of(&empty).0, "refused_in_place");
+    assert_eq!(state_of(&small).0, "refused");
+}
+
+/// A ledger that cannot record a refusal in place refuses: the file is not
+/// deleted (the default `Ledger::refused_in_place`).
+#[tokio::test]
+async fn a_ledger_without_in_place_support_never_deletes_the_file() {
+    struct NoInPlace(MemoryLedger);
+    #[async_trait]
+    impl Ledger for NoInPlace {
+        async fn source(&self, id: Uuid) -> Result<Option<LandingSource>> { self.0.source(id).await }
+        async fn claim(&self, k: &str, e: &str, s: u64, id: Option<Uuid>) -> Result<Claim> { self.0.claim(k, e, s, id).await }
+        async fn accepted(&self, id: i64, c: &Converted, b: &str) -> Result<()> { self.0.accepted(id, c, b).await }
+        async fn refused(&self, id: i64, r: &str, n: u64, s: Option<&str>) -> Result<()> { self.0.refused(id, r, n, s).await }
+        async fn redelivered(&self, id: i64) -> Result<()> { self.0.redelivered(id).await }
+    }
+    let landing = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let converter = Converter {
+        store: landing.clone(),
+        ledger: NoInPlace(MemoryLedger { sources: vec![source()], ..Default::default() }),
+        stage: stage(),
+        tenant_id: TENANT.into(),
+        max_files_per_tick: 10,
+        emit: PublishedBronze { store: PublishedMem::default() },
+    };
+    let empty = format!("{LANDING_PREFIX}tenant_id={TENANT}/source={}/empty.ndjson", Uuid::new_v4());
+    landing.write(&empty, Vec::<u8>::new()).await.unwrap();
+    let report = converter.tick().await.unwrap();
+    assert_eq!((report.refused, report.failed), (0, 1), "{report:?}");
+    assert!(landing.exists(&empty).await.unwrap());
+}
+
+/// NAN-4629 on PostgreSQL: a refused-in-place row stays refused, is never
+/// claimed, redelivered or pruned, and its file is never deleted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a disposable NANOSIEM_TEST_DATABASE_URL"]
+async fn pg_ledger_keeps_a_refused_in_place_file_and_never_deletes_it() {
+    let Ok(url) = std::env::var("NANOSIEM_TEST_DATABASE_URL") else { return };
+    let schema = format!("nan4629_{}", Uuid::new_v4().simple());
+    let admin = ha_pool(&url, &schema).await;
+    sqlx::raw_sql(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.log_sources (id UUID PRIMARY KEY);"))
+        .execute(&admin)
+        .await
+        .expect("setup");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/364_landing_ocsf.sql")).execute(&admin).await.expect("364");
+    sqlx::raw_sql(include_str!("../../migrations/postgres/374_landing_tenant_lister.sql")).execute(&admin).await.expect("374");
+    let landing = Operator::new(opendal::services::Memory::default()).unwrap().finish();
+    let converter = Converter {
+        store: landing.clone(),
+        ledger: PgLedger::new(ha_pool(&url, &schema).await, std::time::Duration::from_secs(600), HA_TENANT),
+        stage: stage(),
+        tenant_id: HA_TENANT.into(),
+        max_files_per_tick: 10,
+        emit: PublishedBronze { store: PublishedMem::default() },
+    };
+    // No source registered: refused source_unknown; empty, so no copy.
+    let empty = ha_key(Uuid::new_v4(), "empty.ndjson");
+    landing.write(&empty, Vec::<u8>::new()).await.unwrap();
+    let report = converter.tick().await.unwrap();
+    assert_eq!(report.refused, 1, "{report:?}");
+    let row: (String, bool, Option<String>) =
+        sqlx::query_as("SELECT state, refused_in_place, reason FROM landing_files WHERE object_key = $1")
+            .bind(&empty)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(row, ("refused".to_string(), true, Some("source_unknown".to_string())));
+    assert!(landing.exists(&empty).await.unwrap());
+    // Later ticks: not pending, not reclaimed, not deleted as a redelivery.
+    let report = converter.tick().await.unwrap();
+    assert_eq!((report.refused, report.redelivered, report.accepted), (0, 0, 0), "{report:?}");
+    let etag = landing.stat(&empty).await.unwrap().etag().map(str::to_string);
+    let (etag, _, _) = landed_etag(&landing, &empty, etag.as_deref(), 0).await.unwrap();
+    assert_eq!(converter.ledger.claim(&empty, &etag, 0, None).await.unwrap(), Claim::Leased);
+    assert!(landing.exists(&empty).await.unwrap());
+    // Not pruned while it exists, however old.
+    sqlx::query("UPDATE landing_files SET finished_at = NOW() - INTERVAL '400 days' WHERE object_key = $1")
+        .bind(&empty)
+        .execute(&admin)
+        .await
+        .unwrap();
+    assert_eq!(converter.ledger.prune().await.unwrap(), 0);
+    assert_eq!(converter.ledger.backlog_age().await.unwrap(), None);
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE")).execute(&admin).await.unwrap();
+}
+
+/// NAN-4675: a Vector-less tenant's platform audit, delivered by the hosted control plane
+/// into its bucket drop under the platform `audit` landing source, converts
+/// with the PRODUCTION stage (`LandingOcsfStage::new(1)`, as `landing_cell`
+/// builds it) into bronze that the real admission admits as
+/// `log_source = audit`, including the NAN-3304 null-only rows; a foreign
+/// tenant's row in the same file is counted refused, never landed.
+#[test]
+fn cell_feature_lean_landing_platform_audit_v1_is_backed() {
+    use nanosiem_core::audit::{AuditEvent, AuditSource};
+    use nanosiem_core::parsers::landing_ocsf::PLATFORM_AUDIT_ROUTE_KEY;
+    assert!(nanosiem_lake_cell::features::CELL_FEATURES.contains(&"lean_landing_platform_audit_v1"));
+    const T: &str = "11111111-1111-4111-8111-111111111111";
+    const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+    let at = chrono::DateTime::parse_from_rfc3339("2026-10-21T06:02:00.123Z").unwrap().with_timezone(&Utc);
+    let event = |id: &str, tenant: &str, client: bool| {
+        let mut builder = AuditEvent::builder(AuditSource::Detection, "rule_created").success(true);
+        if client {
+            builder = builder.actor(Some(Uuid::nil()), Some("dan@nano.rs".to_string()));
+        }
+        let mut v = builder.build().to_ocsf_event_for_lake(at, Uuid::parse_str(id).unwrap(), tenant);
+        if client {
+            v["src_endpoint"]["ip"] = json!("10.1.2.3");
+        }
+        v
+    };
+    let ids = ["018f6a1e-0d2b-7c3a-9e4f-5a6b7c8d9e01", "018f6a1e-0d2b-7c3a-9e4f-5a6b7c8d9e02", "018f6a1e-0d2b-7c3a-9e4f-5a6b7c8d9e03"];
+    // Exactly the body the control plane reserves: one OCSF mirror per line.
+    let file = ndjson(&[event(ids[0], T, true), event(ids[1], T, false), event(ids[2], OTHER, true)]);
+    let audit = LandingSource { route_key: PLATFORM_AUDIT_ROUTE_KEY.into(), ..source() };
+    let stage = LandingOcsfStage::new(1).unwrap();
+    let converted = convert_file(&file, FileFormat::Ndjson { gzip: false }, &stage, T, &audit, Utc::now()).unwrap();
+    assert_eq!((converted.rows_accepted, converted.rows_refused), (2, 1), "the foreign tenant's row is refused");
+    assert_eq!(converted.objects.len(), 1);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit.parquet");
+    std::fs::write(&path, &converted.objects[0].1).unwrap();
+    let admitted = crate::bronze::admit_bronze_files(&[path], T).unwrap();
+    assert_eq!(admitted.source_rows, 2);
+    assert_eq!(admitted.batch.len(), 2, "both rows pass strict OCSF 1.9 admission, the null-only one included");
+    let mut uids: Vec<String> = admitted.batch.rows().iter().map(|row| {
+        let e = &row.ocsf_event;
+        assert_eq!(e["metadata"]["log_source"], "audit");
+        assert_eq!(e["metadata"]["tenant_uid"], T);
+        assert_eq!(e["metadata"]["ingress_transport"], "landing_bucket");
+        assert_eq!(e["class_uid"], 6003);
+        e["metadata"]["uid"].as_str().unwrap().to_string()
+    }).collect();
+    uids.sort();
+    assert_eq!(uids, [ids[0], ids[1]], "the audit event ids stay the uids (replays dedupe in ingest[T])");
+}
+

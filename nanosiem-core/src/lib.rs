@@ -33,6 +33,13 @@ pub mod ai_budget_model;
 // `nanosiem-core/src/airgap` directory outright (tools/sync-to-nano-mirror.sh).
 #[cfg(feature = "enterprise")]
 pub mod airgap;
+// Protocol types remain available to sovereign roots; cryptographic offline
+// verification itself refuses without the existing enterprise edition.
+pub mod offline_content;
+// NAN-4666: typed sovereign app-tier facts from the installation mount.
+pub mod sovereign_runtime;
+#[cfg(feature = "enterprise")]
+pub(crate) mod enterprise_shared_content_staging;
 pub mod audit;
 pub mod auth;
 pub mod baseline;
@@ -413,6 +420,10 @@ pub mod ingest_sender_templates;
 /// Named, revocable per-sender ingest tokens for dedicated deployments (NAN-3770).
 pub mod ingest_tokens;
 pub mod inputlookup;
+/// Bounded native landing transport data; never tenant or execution authority.
+pub mod landing_bytes;
+/// Bounded Parquet page-header walk (decoded-size claims tied to the footer).
+pub mod parquet_page_bounds;
 /// Read-only status of OCSF bucket-drop sources (NAN-3807).
 pub mod landing_sources;
 pub mod ip_allowlist;
@@ -465,6 +476,7 @@ pub mod udm_context;
 pub mod upload;
 pub mod vector_naming;
 pub mod webhooks;
+pub mod demo_outbound;
 
 pub use audit::{
     AuditEmitError,

@@ -333,6 +333,7 @@ function AiTab({
               onChange={onHintsChange}
               ruleMetadata={ruleMeta}
               melodConnected={melodConnected}
+              ruleId={ruleId ?? null}
             />
           </div>
         ) : (

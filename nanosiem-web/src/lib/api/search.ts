@@ -76,6 +76,28 @@ import { retrySearchAuthority, type AuthorityRetryOptions } from './search-autho
  */
 export const ACCEPT_ASYNC_HEADER = 'x-nano-accept-async';
 
+/**
+ * NAN-4593: the atomic `search()` callers render `results` only, so a
+ * `{job_id, status}` answer (no `results`) would read as "no matches". The
+ * server never sends one to an opted-out caller; should one arrive anyway
+ * (an older server, a proxy), fail loudly instead of rendering an empty set.
+ */
+export class SearchMovedToJobError extends Error {
+  readonly jobId: string;
+  constructor(jobId: string) {
+    super('This search is still running as a background job; open it in Search to see its results.');
+    this.name = 'SearchMovedToJobError';
+    this.jobId = jobId;
+  }
+}
+
+export function requireSyncSearchAnswer(response: SearchResponse | AsyncSearchResponse): SearchResponse {
+  if (response && typeof response === 'object' && 'job_id' in response && !('results' in response)) {
+    throw new SearchMovedToJobError(String((response as AsyncSearchResponse).job_id));
+  }
+  return response as SearchResponse;
+}
+
 export class SearchApi {
   constructor(
     private request: <T>(
@@ -89,12 +111,13 @@ export class SearchApi {
 
   // Core search endpoints
   async search(request: SearchRequest): Promise<SearchResponse> {
-    return this.request('/api/search', {
+    const response = await this.request<SearchResponse | AsyncSearchResponse>('/api/search', {
       // Callers render `results` only; never hand them a job id at the deadline.
       headers: { [ACCEPT_ASYNC_HEADER]: '0' },
       method: 'POST',
       body: JSON.stringify(request),
     });
+    return requireSyncSearchAnswer(response);
   }
 
   /**

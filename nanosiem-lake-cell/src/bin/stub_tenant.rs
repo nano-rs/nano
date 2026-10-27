@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct Stub {
+    control: child::ControlChannel,
+    received_secrets: AtomicU64,
     a: Assignment,
     secret_sha256: String,
     landlock: String,
@@ -280,6 +282,7 @@ fn probe(kind: &str, q: &HashMap<String, String>, stub: &Stub) -> Value {
                 "secret_sha256": stub.secret_sha256, "landlock": stub.landlock,
                 "env": std::env::vars().map(|(k, _)| k).collect::<Vec<_>>(),
                 "parts_written": stub.parts.load(Ordering::Relaxed),
+                "received_secrets": stub.received_secrets.load(Ordering::SeqCst),
                 "memory_cap_bytes": stub.a.memory_cap_bytes,
                 "status": self_status(),
             })
@@ -508,6 +511,34 @@ fn probe(kind: &str, q: &HashMap<String, String>, stub: &Stub) -> Value {
                 }
             }
         }
+        "fill_disk" => {
+            use std::io::Write;
+            let path = stub.a.tmp_dir.join("bounded-disk-probe");
+            let result = (|| -> std::io::Result<()> {
+                let mut file = std::fs::File::create(&path)?;
+                let block = vec![1_u8; 1024 * 1024];
+                for _ in 0..1024 { file.write_all(&block)?; }
+                file.sync_all()
+            })();
+            let _ = std::fs::remove_file(&path);
+            io_outcome(result)
+        }
+        "fill_pids" => {
+            let mut handles = Vec::new();
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            let mut failure = None;
+            for _ in 0..512 {
+                match std::thread::Builder::new().stack_size(128 * 1024).spawn(move || {
+                    while std::time::Instant::now() < end { std::thread::sleep(Duration::from_millis(20)); }
+                }) {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => { failure = error.raw_os_error(); break; }
+                }
+            }
+            let tasks = handles.len();
+            for handle in handles { let _ = handle.join(); }
+            json!({"ok": failure.is_none(), "errno": failure, "spawned": tasks})
+        }
         "write_data" => io_outcome(std::fs::write(arg("path"), arg("data"))),
         "spin" => {
             // Burn CPU on `threads` threads for `secs` seconds (the CPU
@@ -569,6 +600,12 @@ impl Stub {
             .into();
         let _ = req.into_body().collect().await?;
         let body = match path.strip_prefix("/probe/") {
+            Some("refresh") => {
+                match self.control.request_secrets().await {
+                    Ok(()) => json!({"ok": true, "received_secrets": self.received_secrets.load(Ordering::SeqCst)}),
+                    Err(error) => json!({"ok": false, "error": error.to_string()}),
+                }
+            }
             Some(kind) => {
                 let me = self.clone();
                 let kind = kind.to_owned();
@@ -607,6 +644,10 @@ impl Stub {
 
 #[async_trait::async_trait]
 impl TenantService for Stub {
+    async fn secrets(self: Arc<Self>, _secret: zeroize::Zeroizing<Vec<u8>>) {
+        let n = self.received_secrets.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = std::fs::write(self.a.state_dir.join("secret-deliveries"), n.to_string());
+    }
     async fn handle_rpc(self: Arc<Self>, _request_id: u64, stream: tokio::net::UnixStream) {
         let me = self.clone();
         let svc = hyper::service::service_fn(move |req| me.clone().serve(req));
@@ -677,6 +718,8 @@ fn main() -> anyhow::Result<()> {
             _ => None,
         };
         let stub = Arc::new(Stub {
+            control: control.clone(),
+            received_secrets: AtomicU64::new(0),
             secret_sha256: hex::encode(Sha256::digest(&secret[..])),
             a,
             landlock,

@@ -85,17 +85,21 @@ interface PageContextProviderProps {
 export function PageContextProvider({ children }: PageContextProviderProps) {
   const location = useLocation();
   const pageKey = useMemo(() => pageKeyFor(location.pathname), [location.pathname]);
-  const [hereCard, setHereCardRaw] = useState<HereCardData | null>(null);
+  // An override belongs to the page that set it. NAN-4597: this used to be
+  // cleared by a `[pageKey]` effect, but parent effects run after child
+  // effects, so the reset wiped the override a page had just registered on
+  // mount (and on every navigation) and the Here card fell back to the
+  // static entry. Tagging the override with its pageKey resets it on route
+  // changes without racing the page's own effect.
+  const [override, setOverride] = useState<{ pageKey: string; card: HereCardData } | null>(null);
+  const hereCard = override && override.pageKey === pageKey ? override.card : null;
 
-  // Route changes reset any page-level override — each route mount is
-  // responsible for registering its own card.
-  useEffect(() => {
-    setHereCardRaw(null);
-  }, [pageKey]);
-
-  const setHereCard = useCallback((data: HereCardData | null) => {
-    setHereCardRaw(data);
-  }, []);
+  const setHereCard = useCallback(
+    (data: HereCardData | null) => {
+      setOverride(data ? { pageKey, card: data } : null);
+    },
+    [pageKey],
+  );
 
   const value = useMemo<PageContextValue>(
     () => ({ pageKey, hereCard, setHereCard }),
@@ -134,6 +138,12 @@ export function usePageContext(): PageContextValue {
  * ```
  *
  * Passing `null` keeps the static registry entry.
+ *
+ * Call it only from a component mounted by its route (a page). The override
+ * is tagged with the pageKey current when it registers, and `setHereCard`
+ * changes with every route, so a component that stays mounted across routes
+ * (layout, rail, pivt panel) would re-register on each navigation and its
+ * card would replace the Here card on every page.
  */
 export function useHereCardOverride(card: HereCardData | null): void {
   const { setHereCard } = usePageContext();

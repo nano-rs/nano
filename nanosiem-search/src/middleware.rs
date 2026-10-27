@@ -1071,6 +1071,31 @@ pub async fn product_view_memory_middleware(request: Request, next: Next) -> Res
     }
 }
 
+/// NAN-4664: every HTTP search runs with an admission wait budget: the
+/// caller's `x-nano-admission-wait-ms` (agents and API callers opt into a
+/// longer wait, `0` fails fast), else
+/// [`nanosiem_core::search::admission::DEFAULT_ADMISSION_WAIT`]. Admission
+/// caps it at the configured `queue_timeout_ms`.
+pub async fn admission_wait_budget_middleware(request: Request, next: Next) -> Response {
+    let headers = request.headers();
+    let header = headers
+        .get(nanosiem_core::search::admission::ADMISSION_WAIT_HEADER)
+        .and_then(|value| value.to_str().ok());
+    // An atomic caller (`x-nano-accept-async: 0`, e.g. shipped desktop
+    // builds) can never be handed a job, so without its own budget it keeps
+    // the full configured queue wait it always had instead of a 429 at 60 s.
+    let atomic = headers
+        .get("x-nano-accept-async")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0");
+    let budget = if header.is_none() && atomic {
+        std::time::Duration::MAX
+    } else {
+        nanosiem_core::search::admission::request_wait_budget(header)
+    };
+    nanosiem_core::search::admission::with_wait_budget(budget, next.run(request)).await
+}
+
 // ============================================================================
 // IP Allowlist Middleware
 // ============================================================================

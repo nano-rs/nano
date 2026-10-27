@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 import { expect, it, vi } from 'vitest';
-import { SearchApi } from './search';
+import { SearchApi, SearchMovedToJobError } from './search';
 it('passes log, status and artifact AbortSignals to the transport', async () => {
   const request = vi.fn(async () => ({}));
   const search = new SearchApi(request as never);
@@ -31,4 +31,16 @@ it('keeps the atomic search synchronous now the deadline applies by default (NAN
   await search.search({ query: 'error', time_range: { start: 'a', end: 'b' } } as never);
   const init = (request.mock.calls[0] as unknown as [string, RequestInit])[1];
   expect(init.headers).toEqual({ 'x-nano-accept-async': '0' });
+});
+it('fails loudly instead of rendering a job id as an empty result (NAN-4593)', async () => {
+  const request = vi.fn(async () => ({ job_id: 'shed', status: 'queued' }));
+  const search = new SearchApi(request as never);
+  await expect(search.search({ query: 'error', time_range: { start: 'a', end: 'b' } } as never))
+    .rejects.toBeInstanceOf(SearchMovedToJobError);
+});
+it('still returns a genuinely empty synchronous result (NAN-4593)', async () => {
+  const request = vi.fn(async () => ({ results: [], total_count: 0 }));
+  const search = new SearchApi(request as never);
+  await expect(search.search({ query: 'error', time_range: { start: 'a', end: 'b' } } as never))
+    .resolves.toEqual({ results: [], total_count: 0 });
 });

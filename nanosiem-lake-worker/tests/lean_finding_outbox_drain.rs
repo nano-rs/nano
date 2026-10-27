@@ -226,7 +226,10 @@ async fn two_tenants_commit_before_ack_and_replay() {
     let store = LocalObjectStore::new(dir.path().join("store")).unwrap();
     let signer_a = LocalPartSigner::new("lab-risk-a", SigningKey::from_bytes(&[3; 32])).unwrap();
     let signer_b = LocalPartSigner::new("lab-risk-b", SigningKey::from_bytes(&[4; 32])).unwrap();
-    let now_ms = 1_790_444_800_000_i64;
+    // Real time: attempt markers are listed from the receipts' Last-Modified
+    // (NAN-4181), so a fixed past clock hid the crash marker and the restart
+    // re-sent a committed finding (the writer refused the double consume).
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let queue_a = SpoolQueue::new(dir.path().join("spool-a"), A).unwrap();
     let queue_b = SpoolQueue::new(dir.path().join("spool-b"), B).unwrap();
     let mut append_a = fixture_append(A, dir.path(), &store, &queue_a, &signer_a, now_ms).await;

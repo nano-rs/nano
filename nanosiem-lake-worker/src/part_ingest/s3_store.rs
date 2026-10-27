@@ -445,6 +445,9 @@ impl ObjectStore for S3ObjectStore {
             Err(e) => Err(e.into()),
         }
     }
+    async fn object_identity(&self, key: &str) -> Result<Option<(String, u64)>> {
+        self.stat_strong(key).await
+    }
     async fn modified_ms(&self, key: &str) -> Result<Option<i64>> {
         match self.op.load().stat(key).await {
             Ok(meta) => Ok(meta.last_modified().and_then(|modified| {

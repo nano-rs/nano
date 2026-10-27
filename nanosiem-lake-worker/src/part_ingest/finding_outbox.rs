@@ -15,6 +15,7 @@ use sqlx::Row;
 
 use super::finding_append::{FindingAppendRequest, FindingAppendTransport};
 use super::finding_attempts::{attempted_receipts, AttemptCache};
+use super::finding_floors::{floors_for, put_floor_logged, FloorCache, FLOOR_EVERY};
 use super::ingest::FINDING_IO_CONCURRENCY;
 use super::schema::{additive_merge, decode, infer_schema};
 use super::writer::{publish_parts, sort_by_time_uid, PartDraft, PartWriter, PartialSource};
@@ -84,23 +85,57 @@ impl FindingReceipt {
     }
 }
 
-/// Exact signed-log evidence of one consumed receipt. Scans immutable entries
-/// from genesis, including entries older than the live-set's 48-hour source
-/// memory. Caller verifies receipt bytes and signed part provenance before ack.
+/// Exact signed-log evidence of one consumed receipt. Caller verifies
+/// receipt bytes and signed part provenance before ack.
+///
+/// NAN-4656: the scan resumes after the weakest durable replay floor of the
+/// wanted receipts ([`super::finding_floors`]) and records its own progress,
+/// so a proof reads only the entries no earlier proof or commit has covered.
+/// With no floor for some wanted receipt it reads from genesis, including
+/// entries older than the live-set's 48-hour source memory.
 pub async fn committed_receipts(
     store: &dyn ObjectStore,
     tenant_id: &str,
     wanted: &[SourceRef],
     trusted: &TenantKeySet,
 ) -> Result<BTreeMap<String, (u64, String)>> {
+    committed_receipts_cached(store, tenant_id, wanted, trusted, &FloorCache::default()).await
+}
+
+/// [`committed_receipts`] reusing floor bodies already read.
+pub async fn committed_receipts_cached(
+    store: &dyn ObjectStore,
+    tenant_id: &str,
+    wanted_refs: &[SourceRef],
+    trusted: &TenantKeySet,
+    floor_cache: &FloorCache,
+) -> Result<BTreeMap<String, (u64, String)>> {
     validate_tenant_uuid(tenant_id)?;
     let keys = LogKeys::new(tenant_id)?;
-    let wanted = wanted.iter().map(|source| (source.key.as_str(), source.sha256.as_str())).collect::<Vec<_>>();
+    let identity = |source: &SourceRef| (source.key.clone(), source.sha256.clone(), source.version.clone());
+    let floors = floors_for(store, tenant_id, wanted_refs, floor_cache).await?;
+    // Every wanted receipt is proven absent through the weakest of their
+    // floors; one receipt with no floor means genesis.
+    let resume = wanted_refs.iter().map(|source| floors.get(&identity(source)).cloned())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|bounds| bounds.into_iter().min_by_key(|(seq, _)| *seq));
+    let wanted = wanted_refs.iter().map(|source| (source.key.as_str(), source.sha256.as_str())).collect::<Vec<_>>();
     let mut committed = BTreeMap::new();
     let mut verified = LiveSet::default();
-    let mut prev = GENESIS_PREV.to_owned();
+    let (mut next, mut prev, mut min_epoch) = match &resume {
+        Some((seq, sha)) => {
+            // Trusted like a checkpoint: the entry it names must exist with
+            // the recorded digest; the chain is verified from there on.
+            let bytes = store.get(&keys.entry(*seq)).await?.context("finding replay floor names a missing entry")?;
+            ensure!(sha256_hex(&bytes) == *sha, "finding replay floor does not match its entry");
+            let entry = LogEntry::parse_bytes(&bytes, tenant_id)?;
+            ensure!(entry.seq == *seq, "finding replay floor names another entry");
+            (seq + 1, sha.clone(), entry.writer_epoch)
+        }
+        None => (0u64, GENESIS_PREV.to_owned(), 0u64),
+    };
+    let start = next;
     let started = std::time::Instant::now();
-    let mut next = 0u64;
     let mut window = std::collections::VecDeque::new();
     loop {
         // Entries are fetched REPLAY_FETCH_WINDOW at a time, concurrently,
@@ -114,17 +149,28 @@ pub async fn committed_receipts(
         let Some(Some(bytes)) = window.pop_front() else { break };
         let seq = next;
         next += 1;
-        if seq > 0 && seq % REPLAY_PROGRESS_EVERY == 0 {
-            tracing::info!(tenant_id, seq, wanted = wanted.len(), found = committed.len(),
+        if seq > start && (seq - start) % REPLAY_PROGRESS_EVERY == 0 {
+            tracing::info!(tenant_id, seq, start, wanted = wanted.len(), found = committed.len(),
                 elapsed_s = started.elapsed().as_secs(), "finding replay scanning the part log");
         }
         let entry = LogEntry::parse_bytes(&bytes, tenant_id)?;
         ensure!(entry.seq == seq && entry.prev_sha256 == prev, "finding replay saw a broken part-log chain");
+        ensure!(entry.writer_epoch >= min_epoch, "finding replay saw the writer epoch regress");
+        min_epoch = entry.writer_epoch;
         let sha = sha256_hex(&bytes);
-        verified.apply(&entry, &sha)?;
+        if resume.is_none() {
+            // From genesis the whole fold is checked too; a resumed scan has
+            // no live set to fold into (as after a checkpoint, the chain is).
+            verified.apply(&entry, &sha)?;
+        }
         if let LogOp::Add { consumed, parts, edge_log } = &entry.op {
             for source in consumed {
                 if wanted.iter().any(|(key, digest)| *key == source.key && *digest == source.sha256) {
+                    // A floor is a proof of absence: a consumption at or
+                    // below it means a floor lied. Fail-stop, never ack.
+                    if let Some((floor, _)) = floors.get(&identity(source)) {
+                        ensure!(seq > *floor, "finding receipt is consumed at seq {seq}, below its replay floor {floor}");
+                    }
                     ensure!(edge_log.is_none(), "finding receipt was consumed as an edge source");
                     let receipt_bytes = store.get(&source.key).await?.context("committed finding receipt is missing")?;
                     FindingReceipt::parse(&receipt_bytes, tenant_id, source)?;
@@ -152,18 +198,40 @@ pub async fn committed_receipts(
             }
         }
         prev = sha;
+        if (seq + 1 - start) % FLOOR_EVERY == 0 {
+            // Durable progress: a proof cut here (deadline, restart, the
+            // other role) resumes after `seq`, not at genesis.
+            let absent = unfound(wanted_refs, &committed);
+            put_floor_logged(store, tenant_id, seq, &prev, &absent).await;
+        }
     }
-    tracing::info!(tenant_id, entries = next, wanted = wanted.len(), found = committed.len(),
-        elapsed_ms = started.elapsed().as_millis() as u64, "finding replay scanned the part log");
+    if next > start && (next - start) % FLOOR_EVERY != 0 {
+        let absent = unfound(wanted_refs, &committed);
+        put_floor_logged(store, tenant_id, next - 1, &prev, &absent).await;
+    }
+    tracing::info!(tenant_id, start, entries = next - start, head = next.checked_sub(1), wanted = wanted.len(),
+        found = committed.len(), elapsed_ms = started.elapsed().as_millis() as u64, "finding replay scanned the part log");
     Ok(committed)
+}
+
+/// The wanted receipts a scan has not found (deduplicated).
+fn unfound(wanted: &[SourceRef], committed: &BTreeMap<String, (u64, String)>) -> Vec<SourceRef> {
+    let mut seen = std::collections::BTreeSet::new();
+    wanted.iter()
+        .filter(|source| !committed.contains_key(&source.key) && seen.insert((&source.key, &source.sha256, &source.version)))
+        .cloned()
+        .collect()
 }
 
 /// A drain batch's outbox bytes (compact + OCSF JSON): a few MB per append.
 pub const DRAIN_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Delivered findings stay this long: the seven-day tuning metrics read
-/// them from the outbox (gen1's `lake_risk_publish` keeps the same window).
-pub const OUTBOX_RETENTION_DAYS: i32 = 8;
+/// them from the outbox by event time, and a delivered row's event precedes
+/// its delivery, so a row delivered more than 7 days ago is already outside
+/// that window. NAN-4668 (FP-INC-1027): 7, was 8; the finding-drain DELETE
+/// policy (9015560) allows exactly this window.
+pub const OUTBOX_RETENTION_DAYS: i32 = 7;
 /// Rows removed per prune statement; a larger backlog drains over passes.
 const OUTBOX_PRUNE_BATCH: i64 = 1_000;
 /// How often a long-running drain loop prunes.
@@ -240,12 +308,43 @@ pub struct DrainPass {
     pub skipped: Option<&'static str>,
     /// Delivered rows past [`OUTBOX_RETENTION_DAYS`] removed this pass.
     pub pruned: u64,
+    /// NAN-4610: the retention check made with a scheduled prune; `None` on
+    /// passes that did not prune or when the check itself could not be read.
+    pub retention: Option<RetentionCheck>,
 }
 
 impl DrainPass {
     pub fn oldest_age_ms(&self, now_ms: i64) -> i64 {
         self.oldest_created_ms.map_or(0, |at| now_ms.saturating_sub(at).max(0))
     }
+}
+
+/// What the outbox retains after a scheduled prune (NAN-4610). Delivered
+/// rows are kept [`OUTBOX_RETENTION_DAYS`] on purpose (the tuning metrics read
+/// them), so row count alone cannot tell a full window from a prune that
+/// stopped working; the oldest retained delivery can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionCheck {
+    /// `published_at` (unix ms) of this tenant's oldest delivered row still in
+    /// the outbox; `None` when none is retained.
+    pub oldest_retained_published_ms: Option<i64>,
+}
+
+impl RetentionCheck {
+    /// How long (ms) the oldest retained delivered row has outlived the
+    /// retention window: 0 while retention keeps up. It keeps growing when
+    /// the prune fails (a revoked grant, a policy drift) or cannot keep up.
+    pub fn overdue_ms(&self, now_ms: i64) -> i64 {
+        retention_overdue_ms(self.oldest_retained_published_ms, now_ms)
+    }
+}
+
+/// [`RetentionCheck::overdue_ms`] for a stored `published_at` (unix ms).
+pub fn retention_overdue_ms(oldest_retained_published_ms: Option<i64>, now_ms: i64) -> i64 {
+    const DAY_MS: i64 = 86_400_000;
+    oldest_retained_published_ms.map_or(0, |at| {
+        now_ms.saturating_sub(at).saturating_sub(i64::from(OUTBOX_RETENTION_DAYS) * DAY_MS).max(0)
+    })
 }
 
 struct PendingFinding {
@@ -316,6 +415,8 @@ pub struct DrainLogCache {
     next_prune_ms: i64,
     /// NAN-4181: attempt marker bodies already read (immutable).
     attempts: AttemptCache,
+    /// NAN-4656: replay floor bodies already read (immutable).
+    floors: FloorCache,
 }
 
 impl DrainLogCache {
@@ -415,9 +516,11 @@ async fn drain_pass_authorized(
     ensure!(writer_epoch > 0, "finding drain has no writer epoch");
     let tenant_uuid = uuid::Uuid::parse_str(tenant_id)?;
     let mut pruned = 0;
+    let mut retention = None;
     if now_ms >= cache.next_prune_ms {
         cache.next_prune_ms = now_ms.saturating_add(OUTBOX_PRUNE_EVERY_MS);
         pruned = prune_delivered(pool, tenant_uuid, tenant_id).await;
+        retention = retention_check(pool, tenant_uuid, tenant_id).await;
     }
     let mut tx = pool.begin().await?;
     if require_hosted_principal {
@@ -427,7 +530,7 @@ async fn drain_pass_authorized(
         ensure!(binding.0 == Some(tenant_uuid) && binding.1.as_deref() == Some("finding_drain"),
             "finding drain database principal is not bound to this tenant and capability");
     }
-    let mut pass = DrainPass { pruned, ..DrainPass::default() };
+    let mut pass = DrainPass { pruned, retention, ..DrainPass::default() };
     let (backlog, oldest): (i64, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
         "SELECT count(*), min(created_at) FROM detection_finding_lake_outbox \
          WHERE security_tenant_id = $1 AND tenant_id = $2 \
@@ -507,6 +610,28 @@ async fn prune_delivered(pool: &sqlx::PgPool, tenant_uuid: uuid::Uuid, tenant_id
         Err(error) => {
             tracing::warn!(tenant_id, error = %error, "finding outbox prune failed; delivery continues");
             0
+        }
+    }
+}
+
+/// The oldest delivered row this tenant still retains (NAN-4610). Read after
+/// every scheduled prune, whether or not the prune succeeded, so a prune that
+/// silently stops deleting shows up as a growing overdue age. Served by the
+/// `published_at IS NOT NULL` retention index (310). Best effort: `None` on
+/// error, and the caller keeps its previous reading.
+async fn retention_check(pool: &sqlx::PgPool, tenant_uuid: uuid::Uuid, tenant_id: &str) -> Option<RetentionCheck> {
+    let oldest: Result<Option<chrono::DateTime<chrono::Utc>>, _> = sqlx::query_scalar(
+        "SELECT min(published_at) FROM detection_finding_lake_outbox \
+         WHERE security_tenant_id = $1 AND tenant_id = $2 AND published_at IS NOT NULL",
+    )
+    .bind(tenant_uuid)
+    .bind(tenant_id)
+    .fetch_one(pool).await;
+    match oldest {
+        Ok(oldest) => Some(RetentionCheck { oldest_retained_published_ms: oldest.map(|at| at.timestamp_millis()) }),
+        Err(error) => {
+            tracing::warn!(tenant_id, error = %error, "finding outbox retention check failed");
+            None
         }
     }
 }
@@ -594,13 +719,14 @@ async fn publish_claimed(
     pass.preexisting_receipts = preexisting.len();
     if cache.tenant_id.as_deref().is_some_and(|cached| cached != tenant_id) {
         cache.attempts = AttemptCache::default();
+        cache.floors = FloorCache::default();
     }
     let attempted = receipts_needing_log_proof_cached(store, tenant_id, &preexisting, &cache.attempts).await?;
     pass.replay_checked = attempted.len();
     let committed = if attempted.is_empty() {
         BTreeMap::new()
     } else {
-        committed_receipts(store, tenant_id, &attempted, trusted).await?
+        committed_receipts_cached(store, tenant_id, &attempted, trusted, &cache.floors).await?
     };
     let mut acks = BTreeMap::new();
     let mut fresh = Vec::new();
@@ -740,6 +866,21 @@ mod tests {
 
     const TENANT_A: &str = "00000000-0000-4000-8000-000000000001";
     const TENANT_B: &str = "00000000-0000-4000-8000-000000000002";
+
+    /// NAN-4610: a full 7-day window is healthy (overdue 0); only a delivered
+    /// row older than the window counts, and by how much it outlived it.
+    #[test]
+    fn retention_overdue_counts_only_past_the_window() {
+        const DAY: i64 = 86_400_000;
+        let now = 1_800_000_000_000;
+        assert_eq!(RetentionCheck::default().overdue_ms(now), 0, "nothing retained");
+        let within = RetentionCheck { oldest_retained_published_ms: Some(now - 7 * DAY + 1) };
+        assert_eq!(within.overdue_ms(now), 0);
+        let past = RetentionCheck { oldest_retained_published_ms: Some(now - 8 * DAY - 5_000) };
+        assert_eq!(past.overdue_ms(now), DAY + 5_000);
+        assert_eq!(retention_overdue_ms(Some(now + DAY), now), 0, "clock skew never goes negative");
+        assert_eq!(retention_overdue_ms(Some(i64::MIN), now), i64::MAX - 7 * DAY, "saturates instead of overflowing");
+    }
 
     #[test]
     fn receipt_is_stable_and_refuses_foreign_tenant_or_changed_content() {

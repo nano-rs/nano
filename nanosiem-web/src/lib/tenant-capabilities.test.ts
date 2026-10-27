@@ -108,6 +108,45 @@ test('disabled components remain explicit and missing components reject the plan
   );
 });
 
+test('NAN-4435: optional soar component is absent-means-disabled; unknown codes still fail closed', () => {
+  // `lean` plans predate SOAR: the server omits the row entirely.
+  const lean = validateTenantCapabilitySnapshot(response(), expected());
+  assert.equal(lean.components.soar.enabled, false);
+  assert.equal(lean.components.search.enabled, true);
+
+  // `lean-soar` (migration 9014940) serializes `soar` alongside every legacy row.
+  for (const enabled of [true, false]) {
+    const leanSoar = response();
+    (leanSoar.components as Record<string, unknown>).soar = { enabled, configuration: {} };
+    const parsed = validateTenantCapabilitySnapshot(leanSoar, expected());
+    assert.equal(parsed.components.soar.enabled, enabled);
+    for (const code of TENANT_COMPONENT_CODES) {
+      assert.equal(parsed.components[code].enabled, true, code);
+    }
+  }
+
+  const unknown = response();
+  (unknown.components as Record<string, unknown>).unrecognized = { enabled: true, configuration: {} };
+  assert.throws(
+    () => validateTenantCapabilitySnapshot(unknown, expected()),
+    /manifest is incomplete or unknown/,
+  );
+
+  const malformed = response();
+  (malformed.components as Record<string, unknown>).soar = { enabled: 'yes', configuration: {} };
+  assert.throws(
+    () => validateTenantCapabilitySnapshot(malformed, expected()),
+    /component soar is invalid/,
+  );
+
+  const leaky = response();
+  (leaky.components as Record<string, unknown>).soar = { enabled: true, configuration: { api_key: 'x' } };
+  assert.throws(
+    () => validateTenantCapabilitySnapshot(leaky, expected()),
+    /component soar is invalid/,
+  );
+});
+
 test('auth, assignment, and feature revisions are monotonic as one bootstrap', () => {
   const first = validateTenantCapabilitySnapshot(response(TENANT_A, 7), expected());
   const changed = validateTenantCapabilitySnapshot(response(TENANT_A, 8, 12, 14), expected());

@@ -92,9 +92,13 @@ impl ObjectStore for ReserveGuard {
 }
 
 fn event(i: usize, time_ms: i64) -> Value {
-    // The `nan2868_part_ingest` fixture shape (it passes bronze admission).
+    fixture_event(TENANT, &format!("nan4336-{i:05}"), i, time_ms)
+}
+
+/// One bronze row of `tenant` (the `nan2868_part_ingest` fixture shape: it
+/// passes bronze admission), with `metadata.uid` = `uid`.
+pub(crate) fn fixture_event(tenant: &str, uid: &str, i: usize, time_ms: i64) -> Value {
     let time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(time_ms).unwrap();
-    let uid = format!("nan4336-{i:05}");
     let raw = format!("raw {uid} token{i}");
     json!({
         "activity_id": 1, "activity_name": "Logon", "actor": {"user": {"name": format!("USER{}", i % 5)}},
@@ -102,7 +106,7 @@ fn event(i: usize, time_ms: i64) -> Value {
         "class_name": "Authentication", "class_uid": 3002,
         "message": format!("token logon {i}"), "raw_data": raw, "raw_data_size": raw.len(),
         "metadata": {"log_name": "security", "log_source": "hec_skewed",
-            "product": {"name": "fixture", "vendor_name": "nano"}, "tenant_uid": TENANT, "uid": uid, "version": "1.9.0"},
+            "product": {"name": "fixture", "vendor_name": "nano"}, "tenant_uid": tenant, "uid": uid, "version": "1.9.0"},
         "severity": "Informational", "severity_id": 1,
         "src_endpoint": {"ip": format!("10.0.0.{}", i % 250), "hostname": format!("ws-{}.corp.local", i % 11)},
         "dst_endpoint": {"ip": format!("192.168.1.{}", i % 20)},
@@ -112,6 +116,11 @@ fn event(i: usize, time_ms: i64) -> Value {
 }
 
 fn write_bronze(path: &std::path::Path, events: &[Value]) {
+    std::fs::write(path, bronze_bytes(events)).unwrap();
+}
+
+/// A bronze object (Parquet) holding `events`.
+pub(crate) fn bronze_bytes(events: &[Value]) -> Vec<u8> {
     use arrow_json::reader::infer_json_schema_from_seekable;
     let mut lines = Vec::new();
     for event in events {
@@ -124,11 +133,11 @@ fn write_bronze(path: &std::path::Path, events: &[Value]) {
     for batch in reader {
         let batch = batch.unwrap();
         writer
-            .get_or_insert_with(|| parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), batch.schema(), None).unwrap())
+            .get_or_insert_with(|| parquet::arrow::ArrowWriter::try_new(Vec::new(), batch.schema(), None).unwrap())
             .write(&batch)
             .unwrap();
     }
-    writer.unwrap().close().unwrap();
+    writer.unwrap().into_inner().unwrap()
 }
 
 fn notice(key: &str, at: i64) -> SourceNotice {
@@ -424,4 +433,95 @@ async fn a_future_row_without_metadata_is_clamped_and_its_object_lands() {
         assert_eq!(original.timestamp_millis(), future);
         assert!(row["metadata"]["labels"].as_array().unwrap().iter().any(|label| label == TIME_CLAMPED_LABEL), "{row}");
     }
+}
+
+/// NAN-4573: the clamp target is per delivery (its object's receipt time),
+/// so two deliveries of one future-dated event, in different objects, can
+/// be stored in different event hours: one clamped to the hour before the
+/// event, one unclamped, or both clamped to different hours. The window is
+/// per hour, so each copy used to be kept (a permanent duplicate). Every
+/// delivery shares the original time: a clamped row is checked against, and
+/// recorded under, its original hour too. The unclamped-first order also
+/// holds across a restart (the clamped copy hydrates its original hour from
+/// the live parts).
+#[tokio::test(flavor = "current_thread")]
+async fn a_clamped_redelivery_in_another_hour_is_a_duplicate() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    std::fs::create_dir_all(root.join("sources").join("bronze")).unwrap();
+    let parts = ReserveGuard::new(&root.join("parts"));
+    let sources = LocalObjectStore::new(root.join("sources")).unwrap();
+    let spool = SpoolQueue::new(root.join("spool"), TENANT).unwrap();
+    let signer = signer();
+    let mut config = IngestConfig::new(TENANT, root.join("work"));
+    config.flush_interval_override_ms = Some(0);
+    config.prevalence_enabled = false;
+    let seed = seed_schema();
+    let open = || Ingestor::open(config.clone(), &parts, &sources, &spool as &dyn NoticeQueue, &signer,
+        signer.trusted(), BronzeIngestEnricher::disabled(), &seed, CLOCK);
+    let base = BASE_HOUR * 3_600_000;
+    let now = base + 20 * 60_000;
+    parts.control_now_ms.store(now, Ordering::SeqCst);
+    let ahead = base + 10 * 60_000;
+    let far = base + 2 * 3_600_000;
+    // a: clamped first (hour - 1), then unclamped (its own hour).
+    // b: unclamped first, then clamped (hour - 1) after a restart.
+    // c: clamped twice, to two different hours.
+    // One distinct row per object so no two objects are byte-identical.
+    let objects: [(&str, i64, Vec<Value>); 3] = [
+        ("one", base - 60_000, vec![fixture_event(TENANT, "a", 0, ahead), fixture_event(TENANT, "c", 2, far),
+            fixture_event(TENANT, "x1", 3, base - 120_000)]),
+        ("two", base + 9 * 60_000, vec![fixture_event(TENANT, "a", 0, ahead), fixture_event(TENANT, "b", 1, ahead),
+            fixture_event(TENANT, "c", 2, far), fixture_event(TENANT, "x2", 4, base + 60_000)]),
+        ("three", base - 60_000, vec![fixture_event(TENANT, "b", 1, ahead), fixture_event(TENANT, "x3", 5, base - 120_000)]),
+    ];
+    // Delivered one at a time: each object is its own admission (within
+    // one admission, bronze dedups uids before any window lookup).
+    let mut ingestor = open().await.expect("ingest opens");
+    for (step, (name, received, events)) in objects.iter().enumerate() {
+        if step == 2 {
+            assert_eq!(ingestor.health().clamped_cross_hour_duplicates_total, 1, "c, clamped into another hour again");
+            drop(ingestor);
+            ingestor = open().await.expect("ingest reopens");
+        }
+        let key = format!("bronze/{name}.parquet");
+        write_bronze(&root.join("sources").join(&key), events);
+        spool.deliver(&notice(&key, *received)).unwrap();
+        ingestor.tick(now).await.unwrap();
+        ingestor.flush_now(now).await.unwrap();
+        assert!(spool.pending(10).await.unwrap().is_empty(), "{name} acknowledged");
+    }
+    let rows = committed_rows(&parts, &ingestor).await;
+    let mut uids = rows.iter().map(|row| row["metadata"]["uid"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    uids.sort();
+    assert_eq!(uids, ["a", "b", "c", "x1", "x2", "x3"], "every event once");
+    let hours = ingestor.live_parts().iter().map(|part| i64::from(part.event_hour)).collect::<BTreeSet<_>>();
+    assert!(hours.contains(&(BASE_HOUR - 1)) && hours.contains(&BASE_HOUR), "the copies did straddle the hour: {hours:?}");
+    assert_eq!(ingestor.health().clamped_cross_hour_duplicates_total, 1, "b, against its unclamped copy's live part");
+}
+
+/// NAN-4573: the original time the uid window also keys a clamped row by.
+/// A row the landing stage already clamped (labelled, `time` = its
+/// conversion time) keeps its source time; one clamped at admission gets
+/// its pre-clamp time; a labelled row whose `original_time` is not later
+/// than its `time` (nothing a clamp writes) and an unclamped row get none.
+#[test]
+fn admission_keeps_each_clamped_rows_source_time() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("clamped.parquet");
+    let future = CLOCK + FOURTEEN_HOURS_MS;
+    let rfc3339 = |ms: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let labelled = |uid: &str, i: usize, original: i64| {
+        let mut row = fixture_event(TENANT, uid, i, CLOCK - 1_000);
+        row["metadata"]["original_time"] = json!(rfc3339(original));
+        row["metadata"]["labels"] = json!([TIME_CLAMPED_LABEL]);
+        row
+    };
+    write_bronze(&path, &[labelled("landing", 0, future), fixture_event(TENANT, "now", 1, future),
+        labelled("earlier", 2, CLOCK - 3_600_000), fixture_event(TENANT, "plain", 3, CLOCK - 60_000)]);
+    let admission = crate::bronze::admit_bronze_files_received(&[path.clone()], TENANT, &BronzeIngestEnricher::disabled(),
+        &crate::bronze::IngestTimes { received_ms: BTreeMap::from([(path, CLOCK)]), now_ms: CLOCK }).unwrap().0;
+    assert_eq!(admission.batch.rows().len(), 4);
+    assert_eq!(admission.clamped_original_ms, BTreeMap::from([("landing".to_string(), future), ("now".to_string(), future)]));
 }

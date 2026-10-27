@@ -196,7 +196,7 @@ impl std::fmt::Display for AuditSource {
 
 /// Verb lists for [`AuditEvent::ocsf_activity`]. The SQL copy in the latest
 /// `nano_shared.ocsf_api_activity_id` definition
-/// (enterprise migration `9012100_platform_audit_ocsf_iam_classes.sql`,
+/// (enterprise migration `9015390_audit_ocsf_mapping_gaps.sql`,
 /// used for SQL-built audit rows) must list exactly the same verbs —
 /// `sql_activity_verbs_match_rust` enforces it (NAN-3227, NAN-3460).
 const OCSF_CREATE_VERBS: &[&str] = &[
@@ -224,7 +224,7 @@ const OCSF_UPDATE_VERBS: &[&str] = &[
     "regenerated", "escalated", "dismissed", "accepted", "canceled", "cancelled",
     "paused", "resumed", "reordered", "restricted", "unrestricted", "enforced",
     "fulfilled", "saved", "rolled", "anonymized", "pushed", "promote", "retire",
-    "retired", "renewed", "superseded", "expired",
+    "retired", "renewed", "superseded", "expired", "synchronized",
 ];
 const OCSF_DELETE_VERBS: &[&str] = &[
     "delete", "deleted", "remove", "removed", "uninstall", "uninstalled",
@@ -1422,7 +1422,7 @@ mod tests {
 
     #[cfg(feature = "enterprise")]
     /// NAN-3227: SQL-built audit rows are classified by
-    /// `nano_shared.ocsf_api_activity_id` (migration 9012100). Its verb lists
+    /// `nano_shared.ocsf_api_activity_id` (migration 9015390). Its verb lists
     /// must equal the Rust ones, in order, or the same action would get a
     /// different OCSF activity depending on which writer built the row.
     #[test]
@@ -1433,7 +1433,7 @@ mod tests {
         // when the file is genuinely absent; any other IO error fails.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../migrations/postgres-enterprise/9012100_platform_audit_ocsf_iam_classes.sql"
+            "/../migrations/postgres-enterprise/9015390_audit_ocsf_mapping_gaps.sql"
         );
         let sql = match std::fs::read_to_string(path) {
             Ok(sql) => sql,
@@ -1464,7 +1464,7 @@ mod tests {
             ("delete_verbs", OCSF_DELETE_VERBS),
             ("non_crud_verbs", OCSF_NON_CRUD_VERBS),
         ] {
-            assert_eq!(list(name), rust, "{name} drifted between Rust and 9012100");
+            assert_eq!(list(name), rust, "{name} drifted between Rust and 9015390");
         }
     }
 

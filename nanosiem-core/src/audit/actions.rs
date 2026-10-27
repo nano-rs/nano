@@ -719,6 +719,17 @@ pub const MELOD_BACKGROUND_AI_RAN: &str = "melod_background_ai_ran";
 /// enterprise-shared). Details carry the brief size, category, step count and
 /// whether the single repair pass was needed — never the brief text itself.
 pub const MELOD_PLAYBOOK_DRAFTED: &str = "melod_playbook_drafted";
+/// NAN-4535: pivt drafted a disabled SOAR flow from an analyst brief
+/// (enterprise-shared). Details carry the brief size, trigger kind, module
+/// count, the created draft flow id and whether the single repair pass was
+/// needed, never the brief text itself.
+pub const MELOD_FLOW_DRAFTED: &str = "melod_flow_drafted";
+/// NAN-4653: pivt proposed a revision of an open artifact in a conversational
+/// edit session (kind, artifact id and base version). Nothing is saved: the
+/// page applies the revision as an unsaved change. Details carry sizes, the
+/// changed-part count, findings and outcome, never the instruction or the
+/// conversation text.
+pub const MELOD_ARTIFACT_REVISION_DRAFTED: &str = "melod_artifact_revision_drafted";
 /// Retention configuration was updated
 pub const RETENTION_CONFIG_UPDATED: &str = "retention_config_updated";
 /// Retention was manually triggered
@@ -772,6 +783,10 @@ pub const AVAILABLE_MODEL_DELETED: &str = "available_model_deleted";
 pub const MODEL_CATALOG_SYNCED: &str = "model_catalog_synced";
 /// Webhook was tested
 pub const WEBHOOK_TESTED: &str = "webhook_tested";
+
+/// The sovereign capacity advisor raised, changed or cleared a
+/// recommendation (add hosts, add disks, raise host RAM/CPU, grow a cell volume).
+pub const SOVEREIGN_CAPACITY_RECOMMENDED: &str = "sovereign_capacity_recommended";
 
 /// A system-health lifecycle was acknowledged by an owner.
 pub const SYSTEM_HEALTH_ACKNOWLEDGED: &str = "system_health_acknowledged";

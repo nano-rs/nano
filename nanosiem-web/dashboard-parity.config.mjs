@@ -7,7 +7,7 @@ const mocks = {
   '@/contexts/AuthContext': `export const useAuth=()=>({hasPermission:()=>true});`,
   '@/hooks/use-capabilities': `export const useCapabilities=()=>({capabilities:{melod:true}});`,
   '@/hooks/use-toast': `export const useToast=()=>({toast:()=>{}});`,
-  '@/enterprise/components/dashboard/DashboardGenerationWizard': `export const DashboardGenerationWizard=()=>null;`,
+  '@/enterprise/components/pivt/commands/router': `export const openPivtPanel=()=>{};`,
 };
 export default defineConfig({
   plugins: [

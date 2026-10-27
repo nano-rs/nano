@@ -148,6 +148,75 @@ fn body(value: Value) -> Result<FormattedBody, String> {
     })
 }
 
+/// Catalog actions reuse the channel definitions, with only the envelope their
+/// authenticated API requires. No catalog spec, destination or secret is loaded
+/// here. Existing incoming-webhook channel bodies remain unchanged.
+pub enum NotificationTransport<'a> {
+    Generic,
+    SlackChat {
+        channel: &'a str,
+    },
+    TeamsGraph,
+    /// The native auth plugin injects the connection's routing key after render.
+    PagerDuty,
+}
+
+/// Read the serialized canonical event without changing the legacy channel
+/// deserializer. Its custom TypeID adapters require explicit nulls, whereas the
+/// serializer omits absent alert/rule IDs (in particular for case events).
+pub fn decode_notification_event(mut value: Value) -> Result<WebhookPayload, serde_json::Error> {
+    if let Some(object) = value.as_object_mut() {
+        for field in ["alert_id", "rule_id"] {
+            object.entry(field).or_insert(Value::Null);
+        }
+    }
+    serde_json::from_value(value)
+}
+
+pub fn build_notification_body(
+    transport: NotificationTransport<'_>,
+    payload: &WebhookPayload,
+) -> Result<Vec<u8>, String> {
+    let ctx = FormatContext { routing_key: None };
+    let value = match transport {
+        NotificationTransport::Generic => {
+            return Ok(build_channel_body(ChannelType::Generic, payload, &ctx)?.bytes);
+        }
+        NotificationTransport::SlackChat { channel } => {
+            if channel.is_empty() {
+                return Err("Slack notification requires a channel".into());
+            }
+            let mut value = SlackFormatter.format(payload, &ctx);
+            value["channel"] = json!(channel);
+            value["parse"] = json!("none");
+            value["unfurl_links"] = json!(false);
+            value["unfurl_media"] = json!(false);
+            value
+        }
+        NotificationTransport::TeamsGraph => {
+            let card = TeamsFormatter.format(payload, &ctx);
+            json!({
+                "body": {"contentType":"html", "content":"<attachment id=\"nano-notification\"></attachment>"},
+                "attachments": [{
+                    "id":"nano-notification",
+                    "contentType":"application/vnd.microsoft.card.adaptive",
+                    "content": serde_json::to_string(&card["attachments"][0]["content"])
+                        .map_err(|e| e.to_string())?
+                }]
+            })
+        }
+        NotificationTransport::PagerDuty => {
+            let mut value = PagerDutyFormatter.format(payload, &ctx);
+            value
+                .as_object_mut()
+                .expect("PagerDuty object")
+                .remove("routing_key");
+            value
+        }
+    };
+    Ok(body(value)?.bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Shared display helpers
 // ---------------------------------------------------------------------------

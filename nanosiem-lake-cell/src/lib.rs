@@ -35,7 +35,9 @@ pub mod identity;
 pub mod jail;
 pub mod limits;
 pub mod oom;
+pub mod part_channel;
 pub mod pidfd;
+pub mod policy;
 pub mod procfs;
 pub mod probe;
 pub mod report;
@@ -52,3 +54,6 @@ pub mod uidmap;
 pub mod upstream;
 pub mod watchdog;
 pub mod volume_usage;
+
+/// Native sealed worker launcher; no hosted behavior change.
+pub mod worker_launch;

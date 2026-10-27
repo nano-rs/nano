@@ -27,7 +27,87 @@ pub struct HostedExportTarget {
     source: Arc<dyn ObjectStore>,
     keys: TenantKeySet,
     bucket: String,
+    verified: Option<VerifiedFiles>,
 }
+
+/// NAN-4614: data files whose bytes (signed SHA-256) and Parquet footer
+/// (against one exact schema) this writer already verified, one small record
+/// per data key on the writer's private custody volume. Preparing a file
+/// again (a retried or cut-off batch, the fresh serving epoch that registers
+/// the master's files a second time) re-checks the part's signed provenance,
+/// but skips the full-object read only when the signed digest, row count and
+/// schema are exactly the recorded ones AND the object still has the strong
+/// identity (ETag) it had across the verified read: a replaced object (same
+/// key and size, other bytes) is a different ETag and is read in full. A
+/// miss, an unreadable or foreign record, or a store that cannot report an
+/// identity is a full verification: the memo only ever saves IO.
+pub(crate) struct VerifiedFiles {
+    dir: std::path::PathBuf,
+    tenant: String,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedFile {
+    tenant: String,
+    key: String,
+    bytes: u64,
+    sha256: String,
+    rows: u64,
+    schema_sha256: String,
+    /// The object's strong identity, unchanged from before to after the
+    /// verified full read.
+    etag: String,
+}
+
+impl VerifiedFiles {
+    fn path(&self, key: &str) -> std::path::PathBuf {
+        use sha2::Digest;
+        self.dir
+            .join(format!("{}.json", hex::encode(sha2::Sha256::digest(key.as_bytes()))))
+    }
+    fn contains(&self, entry: &VerifiedFile) -> bool {
+        std::fs::read(self.path(&entry.key))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<VerifiedFile>(&bytes).ok())
+            .is_some_and(|found| found == *entry)
+    }
+    /// Drop every record that names no data file of `live`. Only costs a
+    /// re-verification should such a file ever be prepared again.
+    fn retain(&self, tenant: &str, live: &[crate::parts::part_log::PartRef]) -> Result<usize> {
+        let mut keep = std::collections::BTreeSet::new();
+        for part in live {
+            let keys = PartKeys::new(tenant, part.level, part.event_hour, &part.part_id)?;
+            for index in 0..part.data_files as usize {
+                keep.insert(self.path(&keys.data(index)));
+            }
+        }
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut pruned = 0;
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") && !keep.contains(&path) {
+                std::fs::remove_file(&path)?;
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+    fn record(&self, entry: &VerifiedFile) {
+        let written = std::fs::create_dir_all(&self.dir).map_err(anyhow::Error::from).and_then(|()| {
+            crate::part_ingest::export::atomic_write(&self.path(&entry.key), &serde_json::to_vec(entry)?, false)
+        });
+        if let Err(error) = written {
+            // Only costs a re-verification of this file later.
+            tracing::warn!(error = %format!("{error:#}"), "export verified-file record not written");
+        }
+    }
+}
+
 impl HostedExportTarget {
     pub(crate) fn new(
         tenant: String,
@@ -45,7 +125,27 @@ impl HostedExportTarget {
             source,
             keys,
             bucket,
+            verified: None,
         })
+    }
+
+    /// NAN-4614: keep [`VerifiedFiles`] under `dir`, a directory private to
+    /// this tenant's single writer.
+    pub(crate) fn with_verified_files(mut self, dir: std::path::PathBuf) -> Self {
+        self.verified = Some(VerifiedFiles { dir, tenant: self.tenant.clone() });
+        self
+    }
+    /// NAN-4614: forget verified-file records of data files outside `live`
+    /// (merged away, erased, retired), so the memo tracks the live set
+    /// instead of growing with every file ever exported.
+    pub(crate) fn retain_verified(&self, live: &[crate::parts::part_log::PartRef]) -> Result<()> {
+        if let Some(memo) = &self.verified {
+            let pruned = memo.retain(&self.tenant, live)?;
+            if pruned > 0 {
+                tracing::info!(pruned, "export verified-file records pruned to the live set");
+            }
+        }
+        Ok(())
     }
     pub fn from_s3(
         tenant: String,
@@ -151,7 +251,13 @@ impl ExportTarget for HostedExportTarget {
         schema: &Schema,
     ) -> Result<BTreeMap<String, Vec<DataFile>>> {
         validate_manifest(manifest, &self.tenant, 100_000)?;
+        let started = std::time::Instant::now();
         let spool = tempfile::tempdir()?;
+        let schema_sha256 = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(serde_json::to_vec(schema)?))
+        };
+        let (mut read_files, mut read_bytes, mut reused_files) = (0usize, 0u64, 0usize);
         let mut prepared = BTreeMap::new();
         for part in &manifest.add {
             let directory = part.keys[0]
@@ -198,17 +304,52 @@ impl ExportTarget for HostedExportTarget {
                     part.keys[index] == keys.data(index),
                     "hosted source path differs"
                 );
-                let path = spool.path().join("data.parquet");
-                stage_bounded(
-                    self.source.as_ref(),
-                    &part.keys[index],
-                    &path,
-                    digest.bytes,
-                    &digest.sha256,
-                    MAX_OBJECT_BYTES,
-                )
-                .await?;
-                footer(&path, schema, digest.rows)?;
+                let key = &part.keys[index];
+                // One HEAD: the identity the memo is bound to.
+                let identity = match &self.verified {
+                    Some(_) => self.source.object_identity(key).await?,
+                    None => None,
+                };
+                let entry = self.verified.as_ref().zip(identity.as_ref()).map(|(memo, (etag, _))| VerifiedFile {
+                    tenant: memo.tenant.clone(),
+                    key: key.clone(),
+                    bytes: digest.bytes,
+                    sha256: digest.sha256.clone(),
+                    rows: digest.rows,
+                    schema_sha256: schema_sha256.clone(),
+                    etag: etag.clone(),
+                });
+                let known = identity.as_ref().is_some_and(|(_, size)| *size == digest.bytes)
+                    && self
+                        .verified
+                        .as_ref()
+                        .zip(entry.as_ref())
+                        .is_some_and(|(memo, entry)| memo.contains(entry));
+                if known {
+                    reused_files += 1;
+                } else {
+                    let path = spool.path().join("data.parquet");
+                    stage_bounded(
+                        self.source.as_ref(),
+                        key,
+                        &path,
+                        digest.bytes,
+                        &digest.sha256,
+                        MAX_OBJECT_BYTES,
+                    )
+                    .await?;
+                    footer(&path, schema, digest.rows)?;
+                    read_files += 1;
+                    read_bytes = read_bytes.saturating_add(digest.bytes);
+                    if let Some((memo, entry)) = self.verified.as_ref().zip(entry.as_ref()) {
+                        // Record only an identity that held across the whole
+                        // read: the verified bytes are that object's bytes.
+                        let after = self.source.object_identity(key).await?;
+                        if after.is_some_and(|(etag, size)| etag == entry.etag && size == digest.bytes) {
+                            memo.record(entry);
+                        }
+                    }
+                }
                 files.push(
                     DataFileBuilder::default()
                         .content(DataContentType::Data)
@@ -223,6 +364,14 @@ impl ExportTarget for HostedExportTarget {
             }
             prepared.insert(part.part_id.clone(), files);
         }
+        tracing::info!(
+            parts = manifest.add.len(),
+            read_files,
+            read_bytes,
+            reused_files,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "hosted export target prepared"
+        );
         Ok(prepared)
     }
 }

@@ -14,6 +14,11 @@ path = "src/main.rs"
 name = "nanosiem-lake-cell-stub"
 path = "src/bin/stub_tenant.rs"
 
+[[bin]]
+name = "nanosiem-lake-cell-native-lab-child"
+path = "src/bin/native_lab_child.rs"
+required-features = ["sandbox-integration"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
@@ -52,6 +57,16 @@ sandbox-integration = []
 [[test]]
 name = "isolation"
 path = "tests/isolation.rs"
+required-features = ["sandbox-integration"]
+
+[[test]]
+name = "native_lab"
+path = "tests/native_lab.rs"
+required-features = ["sandbox-integration"]
+
+[[test]]
+name = "guarded_work"
+path = "tests/guarded_work.rs"
 required-features = ["sandbox-integration"]
 
 [[test]]

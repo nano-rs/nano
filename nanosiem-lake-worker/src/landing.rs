@@ -824,7 +824,30 @@ pub trait Ledger: Send + Sync {
     async fn accepted(&self, id: i64, converted: &Converted, bronze_keys: &str) -> Result<()>;
     async fn refused(&self, id: i64, reason: &str, rows_refused: u64, content_sha256: Option<&str>) -> Result<()>;
     async fn redelivered(&self, id: i64) -> Result<()>;
+    /// NAN-4629: the file is refused but stays where it landed (no copy could
+    /// be kept, so it is never deleted). The ledger must never hand it out
+    /// again: not as a claim, not as a redelivery (which deletes). A ledger
+    /// that cannot record this refuses, and the file stays untouched.
+    async fn refused_in_place(&self, _id: i64, _reason: &str, _rows_refused: u64, _content_sha256: Option<&str>) -> Result<()> {
+        anyhow::bail!("this landing ledger cannot keep a refused file in place")
+    }
+    /// NAN-4629: the ledger is the work queue. `Some` replaces listing the
+    /// landing folder: the ledger's own (leased) lister recorded the objects
+    /// and every node claims from what it recorded. `None` (the default): the
+    /// caller lists the folder itself.
+    async fn pending(&self, _store: &Operator, _tenant_id: &str, _max: usize) -> Result<Option<(usize, Vec<Candidate>)>> {
+        Ok(None)
+    }
+    /// NAN-4629: age of the oldest landed file not yet finished, when the
+    /// ledger can tell (the backlog-age health field).
+    async fn backlog_age(&self) -> Result<Option<std::time::Duration>> {
+        Ok(None)
+    }
 }
+
+/// NAN-4629 (coordinator Q-F): a landed file unfinished for longer than this
+/// raises the `landing_backlog_age` alert. Files are never dropped for age.
+pub const BACKLOG_ALERT_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// What one tick did (for logs and tests).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -839,6 +862,9 @@ pub struct TickReport {
     /// (the tenant edge log) applied backpressure. No attempt is spent; the
     /// tick stops at the first one. Always 0 on open core.
     pub held: usize,
+    /// NAN-4629: age of the oldest unfinished landed file after this tick,
+    /// in seconds (`None`: nothing pending, or the ledger cannot tell).
+    pub backlog_age_secs: Option<u64>,
 }
 
 // ------------------------------------------------------------ discover / emit
@@ -902,9 +928,17 @@ pub trait Discover: Send + Sync {
     async fn source(&self, candidate: &Candidate, source_id: Uuid) -> Result<Option<LandingSource>>;
     /// The rows are durable downstream (`emitted`): finish the file.
     async fn finish_accepted(&self, store: &Operator, candidate: &Candidate, id: i64, converted: &Converted, emitted: &str) -> Result<()>;
-    /// The file is refused whole: move it aside and record the reason.
-    async fn finish_refused(&self, store: &Operator, candidate: &Candidate, id: i64, refusal: &FileRefusal, sha: Option<&str>)
-        -> Result<()>;
+    /// The file is refused whole: keep it aside as `copy` says, delete the
+    /// original only once a copy exists, and record the reason.
+    async fn finish_refused(
+        &self,
+        store: &Operator,
+        candidate: &Candidate,
+        id: i64,
+        refusal: &FileRefusal,
+        sha: Option<&str>,
+        copy: RefusedCopy,
+    ) -> Result<()>;
     /// An already finished file reappeared.
     async fn finish_redelivered(&self, store: &Operator, candidate: &Candidate, id: i64) -> Result<()>;
     /// Hand an unfinished file back without spending an attempt (the output
@@ -920,6 +954,21 @@ pub trait Discover: Send + Sync {
     }
 }
 
+/// NAN-4629: what happens to a refused landed file's bytes. A refused file is
+/// deleted from the landing folder only once a copy of it exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedCopy {
+    /// The discoverer copies it aside (open core: under [`REFUSED_PREFIX`] in
+    /// the landing store), then deletes the original.
+    MoveAside,
+    /// The output already holds a copy (or the original is already gone):
+    /// delete the original.
+    Kept,
+    /// No copy could be made: the file stays where it landed, recorded as
+    /// refused (`landing_refused_in_place` alert). Never deleted.
+    InPlace,
+}
+
 /// Where converted rows go.
 #[async_trait]
 pub trait Emit: Send + Sync {
@@ -928,6 +977,12 @@ pub trait Emit: Send + Sync {
     /// [`Backpressure`] holds the file without spending an attempt; one that
     /// is a [`FileRefusal`] refuses it whole (decide that before writing).
     async fn emit(&self, store: &Operator, tenant_id: &str, candidate: &Candidate, converted: &Converted) -> Result<String>;
+    /// Keep a copy of a refused landed file for the operator before the
+    /// original is deleted (see [`RefusedCopy`]). Default: the discoverer
+    /// moves it aside.
+    async fn keep_refused(&self, _landing: &Operator, _key: &str) -> Result<RefusedCopy> {
+        Ok(RefusedCopy::MoveAside)
+    }
 }
 
 /// The output is full (the tenant edge log refuses appends with 503 while
@@ -952,6 +1007,9 @@ pub struct PrefixDiscover<'a, L: Ledger> {
 #[async_trait]
 impl<L: Ledger> Discover for PrefixDiscover<'_, L> {
     async fn discover(&self, store: &Operator, tenant_id: &str, max: usize) -> Result<(usize, Vec<Candidate>)> {
+        if let Some(found) = self.ledger.pending(store, tenant_id, max).await? {
+            return Ok(found);
+        }
         let prefix = format!("{LANDING_PREFIX}tenant_id={tenant_id}/");
         let entries = store.list_with(&prefix).recursive(true).await.context("list landing prefix")?;
         let mut objects = entries
@@ -975,29 +1033,7 @@ impl<L: Ledger> Discover for PrefixDiscover<'_, L> {
 
     async fn claim(&self, store: &Operator, candidate: &Candidate, source_id: Option<Uuid>) -> Result<Claimed> {
         let key = candidate.key.as_str();
-        // Listings normally carry the etag; stat when they do not, and fall
-        // back to the content digest for a store that reports none.
-        let mut preloaded: Option<Vec<u8>> = None;
-        let (etag, size) = match candidate.etag.as_deref().map(|etag| etag.trim_matches('"')) {
-            Some(etag) if !etag.is_empty() => (etag.to_string(), candidate.size),
-            _ => {
-                let meta = store.stat(key).await.context("stat landed object")?;
-                match meta.etag().map(|etag| etag.trim_matches('"')).filter(|etag| !etag.is_empty()) {
-                    Some(etag) => (etag.to_string(), meta.content_length()),
-                    None => {
-                        if meta.content_length() > MAX_LANDING_BYTES {
-                            (format!("size:{}", meta.content_length()), meta.content_length())
-                        } else {
-                            let bytes = store.read(key).await.context("read landed object")?.to_vec();
-                            let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
-                            let size = bytes.len() as u64;
-                            preloaded = Some(bytes);
-                            (digest, size)
-                        }
-                    }
-                }
-            }
-        };
+        let (etag, size, preloaded) = landed_etag(store, key, candidate.etag.as_deref(), candidate.size).await?;
         let claim = self.ledger.claim(key, &etag, size, source_id).await?;
         Ok(Claimed { claim, size, preloaded })
     }
@@ -1013,9 +1049,20 @@ impl<L: Ledger> Discover for PrefixDiscover<'_, L> {
         self.ledger.accepted(id, converted, emitted).await
     }
 
-    async fn finish_refused(&self, store: &Operator, candidate: &Candidate, id: i64, refusal: &FileRefusal, sha: Option<&str>)
-        -> Result<()> {
-        move_aside(store, &candidate.key).await?;
+    async fn finish_refused(
+        &self,
+        store: &Operator,
+        candidate: &Candidate,
+        id: i64,
+        refusal: &FileRefusal,
+        sha: Option<&str>,
+        copy: RefusedCopy,
+    ) -> Result<()> {
+        match copy {
+            RefusedCopy::InPlace => return self.ledger.refused_in_place(id, refusal.reason, refusal.rows, sha).await,
+            RefusedCopy::MoveAside => move_aside(store, &candidate.key).await?,
+            RefusedCopy::Kept => {}
+        }
         store.delete(&candidate.key).await.context("delete refused landed object")?;
         self.ledger.refused(id, refusal.reason, refusal.rows, sha).await
     }
@@ -1024,6 +1071,26 @@ impl<L: Ledger> Discover for PrefixDiscover<'_, L> {
         store.delete(&candidate.key).await.context("delete redelivered landed object")?;
         self.ledger.redelivered(id).await
     }
+}
+
+/// The (etag, size) a landed object is claimed under, and its bytes when
+/// they had to be read. Listings normally carry the etag; stat when they do
+/// not, and fall back to the content digest for a store that reports none.
+async fn landed_etag(store: &Operator, key: &str, listed: Option<&str>, listed_size: u64) -> Result<(String, u64, Option<Vec<u8>>)> {
+    if let Some(etag) = listed.map(|etag| etag.trim_matches('"')).filter(|etag| !etag.is_empty()) {
+        return Ok((etag.to_string(), listed_size, None));
+    }
+    let meta = store.stat(key).await.context("stat landed object")?;
+    if let Some(etag) = meta.etag().map(|etag| etag.trim_matches('"')).filter(|etag| !etag.is_empty()) {
+        return Ok((etag.to_string(), meta.content_length(), None));
+    }
+    if meta.content_length() > MAX_LANDING_BYTES {
+        return Ok((format!("size:{}", meta.content_length()), meta.content_length(), None));
+    }
+    let bytes = store.read(key).await.context("read landed object")?.to_vec();
+    let digest = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+    let size = bytes.len() as u64;
+    Ok((digest, size, Some(bytes)))
 }
 
 /// Copy a refused landed object under [`REFUSED_PREFIX`] (the caller
@@ -1058,30 +1125,110 @@ impl Emit for BronzeObjects {
     }
 }
 
-/// The converter: one object store, one tenant, one ledger.
-pub struct Converter<L: Ledger> {
+/// Sovereign (NAN-4629, coordinator Q-B): bronze is handed to the consumer
+/// store (C13 publication through [`crate::parts::part_log::ObjectStore`],
+/// e.g. the supervisor's `SovereignPartStore`) with an immutable create, so
+/// it is published, never written raw next to the landing folder.
+pub struct PublishedBronze<S: crate::parts::part_log::ObjectStore> {
+    pub store: S,
+}
+
+#[async_trait]
+impl<S: crate::parts::part_log::ObjectStore> Emit for PublishedBronze<S> {
+    async fn emit(&self, _landing: &Operator, _tenant_id: &str, _candidate: &Candidate, converted: &Converted) -> Result<String> {
+        let mut keys = Vec::with_capacity(converted.objects.len());
+        for (bronze_key, body, _) in &converted.objects {
+            // `false`: the key already exists (a retried emit after a lost
+            // reply). Bronze keys carry a fresh suffix per conversion, so it
+            // is this conversion's own object; a reconversion writes new keys
+            // whose rows the uid window drops.
+            self.store.put_if_absent(bronze_key, body).await.context("publish bronze object")?;
+            keys.push(bronze_key.as_str());
+        }
+        Ok(keys.join(","))
+    }
+
+    /// The refused copy is published too (the converter's own object-store
+    /// principal may only list, read and delete the landing folder). A file
+    /// the consumer store cannot take (empty, or over its write bound) is
+    /// never deleted: it stays where it landed ([`RefusedCopy::InPlace`]).
+    async fn keep_refused(&self, landing: &Operator, key: &str) -> Result<RefusedCopy> {
+        let size = match landing.stat(key).await {
+            Ok(meta) => meta.content_length(),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => return Ok(RefusedCopy::Kept),
+            Err(error) => return Err(anyhow::Error::from(error).context("stat refused landed file")),
+        };
+        if size == 0 || size > MAX_PUBLISHED_REFUSED_BYTES {
+            return Ok(RefusedCopy::InPlace);
+        }
+        let bytes = landing.read(key).await.context("read refused landed file")?.to_vec();
+        let target = refused_key(key);
+        if self.store.put_if_absent(&target, &bytes).await.context("publish refused landed file")? {
+            return Ok(RefusedCopy::Kept);
+        }
+        // The key is taken: a retry of this same refusal (same bytes), or an
+        // earlier refused file under the same landed key. Never drop the
+        // second one: keep it beside the first, named by its content digest.
+        if self.store.get(&target).await.context("read published refused file")?.as_deref() == Some(bytes.as_slice()) {
+            return Ok(RefusedCopy::Kept);
+        }
+        let digest = hex::encode(Sha256::digest(&bytes));
+        self.store
+            .put_if_absent(&format!("{target}.sha256-{digest}"), &bytes)
+            .await
+            .context("publish refused landed file")?;
+        Ok(RefusedCopy::Kept)
+    }
+}
+
+/// Largest refused landed file [`PublishedBronze`] publishes a copy of: the
+/// C13 consumer store's write bound (`MAX_CONSUMER_WRITE`, 64 MiB). A larger
+/// one is refused in place, never deleted.
+pub const MAX_PUBLISHED_REFUSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The converter: one object store, one tenant, one ledger, one output
+/// ([`BronzeObjects`] on open core, [`PublishedBronze`] on sovereign).
+pub struct Converter<L: Ledger, E: Emit = BronzeObjects> {
     pub store: Operator,
     pub ledger: L,
     pub stage: LandingOcsfStage,
     pub tenant_id: String,
     /// Most objects handled per tick.
     pub max_files_per_tick: usize,
+    pub emit: E,
 }
 
-impl<L: Ledger> Converter<L> {
-    /// List the tenant's landing folder and handle every unfinished object.
+impl<L: Ledger, E: Emit> Converter<L, E> {
+    /// Handle every unfinished landed object of the tenant (listed by this
+    /// converter, or by the ledger's lister), then report the backlog age.
     pub async fn tick(&self) -> Result<TickReport> {
         let discover = PrefixDiscover { ledger: &self.ledger };
-        Engine {
+        let mut report = Engine {
             store: &self.store,
             discover: &discover,
-            emit: &BronzeObjects,
+            emit: &self.emit,
             stage: &self.stage,
             tenant_id: &self.tenant_id,
             max_files_per_tick: self.max_files_per_tick,
         }
         .tick()
-        .await
+        .await?;
+        match self.ledger.backlog_age().await {
+            Ok(age) => {
+                report.backlog_age_secs = age.map(|age| age.as_secs());
+                if let Some(age) = age.filter(|age| *age > BACKLOG_ALERT_AFTER) {
+                    tracing::error!(
+                        alert = "landing_backlog_age",
+                        tenant_id = %self.tenant_id,
+                        backlog_age_secs = age.as_secs(),
+                        threshold_secs = BACKLOG_ALERT_AFTER.as_secs(),
+                        "a landed file has waited longer than the backlog threshold"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(error = %format!("{error:#}"), "landing backlog age unavailable"),
+        }
+        Ok(report)
     }
 }
 
@@ -1206,7 +1353,19 @@ impl<D: Discover, E: Emit> Engine<'_, D, E> {
     }
 
     async fn refuse_whole(&self, candidate: &Candidate, id: i64, refusal: FileRefusal, sha: Option<&str>) -> Result<Outcome> {
-        self.discover.finish_refused(self.store, candidate, id, &refusal, sha).await?;
+        let copy = self.emit.keep_refused(self.store, &candidate.key).await?;
+        self.discover.finish_refused(self.store, candidate, id, &refusal, sha, copy).await?;
+        if copy == RefusedCopy::InPlace {
+            tracing::error!(
+                alert = "landing_refused_in_place",
+                tenant_id = %self.tenant_id,
+                reason = refusal.reason,
+                size_bytes = candidate.size,
+                "landed file refused and no copy could be kept: it stays where it landed and is never deleted; \
+                 an operator must fix and re-send or remove it"
+            );
+            return Ok(Outcome::Refused);
+        }
         tracing::warn!(
             reason = refusal.reason,
             rows_refused = refusal.rows,
@@ -1225,32 +1384,185 @@ enum Outcome {
     Held,
 }
 
-/// The Postgres ledger (`landing_sources` / `landing_files`, migration 364).
+/// The Postgres ledger (`landing_sources` / `landing_files` / `landing_listers`,
+/// migrations 364 and 374). Bound to ONE tenant: every query it makes is
+/// filtered by `tenant_id`, so a converter never sees, claims or finishes
+/// another tenant's file or source (several tenants may share the database).
 pub struct PgLedger {
     pub pool: sqlx::PgPool,
     /// How long one claim owns a file before another tick may retry it.
     pub lease: std::time::Duration,
+    /// The tenant this ledger serves (the converter's `tenant_id`).
+    pub tenant_id: String,
+    /// This converter node (holder id of the tenant's lister lease).
+    pub node: Uuid,
 }
 
 /// Finished ledger rows kept for the status view.
 pub const LEDGER_RETENTION_DAYS: i32 = 30;
 
+/// How long one node holds a tenant's lister lease without renewing it. The
+/// holder renews it every tick; another node takes over once it lapses.
+pub const LISTER_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One listed landed object, as the lister records it.
+struct ListedObject {
+    key: String,
+    etag: String,
+    size: i64,
+    source_id: Option<Uuid>,
+    landed_at: Option<DateTime<Utc>>,
+}
+
 impl PgLedger {
-    /// Drop finished rows past [`LEDGER_RETENTION_DAYS`], and claims abandoned
-    /// for a week (the object was finished but the ledger write failed). A
-    /// redelivery of a pruned file is converted again; its rows keep their
-    /// uids, so the lake's uid window drops them while it still covers them.
+    /// A ledger for `tenant_id` with a fresh node id.
+    pub fn new(pool: sqlx::PgPool, lease: std::time::Duration, tenant_id: impl Into<String>) -> Self {
+        Self { pool, lease, tenant_id: tenant_id.into(), node: Uuid::new_v4() }
+    }
+
+    /// Drop this tenant's finished rows past [`LEDGER_RETENTION_DAYS`], and
+    /// claims abandoned for a week (the object was finished but the ledger
+    /// write failed). A redelivery of a pruned file is converted again; its
+    /// rows keep their uids, so the lake's uid window drops them while it
+    /// still covers them.
     pub async fn prune(&self) -> Result<u64> {
         let done = sqlx::query(
             "DELETE FROM landing_files \
-              WHERE (state <> 'claimed' AND finished_at < NOW() - make_interval(days => $1)) \
-                 OR (state = 'claimed' AND lease_until < NOW() - INTERVAL '7 days')",
+              WHERE tenant_id = $2 AND NOT refused_in_place \
+                AND ((state IN ('accepted', 'refused') AND finished_at < NOW() - make_interval(days => $1)) \
+                  OR (state = 'claimed' AND lease_until < NOW() - INTERVAL '7 days'))",
         )
         .bind(LEDGER_RETENTION_DAYS)
+        .bind(&self.tenant_id)
         .execute(&self.pool)
         .await
         .context("prune landing ledger")?;
         Ok(done.rows_affected())
+    }
+
+    /// Rows written before migration 374 have no tenant. Files take the
+    /// tenant of their key's folder (only this tenant's folder is adopted).
+    /// A source takes this tenant only on evidence that it is this tenant's:
+    /// none of its files lies outside this tenant's folder, and either one
+    /// lies inside it, or the whole database shows no other tenant (no other
+    /// tenant's source, no file outside this folder). Whichever tenant's
+    /// converter starts first, it never adopts another tenant's source. A
+    /// source with no files on a multi-tenant install stays unadopted (its
+    /// files are refused `source_unknown`) until an operator sets it.
+    pub async fn adopt_legacy_rows(&self) -> Result<(u64, u64)> {
+        let folder = format!("{LANDING_PREFIX}tenant_id={}/", self.tenant_id);
+        let files = sqlx::query(
+            "UPDATE landing_files SET tenant_id = $1 \
+              WHERE tenant_id IS NULL AND starts_with(object_key, $2)",
+        )
+        .bind(&self.tenant_id)
+        .bind(&folder)
+        .execute(&self.pool)
+        .await
+        .context("adopt pre-374 landing files")?;
+        let sources = sqlx::query(
+            "UPDATE landing_sources s SET tenant_id = $1 \
+              WHERE s.tenant_id IS NULL \
+                AND NOT EXISTS (SELECT 1 FROM landing_files f \
+                                 WHERE f.source_id = s.source_id AND NOT starts_with(f.object_key, $2)) \
+                AND (EXISTS (SELECT 1 FROM landing_files f \
+                              WHERE f.source_id = s.source_id AND starts_with(f.object_key, $2)) \
+                     OR (NOT EXISTS (SELECT 1 FROM landing_sources o WHERE o.tenant_id IS NOT NULL AND o.tenant_id <> $1) \
+                         AND NOT EXISTS (SELECT 1 FROM landing_files f WHERE NOT starts_with(f.object_key, $2))))",
+        )
+        .bind(&self.tenant_id)
+        .bind(&folder)
+        .execute(&self.pool)
+        .await
+        .context("adopt pre-374 landing sources")?;
+        Ok((files.rows_affected(), sources.rows_affected()))
+    }
+
+    /// Take or renew the tenant's lister lease. `true`: this node lists.
+    pub async fn hold_lister(&self) -> Result<bool> {
+        let held: Option<(Uuid,)> = sqlx::query_as(
+            "INSERT INTO landing_listers (tenant_id, holder, lease_until) \
+             VALUES ($1, $2, NOW() + make_interval(secs => $3)) \
+             ON CONFLICT (tenant_id) DO UPDATE \
+                SET holder = EXCLUDED.holder, lease_until = EXCLUDED.lease_until \
+              WHERE landing_listers.holder = EXCLUDED.holder OR landing_listers.lease_until < NOW() \
+             RETURNING holder",
+        )
+        .bind(&self.tenant_id)
+        .bind(self.node)
+        .bind(LISTER_LEASE.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await
+        .context("hold landing lister lease")?;
+        Ok(held.is_some_and(|(holder,)| holder == self.node))
+    }
+
+    /// The lease holder's step: list the tenant's landing folder once and
+    /// record every object as a `listed` row (a known (key, etag) is left as
+    /// it is). A `listed` row whose object is gone from a complete listing is
+    /// dropped (deleted or overwritten out of band; nothing claimed it).
+    /// Returns how many objects the listing held.
+    pub async fn list_into_ledger(&self, store: &Operator) -> Result<usize> {
+        let started: DateTime<Utc> = sqlx::query_scalar("SELECT NOW()").fetch_one(&self.pool).await.context("ledger clock")?;
+        let prefix = format!("{LANDING_PREFIX}tenant_id={}/", self.tenant_id);
+        let entries = store.list_with(&prefix).recursive(true).await.context("list landing prefix")?;
+        let mut objects = Vec::new();
+        for entry in entries.into_iter().filter(|entry| !entry.path().ends_with('/')) {
+            let key = entry.path().to_string();
+            let meta = entry.metadata();
+            let (etag, size, _) = landed_etag(store, &key, meta.etag(), meta.content_length()).await?;
+            let landed_at = meta.last_modified().map(|at| DateTime::<Utc>::from(std::time::SystemTime::from(at)));
+            let source_id = parse_key(&key, &self.tenant_id).ok().map(|parsed| parsed.source_id);
+            objects.push(ListedObject { key, etag, size: to_i64(size), source_id, landed_at });
+        }
+        objects.sort_by(|a, b| a.key.cmp(&b.key));
+        let listed = objects.len();
+        let keys: Vec<&str> = objects.iter().map(|o| o.key.as_str()).collect();
+        let etags: Vec<&str> = objects.iter().map(|o| o.etag.as_str()).collect();
+        let sizes: Vec<i64> = objects.iter().map(|o| o.size).collect();
+        let sources: Vec<Option<Uuid>> = objects.iter().map(|o| o.source_id).collect();
+        let landed: Vec<Option<DateTime<Utc>>> = objects.iter().map(|o| o.landed_at).collect();
+        let mut tx = self.pool.begin().await.context("begin listing")?;
+        sqlx::query(
+            "INSERT INTO landing_files (tenant_id, object_key, etag, source_id, size_bytes, state, attempts, landed_at) \
+             SELECT $1, o.key, o.etag, \
+                    (SELECT s.source_id FROM landing_sources s WHERE s.source_id = o.source_id AND s.tenant_id = $1), \
+                    o.size, 'listed', 0, o.landed_at \
+               FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::uuid[], $6::timestamptz[]) WITH ORDINALITY \
+                    AS o(key, etag, size, source_id, landed_at, ord) \
+              ORDER BY o.ord \
+             ON CONFLICT (object_key, etag) DO NOTHING",
+        )
+        .bind(&self.tenant_id)
+        .bind(&keys)
+        .bind(&etags)
+        .bind(&sizes)
+        .bind(&sources)
+        .bind(&landed)
+        .execute(&mut *tx)
+        .await
+        .context("record listed landed files")?;
+        sqlx::query(
+            "DELETE FROM landing_files f \
+              WHERE f.tenant_id = $1 AND f.state = 'listed' AND f.first_seen_at < $2 \
+                AND NOT EXISTS (SELECT 1 FROM UNNEST($3::text[], $4::text[]) AS o(key, etag) \
+                                 WHERE o.key = f.object_key AND o.etag = f.etag)",
+        )
+        .bind(&self.tenant_id)
+        .bind(started)
+        .bind(&keys)
+        .bind(&etags)
+        .execute(&mut *tx)
+        .await
+        .context("drop listed rows whose object is gone")?;
+        sqlx::query("UPDATE landing_listers SET listed_at = NOW() WHERE tenant_id = $1 AND holder = $2")
+            .bind(&self.tenant_id)
+            .bind(self.node)
+            .execute(&mut *tx)
+            .await
+            .context("record listing time")?;
+        tx.commit().await.context("commit listing")?;
+        Ok(listed)
     }
 }
 
@@ -1272,14 +1584,17 @@ pub struct OrphanedSource {
 }
 
 impl PgLedger {
-    /// Landing sources whose log source was deleted (no foreign key ties them,
-    /// migration 364). Each still owns an object-store user until revoked.
+    /// This tenant's landing sources whose log source was deleted (no foreign
+    /// key ties them, migration 364). Each still owns an object-store user
+    /// until revoked.
     pub async fn orphaned_sources(&self) -> Result<Vec<OrphanedSource>> {
         let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
             "SELECT ls.source_id, ls.object_user, ls.state FROM landing_sources ls \
-              WHERE NOT EXISTS (SELECT 1 FROM log_sources s WHERE s.id = ls.source_id) \
+              WHERE ls.tenant_id = $1 \
+                AND NOT EXISTS (SELECT 1 FROM log_sources s WHERE s.id = ls.source_id) \
               ORDER BY ls.source_id",
         )
+        .bind(&self.tenant_id)
         .fetch_all(&self.pool)
         .await
         .context("list orphaned landing sources")?;
@@ -1304,10 +1619,11 @@ impl PgLedger {
                 }
             }
             sqlx::query(
-                "DELETE FROM landing_sources ls WHERE ls.source_id = $1 \
+                "DELETE FROM landing_sources ls WHERE ls.source_id = $1 AND ls.tenant_id = $2 \
                    AND NOT EXISTS (SELECT 1 FROM log_sources s WHERE s.id = ls.source_id)",
             )
             .bind(orphan.source_id)
+            .bind(&self.tenant_id)
             .execute(&self.pool)
             .await
             .context("delete orphaned landing source")?;
@@ -1327,13 +1643,15 @@ impl Ledger for PgLedger {
     async fn source(&self, source_id: Uuid) -> Result<Option<LandingSource>> {
         // Active only while its log source exists: no foreign key ties the two
         // (migration 364), so a deleted log source stops intake here at once,
-        // before the orphan sweep revokes its key.
+        // before the orphan sweep revokes its key. Another tenant's source is
+        // unknown here (migration 374).
         let row: Option<(Uuid, String, Uuid, String, bool)> = sqlx::query_as(
             "SELECT ls.source_id, ls.route_key, ls.credential_id, ls.state, \
                     EXISTS (SELECT 1 FROM log_sources s WHERE s.id = ls.source_id) \
-               FROM landing_sources ls WHERE ls.source_id = $1",
+               FROM landing_sources ls WHERE ls.source_id = $1 AND ls.tenant_id = $2",
         )
         .bind(source_id)
+        .bind(&self.tenant_id)
         .fetch_optional(&self.pool)
         .await
         .context("read landing source")?;
@@ -1347,16 +1665,21 @@ impl Ledger for PgLedger {
 
     async fn claim(&self, key: &str, etag: &str, size: u64, source_id: Option<Uuid>) -> Result<Claim> {
         let lease_secs = i32::try_from(self.lease.as_secs().max(1)).unwrap_or(i32::MAX);
-        // New: insert as claimed. Claimed with an expired lease: take it over.
-        // Anything else: no row comes back and the state is read below.
+        // New: insert as claimed. Listed, or claimed with an expired lease:
+        // take it. Another tenant's row is never taken (its key is in another
+        // folder, and the tenant must match). Anything else: no row comes
+        // back and the state is read below.
         let owned: Option<(i64, i32)> = sqlx::query_as(
-            "INSERT INTO landing_files (object_key, etag, source_id, size_bytes, state, attempts, lease_until) \
-             VALUES ($1, $2, (SELECT source_id FROM landing_sources WHERE source_id = $3), $4, 'claimed', 1, \
-                     NOW() + make_interval(secs => $5)) \
+            "INSERT INTO landing_files (tenant_id, object_key, etag, source_id, size_bytes, state, attempts, lease_until) \
+             VALUES ($6, $1, $2, (SELECT source_id FROM landing_sources WHERE source_id = $3 AND tenant_id = $6), $4, \
+                     'claimed', 1, NOW() + make_interval(secs => $5)) \
              ON CONFLICT (object_key, etag) DO UPDATE \
-                SET attempts = landing_files.attempts + 1, \
+                SET state = 'claimed', \
+                    attempts = landing_files.attempts + 1, \
                     lease_until = NOW() + make_interval(secs => $5) \
-              WHERE landing_files.state = 'claimed' AND landing_files.lease_until < NOW() \
+              WHERE landing_files.tenant_id = EXCLUDED.tenant_id \
+                AND (landing_files.state = 'listed' \
+                     OR (landing_files.state = 'claimed' AND landing_files.lease_until < NOW())) \
              RETURNING id, attempts",
         )
         .bind(key)
@@ -1364,21 +1687,27 @@ impl Ledger for PgLedger {
         .bind(source_id)
         .bind(to_i64(size))
         .bind(f64::from(lease_secs))
+        .bind(&self.tenant_id)
         .fetch_optional(&self.pool)
         .await
         .context("claim landed file")?;
         if let Some((id, attempt)) = owned {
             return Ok(Claim::Owned { id, attempt });
         }
-        let existing: Option<(i64, String)> =
-            sqlx::query_as("SELECT id, state FROM landing_files WHERE object_key = $1 AND etag = $2")
-                .bind(key)
-                .bind(etag)
-                .fetch_optional(&self.pool)
-                .await
-                .context("read landed file claim")?;
+        let existing: Option<(i64, String, bool)> = sqlx::query_as(
+            "SELECT id, state, refused_in_place FROM landing_files WHERE object_key = $1 AND etag = $2 AND tenant_id = $3",
+        )
+        .bind(key)
+        .bind(etag)
+        .bind(&self.tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("read landed file claim")?;
         Ok(match existing {
-            Some((id, state)) if state != "claimed" => Claim::Finished { id },
+            // Refused in place: still where it landed by design. Never a
+            // redelivery (that deletes it) and never claimed again.
+            Some((_, _, true)) => Claim::Leased,
+            Some((id, state, false)) if state == "accepted" || state == "refused" => Claim::Finished { id },
             _ => Claim::Leased,
         })
     }
@@ -1387,7 +1716,7 @@ impl Ledger for PgLedger {
         sqlx::query(
             "UPDATE landing_files SET state = 'accepted', rows_accepted = $2, rows_refused = $3, \
                     reason = $4, content_sha256 = $5, bronze_key = $6, lease_until = NULL, finished_at = NOW() \
-              WHERE id = $1",
+              WHERE id = $1 AND tenant_id = $7",
         )
         .bind(id)
         .bind(to_i64(converted.rows_accepted))
@@ -1395,6 +1724,7 @@ impl Ledger for PgLedger {
         .bind(converted.first_refusal.as_ref().map(|refusal| refusal.reason))
         .bind(&converted.content_sha256)
         .bind(bronze_keys)
+        .bind(&self.tenant_id)
         .execute(&self.pool)
         .await
         .context("record accepted landed file")?;
@@ -1405,26 +1735,124 @@ impl Ledger for PgLedger {
         sqlx::query(
             "UPDATE landing_files SET state = 'refused', rows_refused = $3, reason = $2, \
                     content_sha256 = COALESCE($4, content_sha256), lease_until = NULL, finished_at = NOW() \
-              WHERE id = $1",
+              WHERE id = $1 AND tenant_id = $5",
         )
         .bind(id)
         .bind(reason)
         .bind(to_i64(rows_refused))
         .bind(content_sha256)
+        .bind(&self.tenant_id)
         .execute(&self.pool)
         .await
         .context("record refused landed file")?;
         Ok(())
     }
 
+    async fn refused_in_place(&self, id: i64, reason: &str, rows_refused: u64, content_sha256: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE landing_files SET state = 'refused', refused_in_place = TRUE, rows_refused = $3, reason = $2, \
+                    content_sha256 = COALESCE($4, content_sha256), lease_until = NULL, finished_at = NOW() \
+              WHERE id = $1 AND tenant_id = $5",
+        )
+        .bind(id)
+        .bind(reason)
+        .bind(to_i64(rows_refused))
+        .bind(content_sha256)
+        .bind(&self.tenant_id)
+        .execute(&self.pool)
+        .await
+        .context("record landed file refused in place")?;
+        Ok(())
+    }
+
     async fn redelivered(&self, id: i64) -> Result<()> {
-        sqlx::query("UPDATE landing_files SET redeliveries = redeliveries + 1 WHERE id = $1")
+        sqlx::query("UPDATE landing_files SET redeliveries = redeliveries + 1 WHERE id = $1 AND tenant_id = $2")
             .bind(id)
+            .bind(&self.tenant_id)
             .execute(&self.pool)
             .await
             .context("record redelivered landed file")?;
         Ok(())
     }
+
+    async fn pending(&self, store: &Operator, tenant_id: &str, max: usize) -> Result<Option<(usize, Vec<Candidate>)>> {
+        anyhow::ensure!(tenant_id == self.tenant_id, "landing ledger is bound to another tenant");
+        // Only the lease holder lists (one LIST per tick per tenant, not per
+        // node). A failed listing leaves the rows already recorded claimable.
+        match self.hold_lister().await {
+            Ok(true) => {
+                if let Err(error) = self.list_into_ledger(store).await {
+                    tracing::warn!(error = %format!("{error:#}"), "landing listing failed; claiming what the ledger holds");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(error = %format!("{error:#}"), "landing lister lease unavailable"),
+        }
+        let limit = i64::try_from(max).unwrap_or(i64::MAX);
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT object_key, etag, size_bytes FROM landing_files \
+              WHERE tenant_id = $1 \
+                AND (state = 'listed' OR (state = 'claimed' AND lease_until < NOW())) \
+              ORDER BY id LIMIT $2",
+        )
+        .bind(&self.tenant_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("read claimable landed files")?;
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM landing_files WHERE tenant_id = $1 AND state IN ('listed', 'claimed')",
+        )
+        .bind(&self.tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("count unfinished landed files")?;
+        let candidates = rows
+            .into_iter()
+            .map(|(key, etag, size)| Candidate { key, etag: Some(etag), size: u64::try_from(size).unwrap_or(0), leased: None })
+            .collect();
+        Ok(Some((usize::try_from(open).unwrap_or(usize::MAX), candidates)))
+    }
+
+    async fn backlog_age(&self) -> Result<Option<std::time::Duration>> {
+        let age: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM NOW() - MIN(COALESCE(landed_at, first_seen_at)))::float8 \
+               FROM landing_files WHERE tenant_id = $1 AND state IN ('listed', 'claimed')",
+        )
+        .bind(&self.tenant_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("read landing backlog age")?;
+        Ok(age.map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0))))
+    }
+}
+
+/// NAN-4629 (coordinator Q-A): the converter's own object-store policy for
+/// one tenant, separate from every sender key and every consumer grant. It
+/// may list, read and delete what landed in the tenant's landing folder and
+/// nothing else: no put anywhere (bronze and the refused copy are published
+/// through the consumer store, [`PublishedBronze`]), no other tenant, no
+/// other source's key material. On RustFS it is the converter user's one
+/// policy; on BYO S3 it is the IAM policy template for the converter
+/// principal. Same statements as the H03 `Purpose::LandingConvert` grant.
+pub fn converter_policy(bucket: &str, tenant_id: &str) -> Value {
+    let folder = format!("{LANDING_PREFIX}tenant_id={tenant_id}/");
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": [format!("arn:aws:s3:::{bucket}")],
+                "Condition": {"StringLike": {"s3:prefix": [folder.clone(), format!("{folder}*")]}}
+            },
+            {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:DeleteObject"],
+                "Resource": [format!("arn:aws:s3:::{bucket}/{folder}*")]
+            }
+        ]
+    })
 }
 
 /// The write-only object-store policy of one landing source.

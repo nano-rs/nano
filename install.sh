@@ -73,6 +73,33 @@ fi
 main() {
 set -euo pipefail
 
+# H01: one purchaser entry from the authenticated native distribution. Dispatch
+# before legacy env/defaults, Docker, git, admin setup or verification bypasses.
+# The executable derives its protected home from its own installed location.
+if [ "${1:-}" = sovereign ]; then
+    shift
+    # NAN-4629: --tenzir records the Tenzir ingest model (no Vector; Tenzir
+    # drops OCSF files into the object store). Fixed at install.
+    local sovereign_flags=()
+    if [ "${1:-}" = --tenzir ]; then
+        sovereign_flags=(--tenzir)
+        shift
+    fi
+    if [ "$#" -ne 1 ]; then
+        printf '%s\n' 'Usage: install.sh sovereign [--tenzir] purchaser-inputs.json' >&2
+        return 2
+    fi
+    local native_home
+    native_home="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || return 1
+    # The authenticated distribution bundles its bootstrap libc/loader when
+    # needed. This loader is one level below home so /proc/self/exe retains
+    # the same protected home as bin/install. The cell itself is static musl.
+    if [[ -x "$native_home/runtime/ld-linux-x86-64.so.2" ]]; then
+        exec "$native_home/runtime/ld-linux-x86-64.so.2" --library-path "$native_home/runtime/lib" "$native_home/bin/nano-sovereign-linux-install" ${sovereign_flags[@]+"${sovereign_flags[@]}"} < "$1"
+    fi
+    exec "$native_home/bin/nano-sovereign-linux-install" ${sovereign_flags[@]+"${sovereign_flags[@]}"} < "$1"
+fi
+
 # NAN-3402: containers bind-mount files from this checkout (Hydra, nginx,
 # Vector, ClickHouse configs) and run as non-root users, so they must be
 # world-readable. A hardened `umask 077` login made the cloned Hydra config

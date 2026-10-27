@@ -68,6 +68,25 @@ pub fn admission_fits(working_budget: u64, committed: u64, predicted_heap: f64, 
     predicted_heap * ADMISSION_PEAK_PER_MODELLED_HEAP + predicted_arrow <= room
 }
 
+/// Fewest rows in one admission slice (NAN-4553): below this the per-slice
+/// overhead (a Parquet file, one admission pass) outweighs the memory saved.
+pub const MIN_ADMISSION_SLICE_ROWS: u64 = 256;
+
+/// Rows per slice for an object of `rows` rows whose whole admission
+/// (`predicted_heap` modelled JSON heap, `predicted_arrow` Arrow rows) does
+/// not fit beside `committed` (NAN-4553). Its Arrow rows accumulate across
+/// the slices; its JSON values live one slice at a time, so each slice's
+/// peak takes the room the Arrow rows leave (at least a quarter of the
+/// room, so a tight budget still makes progress in small slices).
+pub fn admission_slice_rows(working_budget: u64, committed: u64, predicted_heap: f64, predicted_arrow: f64, rows: u64) -> u64 {
+    let rows = rows.max(1);
+    let room = working_budget.saturating_sub(committed) as f64;
+    let json_room = (room - predicted_arrow).max(room / 4.0);
+    let per_row = predicted_heap * ADMISSION_PEAK_PER_MODELLED_HEAP / rows as f64;
+    let fit = if per_row > 0.0 { (json_room / per_row).floor() as u64 } else { rows };
+    fit.clamp(MIN_ADMISSION_SLICE_ROWS.min(rows), rows)
+}
+
 /// Cap glibc's malloc retention: a fixed mmap threshold so large Arrow and
 /// Parquet buffers return to the kernel on free (glibc's dynamic threshold
 /// otherwise grows to 32 MiB after the first large free and serves them from
@@ -132,6 +151,22 @@ mod tests {
         let flight = flight_bytes(400 * MIB, 4);
         assert!(!admission_fits(budget, flight, 500.0 * MIB as f64, 50.0 * MIB as f64));
         assert!(admission_fits(budget, flight, 200.0 * MIB as f64, 50.0 * MIB as f64));
+    }
+
+    #[test]
+    fn an_object_too_large_to_admit_whole_is_sliced_to_the_room() {
+        let budget = 64 * MIB;
+        // 10k rows, 15 MiB decoded: 240 MiB modelled heap, 15 MiB of rows.
+        let (heap, arrow) = (240.0 * MIB as f64, 15.0 * MIB as f64);
+        assert!(!admission_fits(budget, 0, heap, arrow));
+        let rows = admission_slice_rows(budget, 0, heap, arrow, 10_000);
+        let slice_peak = heap * ADMISSION_PEAK_PER_MODELLED_HEAP * rows as f64 / 10_000.0;
+        assert!(slice_peak + arrow <= budget as f64, "{rows} rows per slice");
+        assert!(rows >= MIN_ADMISSION_SLICE_ROWS && rows < 10_000);
+        // No room left at all: still progress, in the smallest slices.
+        assert_eq!(admission_slice_rows(budget, budget, heap, arrow, 10_000), MIN_ADMISSION_SLICE_ROWS);
+        // A tiny object is never cut below its own size.
+        assert_eq!(admission_slice_rows(budget, budget, heap, arrow, 10), 10);
     }
 
     #[test]

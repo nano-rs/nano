@@ -37,6 +37,11 @@ fn main() -> Result<()> {
 
 async fn server_main() -> Result<()> {
     let _tracing_guard = nanosiem_core::telemetry::init_tracing("nanosiem-api");
+    // NAN-4666: sovereign installation facts gate boot before anything else
+    // reads configuration; missing or invalid facts refuse to start.
+    nanosiem_core::sovereign_runtime::require_at_boot()
+        .map_err(|error| anyhow::anyhow!("Refusing to start: {error}"))?;
+
     nanosiem_core::crypto::EncryptionService::try_from_env()?;
     nanosiem_api::state::load_jwt_secret(nanosiem_api::state::auth_enabled_from_env());
 
@@ -338,8 +343,12 @@ async fn server_main() -> Result<()> {
     // === License status poller (reads cached status from PG, written by nanosiem-jobs) ===
     // Enterprise-only: the open edition ships no license / phone-home machinery
     // and runs unrestricted by construction (NAN-1193).
+    // NAN-4666: one boot decision; a sovereign runtime is always
+    // locked-unless-valid (no phone-home), like an air-gapped install.
     #[cfg(feature = "enterprise")]
-    if state.config.is_license_enabled() {
+    let license_boot_mode = state.config.license_boot_mode();
+    #[cfg(feature = "enterprise")]
+    if license_boot_mode == nanosiem_api::config::LicenseBootMode::Poll {
         let license_repo = nanosiem_core::LicenseRepository::new(state.pool.clone());
         // Load cached status on startup
         match license_repo.get_status().await {
@@ -367,8 +376,8 @@ async fn server_main() -> Result<()> {
         });
         state.add_task_handle(poll_handle).await;
         tracing::info!("License status poller started (5m interval, reads from PG)");
-    } else if state.config.airgap {
-        // === Air-gapped install (AIRGAP_MODE on, no LICENSE_URL) — FAIL CLOSED ===
+    } else if license_boot_mode == nanosiem_api::config::LicenseBootMode::LockedUnlessValid {
+        // === Air-gapped or sovereign install (no LICENSE_URL) — FAIL CLOSED ===
         // There is no phone-home path here (LICENSE_URL is unset, so we never
         // start the poller above). Enforcement instead rides on a signed offline
         // license bundle imported via POST /api/airgap/license/import, which

@@ -29,14 +29,26 @@ export interface PivtDispatchResult {
 
 export const PIVT_ENTRY_EVENT = 'pivt:create-entry' as const;
 export const PIVT_CHAT_MESSAGE_EVENT = 'pivt:chat-message' as const;
-export const PIVT_OPEN_DETECTION_WIZARD = 'pivt:open-detection-wizard' as const;
-export const PIVT_OPEN_TUNING_WIZARD = 'pivt:open-tuning-wizard' as const;
-export const PIVT_OPEN_DASHBOARD_WIZARD = 'pivt:open-dashboard-wizard' as const;
-export const PIVT_OPEN_PLAYBOOK_WIZARD = 'pivt:open-playbook-wizard' as const;
-export const PIVT_OPEN_PIPE_WIZARD = 'pivt:open-pipe-wizard' as const;
-export const PIVT_SUMMARIZE_EVENT = 'pivt:summarize' as const;
+export const PIVT_OPEN_PANEL_EVENT = 'pivt:open-panel' as const;
+
+export interface PivtOpenPanelDetail {
+  prefill?: string;
+}
+
+export interface PivtWizardNavState {
+  pivtWizard: PivtWizardEventDetail;
+}
+
+export interface PivtDispatchOptions {
+  source?: 'typed' | 'suggestion';
+}
+
+/** Open builds have no pivt panel; nothing listens. */
+export function openPivtPanel(prefill?: string) {
+  void prefill;
+}
 
 /** Open builds never dispatch hosted assistant commands. */
-export function usePivtCommands(): { dispatch: (input: string) => PivtDispatchResult } {
+export function usePivtCommands(): { dispatch: (input: string, options?: PivtDispatchOptions) => PivtDispatchResult } {
   return { dispatch: () => ({ handled: false, action: 'unavailable' }) };
 }

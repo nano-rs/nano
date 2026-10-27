@@ -1,0 +1,84 @@
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/* Match the adjacent SOAR settings cards with panel-scoped .n-* styles. */
+.n-soar-pack-updates-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+}
+
+.n-soar-pack-updates-status {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.n-soar-pack-updates-button {
+  flex-shrink: 0;
+  height: 1.75rem;
+  padding-inline: 0.625rem;
+  font-size: 11.5px;
+  box-shadow: none;
+}
+
+/* Keep keyboard focus visible when removing the shared button's shadow. */
+.n-soar-pack-updates-button:focus-visible {
+  outline: 1px solid var(--ring);
+  outline-offset: 2px;
+}
+
+.n-soar-pack-updates-list,
+.n-soar-pack-updates-notice,
+.n-soar-pack-updates-result {
+  border-top: 1px solid var(--border);
+}
+
+.n-soar-pack-updates-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+}
+
+.n-soar-pack-updates-item:last-child {
+  border-bottom: 0;
+}
+
+.n-soar-pack-updates-copy {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.n-soar-pack-updates-name {
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+.n-soar-pack-updates-version,
+.n-soar-pack-updates-summary {
+  color: var(--muted-foreground);
+  font-size: 10.5px;
+}
+
+.n-soar-pack-updates-version,
+.n-soar-pack-updates-result-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.n-soar-pack-updates-notice,
+.n-soar-pack-updates-result {
+  padding: 0.75rem 1rem;
+}
+
+.n-soar-pack-updates-notice {
+  color: var(--muted-foreground);
+}
+
+.n-soar-pack-updates-error {
+  color: var(--destructive);
+}

@@ -6,9 +6,9 @@
 // the live detection API. The old visuals lived at Detections.tsx (kept in-tree
 // under a legacy export until a sunset PR).
 
-import { useCallback, useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { Download, Plus, RefreshCw, Search as SearchIcon, Database, ShieldAlert, History } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Download, Plus, RefreshCw, Search as SearchIcon, Database, ShieldAlert, History, X } from 'lucide-react';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import {
@@ -21,6 +21,8 @@ import {
   useSchedulingLag,
 } from '@/hooks/use-api';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities } from '@/hooks/use-capabilities';
+import { openPivtPanel } from '@/enterprise/components/pivt/commands/router';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { DailyStat, DetectionRule } from '@/lib/api/types';
@@ -63,6 +65,24 @@ export function Rules() {
   const { toast } = useToast();
 
   const canCreate = hasPermission('detections:create');
+  // NAN-4595: drafting rules from a narrative runs in the pivt panel.
+  const { capabilities } = useCapabilities();
+  const canDraftWithPivt = canCreate && capabilities.melod && hasPermission('melod:chat');
+  // `?ids=a,b` narrows the list to specific rules (pivt opens it this way
+  // after creating candidates in staging).
+  const [searchParams, setSearchParams] = useSearchParams();
+  const idFilter = useMemo(() => {
+    const raw = searchParams.get('ids');
+    const ids = raw ? raw.split(',').map((v) => v.trim()).filter(Boolean) : [];
+    return ids.length ? new Set(ids) : null;
+  }, [searchParams]);
+  const clearIdFilter = useCallback(() => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('ids');
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
 
   const { data: apiRules, loading, refetch } = useDetections();
   const { data: stats } = useDetectionStats(28);
@@ -85,6 +105,12 @@ export function Rules() {
     BANDS.forEach((b) => { m[b.id] = b.defaultOpen; });
     return m as Record<BandId, boolean>;
   });
+  // A pivt-filtered list (`?ids=`) is usually fresh staging rules, a band
+  // that starts collapsed: open every band so they are visible.
+  useEffect(() => {
+    if (!idFilter) return;
+    setOpenBands(Object.fromEntries(BANDS.map((b) => [b.id, true])) as Record<BandId, boolean>);
+  }, [idFilter]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkUpdating, setBulkUpdating] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
@@ -111,6 +137,7 @@ export function Rules() {
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return views.filter((v) => {
+      if (idFilter && !idFilter.has(v.id)) return false;
       if (sev !== 'all' && v.severity !== sev) return false;
       if (mode !== 'all' && v.mode !== mode) return false;
       if (status !== 'all') {
@@ -125,7 +152,7 @@ export function Rules() {
       if (needle && !v.name.toLowerCase().includes(needle)) return false;
       return true;
     });
-  }, [views, sev, mode, status, tactic, query]);
+  }, [views, idFilter, sev, mode, status, tactic, query]);
 
   const grouped = useMemo(() => {
     const g: Record<BandId, typeof filtered> = {
@@ -277,6 +304,15 @@ export function Rules() {
               Retro-hunt
             </Link>
           )}
+          {canDraftWithPivt && (
+            <button
+              type="button"
+              onClick={() => openPivtPanel('@detection ')}
+              className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5"
+            >
+              Draft with pivt
+            </button>
+          )}
           {canCreate && (
             <Link
               to="/rules/editor/new"
@@ -341,6 +377,19 @@ export function Rules() {
             ]}
           />
         </div>
+        {idFilter && (
+          <span className="h-6 pl-2 pr-1 rounded-[4px] border border-border text-[11px] text-foreground inline-flex items-center gap-1.5">
+            Only <span className="font-mono tabular-nums">{idFilter.size}</span> {idFilter.size === 1 ? 'rule' : 'rules'} from pivt
+            <button
+              type="button"
+              onClick={clearIdFilter}
+              aria-label="Show all rules"
+              className="h-4 w-4 inline-flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+            >
+              <X className="w-3 h-3" strokeWidth={1.5} />
+            </button>
+          </span>
+        )}
         <div className="flex-1 @max-[900px]:hidden" />
         <span className="font-mono text-[10.5px] text-muted-foreground tabular-nums ml-auto">
           {filtered.length} of {rules.length}

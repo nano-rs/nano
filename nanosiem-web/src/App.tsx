@@ -58,6 +58,7 @@ import { SsoRouteGate } from '@/pages/Settings/SsoRouteGate';
 import { IocListsRouteGate } from '@/pages/IocListsRouteGate';
 import { useRegisterSchemaHighlightFields } from '@/hooks/useRegisterSchemaHighlightFields';
 import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
+import { PivtSessionGuard } from '@/enterprise/components/pivt/PivtSessionGuard';
 import { LayoutProvider } from '@/contexts/LayoutContext';
 import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
 import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
@@ -215,6 +216,13 @@ const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSetti
 const NotificationSettings = lazyWithRetryNamed(() => import('@/pages/Settings/NotificationSettings'), 'NotificationSettings');
 const LookupUrlAllowlist = lazyWithRetryNamed(() => import('@/pages/Settings/LookupUrlAllowlist'), 'LookupUrlAllowlist');
 const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
+const SoarSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SoarSettings'), 'SoarSettings');
+// NAN-4540: Automation workspace, gated by soar_enabled inside each route.
+const AutomationRunsRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationRunsRoute');
+const AutomationFlowsRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationFlowsRoute');
+const AutomationFlowRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationFlowRoute');
+const AutomationApprovalsRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationApprovalsRoute');
+const AutomationCapabilitiesRoute = lazyWithRetryNamed(() => import('@/pages/Automation'), 'AutomationCapabilitiesRoute');
 const SourceScopes = lazyWithRetryNamed(() => import('@/pages/Settings/SourceScopes'), 'SourceScopes');
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
 const AirgapImportPage = lazyWithRetryNamed(() => import('@/enterprise/airgap/AirgapImportPage'), 'AirgapImportPage');
@@ -556,6 +564,26 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+
+          {/* Automation (NAN-4540) — SOAR runs, flows, approvals, capabilities */}
+          <Route path="/automation" element={<Navigate to="/automation/runs" replace />} />
+          {([
+            ['/automation/runs', AutomationRunsRoute],
+            ['/automation/runs/:id', AutomationRunsRoute],
+            ['/automation/flows', AutomationFlowsRoute],
+            ['/automation/flows/:id', AutomationFlowRoute],
+            ['/automation/approvals', AutomationApprovalsRoute],
+            ['/automation/approvals/:id', AutomationApprovalsRoute],
+            ['/automation/capabilities', AutomationCapabilitiesRoute],
+          ] as const).map(([path, Page]) => (
+            <Route key={path} path={path} element={
+              <PermissionRoute permission="soar:view" element={
+                <Suspense fallback={<ListPageLoadingFallback />}>
+                  <Page key={resetKey} />
+                </Suspense>
+              } />
+            } />
+          ))}
 
           {/* Scheduled reports (NAN-1793) */}
           <Route path="/reports" element={
@@ -1078,6 +1106,13 @@ function ProtectedAppRoutes() {
               <Suspense fallback={<SettingsLoadingFallback />}><LookupUrlAllowlist key={resetKey} /></Suspense>
             } />
           } />
+          {/* NAN-4462: SOAR opt-in; the page renders nothing actionable
+              unless the tenant plan grants the `soar` component. */}
+          <Route path="/settings/soar" element={
+            <PermissionRoute anyPermission={['soar:view', 'settings:system']} element={
+              <Suspense fallback={<SettingsLoadingFallback />}><SoarSettings key={resetKey} /></Suspense>
+            } />
+          } />
           <Route path="/settings/search" element={
             <PermissionRoute permission="settings:system" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
@@ -1295,6 +1330,8 @@ function App() {
       <BrowserRouter basename={tenantBasename(rawBrowserPath('/'))}>
         <AuthProvider>
           <BrowserTelemetry />
+          {/* NAN-4606: pivt runs and action cards never outlive the session. */}
+          <PivtSessionGuard />
           <TenantRuntimeBoundary>
             <CapabilitiesProvider>
             <UserPreferencesProvider>

@@ -72,7 +72,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 rayon = "1"
 parquet = "58"
 reqwest = { version = "0.13", features = ["form", "json", "query", "stream"] }
+# iceberg-catalog-rest uses this version internally. Platform catalog control
+# uses public WebPKI roots; private owner signing has a separate transport.
+reqwest12 = { package = "reqwest", version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+webpki-roots = "1"
 serde.workspace = true
 serde_json.workspace = true
 # Runtime-dispatched ARMv8 SHA and x86 SHA-NI acceleration. Unsupported AMD64
@@ -84,6 +88,7 @@ subtle = "2.6"
 tantivy = "=0.26.0"
 thiserror.workspace = true
 tokio.workspace = true
+typetag = "0.2"
 tokio-util = { version = "0.7", features = ["io"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

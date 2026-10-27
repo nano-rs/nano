@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use slatedb::config::{
     CompressionCodec, FlushOptions, FlushType, GarbageCollectorOptions, ObjectStoreCacheOptions, PutOptions, Settings, Ttl,
-    WriteOptions,
+    ReadOptions, WriteOptions,
 };
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
@@ -72,7 +72,53 @@ const CHUNK_ROWS: usize = 8_192;
 /// the watermark never runs more than this ahead of the wall clock.
 const MAX_FUTURE_SKEW_US: i64 = DAY_US;
 /// Concurrent SlateDB point reads per admission batch when stamping.
-const STAMP_READS: usize = 64;
+const STAMP_READS: usize = 256;
+/// Keep main's request granularity for every SST read, including dense
+/// restamps, catch-up, reset scans and compaction. Recent windows live in
+/// a separate bounded cache inside the existing data-cache memory budget.
+const OBJECT_CACHE_PART_BYTES: usize = 4 * 1024 * 1024;
+/// NAN-4592: the smallest local disk cache a remote prevalence state gets (and
+/// what every state got before: a fixed 256 MiB).
+pub const OBJECT_CACHE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
+/// NAN-4592: disk cache per byte of the state's SSTs measured at open: the
+/// state plus room for its growth and for the parts of SSTs that
+/// `maintenance[T]` compacts away until the evictor drops them.
+pub const OBJECT_CACHE_STATE_FACTOR: u64 = 2;
+
+/// NAN-4592: the local disk (object) cache for a remote state whose SSTs
+/// measured `state_bytes` at open (`None`: not measured), within the tenant's
+/// `cap_bytes`.
+///
+/// The large tenant (hosted, 2026-10-26 12:15-13:46Z): with the fixed 256 MiB cache
+/// against a ~3 GiB state, point reads for random keys missed the disk
+/// almost always. A miss fetches the whole 4 MiB part holding the block, so
+/// 91 min of stamps cost ~44k R2 GETs / 87 GB on the stamp path (filters
+/// and indexes) plus ~49k GETs / ~200 GB of data blocks (counted as
+/// "maintenance": SlateDB fetches blocks on spawned tasks that lose the
+/// read-path scope), and 28% of admission batches overran the 5 s wait. A
+/// cache the size of the state fetches each part once per SST.
+pub fn object_cache_bytes(state_bytes: Option<u64>, cap_bytes: u64) -> u64 {
+    let wanted = state_bytes
+        .map_or(OBJECT_CACHE_FLOOR_BYTES, |bytes| bytes.saturating_mul(OBJECT_CACHE_STATE_FACTOR))
+        .max(OBJECT_CACHE_FLOOR_BYTES);
+    // A cap below the floor (tests) wins; production caps start at the floor.
+    wanted.min(cap_bytes)
+}
+
+/// NAN-4592: bytes of the state's compacted SSTs (one LIST of this tenant's
+/// own `db/compacted/`; SSTs compacted away but not yet collected count too).
+async fn measure_state_bytes(store: &Arc<dyn ObjectStore>) -> Result<u64> {
+    let prefix = slatedb::object_store::path::Path::from("db/compacted");
+    let mut listing = store.list(Some(&prefix));
+    let mut bytes = 0_u64;
+    while let Some(meta) = listing.next().await {
+        bytes = bytes.saturating_add(meta?.size);
+    }
+    Ok(bytes)
+}
+/// Nominal analytical budget; production adapts between 16 and 128 lanes.
+#[cfg(test)]
+const RESTAMP_READS: usize = 64;
 /// NAN-3879: concurrent SlateDB point reads per apply chunk / catch-up
 /// batch. In production (2026-10-15): cold prior reads go to R2 (~0.1 s each), so at
 /// 64 a flush of ~11k rows (~3.5k keys) read for ~5.5 s and overran the
@@ -490,6 +536,93 @@ pub const CATCH_UP_BATCH_ROWS: u64 = 65_536;
 /// aborts reads in flight.
 pub const CATCH_UP_BATCH_ENTRIES: usize = 32;
 
+/// NAN-4460: how many times [`CATCH_UP_BATCH_ENTRIES`] / [`CATCH_UP_BATCH_ROWS`]
+/// one catch-up batch may grow while the backlog is long.
+///
+/// The large tenant (hosted, 2026-10-23, after a 62 h outage): a 26-entry batch read
+/// ~42k keys in 15-24 s and committed every ~30 s. The cell's ingress held at
+/// ~160 MB/s throughout. The reason: a cold point read fills a whole 4 MiB part
+/// of the state's object cache (SlateDB's `part_size_bytes`), and that cache
+/// (256 MiB) is far smaller than the state. So once a batch's keys outnumber the
+/// state's parts, its reads re-download about the whole state, however many
+/// keys it has. A batch's read cost is then fixed and its cost per entry falls
+/// as 1/entries. At scale 1 the catch-up drained ~44 entries a minute, a ~5 h
+/// ETA for 16,883 entries.
+pub const CATCH_UP_MAX_SCALE: usize = 8;
+
+/// NAN-4460: bytes of peak heap one partial row of a catch-up batch may cost
+/// (fold, prior reads, the write batch and its memtable copy). Measured: 763
+/// B/row on a large-tenant-shaped batch over multi-day priors
+/// (`catch_up_batch_heap_per_row_stays_under_the_budget`, which keeps 25%
+/// headroom over the measurement).
+pub const CATCH_UP_ROW_BYTES: u64 = 1024;
+
+/// NAN-4460: share of the ingest process's memory cap one catch-up batch
+/// may hold at its peak (one batch at a time; a merge's decode window takes
+/// 5%).
+pub const CATCH_UP_MEMORY_SHARE: f64 = 0.10;
+
+/// NAN-4460: the most partial rows a catch-up batch may fold for an ingest
+/// process with `memory_cap_bytes` (0: unknown). Never below today's
+/// [`CATCH_UP_BATCH_ROWS`] and never above [`CATCH_UP_MAX_SCALE`] times it.
+pub fn catch_up_max_rows_for(memory_cap_bytes: u64) -> u64 {
+    let ceiling = CATCH_UP_BATCH_ROWS * CATCH_UP_MAX_SCALE as u64;
+    if memory_cap_bytes == 0 {
+        return CATCH_UP_BATCH_ROWS;
+    }
+    ((memory_cap_bytes as f64 * CATCH_UP_MEMORY_SHARE / CATCH_UP_ROW_BYTES as f64) as u64)
+        .clamp(CATCH_UP_BATCH_ROWS, ceiling)
+}
+
+/// NAN-4460: the batch scale a backlog of `behind_entries` warrants. The scale
+/// doubles only while at least two full batches at the doubled scale are behind,
+/// so a restart-sized backlog keeps today's batches and its stamping latency.
+pub fn catch_up_scale_for_backlog(behind_entries: u64, base_entries: usize) -> usize {
+    let base = base_entries.max(1) as u64;
+    let mut scale = 1_usize;
+    while scale < CATCH_UP_MAX_SCALE && behind_entries >= base.saturating_mul(scale as u64 * 2).saturating_mul(2) {
+        scale *= 2;
+    }
+    scale
+}
+
+/// NAN-4464: the cell's room for a larger catch-up batch, sampled after each
+/// committed batch ([`super::merge_quota::catch_up_headroom`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUpHeadroom {
+    /// Ingest lag well inside its bound and no CPU throttling or R2 strain:
+    /// the scale may grow toward what the backlog warrants.
+    Room,
+    /// Ingest lag close to its bound: keep the current scale.
+    Hold,
+    /// Ingest lag past its bound, or CPU throttling / R2 strain: halve.
+    Pressured,
+}
+
+/// NAN-4464: share of the ingest lag bound (`IngestConfig::lag_alert_ms`)
+/// above which a catch-up batch stops growing (it halves past the bound).
+pub const CATCH_UP_LAG_HOLD_SHARE: f64 = 0.75;
+
+/// NAN-4460: the next batch's scale after one batch committed. AIMD-style:
+/// - pressure (ingest lag past its bound, CPU throttling, R2 strain) halves
+///   it, down to today's batch;
+/// - lag near its bound holds it;
+/// - otherwise it doubles toward what the backlog warrants;
+/// - it drops at once when the backlog no longer warrants it.
+/// Each step follows a committed batch (~30 s on the large tenant), so 1 -> 8 takes three
+/// batches.
+pub fn next_catch_up_scale(current: usize, behind_entries: u64, base_entries: usize, headroom: CatchUpHeadroom) -> usize {
+    let target = catch_up_scale_for_backlog(behind_entries, base_entries);
+    let current = current.clamp(1, CATCH_UP_MAX_SCALE);
+    let next = match headroom {
+        CatchUpHeadroom::Pressured => current / 2,
+        CatchUpHeadroom::Hold => current,
+        CatchUpHeadroom::Room if current < target => current * 2,
+        CatchUpHeadroom::Room => target,
+    };
+    next.clamp(1, target)
+}
+
 /// NAN-3849: one committed `Add` entry of a catch-up batch
 /// ([`IngestPrevalence::apply_entries_batch`]).
 #[derive(Debug, Clone)]
@@ -556,6 +689,10 @@ pub struct EntryRef<'a> {
 pub struct IngestPrevalence {
     tenant_id: String,
     db: Db,
+    point_cache: Arc<super::prevalence_io::ValueCache>,
+    read_counters: Arc<super::prevalence_io::ReadCounters>,
+    restamp_budget: Arc<super::prevalence_io::RestampBudget>,
+    main_read_policy: bool,
     watermark_us: Option<i64>,
     created: bool,
     physical_ttl: bool,
@@ -594,6 +731,15 @@ pub struct IngestPrevalence {
     /// Test hook: each apply-chunk point read sleeps this long first.
     #[cfg(test)]
     read_delay: Option<std::time::Duration>,
+    /// Test hook (NAN-4592): each admission batch's lookup
+    /// ([`PrevalenceLookup::observe`]) sleeps this long before its reads; a
+    /// restamp's lookups are not delayed.
+    #[cfg(test)]
+    pub(crate) stamp_delay: Option<std::time::Duration>,
+    /// NAN-4592: the state's SST bytes measured at open (`None`: a local
+    /// state, or the measurement failed) and the disk cache sized from them.
+    measured_state_bytes: Option<u64>,
+    object_cache_bytes: u64,
 }
 
 /// One apply chunk's prior values: `(key, the chunk's state, prior state)`.
@@ -765,8 +911,16 @@ pub fn stamp_artifacts<'e>(events: impl IntoIterator<Item = &'e Value>) -> Resul
 #[derive(Clone)]
 pub struct PrevalenceLookup {
     db: Db,
+    point_cache: Arc<super::prevalence_io::ValueCache>,
+    read_counters: Arc<super::prevalence_io::ReadCounters>,
+    restamp_budget: Arc<super::prevalence_io::RestampBudget>,
+    main_read_policy: bool,
     watermark_us: Option<i64>,
     rarity_threshold: u64,
+    #[cfg(test)]
+    read_delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    observe_delay: Option<std::time::Duration>,
 }
 
 /// What [`PrevalenceLookup::observe`] read, ready to stamp the batch.
@@ -778,12 +932,15 @@ pub struct Observed {
 impl PrevalenceLookup {
     /// Read every artifact once, with bounded concurrency.
     pub async fn observe(self, artifacts: std::collections::BTreeSet<String>) -> Result<Observed> {
+        let _foreground = self.restamp_budget.foreground();
+        #[cfg(test)]
+        if let Some(delay) = self.observe_delay { tokio::time::sleep(delay).await; }
         let this = &self;
         let rows = stream::iter(artifacts.into_iter().map(|artifact| async move {
-            let row = this.observation(IngestPrevalence::kind(&artifact), &artifact).await?;
+            let row = this.observation(IngestPrevalence::kind(&artifact), &artifact, true).await?;
             Ok::<_, anyhow::Error>((artifact, row))
         }))
-        .buffer_unordered(STAMP_READS)
+        .buffer_unordered(if self.main_read_policy { 64 } else { STAMP_READS })
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -794,18 +951,79 @@ impl PrevalenceLookup {
     /// One point read: the entity's window ending at the watermark. Hosts
     /// and occurrences on days before the window are not counted, so an
     /// entity active for more than 30 days reports only its recent spread.
-    async fn observation(&self, kind: &str, artifact: &str) -> Result<Option<PrevalenceRow>> {
+    async fn observation(&self, kind: &str, artifact: &str, cache_blocks: bool) -> Result<Option<PrevalenceRow>> {
+        #[cfg(test)]
+        if let Some(delay) = self.read_delay { tokio::time::sleep(delay).await; }
         let Some(watermark) = self.watermark_us else {
             return Ok(None);
         };
-        let Some(state) = self.db.get(key(kind, artifact)).await?.map(|bytes| decode(&bytes)).transpose()? else {
-            return Ok(None);
+        let k = key(kind, artifact);
+        let bytes = if cache_blocks {
+            super::prevalence_io::read(&self.db, &self.point_cache, &self.read_counters,
+                super::prevalence_io::ReadPath::Stamp, &k).await?
+        } else {
+            self.read_counters.db_read(super::prevalence_io::ReadPath::Restamp);
+            super::prevalence_io::scope(super::prevalence_io::ReadPath::Restamp,
+                self.db.get_with_options(k, &ReadOptions::default().with_cache_blocks(self.main_read_policy))).await?
         };
+        let Some(state) = bytes.map(|bytes| decode(&bytes)).transpose()? else { return Ok(None) };
         if state.last_seen <= watermark.saturating_sub(INACTIVE_TTL_US) {
             return Ok(None);
         }
         let row = state.window(kind, artifact, floor_day(watermark));
         Ok((!row.hosts.is_empty()).then_some(row))
+    }
+
+    /// Keep completed scalars when a routine merge's budget expires. A
+    /// sealed rewrite resumes the same stream after every budget slice;
+    /// only a store making no progress for the stall timeout fails it.
+    /// Missing scalars stay unstamped, never become invented rarity.
+    pub(super) async fn observe_restamp(self, artifacts: std::collections::BTreeSet<String>, sealed: bool)
+        -> Result<(std::collections::HashMap<String, u64>, bool)> {
+        let this = &self;
+        let total = artifacts.len();
+        let mut artifacts = artifacts.into_iter();
+        let mut reads = futures::stream::FuturesUnordered::new();
+        let read = |artifact: String| async move {
+            let row = tokio::time::timeout(super::restamp::RESTAMP_LOOKUP_TIMEOUT,
+                this.observation(IngestPrevalence::kind(&artifact), &artifact, false)).await
+                .context("prevalence restamp point read stalled")??;
+            Ok::<_, anyhow::Error>((artifact, IngestPrevalence::scalar(row.as_ref())))
+        };
+        let mut scalars = std::collections::HashMap::new();
+        let mut deadline = tokio::time::Instant::now() + super::restamp::RESTAMP_MERGE_LOOKUP_TIMEOUT;
+        loop {
+            while reads.len() < self.restamp_budget.lanes() {
+                let Some(artifact) = artifacts.next() else { break };
+                reads.push(read(artifact));
+            }
+            if scalars.len() == total {
+                return Ok((scalars, true));
+            }
+            // timeout_at polls a ready future before its timer. Check the
+            // clock too, so a fully cached hour still respects the budget.
+            if tokio::time::Instant::now() >= deadline {
+                if !sealed { return Ok((scalars, false)) }
+                tokio::task::yield_now().await;
+                deadline = tokio::time::Instant::now() + super::restamp::RESTAMP_MERGE_LOOKUP_TIMEOUT;
+            }
+            match tokio::time::timeout_at(deadline, reads.next()).await {
+                Ok(Some(row)) => {
+                    let (artifact, scalar) = row?;
+                    scalars.insert(artifact, scalar);
+                    if scalars.len() % 256 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Ok(None) => return Ok((scalars, true)),
+                Err(_) if !sealed => return Ok((scalars, false)),
+                Err(_) => {
+                    tracing::info!(artifacts = scalars.len(), "prevalence restamp lookup budget yielded; resuming");
+                    tokio::task::yield_now().await;
+                    deadline = tokio::time::Instant::now() + super::restamp::RESTAMP_MERGE_LOOKUP_TIMEOUT;
+                }
+            }
+        }
     }
 }
 
@@ -860,6 +1078,21 @@ impl IngestPrevalence {
         access: Option<&PrevalenceAccess>,
         reads: Option<Arc<dyn ObjectStore>>,
     ) -> Result<Self> {
+        Self::open_sized(tenant_id, work_dir, access, reads, OBJECT_CACHE_FLOOR_BYTES).await
+    }
+
+    /// [`Self::open_with_reads`] with the tenant's disk-cache cap (NAN-4592,
+    /// the production open: `spawn_prevalence_open`). A remote state (a
+    /// grant, or `reads`) sizes its disk cache from the state's measured
+    /// SSTs within `cache_cap_bytes` ([`object_cache_bytes`]); a state on the
+    /// local filesystem keeps the floor (it is already local).
+    pub async fn open_sized(
+        tenant_id: &str,
+        work_dir: &Path,
+        access: Option<&PrevalenceAccess>,
+        reads: Option<Arc<dyn ObjectStore>>,
+        cache_cap_bytes: u64,
+    ) -> Result<Self> {
         ensure!(
             uuid::Uuid::parse_str(tenant_id).is_ok_and(|id| id.to_string() == tenant_id),
             "prevalence tenant must be a canonical UUID"
@@ -903,10 +1136,31 @@ impl IngestPrevalence {
                 }
             },
         };
+        // NAN-4592: only a remote state's reads cost R2 GETs. The cache
+        // directory is this tenant's own (`prevalence/<tenant>/object-cache`)
+        // and every SST path is under the tenant's prefix: nothing is shared.
+        let (measured, cache_bytes) = if embedded_compaction {
+            (None, OBJECT_CACHE_FLOOR_BYTES.min(cache_cap_bytes))
+        } else {
+            let measured = match measure_state_bytes(&store).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) => {
+                    tracing::warn!(tenant = %tenant_id, error = %format!("{error:#}"),
+                        "prevalence state size unknown; its disk cache keeps the floor");
+                    None
+                }
+            };
+            let bytes = object_cache_bytes(measured, cache_cap_bytes);
+            tracing::info!(tenant = %tenant_id, state_bytes = measured, cache_bytes = bytes, cap_bytes = cache_cap_bytes,
+                "prevalence disk cache sized from the state");
+            (measured, bytes)
+        };
         let local_root = work_dir.join("prevalence").join(tenant_id);
-        let mut state = Self::open_store(tenant_id, store, "db", Some(&cache), access.is_some(), Some(local_root), embedded_compaction)
+        let mut state = Self::open_store(tenant_id, store, "db", Some((&cache, cache_bytes)), access.is_some(),
+            Some(local_root), embedded_compaction)
             .await?;
         state.owner = owner_store;
+        state.measured_state_bytes = measured;
         Ok(state)
     }
 
@@ -972,13 +1226,18 @@ impl IngestPrevalence {
         tenant_id: &str,
         store: Arc<dyn ObjectStore>,
         path: &str,
-        cache_dir: Option<&Path>,
+        cache_dir: Option<(&Path, u64)>,
         physical_ttl: bool,
         local_root: Option<PathBuf>,
         embedded_compaction: bool,
     ) -> Result<Self> {
+        let main_read_policy = super::prevalence_io::main_policy();
+        let point_cache = Arc::new(super::prevalence_io::ValueCache::new(!main_read_policy));
+        let read_counters = Arc::new(super::prevalence_io::ReadCounters::default());
+        let restamp_budget = Arc::new(super::prevalence_io::RestampBudget::default());
+        let store: Arc<dyn ObjectStore> = Arc::new(super::prevalence_io::MeteredStore { inner: store, counters: read_counters.clone() });
         let blocks: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
-            max_capacity: 32 * 1024 * 1024,
+            max_capacity: if main_read_policy { 32 * 1024 * 1024 } else { super::prevalence_io::VALUE_CACHE_BYTES as u64 },
             shards: 8,
         }));
         let metadata: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
@@ -1007,14 +1266,15 @@ impl IngestPrevalence {
             ..Settings::default()
         };
         settings.object_store_cache_options = ObjectStoreCacheOptions {
-            root_folder: cache_dir.map(Path::to_path_buf),
-            max_cache_size_bytes: cache_dir.map(|_| 256 * 1024 * 1024),
+            root_folder: cache_dir.map(|(dir, _)| dir.to_path_buf()),
+            max_cache_size_bytes: cache_dir.map(|(_, bytes)| usize::try_from(bytes).unwrap_or(usize::MAX)),
             cache_on_flush: cache_dir.is_some(),
             cache_on_compaction: cache_dir.is_some(),
+            part_size_bytes: OBJECT_CACHE_PART_BYTES,
             ..ObjectStoreCacheOptions::default()
         };
         let db = Db::builder(path, store)
-            .with_db_cache(cache)
+            .with_db_cache(Arc::new(super::prevalence_io::MeasuredCache { inner: cache, counters: read_counters.clone() }))
             .with_settings(settings)
             .build()
             .await
@@ -1042,6 +1302,7 @@ impl IngestPrevalence {
         Ok(Self {
             tenant_id: tenant_id.into(),
             db,
+            point_cache, read_counters, restamp_budget, main_read_policy,
             watermark_us,
             created,
             reset_pending,
@@ -1061,6 +1322,10 @@ impl IngestPrevalence {
             crash_after_writes: None,
             #[cfg(test)]
             read_delay: None,
+            #[cfg(test)]
+            stamp_delay: None,
+            measured_state_bytes: None,
+            object_cache_bytes: cache_dir.map_or(0, |(_, bytes)| bytes),
         })
     }
 
@@ -1145,7 +1410,7 @@ impl IngestPrevalence {
         };
         let mut writes = WriteBatch::new();
         writes.put(APPLIED_KEY, serde_json::to_vec(&next)?);
-        self.commit(writes, true).await
+        self.commit_metadata(writes, true).await
     }
 
     /// The part list an interrupted rebuild resumes.
@@ -1163,6 +1428,7 @@ impl IngestPrevalence {
     /// caller runs it only after every `add` up to its last erasure rewrite
     /// was applied, so no replay of a pre-erasure part can re-add it.
     pub async fn erase_artifact(&mut self, kind: &str, artifact: &str) -> Result<bool> {
+        self.point_cache.invalidate();
         let key = key(kind, artifact);
         if self.db.get(&key).await?.is_none() {
             return Ok(false);
@@ -1533,6 +1799,7 @@ impl IngestPrevalence {
             };
             let reads = self.read_chunk(chunk_key, batch_rows).await?;
             let mut writes = WriteBatch::new();
+            let mut updates = Vec::with_capacity(reads.len());
             for (key, row, prior) in reads {
                 let mut value = match prior.filter(|old| old.last_seen > floor) {
                     Some(mut prior) => {
@@ -1543,7 +1810,7 @@ impl IngestPrevalence {
                 };
                 // Shed days (and their hosts) that left the 30-day window.
                 value.prune(first_day, top_day);
-                self.put_state(&mut writes, key, &value);
+                updates.push(self.put_state(&mut writes, key, &value));
             }
             cursor.next_chunk = chunk + 1;
             writes.put(APPLIED_KEY, serde_json::to_vec(&cursor)?);
@@ -1560,7 +1827,7 @@ impl IngestPrevalence {
             // per chunk and per part was an owner round trip each (~0.45 s),
             // serial in every flush commit.
             let durable = self.last_flush.elapsed() >= REBUILD_FLUSH_EVERY;
-            self.commit(writes, durable).await.context("durably apply committed prevalence chunk")?;
+            self.commit_with_values(writes, durable, Some(&updates)).await.context("durably apply committed prevalence chunk")?;
             // The chunk landed: its reads are spent (the next chunk reads
             // after this write).
             self.chunk_reads = None;
@@ -1578,7 +1845,7 @@ impl IngestPrevalence {
         // The final part of an entry (a rebuild's too) is durable before
         // stamping.
         let durable = index + 1 == entry.parts || self.last_flush.elapsed() >= REBUILD_FLUSH_EVERY;
-        self.commit(writes, durable).await.context("durably complete prevalence part")?;
+        self.commit_metadata(writes, durable).await.context("durably complete prevalence part")?;
         Ok(true)
     }
 
@@ -1608,17 +1875,19 @@ impl IngestPrevalence {
     }
 
     /// Stage one entity's state, with its physical TTL when enabled.
-    fn put_state(&self, writes: &mut WriteBatch, key: Vec<u8>, value: &WindowState) {
+    fn put_state(&self, writes: &mut WriteBatch, key: Vec<u8>, value: &WindowState) -> (Vec<u8>, bytes::Bytes) {
+        let encoded = bytes::Bytes::from(encode(value));
         if self.physical_ttl {
             // SlateDB TTL uses milliseconds. Round expiry upward so
             // the exact microsecond read gate remains authoritative.
             let expiry_us = value.last_seen.saturating_add(INACTIVE_TTL_US);
             let expiry_ms = expiry_us.div_euclid(1_000)
                 .saturating_add(i64::from(expiry_us.rem_euclid(1_000) != 0));
-            writes.put_with_options(key, encode(value), &PutOptions { ttl: Ttl::ExpireAt(expiry_ms) });
+            writes.put_bytes_with_options(bytes::Bytes::copy_from_slice(&key), encoded.clone(), &PutOptions { ttl: Ttl::ExpireAt(expiry_ms) });
         } else {
-            writes.put(key, encode(value));
+            writes.put_bytes(bytes::Bytes::copy_from_slice(&key), encoded.clone());
         }
+        (key, encoded)
     }
 
     /// NAN-3849: apply several whole committed `Add` entries, in log order,
@@ -1647,6 +1916,25 @@ impl IngestPrevalence {
     /// `first_seen` of an entity whose prior is exactly at the 30-day
     /// inactivity boundary inside the batch's watermark spread).
     pub async fn apply_entries_batch(&mut self, tenant_id: &str, batch: &[BatchEntry]) -> Result<BatchApplied> {
+        self.apply_entries_batch_within(tenant_id, batch, None).await?
+            .context("a catch-up batch without a read deadline always applies")
+    }
+
+    /// [`Self::apply_entries_batch`], waiting for the batch's reads at most
+    /// until `patience`. `Ok(None)`: they are still running (in
+    /// [`Self::chunk_reads`], like a step the ingest wait drops); the same
+    /// batch picks them up later and commits.
+    ///
+    /// NAN-4464 (a large hosted tenant, 2026-10-23): a batch's reads take 15-24 s
+    /// (they re-download ~the state). The step waited for them until the 5 s
+    /// ingest wait cut it, on every tick, so ingest lost 5 s of each ~5.5 s
+    /// tick while a batch read. The finished reads then waited for whichever
+    /// step came next, usually the one after an ingest flush (~30 s apart).
+    /// With a patience deadline the step returns while the reads run, and
+    /// the caller skips its steps until they finish
+    /// ([`Self::catch_up_reads_in_flight`]).
+    pub async fn apply_entries_batch_within(&mut self, tenant_id: &str, batch: &[BatchEntry],
+        patience: Option<std::time::Instant>) -> Result<Option<BatchApplied>> {
         ensure!(tenant_id == self.tenant_id, "prevalence part belongs to another tenant");
         ensure!(!self.created, "prevalence state is not initialized");
         let (first, last) = (batch.first().context("empty prevalence batch")?, batch.last().context("empty prevalence batch")?);
@@ -1662,6 +1950,22 @@ impl IngestPrevalence {
                 ensure!(valid_part_id(part_id), "invalid prevalence part id");
             }
             previous = entry.seq;
+        }
+        let chunk_key = ChunkKey {
+            first_seq: first.seq,
+            seq: last.seq,
+            entry_sha256: last.sha256.clone(),
+            rebuild: false,
+            index: u32::MAX,
+            part_sha256: String::new(),
+            chunk: u32::try_from(batch.len()).unwrap_or(u32::MAX),
+        };
+        // This batch's reads still running: wait for them (within
+        // `patience`) before folding its partials again.
+        if self.chunk_reads.as_ref().is_some_and(|reads| reads.key == chunk_key && reads.basis.as_ref() == Some(&cursor))
+            && !self.await_chunk_reads(patience).await?
+        {
+            return Ok(None);
         }
         let started = std::time::Instant::now();
         let mut watermark = self.watermark_us;
@@ -1703,20 +2007,12 @@ impl IngestPrevalence {
         let floor = mark.saturating_sub(INACTIVE_TTL_US);
         let (first_day, top_day) = (floor_day(mark), day_of(mark));
         let keys = folded.len();
-        let chunk_key = ChunkKey {
-            first_seq: first.seq,
-            seq: last.seq,
-            entry_sha256: last.sha256.clone(),
-            rebuild: false,
-            index: u32::MAX,
-            part_sha256: String::new(),
-            chunk: u32::try_from(batch.len()).unwrap_or(u32::MAX),
-        };
         let fold_ms = started.elapsed().as_millis() as u64;
         let reading = std::time::Instant::now();
-        let reads = self.read_chunk(chunk_key, folded).await?;
+        let Some(reads) = self.read_chunk_within(chunk_key, folded, patience).await? else { return Ok(None) };
         let read_ms = reading.elapsed().as_millis() as u64;
         let mut writes = WriteBatch::new();
+        let mut updates = Vec::with_capacity(reads.len());
         for (key, row, prior) in reads {
             let mut value = match prior.filter(|old| old.last_seen > floor) {
                 Some(mut prior) => {
@@ -1726,7 +2022,7 @@ impl IngestPrevalence {
                 None => row,
             };
             value.prune(first_day, top_day);
-            self.put_state(&mut writes, key, &value);
+            updates.push(self.put_state(&mut writes, key, &value));
         }
         let parts = u32::try_from(last.parts.len()).context("too many parts in one add")?;
         let cursor = Applied {
@@ -1744,10 +2040,10 @@ impl IngestPrevalence {
         self.maybe_crash()?;
         let writing = std::time::Instant::now();
         // Durable before stamping, like the last part of a single entry.
-        self.commit(writes, true).await.context("durably apply a prevalence catch-up batch")?;
+        self.commit_with_values(writes, true, Some(&updates)).await.context("durably apply a prevalence catch-up batch")?;
         self.chunk_reads = None;
         self.advance_watermark(mark);
-        Ok(BatchApplied {
+        Ok(Some(BatchApplied {
             entries: batch.len(),
             parts: parts_total,
             rows: rows_total,
@@ -1755,8 +2051,30 @@ impl IngestPrevalence {
             fold_ms,
             read_ms,
             write_ms: writing.elapsed().as_millis() as u64,
-        })
+        }))
     }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_io_pressure_for_test(&mut self, keys: usize) -> Result<()> {
+        let mark = self.watermark_us.context("seed after real replay")?;
+        let day = day_of(mark);
+        for first in (0..keys).step_by(8_192) {
+            let mut writes = WriteBatch::new();
+            for k in first..(first+8_192).min(keys) {
+                let artifact = crate::parts::sha256_hex(&(1_000_000_u64+k as u64).to_le_bytes());
+                let value = WindowState { first_seen: mark, last_seen: mark, days: vec![(day,4)],
+                    hosts: (0..4).map(|h| ((k*4+h) as u64,day)).collect() };
+                writes.put(key("hash", &artifact), encode(&value));
+            }
+            self.commit(writes,true).await?;
+        }
+        self.flush_memtable().await
+    }
+
+    pub(crate) fn update_restamp_headroom(&self, lag_ms: i64, bound_ms: i64, l0_overdue_ms: i64) {
+        self.restamp_budget.update(lag_ms, bound_ms, l0_overdue_ms);
+    }
+    pub(crate) fn read_stats(&self) -> Vec<super::prevalence_io::ReadStats> { self.read_counters.snapshot() }
 
     /// NAN-3873: whether SlateDB has closed this writer under us. SlateDB
     /// latches the first background error (a WAL or memtable flush the owner
@@ -1803,6 +2121,13 @@ impl IngestPrevalence {
     /// the keys they did not cover are read, so a cut apply's reads are
     /// never thrown away.
     async fn read_chunk(&mut self, key: ChunkKey, rows: BTreeMap<Vec<u8>, WindowState>) -> Result<Vec<ChunkRead>> {
+        self.read_chunk_within(key, rows, None).await?.context("chunk reads without a deadline always finish")
+    }
+
+    /// NAN-4464: [`Self::read_chunk`], waiting at most until `patience`.
+    /// `Ok(None)`: the reads keep running in [`Self::chunk_reads`].
+    async fn read_chunk_within(&mut self, key: ChunkKey, rows: BTreeMap<Vec<u8>, WindowState>,
+        patience: Option<std::time::Instant>) -> Result<Option<Vec<ChunkRead>>> {
         let basis = self.applied().await?;
         let reusable = self.chunk_reads.as_ref().is_some_and(|reads| reads.key == key && reads.basis == basis);
         if !reusable {
@@ -1814,10 +2139,15 @@ impl IngestPrevalence {
                 None => None,
             };
             let db = self.db.clone();
+            let point_cache = self.point_cache.clone();
+            let read_counters = self.read_counters.clone();
+            let restamp_budget = self.restamp_budget.clone();
+            let read_path = if key.index == u32::MAX { super::prevalence_io::ReadPath::CatchUp } else { super::prevalence_io::ReadPath::Apply };
             let done = self.chunk_reads_done.clone();
             #[cfg(test)]
             let delay = self.read_delay;
             let handle = tokio::spawn(async move {
+                let _foreground = restamp_budget.foreground();
                 let mut known = std::collections::HashMap::new();
                 let adopted = match adopted {
                     Some(Ok(rows)) => Some(Ok(rows)),
@@ -1837,13 +2167,13 @@ impl IngestPrevalence {
                 // reads would hold an otherwise small partial well beyond the
                 // publication SLO.
                 let fresh = stream::iter(read.into_iter().map(|(key, row)| {
-                    let (db, done) = (db.clone(), done.clone());
+                    let (db, done, point_cache, read_counters) = (db.clone(), done.clone(), point_cache.clone(), read_counters.clone());
                     async move {
                         #[cfg(test)]
                         if let Some(delay) = delay {
                             tokio::time::sleep(delay).await;
                         }
-                        let prior = db.get(&key).await?.map(|value| decode(&value)).transpose()?;
+                        let prior = super::prevalence_io::read(&db, &point_cache, &read_counters, read_path, &key).await?.map(|value| decode(&value)).transpose()?;
                         done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Ok::<_, anyhow::Error>((key, row, prior))
                     }
@@ -1859,25 +2189,51 @@ impl IngestPrevalence {
             // Replacing a stale task (another cursor) aborts it.
             self.chunk_reads = Some(ChunkReads { key, basis, state: ChunkReadState::Running(handle) });
         }
-        let reads = self.chunk_reads.as_mut().expect("set above");
-        if let ChunkReadState::Running(handle) = &mut reads.state {
-            let outcome = handle.await;
-            match outcome {
-                Ok(Ok(rows)) => reads.state = ChunkReadState::Ready(rows),
-                Ok(Err(error)) => {
-                    self.chunk_reads = None;
-                    return Err(error.context("read prevalence chunk priors"));
-                }
-                Err(error) => {
-                    self.chunk_reads = None;
-                    return Err(anyhow::anyhow!("prevalence chunk read task ended: {error}"));
-                }
-            }
+        if !self.await_chunk_reads(patience).await? {
+            return Ok(None);
         }
         match &self.chunk_reads.as_ref().expect("set above").state {
-            ChunkReadState::Ready(rows) => Ok(rows.clone()),
+            ChunkReadState::Ready(rows) => Ok(Some(rows.clone())),
             ChunkReadState::Running(_) => unreachable!("awaited above"),
         }
+    }
+
+    /// Wait for the reads in [`Self::chunk_reads`] (at most until
+    /// `patience`) and keep their result. `Ok(false)`: still running.
+    /// Cancel-safe: the task stays in place until it finishes.
+    async fn await_chunk_reads(&mut self, patience: Option<std::time::Instant>) -> Result<bool> {
+        let Some(reads) = self.chunk_reads.as_mut() else { return Ok(true) };
+        let ChunkReadState::Running(handle) = &mut reads.state else { return Ok(true) };
+        let outcome = match patience {
+            None => handle.await,
+            Some(patience) => match tokio::time::timeout_at(tokio::time::Instant::from_std(patience), &mut *handle).await {
+                Ok(outcome) => outcome,
+                Err(_) => return Ok(false),
+            },
+        };
+        match outcome {
+            Ok(Ok(rows)) => {
+                reads.state = ChunkReadState::Ready(rows);
+                Ok(true)
+            }
+            Ok(Err(error)) => {
+                self.chunk_reads = None;
+                Err(error.context("read prevalence chunk priors"))
+            }
+            Err(error) => {
+                self.chunk_reads = None;
+                Err(anyhow::anyhow!("prevalence chunk read task ended: {error}"))
+            }
+        }
+    }
+
+    /// NAN-4464: a chunk's or catch-up batch's reads are still running in
+    /// the background (a step returned or was cut before they finished).
+    pub fn catch_up_reads_in_flight(&self) -> bool {
+        self.chunk_reads.as_ref().is_some_and(|reads| match &reads.state {
+            ChunkReadState::Running(handle) => !handle.is_finished(),
+            ChunkReadState::Ready(_) => false,
+        })
     }
 
     /// Durable once the WAL SST is on object storage. Memtables still flush
@@ -1887,6 +2243,7 @@ impl IngestPrevalence {
     /// a restart then resumes exactly where this step stopped).
     pub async fn make_durable(&mut self) -> Result<()> {
         self.db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await?;
+        self.point_cache.after_durability_barrier();
         self.durable_commits = self.durable_commits.saturating_add(1);
         self.last_flush = std::time::Instant::now();
         self.wal_flushes_since_l0 = self.wal_flushes_since_l0.saturating_add(1);
@@ -1894,17 +2251,22 @@ impl IngestPrevalence {
     }
 
     async fn commit(&mut self, writes: WriteBatch, durable: bool) -> Result<()> {
+        self.commit_with_values(writes, durable, None).await
+    }
+
+    async fn commit_with_values(&mut self, writes: WriteBatch, durable: bool, updates: Option<&[(Vec<u8>, bytes::Bytes)]>) -> Result<()> {
+        self.point_cache.before_write(updates);
+        self.db.write_with_options(writes, &WriteOptions { await_durable: false, ..WriteOptions::default() }).await?;
+        self.point_cache.after_write(updates);
+        if durable { self.make_durable().await?; }
+        Ok(())
+    }
+
+    async fn commit_metadata(&mut self, writes: WriteBatch, durable: bool) -> Result<()> {
         self.db
             .write_with_options(writes, &WriteOptions { await_durable: false, ..WriteOptions::default() })
             .await?;
-        if durable {
-            self.db
-                .flush_with_options(FlushOptions { flush_type: FlushType::Wal })
-                .await?;
-            self.durable_commits = self.durable_commits.saturating_add(1);
-            self.last_flush = std::time::Instant::now();
-            self.wal_flushes_since_l0 = self.wal_flushes_since_l0.saturating_add(1);
-        }
+        if durable { self.make_durable().await?; }
         Ok(())
     }
 
@@ -1915,6 +2277,11 @@ impl IngestPrevalence {
             *left -= 1;
         }
         Ok(())
+    }
+
+    /// NAN-4592: `(state SST bytes measured at open, disk cache bytes)`.
+    pub fn object_cache_sizing(&self) -> (Option<u64>, u64) {
+        (self.measured_state_bytes, self.object_cache_bytes)
     }
 
     pub fn disk_bytes(&self) -> Result<u64> {
@@ -1996,7 +2363,12 @@ impl IngestPrevalence {
     /// ingest loop: the batch goes unstamped and the read finishes (warming
     /// the cache) in the background.
     pub fn lookup(&self) -> PrevalenceLookup {
-        PrevalenceLookup { db: self.db.clone(), watermark_us: self.watermark_us, rarity_threshold: self.rarity_threshold }
+        PrevalenceLookup { db: self.db.clone(), point_cache: self.point_cache.clone(), read_counters: self.read_counters.clone(), restamp_budget: self.restamp_budget.clone(), main_read_policy: self.main_read_policy, watermark_us: self.watermark_us, rarity_threshold: self.rarity_threshold,
+            #[cfg(test)]
+            read_delay: None,
+            #[cfg(test)]
+            observe_delay: self.stamp_delay,
+        }
     }
 
     fn stamp_from(observed: &BTreeMap<String, Option<PrevalenceRow>>, event: &mut Value, rarity_threshold: u64) -> Result<()> {
@@ -2215,6 +2587,32 @@ mod tests {
         other.stamp(&mut forged).await.unwrap();
         assert_eq!(forged["enrichments"].as_array().unwrap().len(), 1);
         assert_eq!(forged["enrichments"][0]["data"]["host_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn erasure_revokes_cached_values_even_when_the_db_key_is_already_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let part = temp.path().join("prevalence.parquet");
+        write_sorted(vec![row(&["one", "two"], 10)], &part).unwrap();
+        let mut state = IngestPrevalence::open(TENANT_A, temp.path(), None).await.unwrap();
+        state.absorb_part(TENANT_A, &part, 10 * DAY_US).await.unwrap();
+        let mut seen = event("8.8.8.8");
+        state.stamp(&mut seen).await.unwrap();
+        assert_eq!(scalar(&seen, "prevalence_dest_ip"), 2);
+        // Emulate physical expiry below the application cache. Explicit
+        // erasure must revoke its value even though no DB row remains.
+        let mut expired = WriteBatch::new();
+        expired.delete(key("ip", "8.8.8.8"));
+        state.db.write_with_options(expired, &WriteOptions { await_durable: false, ..WriteOptions::default() }).await.unwrap();
+        state.make_durable().await.unwrap();
+        assert!(!state.erase_artifact("ip", "8.8.8.8").await.unwrap());
+        state.stamp(&mut seen).await.unwrap();
+        assert_eq!(scalar(&seen, "prevalence_dest_ip"), 1);
+        state.absorb_part(TENANT_A, &part, 10 * DAY_US).await.unwrap();
+        assert!(state.erase_artifact("ip", "8.8.8.8").await.unwrap());
+        state.stamp(&mut seen).await.unwrap();
+        assert_eq!(scalar(&seen, "prevalence_dest_ip"), 1);
+        state.close().await.unwrap();
     }
 
     /// NAN-3213 end to end: ingest partials built with the observer identity
@@ -2885,7 +3283,20 @@ mod tests {
             attempts += 1;
             assert!(attempts <= 40, "the batch never landed: every cut restarted its reads");
             match tokio::time::timeout(std::time::Duration::from_millis(60), state.apply_entries_batch(TENANT_A, &batch)).await {
-                Ok(applied) => break assert_eq!(applied.unwrap().entries, 6),
+                Ok(Ok(applied)) => break assert_eq!(applied.entries, 6),
+                Ok(Err(error)) => {
+                    // A cut may land after the atomic cursor write but before
+                    // its durability wait returns. The production replay
+                    // planner observes that cursor and makes it durable; it
+                    // never retries an already-applied batch as a new one.
+                    let cursor = state.applied().await.unwrap().unwrap();
+                    assert_eq!((cursor.seq, cursor.entry_sha256.as_str(), cursor.is_complete()),
+                        (6, batch.last().unwrap().sha256.as_str(), true), "unexpected apply error: {error:#}");
+                    state.make_durable().await.unwrap();
+                    // Admission advances its lookup window before stamping.
+                    state.advance_watermark(batch.iter().flat_map(|entry| entry.parts.iter().map(|(_, _, mark)| *mark)).max().unwrap());
+                    break;
+                }
                 Err(_) => assert!(state.chunk_reads.is_some(), "a cut keeps the batch's reads"),
             }
         }
@@ -2896,6 +3307,42 @@ mod tests {
         assert_eq!(stamped(&state, "1.2.0.1").await, (6, json!(6)), "applied once");
         // An entry that does not follow the cursor is refused.
         assert!(state.apply_entries_batch(TENANT_A, &batch[..1]).await.is_err());
+    }
+
+    /// NAN-4464: with a patience deadline a batch returns while its reads
+    /// run (they stay in flight, nothing lands), and the same batch commits
+    /// once they finish, reading every key exactly once.
+    #[tokio::test]
+    async fn a_patient_catch_up_batch_returns_while_its_reads_run_and_commits_after() {
+        let temp = tempfile::tempdir().unwrap();
+        let batch = backlog(temp.path(), 6, 100, 10);
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut state = IngestPrevalence::open_shared(TENANT_A, store).await.unwrap();
+        state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+        state.read_delay = Some(std::time::Duration::from_millis(100));
+        let mut early = 0;
+        let applied = loop {
+            let started = std::time::Instant::now();
+            let patience = started + std::time::Duration::from_millis(20);
+            match state.apply_entries_batch_within(TENANT_A, &batch, Some(patience)).await.unwrap() {
+                Some(applied) => break applied,
+                None => {
+                    early += 1;
+                    assert!(started.elapsed() < std::time::Duration::from_millis(80), "returns at its patience");
+                    assert!(state.catch_up_reads_in_flight(), "its reads keep running");
+                    assert_eq!(state.applied().await.unwrap().unwrap().seq, 0, "nothing landed yet");
+                    // The caller skips its steps while the reads run.
+                    while state.catch_up_reads_in_flight() {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                }
+            }
+        };
+        assert_eq!(early, 1, "the step after the reads finish commits without waiting again");
+        assert_eq!(applied.entries, 6);
+        assert!(!state.catch_up_reads_in_flight());
+        assert_eq!(state.chunk_reads_done(), 160, "every distinct key read exactly once");
+        assert_eq!(stamped(&state, "1.2.0.1").await, (6, json!(6)), "applied once");
     }
 
     /// NAN-3811: reads left by a cut belong to their chunk only: another
@@ -3721,4 +4168,359 @@ mod tests {
         state.write_test_wals(1).await.unwrap();
         assert!(state.memtable_flush_due(), "due by WAL count");
     }
+
+    /// NAN-4460: entries of `rows_per_entry` rows shaped like the large tenant's catch-up
+    /// batches (2026-10-23: ~0.68 distinct keys a row): `recurring` rows from
+    /// a rotating pool shared across entries, the rest new to the entry.
+    fn b12_shaped_backlog(dir: &Path, first_seq: u64, entries: usize, rows_per_entry: usize, recurring: usize,
+        day: i32) -> Vec<BatchEntry> {
+        (0..entries).map(|n| {
+            let host = format!("host-{}", n % 11);
+            let rows = (0..recurring).map(|i| { let k = (n * 97 + i) % (4 * recurring); format!("10.{}.{}.{}", k / 65_536, k / 256 % 256, k % 256) })
+                .chain((0..rows_per_entry - recurring).map(|i| format!("172.{}.{}.{}", n % 256, i / 256, i % 256)))
+                .map(|ip| { let mut row = row(&[host.as_str(), "shared-host"], day); row.key.2 = ip; row })
+                .collect::<Vec<_>>();
+            let seq = first_seq + n as u64;
+            let path = dir.join(format!("large-{day}-{seq}.parquet"));
+            write_sorted(rows, &path).unwrap();
+            BatchEntry { seq, sha256: format!("{seq:064x}"), parts: vec![(format!("p{day}-{seq}"), path, day as i64 * DAY_US)] }
+        }).collect()
+    }
+
+    /// NAN-4460: measured peak heap of one catch-up batch, per partial row,
+    /// on the production open path (object cache, a state that already holds
+    /// multi-day priors for the batch's keys). `CATCH_UP_ROW_BYTES`, and so
+    /// how far a batch may grow on a given memory cap, rests on this.
+    #[test]
+    fn catch_up_batch_heap_per_row_stays_under_the_budget() {
+        let _workload = super::super::test_resources::PREVALENCE_WORKLOAD.blocking_read();
+        let _serial = crate::test_heap::MEASUREMENT.lock().unwrap_or_else(|e| e.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        // 26 entries x 2,450 rows: the large tenant's batch (63,700 rows, under the row cap).
+        let (entries, per_entry, recurring) = (26, 2_450, 1_000);
+        let history = (7..10).map(|day| b12_shaped_backlog(temp.path(), 1 + (day - 7) as u64 * entries as u64,
+            entries, per_entry, recurring, day)).collect::<Vec<_>>();
+        let batch = b12_shaped_backlog(temp.path(), 1 + 3 * entries as u64, entries, per_entry, recurring, 10);
+        let work = temp.path().join("work");
+        let (peak, keys, rows) = std::thread::spawn(move || {
+            crate::test_heap::track_current_thread(true);
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let measured = runtime.block_on(async {
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                let mut state = IngestPrevalence::open_with_reads(TENANT_A, &work, None, Some(store)).await.unwrap();
+                state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+                for day in &history {
+                    state.apply_entries_batch(TENANT_A, day).await.unwrap();
+                }
+                state.flush_memtable().await.unwrap();
+                let base = crate::test_heap::reset_peak();
+                let applied = state.apply_entries_batch(TENANT_A, &batch).await.unwrap();
+                let peak = crate::test_heap::peak() - base;
+                state.close().await.unwrap();
+                (peak, applied.keys, applied.rows)
+            });
+            drop(runtime);
+            crate::test_heap::track_current_thread(false);
+            measured
+        }).join().unwrap();
+        let per_row = peak as f64 / rows as f64;
+        eprintln!("catch-up batch: {rows} rows, {keys} keys ({:.2} keys/row), peak heap {:.1} MiB = {per_row:.0} B/row \
+            (budget {CATCH_UP_ROW_BYTES} B/row)", keys as f64 / rows as f64, peak as f64 / 1048576.0);
+        assert_eq!(rows, (entries * per_entry) as u64);
+        assert!((0.55..0.85).contains(&(keys as f64 / rows as f64)), "the large tenant's key density: {keys} keys");
+        assert!(per_row * 1.25 <= CATCH_UP_ROW_BYTES as f64, "the row budget keeps 25% over the measured peak: {per_row:.0} B/row");
+    }
+
+    /// NAN-4472: retain main's object request granularity; dense catch-up
+    /// batches keep their locality and read approximately one state.
+    #[tokio::test]
+    async fn cold_batches_preserve_main_request_granularity_and_scan_dense_batches_once() {
+        let _workload = super::super::test_resources::PREVALENCE_WORKLOAD.read().await;
+        #[derive(Debug, Default)]
+        struct ReadCounter {
+            inner: InMemory,
+            sst_bytes: std::sync::atomic::AtomicU64,
+            sst_gets: std::sync::atomic::AtomicU64,
+            unaligned: std::sync::atomic::AtomicU64,
+        }
+        impl std::fmt::Display for ReadCounter {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "ReadCounter") }
+        }
+        #[async_trait::async_trait]
+        impl ObjectStore for ReadCounter {
+            async fn put_opts(&self, path: &slatedb::object_store::path::Path, payload: slatedb::object_store::PutPayload,
+                opts: slatedb::object_store::PutOptions) -> slatedb::object_store::Result<slatedb::object_store::PutResult> {
+                self.inner.put_opts(path, payload, opts).await
+            }
+            async fn put_multipart_opts(&self, path: &slatedb::object_store::path::Path, opts: slatedb::object_store::PutMultipartOptions)
+                -> slatedb::object_store::Result<Box<dyn slatedb::object_store::MultipartUpload>> {
+                self.inner.put_multipart_opts(path, opts).await
+            }
+            async fn get_opts(&self, path: &slatedb::object_store::path::Path, options: slatedb::object_store::GetOptions)
+                -> slatedb::object_store::Result<slatedb::object_store::GetResult> {
+                let head = options.head;
+                let mut result = self.inner.get_opts(path, options).await?;
+                // InMemory returns a body even for HEAD. A real HEAD must
+                // not prefill every disk-cache part on a supposedly cold open.
+                if head {
+                    result.payload = slatedb::object_store::GetResultPayload::Stream(stream::empty().boxed());
+                }
+                if !head && path.as_ref().contains("compacted/") {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let range = result.range.clone();
+                    self.sst_gets.fetch_add(1, Relaxed);
+                    self.sst_bytes.fetch_add(range.end - range.start, Relaxed);
+                    let part = OBJECT_CACHE_PART_BYTES as u64;
+                    if range.start % part != 0 || ((range.end - range.start) % part != 0 && range.end != result.meta.size) {
+                        self.unaligned.fetch_add(1, Relaxed);
+                    }
+                }
+                Ok(result)
+            }
+            fn delete_stream(&self, locations: futures::stream::BoxStream<'static, slatedb::object_store::Result<slatedb::object_store::path::Path>>)
+                -> futures::stream::BoxStream<'static, slatedb::object_store::Result<slatedb::object_store::path::Path>> {
+                self.inner.delete_stream(locations)
+            }
+            fn list(&self, prefix: Option<&slatedb::object_store::path::Path>)
+                -> futures::stream::BoxStream<'static, slatedb::object_store::Result<slatedb::object_store::ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+            async fn list_with_delimiter(&self, prefix: Option<&slatedb::object_store::path::Path>)
+                -> slatedb::object_store::Result<slatedb::object_store::ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+            async fn copy_opts(&self, from: &slatedb::object_store::path::Path, to: &slatedb::object_store::path::Path,
+                options: slatedb::object_store::CopyOptions) -> slatedb::object_store::Result<()> {
+                self.inner.copy_opts(from, to, options).await
+            }
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        let temp = tempfile::tempdir().unwrap();
+        let counter = Arc::new(ReadCounter::default());
+        let store: Arc<dyn ObjectStore> = counter.clone();
+        // A state of 256k distinct hashes seen on 4 hosts each (~20 MB of
+        // SSTs, several cache parts), flushed to SSTs.
+        let keys = 256_000_usize;
+        let hash = |k: usize| crate::parts::sha256_hex(&k.to_le_bytes());
+        let entry = |dir: &Path, seq: u64, keys: &mut dyn Iterator<Item = usize>| {
+            let rows = keys.map(|k| {
+                let hosts = (0..4).map(|h| format!("host-{k}-{h}")).collect::<Vec<_>>();
+                let mut row = row(&hosts.iter().map(String::as_str).collect::<Vec<_>>(), 10);
+                row.key.0 = "hash".into();
+                row.key.2 = hash(k);
+                row
+            }).collect::<Vec<_>>();
+            let path = dir.join(format!("e{seq}.parquet"));
+            write_sorted(rows, &path).unwrap();
+            BatchEntry { seq, sha256: format!("{seq:064x}"), parts: vec![(format!("p{seq}"), path, 10 * DAY_US)] }
+        };
+        let mut state = IngestPrevalence::open_with_reads(TENANT_A, &temp.path().join("w0"), None, Some(store.clone())).await.unwrap();
+        state.initialize_at(0, &"0".repeat(64)).await.unwrap();
+        for chunk in 0..4 {
+            let batch = vec![entry(temp.path(), chunk as u64 + 1, &mut (chunk * keys / 4..(chunk + 1) * keys / 4))];
+            state.apply_entries_batch(TENANT_A, &batch).await.unwrap();
+        }
+        state.flush_memtable().await.unwrap();
+        state.close().await.unwrap();
+        let state_bytes: u64 = counter.inner.list(None).filter_map(|meta| async move { meta.ok() })
+            .filter(|meta| std::future::ready(meta.location.as_ref().contains("compacted/")))
+            .map(|meta| meta.size).collect::<Vec<_>>().await.into_iter().sum();
+        // Three batches on fresh production caches, including open: sparse
+        // point reads, a small batch, then dense catch-up.
+        let mut fetched = Vec::new();
+        for (round, wanted) in [16_usize, 1_000, 16_000].into_iter().enumerate() {
+            counter.sst_bytes.store(0, Relaxed);
+            counter.sst_gets.store(0, Relaxed);
+            let mut state = IngestPrevalence::open_with_reads(TENANT_A, &temp.path().join(format!("cold{round}")), None,
+                Some(store.clone())).await.unwrap();
+            let seq = 5 + round as u64;
+            let batch = vec![entry(temp.path(), seq, &mut (0..wanted).map(|i| i * (keys / wanted)))];
+            let applied = state.apply_entries_batch(TENANT_A, &batch).await.unwrap();
+            assert_eq!(applied.keys, wanted);
+            fetched.push((wanted, counter.sst_gets.load(Relaxed), counter.sst_bytes.load(Relaxed)));
+            state.close().await.unwrap();
+        }
+        eprintln!("state {state_bytes} B in SSTs; cold batch reads (keys, GETs, bytes): {fetched:?}");
+        assert_eq!(counter.unaligned.load(Relaxed), 0, "SST reads align to cache parts, including coalesced metadata reads and object tails");
+        let (sparse, small, large) = (fetched[0].2, fetched[1].2, fetched[2].2);
+        assert_eq!(OBJECT_CACHE_PART_BYTES, 4 * 1024 * 1024, "dense paths must retain main request granularity");
+        assert!(sparse <= 2 * state_bytes, "cold sparse reads retain main granularity: {sparse}");
+        assert!(state_bytes > 3 * 4 * 1024 * 1024, "the state spans several cache parts: {state_bytes}");
+        assert!(large as f64 >= state_bytes as f64 * 0.9, "dense catch-up still scans the state: {large} of {state_bytes}");
+        assert!(large <= 2 * state_bytes, "dense reads must not repeatedly fetch the state: {large} of {state_bytes}; small {small}");
+    }
+
+    /// NAN-4460: the batch scale follows the backlog and halves under
+    /// pressure. A short backlog keeps today's batch. The row cap follows the
+    /// memory cap and is never below today's.
+    #[test]
+    fn catch_up_scale_follows_the_backlog_and_backs_off_under_pressure() {
+        let base = CATCH_UP_BATCH_ENTRIES;
+        assert_eq!(catch_up_scale_for_backlog(0, base), 1);
+        assert_eq!(catch_up_scale_for_backlog(127, base), 1, "a restart-sized backlog keeps today's batch");
+        assert_eq!(catch_up_scale_for_backlog(128, base), 2);
+        assert_eq!(catch_up_scale_for_backlog(511, base), 4);
+        assert_eq!(catch_up_scale_for_backlog(16_883, base), CATCH_UP_MAX_SCALE, "the large tenant's backlog");
+        // Ramp 1 -> 2 -> 4 -> 8, one step per committed batch.
+        let mut scale = 1;
+        for expected in [2, 4, 8, 8] {
+            scale = next_catch_up_scale(scale, 16_883, base, CatchUpHeadroom::Room);
+            assert_eq!(scale, expected);
+        }
+        assert_eq!(next_catch_up_scale(8, 16_883, base, CatchUpHeadroom::Pressured), 4, "pressure halves");
+        assert_eq!(next_catch_up_scale(1, 16_883, base, CatchUpHeadroom::Pressured), 1, "never below today's batch");
+        assert_eq!(next_catch_up_scale(2, 16_883, base, CatchUpHeadroom::Hold), 2, "lag near its bound holds");
+        assert_eq!(next_catch_up_scale(8, 200, base, CatchUpHeadroom::Hold), 2, "drops at once to what the backlog warrants");
+        assert_eq!(next_catch_up_scale(8, 200, base, CatchUpHeadroom::Room), 2);
+        assert_eq!(next_catch_up_scale(8, 0, base, CatchUpHeadroom::Room), 1);
+        assert_eq!(next_catch_up_scale(usize::MAX, 16_883, base, CatchUpHeadroom::Room), CATCH_UP_MAX_SCALE);
+        // NAN-4464: lag against the ingest stall bound (`lag_alert_ms`).
+        let headroom = super::super::merge_quota::catch_up_headroom_given;
+        assert_eq!(headroom(120_001, 120_000, false), CatchUpHeadroom::Pressured, "lag past its bound is pressure");
+        assert_eq!(headroom(98_018, 120_000, false), CatchUpHeadroom::Hold, "lag near its bound holds");
+        assert_eq!(headroom(71_910, 120_000, false), CatchUpHeadroom::Room, "the large tenant's healthy lag is room");
+        assert_eq!(headroom(0, 120_000, true), CatchUpHeadroom::Pressured, "CPU throttling or R2 strain is pressure");
+        assert_eq!(catch_up_max_rows_for(0), CATCH_UP_BATCH_ROWS, "unknown cap: today's rows");
+        assert_eq!(catch_up_max_rows_for(512 * 1024 * 1024 / 10 * 4), CATCH_UP_BATCH_ROWS, "a 20 eps tenant keeps today's rows");
+        assert_eq!(catch_up_max_rows_for(u64::MAX), CATCH_UP_BATCH_ROWS * CATCH_UP_MAX_SCALE as u64);
+    }
+
+    /// NAN-4464 convergence proof for the large tenant's backlog at the cell's real tick
+    /// cadence. It drives the real scale controller, lag headroom and row
+    /// cap through a tick-by-tick model of the ingest loop, with costs
+    /// measured on the large tenant (hosted, 2026-10-23 20:37-20:45Z, the "prevalence
+    /// catch-up batch applied", "ingest flush committed" and ingest-wait WARN
+    /// lines, plus the cell's eth0 counters):
+    /// - ticks run back to back: a tick's ingest phase takes ~0.5 s, a flush
+    ///   tick's ~17 s, and a flush lands every ~35 s;
+    /// - a batch's reads take >= 15 s (still running at the third 5 s cut
+    ///   after the batch started) at ~240 MB/s of ingress, because they
+    ///   re-download ~the state
+    ///   (`cold_batches_preserve_main_request_granularity_and_scan_dense_batches_once`);
+    ///   the model also charges 20 us a key on top;
+    /// - a commit (fold ~0.1 s for 63k rows, write 1.05-1.4 s for ~43k keys);
+    /// - scale 1: <= 65,536 rows, ~22 `Add` entries (~2,880 rows each) that
+    ///   cover ~26 log entries;
+    /// - ingest lag 72-98 s with ingest keeping up (4-10 notices pending);
+    /// - the log head grows ~3.2 entries a minute;
+    /// - net drain before the fix: 8,423 -> 8,136 behind in 6.3 min, ~46/min.
+    ///
+    /// Before the fix, a step waited on a running batch's reads until the 5 s
+    /// ingest wait cut it, every tick, and the 30 s lag backoff pinned the
+    /// scale at 1. The model reproduces that rate (calibration), then shows:
+    /// - with the fix (steps skip while reads run, lag measured against its
+    ///   bound) the large tenant's backlog drains well inside the hour;
+    /// - every scale drains faster than ingest appends, even pinned at 1;
+    /// - a step's foreground work (plan, fold, write) stays inside the ingest
+    ///   wait at every scale;
+    /// - ingest gets back the seconds per minute the old waits took.
+    #[test]
+    fn b12_backlog_drains_inside_the_hour_at_the_real_tick_cadence() {
+        use super::super::ingest::{l0_merges_run_beside_prevalence, PREVALENCE_CATCH_UP_SCAN, PREVALENCE_INGEST_WAIT,
+            PREVALENCE_L0_YIELD_MS};
+        use super::super::merge_quota::catch_up_headroom_given;
+        const BACKLOG: f64 = 8_300.0;
+        const OBSERVED_NET_PER_MIN: f64 = 46.0;
+        const APPEND_PER_MIN: f64 = 3.2;
+        const FLUSH_EVERY_S: f64 = 35.0;
+        const FLUSH_TICK_S: f64 = 17.0;
+        const TICK_S: f64 = 0.5;
+        const READ_FIXED_S: f64 = 18.0;
+        // NAN-4472: charge a conservative 3 GiB cold sweep at the large tenant's
+        // bandwidth plus each 4 MiB part's RTT on the production apply
+        // lanes. This is a cost model, not production convergence evidence.
+        let sweep_s = 3_072.0 / 130.0
+            + (3.0 * 1024.0 * 1024.0 * 1024.0 / OBJECT_CACHE_PART_BYTES as f64 / APPLY_READS as f64).ceil() * 0.1;
+        const READ_PER_KEY_S: f64 = 20e-6;
+        const KEYS_PER_ROW: f64 = 0.68;
+        const ROWS_PER_ADD: f64 = 2_880.0;
+        const ENTRIES_PER_ADD: f64 = 1.18;
+        const FOLD_PER_ROW_S: f64 = 0.11 / 63_000.0;
+        const WRITE_FIXED_S: f64 = 1.0;
+        const WRITE_PER_KEY_S: f64 = 8e-6;
+        const PLAN_S: f64 = 0.3;
+        const LIVE_LAG_MS: [i64; 4] = [71_910, 98_018, 85_000, 76_000];
+        const LAG_BOUND_MS: i64 = 120_000;
+        let wait = PREVALENCE_INGEST_WAIT.as_secs_f64();
+        let max_rows = catch_up_max_rows_for(4_831_838_208);
+        // One batch at `scale`: (log entries it covers, read seconds, commit
+        // seconds of foreground work).
+        let batch = |scale: usize| -> (f64, f64, f64) {
+            let rows_cap = (CATCH_UP_BATCH_ROWS * scale as u64).min(max_rows.max(CATCH_UP_BATCH_ROWS)) as f64;
+            let adds = (rows_cap / ROWS_PER_ADD).floor().min((CATCH_UP_BATCH_ENTRIES * scale) as f64);
+            let entries = (adds * ENTRIES_PER_ADD).min((PREVALENCE_CATCH_UP_SCAN as usize * scale) as f64);
+            let rows = adds * ROWS_PER_ADD;
+            let keys = rows * KEYS_PER_ROW;
+            (entries, READ_FIXED_S + keys * READ_PER_KEY_S, PLAN_S + rows * FOLD_PER_ROW_S + WRITE_FIXED_S + keys * WRITE_PER_KEY_S)
+        };
+        for scale in (0..=CATCH_UP_MAX_SCALE.trailing_zeros()).map(|bit| 1_usize << bit) {
+            let (entries, read, commit) = batch(scale);
+            assert!(commit < wait, "scale {scale}: a commit step ({commit:.2} s) fits the ingest wait");
+            let cycle = read + commit + FLUSH_TICK_S;
+            assert!(entries >= 2.0 * APPEND_PER_MIN * cycle / 60.0,
+                "scale {scale}: a batch drains at least twice what ingest appends meanwhile");
+        }
+        // (minutes to the head, seconds of prevalence steps per minute,
+        // largest scale).
+        let drain = |fixed: bool| -> (f64, f64, usize) {
+            let (mut t, mut behind, mut scale, mut largest) = (0.0_f64, BACKLOG, 1_usize, 1_usize);
+            let (mut next_flush, mut stepping, mut batches) = (FLUSH_EVERY_S, 0.0_f64, 0_usize);
+            let (entries, read, _) = batch(scale);
+            let read_cost = |read: f64| if fixed { read + (sweep_s - READ_FIXED_S).max(0.0) } else { read };
+            let (mut covers, mut reads_done) = (entries, t + PLAN_S + read_cost(read));
+            while behind > 0.0 && t < 24.0 * 3_600.0 {
+                let tick_start = t;
+                let step = if t >= reads_done {
+                    // Commit, rescale, start the next batch's reads.
+                    let (_, _, commit) = batch(scale);
+                    behind -= covers;
+                    batches += 1;
+                    scale = if fixed {
+                        let lag = LIVE_LAG_MS[batches % LIVE_LAG_MS.len()];
+                        next_catch_up_scale(scale, behind.max(0.0) as u64, CATCH_UP_BATCH_ENTRIES,
+                            catch_up_headroom_given(lag, LAG_BOUND_MS, false))
+                    } else {
+                        // Before: lag >= 72 s against the 30 s backoff.
+                        next_catch_up_scale(scale, behind.max(0.0) as u64, CATCH_UP_BATCH_ENTRIES, CatchUpHeadroom::Pressured)
+                    };
+                    largest = largest.max(scale);
+                    let (entries, read, _) = batch(scale);
+                    covers = entries;
+                    reads_done = t + commit + read_cost(read);
+                    // Before: the step then waited on the new reads until cut.
+                    if fixed { commit } else { wait }
+                } else if fixed {
+                    0.0
+                } else {
+                    wait
+                };
+                stepping += step;
+                t += step;
+                if t >= next_flush {
+                    t += FLUSH_TICK_S;
+                    next_flush = t + FLUSH_EVERY_S;
+                } else {
+                    t += TICK_S;
+                }
+                behind += APPEND_PER_MIN * (t - tick_start) / 60.0;
+            }
+            (t / 60.0, stepping / (t / 60.0), largest)
+        };
+        let (before, before_stepping, _) = drain(false);
+        let (after, after_stepping, largest) = drain(true);
+        let modeled = BACKLOG / before;
+        eprintln!("the large-tenant model: max_rows {max_rows}; before {before:.0} min ({modeled:.0}/min, {before_stepping:.0} s/min in steps); \
+            after (scale to {largest}) {after:.0} min ({after_stepping:.1} s/min in steps)");
+        assert!((modeled / OBSERVED_NET_PER_MIN - 1.0).abs() < 0.3,
+            "the model reproduces the large tenant before the fix: {modeled:.0}/min vs {OBSERVED_NET_PER_MIN}/min observed");
+        assert!(before > 2.0 * 60.0 && before < 24.0 * 60.0, "before: hours, but converging ({before:.0} min)");
+        assert_eq!(largest, CATCH_UP_MAX_SCALE, "the large tenant's live lag lets the scale rise");
+        assert!(after < 60.0, "the large tenant's 8.3k entries drain inside the hour even charging smaller parts' RTTs: {after:.0} min");
+        assert!(after_stepping < before_stepping / 4.0, "ingest gets back the old waits");
+        assert!(l0_merges_run_beside_prevalence(PREVALENCE_L0_YIELD_MS), "L0 merges keep their yield bound");
+    }
 }
+
+#[cfg(test)]
+#[path = "prevalence_steady_tests.rs"]
+pub(crate) mod steady_tests;

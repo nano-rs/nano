@@ -17,6 +17,11 @@ pub enum EgressPurpose {
     /// A native SOAR vendor call for one tenant connection at one revision:
     /// `soar-v1|tenant|connection|revision|host|exp`.
     Soar { connection: Uuid, revision: i64 },
+    SoarSmtp {
+        connection: Uuid,
+        revision: i64,
+        port: u16,
+    },
 }
 
 impl EgressPurpose {
@@ -27,6 +32,14 @@ impl EgressPurpose {
                 format!("soar-v1|{tenant}|{connection}|{revision}|{host}|{exp}"),
             ),
             Self::Soar { .. } => None,
+            Self::SoarSmtp {
+                connection,
+                revision,
+                port,
+            } if !connection.is_nil() && revision > 0 && port > 0 => Some(format!(
+                "soar-smtp-v1|{tenant}|{connection}|{revision}|{host}|{port}|{exp}"
+            )),
+            Self::SoarSmtp { .. } => None,
         }
     }
 }
@@ -107,6 +120,22 @@ pub fn service_token_matches(expected: &[u8], supplied: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn smtp_tokens_bind_exact_port_and_cannot_authorize_https_or_another_tenant() {
+        use super::*;
+        let key = [0x42; 32];
+        let tenant = Uuid::new_v4();
+        let connection = Uuid::new_v4();
+        let purpose = EgressPurpose::SoarSmtp { connection, revision: 1, port: 587 };
+        let token = sign_for(&key,purpose,tenant,"smtp.example.com",1050).unwrap();
+        assert!(verify_for(&key,purpose,tenant,"smtp.example.com",&token,1050,1000));
+        for other in [EgressPurpose::SoarSmtp { connection,revision:1,port:465 }, EgressPurpose::SoarSmtp { connection,revision:2,port:587 }, EgressPurpose::Soar { connection,revision:1 }, EgressPurpose::InputLookup] {
+            assert!(!verify_for(&key,other,tenant,"smtp.example.com",&token,1050,1000));
+        }
+        assert!(!verify_for(&key,purpose,Uuid::new_v4(),"smtp.example.com",&token,1050,1000));
+        assert!(!verify_for(&key,purpose,tenant,"other.example.com",&token,1050,1000));
+        assert!(!verify_for(&key,purpose,tenant,"smtp.example.com",&token,1050,1050));
+    }
     use super::*;
     #[test]
     fn capability_binds_tenant_host_and_replay_window() {

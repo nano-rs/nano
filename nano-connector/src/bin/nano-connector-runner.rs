@@ -157,10 +157,6 @@ fn main() -> ExitCode {
         tracing::error!(error = %e, "nano-connector-runner could not make itself non-dumpable");
         return ExitCode::FAILURE;
     }
-    if let Err(error) = EncryptionService::try_from_env() {
-        tracing::error!(%error, "credential key configuration refused");
-        return ExitCode::FAILURE;
-    }
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -371,6 +367,14 @@ fn worker_exe() -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// The deployment cipher (NAN-4401): strictly parsed from
+/// `NANOSIEM_ENCRYPTION_KEY`, refused when missing or malformed. Every path
+/// that reads or seals feed secrets calls this before any IO; the operator
+/// CLI calls it after argument parsing, so usage text needs no key.
+fn credential_cipher() -> Result<EncryptionService, String> {
+    EncryptionService::try_from_env().map_err(|e| format!("credential key configuration refused: {e}"))
+}
+
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -381,6 +385,9 @@ async fn run() -> Result<(), String> {
         Some("catalog") => return Err("Hosted mock catalog tools require an enterprise build".into()),
         _ => {}
     }
+    // The runner daemon holds every tenant's sealed feed secrets: refuse a
+    // missing or malformed key at boot, before any configuration or IO.
+    let cipher = credential_cipher()?;
     // Configuration errors first, before any connection is made.
     #[cfg(feature = "enterprise")]
     let shared = is_enterprise_shared()?;
@@ -470,7 +477,7 @@ async fn run() -> Result<(), String> {
     let Deployment { tenancy, .. } = connect((max_concurrent as u32 + 2).min(32)).await?;
     // Migrate first (350 / 9013180), then roll the runner: before the
     // migration the runner keeps HEC feeds going with identity disabled.
-    let store = Arc::new(PgFeedStore::new(tenancy, EncryptionService::from_env()).probe_schema().await?);
+    let store = Arc::new(PgFeedStore::new(tenancy, cipher).probe_schema().await?);
 
     let node = env("HOSTNAME").unwrap_or_else(|| "nano-connector-runner".into());
     let mut cfg = RunnerConfig::new(node, engine);
@@ -584,7 +591,6 @@ mod admin {
 
     use nano_connector::service::admin::{NewFeed, hosted_ingest_url, plan_from_catalog};
     use nano_connector::service::pg::{PgFeedStore, read_catalog_entry};
-    use nanosiem_core::crypto::EncryptionService;
     use serde_json::{Map, Value};
     use uuid::Uuid;
 
@@ -682,10 +688,11 @@ Secret files (credentials, ingest token) must not be group/world readable.";
 
     pub async fn run(args: &[String]) -> Result<(), String> {
         let command = parse(args)?;
+        let cipher = super::credential_cipher()?;
         let deployment = connect(2).await?;
         let shared = deployment.shared;
         let catalog_pool = deployment.catalog_pool.clone();
-        let store = PgFeedStore::new(deployment.tenancy, EncryptionService::from_env()).probe_schema().await?;
+        let store = PgFeedStore::new(deployment.tenancy, cipher).probe_schema().await?;
         let out = match command {
             Command::List { tenant } => {
                 let slot = store.slot_for(tenant).await.map_err(|e| e.to_string())?;

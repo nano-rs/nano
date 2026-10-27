@@ -30,6 +30,17 @@
 //! bronze shard and applies the fixed bronze row contract
 //! ([`super::lake_bronze_row`]). Nothing here re-implements that logic, so it
 //! cannot drift from Vector's.
+//!
+//! NAN-4675: a Vector-less (hosted Tenzir) tenant has no Vector, so the
+//! platform delivers its platform audit through its bucket drop, under the
+//! platform-owned landing source whose route key is
+//! [`PLATFORM_AUDIT_ROUTE_KEY`] (`audit`). Vector runs every delivered audit
+//! line through the base's `audit` plumbing lane BEFORE this stage (tenant,
+//! class and product guard, the NAN-3304 null anchors, `unmapped` as one JSON
+//! string). The landing stage runs that same lane VRL
+//! ([`AUDIT_LANE_VRL`]) first for that route key, so a landed audit row is
+//! byte-for-byte the row a Vector tenant writes, and a row the lane refuses
+//! is dropped exactly as Vector drops it.
 
 use chrono::{DateTime, Utc};
 use vrl::compiler::runtime::{Runtime, Terminate};
@@ -38,6 +49,12 @@ use vrl::compiler::{Program, TargetValue, TimeZone};
 use vrl::value::{ObjectMap, Secrets, Value as VrlValue};
 
 use super::lake_bronze_row::{BRONZE_EVENT_COLUMN, BRONZE_TIME_COLUMN};
+use super::tenant_bundle::platform_audit_lane::{AUDIT_LANE_VRL, AUDIT_SLUG};
+
+/// NAN-4675: the route key of the platform audit landing source. Rows landed
+/// under it cross the platform `audit` lane ([`AUDIT_LANE_VRL`]) before the
+/// storage stage, exactly as Vector routes `source_type = audit`.
+pub const PLATFORM_AUDIT_ROUTE_KEY: &str = AUDIT_SLUG;
 
 /// The ingress lane stamped on landed rows (`metadata.ingress_transport`).
 /// A member of the lake's closed lane list (`is_platform_ingress_transport`).
@@ -89,9 +106,12 @@ pub enum StageError {
     Shape(&'static str),
 }
 
-/// `ocsf_lake_storage_prepare`, compiled once and shared by every request.
+/// `ocsf_lake_storage_prepare`, compiled once and shared by every request,
+/// with the platform `audit` lane that precedes it for
+/// [`PLATFORM_AUDIT_ROUTE_KEY`] (NAN-4675).
 pub struct LandingOcsfStage {
     program: Program,
+    audit_lane: Program,
 }
 
 impl std::fmt::Debug for LandingOcsfStage {
@@ -137,11 +157,65 @@ impl LandingOcsfStage {
     /// Compile the stage for an install with `bronze_shards` bronze prefixes.
     pub fn new(bronze_shards: u32) -> Result<Self, String> {
         let source = storage_prepare_vrl(bronze_shards)?;
-        let compiled = super::vrl_guard::compile(&source, &vrl::stdlib::all())
-            .map_err(|e| e.render(&source))?;
+        Self::compile(&source)
+    }
+
+    /// Bind the canonical stage's clock to a retained millisecond timestamp.
+    /// Native durable retries must pass this same timestamp to the common
+    /// converter as well. This pure factory supplies no source authority.
+    pub fn new_at(bronze_shards: u32, received_at: DateTime<Utc>) -> Result<Self, String> {
+        let millis = received_at.timestamp_millis();
+        if millis <= 0 {
+            return Err("landing conversion clock must be positive".into());
+        }
+        let source = storage_prepare_vrl(bronze_shards)?;
+        // Bind event and final bronze-time fallbacks plus processed/logged
+        // time. Refuse canonical-stage drift instead of retaining any clock.
+        if source.matches("now()").count() != 3
+            || source.matches("event_time = now()").count() != 1
+            || source.matches("bronze_time = now()").count() != 1
+            || source
+                .matches("processed_time = to_unix_timestamp(now(), unit: \"milliseconds\")")
+                .count()
+                != 1
+        {
+            return Err("landing canonical clock shape changed".into());
+        }
+        let clock = format!("from_unix_timestamp!({millis}, unit: \"milliseconds\")");
+        Self::compile(&source.replace("now()", &clock))
+    }
+
+    fn compile(source: &str) -> Result<Self, String> {
+        let compiled =
+            super::vrl_guard::compile(source, &vrl::stdlib::all()).map_err(|e| e.render(source))?;
+        // The lane reads no clock, so `new_at` needs no rewrite of it.
+        let audit_lane = super::vrl_guard::compile(AUDIT_LANE_VRL, &vrl::stdlib::all())
+            .map_err(|e| e.render(AUDIT_LANE_VRL))?;
         Ok(Self {
             program: compiled.program,
+            audit_lane: audit_lane.program,
         })
+    }
+
+    /// NAN-4675: the platform `audit` lane, as Vector runs it on a delivered
+    /// line (`.message` holds the line, `%tenant_id` the cell's tenant). Its
+    /// output is the `{event, timestamp, source_type}` row the storage stage
+    /// receives from that lane.
+    fn run_audit_lane(&self, event: serde_json::Value, metadata: &ObjectMap) -> Result<VrlValue, StageError> {
+        let line = serde_json::to_string(&event).map_err(|_| StageError::Failed)?;
+        let mut envelope = ObjectMap::new();
+        envelope.insert("message".into(), VrlValue::from(line));
+        envelope.insert("source_type".into(), VrlValue::from(PLATFORM_AUDIT_ROUTE_KEY));
+        let mut target = TargetValue {
+            value: VrlValue::Object(envelope),
+            metadata: VrlValue::Object(metadata.clone()),
+            secrets: Secrets::new(),
+        };
+        match Runtime::new(RuntimeState::default()).resolve(&mut target, &self.audit_lane, &TimeZone::Local) {
+            Ok(_) => Ok(target.value),
+            Err(Terminate::Abort(_)) => Err(StageError::Aborted),
+            Err(Terminate::Error(_) | Terminate::Interrupted) => Err(StageError::Failed),
+        }
     }
 
     /// Run the stage on one OCSF event (a JSON object) sent by `ctx`.
@@ -150,11 +224,6 @@ impl LandingOcsfStage {
         event: serde_json::Value,
         ctx: &StageContext<'_>,
     ) -> Result<BronzeRow, StageError> {
-        // The Vector lanes hand the stage `{event, source_type}`; the
-        // folder's source wins over anything inside the event.
-        let mut envelope = ObjectMap::new();
-        envelope.insert("event".into(), VrlValue::from(event));
-        envelope.insert("source_type".into(), VrlValue::from(ctx.source_type));
         let mut metadata = ObjectMap::new();
         for (key, value) in [
             ("tenant_id", ctx.tenant_id),
@@ -167,8 +236,19 @@ impl LandingOcsfStage {
         if let Some(key) = &ctx.event_key {
             metadata.insert("nano_event_key".into(), VrlValue::from(key.as_str()));
         }
+        // The Vector lanes hand the stage `{event, source_type}`; the
+        // folder's source wins over anything inside the event. The platform
+        // audit source first crosses Vector's own `audit` lane (NAN-4675).
+        let envelope = if ctx.source_type == PLATFORM_AUDIT_ROUTE_KEY {
+            self.run_audit_lane(event, &metadata)?
+        } else {
+            let mut envelope = ObjectMap::new();
+            envelope.insert("event".into(), VrlValue::from(event));
+            envelope.insert("source_type".into(), VrlValue::from(ctx.source_type));
+            VrlValue::Object(envelope)
+        };
         let mut target = TargetValue {
-            value: VrlValue::Object(envelope),
+            value: envelope,
             metadata: VrlValue::Object(metadata),
             secrets: Secrets::new(),
         };
@@ -351,6 +431,163 @@ mod tests {
         // The stage falls back to NANO_TENANT_ID; with none set it aborts.
         if std::env::var("NANO_TENANT_ID").map(|v| v.is_empty()).unwrap_or(true) {
             assert_eq!(stage.prepare(sysmon(None), &context), Err(StageError::Aborted));
+        }
+    }
+
+    #[test]
+    fn retained_clock_controls_processing_and_missing_time_without_sender_override() {
+        let received = DateTime::<Utc>::from_timestamp_millis(1_792_843_200_123).unwrap();
+        let stage = LandingOcsfStage::new_at(1, received).unwrap();
+        let mut event = sysmon(None);
+        event.as_object_mut().unwrap().remove("time");
+        event["metadata"]["processed_time"] = json!(1);
+        event["metadata"]["logged_time"] = json!(2);
+        let context = ctx(Some("retained-clock:0"));
+        let row = stage.prepare(event.clone(), &context).unwrap();
+        assert_eq!(row.time_micros, received.timestamp_micros());
+        assert_eq!(row, stage.prepare(event.clone(), &context).unwrap());
+        let prepared = event_of(&row);
+        assert_eq!(
+            prepared["metadata"]["processed_time"],
+            received.timestamp_millis()
+        );
+        assert_eq!(
+            prepared["metadata"]["logged_time"],
+            received.timestamp_millis()
+        );
+        // A supplied event time remains independent of the receiver clock.
+        event["time"] = json!(received.timestamp_millis() - 10_000);
+        assert_eq!(
+            stage.prepare(event, &context).unwrap().time_micros,
+            received.timestamp_micros() - 10_000_000
+        );
+    }
+
+    #[test]
+    fn fixed_clock_factory_refuses_invalid_clock_and_shard_inputs() {
+        let received = DateTime::<Utc>::from_timestamp_millis(1_792_843_200_123).unwrap();
+        for millis in [0, -1] {
+            assert!(
+                LandingOcsfStage::new_at(
+                    1,
+                    DateTime::<Utc>::from_timestamp_millis(millis).unwrap()
+                )
+                .is_err()
+            );
+        }
+        for shards in [0, 129] {
+            assert!(LandingOcsfStage::new_at(shards, received).is_err());
+        }
+    }
+
+    /// NAN-4675: platform audit landed by a Vector-less tenant.
+    mod platform_audit {
+        use super::*;
+        use crate::parsers::tenant_bundle::{archive, platform_audit_lane};
+
+        const AUDIT_TENANT: &str = "11111111-1111-4111-8111-111111111111";
+        const OTHER_TENANT: &str = "22222222-2222-4222-8222-222222222222";
+        const EVENT_ID: &str = "018f6a1e-0d2b-7c3a-9e4f-5a6b7c8d9e0f";
+
+        /// The mirror the control plane stores and delivers
+        /// (`AuditEvent::to_ocsf_event_for_lake`): a system actor with no
+        /// client, so `src_endpoint` / `actor.user` are null-only (NAN-3304).
+        fn audit_event(tenant: &str) -> Value {
+            let event = crate::audit::AuditEvent::builder(crate::audit::AuditSource::Identity, "identity_sync_completed")
+                .success(true)
+                .build();
+            let at = chrono::DateTime::parse_from_rfc3339("2026-10-21T06:02:00.123Z").unwrap().with_timezone(&Utc);
+            event.to_ocsf_event_for_lake(at, uuid::Uuid::parse_str(EVENT_ID).unwrap(), tenant)
+        }
+
+        fn audit_ctx() -> StageContext<'static> {
+            StageContext {
+                tenant_id: AUDIT_TENANT,
+                source_type: PLATFORM_AUDIT_ROUTE_KEY,
+                credential_id: CREDENTIAL,
+                event_key: Some(format!("{}:0", "a".repeat(64))),
+            }
+        }
+
+        /// Fields Vector's and landing's rows legitimately differ in: the
+        /// ingress lane and its credential, and the processing clocks.
+        fn comparable(mut row: Value) -> Value {
+            if let Some(metadata) = row["metadata"].as_object_mut() {
+                for key in ["ingress_transport", "nano_credential_id", "processed_time", "logged_time"] {
+                    metadata.remove(key);
+                }
+            }
+            row
+        }
+
+        #[test]
+        fn the_route_key_is_the_platform_audit_slug() {
+            assert_eq!(PLATFORM_AUDIT_ROUTE_KEY, "audit");
+            assert_eq!(PLATFORM_AUDIT_ROUTE_KEY, platform_audit_lane::AUDIT_SLUG);
+        }
+
+        /// A landed audit row is the row a Vector tenant writes for the same
+        /// delivered line: the base's audit lane, then its storage stage.
+        #[test]
+        fn a_landed_audit_row_is_the_row_vector_writes() {
+            let stage = LandingOcsfStage::new(1).unwrap();
+            let landed = stage.prepare(audit_event(AUDIT_TENANT), &audit_ctx()).unwrap();
+            let landed_event = event_of(&landed);
+            let base = archive::unpack(include_bytes!("tenant_bundle/testdata/platform-base-zero.tar.gz")).unwrap();
+            let with = platform_audit_lane::add_platform_audit_lane(&base).unwrap();
+            let line = serde_json::to_string(&audit_event(AUDIT_TENANT)).unwrap();
+            let mut vector = platform_audit_lane::lake_row(&with, &line, AUDIT_TENANT).unwrap();
+            // Vector's sink strips these two before writing the bronze event.
+            let vector = vector.as_object_mut().map(|row| {
+                row.remove("_nano_bronze_partition");
+                row.remove("time");
+                Value::Object(row.clone())
+            }).unwrap();
+            assert_eq!(comparable(landed_event.clone()), comparable(vector));
+            assert_eq!(landed_event["metadata"]["log_source"], "audit");
+            assert_eq!(landed_event["metadata"]["tenant_uid"], AUDIT_TENANT);
+            assert_eq!(landed_event["metadata"]["uid"], EVENT_ID, "the audit id stays the uid: replays dedupe");
+            assert_eq!(landed_event["metadata"]["ingress_transport"], LANDING_INGRESS_TRANSPORT);
+            // NAN-3304 anchors: a null-only endpoint and actor become the emitting service.
+            assert_eq!(landed_event["src_endpoint"]["svc_name"], "identity");
+            assert_eq!(landed_event["actor"], json!({"app_name": "identity"}));
+            let unmapped: Value = serde_json::from_str(landed_event["unmapped"].as_str().unwrap()).unwrap();
+            assert_eq!(unmapped["nano_src_endpoint"], "synthesized:emitting_service");
+            assert_eq!(landed.uid, EVENT_ID);
+        }
+
+        /// The lane's guard holds on the landing path too: nothing that is not
+        /// this tenant's nano platform audit event lands as `log_source = audit`.
+        #[test]
+        fn the_audit_lane_guard_refuses_foreign_or_non_audit_rows() {
+            let stage = LandingOcsfStage::new(1).unwrap();
+            assert_eq!(stage.prepare(audit_event(OTHER_TENANT), &audit_ctx()).unwrap_err(), StageError::Aborted);
+            let mut not_nano = audit_event(AUDIT_TENANT);
+            not_nano["metadata"]["product"]["name"] = json!("acme");
+            assert_eq!(stage.prepare(not_nano, &audit_ctx()).unwrap_err(), StageError::Aborted);
+            // A sender's sysmon row cannot ride the audit source either.
+            assert_eq!(stage.prepare(sysmon(Some("u")), &audit_ctx()).unwrap_err(), StageError::Aborted);
+        }
+
+        /// Every other route key is untouched: the lane runs only for `audit`.
+        #[test]
+        fn other_route_keys_skip_the_audit_lane() {
+            let stage = LandingOcsfStage::new(1).unwrap();
+            let mut ctx = audit_ctx();
+            ctx.source_type = "tenzir_audit";
+            let row = stage.prepare(audit_event(AUDIT_TENANT), &ctx).unwrap();
+            let event = event_of(&row);
+            assert_eq!(event["metadata"]["log_source"], "tenzir_audit");
+            assert!(event["src_endpoint"].get("svc_name").is_none(), "no lane anchoring outside `audit`");
+        }
+
+        /// The retained-clock factory (native durable retries) compiles the lane too.
+        #[test]
+        fn the_fixed_clock_stage_runs_the_lane() {
+            let received = DateTime::<Utc>::from_timestamp_millis(1_792_843_200_123).unwrap();
+            let stage = LandingOcsfStage::new_at(1, received).unwrap();
+            let row = stage.prepare(audit_event(AUDIT_TENANT), &audit_ctx()).unwrap();
+            assert_eq!(event_of(&row)["metadata"]["log_source"], "audit");
         }
     }
 }

@@ -2939,37 +2939,6 @@ export interface MelodCreateDetectionRequest {
   run_historical?: boolean;
 }
 
-export interface FetchUrlForDetectionResponse {
-  url: string;
-  title?: string;
-  content: string;
-  extracted_indicators?: {
-    command_lines?: string[];
-    user_agents?: string[];
-    file_paths?: string[];
-    registry_keys?: string[];
-    process_names?: string[];
-    techniques?: string[];
-  };
-}
-
-// Request for generating AI triage hints for a new detection
-export interface GenerateDetectionHintsRequest {
-  query: string;
-  description?: string;
-  mitre_tactics?: string[];
-  mitre_techniques?: string[];
-  narrative?: string;
-  severity: string;
-}
-
-// Response containing generated AI triage hints
-export interface GenerateDetectionHintsResponse {
-  ignore_when: string[];
-  suspicious_when: string[];
-  context?: string;
-}
-
 export interface MelodTuneDetectionRequest {
   session_id?: string;
   rule_id: string;
@@ -2983,6 +2952,9 @@ export interface MelodSummarizeRequest {
   total_count: number;
   time_range: TimeRange;
   histogram?: Array<{ time: string; count: number }>;
+  /** NAN-4594: the analyst's `@summarize` focus. Blank is the same as absent;
+      the server caps it at 500 characters and treats it as text, not instructions. */
+  focus?: string;
 }
 
 export interface MelodEditParserRequest {
@@ -8902,6 +8874,64 @@ export interface PlaybookDraft {
   parsed: ParsedStepTree;
   step_count: number;
   /** True when the first answer failed validation and one repair pass fixed it. */
+  repaired: boolean;
+}
+
+/** NAN-4535: trigger hint for the pivt SOAR flow-drafting brief. */
+export type FlowDraftTrigger = 'manual' | 'alert' | 'case' | 'schedule';
+
+/** NAN-4535: `POST /api/melod/flow/draft` request body. */
+export interface DraftFlowRequest {
+  brief: string;
+  trigger?: FlowDraftTrigger;
+}
+
+/** NAN-4535: completed flow-draft job result — a disabled (status `draft`)
+ *  SOAR flow validated by the server flow compiler and already saved. */
+export interface FlowDraftCreated {
+  flow_id: string;
+  name: string;
+  version: number;
+  status: 'draft';
+  trigger: { on: string; match?: string | null; cron?: string | null };
+  module_count: number;
+  approval_gates: number;
+  /** True when the first answer failed validation and one repair pass fixed it. */
+  repaired: boolean;
+}
+
+/** NAN-4653: artifact kinds pivt can edit conversationally. */
+export type EditArtifactKind = 'flow';
+
+/** NAN-4653: one earlier turn of a pivt edit session (text only). */
+export interface EditConversationTurn {
+  role: 'user' | 'pivt';
+  text: string;
+}
+
+/** NAN-4653: `POST /api/melod/edit/turn` request body. */
+export interface EditTurnRequest {
+  kind: EditArtifactKind;
+  artifact_id: string;
+  /** Stored version the page loaded (required for flows). */
+  version?: number;
+  /** The page's current document, unsaved edits included. */
+  document: unknown;
+  conversation?: EditConversationTurn[];
+  instruction: string;
+}
+
+/** NAN-4653: completed edit-turn job result. Nothing is saved server-side. */
+export interface EditTurnResult {
+  kind: EditArtifactKind;
+  artifact_id: string;
+  base_version: number | null;
+  document: unknown;
+  reply: string;
+  /** Ids of the parts that changed, moved, were added or removed (step ids, `trigger`). */
+  changed: string[];
+  facts: Array<{ label: string; value: string }>;
+  carried_findings: string[];
   repaired: boolean;
 }
 

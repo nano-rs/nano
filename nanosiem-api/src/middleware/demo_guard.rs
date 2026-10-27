@@ -7,6 +7,7 @@
 //! Only active when DEPLOYMENT_MODE=demo.
 
 use axum::{
+    body::HttpBody as _,
     extract::{Request, State},
     http::{Method, StatusCode},
     middleware::Next,
@@ -27,6 +28,7 @@ const BLOCKED_PREFIXES: &[&str] = &[
     "/api/api-keys",
     "/api/sessions",
     "/api/credentials",
+    "/api/automation-keys",
     "/api/ip-allowlist",
     "/api/gdpr",
     "/api/system",
@@ -81,11 +83,14 @@ pub async fn demo_guard(
     let is_demo_user = request
         .extensions()
         .get::<AuthContext>()
-        .map(|auth| auth.claims.roles.contains(&"demo_analyst".to_string()))
+        .map(|auth| auth.claims.roles.iter().any(|role| role.trim().eq_ignore_ascii_case("demo_analyst")))
         .unwrap_or(false);
 
     if !is_demo_user {
         return Ok(next.run(request).await);
+    }
+    if nanosiem_core::demo_outbound::soar_read_path(request.method().as_str(), request.uri().path()) == Some(false) {
+        return Err(normalize_empty_demo_not_found(StatusCode::NOT_FOUND.into_response()));
     }
 
     let path = request.uri().path().to_string();
@@ -94,13 +99,13 @@ pub async fn demo_guard(
     // Always allow self-service paths
     for allowed in ALLOWED_SELF_PATHS {
         if path == *allowed || path.starts_with(allowed) {
-            return Ok(next.run(request).await);
+            return Ok(normalize_empty_demo_not_found(next.run(request).await));
         }
     }
 
     // Allow specific read-only endpoints needed for the demo analyst workflow.
     if is_allowed_safe_path(&path, &method) {
-        return Ok(next.run(request).await);
+        return Ok(normalize_empty_demo_not_found(next.run(request).await));
     }
 
     // Block completely restricted prefixes
@@ -119,7 +124,16 @@ pub async fn demo_guard(
         }
     }
 
-    Ok(next.run(request).await)
+    Ok(normalize_empty_demo_not_found(next.run(request).await))
+}
+
+// Matched routes receive Content-Length from Axum's MethodRouter, while
+// an unmatched fallback may not. Canonicalize empty demo 404s in both paths.
+fn normalize_empty_demo_not_found(mut response: Response) -> Response {
+    if response.status()==StatusCode::NOT_FOUND && response.body().size_hint().exact()==Some(0) {
+        response.headers_mut().insert(axum::http::header::CONTENT_LENGTH,axum::http::HeaderValue::from_static("0"));
+    }
+    response
 }
 
 fn is_safe_method(method: &Method) -> bool {
@@ -242,4 +256,42 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+    #[cfg(feature = "enterprise")]
+    #[tokio::test]
+    async fn demo_soar_production_guard_route_matrix() {
+        // Use the actual legacy middleware/typed deployment wiring. Handler
+        // stubs distinguish guard refusal from downstream authorization.
+        let spec=<nanosiem_enterprise::handlers::soar::SoarApiDoc as utoipa::OpenApi>::openapi();
+        let spec:serde_json::Value=serde_json::from_str(&spec.to_json().unwrap()).unwrap();
+        let mut routes=Router::new();
+        for path in spec["paths"].as_object().unwrap().keys().filter(|path|path.starts_with("/api/soar")) {
+            routes=routes.route(path,axum::routing::any(||async{StatusCode::OK}));
+        }
+        let routes=routes.layer(from_fn_with_state(DeploymentMode::Demo,demo_guard));
+        let unknown=routes.clone().oneshot(Request::builder().uri("/api/unknown-demo-route")
+            .extension(demo_auth_context()).body(Body::empty()).unwrap()).await.unwrap();
+        let headers=unknown.headers().clone();
+        let bytes=axum::body::to_bytes(unknown.into_body(),4096).await.unwrap();
+        for (path,methods) in spec["paths"].as_object().unwrap() {
+            if !path.starts_with("/api/soar"){continue;}
+            let path=path.replace("{id}","11111111-1111-4111-8111-111111111111").replace("{name}","okta");
+            for method in methods.as_object().unwrap().keys() {
+                let method=method.to_uppercase();
+                let response=routes.clone().oneshot(Request::builder().method(method.as_str()).uri(&path)
+                    .extension(demo_auth_context()).body(Body::empty()).unwrap()).await.unwrap();
+                if nanosiem_core::demo_outbound::soar_read_path(&method,&path)==Some(true) {
+                    assert_eq!(response.status(),StatusCode::OK,"{method} {path}");
+                } else {
+                    assert_eq!(response.status(),StatusCode::NOT_FOUND,"{method} {path}");
+                    assert_eq!(response.headers(),&headers);
+                    assert_eq!(axum::body::to_bytes(response.into_body(),4096).await.unwrap(),bytes);
+                }
+                let mut admin=demo_auth_context();admin.claims.roles=vec!["admin".into()];
+                let response=routes.clone().oneshot(Request::builder().method(method.as_str()).uri(&path)
+                    .extension(admin).body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(),StatusCode::OK,"normal administrator control: {method} {path}");
+            }
+        }
+    }
+
 }

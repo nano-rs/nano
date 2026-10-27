@@ -144,9 +144,18 @@ impl DualPoolConfig {
     /// - `PG_CONNECT_TIMEOUT`: PostgreSQL connection timeout in seconds (default: 30)
     /// - `CH_CONNECT_TIMEOUT`: ClickHouse connection timeout in seconds (default: 30)
     pub fn from_env() -> Result<Self, DualPoolError> {
-        let postgres_url = std::env::var("DATABASE_URL").map_err(|_| {
-            DualPoolError::ConfigError("DATABASE_URL environment variable is required".to_string())
-        })?;
+        // NAN-4666: a sovereign runtime takes the product database only from
+        // its installation facts (never DATABASE_URL, never a default).
+        let postgres_url = match crate::sovereign_runtime::process_runtime()
+            .map_err(|error| DualPoolError::ConfigError(error.to_string()))?
+        {
+            Some(sovereign) => sovereign.database_url().to_string(),
+            None => std::env::var("DATABASE_URL").map_err(|_| {
+                DualPoolError::ConfigError(
+                    "DATABASE_URL environment variable is required".to_string(),
+                )
+            })?,
+        };
 
         // NAN-3491: logs are served by the lake and no service process connects
         // to ClickHouse, so CLICKHOUSE_URL is never required. The inert URL

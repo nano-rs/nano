@@ -2,7 +2,9 @@
 //! Credential encryption. This reader release deliberately retains legacy writes.
 mod envelope;
 mod keyring;
+mod selected;
 pub use envelope::{CredentialContext, CredentialScope};
+pub use selected::{v2_key_id, V2CredentialReader};
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},

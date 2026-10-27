@@ -21,13 +21,13 @@
 # How it works: BuildKit transfers build context LAZILY, so a Dockerfile that
 # only COPYs the assets under test costs a few hundred kB, not the whole repo. A
 # path excluded by .dockerignore makes COPY fail with `"<path>": not found`, and
-# a partially-excluded directory trips a file-count assertion. Docker's own
+# a partially-excluded directory trips a tracked-file assertion. Docker's own
 # matcher decides, rather than a reimplementation of its glob semantics.
 #
-# Scope: only what the image targets actually compile — <crate>/src/** and
-# <crate>/build.rs. tests/ and benches/ are excluded on purpose: `cargo build`
-# for a bin never compiles them, and some of their fixtures legitimately live
-# under directories .dockerignore excludes.
+# Source scope: <crate>/src/** and <crate>/build.rs. External tests/ and
+# benches/ source files are excluded. Inline cfg(test) includes inside src/ are
+# conservatively checked too: this scanner does not evaluate Rust cfg, so their
+# tracked assets must also survive the context.
 #
 # Usage: scripts/check-build-context-includes.sh [--list] [--quiet]
 #   --list   print the resolved assets and exit (no daemon needed)
@@ -167,40 +167,22 @@ emit_dockerfile() {
 }
 
 emit_dockerfile "$FILES" "$DIRS" > "$WORK/probe.Dockerfile"
-if docker build -f "$WORK/probe.Dockerfile" -t nano-buildctx-probe:tmp . >"$WORK/build.log" 2>&1; then
+if docker build --progress=plain -f "$WORK/probe.Dockerfile" -t nano-buildctx-probe:tmp . >"$WORK/build.log" 2>&1; then
     ok "$NF compile-time files + $ND embedded directories are all intact in the Docker build context"
     exit 0
 fi
 
-if grep -q 'DIRDROP' "$WORK/build.log"; then
-    printf '\033[31mFAIL\033[0m .dockerignore drops files from a directory embedded by sqlx::migrate!:\n' >&2
-    grep -o 'DIRDROP .*' "$WORK/build.log" | sed 's/^DIRDROP /  /' >&2
+# Keep the actual daemon/frontend/COPY/RUN error visible. A generic Docker
+# failure must not be relabeled as an ignore rule or trigger one build per asset.
+printf '\033[31mFAIL\033[0m Docker build-context probe failed; Docker output follows:\n' >&2
+cat "$WORK/build.log" >&2
+
+# --progress=plain RUN stdout has a step number plus elapsed time. Dockerfile
+# excerpts/echoed commands can contain the literal marker, but are not receipts.
+DROPPED=$(sed -nE 's/^#[0-9]+ [0-9]+([.][0-9]+)? DIRDROP (.+)$/\2/p' "$WORK/build.log")
+if [[ -n "$DROPPED" ]]; then
+    printf '\n\033[31mFAIL\033[0m .dockerignore drops files from a directory embedded by sqlx::migrate!:\n' >&2
+    printf '  %s\n' "$DROPPED" >&2
     printf '\n  sqlx verifies migrations at COMPILE time, so a partially-excluded\n  directory produces an image with silently missing migrations.\n' >&2
-    exit 1
 fi
-
-printf '\033[31mFAIL\033[0m .dockerignore excludes compile-time asset(s) the crates need:\n' >&2
-MISSING=0
-while IFS= read -r a; do
-    [[ -z "$a" ]] && continue
-    printf 'FROM busybox\nCOPY ["%s", "/probe/x"]\n' "$a" > "$WORK/one.Dockerfile"
-    docker build -f "$WORK/one.Dockerfile" -t nano-buildctx-probe:tmp . >/dev/null 2>&1 \
-        || { printf '  %s\n' "$a" >&2; MISSING=$((MISSING + 1)); }
-done <<< "$FILES
-$(awk '{print $1}' <<< "$DIRS")"
-
-cat >&2 <<MSG
-
-  $MISSING asset(s) are excluded. Each is pulled in at compile time, so the
-  image build fails without them.
-
-  Fix .dockerignore by re-including the file AND every parent directory:
-
-      !config/vector/
-      config/vector/*
-      !config/vector/00-base.toml
-
-  (a negation cannot resurrect a file whose parent directory is still excluded).
-MSG
-[[ "$MISSING" == "0" ]] && sed -n '$p' "$WORK/build.log" >&2
 exit 1

@@ -452,9 +452,10 @@ impl SsrfValidator {
     fn validate_ipv4(&self, ip: Ipv4Addr) -> Result<(), SsrfError> {
         let octets = ip.octets();
 
-        // Cloud metadata endpoint — ALWAYS blocked, even with allow_private_networks.
-        // (169.254.169.254 is a subset of link-local but is never a legitimate target.)
-        if octets == [169, 254, 169, 254] {
+        // Cloud metadata / credential endpoints — ALWAYS blocked, even with
+        // allow_private_networks (NAN-4666: sovereign installs turn that on by
+        // default on real AWS/GCP hosts, where these are live).
+        if is_metadata_ipv4(ip) {
             return Err(SsrfError::MetadataEndpointBlocked(ip.to_string()));
         }
 
@@ -523,6 +524,16 @@ impl SsrfValidator {
         // metadata + allow_private_networks are handled in one place.
         if let Some(ipv4) = ip.to_ipv4_mapped() {
             return self.validate_ipv4(ipv4);
+        }
+        // IPv6 forms that carry an IPv4 destination (NAT64, 6to4,
+        // IPv4-compatible) are judged as that IPv4 address, so neither a
+        // private nor a metadata target hides behind a v6 literal.
+        if let Some(ipv4) = embedded_ipv4(ip) {
+            return self.validate_ipv4(ipv4);
+        }
+        // IPv6 cloud metadata / credential endpoints — ALWAYS blocked.
+        if is_metadata_ipv6(ip) {
+            return Err(SsrfError::MetadataEndpointBlocked(ip.to_string()));
         }
 
         // Unspecified (::) / multicast (ff00::/8) — never a valid target, blocked always.
@@ -614,6 +625,49 @@ impl SsrfValidator {
     }
 }
 
+/// Cloud metadata and workload-credential IPv4 endpoints. Never a legitimate
+/// outbound target, so blocked under every configuration.
+fn is_metadata_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    // AWS/GCP/Azure/OCI IMDS 169.254.169.254 plus AWS's reserved service
+    // block around it (DNS .253, NTP .123); ECS task credentials 169.254.170.2
+    // and EKS Pod Identity 169.254.170.23 (AWS reserves 169.254.170.0/24).
+    (o[0] == 169 && o[1] == 254 && (o[2] == 169 || o[2] == 170))
+        // Alibaba Cloud metadata.
+        || o == [100, 100, 100, 200]
+        // Azure WireServer (extension/goal-state service).
+        || o == [168, 63, 129, 16]
+        // Oracle Cloud legacy metadata.
+        || o == [192, 0, 0, 192]
+}
+
+/// Cloud metadata IPv6 endpoints: AWS `fd00:ec2::/64` (IMDS ::254, DNS ::253,
+/// EKS Pod Identity ::23, NTP ::123) and GCP `fd20:ce::254`.
+fn is_metadata_ipv6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (s[0] == 0xfd00 && s[1] == 0x0ec2 && s[2] == 0 && s[3] == 0)
+        || ip == Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254)
+}
+
+/// The IPv4 destination an IPv6 address encodes: NAT64 well-known prefix
+/// `64:ff9b::/96`, local-use NAT64 `64:ff9b:1::/48` (RFC 8215, /96 form),
+/// 6to4 `2002::/16`, and deprecated IPv4-compatible `::a.b.c.d`.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let tail =
+        |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
+    if s[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] || s[..6] == [0x0064, 0xff9b, 0x0001, 0, 0, 0] {
+        return Some(tail(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return Some(tail(s[1], s[2]));
+    }
+    if s[..6] == [0; 6] && !ip.is_unspecified() && !ip.is_loopback() {
+        return Some(tail(s[6], s[7]));
+    }
+    None
+}
+
 /// Env var that opts an operator into private/loopback AI provider endpoints.
 pub const ALLOW_PRIVATE_AI_ENDPOINTS_ENV: &str = "NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS";
 
@@ -646,8 +700,20 @@ fn env_flag_enabled(var: &str) -> bool {
 ///   endpoint is the *only* kind that exists and there is no egress to pivot
 ///   to, so requiring a second flag was friction that bought nothing — the
 ///   operator had already declared the deployment air-gapped.
+///
+/// A sovereign installation (NAN-4666) implies it from its installation
+/// facts, with no environment flag: its AI is the customer's own model
+/// endpoint (Azure OpenAI, a LiteLLM proxy, vLLM), which is usually private.
+/// Invalid sovereign facts never grant it.
 pub fn private_ai_endpoints_allowed() -> bool {
-    env_flag_enabled(ALLOW_PRIVATE_AI_ENDPOINTS_ENV) || env_flag_enabled(AIRGAP_MODE_ENV)
+    private_ai_endpoints_allowed_with(
+        env_flag_enabled,
+        crate::sovereign_runtime::private_ai_endpoints_allowed(),
+    )
+}
+
+fn private_ai_endpoints_allowed_with(flag: impl Fn(&str) -> bool, sovereign: bool) -> bool {
+    sovereign || flag(ALLOW_PRIVATE_AI_ENDPOINTS_ENV) || flag(AIRGAP_MODE_ENV)
 }
 
 /// SSRF validator for an admin-configured AI provider `base_url`.
@@ -657,9 +723,13 @@ pub fn private_ai_endpoints_allowed() -> bool {
 /// HTTP behind a network boundary. Private targets are permitted only when
 /// [`private_ai_endpoints_allowed`] is set; metadata endpoints are never allowed.
 pub fn ai_base_url_validator() -> SsrfValidator {
+    ai_base_url_validator_with(private_ai_endpoints_allowed())
+}
+
+fn ai_base_url_validator_with(allow_private_networks: bool) -> SsrfValidator {
     SsrfValidator::new(SsrfConfig {
         allow_http: true,
-        allow_private_networks: private_ai_endpoints_allowed(),
+        allow_private_networks,
         ..Default::default()
     })
 }
@@ -723,6 +793,79 @@ pub fn pin_resolved_addrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-4666: a sovereign runtime allows private customer AI endpoints on
+    /// save and per request (both use `ai_base_url_validator`) with no env
+    /// flag; metadata stays blocked. Without sovereign facts or a flag the
+    /// hosted default still refuses them.
+    #[test]
+    fn sovereign_runtime_allows_private_ai_endpoints_without_env_flags() {
+        let no_flags = |_: &str| false;
+        assert!(private_ai_endpoints_allowed_with(no_flags, true));
+        assert!(!private_ai_endpoints_allowed_with(no_flags, false));
+        let sovereign =
+            ai_base_url_validator_with(private_ai_endpoints_allowed_with(no_flags, true));
+        for url in [
+            "http://10.20.0.5:8000/v1",
+            "https://172.16.4.2:4000",
+            "http://192.168.10.4/openai/v1",
+            "http://127.0.0.1:8000/v1",
+        ] {
+            assert!(sovereign.validate_url(url).is_ok(), "{url}");
+        }
+        for url in [
+            "http://169.254.169.254/latest",
+            "http://169.254.169.253/",
+            "http://169.254.170.2/v2/credentials",
+            "http://169.254.170.23/v1/credentials",
+            "http://100.100.100.200/latest/meta-data",
+            "http://168.63.129.16/machine",
+            "http://192.0.0.192/",
+            "http://[fd00:ec2::254]/latest",
+            "http://[fd00:ec2::23]/v1/credentials",
+            "http://[fd20:ce::254]/computeMetadata/v1/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[64:ff9b:1::a9fe:a9fe]/",
+            "http://[2002:a9fe:a9fe::1]/",
+            "http://[::a9fe:a9fe]/",
+            "http://metadata.google.internal/",
+            "http://metadata.goog/",
+        ] {
+            assert!(
+                matches!(
+                    sovereign.validate_url(url),
+                    Err(SsrfError::MetadataEndpointBlocked(_))
+                ),
+                "{url}"
+            );
+        }
+        // Per request the resolved addresses go through the same IP rules, so
+        // a hostname that resolves (or rebinds) to metadata is refused too.
+        for ip in [
+            "169.254.169.254",
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "64:ff9b::a9fe:a9fe",
+        ] {
+            assert!(
+                sovereign.validate_ip_address(ip.parse().unwrap()).is_err(),
+                "{ip}"
+            );
+        }
+        // NAT64 to a private v4 stays private for the hosted validator.
+        assert!(ai_base_url_validator_with(false)
+            .validate_url("http://[64:ff9b::a00:5]/")
+            .is_err());
+        assert!(sovereign.validate_url("http://[64:ff9b::a00:5]/").is_ok());
+        assert!(sovereign
+            .validate_url("http://[fd12:3456::5]:8000/v1")
+            .is_ok());
+        let hosted = ai_base_url_validator_with(private_ai_endpoints_allowed_with(no_flags, false));
+        assert!(hosted.validate_url("http://10.20.0.5:8000/v1").is_err());
+        // No sovereign mount on a test host: the process default is unchanged.
+        assert!(!crate::sovereign_runtime::private_ai_endpoints_allowed());
+    }
 
     fn validator() -> SsrfValidator {
         SsrfValidator::default_secure()
@@ -1191,8 +1334,12 @@ mod tests {
     async fn validate_and_resolve_allows_bracketed_public_ipv6_without_dns() {
         let (url, addrs) = SsrfValidator::default_secure()
             .validate_and_resolve("https://[2606:4700:4700::1111]/hook")
-            .await.expect("an IPv6 literal must not go through hostname resolution");
-        assert_eq!(url.host(), Some(url::Host::Ipv6("2606:4700:4700::1111".parse().unwrap())));
+            .await
+            .expect("an IPv6 literal must not go through hostname resolution");
+        assert_eq!(
+            url.host(),
+            Some(url::Host::Ipv6("2606:4700:4700::1111".parse().unwrap()))
+        );
         assert!(addrs.is_empty());
     }
 
@@ -1202,11 +1349,25 @@ mod tests {
             blocked_domains: vec!["localhost".into(), "svc".into(), "cluster.local".into()],
             ..Default::default()
         });
-        for host in ["localhost.", "api.tenant.svc.", "api.tenant.svc.cluster.local."] {
-            assert!(matches!(v.validate_url(&format!("https://{host}/")), Err(SsrfError::DomainBlocked(_))));
+        for host in [
+            "localhost.",
+            "api.tenant.svc.",
+            "api.tenant.svc.cluster.local.",
+        ] {
+            assert!(matches!(
+                v.validate_url(&format!("https://{host}/")),
+                Err(SsrfError::DomainBlocked(_))
+            ));
         }
-        for host in ["metadata.google.internal.", "metadata.goog.", "instance-data."] {
-            assert!(matches!(v.validate_url(&format!("https://{host}/")), Err(SsrfError::MetadataEndpointBlocked(_))));
+        for host in [
+            "metadata.google.internal.",
+            "metadata.goog.",
+            "instance-data.",
+        ] {
+            assert!(matches!(
+                v.validate_url(&format!("https://{host}/")),
+                Err(SsrfError::MetadataEndpointBlocked(_))
+            ));
         }
     }
 

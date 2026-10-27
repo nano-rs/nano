@@ -155,6 +155,12 @@ pub(super) fn footer(path: &Path, schema: &Schema, rows: u64) -> Result<()> {
         "export required footer field missing"
     );
     for field in actual.as_struct().fields() {
+        // NAN-4664: the derived IOC indicator columns are a lake index, not
+        // table data. They carry no field ID, so Iceberg's name mapping never
+        // projects them.
+        if nanosiem_core::search::lake_indicators::is_indicator_column(&field.name) {
+            continue;
+        }
         let expected = schema
             .as_struct()
             .fields()
@@ -448,6 +454,34 @@ mod tests {
             iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow).unwrap(),
         )
     }
+    /// NAN-4664: a signed data file carrying the derived IOC indicator
+    /// columns still exports (they sit outside the table contract, without
+    /// field IDs); any other extra column is still refused.
+    #[test]
+    fn export_footer_admits_only_the_indicator_columns_beyond_the_contract() {
+        let contract = ArrowSchema::new(vec![Field::new("time", DataType::Int64, true), Field::new("uid", DataType::Utf8, true)]);
+        let schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&contract).unwrap();
+        let list = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let write = |extra: &str| {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let arrow = Arc::new(ArrowSchema::new(vec![
+                Field::new("time", DataType::Int64, true), Field::new("uid", DataType::Utf8, true), Field::new(extra, list.clone(), true),
+            ]));
+            let mut values = arrow_array::builder::ListBuilder::new(arrow_array::builder::StringBuilder::new());
+            values.values().append_value("203.0.113.77");
+            values.append(true);
+            let batch = RecordBatch::try_new(arrow.clone(), vec![
+                Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec!["a"])), Arc::new(values.finish()),
+            ]).unwrap();
+            let mut writer = ArrowWriter::try_new(file.reopen().unwrap(), arrow, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            file
+        };
+        footer(write("nano_ioc_ips").path(), &schema, 1).unwrap();
+        assert!(footer(write("other_ips").path(), &schema, 1).is_err());
+    }
+
     #[tokio::test]
     async fn signed_copy_replays_without_rewriting_or_source_mutation() {
         let (_directory, source, destination, target, manifest, schema) = fixture().await;

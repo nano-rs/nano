@@ -1118,10 +1118,34 @@ pub async fn attempt_webhook_delivery(
     webhook: &super::models::Webhook,
     payload: &WebhookPayload,
 ) -> WebhookAttemptOutcome {
-    attempt_webhook_delivery_for_tenant(crate::egress::LOCAL_TENANT, encryption, webhook, payload).await
+    if crate::demo_outbound::legacy_demo() { return demo_suppressed(); }
+    attempt_webhook_delivery_inner(crate::egress::LOCAL_TENANT, encryption, webhook, payload).await
 }
 
+#[cfg(feature = "enterprise")]
 pub async fn attempt_webhook_delivery_for_tenant(
+    lease: crate::demo_outbound::NotificationSendLease,
+    encryption: &EncryptionService,
+    webhook: &super::models::Webhook,
+    payload: &WebhookPayload,
+) -> WebhookAttemptOutcome {
+    let tenant = lease.tenant();
+    lease.run(attempt_webhook_delivery_inner(tenant, encryption, webhook, payload)).await
+        .unwrap_or_else(notification_attempt_expired)
+}
+
+#[cfg(feature = "enterprise")]
+pub fn notification_attempt_expired() -> WebhookAttemptOutcome {
+    WebhookAttemptOutcome { success:false,status_code:None,response_body:None,
+        error:Some("delivery attempt exceeded its admitted deadline".into()),retryable:true,duration_ms:45_000 }
+}
+
+pub fn demo_suppressed() -> WebhookAttemptOutcome {
+    WebhookAttemptOutcome { success: false, status_code: None, response_body: None,
+        error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), retryable: false, duration_ms: 0 }
+}
+
+async fn attempt_webhook_delivery_inner(
     tenant: Uuid,
     encryption: &EncryptionService,
     webhook: &super::models::Webhook,
@@ -1190,6 +1214,10 @@ impl WebhookService {
         event_type: &str,
     ) -> WebhookTestResult {
         let start = Instant::now();
+        if crate::demo_outbound::legacy_demo() {
+            self.record(webhook, alert_id, event_type, None, None, false, Some(crate::demo_outbound::SUPPRESSED_DEMO), 0).await;
+            return WebhookTestResult { success: false, status_code: None, error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), duration_ms: 0 };
+        }
 
         // Render the provider-specific body once (deterministic across retries).
         // A formatter or secret-decrypt failure is recorded as a failed delivery
@@ -1258,6 +1286,10 @@ impl WebhookService {
         };
 
         for attempt in 1..=MAX_DELIVERY_ATTEMPTS {
+            if crate::demo_outbound::legacy_demo() {
+                self.record(webhook, alert_id, event_type, None, None, false, Some(crate::demo_outbound::SUPPRESSED_DEMO), 0).await;
+                return WebhookTestResult { success: false, status_code: None, error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), duration_ms: 0 };
+            }
             // Fail closed on a crypto error (deterministic — don't burn retries).
             let request = match self.build_request(&client, webhook, &payload_bytes, sign_generic) {
                 Ok(r) => r,
@@ -1498,6 +1530,11 @@ impl WebhookService {
             .get(webhook_id)
             .await
             .map_err(|e| format!("Webhook not found: {}", e))?;
+
+        if crate::demo_outbound::legacy_demo() {
+            self.record(&webhook, None, "webhook.test", None, None, false, Some(crate::demo_outbound::SUPPRESSED_DEMO), 0).await;
+            return Ok(WebhookTestResult { success: false, status_code: None, error: Some(crate::demo_outbound::SUPPRESSED_DEMO.into()), duration_ms: 0 });
+        }
 
         let base = self.resolve_base_url().await;
         let payload = WebhookPayload {

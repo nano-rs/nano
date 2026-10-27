@@ -2503,10 +2503,12 @@ impl ObjectStore for UnknownNativePut {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unresolved_native_put_rebuilds_only_its_hour_and_keeps_completed_other_parts() {
     let fx = fixture(1, 4);
-    let (key, at) = &fx.objects[0];
+    let (key, _) = &fx.objects[0];
     let events = (0..4).map(|hour| event(&format!("unknown-put-{hour}"), DAY0_S + hour as i64 * 3_600 + 60, hour)).collect::<Vec<_>>();
     write_bronze(&fx.root.join("sources").join(key), &events);
-    fx.spool.deliver(&notice(key, *at)).unwrap();
+    // The object reaches the tenant after its newest event (hour 3): with the
+    // fixture's notice time (00:40Z) NAN-4336 clamps hours 1-3 into hour 0.
+    fx.spool.deliver(&notice(key, DAY0_S + 3 * 3_600 + 120)).unwrap();
     let failed_hour = event_hour_of((DAY0_S + 3 * 3_600) * 1_000_000);
     let keys = PartKeys::new(TENANT, Level::L0, failed_hour, &nanosiem_lake_worker::parts::format::PartId::new(1).unwrap()).unwrap();
     let key = keys.provenance();
@@ -3161,7 +3163,8 @@ mod part_gc_gate {
             DELETE_CONTROL_CONTRACT, DELETE_CONTROL_SCHEMA_VERSION,
         };
         use nanosiem_lake_worker::part_ingest::part_gc_cell::{
-            CellPartGcWiring, CellSanctionedPartGc, LakePartGcAccess, OWNER_DELETE_SCOPE,
+            CellPartGcWiring, CellSanctionedPartGc, LakePartGcAccess, DEFAULT_LOG_READS_PER_SECOND, OWNER_DELETE_SCOPE,
+            PASSES_PER_INVENTORY,
         };
         use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair};
 
@@ -3570,6 +3573,31 @@ mod part_gc_gate {
             harness_with_reader(fx, None).await
         }
 
+        /// NAN-4566: one sanctioned pass over a complete view, whatever the
+        /// scheduling. `run_pass_now` folds the part log in bounded slices
+        /// (production's 2 s `CATCH_UP_SLICE`) and pauses `log_catching_up`
+        /// when a slice ends before the log head: the harness's 321-entry log
+        /// at 200 paced reads/s sits right at that cut, so a busy farm runner
+        /// returned the pause before the pass ever reached control. That pause
+        /// is production's routine answer and its task keeps folding on it
+        /// (`run_catch_up`); do the same here. Every slice applies at least
+        /// one entry, so the fold ends within `log entries + 1` passes, and a
+        /// pass that stops to fold must not have reached any plane.
+        async fn pass_over_complete_view(fx: &Fixture, h: &Harness, now: i64) -> nanosiem_lake_worker::lake_part_gc::PassReport {
+            let entries = live(fx).await.head().map_or(0, |(seq, _, _)| seq + 1);
+            for _ in 0..=entries {
+                let report = h.pass.run_pass_now(now).await.unwrap();
+                if report.paused_reason.as_deref() != Some("log_catching_up") {
+                    return report;
+                }
+                let plane = h.plane.lock().unwrap();
+                assert_eq!((report.indexed, report.deleted), (0, 0), "a folding pass publishes and deletes nothing: {report:?}");
+                assert_eq!((plane.owner_calls, plane.worker_calls), (0, 0), "a folding pass reaches no plane: {report:?}");
+                assert!(plane.attested.is_empty() && plane.retired.is_empty());
+            }
+            panic!("the bounded fold did not reach the log head within {} passes", entries + 1);
+        }
+
         async fn harness_with_reader(fx: &Fixture, reader: Option<Arc<dyn nanosiem_lake_worker::lake_part_gc::PartLogReader>>) -> Harness {
             harness_with_inputs(fx, reader, None).await
         }
@@ -3858,6 +3886,7 @@ mod part_gc_gate {
             let mut reports = Vec::new();
             let mut completed = 0usize;
             let mut indexed_reported = 0u64;
+            let mut tasks_run = 0usize;
             let mut finished = Ok(());
             // Real ingest scheduler starts distinct tasks only at the ordinary
             // ten-minute cadence; wall-clock arrivals and refresh continue.
@@ -3876,7 +3905,9 @@ mod part_gc_gate {
                     break;
                 }
                 let report = outcome.unwrap();
-                assert!(report.deleted <= 512, "owned task {task}: {report:?}");
+                // NAN-4162: one listing feeds PASSES_PER_INVENTORY bounded
+                // passes of at most 512 deletes each.
+                assert!(report.deleted <= 512 * PASSES_PER_INVENTORY as u64, "owned task {task}: {report:?}");
                 assert_eq!(report.deleted_reported, report.deleted);
                 assert!(report.paused_reason.is_none(), "owned task {task}: {report:?}");
                 {
@@ -3900,6 +3931,7 @@ mod part_gc_gate {
                 completed += report.deleted as usize;
                 eprintln!("PASS owned_task={task} scheduled_ms={scheduled} budget=512 pacing=200/s cadence_ms=600000 report={report:?} reads={}", h.pass.reads());
                 reports.push(Ok(report));
+                tasks_run += 1;
                 let starts_before = starts.load(Ordering::SeqCst);
                 ingestor.tick(scheduled + 599_999).await.unwrap();
                 assert_eq!(starts.load(Ordering::SeqCst), starts_before, "ordinary cadence forbids another task");
@@ -3946,7 +3978,7 @@ mod part_gc_gate {
             );
             assert_eq!(
                 listing_tasks.load(Ordering::SeqCst),
-                3,
+                tasks_run,
                 "one full listing per distinct owned task (credential refresh may retry the first HTTP page)"
             );
             assert!(
@@ -4086,6 +4118,70 @@ mod part_gc_gate {
             assert_live_set_intact(&fx).await;
         }
 
+        /// NAN-4601, the large-tenant hold (2026-10-25): catalog attach failed, so
+        /// ingest holds the recorded catalog. Deletes stay held (fail closed)
+        /// but the part-log index keeps following the log through the same
+        /// wired route: before this, the hold dropped the whole gate and the
+        /// index head froze with it. Production path: `Ingestor::open`, the
+        /// cell's gate (`ExchangedGrantAuthority`) over the cell's pass, an
+        /// enabled grant, then the hold the activation records.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_held_catalog_keeps_the_index_feed_and_deletes_nothing() {
+            let fx = fixture(420, 12);
+            let (mut ingestor, clock) = merged(&fx).await;
+            let (old, _) = superseded(&fx, clock + 30 * 60_000, 3_600_000).await;
+            assert!(!old.is_empty(), "there is something a delete pass would take");
+            let h = harness(&fx).await;
+            let gate = Arc::new(ExchangedGrantAuthority::new(TENANT, Some(h.pass.clone() as Arc<dyn SanctionedPartGc>)));
+            gate.update(Some(&grant(true)));
+            // The activation.rs order (catalog_attach_failed, the large tenant): the attach
+            // failure is recorded first, then the cell installs the gate
+            // (`set_part_gc_authority` holds it). The cell.rs report-failure
+            // order (gate first, then `hold_catalog`) moves the installed gate
+            // aside through the same `take()`.
+            ingestor.hold_catalog("catalog_attach_failed");
+            ingestor.set_part_gc_authority(gate.clone());
+
+            let mut now = clock + 30 * 60_000;
+            let first = now;
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                loop {
+                    ingestor.tick(now).await.unwrap();
+                    h.pass.wait_index_idle().await;
+                    let head = live(&fx).await.head().map(|(seq, _, _)| seq).unwrap();
+                    if h.plane.lock().unwrap().index_shas.len() as u64 == head + 1 {
+                        break;
+                    }
+                    // Past the index-only cadence (60 s, jittered, backs off to 5 min).
+                    now += 6 * 60_000;
+                }
+            })
+            .await
+            .expect("the part-log index reached the log head while the catalog was held");
+
+            // Deletes stay held: nothing planned, authorized, attested or deleted.
+            {
+                let plane = h.plane.lock().unwrap();
+                assert!(plane.attested.is_empty() && plane.retired.is_empty() && plane.prepared.is_empty(),
+                    "a held catalog never deletes");
+                assert_eq!(plane.worker_calls, 0, "no Worker call while held");
+                assert!(plane.reported_deleted.is_empty());
+            }
+            h.pass.wait_idle().await;
+            let health = ingestor.health();
+            assert_eq!(health.part_gc_deleted_total, 0);
+            let blocked = health.part_gc_blocked.as_ref().expect("the hold is reported");
+            assert_eq!((blocked.reason.as_str(), blocked.detail.as_str()), ("catalog_held", "catalog_attach_failed"));
+            assert_eq!(blocked.blocked_seconds, ((now - first) / 1000) as u64, "held time counts from the first held tick");
+            assert!(blocked.parts > 0, "the superseded parts it keeps");
+            let metrics = blocked.metric_lines("c", "t");
+            assert!(metrics.contains("lake_part_gc_blocked_seconds{cell=\"c\",tenant=\"t\",reason=\"catalog_held\",detail=\"catalog_attach_failed\"}"),
+                "{metrics}");
+            assert_eq!(health.agent_catalog.as_ref().unwrap()["gc_attached"], false);
+            assert_nothing_deleted(&fx).await;
+            assert_live_set_intact(&fx).await;
+        }
+
         struct PausedHistory {
             reader: StorePartLogReader,
             reached: tokio::sync::Notify,
@@ -4197,9 +4293,11 @@ mod part_gc_gate {
                 "all bounded index slices are reported"
             );
             assert_eq!(plane.retired.len() as u64, report.deleted);
+            // NAN-4162: one task runs at most PASSES_PER_INVENTORY bounded
+            // passes (each at most 512 deletes) from its one listing.
             assert!(
-                report.deleted <= 512,
-                "catch-up must run at most one bounded destructive pass"
+                report.deleted <= 512 * PASSES_PER_INVENTORY as u64,
+                "catch-up must run at most one task's bounded destructive passes"
             );
             assert!(plane.retired.iter().all(|key| plane.attested.contains(key)));
             drop(plane);
@@ -4396,7 +4494,8 @@ mod part_gc_gate {
             entry: nanosiem_lake_worker::parts::part_log::LogEntry,
             plane: std::sync::Mutex<Option<Arc<std::sync::Mutex<Plane>>>>,
             probes: AtomicUsize,
-            observations: std::sync::Mutex<Vec<&'static str>>,
+            /// (event, any key already deleted when it was observed)
+            observations: std::sync::Mutex<Vec<(&'static str, bool)>>,
         }
         #[async_trait]
         impl nanosiem_lake_worker::lake_part_gc::PartLogReader for ArrivalAtRecheck {
@@ -4432,11 +4531,13 @@ mod part_gc_gate {
                     Some("fresh_successor_absence")
                 } else { None };
                 if let Some(event) = event {
-                    assert!(self.plane.lock().unwrap().as_ref().unwrap().lock().unwrap().retired.is_empty(),
-                        "fresh tail and arrival observations precede deletion");
+                    // NAN-4162: later bounded passes of the same task re-read
+                    // the tail after the first pass deleted; the test checks
+                    // that the first pass's observations precede deletion.
+                    let deleted = !self.plane.lock().unwrap().as_ref().unwrap().lock().unwrap().retired.is_empty();
                     let mut observations = self.observations.lock().unwrap();
-                    assert!(observations.len() < 32, "bounded fresh-read event observations");
-                    observations.push(event);
+                    assert!(observations.len() < 32 * PASSES_PER_INVENTORY, "bounded fresh-read event observations");
+                    observations.push((event, deleted));
                 }
                 Ok(entry)
             }
@@ -4505,13 +4606,16 @@ mod part_gc_gate {
             let observations = reader.observations.lock().unwrap();
             eprintln!("ARRIVAL_FRESHNESS events={observations:?} actual_tail_reads={}",
                 reader.probes.load(Ordering::SeqCst));
-            let position = |event| observations.iter().position(|seen| *seen == event).unwrap();
+            let position = |event| observations.iter().position(|(seen, _)| *seen == event).unwrap();
             let arrival = position("arrival_observed");
             assert!(position("fresh_initial_absence") < arrival);
             // Initial ordered read-ahead may speculatively observe a higher
             // missing sequence. Require a NEW real successor probe after the
             // canonical arrival is observed, not the first speculative probe.
-            assert!(observations[arrival + 1..].contains(&"fresh_successor_absence"));
+            let successor = arrival + 1 + observations[arrival + 1..].iter()
+                .position(|(seen, _)| *seen == "fresh_successor_absence").expect("a fresh successor probe after the arrival");
+            assert!(observations[..=successor].iter().all(|(_, deleted)| !deleted),
+                "fresh tail and arrival observations precede deletion: {observations:?}");
             assert_eq!(
                 h.plane.lock().unwrap().index_shas[expected_head as usize],
                 sha256_hex(&reader.entry.to_bytes().unwrap()),
@@ -4525,20 +4629,42 @@ mod part_gc_gate {
             let fx = fixture(420, 12);
             let (_ingestor, clock) = merged(&fx).await;
             let h = harness(&fx).await;
+            reservation_never_authorizes(&fx, &h, clock).await;
+        }
+
+        /// NAN-4566: the same guarantee when the fold provably spans several
+        /// slices. At production's default 100 paced reads/s the 321-entry
+        /// log needs >= 3.2 s, past one 2 s slice on any runner, so the first
+        /// pass always stops `log_catching_up` before reaching control.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn reservation_never_authorizes_across_bounded_fold_slices() {
+            let fx = fixture(420, 12);
+            let (_ingestor, clock) = merged(&fx).await;
+            let mut h = harness(&fx).await;
+            h.pass = Arc::new(Arc::try_unwrap(h.pass).ok().unwrap().with_log_reads_per_second(DEFAULT_LOG_READS_PER_SECOND));
+            assert!(live(&fx).await.head().unwrap().0 as u32 >= 2 * DEFAULT_LOG_READS_PER_SECOND, "the fold spans slices");
+            h.plane.lock().unwrap().pending_log_reservation = true;
+            let first = h.pass.run_pass_now(clock + 30 * 60_000).await.unwrap();
+            assert_eq!(first.paused_reason.as_deref(), Some("log_catching_up"), "{first:?}");
+            assert_eq!(h.plane.lock().unwrap().owner_calls, 0, "a partial view never reaches the owner");
+            reservation_never_authorizes(&fx, &h, clock).await;
+        }
+
+        async fn reservation_never_authorizes(fx: &Fixture, h: &Harness, clock: i64) {
             h.plane.lock().unwrap().pending_log_reservation = true;
             let now = clock + 30 * 60_000;
-            let report = h.pass.run_pass_now(now).await.unwrap();
-            assert_eq!(report.paused_reason.as_deref(), Some("lake_part_index_incomplete"));
+            let report = pass_over_complete_view(fx, h, now).await;
+            assert_eq!(report.paused_reason.as_deref(), Some("lake_part_index_incomplete"), "{report:?}");
             assert_eq!(report.deleted, 0);
             assert!(!h.plane.lock().unwrap().index_shas.is_empty());
             assert!(h.plane.lock().unwrap().attested.is_empty());
-            assert_nothing_deleted(&fx).await;
+            assert_nothing_deleted(fx).await;
             // Explicit fixture reservation expiry; production expiry remains
             // control's effective completion deadline, never client inference.
             h.plane.lock().unwrap().pending_log_reservation = false;
             let resumed = h.pass.run_pass_now(now + 1).await.unwrap();
-            assert!(resumed.deleted > 0);
-            assert_live_set_intact(&fx).await;
+            assert!(resumed.deleted > 0, "{resumed:?}");
+            assert_live_set_intact(fx).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4613,7 +4739,7 @@ mod part_gc_gate {
             let now = clock + 30 * 60_000;
             let h = harness(&fx).await;
             h.plane.lock().unwrap().control_grant_enabled = false;
-            let report = h.pass.run_pass_now(now).await.unwrap();
+            let report = pass_over_complete_view(&fx, &h, now).await;
             assert_eq!(report.paused_reason.as_deref(), Some("lake_part_grant_required"), "{report:?}");
             assert_eq!(report.deleted, 0);
             assert!(h.plane.lock().unwrap().retired.is_empty());
@@ -4631,7 +4757,7 @@ mod part_gc_gate {
             let h = harness(&fx).await;
             // Hold every superseded part: none may go.
             h.plane.lock().unwrap().holds = old.iter().map(|p| p.part_id.to_string()).collect();
-            let report = h.pass.run_pass_now(now).await.unwrap();
+            let report = pass_over_complete_view(&fx, &h, now).await;
             assert_eq!(report.paused_reason.as_deref(), Some("lake_part_held"), "{report:?}");
             assert_eq!(report.deleted, 0);
             assert!(h.plane.lock().unwrap().retired.is_empty());
@@ -4656,7 +4782,7 @@ mod part_gc_gate {
             ] {
                 let h = harness(&fx).await;
                 h.plane.lock().unwrap().fail = Some(hop);
-                let report = h.pass.run_pass_now(now).await.unwrap();
+                let report = pass_over_complete_view(&fx, &h, now).await;
                 assert_eq!(report.deleted, 0, "{hop:?}: {report:?}");
                 assert!(report.paused_reason.is_some(), "{hop:?} must stop the pass: {report:?}");
                 assert!(h.plane.lock().unwrap().retired.is_empty(), "{hop:?} deleted something");
@@ -4667,7 +4793,7 @@ mod part_gc_gate {
             let mut wrong = access_json(h.worker_port);
             wrong["owner_delete"]["token"] = json!("stolen");
             h.pass.update(Some(&LakePartGcAccess::parse(&wrong).unwrap()), Some(&grant(true)));
-            let report = h.pass.run_pass_now(now).await.unwrap();
+            let report = pass_over_complete_view(&fx, &h, now).await;
             assert_eq!(report.deleted, 0);
             assert!(report.paused_reason.as_deref().is_some_and(|r| r.contains("401")), "{report:?}");
             let owner_calls = h.plane.lock().unwrap().owner_calls;
@@ -5530,6 +5656,20 @@ async fn pipelined_ticks(ingestor: &mut Ingestor<'_>, clock: &mut i64, ticks: us
 /// row lands exactly once, including across a crash with a flush in flight.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pipelined_catch_up_flushes_commit_in_order_exactly_once() {
+    pipelined_catch_up_case(true).await;
+}
+
+/// NAN-4573: the same with commits on the tick (the pre-#7830 default). Its
+/// slower catch-up let the restarted clock trail the fixture's event times
+/// by more than 5 min, so an object was clamped into the hour before its
+/// events while its replay (admitted later) was not: the two copies landed
+/// in different hours and both stayed live (1210 rows for 1200 uids).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipelined_catch_up_committing_on_the_tick_is_exactly_once() {
+    pipelined_catch_up_case(false).await;
+}
+
+async fn pipelined_catch_up_case(commit_when_ready: bool) {
     let fx = fixture(120, 10);
     for (key, at) in &fx.objects {
         fx.spool.deliver(&notice(key, *at)).unwrap();
@@ -5545,7 +5685,9 @@ async fn pipelined_catch_up_flushes_commit_in_order_exactly_once() {
         let queue = &queue;
         let fx = &fx;
         async move {
-            let mut ingestor = Ingestor::open(config(&fx.root), &fx.parts, &fx.sources, queue, &fx.signer, trusted(),
+            let mut cfg = config(&fx.root);
+            cfg.commit_when_ready = commit_when_ready;
+            let mut ingestor = Ingestor::open(cfg, &fx.parts, &fx.sources, queue, &fx.signer, trusted(),
                 BronzeIngestEnricher::disabled(), &seed_schema(), clock).await.unwrap();
             ingestor.set_background_store(store);
             ingestor.set_background_signer(background_signer);
@@ -5598,6 +5740,10 @@ struct DepthTwoQueue<'a> {
     /// Largest `pending(max)` asked for, and empty `ack_skipped` calls.
     max_pending_window: AtomicUsize,
     empty_skip_acks: AtomicUsize,
+    /// NAN-4539: while set, an `ack` waits (before any check) so a test can
+    /// drop the commit mid-ack; `ack_entered` is signaled as one starts.
+    stall_ack: std::sync::atomic::AtomicBool,
+    ack_entered: tokio::sync::Notify,
 }
 
 impl<'a> DepthTwoQueue<'a> {
@@ -5607,6 +5753,7 @@ impl<'a> DepthTwoQueue<'a> {
             issued: Default::default(), keys: Default::default(),
             ranges: AtomicUsize::new(0), acked: AtomicUsize::new(0), peak_outstanding: AtomicUsize::new(0),
             max_pending_window: AtomicUsize::new(0), empty_skip_acks: AtomicUsize::new(0),
+            stall_ack: Default::default(), ack_entered: tokio::sync::Notify::new(),
         }
     }
 }
@@ -5623,6 +5770,12 @@ impl NoticeQueue for DepthTwoQueue<'_> {
         Ok(pending)
     }
     async fn ack(&self, handles: &[NoticeHandle]) -> Result<()> {
+        if self.stall_ack.load(Ordering::SeqCst) {
+            self.ack_entered.notify_one();
+            while self.stall_ack.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
         let acked = handles.iter()
             .map(|h| self.keys.lock().unwrap().get(&h.0).cloned().expect("acked handle was pending"))
             .collect::<std::collections::BTreeSet<_>>();
@@ -5848,32 +6001,199 @@ async fn a_crash_with_two_flights_in_flight_replays_exactly_once() {
     assert_exactly_once(&live_rows(&fx).await, fx.unique_uids);
 }
 
-#[test]
-fn flush_depth_flag_defaults_to_one() {
-    use nanosiem_lake_worker::part_ingest::ingest::{edge_source_config, flush_depth_from_env};
-    assert_eq!(flush_depth_from_env(None), 1);
-    assert_eq!(flush_depth_from_env(Some("1")), 1);
-    assert_eq!(flush_depth_from_env(Some("3")), 1);
-    assert_eq!(flush_depth_from_env(Some("yes")), 1);
-    assert_eq!(flush_depth_from_env(Some(" 2 ")), 2);
-    assert_eq!(IngestConfig::new(TENANT, "/tmp/x").flush_depth, 1);
-    assert_eq!(edge_source_config(1).max_issued_ranges, 1);
-    assert_eq!(edge_source_config(1).max_buffered_bytes, nanosiem_lake_worker::edge_log::EdgeLogSourceConfig::default().max_buffered_bytes);
-    assert_eq!(edge_source_config(2).max_issued_ranges, 2);
+/// NAN-4539: the foreground part store, signaling once (when armed) that a
+/// part-log entry landed, so a test can drop the commit right after its
+/// `add` committed.
+struct LogSignalParts<'a> {
+    inner: &'a LocalObjectStore,
+    armed: std::sync::atomic::AtomicBool,
+    landed: tokio::sync::Notify,
+    entries: AtomicUsize,
 }
 
-/// NAN-3619: commit-when-ready is default off and off keeps today's path:
-/// a flight whose parts are published stays uncommitted until the next
-/// ingest phase (no reap in maintenance), the pending window stays fixed,
-/// and the empty skip ack is still sent. On, maintenance commits it.
+impl<'a> LogSignalParts<'a> {
+    fn new(inner: &'a LocalObjectStore) -> Self {
+        Self { inner, armed: Default::default(), landed: tokio::sync::Notify::new(), entries: AtomicUsize::new(0) }
+    }
+}
+
+#[async_trait]
+impl ObjectStore for LogSignalParts<'_> {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+    async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<bool> {
+        let written = self.inner.put_if_absent(key, bytes).await?;
+        if written && key.contains("/log/entries/") {
+            self.entries.fetch_add(1, Ordering::SeqCst);
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.landed.notify_one();
+            }
+        }
+        Ok(written)
+    }
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+}
+
+/// Every `add` entry of the part log: the sources it consumed.
+async fn logged_adds(fx: &Fixture) -> Vec<Vec<String>> {
+    use nanosiem_lake_worker::parts::part_log::{LogEntry, LogOp};
+    let keys = nanosiem_lake_worker::parts::format::LogKeys::new(TENANT).unwrap();
+    let mut adds = Vec::new();
+    for seq in 0.. {
+        let Some(bytes) = fx.parts.get(&keys.entry(seq)).await.unwrap() else { break };
+        if let LogOp::Add { consumed, .. } = LogEntry::parse_bytes(&bytes, TENANT).unwrap().op {
+            adds.push(consumed.into_iter().map(|source| source.key).collect());
+        }
+    }
+    adds
+}
+
+fn assert_each_source_added_once(adds: &[Vec<String>]) {
+    let mut seen = HashSet::new();
+    for key in adds.iter().flatten() {
+        assert!(seen.insert(key.clone()), "{key} consumed by two adds");
+    }
+}
+
+/// NAN-4539: a commit of the oldest flight dropped at every await (its
+/// background task, right after its `add` landed while prevalence applies,
+/// and mid-ack) keeps that flight, its reservation and its immutable output.
+/// The next commit resumes it: the landed `add` is adopted (no second
+/// append, no DoubleConsume), acks stay in issue order, nothing is lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn commit_when_ready_is_off_by_default_and_off_keeps_todays_path() {
-    assert!(!IngestConfig::new(TENANT, "/tmp/x").commit_when_ready);
-    use nanosiem_lake_worker::part_ingest::ingest::commit_when_ready_from_env;
-    assert!(!commit_when_ready_from_env(None));
-    assert!(!commit_when_ready_from_env(Some("0")));
-    assert!(commit_when_ready_from_env(Some("1")));
-    assert!(commit_when_ready_from_env(Some(" On ")));
+async fn a_dropped_pipelined_commit_keeps_the_oldest_flight_and_resumes_exactly_once() {
+    let fx = fixture(120, 10);
+    for (key, at) in &fx.objects {
+        fx.spool.deliver(&notice(key, *at)).unwrap();
+    }
+    let queue = DepthTwoQueue::new(&fx);
+    let parts = LogSignalParts::new(&fx.parts);
+    let braked: &'static BrakedParts = Box::leak(Box::new(BrakedParts {
+        inner: LocalObjectStore::new(fx.root.join("parts")).unwrap(),
+        capture: Default::default(), slow: Default::default(), fast_provenance: AtomicUsize::new(0),
+    }));
+    let background_signer: &'static LocalPartSigner = Box::leak(Box::new(signer()));
+    let mut clock = (DAY0_S + 2_400) * 1_000;
+    let mut ingestor = Ingestor::open(depth_two_config(&fx.root), &parts, &fx.sources, &queue, &fx.signer, trusted(),
+        BronzeIngestEnricher::disabled(), &seed_schema(), clock).await.unwrap();
+    ingestor.set_background_store(braked);
+    ingestor.set_background_signer(background_signer);
+    two_flights_younger_done(&mut ingestor, &mut clock, braked).await;
+    let reserved = ingestor.health().clone();
+
+    // 1. Dropped while the older (braked) flight's task is awaited.
+    let dropped = tokio::time::timeout(std::time::Duration::from_millis(50), ingestor.flush_now(clock)).await;
+    assert!(dropped.is_err(), "the older flight is still uploading");
+    assert_eq!(ingestor.health().flushes_in_flight, 2, "a dropped commit keeps the oldest flight");
+    assert_eq!(queue.acked.load(Ordering::SeqCst), 0);
+
+    // 2. Dropped right after its add landed, while prevalence applies.
+    ingestor.stall_next_prevalence_ops(1);
+    parts.armed.store(true, Ordering::SeqCst);
+    let entries = parts.entries.load(Ordering::SeqCst);
+    tokio::select! {
+        outcome = ingestor.flush_now(clock) => panic!("the stalled apply finished first: {outcome:?}"),
+        _ = parts.landed.notified() => {}
+    }
+    assert_eq!(parts.entries.load(Ordering::SeqCst), entries + 1, "exactly the oldest add landed");
+    assert_eq!(ingestor.health().flushes_in_flight, 2, "an add without its acks keeps the flight");
+    assert_eq!(queue.acked.load(Ordering::SeqCst), 0, "nothing acked yet");
+    assert_eq!(logged_adds(&fx).await.len(), 1);
+
+    // 3. The retry adopts that add, then is dropped mid-ack.
+    queue.stall_ack.store(true, Ordering::SeqCst);
+    tokio::select! {
+        outcome = ingestor.flush_now(clock) => panic!("the stalled ack finished first: {outcome:?}"),
+        _ = queue.ack_entered.notified() => {}
+    }
+    assert_eq!(parts.entries.load(Ordering::SeqCst), entries + 1, "the landed add is adopted, never appended again");
+    assert_eq!(ingestor.health().flushes_in_flight, 2, "a dropped ack keeps the flight");
+    queue.stall_ack.store(false, Ordering::SeqCst);
+    braked.slow.lock().unwrap().clear();
+
+    // Drain: every flight commits in issue order, each source once.
+    pipelined_ticks(&mut ingestor, &mut clock, 400, &fx.spool).await.unwrap();
+    ingestor.flush_now(clock + 11_000).await.unwrap();
+    assert!(reserved.flushes_in_flight_peak <= 2 && ingestor.health().flushes_in_flight_peak <= 2);
+    assert!(fx.spool.pending(1).await.unwrap().is_empty(), "every notice acked");
+    assert!(queue.issued.lock().unwrap().is_empty());
+    assert_eq!(queue.acked.load(Ordering::SeqCst), fx.objects.len(), "each notice acked exactly once");
+    let adds = logged_adds(&fx).await;
+    assert_each_source_added_once(&adds);
+    assert_exactly_once(&live_rows(&fx).await, fx.unique_uids);
+}
+
+/// NAN-4539: the serial path too. A flush dropped after its `add` landed
+/// (prevalence stalled) keeps its immutable output; the retry republishes the
+/// same parts, adopts the landed add instead of appending a second one, and
+/// the cursor replay applies its prevalence exactly once.
+#[tokio::test(flavor = "current_thread")]
+async fn a_serial_flush_dropped_after_its_add_landed_is_adopted_not_reappended() {
+    let fx = fixture(3, 1);
+    write_stamp_sources(&fx);
+    let parts = LogSignalParts::new(&fx.parts);
+    let mut ingestor = Ingestor::open(config(&fx.root), &parts, &fx.sources, &fx.spool, &fx.signer, trusted(),
+        BronzeIngestEnricher::disabled(), &seed_schema(), DAY0_S * 1_000).await.unwrap();
+    let (key, at) = &fx.objects[0];
+    fx.spool.deliver(&notice(key, *at)).unwrap();
+    ingestor.tick(at * 1_000).await.unwrap();
+    ingestor.flush_now(at * 1_000).await.unwrap();
+
+    let (key, at) = &fx.objects[1];
+    fx.spool.deliver(&notice(key, *at)).unwrap();
+    ingestor.tick(at * 1_000).await.unwrap();
+    ingestor.stall_next_prevalence_ops(1);
+    parts.armed.store(true, Ordering::SeqCst);
+    tokio::select! {
+        outcome = ingestor.flush_now(at * 1_000) => panic!("the stalled apply finished first: {outcome:?}"),
+        _ = parts.landed.notified() => {}
+    }
+    let entries = parts.entries.load(Ordering::SeqCst);
+    assert!(ingestor.prevalence_pending(), "the landed add's apply is owed");
+    // The retry: the same parts, the landed add adopted (a re-append would
+    // double-consume the source, a fatal error).
+    ingestor.flush_now(at * 1_000).await.expect("the retry adopts the landed add");
+    assert_eq!(parts.entries.load(Ordering::SeqCst), entries, "no second add");
+    assert!(fx.spool.pending(1).await.unwrap().is_empty(), "the source is acked after the adopted add");
+    ingestor.tick(at * 1_000 + 1).await.unwrap();
+    assert!(!ingestor.prevalence_pending(), "the next tick replays the committed add");
+
+    let (key, at) = &fx.objects[2];
+    fx.spool.deliver(&notice(key, *at)).unwrap();
+    ingestor.tick(at * 1_000).await.unwrap();
+    ingestor.flush_now(at * 1_000).await.unwrap();
+    let adds = logged_adds(&fx).await;
+    assert_eq!(adds.len(), 3, "one add per source");
+    assert_each_source_added_once(&adds);
+    assert_eq!(dest_ip_stamps(&fx).await, vec![Some(1), Some(1), Some(2)], "prevalence applied exactly once");
+}
+
+#[test]
+fn flush_pipeline_defaults_are_bounded_without_deployment_switches() {
+    use nanosiem_lake_worker::part_ingest::ingest::edge_source_config;
+    let cfg = IngestConfig::new(TENANT, "/tmp/x");
+    assert_eq!(cfg.flush_depth, 2);
+    assert!(cfg.commit_when_ready);
+    assert_eq!(edge_source_config(1).max_issued_ranges, 1);
+    assert_eq!(edge_source_config(2).max_issued_ranges, 2);
+    assert_eq!(edge_source_config(2).max_buffered_bytes,
+        nanosiem_lake_worker::edge_log::EdgeLogSourceConfig::default().max_buffered_bytes);
+}
+
+/// Ready commits default on; an explicit serial baseline still exercises the
+/// previous off behavior for the offline comparison (no environment switch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_when_ready_defaults_on_and_serial_comparison_preserves_the_old_path() {
+    assert!(IngestConfig::new(TENANT, "/tmp/x").commit_when_ready);
     for on in [false, true] {
         let fx = fixture(120, 10);
         for (key, at) in &fx.objects {
@@ -5886,6 +6206,7 @@ async fn commit_when_ready_is_off_by_default_and_off_keeps_todays_path() {
         }));
         let background_signer: &'static LocalPartSigner = Box::leak(Box::new(signer()));
         let mut cfg = config(&fx.root);
+        cfg.flush_depth = 1;
         cfg.commit_when_ready = on;
         let mut clock = (DAY0_S + 2_400) * 1_000;
         let mut ingestor = Ingestor::open(cfg, &fx.parts, &fx.sources, &queue, &fx.signer, trusted(),
@@ -6016,10 +6337,24 @@ impl slatedb::object_store::ObjectStore for GatedStore {
 /// NAN-3774 config: prevalence on `store`, a short ingest wait, and the
 /// default 45 s `prevalence_op_timeout` (no test here needs the stall
 /// detector for ingest to keep committing).
+/// What one ingest tick + flush may take while the prevalence store stalls.
+/// A held tick waits for the stall itself (unbounded here: [`GatedStore`]
+/// holds until killed; the 45 s op timeout in production), so the bound only
+/// needs a wide margin over a tick's own work (`prevalence_ingest_wait` is
+/// 250 ms) for a loaded build-farm VM. 3 s was tripped by flush I/O jitter
+/// alone with extra load beside the suite (NAN-4573).
+const STALLED_STORE_TICK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn gated_config(fx: &Fixture, store: &Arc<GatedStore>) -> IngestConfig {
     let mut cfg = config(&fx.root);
     cfg.prevalence_read_store = Some(store.clone());
     cfg.prevalence_ingest_wait = std::time::Duration::from_millis(250);
+    // The cell's merge mode (`cell.rs` sets it with its background handles):
+    // a merge computes off the tick and is reaped without waiting. Inline
+    // merges (the lab default) compute on the tick, so the "held tick +
+    // flush" bounds below measured the L0 merge that comes due a few calls
+    // in, not prevalence; under farm suite load it took 2-7 s (NAN-4573).
+    cfg.background_merges = true;
     cfg
 }
 
@@ -6087,7 +6422,7 @@ async fn a_stalled_prevalence_store_never_holds_a_commit_and_catches_up_exactly_
     store.stall(true, true);
     for (key, at) in stalled {
         let took = ingest_one(&fx, &mut ingestor, key, *at).await;
-        assert!(took < std::time::Duration::from_secs(3), "a stalled prevalence store held tick + flush for {took:?}");
+        assert!(took < STALLED_STORE_TICK_BOUND, "a stalled prevalence store held tick + flush for {took:?}");
     }
     assert!(fx.spool.pending(1).await.unwrap().is_empty(), "every notice committed and acked");
     assert_exactly_once(&live_rows(&fx).await, 1 + stalled.len());
@@ -6134,7 +6469,7 @@ async fn a_restart_mid_catch_up_applies_every_add_exactly_once() {
     store.stall(false, true);
     for (key, at) in stalled {
         let took = ingest_one(&fx, &mut ingestor, key, *at).await;
-        assert!(took < std::time::Duration::from_secs(3), "a stalled prevalence store held tick + flush for {took:?}");
+        assert!(took < STALLED_STORE_TICK_BOUND, "a stalled prevalence store held tick + flush for {took:?}");
     }
     assert!(ingestor.prevalence_pending());
     // The process restarts; its stalled writes time out.
@@ -6166,6 +6501,80 @@ async fn a_restart_mid_catch_up_applies_every_add_exactly_once() {
     let objects = fx.objects.len() as u64;
     assert_eq!(dest_ip_prevalence(&fx, &store, now + 1_000).await, (objects, objects),
         "no add counted twice across the restarts");
+}
+
+/// NAN-4460 (the large tenant 2026-10-23: 16,883 entries behind after a 62 h outage, ~26
+/// entries a batch, a ~5 h ETA): a long backlog grows the catch-up batches
+/// with the backlog, then shrinks them back to today's size near the head. Runs
+/// on the production `Ingestor` with prevalence on the production open path,
+/// the cap from the large tenant's ingest memory limit. Every committed `Add` lands exactly
+/// once, and every tick stays bounded while the state is behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_prevalence_backlog_scales_its_catch_up_batches_and_lands_every_add_once() {
+    use nanosiem_lake_worker::part_ingest::prevalence::{catch_up_max_rows_for, CATCH_UP_MAX_SCALE};
+    let fx = fixture(40, 1);
+    write_stamp_sources(&fx);
+    let store = Arc::new(GatedStore::default());
+    let mut ingestor = open_with(&fx, gated_config(&fx, &store), DAY0_S * 1_000).await.unwrap();
+    let (first, rest) = fx.objects.split_first().unwrap();
+    let (last, stalled) = rest.split_last().unwrap();
+    ingest_one(&fx, &mut ingestor, &first.0, first.1).await;
+    // The state's writes stall (the outage); every Add commits and is owed.
+    store.stall(false, true);
+    for (key, at) in stalled {
+        let took = ingest_one(&fx, &mut ingestor, key, *at).await;
+        assert!(took < STALLED_STORE_TICK_BOUND, "a stalled prevalence store held tick + flush for {took:?}");
+    }
+    assert!(ingestor.prevalence_pending());
+    drop(ingestor);
+    store.kill();
+
+    // A fresh process catches up. Base batches of 2 entries stand in for
+    // 32 (the backlog is 38 entries rather than 16,883).
+    let store = store.handle();
+    let mut cfg = gated_config(&fx, &store);
+    cfg.prevalence_catch_up_batch_entries = 2;
+    cfg.prevalence_catch_up_max_rows = catch_up_max_rows_for(4_831_838_208);
+    // NAN-4550: one catch-up batch per step (the step budget only bounds how
+    // many batches a tick runs, never their size or scale), so the scale is
+    // observed after every batch. With the 2 s budget a fast host ran every
+    // batch of the climb and the descent inside one tick, and the per-tick
+    // sample saw [1, 2, 1].
+    cfg.prevalence_rebuild_budget_ms = 0;
+    let mut now = last.1 * 1_000;
+    let mut ingestor = open_with(&fx, cfg, now).await.unwrap();
+    assert_eq!(ingestor.prevalence_status(), "unstamped: catching up with committed adds");
+    let behind = stalled.len() as u64;
+    let mut scales = vec![ingestor.prevalence_catch_up_scale()];
+    let mut seen_batches = ingestor.health().prevalence_catch_up_batches_total;
+    // A liveness bound only: the scales asserted below depend on the batch
+    // sequence, not on how fast the host runs it.
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    while ingestor.prevalence_status() != "stamping" {
+        assert!(Instant::now() < deadline, "prevalence never caught up: {}", ingestor.prevalence_status());
+        now += 1_000;
+        let began = Instant::now();
+        ingestor.tick(now).await.unwrap();
+        assert!(began.elapsed() < std::time::Duration::from_secs(3), "a catch-up tick held ingest for {:?}", began.elapsed());
+        let batches = ingestor.health().prevalence_catch_up_batches_total;
+        assert!(batches <= seen_batches + 1, "one batch per step: every batch's scale is sampled ({seen_batches} -> {batches})");
+        seen_batches = batches;
+        scales.push(ingestor.prevalence_catch_up_scale());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let batches = ingestor.health().prevalence_catch_up_batches_total;
+    let largest = scales.iter().copied().max().unwrap();
+    eprintln!("{behind} entries behind: {batches} catch-up batches, scales {scales:?}");
+    assert!((4..=CATCH_UP_MAX_SCALE).contains(&largest), "the batch grew with the backlog: {scales:?}");
+    assert!(batches * 2 <= behind / 2, "at least twice fewer batches than at a fixed size: {batches} for {behind}");
+    assert_eq!(ingestor.prevalence_catch_up_scale(), 1, "back to today's batch at the head");
+    ingest_one(&fx, &mut ingestor, &last.0, last.1).await;
+    let stamps = dest_ip_stamps(&fx).await;
+    assert_eq!(stamps.last().copied().flatten(), Some(fx.objects.len() as u64 - 1), "{stamps:?}");
+    drop(ingestor);
+    let objects = fx.objects.len() as u64;
+    assert_eq!(dest_ip_prevalence(&fx, &store, now + 1_000).await, (objects, objects),
+        "every committed add is in the state exactly once");
 }
 
 /// NAN-3774 (tenant-a 2026-10-13 15:18Z: the first flush after the r48 roll

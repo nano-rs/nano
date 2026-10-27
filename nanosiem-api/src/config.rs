@@ -24,6 +24,16 @@ pub enum DeploymentMode {
 }
 
 impl DeploymentMode {
+    #[cfg(feature = "enterprise")]
+    pub fn soar_smtp_deployment(self) -> nanosiem_enterprise::soar::notify::smtp::SmtpDeployment {
+        use nanosiem_enterprise::soar::notify::smtp::SmtpDeployment;
+        match self {
+            Self::SelfHosted => SmtpDeployment::SelfHosted,
+            Self::Managed | Self::EnterpriseShared => SmtpDeployment::Hosted,
+            Self::Demo => SmtpDeployment::Demo,
+        }
+    }
+
     pub fn is_managed(&self) -> bool {
         matches!(self, DeploymentMode::Managed)
     }
@@ -172,6 +182,20 @@ pub struct ApiConfig {
     /// Ingest mode from `NANO_VECTOR_PROFILE` (NAN-3844). Shared tenants
     /// always report `Vector`; only an open-core `install.sh --tenzir` sets it.
     pub ingest_mode: IngestMode,
+    /// Sovereign installation (NAN-4666), derived from the installation facts
+    /// at `/app/sovereign`, never from an environment flag. Implies `airgap`.
+    pub sovereign: bool,
+}
+
+/// How this process enforces the license at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LicenseBootMode {
+    /// Hosted/BYOC phone-home status poller (LICENSE_URL + token + id).
+    Poll,
+    /// Offline: locked until a valid, non-expired offline license is imported.
+    LockedUnlessValid,
+    /// Open-core / unconfigured: unrestricted.
+    Unrestricted,
 }
 
 impl ApiConfig {
@@ -231,7 +255,15 @@ impl ApiConfig {
             ingest_mode: IngestMode::from_vector_profile(
                 env::var("NANO_VECTOR_PROFILE").ok().as_deref(),
             ),
+            sovereign: false,
         };
+        // NAN-4666: sovereign facts are the only source for a sovereign
+        // runtime. Missing or invalid facts refuse to boot (no localhost).
+        match nanosiem_core::sovereign_runtime::process_runtime() {
+            Ok(Some(sovereign)) => config.apply_sovereign(sovereign),
+            Ok(None) => {}
+            Err(error) => panic!("Refusing to start: {error}"),
+        }
         // The hosted-shared substrate has no per-install Vector profile; a
         // stray NANO_VECTOR_PROFILE there must not switch tenant surfaces off.
         #[cfg(feature = "enterprise")]
@@ -242,6 +274,32 @@ impl ApiConfig {
             .validate_runtime_security()
             .unwrap_or_else(|error| panic!("{error}"));
         config
+    }
+
+    /// Apply the fixed sovereign policy from validated installation facts:
+    /// an offline (airgap-equivalent) runtime, the product database and the
+    /// browser origin from the facts, self-hosted settings, no phone-home.
+    /// `detect_at` already refused env that would contradict the facts.
+    pub fn apply_sovereign(&mut self, sovereign: &nanosiem_core::sovereign_runtime::SovereignRuntime) {
+        self.sovereign = true;
+        self.airgap = !sovereign.egress_jobs_enabled();
+        self.deployment_mode = DeploymentMode::SelfHosted;
+        self.database_url = sovereign.database_url().to_string();
+        self.cors_origins = vec![sovereign.browser_origin()];
+        self.license_url = None;
+        self.license_token = None;
+    }
+
+    /// License enforcement chosen at boot. A sovereign runtime is always
+    /// locked unless a valid offline license is installed.
+    pub fn license_boot_mode(&self) -> LicenseBootMode {
+        if self.sovereign || (self.airgap && !self.is_license_enabled()) {
+            LicenseBootMode::LockedUnlessValid
+        } else if self.is_license_enabled() {
+            LicenseBootMode::Poll
+        } else {
+            LicenseBootMode::Unrestricted
+        }
     }
 
     /// Whether a resolved runtime profile is the canonical OCSF 1.9 lake lane.
@@ -370,6 +428,16 @@ mod tests {
 
     #[cfg(feature = "enterprise")]
     #[test]
+    fn smtp_private_networks_require_the_typed_self_hosted_profile() {
+        use nanosiem_enterprise::soar::notify::smtp::SmtpDeployment;
+        assert_eq!(DeploymentMode::SelfHosted.soar_smtp_deployment(), SmtpDeployment::SelfHosted);
+        assert_eq!(DeploymentMode::Demo.soar_smtp_deployment(), SmtpDeployment::Demo);
+        for mode in [DeploymentMode::Managed, DeploymentMode::EnterpriseShared] {
+            assert_eq!(mode.soar_smtp_deployment(), SmtpDeployment::Hosted);
+        }
+    }
+    #[cfg(feature = "enterprise")]
+    #[test]
     fn deployment_mode_requires_explicit_enterprise_shared_profile() {
         assert_eq!(
             DeploymentMode::from_env_value(Some("enterprise_shared")),
@@ -463,6 +531,104 @@ mod tests {
             };
             assert!(config.validate_runtime_security_values(true).is_ok());
         }
+    }
+
+    /// NAN-4666 fixture: the installer-persisted sovereign facts directory.
+    fn sovereign_facts(dir: &std::path::Path) -> nanosiem_core::sovereign_runtime::SovereignRuntime {
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt;
+        use nanosiem_core::sovereign_runtime::*;
+        let root = dir.join("sovereign");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let document = serde_json::json!({
+            "schema_version": 1,
+            "inputs": {"domain": "siem.customer.example", "idp": {"kind": "oidc", "issuer": "https://idp.customer.example"}, "connectivity": "connected"},
+            "derived": {"installation_id": "inst-1", "organization_id": "org-1", "revision": 1, "release_epoch": 1},
+            "target": {"kind": "linux", "inputs": {}, "derived": {}}
+        });
+        let deployment = serde_json::json!({
+            "installationDocument": base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&document).unwrap()),
+            "postgres": {"runtimeUrl": {"id": "postgres-runtime"}, "migratorUrl": {"id": "postgres-migrator"}, "ca": {"id": "postgres-ca"}},
+            "coordination": {"url": {"id": "coordination-url"}, "ca": {"id": "coordination-ca"}},
+            "identity": {"sessionSecret": {"id": "session-secret"}, "oidcClient": {"id": "oidc-client"}, "recoveryAuthority": {"id": "bootstrap-verifier"}},
+            "releaseDigest": format!("sha256:{}", "b".repeat(64)),
+            "listen": {"host": "127.0.0.1", "port": 13000}
+        });
+        for (name, bytes) in [
+            (DEPLOYMENT_FILE, serde_json::to_vec(&deployment).unwrap()),
+            (PRODUCT_POSTGRES_RUNTIME_FILE, b"postgresql://nano_runtime:pw@pg.customer.internal/nano?sslmode=verify-full".to_vec()),
+            (PRODUCT_POSTGRES_CA_FILE, b"synthetic ca".to_vec()),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        SovereignRuntime::load(&root).unwrap()
+    }
+
+    /// NAN-4666: sovereign facts give an offline runtime with no egress
+    /// schedulers, the product DB from facts, the customer browser origin,
+    /// no phone-home, and the license locked unless a valid offline license
+    /// is installed.
+    #[test]
+    fn sovereign_facts_select_offline_runtime_and_locked_license() {
+        let dir = tempfile::tempdir().unwrap();
+        let sovereign = sovereign_facts(dir.path());
+        // Even a config that had hosted values ends in the sovereign policy.
+        let mut config = ApiConfig {
+            license_url: Some("https://api.nano.rs/api/license/status".into()),
+            license_token: Some("t".into()),
+            deployment_id: Some("d".into()),
+            ..ApiConfig::default()
+        };
+        config.apply_sovereign(&sovereign);
+        assert!(config.sovereign);
+        assert!(config.airgap);
+        assert!(!config.egress_jobs_enabled(), "no internet egress schedulers");
+        assert_eq!(config.deployment_mode, DeploymentMode::SelfHosted);
+        assert!(!config.is_license_enabled(), "no phone-home");
+        assert!(config.license_url.is_none() && config.license_token.is_none());
+        // Sovereign wins over any phone-home config, even with airgap off.
+        let forced = ApiConfig {
+            sovereign: true,
+            airgap: false,
+            license_url: Some("u".into()),
+            license_token: Some("t".into()),
+            deployment_id: Some("d".into()),
+            ..ApiConfig::default()
+        };
+        assert_eq!(forced.license_boot_mode(), LicenseBootMode::LockedUnlessValid);
+        assert_eq!(config.license_boot_mode(), LicenseBootMode::LockedUnlessValid);
+        assert_eq!(config.cors_origins, vec!["https://siem.customer.example".to_string()]);
+        assert!(config.database_url.starts_with("postgresql://nano_runtime:pw@pg.customer.internal/nano?sslmode=verify-full&sslrootcert="));
+        assert!(!config.database_url.contains("localhost"));
+    }
+
+    /// NAN-4666: hosted / open-core behavior is unchanged. No sovereign mount
+    /// on a normal host, and the env-driven license decisions keep their
+    /// previous precedence.
+    #[test]
+    fn hosted_license_and_egress_behavior_is_unchanged() {
+        assert!(nanosiem_core::sovereign_runtime::process_runtime().unwrap().is_none());
+        let default = ApiConfig::default();
+        assert!(!default.sovereign);
+        assert_eq!(default.database_url, "postgres://localhost/nanosiem");
+        assert_eq!(default.license_boot_mode(), LicenseBootMode::Unrestricted);
+        assert!(default.egress_jobs_enabled());
+        let licensed = ApiConfig {
+            license_url: Some("u".into()),
+            license_token: Some("t".into()),
+            deployment_id: Some("d".into()),
+            ..ApiConfig::default()
+        };
+        assert_eq!(licensed.license_boot_mode(), LicenseBootMode::Poll);
+        // Pre-NAN-4666 precedence: a configured LICENSE_URL wins over AIRGAP_MODE.
+        let licensed_airgap = ApiConfig { airgap: true, ..licensed.clone() };
+        assert_eq!(licensed_airgap.license_boot_mode(), LicenseBootMode::Poll);
+        let airgap = ApiConfig { airgap: true, ..ApiConfig::default() };
+        assert_eq!(airgap.license_boot_mode(), LicenseBootMode::LockedUnlessValid);
+        assert!(!airgap.sovereign);
     }
 
     #[test]
@@ -620,6 +786,7 @@ impl Default for ApiConfig {
             schema_id: nanosiem_core::schema::SchemaId::Udm,
             canonical_lake_ocsf: false,
             ingest_mode: IngestMode::Vector,
+            sovereign: false,
         }
     }
 }

@@ -23,6 +23,15 @@ pub const MAX_ORPHAN_AGE_SECONDS: u64 = 30 * 86_400;
 pub const ORPHAN_ID_MEMORY_MARGIN_MS: i64 = 3_600_000;
 pub const RETENTION_DAYS: [u64; 4] = [30, 90, 180, 365];
 pub const MAX_KEY_BYTES: usize = 1_024;
+/// NAN-4567: the bronze quarantine store under a tenant's `log/` family
+/// (NAN-4554, `part_ingest::quarantine_store`). The only `log/` keys a
+/// delete may name, and only with [`LakePartDeleteReason::QuarantineExpired`].
+pub const QUARANTINE_DIR: &str = "log/checkpoints/bronze-quarantine-v1/";
+/// NAN-4567: the age a quarantine object or record must reach before it may
+/// be deleted: the quarantine TTL (7 d) plus the restore's day of clock-skew
+/// slack, i.e. `quarantine_store::RESTORE_HORIZON_MS`. Past it a record can
+/// only describe an expired entry, so no restore ever reads it.
+pub const QUARANTINE_MIN_AGE_SECONDS: u64 = 8 * 86_400;
 /// Fixed part file names (owner `LAKE_PART_FILE_NAMES`, contract r2). Data
 /// files and UID/entity JSON sidecars use five-digit indices, `i` <
 /// `format::MAX_DATA_FILES`, matched separately.
@@ -84,6 +93,47 @@ impl PartFileKey {
     pub fn is_provenance(&self) -> bool {
         self.file == PROVENANCE_FILE
     }
+}
+
+/// What a bronze quarantine key names (NAN-4567).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuarantineKeyKind {
+    /// `objects/{id}.parquet`: the kept bytes; `id` is their SHA-256.
+    Object { id: String },
+    /// `records/{written_ms:013}-{sha16}.json`: one immutable state record.
+    Record { written_ms: i64 },
+}
+
+/// A parsed bronze quarantine key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineKey {
+    pub tenant_uuid: String,
+    pub kind: QuarantineKeyKind,
+}
+
+/// Parse an exact bronze quarantine object or record key; `None` for
+/// anything else (every other `log/` key included).
+pub fn parse_quarantine_key(key: &str) -> Option<QuarantineKey> {
+    if key.len() > MAX_KEY_BYTES { return None; }
+    let rest = key.strip_prefix("lake/parts/v1/tenant=")?;
+    let (tenant, rest) = rest.split_at_checked(36)?;
+    if !uuid_v4_regex().is_match(tenant) { return None; }
+    let rest = rest.strip_prefix('/')?.strip_prefix(QUARANTINE_DIR)?;
+    let kind = if let Some(name) = rest.strip_prefix("objects/") {
+        let id = name.strip_suffix(".parquet")?;
+        if !is_sha256_hex(id) { return None; }
+        QuarantineKeyKind::Object { id: id.to_string() }
+    } else {
+        let name = rest.strip_prefix("records/")?;
+        let bytes = name.as_bytes();
+        if bytes.len() != 35 || !bytes[..13].iter().all(u8::is_ascii_digit) || bytes[13] != b'-'
+            || !bytes[14..30].iter().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            || &name[30..] != ".json" {
+            return None;
+        }
+        QuarantineKeyKind::Record { written_ms: name[..13].parse().ok()? }
+    };
+    Some(QuarantineKey { tenant_uuid: tenant.to_string(), kind })
 }
 
 /// True for any key under a tenant's `log/` family (entries, checkpoints,
@@ -170,6 +220,8 @@ pub enum LakePartDeleteReason {
     Superseded,
     Orphan,
     Retention,
+    /// NAN-4567: an expired bronze quarantine object or record.
+    QuarantineExpired,
 }
 
 impl LakePartDeleteReason {
@@ -178,6 +230,7 @@ impl LakePartDeleteReason {
             Self::Superseded => "superseded",
             Self::Orphan => "orphan",
             Self::Retention => "retention",
+            Self::QuarantineExpired => "quarantine_expired",
         }
     }
 }
@@ -214,6 +267,10 @@ pub struct LakePartDeleteRequest {
     pub retention_day: Option<String>,
     #[serde(default, deserialize_with = "some", skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u64>,
+    /// NAN-4567: exactly [`QUARANTINE_MIN_AGE_SECONDS`], for
+    /// [`LakePartDeleteReason::QuarantineExpired`] only.
+    #[serde(default, deserialize_with = "some", skip_serializing_if = "Option::is_none")]
+    pub quarantine_min_age_seconds: Option<u64>,
 }
 
 /// `nano-shared-r2-{tenant_uuid}`.
@@ -247,6 +304,7 @@ impl LakePartDeleteRequest {
             orphan_min_age_seconds: None,
             retention_day: None,
             retention_days: None,
+            quarantine_min_age_seconds: None,
         }
     }
 
@@ -272,6 +330,29 @@ impl LakePartDeleteRequest {
         }
         if self.key.is_empty() || self.key.len() > MAX_KEY_BYTES {
             bail!("lake part delete key is empty or too long");
+        }
+        if self.reason == LakePartDeleteReason::QuarantineExpired {
+            // NAN-4567: the one `log/` family a delete may name.
+            let Some(key) = parse_quarantine_key(&self.key) else {
+                bail!("quarantine delete key is not an exact bronze quarantine key");
+            };
+            if key.tenant_uuid != self.tenant_uuid {
+                bail!("lake part delete key is outside the tenant's prefix");
+            }
+            if self.removal_seq.is_some()
+                || self.removal_entry_sha256.is_some()
+                || self.grace_seconds.is_some()
+                || self.orphan_min_age_seconds.is_some()
+                || self.retention_day.is_some()
+                || self.retention_days.is_some()
+                || self.quarantine_min_age_seconds != Some(QUARANTINE_MIN_AGE_SECONDS)
+            {
+                bail!("quarantine delete fields are not exactly quarantine_min_age_seconds");
+            }
+            return Ok(());
+        }
+        if self.quarantine_min_age_seconds.is_some() {
+            bail!("quarantine_min_age_seconds is only for a quarantine_expired delete");
         }
         if is_log_key(&self.key) {
             bail!("part-log entries, checkpoints and HEAD are never deletable");
@@ -316,6 +397,7 @@ impl LakePartDeleteRequest {
                     bail!("orphan delete fields are not exactly orphan_min_age_seconds");
                 }
             }
+            LakePartDeleteReason::QuarantineExpired => bail!("quarantine deletes are validated above"),
             LakePartDeleteReason::Retention => {
                 if !removal_ok()
                     || self.orphan_min_age_seconds.is_some()
@@ -492,6 +574,76 @@ pub(crate) mod tests {
         assert!(retention.validate().is_err());
         retention.retention_days = None;
         assert!(retention.validate().is_err());
+    }
+
+    pub fn quarantine(key: &str) -> LakePartDeleteRequest {
+        let mut request = LakePartDeleteRequest::base(
+            "tenant1", TENANT_UUID, key, "\"etag-q\"", 42, LakePartDeleteReason::QuarantineExpired,
+        );
+        request.quarantine_min_age_seconds = Some(QUARANTINE_MIN_AGE_SECONDS);
+        request
+    }
+
+    /// NAN-4567: a quarantine delete names exactly one bronze quarantine
+    /// object or record of its own tenant, with exactly the age field.
+    #[test]
+    fn quarantine_validation_is_exact() {
+        let root = format!("lake/parts/v1/tenant={TENANT_UUID}/{QUARANTINE_DIR}");
+        assert_eq!(
+            root,
+            crate::part_ingest::quarantine_store::store_prefix(TENANT_UUID).unwrap(),
+            "the delete layout is the store's layout"
+        );
+        assert_eq!(QUARANTINE_MIN_AGE_SECONDS as i64 * 1_000, crate::part_ingest::quarantine_store::RESTORE_HORIZON_MS);
+        let object = format!("{root}objects/{}.parquet", "ab".repeat(32));
+        let record = format!("{root}records/1790330400123-0123456789abcdef.json");
+        quarantine(&object).validate().unwrap();
+        quarantine(&record).validate().unwrap();
+        assert_eq!(
+            parse_quarantine_key(&record).unwrap().kind,
+            QuarantineKeyKind::Record { written_ms: 1_790_330_400_123 }
+        );
+        // The canonical form carries the age; the digest is stable.
+        let json = String::from_utf8(quarantine(&record).canonical_json().unwrap()).unwrap();
+        assert!(json.contains(r#""quarantine_min_age_seconds":691200"#), "{json}");
+        assert!(json.contains(r#""reason":"quarantine_expired""#), "{json}");
+        for bad_key in [
+            format!("{root}objects/{}.parquet", "AB".repeat(32)),
+            format!("{root}objects/{}.json", "ab".repeat(32)),
+            format!("{root}objects/{}.parquet/x", "ab".repeat(32)),
+            format!("{root}records/179033040012-0123456789abcdef.json"),
+            format!("{root}records/1790330400123-0123456789ABCDEF.json"),
+            format!("{root}records/1790330400123_0123456789abcdef.json"),
+            format!("{root}outbox/{}", "ab".repeat(32)),
+            format!("lake/parts/v1/tenant={TENANT_UUID}/log/checkpoints/00000000000000000001.json"),
+            format!("lake/parts/v1/tenant={TENANT_UUID}/log/HEAD"),
+            key("data-00000.parquet"),
+            // Another tenant's quarantine.
+            format!("lake/parts/v1/tenant=7f1c1e2a-5b8e-4d4c-9a3e-0e2b7c9d1f00/{QUARANTINE_DIR}objects/{}.parquet", "ab".repeat(32)),
+        ] {
+            assert!(quarantine(&bad_key).validate().is_err(), "{bad_key}");
+        }
+        let mut young = quarantine(&record);
+        young.quarantine_min_age_seconds = Some(QUARANTINE_MIN_AGE_SECONDS - 1);
+        assert!(young.validate().is_err());
+        let mut absent = quarantine(&record);
+        absent.quarantine_min_age_seconds = None;
+        assert!(absent.validate().is_err());
+        let mut mixed = quarantine(&record);
+        mixed.orphan_min_age_seconds = Some(MIN_ORPHAN_AGE_SECONDS);
+        assert!(mixed.validate().is_err());
+        // Other reasons never carry the quarantine age, and the reason never
+        // opens any other `log/` key.
+        let mut stray = superseded();
+        stray.quarantine_min_age_seconds = Some(QUARANTINE_MIN_AGE_SECONDS);
+        assert!(stray.validate().is_err());
+        let mut orphan = quarantine(&object);
+        orphan.reason = LakePartDeleteReason::Orphan;
+        orphan.quarantine_min_age_seconds = None;
+        orphan.orphan_min_age_seconds = Some(MIN_ORPHAN_AGE_SECONDS);
+        assert!(orphan.validate().is_err(), "an orphan delete never names a quarantine key");
+        // Unchanged canonical form for the existing reasons.
+        assert!(!String::from_utf8(superseded().canonical_json().unwrap()).unwrap().contains("quarantine"));
     }
 
     #[test]

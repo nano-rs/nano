@@ -11,11 +11,31 @@
 //! waits in a bounded priority queue. Every permit is a lease that expires at the
 //! priority's execution ceiling plus slack, so a permit whose holder died is
 //! reclaimed instead of leaking (NAN-3299).
+//!
+//! **Queue, not reject (NAN-4664).** Overflow waits in a bounded fair queue
+//! for at most the request's wait budget ([`ADMISSION_WAIT_HEADER`], default
+//! [`DEFAULT_ADMISSION_WAIT`], capped at `queue_timeout_ms`); a refusal
+//! (`QueueTimeout`, `QueueFull`, 429 with `Retry-After`) comes only when that
+//! budget ends or the queue is full. Concurrency limits are unchanged. The
+//! drain serves waiters in [`service_order`]: round-robin across principals
+//! within a tenant, round-robin across tenants, priority only inside a
+//! tenant. A caller that disconnects leaves the queue at once and its work is
+//! never started.
+//!
+//! **Pooled cells.** One search process fronts every tenant of a pooled lake
+//! cell. Tenants share only `global_adhoc_limit` (the cell ceiling) and the
+//! process queue bound; each shared tenant also has its own concurrency cap
+//! (`shared_tenant_adhoc_limit`), its own queue quota and reserved waiters
+//! (NAN-3286), so one tenant's backlog, priority or full queue never refuses
+//! or reorders another tenant's searches. Below this, each tenant's query[T]
+//! process on the cell has its own native-work slots (a FIFO with a 20 s
+//! deadline, whose overflow the handler escalates to a durable job), and the
+//! cell's cgroups divide CPU between tenants by weight; no queue is shared
+//! across tenants there.
 
 use metrics::{counter, gauge, histogram};
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{oneshot, Mutex, Notify};
@@ -245,11 +265,91 @@ fn shared_tenant_reserved_queue(tenant_limit: u32) -> u32 {
     (tenant_limit / 5).max(1).min(tenant_limit)
 }
 
-/// NAN-3299: waiters one user may queue beyond their running searches. A
-/// per-user overflow waits instead of failing, but one user still cannot
-/// fill the process (or tenant) queue on their own.
-fn per_user_queue_limit(per_user_limit: u32) -> u32 {
-    per_user_limit.saturating_mul(2).max(1)
+/// NAN-3299 / NAN-4664: waiters one principal (a user or an API key) may
+/// queue beyond their running searches. A per-principal overflow waits
+/// instead of failing; the bound only keeps one principal from filling its
+/// tenant's (or a dedicated process's) whole queue, so other principals can
+/// still enqueue. `queue_share` is the bound of the queue the principal waits
+/// in: `max_queue_depth` (dedicated) or its tenant's quota (shared).
+///
+/// The old bound (`2 x per_user_limit`) refused a closed-loop fleet of 16
+/// agents sharing one login at the DB default of 5 permits: 5 running plus
+/// 10 queued left the 16th a 429 (NAN-4664 bakeoff, 12 of 160 hunts).
+fn principal_queue_limit(per_user_limit: u32, queue_share: u32) -> u32 {
+    per_user_limit
+        .saturating_mul(2)
+        .max(queue_share / 2)
+        .min(queue_share.max(1))
+        .max(1)
+}
+
+// ============================================================================
+// Per-request wait budget (NAN-4664)
+// ============================================================================
+
+/// Request header carrying a caller's admission wait budget in milliseconds.
+/// Agent and API callers set a longer budget (up to the configured
+/// `queue_timeout_ms`) to queue instead of failing; `0` means "fail fast
+/// when no slot is free".
+pub const ADMISSION_WAIT_HEADER: &str = "x-nano-admission-wait-ms";
+
+/// The wait budget of an HTTP search that names none. Longer than the
+/// interactive escalation deadline (45 s), so a browser search that waits
+/// becomes the durable job the UI follows instead of a 429, and well above a
+/// fleet's expected wait (16 closed-loop agents over 5 permits at the
+/// bakeoff's 3.5 s p50 queue for ~8 s each).
+pub const DEFAULT_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+tokio::task_local! {
+    /// The current request's admission wait budget (see [`with_wait_budget`]).
+    static ADMISSION_WAIT_BUDGET: std::time::Duration;
+}
+
+/// Run `future` with `budget` as its admission wait budget. Every admission
+/// inside it waits at most `budget`, capped by the configured
+/// `queue_timeout_ms`. Outside any scope (internal callers: jobs, SOAR,
+/// shadow investigation) the configured `queue_timeout_ms` applies as before.
+pub async fn with_wait_budget<F: std::future::Future>(
+    budget: std::time::Duration,
+    future: F,
+) -> F::Output {
+    ADMISSION_WAIT_BUDGET.scope(budget, future).await
+}
+
+/// Run `future` free of any request's wait budget: background work that
+/// outlives its HTTP request (an async job) waits up to the configured
+/// `queue_timeout_ms`, as internal callers always have.
+pub async fn without_wait_budget<F: std::future::Future>(future: F) -> F::Output {
+    ADMISSION_WAIT_BUDGET.scope(std::time::Duration::MAX, future).await
+}
+
+/// The current request's admission wait budget, if a scope is active.
+pub fn current_wait_budget() -> Option<std::time::Duration> {
+    ADMISSION_WAIT_BUDGET.try_with(|budget| *budget).ok()
+}
+
+/// Parse an [`ADMISSION_WAIT_HEADER`] value. `None` (use
+/// [`DEFAULT_ADMISSION_WAIT`]) for an absent or unparsable value; the
+/// controller caps any value at the configured `queue_timeout_ms`.
+pub fn parse_wait_budget_header(value: Option<&str>) -> Option<std::time::Duration> {
+    value
+        .map(str::trim)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+}
+
+/// The budget an HTTP search runs with: the caller's header value, else
+/// [`DEFAULT_ADMISSION_WAIT`]. (The cap is applied at admission, where the
+/// live config is known.)
+pub fn request_wait_budget(header: Option<&str>) -> std::time::Duration {
+    parse_wait_budget_header(header).unwrap_or(DEFAULT_ADMISSION_WAIT)
+}
+
+/// The wait one admission gets: the request's budget capped at the
+/// configured `queue_timeout_ms`, or that cap outside any budget scope.
+fn effective_wait(budget: Option<std::time::Duration>, queue_timeout_ms: u64) -> std::time::Duration {
+    let cap = std::time::Duration::from_millis(queue_timeout_ms);
+    budget.map_or(cap, |budget| budget.min(cap))
 }
 
 /// NAN-3299: slots one user's auxiliary requests (histogram, field stats)
@@ -498,6 +598,7 @@ impl AdmissionSubject {
         self.tenant_id == scope.tenant_id()
     }
 
+    #[cfg(test)]
     const fn scope(self) -> SearchTenantScope {
         match self.tenant_id {
             Some(tenant_id) => SearchTenantScope::EnterpriseShared(tenant_id),
@@ -708,48 +809,194 @@ fn queue_rejection(
 
 /// A queued search waiting for admission
 struct QueuedSearch {
+    /// Unique, monotonically increasing per controller: FIFO order and the
+    /// handle a waiter's [`QueuedGuard`] removes itself by.
+    seq: u64,
     job_id: String,
     subject: AdmissionSubject,
     require_distributed: bool,
     priority: QueryPriority,
     lane: AdmissionLane,
-    /// NAN-3286: fair-share position within this tenant's own waiters
-    /// (one past its newest queued waiter's rank, 0 when it has none). The
-    /// drain serves equal-priority waiters by rank first, so tenants are
-    /// served round-robin instead of one tenant's backlog going first.
-    tenant_rank: u64,
-    enqueued_at: Instant,
+    /// Fair-queue tag among the tenant's principals (see [`WaitQueue`]).
+    principal_tag: u64,
+    /// Fair-queue tag among tenants (see [`WaitQueue`]).
+    tenant_tag: u64,
     /// Sender to notify when admitted
     tx: oneshot::Sender<Result<AdmissionPermit, AdmissionError>>,
 }
 
-impl PartialEq for QueuedSearch {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+/// NAN-4664: the bounded admission queue, served by start-time fair
+/// queueing at two levels.
+///
+/// Every waiter carries two tags, taken at enqueue: a **principal tag**
+/// (one past the later of its tenant's virtual clock and its principal's
+/// newest queued tag) and a **tenant tag** (the same across tenants). A
+/// virtual clock advances to the tags of each admitted waiter, so a
+/// principal or tenant arriving late starts level with the others' next
+/// turn instead of behind their whole backlog, and one that was just served
+/// goes to the back. The drain serves:
+///
+/// 1. **Across tenants**: the lowest tenant tag first (ties FIFO), i.e.
+///    round-robin between tenants with waiters (NAN-3286). Priority never
+///    crosses a tenant: another tenant's Interactive backlog cannot jump this
+///    tenant's turn. Dedicated deployments are one tenant (`tenant_id: None`).
+/// 2. **Within the tenant whose turn it is**: higher priority first, then
+///    primary before auxiliary (NAN-3299), then the lowest principal tag
+///    (round-robin across principals: one agent with a deep backlog cannot
+///    starve the tenant's other agents or analysts), then FIFO.
+///
+/// Tags are tickets of their flow, not of one search: [`service_order`]
+/// hands a flow's tickets to its waiters in the flow's own order, so a
+/// principal's Interactive search can use the ticket its older Analytics
+/// search took. Memory is bounded by `max_queue_depth` (and the per-tenant
+/// quotas) whatever the arrival rate; the per-tenant clocks exist only while
+/// a tenant has waiters.
+#[derive(Default)]
+struct WaitQueue {
+    next_seq: u64,
+    waiters: Vec<QueuedSearch>,
+    /// Tenant tag of the latest admission across tenants.
+    tenant_clock: u64,
+    /// Principal tag of the latest admission, per tenant with waiters.
+    principal_clocks: HashMap<Option<uuid::Uuid>, u64>,
+}
+
+impl WaitQueue {
+    fn len(&self) -> usize {
+        self.waiters.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.waiters.is_empty()
+    }
+
+    /// Enqueue `search` (its `seq` and tags are assigned here); returns its seq.
+    fn push(&mut self, mut search: QueuedSearch) -> u64 {
+        self.next_seq += 1;
+        search.seq = self.next_seq;
+        let tenant = search.subject.tenant_id;
+        let principal_clock = self.principal_clocks.get(&tenant).copied().unwrap_or(0);
+        let principal_last = self
+            .waiters
+            .iter()
+            .filter(|queued| queued.subject == search.subject)
+            .map(|queued| queued.principal_tag)
+            .max()
+            .unwrap_or(0);
+        let tenant_last = self
+            .waiters
+            .iter()
+            .filter(|queued| queued.subject.tenant_id == tenant)
+            .map(|queued| queued.tenant_tag)
+            .max()
+            .unwrap_or(0);
+        search.principal_tag = principal_clock.max(principal_last) + 1;
+        search.tenant_tag = self.tenant_clock.max(tenant_last) + 1;
+        self.waiters.push(search);
+        self.next_seq
+    }
+
+    /// Advance the virtual clocks past an admitted waiter's tags.
+    fn record_admitted(&mut self, search: &QueuedSearch) {
+        self.tenant_clock = self.tenant_clock.max(search.tenant_tag);
+        let clock = self.principal_clocks.entry(search.subject.tenant_id).or_insert(0);
+        *clock = (*clock).max(search.principal_tag);
+    }
+
+    /// Forget the clocks of tenants with no waiters (bounded state).
+    fn prune_clocks(&mut self) {
+        let waiters = &self.waiters;
+        self.principal_clocks
+            .retain(|tenant, _| waiters.iter().any(|queued| queued.subject.tenant_id == *tenant));
+    }
+
+    /// Drop waiters whose caller is gone (a disconnected client whose
+    /// guard has not run yet). Returns how many.
+    fn purge_abandoned(&mut self) -> usize {
+        let before = self.waiters.len();
+        self.waiters.retain(|queued| !queued.tx.is_closed());
+        before - self.waiters.len()
+    }
+
+    fn take(&mut self, seq: u64) -> Option<QueuedSearch> {
+        let index = self.waiters.iter().position(|queued| queued.seq == seq)?;
+        Some(self.waiters.swap_remove(index))
     }
 }
 
-impl Eq for QueuedSearch {}
-
-impl PartialOrd for QueuedSearch {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+/// Hand each flow's tags to its waiters in the flow's own order, so tickets
+/// follow service order rather than arrival.
+fn reassign_tags<K: std::hash::Hash + Eq>(
+    queue: &mut [QueuedSearch],
+    flow: impl Fn(&QueuedSearch) -> K,
+    order_key: impl Fn(&QueuedSearch) -> (u8, u8, u64, u64),
+    tag: fn(&mut QueuedSearch) -> &mut u64,
+) {
+    let mut flows: HashMap<K, Vec<usize>> = HashMap::new();
+    for (index, queued) in queue.iter().enumerate() {
+        flows.entry(flow(queued)).or_default().push(index);
+    }
+    for mut indices in flows.into_values() {
+        let mut tags: Vec<u64> = indices.iter().map(|&index| *tag(&mut queue[index])).collect();
+        tags.sort_unstable();
+        indices.sort_by_key(|&index| order_key(&queue[index]));
+        for (index, value) in indices.into_iter().zip(tags) {
+            *tag(&mut queue[index]) = value;
+        }
     }
 }
 
-impl Ord for QueuedSearch {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Higher priority (lower ordinal) first, then primary before
-        // auxiliary requests (NAN-3299), then the lower per-tenant
-        // fair-share rank (round-robin across tenants), then older first
-        // (FIFO within one tenant and priority).
-        other
-            .priority
-            .ordinal()
-            .cmp(&self.priority.ordinal())
-            .then_with(|| other.lane.ordinal().cmp(&self.lane.ordinal()))
-            .then_with(|| other.tenant_rank.cmp(&self.tenant_rank))
-            .then_with(|| other.enqueued_at.cmp(&self.enqueued_at))
+/// The waiters' service order, as indices into `queue`, first served first
+/// (see [`WaitQueue`]). Normalizes the tags in place. The queue is bounded
+/// (a few hundred entries at most), so this runs on every drain.
+fn service_order(queue: &mut [QueuedSearch]) -> Vec<usize> {
+    reassign_tags(
+        queue,
+        |queued| queued.subject,
+        |queued| (queued.priority.ordinal(), queued.lane.ordinal(), queued.seq, 0),
+        |queued| &mut queued.principal_tag,
+    );
+    reassign_tags(
+        queue,
+        |queued| queued.subject.tenant_id,
+        |queued| (queued.priority.ordinal(), queued.lane.ordinal(), queued.principal_tag, queued.seq),
+        |queued| &mut queued.tenant_tag,
+    );
+    let mut order: Vec<usize> = (0..queue.len()).collect();
+    order.sort_by_key(|&index| (queue[index].tenant_tag, queue[index].seq));
+    order
+}
+
+fn lock_queue(queue: &std::sync::Mutex<WaitQueue>) -> std::sync::MutexGuard<'_, WaitQueue> {
+    queue.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("search admission queue was poisoned; repairing");
+        poisoned.into_inner()
+    })
+}
+
+/// NAN-4664: removes a waiter from the queue when its `acquire` future is
+/// dropped (client disconnect, deadline escalation, task abort) so a dead
+/// waiter never holds a queue slot and is never admitted.
+struct QueuedGuard<'a> {
+    queue: &'a std::sync::Mutex<WaitQueue>,
+    seq: u64,
+    armed: bool,
+}
+
+impl Drop for QueuedGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let depth = {
+            let mut queue = lock_queue(self.queue);
+            if queue.take(self.seq).is_some() {
+                counter!("nanosiem_search_jobs_rejected_total", "reason" => "client_gone")
+                    .increment(1);
+            }
+            queue.len()
+        };
+        gauge!("nanosiem_search_queue_depth").set(depth as f64);
     }
 }
 
@@ -777,7 +1024,7 @@ pub struct AdmissionController {
     /// Local permit leases. The same short critical section serializes the
     /// local check+lease and release paths.
     ledger: Arc<std::sync::Mutex<LocalLedger>>,
-    queue: Mutex<BinaryHeap<QueuedSearch>>,
+    queue: std::sync::Mutex<WaitQueue>,
     /// NAN-3286: `NANO_SEARCH_SHARED_TENANT_QUEUE_LIMIT`, read once.
     shared_tenant_queue_limit_override: Option<u32>,
     /// Test hook: a fixed lease instead of the per-priority one.
@@ -793,7 +1040,7 @@ impl AdmissionController {
         Self {
             config: Mutex::new(config),
             ledger: Arc::new(std::sync::Mutex::new(LocalLedger::default())),
-            queue: Mutex::new(BinaryHeap::new()),
+            queue: std::sync::Mutex::new(WaitQueue::default()),
             shared_tenant_queue_limit_override: std::env::var(SHARED_TENANT_QUEUE_LIMIT_ENV)
                 .ok()
                 .and_then(|value| value.trim().parse::<u32>().ok()),
@@ -922,59 +1169,86 @@ impl AdmissionController {
             });
         }
 
-        // Try immediate admission
-        match self
-            .try_admit(subject, require_distributed, priority, lane)
-            .await?
-        {
-            AdmissionAttempt::Admitted(permit) => {
-                counter!("nanosiem_search_jobs_admitted_total", "priority" => priority.to_string())
-                    .increment(1);
-                self.update_gauges().await;
-                return Ok(permit);
+        // Try immediate admission, but never barge past waiters: with anyone
+        // queued, a new arrival takes its turn through the fair drain. In a
+        // closed-loop fleet an agent re-acquires the instant it releases, so
+        // barging let it re-take its own freed slot ahead of every waiter
+        // (NAN-4664). The drain still admits it at once when the waiters
+        // ahead are blocked on their own tenant or principal caps.
+        let queue_idle = {
+            let mut queue = lock_queue(&self.queue);
+            queue.purge_abandoned();
+            queue.is_empty()
+        };
+        // A fail-fast caller (budget 0) never waits, so it only ever takes a
+        // slot that is free right now.
+        let fail_fast = current_wait_budget().is_some_and(|budget| budget.is_zero());
+        if queue_idle || fail_fast {
+            match self
+                .try_admit(subject, require_distributed, priority, lane)
+                .await?
+            {
+                AdmissionAttempt::Admitted(permit) => {
+                    counter!("nanosiem_search_jobs_admitted_total", "priority" => priority.to_string())
+                        .increment(1);
+                    self.update_gauges().await;
+                    return Ok(permit);
+                }
+                AdmissionAttempt::CellFull
+                | AdmissionAttempt::TenantFull
+                | AdmissionAttempt::UserFull => {}
             }
-            AdmissionAttempt::CellFull
-            | AdmissionAttempt::TenantFull
-            | AdmissionAttempt::UserFull => {}
         }
 
-        // Enqueue and wait. NAN-3299: a per-user overflow waits here like a
-        // cell/tenant overflow; it is refused only when the user's own share
-        // of the queue is full as well.
+        // Enqueue and wait. NAN-3299 / NAN-4664: an overflow (cell, tenant
+        // or principal) waits here in a bounded fair queue for at most the
+        // request's wait budget; it is refused only when that budget ends or
+        // the queue it waits in is full.
         let (tx, rx) = oneshot::channel();
         let config = self.config.lock().await;
-        let queue_timeout_ms = config.queue_timeout_ms;
+        let wait = effective_wait(current_wait_budget(), config.queue_timeout_ms);
         let max_queue_depth = config.max_queue_depth;
         let per_user_limit = config.per_user_limit;
         drop(config);
 
+        if wait.is_zero() {
+            // The caller asked not to wait.
+            counter!("nanosiem_search_jobs_rejected_total", "reason" => "queue_timeout")
+                .increment(1);
+            histogram!("nanosiem_search_queue_wait_seconds", "outcome" => "rejected").record(0.0);
+            return Err(AdmissionError::QueueTimeout { timeout_ms: 0 });
+        }
+
         let enqueued_at = Instant::now();
-        {
-            let mut queue = self.queue.lock().await;
+        let seq = {
+            let mut queue = lock_queue(&self.queue);
+            queue.purge_abandoned();
+            let tenant_queued = queue
+                .waiters
+                .iter()
+                .filter(|queued| queued.subject.tenant_id == subject.tenant_id)
+                .count();
             let user_queued = queue
+                .waiters
                 .iter()
                 .filter(|queued| queued.subject == subject)
                 .count();
-            if user_queued >= per_user_queue_limit(per_user_limit) as usize {
-                counter!("nanosiem_search_jobs_rejected_total", "reason" => "user_limit")
+            let queue_share = if subject.tenant_id.is_some() {
+                shared_tenant_queue_limit(max_queue_depth, self.shared_tenant_queue_limit_override)
+            } else {
+                max_queue_depth
+            };
+            let principal_limit = principal_queue_limit(per_user_limit, queue_share);
+            if user_queued >= principal_limit as usize {
+                counter!("nanosiem_search_jobs_rejected_total", "reason" => "principal_queue_full")
                     .increment(1);
                 return Err(AdmissionError::UserLimitExceeded {
-                    limit: per_user_limit,
+                    limit: principal_limit,
                 });
             }
             // NAN-3286: one tenant's waiters are bounded by its own share, so
             // a tenant saturating the process queue cannot turn another
             // tenant's searches into immediate `QueueFull`.
-            let same_tenant = || {
-                queue
-                    .iter()
-                    .filter(|queued| queued.subject.tenant_id == subject.tenant_id)
-            };
-            let tenant_queued = same_tenant().count();
-            let tenant_rank = same_tenant()
-                .map(|queued| queued.tenant_rank + 1)
-                .max()
-                .unwrap_or(0);
             if let Some(rejected_at) = queue_rejection(
                 subject,
                 queue.len(),
@@ -986,51 +1260,72 @@ impl AdmissionController {
                     .increment(1);
                 return Err(AdmissionError::QueueFull { depth: rejected_at });
             }
-            queue.push(QueuedSearch {
+            let seq = queue.push(QueuedSearch {
+                seq: 0,
                 job_id: job_id.to_string(),
                 subject,
                 require_distributed,
                 priority,
                 lane,
-                tenant_rank,
-                enqueued_at,
+                principal_tag: 0,
+                tenant_tag: 0,
                 tx,
             });
             counter!("nanosiem_search_jobs_queued_total").increment(1);
             gauge!("nanosiem_search_queue_depth").set(queue.len() as f64);
-        }
+            seq
+        };
+        // Dropping this future (client gone) removes the waiter at once.
+        let mut guard = QueuedGuard {
+            queue: &self.queue,
+            seq,
+            armed: true,
+        };
         // Close the check-then-enqueue race with a concurrently dropped
         // permit: even if its notification arrived before this queue insert,
         // the drain loop gets another chance to observe the waiter.
         self.slot_available.notify_one();
 
-        // Wait for slot with timeout
-        match tokio::time::timeout(std::time::Duration::from_millis(queue_timeout_ms), rx).await {
+        // Wait for a slot within the budget.
+        let outcome = tokio::time::timeout(wait, rx).await;
+        let wait_secs = enqueued_at.elapsed().as_secs_f64();
+        match outcome {
             Ok(Ok(Ok(permit))) => {
                 // We were admitted by drain_queue and receive the exact permit
                 // whose local/distributed leases it took.
-                let wait_secs = enqueued_at.elapsed().as_secs_f64();
-                histogram!("nanosiem_search_queue_wait_seconds").record(wait_secs);
+                guard.armed = false;
+                histogram!("nanosiem_search_queue_wait_seconds", "outcome" => "admitted")
+                    .record(wait_secs);
                 counter!("nanosiem_search_jobs_admitted_total", "priority" => priority.to_string())
                     .increment(1);
                 self.update_gauges().await;
                 Ok(permit)
             }
-            Ok(Ok(Err(e))) => Err(e),
+            Ok(Ok(Err(e))) => {
+                guard.armed = false;
+                histogram!("nanosiem_search_queue_wait_seconds", "outcome" => "rejected")
+                    .record(wait_secs);
+                Err(e)
+            }
             Ok(Err(_)) => {
                 // Sender dropped (cancelled)
-                self.remove_from_queue(job_id, Some(subject.scope())).await;
+                drop(guard);
+                histogram!("nanosiem_search_queue_wait_seconds", "outcome" => "cancelled")
+                    .record(wait_secs);
                 self.update_gauges().await;
                 Err(AdmissionError::Cancelled)
             }
             Err(_) => {
-                // Timeout
-                self.remove_from_queue(job_id, Some(subject.scope())).await;
+                // The wait budget ended first.
+                lock_queue(&self.queue).take(seq);
+                guard.armed = false;
                 counter!("nanosiem_search_jobs_rejected_total", "reason" => "queue_timeout")
                     .increment(1);
+                histogram!("nanosiem_search_queue_wait_seconds", "outcome" => "rejected")
+                    .record(wait_secs);
                 self.update_gauges().await;
                 Err(AdmissionError::QueueTimeout {
-                    timeout_ms: queue_timeout_ms,
+                    timeout_ms: wait.as_millis() as u64,
                 })
             }
         }
@@ -1213,7 +1508,7 @@ impl AdmissionController {
 
     /// Update Prometheus gauges for queue depth and active queries
     async fn update_gauges(&self) {
-        let queued = self.queue.lock().await.len() as f64;
+        let queued = lock_queue(&self.queue).len() as f64;
         let active = self.local_active() as f64;
         gauge!("nanosiem_search_queue_depth").set(queued);
         gauge!("nanosiem_search_active_queries").set(active);
@@ -1242,27 +1537,25 @@ impl AdmissionController {
         job_id: &str,
         scope: SearchTenantScope,
     ) -> Option<u32> {
-        let queue = self.queue.lock().await;
-        // BinaryHeap doesn't support indexed access, so we iterate
-        let mut sorted: Vec<&QueuedSearch> = queue
-            .iter()
+        let mut queue = lock_queue(&self.queue);
+        // The tenant's own waiters in service order: a shared caller never
+        // learns another tenant's backlog from its position.
+        service_order(&mut queue.waiters)
+            .into_iter()
+            .map(|index| &queue.waiters[index])
             .filter(|queued| queued.subject.belongs_to(scope))
-            .collect();
-        sorted.sort_by(|a, b| b.cmp(a)); // Reverse because BinaryHeap is max-heap
-        sorted
-            .iter()
-            .position(|q| q.job_id == job_id)
+            .position(|queued| queued.job_id == job_id)
             .map(|pos| (pos + 1) as u32)
     }
 
     /// Get total queue depth
     pub async fn queue_depth(&self) -> u32 {
-        self.queue.lock().await.len() as u32
+        lock_queue(&self.queue).len() as u32
     }
 
     /// Get admission statistics
     pub async fn stats(&self) -> AdmissionStats {
-        let queued = self.queue.lock().await.len() as u32;
+        let queued = lock_queue(&self.queue).len() as u32;
         let ledger = lock_ledger(&self.ledger);
         AdmissionStats {
             active_adhoc: ledger.active(),
@@ -1321,7 +1614,7 @@ impl AdmissionController {
                 tokio::select! {
                     _ = controller.slot_available.notified() => {}
                     _ = periodic_recheck.tick() => {
-                        if controller.queue.lock().await.is_empty() {
+                        if lock_queue(&controller.queue).is_empty() {
                             continue;
                         }
                     }
@@ -1331,81 +1624,120 @@ impl AdmissionController {
         });
     }
 
-    /// Try to admit queued searches when slots become available
+    /// Try to admit queued searches when slots become available, in
+    /// [`service_order`].
     async fn drain_queue(&self) {
-        // Try each request present at the start at most once. Tenant- and
-        // user-full work is rotated behind other waiters; a cell-full result
-        // stops the pass because no queued request can safely admit then.
-        let attempts = self.queue.lock().await.len();
-        let mut blocked = Vec::new();
-        for _ in 0..attempts {
+        // Try each request present at the start at most once, in service
+        // order. Tenant- and principal-full work is skipped (it stays
+        // queued); a cell-full result stops the pass because no queued
+        // request can safely admit then.
+        //
+        // A waiter stays in the queue while it is tried and leaves it only
+        // once admitted, so during the pass (which awaits Redis) it is still
+        // visible: a cancel reaches it, its queue position holds, the queue
+        // bounds and tags count it, and a releasing caller cannot see an
+        // empty queue and barge past it (NAN-4664 review).
+        let order: Vec<u64> = {
+            let mut queue = lock_queue(&self.queue);
+            queue.purge_abandoned();
+            service_order(&mut queue.waiters)
+                .into_iter()
+                .map(|index| queue.waiters[index].seq)
+                .collect()
+        };
+        for seq in order {
             // Never hold the queue lock while awaiting Redis. Apart from
             // keeping cancellation responsive, this lets a dropping permit
             // wake another drain without deadlocking behind an I/O attempt.
-            let Some(queued) = self.queue.lock().await.pop() else {
-                break;
+            let candidate = {
+                let mut queue = lock_queue(&self.queue);
+                match queue.waiters.iter().find(|queued| queued.seq == seq) {
+                    // Cancelled, timed out or its client left meanwhile.
+                    None => None,
+                    Some(queued) if queued.tx.is_closed() => {
+                        // NAN-4664: the caller is gone; never start its work.
+                        queue.take(seq);
+                        None
+                    }
+                    Some(queued) => Some((
+                        queued.subject,
+                        queued.require_distributed,
+                        queued.priority,
+                        queued.lane,
+                    )),
+                }
+            };
+            let Some((subject, require_distributed, priority, lane)) = candidate else {
+                continue;
             };
 
             match self
-                .try_admit(
-                    queued.subject,
-                    queued.require_distributed,
-                    queued.priority,
-                    queued.lane,
-                )
+                .try_admit(subject, require_distributed, priority, lane)
                 .await
             {
                 Ok(AdmissionAttempt::Admitted(permit)) => {
-                    // A timed-out/cancelled receiver may already be gone. Drop
-                    // the permit immediately in that case so no lease leaks
-                    // and continue looking for a live waiter.
-                    let _ = queued.tx.send(Ok(permit));
+                    let queued = {
+                        let mut queue = lock_queue(&self.queue);
+                        let queued = queue.take(seq);
+                        if let Some(queued) = &queued {
+                            queue.record_admitted(queued);
+                        }
+                        queued
+                    };
+                    match queued {
+                        // A receiver that left in the meantime gets nothing:
+                        // the permit drops, so no lease leaks and no work starts.
+                        Some(queued) => {
+                            let _ = queued.tx.send(Ok(permit));
+                        }
+                        // Cancelled, timed out or gone while it was tried.
+                        None => drop(permit),
+                    }
                 }
                 Ok(AdmissionAttempt::CellFull) => {
-                    // The process/cell ceiling is still full. Preserve the
-                    // current and blocked searches' identities.
-                    self.queue.lock().await.push(queued);
+                    // The process/cell ceiling is still full; every waiter
+                    // keeps its seq and tags, so its place in line too.
                     break;
                 }
                 Ok(AdmissionAttempt::TenantFull | AdmissionAttempt::UserFull) => {
-                    // Do not let a saturated tenant or user at the head of the
-                    // priority heap block other waiters from a free slot.
-                    blocked.push(queued);
+                    // Do not let a saturated tenant or principal first in line
+                    // block other waiters from a free slot; it stays queued.
                 }
                 Err(error) => {
                     // A shared admission outage is terminal for this waiter,
                     // but must not stall unrelated tenant/user work behind it.
-                    let _ = queued.tx.send(Err(error));
+                    let queued = lock_queue(&self.queue).take(seq);
+                    if let Some(queued) = queued {
+                        let _ = queued.tx.send(Err(error));
+                    }
                 }
             }
         }
 
-        if !blocked.is_empty() {
-            let mut queue = self.queue.lock().await;
-            queue.extend(blocked);
-        }
-
-        let depth = self.queue.lock().await.len();
-        // Update gauges after draining
+        let depth = {
+            let mut queue = lock_queue(&self.queue);
+            queue.prune_clocks();
+            queue.len()
+        };
         gauge!("nanosiem_search_queue_depth").set(depth as f64);
         gauge!("nanosiem_search_active_queries").set(self.local_active() as f64);
     }
 
     /// Remove a job from the queue
     async fn remove_from_queue(&self, job_id: &str, scope: Option<SearchTenantScope>) {
-        let mut queue = self.queue.lock().await;
-        let mut remaining = BinaryHeap::new();
-        while let Some(queued) = queue.pop() {
+        let mut queue = lock_queue(&self.queue);
+        let mut kept = Vec::with_capacity(queue.waiters.len());
+        for queued in std::mem::take(&mut queue.waiters) {
             let scope_matches = scope
                 .map(|scope| queued.subject.belongs_to(scope))
                 .unwrap_or(true);
             if queued.job_id == job_id && scope_matches {
                 let _ = queued.tx.send(Err(AdmissionError::Cancelled));
             } else {
-                remaining.push(queued);
+                kept.push(queued);
             }
         }
-        *queue = remaining;
+        queue.waiters = kept;
     }
 }
 
@@ -1837,16 +2169,17 @@ mod tests {
         for task in tasks {
             match task.await.expect("admission task should join") {
                 Ok(permit) => permits.push(permit),
-                Err(AdmissionError::UserLimitExceeded { limit: 2 }) => rejected += 1,
+                Err(AdmissionError::UserLimitExceeded { limit: 8 }) => rejected += 1,
                 Err(AdmissionError::QueueTimeout { .. }) => timed_out += 1,
                 Err(other) => panic!("unexpected admission result: {other}"),
             }
         }
-        // Two run; the user's queue share (2x the limit) waits and, with
-        // no release, times out; only the overflow beyond that is refused.
+        // Two run (the cap is never raced past); the principal's queue share
+        // (NAN-4664: half the tenant's quota of 16) waits and, with no
+        // release, times out; only the overflow beyond that is refused.
         assert_eq!(permits.len(), 2);
-        assert_eq!(timed_out, 4);
-        assert_eq!(rejected, 26);
+        assert_eq!(timed_out, 8);
+        assert_eq!(rejected, 22);
         assert_eq!(controller.stats().await.active_adhoc, 2);
     }
 
@@ -2228,7 +2561,12 @@ mod tests {
         assert_eq!(auxiliary_user_limit(2), 1);
         assert_eq!(auxiliary_user_limit(5), 4);
         assert_eq!(auxiliary_user_limit(10), 8);
-        assert_eq!(per_user_queue_limit(10), 20);
+        // NAN-4664: a principal may hold half its queue (dedicated: the
+        // process queue), never less than twice its running permits.
+        assert_eq!(principal_queue_limit(10, 25), 20);
+        assert_eq!(principal_queue_limit(5, 100), 50);
+        assert_eq!(principal_queue_limit(5, 4), 4);
+        assert_eq!(principal_queue_limit(1, 0), 1);
     }
 
     fn short_lease_controller(config: AdmissionConfig, lease_ms: u64) -> Arc<AdmissionController> {
@@ -2469,6 +2807,427 @@ mod tests {
             .expect("join")
             .expect("admitted");
         drop(busy_second);
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-4664: bounded fair queue instead of rejection
+    // ------------------------------------------------------------------
+
+    fn fleet_config(global: u32, per_user: u32) -> AdmissionConfig {
+        AdmissionConfig {
+            global_adhoc_limit: global,
+            shared_tenant_adhoc_limit: global,
+            per_user_limit: per_user,
+            max_queue_depth: 100,
+            queue_timeout_ms: 300_000,
+        }
+    }
+
+    /// The bakeoff shape: 16 closed-loop agents, each always with exactly one
+    /// search in flight, 10 hunts each, over a cap of 5. Every hunt waits
+    /// inside its budget instead of failing, and the cap is never exceeded.
+    /// Covered twice: 16 agents sharing one login (the per-principal cap of
+    /// 5 binds, as in the bakeoff) and 16 distinct principals over a cell
+    /// cap of 5.
+    #[tokio::test(start_paused = true)]
+    async fn fleet_of_16_agents_over_a_cap_of_5_completes_with_no_rejects() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        for (config, shared_login) in [(fleet_config(30, 5), true), (fleet_config(5, 10), false)] {
+            let controller = Arc::new(AdmissionController::new(config));
+            controller.start_drain_loop();
+            let running = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let shared_user = Uuid::now_v7();
+            let mut agents = Vec::new();
+            for agent in 0..16u64 {
+                let (controller, running, peak) = (controller.clone(), running.clone(), peak.clone());
+                let user = if shared_login { shared_user } else { Uuid::now_v7() };
+                agents.push(tokio::spawn(with_wait_budget(std::time::Duration::from_secs(60), async move {
+                    let mut rejects = 0;
+                    for hunt in 0..10u64 {
+                        match controller.acquire(&format!("agent{agent}-hunt{hunt}"), user, QueryPriority::Interactive).await {
+                            Ok(permit) => {
+                                let now = running.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                                peak.fetch_max(now, AtomicOrdering::SeqCst);
+                                // Hunts of uneven cost (the bakeoff p50 was 3.5 s).
+                                tokio::time::sleep(std::time::Duration::from_millis(500 + 300 * ((agent + hunt) % 7))).await;
+                                running.fetch_sub(1, AtomicOrdering::SeqCst);
+                                drop(permit);
+                            }
+                            Err(_) => rejects += 1,
+                        }
+                    }
+                    rejects
+                })));
+            }
+            let mut rejects = 0;
+            for agent in agents {
+                rejects += agent.await.expect("agent");
+            }
+            assert_eq!(rejects, 0, "every hunt waits inside its budget (shared login: {shared_login})");
+            assert_eq!(peak.load(AtomicOrdering::SeqCst), 5, "the cap of 5 is kept, never raised");
+            assert_eq!(controller.queue_depth().await, 0);
+            assert_eq!(controller.stats().await.active_adhoc, 0);
+        }
+    }
+
+    /// The budget is the only clock: it ends the wait with `QueueTimeout`
+    /// (429 + Retry-After at the handler), is capped by `queue_timeout_ms`,
+    /// and `0` fails fast. The expired waiter leaves the queue.
+    #[tokio::test(start_paused = true)]
+    async fn wait_budget_expiry_refuses_and_leaves_the_queue() {
+        let controller = Arc::new(AdmissionController::new(AdmissionConfig {
+            queue_timeout_ms: 300,
+            ..fleet_config(1, 1)
+        }));
+        controller.start_drain_loop();
+        let holder = controller.acquire("holder", Uuid::now_v7(), QueryPriority::Interactive).await.unwrap();
+
+        let started = tokio::time::Instant::now();
+        let short = with_wait_budget(std::time::Duration::from_millis(100),
+            controller.acquire("short", Uuid::now_v7(), QueryPriority::Interactive)).await;
+        assert!(matches!(short, Err(AdmissionError::QueueTimeout { timeout_ms: 100 })), "{:?}", short.err());
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_millis(100) && waited < std::time::Duration::from_millis(150), "{waited:?}");
+        assert_eq!(controller.queue_depth().await, 0, "an expired waiter leaves the queue");
+
+        // An opt-in longer than the configured cap is capped.
+        let capped = with_wait_budget(std::time::Duration::from_secs(3600),
+            controller.acquire("capped", Uuid::now_v7(), QueryPriority::Interactive)).await;
+        assert!(matches!(capped, Err(AdmissionError::QueueTimeout { timeout_ms: 300 })), "{:?}", capped.err());
+
+        // Zero: fail fast, never queued.
+        let started = tokio::time::Instant::now();
+        let fast = with_wait_budget(std::time::Duration::ZERO,
+            controller.acquire("fast", Uuid::now_v7(), QueryPriority::Interactive)).await;
+        assert!(matches!(fast, Err(AdmissionError::QueueTimeout { timeout_ms: 0 })));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1), "never queued");
+
+        // Inside the budget it waits and is admitted.
+        let waiter_controller = controller.clone();
+        let waiter = tokio::spawn(with_wait_budget(std::time::Duration::from_millis(250), async move {
+            waiter_controller.acquire("waits", Uuid::now_v7(), QueryPriority::Interactive).await
+        }));
+        wait_for_depth(&controller, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(holder);
+        waiter.await.unwrap().expect("admitted inside its budget");
+    }
+
+    /// No barging: an agent that releases and re-acquires at once queues
+    /// behind the waiter that was already there.
+    #[tokio::test]
+    async fn releasing_agent_cannot_retake_its_slot_ahead_of_a_waiter() {
+        let controller = Arc::new(AdmissionController::new(fleet_config(1, 10)));
+        controller.start_drain_loop();
+        let (agent, waiter_user) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let held = controller.acquire("agent-1", agent, QueryPriority::Interactive).await.unwrap();
+        let waiting = controller.clone();
+        let waiter = tokio::spawn(async move { waiting.acquire("waiter", waiter_user, QueryPriority::Interactive).await });
+        wait_for_depth(&controller, 1).await;
+        // Release and re-acquire in the same task, before the drain can run.
+        drop(held);
+        let barged = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            controller.acquire("agent-2", agent, QueryPriority::Interactive),
+        )
+        .await;
+        assert!(barged.is_err(), "the releasing agent queues instead of re-taking the slot");
+        let waiter = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await.expect("the waiter got the freed slot").unwrap().unwrap();
+        assert_eq!(controller.queue_depth().await, 0, "the abandoned re-acquire left the queue");
+        drop(waiter);
+    }
+
+    #[test]
+    fn header_budget_defaults_and_parses() {
+        assert_eq!(request_wait_budget(None), DEFAULT_ADMISSION_WAIT);
+        assert_eq!(request_wait_budget(Some("garbage")), DEFAULT_ADMISSION_WAIT);
+        assert_eq!(request_wait_budget(Some(" 120000 ")), std::time::Duration::from_secs(120));
+        assert_eq!(request_wait_budget(Some("0")), std::time::Duration::ZERO);
+        assert_eq!(effective_wait(None, 300_000), std::time::Duration::from_secs(300));
+        assert_eq!(effective_wait(Some(std::time::Duration::from_secs(900)), 300_000), std::time::Duration::from_secs(300));
+        assert_eq!(effective_wait(Some(std::time::Duration::from_secs(5)), 300_000), std::time::Duration::from_secs(5));
+    }
+
+    /// A background job escapes its request's HTTP budget (it waits up to
+    /// the configured cap); spawned request work keeps it via `inherit`.
+    #[tokio::test]
+    async fn async_jobs_escape_the_request_budget_and_side_tasks_inherit_it() {
+        let five = std::time::Duration::from_secs(5);
+        let job = with_wait_budget(five, without_wait_budget(async { current_wait_budget() })).await;
+        assert_eq!(effective_wait(job, 300_000), std::time::Duration::from_secs(300));
+        let side = with_wait_budget(five, async {
+            tokio::spawn(crate::search::request_actor::inherit(async { current_wait_budget() })).await.unwrap()
+        })
+        .await;
+        assert_eq!(side, Some(five));
+        assert_eq!(current_wait_budget(), None);
+    }
+
+    fn synthetic(seq: u64, subject: AdmissionSubject, priority: QueryPriority) -> QueuedSearch {
+        QueuedSearch {
+            seq,
+            job_id: format!("job-{seq}"),
+            subject,
+            require_distributed: false,
+            priority,
+            lane: AdmissionLane::Primary,
+            principal_tag: 0,
+            tenant_tag: 0,
+            tx: oneshot::channel().0,
+        }
+    }
+
+    fn queue_of(entries: &[(AdmissionSubject, QueryPriority)]) -> WaitQueue {
+        let mut queue = WaitQueue::default();
+        for &(subject, priority) in entries {
+            queue.push(synthetic(0, subject, priority));
+        }
+        queue
+    }
+
+    fn served(queue: &mut WaitQueue) -> Vec<u64> {
+        let order = service_order(&mut queue.waiters);
+        order.into_iter().map(|index| queue.waiters[index].seq).collect()
+    }
+
+    /// Serve the first waiter in line, as the drain does.
+    fn serve_next(queue: &mut WaitQueue) -> u64 {
+        let first = served(queue)[0];
+        let search = queue.take(first).unwrap();
+        queue.record_admitted(&search);
+        first
+    }
+
+    /// Within a tenant, principals are served round-robin (a deep backlog
+    /// from one agent cannot starve another), priority still first.
+    #[test]
+    fn service_order_is_round_robin_across_principals_within_a_tenant() {
+        let greedy = shared_subject(0xa, 1);
+        let other = shared_subject(0xa, 2);
+        let mut queue = queue_of(&[
+            (greedy, QueryPriority::Interactive),
+            (greedy, QueryPriority::Interactive),
+            (greedy, QueryPriority::Interactive),
+            (other, QueryPriority::Interactive),
+            (other, QueryPriority::Interactive),
+            (greedy, QueryPriority::Analytics),
+        ]);
+        assert_eq!(served(&mut queue), vec![1, 4, 2, 5, 3, 6]);
+
+        // Served history counts: a principal arriving once service is under
+        // way joins the current round (behind at most one search of each
+        // other principal), never behind greedy's whole backlog.
+        assert_eq!(serve_next(&mut queue), 1);
+        let late = queue.push(synthetic(0, shared_subject(0xa, 3), QueryPriority::Interactive));
+        assert_eq!(served(&mut queue), vec![4, 2, 5, late, 3, 6]);
+        for expected in [4, 2, 5, late, 3, 6] {
+            assert_eq!(serve_next(&mut queue), expected);
+        }
+    }
+
+    /// Across tenants, service alternates by each waiter's place in its own
+    /// tenant's line: another tenant's backlog or higher priority never
+    /// jumps this tenant's first waiter.
+    #[test]
+    fn service_order_never_lets_priority_or_backlog_cross_tenants() {
+        let a = shared_subject(0xa, 1);
+        let b = shared_subject(0xb, 1);
+        let mut queue = queue_of(&[
+            (a, QueryPriority::Interactive),
+            (a, QueryPriority::Interactive),
+            (a, QueryPriority::Interactive),
+            (b, QueryPriority::Analytics),
+        ]);
+        assert_eq!(served(&mut queue), vec![1, 4, 2, 3]);
+        // Taking turns holds as service goes on: B, served last, rejoins
+        // level with A's next turn (not ahead of A's waiting backlog).
+        assert_eq!(serve_next(&mut queue), 1);
+        assert_eq!(serve_next(&mut queue), 4);
+        let b_again = queue.push(synthetic(0, b, QueryPriority::Interactive));
+        assert_eq!(served(&mut queue), vec![2, b_again, 3]);
+        // Clocks of tenants without waiters are forgotten.
+        while !queue.is_empty() {
+            serve_next(&mut queue);
+        }
+        queue.prune_clocks();
+        assert!(queue.principal_clocks.is_empty());
+    }
+
+    /// The fair order drives the real drain: a principal arriving behind
+    /// another's backlog is admitted second, not seventh.
+    #[tokio::test]
+    async fn drain_serves_a_late_principal_before_anothers_backlog() {
+        let controller = Arc::new(AdmissionController::new(fleet_config(1, 10)));
+        let holder = controller.acquire("holder", Uuid::from_u128(9), QueryPriority::Interactive).await.unwrap();
+        let mut greedy = Vec::new();
+        for index in 0..6u32 {
+            let waiting = controller.clone();
+            greedy.push(tokio::spawn(async move {
+                waiting.acquire(&format!("greedy-{index}"), Uuid::from_u128(1), QueryPriority::Interactive).await
+            }));
+            wait_for_depth(&controller, index + 1).await;
+        }
+        let late_controller = controller.clone();
+        let late = tokio::spawn(async move {
+            late_controller.acquire("late", Uuid::from_u128(2), QueryPriority::Interactive).await
+        });
+        wait_for_depth(&controller, 7).await;
+        assert_eq!(controller.queue_position("late").await, Some(2));
+        controller.start_drain_loop();
+        drop(holder);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), greedy.remove(0))
+            .await.expect("oldest admitted first").unwrap().unwrap();
+        assert!(!late.is_finished());
+        drop(first);
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), late)
+            .await.expect("late principal admitted second").unwrap().unwrap();
+        assert_eq!(controller.queue_depth().await, 5, "the greedy backlog still waits");
+        drop(late);
+        for waiter in greedy {
+            waiter.abort();
+        }
+    }
+
+    /// A client that disconnects (its future is dropped) leaves the queue at
+    /// once and its work is never started: the slot goes to the next live
+    /// waiter, and no permit is ever granted to the dead one.
+    #[tokio::test]
+    async fn disconnected_waiter_leaves_the_queue_and_never_starts() {
+        let controller = Arc::new(AdmissionController::new(fleet_config(1, 10)));
+        controller.start_drain_loop();
+        let holder = controller.acquire("holder", Uuid::now_v7(), QueryPriority::Interactive).await.unwrap();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gone_controller = controller.clone();
+        let gone_started = started.clone();
+        let gone = tokio::spawn(async move {
+            let permit = gone_controller.acquire("gone", Uuid::now_v7(), QueryPriority::Interactive).await;
+            gone_started.store(true, std::sync::atomic::Ordering::SeqCst);
+            permit
+        });
+        wait_for_depth(&controller, 1).await;
+        gone.abort();
+        let _ = gone.await;
+        assert_eq!(controller.queue_depth().await, 0, "the disconnected waiter left the queue");
+
+        let live_controller = controller.clone();
+        let live = tokio::spawn(async move {
+            live_controller.acquire("live", Uuid::now_v7(), QueryPriority::Interactive).await
+        });
+        wait_for_depth(&controller, 1).await;
+        drop(holder);
+        let live = tokio::time::timeout(std::time::Duration::from_secs(5), live)
+            .await.expect("live waiter admitted").unwrap().unwrap();
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst), "the dead waiter's work never started");
+        assert_eq!(controller.stats().await.active_adhoc, 1);
+        drop(live);
+
+        // A waiter whose receiver closed before the drain saw it (no guard
+        // ran yet) is skipped by the drain, never admitted.
+        let holder = controller.acquire("holder-2", Uuid::now_v7(), QueryPriority::Interactive).await.unwrap();
+        lock_queue(&controller.queue).push(synthetic(0, AdmissionSubject::new(SearchTenantScope::Dedicated, Uuid::now_v7()), QueryPriority::Interactive));
+        drop(holder);
+        controller.drain_queue().await;
+        assert_eq!(controller.queue_depth().await, 0);
+        assert_eq!(controller.stats().await.active_adhoc, 0, "no permit for a closed waiter");
+    }
+
+    /// Tenant isolation of queue state: a tenant's queue position counts only
+    /// its own waiters (another tenant's backlog is invisible), another
+    /// tenant can neither see nor cancel its waiter by job id.
+    #[tokio::test]
+    async fn queue_position_and_cancel_never_cross_tenants() {
+        let controller = AdmissionController::new(fleet_config(1, 10));
+        let (a, b) = (shared_subject(0xa, 1), shared_subject(0xb, 1));
+        let (b_tx, mut b_rx) = oneshot::channel();
+        {
+            let mut queue = lock_queue(&controller.queue);
+            for _ in 0..3 {
+                let mut search = synthetic(0, a, QueryPriority::Interactive);
+                search.job_id = "a-job".into();
+                queue.push(search);
+            }
+            let mut search = synthetic(0, b, QueryPriority::Interactive);
+            search.job_id = "b-job".into();
+            search.tx = b_tx;
+            queue.push(search);
+        }
+        assert_eq!(controller.queue_position_for_scope("b-job", b.scope()).await, Some(1));
+        assert_eq!(controller.queue_position_for_scope("b-job", a.scope()).await, None);
+        controller.cancel_queued_for_scope("b-job", a.scope()).await;
+        assert!(b_rx.try_recv().is_err(), "another tenant cannot cancel B's waiter");
+        assert_eq!(controller.queue_depth().await, 4);
+    }
+
+    /// A waiter being tried by the drain (which awaits config and Redis)
+    /// stays queued until admitted: its position holds, a cancel reaches it,
+    /// and the permit taken for a waiter cancelled meanwhile is released.
+    #[tokio::test]
+    async fn waiter_stays_queued_and_cancellable_while_the_drain_tries_it() {
+        let controller = Arc::new(AdmissionController::new(fleet_config(1, 10)));
+        let holder = controller.acquire("holder", Uuid::now_v7(), QueryPriority::Interactive).await.unwrap();
+        let waiting = controller.clone();
+        let waiter = tokio::spawn(async move {
+            waiting.acquire("waiter", Uuid::now_v7(), QueryPriority::Interactive).await
+        });
+        wait_for_depth(&controller, 1).await;
+        drop(holder);
+
+        // Park the drain inside `try_admit` (it awaits the config lock).
+        let config = controller.config.lock().await;
+        let draining = controller.clone();
+        let drain = tokio::spawn(async move { draining.drain_queue().await });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!drain.is_finished(), "the drain is mid-pass");
+        assert_eq!(controller.queue_depth().await, 1, "a waiter being tried is still queued");
+        assert_eq!(controller.queue_position("waiter").await, Some(1));
+        controller.cancel_queued("waiter").await;
+        assert!(matches!(waiter.await.unwrap(), Err(AdmissionError::Cancelled)));
+
+        drop(config);
+        drain.await.unwrap();
+        assert_eq!(controller.queue_depth().await, 0);
+        assert_eq!(controller.stats().await.active_adhoc, 0, "no permit kept for the cancelled waiter");
+    }
+
+    /// The queue is bounded whatever the arrival rate: a burst of 1,000
+    /// waiters holds `max_queue_depth` entries, the rest are refused at once
+    /// with `QueueFull`, and memory does not grow with the burst.
+    #[tokio::test]
+    async fn queue_memory_is_bounded_under_a_burst() {
+        let controller = Arc::new(AdmissionController::new(AdmissionConfig {
+            max_queue_depth: 50,
+            ..fleet_config(1, 1)
+        }));
+        let _holder = controller.acquire("holder", Uuid::now_v7(), QueryPriority::Interactive).await.unwrap();
+        let mut waiters = Vec::new();
+        for index in 0..1_000u32 {
+            let controller = controller.clone();
+            waiters.push(tokio::spawn(async move {
+                controller.acquire(&format!("burst-{index}"), Uuid::now_v7(), QueryPriority::Interactive).await
+            }));
+        }
+        let mut refused = 0;
+        let mut pending = Vec::new();
+        for waiter in waiters {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), async { while !waiter.is_finished() { tokio::task::yield_now().await; } }).await {
+                Ok(()) => match waiter.await.unwrap() {
+                    Err(AdmissionError::QueueFull { depth: 50 }) => refused += 1,
+                    other => panic!("unexpected: {:?}", other.err()),
+                },
+                Err(_) => pending.push(waiter),
+            }
+        }
+        assert_eq!(pending.len(), 50);
+        assert_eq!(refused, 950);
+        assert_eq!(controller.queue_depth().await, 50);
+        assert!(lock_queue(&controller.queue).waiters.capacity() <= 128, "queue storage stays at its bound");
+        for waiter in pending {
+            waiter.abort();
+        }
     }
 
     /// NAN-3299 leak regression against a real Redis-compatible server: a

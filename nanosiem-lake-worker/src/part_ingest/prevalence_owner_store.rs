@@ -26,6 +26,46 @@ use super::s3_store::S3Location;
 const STORE: &str = "prevalence-owner";
 const OWNER_CA_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// NAN-4445: how long an ingest create of a numbered WAL key keeps retrying
+/// an owner 409 on an absent object in place. 9015130 lets a fresh ingest
+/// request take over a WAL create reservation abandoned for five minutes (an
+/// owner roll interrupted it and the old process's request id was lost with
+/// its ephemeral journal). Six minutes covers that window from a reservation
+/// made just before this process started, so one open heals instead of
+/// failing and waiting out the ingest's open backoff (up to 10 min). Past it
+/// the open fails as before and the backoff schedules the next one.
+const INGEST_WAL_CONFLICT_RETRY: std::time::Duration = std::time::Duration::from_secs(6 * 60);
+/// NAN-4445: the longest pause between those ingest retries (about 30 owner
+/// calls per open instead of 70).
+const INGEST_WAL_CONFLICT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What an owner 409 on a still-absent object does for this writer class and
+/// key family. A 409 means another request holds the key's reservation
+/// (`authorize_object_state`) or a replay mismatched; it is never proof that
+/// the conditional create landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbsentConflict {
+    /// Return the error: the caller (SlateDB, the open) decides.
+    Fail,
+    /// NAN-3956: the standalone compactor retries in place until the 9013910
+    /// takeover or the holder completes. Bounded by the compactor's own
+    /// cancellation; returning would stop SlateDB's compactor.
+    RetryUntilCancelled,
+    /// NAN-4445: ingest WAL creates retry for at most this long (9015130).
+    RetryFor(std::time::Duration),
+}
+
+fn absent_conflict(writer_class: WriterClass, key_family: &str) -> AbsentConflict {
+    match (writer_class, key_family) {
+        (WriterClass::Maintenance, _) => AbsentConflict::RetryUntilCancelled,
+        // Only wal/ is a numbered family the ingest class creates alone.
+        // manifest/ is SlateDB's writer/compactor fence (no takeover exists)
+        // and compacted/ keys are fresh ULIDs per attempt.
+        (WriterClass::Ingest, "wal") => AbsentConflict::RetryFor(INGEST_WAL_CONFLICT_RETRY),
+        (WriterClass::Ingest, _) => AbsentConflict::Fail,
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerAccess {
@@ -252,6 +292,8 @@ pub struct OwnerStore {
     /// The owner bearer, swappable in place ([`Self::set_bearer`]): a
     /// long-running compactor keeps its store across credential refreshes.
     bearer: std::sync::RwLock<String>,
+    /// [`INGEST_WAL_CONFLICT_RETRY`]; shortened only by tests.
+    ingest_wal_conflict_retry: std::time::Duration,
 }
 
 impl fmt::Debug for OwnerStore {
@@ -359,6 +401,7 @@ impl OwnerStore {
             tls,
             mutation_lock: tokio::sync::Mutex::new(()),
             writer_class,
+            ingest_wal_conflict_retry: INGEST_WAL_CONFLICT_RETRY,
         })
     }
 
@@ -489,7 +532,8 @@ impl OwnerStore {
         // - absent: nothing landed; drop the record and create afresh. If
         //   the owner still holds a pending row for the old request it
         //   refuses, except for abandoned maintenance compactions creates
-        //   recovered by 9013910. No key is quarantined. If the owner never
+        //   (9013910) and ingest WAL creates (9015130) idle for five
+        //   minutes, which the retry below waits out. No key is quarantined. If the owner never
         //   authorized it (cell30: it crashed first), the create succeeds.
         if journal_path.exists() {
             let bytes = std::fs::read(&journal_path).map_err(|e| error(e.to_string()))?;
@@ -584,6 +628,15 @@ impl OwnerStore {
         // contested. A 409 is not proof that the conditional create landed.
         // In particular, never invent AlreadyExists for an absent numbered
         // compactions file: SlateDB would refresh the same version forever.
+        let retry = match absent_conflict(self.writer_class, key_family) {
+            AbsentConflict::RetryFor(_) => AbsentConflict::RetryFor(self.ingest_wal_conflict_retry),
+            other => other,
+        };
+        let backoff_max = match retry {
+            AbsentConflict::RetryFor(_) => INGEST_WAL_CONFLICT_BACKOFF_MAX,
+            _ => std::time::Duration::from_secs(5),
+        };
+        let started = std::time::Instant::now();
         let mut conflict_backoff = std::time::Duration::from_millis(100);
         let response = loop {
             let body = reqwest::Body::wrap_stream(futures::stream::iter(
@@ -602,10 +655,17 @@ impl OwnerStore {
                 .send()
                 .await
                 .map_err(|e| error(e.to_string()))?;
-            if response.status() != reqwest::StatusCode::CONFLICT
-                || self.writer_class != WriterClass::Maintenance
-            {
+            if response.status() != reqwest::StatusCode::CONFLICT {
                 break response;
+            }
+            match retry {
+                AbsentConflict::Fail => break response,
+                AbsentConflict::RetryFor(budget) if started.elapsed() + conflict_backoff > budget => {
+                    tracing::warn!(key_family, waited_secs = started.elapsed().as_secs(),
+                        "prevalence owner conflict on this key outlasted the in-place retry; failing the write");
+                    break response;
+                }
+                AbsentConflict::RetryFor(_) | AbsentConflict::RetryUntilCancelled => {}
             }
             drop(response);
             match slatedb::object_store::ObjectStoreExt::head(&self.reads(), path).await {
@@ -621,15 +681,16 @@ impl OwnerStore {
                 Err(other) => return Err(other),
             }
             // The owner's conditional-create reservation recovery allows a
-            // fresh current maintenance request to replace an abandoned
-            // compactions reservation. Retry in place while that migration
-            // rolls out or another request is still completing. This future
-            // remains cancellable; the role's credential refresh runs beside
-            // it and can refresh the bearer without reopening the compactor.
+            // fresh current request to replace an abandoned maintenance
+            // compactions (9013910) or ingest WAL (9015130) reservation.
+            // Retry in place while it ages past five minutes or another
+            // request is still completing. This future remains cancellable;
+            // the role's credential refresh runs beside it and can refresh
+            // the bearer without reopening the state.
             tracing::warn!(key_family, backoff_ms = conflict_backoff.as_millis() as u64,
                 "prevalence owner conflict on absent object; re-reading and retrying");
             tokio::time::sleep(conflict_backoff).await;
-            conflict_backoff = (conflict_backoff * 2).min(std::time::Duration::from_secs(5));
+            conflict_backoff = (conflict_backoff * 2).min(backoff_max);
         };
         if response.status() != reqwest::StatusCode::OK {
             if response.status() == reqwest::StatusCode::PRECONDITION_FAILED {
@@ -1058,6 +1119,75 @@ mod tests {
         let requests = fixture.requests.lock().unwrap();
         assert!(requests.iter().all(|id| *id == requests[0]));
         assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// NAN-4445: which owner 409s on an absent object retry in place.
+    #[test]
+    fn absent_conflict_retry_classification() {
+        for fam in ["wal", "manifest", "compacted", "compactions", "gc_boundary"] {
+            assert_eq!(absent_conflict(WriterClass::Maintenance, fam), AbsentConflict::RetryUntilCancelled, "{fam}");
+        }
+        assert_eq!(absent_conflict(WriterClass::Ingest, "wal"), AbsentConflict::RetryFor(INGEST_WAL_CONFLICT_RETRY));
+        // The bound covers 9015130's five-minute takeover window, and stays
+        // under the ingest open's hard timeout (15 min).
+        assert!(INGEST_WAL_CONFLICT_RETRY > std::time::Duration::from_secs(5 * 60));
+        assert!(INGEST_WAL_CONFLICT_RETRY < super::super::ingest::PREVALENCE_OPEN_HARD_TIMEOUT);
+        for fam in ["manifest", "compacted"] {
+            assert_eq!(absent_conflict(WriterClass::Ingest, fam), AbsentConflict::Fail, "{fam}");
+        }
+    }
+
+    /// NAN-4445 (the large tenant): an orphaned WAL create reservation answers 409 until
+    /// the owner's five-minute takeover; the ingest write retries in place
+    /// with one request id and lands once the owner lets it.
+    #[tokio::test]
+    async fn ingest_wal_owner_conflict_retries_in_place_until_the_takeover() {
+        let (objects, access, fixture, tmp) = setup(4).await;
+        let store = OwnerStore::new(objects.clone(), access, tmp.path()).unwrap();
+        let path = Path::from("db/wal/00000000000000000007.sst");
+        let write = store.put_opts(&path, b"wal".to_vec().into(), PutMode::Create.into());
+        tokio::pin!(write);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut write => panic!("contested WAL write returned before the takeover: {result:?}"),
+                _ = async {
+                    while fixture.requests.lock().unwrap().len() < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        }).await.expect("owner did not receive repeated contested requests");
+        fixture.failure.store(0, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(10), &mut write).await.unwrap().unwrap();
+        let requests = fixture.requests.lock().unwrap();
+        assert!(requests.iter().all(|id| *id == requests[0]));
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// NAN-4445: the in-place WAL retry is bounded; past it the write fails
+    /// (the open fails and the ingest's backoff schedules the next one).
+    #[tokio::test]
+    async fn ingest_wal_owner_conflict_retry_is_bounded() {
+        let (objects, access, fixture, tmp) = setup(4).await;
+        let mut store = OwnerStore::new(objects.clone(), access, tmp.path()).unwrap();
+        store.ingest_wal_conflict_retry = std::time::Duration::from_millis(500);
+        let path = Path::from("db/wal/00000000000000000007.sst");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10),
+            store.put_opts(&path, b"wal".to_vec().into(), PutMode::Create.into())).await.expect("retry was not bounded");
+        assert!(result.is_err());
+        assert!(fixture.requests.lock().unwrap().len() >= 2, "retried at least once");
+        assert_eq!(fixture.writes.load(Ordering::SeqCst), 0);
+    }
+
+    /// NAN-4445: an ingest manifest 409 (SlateDB's writer/compactor fence,
+    /// no takeover exists) still fails at once.
+    #[tokio::test]
+    async fn ingest_manifest_owner_conflict_fails_without_retry() {
+        let (objects, access, fixture, tmp) = setup(4).await;
+        let store = OwnerStore::new(objects.clone(), access, tmp.path()).unwrap();
+        let path = Path::from("db/manifest/00000000000000000003.manifest");
+        assert!(store.put_opts(&path, b"m".to_vec().into(), PutMode::Create.into()).await.is_err());
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

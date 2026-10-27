@@ -86,10 +86,12 @@ pub fn record_search_query(query_type: &str, duration_ms: f64, success: bool) {
 // Counters:
 //   nanosiem_search_jobs_admitted_total{priority}  — searches admitted by priority
 //   nanosiem_search_jobs_queued_total              — searches that entered the queue
-//   nanosiem_search_jobs_rejected_total{reason}    — searches rejected (user_limit, queue_full, queue_timeout)
+//   nanosiem_search_jobs_rejected_total{reason}    — searches refused or dropped: queue_timeout (wait
+//                                                    budget ended), queue_full, principal_queue_full,
+//                                                    client_gone (caller left while queued, never run)
 //
 // Histogram:
-//   nanosiem_search_queue_wait_seconds             — time spent waiting in queue before admission
+//   nanosiem_search_queue_wait_seconds{outcome}    — time spent queued (admitted, rejected, cancelled)
 //
 // Gauges:
 //   nanosiem_search_queue_depth                    — current queue depth

@@ -416,6 +416,10 @@ fn compile(request: CompileRequest) -> Result<CompileResponse> {
         other => bail!("unsupported lake dataset: {other}"),
     };
     apply_profile_product_semantics(&mut query, profile.as_ref());
+    if dataset == "logs" && request.event_contract == "ocsf-1.9" {
+        // NAN-4664: `hash=` / `ip=` / `domain=` are the typed IOC fields.
+        nanosiem_core::search::lake_indicators::expand_typed_fields(&mut query, &|field| profile.is_known_field(field));
+    }
     if dataset == "logs" && contains_lake_post_processing_anywhere(&query) {
         // NAN-4287: a 400 the analyst can act on, naming the supported shape.
         bail!(
@@ -911,6 +915,52 @@ mod tests {
             snapshot_field_types: BTreeMap::new(),
             lowercased_fields: Vec::new(),
         }
+    }
+
+    /// NAN-4664: the IOC lookups carry entity hints the indicator columns
+    /// answer: the bakeoff's three-field domain OR (one union), `ioc=`
+    /// (scoped to the value's observable leaves), and the typed `hash=` /
+    /// `ip=` / `domain=` fields (an OR of the canonical leaves, same SQL as
+    /// writing the OR by hand).
+    #[test]
+    fn ioc_lookups_carry_indicator_entity_hints() {
+        let entity = |path: &str, value: &str| CandidateHint::Entity { source_path: path.into(), value: value.into() };
+        let union = |legs: Vec<CandidateHint>| vec![CandidateHint::Any { alternatives: legs }];
+        let domain = "update-cdn.example.com";
+        let h3 = compile(request(&format!(
+            "(dst_endpoint.domain={domain} OR query.hostname={domain} OR http_request.url.hostname={domain}) | stats count as c by device.hostname"
+        ))).unwrap();
+        assert_eq!(h3.candidate_hints, union(vec![
+            entity("dst_endpoint.domain", domain), entity("query.hostname", domain), entity("http_request.url.hostname", domain),
+        ]));
+        let hash = "5b7c2e1f0a9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b";
+        let ioc = compile(request(&format!("ioc={}", hash.to_uppercase()))).unwrap();
+        assert_eq!(ioc.candidate_hints, union(vec![
+            entity("file.hashes.value", hash), entity("process.file.hashes.value", hash), entity("actor.process.file.hashes.value", hash),
+        ]));
+        let ioc_ip = compile(request("ioc=203.0.113.77")).unwrap();
+        assert_eq!(ioc_ip.candidate_hints, union(vec![entity("src_endpoint.ip", "203.0.113.77"), entity("dst_endpoint.ip", "203.0.113.77")]));
+        // A feed term and a non-ASCII value carry none (always sound).
+        assert!(compile(request("ioc=ä.example")).unwrap().candidate_hints.is_empty());
+
+        let typed = compile(request(&format!("domain={} | stats count", domain.to_uppercase()))).unwrap();
+        let by_hand = compile(request(&format!(
+            "(dst_endpoint.domain={0} OR src_endpoint.domain={0} OR query.hostname={0} OR http_request.url.hostname={0} OR url.hostname={0}) | stats count",
+            domain.to_uppercase()
+        ))).unwrap();
+        assert_eq!(typed.sql, by_hand.sql);
+        assert_eq!(typed.candidate_hints, by_hand.candidate_hints);
+        assert!(matches!(typed.candidate_hints.as_slice(), [CandidateHint::Any { alternatives }] if alternatives.len() == 5));
+        let typed_hash = compile(request(&format!("hash={hash}"))).unwrap();
+        for leaf in ["\"file.hashes.value\"", "\"process.file.hashes.value\"", "\"actor.process.file.hashes.value\""] {
+            assert!(typed_hash.sql.contains(leaf), "{leaf}: {}", typed_hash.sql);
+        }
+        let typed_ip = compile(request("ip!=203.0.113.77 | stats count")).unwrap();
+        assert!(typed_ip.sql.contains("NOT"), "{}", typed_ip.sql);
+        for leaf in ["src_endpoint.ip", "dst_endpoint.ip", "device.ip"] {
+            assert!(typed_ip.sql.contains(leaf), "{leaf}: {}", typed_ip.sql);
+        }
+        assert!(typed_ip.candidate_hints.is_empty(), "a negation hints nothing");
     }
 
     #[test]

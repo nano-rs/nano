@@ -77,7 +77,6 @@ vi.mock('@/components/search', () => ({
 }));
 vi.mock('@/components/editor', () => ({ registerDynamicFields: () => {} }));
 vi.mock('@/components/search/retro/useRetro', () => ({ primeDurableRetroResult: () => {} }));
-vi.mock('@/enterprise/components/search/AnalyzeView', () => ({ AnalyzeView: () => null }));
 vi.mock('@/components/reports/ScheduleReportDialog', () => ({ ScheduleReportDialog: () => null }));
 vi.mock('@/components/dashboard', () => ({ AddToDashboardDialog: () => null }));
 vi.mock('@/components/DemoHints', () => ({ SearchDemoHint: () => null }));

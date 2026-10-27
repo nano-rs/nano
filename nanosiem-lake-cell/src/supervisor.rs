@@ -10,6 +10,10 @@
 //! and passes the fd to the process only after verifying (from
 //! `/proc/<pid>/status`) that the process already runs as the tenant uid.
 
+#[path = "supervisor/guarded_work.rs"]
+mod guarded_work;
+pub use guarded_work::{GuardedLandingWorker, GuardedNativeWorker};
+
 /// Explicit rollout knobs only. Never inherit arbitrary NANO_LAKE_* or credentials.
 /// Reader locations below are relative to nanosiem-lake-worker/src.
 pub(crate) const FEATURE_ENV: &[&str] = &[
@@ -114,12 +118,6 @@ pub(crate) const FEATURE_ENV: &[&str] = &[
     "NANO_LAKE_COMPACTION_CPU_PERCENT",
     "NANO_LAKE_COMPACTION_REMOTE_BYTES_PER_SECOND",
     "NANO_LAKE_COMPACTION_REMOTE_REQUESTS_PER_SECOND",
-    // part_ingest/ingest.rs (NAN-3619): pipelined flush depth ("2" adds a
-    // second flight; unset/"1" keeps the serial contract) and commit a
-    // finished flush as soon as it is ready ("1"/"true"/"on"); ingest role,
-    // default off.
-    "NANO_LAKE_INGEST_FLUSH_DEPTH",
-    "NANO_LAKE_INGEST_COMMIT_WHEN_READY",
     // parts/refusal_tally.rs (NAN-3662): each part-log `reject` detail
     // starts with the refused rows per source lane, read by query[T]'s
     // `/v1/ingest/refusals`; ingest role; "1"/"true"/"on", default off. The
@@ -265,7 +263,7 @@ fn hot_quarantine_dir() -> Option<PathBuf> {
 /// fatal) and record every tenant tree's on-disk ownership as a claim, so
 /// allocation follows the disk, never first-touch order (NAN-3875, r56).
 /// Also prepares (and sweeps) the hot-volume quarantine.
-fn load_uid_map(cfg: &CellConfig, euid: u32, egid: u32) -> anyhow::Result<UidMap> {
+fn load_uid_map(cfg: &CellConfig, euid: u32, egid: u32, strict: bool) -> anyhow::Result<UidMap> {
     let hot_base = persistent_hot_tenants_dir().and_then(|t| t.parent().map(Path::to_path_buf));
     let path = uid_map_path(&cfg.state_dir, hot_base.as_deref());
     if let Some(dir) = path.parent().filter(|_| hot_base.is_some()) {
@@ -283,7 +281,10 @@ fn load_uid_map(cfg: &CellConfig, euid: u32, egid: u32) -> anyhow::Result<UidMap
             Err(error) => tracing::warn!(%error, "hot quarantine sweep failed; leftovers stay unreachable"),
         }
     }
-    let (mut map, aside) = UidMap::load_or_recover(&path, cfg.uid_base, cfg.uid_slots)?;
+    let (mut map, aside) = if strict {
+        anyhow::ensure!(path.is_file(), "installation policy: durable UID map is absent");
+        (UidMap::load(&path, cfg.uid_base, cfg.uid_slots)?, None)
+    } else { UidMap::load_or_recover(&path, cfg.uid_base, cfg.uid_slots)? };
     let roots = purge_roots(&cfg.data_dir.join("tenants"), external_hot_tenants_dir().as_deref());
     let observed = UidMap::observe_trees(&roots)?;
     let unclaimed = map.set_disk_claims(&observed);
@@ -591,7 +592,7 @@ mod feature_env_tests {
     #[test]
     fn every_child_env_name_is_forwarded_or_excluded_with_a_reason() {
         let names = child_env_names();
-        assert!(names.contains("NANO_LAKE_INGEST_FLUSH_DEPTH"), "the scan must see the child crates");
+        assert!(names.contains("NANO_LAKE_PRODUCER_CACHE_INDEX"), "the scan must see the child crates");
         let excluded: std::collections::BTreeMap<_, _> = NOT_FORWARDED.iter().copied().collect();
         assert_eq!(excluded.len(), NOT_FORWARDED.len(), "NOT_FORWARDED has duplicates");
         let unaccounted: Vec<_> = names.iter()
@@ -611,15 +612,22 @@ mod feature_env_tests {
         assert_eq!(forwarded.len(), super::FEATURE_ENV.len(), "FEATURE_ENV has duplicates");
     }
 
-    /// NAN-3619 / NAN-3610: the ingest pipelining and producer cache index
-    /// flags reach the child (they were dropped before).
+    /// NAN-3610: the producer cache index flag reaches the child (it was
+    /// dropped before). NAN-4539: bounded flush overlap is coded, not a
+    /// rollout knob; the retired NAN-3619 switch names are neither forwarded
+    /// nor read by any child crate.
     #[test]
-    fn ingest_pipelining_and_producer_cache_flags_are_forwarded() {
-        for name in ["NANO_LAKE_INGEST_FLUSH_DEPTH", "NANO_LAKE_INGEST_COMMIT_WHEN_READY", "NANO_LAKE_PRODUCER_CACHE_INDEX"] {
-            assert!(super::FEATURE_ENV.contains(&name), "{name}");
-            for role in [super::Role::Ingest, super::Role::Query] {
-                assert!(super::feature_allowed_for_role(name, role), "{name} {role:?}");
-            }
+    fn producer_cache_flag_is_forwarded_and_retired_pipelining_switches_are_not() {
+        let name = "NANO_LAKE_PRODUCER_CACHE_INDEX";
+        assert!(super::FEATURE_ENV.contains(&name), "{name}");
+        for role in [super::Role::Ingest, super::Role::Query] {
+            assert!(super::feature_allowed_for_role(name, role), "{name} {role:?}");
+        }
+        let names = child_env_names();
+        // Split literals: this file is itself scanned as a child source.
+        for retired in [concat!("NANO_LAKE_", "INGEST_FLUSH_DEPTH"), concat!("NANO_LAKE_", "INGEST_COMMIT_WHEN_READY")] {
+            assert!(!super::FEATURE_ENV.contains(&retired), "{retired} is still forwarded");
+            assert!(!names.contains(retired), "{retired} is still read by a child crate");
         }
     }
 
@@ -643,7 +651,8 @@ mod feature_env_tests {
 use crate::budget::TenantBudget;
 use crate::config::{CellConfig, CgroupPolicy, IngestMode, Placement, TenantPlacement};
 use crate::contract::{ROLES, 
-    Assignment, Heartbeat, JailSpec, Role, TenantId, ToChild, ToSupervisor, WakeReason, CONTROL_FD,
+    Assignment, Heartbeat, JailSpec, NativeChildService, NativeLandingAssignment, NativeRoleAssignment, Role, TenantId, ToChild,
+    ToSupervisor, WakeReason, CONTROL_FD,
     CONTROL_FD_FLAG, HEARTBEAT_INTERVAL_MAX, PROTOCOL_VERSION,
 };
 use crate::fdpass::{self, AsyncSeqpacket};
@@ -888,15 +897,26 @@ struct WarmProc {
     /// With the pid, the process identity.
     starttime: u64,
     label: Arc<OnceLock<String>>,
+    /// Expected native service captured from the installation policy at
+    /// spawn and matched against the actual Hello; never caller-selected.
+    native: Option<NativeChildService>,
 }
 
 /// A running, assigned tenant process.
 pub struct Proc {
+    /// Immutable native byte service of this exact process. Native has no
+    /// credential: refresh is refused and the child killed.
+    native: Option<NativeChildService>,
+    /// H02 B2: the supervisor end of a native parts service's one channel.
+    part_channel: Option<Arc<crate::part_channel::PartChannel>>,
+    jail_completed: bool,
+    cgroup_namespace: bool,
     pub pid: u32,
     pub role: Role,
     pub tenant: TenantId,
     pub uid: u32,
     pub landlock: String,
+    jail: JailSpec,
     /// detect: assigned `detect_runs_rules` (the router sends `/detect/...`
     /// here only then), and the memory cap its engine budget was sized from.
     pub runs_rules: bool,
@@ -915,6 +935,9 @@ pub struct Proc {
     /// ingest: the over-commit hold it was assigned (NAN-3522); a placement
     /// that changes it restarts the process gracefully.
     pub ingest_hold_eps: Option<f64>,
+    /// The placement eps it was assigned (NAN-4642): ingest sizes its owner
+    /// call pacing, cache and memory budget from it once, at spawn.
+    pub eps: f64,
     last_activity: Mutex<Instant>,
     heartbeat: Mutex<(Instant, Heartbeat)>,
     last_busy: Mutex<Instant>,
@@ -1165,6 +1188,12 @@ pub struct ProcStatus {
     /// detect: this process runs the tenant's rule searches itself.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub runs_rules: bool,
+    /// ingest: the eps and memory cap it was assigned at spawn (NAN-4642),
+    /// so a placement budget change is visible once it has applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest_eps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingest_memory_cap_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1240,6 +1269,8 @@ pub struct CellStatus {
 }
 
 pub struct Supervisor {
+    secret_delivery: Mutex<()>,
+    installation_policy: Option<Arc<dyn crate::policy::SupervisorPolicy>>,
     cfg: CellConfig,
     keys: Arc<dyn KeySource>,
     /// Set at boot, or later by the live adoption loop (auto).
@@ -1268,6 +1299,10 @@ pub struct Supervisor {
     uidmap: Mutex<UidMap>,
     placement: RwLock<Placement>,
     tenants: Mutex<HashMap<TenantId, Arc<TenantSlot>>>,
+    /// NAN-4642: processes asked to stop that have not exited yet. A
+    /// replacement may already own the role slot, so the slot alone does
+    /// not show them; a `memory.max` shrink holds while one is in the cgroup.
+    stopping_procs: Mutex<Vec<Arc<Proc>>>,
     warm: Mutex<HashMap<Role, VecDeque<WarmProc>>>,
     warm_notify: tokio::sync::Notify,
     /// Wakes the resident-ingest keeper (placement change, ingest exit).
@@ -1400,6 +1435,33 @@ const RESIDENT_DOWN_PAGE: Duration = Duration::from_secs(300);
 /// detect: age of the oldest unpublished finding-outbox row (`finding_outbox_age`).
 const FINDING_OUTBOX_AGE_WARN_S: f64 = 300.0;
 const FINDING_OUTBOX_AGE_PAGE_S: f64 = 600.0;
+/// detect: unpublished finding-outbox rows (`finding_outbox_backlog`, NAN-4610).
+/// One pass claims 512 rows; a healthy busy tenant (the large tenant, ~65k findings/day)
+/// peaks in the low hundreds. Held 10 min ([`crate::signals::Hysteresis`]).
+const FINDING_OUTBOX_BACKLOG_WARN: f64 = 5_000.0;
+const FINDING_OUTBOX_BACKLOG_PAGE: f64 = 50_000.0;
+/// detect: how long the oldest retained delivered row has outlived the 7-day (NAN-4668; 8 before)
+/// retention window (`finding_outbox_retention_overdue`, NAN-4610). The prune
+/// runs every 10 min, so hours overdue means it has stopped or fallen behind:
+/// control-DB growth, not lost findings, so it warns and never pages.
+const FINDING_OUTBOX_RETENTION_OVERDUE_WARN_S: f64 = 6.0 * 3600.0;
+
+/// The detect role's finding-outbox signals, from the drain's own facts
+/// ([`Heartbeat::finding_outbox_view`]) rather than the generic `queue_depth`
+/// / `lag_seconds`, which with `detect_runs_rules` belong to the rule engine.
+fn finding_outbox_signals(t: &Option<TenantId>, hb: &Heartbeat) -> [Signal; 3] {
+    let outbox = hb.finding_outbox_view();
+    [
+        // Findings not yet in the lake: risk and `source_type=findings`
+        // are blind to them. Warn at 5 min, page at 10.
+        Signal::evaluate(t.clone(), "detect", "detect", "finding_outbox_age", "seconds",
+            outbox.oldest_age_seconds, FINDING_OUTBOX_AGE_WARN_S, FINDING_OUTBOX_AGE_PAGE_S, hb.detail.clone()),
+        Signal::evaluate(t.clone(), "detect", "detect", "finding_outbox_backlog", "rows",
+            outbox.backlog as f64, FINDING_OUTBOX_BACKLOG_WARN, FINDING_OUTBOX_BACKLOG_PAGE, hb.detail.clone()),
+        Signal::evaluate(t.clone(), "detect", "detect", "finding_outbox_retention_overdue", "seconds",
+            outbox.retention_overdue_seconds, FINDING_OUTBOX_RETENTION_OVERDUE_WARN_S, f64::INFINITY, None),
+    ]
+}
 
 /// Whether the idle reaper may stop `role` of a tenant placed as `placed`.
 /// A resident ingest never idles out; everything else does (C1).
@@ -1423,6 +1485,20 @@ pub fn held_ingest_pages(hold_eps: Option<f64>) -> (f64, f64) {
 /// NAN-3522: a running ingest[T] applies the hold it was assigned at spawn.
 pub fn ingest_hold_needs_respawn(assigned: Option<f64>, placed: Option<f64>) -> bool {
     assigned != placed
+}
+
+/// NAN-4642: the memory cap an ingest[T] is assigned for `placement`
+/// (its role limit, at most the eps budget's ingest cap).
+pub fn ingest_memory_cap_bytes(placement: &TenantPlacement) -> u64 {
+    placement.effective_role_budget(Role::Ingest).limit_memory_bytes.min(TenantBudget::from_eps(placement.eps).ingest_memory_cap_bytes)
+}
+
+/// NAN-4642: a running ingest[T] sized its admission (owner call pacing,
+/// part cache) from the eps and its buffers from the memory cap it was
+/// assigned at spawn; a placement that changes either restarts it
+/// gracefully so the new budget applies.
+pub fn ingest_budget_needs_respawn(assigned_eps: f64, assigned_memory_cap_bytes: u64, placed_eps: f64, placed_memory_cap_bytes: u64) -> bool {
+    assigned_eps != placed_eps || assigned_memory_cap_bytes != placed_memory_cap_bytes
 }
 
 /// NAN-3177: a running query[T] sized its chDB threads from the CPU limit it
@@ -1564,6 +1640,26 @@ use crate::tenant_dirs::ensure_dir;
 
 impl Supervisor {
     pub fn new(cfg: CellConfig, keys: Arc<dyn KeySource>) -> anyhow::Result<Arc<Self>> {
+        Self::new_inner(cfg, keys, None)
+    }
+
+    /// Installation-owned production entry point. A policy cannot be selected
+    /// or removed by cell configuration. Preflight runs before all mutations.
+    pub async fn new_with_policy(
+        cfg: CellConfig,
+        keys: Arc<dyn KeySource>,
+        policy: Arc<dyn crate::policy::SupervisorPolicy>,
+    ) -> anyhow::Result<Arc<Self>> {
+        policy.preflight(&cfg).await?;
+        anyhow::ensure!(external_hot_tenants_dir().is_none(), "installation policy: external legacy hot-window paths are not admitted");
+        Self::new_inner(cfg, keys, Some(policy))
+    }
+
+    fn new_inner(
+        cfg: CellConfig,
+        keys: Arc<dyn KeySource>,
+        installation_policy: Option<Arc<dyn crate::policy::SupervisorPolicy>>,
+    ) -> anyhow::Result<Arc<Self>> {
         cfg.validate()?;
         raise_nofile();
         // SAFETY: geteuid never fails.
@@ -1616,7 +1712,7 @@ impl Supervisor {
         tracing::info!(cpu_millicores = capacity.cpu_millicores, memory_bytes = capacity.memory_bytes,
             cpu_source = capacity.cpu_source, memory_source = capacity.memory_source, "cell capacity");
         let monitor = Monitor::new(cfg.resources.clone(), capacity, cgroups.is_some()).with_cell_cgroup(cg_root.clone());
-        let uidmap = load_uid_map(&cfg, euid, egid)?;
+        let uidmap = load_uid_map(&cfg, euid, egid, installation_policy.is_some())?;
         let startup_marker = cfg.state_dir.join("supervisor-started");
         let restarted = startup_marker.exists();
         std::fs::write(&startup_marker, now_ms().to_string())?;
@@ -1650,6 +1746,8 @@ impl Supervisor {
         });
         let disk = Arc::new(crate::disk_ceiling::DiskCeilings::new(cfg.resources.tenant_disk.clone(), cfg.mode));
         let sup = Arc::new(Self {
+            secret_delivery: Mutex::new(()),
+            installation_policy,
             cfg,
             keys,
             cgroups: {
@@ -1676,6 +1774,7 @@ impl Supervisor {
             uidmap: Mutex::new(uidmap),
             placement: RwLock::new(placement),
             tenants: Mutex::new(HashMap::new()),
+            stopping_procs: Mutex::new(Vec::new()),
             warm: Mutex::new(HashMap::new()),
             warm_notify: tokio::sync::Notify::new(),
             keeper_notify: tokio::sync::Notify::new(),
@@ -1822,7 +1921,7 @@ impl Supervisor {
             let me = self.clone();
             tokio::spawn(async move { me.startup_warm_loop().await });
         }
-        if self.cgroups.get().is_none() && self.cfg.cgroup_policy() == CgroupPolicy::Auto {
+        if self.installation_policy.is_none() && self.cgroups.get().is_none() && self.cfg.cgroup_policy() == CgroupPolicy::Auto {
             let me = self.clone();
             tokio::spawn(async move { me.adoption_loop().await });
         }
@@ -1871,6 +1970,9 @@ impl Supervisor {
 
     /// One adoption attempt. `Ok(false)`: not delegated yet.
     fn try_adopt_live(&self) -> Result<bool, String> {
+        if self.installation_policy.is_some() {
+            return Err("installation policy forbids live cgroup adoption".into());
+        }
         let check = limits::check_delegation(&self.cfg.cgroup_mount);
         if !check.delegated() {
             return Ok(false);
@@ -1990,6 +2092,12 @@ impl Supervisor {
     fn reconcile_cgroups(&self) {
         let Some(cg) = self.cgroups.get() else { return };
         let ours = cg.still_delegated();
+        if !ours && self.installation_policy.is_some() {
+            self.delegation_withdrawn.store(true, Ordering::SeqCst);
+            self.shutdown_all();
+            self.halt();
+            return;
+        }
         let was = self.delegation_withdrawn.swap(!ours, Ordering::SeqCst);
         if !ours && !was {
             tracing::error!(root = %cg.root().display(),
@@ -2068,24 +2176,65 @@ impl Supervisor {
         if landing_wanted(self.cfg.tenzir_landing, Some(p)) { with_landing_role(limits, p) } else { limits }
     }
 
+    /// Create or resize `tenant`'s cgroup for `placement`. NAN-4642: a
+    /// `memory.max` shrink (tenant or role leaf) never goes below the
+    /// cgroup's usage, nor at all while a process in it is being replaced;
+    /// [`Self::retighten_memory`] finishes it once that is safe.
     fn ensure_tenant_cgroup(&self, cg: &CgroupTree, tenant: &TenantId, slot: u32, placement: &TenantPlacement) -> std::io::Result<()> {
         let limits = self.placement_limits(placement);
-        cg.ensure_tenant(tenant, slot, &limits)?;
+        cg.ensure_tenant_with_floor(tenant, slot, &limits, self.shrink_floor(tenant, None, true))?;
         for role in Role::ALL {
             let budget = placement.effective_role_budget(role);
             cg.set_role_cpu_max(tenant, role, budget.limit_millicores)?;
             cg.set_role_cpu_weight(tenant, role, budget.request_millicores)?;
-            cg.set_role_memory(tenant, role, budget.request_memory_bytes, budget.limit_memory_bytes)?;
+            cg.set_role_memory_with_floor(tenant, role, budget.request_memory_bytes, budget.limit_memory_bytes,
+                self.shrink_floor(tenant, Some(role), true))?;
         }
         Ok(())
     }
 
+    /// NAN-4642: how far a `memory.max` shrink of `t`'s cgroup (`role` =
+    /// `None`) or role leaf may go now. `Hold` while a process in it is
+    /// stopping and has not exited (it may still be flushing); `strict`
+    /// (a reload or a spawn) never below usage; the follow-up ticks down to
+    /// what reclaim cannot free.
+    fn shrink_floor(&self, t: &TenantId, role: Option<Role>, strict: bool) -> limits::ShrinkFloor {
+        let replacing = {
+            let mut stopping = self.stopping_procs.lock().unwrap();
+            stopping.retain(|p| !p.exited.load(Ordering::SeqCst));
+            stopping.iter().any(|p| &p.tenant == t && role.is_none_or(|r| p.role == r))
+        };
+        match (replacing, strict) {
+            (true, _) => limits::ShrinkFloor::Hold,
+            (false, true) => limits::ShrinkFloor::Usage,
+            (false, false) => limits::ShrinkFloor::Unreclaimable,
+        }
+    }
+
+    /// NAN-4642: lower deferred `memory.max` shrinks once it is safe.
+    fn retighten_memory(&self) {
+        if let Some(cg) = self.cgroups.get() {
+            cg.retighten_memory(|t, role| self.shrink_floor(t, role, false));
+        }
+    }
+
     // ---------------------------------------------------------------- placement
 
-    pub fn set_placement(self: &Arc<Self>, p: Placement) -> anyhow::Result<()> {
+    pub async fn set_placement(self: &Arc<Self>, p: Placement) -> anyhow::Result<()> {
+        if let Some(policy) = &self.installation_policy {
+            anyhow::ensure!(!self.stopping_all.load(Ordering::SeqCst) && !self.is_halted(), "installation policy: cell is permanently draining");
+            policy.placement(&self.cfg, &p).await?;
+        }
         p.validate(&self.cfg)?;
         let placed: std::collections::HashSet<TenantId> = p.tenants.iter().map(|t| t.tenant_id.clone()).collect();
-        *self.placement.write().unwrap() = p;
+        {
+            let _permit = self.secret_delivery.lock().unwrap();
+            if self.installation_policy.is_some() {
+                anyhow::ensure!(!self.stopping_all.load(Ordering::SeqCst) && !self.is_halted(), "installation policy: cell drained during placement authorization");
+                if p.tenants.is_empty() { self.stopping_all.store(true, Ordering::SeqCst); }
+            }
+            *self.placement.write().unwrap() = p;
+        }
         // NAN-3000: removed tenants become pending purges (after the drain).
         let placed_set: std::collections::BTreeSet<TenantId> = placed.iter().cloned().collect();
         let removed = self.ledger.update(|l| {
@@ -2107,26 +2256,14 @@ impl Supervisor {
             tracing::info!(tenant = %slot.id, "tenant no longer placed on this cell; draining");
             self.drain_slot(&slot);
         }
-        // An eps change resizes a live tenant's cgroup right away.
-        if let Some(cg) = self.cgroups.get() {
-            let placement = self.placement.read().unwrap().clone();
-            for tp in &placement.tenants {
-                let slot = self.uidmap.lock().unwrap().get(&tp.tenant_id).map(|i| i.slot);
-                if let (true, Some(slot)) = (cg.tenant_dir(&tp.tenant_id).exists(), slot) {
-                    let resize = self.ensure_tenant_cgroup(cg, &tp.tenant_id, slot, tp)
-                        .and_then(|_| cg.set_cpu_max(&tp.tenant_id, self.placement_limits(tp).cpu_ceiling_millicores));
-                    if let Err(e) = resize {
-                        tracing::warn!(tenant = %tp.tenant_id, error = %e, "cgroup resize failed");
-                    }
-                }
-            }
-        }
         // A detect[T] assigned for another rule mode, or whose engine was
         // sized for another memory limit, restarts gracefully; the next
         // wake assigns it from this placement. Likewise a query[T] whose
         // chDB threads were sized for another CPU limit (NAN-3177): it
         // drains its in-flight requests, and the next one (or the keeper,
         // when resident) starts a replacement at the new size.
+        // NAN-4642: these stops are issued before the cgroups are resized,
+        // so a shrink sees the stopping process and holds until it exits.
         let placement = self.placement.read().unwrap().clone();
         for tp in &placement.tenants {
             let slot = self.tenants.lock().unwrap().get(&tp.tenant_id).cloned();
@@ -2137,9 +2274,23 @@ impl Supervisor {
             // NAN-3522: a hold set, changed or lifted takes effect at once: the
             // running ingest[T] stops gracefully (flushes, acks what it
             // committed) and the next wake/keeper assigns it the new rate.
+            // NAN-4642: so does an eps / ingest memory budget change; a
+            // running ingest otherwise kept its spawn-time admission budget.
             if let Some(p) = ingest.filter(|p| !p.exited.load(Ordering::SeqCst)) {
+                // A native ingest is assigned its role limit as-is and no
+                // eps, so only a memory change restarts it.
+                let (cap, placed_eps) = if p.native.is_some() {
+                    (tp.effective_role_budget(Role::Ingest).limit_memory_bytes, p.eps)
+                } else {
+                    (ingest_memory_cap_bytes(tp), tp.eps)
+                };
                 if ingest_hold_needs_respawn(p.ingest_hold_eps, tp.effective_ingest_hold_eps(now_ms())) {
                     self.stop(p, "ingest_hold_changed");
+                } else if ingest_budget_needs_respawn(p.eps, p.memory_cap_bytes, placed_eps, cap) {
+                    tracing::info!(tenant = %tp.tenant_id, from_eps = p.eps, to_eps = tp.eps,
+                        from_memory_cap = p.memory_cap_bytes, to_memory_cap = cap,
+                        "ingest budget changed; restarting ingest gracefully at the new budget");
+                    self.stop(p, "ingest_budget_changed");
                 }
             }
             if let Some(p) = detect.filter(|p| !p.exited.load(Ordering::SeqCst)) {
@@ -2153,20 +2304,44 @@ impl Supervisor {
                 }
             }
         }
+        // An eps change resizes a live tenant's cgroup right away. NAN-4642:
+        // grows first, then shrinks; a shrink never lowers `memory.max`
+        // below the cgroup's usage, nor at all under a stopping process
+        // (see `ensure_tenant_cgroup`): the rest is applied by the resource
+        // tick once the replaced processes have exited.
+        if let Some(cg) = self.cgroups.get() {
+            let mut live: Vec<(&TenantPlacement, u32, bool)> = placement.tenants.iter().filter_map(|tp| {
+                let slot = self.uidmap.lock().unwrap().get(&tp.tenant_id).map(|i| i.slot)?;
+                let dir = cg.tenant_dir(&tp.tenant_id);
+                if !dir.exists() { return None; }
+                let written = std::fs::read_to_string(dir.join("memory.max")).ok().and_then(|v| v.trim().parse::<u64>().ok());
+                let shrinks = written.is_some_and(|w| self.placement_limits(tp).memory_hard_bytes < w);
+                Some((tp, slot, shrinks))
+            }).collect();
+            live.sort_by_key(|(_, _, shrinks)| *shrinks);
+            for (tp, slot, _) in live {
+                let resize = self.ensure_tenant_cgroup(cg, &tp.tenant_id, slot, tp)
+                    .and_then(|_| cg.set_cpu_max(&tp.tenant_id, self.placement_limits(tp).cpu_ceiling_millicores));
+                if let Err(e) = resize {
+                    tracing::warn!(tenant = %tp.tenant_id, error = %e, "cgroup resize failed");
+                }
+            }
+        }
         // Resident ingest starts (or stops being kept) right away.
         self.keeper_notify.notify_one();
         Ok(())
     }
 
-    pub fn reload_placement(self: &Arc<Self>) -> anyhow::Result<()> {
+    pub async fn reload_placement(self: &Arc<Self>) -> anyhow::Result<()> {
         let bytes = std::fs::read(&self.cfg.placement_file)?;
         let p: Placement = serde_json::from_slice(&bytes)?;
         // The first load always applies, even when it equals the empty boot
         // placement: it is what arms the purge (an empty placement removes
         // every tenant the previous one had).
-        if *self.placement.read().unwrap() != p || !self.placement_loaded.load(Ordering::SeqCst) {
+        let changed = *self.placement.read().unwrap() != p || !self.placement_loaded.load(Ordering::SeqCst);
+        if changed {
             tracing::info!(revision = p.revision, tenants = p.tenants.len(), "placement updated");
-            self.set_placement(p)?;
+            self.set_placement(p).await?;
         }
         Ok(())
     }
@@ -2177,7 +2352,7 @@ impl Supervisor {
             if self.halted.load(Ordering::SeqCst) {
                 return;
             }
-            if let Err(e) = self.reload_placement() {
+            if let Err(e) = self.reload_placement().await {
                 if self.cfg.placement_file.exists() {
                     tracing::error!(error = %e, "placement reload failed; keeping the previous placement");
                 }
@@ -2267,24 +2442,85 @@ impl Supervisor {
     // ---------------------------------------------------------------- spawning
 
     fn binary(&self, role: Role) -> &Path {
-        match role {
-            Role::Ingest => &self.cfg.ingest_binary,
-            Role::Detect => &self.cfg.query_binary,
-            Role::Query => &self.cfg.query_binary,
-            // The ingest binary serves the maintenance role (its exchange,
-            // owner client and SlateDB build), dispatched on the assignment.
-            Role::Maintenance => &self.cfg.ingest_binary,
-            // The query binary builds product state (NAN-3148).
-            Role::Product => &self.cfg.query_binary,
-            // The ingest binary serves landing[T] (NAN-4137): the shared
-            // landing conversion, dispatched on the assignment's role.
-            Role::Landing => &self.cfg.ingest_binary,
+        binary_for(&self.cfg, role)
+    }
+
+    /// The installation policy's immutable native projection for `role`;
+    /// `None` without a policy or for every legacy selection.
+    fn expected_native(&self, role: Role) -> Option<NativeChildService> {
+        self.installation_policy.as_deref().and_then(|p| p.native_service(role))
+    }
+
+    /// Credential-free native startup after the actual `Jailed` frame: the
+    /// bounded C04 current child/authority guard, then `NativeRun` under the
+    /// same delivery gate and local stop/drain/liveness checks as secrets.
+    /// No KeySource, proxy, memfd or token future exists on this path.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_native(
+        &self,
+        t: &TenantId,
+        role: Role,
+        jail: &JailSpec,
+        child: crate::policy::ChildIdentity<'_>,
+        service: NativeChildService,
+        control: &AsyncSeqpacket,
+        pidfd: &PidFd,
+        progress: &Progress,
+    ) -> anyhow::Result<Option<Arc<crate::part_channel::PartChannel>>> {
+        let policy = self
+            .installation_policy
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("native start requires the installation policy"))?;
+        let to = self.cfg.spawn_timeout();
+        progress.set("native_guard");
+        let guarded = crate::policy::guarded_native_start(policy, t, role, jail, child, to).await?;
+        anyhow::ensure!(guarded == service, "native service changed during the guard");
+        let stopped = || {
+            self.stopping_all.load(Ordering::SeqCst) || self.is_halted() || self.draining() || pidfd.exited()
+        };
+        anyhow::ensure!(!stopped(), "cell or child stopped during native bootstrap");
+        progress.set("native_run");
+        // H02 B2: a parts service gets exactly one fresh unix stream to us
+        // with NativeRun; we keep the other end, bound to this process.
+        let channel = if service.has_part_channel() {
+            Some(fdpass::stream_pair()?)
+        } else {
+            None
+        };
+        let fds: Vec<_> = channel.iter().map(|(_, theirs)| theirs.as_fd()).collect();
+        tokio::time::timeout(
+            to,
+            control.send_json_guarded(&ToChild::NativeRun { service }, &fds, &self.secret_delivery, || {
+                if stopped() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cell stopped before native run"));
+                }
+                Ok(())
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("native run not accepted after {}s", to.as_secs()))??;
+        drop(fds);
+        match channel {
+            Some((ours, theirs)) => {
+                drop(theirs);
+                let limits = crate::contract::PartChannelLimits::DEFAULT;
+                Ok(Some(Arc::new(crate::part_channel::PartChannel::new(ours, limits)?)))
+            }
+            None => Ok(None),
         }
+    }
+
+    /// Exact-child refusal for a native process: mark it stopping and kill
+    /// its pidfd now (no shutdown grace for a protocol violation).
+    fn refuse_native(&self, proc: &Arc<Proc>, why: &'static str) {
+        self.stop(proc.clone(), why);
+        proc.kill(why);
     }
 
     /// Start an unassigned process and wait for its `Hello`.
     async fn spawn_warm(&self, role: Role) -> Result<WarmProc, CellError> {
         let err = |e: std::io::Error| CellError::Spawn(e.to_string());
+        let native = self.expected_native(role);
         let (ours, theirs) = fdpass::seqpacket_pair().map_err(err)?;
         let theirs_raw = theirs.as_raw_fd();
         let mut cmd = tokio::process::Command::new(self.binary(role));
@@ -2366,15 +2602,17 @@ impl Supervisor {
         let control = Arc::new(AsyncSeqpacket::new(ours).map_err(err)?);
         let hello = tokio::time::timeout(self.cfg.spawn_timeout(), control.recv_json::<ToSupervisor>()).await;
         match hello {
-            Ok(Ok(Some((ToSupervisor::Hello { pid: p, protocol_version }, _))))
-                if p == pid && protocol_version == PROTOCOL_VERSION => {}
+            Ok(Ok(Some((ToSupervisor::Hello { pid: p, protocol_version, native_services }, _))))
+                if p == pid && protocol_version == PROTOCOL_VERSION
+                    && crate::contract::valid_native_services(&native_services)
+                    && native_hello_matches(native, role, &native_services) => {}
             other => {
                 pidfd.kill();
                 return Err(CellError::Spawn(format!("bad hello from {pid}: {other:?}")));
             }
         }
         tracing::debug!(role = role.as_str(), pid, ms = started.elapsed().as_millis() as u64, "process hello");
-        Ok(WarmProc { pid, child, control, pidfd, starttime, label })
+        Ok(WarmProc { pid, child, control, pidfd, starttime, label, native })
     }
 
     fn jail_spec(
@@ -2386,62 +2624,7 @@ impl Supervisor {
         cgroups: Option<&CgroupTree>,
         placement: &TenantPlacement,
     ) -> JailSpec {
-        let root = self.tenant_root(t);
-        let product = self.product_dir(t);
-        let (mut rw, mut ro) = role_mounts(&root, role, self.cfg.product_state_role, &product);
-        if role == Role::Query && local_hot_window_enabled() {
-            if let Some(base) = std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR") {
-                rw.push(PathBuf::from(base).join("tenants").join(t.as_str()).join("query"));
-            }
-        }
-        // NAN-4183: ingest[T] keeps its GC view on the persistent hot volume.
-        if role == Role::Ingest {
-            rw.extend(part_gc_state_dir_for(t.as_str(), persistent_hot_tenants_dir().as_deref()));
-        }
-        // NAN-4137: landing[T] converts untrusted sender files; it gets no
-        // shared or tenant input path at all (feed, policy, custom context).
-        let tenant_inputs = role != Role::Landing;
-        if let Some(f) = self.cfg.feed_dir.as_ref().filter(|_| tenant_inputs) {
-            ro.push(f.clone());
-        }
-        // The owner-sign CA bundle: its directory, not the file, because a
-        // Kubernetes Secret/ConfigMap file is a symlink into `..data/`.
-        // Detect signs finding parts with the same owner (NAN-2916).
-        if matches!(role, Role::Ingest | Role::Detect | Role::Maintenance) {
-            if let Some(dir) = self.cfg.part_signing_ca_dir() {
-                ro.push(dir.to_path_buf());
-            }
-        }
-        if let Some(policy) = placement.platform_policy_file.as_ref().filter(|_| tenant_inputs) {
-            if let Some(parent) = policy.parent() { ro.push(parent.to_path_buf()); }
-        }
-        if let Some(custom) = placement.custom_context_root.as_ref().filter(|_| tenant_inputs) { ro.push(custom.clone()); }
-        if role == Role::Query && local_hot_window_enabled() {
-            let base = std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR")
-                .map(PathBuf::from).unwrap_or_else(|| self.cfg.data_dir.clone());
-            ro.push(base.join(crate::volume_usage::SOCKET));
-        }
-        let mut system = self.cfg.system_ro_paths.clone();
-        system.extend(self.cfg.extra_ro_paths.iter().cloned());
-        if let Some(dir) = self.binary(role).parent() {
-            system.push(dir.to_path_buf());
-        }
-        JailSpec {
-            uid: ids.uid(role),
-            gid: ids.gid,
-            rw_paths: rw,
-            ro_paths: ro,
-            system_ro_paths: system,
-            tcp_connect_ports: self.cfg.tcp_connect_ports.clone(),
-            cgroup_dir: cgroups.map(|c| c.role_rel(t, role)),
-            // Query shares the tenant gid with detect, which has group-write
-            // access to parts. Without Landlock, query would inherit that
-            // local write permission through DAC even with read-only R2 keys.
-            require_landlock: self.cfg.require_landlock || (!self.cfg.trusted_local && matches!(role, Role::Query | Role::Detect | Role::Product | Role::Landing)),
-            // RLIMIT_NPROC is per uid. Split the tenant cap across roles.
-            max_processes: Some((budget.max_pids / 3).max(64)),
-            max_open_files: 65_536,
-        }
+        jail_spec_for(&self.cfg, t, role, ids, budget, cgroups, placement)
     }
 
     /// Turn a warm process into `role` for tenant `slot`.
@@ -2453,11 +2636,15 @@ impl Supervisor {
         role: Role,
         progress: &Progress,
     ) -> Result<Arc<Proc>, CellError> {
-        let WarmProc { pid, child, control, pidfd, starttime, label } = warm;
+        let WarmProc { pid, child, control, pidfd, starttime, label, native } = warm;
         let fail = |pidfd: &PidFd, msg: String| {
             pidfd.kill();
             CellError::Spawn(msg)
         };
+        // The warm selection must still be the policy's immutable projection.
+        if native != self.expected_native(role) {
+            return Err(fail(&pidfd, "native service selection changed".into()));
+        }
         let t = &slot.id;
         let budget = TenantBudget::from_eps(placement.eps);
         if let Err(e) = validate_enrichment_mounts(&self.cfg, placement) {
@@ -2493,7 +2680,16 @@ impl Supervisor {
         }
         let _ = label.set(format!("{}/{}", t, role.as_str()));
         let root = self.tenant_root(t);
-        let jail = self.jail_spec(t, role, &slot.ids, &budget, cgroups, placement);
+        let mut jail = self.jail_spec(t, role, &slot.ids, &budget, cgroups, placement);
+        let msg = if let Some(service) = native {
+            // Native: no proxy/credential/endpoint is resolved or minted.
+            let assignment = match native_role_preflight(&self.cfg, t, role, &slot.ids, cgroups, placement, service) {
+                Ok(a) => a,
+                Err(e) => return Err(fail(&pidfd, format!("native assignment: {e}"))),
+            };
+            jail = assignment.jail.clone();
+            NativeOrLegacy::Native { service, assignment }
+        } else {
         let assignment = Assignment {
             outbound_proxy: assignment_proxy(&self.cfg, t).await?,
             tenant: t.clone(),
@@ -2509,7 +2705,7 @@ impl Supervisor {
             platform_policy_file: placement.platform_policy_file.clone(),
             custom_context_root: placement.custom_context_root.clone(),
             memory_cap_bytes: match role {
-                Role::Ingest => placement.effective_role_budget(Role::Ingest).limit_memory_bytes.min(budget.ingest_memory_cap_bytes),
+                Role::Ingest => ingest_memory_cap_bytes(placement),
                 Role::Detect => placement.effective_role_budget(Role::Detect).limit_memory_bytes,
                 Role::Query => placement.effective_role_budget(Role::Query).limit_memory_bytes,
                 Role::Maintenance => placement.effective_role_budget(Role::Maintenance).limit_memory_bytes,
@@ -2573,14 +2769,26 @@ impl Supervisor {
         if let Err(e) = check_assignment_signing(&self.cfg, &assignment) {
             return Err(fail(&pidfd, format!("assignment: {e}")));
         }
-        let (runs_rules, memory_cap_bytes, cpu_millis, ingest_hold_eps) =
-            (assignment.detect_runs_rules, assignment.memory_cap_bytes, assignment.cpu_millis, assignment.ingest_hold_eps);
-        let msg = ToChild::Assign { protocol_version: PROTOCOL_VERSION, assignment: Box::new(assignment) };
+        NativeOrLegacy::Legacy(assignment)
+        };
+        let (runs_rules, memory_cap_bytes, cpu_millis, ingest_hold_eps) = match &msg {
+            NativeOrLegacy::Legacy(a) => (a.detect_runs_rules, a.memory_cap_bytes, a.cpu_millis, a.ingest_hold_eps),
+            NativeOrLegacy::Native { assignment, .. } => (false, assignment.memory_cap_bytes, assignment.cpu_millis, None),
+        };
+        let (msg, native_service) = match msg {
+            NativeOrLegacy::Legacy(a) => (ToChild::Assign { protocol_version: PROTOCOL_VERSION, assignment: Box::new(a) }, None),
+            NativeOrLegacy::Native { service, assignment } => (
+                ToChild::NativeAssign { protocol_version: PROTOCOL_VERSION, service, assignment: Box::new(assignment) },
+                Some(service),
+            ),
+        };
         // NAN-3139: the jail denies socket(AF_UNIX) and pathname-unix
         // connects, so a query process reaches the volume accountant only
         // through a connection we create for it and pass with the assignment.
+        // A native child receives no fd with its assignment (H02 B2: the
+        // native query worker reads only through its part channel).
         let accountant_fd = match (role, self.volume_accountant.get()) {
-            (Role::Query, Some(accountant)) => match accountant.pair() {
+            (Role::Query, Some(accountant)) if native_service.is_none() => match accountant.pair() {
                 Ok(fd) => Some(fd),
                 Err(error) => {
                     tracing::warn!(tenant = %t, %error, "volume accountant connection unavailable for query process");
@@ -2598,8 +2806,8 @@ impl Supervisor {
         }
         progress.set("jailed");
         match tokio::time::timeout(to, control.recv_json::<ToSupervisor>()).await {
-            Ok(Ok(Some((ToSupervisor::Jailed { uid, gid, landlock, seccomp }, _))))
-                if uid == jail.uid && gid == jail.gid && seccomp =>
+            Ok(Ok(Some((ToSupervisor::Jailed { uid, gid, landlock, seccomp, cgroupns }, _))))
+                if uid == jail.uid && gid == jail.gid && seccomp && (native_service.is_none() || cgroupns) =>
             {
                 // Trust, then verify: the kernel's view of the credentials.
                 match read_status_ids(pid) {
@@ -2610,9 +2818,22 @@ impl Supervisor {
                     return Err(fail(&pidfd, "landlock not enforced".into()));
                 }
                 // Each role's token is bound to that role; detect exchanges as detect.
+                let jail_completed = seccomp && matches!(landlock.as_str(), "full" | "partial");
+                let mut part_channel = None;
+                if let Some(service) = native_service {
+                    let child_id = crate::policy::ChildIdentity { stage: crate::policy::SecretStage::Assignment, pid, pidfd: pidfd.as_fd(), spawn_start_time_ticks: starttime, jail_completed, cgroup_namespace: cgroupns };
+                    match self.start_native(t, role, &jail, child_id, service, &control, &pidfd, progress).await {
+                        Ok(channel) => part_channel = channel,
+                        Err(e) => return Err(fail(&pidfd, format!("native start: {e}"))),
+                    }
+                } else {
                 progress.set("mint_bootstrap_token");
-                let minted = mint_awaiting_assignment(
-                    self.keys.as_ref(), t, role, to, self.precondition_wait(), &self.stopping_all,
+                let minted = crate::policy::guarded_mint(
+                    self.installation_policy.as_deref(), t, role, &jail,
+                    crate::policy::ChildIdentity { stage: crate::policy::SecretStage::Assignment, pid, pidfd: pidfd.as_fd(), spawn_start_time_ticks: starttime, jail_completed, cgroup_namespace: cgroupns },
+                    mint_awaiting_assignment(
+                        self.keys.as_ref(), t, role, to, self.precondition_wait(), &self.stopping_all,
+                    ),
                 ).await;
                 let secret = match minted {
                     Ok(s) => s,
@@ -2625,6 +2846,10 @@ impl Supervisor {
                 };
                 // NAN-3569: a slow mint may finish after SIGTERM. The child
                 // has no credentials yet, so kill it before it can become a writer.
+                if self.installation_policy.is_some() && (self.stopping_all.load(Ordering::SeqCst)
+                    || self.is_halted() || self.draining() || pidfd.exited()) {
+                    return Err(fail(&pidfd, "cell or child stopped during bootstrap".into()));
+                }
                 if matches!(role, Role::Ingest | Role::Detect | Role::Maintenance)
                     && self.handover.as_ref().is_some_and(|h| h.draining())
                 {
@@ -2636,12 +2861,24 @@ impl Supervisor {
                 };
                 drop(secret);
                 progress.set("send_secrets");
-                match tokio::time::timeout(to, control.send_json(&ToChild::Secrets, &[memfd.as_fd()])).await {
+                let send = async {
+                    let fds = [memfd.as_fd()];
+                    if self.installation_policy.is_some() {
+                        control.send_json_guarded(&ToChild::Secrets, &fds, &self.secret_delivery, || {
+                            if self.stopping_all.load(Ordering::SeqCst) || self.is_halted() || self.draining() || pidfd.exited() {
+                                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cell stopped before secret sendmsg"));
+                            }
+                            Ok(())
+                        }).await
+                    } else { control.send_json(&ToChild::Secrets, &fds).await }
+                };
+                match tokio::time::timeout(to, send).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return Err(fail(&pidfd, format!("send secrets: {e}"))),
                     Err(_) => return Err(fail(&pidfd, format!("send secrets: not accepted after {}s", to.as_secs()))),
                 }
                 drop(memfd);
+                }
                 progress.set("ready");
                 match tokio::time::timeout(to, control.recv_json::<ToSupervisor>()).await {
                     Ok(Ok(Some((ToSupervisor::Ready, _)))) => {}
@@ -2653,11 +2890,16 @@ impl Supervisor {
                 }
                 let now = Instant::now();
                 let proc = Arc::new(Proc {
+                    native: native_service,
+                    part_channel,
+                    jail_completed,
+                    cgroup_namespace: cgroupns,
                     pid,
                     role,
                     tenant: t.clone(),
                     uid,
                     landlock,
+                    jail,
                     runs_rules,
                     memory_cap_bytes,
                     cpu_millis,
@@ -2667,8 +2909,11 @@ impl Supervisor {
                     started: now,
                     spawned_unix_ms: now_ms(),
                     ingest_hold_eps,
+                    eps: placement.eps,
                     last_activity: Mutex::new(now),
-                    heartbeat: Mutex::new((now, Heartbeat::default())),
+                    // NAN-4445: before its first heartbeat a process has
+                    // not said whether a prevalence spell is under way.
+                    heartbeat: Mutex::new((now, Heartbeat { prevalence_degraded_known: Some(false), ..Heartbeat::default() })),
                     last_busy: Mutex::new(now),
                     busy_seen: Mutex::new(None),
                     stopping: AtomicBool::new(false),
@@ -2690,30 +2935,50 @@ impl Supervisor {
         }
     }
 
+    async fn send_fresh_secret(self: &Arc<Self>, proc: Arc<Proc>) {
+        let io = ProcSecretRefresh { supervisor: self, proc: proc.clone() };
+        let child = crate::policy::ChildIdentity {
+            jail_completed: proc.jail_completed, cgroup_namespace: proc.cgroup_namespace,
+            stage: crate::policy::SecretStage::Refresh, pid: proc.pid, pidfd: proc.pidfd.as_fd(), spawn_start_time_ticks: proc.starttime,
+        };
+        if let Err(error) = crate::policy::send_fresh_secret(
+            self.installation_policy.as_deref(), &proc.tenant, proc.role, &proc.jail, child, &io,
+        ).await {
+            tracing::warn!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid,
+                %error, "refresh: fresh secret refused or unavailable");
+        }
+    }
+
     fn spawn_control_reader(self: &Arc<Self>, proc: Arc<Proc>) {
-        let keys = self.keys.clone();
         let supervisor = self.clone();
         tokio::spawn(async move {
             let pacer = Arc::new(Mutex::new(RefreshPacer::new(REFRESH_MIN_INTERVAL)));
             loop {
                 match proc.control.recv_json::<ToSupervisor>().await {
+                    Ok(Some((ToSupervisor::RefreshSecrets, _))) if proc.native.is_some() => {
+                        // Native has no credential: refuse before any pacer,
+                        // KeySource or delivery, and stop the exact child.
+                        tracing::warn!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid,
+                            "native byte service requested credentials; stopping it");
+                        supervisor.refuse_native(&proc, "native_refresh_refused");
+                    }
                     Ok(Some((ToSupervisor::RefreshSecrets, _))) => {
                         // At most one fresh bootstrap per REFRESH_MIN_INTERVAL;
                         // an early request is answered at the interval's end,
                         // never dropped (NAN-4326).
                         let pace = pacer.lock().unwrap().request(Instant::now());
                         match pace {
-                            RefreshPace::MintNow => send_fresh_secret(&keys, &proc).await,
+                            RefreshPace::MintNow => supervisor.send_fresh_secret(proc.clone()).await,
                             RefreshPace::DeferUntil(at) => {
                                 tracing::info!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid,
                                     defer_ms = at.saturating_duration_since(Instant::now()).as_millis() as u64,
                                     "refresh request inside the mint interval; answering at its end");
-                                let (keys, proc, pacer) = (keys.clone(), proc.clone(), pacer.clone());
+                                let (supervisor, proc, pacer) = (supervisor.clone(), proc.clone(), pacer.clone());
                                 tokio::spawn(async move {
                                     tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
                                     pacer.lock().unwrap().deferred_due(Instant::now());
                                     if !proc.exited.load(Ordering::SeqCst) {
-                                        send_fresh_secret(&keys, &proc).await;
+                                        supervisor.send_fresh_secret(proc.clone()).await;
                                     }
                                 });
                             }
@@ -2723,6 +2988,9 @@ impl Supervisor {
                         }
                     }
                     Ok(Some((ToSupervisor::Heartbeat(mut hb), _))) => {
+                        if proc.native.is_some() {
+                            hb = native_heartbeat(&hb);
+                        }
                         // Tenant-controlled text flows into alerts: bound it.
                         if let Some(d) = hb.detail.as_mut() {
                             *d = d.chars().filter(|c| !c.is_control()).take(200).collect();
@@ -2992,7 +3260,10 @@ impl Supervisor {
         if role == Role::Product && !self.cfg.product_state_role {
             return Err(CellError::Unavailable("the product state role is not enabled on this cell".into()));
         }
-        let (slot, placement) = self.slot(t)?;
+        let (slot, placement) = {
+            let _permit = self.installation_live_permit()?;
+            self.slot(t)?
+        };
         // NAN-4137: landing[T] only for a tenant placed with `landing` on a
         // `tenzir_landing` cell, and only under its own uid.
         if role == Role::Landing {
@@ -3011,9 +3282,14 @@ impl Supervisor {
             }
         }
         let i = role_idx(role);
-        if let Some(p) = slot.procs.lock().unwrap()[i].clone() {
-            if !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst) {
-                return Ok(p);
+        let cached = slot.procs.lock().unwrap()[i].clone();
+        {
+            let _permit = self.installation_live_permit()?;
+            if let Some(p) = cached {
+                if !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst)
+                    && (self.installation_policy.is_none() || !p.pidfd.exited()) {
+                    return Ok(p);
+                }
             }
         }
         // NAN-4128: the spawn runs detached under an overall deadline; this
@@ -3029,7 +3305,14 @@ impl Supervisor {
             })
             .await;
         match res {
-            Ok(p) => Ok(p),
+            Ok(p) => {
+                let _permit = self.installation_live_permit()?;
+                if self.installation_policy.is_some()
+                    && (p.stopping.load(Ordering::SeqCst) || p.exited.load(Ordering::SeqCst) || p.pidfd.exited()) {
+                    return Err(CellError::Unavailable("installation policy: child stopped before request admission".into()));
+                }
+                Ok(p)
+            },
             Err(FlightError::Failed(e)) => Err(e),
             Err(FlightError::TimedOut { step, secs }) => {
                 self.spawn_failures.fetch_add(1, Ordering::Relaxed);
@@ -3044,6 +3327,18 @@ impl Supervisor {
                 Err(CellError::SpawnTimedOut { role, step, secs, still_running: true })
             }
         }
+    }
+
+    /// Serialize sovereign cached/flight admission with halt and drain just as
+    /// secret delivery does. Never retain this permit over an await.
+    fn installation_live_permit(&self) -> Result<Option<std::sync::MutexGuard<'_, ()>>, CellError> {
+        if self.installation_policy.is_none() { return Ok(None); }
+        let permit = self.secret_delivery.lock().unwrap();
+        if self.stopping_all.load(Ordering::SeqCst) || self.is_halted() || self.draining()
+            || self.delegation_withdrawn.load(Ordering::SeqCst) {
+            return Err(CellError::Unavailable("installation policy: cell is permanently draining".into()));
+        }
+        Ok(Some(permit))
     }
 
     /// NAN-4128: the overall bound of one spawn attempt: its restart
@@ -3103,9 +3398,14 @@ impl Supervisor {
         progress.set("role_lock");
         let _guard = slot.spawn_lock[i].lock_logged(&progress, t.as_str(), role.as_str(), LOCK_WAIT_LOG_EVERY).await;
         progress.set("admission");
-        if let Some(p) = slot.procs.lock().unwrap()[i].clone() {
-            if !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst) {
-                return Ok(p);
+        let cached = slot.procs.lock().unwrap()[i].clone();
+        {
+            let _permit = self.installation_live_permit()?;
+            if let Some(p) = cached {
+                if !p.stopping.load(Ordering::SeqCst) && !p.exited.load(Ordering::SeqCst)
+                    && (self.installation_policy.is_none() || !p.pidfd.exited()) {
+                    return Ok(p);
+                }
             }
         }
         // Shutting down: never start a process the final kill would take
@@ -3602,6 +3902,10 @@ impl Supervisor {
             }
         }
         let p = self.ensure_running(t, role).await?;
+        if p.native.is_some() {
+            // Native byte streams open only through the guarded landing worker.
+            return Err(CellError::Unavailable("native process is not routable".into()));
+        }
         let guard = p.begin_request();
         let (ours, theirs) = fdpass::stream_pair().map_err(|e| CellError::Unavailable(e.to_string()))?;
         let id = p.next_request.fetch_add(1, Ordering::Relaxed);
@@ -3639,6 +3943,7 @@ impl Supervisor {
         let slot = self.tenants.lock().unwrap().get(t).cloned();
         match slot {
             Some(s) => {
+                if self.installation_policy.is_some() { self.mark_stopping_all(); }
                 self.drain_slot(&s);
                 true
             }
@@ -3654,8 +3959,15 @@ impl Supervisor {
     }
 
     fn stop(&self, p: Arc<Proc>, why: &'static str) {
-        if p.stopping.swap(true, Ordering::SeqCst) {
-            return;
+        let already_stopping = {
+            let _permit = self.secret_delivery.lock().unwrap();
+            p.stopping.swap(true, Ordering::SeqCst)
+        };
+        if already_stopping { return; }
+        {
+            let mut stopping = self.stopping_procs.lock().unwrap();
+            stopping.retain(|q| !q.exited.load(Ordering::SeqCst));
+            stopping.push(p.clone());
         }
         let grace = self.cfg.shutdown_grace_ms;
         tracing::info!(tenant = %p.tenant, role = p.role.as_str(), pid = p.pid, why, "stopping tenant process");
@@ -3748,8 +4060,15 @@ impl Supervisor {
             let procs: Vec<Arc<Proc>> =
                 slot.map(|s| s.procs.lock().unwrap().iter().flatten().cloned().collect()).unwrap_or_default();
             let placed = placement.tenants.iter().find(|x| x.tenant_id == tenant).cloned().unwrap_or_else(|| TenantPlacement::legacy(tenant.clone(), 0.0));
+            // NAN-4642: while a `memory.max` shrink is deferred the kernel
+            // limit is still the higher written one; the watchdog's hard
+            // ceiling and `memory.high` follow it, not the new target.
+            let mut limits = self.placement_limits(&placed);
+            if let Some(w) = self.cgroups.get().and_then(|cg| cg.pending_memory_max(&tenant, None)) {
+                limits.memory_hard_bytes = limits.memory_hard_bytes.max(w);
+            }
             specs.push(TenantSpec {
-                limits: self.placement_limits(&placed),
+                limits,
                 roots: procs.iter().map(|p| (p.pid, p.starttime)).collect(),
                 uids: ids.uids(),
                 exempt: procs.iter().filter(|p| p.stopping.load(Ordering::SeqCst)).map(|p| (p.pid, p.starttime)).collect(),
@@ -3831,6 +4150,9 @@ impl Supervisor {
             }
         }
         self.enforce_disk_ceilings(&placement, &by_id, now);
+        // NAN-4642: finish deferred memory.max shrinks whose replaced
+        // processes have exited (or whose usage has come down).
+        self.retighten_memory();
         // Delegated: nothing stays unlimited in init/ or warm/, and the
         // delegation is re-checked.
         self.reconcile_cgroups();
@@ -4293,6 +4615,8 @@ impl Supervisor {
                         landlock: p.landlock.clone(),
                         stopping: p.stopping.load(Ordering::SeqCst),
                         runs_rules: p.runs_rules,
+                        ingest_eps: (p.role == Role::Ingest).then_some(p.eps),
+                        ingest_memory_cap_bytes: (p.role == Role::Ingest).then_some(p.memory_cap_bytes),
                     }
                 })
                 .collect();
@@ -4479,7 +4803,8 @@ impl Supervisor {
                     out.push(crate::signals::l0_merge_overdue(t.clone(), hb.l0_merge_overdue_seconds));
                     out.push(crate::signals::prevalence_behind(t.clone(), hb.prevalence_behind_seconds,
                         hb.prevalence_behind_entries));
-                    out.push(crate::signals::prevalence_degraded(t.clone(), hb.prevalence_degraded_seconds));
+                    out.extend(crate::signals::prevalence_degraded_reported(t.clone(), hb.prevalence_degraded_seconds,
+                        hb.prevalence_degraded_known));
                     // NAN-3773: pending input that does not commit, not "busy
                     // and the last commit is old" (a quiet tenant's next batch).
                     let stalled = crate::signals::ingest_stalled_minutes(now_ms(), hb.busy, hb.retrying,
@@ -4496,10 +4821,7 @@ impl Supervisor {
                         if hb.retrying { 1.0 } else { 0.0 }, 1.0, f64::INFINITY, hb.detail.clone()));
                 }
                 if p.role == Role::Detect {
-                    // Findings not yet in the lake: risk and `source_type=findings`
-                    // are blind to them. Warn at 5 min, page at 10.
-                    out.push(Signal::evaluate(t.clone(), "detect", "detect", "finding_outbox_age", "seconds",
-                        hb.lag_seconds, FINDING_OUTBOX_AGE_WARN_S, FINDING_OUTBOX_AGE_PAGE_S, hb.detail.clone()));
+                    out.extend(finding_outbox_signals(&t, &hb));
                 }
             }
             let st = slot.stats.lock().unwrap();
@@ -4711,10 +5033,13 @@ impl Supervisor {
                         }
                     }
                     if role == Role::Detect {
+                        let outbox = p.heartbeat.finding_outbox_view();
                         let _ = writeln!(m, "nano_cell_finding_outbox_backlog{{cell=\"{}\",tenant=\"{id}\"}} {}",
-                            s.cell_id, p.heartbeat.queue_depth);
+                            s.cell_id, outbox.backlog);
                         let _ = writeln!(m, "nano_cell_finding_outbox_oldest_age_seconds{{cell=\"{}\",tenant=\"{id}\"}} {:.3}",
-                            s.cell_id, p.heartbeat.lag_seconds);
+                            s.cell_id, outbox.oldest_age_seconds);
+                        let _ = writeln!(m, "nano_cell_finding_outbox_retention_overdue_seconds{{cell=\"{}\",tenant=\"{id}\"}} {:.3}",
+                            s.cell_id, outbox.retention_overdue_seconds);
                     }
                     if role == Role::Ingest {
                         let _ = writeln!(m, "nano_cell_oldest_unmerged_l0_age_seconds{{cell=\"{}\",tenant=\"{id}\"}} {:.3}",
@@ -4745,6 +5070,9 @@ impl Supervisor {
                         if let Some(blocked) = &p.heartbeat.part_gc_blocked {
                             m.push_str(&blocked.metric_lines(&s.cell_id, id));
                         }
+                        if let Some(runway)=crate::contract::catalog_custody_runway_seconds(p.heartbeat.agent_catalog_custody.as_ref(),now_ms()) {
+                            let _=writeln!(m,"nano_cell_agent_catalog_custody_expiry_seconds{{cell=\"{}\",tenant=\"{id}\"}} {runway:.3}",s.cell_id);
+                        }
                         m.push_str(&crate::contract::part_gc_deleted_metric_line(
                             &s.cell_id, id, p.heartbeat.part_gc_deleted_total));
                         if let Some(identity) = &p.heartbeat.identity_directory {
@@ -4770,7 +5098,7 @@ impl Supervisor {
     /// Graceful stop of every tenant process (SIGTERM path): `Shutdown`,
     /// wait the grace, then kill whatever is left.
     pub async fn drain_all(&self) {
-        self.stopping_all.store(true, Ordering::SeqCst);
+        self.mark_stopping_all();
         let slots: Vec<Arc<TenantSlot>> = self.tenants.lock().unwrap().values().cloned().collect();
         for s in &slots {
             self.drain_slot(s);
@@ -4784,9 +5112,15 @@ impl Supervisor {
         self.shutdown_all();
     }
 
+    fn mark_stopping_all(&self) {
+        let _permit = self.secret_delivery.lock().unwrap();
+        self.stopping_all.store(true, Ordering::SeqCst);
+    }
+
     /// Stop the background loops (placement, warm pool, reaper, watchdog,
     /// adoption). Call after [`Supervisor::shutdown_all`].
     pub fn halt(&self) {
+        let _permit = self.secret_delivery.lock().unwrap();
         self.halted.store(true, Ordering::SeqCst);
     }
 
@@ -5052,7 +5386,10 @@ impl Supervisor {
             return;
         };
         let t0 = Instant::now();
-        h.begin_drain();
+        {
+            let _permit = self.secret_delivery.lock().unwrap();
+            h.begin_drain();
+        }
         let slots: Vec<Arc<TenantSlot>> = self.tenants.lock().unwrap().values().cloned().collect();
         let held = self.writer_tenants();
         tracing::info!(writers = held.len(), "SIGTERM: readiness withdrawn; releasing writers to the next pod");
@@ -5098,7 +5435,7 @@ impl Supervisor {
 
     /// Stop everything now (SIGKILL).
     pub fn shutdown_all(&self) {
-        self.stopping_all.store(true, Ordering::SeqCst);
+        self.mark_stopping_all();
         let slots: Vec<Arc<TenantSlot>> = self.tenants.lock().unwrap().values().cloned().collect();
         for s in slots {
             for p in s.procs.lock().unwrap().iter().flatten() {
@@ -5335,22 +5672,280 @@ impl RefreshPacer {
     }
 }
 
-/// Mint a fresh bootstrap for `proc` and send it as `Secrets` + memfd. A
-/// failure is logged; the child's own retry schedule asks again.
-async fn send_fresh_secret(keys: &Arc<dyn KeySource>, proc: &Proc) {
-    let secret = match keys.mint(&proc.tenant, proc.role.credential_role()).await {
-        Ok(secret) => secret,
-        Err(error) => {
-            tracing::warn!(tenant = %proc.tenant, role = proc.role.as_str(), pid = proc.pid, %error, "refresh: mint bootstrap token failed; child will retry");
-            return;
+/// Assignment message choice: the native frame never carries a legacy field.
+enum NativeOrLegacy {
+    Native { service: NativeChildService, assignment: NativeLandingAssignment },
+    Legacy(Assignment),
+}
+
+/// An expected native selection requires the actual Hello to advertise
+/// exactly that service; legacy selections accept any valid advertisement.
+fn native_hello_matches(
+    expected: Option<NativeChildService>,
+    role: Role,
+    advertised: &[NativeChildService],
+) -> bool {
+    match expected {
+        None => true,
+        Some(service) => crate::policy::native_service_allowed(role, service) && advertised == [service],
+    }
+}
+
+/// The jail every spawned role gets (shared by [`Supervisor::assign`] and
+/// [`native_landing_preflight`]).
+fn jail_spec_for(
+cfg: &CellConfig,
+    t: &TenantId,
+    role: Role,
+    ids: &TenantIds,
+    budget: &TenantBudget,
+    cgroups: Option<&CgroupTree>,
+    placement: &TenantPlacement,
+) -> JailSpec {
+    let root = cfg.data_dir.join("tenants").join(t.as_str());
+    let product = product_dir_for(&root, t.as_str(), persistent_hot_tenants_dir().as_deref());
+    let (mut rw, mut ro) = role_mounts(&root, role, cfg.product_state_role, &product);
+    if role == Role::Query && local_hot_window_enabled() {
+        if let Some(base) = std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR") {
+            rw.push(PathBuf::from(base).join("tenants").join(t.as_str()).join("query"));
         }
+    }
+    // NAN-4183: ingest[T] keeps its GC view on the persistent hot volume.
+    if role == Role::Ingest {
+        rw.extend(part_gc_state_dir_for(t.as_str(), persistent_hot_tenants_dir().as_deref()));
+    }
+    // NAN-4137: landing[T] converts untrusted sender files; it gets no
+    // shared or tenant input path at all (feed, policy, custom context).
+    let tenant_inputs = role != Role::Landing;
+    if let Some(f) = cfg.feed_dir.as_ref().filter(|_| tenant_inputs) {
+        ro.push(f.clone());
+    }
+    // The owner-sign CA bundle: its directory, not the file, because a
+    // Kubernetes Secret/ConfigMap file is a symlink into `..data/`.
+    // Detect signs finding parts with the same owner (NAN-2916).
+    if matches!(role, Role::Ingest | Role::Detect | Role::Maintenance) {
+        if let Some(dir) = cfg.part_signing_ca_dir() {
+            ro.push(dir.to_path_buf());
+        }
+    }
+    if let Some(policy) = placement.platform_policy_file.as_ref().filter(|_| tenant_inputs) {
+        if let Some(parent) = policy.parent() { ro.push(parent.to_path_buf()); }
+    }
+    if let Some(custom) = placement.custom_context_root.as_ref().filter(|_| tenant_inputs) { ro.push(custom.clone()); }
+    if role == Role::Query && local_hot_window_enabled() {
+        let base = std::env::var_os("NANO_LAKE_LOCAL_HOT_WINDOW_DIR")
+            .map(PathBuf::from).unwrap_or_else(|| cfg.data_dir.clone());
+        ro.push(base.join(crate::volume_usage::SOCKET));
+    }
+    let mut system = cfg.system_ro_paths.clone();
+    system.extend(cfg.extra_ro_paths.iter().cloned());
+    if let Some(dir) = binary_for(cfg, role).parent() {
+        system.push(dir.to_path_buf());
+    }
+    JailSpec {
+        uid: ids.uid(role),
+        gid: ids.gid,
+        rw_paths: rw,
+        ro_paths: ro,
+        system_ro_paths: system,
+        tcp_connect_ports: cfg.tcp_connect_ports.clone(),
+        cgroup_dir: cgroups.map(|c| c.role_rel(t, role)),
+        // Query shares the tenant gid with detect, which has group-write
+        // access to parts. Without Landlock, query would inherit that
+        // local write permission through DAC even with read-only R2 keys.
+        require_landlock: cfg.require_landlock || (!cfg.trusted_local && matches!(role, Role::Query | Role::Detect | Role::Product | Role::Landing)),
+        // RLIMIT_NPROC is per uid. Split the tenant cap across roles.
+        max_processes: Some((budget.max_pids / 3).max(64)),
+        max_open_files: 65_536,
+    }
+}
+
+
+fn binary_for(cfg: &CellConfig, role: Role) -> &Path {
+    match role {
+        Role::Ingest => &cfg.ingest_binary,
+        Role::Detect => &cfg.query_binary,
+        Role::Query => &cfg.query_binary,
+        // The ingest binary serves the maintenance role (its exchange,
+        // owner client and SlateDB build), dispatched on the assignment.
+        Role::Maintenance => &cfg.ingest_binary,
+        // The query binary builds product state (NAN-3148).
+        Role::Product => &cfg.query_binary,
+        // The ingest binary serves landing[T] (NAN-4137): the shared
+        // landing conversion, dispatched on the assignment's role.
+        Role::Landing => &cfg.ingest_binary,
+    }
+}
+
+/// H02 CP32: the exact native Landing assignment [`Supervisor::assign`] sends
+/// (it calls this function), built from the cell config, the tenant's durable
+/// ids, the adopted cgroup tree and the placement, with no process, root or
+/// kernel. The result already passed the receiver's own validation, so an
+/// offline test of a lab or install config proves the child accepts it
+/// before any host time is spent.
+#[doc(hidden)]
+pub fn native_landing_preflight(
+    cfg: &CellConfig,
+    t: &TenantId,
+    ids: &TenantIds,
+    cgroups: Option<&CgroupTree>,
+    placement: &TenantPlacement,
+    service: NativeChildService,
+) -> anyhow::Result<NativeLandingAssignment> {
+    native_role_preflight(cfg, t, Role::Landing, ids, cgroups, placement, service)
+}
+
+/// H02 B2: [`native_landing_preflight`] for any native role (Landing,
+/// Ingest, Query): the exact assignment `assign` sends for `role`.
+#[doc(hidden)]
+pub fn native_role_preflight(
+    cfg: &CellConfig,
+    t: &TenantId,
+    role: Role,
+    ids: &TenantIds,
+    cgroups: Option<&CgroupTree>,
+    placement: &TenantPlacement,
+    service: NativeChildService,
+) -> anyhow::Result<NativeRoleAssignment> {
+    anyhow::ensure!(crate::policy::native_service_allowed(role, service), "native service does not serve this role");
+    let budget = TenantBudget::from_eps(placement.eps);
+    let jail = jail_spec_for(cfg, t, role, ids, &budget, cgroups, placement);
+    let limits = placement.effective_role_budget(role);
+    let root = cfg.data_dir.join("tenants").join(t.as_str());
+    native_role_assignment(&cfg.cell_id, t, &root, &jail, limits.limit_memory_bytes, limits.limit_millicores, service)
+}
+
+/// The one rw directory a native role's assignment grants
+/// (`native_role_assignment`'s `state_dir`).
+fn native_rw_root(data_dir: &Path, t: &TenantId, role: Role) -> PathBuf {
+    data_dir.join("tenants").join(t.as_str()).join(role.as_str())
+}
+
+/// The fixed worker closure root of a native role.
+fn native_worker_root(role: Role) -> &'static str {
+    match role {
+        Role::Query => "/cell/workers/query",
+        _ => "/cell/workers/ingest",
+    }
+}
+
+/// Reduced native payload for the service's role: own role state rw, only
+/// the release/worker readonly closure, no network or foreign input, the
+/// existing uid/gid/cgroup/process/file bounds, and (H02 B2, parts services
+/// only) the part-channel bounds. Validated by the SAME function the receiver
+/// uses, so a description the child refuses is never sent.
+fn native_role_assignment(
+    cell_id: &str,
+    tenant: &TenantId,
+    root: &Path,
+    jail: &JailSpec,
+    memory_cap_bytes: u64,
+    cpu_millis: u32,
+    service: NativeChildService,
+) -> anyhow::Result<NativeRoleAssignment> {
+    let role = service.role();
+    let state = root.join(role.as_str());
+    let closure = ["/cell/release", native_worker_root(role)];
+    let mut system: Vec<PathBuf> = jail
+        .system_ro_paths
+        .iter()
+        .filter(|path| closure.iter().any(|r| path.starts_with(r)))
+        .cloned()
+        .collect();
+    system.sort();
+    system.dedup();
+    let assignment = NativeLandingAssignment {
+        tenant: tenant.clone(),
+        cell_id: cell_id.to_string(),
+        state_dir: state.clone(),
+        tmp_dir: state.join("tmp"),
+        memory_cap_bytes,
+        cpu_millis,
+        jail: JailSpec {
+            uid: jail.uid,
+            gid: jail.gid,
+            rw_paths: vec![state],
+            ro_paths: vec![],
+            system_ro_paths: system,
+            tcp_connect_ports: vec![],
+            // H02 CP32: CgroupTree::role_rel is absolute (`/<cell scope>/tenants/sN/landing`,
+            // from /proc/self/cgroup). The receiver takes the same leaf as a relative path under
+            // the unified mount; jail.rs joins either form under /sys/fs/cgroup.
+            cgroup_dir: jail.cgroup_dir.as_deref().map(|path| path.strip_prefix("/").unwrap_or(path).to_path_buf()),
+            require_landlock: true,
+            max_processes: jail.max_processes,
+            max_open_files: jail.max_open_files,
+        },
+        part_channel: service.has_part_channel().then_some(crate::contract::PartChannelLimits::DEFAULT),
     };
-    let sent = match fdpass::secret_memfd(&secret) {
-        Ok(memfd) => proc.control.send_json(&ToChild::Secrets, &[memfd.as_fd()]).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = sent {
-        tracing::error!(tenant = %proc.tenant, pid = proc.pid, %error, "refresh: send secrets failed");
+    crate::child::validate_native_assignment(&[service], PROTOCOL_VERSION, service, &assignment, &[])?;
+    Ok(assignment)
+}
+
+/// Parent-side value-free projection of a native heartbeat.
+fn native_heartbeat(hb: &Heartbeat) -> Heartbeat {
+    Heartbeat {
+        busy: hb.busy,
+        queue_depth: hb.queue_depth,
+        last_progress_unix_ms: hb.last_progress_unix_ms,
+        ..Heartbeat::default()
+    }
+}
+
+struct ProcSecretRefresh<'a> {
+    supervisor: &'a Arc<Supervisor>,
+    proc: Arc<Proc>,
+}
+#[async_trait::async_trait]
+impl crate::policy::SecretRefresh for ProcSecretRefresh<'_> {
+    async fn mint(&self) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+        if self.proc.native.is_some() {
+            anyhow::bail!("native byte service has no credential");
+        }
+        if self.supervisor.installation_policy.is_some()
+            && (self.supervisor.stopping_all.load(Ordering::SeqCst) || self.proc.stopping.load(Ordering::SeqCst) || self.proc.exited.load(Ordering::SeqCst)
+                || self.supervisor.is_halted() || self.supervisor.draining()) {
+            anyhow::bail!("installation policy: child or supervisor is draining");
+        }
+        let mint = self.supervisor.keys.mint(&self.proc.tenant, self.proc.role.credential_role());
+        if self.supervisor.installation_policy.is_some() {
+            tokio::time::timeout(self.supervisor.cfg.spawn_timeout(), mint).await
+                .map_err(|_| anyhow::anyhow!("installation policy: refresh mint deadline"))?
+        } else { mint.await }
+    }
+    async fn deliver(&self, secret: &[u8]) -> anyhow::Result<()> {
+        if self.proc.native.is_some() {
+            anyhow::bail!("native byte service has no credential");
+        }
+        if self.supervisor.installation_policy.is_some()
+            && (self.supervisor.stopping_all.load(Ordering::SeqCst) || self.proc.stopping.load(Ordering::SeqCst) || self.proc.exited.load(Ordering::SeqCst)
+                || self.proc.pidfd.exited() || self.supervisor.is_halted() || self.supervisor.draining()) {
+            anyhow::bail!("installation policy: child or supervisor began draining");
+        }
+        let memfd = fdpass::secret_memfd(secret)?;
+        if self.supervisor.installation_policy.is_some() {
+            let fds = [memfd.as_fd()];
+            tokio::time::timeout(self.supervisor.cfg.spawn_timeout(), self.proc.control.send_json_guarded(
+                &ToChild::Secrets, &fds, &self.supervisor.secret_delivery, || {
+                    if self.supervisor.stopping_all.load(Ordering::SeqCst) || self.proc.stopping.load(Ordering::SeqCst)
+                        || self.proc.exited.load(Ordering::SeqCst) || self.proc.pidfd.exited() || self.supervisor.is_halted() || self.supervisor.draining() {
+                        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cell stopped before refresh sendmsg"));
+                    }
+                    Ok(())
+                },
+            )).await.map_err(|_| anyhow::anyhow!("installation policy: refresh delivery deadline"))??;
+        } else { self.proc.control.send_json(&ToChild::Secrets, &[memfd.as_fd()]).await?; }
+        Ok(())
+    }
+    fn stop(&self) {
+        if self.proc.native.is_some() {
+            self.supervisor.refuse_native(&self.proc, "native_refresh_refused");
+        } else {
+            self.supervisor.stop(self.proc.clone(), "installation_policy_refused");
+        }
+    }
+    fn native(&self) -> Option<NativeChildService> {
+        self.proc.native
     }
 }
 
@@ -6035,6 +6630,21 @@ mod crash_backoff_tests {
     }
 
     #[test]
+    fn ingest_respawns_when_its_eps_or_memory_budget_changes() {
+        // The 2026-10-26 tzd placement: INGEST_EPS 145 -> 220.
+        let at = |eps: f64| TenantPlacement::legacy(TenantId::new("tzd").unwrap(), eps);
+        let (old, new) = (at(145.0), at(220.0));
+        let spawned = (old.eps, ingest_memory_cap_bytes(&old));
+        assert!(!ingest_budget_needs_respawn(spawned.0, spawned.1, old.eps, ingest_memory_cap_bytes(&old)));
+        assert!(ingest_memory_cap_bytes(&new) > spawned.1, "the eps budget grows the ingest cap");
+        assert!(ingest_budget_needs_respawn(spawned.0, spawned.1, new.eps, ingest_memory_cap_bytes(&new)));
+        // An explicit ingest memory limit change alone also restarts it.
+        let capped = TenantPlacement { ingest_request_millicores: Some(50), ingest_limit_millicores: Some(500),
+            ingest_request_memory_bytes: Some(32 * crate::budget::MIB), ingest_limit_memory_bytes: Some(64 * crate::budget::MIB), ..old.clone() };
+        assert!(ingest_budget_needs_respawn(spawned.0, spawned.1, capped.eps, ingest_memory_cap_bytes(&capped)));
+    }
+
+    #[test]
     fn detect_respawns_when_its_rule_mode_or_engine_budget_changes() {
         use crate::budget::{GIB, MIB};
         let t = TenantId::new("t").unwrap();
@@ -6542,5 +7152,225 @@ mod assignment_egress_tests {
             assert!(validate_cell_proxy(&bad,"storage",Some(a)).is_err());
         }
         assert_eq!(format!("{:?}",crate::contract::OutboundProxy(storage)),"OutboundProxy([redacted])");
+    }
+}
+
+#[cfg(test)]
+mod native_parent_tests {
+    use super::*;
+    use crate::contract::NativeChildService::LandingBytesV1;
+
+    fn tenant() -> TenantId {
+        TenantId::new("tenant-a").unwrap()
+    }
+    /// The legacy jail_spec shape: role rw plus broad cfg/system paths and ports.
+    fn broad_jail() -> JailSpec {
+        JailSpec {
+            uid: 20020,
+            gid: 20000,
+            rw_paths: vec!["/cell/data/tenants/tenant-a/landing".into()],
+            ro_paths: vec!["/cell/feed".into(), "/cell/policy".into()],
+            system_ro_paths: vec![
+                "/usr/lib".into(),
+                "/etc/ssl".into(),
+                "/cell/workers/ingest/bin".into(),
+                "/cell/release".into(),
+                "/cell/workers/ingest/bin".into(),
+                "/cell/workers/ingestion-foreign".into(),
+            ],
+            tcp_connect_ports: vec![443, 3128],
+            cgroup_dir: Some("tenant-a/landing".into()),
+            require_landlock: false,
+            max_processes: Some(64),
+            max_open_files: 65_536,
+        }
+    }
+    fn project(jail: &JailSpec, root: &str) -> anyhow::Result<NativeLandingAssignment> {
+        native_role_assignment("cell-a", &tenant(), Path::new(root), jail, 512 << 20, 100, LandingBytesV1)
+    }
+
+    #[test]
+    fn native_projection_narrows_the_legacy_jail_and_matches_the_receiver() {
+        let a = project(&broad_jail(), "/cell/data/tenants/tenant-a").unwrap();
+        assert_eq!(a.state_dir, Path::new("/cell/data/tenants/tenant-a/landing"));
+        assert_eq!(a.tmp_dir, Path::new("/cell/data/tenants/tenant-a/landing/tmp"));
+        assert_eq!(a.jail.rw_paths, vec![a.state_dir.clone()]);
+        assert!(a.jail.ro_paths.is_empty(), "no feed/policy/foreign input");
+        assert!(a.jail.tcp_connect_ports.is_empty(), "no network");
+        assert!(a.jail.require_landlock);
+        assert_eq!(
+            a.jail.system_ro_paths,
+            vec![PathBuf::from("/cell/release"), PathBuf::from("/cell/workers/ingest/bin")],
+            "only the release/ingest closure, deduplicated; prefix lookalikes refused"
+        );
+        assert_eq!((a.jail.uid, a.jail.gid, a.jail.max_processes, a.jail.max_open_files), (20020, 20000, Some(64), 65_536));
+        assert_eq!(a.jail.cgroup_dir, Some("tenant-a/landing".into()));
+        crate::child::validate_native_assignment(&[LandingBytesV1], PROTOCOL_VERSION, LandingBytesV1, &a, &[]).unwrap();
+        // The emitted frame is the closed reduced payload, no legacy field.
+        let frame = serde_json::to_value(ToChild::NativeAssign {
+            protocol_version: PROTOCOL_VERSION,
+            service: LandingBytesV1,
+            assignment: Box::new(a),
+        })
+        .unwrap();
+        for legacy in ["outbound_proxy", "control_url", "part_signing", "writer_lease", "feed_dir", "role", "parts_dir"] {
+            assert!(frame["assignment"].get(legacy).is_none(), "{legacy} never native");
+        }
+    }
+
+    #[test]
+    fn native_parts_projection_serves_ingest_and_query_with_one_channel() {
+        use crate::contract::NativeChildService::{IngestPartsV1, QueryPartsV1};
+        for (service, role, worker) in [(IngestPartsV1, Role::Ingest, "/cell/workers/ingest/bin"), (QueryPartsV1, Role::Query, "/cell/workers/query/bin")] {
+            let mut j = broad_jail();
+            j.system_ro_paths.push("/cell/workers/query/bin".into());
+            j.cgroup_dir = Some(format!("/scope/tenants/s0/{}", role.as_str()).into());
+            let a = native_role_assignment("cell-a", &tenant(), Path::new("/cell/data/tenants/tenant-a"), &j, 512 << 20, 100, service).unwrap();
+            let state = PathBuf::from("/cell/data/tenants/tenant-a").join(role.as_str());
+            assert_eq!(a.jail.rw_paths, vec![state.clone()]);
+            assert_eq!(a.state_dir, state);
+            // tenant_rw_root (PutSpool) names exactly the granted rw directory.
+            assert_eq!(native_rw_root(Path::new("/cell/data"), &tenant(), role), state);
+            assert!(a.jail.ro_paths.is_empty() && a.jail.tcp_connect_ports.is_empty());
+            assert_eq!(a.jail.system_ro_paths, vec![PathBuf::from("/cell/release"), PathBuf::from(worker)]);
+            assert_eq!(a.part_channel, Some(crate::contract::PartChannelLimits::DEFAULT));
+            crate::child::validate_native_assignment(&[service], PROTOCOL_VERSION, service, &a, &[]).unwrap();
+            assert!(crate::policy::native_service_allowed(role, service));
+            assert!(!crate::policy::native_service_allowed(Role::Landing, service));
+        }
+        // Landing keeps zero channel.
+        let a = project(&broad_jail(), "/cell/data/tenants/tenant-a").unwrap();
+        assert_eq!(a.part_channel, None);
+        // Detect/Maintenance/Product have no native service at all.
+        for role in [Role::Detect, Role::Maintenance, Role::Product] {
+            for service in [LandingBytesV1, IngestPartsV1, QueryPartsV1] {
+                assert!(!crate::policy::native_service_allowed(role, service));
+            }
+        }
+    }
+
+    #[test]
+    fn native_projection_takes_the_real_absolute_cgroup_leaf() {
+        // H02 CP30 lab: CgroupTree::role_rel is absolute on a real host.
+        let mut j = broad_jail();
+        j.cgroup_dir = Some("/system.slice/run-u7.scope/tenants/s0/landing".into());
+        let a = project(&j, "/cell/data/tenants/tenant-a").unwrap();
+        assert_eq!(a.jail.cgroup_dir, Some("system.slice/run-u7.scope/tenants/s0/landing".into()));
+        crate::child::validate_native_assignment(&[LandingBytesV1], PROTOCOL_VERSION, LandingBytesV1, &a, &[]).unwrap();
+        // Normalizing never admits an escape.
+        j.cgroup_dir = Some("/system.slice/../foreign".into());
+        assert!(project(&j, "/cell/data/tenants/tenant-a").is_err());
+    }
+
+    #[test]
+    fn native_projection_refuses_what_the_receiver_would_refuse() {
+        // Wrong data root: the child accepts only /cell/data.
+        assert!(project(&broad_jail(), "/var/lib/cell/tenants/tenant-a").is_err());
+        let mut j = broad_jail();
+        j.cgroup_dir = None;
+        assert!(project(&j, "/cell/data/tenants/tenant-a").is_err(), "private cgroup required");
+        let mut j = broad_jail();
+        j.uid = 0;
+        assert!(project(&j, "/cell/data/tenants/tenant-a").is_err());
+        let mut j = broad_jail();
+        j.system_ro_paths = vec!["/usr/lib".into()];
+        assert!(project(&j, "/cell/data/tenants/tenant-a").is_err(), "empty closure refused");
+        let mut j = broad_jail();
+        j.max_processes = None;
+        assert!(project(&j, "/cell/data/tenants/tenant-a").is_err());
+        assert!(native_role_assignment("cell-a", &tenant(), Path::new("/cell/data/tenants/tenant-a"), &broad_jail(), 0, 100, LandingBytesV1).is_err());
+        assert!(native_role_assignment("cell/x", &tenant(), Path::new("/cell/data/tenants/tenant-a"), &broad_jail(), 1, 100, LandingBytesV1).is_err());
+    }
+
+    #[test]
+    fn expected_native_selection_requires_the_exact_actual_hello() {
+        // Legacy selection accepts any valid advertisement, as before.
+        assert!(native_hello_matches(None, Role::Ingest, &[]));
+        assert!(native_hello_matches(None, Role::Landing, &[LandingBytesV1]));
+        // Native selection: only Landing, only an exact advertisement.
+        assert!(native_hello_matches(Some(LandingBytesV1), Role::Landing, &[LandingBytesV1]));
+        assert!(!native_hello_matches(Some(LandingBytesV1), Role::Landing, &[]), "never silently legacy");
+        assert!(!native_hello_matches(Some(LandingBytesV1), Role::Landing, &[LandingBytesV1, LandingBytesV1]));
+        for role in [Role::Ingest, Role::Detect, Role::Query, Role::Maintenance, Role::Product] {
+            assert!(!native_hello_matches(Some(LandingBytesV1), role, &[LandingBytesV1]));
+            assert!(!crate::policy::native_service_allowed(role, LandingBytesV1));
+        }
+    }
+
+    #[test]
+    fn parent_projects_native_heartbeats_value_free() {
+        let hosted = Heartbeat {
+            busy: true,
+            queue_depth: 2,
+            last_progress_unix_ms: 5,
+            agent_catalog_custody: Some(serde_json::json!({"x": "y"})),
+            ingest_diagnostics: Some(serde_json::json!([1])),
+            selection_evidence_cache: Some(serde_json::json!("z")),
+            detail: Some("free text".into()),
+            writer_ready: true,
+            writer_lease_epoch: Some(4),
+            landing: Some(Default::default()),
+            ..Heartbeat::default()
+        };
+        assert_eq!(
+            native_heartbeat(&hosted),
+            Heartbeat { busy: true, queue_depth: 2, last_progress_unix_ms: 5, ..Heartbeat::default() }
+        );
+    }
+}
+
+#[cfg(test)]
+mod finding_outbox_signal_tests {
+    use super::*;
+    use crate::contract::FindingOutboxStatus;
+    use crate::signals::Severity;
+
+    fn by_name(signals: &[Signal], name: &str) -> (f64, Severity) {
+        let s = signals.iter().find(|s| s.signal == name).unwrap_or_else(|| panic!("{name} missing"));
+        (s.value, s.severity)
+    }
+
+    /// NAN-4610: with `detect_runs_rules` the detect heartbeat's generic
+    /// `queue_depth` is the rule engine's queue and its `lag_seconds` is 0, so
+    /// the outbox signals must come from the drain's own block. A stuck
+    /// drain pages on age, a deep backlog warns, and a prune that stopped
+    /// (delivered rows outliving the 7-day window) warns but never pages.
+    #[test]
+    fn detect_outbox_signals_read_the_drain_not_the_rule_engine() {
+        let t = Some(TenantId::new("tenant-a").unwrap());
+        let rule_engine_busy = Heartbeat {
+            queue_depth: 2, lag_seconds: 0.0,
+            finding_outbox: Some(FindingOutboxStatus {
+                backlog: 6_000, oldest_age_seconds: 900.0, retention_overdue_seconds: 7.0 * 3600.0,
+            }),
+            ..Heartbeat::default()
+        };
+        let signals = finding_outbox_signals(&t, &rule_engine_busy);
+        assert_eq!(by_name(&signals, "finding_outbox_age"), (900.0, Severity::Page));
+        assert_eq!(by_name(&signals, "finding_outbox_backlog"), (6_000.0, Severity::Warn));
+        assert_eq!(by_name(&signals, "finding_outbox_retention_overdue"), (7.0 * 3600.0, Severity::Warn));
+        let huge = Heartbeat { finding_outbox: Some(FindingOutboxStatus {
+            backlog: 50_000, oldest_age_seconds: 0.0, retention_overdue_seconds: 30.0 * 86_400.0 }), ..Heartbeat::default() };
+        let signals = finding_outbox_signals(&t, &huge);
+        assert_eq!(by_name(&signals, "finding_outbox_backlog").1, Severity::Page);
+        assert_eq!(by_name(&signals, "finding_outbox_retention_overdue").1, Severity::Warn, "retention never pages");
+
+        // A healthy full window: rows kept on purpose, nothing overdue.
+        let healthy = Heartbeat { finding_outbox: Some(FindingOutboxStatus {
+            backlog: 178, oldest_age_seconds: 38.0, retention_overdue_seconds: 0.0 }), ..Heartbeat::default() };
+        assert!(finding_outbox_signals(&t, &healthy).iter().all(|s| s.severity == Severity::Ok));
+
+        // An old drain-only child still reports through the generic fields.
+        let old_child = Heartbeat { queue_depth: 9, lag_seconds: 700.0, ..Heartbeat::default() };
+        let signals = finding_outbox_signals(&t, &old_child);
+        assert_eq!(by_name(&signals, "finding_outbox_age"), (700.0, Severity::Page));
+        assert_eq!(by_name(&signals, "finding_outbox_backlog"), (9.0, Severity::Ok));
+    }
+
+    #[test]
+    fn outbox_backlog_alerts_only_when_sustained() {
+        assert_eq!(crate::signals::Hysteresis::for_signal("finding_outbox_backlog"),
+            crate::signals::Hysteresis::SUSTAINED_CAPACITY);
+        assert_eq!(crate::signals::Hysteresis::for_signal("finding_outbox_age"), crate::signals::Hysteresis::DEFAULT);
     }
 }

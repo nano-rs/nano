@@ -630,7 +630,7 @@ services:
     # OCSF bucket drop (lean-landing). Unset, Vector is part of `lean`.
     profiles: ["legacy", "lake", "${NANO_VECTOR_PROFILE:-lean}"]
     # Digest-pinned — see the note on the postgres service (NAN-1258).
-    image: ghcr.io/nano-rs/vector:0.59.0-nano.7-debian@sha256:3219f912af603e68a23100fb0909d139635aab56bb253461fc794fca88c079d6
+    image: ghcr.io/nano-rs/vector:0.59.0-nano.12-debian@sha256:add06b5413292f53db629161c8f3805e8a3ed61bcb0785b5a0f252ae5ae0ecea
     restart: unless-stopped
     logging: *verbose-logging
     security_opt:
@@ -1603,7 +1603,7 @@ services:
   # on the compose network (never published).
   lean-audit-vector:
     profiles: ["lean"]
-    image: ghcr.io/nano-rs/vector:0.59.0-nano.7-debian@sha256:3219f912af603e68a23100fb0909d139635aab56bb253461fc794fca88c079d6
+    image: ghcr.io/nano-rs/vector:0.59.0-nano.12-debian@sha256:add06b5413292f53db629161c8f3805e8a3ed61bcb0785b5a0f252ae5ae0ecea
     restart: unless-stopped
     logging: *default-logging
     security_opt: ["no-new-privileges:true"]

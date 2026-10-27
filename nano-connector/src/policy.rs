@@ -1,9 +1,9 @@
 //! Outbound policy: which URLs a run may reach, and which IPs it may connect to.
 //!
 //! Two independent checks. The host/path allowlist comes from the spec (with
-//! per-tenant hosts resolved from config at run start). The IP check is fixed:
-//! only globally routable unicast addresses are reachable, whatever the
-//! allowlist says.
+//! per-tenant hosts resolved from config at run start). Public runs admit only
+//! globally routable unicast addresses. A trusted caller may select the
+//! SelfManaged scope for signed on-prem SOAR packs; explicit denies still win.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -153,14 +153,47 @@ impl EgressDeny {
 /// platform and tenant deny lists.
 #[derive(Debug, Clone, Default)]
 pub struct HostPolicy {
+    network: NetworkScope,
     rules: Vec<HostRule>,
     deny: EgressDeny,
 }
 
+/// Trusted caller authority, never deserialized from connector/customer config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NetworkScope {
+    #[default]
+    Public,
+    SelfManaged,
+}
+impl NetworkScope {
+    fn check_name(self, host: &str) -> Result<(), PolicyError> {
+        if self == Self::SelfManaged {
+            // Corporate DNS is permitted, infrastructure service/metadata names are not.
+            let h = format!(".{host}");
+            if [".internal", ".local", ".lan", ".intranet", ".corp", ".private"].iter().any(|s| h.ends_with(s))
+                && !h.ends_with(".cluster.local") && !h.ends_with(".localhost")
+                && !host.split('.').any(|label| matches!(label, "metadata" | "localhost" | "svc")) {
+                return Ok(());
+            }
+        }
+        check_reserved_name(host)
+    }
+    fn permits_private(self, ip: IpAddr) -> bool {
+        self == Self::SelfManaged && match canonical(ip) {
+            IpAddr::V4(ip) => ip.is_private(),
+            IpAddr::V6(ip) => ip.is_unique_local()
+                // AWS IPv6 instance metadata is inside ULA; always refuse it.
+                && !Cidr::parse("fd00:ec2::/32").expect("constant CIDR").contains(IpAddr::V6(ip)),
+        }
+    }
+}
 impl HostPolicy {
     /// Resolve spec rules against config. A templated host must resolve to a
     /// plain host name ending in one of the rule's suffixes.
     pub fn compile(rules: &[AllowRule], scope: &Scope) -> Result<Self, PolicyError> {
+        Self::compile_for_network(rules, scope, NetworkScope::Public)
+    }
+    pub fn compile_for_network(rules: &[AllowRule], scope: &Scope, network: NetworkScope) -> Result<Self, PolicyError> {
         let mut out = Vec::new();
         for r in rules {
             let raw = r
@@ -199,7 +232,7 @@ impl HostPolicy {
             if !is_plain_hostname(&host) {
                 return Err(PolicyError::BadRule(format!("{host:?} is not a host name")));
             }
-            check_reserved_name(&host)?;
+            network.check_name(&host)?;
             let mut prefixes = r.path_prefixes.clone();
             if prefixes.is_empty() {
                 prefixes.push("/".into());
@@ -214,7 +247,7 @@ impl HostPolicy {
                 path_prefixes: prefixes,
             });
         }
-        Ok(Self { rules: out, deny: EgressDeny::default() })
+        Ok(Self { rules: out, deny: EgressDeny::default(), network })
     }
 
     /// Apply a deny list. Fails if it removes every allowed host, so a
@@ -265,7 +298,7 @@ impl HostPolicy {
         if !is_plain_hostname(&host) {
             return Err(PolicyError::HostNotAllowed(host));
         }
-        check_reserved_name(&host)?;
+        self.network.check_name(&host)?;
         if self.deny.denies_host(&host) {
             return Err(PolicyError::HostDenied(host));
         }
@@ -301,10 +334,12 @@ impl HostPolicy {
         Ok((host, port))
     }
 
-    /// The fixed IP check plus the deny CIDRs. Run on every resolved
+    /// The selected network scope plus deny CIDRs. Run on every resolved
     /// address before a connection is made.
     pub fn check_ip(&self, ip: IpAddr) -> Result<(), PolicyError> {
-        check_ip(ip)?;
+        if !self.network.permits_private(ip) {
+            check_ip(ip)?;
+        }
         if self.deny.denies_ip(ip) {
             return Err(PolicyError::IpDenied(ip));
         }

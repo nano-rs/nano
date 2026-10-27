@@ -25,8 +25,9 @@ pub const MAX_FILES_LIMIT: i64 = 200;
 /// Files returned when the caller gives no limit.
 pub const DEFAULT_FILES_LIMIT: i64 = 50;
 
-/// Landing-file states (`landing_files.state`).
-pub const FILE_STATES: [&str; 3] = ["claimed", "accepted", "refused"];
+/// Landing-file states (`landing_files.state`). `listed`: recorded by the
+/// tenant's lister, not claimed yet (migration 374, NAN-4629).
+pub const FILE_STATES: [&str; 4] = ["listed", "claimed", "accepted", "refused"];
 
 /// One bucket-drop source with its file and row totals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -44,7 +45,7 @@ pub struct LandingSourceStatus {
     pub revoked_at: Option<DateTime<Utc>>,
     pub files_accepted: i64,
     pub files_refused: i64,
-    /// Files claimed by the converter and not yet finished.
+    /// Files landed (listed or claimed) and not yet finished.
     pub files_in_progress: i64,
     pub rows_accepted: i64,
     pub rows_refused: i64,
@@ -109,6 +110,7 @@ mod tests {
 
     #[test]
     fn file_states_are_the_migration_states() {
+        assert!(is_file_state("listed"));
         assert!(is_file_state("claimed"));
         assert!(is_file_state("accepted"));
         assert!(is_file_state("refused"));

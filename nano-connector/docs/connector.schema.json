@@ -143,6 +143,28 @@
         },
         {
           "additionalProperties": false,
+          "description": "One credential in a top-level JSON request field",
+          "properties": {
+            "credential": {
+              "type": "string"
+            },
+            "field": {
+              "type": "string"
+            },
+            "type": {
+              "const": "json_body_credential"
+            }
+          },
+          "required": [
+            "credential",
+            "field",
+            "type"
+          ],
+          "title": "JsonBodyCredentialParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Authorization: Basic base64(user:password)",
           "properties": {
             "password_credential": {
@@ -167,6 +189,15 @@
           "additionalProperties": false,
           "description": "RFC 6749 client credentials, cached, refreshed on 401",
           "properties": {
+            "client_auth": {
+              "default": "body",
+              "description": "RFC 6749 client authentication: form fields (default), or HTTP Basic.",
+              "enum": [
+                "body",
+                "basic"
+              ],
+              "type": "string"
+            },
             "client_id": {
               "default": null,
               "description": "The client id itself, not a secret; may template `config.*` (for\nexample `{{config.CLIENT_ID}}`). Exactly one of this and\n`client_id_credential`.",
@@ -207,6 +238,103 @@
             "type"
           ],
           "title": "OAuth2Params",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "OAuth client credentials with a scoped secret JSON field",
+          "properties": {
+            "credential": {
+              "type": "string"
+            },
+            "field_pointer": {
+              "description": "Literal RFC 6901 object-member pointer, at most eight identifier segments.",
+              "type": "string"
+            },
+            "format": {
+              "default": "opaque",
+              "enum": [
+                "opaque",
+                "six_digit_pin"
+              ],
+              "type": "string"
+            },
+            "oauth2": {
+              "additionalProperties": false,
+              "properties": {
+                "client_auth": {
+                  "default": "body",
+                  "description": "RFC 6749 client authentication: form fields (default), or HTTP Basic.",
+                  "enum": [
+                    "body",
+                    "basic"
+                  ],
+                  "type": "string"
+                },
+                "client_id": {
+                  "default": null,
+                  "description": "The client id itself, not a secret; may template `config.*` (for\nexample `{{config.CLIENT_ID}}`). Exactly one of this and\n`client_id_credential`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "client_id_credential": {
+                  "default": null,
+                  "description": "Credential field holding the client id. Exactly one of this and\n`client_id`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "client_secret_credential": {
+                  "type": "string"
+                },
+                "scope": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "token_url": {
+                  "description": "The token endpoint; may template `config.*` (for example\n`https://login.microsoftonline.com/{{config.DIRECTORY_ID}}/oauth2/v2.0/token`).\nThe rendered URL must be in the spec allowlist.",
+                  "type": "string"
+                },
+                "type": {
+                  "default": null,
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "token_url",
+                "client_secret_credential"
+              ],
+              "type": "object"
+            },
+            "selector_pointer": {
+              "description": "Every JSON mutation must have this string discriminator. Other values\nuse OAuth only; exactly selector_value additionally injects the secret.",
+              "type": "string"
+            },
+            "selector_value": {
+              "type": "string"
+            },
+            "type": {
+              "const": "oauth2_json_credential"
+            }
+          },
+          "required": [
+            "oauth2",
+            "credential",
+            "field_pointer",
+            "selector_pointer",
+            "selector_value",
+            "type"
+          ],
+          "title": "OAuth2JsonCredentialParams",
           "type": "object"
         },
         {
@@ -552,6 +680,28 @@
             "type"
           ],
           "title": "HmacParams",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Duo v5 HMAC-SHA512 with JSON body and signed headers",
+          "properties": {
+            "integration_key_credential": {
+              "type": "string"
+            },
+            "secret_key_credential": {
+              "type": "string"
+            },
+            "type": {
+              "const": "duo_hmac"
+            }
+          },
+          "required": [
+            "integration_key_credential",
+            "secret_key_credential",
+            "type"
+          ],
+          "title": "DuoHmacParams",
           "type": "object"
         },
         {

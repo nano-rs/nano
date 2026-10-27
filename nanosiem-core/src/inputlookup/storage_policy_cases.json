@@ -1,0 +1,434 @@
+{
+  "psl_version": "2.1.199",
+  "entries": [
+    {
+      "raw": "ap-north-1.r.cloud.int.apple",
+      "normalized": "ap-north-1.r.cloud.int.apple"
+    },
+    {
+      "raw": "x.ap-north-1.r.cloud.int.apple",
+      "normalized": null
+    },
+    {
+      "raw": "x.r.cloud.int.apple",
+      "normalized": null
+    },
+    {
+      "raw": "child.x.ap-north-1.r.cloud.int.apple",
+      "normalized": "child.x.ap-north-1.r.cloud.int.apple"
+    },
+    {
+      "raw": "*",
+      "normalized": null
+    },
+    {
+      "raw": "com",
+      "normalized": null
+    },
+    {
+      "raw": "*.com",
+      "normalized": null
+    },
+    {
+      "raw": "*.co.uk",
+      "normalized": null
+    },
+    {
+      "raw": "*.amazonaws.com",
+      "normalized": null
+    },
+    {
+      "raw": "127.0.0.1",
+      "normalized": null
+    },
+    {
+      "raw": "2130706433",
+      "normalized": null
+    },
+    {
+      "raw": "0177.0.0.1",
+      "normalized": null
+    },
+    {
+      "raw": "0x7f000001",
+      "normalized": null
+    },
+    {
+      "raw": "[::1]",
+      "normalized": null
+    },
+    {
+      "raw": "localhost",
+      "normalized": null
+    },
+    {
+      "raw": "a.local",
+      "normalized": null
+    },
+    {
+      "raw": "a.localdomain",
+      "normalized": null
+    },
+    {
+      "raw": "a.internal",
+      "normalized": null
+    },
+    {
+      "raw": "a.intranet",
+      "normalized": null
+    },
+    {
+      "raw": "a.lan",
+      "normalized": null
+    },
+    {
+      "raw": "a.home.arpa",
+      "normalized": null
+    },
+    {
+      "raw": "a.svc",
+      "normalized": null
+    },
+    {
+      "raw": "a.cluster.local",
+      "normalized": null
+    },
+    {
+      "raw": "metadata.google.internal",
+      "normalized": null
+    },
+    {
+      "raw": "nano.rs",
+      "normalized": null
+    },
+    {
+      "raw": "a.nano.rs",
+      "normalized": null
+    },
+    {
+      "raw": "user@a.com",
+      "normalized": null
+    },
+    {
+      "raw": "a.com:443",
+      "normalized": null
+    },
+    {
+      "raw": "a.com/x",
+      "normalized": null
+    },
+    {
+      "raw": "bücher.de",
+      "normalized": null
+    },
+    {
+      "raw": "Example.COM.",
+      "normalized": "example.com"
+    },
+    {
+      "raw": "*.Example.COM.",
+      "normalized": "*.example.com"
+    },
+    {
+      "raw": "XN--BCHER-KVA.DE.",
+      "normalized": "xn--bcher-kva.de"
+    },
+    {
+      "raw": "feeds.example.com",
+      "normalized": "feeds.example.com"
+    },
+    {
+      "raw": "example.co.uk",
+      "normalized": "example.co.uk"
+    },
+    {
+      "raw": "tenant.github.io",
+      "normalized": "tenant.github.io"
+    },
+    {
+      "raw": "city.kawasaki.jp",
+      "normalized": "city.kawasaki.jp"
+    },
+    {
+      "raw": "a.b.kawasaki.jp",
+      "normalized": "a.b.kawasaki.jp"
+    },
+    {
+      "raw": "",
+      "normalized": null
+    },
+    {
+      "raw": "a..example.com",
+      "normalized": null
+    },
+    {
+      "raw": "-a.example.com",
+      "normalized": null
+    },
+    {
+      "raw": "a-.example.com",
+      "normalized": null
+    },
+    {
+      "raw": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
+      "normalized": null
+    },
+    {
+      "raw": "example.com..",
+      "normalized": null
+    },
+    {
+      "raw": "example.com ",
+      "normalized": null
+    },
+    {
+      "raw": " example.com",
+      "normalized": null
+    },
+    {
+      "raw": "github.io",
+      "normalized": null
+    },
+    {
+      "raw": "*.github.io",
+      "normalized": null
+    },
+    {
+      "raw": "a.kawasaki.jp",
+      "normalized": null
+    },
+    {
+      "raw": "example.invalid",
+      "normalized": null
+    },
+    {
+      "raw": "example.com%00",
+      "normalized": null
+    },
+    {
+      "raw": "example.com\\x",
+      "normalized": null
+    }
+  ],
+  "urls": [
+    {
+      "raw": "https://storage.googleapis.com@evil.com/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://evil.com#@storage.googleapis.com",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://@storage.googleapis.com/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage.googleapis.com:8443/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "http://storage.googleapis.com/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage.googleapis.com\\@evil.com/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage%2egoogleapis.com/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage.googleapis.com/%2e%2e/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage.googleapis.com/bucket%2fx",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage.googleapis.com/bucket/../x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://2130706433/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://0177.0.0.1/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://0x7f000001/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://[::1]/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://[::ffff:169.254.169.254]/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://8.8.8.8/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://storage.googleapis.com/{user}",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": false,
+      "error": "Shared inputlookup requires a static public HTTPS URL on port 443"
+    },
+    {
+      "raw": "https://STORAGE.GOOGLEAPIS.COM./bucket/x",
+      "entries": [
+        "storage.googleapis.com"
+      ],
+      "allowed": true,
+      "host": "storage.googleapis.com"
+    },
+    {
+      "raw": "https://storage.googleapis.com/x",
+      "entries": [],
+      "allowed": false,
+      "host": "storage.googleapis.com",
+      "error": "host not in this tenant's inputlookup allowlist; a tenant admin can add it in Settings"
+    },
+    {
+      "raw": "https://a.example.com/x",
+      "entries": [
+        "*.example.com"
+      ],
+      "allowed": true,
+      "host": "a.example.com"
+    },
+    {
+      "raw": "https://a.b.example.com/x",
+      "entries": [
+        "*.example.com"
+      ],
+      "allowed": true,
+      "host": "a.b.example.com"
+    },
+    {
+      "raw": "https://example.com/x",
+      "entries": [
+        "*.example.com"
+      ],
+      "allowed": false,
+      "host": "example.com",
+      "error": "host not in this tenant's inputlookup allowlist; a tenant admin can add it in Settings"
+    },
+    {
+      "raw": "https://badexample.com/x",
+      "entries": [
+        "*.example.com"
+      ],
+      "allowed": false,
+      "host": "badexample.com",
+      "error": "host not in this tenant's inputlookup allowlist; a tenant admin can add it in Settings"
+    },
+    {
+      "raw": "https://a.example.com.evil.com/x",
+      "entries": [
+        "*.example.com"
+      ],
+      "allowed": false,
+      "host": "a.example.com.evil.com",
+      "error": "host not in this tenant's inputlookup allowlist; a tenant admin can add it in Settings"
+    },
+    {
+      "raw": "https://feeds.example.com:443/x?sig=offline",
+      "entries": [
+        "feeds.example.com"
+      ],
+      "allowed": true,
+      "host": "feeds.example.com"
+    },
+    {
+      "raw": "https://sub.feeds.example.com/x",
+      "entries": [
+        "feeds.example.com"
+      ],
+      "allowed": false,
+      "host": "sub.feeds.example.com",
+      "error": "host not in this tenant's inputlookup allowlist; a tenant admin can add it in Settings"
+    },
+    {
+      "raw": "https://bücher.de/x",
+      "entries": [
+        "xn--bcher-kva.de"
+      ],
+      "allowed": true,
+      "host": "xn--bcher-kva.de"
+    }
+  ]
+}
